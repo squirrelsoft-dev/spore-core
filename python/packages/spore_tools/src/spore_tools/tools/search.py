@@ -57,7 +57,7 @@ class GrepFilesTool:
             regex = re.compile(params.pattern)
         except re.error as e:
             return InvalidParameters(reason=f"invalid regex: {e}").to_tool_output()
-        root = await sandbox.resolve_path(params.path)
+        root = await sandbox.resolve_path(params.path, "read")
 
         def _scan() -> list[str]:
             matches: list[tuple[str, int, str]] = []
@@ -121,7 +121,7 @@ class FindFilesTool:
             params = parse_params(FindFilesParams, call)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        root = await sandbox.resolve_path(params.path)
+        root = await sandbox.resolve_path(params.path, "read")
 
         def _glob() -> list[str]:
             return sorted(str(p) for p in Path(root).glob(params.glob))

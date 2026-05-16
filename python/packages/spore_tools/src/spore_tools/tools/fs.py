@@ -7,11 +7,13 @@ from pathlib import Path
 import anyio
 
 from spore_core.harness import (
+    Operation,
     SandboxProvider,
     ToolOutput,
     ToolOutputError,
     ToolOutputSuccess,
 )
+from spore_core.sandbox import SandboxViolationException
 from spore_core.model import ToolCall
 from spore_core.tool_registry import ToolAnnotations, ToolSchema
 
@@ -64,7 +66,7 @@ class ReadFileTool:
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         try:
             params = parse_params(ReadFileParams, call)
-            resolved = await _resolve(sandbox, params.path)
+            resolved = await _resolve(sandbox, params.path, "read")
         except ToolExecutionError as e:
             return e.to_tool_output()
         try:
@@ -113,7 +115,7 @@ class WriteFileTool:
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         try:
             params = parse_params(WriteFileParams, call)
-            resolved = await _resolve(sandbox, params.path)
+            resolved = await _resolve(sandbox, params.path, "write")
         except ToolExecutionError as e:
             return e.to_tool_output()
 
@@ -168,7 +170,7 @@ class ListDirTool:
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         try:
             params = parse_params(ListDirParams, call)
-            resolved = await _resolve(sandbox, params.path)
+            resolved = await _resolve(sandbox, params.path, "read")
         except ToolExecutionError as e:
             return e.to_tool_output()
 
@@ -229,7 +231,7 @@ class DeleteFileTool:
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         try:
             params = parse_params(DeleteFileParams, call)
-            resolved = await _resolve(sandbox, params.path)
+            resolved = await _resolve(sandbox, params.path, "write")
         except ToolExecutionError as e:
             return e.to_tool_output()
         try:
@@ -275,8 +277,8 @@ class MoveFileTool:
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         try:
             params = parse_params(MoveFileParams, call)
-            src = await _resolve(sandbox, params.src)
-            dst = await _resolve(sandbox, params.dst)
+            src = await _resolve(sandbox, params.src, "write")
+            dst = await _resolve(sandbox, params.dst, "write")
         except ToolExecutionError as e:
             return e.to_tool_output()
         try:
@@ -291,18 +293,15 @@ class MoveFileTool:
 # ============================================================================
 
 
-async def _resolve(sandbox: SandboxProvider, path: str) -> Path:
+async def _resolve(sandbox: SandboxProvider, path: str, operation: Operation = "read") -> Path:
     """Resolve a path through the sandbox, raising :class:`SandboxViolationError`."""
 
-    # SandboxProvider.resolve_path returns Path. Sandbox-violation paths are
-    # signalled via the Layer-1 ``validate`` already executed by the registry;
-    # the default base impl never raises. Custom sandboxes that need to reject
-    # paths from inside ``resolve_path`` can do so by raising
-    # :class:`SandboxViolationError`.
     try:
-        return await sandbox.resolve_path(path)
+        return await sandbox.resolve_path(path, operation)
     except SandboxViolationError:
         raise
+    except SandboxViolationException as e:
+        raise SandboxViolationError(violation=e.violation) from e
     except Exception as e:  # noqa: BLE001 — keep contract loose for now
         raise InvalidParameters(reason=f"path resolve failed: {e}") from e
 

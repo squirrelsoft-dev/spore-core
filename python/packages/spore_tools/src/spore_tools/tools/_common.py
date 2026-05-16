@@ -25,7 +25,7 @@ async def finish_with_possible_truncation(
         truncated = await sandbox.handle_large_output(
             content, call_id, DEFAULT_HEAD_TOKENS, DEFAULT_TAIL_TOKENS
         )
-        return ToolOutputSuccess(content=truncated.summary, truncated=True)
+        return ToolOutputSuccess(content=truncated.content, truncated=True)
     return ToolOutputSuccess(content=content, truncated=False)
 
 

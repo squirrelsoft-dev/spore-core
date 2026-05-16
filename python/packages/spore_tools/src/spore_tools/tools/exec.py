@@ -96,7 +96,7 @@ class RunTestsTool:
             params = parse_params(RunTestsParams, call)
         except ToolExecutionError as e:
             return e.to_tool_output()
-        working = await sandbox.resolve_path(params.working_dir)
+        working = await sandbox.resolve_path(params.working_dir, "execute")
         parts = params.command.split()
         if not parts:
             return InvalidParameters(reason="command must not be empty").to_tool_output()

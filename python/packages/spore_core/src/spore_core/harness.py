@@ -302,6 +302,7 @@ class SandboxNetworkViolation(_Model):
 class SandboxPathDenied(_Model):
     kind: Literal["path_denied"] = "path_denied"
     path: str
+    matched_rule: str = ""
 
 
 class SandboxReadOnlyViolation(_Model):
@@ -309,8 +310,32 @@ class SandboxReadOnlyViolation(_Model):
     path: str
 
 
+class SandboxExtensionDenied(_Model):
+    kind: Literal["extension_denied"] = "extension_denied"
+    path: str
+    extension: str
+
+
+class SandboxFileSizeExceeded(_Model):
+    kind: Literal["file_size_exceeded"] = "file_size_exceeded"
+    path: str
+    size: int
+    limit: int
+
+
+class SandboxDisallowedCommand(_Model):
+    kind: Literal["disallowed_command"] = "disallowed_command"
+    command: str
+
+
 SandboxViolation = Annotated[
-    SandboxPathEscape | SandboxNetworkViolation | SandboxPathDenied | SandboxReadOnlyViolation,
+    SandboxPathEscape
+    | SandboxNetworkViolation
+    | SandboxPathDenied
+    | SandboxReadOnlyViolation
+    | SandboxExtensionDenied
+    | SandboxFileSizeExceeded
+    | SandboxDisallowedCommand,
     Field(discriminator="kind"),
 ]
 
@@ -506,6 +531,7 @@ class CommandOutput(_Model):
     stderr: str = ""
     exit_code: int = 0
     timed_out: bool = False
+    truncated: bool = False
 
 
 class FileRef(_Model):
@@ -519,17 +545,92 @@ class TruncatedOutput(_Model):
     """Head+tail-truncated output. ``full_ref`` is set when the sandbox
     offloads the original content to a backing file."""
 
-    summary: str
+    content: str
+    truncated: bool = False
     full_ref: FileRef | None = None
+    original_size: int = 0
+
+
+# ----- Operation / IsolationMode / NetworkPolicy (issue #6) ---------------
+
+
+Operation = Literal["read", "write", "execute"]
+
+
+class BwrapProfile(_Model):
+    """Bubblewrap profile descriptor. Opaque placeholder in v1."""
+
+
+class NetworkPolicyNone(_Model):
+    kind: Literal["none"] = "none"
+
+
+class NetworkPolicyAllowlist(_Model):
+    kind: Literal["allowlist"] = "allowlist"
+    hosts: list[str] = Field(default_factory=list)
+
+
+class NetworkPolicyFull(_Model):
+    kind: Literal["full"] = "full"
+
+
+NetworkPolicy = Annotated[
+    NetworkPolicyNone | NetworkPolicyAllowlist | NetworkPolicyFull,
+    Field(discriminator="kind"),
+]
+
+
+class IsolationModeNone(_Model):
+    kind: Literal["none"] = "none"
+
+
+class IsolationModeWorkspaceScoped(_Model):
+    kind: Literal["workspace_scoped"] = "workspace_scoped"
+
+
+class IsolationModeBubblewrap(_Model):
+    kind: Literal["bubblewrap"] = "bubblewrap"
+    profile: BwrapProfile = Field(default_factory=BwrapProfile)
+
+
+class IsolationModeDocker(_Model):
+    kind: Literal["docker"] = "docker"
+    image: str
+    network: NetworkPolicy
+
+
+IsolationMode = Annotated[
+    IsolationModeNone
+    | IsolationModeWorkspaceScoped
+    | IsolationModeBubblewrap
+    | IsolationModeDocker,
+    Field(discriminator="kind"),
+]
+
+
+class WorkspaceConfig(_Model):
+    """Configuration injected at harness construction time.
+
+    Mirrors the Rust ``WorkspaceConfig`` struct. ``allowed_paths`` /
+    ``denied_paths`` are relative-or-absolute filesystem paths;
+    :class:`WorkspaceScopedSandbox` normalizes them at construction time.
+    """
+
+    root: Path
+    allowed_paths: list[Path] = Field(default_factory=list)
+    denied_paths: list[Path] = Field(default_factory=list)
+    allowed_extensions: list[str] | None = None
+    denied_extensions: list[str] = Field(default_factory=list)
+    read_only: bool = False
+    max_file_size: int = 0
 
 
 @runtime_checkable
 class SandboxProvider(Protocol):
     """Issue #6 — validates tool calls against sandbox policy.
 
-    Issue #5 adds ``execute_command``, ``handle_large_output``, and
-    ``resolve_path`` so the standard tool catalogue can be built before #6
-    lands its canonical sandbox. Production sandboxes must override.
+    ``resolve_path`` takes an :data:`Operation` so the sandbox can apply
+    read-only policy and handle missing-file Write/Execute canonicalization.
     """
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None: ...
@@ -550,7 +651,11 @@ class SandboxProvider(Protocol):
         tail_tokens: int,
     ) -> TruncatedOutput: ...
 
-    async def resolve_path(self, path: str) -> Path: ...
+    async def resolve_path(self, path: str, operation: Operation = "read") -> Path: ...
+
+    def isolation_mode(self) -> IsolationMode: ...
+
+    def workspace_root(self) -> Path: ...
 
 
 class BaseSandboxProvider:
@@ -627,16 +732,27 @@ class BaseSandboxProvider:
         head_chars = max(0, head_tokens) * 4
         tail_chars = max(0, tail_tokens) * 4
         total = len(content)
+        original = len(content.encode("utf-8"))
         if total <= head_chars + tail_chars:
-            return TruncatedOutput(summary=content, full_ref=None)
+            return TruncatedOutput(
+                content=content, truncated=False, full_ref=None, original_size=original
+            )
         head = content[:head_chars]
         tail = content[total - tail_chars :]
         elided = total - head_chars - tail_chars
         summary = f"{head}\n... [{elided} chars elided] ...\n{tail}"
-        return TruncatedOutput(summary=summary, full_ref=None)
+        return TruncatedOutput(
+            content=summary, truncated=True, full_ref=None, original_size=original
+        )
 
-    async def resolve_path(self, path: str) -> Path:
+    async def resolve_path(self, path: str, operation: Operation = "read") -> Path:
         return Path(path)
+
+    def isolation_mode(self) -> IsolationMode:
+        return IsolationModeNone()
+
+    def workspace_root(self) -> Path:
+        return Path("/")
 
 
 @runtime_checkable
@@ -1505,12 +1621,27 @@ __all__ = [
     "RunResultFailure",
     "RunResultSuccess",
     "RunResultWaitingForHuman",
+    "BwrapProfile",
+    "IsolationMode",
+    "IsolationModeBubblewrap",
+    "IsolationModeDocker",
+    "IsolationModeNone",
+    "IsolationModeWorkspaceScoped",
+    "NetworkPolicy",
+    "NetworkPolicyAllowlist",
+    "NetworkPolicyFull",
+    "NetworkPolicyNone",
+    "Operation",
+    "SandboxDisallowedCommand",
+    "SandboxExtensionDenied",
+    "SandboxFileSizeExceeded",
     "SandboxNetworkViolation",
     "SandboxPathDenied",
     "SandboxPathEscape",
     "SandboxProvider",
     "SandboxReadOnlyViolation",
     "SandboxViolation",
+    "WorkspaceConfig",
     "ScriptedMiddleware",
     "ScriptedSandbox",
     "ScriptedTerminationPolicy",

@@ -93,7 +93,7 @@ async def test_fixture_replay_output_truncation() -> None:
     for sc in scenarios:
         content = "x" * sc["content_length"]
         out = await sb.handle_large_output(content, "fx", sc["head_tokens"], sc["tail_tokens"])
-        truncated = out.summary != content
+        truncated = out.content != content
         assert truncated == sc["expects_truncated"], (
             f"truncation mismatch at content_length={sc['content_length']}"
         )
