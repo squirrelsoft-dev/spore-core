@@ -420,6 +420,7 @@ HumanResponse = Annotated[
 class ToolOutputSuccess(_Model):
     kind: Literal["success"] = "success"
     content: str
+    truncated: bool = False
 
 
 class ToolOutputError(_Model):
