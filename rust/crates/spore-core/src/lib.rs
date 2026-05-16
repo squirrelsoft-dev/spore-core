@@ -19,9 +19,19 @@
 //!   - #13 TerminationPolicy
 
 pub mod agent;
+pub mod harness;
 pub mod model;
 
 pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
+pub use harness::{
+    AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, ChildPausedState, HaltReason,
+    Harness, HarnessConfig, HarnessError, HarnessRunOptions, HookPoint, HumanRequest,
+    HumanResponse, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig,
+    ObservabilityProvider, OptimizationDirection, PausedState, RiskLevel, RunResult,
+    SandboxProvider, SandboxViolation, SessionId, SessionState, StandardHarness,
+    StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
+    ToolOutput, ToolRegistry, ToolResult as HarnessToolResult,
+};
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
     ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
