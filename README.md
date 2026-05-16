@@ -64,7 +64,7 @@ const result = await harness.run({
 
 ## Components
 
-The harness wires together thirteen components. Every component is a trait/interface — bring your own implementation or use the reference implementations included in the library.
+The harness wires together fifteen components. Every component is a trait/interface — bring your own implementation or use the reference implementations included in the library.
 
 | Component | Purpose |
 |---|---|
@@ -234,4 +234,4 @@ The name comes from mycelium — the persistent underground network that connect
 
 ## License
 
-To be determined.
+[MIT](./LICENSE)
