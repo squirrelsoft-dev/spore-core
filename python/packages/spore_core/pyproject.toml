@@ -3,6 +3,10 @@ name = "spore-core"
 version = "0.0.0"
 description = "spore-core harness runtime library"
 requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.13.0",
+    "pydantic>=2",
+]
 
 [build-system]
 requires = ["hatchling"]

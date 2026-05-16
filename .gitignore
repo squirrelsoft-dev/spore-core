@@ -27,6 +27,19 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+**/.venv/
+.uv-cache/
+**/.uv-cache/
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/
+
 # Tooling
 .omc/
 .claude/worktrees/
