@@ -150,6 +150,12 @@ export interface Tool {
    * the only path to the environment.
    */
   execute(call: ToolCall, sandbox: SandboxProvider, signal?: AbortSignal): Promise<ToolOutput>;
+
+  /**
+   * `true` if this tool may produce a large output that should be routed
+   * through {@link SandboxProvider.handleLargeOutput}. Defaults to `false`.
+   */
+  mayProduceLargeOutput?(): boolean;
 }
 
 // ============================================================================

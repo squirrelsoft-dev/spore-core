@@ -282,10 +282,50 @@ export interface ToolRegistry {
   schemas(): ToolSchema[];
 }
 
-/** Issue #6 — SandboxProvider. */
+/** Output of a sandboxed command. */
+export interface CommandOutput {
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  timed_out: boolean;
+}
+
+/** Result of routing oversized tool output through the sandbox. */
+export interface TruncatedOutput {
+  summary: string;
+  full_ref: string | null;
+}
+
+/** Issue #6 — SandboxProvider.
+ *
+ * The methods `executeCommand`, `handleLargeOutput`, and `resolvePath` mirror
+ * the Rust trait's defaulted methods (issue #5). They are optional here so
+ * that lightweight test stubs only need `validate`; tools fall back to
+ * Node-based defaults when an implementation does not provide them.
+ */
 export interface SandboxProvider {
   /** Resolves with `null` on success, or a SandboxViolation. */
   validate(call: ToolCall, signal?: AbortSignal): Promise<SandboxViolation | null>;
+
+  /** Execute a command (no shell). Default impl spawns via `child_process`. */
+  executeCommand?(
+    command: string,
+    args: readonly string[],
+    cwd?: string | null,
+    timeoutMs?: number | null,
+    signal?: AbortSignal,
+  ): Promise<CommandOutput | SandboxViolation>;
+
+  /** Truncate a large body head+tail. Default impl returns head+marker+tail. */
+  handleLargeOutput?(
+    content: string,
+    callId: string,
+    headTokens: number,
+    tailTokens: number,
+  ): Promise<TruncatedOutput>;
+
+  /** Resolve a path against the workspace root. Default impl is identity. */
+  resolvePath?(path: string): Promise<string | SandboxViolation>;
 }
 
 /** Issue #7 — ContextManager. */

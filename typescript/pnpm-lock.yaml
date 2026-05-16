@@ -38,7 +38,42 @@ importers:
 
   packages/test-utils: {}
 
-  packages/tools: {}
+  packages/tools:
+    dependencies:
+      '@spore/core':
+        specifier: workspace:*
+        version: link:../core
+      picomatch:
+        specifier: ~2.3.2
+        version: 2.3.2
+      zod:
+        specifier: ~3.23.8
+        version: 3.23.8
+    devDependencies:
+      '@types/node':
+        specifier: ~20.16.15
+        version: 20.16.15
+      '@types/picomatch':
+        specifier: ~2.3.4
+        version: 2.3.4
+      eslint:
+        specifier: ~9.13.0
+        version: 9.13.0
+      eslint-config-prettier:
+        specifier: ~9.1.2
+        version: 9.1.2(eslint@9.13.0)
+      prettier:
+        specifier: ~3.3.3
+        version: 3.3.3
+      typescript:
+        specifier: ~5.6.3
+        version: 5.6.3
+      typescript-eslint:
+        specifier: ~8.12.2
+        version: 8.12.2(eslint@9.13.0)(typescript@5.6.3)
+      vitest:
+        specifier: ~2.1.9
+        version: 2.1.9(@types/node@20.16.15)
 
 packages:
 
@@ -393,6 +428,9 @@ packages:
 
   '@types/node@20.16.15':
     resolution: {integrity: sha512-DV58qQz9dBMqVVn+qnKwGa51QzCD4YM/tQM16qLKxdf5tqz5W4QwtrMzjSTbabN1cFTSuyxVYBy+QWHjWW8X/g==}
+
+  '@types/picomatch@2.3.4':
+    resolution: {integrity: sha512-0so8lU8O5zatZS/2Fi4zrwks+vZv7e0dygrgEZXljODXBig97l4cPQD+9LabXfGJOWwoRkTVz6Q4edZvD12UOA==}
 
   '@typescript-eslint/eslint-plugin@8.12.2':
     resolution: {integrity: sha512-gQxbxM8mcxBwaEmWdtLCIGLfixBMHhQjBqR8sVWNTPpcj45WlYL2IObS/DNMLH1DBP0n8qz+aiiLTGfopPEebw==}
@@ -1255,6 +1293,8 @@ snapshots:
   '@types/node@20.16.15':
     dependencies:
       undici-types: 6.19.8
+
+  '@types/picomatch@2.3.4': {}
 
   '@typescript-eslint/eslint-plugin@8.12.2(@typescript-eslint/parser@8.12.2(eslint@9.13.0)(typescript@5.6.3))(eslint@9.13.0)(typescript@5.6.3)':
     dependencies:
