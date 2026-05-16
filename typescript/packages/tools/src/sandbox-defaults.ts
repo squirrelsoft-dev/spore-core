@@ -3,20 +3,25 @@
  *
  * Mirrors the defaulted methods on the Rust `SandboxProvider` trait
  * (`executeCommand`, `handleLargeOutput`, `resolvePath`). Tools call into
- * these helpers so that lightweight test sandboxes only need to implement
- * `validate` while production sandboxes can override each method.
+ * these helpers so lightweight test sandboxes only need to implement
+ * `validate` while production sandboxes override each method.
+ *
+ * Issue #6 update: `resolvePath` now takes an `Operation`, `TruncatedOutput`
+ * now carries `{ content, truncated, fullRef, originalSize }`, and
+ * `CommandOutput` has a `truncated` field.
  */
 
 import { spawn } from "node:child_process";
 import { resolve as pathResolve } from "node:path";
 import type {
   CommandOutput,
+  Operation,
   SandboxProvider,
   SandboxViolation,
   TruncatedOutput,
 } from "@spore/core";
 
-/** Threshold (in bytes/chars) above which tool output is routed through
+/** Threshold (in chars) above which tool output is routed through
  * `SandboxProvider.handleLargeOutput` instead of returned inline. */
 export const LARGE_OUTPUT_THRESHOLD = 64 * 1024;
 
@@ -80,6 +85,7 @@ export async function defaultExecuteCommand(
         stderr: stderr + String(err),
         exit_code: -1,
         timed_out: timedOut,
+        truncated: false,
       });
     });
     child.on("close", (code, sig) => {
@@ -92,6 +98,7 @@ export async function defaultExecuteCommand(
         stderr,
         exit_code: exit,
         timed_out: timedOut || aborted,
+        truncated: false,
       });
     });
   });
@@ -100,6 +107,7 @@ export async function defaultExecuteCommand(
 /**
  * Default truncation strategy. Approximates the head/tail budgets as
  * `tokens * CHARS_PER_TOKEN` characters and joins them with a marker.
+ * Does not offload — `full_ref` is always `null`.
  */
 export async function defaultHandleLargeOutput(
   content: string,
@@ -109,20 +117,32 @@ export async function defaultHandleLargeOutput(
 ): Promise<TruncatedOutput> {
   const headChars = headTokens * CHARS_PER_TOKEN;
   const tailChars = tailTokens * CHARS_PER_TOKEN;
-  if (content.length <= headChars + tailChars) {
-    return { summary: content, full_ref: null };
+  const originalSize = content.length;
+  if (originalSize <= headChars + tailChars) {
+    return {
+      content,
+      truncated: false,
+      full_ref: null,
+      original_size: originalSize,
+    };
   }
   const head = content.slice(0, headChars);
-  const tail = content.slice(content.length - tailChars);
-  const omitted = content.length - headChars - tailChars;
+  const tail = content.slice(originalSize - tailChars);
+  const omitted = originalSize - headChars - tailChars;
   const marker = `\n... [truncated ${omitted} chars; call_id=${callId}] ...\n`;
-  return { summary: head + marker + tail, full_ref: null };
+  return {
+    content: head + marker + tail,
+    truncated: true,
+    full_ref: null,
+    original_size: originalSize,
+  };
 }
 
 /** Identity path resolution. Production sandboxes canonicalize and check
  * against root/allowlist/denylist. */
 export async function defaultResolvePath(
   path: string,
+  _operation: Operation,
 ): Promise<string | SandboxViolation> {
   return pathResolve(path);
 }
@@ -161,9 +181,10 @@ export async function sbHandleLargeOutput(
 export async function sbResolvePath(
   sandbox: SandboxProvider,
   path: string,
+  operation: Operation,
 ): Promise<string | SandboxViolation> {
-  if (sandbox.resolvePath) return sandbox.resolvePath(path);
-  return defaultResolvePath(path);
+  if (sandbox.resolvePath) return sandbox.resolvePath(path, operation);
+  return defaultResolvePath(path, operation);
 }
 
 export function isSandboxViolation(v: unknown): v is SandboxViolation {
@@ -171,9 +192,12 @@ export function isSandboxViolation(v: unknown): v is SandboxViolation {
   const k = (v as { kind?: unknown }).kind;
   return (
     k === "path_escape" ||
-    k === "network_violation" ||
     k === "path_denied" ||
-    k === "read_only_violation"
+    k === "extension_denied" ||
+    k === "read_only_violation" ||
+    k === "file_size_exceeded" ||
+    k === "disallowed_command" ||
+    k === "network_violation"
   );
 }
 
@@ -194,7 +218,7 @@ export async function finishWithPossibleTruncation(
       DEFAULT_HEAD_TOKENS,
       DEFAULT_TAIL_TOKENS,
     );
-    return { kind: "success", content: t.summary, truncated: true };
+    return { kind: "success", content: t.content, truncated: t.truncated };
   }
   return { kind: "success", content, truncated: false };
 }

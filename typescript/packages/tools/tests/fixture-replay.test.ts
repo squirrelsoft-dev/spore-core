@@ -123,8 +123,7 @@ describe("fixture: output_truncation", () => {
         sc.head_tokens,
         sc.tail_tokens,
       );
-      const actuallyTruncated = out.summary !== content;
-      expect(actuallyTruncated).toBe(sc.expects_truncated);
+      expect(out.truncated).toBe(sc.expects_truncated);
     });
   }
 });

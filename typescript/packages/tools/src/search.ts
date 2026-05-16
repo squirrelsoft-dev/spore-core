@@ -107,7 +107,7 @@ export class GrepFilesTool implements Tool {
         reason: `invalid regex: ${e instanceof Error ? e.message : String(e)}`,
       });
     }
-    const root = await sbResolvePath(sandbox, p.value.path);
+    const root = await sbResolvePath(sandbox, p.value.path, "read");
     if (isSandboxViolation(root))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
@@ -178,7 +178,7 @@ export class FindFilesTool implements Tool {
   async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
     const p = parseParams(FindFilesParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
-    const root = await sbResolvePath(sandbox, p.value.path);
+    const root = await sbResolvePath(sandbox, p.value.path, "read");
     if (isSandboxViolation(root))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",

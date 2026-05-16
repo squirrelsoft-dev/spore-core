@@ -136,7 +136,11 @@ export class RunTestsTool implements Tool {
     const p = parseParams(RunTestsParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const timeoutMs = p.value.timeout != null ? p.value.timeout * 1000 : null;
-    const working = await sbResolvePath(sandbox, p.value.working_dir);
+    const working = await sbResolvePath(
+      sandbox,
+      p.value.working_dir,
+      "execute",
+    );
     if (isSandboxViolation(working))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",

@@ -241,15 +241,66 @@ export interface ToolResultRecord {
   output: ToolOutput;
 }
 
-/** Sandbox violation. Full enum lives in issue #6. */
+/** Sandbox violation — issue #6.
+ *
+ * Discriminated union, `kind` tag in `snake_case`. Wire-compatible with the
+ * Rust `SandboxViolation` enum (which uses `#[serde(tag = "kind")]`).
+ */
 export type SandboxViolation =
   | { kind: "path_escape"; path: string }
-  | { kind: "network_violation"; host: string }
-  | { kind: "path_denied"; path: string }
-  | { kind: "read_only_violation"; path: string };
+  | { kind: "path_denied"; path: string; matched_rule: string }
+  | { kind: "extension_denied"; path: string; extension: string }
+  | { kind: "read_only_violation"; path: string }
+  | { kind: "file_size_exceeded"; path: string; size: number; limit: number }
+  | { kind: "disallowed_command"; command: string }
+  | { kind: "network_violation"; host: string };
 
 export function sandboxViolationIsAlwaysHalt(v: SandboxViolation): boolean {
   return v.kind === "path_escape" || v.kind === "network_violation";
+}
+
+// ============================================================================
+// Sandbox isolation modes — issue #6
+// ============================================================================
+
+/** Read/write/execute operation tag — passed to `resolvePath`. */
+export type Operation = "read" | "write" | "execute";
+
+/** Bubblewrap profile — placeholder; backend not wired in v1. */
+export interface BwrapProfile {
+  /** Free-form profile name; semantics deferred to the backend. */
+  name?: string;
+}
+
+/** Docker network policy. */
+export type NetworkPolicy =
+  | { kind: "none" }
+  | { kind: "allowlist"; hosts: string[] }
+  | { kind: "full" };
+
+/** Discriminated isolation mode. */
+export type IsolationMode =
+  | { kind: "none" }
+  | { kind: "workspace_scoped" }
+  | { kind: "bubblewrap"; profile: BwrapProfile }
+  | { kind: "docker"; image: string; network: NetworkPolicy };
+
+/** Configuration consumed by `WorkspaceScopedSandbox`. */
+export interface WorkspaceConfig {
+  /** Workspace root. Canonicalized at construction. */
+  root: string;
+  /** Explicit allowlist (relative to root, or absolute under root). */
+  allowed_paths?: string[];
+  /** Explicit denylist; evaluated after the allowlist. */
+  denied_paths?: string[];
+  /** Allowed extensions. `undefined` = allow all. Advisory in v1. */
+  allowed_extensions?: string[];
+  /** Denied extensions (e.g. `["env", "pem", "key"]`). Leading dot tolerated. */
+  denied_extensions?: string[];
+  /** If true, Write/Execute resolve to ReadOnlyViolation. */
+  read_only?: boolean;
+  /** Max file size (bytes) for reads. `0` disables. */
+  max_file_size?: number;
 }
 
 export type HookPoint = "before_turn" | "before_tool" | "after_tool" | "before_completion";
@@ -288,20 +339,36 @@ export interface CommandOutput {
   stderr: string;
   exit_code: number;
   timed_out: boolean;
+  /** Additive field (#6): true when stdout/stderr were truncated upstream. */
+  truncated: boolean;
 }
 
-/** Result of routing oversized tool output through the sandbox. */
+/** Reference to a file containing offloaded full content. */
+export interface FileRef {
+  path: string;
+  size: number;
+}
+
+/** Result of routing oversized tool output through the sandbox (#6 shape). */
 export interface TruncatedOutput {
-  summary: string;
-  full_ref: string | null;
+  /** head + separator + tail (or original content when below threshold). */
+  content: string;
+  truncated: boolean;
+  /** Path + size of the offloaded full content, when one was written. */
+  full_ref: FileRef | null;
+  /** Original (untruncated) size in characters. */
+  original_size: number;
 }
 
 /** Issue #6 — SandboxProvider.
  *
- * The methods `executeCommand`, `handleLargeOutput`, and `resolvePath` mirror
- * the Rust trait's defaulted methods (issue #5). They are optional here so
- * that lightweight test stubs only need `validate`; tools fall back to
+ * `executeCommand`, `handleLargeOutput`, and `resolvePath` mirror the
+ * Rust trait's defaulted methods (issue #5). They are optional here so
+ * lightweight test stubs only need `validate`; tools fall back to
  * Node-based defaults when an implementation does not provide them.
+ *
+ * `isolationMode` and `workspaceRoot` are likewise optional for the same
+ * reason — production sandboxes implement both.
  */
 export interface SandboxProvider {
   /** Resolves with `null` on success, or a SandboxViolation. */
@@ -324,8 +391,14 @@ export interface SandboxProvider {
     tailTokens: number,
   ): Promise<TruncatedOutput>;
 
-  /** Resolve a path against the workspace root. Default impl is identity. */
-  resolvePath?(path: string): Promise<string | SandboxViolation>;
+  /** Resolve a path against the workspace root. */
+  resolvePath?(path: string, operation: Operation): Promise<string | SandboxViolation>;
+
+  /** Current isolation mode. */
+  isolationMode?(): IsolationMode;
+
+  /** Canonical workspace root. */
+  workspaceRoot?(): string;
 }
 
 /** Issue #7 — ContextManager. */

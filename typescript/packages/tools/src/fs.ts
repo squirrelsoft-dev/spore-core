@@ -59,7 +59,7 @@ export class ReadFileTool implements Tool {
   async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
     const p = parseParams(ReadFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
-    const resolved = await sbResolvePath(sandbox, p.value.path);
+    const resolved = await sbResolvePath(sandbox, p.value.path, "read");
     if (isSandboxViolation(resolved))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
@@ -113,7 +113,7 @@ export class WriteFileTool implements Tool {
     const p = parseParams(WriteFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const { path, content, append } = p.value;
-    const resolved = await sbResolvePath(sandbox, path);
+    const resolved = await sbResolvePath(sandbox, path, "write");
     if (isSandboxViolation(resolved))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
@@ -173,7 +173,7 @@ export class ListDirTool implements Tool {
   async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
     const p = parseParams(ListDirParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
-    const resolved = await sbResolvePath(sandbox, p.value.path);
+    const resolved = await sbResolvePath(sandbox, p.value.path, "read");
     if (isSandboxViolation(resolved))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
@@ -250,7 +250,7 @@ export class DeleteFileTool implements Tool {
   async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
     const p = parseParams(DeleteFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
-    const resolved = await sbResolvePath(sandbox, p.value.path);
+    const resolved = await sbResolvePath(sandbox, p.value.path, "write");
     if (isSandboxViolation(resolved))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
@@ -302,13 +302,13 @@ export class MoveFileTool implements Tool {
   async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
     const p = parseParams(MoveFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
-    const src = await sbResolvePath(sandbox, p.value.src);
+    const src = await sbResolvePath(sandbox, p.value.src, "write");
     if (isSandboxViolation(src))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
         violation: src,
       });
-    const dst = await sbResolvePath(sandbox, p.value.dst);
+    const dst = await sbResolvePath(sandbox, p.value.dst, "write");
     if (isSandboxViolation(dst))
       return toolExecutionErrorToOutput({
         kind: "sandbox_violation",
