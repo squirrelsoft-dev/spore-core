@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod harness;
 pub mod model;
+pub mod tool_registry;
 
 pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
 pub use harness::{
@@ -30,11 +31,15 @@ pub use harness::{
     ObservabilityProvider, OptimizationDirection, PausedState, RiskLevel, RunResult,
     SandboxProvider, SandboxViolation, SessionId, SessionState, StandardHarness,
     StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
-    ToolOutput, ToolRegistry, ToolResult as HarnessToolResult,
+    ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult,
 };
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
     ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
     RecordedExchange, ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall,
     ToolResult, ToolSchema,
+};
+pub use tool_registry::{
+    DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
+    ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
 };

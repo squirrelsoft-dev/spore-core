@@ -286,6 +286,8 @@ pub type StreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
 pub enum ToolOutput {
     Success {
         content: String,
+        #[serde(default)]
+        truncated: bool,
     },
     Error {
         message: String,
@@ -1295,7 +1297,7 @@ pub mod testing {
         ) -> BoxFut<'a, ()> {
             Box::pin(async move {
                 let text = match &result.output {
-                    ToolOutput::Success { content } => content.clone(),
+                    ToolOutput::Success { content, .. } => content.clone(),
                     ToolOutput::Error { message, .. } => format!("[error] {message}"),
                     ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                 };
@@ -1389,6 +1391,7 @@ pub mod testing {
                 .pop_front()
                 .unwrap_or(ToolOutput::Success {
                     content: "ok".into(),
+                    truncated: false,
                 });
             Box::pin(async move { out })
         }
@@ -1572,6 +1575,7 @@ mod tests {
         let reg = Arc::new(ScriptedToolRegistry::new());
         reg.push(ToolOutput::Success {
             content: "tool-ok".into(),
+            truncated: false,
         });
         cfg.tool_registry = reg.clone();
         let h = StandardHarness::new(cfg);
@@ -1612,9 +1616,11 @@ mod tests {
         let reg = Arc::new(ScriptedToolRegistry::new());
         reg.push(ToolOutput::Success {
             content: "1".into(),
+            truncated: false,
         });
         reg.push(ToolOutput::Success {
             content: "2".into(),
+            truncated: false,
         });
         cfg.tool_registry = reg.clone();
         let h = StandardHarness::new(cfg);
@@ -1963,6 +1969,7 @@ mod tests {
         let reg = Arc::new(ScriptedToolRegistry::new());
         reg.push(ToolOutput::Success {
             content: "tool-ok".into(),
+            truncated: false,
         });
         cfg.tool_registry = reg.clone();
         let h = StandardHarness::new(cfg);
@@ -2049,6 +2056,7 @@ mod tests {
         let reg = Arc::new(ScriptedToolRegistry::new());
         reg.push(ToolOutput::Success {
             content: "x".into(),
+            truncated: false,
         });
         cfg.tool_registry = reg;
         let h = StandardHarness::new(cfg);

@@ -45,6 +45,7 @@ async fn react_loop_dispatches_tool_then_completes() {
     let tool_registry = Arc::new(ScriptedToolRegistry::new());
     tool_registry.push(ToolOutput::Success {
         content: "127.0.0.1 localhost".into(),
+        truncated: false,
     });
 
     let config = HarnessConfig {

@@ -1,0 +1,58 @@
+[
+  {
+    "name": "happy_path_dispatch",
+    "register": [
+      {
+        "name": "echo",
+        "description": "echo tool",
+        "parameters": {
+          "type": "object",
+          "properties": {"v": {"type": "string"}}
+        },
+        "annotations": {"read_only": true}
+      }
+    ],
+    "call": {"id": "c1", "name": "echo", "input": {"v": "hi"}},
+    "expected": {"kind": "ok", "call_id": "c1"}
+  },
+  {
+    "name": "unregistered_tool",
+    "register": [],
+    "call": {"id": "c2", "name": "missing", "input": {}},
+    "expected": {"kind": "err", "error": "UnregisteredTool"}
+  },
+  {
+    "name": "missing_required_field",
+    "register": [
+      {
+        "name": "read",
+        "description": "read file",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        },
+        "annotations": {"read_only": true}
+      }
+    ],
+    "call": {"id": "c3", "name": "read", "input": {}},
+    "expected": {"kind": "err", "error": "SchemaValidationFailed"}
+  },
+  {
+    "name": "required_field_present",
+    "register": [
+      {
+        "name": "read",
+        "description": "read file",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        },
+        "annotations": {"read_only": true}
+      }
+    ],
+    "call": {"id": "c4", "name": "read", "input": {"path": "/x"}},
+    "expected": {"kind": "ok", "call_id": "c4"}
+  }
+]
