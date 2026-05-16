@@ -1,0 +1,24 @@
+// Watches .spore/sessions/**/*.jsonl files and ships them to Loki.
+// The harness writes traces here as the durable local buffer (#33).
+// Alloy tails these files and indexes them for full-text search in Grafana.
+
+local.file_match "spore_sessions" {
+  path_targets = [{"__path__" = "/workspace/.spore/sessions/**/*.jsonl"}]
+  sync_period  = "10s"
+}
+
+loki.source.file "spore_sessions" {
+  targets    = local.file_match.spore_sessions.targets
+  forward_to = [loki.write.default.receiver]
+
+  labels = {
+    job    = "spore-sessions",
+    source = "jsonl",
+  }
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
