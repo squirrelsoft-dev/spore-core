@@ -1,0 +1,13 @@
+{
+  "name": "escape_via_absolute_dotdot",
+  "workspace_root": "/work",
+  "raw_path": "/../../etc/passwd",
+  "filesystem": {},
+  "allowed_paths": [],
+  "denied_paths": [],
+  "denied_extensions": [],
+  "read_only": false,
+  "max_file_size": 0,
+  "operation": "read",
+  "expected": { "kind": "path_escape" }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "path_denied_denylist",
+  "workspace_root": "/work",
+  "raw_path": "secrets/k.txt",
+  "filesystem": {
+    "secrets": { "dir": true },
+    "secrets/k.txt": { "file": "shh" }
+  },
+  "allowed_paths": [],
+  "denied_paths": ["secrets"],
+  "denied_extensions": [],
+  "read_only": false,
+  "max_file_size": 0,
+  "operation": "read",
+  "expected": { "kind": "path_denied" }
+}

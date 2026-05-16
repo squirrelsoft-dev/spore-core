@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
+use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
@@ -150,7 +150,10 @@ impl Tool for RunTestsTool {
                 Err(e) => return e.into(),
             };
             let timeout = params.timeout.map(Duration::from_secs);
-            let working = match sandbox.resolve_path(&params.working_dir).await {
+            let working = match sandbox
+                .resolve_path(&params.working_dir, Operation::Read)
+                .await
+            {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };

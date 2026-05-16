@@ -1,0 +1,15 @@
+{
+  "name": "file_size_exceeded",
+  "workspace_root": "/work",
+  "raw_path": "big.txt",
+  "filesystem": {
+    "big.txt": { "file": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+  },
+  "allowed_paths": [],
+  "denied_paths": [],
+  "denied_extensions": [],
+  "read_only": false,
+  "max_file_size": 32,
+  "operation": "read",
+  "expected": { "kind": "file_size_exceeded" }
+}

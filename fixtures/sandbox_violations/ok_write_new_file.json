@@ -1,0 +1,13 @@
+{
+  "name": "ok_write_new_file",
+  "workspace_root": "/work",
+  "raw_path": "new.txt",
+  "filesystem": {},
+  "allowed_paths": [],
+  "denied_paths": [],
+  "denied_extensions": [],
+  "read_only": false,
+  "max_file_size": 0,
+  "operation": "write",
+  "expected": { "kind": "ok" }
+}

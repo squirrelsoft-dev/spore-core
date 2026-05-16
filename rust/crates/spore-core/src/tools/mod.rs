@@ -53,7 +53,7 @@ pub(crate) async fn finish_with_possible_truncation(
             .handle_large_output(content, call_id, DEFAULT_HEAD_TOKENS, DEFAULT_TAIL_TOKENS)
             .await;
         crate::harness::ToolOutput::Success {
-            content: truncated.summary,
+            content: truncated.content,
             truncated: true,
         }
     } else {
@@ -157,7 +157,7 @@ mod fixture_tests {
             let truncated = sandbox
                 .handle_large_output(content.clone(), "fx", sc.head_tokens, sc.tail_tokens)
                 .await;
-            let actually_truncated = truncated.summary != content;
+            let actually_truncated = truncated.content != content;
             assert_eq!(
                 actually_truncated, sc.expects_truncated,
                 "truncation mismatch at content_length={}",

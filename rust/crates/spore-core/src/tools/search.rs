@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
+use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
@@ -86,7 +86,7 @@ impl Tool for GrepFilesTool {
                     .into()
                 }
             };
-            let root = match sandbox.resolve_path(&params.path).await {
+            let root = match sandbox.resolve_path(&params.path, Operation::Read).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
@@ -175,7 +175,7 @@ impl Tool for FindFilesTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let root = match sandbox.resolve_path(&params.path).await {
+            let root = match sandbox.resolve_path(&params.path, Operation::Read).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };

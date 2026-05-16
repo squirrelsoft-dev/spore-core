@@ -314,10 +314,32 @@ pub struct ToolResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SandboxViolation {
-    PathEscape { path: String },
-    NetworkViolation { host: String },
-    PathDenied { path: String },
-    ReadOnlyViolation { path: String },
+    PathEscape {
+        path: String,
+    },
+    NetworkViolation {
+        host: String,
+    },
+    PathDenied {
+        path: String,
+        #[serde(default)]
+        matched_rule: String,
+    },
+    ReadOnlyViolation {
+        path: String,
+    },
+    ExtensionDenied {
+        path: String,
+        extension: String,
+    },
+    FileSizeExceeded {
+        path: String,
+        size: u64,
+        limit: u64,
+    },
+    DisallowedCommand {
+        command: String,
+    },
 }
 
 impl SandboxViolation {
@@ -417,6 +439,7 @@ pub trait SandboxProvider: Send + Sync {
                             stderr: format!("command timed out after {}s", t.as_secs()),
                             exit_code: -1,
                             timed_out: true,
+                            truncated: false,
                         });
                     }
                 }
@@ -429,12 +452,14 @@ pub trait SandboxProvider: Send + Sync {
                     stderr: String::from_utf8_lossy(&out.stderr).to_string(),
                     exit_code: out.status.code().unwrap_or(-1),
                     timed_out: false,
+                    truncated: false,
                 }),
                 Err(e) => Ok(CommandOutput {
                     stdout: String::new(),
                     stderr: format!("spawn failed: {e}"),
                     exit_code: -1,
                     timed_out: false,
+                    truncated: false,
                 }),
             }
         })
@@ -454,32 +479,109 @@ pub trait SandboxProvider: Send + Sync {
             let head_chars = (head_tokens as usize).saturating_mul(4);
             let tail_chars = (tail_tokens as usize).saturating_mul(4);
             let total = content.chars().count();
+            let original_size = content.len() as u64;
             if total <= head_chars + tail_chars {
                 return TruncatedOutput {
-                    summary: content,
+                    content,
+                    truncated: false,
                     full_ref: None,
+                    original_size,
                 };
             }
             let head: String = content.chars().take(head_chars).collect();
             let tail: String = content.chars().skip(total - tail_chars).collect();
             let elided = total - head_chars - tail_chars;
-            let summary = format!("{head}\n... [{elided} chars elided] ...\n{tail}");
+            let snippet = format!("{head}\n... [{elided} chars elided] ...\n{tail}");
             TruncatedOutput {
-                summary,
+                content: snippet,
+                truncated: true,
                 full_ref: None,
+                original_size,
             }
         })
     }
 
     /// Resolve / canonicalize a path against the sandbox root. Default is
     /// an identity pass-through; production sandboxes must enforce roots.
+    ///
+    /// `operation` lets implementations distinguish reads from writes so they
+    /// can apply `read_only`-style policies and skip canonicalization for
+    /// not-yet-existing files on writes.
     fn resolve_path<'a>(
         &'a self,
         path: &'a str,
+        operation: Operation,
     ) -> BoxFut<'a, Result<std::path::PathBuf, SandboxViolation>> {
+        let _ = operation;
         Box::pin(async move { Ok(std::path::PathBuf::from(path)) })
     }
+
+    /// Active isolation mode. Used by observability and middleware. Default
+    /// returns `IsolationMode::None`; production sandboxes should override.
+    fn isolation_mode(&self) -> IsolationMode {
+        IsolationMode::None
+    }
+
+    /// Workspace root used by `ContextManager` for directory-map injection.
+    /// Default returns `/`, which is **not** safe — production sandboxes
+    /// must override.
+    fn workspace_root(&self) -> &std::path::Path {
+        std::path::Path::new("/")
+    }
 }
+
+/// Filesystem operation being performed on a path. Passed to
+/// [`SandboxProvider::resolve_path`] so the sandbox can apply read-only
+/// policies and adjust canonicalization behavior for not-yet-existing files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    Read,
+    Write,
+    Execute,
+}
+
+/// Isolation strategy for sandboxed subprocess execution.
+///
+/// Lives on the trait so middleware and observability can route on it
+/// without depending on the concrete sandbox impl.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IsolationMode {
+    /// No isolation. Trusted-dev use only; the sandbox must emit a warning
+    /// at construction time.
+    None,
+    /// Path enforcement only — no process or network isolation. Default for
+    /// the canonical `WorkspaceScopedSandbox`.
+    WorkspaceScoped,
+    /// Linux process isolation via bubblewrap. Reserved; not implemented in
+    /// the v1 reference sandbox.
+    Bubblewrap { profile: BwrapProfile },
+    /// Full Docker isolation including network policy. Reserved; not
+    /// implemented in the v1 reference sandbox.
+    Docker {
+        image: String,
+        network: NetworkPolicy,
+    },
+}
+
+/// Network egress policy for `IsolationMode::Docker`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    /// No network access at all.
+    None,
+    /// Allow egress to the listed hosts only.
+    Allowlist { hosts: Vec<String> },
+    /// Unrestricted egress. Use with caution.
+    Full,
+}
+
+/// Bubblewrap profile descriptor. Opaque in v1 — the bubblewrap backend is
+/// not yet implemented, but the shape lives on the public surface so the
+/// `IsolationMode` enum can be exhaustive across all four implementations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BwrapProfile {}
 
 /// Output of a subprocess executed through the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,18 +591,35 @@ pub struct CommandOutput {
     pub exit_code: i32,
     #[serde(default)]
     pub timed_out: bool,
+    /// `true` if `stdout`/`stderr` were truncated by `handle_large_output`
+    /// before being returned. Kept alongside `timed_out` so existing callers
+    /// continue to compile.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Head+tail-truncated output. `full_ref` is `Some` when the sandbox offloads
 /// the original content to a backing file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruncatedOutput {
-    pub summary: String,
+    /// The (possibly truncated) head+tail content surfaced to the agent.
+    pub content: String,
+    /// `true` if the original content was truncated.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Backing file holding the full original content, if offloaded.
     #[serde(default)]
     pub full_ref: Option<FileRef>,
+    /// Original size of the input content in bytes.
+    #[serde(default)]
+    pub original_size: u64,
 }
 
 /// Reference to a file holding offloaded tool output.
+///
+/// `path` is a string and `byte_len` is a `u64` to keep the wire format
+/// portable across the four reference implementations — `PathBuf` serde is
+/// platform-specific and `usize` width differs by target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRef {
     pub path: String,
@@ -1849,7 +1968,10 @@ mod tests {
         });
         let mut cfg = standard_config(a);
         let sb = Arc::new(ScriptedSandbox::new());
-        sb.push(Err(SandboxViolation::PathDenied { path: "/p".into() }));
+        sb.push(Err(SandboxViolation::PathDenied {
+            path: "/p".into(),
+            matched_rule: "test".into(),
+        }));
         cfg.sandbox = sb;
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(react(5))).await {

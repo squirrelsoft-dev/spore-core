@@ -21,19 +21,20 @@
 pub mod agent;
 pub mod harness;
 pub mod model;
+pub mod sandbox;
 pub mod tool_registry;
 pub mod tools;
 
 pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
 pub use harness::{
-    AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, ChildPausedState, CommandOutput,
-    FileRef, HaltReason, Harness, HarnessConfig, HarnessError, HarnessRunOptions, HookPoint,
-    HumanRequest, HumanResponse, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig,
-    ObservabilityProvider, OptimizationDirection, PausedState, RiskLevel, RunResult,
-    SandboxProvider, SandboxViolation, SessionId, SessionState, StandardHarness,
-    StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
-    ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult,
-    TruncatedOutput,
+    AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
+    CommandOutput, FileRef, HaltReason, Harness, HarnessConfig, HarnessError, HarnessRunOptions,
+    HookPoint, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain,
+    MiddlewareDecision, ModelConfig, NetworkPolicy, ObservabilityProvider, Operation,
+    OptimizationDirection, PausedState, RiskLevel, RunResult, SandboxProvider, SandboxViolation,
+    SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
+    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    ToolResult as HarnessToolResult, TruncatedOutput,
 };
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
@@ -41,6 +42,7 @@ pub use model::{
     RecordedExchange, ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall,
     ToolResult, ToolSchema,
 };
+pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
     ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,

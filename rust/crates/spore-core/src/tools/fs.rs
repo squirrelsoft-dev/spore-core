@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::harness::{BoxFut, SandboxProvider, ToolOutput};
+use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
@@ -63,7 +63,7 @@ impl Tool for ReadFileTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let resolved = match sandbox.resolve_path(&params.path).await {
+            let resolved = match sandbox.resolve_path(&params.path, Operation::Read).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
@@ -131,7 +131,7 @@ impl Tool for WriteFileTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let resolved = match sandbox.resolve_path(&params.path).await {
+            let resolved = match sandbox.resolve_path(&params.path, Operation::Write).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
@@ -215,7 +215,7 @@ impl Tool for ListDirTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let resolved = match sandbox.resolve_path(&params.path).await {
+            let resolved = match sandbox.resolve_path(&params.path, Operation::Read).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
@@ -311,7 +311,7 @@ impl Tool for DeleteFileTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let resolved = match sandbox.resolve_path(&params.path).await {
+            let resolved = match sandbox.resolve_path(&params.path, Operation::Write).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
@@ -380,11 +380,11 @@ impl Tool for MoveFileTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
-            let src = match sandbox.resolve_path(&params.src).await {
+            let src = match sandbox.resolve_path(&params.src, Operation::Write).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
-            let dst = match sandbox.resolve_path(&params.dst).await {
+            let dst = match sandbox.resolve_path(&params.dst, Operation::Write).await {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };

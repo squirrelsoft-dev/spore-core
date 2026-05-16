@@ -1,0 +1,17 @@
+{
+  "name": "path_denied_allowlist_miss",
+  "workspace_root": "/work",
+  "raw_path": "outside.rs",
+  "filesystem": {
+    "src": { "dir": true },
+    "src/a.rs": { "file": "" },
+    "outside.rs": { "file": "" }
+  },
+  "allowed_paths": ["src"],
+  "denied_paths": [],
+  "denied_extensions": [],
+  "read_only": false,
+  "max_file_size": 0,
+  "operation": "read",
+  "expected": { "kind": "path_denied" }
+}
