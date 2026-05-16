@@ -19,4 +19,4 @@
  *   #12 ObservabilityProvider
  *   #13 TerminationPolicy
  */
-export {};
+export * from "./model/index.js";
