@@ -90,7 +90,7 @@ func (t *GrepFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sa
 	if err != nil {
 		return InvalidParameters(fmt.Sprintf("invalid regex: %s", err)).ToToolOutput()
 	}
-	root, v := sandbox.ResolvePath(ctx, params.Path)
+	root, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationRead)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -175,7 +175,7 @@ func (t *FindFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sa
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	root, v := sandbox.ResolvePath(ctx, params.Path)
+	root, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationRead)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}

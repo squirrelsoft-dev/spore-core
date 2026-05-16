@@ -117,7 +117,7 @@ func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if params.Timeout != nil {
 		timeout = time.Duration(*params.Timeout) * time.Second
 	}
-	working, v := sandbox.ResolvePath(ctx, params.WorkingDir)
+	working, v := sandbox.ResolvePath(ctx, params.WorkingDir, sporecore.OperationExecute)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}

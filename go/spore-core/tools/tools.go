@@ -177,7 +177,7 @@ func finishWithPossibleTruncation(
 		t := sandbox.HandleLargeOutput(ctx, content, callID, DefaultHeadTokens, DefaultTailTokens)
 		return sporecore.ToolOutput{
 			Kind:      sporecore.ToolOutputSuccess,
-			Content:   t.Summary,
+			Content:   t.Content,
 			Truncated: true,
 		}
 	}

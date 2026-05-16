@@ -46,7 +46,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	resolved, v := sandbox.ResolvePath(ctx, params.Path)
+	resolved, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationRead)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -93,7 +93,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sa
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	resolved, v := sandbox.ResolvePath(ctx, params.Path)
+	resolved, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationWrite)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -153,7 +153,7 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	resolved, v := sandbox.ResolvePath(ctx, params.Path)
+	resolved, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationRead)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -224,7 +224,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, s
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	resolved, v := sandbox.ResolvePath(ctx, params.Path)
+	resolved, v := sandbox.ResolvePath(ctx, params.Path, sporecore.OperationWrite)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -272,11 +272,11 @@ func (t *MoveFileTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
-	src, v := sandbox.ResolvePath(ctx, params.Src)
+	src, v := sandbox.ResolvePath(ctx, params.Src, sporecore.OperationWrite)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
-	dst, v := sandbox.ResolvePath(ctx, params.Dst)
+	dst, v := sandbox.ResolvePath(ctx, params.Dst, sporecore.OperationWrite)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}

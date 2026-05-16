@@ -502,27 +502,69 @@ type HarnessToolResult struct {
 type SandboxViolationKind string
 
 const (
-	SandboxPathEscape       SandboxViolationKind = "path_escape"
-	SandboxNetworkViolation SandboxViolationKind = "network_violation"
-	SandboxPathDenied       SandboxViolationKind = "path_denied"
-	SandboxReadOnly         SandboxViolationKind = "read_only_violation"
+	SandboxPathEscape        SandboxViolationKind = "path_escape"
+	SandboxNetworkViolation  SandboxViolationKind = "network_violation"
+	SandboxPathDenied        SandboxViolationKind = "path_denied"
+	SandboxReadOnly          SandboxViolationKind = "read_only_violation"
+	SandboxExtensionDenied   SandboxViolationKind = "extension_denied"
+	SandboxFileSizeExceeded  SandboxViolationKind = "file_size_exceeded"
+	SandboxDisallowedCommand SandboxViolationKind = "disallowed_command"
 )
 
-// SandboxViolation is a sandbox-side rejection. Full enum lives in #6.
+// SandboxViolation is a sandbox-side rejection. Issue #6 expands the variant
+// set; the on-wire shape is a flat tagged object discriminated by Kind.
+//
+// Per-variant fields (only the relevant ones are populated):
+//   - path_escape:         Path
+//   - path_denied:         Path, MatchedRule
+//   - read_only_violation: Path
+//   - extension_denied:    Path, Extension
+//   - file_size_exceeded:  Path, Size, Limit
+//   - disallowed_command:  Command
+//   - network_violation:   Host
 type SandboxViolation struct {
-	Kind SandboxViolationKind `json:"kind"`
-	Path string               `json:"-"`
-	Host string               `json:"-"`
+	Kind        SandboxViolationKind `json:"kind"`
+	Path        string               `json:"-"`
+	Host        string               `json:"-"`
+	MatchedRule string               `json:"-"`
+	Extension   string               `json:"-"`
+	Size        uint64               `json:"-"`
+	Limit       uint64               `json:"-"`
+	Command     string               `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
 func (s SandboxViolation) MarshalJSON() ([]byte, error) {
 	switch s.Kind {
-	case SandboxPathEscape, SandboxPathDenied, SandboxReadOnly:
+	case SandboxPathEscape, SandboxReadOnly:
 		return json.Marshal(struct {
 			Kind SandboxViolationKind `json:"kind"`
 			Path string               `json:"path"`
 		}{s.Kind, s.Path})
+	case SandboxPathDenied:
+		return json.Marshal(struct {
+			Kind        SandboxViolationKind `json:"kind"`
+			Path        string               `json:"path"`
+			MatchedRule string               `json:"matched_rule"`
+		}{s.Kind, s.Path, s.MatchedRule})
+	case SandboxExtensionDenied:
+		return json.Marshal(struct {
+			Kind      SandboxViolationKind `json:"kind"`
+			Path      string               `json:"path"`
+			Extension string               `json:"extension"`
+		}{s.Kind, s.Path, s.Extension})
+	case SandboxFileSizeExceeded:
+		return json.Marshal(struct {
+			Kind  SandboxViolationKind `json:"kind"`
+			Path  string               `json:"path"`
+			Size  uint64               `json:"size"`
+			Limit uint64               `json:"limit"`
+		}{s.Kind, s.Path, s.Size, s.Limit})
+	case SandboxDisallowedCommand:
+		return json.Marshal(struct {
+			Kind    SandboxViolationKind `json:"kind"`
+			Command string               `json:"command"`
+		}{s.Kind, s.Command})
 	case SandboxNetworkViolation:
 		return json.Marshal(struct {
 			Kind SandboxViolationKind `json:"kind"`
@@ -536,9 +578,14 @@ func (s SandboxViolation) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON decodes the flat form.
 func (s *SandboxViolation) UnmarshalJSON(data []byte) error {
 	var probe struct {
-		Kind SandboxViolationKind `json:"kind"`
-		Path string               `json:"path"`
-		Host string               `json:"host"`
+		Kind        SandboxViolationKind `json:"kind"`
+		Path        string               `json:"path"`
+		Host        string               `json:"host"`
+		MatchedRule string               `json:"matched_rule"`
+		Extension   string               `json:"extension"`
+		Size        uint64               `json:"size"`
+		Limit       uint64               `json:"limit"`
+		Command     string               `json:"command"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -546,6 +593,11 @@ func (s *SandboxViolation) UnmarshalJSON(data []byte) error {
 	s.Kind = probe.Kind
 	s.Path = probe.Path
 	s.Host = probe.Host
+	s.MatchedRule = probe.MatchedRule
+	s.Extension = probe.Extension
+	s.Size = probe.Size
+	s.Limit = probe.Limit
+	s.Command = probe.Command
 	return nil
 }
 
@@ -557,9 +609,15 @@ func (s *SandboxViolation) Error() string {
 	case SandboxNetworkViolation:
 		return fmt.Sprintf("sandbox: network violation: %s", s.Host)
 	case SandboxPathDenied:
-		return fmt.Sprintf("sandbox: path denied: %s", s.Path)
+		return fmt.Sprintf("sandbox: path denied: %s (rule=%s)", s.Path, s.MatchedRule)
 	case SandboxReadOnly:
 		return fmt.Sprintf("sandbox: read-only violation: %s", s.Path)
+	case SandboxExtensionDenied:
+		return fmt.Sprintf("sandbox: extension denied: %s (.%s)", s.Path, s.Extension)
+	case SandboxFileSizeExceeded:
+		return fmt.Sprintf("sandbox: file size exceeded: %s (%d > %d)", s.Path, s.Size, s.Limit)
+	case SandboxDisallowedCommand:
+		return fmt.Sprintf("sandbox: disallowed command: %s", s.Command)
 	default:
 		return fmt.Sprintf("sandbox violation: %s", s.Kind)
 	}
@@ -569,6 +627,99 @@ func (s *SandboxViolation) Error() string {
 func (s SandboxViolation) IsAlwaysHalt() bool {
 	return s.Kind == SandboxPathEscape || s.Kind == SandboxNetworkViolation
 }
+
+// ============================================================================
+// Operation — read | write | execute
+// ============================================================================
+
+// Operation tags the intent of a path resolution. Read operations are
+// permitted in read-only mode; Write and Execute are not.
+type Operation string
+
+const (
+	OperationRead    Operation = "read"
+	OperationWrite   Operation = "write"
+	OperationExecute Operation = "execute"
+)
+
+// ============================================================================
+// WorkspaceConfig — sandbox construction inputs
+// ============================================================================
+
+// WorkspaceConfig is the input to NewWorkspaceScopedSandbox. Paths are kept
+// as strings to stay portable across the cross-language fixtures; the
+// canonical, OS-specific resolution happens inside the sandbox.
+type WorkspaceConfig struct {
+	Root              string   `json:"root"`
+	AllowedPaths      []string `json:"allowed_paths,omitempty"`
+	DeniedPaths       []string `json:"denied_paths,omitempty"`
+	AllowedExtensions []string `json:"allowed_extensions,omitempty"`
+	DeniedExtensions  []string `json:"denied_extensions,omitempty"`
+	ReadOnly          bool     `json:"read_only,omitempty"`
+	MaxFileSize       uint64   `json:"max_file_size,omitempty"`
+}
+
+// ============================================================================
+// IsolationMode — sealed interface
+// ============================================================================
+
+// IsolationMode is a sealed interface with concrete impls IsolationNone,
+// IsolationWorkspaceScoped, IsolationBubblewrap, IsolationDocker. The
+// unexported sealedIsolationMode() method seals the type so external
+// implementations cannot satisfy it.
+type IsolationMode interface {
+	sealedIsolationMode()
+	Kind() string
+}
+
+type IsolationNone struct{}
+type IsolationWorkspaceScoped struct{}
+type IsolationBubblewrap struct {
+	Profile BwrapProfile `json:"profile"`
+}
+type IsolationDocker struct {
+	Image   string        `json:"image"`
+	Network NetworkPolicy `json:"network"`
+}
+
+func (IsolationNone) sealedIsolationMode()            {}
+func (IsolationWorkspaceScoped) sealedIsolationMode() {}
+func (IsolationBubblewrap) sealedIsolationMode()      {}
+func (IsolationDocker) sealedIsolationMode()          {}
+
+func (IsolationNone) Kind() string            { return "none" }
+func (IsolationWorkspaceScoped) Kind() string { return "workspace_scoped" }
+func (IsolationBubblewrap) Kind() string      { return "bubblewrap" }
+func (IsolationDocker) Kind() string          { return "docker" }
+
+// BwrapProfile is a placeholder for the bubblewrap configuration. Fields
+// will be filled in when a bubblewrap backend lands.
+type BwrapProfile struct{}
+
+// ============================================================================
+// NetworkPolicy — sealed interface
+// ============================================================================
+
+// NetworkPolicy is a sealed interface with NetworkNone, NetworkAllowlist,
+// NetworkFull concrete impls.
+type NetworkPolicy interface {
+	sealedNetworkPolicy()
+	Kind() string
+}
+
+type NetworkNone struct{}
+type NetworkAllowlist struct {
+	Hosts []string `json:"hosts"`
+}
+type NetworkFull struct{}
+
+func (NetworkNone) sealedNetworkPolicy()      {}
+func (NetworkAllowlist) sealedNetworkPolicy() {}
+func (NetworkFull) sealedNetworkPolicy()      {}
+
+func (NetworkNone) Kind() string      { return "none" }
+func (NetworkAllowlist) Kind() string { return "allowlist" }
+func (NetworkFull) Kind() string      { return "full" }
 
 // HookPoint indicates where in the lifecycle a middleware hook fired.
 type HookPoint string
@@ -637,31 +788,40 @@ type SandboxProvider interface {
 	// A non-zero timeout (Duration > 0) bounds execution.
 	ExecuteCommand(ctx context.Context, command string, args []string, workingDir string, timeout time.Duration) (CommandOutput, *SandboxViolation)
 
-	// HandleLargeOutput head+tail-truncates content. Returns a TruncatedOutput
-	// whose Summary equals the input iff no truncation occurred. callID is
-	// echoed for offload bookkeeping.
+	// HandleLargeOutput head+tail-truncates content and may offload the full
+	// content to a backing file. Truncated == false means the input was
+	// returned unchanged.
 	HandleLargeOutput(ctx context.Context, content string, callID string, headTokens uint32, tailTokens uint32) TruncatedOutput
 
-	// ResolvePath canonicalizes a raw path against the sandbox root. The
-	// default is an identity pass-through; production sandboxes must enforce
-	// the workspace root.
-	ResolvePath(ctx context.Context, path string) (string, *SandboxViolation)
+	// ResolvePath canonicalizes a raw path against the sandbox root and
+	// validates it against the workspace policy for the given operation.
+	ResolvePath(ctx context.Context, path string, op Operation) (string, *SandboxViolation)
+
+	// IsolationMode returns the active isolation mode (used by middleware /
+	// observability).
+	IsolationMode() IsolationMode
+
+	// WorkspaceRoot returns the canonical workspace root path.
+	WorkspaceRoot() string
 }
 
 // CommandOutput is the result of a subprocess executed via the sandbox.
 type CommandOutput struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
-	TimedOut bool   `json:"timed_out,omitempty"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	ExitCode  int    `json:"exit_code"`
+	TimedOut  bool   `json:"timed_out,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
-// TruncatedOutput is the result of HandleLargeOutput. Summary equals the
-// original content iff no truncation happened. FullRef is populated when the
+// TruncatedOutput is the result of HandleLargeOutput. Content equals the
+// original input iff Truncated == false. FullRef is populated when the
 // sandbox offloads the original to a backing file.
 type TruncatedOutput struct {
-	Summary string   `json:"summary"`
-	FullRef *FileRef `json:"full_ref,omitempty"`
+	Content      string   `json:"content"`
+	Truncated    bool     `json:"truncated"`
+	FullRef      *FileRef `json:"full_ref,omitempty"`
+	OriginalSize uint64   `json:"original_size"`
 }
 
 // FileRef references a file holding offloaded tool output.

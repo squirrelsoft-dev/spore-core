@@ -142,7 +142,7 @@ func TestFixtureReplayOutputTruncation(t *testing.T) {
 	for _, sc := range scenarios {
 		content := strings.Repeat("x", sc.ContentLength)
 		out := sb.HandleLargeOutput(context.Background(), content, "fx", sc.HeadTokens, sc.TailTokens)
-		actuallyTruncated := out.Summary != content
+		actuallyTruncated := out.Truncated
 		if actuallyTruncated != sc.ExpectsTruncated {
 			t.Errorf("content_length=%d head=%d tail=%d: truncated=%v, expected=%v",
 				sc.ContentLength, sc.HeadTokens, sc.TailTokens, actuallyTruncated, sc.ExpectsTruncated)

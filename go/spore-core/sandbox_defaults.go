@@ -1,18 +1,18 @@
-// Default sandbox helpers (issue #5).
+// Default sandbox helpers.
 //
-// DefaultSandbox supplies non-sandboxed default implementations of the three
-// new SandboxProvider methods introduced by the standard tool catalogue:
-// ExecuteCommand, HandleLargeOutput, and ResolvePath. Test stubs and the
-// in-tree AllowAllSandbox embed it so they don't have to spell out each
-// method individually.
+// DefaultSandbox supplies non-sandboxed default implementations of the
+// SandboxProvider methods that are not specific to a workspace root. Test
+// stubs and the in-tree AllowAllSandbox embed it so they don't have to spell
+// out each method individually.
 //
 // These defaults are deliberately not production-safe:
 //   - ExecuteCommand spawns processes directly via os/exec with no isolation.
 //   - ResolvePath returns the raw path unchanged.
 //   - HandleLargeOutput truncates head+tail in memory and never offloads.
+//   - IsolationMode is IsolationNone and WorkspaceRoot is empty.
 //
-// Issue #6 (SandboxProvider) overrides these with a workspace-rooted
-// canonical implementation.
+// Issue #6 (SandboxProvider) ships the canonical WorkspaceScopedSandbox in
+// sandbox.go for production use.
 
 package sporecore
 
@@ -23,9 +23,8 @@ import (
 	"time"
 )
 
-// DefaultSandbox supplies the non-sandboxed defaults for the three issue-#5
-// SandboxProvider methods. Embed it in any SandboxProvider implementation
-// that only needs to override Validate.
+// DefaultSandbox supplies the non-sandboxed defaults for the
+// SandboxProvider methods that are reused across test stubs.
 type DefaultSandbox struct{}
 
 // ExecuteCommand runs a subprocess via os/exec.CommandContext. A non-zero
@@ -97,18 +96,26 @@ func (DefaultSandbox) HandleLargeOutput(
 	tailChars := int(tailTokens) * 4
 	// Operate on runes so the truncation is UTF-8 safe.
 	runes := []rune(content)
+	originalSize := uint64(len(content))
 	if len(runes) <= headChars+tailChars {
-		return TruncatedOutput{Summary: content}
+		return TruncatedOutput{Content: content, Truncated: false, OriginalSize: originalSize}
 	}
 	head := string(runes[:headChars])
 	tail := string(runes[len(runes)-tailChars:])
 	elided := len(runes) - headChars - tailChars
 	summary := fmt.Sprintf("%s\n... [%d chars elided] ...\n%s", head, elided, tail)
-	return TruncatedOutput{Summary: summary}
+	return TruncatedOutput{Content: summary, Truncated: true, OriginalSize: originalSize}
 }
 
 // ResolvePath is an identity pass-through — the default sandbox does not
 // enforce a workspace root.
-func (DefaultSandbox) ResolvePath(_ context.Context, path string) (string, *SandboxViolation) {
+func (DefaultSandbox) ResolvePath(_ context.Context, path string, _ Operation) (string, *SandboxViolation) {
 	return path, nil
 }
+
+// IsolationMode reports IsolationNone for the default (non-sandboxed) stub.
+func (DefaultSandbox) IsolationMode() IsolationMode { return IsolationNone{} }
+
+// WorkspaceRoot returns the empty string — the default sandbox does not
+// enforce a workspace root.
+func (DefaultSandbox) WorkspaceRoot() string { return "" }
