@@ -1,0 +1,114 @@
+// Default sandbox helpers (issue #5).
+//
+// DefaultSandbox supplies non-sandboxed default implementations of the three
+// new SandboxProvider methods introduced by the standard tool catalogue:
+// ExecuteCommand, HandleLargeOutput, and ResolvePath. Test stubs and the
+// in-tree AllowAllSandbox embed it so they don't have to spell out each
+// method individually.
+//
+// These defaults are deliberately not production-safe:
+//   - ExecuteCommand spawns processes directly via os/exec with no isolation.
+//   - ResolvePath returns the raw path unchanged.
+//   - HandleLargeOutput truncates head+tail in memory and never offloads.
+//
+// Issue #6 (SandboxProvider) overrides these with a workspace-rooted
+// canonical implementation.
+
+package sporecore
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"time"
+)
+
+// DefaultSandbox supplies the non-sandboxed defaults for the three issue-#5
+// SandboxProvider methods. Embed it in any SandboxProvider implementation
+// that only needs to override Validate.
+type DefaultSandbox struct{}
+
+// ExecuteCommand runs a subprocess via os/exec.CommandContext. A non-zero
+// timeout bounds execution; on expiry, TimedOut is set and ExitCode is -1.
+// Never returns a SandboxViolation — failures land in CommandOutput.
+func (DefaultSandbox) ExecuteCommand(
+	ctx context.Context,
+	command string,
+	args []string,
+	workingDir string,
+	timeout time.Duration,
+) (CommandOutput, *SandboxViolation) {
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(runCtx, command, args...)
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
+	stdout, err := cmd.Output()
+	stderr := ""
+	if ee, ok := err.(*exec.ExitError); ok {
+		stderr = string(ee.Stderr)
+	}
+	exitCode := 0
+	timedOut := false
+	if err != nil {
+		if runCtx.Err() == context.DeadlineExceeded {
+			return CommandOutput{
+				Stdout:   "",
+				Stderr:   fmt.Sprintf("command timed out after %s", timeout),
+				ExitCode: -1,
+				TimedOut: true,
+			}, nil
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			return CommandOutput{
+				Stdout:   "",
+				Stderr:   fmt.Sprintf("spawn failed: %s", err),
+				ExitCode: -1,
+				TimedOut: timedOut,
+			}, nil
+		}
+	}
+	return CommandOutput{
+		Stdout:   string(stdout),
+		Stderr:   stderr,
+		ExitCode: exitCode,
+		TimedOut: timedOut,
+	}, nil
+}
+
+// HandleLargeOutput head+tail-truncates content using a 4-chars-per-token
+// approximation. Returns the original content unchanged if it already fits.
+// Never offloads — FullRef is always nil.
+func (DefaultSandbox) HandleLargeOutput(
+	_ context.Context,
+	content string,
+	_ string,
+	headTokens uint32,
+	tailTokens uint32,
+) TruncatedOutput {
+	headChars := int(headTokens) * 4
+	tailChars := int(tailTokens) * 4
+	// Operate on runes so the truncation is UTF-8 safe.
+	runes := []rune(content)
+	if len(runes) <= headChars+tailChars {
+		return TruncatedOutput{Summary: content}
+	}
+	head := string(runes[:headChars])
+	tail := string(runes[len(runes)-tailChars:])
+	elided := len(runes) - headChars - tailChars
+	summary := fmt.Sprintf("%s\n... [%d chars elided] ...\n%s", head, elided, tail)
+	return TruncatedOutput{Summary: summary}
+}
+
+// ResolvePath is an identity pass-through — the default sandbox does not
+// enforce a workspace root.
+func (DefaultSandbox) ResolvePath(_ context.Context, path string) (string, *SandboxViolation) {
+	return path, nil
+}

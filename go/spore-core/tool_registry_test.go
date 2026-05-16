@@ -16,8 +16,9 @@ type echoTool struct {
 	calls atomic.Int64
 }
 
-func (e *echoTool) Name() string         { return e.name }
-func (e *echoTool) IsSubagentTool() bool { return false }
+func (e *echoTool) Name() string                { return e.name }
+func (e *echoTool) IsSubagentTool() bool        { return false }
+func (e *echoTool) MayProduceLargeOutput() bool { return false }
 func (e *echoTool) Execute(_ context.Context, call ToolCall, _ SandboxProvider) ToolOutput {
 	e.calls.Add(1)
 	return ToolOutput{
@@ -28,17 +29,18 @@ func (e *echoTool) Execute(_ context.Context, call ToolCall, _ SandboxProvider) 
 
 type subagentTool struct{ name string }
 
-func (s *subagentTool) Name() string         { return s.name }
-func (s *subagentTool) IsSubagentTool() bool { return true }
+func (s *subagentTool) Name() string                { return s.name }
+func (s *subagentTool) IsSubagentTool() bool        { return true }
+func (s *subagentTool) MayProduceLargeOutput() bool { return false }
 func (s *subagentTool) Execute(_ context.Context, _ ToolCall, _ SandboxProvider) ToolOutput {
 	return ToolOutput{Kind: ToolOutputSuccess, Content: "subagent done"}
 }
 
-type allowAllSandbox struct{}
+type allowAllSandbox struct{ DefaultSandbox }
 
 func (allowAllSandbox) Validate(context.Context, ToolCall) *SandboxViolation { return nil }
 
-type denyAllSandbox struct{}
+type denyAllSandbox struct{ DefaultSandbox }
 
 func (denyAllSandbox) Validate(context.Context, ToolCall) *SandboxViolation {
 	return &SandboxViolation{Kind: SandboxPathEscape, Path: "denied"}

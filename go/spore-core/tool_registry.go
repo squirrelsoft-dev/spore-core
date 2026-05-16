@@ -280,6 +280,10 @@ type Tool interface {
 	// at construction time. Default false for non-subagent tools.
 	IsSubagentTool() bool
 
+	// MayProduceLargeOutput reports whether this tool can return output
+	// large enough to warrant routing through SandboxProvider.HandleLargeOutput.
+	MayProduceLargeOutput() bool
+
 	// Execute runs the tool with validated input. The SandboxProvider is
 	// the only path to the environment.
 	Execute(ctx context.Context, call ToolCall, sandbox SandboxProvider) ToolOutput

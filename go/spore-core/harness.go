@@ -619,8 +619,55 @@ func (s SessionState) MarshalJSON() ([]byte, error) {
 // ToolRegistry (#4) is defined in tool_registry.go.
 
 // SandboxProvider (#6) validates tool calls against sandbox policy.
+//
+// Issue #5 adds ExecuteCommand, HandleLargeOutput, and ResolvePath so the
+// standard tool catalogue can be built before #6 lands its canonical
+// sandbox. The DefaultSandbox struct (sandbox_defaults.go) implements those
+// three methods with non-sandboxed defaults; embed it in any stub
+// implementation that only cares about Validate.
+//
+// These defaults are NOT production-safe: ExecuteCommand spawns processes
+// directly with no sandboxing, ResolvePath returns the input as-is, and
+// HandleLargeOutput truncates inline without offloading. Issue #6 must
+// override these.
 type SandboxProvider interface {
 	Validate(ctx context.Context, call ToolCall) *SandboxViolation
+
+	// ExecuteCommand runs a subprocess. working_dir may be "" to inherit.
+	// A non-zero timeout (Duration > 0) bounds execution.
+	ExecuteCommand(ctx context.Context, command string, args []string, workingDir string, timeout time.Duration) (CommandOutput, *SandboxViolation)
+
+	// HandleLargeOutput head+tail-truncates content. Returns a TruncatedOutput
+	// whose Summary equals the input iff no truncation occurred. callID is
+	// echoed for offload bookkeeping.
+	HandleLargeOutput(ctx context.Context, content string, callID string, headTokens uint32, tailTokens uint32) TruncatedOutput
+
+	// ResolvePath canonicalizes a raw path against the sandbox root. The
+	// default is an identity pass-through; production sandboxes must enforce
+	// the workspace root.
+	ResolvePath(ctx context.Context, path string) (string, *SandboxViolation)
+}
+
+// CommandOutput is the result of a subprocess executed via the sandbox.
+type CommandOutput struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
+	TimedOut bool   `json:"timed_out,omitempty"`
+}
+
+// TruncatedOutput is the result of HandleLargeOutput. Summary equals the
+// original content iff no truncation happened. FullRef is populated when the
+// sandbox offloads the original to a backing file.
+type TruncatedOutput struct {
+	Summary string   `json:"summary"`
+	FullRef *FileRef `json:"full_ref,omitempty"`
+}
+
+// FileRef references a file holding offloaded tool output.
+type FileRef struct {
+	Path    string `json:"path"`
+	ByteLen uint64 `json:"byte_len"`
 }
 
 // ContextManager (#7) assembles per-turn context and appends results.
@@ -1698,8 +1745,10 @@ func (NoopContextManager) AppendUserMessage(_ context.Context, s *SessionState, 
 // ShouldCompact always returns false.
 func (NoopContextManager) ShouldCompact(*SessionState) bool { return false }
 
-// AllowAllSandbox is a SandboxProvider that approves every call.
-type AllowAllSandbox struct{}
+// AllowAllSandbox is a SandboxProvider that approves every call. It embeds
+// DefaultSandbox to pick up ExecuteCommand / HandleLargeOutput / ResolvePath
+// implementations.
+type AllowAllSandbox struct{ DefaultSandbox }
 
 // Validate always returns nil (no violation).
 func (AllowAllSandbox) Validate(context.Context, ToolCall) *SandboxViolation { return nil }
@@ -1791,6 +1840,7 @@ func (s *ScriptedToolRegistry) IsAlwaysHalt(name string) bool {
 
 // ScriptedSandbox returns queued violations.
 type ScriptedSandbox struct {
+	DefaultSandbox
 	mu       sync.Mutex
 	outcomes []*SandboxViolation
 }
