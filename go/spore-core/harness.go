@@ -430,7 +430,8 @@ const (
 type ToolOutput struct {
 	Kind ToolOutputKind `json:"kind"`
 	// success
-	Content string `json:"-"`
+	Content   string `json:"-"`
+	Truncated bool   `json:"-"`
 	// error
 	Message     string `json:"-"`
 	Recoverable bool   `json:"-"`
@@ -444,9 +445,10 @@ func (o ToolOutput) MarshalJSON() ([]byte, error) {
 	switch o.Kind {
 	case ToolOutputSuccess:
 		return json.Marshal(struct {
-			Kind    ToolOutputKind `json:"kind"`
-			Content string         `json:"content"`
-		}{o.Kind, o.Content})
+			Kind      ToolOutputKind `json:"kind"`
+			Content   string         `json:"content"`
+			Truncated bool           `json:"truncated,omitempty"`
+		}{o.Kind, o.Content, o.Truncated})
 	case ToolOutputError:
 		return json.Marshal(struct {
 			Kind        ToolOutputKind `json:"kind"`
@@ -469,6 +471,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	var probe struct {
 		Kind        ToolOutputKind    `json:"kind"`
 		Content     string            `json:"content"`
+		Truncated   bool              `json:"truncated"`
 		Message     string            `json:"message"`
 		Recoverable bool              `json:"recoverable"`
 		ChildState  *ChildPausedState `json:"child_state"`
@@ -479,6 +482,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	}
 	o.Kind = probe.Kind
 	o.Content = probe.Content
+	o.Truncated = probe.Truncated
 	o.Message = probe.Message
 	o.Recoverable = probe.Recoverable
 	o.ChildState = probe.ChildState
@@ -612,12 +616,7 @@ func (s SessionState) MarshalJSON() ([]byte, error) {
 // Forward-declared sibling interfaces
 // ============================================================================
 
-// ToolRegistry (#4) dispatches tool calls. Minimal surface; #4 will extend.
-type ToolRegistry interface {
-	Dispatch(ctx context.Context, call ToolCall) ToolOutput
-	IsAlwaysHalt(toolName string) bool
-	Schemas() []ToolSchema
-}
+// ToolRegistry (#4) is defined in tool_registry.go.
 
 // SandboxProvider (#6) validates tool calls against sandbox policy.
 type SandboxProvider interface {
@@ -1451,7 +1450,7 @@ func (h *StandardHarness) runReAct(
 				emit(onStream, HarnessStreamEvent{
 					Kind: HarnessStreamToolCall, CallID: call.ID, Name: call.Name,
 				})
-				output := h.config.ToolRegistry.Dispatch(ctx, call)
+				output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
 
 				// Pause propagation: WaitingForHuman from a subagent tool.
 				if output.Kind == ToolOutputWaitingForHuman {
@@ -1582,13 +1581,13 @@ func (h *StandardHarness) Resume(
 		h.config.ContextManager.AppendUserMessage(ctx, &session, response.Feedback)
 	case HumanRespAllow:
 		for _, call := range pending {
-			output := h.config.ToolRegistry.Dispatch(ctx, call)
+			output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
 	case HumanRespAllowWithModification:
 		for _, call := range response.Calls {
-			output := h.config.ToolRegistry.Dispatch(ctx, call)
+			output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
@@ -1603,6 +1602,63 @@ func (h *StandardHarness) Resume(
 
 // Compile-time interface check.
 var _ Harness = (*StandardHarness)(nil)
+
+// dispatchAndUnwrap calls the registry's Dispatch and folds a *DispatchError
+// into a ToolOutput so the harness loop can keep operating on a uniform
+// ToolOutput shape. Recoverability follows the spec's Layer-2 routing:
+// UnregisteredTool is unrecoverable; SchemaValidationFailed and recoverable
+// SandboxViolations stay recoverable; ToolExecutionFailed mirrors the
+// originating recoverable flag (treated as unrecoverable by default since
+// the spec routes it via middleware on failure).
+func dispatchAndUnwrap(
+	ctx context.Context,
+	registry ToolRegistry,
+	sandbox SandboxProvider,
+	call ToolCall,
+) ToolOutput {
+	tr, err := registry.Dispatch(ctx, call, sandbox)
+	if err == nil {
+		return tr.Output
+	}
+	de, ok := err.(*DispatchError)
+	if !ok {
+		return ToolOutput{
+			Kind:        ToolOutputError,
+			Message:     err.Error(),
+			Recoverable: false,
+		}
+	}
+	switch de.Kind {
+	case DispatchErrUnregisteredTool:
+		return ToolOutput{
+			Kind:        ToolOutputError,
+			Message:     de.Error(),
+			Recoverable: false,
+		}
+	case DispatchErrSchemaValidationFailed:
+		return ToolOutput{
+			Kind:        ToolOutputError,
+			Message:     de.Error(),
+			Recoverable: true,
+		}
+	case DispatchErrSandboxViolation:
+		recoverable := true
+		if de.Violation != nil && de.Violation.IsAlwaysHalt() {
+			recoverable = false
+		}
+		return ToolOutput{
+			Kind:        ToolOutputError,
+			Message:     de.Error(),
+			Recoverable: recoverable,
+		}
+	default:
+		return ToolOutput{
+			Kind:        ToolOutputError,
+			Message:     de.Error(),
+			Recoverable: false,
+		}
+	}
+}
 
 // ============================================================================
 // Test-only stub implementations of the sibling interfaces.
@@ -1685,17 +1741,45 @@ func (s *ScriptedToolRegistry) MarkAlwaysHalt(name string) {
 }
 
 // Dispatch returns the next queued output (defaulting to Success "ok").
-func (s *ScriptedToolRegistry) Dispatch(context.Context, ToolCall) ToolOutput {
+func (s *ScriptedToolRegistry) Dispatch(_ context.Context, call ToolCall, _ SandboxProvider) (HarnessToolResult, error) {
 	s.CallCount.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var out ToolOutput
 	if len(s.outputs) == 0 {
-		return ToolOutput{Kind: ToolOutputSuccess, Content: "ok"}
+		out = ToolOutput{Kind: ToolOutputSuccess, Content: "ok"}
+	} else {
+		out = s.outputs[0]
+		s.outputs = s.outputs[1:]
 	}
-	out := s.outputs[0]
-	s.outputs = s.outputs[1:]
+	return HarnessToolResult{CallID: call.ID, Output: out}, nil
+}
+
+// DispatchAll dispatches calls sequentially, preserving input order.
+func (s *ScriptedToolRegistry) DispatchAll(ctx context.Context, calls []ToolCall, sandbox SandboxProvider) []DispatchOutcome {
+	out := make([]DispatchOutcome, len(calls))
+	for i, c := range calls {
+		res, err := s.Dispatch(ctx, c, sandbox)
+		if err != nil {
+			out[i].Err = err.(*DispatchError)
+		} else {
+			out[i].Result = res
+		}
+	}
 	return out
 }
+
+// Register is a no-op for the test stub.
+func (s *ScriptedToolRegistry) Register(Tool, RegistryToolSchema) error { return nil }
+
+// RegisterSet is a no-op for the test stub.
+func (s *ScriptedToolRegistry) RegisterSet(ToolSet) error { return nil }
+
+// ActiveSchemas returns an empty slice.
+func (s *ScriptedToolRegistry) ActiveSchemas(*TaskPhase) []RegistryToolSchema { return nil }
+
+// HasSubagentTools always reports false in the scripted stub.
+func (s *ScriptedToolRegistry) HasSubagentTools() bool { return false }
 
 // IsAlwaysHalt reports whether a tool name was marked.
 func (s *ScriptedToolRegistry) IsAlwaysHalt(name string) bool {
@@ -1704,9 +1788,6 @@ func (s *ScriptedToolRegistry) IsAlwaysHalt(name string) bool {
 	_, ok := s.alwaysHalt[name]
 	return ok
 }
-
-// Schemas returns an empty slice.
-func (s *ScriptedToolRegistry) Schemas() []ToolSchema { return nil }
 
 // ScriptedSandbox returns queued violations.
 type ScriptedSandbox struct {
