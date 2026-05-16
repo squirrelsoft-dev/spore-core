@@ -4,6 +4,10 @@
 **/*.rs.bk
 *.pdb
 
+# Go
+go/spore-cli/spore-cli
+go/spore-eval/spore-eval
+
 # Editors
 .vscode/
 .idea/
