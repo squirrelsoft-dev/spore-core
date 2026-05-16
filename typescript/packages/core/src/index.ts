@@ -22,3 +22,4 @@
 export * from "./model/index.js";
 export * from "./agent/index.js";
 export * from "./harness/index.js";
+export * as toolRegistry from "./tool-registry/index.js";

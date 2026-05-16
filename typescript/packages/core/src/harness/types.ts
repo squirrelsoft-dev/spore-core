@@ -232,7 +232,7 @@ export type StreamSink = (event: HarnessStreamEvent) => void;
 
 /** Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing. */
 export type ToolOutput =
-  | { kind: "success"; content: string }
+  | { kind: "success"; content: string; truncated?: boolean }
   | { kind: "error"; message: string; recoverable: boolean }
   | { kind: "waiting_for_human"; child_state: ChildPausedState; request: HumanRequest };
 
