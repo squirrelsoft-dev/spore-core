@@ -18,8 +18,10 @@
 //!   - #12 ObservabilityProvider
 //!   - #13 TerminationPolicy
 
+pub mod agent;
 pub mod model;
 
+pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
     ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
