@@ -20,6 +20,26 @@ Spore is an implementation of that equation. It defines clear component boundari
 
 ---
 
+## Not Just for Coding Agents
+
+The harness engineering literature — and much of this project's documentation — uses coding agents as the primary example. That is because coding agents are where the discipline emerged and where the benchmarks are. It is not a constraint.
+
+The harness primitives are domain-agnostic. What changes between a coding agent and a conversational agent is not the harness structure — it is the components you inject and the guides you load.
+
+| Agent Type | Session | SandboxProvider | Tools | Sensors | Termination |
+|---|---|---|---|---|---|
+| **Coding agent** | Git workspace | WorkspaceScoped filesystem | bash, file read/write, git | Test runner, linter, type checker | Feature list complete, tests pass |
+| **Conversational / RAG** | Chat thread | Read-only document scope | Document search, fetch | Citation grounding, answer completeness | Question answered with citations |
+| **NL-to-SQL** | DB connection + user context | Database-scoped, read-only by default | Schema introspection, SQL execution | SQL safety (no unguarded DELETE/DROP), result sanity | Valid result set returned |
+| **Research agent** | Research workspace | Workspace + web access | Web search, fetch, summarize, file write | Source credibility, claim grounding | Research brief complete |
+| **Data analysis** | Notebook workspace | WorkspaceScoped | Code execution, data read, chart generation | Result sanity, statistical validity | Analysis complete with outputs |
+
+The key insight: a RAG assistant's document scope is the same concept as a coding agent's filesystem scope — both are `SandboxProvider` implementations that enforce a capability boundary. A SQL safety sensor checking for unguarded `DELETE` statements is the same concept as a linter checking for code style violations — both are `SensorChain` implementations that provide feedback after tool execution. The conversation thread in a chat assistant is the same concept as the git workspace in a coding agent — both are the `SessionId`-scoped persistent container the user returns to.
+
+The examples in this project use coding tasks because they are concrete, verifiable, and benchmark-able. The architecture applies everywhere agents need to act reliably.
+
+---
+
 ## Design Principles
 
 **The agent is one turn.** The agent executes one model call and returns a result (tool call requests or a final response). The harness drives the loop. This separation makes loop strategies, middleware, and termination policy fully composable.
