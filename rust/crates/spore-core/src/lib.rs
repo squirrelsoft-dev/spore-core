@@ -4,7 +4,7 @@
 //! `docs/harness-engineering-concepts.md`.
 //!
 //! Components (one issue per trait/struct):
-//!   - #1  ModelInterface
+//!   - #1  ModelInterface         ← implemented in [`model`]
 //!   - #2  Agent (one turn)
 //!   - #3  Harness runtime loop
 //!   - #4  ToolRegistry
@@ -17,3 +17,12 @@
 //!   - #11 Middleware Chain
 //!   - #12 ObservabilityProvider
 //!   - #13 TerminationPolicy
+
+pub mod model;
+
+pub use model::{
+    enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
+    ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
+    RecordedExchange, ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall,
+    ToolResult, ToolSchema,
+};
