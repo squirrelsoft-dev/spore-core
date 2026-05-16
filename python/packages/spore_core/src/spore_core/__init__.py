@@ -20,6 +20,25 @@ Components (one issue per trait/class):
 * #13 TerminationPolicy
 """
 
+from .agent import (
+    Agent,
+    AgentError,
+    AgentErrorEmpty,
+    AgentErrorException,
+    AgentErrorMalformed,
+    AgentErrorModel,
+    AgentId,
+    Context,
+    EmptyResponseError,
+    FinalResponse,
+    MalformedToolCallError,
+    MockAgent,
+    ModelAgent,
+    ModelErrorPayload,
+    ToolCallRequested,
+    TurnError,
+    TurnResult,
+)
 from .errors import AlwaysHaltError, SporeError
 from .model import (
     BudgetExceeded,
@@ -64,8 +83,25 @@ from .model import (
 )
 
 __all__ = [
+    "Agent",
+    "AgentError",
+    "AgentErrorEmpty",
+    "AgentErrorException",
+    "AgentErrorMalformed",
+    "AgentErrorModel",
+    "AgentId",
     "AlwaysHaltError",
     "BudgetExceeded",
+    "Context",
+    "EmptyResponseError",
+    "FinalResponse",
+    "MalformedToolCallError",
+    "MockAgent",
+    "ModelAgent",
+    "ModelErrorPayload",
+    "ToolCallRequested",
+    "TurnError",
+    "TurnResult",
     "Content",
     "ContentBlock",
     "ContentBlockDelta",
