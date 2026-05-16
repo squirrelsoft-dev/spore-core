@@ -49,8 +49,10 @@ issue lands its canonical definition will replace the stub here.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any, Literal, NewType, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -497,11 +499,144 @@ class ToolRegistry(Protocol):
     def schemas(self) -> list[ToolSchema]: ...
 
 
+class CommandOutput(_Model):
+    """Output of a subprocess executed through the sandbox."""
+
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
+    timed_out: bool = False
+
+
+class FileRef(_Model):
+    """Reference to a file holding offloaded tool output."""
+
+    path: str
+    byte_len: int
+
+
+class TruncatedOutput(_Model):
+    """Head+tail-truncated output. ``full_ref`` is set when the sandbox
+    offloads the original content to a backing file."""
+
+    summary: str
+    full_ref: FileRef | None = None
+
+
 @runtime_checkable
 class SandboxProvider(Protocol):
-    """Issue #6 — validates tool calls against sandbox policy."""
+    """Issue #6 — validates tool calls against sandbox policy.
+
+    Issue #5 adds ``execute_command``, ``handle_large_output``, and
+    ``resolve_path`` so the standard tool catalogue can be built before #6
+    lands its canonical sandbox. Production sandboxes must override.
+    """
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None: ...
+
+    async def execute_command(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+    ) -> CommandOutput: ...
+
+    async def handle_large_output(
+        self,
+        content: str,
+        call_id: str,
+        head_tokens: int,
+        tail_tokens: int,
+    ) -> TruncatedOutput: ...
+
+    async def resolve_path(self, path: str) -> Path: ...
+
+
+class BaseSandboxProvider:
+    """Concrete base class providing default implementations of
+    ``execute_command``, ``handle_large_output``, and ``resolve_path``.
+
+    **NOT production-safe** — these defaults spawn processes directly with
+    no sandboxing, return paths as-is, and truncate inline without
+    offloading. Issue #6 will replace this with a real sandbox.
+
+    Subclasses must still implement :meth:`validate`.
+    """
+
+    async def validate(self, call: ToolCall) -> SandboxViolation | None:
+        return None
+
+    async def execute_command(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+    ) -> CommandOutput:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                command,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(working_dir) if working_dir is not None else None,
+            )
+        except (FileNotFoundError, OSError) as e:
+            return CommandOutput(
+                stdout="",
+                stderr=f"spawn failed: {e}",
+                exit_code=-1,
+                timed_out=False,
+            )
+        try:
+            if timeout is not None:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            else:
+                stdout_b, stderr_b = await proc.communicate()
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except (ProcessLookupError, asyncio.CancelledError):
+                pass
+            secs = int(timeout) if timeout is not None else 0
+            return CommandOutput(
+                stdout="",
+                stderr=f"command timed out after {secs}s",
+                exit_code=-1,
+                timed_out=True,
+            )
+        return CommandOutput(
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+            exit_code=proc.returncode if proc.returncode is not None else -1,
+            timed_out=False,
+        )
+
+    async def handle_large_output(
+        self,
+        content: str,
+        call_id: str,
+        head_tokens: int,
+        tail_tokens: int,
+    ) -> TruncatedOutput:
+        head_chars = max(0, head_tokens) * 4
+        tail_chars = max(0, tail_tokens) * 4
+        total = len(content)
+        if total <= head_chars + tail_chars:
+            return TruncatedOutput(summary=content, full_ref=None)
+        head = content[:head_chars]
+        tail = content[total - tail_chars :]
+        elided = total - head_chars - tail_chars
+        summary = f"{head}\n... [{elided} chars elided] ...\n{tail}"
+        return TruncatedOutput(summary=summary, full_ref=None)
+
+    async def resolve_path(self, path: str) -> Path:
+        return Path(path)
 
 
 @runtime_checkable
@@ -1209,12 +1344,12 @@ class NoopContextManager:
         return False
 
 
-class AllowAllSandbox:
+class AllowAllSandbox(BaseSandboxProvider):
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
 
 
-class ScriptedSandbox:
+class ScriptedSandbox(BaseSandboxProvider):
     """Pop-front queue of validation outcomes (None for allow)."""
 
     def __init__(self) -> None:
@@ -1311,6 +1446,10 @@ __all__ = [
     "AggregateUsage",
     "AllowAllSandbox",
     "AlwaysContinuePolicy",
+    "BaseSandboxProvider",
+    "CommandOutput",
+    "FileRef",
+    "TruncatedOutput",
     "BudgetLimits",
     "BudgetLimitTypeT",
     "BudgetSnapshot",

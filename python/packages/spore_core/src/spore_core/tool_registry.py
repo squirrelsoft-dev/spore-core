@@ -63,6 +63,7 @@ from .harness import (
     HarnessToolResult as ToolResult,
 )
 from .harness import (
+    BaseSandboxProvider,
     SandboxProvider,
     SandboxViolation,
     ToolOutput,
@@ -228,6 +229,8 @@ class Tool(Protocol):
     def name(self) -> str: ...
 
     def is_subagent_tool(self) -> bool: ...
+
+    def may_produce_large_output(self) -> bool: ...
 
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput: ...
 
@@ -431,6 +434,9 @@ class EchoTool:
     def is_subagent_tool(self) -> bool:
         return False
 
+    def may_produce_large_output(self) -> bool:
+        return False
+
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         import json as _json
 
@@ -453,6 +459,9 @@ class FailingTool:
     def is_subagent_tool(self) -> bool:
         return False
 
+    def may_produce_large_output(self) -> bool:
+        return False
+
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         from .harness import ToolOutputError
 
@@ -471,18 +480,21 @@ class SubagentMock:
     def is_subagent_tool(self) -> bool:
         return True
 
+    def may_produce_large_output(self) -> bool:
+        return False
+
     async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
         return ToolOutputSuccess(content="subagent done", truncated=False)
 
 
-class AllowAllSandbox:
+class AllowAllSandbox(BaseSandboxProvider):
     """Permissive sandbox stub — accepts everything."""
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
 
 
-class DenyAllSandbox:
+class DenyAllSandbox(BaseSandboxProvider):
     """Denying sandbox stub — rejects everything with ``PathEscape``."""
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None:

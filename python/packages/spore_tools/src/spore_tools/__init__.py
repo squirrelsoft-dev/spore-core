@@ -1,5 +1,68 @@
 """spore_tools: standard Tool implementations built on spore_core.
 
-Tools conform to the Tool protocol defined by issue #5 and run against the
-SandboxProvider defined by issue #6.
+Tools conform to the :class:`spore_core.tool_registry.Tool` protocol defined
+by issue #5 and run against the :class:`spore_core.harness.SandboxProvider`
+defined by issue #6.
 """
+
+from .tools import (
+    BashCommandTool,
+    BuildError,
+    ContextSharing,
+    ContextSharingIsolated,
+    ContextSharingSharedSession,
+    ContextSharingSummaryHandoff,
+    DeleteFileTool,
+    ExecutionFailed,
+    FindFilesTool,
+    GitCommitTool,
+    GitDiffTool,
+    GitLogTool,
+    GitResetMode,
+    GitResetTool,
+    GitStatusTool,
+    GrepFilesTool,
+    HttpGetTool,
+    HttpPostTool,
+    InvalidParameters,
+    ListDirTool,
+    MoveFileTool,
+    ReadFileTool,
+    RunTestsTool,
+    SandboxViolationError,
+    SubagentTool,
+    Timeout,
+    ToolExecutionError,
+    WriteFileTool,
+)
+
+__all__ = [
+    "BashCommandTool",
+    "BuildError",
+    "ContextSharing",
+    "ContextSharingIsolated",
+    "ContextSharingSharedSession",
+    "ContextSharingSummaryHandoff",
+    "DeleteFileTool",
+    "ExecutionFailed",
+    "FindFilesTool",
+    "GitCommitTool",
+    "GitDiffTool",
+    "GitLogTool",
+    "GitResetMode",
+    "GitResetTool",
+    "GitStatusTool",
+    "GrepFilesTool",
+    "HttpGetTool",
+    "HttpPostTool",
+    "InvalidParameters",
+    "ListDirTool",
+    "MoveFileTool",
+    "ReadFileTool",
+    "RunTestsTool",
+    "SandboxViolationError",
+    "SubagentTool",
+    "Timeout",
+    "ToolExecutionError",
+    "WriteFileTool",
+]
