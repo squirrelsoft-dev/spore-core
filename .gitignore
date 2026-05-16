@@ -16,3 +16,12 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Tooling
+.omc/
+.claude/worktrees/
+.claude/settings.local.json
+.claude/projects/
+.claude/todos/
+.claude/shell-snapshots/
+.claude/statsig/
