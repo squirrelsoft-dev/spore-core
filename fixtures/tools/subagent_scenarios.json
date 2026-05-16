@@ -1,0 +1,20 @@
+[
+  {
+    "name": "child_success",
+    "child_run_result": {"kind": "success", "output": "done"},
+    "parent_call_id": "p1",
+    "expected": {"kind": "success", "content": "done"}
+  },
+  {
+    "name": "child_failure",
+    "child_run_result": {"kind": "failure"},
+    "parent_call_id": "p2",
+    "expected": {"kind": "error", "recoverable": true}
+  },
+  {
+    "name": "child_waiting_for_human",
+    "child_run_result": {"kind": "waiting_for_human"},
+    "parent_call_id": "p3",
+    "expected": {"kind": "waiting_for_human", "parent_tool_call_id": "p3"}
+  }
+]

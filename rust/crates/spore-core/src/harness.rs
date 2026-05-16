@@ -381,8 +381,130 @@ pub trait ToolRegistry: Send + Sync {
 }
 
 /// Issue #6 — SandboxProvider: validates tool calls against sandbox policy.
+///
+/// Issue #5 adds default implementations for `execute_command`,
+/// `handle_large_output`, and `resolve_path` so the standard tool catalogue
+/// can be built before #6 lands its canonical sandbox. **These defaults are
+/// NOT production-safe**: `execute_command` spawns processes directly with no
+/// sandboxing, `resolve_path` returns the input as-is, and
+/// `handle_large_output` truncates inline without offloading. Issue #6 must
+/// override these.
 pub trait SandboxProvider: Send + Sync {
     fn validate<'a>(&'a self, call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>>;
+
+    /// Run a subprocess. **Default impl spawns directly with no sandboxing —
+    /// production sandboxes must override.**
+    fn execute_command<'a>(
+        &'a self,
+        command: &'a str,
+        args: &'a [String],
+        working_dir: Option<&'a std::path::Path>,
+        timeout: Option<std::time::Duration>,
+    ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+        Box::pin(async move {
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args);
+            if let Some(dir) = working_dir {
+                cmd.current_dir(dir);
+            }
+            let fut = cmd.output();
+            let output_res = if let Some(t) = timeout {
+                match tokio::time::timeout(t, fut).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Ok(CommandOutput {
+                            stdout: String::new(),
+                            stderr: format!("command timed out after {}s", t.as_secs()),
+                            exit_code: -1,
+                            timed_out: true,
+                        });
+                    }
+                }
+            } else {
+                fut.await
+            };
+            match output_res {
+                Ok(out) => Ok(CommandOutput {
+                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                    exit_code: out.status.code().unwrap_or(-1),
+                    timed_out: false,
+                }),
+                Err(e) => Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: format!("spawn failed: {e}"),
+                    exit_code: -1,
+                    timed_out: false,
+                }),
+            }
+        })
+    }
+
+    /// Truncate large output head+tail. Default treats `head_tokens * 4` as
+    /// an approximate char budget per half. Production sandboxes should
+    /// offload the full content to a file and return a `FileRef`.
+    fn handle_large_output<'a>(
+        &'a self,
+        content: String,
+        _call_id: &'a str,
+        head_tokens: u32,
+        tail_tokens: u32,
+    ) -> BoxFut<'a, TruncatedOutput> {
+        Box::pin(async move {
+            let head_chars = (head_tokens as usize).saturating_mul(4);
+            let tail_chars = (tail_tokens as usize).saturating_mul(4);
+            let total = content.chars().count();
+            if total <= head_chars + tail_chars {
+                return TruncatedOutput {
+                    summary: content,
+                    full_ref: None,
+                };
+            }
+            let head: String = content.chars().take(head_chars).collect();
+            let tail: String = content.chars().skip(total - tail_chars).collect();
+            let elided = total - head_chars - tail_chars;
+            let summary = format!("{head}\n... [{elided} chars elided] ...\n{tail}");
+            TruncatedOutput {
+                summary,
+                full_ref: None,
+            }
+        })
+    }
+
+    /// Resolve / canonicalize a path against the sandbox root. Default is
+    /// an identity pass-through; production sandboxes must enforce roots.
+    fn resolve_path<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> BoxFut<'a, Result<std::path::PathBuf, SandboxViolation>> {
+        Box::pin(async move { Ok(std::path::PathBuf::from(path)) })
+    }
+}
+
+/// Output of a subprocess executed through the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+/// Head+tail-truncated output. `full_ref` is `Some` when the sandbox offloads
+/// the original content to a backing file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncatedOutput {
+    pub summary: String,
+    #[serde(default)]
+    pub full_ref: Option<FileRef>,
+}
+
+/// Reference to a file holding offloaded tool output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub path: String,
+    pub byte_len: u64,
 }
 
 /// Issue #7 — ContextManager: assembles per-turn context.

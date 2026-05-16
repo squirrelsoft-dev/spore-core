@@ -187,6 +187,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// `true` if this tool's output may exceed inline budgets and should be
+    /// routed through `SandboxProvider::handle_large_output`. Defaults to
+    /// `false`. Standard read/exec/search/git/http tools override to `true`.
+    fn may_produce_large_output(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with validated input. The `SandboxProvider` is
     /// the only path to the environment.
     fn execute<'a>(

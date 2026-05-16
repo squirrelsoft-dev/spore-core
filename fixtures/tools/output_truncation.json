@@ -1,0 +1,6 @@
+[
+  {"content_length": 100, "head_tokens": 100, "tail_tokens": 100, "expects_truncated": false},
+  {"content_length": 100000, "head_tokens": 100, "tail_tokens": 100, "expects_truncated": true},
+  {"content_length": 5000, "head_tokens": 2000, "tail_tokens": 2000, "expects_truncated": false},
+  {"content_length": 200000, "head_tokens": 2000, "tail_tokens": 2000, "expects_truncated": true}
+]

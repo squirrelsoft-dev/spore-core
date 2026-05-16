@@ -1,0 +1,32 @@
+[
+  {
+    "tool": "read_file",
+    "input": {"path": "/tmp/spore-fixture-does-not-exist"},
+    "expected": "ok"
+  },
+  {
+    "tool": "read_file",
+    "input": {},
+    "expected": "invalid_parameters"
+  },
+  {
+    "tool": "write_file",
+    "input": {"path": "/tmp/spore-fx", "content": "hi"},
+    "expected": "ok"
+  },
+  {
+    "tool": "write_file",
+    "input": {"path": "/tmp/spore-fx"},
+    "expected": "invalid_parameters"
+  },
+  {
+    "tool": "move_file",
+    "input": {"src": "a"},
+    "expected": "invalid_parameters"
+  },
+  {
+    "tool": "grep_files",
+    "input": {"pattern": "(unclosed", "path": "/tmp"},
+    "expected": "invalid_parameters"
+  }
+]

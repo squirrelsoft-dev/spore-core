@@ -22,16 +22,18 @@ pub mod agent;
 pub mod harness;
 pub mod model;
 pub mod tool_registry;
+pub mod tools;
 
 pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
 pub use harness::{
-    AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, ChildPausedState, HaltReason,
-    Harness, HarnessConfig, HarnessError, HarnessRunOptions, HookPoint, HumanRequest,
-    HumanResponse, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig,
+    AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, ChildPausedState, CommandOutput,
+    FileRef, HaltReason, Harness, HarnessConfig, HarnessError, HarnessRunOptions, HookPoint,
+    HumanRequest, HumanResponse, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig,
     ObservabilityProvider, OptimizationDirection, PausedState, RiskLevel, RunResult,
     SandboxProvider, SandboxViolation, SessionId, SessionState, StandardHarness,
     StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
     ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult,
+    TruncatedOutput,
 };
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
