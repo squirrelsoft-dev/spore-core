@@ -162,19 +162,36 @@ Three interaction types: **ToolApproval** (approve/deny/modify a tool call), **C
 Spore is designed to get better over time without changing the model.
 
 ```
-Run → Trace → Analyze failure patterns → Propose guide/chunk changes
-  ↑                                                              ↓
-  └───────── Human approves ← Statistical comparison ← Test candidates
+Run → Trace → Analyze failure patterns → Propose harness changes
+  ↑                                                          ↓
+  └────── Human approves ← Statistical comparison ← Test candidates
 ```
 
 1. Every session emits a structured trace via `ObservabilityProvider`
 2. `GuideRegistry.analyze_performance()` identifies failure patterns across traces
-3. A meta-agent (or human) proposes new guides, updated prompt chunks, or middleware threshold changes
+3. A meta-agent (or human) proposes candidate changes to the harness configuration
 4. The eval harness runs candidates against a task suite and produces a `ComparisonReport`
 5. Human reviews and approves winners — they are promoted to Active and become the new baseline
 6. Repeat
 
 Automated proposals always start in `PendingReview`. Nothing is promoted without a review gate.
+
+### What gets improved
+
+This is not just prompt tuning. The flywheel targets the full harness configuration:
+
+| What changes | Example |
+|---|---|
+| **Prompt chunk content** | Role description becomes more precise, mode instructions are tightened |
+| **Guide content** | Schema annotations updated, domain conventions refined |
+| **Middleware thresholds** | Loop detection fires after 3 file edits instead of 5 |
+| **Sensor parameters** | Citation grounding threshold raised from 0.7 to 0.85 |
+| **Tool schemas** | Parameter description clarified, reducing model misuse |
+| **Active ToolSet per phase** | Browser tools only available during verification, not planning |
+| **CompletionCheck logic** | Done condition tightened to require all tests passing, not just build success |
+| **Approval policy** | SQL DELETE elevated from Medium to High risk after observed incidents |
+
+Prompt chunks are the most visible artifact because they are human-readable text you can diff. But a middleware threshold going from 5 to 3, or a tool being removed from the planning phase, is equally a harness improvement — it changes what the agent can do and when, not just what it is told. The model never changes. The environment it operates in does.
 
 ---
 
