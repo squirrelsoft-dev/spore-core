@@ -20,3 +20,4 @@
  *   #13 TerminationPolicy
  */
 export * from "./model/index.js";
+export * from "./agent/index.js";
