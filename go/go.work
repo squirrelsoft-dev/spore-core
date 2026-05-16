@@ -1,0 +1,7 @@
+go 1.22
+
+use (
+	./spore-core
+	./spore-cli
+	./spore-eval
+)

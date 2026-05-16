@@ -1,0 +1,6 @@
+[package]
+name = "spore-eval"
+version = "0.0.0"
+edition = "2021"
+description = "spore-core evaluation harness"
+license = "Apache-2.0"

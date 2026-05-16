@@ -1,0 +1,16 @@
+[project]
+name = "spore-core-workspace"
+version = "0.0.0"
+description = "spore-core Python workspace root"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["packages"]
+asyncio_mode = "auto"

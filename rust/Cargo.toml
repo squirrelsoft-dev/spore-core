@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spore-core",
+    "crates/spore-cli",
+    "crates/spore-eval",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/squirrelsoft-dev/spore-core"
