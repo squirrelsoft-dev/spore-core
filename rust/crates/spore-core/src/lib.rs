@@ -19,13 +19,21 @@
 //!   - #13 TerminationPolicy
 
 pub mod agent;
+pub mod context;
 pub mod harness;
 pub mod model;
 pub mod sandbox;
 pub mod tool_registry;
 pub mod tools;
 
-pub use agent::{Agent, AgentError, AgentId, Context, ModelAgent, TurnResult};
+pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent, TurnResult};
+pub use context::{
+    BreakpointInfo, CacheBlockStatus, CacheProvider, CacheStats, CompactionConfig,
+    CompactionPreserveHints, CompactionRequest, CompactionResult, ComposedPrompt, Context,
+    ContextError, ContextManager, ContextMeta, ContextSources, Guide, GuideId, MemoryItem,
+    NullCacheProvider, PromptSegment, RenderedSystemPrompt, SegmentStability,
+    SessionState as ContextSessionState, StandardContextManager,
+};
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
     CommandOutput, FileRef, HaltReason, Harness, HarnessConfig, HarnessError, HarnessRunOptions,

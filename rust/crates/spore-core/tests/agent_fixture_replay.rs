@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use spore_core::{
-    Agent, AgentError, AgentId, Context, ModelAgent, ProviderInfo, ReplayModelInterface, TurnResult,
+    Agent, AgentContext as Context, AgentError, AgentId, ModelAgent, ProviderInfo,
+    ReplayModelInterface, TurnResult,
 };
 
 fn fixture_path() -> std::path::PathBuf {
