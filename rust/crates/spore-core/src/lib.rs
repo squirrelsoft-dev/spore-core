@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod context;
 pub mod harness;
+pub mod memory;
 pub mod model;
 pub mod sandbox;
 pub mod tool_registry;
@@ -30,9 +31,9 @@ pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent,
 pub use context::{
     BreakpointInfo, CacheBlockStatus, CacheProvider, CacheStats, CompactionConfig,
     CompactionPreserveHints, CompactionRequest, CompactionResult, ComposedPrompt, Context,
-    ContextError, ContextManager, ContextMeta, ContextSources, Guide, GuideId, MemoryItem,
-    NullCacheProvider, PromptSegment, RenderedSystemPrompt, SegmentStability,
-    SessionState as ContextSessionState, StandardContextManager,
+    ContextError, ContextManager, ContextMeta, ContextSources, Guide, GuideId, NullCacheProvider,
+    PromptSegment, RenderedSystemPrompt, SegmentStability, SessionState as ContextSessionState,
+    StandardContextManager,
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
@@ -43,6 +44,10 @@ pub use harness::{
     SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
     TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, TruncatedOutput,
+};
+pub use memory::{
+    EpisodicMemory, MemoryError, MemoryId, MemoryItem, MemoryProvider, MemoryQuery, MemorySource,
+    MemoryStatus, MergeStrategy, SemanticMemory, StandardMemoryProvider, Timestamp,
 };
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,

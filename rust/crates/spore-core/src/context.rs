@@ -51,12 +51,9 @@ pub struct Guide {
     pub content: String,
 }
 
-/// Forward-declared `MemoryItem` (issue #8 — MemoryProvider).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryItem {
-    pub key: String,
-    pub content: String,
-}
+// `MemoryItem` is defined in [`crate::memory`] (issue #8). Re-exported here
+// for downstream callers building `ContextSources`.
+pub use crate::memory::MemoryItem;
 
 /// Forward-declared `ComposedPrompt` (issue #14 — PromptChunkRegistry).
 ///
