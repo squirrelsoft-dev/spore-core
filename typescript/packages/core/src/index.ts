@@ -27,3 +27,4 @@ export * from "./sandbox/index.js";
 export * as context from "./context/index.js";
 export * as memory from "./memory/index.js";
 export * as guideRegistry from "./guide-registry/index.js";
+export * as sensor from "./sensor/index.js";
