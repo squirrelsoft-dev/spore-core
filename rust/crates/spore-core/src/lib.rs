@@ -25,6 +25,7 @@ pub mod harness;
 pub mod memory;
 pub mod middleware;
 pub mod model;
+pub mod observability;
 pub mod sandbox;
 pub mod sensor;
 pub mod tool_registry;
@@ -69,6 +70,11 @@ pub use model::{
     ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
     RecordedExchange, ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall,
     ToolResult, ToolSchema,
+};
+pub use observability::{
+    ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
+    ObservabilityProvider as FullObservabilityProvider, PricingTable, SensorSpan, SessionMetrics,
+    Span, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan,
 };
 pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
 pub use sensor::{

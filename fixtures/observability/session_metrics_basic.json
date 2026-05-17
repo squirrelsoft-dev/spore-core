@@ -1,0 +1,14 @@
+{
+  "session_id": "fixture_session",
+  "turns": [
+    { "span_id": "sp1", "turn": 1, "input": 1000, "output": 250 },
+    { "span_id": "sp2", "turn": 2, "input": 1500, "output": 400 },
+    { "span_id": "sp3", "turn": 3, "input": 1200, "output": 300 }
+  ],
+  "outcome": "success",
+  "expected": {
+    "total_turns": 3,
+    "total_input_tokens": 3700,
+    "total_output_tokens": 950
+  }
+}
