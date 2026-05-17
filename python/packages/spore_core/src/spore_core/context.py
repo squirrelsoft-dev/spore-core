@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import ClassVar, NewType, Protocol, runtime_checkable
 
 from .errors import SporeError
+
+# ``MemoryItem`` is defined in :mod:`spore_core.memory` (issue #8).
+# Re-exported here so ``ContextSources.memory`` consumes the canonical type.
+from .memory import MemoryItem
 from .harness import (
     FileRef,
     HarnessToolResult,
@@ -72,14 +76,6 @@ class Guide:
     forbids reformatting at assembly time."""
 
     id: GuideId
-    content: str
-
-
-@dataclass(frozen=True)
-class MemoryItem:
-    """Forward-declared ``MemoryItem`` (issue #8 — MemoryProvider)."""
-
-    key: str
     content: str
 
 
