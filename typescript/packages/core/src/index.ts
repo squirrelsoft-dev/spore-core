@@ -26,3 +26,4 @@ export * as toolRegistry from "./tool-registry/index.js";
 export * from "./sandbox/index.js";
 export * as context from "./context/index.js";
 export * as memory from "./memory/index.js";
+export * as guideRegistry from "./guide-registry/index.js";
