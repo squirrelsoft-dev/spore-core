@@ -29,3 +29,4 @@ export * as memory from "./memory/index.js";
 export * as guideRegistry from "./guide-registry/index.js";
 export * as sensor from "./sensor/index.js";
 export * as middleware from "./middleware/index.js";
+export * as observability from "./observability/index.js";
