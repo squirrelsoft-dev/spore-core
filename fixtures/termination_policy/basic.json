@@ -1,0 +1,141 @@
+{
+  "description": "Cross-language consistency fixture for TerminationPolicy (issue #13).\n\nEach case feeds a `TerminationInput` through `StandardTerminationPolicy` with the named `completion_check` and asserts that the policy returns `expected` (a serialized `TerminationDecision`).",
+  "cases": [
+    {
+      "name": "not_done_continues",
+      "agent_claims_done": false,
+      "agent_response": null,
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [],
+      "completion_check": { "kind": "complete" },
+      "expected": { "kind": "continue" }
+    },
+    {
+      "name": "complete_halts_success_with_summary",
+      "agent_claims_done": true,
+      "agent_response": "all done",
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [],
+      "completion_check": { "kind": "complete" },
+      "expected": { "kind": "halt_success", "summary": "all done" }
+    },
+    {
+      "name": "complete_halts_success_empty_summary",
+      "agent_claims_done": true,
+      "agent_response": null,
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [],
+      "completion_check": { "kind": "complete" },
+      "expected": { "kind": "halt_success", "summary": "" }
+    },
+    {
+      "name": "incomplete_check_overrides_agent_done",
+      "agent_claims_done": true,
+      "agent_response": "I think I'm done",
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [],
+      "completion_check": { "kind": "incomplete", "reason": "feature B incomplete" },
+      "expected": { "kind": "continue" }
+    },
+    {
+      "name": "sensor_halt_blocks_success",
+      "agent_claims_done": true,
+      "agent_response": "done",
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [
+        {
+          "sensor_id": "guardrail",
+          "outcome": "halt",
+          "observation": null,
+          "detail": "policy violation",
+          "fired_at": "2026-05-17T00:00:00Z"
+        }
+      ],
+      "completion_check": { "kind": "complete" },
+      "expected": {
+        "kind": "halt_failure",
+        "reason": {
+          "kind": "unrecoverable_sensor_halt",
+          "sensor_id": "guardrail",
+          "detail": "policy violation"
+        }
+      }
+    },
+    {
+      "name": "sensor_warn_does_not_halt",
+      "agent_claims_done": true,
+      "agent_response": "done",
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": {},
+      "sensor_results": [
+        {
+          "sensor_id": "guardrail",
+          "outcome": "warn",
+          "observation": "noted",
+          "detail": "soft warning",
+          "fired_at": "2026-05-17T00:00:00Z"
+        }
+      ],
+      "completion_check": { "kind": "complete" },
+      "expected": { "kind": "halt_success", "summary": "done" }
+    },
+    {
+      "name": "budget_exceeded_turns",
+      "agent_claims_done": false,
+      "agent_response": null,
+      "budget_used": { "turns": 10, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": { "max_turns": 10 },
+      "sensor_results": [],
+      "completion_check": { "kind": "complete" },
+      "expected": {
+        "kind": "halt_budget_exceeded",
+        "limit_type": "turns",
+        "used": { "kind": "turns", "value": 10 },
+        "limit": { "kind": "turns", "value": 10 }
+      }
+    },
+    {
+      "name": "budget_exceeded_cost",
+      "agent_claims_done": true,
+      "agent_response": "done",
+      "budget_used": { "turns": 1, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 2.5 },
+      "budget_limits": { "max_cost_usd": 2.0 },
+      "sensor_results": [],
+      "completion_check": { "kind": "complete" },
+      "expected": {
+        "kind": "halt_budget_exceeded",
+        "limit_type": "cost_usd",
+        "used": { "kind": "usd", "value": 2.5 },
+        "limit": { "kind": "usd", "value": 2.0 }
+      }
+    },
+    {
+      "name": "budget_check_runs_before_agent_done",
+      "agent_claims_done": true,
+      "agent_response": "done",
+      "budget_used": { "turns": 5, "input_tokens": 0, "output_tokens": 0, "wall_time": null, "cost_usd": 0.0 },
+      "budget_limits": { "max_turns": 5 },
+      "sensor_results": [
+        {
+          "sensor_id": "guardrail",
+          "outcome": "halt",
+          "observation": null,
+          "detail": "tripped",
+          "fired_at": "2026-05-17T00:00:00Z"
+        }
+      ],
+      "completion_check": { "kind": "complete" },
+      "expected": {
+        "kind": "halt_budget_exceeded",
+        "limit_type": "turns",
+        "used": { "kind": "turns", "value": 5 },
+        "limit": { "kind": "turns", "value": 5 }
+      }
+    }
+  ]
+}

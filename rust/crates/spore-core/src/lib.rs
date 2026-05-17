@@ -28,6 +28,7 @@ pub mod model;
 pub mod observability;
 pub mod sandbox;
 pub mod sensor;
+pub mod termination;
 pub mod tool_registry;
 pub mod tools;
 
@@ -81,6 +82,12 @@ pub use sensor::{
     Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
     SensorTrigger, StandardSensorChain,
+};
+pub use termination::{
+    check_budget_default, BudgetValue, CompletionCheck, FixedCompletionCheck, NullCompletionCheck,
+    SessionStateSnapshot, StandardTerminationPolicy,
+    TerminationDecision as FullTerminationDecision, TerminationFailureReason, TerminationInput,
+    TerminationPolicy as FullTerminationPolicy,
 };
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
