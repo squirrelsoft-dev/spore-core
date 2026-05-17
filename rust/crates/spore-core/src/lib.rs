@@ -23,6 +23,7 @@ pub mod context;
 pub mod guide_registry;
 pub mod harness;
 pub mod memory;
+pub mod middleware;
 pub mod model;
 pub mod sandbox;
 pub mod sensor;
@@ -55,6 +56,13 @@ pub use harness::{
 pub use memory::{
     EpisodicMemory, MemoryError, MemoryId, MemoryItem, MemoryProvider, MemoryQuery, MemorySource,
     MemoryStatus, MergeStrategy, SemanticMemory, StandardMemoryProvider, Timestamp,
+};
+pub use middleware::{
+    HookContext as MiddlewareHookContext, HookPoint as MiddlewareHookPoint,
+    LoopDetectionMiddleware, Middleware, MiddlewareChain as FullMiddlewareChain,
+    MiddlewareDecision as FullMiddlewareDecision, MiddlewareError, PatchToolCallsMiddleware,
+    PreCompletionChecklistMiddleware, StandardMiddlewareChain, TokenBudgetMiddleware,
+    TracingMiddleware,
 };
 pub use model::{
     enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,

@@ -1,0 +1,5 @@
+{
+  "required": ["tests passed", "lint clean"],
+  "response": "All tests passed and lint clean. Done.",
+  "expected": "continue"
+}
