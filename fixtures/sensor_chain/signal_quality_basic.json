@@ -1,0 +1,48 @@
+{
+  "name": "signal_quality_basic",
+  "description": "Three sensors across five sessions: 'noisy' fires every PostTurn (always_firing); 'quiet' is registered for PostSession but PostSession is never fired (never_fired); 'normal' fires on a single session only.",
+  "sensors": [
+    {
+      "id": "noisy",
+      "kind": "computational",
+      "triggers": [{ "kind": "post_turn" }],
+      "outcome": "warn",
+      "thresholds": {
+        "never_fired_after_n_sessions": 100,
+        "always_fired_rate": 0.5
+      }
+    },
+    {
+      "id": "quiet",
+      "kind": "computational",
+      "triggers": [{ "kind": "post_session" }],
+      "outcome": "pass",
+      "thresholds": {
+        "never_fired_after_n_sessions": 3,
+        "always_fired_rate": 0.9
+      }
+    },
+    {
+      "id": "normal",
+      "kind": "computational",
+      "triggers": [{ "kind": "post_turn" }],
+      "outcome": "pass",
+      "thresholds": {
+        "never_fired_after_n_sessions": 100,
+        "always_fired_rate": 0.99
+      }
+    }
+  ],
+  "events": [
+    { "trigger": { "kind": "post_turn" }, "session_id": "s1" },
+    { "trigger": { "kind": "post_turn" }, "session_id": "s2" },
+    { "trigger": { "kind": "post_turn" }, "session_id": "s3" },
+    { "trigger": { "kind": "post_turn" }, "session_id": "s4" },
+    { "trigger": { "kind": "post_turn" }, "session_id": "s5" }
+  ],
+  "min_sessions": 3,
+  "expected": {
+    "never_fired": ["quiet"],
+    "always_firing": ["noisy", "normal"]
+  }
+}

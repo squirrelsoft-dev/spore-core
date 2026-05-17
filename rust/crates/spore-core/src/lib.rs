@@ -25,6 +25,7 @@ pub mod harness;
 pub mod memory;
 pub mod model;
 pub mod sandbox;
+pub mod sensor;
 pub mod tool_registry;
 pub mod tools;
 
@@ -62,6 +63,11 @@ pub use model::{
     ToolResult, ToolSchema,
 };
 pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
+pub use sensor::{
+    Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
+    SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
+    SensorTrigger, StandardSensorChain,
+};
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
     ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
