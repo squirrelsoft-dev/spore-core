@@ -346,8 +346,18 @@ def sandbox_violation_is_always_halt(v: SandboxViolation) -> bool:
 
 
 # ----- HookPoint (issue #11) ----------------------------------------------
+# Re-exported from :mod:`spore_core.middleware`. We use a string alias here
+# because :class:`HaltReasonMiddlewareHalt` and :class:`ScriptedMiddleware`
+# round-trip these values as strings on the wire.
 
-HookPoint = Literal["before_turn", "before_tool", "after_tool", "before_completion"]
+HookPoint = Literal[
+    "before_session",
+    "before_turn",
+    "before_tool",
+    "after_tool",
+    "before_completion",
+    "after_session",
+]
 
 
 # ----- TerminationDecision (issue #13) ------------------------------------
@@ -480,34 +490,11 @@ class HarnessToolResult(_Model):
 
 
 # ----- MiddlewareDecision (issue #11) -------------------------------------
-
-
-class MiddlewareContinue(_Model):
-    kind: Literal["continue"] = "continue"
-
-
-class MiddlewareContinueWithModification(_Model):
-    kind: Literal["continue_with_modification"] = "continue_with_modification"
-    calls: list[ToolCall]
-
-
-class MiddlewareHalt(_Model):
-    kind: Literal["halt"] = "halt"
-    reason: str
-
-
-class MiddlewareSurfaceToHuman(_Model):
-    kind: Literal["surface_to_human"] = "surface_to_human"
-    request: HumanRequest
-
-
-MiddlewareDecision = Annotated[
-    MiddlewareContinue
-    | MiddlewareContinueWithModification
-    | MiddlewareHalt
-    | MiddlewareSurfaceToHuman,
-    Field(discriminator="kind"),
-]
+# The canonical types live in :mod:`spore_core.middleware`. They are
+# imported below (at the bottom of this module, after PausedState resolves
+# its forward references) and re-exported for ergonomic
+# ``from spore_core.harness import MiddlewareHalt`` style imports used by
+# the existing harness tests.
 
 
 # ----- Component protocols (forward declarations) -------------------------
@@ -780,8 +767,18 @@ class TerminationPolicy(Protocol):
 
 
 @runtime_checkable
-class MiddlewareChain(Protocol):
-    """Issue #11 — lifecycle middleware."""
+class HarnessMiddlewareChain(Protocol):
+    """Simplified middleware-chain Protocol consumed by
+    :class:`StandardHarness`.
+
+    The canonical, spec-rich :class:`spore_core.middleware.MiddlewareChain`
+    (issue #11) ships with a per-hook ``fire_before_*`` / ``fire_after_*``
+    surface. The harness loop here keeps a thinner ``fire(hook, session)``
+    interface so existing ReAct unit tests and the
+    :class:`ScriptedMiddleware` test double keep working without an
+    adapter. Adapters bridging the two surfaces will land alongside the
+    harness-middleware integration test in a future commit.
+    """
 
     async def fire(self, hook: HookPoint, session: SessionState) -> MiddlewareDecision: ...
 
@@ -929,6 +926,20 @@ RunResult = Annotated[
 ]
 
 
+# Import canonical middleware decision types. This import is deliberately
+# placed after the harness's own types are defined so
+# :mod:`spore_core.middleware` can import :class:`HumanRequest`,
+# :class:`RunResult`, :class:`Task`, :class:`SessionState`, etc., from
+# this module without circularity.
+from .middleware import (  # noqa: E402
+    MiddlewareContinue,
+    MiddlewareContinueWithModification,
+    MiddlewareDecision,
+    MiddlewareForceAnotherTurn,
+    MiddlewareHalt,
+    MiddlewareSurfaceToHuman,
+)
+
 # ============================================================================
 # HarnessRunOptions
 # ============================================================================
@@ -989,7 +1000,7 @@ class HarnessConfig:
         sandbox: SandboxProvider,
         context_manager: ContextManager,
         termination_policy: TerminationPolicy,
-        middleware: MiddlewareChain | None = None,
+        middleware: HarnessMiddlewareChain | None = None,
         observability: ObservabilityProvider | None = None,
     ) -> None:
         self.agent = agent
@@ -1312,7 +1323,8 @@ class StandardHarness:
                 if config.middleware is not None:
                     decision = await config.middleware.fire("before_tool", session_state)
                     if isinstance(decision, MiddlewareContinueWithModification):
-                        calls = decision.calls
+                        if decision.calls is not None:
+                            calls = decision.calls
                     elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(hook="before_tool", reason=decision.reason),
@@ -1605,10 +1617,11 @@ __all__ = [
     "LoopStrategyRalph",
     "LoopStrategyReAct",
     "LoopStrategySelfVerifying",
-    "MiddlewareChain",
+    "HarnessMiddlewareChain",
     "MiddlewareContinue",
     "MiddlewareContinueWithModification",
     "MiddlewareDecision",
+    "MiddlewareForceAnotherTurn",
     "MiddlewareHalt",
     "MiddlewareSurfaceToHuman",
     "ModelConfig",
