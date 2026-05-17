@@ -784,8 +784,10 @@ class HarnessMiddlewareChain(Protocol):
 
 
 @runtime_checkable
-class ObservabilityProvider(Protocol):
-    """Issue #12 — per-turn observability sink."""
+class LegacyObservabilityProvider(Protocol):
+    """Legacy per-turn observability sink retained for the existing harness
+    integration. The full :class:`spore_core.observability.ObservabilityProvider`
+    surface (issue #12) lives in ``spore_core.observability``."""
 
     async def record_turn(self, turn: int, usage: TokenUsage) -> None: ...
 
@@ -1001,7 +1003,7 @@ class HarnessConfig:
         context_manager: ContextManager,
         termination_policy: TerminationPolicy,
         middleware: HarnessMiddlewareChain | None = None,
-        observability: ObservabilityProvider | None = None,
+        observability: LegacyObservabilityProvider | None = None,
     ) -> None:
         self.agent = agent
         self.tool_registry = tool_registry
@@ -1626,7 +1628,7 @@ __all__ = [
     "MiddlewareSurfaceToHuman",
     "ModelConfig",
     "NoopContextManager",
-    "ObservabilityProvider",
+    "LegacyObservabilityProvider",
     "OptimizationDirection",
     "PausedState",
     "RiskLevel",
