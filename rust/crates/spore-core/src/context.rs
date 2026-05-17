@@ -32,24 +32,9 @@ use crate::tool_registry::TaskPhase;
 // Forward-declared sibling types (issues #8, #9, #14)
 // ============================================================================
 
-/// Stable identifier for a guide or skill (issue #9 — GuideRegistry).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GuideId(pub String);
-
-impl GuideId {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-}
-
-/// Forward-declared `Guide` (issue #9). Carries the rendered chunk and an
-/// identifier; full lifecycle metadata lives with `GuideRegistry`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Guide {
-    pub id: GuideId,
-    /// Rendered final form. The spec forbids reformatting at assembly time.
-    pub content: String,
-}
+// `Guide` and `GuideId` are defined in [`crate::guide_registry`] (issue #9).
+// Re-exported here so existing context callers keep working.
+pub use crate::guide_registry::{Guide, GuideId};
 
 // `MemoryItem` is defined in [`crate::memory`] (issue #8). Re-exported here
 // for downstream callers building `ContextSources`.
@@ -1099,14 +1084,8 @@ mod tests {
         let before_static = ctx.system_prompt.static_block_hash;
         let before_session = ctx.system_prompt.session_block_hash;
         let before_messages = ctx.messages.len();
-        mgr.inject_skill(
-            &mut ctx,
-            &Guide {
-                id: GuideId::new("rust-style"),
-                content: "prefer iterators".into(),
-            },
-        )
-        .unwrap();
+        mgr.inject_skill(&mut ctx, &Guide::skill("rust-style", "prefer iterators"))
+            .unwrap();
         assert_eq!(ctx.system_prompt.static_block_hash, before_static);
         assert_eq!(ctx.system_prompt.session_block_hash, before_session);
         assert_eq!(ctx.messages.len(), before_messages);
@@ -1157,10 +1136,7 @@ mod tests {
     async fn pending_skill_injections_appear_in_meta() {
         let mgr = mk();
         let mut st = state();
-        st.pending_skill_injections.push(Guide {
-            id: GuideId::new("g1"),
-            content: "do x".into(),
-        });
+        st.pending_skill_injections.push(Guide::skill("g1", "do x"));
         let ctx = mgr
             .assemble(&st, &sources("BLOCK1", 0xAB, vec![]))
             .await

@@ -20,6 +20,7 @@
 
 pub mod agent;
 pub mod context;
+pub mod guide_registry;
 pub mod harness;
 pub mod memory;
 pub mod model;
@@ -31,9 +32,14 @@ pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent,
 pub use context::{
     BreakpointInfo, CacheBlockStatus, CacheProvider, CacheStats, CompactionConfig,
     CompactionPreserveHints, CompactionRequest, CompactionResult, ComposedPrompt, Context,
-    ContextError, ContextManager, ContextMeta, ContextSources, Guide, GuideId, NullCacheProvider,
-    PromptSegment, RenderedSystemPrompt, SegmentStability, SessionState as ContextSessionState,
+    ContextError, ContextManager, ContextMeta, ContextSources, NullCacheProvider, PromptSegment,
+    RenderedSystemPrompt, SegmentStability, SessionState as ContextSessionState,
     StandardContextManager,
+};
+pub use guide_registry::{
+    Guide, GuideConflict, GuideId, GuideQuery, GuideRegistry, GuideRegistryError, GuideSource,
+    GuideStatus, GuideType, GuideUsageRecord, ImprovementSignal, PendingReason, SessionOutcome,
+    StandardGuideRegistry,
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
