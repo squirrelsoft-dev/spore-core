@@ -25,3 +25,4 @@ export * from "./harness/index.js";
 export * as toolRegistry from "./tool-registry/index.js";
 export * from "./sandbox/index.js";
 export * as context from "./context/index.js";
+export * as memory from "./memory/index.js";
