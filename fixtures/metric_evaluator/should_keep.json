@@ -1,0 +1,101 @@
+{
+  "description": "Cross-language fixture for the should_keep helper used by HillClimbing (issue #23). Each case feeds (new_value, current_best, direction, min_delta) into should_keep and asserts the boolean keep/revert decision. Equal scores are discarded; a delta of exactly min_delta is discarded.",
+  "cases": [
+    {
+      "name": "minimize_improvement_kept",
+      "new_value": 1.0,
+      "current_best": 2.0,
+      "direction": "minimize",
+      "min_delta": null,
+      "expected": true
+    },
+    {
+      "name": "minimize_regression_discarded",
+      "new_value": 2.0,
+      "current_best": 1.0,
+      "direction": "minimize",
+      "min_delta": null,
+      "expected": false
+    },
+    {
+      "name": "maximize_improvement_kept",
+      "new_value": 2.0,
+      "current_best": 1.0,
+      "direction": "maximize",
+      "min_delta": null,
+      "expected": true
+    },
+    {
+      "name": "maximize_regression_discarded",
+      "new_value": 1.0,
+      "current_best": 2.0,
+      "direction": "maximize",
+      "min_delta": null,
+      "expected": false
+    },
+    {
+      "name": "minimize_equal_discarded",
+      "new_value": 1.0,
+      "current_best": 1.0,
+      "direction": "minimize",
+      "min_delta": null,
+      "expected": false
+    },
+    {
+      "name": "maximize_equal_discarded",
+      "new_value": 1.0,
+      "current_best": 1.0,
+      "direction": "maximize",
+      "min_delta": null,
+      "expected": false
+    },
+    {
+      "name": "minimize_delta_equal_to_min_delta_discarded",
+      "new_value": 1.5,
+      "current_best": 2.0,
+      "direction": "minimize",
+      "min_delta": 0.5,
+      "expected": false
+    },
+    {
+      "name": "minimize_delta_just_above_min_delta_kept",
+      "new_value": 1.49,
+      "current_best": 2.0,
+      "direction": "minimize",
+      "min_delta": 0.5,
+      "expected": true
+    },
+    {
+      "name": "maximize_delta_equal_to_min_delta_discarded",
+      "new_value": 2.5,
+      "current_best": 2.0,
+      "direction": "maximize",
+      "min_delta": 0.5,
+      "expected": false
+    },
+    {
+      "name": "maximize_delta_just_above_min_delta_kept",
+      "new_value": 2.51,
+      "current_best": 2.0,
+      "direction": "maximize",
+      "min_delta": 0.5,
+      "expected": true
+    },
+    {
+      "name": "zero_min_delta_behaves_like_none",
+      "new_value": 1.0,
+      "current_best": 1.0,
+      "direction": "minimize",
+      "min_delta": 0.0,
+      "expected": false
+    },
+    {
+      "name": "negative_values_minimize",
+      "new_value": -3.0,
+      "current_best": -2.0,
+      "direction": "minimize",
+      "min_delta": null,
+      "expected": true
+    }
+  ]
+}

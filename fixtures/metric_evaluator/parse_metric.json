@@ -1,0 +1,35 @@
+{
+  "description": "Cross-language fixture for CommandMetricEvaluator's regex-based metric parser (issue #23). The pattern must contain exactly one capture group; the captured substring is parsed as f64. A missing match or unparseable capture is ParseFailed.",
+  "cases": [
+    {
+      "name": "autoresearch_val_bpb",
+      "output": "epoch 1\nval_bpb: 3.125\nepoch 2\n",
+      "pattern": "val_bpb:\\s+([\\d.]+)",
+      "expected": { "kind": "value", "value": 3.125 }
+    },
+    {
+      "name": "first_match_wins",
+      "output": "val_bpb: 1.0\nval_bpb: 2.0\n",
+      "pattern": "val_bpb:\\s+([\\d.]+)",
+      "expected": { "kind": "value", "value": 1.0 }
+    },
+    {
+      "name": "integer_metric",
+      "output": "score=42",
+      "pattern": "score=(\\d+)",
+      "expected": { "kind": "value", "value": 42.0 }
+    },
+    {
+      "name": "no_match_is_parse_failed",
+      "output": "no metric here",
+      "pattern": "val_bpb:\\s+([\\d.]+)",
+      "expected": { "kind": "parse_failed" }
+    },
+    {
+      "name": "unparseable_capture_is_parse_failed",
+      "output": "val_bpb: oops",
+      "pattern": "val_bpb:\\s+(\\S+)",
+      "expected": { "kind": "parse_failed" }
+    }
+  ]
+}

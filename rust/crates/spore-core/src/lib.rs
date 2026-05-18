@@ -23,6 +23,7 @@ pub mod context;
 pub mod guide_registry;
 pub mod harness;
 pub mod memory;
+pub mod metric;
 pub mod middleware;
 pub mod model;
 pub mod observability;
@@ -58,6 +59,11 @@ pub use harness::{
 pub use memory::{
     EpisodicMemory, MemoryError, MemoryId, MemoryItem, MemoryProvider, MemoryQuery, MemorySource,
     MemoryStatus, MergeStrategy, SemanticMemory, StandardMemoryProvider, Timestamp,
+};
+pub use metric::{
+    should_keep, CommandMetricEvaluator, IterationStatus, JudgeModelConfig, LatencyEvaluator,
+    LlmJudgeEvaluator, MetricError, MetricEvaluator, MetricResult, ResultsEntry,
+    TestPassRateEvaluator,
 };
 pub use middleware::{
     HookContext as MiddlewareHookContext, HookPoint as MiddlewareHookPoint,
