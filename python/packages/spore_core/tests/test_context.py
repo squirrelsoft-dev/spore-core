@@ -8,9 +8,9 @@ from collections.abc import AsyncIterator
 import pytest
 
 from spore_core.context import (
+    CacheBlockHits,
     CacheHashMismatch,
     CacheProvider,
-    CacheStats,
     CompactionConfig,
     CompactionFailed,
     CompactionPreserveHints,
@@ -399,7 +399,9 @@ async def test_inject_skill_does_not_touch_history_or_static_hashes() -> None:
 async def test_record_cache_result_updates_meta() -> None:
     mgr = _mk()
     ctx = await mgr.assemble(_state(), _sources())
-    mgr.record_cache_result(ctx, CacheStats(static_hit=True, session_hit=False, history_hit=True))
+    mgr.record_cache_result(
+        ctx, CacheBlockHits(static_hit=True, session_hit=False, history_hit=True)
+    )
     assert ctx.meta.cache_blocks.static_hit is True
     assert ctx.meta.cache_blocks.session_hit is False
     assert ctx.meta.cache_blocks.history_hit is True

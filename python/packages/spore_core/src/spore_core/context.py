@@ -93,8 +93,12 @@ class ComposedPrompt:
 
 
 @dataclass(frozen=True)
-class CacheStats:
-    """Forward-declared cache stats parsed by a :class:`CacheProvider`."""
+class CacheBlockHits:
+    """Per-block cache hit signal recorded into :class:`ContextMeta` after
+    each model response. Distinct from
+    :class:`spore_core.cache_provider.CacheStats`, which carries token
+    counts and costs parsed from the response.
+    """
 
     static_hit: bool | None = None
     session_hit: bool | None = None
@@ -344,7 +348,7 @@ class ContextManager(Protocol):
 
     def inject_skill(self, context: Context, skill: Guide) -> None: ...
 
-    def record_cache_result(self, context: Context, cache_stats: CacheStats) -> None: ...
+    def record_cache_result(self, context: Context, cache_stats: CacheBlockHits) -> None: ...
 
 
 # ============================================================================
@@ -671,7 +675,7 @@ class StandardContextManager:
 
     # ---- record_cache_result ----------------------------------------
 
-    def record_cache_result(self, context: Context, cache_stats: CacheStats) -> None:
+    def record_cache_result(self, context: Context, cache_stats: CacheBlockHits) -> None:
         context.meta.cache_blocks = CacheBlockStatus(
             static_hit=cache_stats.static_hit,
             session_hit=cache_stats.session_hit,
@@ -682,10 +686,10 @@ class StandardContextManager:
 __all__ = [
     "AssemblyFailed",
     "BreakpointInfo",
+    "CacheBlockHits",
     "CacheBlockStatus",
     "CacheHashMismatch",
     "CacheProvider",
-    "CacheStats",
     "CompactionConfig",
     "CompactionFailed",
     "CompactionPreserveHints",
