@@ -1,0 +1,66 @@
+{
+  "description": "Cross-language consistency fixture for PromptChunkRegistry (issue #24).\n\nEach case feeds a `StandardPromptChunkRegistry` populated with `register_inputs` (each chunk's id, content, slot, cache_block). Then it calls `compose(role, mode, capabilities, skills)` and asserts that:\n  - the composed chunk list has the expected sequence of (slot, id) entries,\n  - rendered text contains every string in `rendered_contains`,\n  - `validate()` on the composed prompt returns an empty error list,\n  - changing any Static chunk's content changes `block_1_hash` (verified per-language; cross-language byte equality of the hash is NOT required because each language uses its own deterministic hasher).\n\nMode chunks are NOT in `register_inputs` — they are sourced from `Mode::prompt_chunk()`.",
+  "cases": [
+    {
+      "name": "minimal_role_only",
+      "register_inputs": [
+        { "id": "role-test", "content": "you are a test agent", "slot": "role", "cache_block": "static" }
+      ],
+      "compose": {
+        "role": "role-test",
+        "mode": "yolo",
+        "capabilities": [],
+        "skills": []
+      },
+      "expected_chunks": [
+        { "slot": "role", "id": "role-test" },
+        { "slot": "mode", "id": "mode-yolo" }
+      ],
+      "rendered_contains": ["you are a test agent", "Mode: Yolo"]
+    },
+    {
+      "name": "coding_agent_safeauto_with_capabilities_and_skills",
+      "register_inputs": [
+        { "id": "role-coding-agent", "content": "You are an expert software engineer.", "slot": "role", "cache_block": "static" },
+        { "id": "capability-bash", "content": "Capability: bash.", "slot": "capability", "cache_block": "static" },
+        { "id": "capability-filesystem", "content": "Capability: filesystem.", "slot": "capability", "cache_block": "static" },
+        { "id": "capability-git", "content": "Capability: git.", "slot": "capability", "cache_block": "static" },
+        { "id": "skill-testing", "content": "Skill: always run the tests.", "slot": "skill", "cache_block": "static" },
+        { "id": "skill-security-review", "content": "Skill: security review.", "slot": "skill", "cache_block": "static" }
+      ],
+      "compose": {
+        "role": "role-coding-agent",
+        "mode": "safe_auto",
+        "capabilities": ["capability-bash", "capability-filesystem", "capability-git"],
+        "skills": ["skill-testing", "skill-security-review"]
+      },
+      "expected_chunks": [
+        { "slot": "role", "id": "role-coding-agent" },
+        { "slot": "mode", "id": "mode-safe-auto" },
+        { "slot": "capability", "id": "capability-bash" },
+        { "slot": "capability", "id": "capability-filesystem" },
+        { "slot": "capability", "id": "capability-git" },
+        { "slot": "skill", "id": "skill-testing" },
+        { "slot": "skill", "id": "skill-security-review" }
+      ],
+      "rendered_contains": ["expert software engineer", "Mode: SafeAuto", "Capability: bash", "security review"]
+    },
+    {
+      "name": "plan_mode_orders_mode_after_role",
+      "register_inputs": [
+        { "id": "role-planner", "content": "You decompose tasks.", "slot": "role", "cache_block": "static" }
+      ],
+      "compose": {
+        "role": "role-planner",
+        "mode": "plan",
+        "capabilities": [],
+        "skills": []
+      },
+      "expected_chunks": [
+        { "slot": "role", "id": "role-planner" },
+        { "slot": "mode", "id": "mode-plan" }
+      ],
+      "rendered_contains": ["decompose tasks", "Mode: Plan"]
+    }
+  ]
+}

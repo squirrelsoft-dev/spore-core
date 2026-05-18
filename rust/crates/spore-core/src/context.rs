@@ -40,16 +40,8 @@ pub use crate::guide_registry::{Guide, GuideId};
 // for downstream callers building `ContextSources`.
 pub use crate::memory::MemoryItem;
 
-/// Forward-declared `ComposedPrompt` (issue #14 — PromptChunkRegistry).
-///
-/// Block 1 is computed ONCE at harness startup. `rendered` is the final
-/// byte-for-byte content; `block_1_hash` is a stable digest used by the
-/// `ContextManager` to detect unexpected cache invalidation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComposedPrompt {
-    pub rendered: String,
-    pub block_1_hash: u64,
-}
+// `ComposedPrompt` is defined by `PromptChunkRegistry` (issue #24).
+pub use crate::prompt_chunk_registry::ComposedPrompt;
 
 /// Forward-declared cache stats parsed by a `CacheProvider` (issue spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -529,7 +521,8 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
         }
 
         // ── Render ───────────────────────────────────────────────────────
-        let (rendered, breakpoints) = render_segments(&sources.composed_prompt.rendered, &segments);
+        let (rendered, breakpoints) =
+            render_segments(sources.composed_prompt.rendered_str(), &segments);
         let system_prompt = RenderedSystemPrompt {
             content: rendered,
             breakpoints,
@@ -818,8 +811,10 @@ mod tests {
             memory: vec![],
             tool_schemas: schemas,
             composed_prompt: ComposedPrompt {
-                rendered: rendered.into(),
+                chunks: vec![],
                 block_1_hash: hash,
+                block_2_hash: 0,
+                rendered: Some(rendered.into()),
             },
         }
     }
