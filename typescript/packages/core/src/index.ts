@@ -31,3 +31,4 @@ export * as sensor from "./sensor/index.js";
 export * as middleware from "./middleware/index.js";
 export * as observability from "./observability/index.js";
 export * as termination from "./termination/index.js";
+export * as metric from "./metric/index.js";
