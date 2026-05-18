@@ -1,0 +1,59 @@
+{
+  "description": "Cross-language consistency fixture for CacheProvider.parse_cache_stats (issue #25).\n\nEach case feeds a synthetic ModelResponse usage block (cache_read_tokens, cache_write_tokens) into the named provider's parse_cache_stats. Assertions:\n  - When `expected.is_some` is false, parse_cache_stats must return None / null.\n  - When `expected.is_some` is true, parse_cache_stats must return Some/non-null with cache_read_tokens and cache_write_tokens matching `expected`.\n\nAnthropic returns Some when either cache_read_tokens or cache_write_tokens is present.\nOpenAI returns Some only when cache_read_tokens is present (OpenAI does not return a write count; writes are reported as 0).\nOllama and Null always return None.",
+  "cases": [
+    {
+      "name": "anthropic_hit",
+      "provider": "anthropic",
+      "usage": { "cache_read_tokens": 900, "cache_write_tokens": 120 },
+      "expected": { "is_some": true, "cache_read_tokens": 900, "cache_write_tokens": 120 }
+    },
+    {
+      "name": "anthropic_miss_with_creation_only",
+      "provider": "anthropic",
+      "usage": { "cache_read_tokens": 0, "cache_write_tokens": 500 },
+      "expected": { "is_some": true, "cache_read_tokens": 0, "cache_write_tokens": 500 }
+    },
+    {
+      "name": "anthropic_one_sided_read_zero",
+      "provider": "anthropic",
+      "usage": { "cache_read_tokens": 0, "cache_write_tokens": null },
+      "expected": { "is_some": true, "cache_read_tokens": 0, "cache_write_tokens": 0 }
+    },
+    {
+      "name": "anthropic_no_metadata",
+      "provider": "anthropic",
+      "usage": { "cache_read_tokens": null, "cache_write_tokens": null },
+      "expected": { "is_some": false }
+    },
+    {
+      "name": "openai_hit",
+      "provider": "openai",
+      "usage": { "cache_read_tokens": 512, "cache_write_tokens": null },
+      "expected": { "is_some": true, "cache_read_tokens": 512, "cache_write_tokens": 0 }
+    },
+    {
+      "name": "openai_ignores_write_token_field",
+      "provider": "openai",
+      "usage": { "cache_read_tokens": 1024, "cache_write_tokens": 999 },
+      "expected": { "is_some": true, "cache_read_tokens": 1024, "cache_write_tokens": 0 }
+    },
+    {
+      "name": "openai_no_cache_metadata",
+      "provider": "openai",
+      "usage": { "cache_read_tokens": null, "cache_write_tokens": null },
+      "expected": { "is_some": false }
+    },
+    {
+      "name": "ollama_always_none",
+      "provider": "ollama",
+      "usage": { "cache_read_tokens": 200, "cache_write_tokens": 200 },
+      "expected": { "is_some": false }
+    },
+    {
+      "name": "null_always_none",
+      "provider": "null",
+      "usage": { "cache_read_tokens": 100, "cache_write_tokens": 100 },
+      "expected": { "is_some": false }
+    }
+  ]
+}

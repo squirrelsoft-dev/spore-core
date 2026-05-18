@@ -43,15 +43,17 @@ pub use crate::memory::MemoryItem;
 // `ComposedPrompt` is defined by `PromptChunkRegistry` (issue #24).
 pub use crate::prompt_chunk_registry::ComposedPrompt;
 
-/// Forward-declared cache stats parsed by a `CacheProvider` (issue spec).
+/// Per-block cache hit signal recorded into `ContextMeta` after each
+/// model response. Distinct from [`crate::cache_provider::CacheStats`],
+/// which carries token counts and costs parsed from the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct CacheStats {
+pub struct CacheBlockHits {
     pub static_hit: Option<bool>,
     pub session_hit: Option<bool>,
     pub history_hit: Option<bool>,
 }
 
-impl CacheStats {
+impl CacheBlockHits {
     pub fn new(
         static_hit: Option<bool>,
         session_hit: Option<bool>,
@@ -65,20 +67,7 @@ impl CacheStats {
     }
 }
 
-/// Forward-declared `CacheProvider` trait (issue #7 dependency). The default
-/// `NullCacheProvider` is the testing default — it never interferes.
-pub trait CacheProvider: Send + Sync {
-    fn supports_caching(&self) -> bool {
-        false
-    }
-    /// Annotate the assembled context with provider-specific cache markers.
-    /// No-op when `supports_caching()` is false.
-    fn annotate(&self, _context: &mut Context) {}
-}
-
-/// Testing default — no-op for all calls. Never interferes with unit tests.
-pub struct NullCacheProvider;
-impl CacheProvider for NullCacheProvider {}
+pub use crate::cache_provider::{CacheProvider, NullCacheProvider};
 
 // ============================================================================
 // Spec-defined types
@@ -329,7 +318,7 @@ pub trait ContextManager: Send + Sync {
 
     fn inject_skill(&self, context: &mut Context, skill: &Guide) -> Result<(), ContextError>;
 
-    fn record_cache_result(&self, context: &mut Context, cache_stats: CacheStats);
+    fn record_cache_result(&self, context: &mut Context, cache_stats: CacheBlockHits);
 }
 
 // ============================================================================
@@ -700,7 +689,7 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
         Ok(())
     }
 
-    fn record_cache_result(&self, context: &mut Context, cache_stats: CacheStats) {
+    fn record_cache_result(&self, context: &mut Context, cache_stats: CacheBlockHits) {
         context.meta.cache_blocks = CacheBlockStatus {
             static_hit: cache_stats.static_hit,
             session_hit: cache_stats.session_hit,
@@ -790,8 +779,12 @@ mod tests {
         fn supports_caching(&self) -> bool {
             true
         }
-        fn annotate(&self, _context: &mut Context) {
+        fn annotate(&self, _context: &mut Context) -> crate::cache_provider::CacheAnnotationResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            crate::cache_provider::CacheAnnotationResult::default()
+        }
+        fn provider_name(&self) -> &'static str {
+            "counting"
         }
     }
 
@@ -1100,7 +1093,7 @@ mod tests {
             .unwrap();
         mgr.record_cache_result(
             &mut ctx,
-            CacheStats::new(Some(true), Some(false), Some(true)),
+            CacheBlockHits::new(Some(true), Some(false), Some(true)),
         );
         assert_eq!(ctx.meta.cache_blocks.static_hit, Some(true));
         assert_eq!(ctx.meta.cache_blocks.session_hit, Some(false));

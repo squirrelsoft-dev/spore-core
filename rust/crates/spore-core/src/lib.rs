@@ -19,6 +19,7 @@
 //!   - #13 TerminationPolicy
 
 pub mod agent;
+pub mod cache_provider;
 pub mod context;
 pub mod guide_registry;
 pub mod harness;
@@ -35,12 +36,15 @@ pub mod tool_registry;
 pub mod tools;
 
 pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent, TurnResult};
+pub use cache_provider::{
+    auto_detect as auto_detect_cache_provider, AnthropicCacheProvider, CacheAnnotationResult,
+    CacheProvider, CacheStats, NullCacheProvider, OllamaCacheProvider, OpenAICacheProvider,
+};
 pub use context::{
-    BreakpointInfo, CacheBlockStatus, CacheProvider, CacheStats, CompactionConfig,
-    CompactionPreserveHints, CompactionRequest, CompactionResult, ComposedPrompt, Context,
-    ContextError, ContextManager, ContextMeta, ContextSources, NullCacheProvider, PromptSegment,
-    RenderedSystemPrompt, SegmentStability, SessionState as ContextSessionState,
-    StandardContextManager,
+    BreakpointInfo, CacheBlockHits, CacheBlockStatus, CompactionConfig, CompactionPreserveHints,
+    CompactionRequest, CompactionResult, ComposedPrompt, Context, ContextError, ContextManager,
+    ContextMeta, ContextSources, PromptSegment, RenderedSystemPrompt, SegmentStability,
+    SessionState as ContextSessionState, StandardContextManager,
 };
 pub use guide_registry::{
     Guide, GuideConflict, GuideId, GuideQuery, GuideRegistry, GuideRegistryError, GuideSource,
