@@ -50,7 +50,14 @@ type countingCache struct {
 }
 
 func (c *countingCache) SupportsCaching() bool { return true }
-func (c *countingCache) Annotate(_ *Context)   { c.calls.Add(1) }
+func (c *countingCache) Annotate(_ *Context) CacheAnnotationResult {
+	c.calls.Add(1)
+	return CacheAnnotationResult{}
+}
+func (c *countingCache) ParseCacheStats(_ *sporecore.ModelResponse) (CacheStats, bool) {
+	return CacheStats{}, false
+}
+func (c *countingCache) ProviderName() string { return "counting" }
 
 // passthroughSandbox truncates via head+tail with a small marker; it does
 // not offload to disk.
@@ -374,7 +381,7 @@ func TestRecordCacheResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr, fa := true, false
-	mgr.RecordCacheResult(c, CacheStats{StaticHit: &tr, SessionHit: &fa, HistoryHit: &tr})
+	mgr.RecordCacheResult(c, CacheBlockHits{StaticHit: &tr, SessionHit: &fa, HistoryHit: &tr})
 	if c.Meta.CacheBlocks.StaticHit == nil || !*c.Meta.CacheBlocks.StaticHit {
 		t.Error("static_hit not recorded")
 	}

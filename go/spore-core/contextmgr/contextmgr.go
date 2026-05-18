@@ -57,31 +57,18 @@ type ComposedPrompt struct {
 	Block1Hash uint64 `json:"block_1_hash"`
 }
 
-// CacheStats is forward-declared cache-result parsed by a CacheProvider.
-type CacheStats struct {
+// CacheBlockHits is the per-block cache hit signal recorded into ContextMeta
+// after each model response. Distinct from sporecore.CacheStats (#25), which
+// carries token counts and costs parsed from the response.
+type CacheBlockHits struct {
 	StaticHit  *bool `json:"static_hit"`
 	SessionHit *bool `json:"session_hit"`
 	HistoryHit *bool `json:"history_hit"`
 }
 
-// CacheProvider annotates the assembled context with provider-specific cache
-// markers. The default NullCacheProvider is the testing default — it never
-// interferes.
-type CacheProvider interface {
-	SupportsCaching() bool
-	Annotate(ctx *Context)
-}
-
-// NullCacheProvider is the testing default — a no-op for all calls.
-type NullCacheProvider struct{}
-
-// SupportsCaching reports false.
-func (NullCacheProvider) SupportsCaching() bool { return false }
-
-// Annotate is a no-op.
-func (NullCacheProvider) Annotate(_ *Context) {}
-
-var _ CacheProvider = NullCacheProvider{}
+// CacheProvider, NullCacheProvider, and friends live in cache_provider.go
+// (issue #25). The interface is the canonical surface; ContextManager calls
+// Annotate after assembling a Context.
 
 // ============================================================================
 // Spec-defined types
@@ -340,7 +327,7 @@ type ContextManager interface {
 	PrepareCompaction(state *SessionState) (*CompactionRequest, error)
 	ApplyCompaction(state *SessionState, result CompactionResult) error
 	InjectSkill(ctx *Context, skill *Guide) error
-	RecordCacheResult(ctx *Context, stats CacheStats)
+	RecordCacheResult(ctx *Context, stats CacheBlockHits)
 }
 
 // ============================================================================
@@ -504,7 +491,7 @@ func (m *StandardContextManager) Assemble(
 		Meta:         meta,
 	}
 
-	m.cacheProvider.Annotate(out)
+	_ = m.cacheProvider.Annotate(out)
 	return out, nil
 }
 
@@ -622,7 +609,7 @@ func (m *StandardContextManager) InjectSkill(c *Context, skill *Guide) error {
 }
 
 // RecordCacheResult updates ContextMeta.CacheBlocks with the supplied stats.
-func (m *StandardContextManager) RecordCacheResult(c *Context, stats CacheStats) {
+func (m *StandardContextManager) RecordCacheResult(c *Context, stats CacheBlockHits) {
 	c.Meta.CacheBlocks = CacheBlockStatus{
 		StaticHit:  stats.StaticHit,
 		SessionHit: stats.SessionHit,

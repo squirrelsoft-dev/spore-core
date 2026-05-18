@@ -1,0 +1,291 @@
+// Issue #25 — CacheProvider: provider-specific cache annotation and stats.
+//
+// Cache control is provider-specific at the API level: Anthropic uses
+// explicit `cache_control` markers, OpenAI caches automatically above a token
+// threshold, Ollama has no caching. CacheProvider is the abstraction that
+// keeps these concerns out of provider-agnostic ContextManager.
+//
+// Flow (see `docs/harness-engineering-concepts.md` §"Cache Architecture"):
+//
+//	ContextManager.Assemble():
+//	    ... build and render segments ...
+//	    if cacheProvider.SupportsCaching() {
+//	        cacheProvider.Annotate(context)
+//	    }
+//	    return context
+//
+//	// After each model response:
+//	stats, ok := cacheProvider.ParseCacheStats(response)
+//	contextManager.RecordCacheResult(context, stats)
+//	observability.EmitCacheStats(sessionID, stats)
+//
+// Cross-language consistency: see fixtures/cache_provider/parse_cache_stats.json.
+
+package contextmgr
+
+import (
+	"strings"
+
+	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+)
+
+// ============================================================================
+// Spec-defined types
+// ============================================================================
+
+// CacheAnnotationResult is the result of annotating a context with
+// provider-specific cache markers.
+type CacheAnnotationResult struct {
+	MarkersInserted          uint32 `json:"markers_inserted"`
+	EstimatedCacheableTokens uint32 `json:"estimated_cacheable_tokens"`
+}
+
+// CacheStats is cache token usage parsed from a single model response.
+//
+// ParseCacheStats returns (CacheStats{}, false) when the response had no
+// cache metadata at all (caching wasn't attempted). A CacheStats with
+// all-zero fields and ok=true means caching was attempted and missed — the
+// distinction matters for observability.
+type CacheStats struct {
+	CacheReadTokens   uint32  `json:"cache_read_tokens"`
+	CacheWriteTokens  uint32  `json:"cache_write_tokens"`
+	CacheReadCostUSD  float64 `json:"cache_read_cost_usd"`
+	CacheWriteCostUSD float64 `json:"cache_write_cost_usd"`
+}
+
+// ============================================================================
+// Interface
+// ============================================================================
+
+// CacheProvider annotates a fully assembled Context with provider-specific
+// cache markers and parses cache usage from model responses.
+type CacheProvider interface {
+	// SupportsCaching reports whether this provider supports prefix caching.
+	SupportsCaching() bool
+
+	// Annotate annotates a fully assembled context with provider-specific
+	// cache markers. No-op when SupportsCaching is false.
+	Annotate(ctx *Context) CacheAnnotationResult
+
+	// ParseCacheStats parses cache usage from a model response. The second
+	// return is false when the response has no cache metadata at all.
+	ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool)
+
+	// ProviderName is the provider identity used for observability and
+	// auto-detection.
+	ProviderName() string
+}
+
+// ============================================================================
+// NullCacheProvider
+// ============================================================================
+
+// NullCacheProvider is the testing default. All operations are no-ops;
+// SupportsCaching is false.
+//
+// Always use NullCacheProvider in unit tests so cache logic never interferes
+// with assertions.
+type NullCacheProvider struct{}
+
+// SupportsCaching reports false.
+func (NullCacheProvider) SupportsCaching() bool { return false }
+
+// Annotate is a no-op returning the zero CacheAnnotationResult.
+func (NullCacheProvider) Annotate(_ *Context) CacheAnnotationResult {
+	return CacheAnnotationResult{}
+}
+
+// ParseCacheStats always returns (CacheStats{}, false).
+func (NullCacheProvider) ParseCacheStats(_ *sporecore.ModelResponse) (CacheStats, bool) {
+	return CacheStats{}, false
+}
+
+// ProviderName returns "null".
+func (NullCacheProvider) ProviderName() string { return "null" }
+
+var _ CacheProvider = NullCacheProvider{}
+
+// ============================================================================
+// AnthropicCacheProvider
+// ============================================================================
+
+// AnthropicCacheProvider implements Anthropic prefix caching.
+//
+// Inserts logical `cache_control: ephemeral` breakpoints after each stable
+// block boundary (Block 1: Static, Block 2: PerSession, plus history and
+// optional tool-schema anchors). Reads cache_read_tokens and
+// cache_write_tokens from response usage.
+type AnthropicCacheProvider struct {
+	// MaxCacheAnchors is the maximum number of breakpoints per request.
+	// Anthropic supports up to 4.
+	MaxCacheAnchors uint32
+}
+
+// NewAnthropicCacheProvider returns an AnthropicCacheProvider with the
+// default MaxCacheAnchors of 4.
+func NewAnthropicCacheProvider() AnthropicCacheProvider {
+	return AnthropicCacheProvider{MaxCacheAnchors: 4}
+}
+
+// SupportsCaching reports true.
+func (AnthropicCacheProvider) SupportsCaching() bool { return true }
+
+// Annotate inserts up to MaxCacheAnchors breakpoints. Anchors are derived
+// from existing system-prompt breakpoints (Block-1 / Block-2 boundaries)
+// plus an optional history anchor when there are prior messages.
+func (p AnthropicCacheProvider) Annotate(ctx *Context) CacheAnnotationResult {
+	anchors := uint32(len(ctx.SystemPrompt.Breakpoints))
+
+	// History anchor: if there are messages, the last message in the history
+	// is a logical cache anchor. Recorded as a synthetic BreakpointInfo so
+	// downstream code can detect annotation without mutating Messages.
+	if len(ctx.Messages) > 0 && anchors < p.MaxCacheAnchors {
+		ctx.SystemPrompt.Breakpoints = append(ctx.SystemPrompt.Breakpoints, BreakpointInfo{
+			AfterSegment: "__history_tail__",
+			TokenOffset:  ctx.TokenCount,
+		})
+		anchors++
+	}
+
+	markers := anchors
+	if markers > p.MaxCacheAnchors {
+		markers = p.MaxCacheAnchors
+	}
+	var estimated uint32
+	if markers > 0 {
+		estimated = ctx.TokenCount
+	}
+	return CacheAnnotationResult{
+		MarkersInserted:          markers,
+		EstimatedCacheableTokens: estimated,
+	}
+}
+
+// ParseCacheStats reads cache_read_tokens and cache_write_tokens from the
+// response. Returns (_, false) only when both fields are absent.
+func (AnthropicCacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
+	read := resp.Usage.CacheReadTokens
+	write := resp.Usage.CacheWriteTokens
+	if read == nil && write == nil {
+		return CacheStats{}, false
+	}
+	stats := CacheStats{}
+	if read != nil {
+		stats.CacheReadTokens = *read
+	}
+	if write != nil {
+		stats.CacheWriteTokens = *write
+	}
+	return stats, true
+}
+
+// ProviderName returns "anthropic".
+func (AnthropicCacheProvider) ProviderName() string { return "anthropic" }
+
+var _ CacheProvider = AnthropicCacheProvider{}
+
+// ============================================================================
+// OpenAICacheProvider
+// ============================================================================
+
+// OpenAICacheProvider implements OpenAI prefix caching.
+//
+// OpenAI caches automatically on prompts above MinCacheableTokens (1024 by
+// default) — no explicit markers required. Annotate is a no-op (returning
+// zero markers, but reporting cacheable token count when above threshold).
+// ParseCacheStats reads cache_read_tokens; OpenAI does not return a cache
+// write count, so writes remain zero.
+type OpenAICacheProvider struct {
+	// MinCacheableTokens is the lower bound on context size for OpenAI to
+	// cache. Below this value the response will not include cache metadata.
+	MinCacheableTokens uint32
+}
+
+// NewOpenAICacheProvider returns an OpenAICacheProvider with the default
+// MinCacheableTokens of 1024.
+func NewOpenAICacheProvider() OpenAICacheProvider {
+	return OpenAICacheProvider{MinCacheableTokens: 1024}
+}
+
+// SupportsCaching reports true.
+func (OpenAICacheProvider) SupportsCaching() bool { return true }
+
+// Annotate is a no-op (markers_inserted is always 0). When the context
+// token count meets MinCacheableTokens, estimated_cacheable_tokens is the
+// full context size; below the threshold it is 0.
+func (p OpenAICacheProvider) Annotate(ctx *Context) CacheAnnotationResult {
+	var cacheable uint32
+	if ctx.TokenCount >= p.MinCacheableTokens {
+		cacheable = ctx.TokenCount
+	}
+	return CacheAnnotationResult{
+		MarkersInserted:          0,
+		EstimatedCacheableTokens: cacheable,
+	}
+}
+
+// ParseCacheStats returns (_, false) when cache_read_tokens is absent.
+// When present, cache_write_tokens is forced to zero — OpenAI does not
+// expose a write count.
+func (OpenAICacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
+	if resp.Usage.CacheReadTokens == nil {
+		return CacheStats{}, false
+	}
+	return CacheStats{
+		CacheReadTokens:  *resp.Usage.CacheReadTokens,
+		CacheWriteTokens: 0,
+	}, true
+}
+
+// ProviderName returns "openai".
+func (OpenAICacheProvider) ProviderName() string { return "openai" }
+
+var _ CacheProvider = OpenAICacheProvider{}
+
+// ============================================================================
+// OllamaCacheProvider
+// ============================================================================
+
+// OllamaCacheProvider has no caching support. Every method is a no-op.
+type OllamaCacheProvider struct{}
+
+// SupportsCaching reports false.
+func (OllamaCacheProvider) SupportsCaching() bool { return false }
+
+// Annotate is a no-op returning the zero CacheAnnotationResult.
+func (OllamaCacheProvider) Annotate(_ *Context) CacheAnnotationResult {
+	return CacheAnnotationResult{}
+}
+
+// ParseCacheStats always returns (CacheStats{}, false).
+func (OllamaCacheProvider) ParseCacheStats(_ *sporecore.ModelResponse) (CacheStats, bool) {
+	return CacheStats{}, false
+}
+
+// ProviderName returns "ollama".
+func (OllamaCacheProvider) ProviderName() string { return "ollama" }
+
+var _ CacheProvider = OllamaCacheProvider{}
+
+// ============================================================================
+// Auto-detection
+// ============================================================================
+
+// AutoDetectCacheProvider maps a ModelInterface.Provider().Name to the
+// appropriate CacheProvider. The second return is false when the provider
+// is unknown — the caller (typically HarnessBuilder) should emit a
+// CacheProviderNotDetected warning and fall back to NullCacheProvider.
+//
+// Matching is case-insensitive.
+func AutoDetectCacheProvider(name string) (CacheProvider, bool) {
+	switch strings.ToLower(name) {
+	case "anthropic":
+		return NewAnthropicCacheProvider(), true
+	case "openai":
+		return NewOpenAICacheProvider(), true
+	case "ollama":
+		return OllamaCacheProvider{}, true
+	default:
+		return nil, false
+	}
+}
