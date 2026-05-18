@@ -75,8 +75,15 @@ class CountingCache implements CacheProvider {
   supportsCaching(): boolean {
     return true;
   }
-  annotate(_ctx: Context): void {
+  annotate(_ctx: Context): context.CacheAnnotationResult {
     this.calls += 1;
+    return { markers_inserted: 0, estimated_cacheable_tokens: 0 };
+  }
+  parseCacheStats(_response: ModelResponse): context.CacheStats | null {
+    return null;
+  }
+  providerName(): string {
+    return "counting";
   }
 }
 

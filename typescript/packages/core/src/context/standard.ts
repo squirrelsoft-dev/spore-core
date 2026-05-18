@@ -15,8 +15,8 @@ import type { SandboxProvider } from "../harness/types.js";
 
 import {
   type BreakpointInfo,
+  type CacheBlockHits,
   type CacheProvider,
-  type CacheStats,
   type CompactionConfig,
   type CompactionRequest,
   type CompactionResult,
@@ -327,7 +327,7 @@ export class StandardContextManager implements ContextManager {
     context.meta.skills_injected.push(skill.id);
   }
 
-  recordCacheResult(context: Context, cacheStats: CacheStats): void {
+  recordCacheResult(context: Context, cacheStats: CacheBlockHits): void {
     context.meta.cache_blocks = {
       static_hit: cacheStats.static_hit,
       session_hit: cacheStats.session_hit,

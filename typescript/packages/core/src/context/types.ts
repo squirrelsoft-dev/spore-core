@@ -76,39 +76,32 @@ export interface ComposedPrompt {
 }
 
 /**
- * Cache hit/miss stats parsed by a {@link CacheProvider}. `null` means the
- * provider has no signal for that block (e.g. the provider does not support
- * caching at all).
+ * Per-block cache hit signal recorded into {@link ContextMeta} after each
+ * model response. Distinct from {@link "../cache-provider/types.js".CacheStats},
+ * which carries token counts and costs parsed from the response.
+ *
+ * `null` means the provider has no signal for that block (e.g. the provider
+ * does not support caching at all).
  */
-export interface CacheStats {
+export interface CacheBlockHits {
   static_hit: boolean | null;
   session_hit: boolean | null;
   history_hit: boolean | null;
 }
 
-export function emptyCacheStats(): CacheStats {
+export function emptyCacheBlockHits(): CacheBlockHits {
   return { static_hit: null, session_hit: null, history_hit: null };
 }
 
-/**
- * Forward-declared `CacheProvider`. The default {@link NullCacheProvider}
- * is the testing default — it never interferes.
- */
-export interface CacheProvider {
-  supportsCaching(): boolean;
-  /** No-op when `supportsCaching()` is false. */
-  annotate(context: Context): void;
-}
-
-/** Testing default — no-op for all calls. */
-export class NullCacheProvider implements CacheProvider {
-  supportsCaching(): boolean {
-    return false;
-  }
-  annotate(_context: Context): void {
-    void _context;
-  }
-}
+// `CacheProvider` and `NullCacheProvider` are owned by the canonical
+// cache-provider module (issue #25). Re-exported here so existing context
+// callers keep working.
+export {
+  type CacheProvider,
+  NullCacheProvider,
+  type CacheStats,
+  type CacheAnnotationResult,
+} from "../cache-provider/types.js";
 
 // ============================================================================
 // Spec-defined types
@@ -388,7 +381,7 @@ export interface ContextManager {
 
   injectSkill(context: Context, skill: Guide): void;
 
-  recordCacheResult(context: Context, cacheStats: CacheStats): void;
+  recordCacheResult(context: Context, cacheStats: CacheBlockHits): void;
 }
 
 // Re-export the model-side ToolSchema for callers building ContextSources.
