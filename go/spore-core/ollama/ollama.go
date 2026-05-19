@@ -1,0 +1,801 @@
+// Package ollama implements ModelInterface against a local Ollama server's
+// /api/chat, /api/tags, and /api/embed endpoints.
+//
+// Issue #41. Translates the spore-core ModelRequest / ModelResponse types to
+// and from the Ollama wire format, parses Ollama's NDJSON stream (one JSON
+// object per line — not SSE) for CallStreaming, and maps HTTP/transport
+// errors to typed ModelError variants.
+//
+// Unlike the Anthropic and OpenAI clients there is NO retry: spec says fail
+// fast on connection errors with a helpful message ("Ollama not running",
+// "Run: ollama pull <model>").
+//
+// Provider-specific shape
+//
+//   - No API key; default base URL is http://localhost:11434.
+//   - Sampling parameters (num_predict, temperature, top_p, stop) are nested
+//     under `options` rather than being top-level keys.
+//   - keep_alive (default "5m") controls how long Ollama keeps the model
+//     loaded after the call returns.
+//   - Tool-call arguments are a JSON OBJECT in the wire format, not a
+//     JSON-encoded string like OpenAI.
+//   - Ollama does not return tool-call ids; we synthesize "call-{i}" per
+//     index so downstream ToolResult.tool_use_id round-trips work.
+//   - Thinking blocks are silently omitted from outgoing requests — Ollama
+//     has no structured reasoning shape.
+//   - Cache fields on TokenUsage are always nil (Ollama has no prefix
+//     caching).
+//   - Model availability is verified lazily against /api/tags on first call
+//     and cached for the lifetime of the instance.
+package ollama
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+)
+
+// ---------------------------------------------------------------------------
+// Public client
+// ---------------------------------------------------------------------------
+
+const (
+	// DefaultBaseURL is the local Ollama endpoint.
+	DefaultBaseURL = "http://localhost:11434"
+
+	// DefaultTimeout is the per-request timeout. Local models are slower
+	// than hosted providers, so 300s is generous.
+	DefaultTimeout = 300 * time.Second
+
+	// DefaultKeepAlive tells Ollama to keep the model loaded for 5 minutes
+	// after the call returns.
+	DefaultKeepAlive = "5m"
+)
+
+// ModelInterface is the Ollama HTTP client. It implements
+// sporecore.ModelInterface.
+type ModelInterface struct {
+	modelID    string
+	baseURL    string
+	timeout    time.Duration
+	keepAlive  string
+	httpClient *http.Client
+
+	// Lazy /api/tags availability probe. The first Call/CallStreaming
+	// triggers the check; the result is cached for the instance lifetime.
+	checkOnce sync.Once
+	checkErr  error
+}
+
+// New constructs a ModelInterface with localhost defaults.
+func New(modelID string) *ModelInterface {
+	return &ModelInterface{
+		modelID:    modelID,
+		baseURL:    DefaultBaseURL,
+		timeout:    DefaultTimeout,
+		keepAlive:  DefaultKeepAlive,
+		httpClient: &http.Client{},
+	}
+}
+
+// WithBaseURL constructs a ModelInterface pointing at a non-default Ollama
+// host (remote instance, custom port, mock server).
+func WithBaseURL(modelID, baseURL string) *ModelInterface {
+	c := New(modelID)
+	c.baseURL = baseURL
+	return c
+}
+
+// SetTimeout overrides the per-request timeout.
+func (c *ModelInterface) SetTimeout(d time.Duration) *ModelInterface {
+	c.timeout = d
+	return c
+}
+
+// SetKeepAlive overrides how long Ollama keeps the model resident after a
+// call. Pass empty string to omit the field entirely.
+func (c *ModelInterface) SetKeepAlive(s string) *ModelInterface {
+	c.keepAlive = s
+	return c
+}
+
+// SetHTTPClient overrides the http.Client.
+func (c *ModelInterface) SetHTTPClient(h *http.Client) *ModelInterface {
+	c.httpClient = h
+	return c
+}
+
+// String returns a debug representation.
+func (c *ModelInterface) String() string {
+	return fmt.Sprintf(
+		"OllamaModelInterface{model_id=%q, base_url=%q, timeout=%s, keep_alive=%q}",
+		c.modelID, c.baseURL, c.timeout, c.keepAlive,
+	)
+}
+
+// GoString matches String.
+func (c *ModelInterface) GoString() string { return c.String() }
+
+// ContextWindow returns the known context window for an Ollama model id.
+// Unknown models return 0 so callers can detect them. The Rust reference
+// uses a static prefix table; we do the same — no /api/show probe.
+func ContextWindow(modelID string) uint32 {
+	switch {
+	case strings.HasPrefix(modelID, "llama3.2"):
+		return 128_000
+	case strings.HasPrefix(modelID, "qwen2.5-coder"):
+		return 128_000
+	case strings.HasPrefix(modelID, "mistral"):
+		return 32_000
+	case strings.HasPrefix(modelID, "gemma"):
+		return 8_192
+	default:
+		return 0
+	}
+}
+
+// Provider reports the underlying model identity.
+func (c *ModelInterface) Provider() sporecore.ProviderInfo {
+	return sporecore.ProviderInfo{
+		Name:          "ollama",
+		ModelID:       c.modelID,
+		ContextWindow: ContextWindow(c.modelID),
+	}
+}
+
+var _ sporecore.ModelInterface = (*ModelInterface)(nil)
+
+// ---------------------------------------------------------------------------
+// Wire-format types (Ollama Chat API)
+// ---------------------------------------------------------------------------
+
+type wireRequest struct {
+	Model     string        `json:"model"`
+	Messages  []wireMessage `json:"messages"`
+	Stream    bool          `json:"stream"`
+	KeepAlive string        `json:"keep_alive,omitempty"`
+	Options   *wireOptions  `json:"options,omitempty"`
+	Tools     []wireTool    `json:"tools,omitempty"`
+}
+
+type wireOptions struct {
+	NumPredict  *uint32  `json:"num_predict,omitempty"`
+	Temperature *float32 `json:"temperature,omitempty"`
+	TopP        *float32 `json:"top_p,omitempty"`
+	Stop        []string `json:"stop,omitempty"`
+}
+
+func (o *wireOptions) isEmpty() bool {
+	return o.NumPredict == nil && o.Temperature == nil && o.TopP == nil && len(o.Stop) == 0
+}
+
+type wireMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type wireToolCall struct {
+	Function wireFunctionCall `json:"function"`
+}
+
+type wireFunctionCall struct {
+	Name string `json:"name"`
+	// Arguments is a JSON object (not a JSON-encoded string).
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type wireTool struct {
+	Type     string           `json:"type"` // always "function"
+	Function wireToolFunction `json:"function"`
+}
+
+type wireToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type wireResponse struct {
+	Message         wireResponseMessage `json:"message"`
+	Done            bool                `json:"done"`
+	DoneReason      string              `json:"done_reason"`
+	PromptEvalCount *uint32             `json:"prompt_eval_count,omitempty"`
+	EvalCount       *uint32             `json:"eval_count,omitempty"`
+}
+
+type wireResponseMessage struct {
+	Role      string                 `json:"role"`
+	Content   string                 `json:"content"`
+	ToolCalls []wireResponseToolCall `json:"tool_calls"`
+}
+
+type wireResponseToolCall struct {
+	Function wireResponseFunctionCall `json:"function"`
+}
+
+type wireResponseFunctionCall struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type wireTagsResponse struct {
+	Models []wireTagModel `json:"models"`
+}
+
+type wireTagModel struct {
+	Name string `json:"name"`
+}
+
+type wireEmbedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
+}
+
+type wireEmbedResponse struct {
+	PromptEvalCount *uint32 `json:"prompt_eval_count,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Conversions
+// ---------------------------------------------------------------------------
+
+func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream bool) wireRequest {
+	messages := make([]wireMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		messages = append(messages, messageToWire(m))
+	}
+
+	tools := make([]wireTool, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		params := t.InputSchema
+		if len(params) == 0 {
+			params = json.RawMessage("{}")
+		}
+		tools = append(tools, wireTool{
+			Type: "function",
+			Function: wireToolFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  params,
+			},
+		})
+	}
+
+	opts := &wireOptions{
+		NumPredict:  req.Params.MaxTokens,
+		Temperature: req.Params.Temperature,
+		TopP:        req.Params.TopP,
+		Stop:        req.Params.StopSequences,
+	}
+	var optsOut *wireOptions
+	if !opts.isEmpty() {
+		optsOut = opts
+	}
+
+	return wireRequest{
+		Model:     modelID,
+		Messages:  messages,
+		Stream:    stream,
+		KeepAlive: keepAlive,
+		Options:   optsOut,
+		Tools:     tools,
+	}
+}
+
+func messageToWire(m sporecore.Message) wireMessage {
+	role := "user"
+	switch m.Role {
+	case sporecore.RoleSystem:
+		role = "system"
+	case sporecore.RoleAssistant:
+		role = "assistant"
+	case sporecore.RoleTool:
+		role = "tool"
+	}
+	switch m.Content.Type {
+	case sporecore.ContentTypeText:
+		return wireMessage{Role: role, Content: m.Content.Text}
+	case sporecore.ContentTypeToolCall:
+		if m.Content.ToolCall != nil {
+			args := m.Content.ToolCall.Input
+			if len(args) == 0 {
+				args = json.RawMessage("{}")
+			}
+			return wireMessage{
+				Role: "assistant",
+				ToolCalls: []wireToolCall{{
+					Function: wireFunctionCall{
+						Name:      m.Content.ToolCall.Name,
+						Arguments: args,
+					},
+				}},
+			}
+		}
+		return wireMessage{Role: "assistant"}
+	case sporecore.ContentTypeToolResult:
+		if m.Content.ToolResult != nil {
+			return wireMessage{
+				Role:       "tool",
+				Content:    m.Content.ToolResult.Content,
+				ToolCallID: m.Content.ToolResult.ToolUseID,
+			}
+		}
+		return wireMessage{Role: "tool"}
+	case sporecore.ContentTypeImage:
+		// Ollama vision support varies by model; the harness does not
+		// currently emit image content. Emit a textual placeholder so
+		// the request remains well-formed.
+		return wireMessage{Role: role, Content: fmt.Sprintf("[image: %s]", m.Content.MediaType)}
+	}
+	return wireMessage{Role: role, Content: m.Content.Text}
+}
+
+func parseResponse(body wireResponse) sporecore.ModelResponse {
+	blocks := make([]sporecore.ContentBlock, 0, 1+len(body.Message.ToolCalls))
+	if body.Message.Content != "" {
+		blocks = append(blocks, sporecore.NewTextBlock(body.Message.Content))
+	}
+	for i, tc := range body.Message.ToolCalls {
+		input := tc.Function.Arguments
+		if len(input) == 0 || string(input) == "null" {
+			input = json.RawMessage("{}")
+		}
+		blocks = append(blocks, sporecore.NewToolUseBlock(sporecore.ToolCall{
+			ID:    fmt.Sprintf("call-%d", i),
+			Name:  tc.Function.Name,
+			Input: input,
+		}))
+	}
+
+	usage := sporecore.TokenUsage{}
+	if body.PromptEvalCount != nil {
+		usage.InputTokens = *body.PromptEvalCount
+	}
+	if body.EvalCount != nil {
+		usage.OutputTokens = *body.EvalCount
+	}
+
+	return sporecore.ModelResponse{
+		Content:    blocks,
+		Usage:      usage,
+		StopReason: parseStopReason(body.DoneReason),
+	}
+}
+
+func parseStopReason(s string) sporecore.StopReason {
+	switch s {
+	case "tool_calls":
+		return sporecore.StopToolUse
+	case "length":
+		return sporecore.StopMaxTokens
+	case "stop":
+		return sporecore.StopEndTurn
+	default:
+		return sporecore.StopEndTurn
+	}
+}
+
+// nameMatches compares an Ollama tag (e.g. "llama3.2:latest") to a requested
+// model id. Matches the full tag or its bare-name prefix.
+func nameMatches(tag, requested string) bool {
+	if tag == requested {
+		return true
+	}
+	if i := strings.IndexByte(tag, ':'); i >= 0 {
+		return tag[:i] == requested
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// HTTP plumbing (no retry — fail fast per spec)
+// ---------------------------------------------------------------------------
+
+// transportError classifies a transport-layer error into a typed ModelError.
+// Connection refused → helpful "Ollama not running" message. Timeout →
+// ModelErrTimeout. Anything else → generic ProviderError.
+func (c *ModelInterface) transportError(reqCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return sporecore.NewTimeout()
+	}
+	if reqCtx != nil && errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+		return sporecore.NewTimeout()
+	}
+	var ne interface{ Timeout() bool }
+	if errors.As(err, &ne) && ne.Timeout() {
+		return sporecore.NewTimeout()
+	}
+	if isConnectionError(err) {
+		return sporecore.NewProviderError(0, fmt.Sprintf("Ollama not running at %s", c.baseURL))
+	}
+	return sporecore.NewProviderError(0, fmt.Sprintf("HTTP transport error: %v", err))
+}
+
+// isConnectionError reports whether the error looks like an inability to
+// reach the server (connection refused, no route, DNS, etc.) — anything
+// that maps to the "Ollama not running" hint.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Err != nil {
+			err = urlErr.Err
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	msg := err.Error()
+	for _, frag := range []string{
+		"connection refused",
+		"no such host",
+		"no route to host",
+		"connect: cannot",
+		"network is unreachable",
+		"actively refused",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// mapStatusError converts a non-2xx response into a typed ModelError. 404 on
+// either /api/chat or /api/tags surfaces as the helpful "ollama pull" hint.
+func (c *ModelInterface) mapStatusError(resp *http.Response) error {
+	code := resp.StatusCode
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	switch code {
+	case 404:
+		return sporecore.NewProviderError(404, fmt.Sprintf(
+			"Model %s not found. Run: ollama pull %s", c.modelID, c.modelID,
+		))
+	case 408, 504:
+		return sporecore.NewTimeout()
+	}
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		msg = http.StatusText(code)
+	}
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	if code < 0 || code > math.MaxUint16 {
+		code = 500
+	}
+	return sporecore.NewProviderError(uint16(code), msg)
+}
+
+// ensureModelAvailable performs the one-time /api/tags probe. The result is
+// cached via sync.Once for the instance lifetime — every subsequent call
+// returns the same checkErr without hitting the server.
+func (c *ModelInterface) ensureModelAvailable(ctx context.Context) error {
+	c.checkOnce.Do(func() {
+		c.checkErr = c.checkModel(ctx)
+	})
+	return c.checkErr
+}
+
+func (c *ModelInterface) checkModel(ctx context.Context) error {
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	r, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.baseURL+"/api/tags", nil)
+	if err != nil {
+		return sporecore.NewProviderError(0, fmt.Sprintf("HTTP request build failed: %v", err))
+	}
+	resp, err := c.httpClient.Do(r)
+	if err != nil {
+		return c.transportError(reqCtx, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return c.mapStatusError(resp)
+	}
+	var tags wireTagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return sporecore.NewProviderError(0, fmt.Sprintf("tags decode failed: %v", err))
+	}
+	for _, m := range tags.Models {
+		if nameMatches(m.Name, c.modelID) {
+			return nil
+		}
+	}
+	return sporecore.NewProviderError(404, fmt.Sprintf(
+		"Model %s not found. Run: ollama pull %s", c.modelID, c.modelID,
+	))
+}
+
+// ---------------------------------------------------------------------------
+// ModelInterface impl
+// ---------------------------------------------------------------------------
+
+// Call performs one blocking /api/chat call.
+func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (sporecore.ModelResponse, error) {
+	if err := c.ensureModelAvailable(ctx); err != nil {
+		return sporecore.ModelResponse{}, err
+	}
+	body := buildRequest(c.modelID, c.keepAlive, req, false)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("HTTP request build failed: %v", err))
+	}
+	httpReq.Header.Set("content-type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return sporecore.ModelResponse{}, c.transportError(reqCtx, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return sporecore.ModelResponse{}, c.mapStatusError(resp)
+	}
+	var wr wireResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wr); err != nil {
+		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("response decode failed: %v", err))
+	}
+	return parseResponse(wr), nil
+}
+
+// CountTokens estimates token usage. Ollama has no dedicated count endpoint
+// — try /api/embed for prompt_eval_count, then fall back to bytes/4.
+func (c *ModelInterface) CountTokens(ctx context.Context, req sporecore.ModelRequest) (uint32, error) {
+	text := concatRequestText(req)
+	if n, ok := c.tryEmbedCount(ctx, text); ok {
+		return n, nil
+	}
+	return uint32(len(text) / 4), nil
+}
+
+func (c *ModelInterface) tryEmbedCount(ctx context.Context, text string) (uint32, bool) {
+	payload, err := json.Marshal(wireEmbedRequest{Model: c.modelID, Input: text})
+	if err != nil {
+		return 0, false
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	r, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/api/embed", bytes.NewReader(payload))
+	if err != nil {
+		return 0, false
+	}
+	r.Header.Set("content-type", "application/json")
+	resp, err := c.httpClient.Do(r)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, false
+	}
+	var er wireEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		return 0, false
+	}
+	if er.PromptEvalCount == nil {
+		return 0, false
+	}
+	return *er.PromptEvalCount, true
+}
+
+func concatRequestText(req sporecore.ModelRequest) string {
+	var b strings.Builder
+	for _, m := range req.Messages {
+		switch m.Content.Type {
+		case sporecore.ContentTypeText:
+			b.WriteString(m.Content.Text)
+		case sporecore.ContentTypeToolCall:
+			if m.Content.ToolCall != nil {
+				b.WriteString(m.Content.ToolCall.Name)
+				b.WriteByte(' ')
+				b.Write(m.Content.ToolCall.Input)
+			}
+		case sporecore.ContentTypeToolResult:
+			if m.Content.ToolResult != nil {
+				b.WriteString(m.Content.ToolResult.Content)
+			}
+		case sporecore.ContentTypeImage:
+			// 0 contribution
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// CallStreaming opens an NDJSON stream and emits StreamEvents.
+func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelRequest) (<-chan sporecore.StreamEventOrErr, error) {
+	if err := c.ensureModelAvailable(ctx); err != nil {
+		return nil, err
+	}
+	body := buildRequest(c.modelID, c.keepAlive, req, true)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(payload))
+	if err != nil {
+		cancel()
+		return nil, sporecore.NewProviderError(0, fmt.Sprintf("HTTP request build failed: %v", err))
+	}
+	httpReq.Header.Set("content-type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		cancel()
+		return nil, c.transportError(reqCtx, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		mapped := c.mapStatusError(resp)
+		_ = resp.Body.Close()
+		cancel()
+		return nil, mapped
+	}
+	ch := make(chan sporecore.StreamEventOrErr, 16)
+	go func() {
+		defer close(ch)
+		defer resp.Body.Close()
+		defer cancel()
+		parseNDJSONStream(ctx, resp.Body, ch)
+	}()
+	return ch, nil
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON parsing — Ollama chat streaming
+// ---------------------------------------------------------------------------
+
+// parseNDJSONStream reads newline-delimited JSON. Each line carries an
+// incremental message.content delta; tool_calls arrive as full argument
+// objects per chunk; the terminator line carries done=true plus
+// prompt_eval_count and eval_count.
+func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.StreamEventOrErr) {
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 1<<16)
+	scanner.Buffer(buf, 1<<20)
+
+	var (
+		usage              sporecore.TokenUsage
+		stopReason         = sporecore.StopEndTurn
+		started            bool
+		toolIndicesSeen    = map[uint32]bool{}
+		contentIndex       uint32
+		contentIndexActive bool
+	)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(line), &value); err != nil {
+			continue
+		}
+		if !started {
+			started = true
+			if !sendEvent(ctx, ch, sporecore.StreamEvent{Type: sporecore.StreamMessageStart}) {
+				return
+			}
+		}
+		message, _ := value["message"].(map[string]any)
+		if message != nil {
+			if text, ok := message["content"].(string); ok && text != "" {
+				contentIndexActive = true
+				if !sendEvent(ctx, ch, sporecore.StreamEvent{
+					Type:  sporecore.StreamContentBlockDelta,
+					Index: contentIndex,
+					Delta: text,
+				}) {
+					return
+				}
+			}
+			if tcs, ok := message["tool_calls"].([]any); ok {
+				for i, raw := range tcs {
+					tc, _ := raw.(map[string]any)
+					if tc == nil {
+						continue
+					}
+					eventIndex := uint32(i) + 1
+					if !toolIndicesSeen[eventIndex] {
+						toolIndicesSeen[eventIndex] = true
+						if contentIndexActive {
+							if !sendEvent(ctx, ch, sporecore.StreamEvent{
+								Type:  sporecore.StreamContentBlockStop,
+								Index: contentIndex,
+							}) {
+								return
+							}
+							contentIndexActive = false
+							contentIndex = eventIndex
+						}
+					}
+					if fn, ok := tc["function"].(map[string]any); ok {
+						if args, ok := fn["arguments"]; ok {
+							encoded, err := json.Marshal(args)
+							if err != nil {
+								encoded = []byte("{}")
+							}
+							if !sendEvent(ctx, ch, sporecore.StreamEvent{
+								Type:        sporecore.StreamToolUseDelta,
+								Index:       eventIndex,
+								PartialJSON: string(encoded),
+							}) {
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+		if done, _ := value["done"].(bool); done {
+			if pec, ok := value["prompt_eval_count"].(float64); ok {
+				usage.InputTokens = uint32(pec)
+			}
+			if ec, ok := value["eval_count"].(float64); ok {
+				usage.OutputTokens = uint32(ec)
+			}
+			if dr, ok := value["done_reason"].(string); ok {
+				stopReason = parseStopReason(dr)
+			}
+			u := usage
+			sendEvent(ctx, ch, sporecore.StreamEvent{
+				Type:       sporecore.StreamMessageStop,
+				Usage:      &u,
+				StopReason: stopReason,
+			})
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		select {
+		case ch <- sporecore.StreamEventOrErr{Err: sporecore.NewProviderError(0, fmt.Sprintf("stream read error: %v", err))}:
+		case <-ctx.Done():
+		}
+		return
+	}
+	// Defensive terminator if the stream closed without an explicit done line.
+	u := usage
+	sendEvent(ctx, ch, sporecore.StreamEvent{
+		Type:       sporecore.StreamMessageStop,
+		Usage:      &u,
+		StopReason: stopReason,
+	})
+}
+
+func sendEvent(ctx context.Context, ch chan<- sporecore.StreamEventOrErr, ev sporecore.StreamEvent) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- sporecore.StreamEventOrErr{Event: ev}:
+		return true
+	}
+}
