@@ -34,6 +34,7 @@ pub mod sensor;
 pub mod termination;
 pub mod tool_registry;
 pub mod tools;
+pub mod verifier;
 
 pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent, TurnResult};
 pub use cache_provider::{
@@ -108,4 +109,8 @@ pub use termination::{
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
     ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
+};
+pub use verifier::{
+    CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,
+    VerifierVerdict,
 };

@@ -1,0 +1,125 @@
+{
+  "description": "Cross-language consistency fixture for EvaluatorResponseVerifier (issue #44).\n\nDeviates from spec naming: spec lists `evaluator_pass.jsonl` and `evaluator_fail.jsonl`. We use a single JSON file with a `cases` array to match the precedent set by `fixtures/completion_check/sql_result.json`. Each case feeds a synthesized VerifierInput to EvaluatorResponseVerifier with the given regex patterns and asserts the verdict either Passed or Failed with a substring of the reason.",
+  "cases": [
+    {
+      "name": "pass_pattern_matches",
+      "pass_pattern": "(?i)\\bPASS\\b",
+      "fail_pattern": "(?i)\\bFAIL: .+",
+      "build_result": {
+        "kind": "success",
+        "output": "build complete",
+        "session_id": "build-1",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 5
+      },
+      "eval_result": {
+        "kind": "success",
+        "output": "All criteria PASS, ready to ship.",
+        "session_id": "eval-1",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "expected": {"kind": "passed"}
+    },
+    {
+      "name": "fail_pattern_matches",
+      "pass_pattern": "(?i)\\bPASS\\b",
+      "fail_pattern": "(?i)\\bFAIL: .+",
+      "build_result": {
+        "kind": "success",
+        "output": "build complete",
+        "session_id": "build-2",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 5
+      },
+      "eval_result": {
+        "kind": "success",
+        "output": "FAIL: missing edge case in handler.rs line 42",
+        "session_id": "eval-2",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "expected": {"kind": "failed", "contains": "missing edge case"}
+    },
+    {
+      "name": "neither_pattern_default_fail",
+      "pass_pattern": "(?i)\\bPASS\\b",
+      "fail_pattern": "(?i)\\bFAIL: .+",
+      "build_result": {
+        "kind": "success",
+        "output": "build complete",
+        "session_id": "build-3",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 5
+      },
+      "eval_result": {
+        "kind": "success",
+        "output": "the implementation is interesting and uses several patterns",
+        "session_id": "eval-3",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "expected": {"kind": "failed", "contains": "matched neither"}
+    },
+    {
+      "name": "build_failure_propagates",
+      "pass_pattern": "(?i)\\bPASS\\b",
+      "fail_pattern": "(?i)\\bFAIL: .+",
+      "build_result": {
+        "kind": "failure",
+        "reason": {"kind": "strategy_not_yet_implemented", "strategy": "ralph"},
+        "session_id": "build-4",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 0
+      },
+      "eval_result": {
+        "kind": "success",
+        "output": "PASS",
+        "session_id": "eval-4",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "expected": {"kind": "failed", "contains": "build run halted"}
+    },
+    {
+      "name": "eval_failure_propagates",
+      "pass_pattern": "(?i)\\bPASS\\b",
+      "fail_pattern": "(?i)\\bFAIL: .+",
+      "build_result": {
+        "kind": "success",
+        "output": "build complete",
+        "session_id": "build-5",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 5
+      },
+      "eval_result": {
+        "kind": "failure",
+        "reason": {"kind": "strategy_not_yet_implemented", "strategy": "self_verifying"},
+        "session_id": "eval-5",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 0
+      },
+      "expected": {"kind": "failed", "contains": "evaluator run halted"}
+    },
+    {
+      "name": "case_insensitive_pass",
+      "pass_pattern": "(?i)\\bpass\\b",
+      "fail_pattern": "(?i)\\bfail\\b",
+      "build_result": {
+        "kind": "success",
+        "output": "ok",
+        "session_id": "build-6",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "eval_result": {
+        "kind": "success",
+        "output": "Final verdict: pass",
+        "session_id": "eval-6",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        "turns": 1
+      },
+      "expected": {"kind": "passed"}
+    }
+  ]
+}
