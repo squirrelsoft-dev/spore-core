@@ -1,0 +1,84 @@
+{
+  "description": "Cross-language consistency fixture for request_hash (issues #37, #38).\n\nEach case is a ModelRequest paired with the expected hash string. All four language implementations of RecordingModelInterface / ReplayModelInterface must produce the same hash for the same request.\n\nAlgorithm: serialize ModelRequest to canonical JSON (object keys sorted lexicographically, no insignificant whitespace, standard JSON escape rules), then SHA-256 the UTF-8 bytes and hex-encode the first 8 bytes (16 hex characters representing the leading u64).\n\nFixtures avoid floats in `params` (temperature, top_p) because cross-language float canonicalization is unspecified — restrict hashable params to integer-typed fields. If a real-world fixture needs floats, document the canonicalization choice.",
+  "cases": [
+    {
+      "name": "simple_user_text",
+      "request": {
+        "messages": [
+          {"role": "user", "content": {"type": "text", "text": "hello"}}
+        ],
+        "tools": [],
+        "params": {},
+        "stream": false
+      },
+      "expected_hash": "542c25a949caccbd"
+    },
+    {
+      "name": "multi_message",
+      "request": {
+        "messages": [
+          {"role": "system", "content": {"type": "text", "text": "you are helpful"}},
+          {"role": "user", "content": {"type": "text", "text": "what is 2+2?"}},
+          {"role": "assistant", "content": {"type": "text", "text": "4"}}
+        ],
+        "tools": [],
+        "params": {},
+        "stream": false
+      },
+      "expected_hash": "635358489d2253e8"
+    },
+    {
+      "name": "with_tools",
+      "request": {
+        "messages": [
+          {"role": "user", "content": {"type": "text", "text": "look something up"}}
+        ],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Search the web",
+            "input_schema": {
+              "type": "object",
+              "properties": {"q": {"type": "string"}}
+            }
+          }
+        ],
+        "params": {},
+        "stream": false
+      },
+      "expected_hash": "8864ac80ac30b623"
+    },
+    {
+      "name": "with_max_tokens",
+      "request": {
+        "messages": [
+          {"role": "user", "content": {"type": "text", "text": "hi"}}
+        ],
+        "tools": [],
+        "params": {"max_tokens": 256},
+        "stream": false
+      },
+      "expected_hash": "642efa6c831cc1e1"
+    },
+    {
+      "name": "tool_call_message",
+      "request": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content": {
+              "type": "tool_call",
+              "id": "abc123",
+              "name": "fetch",
+              "input": {"url": "https://example.com", "method": "GET"}
+            }
+          }
+        ],
+        "tools": [],
+        "params": {},
+        "stream": false
+      },
+      "expected_hash": "a25cab130fb83175"
+    }
+  ]
+}

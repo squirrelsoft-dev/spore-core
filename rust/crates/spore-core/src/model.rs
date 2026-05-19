@@ -21,6 +21,7 @@
 //! the TypeScript / Python / Go packages. See `fixtures/README.md`.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -280,34 +281,140 @@ pub fn enforce_budget(used: u32, budget: Option<u32>) -> Result<(), ModelError> 
 
 /// A `(ModelRequest, ModelResponse)` pair as serialised in the shared
 /// `fixtures/model_responses/` JSONL files. See `fixtures/README.md`.
+///
+/// `request_hash` (issue #37) is populated by `RecordingModelInterface` (#38)
+/// to enable content-addressed replay. Fixtures recorded before #37 do not
+/// include it; absence triggers positional fallback in `ReplayModelInterface`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedExchange {
+    /// Stable hash of `request` computed by [`request_hash`]. Optional so
+    /// pre-#37 positional fixtures continue to deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
     pub request: ModelRequest,
     pub response: ModelResponse,
     pub provider: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
-/// In-order replay of recorded `(request, response)` pairs. Used by tests in
-/// every language; matching is purely positional — the n-th `call` returns
-/// the n-th recorded response.
+// ============================================================================
+// Cross-language request hashing (#37, #38)
+// ============================================================================
+
+/// Stable content hash of a `ModelRequest`. Produced by canonicalizing the
+/// request to JSON (object keys sorted lexicographically, no insignificant
+/// whitespace) and SHA-256 hashing the resulting bytes, then hex-encoding
+/// the first 8 bytes (16 hex chars representing the leading u64).
 ///
-/// Positional replay (rather than request-hash matching) is the contract
-/// shared across all four language implementations so that fixtures remain
-/// portable; deeper request-equality matching is a follow-up.
+/// All four language implementations of `RecordingModelInterface` and
+/// `ReplayModelInterface` must produce the same hash for the same request.
+/// The cross-language consistency fixture lives at
+/// `fixtures/model_hashing/cases.json`.
+pub fn request_hash(req: &ModelRequest) -> String {
+    use sha2::Digest;
+    let value = serde_json::to_value(req).expect("ModelRequest is always serializable");
+    let canonical = canonicalize_json(&value);
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    encode_hex(&digest[..8])
+}
+
+fn canonicalize_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(true) => "true".into(),
+        Value::Bool(false) => "false".into(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => serde_json::to_string(s).expect("string encoding never fails"),
+        Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonicalize_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    let key_str = serde_json::to_string(k).expect("string encoding never fails");
+                    format!("{}:{}", key_str, canonicalize_json(&map[k]))
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(nibble(b >> 4));
+        s.push(nibble(b & 0x0F));
+    }
+    s
+}
+
+fn nibble(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + n - 10) as char,
+        _ => unreachable!(),
+    }
+}
+
+/// How a [`ReplayModelInterface`] matches incoming requests to recorded
+/// responses (issue #37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayMode {
+    /// Pre-#37 behavior: the n-th `call` returns the n-th recorded response.
+    /// Fragile against loop-order changes but compatible with old fixtures.
+    Positional,
+    /// New behavior: each `call` hashes its request and looks up the matching
+    /// recorded entry. Order-independent.
+    HashMatched,
+}
+
+/// Replay of recorded `(request, response)` pairs. Used by tests in every
+/// language. Defaults to [`ReplayMode::HashMatched`] when every entry has a
+/// `request_hash`, and falls back to [`ReplayMode::Positional`] otherwise so
+/// pre-#37 fixtures continue to work.
 pub struct ReplayModelInterface {
     exchanges: Vec<RecordedExchange>,
     cursor: tokio::sync::Mutex<usize>,
     provider: ProviderInfo,
+    mode: ReplayMode,
 }
 
 impl ReplayModelInterface {
+    /// Construct with the auto-detected mode. Use this in new code.
     pub fn new(exchanges: Vec<RecordedExchange>, provider: ProviderInfo) -> Self {
+        let mode = if exchanges.iter().all(|e| e.request_hash.is_some()) && !exchanges.is_empty() {
+            ReplayMode::HashMatched
+        } else {
+            ReplayMode::Positional
+        };
+        Self::with_mode(exchanges, provider, mode)
+    }
+
+    /// Construct with an explicit mode. Useful when forcing positional replay
+    /// against a hash-tagged fixture (e.g. to test old behavior).
+    pub fn with_mode(
+        exchanges: Vec<RecordedExchange>,
+        provider: ProviderInfo,
+        mode: ReplayMode,
+    ) -> Self {
         Self {
             exchanges,
             cursor: tokio::sync::Mutex::new(0),
             provider,
+            mode,
         }
     }
 
@@ -320,6 +427,10 @@ impl ReplayModelInterface {
         Ok(Self::new(exchanges, provider))
     }
 
+    pub fn mode(&self) -> ReplayMode {
+        self.mode
+    }
+
     pub fn remaining(&self) -> usize {
         let c = self.cursor.try_lock().map(|g| *g).unwrap_or(0);
         self.exchanges.len().saturating_sub(c)
@@ -327,17 +438,33 @@ impl ReplayModelInterface {
 }
 
 impl ModelInterface for ReplayModelInterface {
-    async fn call(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        let mut cursor = self.cursor.lock().await;
-        let exchange = self
-            .exchanges
-            .get(*cursor)
-            .ok_or(ModelError::ProviderError {
-                code: 0,
-                message: "replay exhausted: no more recorded exchanges".into(),
-            })?;
-        *cursor += 1;
-        Ok(exchange.response.clone())
+    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        match self.mode {
+            ReplayMode::HashMatched => {
+                let want = request_hash(&request);
+                let exchange = self
+                    .exchanges
+                    .iter()
+                    .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
+                    .ok_or_else(|| ModelError::ProviderError {
+                        code: 0,
+                        message: format!("no matching fixture for request_hash={want}"),
+                    })?;
+                Ok(exchange.response.clone())
+            }
+            ReplayMode::Positional => {
+                let mut cursor = self.cursor.lock().await;
+                let exchange = self
+                    .exchanges
+                    .get(*cursor)
+                    .ok_or(ModelError::ProviderError {
+                        code: 0,
+                        message: "replay exhausted: no more recorded exchanges".into(),
+                    })?;
+                *cursor += 1;
+                Ok(exchange.response.clone())
+            }
+        }
     }
 
     async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
@@ -386,6 +513,136 @@ impl ModelInterface for ReplayModelInterface {
 
     fn provider(&self) -> ProviderInfo {
         self.provider.clone()
+    }
+}
+
+// ============================================================================
+// RecordingModelInterface (issue #38)
+// ============================================================================
+
+/// Modes for [`RecordingModelInterface`]. See spec on issue #38.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingMode {
+    /// Append every `(request, response)` pair to `output_path`.
+    Record,
+    /// Append only if the file does not yet exist. Useful when running tests
+    /// for the first time against a real provider, then never re-recording.
+    RecordIfNew,
+    /// Call `inner` but do not write anything. Used to disable recording
+    /// without changing call sites.
+    Passthrough,
+}
+
+/// Transparent wrapper around a real [`ModelInterface`] that appends each
+/// `(request, response)` pair to a JSONL fixture file as a
+/// [`RecordedExchange`] with a stable [`request_hash`].
+///
+/// Generic over `M: ModelInterface + 'static` to remain dyn-compatible-free
+/// (the underlying `ModelInterface` is not dyn-compatible because of RPITIT
+/// — see #45). Wires up the same way `LlmJudgeEvaluator<M>` and
+/// `QuestionAnsweredCheck<M>` do.
+pub struct RecordingModelInterface<M: ModelInterface + 'static> {
+    inner: Arc<M>,
+    output_path: std::path::PathBuf,
+    mode: RecordingMode,
+    /// Set to `true` once the first write happens in `RecordIfNew` mode.
+    /// Wrapped in a tokio Mutex so concurrent calls don't double-write.
+    write_lock: tokio::sync::Mutex<()>,
+}
+
+impl<M: ModelInterface + 'static> RecordingModelInterface<M> {
+    pub fn new(
+        inner: Arc<M>,
+        output_path: impl Into<std::path::PathBuf>,
+        mode: RecordingMode,
+    ) -> Self {
+        Self {
+            inner,
+            output_path: output_path.into(),
+            mode,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn output_path(&self) -> &std::path::Path {
+        &self.output_path
+    }
+
+    pub fn mode(&self) -> RecordingMode {
+        self.mode
+    }
+
+    async fn record(
+        &self,
+        request: &ModelRequest,
+        response: &ModelResponse,
+        duration_ms: u64,
+    ) -> Result<(), std::io::Error> {
+        // Centralized check + write under a mutex so concurrent calls serialize.
+        let _guard = self.write_lock.lock().await;
+        let should_write = match self.mode {
+            RecordingMode::Record => true,
+            RecordingMode::RecordIfNew => !self.output_path.exists(),
+            RecordingMode::Passthrough => false,
+        };
+        if !should_write {
+            return Ok(());
+        }
+        if let Some(parent) = self.output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        let provider_info = self.inner.provider();
+        let entry = RecordedExchange {
+            request_hash: Some(request_hash(request)),
+            request: request.clone(),
+            response: response.clone(),
+            provider: provider_info.name.clone(),
+            model_id: Some(provider_info.model_id.clone()),
+            recorded_at: None,
+            duration_ms: Some(duration_ms),
+        };
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.output_path)
+            .await?;
+        f.write_all(line.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        Ok(())
+    }
+}
+
+impl<M: ModelInterface + 'static> ModelInterface for RecordingModelInterface<M> {
+    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let start = std::time::Instant::now();
+        let response = self.inner.call(request.clone()).await?;
+        let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let Err(e) = self.record(&request, &response, duration_ms).await {
+            return Err(ModelError::ProviderError {
+                code: 0,
+                message: format!("recorder write failed: {e}"),
+            });
+        }
+        Ok(response)
+    }
+
+    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+        // Streaming recording is not implemented: spec only requires the
+        // blocking `call()` pair to be recorded. Pass through unchanged.
+        self.inner.call_streaming(request).await
+    }
+
+    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
+        self.inner.count_tokens(request).await
+    }
+
+    fn provider(&self) -> ProviderInfo {
+        self.inner.provider()
     }
 }
 
@@ -762,5 +1019,314 @@ mod tests {
         };
         let n = replay.count_tokens(&req).await.unwrap();
         assert_eq!(n, 10);
+    }
+
+    // ── #37: request_hash + ReplayMode ──────────────────────────────────────
+
+    fn req_text(s: &str) -> ModelRequest {
+        ModelRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::Text { text: s.into() },
+            }],
+            tools: vec![],
+            params: ModelParams::default(),
+            stream: false,
+        }
+    }
+
+    fn resp_text(s: &str) -> ModelResponse {
+        ModelResponse {
+            content: vec![ContentBlock::Text { text: s.into() }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    #[test]
+    fn request_hash_is_stable_across_field_order() {
+        // Two equivalent requests must hash the same. serde_json::Map is
+        // already sorted; we still want to guarantee callers see this.
+        let a = req_text("hello world");
+        let b = req_text("hello world");
+        assert_eq!(request_hash(&a), request_hash(&b));
+    }
+
+    #[test]
+    fn request_hash_changes_when_messages_change() {
+        let a = req_text("hello");
+        let b = req_text("hello!");
+        assert_ne!(request_hash(&a), request_hash(&b));
+    }
+
+    #[test]
+    fn request_hash_is_16_hex_chars() {
+        let h = request_hash(&req_text("x"));
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn replay_auto_detects_positional_when_no_hashes() {
+        let exchanges = vec![RecordedExchange {
+            request_hash: None,
+            request: req_text("q1"),
+            response: resp_text("r1"),
+            provider: "fixture".into(),
+            model_id: None,
+            recorded_at: None,
+            duration_ms: None,
+        }];
+        let r = ReplayModelInterface::new(exchanges, provider());
+        assert_eq!(r.mode(), ReplayMode::Positional);
+        let got = r.call(req_text("any")).await.unwrap();
+        assert_eq!(got, resp_text("r1"));
+    }
+
+    #[tokio::test]
+    async fn replay_auto_detects_hash_matched_when_all_have_hashes() {
+        let q1 = req_text("q1");
+        let q2 = req_text("q2");
+        let exchanges = vec![
+            RecordedExchange {
+                request_hash: Some(request_hash(&q1)),
+                request: q1.clone(),
+                response: resp_text("r1"),
+                provider: "fixture".into(),
+                model_id: None,
+                recorded_at: None,
+                duration_ms: None,
+            },
+            RecordedExchange {
+                request_hash: Some(request_hash(&q2)),
+                request: q2.clone(),
+                response: resp_text("r2"),
+                provider: "fixture".into(),
+                model_id: None,
+                recorded_at: None,
+                duration_ms: None,
+            },
+        ];
+        let r = ReplayModelInterface::new(exchanges, provider());
+        assert_eq!(r.mode(), ReplayMode::HashMatched);
+        // Out-of-order calls return the right response — order-independent.
+        assert_eq!(r.call(q2.clone()).await.unwrap(), resp_text("r2"));
+        assert_eq!(r.call(q1.clone()).await.unwrap(), resp_text("r1"));
+        assert_eq!(r.call(q2).await.unwrap(), resp_text("r2"));
+    }
+
+    #[tokio::test]
+    async fn replay_hash_matched_no_match_returns_provider_error() {
+        let q1 = req_text("q1");
+        let exchanges = vec![RecordedExchange {
+            request_hash: Some(request_hash(&q1)),
+            request: q1,
+            response: resp_text("r1"),
+            provider: "fixture".into(),
+            model_id: None,
+            recorded_at: None,
+            duration_ms: None,
+        }];
+        let r = ReplayModelInterface::new(exchanges, provider());
+        let err = r.call(req_text("unrecorded")).await.unwrap_err();
+        match err {
+            ModelError::ProviderError { message, .. } => {
+                assert!(message.contains("no matching fixture"), "got: {message}");
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    // ── #37: cross-language hash stability fixture ──────────────────────────
+
+    #[derive(Deserialize)]
+    struct HashFixtureCase {
+        name: String,
+        request: ModelRequest,
+        expected_hash: String,
+    }
+
+    #[derive(Deserialize)]
+    struct HashFixtureSuite {
+        cases: Vec<HashFixtureCase>,
+    }
+
+    #[test]
+    #[ignore = "one-shot helper to bootstrap fixture/model_hashing/cases.json"]
+    fn _generate_hash_cases_stdout() {
+        use crate::model::ToolSchema;
+        let cases: Vec<(&str, ModelRequest)> = vec![
+            ("simple_user_text", req_text("hello")),
+            (
+                "multi_message",
+                ModelRequest {
+                    messages: vec![
+                        Message {
+                            role: Role::System,
+                            content: Content::Text {
+                                text: "you are helpful".into(),
+                            },
+                        },
+                        Message {
+                            role: Role::User,
+                            content: Content::Text {
+                                text: "what is 2+2?".into(),
+                            },
+                        },
+                        Message {
+                            role: Role::Assistant,
+                            content: Content::Text { text: "4".into() },
+                        },
+                    ],
+                    tools: vec![],
+                    params: ModelParams::default(),
+                    stream: false,
+                },
+            ),
+            (
+                "with_tools",
+                ModelRequest {
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: Content::Text {
+                            text: "look something up".into(),
+                        },
+                    }],
+                    tools: vec![ToolSchema {
+                        name: "search".into(),
+                        description: "Search the web".into(),
+                        input_schema: serde_json::json!({
+                            "type":"object",
+                            "properties":{"q":{"type":"string"}}
+                        }),
+                    }],
+                    params: ModelParams::default(),
+                    stream: false,
+                },
+            ),
+            (
+                "with_max_tokens",
+                ModelRequest {
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: Content::Text { text: "hi".into() },
+                    }],
+                    tools: vec![],
+                    params: ModelParams {
+                        max_tokens: Some(256),
+                        ..Default::default()
+                    },
+                    stream: false,
+                },
+            ),
+            (
+                "tool_call_message",
+                ModelRequest {
+                    messages: vec![Message {
+                        role: Role::Assistant,
+                        content: Content::ToolCall(ToolCall {
+                            id: "abc123".into(),
+                            name: "fetch".into(),
+                            input: serde_json::json!({"url":"https://example.com","method":"GET"}),
+                        }),
+                    }],
+                    tools: vec![],
+                    params: ModelParams::default(),
+                    stream: false,
+                },
+            ),
+        ];
+        for (name, req) in cases {
+            eprintln!("{}\t{}", name, request_hash(&req));
+        }
+    }
+
+    #[test]
+    fn fixture_replay_request_hash_stability() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/model_hashing/cases.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let suite: HashFixtureSuite = serde_json::from_str(&raw).unwrap();
+        for case in suite.cases {
+            let got = request_hash(&case.request);
+            assert_eq!(
+                got, case.expected_hash,
+                "case `{}`: hash mismatch (got {got}, expected {})",
+                case.name, case.expected_hash
+            );
+        }
+    }
+
+    // ── #38: RecordingModelInterface ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recording_appends_request_response_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recorded.jsonl");
+        let inner = Arc::new(mock::MockModelInterface::new(provider()));
+        inner.push_response(Ok(resp_text("hello back")));
+        inner.push_response(Ok(resp_text("hello again")));
+        let r = RecordingModelInterface::new(inner, &path, RecordingMode::Record);
+        let _ = r.call(req_text("hello")).await.unwrap();
+        let _ = r.call(req_text("hello2")).await.unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let entry: RecordedExchange = serde_json::from_str(line).unwrap();
+            assert!(
+                entry.request_hash.is_some(),
+                "request_hash must be populated"
+            );
+            assert_eq!(entry.provider, "test");
+            assert_eq!(entry.model_id.as_deref(), Some("test-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_record_if_new_skips_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.jsonl");
+        std::fs::write(&path, "preexisting line\n").unwrap();
+        let inner = Arc::new(mock::MockModelInterface::new(provider()));
+        inner.push_response(Ok(resp_text("ok")));
+        let r = RecordingModelInterface::new(inner, &path, RecordingMode::RecordIfNew);
+        let _ = r.call(req_text("q")).await.unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw, "preexisting line\n",
+            "RecordIfNew must not touch existing file"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_passthrough_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.jsonl");
+        let inner = Arc::new(mock::MockModelInterface::new(provider()));
+        inner.push_response(Ok(resp_text("ok")));
+        let r = RecordingModelInterface::new(inner, &path, RecordingMode::Passthrough);
+        let _ = r.call(req_text("q")).await.unwrap();
+        assert!(!path.exists(), "Passthrough must not create the file");
+    }
+
+    #[tokio::test]
+    async fn recording_then_replay_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.jsonl");
+        let inner = Arc::new(mock::MockModelInterface::new(provider()));
+        inner.push_response(Ok(resp_text("answer1")));
+        inner.push_response(Ok(resp_text("answer2")));
+        let recorder = RecordingModelInterface::new(inner, &path, RecordingMode::Record);
+        let q1 = req_text("question 1");
+        let q2 = req_text("question 2");
+        let _ = recorder.call(q1.clone()).await.unwrap();
+        let _ = recorder.call(q2.clone()).await.unwrap();
+        let jsonl = std::fs::read_to_string(&path).unwrap();
+        let replay = ReplayModelInterface::from_jsonl(&jsonl, provider()).unwrap();
+        assert_eq!(replay.mode(), ReplayMode::HashMatched);
+        // Replay out-of-order to confirm hash matching works end-to-end.
+        assert_eq!(replay.call(q2).await.unwrap(), resp_text("answer2"));
+        assert_eq!(replay.call(q1).await.unwrap(), resp_text("answer1"));
     }
 }

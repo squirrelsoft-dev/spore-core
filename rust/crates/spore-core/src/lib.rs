@@ -79,10 +79,11 @@ pub use middleware::{
     TracingMiddleware,
 };
 pub use model::{
-    enforce_budget, enforce_context_limit, Content, ContentBlock, Message, ModelError,
-    ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream, ProviderInfo,
-    RecordedExchange, ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall,
-    ToolResult, ToolSchema,
+    enforce_budget, enforce_context_limit, request_hash, Content, ContentBlock, Message,
+    ModelError, ModelInterface, ModelParams, ModelRequest, ModelResponse, ModelStream,
+    ProviderInfo, RecordedExchange, RecordingMode, RecordingModelInterface, ReplayMode,
+    ReplayModelInterface, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolResult,
+    ToolSchema,
 };
 pub use observability::{
     ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
