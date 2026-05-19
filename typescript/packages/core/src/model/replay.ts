@@ -1,14 +1,20 @@
 /**
- * `ReplayModelInterface` — positional replay of recorded
- * `(request, response)` pairs.
+ * `ReplayModelInterface` — replay of recorded `(request, response)` pairs.
  *
- * The n-th `call` returns the n-th recorded response. Matching is purely
- * positional (rather than request-hash matching) — this is the shared
- * contract across all four language implementations so fixtures stay
- * portable; deeper equality is a follow-up.
+ * Two modes (spore-core issue #37):
+ *   - `positional`: pre-#37 behavior; the n-th `call` returns the n-th
+ *     recorded response. Fragile against loop-order changes but compatible
+ *     with old fixtures.
+ *   - `hash_matched`: each `call` hashes its request via `requestHash` and
+ *     looks up the matching recorded entry. Order-independent.
+ *
+ * `new` (and `fromJsonl`) auto-detect: `hash_matched` when every entry has a
+ * `request_hash` AND the list is non-empty; otherwise `positional`. Pass an
+ * explicit `mode` to `withMode` to override.
  */
 
 import { ProviderError, type ModelError } from "./errors.js";
+import { requestHash } from "./hash.js";
 import type { ModelInterface } from "./interface.js";
 import {
   ModelRequestSchema,
@@ -22,13 +28,25 @@ import {
   type StreamEvent,
 } from "./schemas.js";
 
+export type ReplayMode = "positional" | "hash_matched";
+
 export class ReplayModelInterface implements ModelInterface {
   private cursor = 0;
+  private readonly modeValue: ReplayMode;
 
+  /**
+   * Construct with the auto-detected mode. Use this in new code.
+   *
+   * Pass a `mode` to force a specific mode (e.g. positional replay against a
+   * hash-tagged fixture to test old behaviour).
+   */
   constructor(
     private readonly exchanges: readonly RecordedExchange[],
     private readonly providerInfo: ProviderInfo,
-  ) {}
+    mode?: ReplayMode,
+  ) {
+    this.modeValue = mode ?? autoDetectMode(exchanges);
+  }
 
   /**
    * Parse a JSONL string of {@link RecordedExchange} records and build a
@@ -36,7 +54,7 @@ export class ReplayModelInterface implements ModelInterface {
    * violation — fixtures are part of the test inputs and a broken fixture
    * is a developer bug, not a runtime error.
    */
-  static fromJsonl(jsonl: string, provider: ProviderInfo): ReplayModelInterface {
+  static fromJsonl(jsonl: string, provider: ProviderInfo, mode?: ReplayMode): ReplayModelInterface {
     const exchanges: RecordedExchange[] = [];
     const lines = jsonl.split(/\r?\n/);
     for (const line of lines) {
@@ -44,7 +62,11 @@ export class ReplayModelInterface implements ModelInterface {
       const parsed = JSON.parse(line);
       exchanges.push(RecordedExchangeSchema.parse(parsed));
     }
-    return new ReplayModelInterface(exchanges, provider);
+    return new ReplayModelInterface(exchanges, provider, mode);
+  }
+
+  mode(): ReplayMode {
+    return this.modeValue;
   }
 
   remaining(): number {
@@ -55,7 +77,15 @@ export class ReplayModelInterface implements ModelInterface {
     return this.providerInfo;
   }
 
-  async call(_request: ModelRequest, _signal?: AbortSignal): Promise<ModelResponse> {
+  async call(request: ModelRequest, _signal?: AbortSignal): Promise<ModelResponse> {
+    if (this.modeValue === "hash_matched") {
+      const want = requestHash(request);
+      const match = this.exchanges.find((e) => e.request_hash === want);
+      if (match == null) {
+        throw new ProviderError(0, `no matching fixture for request_hash=${want}`);
+      }
+      return match.response;
+    }
     const next = this.exchanges[this.cursor];
     if (next == null) {
       // Replay exhaustion: surface as a typed ModelError; never throw raw.
@@ -65,10 +95,7 @@ export class ReplayModelInterface implements ModelInterface {
     return next.response;
   }
 
-  async *callStreaming(
-    request: ModelRequest,
-    signal?: AbortSignal,
-  ): AsyncIterable<StreamEvent> {
+  async *callStreaming(request: ModelRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
     const response = await this.call(request, signal);
     yield { type: "message_start" };
     for (let i = 0; i < response.content.length; i++) {
@@ -97,6 +124,14 @@ export class ReplayModelInterface implements ModelInterface {
     }
     return Math.floor(chars / 4);
   }
+}
+
+function autoDetectMode(exchanges: readonly RecordedExchange[]): ReplayMode {
+  if (exchanges.length === 0) return "positional";
+  const allHashed = exchanges.every(
+    (e) => typeof e.request_hash === "string" && e.request_hash.length > 0,
+  );
+  return allHashed ? "hash_matched" : "positional";
 }
 
 function streamEventForBlock(block: ContentBlock, index: number): StreamEvent {

@@ -75,12 +75,7 @@ export const ModelRequestSchema = z.object({
   stream: z.boolean().default(false),
 });
 
-export const StopReasonSchema = z.enum([
-  "tool_use",
-  "end_turn",
-  "max_tokens",
-  "stop_sequence",
-]);
+export const StopReasonSchema = z.enum(["tool_use", "end_turn", "max_tokens", "stop_sequence"]);
 
 export const ContentBlockSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("text"), text: z.string() }),
@@ -141,10 +136,17 @@ export const ProviderInfoSchema = z.object({
 });
 
 export const RecordedExchangeSchema = z.object({
+  /**
+   * Stable hash of `request` (see `requestHash`). Optional so pre-#37
+   * positional fixtures continue to deserialize.
+   */
+  request_hash: z.string().nullable().optional(),
   request: ModelRequestSchema,
   response: ModelResponseSchema,
   provider: z.string(),
+  model_id: z.string().nullable().optional(),
   recorded_at: z.string().nullable().optional(),
+  duration_ms: z.number().int().nonnegative().nullable().optional(),
 });
 
 // Static types derived from the schemas above.
