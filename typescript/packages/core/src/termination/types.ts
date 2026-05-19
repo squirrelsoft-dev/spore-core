@@ -80,19 +80,31 @@ export const BudgetValue = {
  * Read-only snapshot of session state handed to {@link CompletionCheck.check}.
  * Wraps {@link SessionState} so the check can identify the source session
  * and task — completion checks frequently key into per-session scratchpads.
+ *
+ * `workspace_root` is populated by the harness from
+ * `SandboxProvider.workspaceRoot()` so workspace-relative checks (e.g.
+ * {@link FeatureListCheck}) can resolve paths without needing a sandbox
+ * handle. Defaults to the empty string when unknown.
  */
 export interface SessionStateSnapshot {
   session_id: SessionId;
   task_id: TaskId;
   state: SessionState;
+  workspace_root: string;
 }
 
 export function newSessionStateSnapshot(
   sessionId: SessionId,
   taskId: TaskId,
   state: SessionState,
+  workspaceRoot: string = "",
 ): SessionStateSnapshot {
-  return { session_id: sessionId, task_id: taskId, state };
+  return {
+    session_id: sessionId,
+    task_id: taskId,
+    state,
+    workspace_root: workspaceRoot,
+  };
 }
 
 // ============================================================================

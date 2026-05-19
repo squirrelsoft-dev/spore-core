@@ -7,3 +7,10 @@
 
 export * from "./types.js";
 export { StandardTerminationPolicy } from "./standard.js";
+export {
+  AlwaysComplete,
+  FeatureListCheck,
+  QuestionAnsweredCheck,
+  SqlResultCheck,
+  TestSuiteCheck,
+} from "./checks.js";
