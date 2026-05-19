@@ -122,6 +122,34 @@ export class NullCacheProvider implements CacheProvider {
 export interface AnthropicCacheProviderOptions {
   /** Anthropic supports up to 4 breakpoints per request. Defaults to 4. */
   max_cache_anchors?: number;
+  /**
+   * USD per 1M tokens for cache reads. Defaults to Sonnet 4.x pricing (0.30).
+   * Use {@link AnthropicCacheProvider.withModelPricing} to set per-model.
+   */
+  cache_read_usd_per_million?: number;
+  /**
+   * USD per 1M tokens for cache writes (5-minute TTL). Defaults to Sonnet 4.x
+   * pricing (3.75). Use {@link AnthropicCacheProvider.withModelPricing} to set
+   * per-model.
+   */
+  cache_write_usd_per_million?: number;
+}
+
+/**
+ * Anthropic cache pricing per model id (USD per 1M tokens, 5-minute TTL):
+ *  - opus-4.x:   1.50 read / 18.75 write
+ *  - sonnet-4.x: 0.30 read /  3.75 write
+ *  - haiku-4.x:  0.08 read /  1.00 write
+ *
+ * Substring match on model id; unknown ids fall back to Sonnet pricing.
+ */
+export function anthropicCachePricing(modelId: string): {
+  read: number;
+  write: number;
+} {
+  if (modelId.includes("opus")) return { read: 1.5, write: 18.75 };
+  if (modelId.includes("haiku")) return { read: 0.08, write: 1.0 };
+  return { read: 0.3, write: 3.75 };
 }
 
 /**
@@ -134,9 +162,27 @@ export interface AnthropicCacheProviderOptions {
  */
 export class AnthropicCacheProvider implements CacheProvider {
   readonly max_cache_anchors: number;
+  readonly cache_read_usd_per_million: number;
+  readonly cache_write_usd_per_million: number;
 
   constructor(options: AnthropicCacheProviderOptions = {}) {
     this.max_cache_anchors = options.max_cache_anchors ?? 4;
+    this.cache_read_usd_per_million = options.cache_read_usd_per_million ?? 0.3;
+    this.cache_write_usd_per_million = options.cache_write_usd_per_million ?? 3.75;
+  }
+
+  /**
+   * Return a copy with cache pricing set for `modelId`. Substring match on
+   * the id; unknown ids fall back to Sonnet pricing. See
+   * {@link anthropicCachePricing}.
+   */
+  withModelPricing(modelId: string): AnthropicCacheProvider {
+    const { read, write } = anthropicCachePricing(modelId);
+    return new AnthropicCacheProvider({
+      max_cache_anchors: this.max_cache_anchors,
+      cache_read_usd_per_million: read,
+      cache_write_usd_per_million: write,
+    });
   }
 
   supportsCaching(): boolean {
@@ -173,11 +219,13 @@ export class AnthropicCacheProvider implements CacheProvider {
     if ((read === null || read === undefined) && (write === null || write === undefined)) {
       return null;
     }
+    const readTokens = read ?? 0;
+    const writeTokens = write ?? 0;
     return {
-      cache_read_tokens: read ?? 0,
-      cache_write_tokens: write ?? 0,
-      cache_read_cost_usd: 0,
-      cache_write_cost_usd: 0,
+      cache_read_tokens: readTokens,
+      cache_write_tokens: writeTokens,
+      cache_read_cost_usd: (readTokens / 1_000_000) * this.cache_read_usd_per_million,
+      cache_write_cost_usd: (writeTokens / 1_000_000) * this.cache_write_usd_per_million,
     };
   }
 

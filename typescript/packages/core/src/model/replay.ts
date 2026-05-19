@@ -111,13 +111,25 @@ export class ReplayModelInterface implements ModelInterface {
   }
 
   /**
-   * Cheap deterministic estimate sufficient for fixture replay: ~4 chars
-   * per token over the textual content. Real providers override this.
+   * Token count.
+   *
+   * When the fixture was recorded by `RecordingModelInterface` against a real
+   * provider, the recorded response's `usage.input_tokens` carries the
+   * provider's exact count — use that whenever we can match by hash. Fall
+   * back to the bytes/4 heuristic only when no matching entry exists
+   * (positional fixtures or unrecorded requests).
    */
   async countTokens(request: ModelRequest, _signal?: AbortSignal): Promise<number> {
     // Validate input shape so callers that hand-craft requests still get
     // the same defensive treatment they'd get from a real provider.
     const req = ModelRequestSchema.parse(request);
+    if (this.modeValue === "hash_matched") {
+      const want = requestHash(req);
+      const match = this.exchanges.find((e) => e.request_hash === want);
+      if (match != null) {
+        return match.response.usage.input_tokens;
+      }
+    }
     let chars = 0;
     for (const m of req.messages) {
       chars += charLengthOfContent(m.content);

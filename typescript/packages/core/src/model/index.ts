@@ -9,3 +9,17 @@ export { requestHash } from "./hash.js";
 export { ReplayModelInterface, type ReplayMode } from "./replay.js";
 export { RecordingModelInterface, type RecordingMode } from "./recording.js";
 export { MockModelInterface } from "./mock.js";
+export {
+  AnthropicModelInterface,
+  ANTHROPIC_VERSION,
+  DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,
+  DEFAULT_TIMEOUT_MS as ANTHROPIC_DEFAULT_TIMEOUT_MS,
+  DEFAULT_MAX_RETRIES as ANTHROPIC_DEFAULT_MAX_RETRIES,
+  backoffDelayMs as anthropicBackoffDelayMs,
+  buildRequest as anthropicBuildRequest,
+  parseResponse as anthropicParseResponse,
+  parseStopReason as anthropicParseStopReason,
+  parseSseEvent as anthropicParseSseEvent,
+  sseToEvents as anthropicSseToEvents,
+  type AnthropicModelInterfaceOptions,
+} from "./anthropic.js";

@@ -5,18 +5,17 @@ import { describe, expect, it } from "vitest";
 import {
   ProviderError,
   ReplayModelInterface,
+  requestHash,
   type ModelRequest,
   type ProviderInfo,
+  type RecordedExchange,
   type StreamEvent,
 } from "../src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // tests/ -> packages/core/ -> packages/ -> typescript/ -> repo root.
 const repoRoot = resolve(__dirname, "..", "..", "..", "..");
-const fixturePath = resolve(
-  repoRoot,
-  "fixtures/model_responses/model_interface/basic_text.jsonl",
-);
+const fixturePath = resolve(repoRoot, "fixtures/model_responses/model_interface/basic_text.jsonl");
 
 const provider: ProviderInfo = {
   name: "anthropic",
@@ -41,9 +40,7 @@ describe("ReplayModelInterface — fixture replay", () => {
     expect(r1.stop_reason).toBe("end_turn");
     expect(r1.usage.input_tokens).toBe(8);
     expect(r1.usage.output_tokens).toBe(11);
-    expect(r1.content).toEqual([
-      { type: "text", text: "Hello! How can I help you today?" },
-    ]);
+    expect(r1.content).toEqual([{ type: "text", text: "Hello! How can I help you today?" }]);
 
     const r2 = await replay.call(emptyRequest);
     expect(r2.usage.input_tokens).toBe(10);
@@ -101,5 +98,73 @@ describe("ReplayModelInterface — fixture replay", () => {
       stream: false,
     };
     expect(await replay.countTokens(req)).toBe(10);
+  });
+
+  // Carry-over from #38 / #39: in hash_matched mode, countTokens returns the
+  // recorded input_tokens when the request hash matches.
+  it("countTokens uses recorded input_tokens in hash_matched mode", async () => {
+    const q: ModelRequest = {
+      messages: [{ role: "user", content: { type: "text", text: "the quick brown fox" } }],
+      tools: [],
+      params: { stop_sequences: [] },
+      stream: false,
+    };
+    const recorded: RecordedExchange = {
+      request_hash: requestHash(q),
+      request: q,
+      response: {
+        content: [{ type: "text", text: "ok" }],
+        usage: {
+          input_tokens: 137,
+          output_tokens: 4,
+          cache_read_tokens: null,
+          cache_write_tokens: null,
+        },
+        stop_reason: "end_turn",
+      },
+      provider: "anthropic",
+    };
+    const replay = new ReplayModelInterface([recorded], provider);
+    expect(replay.mode()).toBe("hash_matched");
+    // Length 19 → bytes/4 = 4; recorded value 137 wins.
+    expect(await replay.countTokens(q)).toBe(137);
+  });
+
+  it("countTokens falls back to bytes/4 when no hash match", async () => {
+    const q: ModelRequest = {
+      messages: [{ role: "user", content: { type: "text", text: "xx" } }],
+      tools: [],
+      params: { stop_sequences: [] },
+      stream: false,
+    };
+    const recorded: RecordedExchange = {
+      request_hash: requestHash(q),
+      request: q,
+      response: {
+        content: [{ type: "text", text: "r" }],
+        usage: {
+          input_tokens: 999,
+          output_tokens: 1,
+          cache_read_tokens: null,
+          cache_write_tokens: null,
+        },
+        stop_reason: "end_turn",
+      },
+      provider: "anthropic",
+    };
+    const replay = new ReplayModelInterface([recorded], provider);
+    const unrecorded: ModelRequest = {
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: "never seen before, a long string indeed" },
+        },
+      ],
+      tools: [],
+      params: { stop_sequences: [] },
+      stream: false,
+    };
+    // Length 39 → floor(39/4) = 9.
+    expect(await replay.countTokens(unrecorded)).toBe(9);
   });
 });

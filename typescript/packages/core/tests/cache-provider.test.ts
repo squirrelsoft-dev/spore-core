@@ -142,6 +142,37 @@ describe("AnthropicCacheProvider", () => {
     expect(s!.cache_read_tokens).toBe(0);
     expect(s!.cache_write_tokens).toBe(0);
   });
+
+  // Rule (#39): parseCacheStats computes USD cost from per-model pricing.
+
+  it("computes cost using Sonnet defaults", () => {
+    const p = new AnthropicCacheProvider();
+    const s = p.parseCacheStats(response(1_000_000, 1_000_000));
+    expect(s).not.toBeNull();
+    expect(s!.cache_read_cost_usd).toBeCloseTo(0.3, 9);
+    expect(s!.cache_write_cost_usd).toBeCloseTo(3.75, 9);
+  });
+
+  it("withModelPricing('claude-opus-4-7') uses opus pricing", () => {
+    const p = new AnthropicCacheProvider().withModelPricing("claude-opus-4-7");
+    const s = p.parseCacheStats(response(1_000_000, 1_000_000));
+    expect(s!.cache_read_cost_usd).toBeCloseTo(1.5, 9);
+    expect(s!.cache_write_cost_usd).toBeCloseTo(18.75, 9);
+  });
+
+  it("withModelPricing('claude-haiku-4-5') uses haiku pricing", () => {
+    const p = new AnthropicCacheProvider().withModelPricing("claude-haiku-4-5");
+    const s = p.parseCacheStats(response(1_000_000, 1_000_000));
+    expect(s!.cache_read_cost_usd).toBeCloseTo(0.08, 9);
+    expect(s!.cache_write_cost_usd).toBeCloseTo(1.0, 9);
+  });
+
+  it("withModelPricing(unknown model) falls back to Sonnet pricing", () => {
+    const p = new AnthropicCacheProvider().withModelPricing("claude-mystery-9");
+    const s = p.parseCacheStats(response(1_000_000, 1_000_000));
+    expect(s!.cache_read_cost_usd).toBeCloseTo(0.3, 9);
+    expect(s!.cache_write_cost_usd).toBeCloseTo(3.75, 9);
+  });
 });
 
 describe("OpenAICacheProvider", () => {
