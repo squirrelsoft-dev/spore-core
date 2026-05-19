@@ -23,3 +23,15 @@ export {
   sseToEvents as anthropicSseToEvents,
   type AnthropicModelInterfaceOptions,
 } from "./anthropic.js";
+export {
+  OpenAIModelInterface,
+  DEFAULT_BASE_URL as OPENAI_DEFAULT_BASE_URL,
+  DEFAULT_TIMEOUT_MS as OPENAI_DEFAULT_TIMEOUT_MS,
+  DEFAULT_MAX_RETRIES as OPENAI_DEFAULT_MAX_RETRIES,
+  backoffDelayMs as openaiBackoffDelayMs,
+  buildRequest as openaiBuildRequest,
+  parseResponse as openaiParseResponse,
+  parseStopReason as openaiParseStopReason,
+  sseToEvents as openaiSseToEvents,
+  type OpenAIModelInterfaceOptions,
+} from "./openai.js";

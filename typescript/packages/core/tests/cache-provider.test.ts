@@ -206,6 +206,33 @@ describe("OpenAICacheProvider", () => {
     expect(s!.cache_write_tokens).toBe(0);
     expect(p.parseCacheStats(response(null, null))).toBeNull();
   });
+
+  it("default cache_read_usd_per_million is gpt-4o (1.25)", () => {
+    const p = new OpenAICacheProvider();
+    expect(p.cache_read_usd_per_million).toBe(1.25);
+  });
+
+  it("withModelPricing(gpt-4o-mini) sets cheaper rate and applies in parseCacheStats", () => {
+    const p = new OpenAICacheProvider().withModelPricing("gpt-4o-mini");
+    expect(p.cache_read_usd_per_million).toBe(0.075);
+    const s = p.parseCacheStats(response(1_000_000, 0));
+    expect(s).not.toBeNull();
+    expect(s!.cache_read_cost_usd).toBeCloseTo(0.075, 10);
+    expect(s!.cache_write_cost_usd).toBe(0);
+  });
+
+  it("withModelPricing routes by id prefix (o3, o1, o4-mini, default)", () => {
+    expect(new OpenAICacheProvider().withModelPricing("o3").cache_read_usd_per_million).toBe(2.5);
+    expect(new OpenAICacheProvider().withModelPricing("o1-pro").cache_read_usd_per_million).toBe(
+      7.5,
+    );
+    expect(
+      new OpenAICacheProvider().withModelPricing("o4-mini-2026").cache_read_usd_per_million,
+    ).toBe(0.275);
+    expect(
+      new OpenAICacheProvider().withModelPricing("totally-unknown").cache_read_usd_per_million,
+    ).toBe(1.25);
+  });
 });
 
 describe("OllamaCacheProvider", () => {

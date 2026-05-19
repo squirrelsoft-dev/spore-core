@@ -237,6 +237,32 @@ export class AnthropicCacheProvider implements CacheProvider {
 export interface OpenAICacheProviderOptions {
   /** Below this token count OpenAI will not cache. Defaults to 1024. */
   min_cacheable_tokens?: number;
+  /**
+   * USD per 1M tokens for cache reads. OpenAI's prompt caching gives a ~50%
+   * discount on cached input tokens; we charge `cache_read_tokens` at the
+   * reduced rate. Defaults to gpt-4o pricing (1.25). Use
+   * {@link OpenAICacheProvider.withModelPricing} to set per-model.
+   */
+  cache_read_usd_per_million?: number;
+}
+
+/**
+ * OpenAI cache-read pricing per model id (USD per 1M cached input tokens):
+ *  - gpt-4o-mini: 0.075
+ *  - gpt-4o:      1.25
+ *  - o4-mini:     0.275
+ *  - o3:          2.50
+ *  - o1:          7.50
+ *
+ * Prefix match on model id; unknown ids fall back to gpt-4o pricing.
+ */
+export function openaiCacheReadPricing(modelId: string): number {
+  if (modelId.startsWith("gpt-4o-mini")) return 0.075;
+  if (modelId.startsWith("gpt-4o")) return 1.25;
+  if (modelId.startsWith("o4-mini")) return 0.275;
+  if (modelId.startsWith("o3")) return 2.5;
+  if (modelId.startsWith("o1")) return 7.5;
+  return 1.25;
 }
 
 /**
@@ -250,9 +276,23 @@ export interface OpenAICacheProviderOptions {
  */
 export class OpenAICacheProvider implements CacheProvider {
   readonly min_cacheable_tokens: number;
+  readonly cache_read_usd_per_million: number;
 
   constructor(options: OpenAICacheProviderOptions = {}) {
     this.min_cacheable_tokens = options.min_cacheable_tokens ?? 1024;
+    this.cache_read_usd_per_million = options.cache_read_usd_per_million ?? 1.25;
+  }
+
+  /**
+   * Return a copy with cache-read pricing set for `modelId`. Prefix match on
+   * the id; unknown ids fall back to gpt-4o pricing. See
+   * {@link openaiCacheReadPricing}.
+   */
+  withModelPricing(modelId: string): OpenAICacheProvider {
+    return new OpenAICacheProvider({
+      min_cacheable_tokens: this.min_cacheable_tokens,
+      cache_read_usd_per_million: openaiCacheReadPricing(modelId),
+    });
   }
 
   supportsCaching(): boolean {
@@ -275,7 +315,7 @@ export class OpenAICacheProvider implements CacheProvider {
     return {
       cache_read_tokens: read,
       cache_write_tokens: 0,
-      cache_read_cost_usd: 0,
+      cache_read_cost_usd: (read / 1_000_000) * this.cache_read_usd_per_million,
       cache_write_cost_usd: 0,
     };
   }
