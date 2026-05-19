@@ -40,6 +40,7 @@ from .agent import (
     TurnResult,
 )
 from .anthropic import AnthropicModelInterface
+from .ollama import OllamaModelInterface
 from .openai import OpenAIModelInterface
 from .errors import AlwaysHaltError, SporeError
 from .harness import (
@@ -487,6 +488,7 @@ __all__ = [
     "AggregateUsage",
     "Agent",
     "AnthropicModelInterface",
+    "OllamaModelInterface",
     "OpenAIModelInterface",
     "AgentError",
     "AgentErrorEmpty",

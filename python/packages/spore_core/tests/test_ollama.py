@@ -1,0 +1,649 @@
+"""Tests for :mod:`spore_core.ollama` — issue #41.
+
+Mirrors the Rust reference at ``rust/crates/spore-core/src/ollama.rs``
+test module.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from spore_core.model import (
+    Message,
+    MessageStart,
+    MessageStop,
+    ModelParams,
+    ModelRequest,
+    ProviderError,
+    ProviderInfo,
+    ReplayMode,
+    ReplayModelInterface,
+    Role,
+    StopReason,
+    TextBlock,
+    TextContent,
+    TimeoutError as ModelTimeoutError,
+    ToolCallContent,
+    ToolResultContent,
+    ToolSchema,
+    ToolUseBlock,
+    ToolUseDelta,
+)
+from spore_core.ollama import (
+    DEFAULT_BASE_URL,
+    DEFAULT_KEEP_ALIVE,
+    DEFAULT_TIMEOUT_SECONDS,
+    OllamaModelInterface,
+    build_request_body,
+    context_window,
+    parse_response_body,
+    parse_stop_reason,
+)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _user(text: str) -> Message:
+    return Message(role=Role.USER, content=TextContent(text=text))
+
+
+def _req(messages: list[Message], **kwargs: Any) -> ModelRequest:
+    return ModelRequest(messages=messages, **kwargs)
+
+
+def _mock_client(handler: httpx.MockTransport) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=handler)
+
+
+def _tags_handler(model: str = "llama3.2") -> Any:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": f"{model}:latest"}]})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return handle
+
+
+# ---------------------------------------------------------------------------
+# Constructors / defaults
+# ---------------------------------------------------------------------------
+
+
+def test_new_uses_localhost_defaults() -> None:
+    c = OllamaModelInterface("llama3.2")
+    assert c.base_url == "http://localhost:11434"
+    assert c.model_id == "llama3.2"
+    assert c.keep_alive == "5m"
+
+
+def test_with_base_url_overrides() -> None:
+    c = OllamaModelInterface.with_base_url("mistral", "http://remote:9999")
+    assert c.base_url == "http://remote:9999"
+    assert c.model_id == "mistral"
+
+
+def test_defaults_match_spec() -> None:
+    assert DEFAULT_BASE_URL == "http://localhost:11434"
+    assert DEFAULT_TIMEOUT_SECONDS == 300.0
+    assert DEFAULT_KEEP_ALIVE == "5m"
+
+
+# ---------------------------------------------------------------------------
+# build_request_body
+# ---------------------------------------------------------------------------
+
+
+def test_build_request_serializes_options_and_keep_alive() -> None:
+    body = build_request_body(
+        "llama3.2",
+        "10m",
+        _req(
+            [_user("hi")],
+            params=ModelParams(max_tokens=256, temperature=0.7, top_p=0.9, stop_sequences=["END"]),
+        ),
+        stream=False,
+    )
+    assert body["keep_alive"] == "10m"
+    assert body["options"]["num_predict"] == 256
+    assert body["options"]["temperature"] == 0.7
+    assert body["options"]["top_p"] == 0.9
+    assert body["options"]["stop"] == ["END"]
+    assert body["stream"] is False
+
+
+def test_build_request_serializes_tools() -> None:
+    body = build_request_body(
+        "llama3.2",
+        None,
+        _req(
+            [_user("hi")],
+            tools=[
+                ToolSchema(
+                    name="search", description="search the web", input_schema={"type": "object"}
+                )
+            ],
+        ),
+        stream=False,
+    )
+    assert body["tools"][0]["type"] == "function"
+    assert body["tools"][0]["function"]["name"] == "search"
+
+
+def test_build_request_tool_call_uses_object_arguments() -> None:
+    body = build_request_body(
+        "llama3.2",
+        None,
+        _req(
+            [
+                Message(
+                    role=Role.ASSISTANT,
+                    content=ToolCallContent(id="call-0", name="fetch", input={"url": "x"}),
+                )
+            ]
+        ),
+        stream=False,
+    )
+    msg = body["messages"][0]
+    args = msg["tool_calls"][0]["function"]["arguments"]
+    # arguments must be a JSON object (dict), NOT a JSON-encoded string.
+    assert isinstance(args, dict)
+    assert args == {"url": "x"}
+
+
+def test_build_request_tool_result_maps_to_tool_role() -> None:
+    body = build_request_body(
+        "llama3.2",
+        None,
+        _req(
+            [
+                Message(
+                    role=Role.TOOL,
+                    content=ToolResultContent(tool_use_id="call-0", content="ok"),
+                )
+            ]
+        ),
+        stream=False,
+    )
+    msg = body["messages"][0]
+    assert msg["role"] == "tool"
+    assert msg["content"] == "ok"
+    assert msg["tool_call_id"] == "call-0"
+
+
+def test_thinking_block_omitted_in_request() -> None:
+    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    s = json.dumps(body)
+    # No "thinking" key ever appears on the Ollama wire.
+    assert "thinking" not in s
+
+
+def test_build_request_omits_keep_alive_when_none() -> None:
+    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    assert "keep_alive" not in body
+
+
+def test_build_request_omits_options_when_empty() -> None:
+    body = build_request_body("llama3.2", "5m", _req([_user("hi")]), stream=False)
+    assert "options" not in body
+
+
+# ---------------------------------------------------------------------------
+# parse_stop_reason / parse_response_body
+# ---------------------------------------------------------------------------
+
+
+def test_stop_reason_mapping_stop() -> None:
+    assert parse_stop_reason("stop") is StopReason.END_TURN
+    assert parse_stop_reason(None) is StopReason.END_TURN
+    assert parse_stop_reason("???") is StopReason.END_TURN
+
+
+def test_stop_reason_mapping_tool_calls_and_length() -> None:
+    assert parse_stop_reason("tool_calls") is StopReason.TOOL_USE
+    assert parse_stop_reason("length") is StopReason.MAX_TOKENS
+
+
+def test_parse_response_extracts_usage() -> None:
+    r = parse_response_body(
+        {
+            "message": {"role": "assistant", "content": "hi"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 2,
+        }
+    )
+    assert r.usage.input_tokens == 7
+    assert r.usage.output_tokens == 2
+    assert r.stop_reason is StopReason.END_TURN
+    assert isinstance(r.content[0], TextBlock)
+    assert r.content[0].text == "hi"
+
+
+def test_parse_response_cache_fields_none() -> None:
+    r = parse_response_body(
+        {
+            "message": {"role": "assistant", "content": "x"},
+            "done": True,
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        }
+    )
+    assert r.usage.cache_read_tokens is None
+    assert r.usage.cache_write_tokens is None
+
+
+def test_parse_response_tool_call_synthesizes_id() -> None:
+    r = parse_response_body(
+        {
+            "message": {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "fetch", "arguments": {"url": "x"}}},
+                    {"function": {"name": "search", "arguments": {"q": "y"}}},
+                ],
+            },
+            "done": True,
+            "done_reason": "tool_calls",
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        }
+    )
+    assert r.stop_reason is StopReason.TOOL_USE
+    assert isinstance(r.content[0], ToolUseBlock)
+    assert r.content[0].id == "call-0"
+    assert r.content[0].name == "fetch"
+    assert r.content[0].input == {"url": "x"}
+    assert isinstance(r.content[1], ToolUseBlock)
+    assert r.content[1].id == "call-1"
+
+
+# ---------------------------------------------------------------------------
+# context_window / provider
+# ---------------------------------------------------------------------------
+
+
+def test_context_window_table() -> None:
+    assert context_window("llama3.2") == 128_000
+    assert context_window("llama3.2:3b") == 128_000
+    assert context_window("qwen2.5-coder-7b") == 128_000
+    assert context_window("mistral") == 32_000
+    assert context_window("gemma") == 8_192
+    assert context_window("unknown") == 0
+
+
+def test_provider_info_uses_table() -> None:
+    p = OllamaModelInterface("llama3.2").provider()
+    assert p.name == "ollama"
+    assert p.model_id == "llama3.2"
+    assert p.context_window == 128_000
+
+
+# ---------------------------------------------------------------------------
+# End-to-end mocked HTTP — call()
+# ---------------------------------------------------------------------------
+
+
+async def test_call_against_mock_returns_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "hello there"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 5,
+                    "eval_count": 2,
+                },
+            )
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    r = await iface.call(_req([_user("hi")]))
+    assert isinstance(r.content[0], TextBlock)
+    assert r.content[0].text == "hello there"
+    assert r.usage.input_tokens == 5
+    assert r.usage.output_tokens == 2
+
+
+async def test_connection_refused_helpful_message() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://127.0.0.1:1", http_client=client)
+    with pytest.raises(ProviderError) as exc:
+        await iface.call(_req([_user("hi")]))
+    assert exc.value.code == 0
+    assert "Ollama not running" in exc.value.message
+
+
+async def test_connection_error_does_not_retry() -> None:
+    """Fail-fast: a connect error returns immediately, not after backoff."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://127.0.0.1:1", http_client=client)
+    start = time.monotonic()
+    with pytest.raises(ProviderError):
+        await iface.call(_req([_user("hi")]))
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5, f"expected fail-fast (<500ms); took {elapsed:.3f}s"
+
+
+async def test_model_not_found_suggests_pull() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "mistral:latest"}]})
+        raise AssertionError("should not POST /api/chat")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    with pytest.raises(ProviderError) as exc:
+        await iface.call(_req([_user("hi")]))
+    assert exc.value.code == 404
+    assert "ollama pull llama3.2" in exc.value.message
+
+
+async def test_chat_404_maps_to_pull_suggestion() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                404,
+                text='{"error":"model \'llama3.2\' not found, try pulling it first"}',
+            )
+        raise AssertionError("unexpected")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    with pytest.raises(ProviderError) as exc:
+        await iface.call(_req([_user("hi")]))
+    assert exc.value.code == 404
+    assert "ollama pull llama3.2" in exc.value.message
+
+
+async def test_timeout_maps_to_timeout() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    with pytest.raises(ModelTimeoutError):
+        await iface.call(_req([_user("hi")]))
+
+
+async def test_model_check_cached_after_first_call() -> None:
+    calls = {"tags": 0, "chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            calls["tags"] += 1
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/chat":
+            calls["chat"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1,
+                },
+            )
+        raise AssertionError("unexpected")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    await iface.call(_req([_user("a")]))
+    await iface.call(_req([_user("b")]))
+    assert calls["tags"] == 1
+    assert calls["chat"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Streaming (NDJSON)
+# ---------------------------------------------------------------------------
+
+
+_NDJSON_TEXT = (
+    '{"message":{"role":"assistant","content":"hello"},"done":false}\n'
+    '{"message":{"role":"assistant","content":" world"},"done":false}\n'
+    '{"message":{"role":"assistant","content":""},"done":true,'
+    '"done_reason":"stop","prompt_eval_count":3,"eval_count":5}\n'
+)
+
+
+async def test_streaming_emits_text_delta_then_stop() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        return httpx.Response(
+            200,
+            content=_NDJSON_TEXT.encode("utf-8"),
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    events: list[Any] = []
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        events.append(ev)
+    assert isinstance(events[0], MessageStart)
+    text_deltas = [e.delta for e in events if hasattr(e, "delta") and isinstance(e.delta, str)]
+    assert text_deltas == ["hello", " world"]
+    last = events[-1]
+    assert isinstance(last, MessageStop)
+    assert last.usage.input_tokens == 3
+    assert last.usage.output_tokens == 5
+    assert last.stop_reason is StopReason.END_TURN
+
+
+async def test_streaming_parses_ndjson_lines() -> None:
+    """Multiple JSON objects in one chunk are both parsed."""
+
+    ndjson = (
+        '{"message":{"role":"assistant","content":"ab"},"done":false}\n'
+        '{"message":{"role":"assistant","content":"cd"},"done":false}\n'
+        '{"message":{"role":"assistant","content":""},"done":true,'
+        '"done_reason":"stop","prompt_eval_count":1,"eval_count":1}\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        return httpx.Response(200, content=ndjson.encode("utf-8"))
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    deltas: list[str] = []
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        if hasattr(ev, "delta") and isinstance(ev.delta, str):
+            deltas.append(ev.delta)
+    assert deltas == ["ab", "cd"]
+
+
+async def test_streaming_done_carries_usage() -> None:
+    ndjson = (
+        '{"message":{"role":"assistant","content":"x"},"done":true,'
+        '"done_reason":"stop","prompt_eval_count":42,"eval_count":7}\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        return httpx.Response(200, content=ndjson.encode("utf-8"))
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    final_usage = None
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        if isinstance(ev, MessageStop):
+            final_usage = ev.usage
+    assert final_usage is not None
+    assert final_usage.input_tokens == 42
+    assert final_usage.output_tokens == 7
+
+
+async def test_streaming_accumulates_tool_calls() -> None:
+    """Ollama returns full arguments objects per chunk (not partial
+    strings). Verify we emit one ToolUseDelta with the serialized object
+    and MessageStop.stop_reason=ToolUse."""
+
+    ndjson = (
+        '{"message":{"role":"assistant","tool_calls":'
+        '[{"function":{"name":"fetch","arguments":{"url":"x"}}}]},"done":false}\n'
+        '{"message":{"role":"assistant","content":""},"done":true,'
+        '"done_reason":"tool_calls","prompt_eval_count":1,"eval_count":1}\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        return httpx.Response(200, content=ndjson.encode("utf-8"))
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    tool_jsons: list[str] = []
+    final_stop = StopReason.END_TURN
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        if isinstance(ev, ToolUseDelta):
+            tool_jsons.append(ev.partial_json)
+        elif isinstance(ev, MessageStop):
+            final_stop = ev.stop_reason
+    assert len(tool_jsons) == 1
+    assert json.loads(tool_jsons[0]) == {"url": "x"}
+    assert final_stop is StopReason.TOOL_USE
+
+
+# ---------------------------------------------------------------------------
+# count_tokens
+# ---------------------------------------------------------------------------
+
+
+async def test_count_tokens_uses_embed_endpoint() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/embed":
+            return httpx.Response(200, json={"prompt_eval_count": 123})
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    n = await iface.count_tokens(_req([_user("hello world")]))
+    assert n == 123
+
+
+async def test_count_tokens_falls_back_to_heuristic() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/embed":
+            return httpx.Response(500)
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    # 40 chars + 1 newline = 41 → 41/4 = 10
+    n = await iface.count_tokens(_req([_user("a" * 40)]))
+    assert n == 10
+
+
+# ---------------------------------------------------------------------------
+# Fixture replay (shared cross-language fixture)
+# ---------------------------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_FIXTURE = (
+    _REPO_ROOT / "fixtures" / "model_responses" / "model_interface" / "ollama_basic_text.jsonl"
+)
+
+
+async def test_ollama_basic_text_fixture_replays() -> None:
+    """Round-trip the shared Ollama fixture through ReplayModelInterface."""
+
+    assert _FIXTURE.exists(), f"missing fixture: {_FIXTURE}"
+    text = _FIXTURE.read_text(encoding="utf-8")
+    provider = ProviderInfo(name="ollama", model_id="llama3.2", context_window=128_000)
+    replay = ReplayModelInterface.from_jsonl(text, provider, mode=ReplayMode.POSITIONAL)
+    request = ModelRequest(
+        messages=[_user("hello")],
+        params=ModelParams(max_tokens=1024),
+    )
+    response = await replay.call(request)
+    assert isinstance(response.content[0], TextBlock)
+    assert response.content[0].text == "Hello! How can I help you today?"
+    assert response.usage.input_tokens == 8
+    assert response.usage.output_tokens == 11
+    assert response.stop_reason is StopReason.END_TURN
+
+
+# ---------------------------------------------------------------------------
+# Live integration tests (skipped by default; require local Ollama)
+# ---------------------------------------------------------------------------
+
+LIVE = pytest.mark.skip(reason="live-API; needs local ollama with llama3.2 pulled")
+
+
+@LIVE
+async def test_ollama_live_call() -> None:
+    iface = OllamaModelInterface("llama3.2")
+    try:
+        r = await iface.call(_req([_user("Reply with the word 'pong'.")]))
+        assert r.usage.input_tokens > 0
+        assert r.usage.output_tokens > 0
+    finally:
+        await iface.aclose()
+
+
+@LIVE
+async def test_ollama_live_streaming() -> None:
+    iface = OllamaModelInterface("llama3.2")
+    saw_stop = False
+    try:
+        async for ev in iface.call_streaming(_req([_user("Reply with the word 'pong'.")])):
+            if isinstance(ev, MessageStop):
+                saw_stop = True
+        assert saw_stop
+    finally:
+        await iface.aclose()
+
+
+@LIVE
+async def test_ollama_live_tool_call() -> None:
+    iface = OllamaModelInterface("llama3.2")
+    try:
+        r = await iface.call(
+            _req(
+                [_user("Use the echo tool with text='hi'.")],
+                tools=[
+                    ToolSchema(
+                        name="echo",
+                        description="echoes the given text",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    )
+                ],
+            )
+        )
+        assert r.stop_reason in (StopReason.TOOL_USE, StopReason.END_TURN)
+    finally:
+        await iface.aclose()
