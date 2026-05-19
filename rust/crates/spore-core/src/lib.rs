@@ -29,6 +29,7 @@ pub mod metric;
 pub mod middleware;
 pub mod model;
 pub mod observability;
+pub mod ollama;
 pub mod openai;
 pub mod prompt_chunk_registry;
 pub mod sandbox;
@@ -93,6 +94,7 @@ pub use observability::{
     ObservabilityProvider as FullObservabilityProvider, PricingTable, SensorSpan, SessionMetrics,
     Span, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan,
 };
+pub use ollama::OllamaModelInterface;
 pub use openai::OpenAIModelInterface;
 pub use prompt_chunk_registry::{
     standard_chunks, ApprovalPolicy, CacheBlock, ChunkError, ChunkId, ChunkSlot,
