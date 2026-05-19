@@ -287,3 +287,60 @@ func TestAutoDetectMapsKnownProviders(t *testing.T) {
 		t.Error("AutoDetectCacheProvider(\"mystery\") should be ok=false")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// AnthropicCacheProvider.WithModelPricing — Rule: per-model cache cost (#39)
+// ---------------------------------------------------------------------------
+
+func TestAnthropicParseComputesCostDefaultSonnet(t *testing.T) {
+	p := NewAnthropicCacheProvider()
+	stats, ok := p.ParseCacheStats(responseWith(u32p(1_000_000), u32p(1_000_000)))
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	// Sonnet pricing: 0.30 read / 3.75 write per 1M.
+	if diff := stats.CacheReadCostUSD - 0.30; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+	if diff := stats.CacheWriteCostUSD - 3.75; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("write cost = %v", stats.CacheWriteCostUSD)
+	}
+}
+
+func TestAnthropicParseWithOpusPricing(t *testing.T) {
+	p := NewAnthropicCacheProvider().WithModelPricing("claude-opus-4-7")
+	stats, ok := p.ParseCacheStats(responseWith(u32p(1_000_000), u32p(1_000_000)))
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	// Opus: 1.50 read / 18.75 write.
+	if diff := stats.CacheReadCostUSD - 1.50; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+	if diff := stats.CacheWriteCostUSD - 18.75; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("write cost = %v", stats.CacheWriteCostUSD)
+	}
+}
+
+func TestAnthropicParseWithHaikuPricing(t *testing.T) {
+	p := NewAnthropicCacheProvider().WithModelPricing("claude-haiku-4-5")
+	stats, ok := p.ParseCacheStats(responseWith(u32p(1_000_000), u32p(1_000_000)))
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	// Haiku: 0.08 read / 1.00 write.
+	if diff := stats.CacheReadCostUSD - 0.08; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+	if diff := stats.CacheWriteCostUSD - 1.00; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("write cost = %v", stats.CacheWriteCostUSD)
+	}
+}
+
+func TestAnthropicParseWithUnknownModelFallsBackToSonnet(t *testing.T) {
+	p := NewAnthropicCacheProvider().WithModelPricing("mystery-3")
+	stats, _ := p.ParseCacheStats(responseWith(u32p(1_000_000), u32p(1_000_000)))
+	if diff := stats.CacheReadCostUSD - 0.30; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}

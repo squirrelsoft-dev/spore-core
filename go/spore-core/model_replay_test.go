@@ -176,3 +176,57 @@ func strRepeat(s string, n int) string {
 	}
 	return string(out)
 }
+
+// ---------------------------------------------------------------------------
+// #39 carry-over: ReplayModel.CountTokens prefers recorded InputTokens.
+// ---------------------------------------------------------------------------
+
+func TestReplayCountTokensUsesRecordedInputTokensInHashMode(t *testing.T) {
+	q := ModelRequest{Messages: []Message{{Role: RoleUser, Content: NewTextContent("the quick brown fox")}}}
+	exchange := RecordedExchange{
+		RequestHash: RequestHash(q),
+		Request:     q,
+		Response: ModelResponse{
+			Content: []ContentBlock{NewTextBlock("ok")},
+			Usage: TokenUsage{
+				InputTokens:  137,
+				OutputTokens: 4,
+			},
+			StopReason: StopEndTurn,
+		},
+		Provider: "anthropic",
+	}
+	r := NewReplayModel([]RecordedExchange{exchange}, replayProvider())
+	if r.Mode() != ReplayModeHashMatched {
+		t.Fatalf("mode = %s", r.Mode())
+	}
+	n, err := r.CountTokens(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bytes/4 of len("the quick brown fox")==19 would be 4. Recorded 137 wins.
+	if n != 137 {
+		t.Fatalf("n = %d, want 137", n)
+	}
+}
+
+func TestReplayCountTokensFallsBackToHeuristicWhenNoMatch(t *testing.T) {
+	q1 := ModelRequest{Messages: []Message{{Role: RoleUser, Content: NewTextContent("xx")}}}
+	exchange := RecordedExchange{
+		RequestHash: RequestHash(q1),
+		Request:     q1,
+		Response:    ModelResponse{Content: []ContentBlock{NewTextBlock("r")}, StopReason: StopEndTurn},
+		Provider:    "fixture",
+	}
+	r := NewReplayModel([]RecordedExchange{exchange}, replayProvider())
+	// Different request — no fixture match → fall back to bytes/4.
+	other := ModelRequest{Messages: []Message{{Role: RoleUser, Content: NewTextContent("never seen before, a long string indeed")}}}
+	n, err := r.CountTokens(context.Background(), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// len("never seen before, a long string indeed") == 39 → 39/4 = 9.
+	if n != 9 {
+		t.Fatalf("n = %d, want 9", n)
+	}
+}

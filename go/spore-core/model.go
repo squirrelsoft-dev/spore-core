@@ -917,9 +917,19 @@ func (r *ReplayModel) CallStreaming(ctx context.Context, req ModelRequest) (<-ch
 	return ch, nil
 }
 
-// CountTokens uses a deterministic ~4 chars/token estimate sufficient for
-// fixture replay. Real providers override this.
+// CountTokens prefers the recorded input_tokens from the matching fixture
+// (when the replay is hash-matched and a fixture is found), otherwise falls
+// back to a deterministic ~4 chars/token estimate. Real providers override
+// this entirely.
 func (r *ReplayModel) CountTokens(_ context.Context, req ModelRequest) (uint32, error) {
+	if r.mode == ReplayModeHashMatched {
+		want := RequestHash(req)
+		for _, ex := range r.exchanges {
+			if ex.RequestHash == want {
+				return ex.Response.Usage.InputTokens, nil
+			}
+		}
+	}
 	n := 0
 	for _, m := range req.Messages {
 		switch m.Content.Type {

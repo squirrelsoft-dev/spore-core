@@ -119,12 +119,49 @@ type AnthropicCacheProvider struct {
 	// MaxCacheAnchors is the maximum number of breakpoints per request.
 	// Anthropic supports up to 4.
 	MaxCacheAnchors uint32
+	// CacheReadUSDPerMillion is the USD price per 1M cache-read tokens.
+	// Default matches Sonnet 4.x published pricing (0.30 USD / 1M).
+	CacheReadUSDPerMillion float64
+	// CacheWriteUSDPerMillion is the USD price per 1M cache-write tokens
+	// (5-minute TTL). Default matches Sonnet 4.x (3.75 USD / 1M).
+	CacheWriteUSDPerMillion float64
 }
 
 // NewAnthropicCacheProvider returns an AnthropicCacheProvider with the
-// default MaxCacheAnchors of 4.
+// default MaxCacheAnchors of 4 and Sonnet 4.x cache pricing. Callers can
+// override per model with WithModelPricing.
 func NewAnthropicCacheProvider() AnthropicCacheProvider {
-	return AnthropicCacheProvider{MaxCacheAnchors: 4}
+	return AnthropicCacheProvider{
+		MaxCacheAnchors:         4,
+		CacheReadUSDPerMillion:  0.30,
+		CacheWriteUSDPerMillion: 3.75,
+	}
+}
+
+// WithModelPricing overrides cache pricing for a specific model id. Pricing
+// data lives in the implementation so callers don't have to import a table —
+// pass the model id and we look it up. Unknown ids return Sonnet pricing.
+//
+// Anthropic cache pricing (USD per 1M tokens, 5-minute TTL):
+//   - opus-4.x:   1.50 read / 18.75 write
+//   - sonnet-4.x: 0.30 read /  3.75 write
+//   - haiku-4.x:  0.08 read /  1.00 write
+func (p AnthropicCacheProvider) WithModelPricing(modelID string) AnthropicCacheProvider {
+	read, write := anthropicCachePricing(modelID)
+	p.CacheReadUSDPerMillion = read
+	p.CacheWriteUSDPerMillion = write
+	return p
+}
+
+func anthropicCachePricing(modelID string) (float64, float64) {
+	switch {
+	case strings.Contains(modelID, "opus"):
+		return 1.50, 18.75
+	case strings.Contains(modelID, "haiku"):
+		return 0.08, 1.00
+	default:
+		return 0.30, 3.75
+	}
 }
 
 // SupportsCaching reports true.
@@ -162,8 +199,9 @@ func (p AnthropicCacheProvider) Annotate(ctx *Context) CacheAnnotationResult {
 }
 
 // ParseCacheStats reads cache_read_tokens and cache_write_tokens from the
-// response. Returns (_, false) only when both fields are absent.
-func (AnthropicCacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
+// response and computes per-token USD cost from the provider's configured
+// pricing. Returns (_, false) only when both token fields are absent.
+func (p AnthropicCacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
 	read := resp.Usage.CacheReadTokens
 	write := resp.Usage.CacheWriteTokens
 	if read == nil && write == nil {
@@ -176,6 +214,8 @@ func (AnthropicCacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (Ca
 	if write != nil {
 		stats.CacheWriteTokens = *write
 	}
+	stats.CacheReadCostUSD = float64(stats.CacheReadTokens) / 1_000_000.0 * p.CacheReadUSDPerMillion
+	stats.CacheWriteCostUSD = float64(stats.CacheWriteTokens) / 1_000_000.0 * p.CacheWriteUSDPerMillion
 	return stats, true
 }
 
