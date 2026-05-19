@@ -24,6 +24,18 @@ export {
   type AnthropicModelInterfaceOptions,
 } from "./anthropic.js";
 export {
+  OllamaModelInterface,
+  DEFAULT_BASE_URL as OLLAMA_DEFAULT_BASE_URL,
+  DEFAULT_TIMEOUT_MS as OLLAMA_DEFAULT_TIMEOUT_MS,
+  DEFAULT_KEEP_ALIVE as OLLAMA_DEFAULT_KEEP_ALIVE,
+  buildRequest as ollamaBuildRequest,
+  parseResponse as ollamaParseResponse,
+  parseStopReason as ollamaParseStopReason,
+  ndjsonToEvents as ollamaNdjsonToEvents,
+  nameMatches as ollamaNameMatches,
+  type OllamaModelInterfaceOptions,
+} from "./ollama.js";
+export {
   OpenAIModelInterface,
   DEFAULT_BASE_URL as OPENAI_DEFAULT_BASE_URL,
   DEFAULT_TIMEOUT_MS as OPENAI_DEFAULT_TIMEOUT_MS,
