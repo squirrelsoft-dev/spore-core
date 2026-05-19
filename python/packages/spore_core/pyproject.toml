@@ -5,6 +5,7 @@ description = "spore-core harness runtime library"
 requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.13.0",
+    "httpx>=0.28",
     "pydantic>=2",
 ]
 

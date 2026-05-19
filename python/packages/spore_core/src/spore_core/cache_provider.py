@@ -114,6 +114,29 @@ class NullCacheProvider:
         return "null"
 
 
+def _anthropic_cache_pricing(model_id: str) -> tuple[float, float]:
+    """Return ``(cache_read_usd_per_million, cache_write_usd_per_million)``.
+
+    Anthropic cache pricing (USD per 1M tokens, 5-minute TTL):
+
+    - opus-4.x:   1.50 read / 18.75 write
+    - sonnet-4.x: 0.30 read /  3.75 write
+    - haiku-4.x:  0.08 read /  1.00 write
+
+    Substring matching: any ``model_id`` containing "opus" gets opus
+    pricing, "haiku" gets haiku pricing, everything else (sonnet, unknown)
+    gets sonnet pricing.
+    """
+
+    lower = model_id.lower()
+    if "opus" in lower:
+        return (1.50, 18.75)
+    if "haiku" in lower:
+        return (0.08, 1.00)
+    # sonnet, unknown, default → sonnet pricing
+    return (0.30, 3.75)
+
+
 @dataclass(frozen=True)
 class AnthropicCacheProvider:
     """Anthropic prefix caching.
@@ -126,6 +149,27 @@ class AnthropicCacheProvider:
 
     #: Anthropic supports up to 4 breakpoints per request.
     max_cache_anchors: int = 4
+    #: USD per 1M tokens for cache reads. Default matches Sonnet 4.x
+    #: published pricing (0.30 USD / 1M cache-read tokens).
+    cache_read_usd_per_million: float = 0.30
+    #: USD per 1M tokens for cache writes (5-minute TTL). Default matches
+    #: Sonnet 4.x (3.75 USD / 1M cache-write tokens).
+    cache_write_usd_per_million: float = 3.75
+
+    def with_model_pricing(self, model_id: str) -> AnthropicCacheProvider:
+        """Return a copy with cache pricing overridden for ``model_id``.
+
+        Pricing data lives in the implementation so callers don't have to
+        import a table — pass the model id and we look it up. Unknown ids
+        return Sonnet pricing. See :func:`_anthropic_cache_pricing`.
+        """
+
+        read, write = _anthropic_cache_pricing(model_id)
+        return AnthropicCacheProvider(
+            max_cache_anchors=self.max_cache_anchors,
+            cache_read_usd_per_million=read,
+            cache_write_usd_per_million=write,
+        )
 
     def supports_caching(self) -> bool:
         return True
@@ -159,11 +203,13 @@ class AnthropicCacheProvider:
         write = response.usage.cache_write_tokens
         if read is None and write is None:
             return None
+        read_tokens = read or 0
+        write_tokens = write or 0
         return CacheStats(
-            cache_read_tokens=read or 0,
-            cache_write_tokens=write or 0,
-            cache_read_cost_usd=0.0,
-            cache_write_cost_usd=0.0,
+            cache_read_tokens=read_tokens,
+            cache_write_tokens=write_tokens,
+            cache_read_cost_usd=read_tokens / 1_000_000.0 * self.cache_read_usd_per_million,
+            cache_write_cost_usd=write_tokens / 1_000_000.0 * self.cache_write_usd_per_million,
         )
 
     def provider_name(self) -> str:

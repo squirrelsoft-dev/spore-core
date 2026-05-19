@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from spore_core.cache_provider import (
     AnthropicCacheProvider,
     CacheAnnotationResult,
@@ -170,8 +172,9 @@ def test_anthropic_parse_reads_tokens() -> None:
     assert s is not None
     assert s.cache_read_tokens == 900
     assert s.cache_write_tokens == 120
-    assert s.cache_read_cost_usd == 0.0
-    assert s.cache_write_cost_usd == 0.0
+    # Default (sonnet) pricing: 0.30 read / 3.75 write per 1M.
+    assert s.cache_read_cost_usd == pytest.approx(900 / 1_000_000 * 0.30)
+    assert s.cache_write_cost_usd == pytest.approx(120 / 1_000_000 * 3.75)
 
 
 # ── Rule: Anthropic.parse_cache_stats treats one-sided metadata as Some
@@ -189,6 +192,46 @@ def test_anthropic_parse_one_sided_is_some() -> None:
     assert s2 is not None
     assert s2.cache_read_tokens == 0
     assert s2.cache_write_tokens == 0
+
+
+# ── Rule: Anthropic.parse_cache_stats computes USD cost from per-model
+#   pricing (#39) ────────────────────────────────────────────────────────
+
+
+def test_anthropic_parse_computes_cost_default_sonnet() -> None:
+    p = AnthropicCacheProvider()
+    s = p.parse_cache_stats(_response(1_000_000, 1_000_000))
+    assert s is not None
+    # Sonnet pricing: 0.30 read / 3.75 write per 1M.
+    assert s.cache_read_cost_usd == pytest.approx(0.30)
+    assert s.cache_write_cost_usd == pytest.approx(3.75)
+
+
+def test_anthropic_parse_with_opus_pricing() -> None:
+    p = AnthropicCacheProvider().with_model_pricing("claude-opus-4-7")
+    s = p.parse_cache_stats(_response(1_000_000, 1_000_000))
+    assert s is not None
+    # Opus pricing: 1.50 read / 18.75 write per 1M.
+    assert s.cache_read_cost_usd == pytest.approx(1.50)
+    assert s.cache_write_cost_usd == pytest.approx(18.75)
+
+
+def test_anthropic_parse_with_haiku_pricing() -> None:
+    p = AnthropicCacheProvider().with_model_pricing("claude-haiku-4-5")
+    s = p.parse_cache_stats(_response(1_000_000, 1_000_000))
+    assert s is not None
+    # Haiku pricing: 0.08 read / 1.00 write per 1M.
+    assert s.cache_read_cost_usd == pytest.approx(0.08)
+    assert s.cache_write_cost_usd == pytest.approx(1.00)
+
+
+def test_anthropic_with_model_pricing_substring_match() -> None:
+    # Substring match: any id containing "opus" gets opus pricing.
+    p = AnthropicCacheProvider().with_model_pricing("anthropic.claude-opus-future")
+    assert p.cache_read_usd_per_million == pytest.approx(1.50)
+    p = AnthropicCacheProvider().with_model_pricing("unknown-model")
+    # Unknown falls back to sonnet pricing.
+    assert p.cache_read_usd_per_million == pytest.approx(0.30)
 
 
 # ── Rule: OpenAI.annotate is a no-op and counts cacheable tokens only

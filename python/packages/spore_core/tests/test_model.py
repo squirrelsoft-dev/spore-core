@@ -323,6 +323,45 @@ async def test_replay_count_tokens_is_deterministic() -> None:
     assert await replay.count_tokens(req) == 10
 
 
+async def test_replay_count_tokens_uses_recorded_input_tokens_in_hash_mode() -> None:
+    # Carry-over from #39: replace the bytes/4 heuristic with the recorded
+    # input_tokens when we can match by request_hash.
+    q = ModelRequest(
+        messages=[Message(role=Role.USER, content=TextContent(text="the quick brown fox"))]
+    )
+    recorded = RecordedExchange(
+        request_hash=request_hash(q),
+        request=q,
+        response=ModelResponse(
+            content=[TextBlock(text="ok")],
+            usage=TokenUsage(input_tokens=137, output_tokens=4),
+            stop_reason=StopReason.END_TURN,
+        ),
+        provider="anthropic",
+    )
+    r = ReplayModelInterface([recorded], _provider())
+    assert r.mode() is ReplayMode.HASH_MATCHED
+    n = await r.count_tokens(q)
+    # 137 came from the recorded usage. bytes/4 would have produced
+    # floor(19/4) = 4, so this proves the recorded value wins.
+    assert n == 137
+
+
+async def test_replay_count_tokens_falls_back_to_heuristic_when_no_match() -> None:
+    q1 = _req_text("xx")
+    recorded = RecordedExchange(
+        request_hash=request_hash(q1),
+        request=q1,
+        response=_resp_text("r"),
+        provider="fixture",
+    )
+    r = ReplayModelInterface([recorded], _provider())
+    unrecorded = _req_text("never seen before, a long string indeed")
+    n = await r.count_tokens(unrecorded)
+    # Length 39 → floor(39/4) = 9.
+    assert n == 9
+
+
 # ---------------------------------------------------------------------------
 # #37: request_hash + ReplayMode
 # ---------------------------------------------------------------------------

@@ -505,6 +505,17 @@ class ReplayModelInterface:
         yield MessageStop(usage=response.usage, stop_reason=response.stop_reason)
 
     async def count_tokens(self, request: ModelRequest) -> int:
+        # When the fixture was recorded by RecordingModelInterface against a
+        # real provider, the recorded response's ``usage.input_tokens``
+        # carries the provider's exact count. Use that whenever we can
+        # match by hash; fall back to the bytes/4 heuristic only when no
+        # matching entry exists (positional fixtures or unrecorded
+        # requests).
+        if self._mode is ReplayMode.HASH_MATCHED:
+            want = request_hash(request)
+            for exchange in self._exchanges:
+                if exchange.request_hash == want:
+                    return exchange.response.usage.input_tokens
         # Cheap deterministic estimate sufficient for fixture replay;
         # mirrors the Rust ~4-chars/token rule of thumb.
         total = 0
