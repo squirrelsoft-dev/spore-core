@@ -19,6 +19,7 @@
 //!   - #13 TerminationPolicy
 
 pub mod agent;
+pub mod anthropic;
 pub mod cache_provider;
 pub mod context;
 pub mod guide_registry;
@@ -37,6 +38,7 @@ pub mod tools;
 pub mod verifier;
 
 pub use agent::{Agent, AgentError, AgentId, Context as AgentContext, ModelAgent, TurnResult};
+pub use anthropic::AnthropicModelInterface;
 pub use cache_provider::{
     auto_detect as auto_detect_cache_provider, AnthropicCacheProvider, CacheAnnotationResult,
     CacheProvider, CacheStats, NullCacheProvider, OllamaCacheProvider, OpenAICacheProvider,

@@ -496,8 +496,21 @@ impl ModelInterface for ReplayModelInterface {
     }
 
     async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
-        // Cheap deterministic estimate sufficient for fixture replay: sum the
-        // textual content of every message. Real providers override this.
+        // When the fixture was recorded by RecordingModelInterface against a
+        // real provider, the recorded response's `usage.input_tokens` carries
+        // the provider's exact count. Use that whenever we can match by hash;
+        // fall back to the bytes/4 heuristic only when no matching entry
+        // exists (positional fixtures or unrecorded requests).
+        if self.mode == ReplayMode::HashMatched {
+            let want = request_hash(request);
+            if let Some(e) = self
+                .exchanges
+                .iter()
+                .find(|e| e.request_hash.as_deref() == Some(want.as_str()))
+            {
+                return Ok(e.response.usage.input_tokens);
+            }
+        }
         let n: usize = request
             .messages
             .iter()
@@ -508,7 +521,7 @@ impl ModelInterface for ReplayModelInterface {
                 Content::Image { .. } => 0,
             })
             .sum();
-        Ok((n / 4) as u32) // ~4 chars/token rule-of-thumb
+        Ok((n / 4) as u32) // ~4 chars/token rule-of-thumb (fallback)
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -1113,6 +1126,57 @@ mod tests {
         assert_eq!(r.call(q2.clone()).await.unwrap(), resp_text("r2"));
         assert_eq!(r.call(q1.clone()).await.unwrap(), resp_text("r1"));
         assert_eq!(r.call(q2).await.unwrap(), resp_text("r2"));
+    }
+
+    #[tokio::test]
+    async fn replay_count_tokens_uses_recorded_input_tokens_in_hash_mode() {
+        // Carry-over from #38: replace the bytes/4 heuristic with the
+        // recorded input_tokens when we can match by request_hash.
+        let q = req_text("the quick brown fox");
+        let recorded = RecordedExchange {
+            request_hash: Some(request_hash(&q)),
+            request: q.clone(),
+            response: ModelResponse {
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                usage: TokenUsage {
+                    input_tokens: 137,
+                    output_tokens: 4,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+                stop_reason: StopReason::EndTurn,
+            },
+            provider: "anthropic".into(),
+            model_id: None,
+            recorded_at: None,
+            duration_ms: None,
+        };
+        let r = ReplayModelInterface::new(vec![recorded], provider());
+        assert_eq!(r.mode(), ReplayMode::HashMatched);
+        let n = r.count_tokens(&q).await.unwrap();
+        // 137 came from the recorded usage. bytes/4 would have produced
+        // floor(19/4) = 4, so this proves the recorded value wins.
+        assert_eq!(n, 137);
+    }
+
+    #[tokio::test]
+    async fn replay_count_tokens_falls_back_to_heuristic_when_no_match() {
+        let q1 = req_text("xx");
+        let recorded = RecordedExchange {
+            request_hash: Some(request_hash(&q1)),
+            request: q1,
+            response: resp_text("r"),
+            provider: "fixture".into(),
+            model_id: None,
+            recorded_at: None,
+            duration_ms: None,
+        };
+        let r = ReplayModelInterface::new(vec![recorded], provider());
+        // A different request — no fixture match.
+        let unrecorded = req_text("never seen before, a long string indeed");
+        let n = r.count_tokens(&unrecorded).await.unwrap();
+        // Length 39 → floor(39/4) = 9.
+        assert_eq!(n, 9);
     }
 
     #[tokio::test]

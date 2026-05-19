@@ -103,13 +103,49 @@ impl CacheProvider for NullCacheProvider {
 pub struct AnthropicCacheProvider {
     /// Anthropic supports up to 4 breakpoints per request.
     pub max_cache_anchors: u32,
+    /// USD per 1M tokens for cache reads. Default matches Sonnet 4.x
+    /// published pricing (0.30 USD / 1M cache-read tokens).
+    pub cache_read_usd_per_million: f64,
+    /// USD per 1M tokens for cache writes (5-minute TTL). Default matches
+    /// Sonnet 4.x (3.75 USD / 1M cache-write tokens).
+    pub cache_write_usd_per_million: f64,
 }
 
 impl Default for AnthropicCacheProvider {
     fn default() -> Self {
         Self {
             max_cache_anchors: 4,
+            // Sonnet 4.x default; callers override per model with
+            // `with_model_pricing`.
+            cache_read_usd_per_million: 0.30,
+            cache_write_usd_per_million: 3.75,
         }
+    }
+}
+
+impl AnthropicCacheProvider {
+    /// Override the cache pricing for a specific model. Pricing data lives in
+    /// the implementation so callers don't have to import a table — pass the
+    /// model id and we look it up. Unknown ids return Sonnet pricing.
+    ///
+    /// Anthropic cache pricing (USD per 1M tokens, 5-minute TTL):
+    /// - opus-4.x:   1.50 read / 18.75 write
+    /// - sonnet-4.x: 0.30 read /  3.75 write
+    /// - haiku-4.x:  0.08 read /  1.00 write
+    pub fn with_model_pricing(mut self, model_id: &str) -> Self {
+        let (read, write) = anthropic_cache_pricing(model_id);
+        self.cache_read_usd_per_million = read;
+        self.cache_write_usd_per_million = write;
+        self
+    }
+}
+
+fn anthropic_cache_pricing(model_id: &str) -> (f64, f64) {
+    match model_id {
+        id if id.contains("opus") => (1.50, 18.75),
+        id if id.contains("haiku") => (0.08, 1.00),
+        // sonnet, unknown, default → sonnet pricing
+        _ => (0.30, 3.75),
     }
 }
 
@@ -154,11 +190,15 @@ impl CacheProvider for AnthropicCacheProvider {
         if read.is_none() && write.is_none() {
             return None;
         }
+        let read_tokens = read.unwrap_or(0);
+        let write_tokens = write.unwrap_or(0);
         Some(CacheStats {
-            cache_read_tokens: read.unwrap_or(0),
-            cache_write_tokens: write.unwrap_or(0),
-            cache_read_cost_usd: 0.0,
-            cache_write_cost_usd: 0.0,
+            cache_read_tokens: read_tokens,
+            cache_write_tokens: write_tokens,
+            cache_read_cost_usd: f64::from(read_tokens) / 1_000_000.0
+                * self.cache_read_usd_per_million,
+            cache_write_cost_usd: f64::from(write_tokens) / 1_000_000.0
+                * self.cache_write_usd_per_million,
         })
     }
 
@@ -328,6 +368,7 @@ mod tests {
     fn anthropic_annotate_caps_at_max_anchors() {
         let p = AnthropicCacheProvider {
             max_cache_anchors: 2,
+            ..Default::default()
         };
         let bps = vec![
             BreakpointInfo {
@@ -408,6 +449,42 @@ mod tests {
         let s = p.parse_cache_stats(&response(Some(0), None)).unwrap();
         assert_eq!(s.cache_read_tokens, 0);
         assert_eq!(s.cache_write_tokens, 0);
+    }
+
+    // ── Rule: Anthropic.parse_cache_stats computes USD cost from per-model
+    //   pricing (#39) ───────────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_parse_computes_cost_default_sonnet() {
+        let p = AnthropicCacheProvider::default();
+        let s = p
+            .parse_cache_stats(&response(Some(1_000_000), Some(1_000_000)))
+            .unwrap();
+        // Sonnet pricing: 0.30 read / 3.75 write per 1M.
+        assert!((s.cache_read_cost_usd - 0.30).abs() < 1e-9, "{s:?}");
+        assert!((s.cache_write_cost_usd - 3.75).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn anthropic_parse_with_opus_pricing() {
+        let p = AnthropicCacheProvider::default().with_model_pricing("claude-opus-4-7");
+        let s = p
+            .parse_cache_stats(&response(Some(1_000_000), Some(1_000_000)))
+            .unwrap();
+        // Opus pricing: 1.50 read / 18.75 write per 1M.
+        assert!((s.cache_read_cost_usd - 1.50).abs() < 1e-9, "{s:?}");
+        assert!((s.cache_write_cost_usd - 18.75).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn anthropic_parse_with_haiku_pricing() {
+        let p = AnthropicCacheProvider::default().with_model_pricing("claude-haiku-4-5");
+        let s = p
+            .parse_cache_stats(&response(Some(1_000_000), Some(1_000_000)))
+            .unwrap();
+        // Haiku pricing: 0.08 read / 1.00 write per 1M.
+        assert!((s.cache_read_cost_usd - 0.08).abs() < 1e-9, "{s:?}");
+        assert!((s.cache_write_cost_usd - 1.00).abs() < 1e-9, "{s:?}");
     }
 
     // ── Rule: OpenAI.annotate is a no-op and counts cacheable tokens only
