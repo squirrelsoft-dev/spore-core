@@ -111,19 +111,31 @@ mod duration_secs {
 /// Wraps [`SessionState`] so the policy can identify the source session and
 /// task — completion checks frequently key into per-session scratchpads
 /// (e.g. `feature_list.json` under `.spore/<session>/`).
+///
+/// `workspace_root` is populated by the harness from
+/// `SandboxProvider::workspace_root()` so checks like [`FeatureListCheck`] can
+/// resolve workspace-relative paths without being given a sandbox handle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStateSnapshot {
     pub session_id: SessionId,
     pub task_id: TaskId,
     pub state: SessionState,
+    #[serde(default)]
+    pub workspace_root: std::path::PathBuf,
 }
 
 impl SessionStateSnapshot {
-    pub fn new(session_id: SessionId, task_id: TaskId, state: SessionState) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        task_id: TaskId,
+        state: SessionState,
+        workspace_root: std::path::PathBuf,
+    ) -> Self {
         Self {
             session_id,
             task_id,
             state,
+            workspace_root,
         }
     }
 }
@@ -257,6 +269,411 @@ impl CompletionCheck for FixedCompletionCheck {
     }
     fn description(&self) -> String {
         self.label.clone()
+    }
+}
+
+/// Spec alias from issue #43. Returns `None` immediately — the task is
+/// considered done the moment the agent claims done. Use for single-turn
+/// tasks where the model's self-assessment is sufficient.
+pub type AlwaysComplete = NullCompletionCheck;
+
+// ============================================================================
+// FeatureListCheck (issue #43)
+// ============================================================================
+
+/// Reads `feature_list.json` under the snapshot's `workspace_root`. Returns
+/// `Some` with a list of incomplete feature names if any entry has
+/// `passes: false`. Returns `None` when all entries pass.
+///
+/// File schema: a JSON array of `{ "name": string, "passes": bool }`. Missing
+/// or unreadable file → `Some("feature_list.json missing")` (treated as
+/// incomplete so the agent learns to create it).
+pub struct FeatureListCheck {
+    pub path: std::path::PathBuf,
+}
+
+impl FeatureListCheck {
+    /// Default location: `<workspace_root>/feature_list.json`.
+    pub fn new() -> Self {
+        Self {
+            path: std::path::PathBuf::from("feature_list.json"),
+        }
+    }
+
+    pub fn with_path(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl Default for FeatureListCheck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Deserialize)]
+struct FeatureEntry {
+    name: String,
+    passes: bool,
+}
+
+impl CompletionCheck for FeatureListCheck {
+    fn check<'a>(&'a self, state: &'a SessionStateSnapshot) -> BoxFut<'a, Option<String>> {
+        Box::pin(async move {
+            let full = if self.path.is_absolute() {
+                self.path.clone()
+            } else {
+                state.workspace_root.join(&self.path)
+            };
+            let raw = match std::fs::read_to_string(&full) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Some(format!("{} missing", self.path.display()));
+                }
+            };
+            let entries: Vec<FeatureEntry> = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(format!("{} invalid JSON: {e}", self.path.display()));
+                }
+            };
+            let incomplete: Vec<String> = entries
+                .into_iter()
+                .filter(|e| !e.passes)
+                .map(|e| e.name)
+                .collect();
+            if incomplete.is_empty() {
+                None
+            } else {
+                Some(format!("incomplete features: {}", incomplete.join(", ")))
+            }
+        })
+    }
+
+    fn description(&self) -> String {
+        format!("feature list at {}", self.path.display())
+    }
+}
+
+// ============================================================================
+// TestSuiteCheck (issue #43)
+// ============================================================================
+
+/// Runs an external test command via the injected [`SandboxProvider`]. Returns
+/// `None` if exit code is 0, otherwise `Some(failure_summary)` containing the
+/// trailing portion of stderr/stdout so the next turn knows what failed.
+///
+/// `command` is parsed shell-style: first whitespace-separated token is the
+/// program, remainder become args. For more complex invocations, callers
+/// should build a wrapper script and invoke it instead.
+pub struct TestSuiteCheck {
+    pub command: String,
+    pub working_dir: std::path::PathBuf,
+    pub timeout: Duration,
+    pub sandbox: Arc<dyn crate::harness::SandboxProvider>,
+}
+
+impl TestSuiteCheck {
+    pub fn new(
+        command: impl Into<String>,
+        working_dir: impl Into<std::path::PathBuf>,
+        timeout: Duration,
+        sandbox: Arc<dyn crate::harness::SandboxProvider>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            working_dir: working_dir.into(),
+            timeout,
+            sandbox,
+        }
+    }
+}
+
+impl CompletionCheck for TestSuiteCheck {
+    fn check<'a>(&'a self, _state: &'a SessionStateSnapshot) -> BoxFut<'a, Option<String>> {
+        Box::pin(async move {
+            let mut parts = self.command.split_whitespace();
+            let program = match parts.next() {
+                Some(p) => p.to_string(),
+                None => return Some("empty test command".into()),
+            };
+            let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+            let result = self
+                .sandbox
+                .execute_command(
+                    &program,
+                    &args,
+                    Some(self.working_dir.as_path()),
+                    Some(self.timeout),
+                )
+                .await;
+            match result {
+                Ok(out) if out.exit_code == 0 && !out.timed_out => None,
+                Ok(out) => {
+                    let tail = tail_lines(&out.stderr, 20);
+                    let tail = if tail.trim().is_empty() {
+                        tail_lines(&out.stdout, 20)
+                    } else {
+                        tail
+                    };
+                    Some(format!(
+                        "test suite failed (exit {}, timed_out={}):\n{}",
+                        out.exit_code, out.timed_out, tail
+                    ))
+                }
+                Err(v) => Some(format!("sandbox refused test command: {v:?}")),
+            }
+        })
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "test suite: `{}` in {}",
+            self.command,
+            self.working_dir.display()
+        )
+    }
+}
+
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+// ============================================================================
+// QuestionAnsweredCheck (issue #43)
+// ============================================================================
+
+/// LLM-as-judge: asks a judge model whether the agent's final response
+/// actually answered the original question.
+///
+/// Spec note: the issue lists `judge_model: ModelConfig`, but `ModelConfig`
+/// today is a 2-field placeholder with no client surface. Until a
+/// `ModelConfig → Arc<dyn ModelInterface>` factory exists, this struct is
+/// generic over a concrete `M: ModelInterface` (the same pattern used by
+/// `LlmJudgeEvaluator` in `metric.rs`). `ModelInterface` is not yet
+/// dyn-compatible because of RPITIT (issue #45); revisit once #45 lands.
+pub struct QuestionAnsweredCheck<M: crate::model::ModelInterface + 'static> {
+    pub judge: Arc<M>,
+    pub original_question: String,
+    pub rubric: Option<String>,
+}
+
+impl<M: crate::model::ModelInterface + 'static> QuestionAnsweredCheck<M> {
+    pub fn new(judge: Arc<M>, original_question: impl Into<String>) -> Self {
+        Self {
+            judge,
+            original_question: original_question.into(),
+            rubric: None,
+        }
+    }
+
+    pub fn with_rubric(mut self, rubric: impl Into<String>) -> Self {
+        self.rubric = Some(rubric.into());
+        self
+    }
+}
+
+impl<M: crate::model::ModelInterface + 'static> CompletionCheck for QuestionAnsweredCheck<M> {
+    fn check<'a>(&'a self, state: &'a SessionStateSnapshot) -> BoxFut<'a, Option<String>> {
+        use crate::model::{Content, ContentBlock, Message, ModelParams, ModelRequest, Role};
+        Box::pin(async move {
+            let agent_response = last_assistant_text(&state.state.messages)
+                .unwrap_or_else(|| "<no agent response>".to_string());
+            let rubric_clause = self
+                .rubric
+                .as_deref()
+                .map(|r| format!("\n\nRubric:\n{r}"))
+                .unwrap_or_default();
+            let user_text = format!(
+                "Question:\n{}\n\nAgent's final response:\n{}\n\nDid the agent's response \
+                 answer the question? Reply with the first line `ANSWERED: YES` or \
+                 `ANSWERED: NO`, then a brief reason on the next line.{rubric_clause}",
+                self.original_question, agent_response
+            );
+            let req = ModelRequest {
+                messages: vec![
+                    Message {
+                        role: Role::System,
+                        content: Content::Text {
+                            text: "You are an evaluation judge. Reply with `ANSWERED: YES` or \
+                                   `ANSWERED: NO` on the first line, no other prefix."
+                                .into(),
+                        },
+                    },
+                    Message {
+                        role: Role::User,
+                        content: Content::Text { text: user_text },
+                    },
+                ],
+                tools: vec![],
+                params: ModelParams::default(),
+                stream: false,
+            };
+            let resp = match self.judge.call(req).await {
+                Ok(r) => r,
+                Err(e) => return Some(format!("judge model error: {e}")),
+            };
+            let verdict = resp
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let first = verdict
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            if first.starts_with("ANSWERED: YES") {
+                None
+            } else {
+                Some(format!("judge says not answered: {verdict}"))
+            }
+        })
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "LLM-judge: did the response answer `{}`",
+            self.original_question
+        )
+    }
+}
+
+fn last_assistant_text(messages: &[crate::model::Message]) -> Option<String> {
+    use crate::model::{Content, Role};
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match (&m.role, &m.content) {
+            (Role::Assistant, Content::Text { text }) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+// ============================================================================
+// SqlResultCheck (issue #43)
+// ============================================================================
+
+/// Validates the most recent SQL tool result in the session. Scans
+/// `state.messages` in reverse for the last `Content::ToolResult` whose
+/// matching `Content::ToolCall` has `name == sql_tool_name`, then parses the
+/// result content as `{ "columns": [string], "rows": [[any]] }`.
+///
+/// Returns `None` when the result satisfies all configured constraints.
+/// Returns `Some(reason)` if no SQL result was found, parsing failed, or a
+/// constraint was violated.
+pub struct SqlResultCheck {
+    pub sql_tool_name: String,
+    pub expected_columns: Option<Vec<String>>,
+    pub min_rows: Option<usize>,
+}
+
+impl SqlResultCheck {
+    /// Default tool name is `execute_sql`.
+    pub fn new() -> Self {
+        Self {
+            sql_tool_name: "execute_sql".into(),
+            expected_columns: None,
+            min_rows: None,
+        }
+    }
+
+    pub fn with_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.sql_tool_name = name.into();
+        self
+    }
+
+    pub fn with_expected_columns(mut self, cols: Vec<String>) -> Self {
+        self.expected_columns = Some(cols);
+        self
+    }
+
+    pub fn with_min_rows(mut self, n: usize) -> Self {
+        self.min_rows = Some(n);
+        self
+    }
+}
+
+impl Default for SqlResultCheck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Deserialize)]
+struct SqlResultPayload {
+    #[serde(default)]
+    columns: Vec<String>,
+    #[serde(default)]
+    rows: Vec<serde_json::Value>,
+}
+
+impl CompletionCheck for SqlResultCheck {
+    fn check<'a>(&'a self, state: &'a SessionStateSnapshot) -> BoxFut<'a, Option<String>> {
+        use crate::model::Content;
+        Box::pin(async move {
+            // Build id -> tool_name map from ToolCalls so we can match
+            // ToolResults back to their originating tool.
+            let mut id_to_name: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::new();
+            for m in &state.state.messages {
+                if let Content::ToolCall(call) = &m.content {
+                    id_to_name.insert(call.id.as_str(), call.name.as_str());
+                }
+            }
+            // Find the most recent ToolResult belonging to sql_tool_name.
+            let result_content = state
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match &m.content {
+                    Content::ToolResult(r) => match id_to_name.get(r.tool_use_id.as_str()) {
+                        Some(&n) if n == self.sql_tool_name => Some(r.content.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            let raw = match result_content {
+                Some(c) => c,
+                None => {
+                    return Some(format!(
+                        "no `{}` tool result found in session",
+                        self.sql_tool_name
+                    ));
+                }
+            };
+            let payload: SqlResultPayload = match serde_json::from_str(&raw) {
+                Ok(p) => p,
+                Err(e) => return Some(format!("sql result is not JSON: {e}")),
+            };
+            if let Some(expected) = &self.expected_columns {
+                if &payload.columns != expected {
+                    return Some(format!(
+                        "sql columns mismatch: expected {expected:?}, got {:?}",
+                        payload.columns
+                    ));
+                }
+            }
+            let min = self.min_rows.unwrap_or(1);
+            if payload.rows.len() < min {
+                return Some(format!(
+                    "sql result has {} rows, expected at least {min}",
+                    payload.rows.len()
+                ));
+            }
+            None
+        })
+    }
+
+    fn description(&self) -> String {
+        format!("sql result check on tool `{}`", self.sql_tool_name)
     }
 }
 
@@ -404,6 +821,7 @@ mod tests {
             SessionId::new("s1"),
             TaskId::new("t1"),
             SessionState::default(),
+            std::path::PathBuf::new(),
         )
     }
 
@@ -720,5 +1138,408 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    // ========================================================================
+    // FeatureListCheck
+    // ========================================================================
+
+    fn snapshot_in(dir: &std::path::Path) -> SessionStateSnapshot {
+        SessionStateSnapshot::new(
+            SessionId::new("s1"),
+            TaskId::new("t1"),
+            SessionState::default(),
+            dir.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn feature_list_all_pass_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("feature_list.json"),
+            r#"[{"name":"a","passes":true},{"name":"b","passes":true}]"#,
+        )
+        .unwrap();
+        let snap = snapshot_in(dir.path());
+        assert_eq!(FeatureListCheck::new().check(&snap).await, None);
+    }
+
+    #[tokio::test]
+    async fn feature_list_some_fail_returns_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("feature_list.json"),
+            r#"[{"name":"a","passes":true},{"name":"b","passes":false},{"name":"c","passes":false}]"#,
+        )
+        .unwrap();
+        let snap = snapshot_in(dir.path());
+        let r = FeatureListCheck::new().check(&snap).await.unwrap();
+        assert!(
+            r.contains("b") && r.contains("c") && !r.contains("a, "),
+            "got: {r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn feature_list_missing_file_returns_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = snapshot_in(dir.path());
+        let r = FeatureListCheck::new().check(&snap).await.unwrap();
+        assert!(r.contains("missing"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn feature_list_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("custom.json"),
+            r#"[{"name":"x","passes":true}]"#,
+        )
+        .unwrap();
+        let snap = snapshot_in(dir.path());
+        assert_eq!(
+            FeatureListCheck::with_path("custom.json")
+                .check(&snap)
+                .await,
+            None
+        );
+    }
+
+    // ========================================================================
+    // TestSuiteCheck
+    // ========================================================================
+
+    struct StubSandbox {
+        out: crate::harness::CommandOutput,
+        root: std::path::PathBuf,
+    }
+
+    impl crate::harness::SandboxProvider for StubSandbox {
+        fn validate<'a>(
+            &'a self,
+            _call: &'a crate::model::ToolCall,
+        ) -> BoxFut<'a, Result<(), crate::harness::SandboxViolation>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn workspace_root(&self) -> &std::path::Path {
+            &self.root
+        }
+        fn execute_command<'a>(
+            &'a self,
+            _command: &'a str,
+            _args: &'a [String],
+            _working_dir: Option<&'a std::path::Path>,
+            _timeout: Option<Duration>,
+        ) -> BoxFut<'a, Result<crate::harness::CommandOutput, crate::harness::SandboxViolation>>
+        {
+            let out = self.out.clone();
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    fn stub_sandbox(exit: i32, stderr: &str) -> Arc<dyn crate::harness::SandboxProvider> {
+        Arc::new(StubSandbox {
+            out: crate::harness::CommandOutput {
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                exit_code: exit,
+                timed_out: false,
+                truncated: false,
+            },
+            root: std::path::PathBuf::from("/"),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_suite_pass_returns_none() {
+        let check = TestSuiteCheck::new(
+            "cargo test",
+            std::path::PathBuf::from("."),
+            Duration::from_secs(30),
+            stub_sandbox(0, ""),
+        );
+        assert_eq!(check.check(&snapshot()).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_suite_fail_includes_stderr_tail() {
+        let check = TestSuiteCheck::new(
+            "cargo test",
+            std::path::PathBuf::from("."),
+            Duration::from_secs(30),
+            stub_sandbox(1, "test foo ... FAILED\nassertion failed"),
+        );
+        let r = check.check(&snapshot()).await.unwrap();
+        assert!(r.contains("FAILED"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn test_suite_empty_command_fails_cleanly() {
+        let check = TestSuiteCheck::new(
+            "",
+            std::path::PathBuf::from("."),
+            Duration::from_secs(30),
+            stub_sandbox(0, ""),
+        );
+        assert!(check.check(&snapshot()).await.is_some());
+    }
+
+    // ========================================================================
+    // QuestionAnsweredCheck
+    // ========================================================================
+
+    struct StubJudge {
+        verdict: String,
+    }
+
+    impl crate::model::ModelInterface for StubJudge {
+        async fn call(
+            &self,
+            _req: crate::model::ModelRequest,
+        ) -> Result<crate::model::ModelResponse, crate::model::ModelError> {
+            Ok(crate::model::ModelResponse {
+                content: vec![crate::model::ContentBlock::Text {
+                    text: self.verdict.clone(),
+                }],
+                stop_reason: crate::model::StopReason::EndTurn,
+                usage: crate::model::TokenUsage::default(),
+            })
+        }
+        async fn call_streaming(
+            &self,
+            _req: crate::model::ModelRequest,
+        ) -> Result<crate::model::ModelStream, crate::model::ModelError> {
+            unreachable!("StubJudge::call_streaming is not used by QuestionAnsweredCheck")
+        }
+        async fn count_tokens(
+            &self,
+            _req: &crate::model::ModelRequest,
+        ) -> Result<u32, crate::model::ModelError> {
+            Ok(0)
+        }
+        fn provider(&self) -> crate::model::ProviderInfo {
+            crate::model::ProviderInfo {
+                name: "stub".into(),
+                model_id: "stub".into(),
+                context_window: 4096,
+            }
+        }
+    }
+
+    fn snap_with_assistant(text: &str) -> SessionStateSnapshot {
+        let mut state = SessionState::default();
+        state.messages.push(crate::model::Message {
+            role: crate::model::Role::Assistant,
+            content: crate::model::Content::Text {
+                text: text.to_string(),
+            },
+        });
+        SessionStateSnapshot::new(
+            SessionId::new("s1"),
+            TaskId::new("t1"),
+            state,
+            std::path::PathBuf::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn question_answered_yes_returns_none() {
+        let judge = Arc::new(StubJudge {
+            verdict: "ANSWERED: YES\nLooks good.".into(),
+        });
+        let c = QuestionAnsweredCheck::new(judge, "What is 2+2?");
+        let snap = snap_with_assistant("It is 4.");
+        assert_eq!(c.check(&snap).await, None);
+    }
+
+    #[tokio::test]
+    async fn question_answered_no_returns_reason() {
+        let judge = Arc::new(StubJudge {
+            verdict: "ANSWERED: NO\nMissed the point.".into(),
+        });
+        let c = QuestionAnsweredCheck::new(judge, "What is 2+2?");
+        let snap = snap_with_assistant("I don't know.");
+        let r = c.check(&snap).await.unwrap();
+        assert!(r.contains("not answered"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn question_answered_uses_rubric() {
+        let judge = Arc::new(StubJudge {
+            verdict: "ANSWERED: YES".into(),
+        });
+        let c = QuestionAnsweredCheck::new(judge, "q").with_rubric("Be strict about citations.");
+        assert!(c.description().contains("q"));
+        assert_eq!(c.check(&snap_with_assistant("a")).await, None);
+    }
+
+    // ========================================================================
+    // SqlResultCheck
+    // ========================================================================
+
+    fn snap_with_sql_result(tool_name: &str, body: &str) -> SessionStateSnapshot {
+        use crate::model::{Content, Message, Role, ToolCall as MTC, ToolResult as MTR};
+        let mut state = SessionState::default();
+        state.messages.push(Message {
+            role: Role::Assistant,
+            content: Content::ToolCall(MTC {
+                id: "call-1".into(),
+                name: tool_name.into(),
+                input: serde_json::json!({"q":"select 1"}),
+            }),
+        });
+        state.messages.push(Message {
+            role: Role::Tool,
+            content: Content::ToolResult(MTR {
+                tool_use_id: "call-1".into(),
+                content: body.into(),
+                is_error: false,
+            }),
+        });
+        SessionStateSnapshot::new(
+            SessionId::new("s1"),
+            TaskId::new("t1"),
+            state,
+            std::path::PathBuf::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_default_passes_when_rows_present() {
+        let snap = snap_with_sql_result(
+            "execute_sql",
+            r#"{"columns":["id","name"],"rows":[[1,"a"],[2,"b"]]}"#,
+        );
+        assert_eq!(SqlResultCheck::new().check(&snap).await, None);
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_empty_rows_fails() {
+        let snap = snap_with_sql_result("execute_sql", r#"{"columns":["id"],"rows":[]}"#);
+        let r = SqlResultCheck::new().check(&snap).await.unwrap();
+        assert!(r.contains("0 rows"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_column_mismatch_fails() {
+        let snap = snap_with_sql_result("execute_sql", r#"{"columns":["id"],"rows":[[1]]}"#);
+        let r = SqlResultCheck::new()
+            .with_expected_columns(vec!["id".into(), "name".into()])
+            .check(&snap)
+            .await
+            .unwrap();
+        assert!(r.contains("columns mismatch"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_min_rows_enforced() {
+        let snap = snap_with_sql_result("execute_sql", r#"{"columns":["id"],"rows":[[1]]}"#);
+        let r = SqlResultCheck::new()
+            .with_min_rows(5)
+            .check(&snap)
+            .await
+            .unwrap();
+        assert!(r.contains("at least 5"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_custom_tool_name() {
+        let snap = snap_with_sql_result("run_query", r#"{"columns":[],"rows":[[1]]}"#);
+        let c = SqlResultCheck::new().with_tool_name("run_query");
+        assert_eq!(c.check(&snap).await, None);
+    }
+
+    #[tokio::test]
+    async fn sql_result_check_no_matching_tool_fails() {
+        let snap = snap_with_sql_result("other_tool", r#"{"columns":[],"rows":[[1]]}"#);
+        let r = SqlResultCheck::new().check(&snap).await.unwrap();
+        assert!(r.contains("no `execute_sql`"), "got: {r}");
+    }
+
+    // ========================================================================
+    // SqlResultCheck — cross-language fixture replay
+    // ========================================================================
+
+    #[derive(Deserialize)]
+    struct SqlFixtureCase {
+        name: String,
+        sql_tool_name: String,
+        #[serde(default)]
+        expected_columns: Option<Vec<String>>,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        messages: Vec<crate::model::Message>,
+        expected: SqlFixtureExpected,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum SqlFixtureExpected {
+        Complete,
+        Incomplete { contains: String },
+    }
+
+    #[derive(Deserialize)]
+    struct SqlFixtureSuite {
+        cases: Vec<SqlFixtureCase>,
+    }
+
+    #[tokio::test]
+    async fn fixture_replay_sql_result_check() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/completion_check/sql_result.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let suite: SqlFixtureSuite = serde_json::from_str(&raw).unwrap();
+        for case in suite.cases {
+            let state = SessionState {
+                messages: case.messages,
+                ..Default::default()
+            };
+            let snap = SessionStateSnapshot::new(
+                SessionId::new("fix"),
+                TaskId::new("fix"),
+                state,
+                std::path::PathBuf::new(),
+            );
+            let mut check = SqlResultCheck::new().with_tool_name(case.sql_tool_name);
+            if let Some(cols) = case.expected_columns {
+                check = check.with_expected_columns(cols);
+            }
+            if let Some(n) = case.min_rows {
+                check = check.with_min_rows(n);
+            }
+            let got = check.check(&snap).await;
+            match (got, case.expected) {
+                (None, SqlFixtureExpected::Complete) => {}
+                (Some(reason), SqlFixtureExpected::Incomplete { contains }) => {
+                    assert!(
+                        reason.contains(&contains),
+                        "case `{}`: expected reason to contain `{contains}`, got `{reason}`",
+                        case.name
+                    );
+                }
+                (got, expected) => panic!(
+                    "case `{}`: mismatch — got {got:?}, expected {}",
+                    case.name,
+                    match expected {
+                        SqlFixtureExpected::Complete => "Complete".to_string(),
+                        SqlFixtureExpected::Incomplete { contains } =>
+                            format!("Incomplete(contains={contains})"),
+                    }
+                ),
+            }
+        }
+    }
+
+    // ========================================================================
+    // AlwaysComplete alias
+    // ========================================================================
+
+    #[tokio::test]
+    async fn always_complete_is_null_check() {
+        // Alias sanity — same observable behavior.
+        let a: AlwaysComplete = NullCompletionCheck;
+        assert_eq!(a.check(&snapshot()).await, None);
     }
 }

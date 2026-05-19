@@ -589,6 +589,7 @@ mod tests {
             SessionId::new("sess"),
             TaskId::new("task"),
             SessionState::default(),
+            std::path::PathBuf::new(),
         )
     }
 

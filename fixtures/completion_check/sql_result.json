@@ -1,0 +1,200 @@
+{
+  "description": "Cross-language consistency fixture for SqlResultCheck (issue #43).\n\nEach case feeds a synthesized SessionState (just the messages list) to SqlResultCheck with the given configuration and asserts that the check returns either Complete (None) or an Incomplete reason containing the named substring.",
+  "cases": [
+    {
+      "name": "default_passes_with_rows",
+      "sql_tool_name": "execute_sql",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "call-1",
+            "name": "execute_sql",
+            "input": {"q": "select 1"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": "{\"columns\":[\"id\",\"name\"],\"rows\":[[1,\"a\"],[2,\"b\"]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "complete"}
+    },
+    {
+      "name": "empty_rows_incomplete",
+      "sql_tool_name": "execute_sql",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "c2",
+            "name": "execute_sql",
+            "input": {"q": "select 1 where false"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "c2",
+            "content": "{\"columns\":[\"id\"],\"rows\":[]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "incomplete", "contains": "0 rows"}
+    },
+    {
+      "name": "column_mismatch_incomplete",
+      "sql_tool_name": "execute_sql",
+      "expected_columns": ["id", "name"],
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "c3",
+            "name": "execute_sql",
+            "input": {"q": "select id from t"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "c3",
+            "content": "{\"columns\":[\"id\"],\"rows\":[[1]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "incomplete", "contains": "columns mismatch"}
+    },
+    {
+      "name": "min_rows_enforced",
+      "sql_tool_name": "execute_sql",
+      "min_rows": 5,
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "c4",
+            "name": "execute_sql",
+            "input": {"q": "select id from t"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "c4",
+            "content": "{\"columns\":[\"id\"],\"rows\":[[1],[2]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "incomplete", "contains": "at least 5"}
+    },
+    {
+      "name": "custom_tool_name",
+      "sql_tool_name": "run_query",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "c5",
+            "name": "run_query",
+            "input": {"q": "select 1"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "c5",
+            "content": "{\"columns\":[\"id\"],\"rows\":[[1]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "complete"}
+    },
+    {
+      "name": "no_matching_tool_call_incomplete",
+      "sql_tool_name": "execute_sql",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "c6",
+            "name": "some_other_tool",
+            "input": {}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "c6",
+            "content": "{\"columns\":[\"id\"],\"rows\":[[1]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "incomplete", "contains": "no `execute_sql`"}
+    },
+    {
+      "name": "uses_most_recent_sql_result",
+      "sql_tool_name": "execute_sql",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "first",
+            "name": "execute_sql",
+            "input": {"q": "select 1"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "first",
+            "content": "{\"columns\":[\"id\"],\"rows\":[]}",
+            "is_error": false
+          }
+        },
+        {
+          "role": "assistant",
+          "content": {
+            "type": "tool_call",
+            "id": "second",
+            "name": "execute_sql",
+            "input": {"q": "select 2"}
+          }
+        },
+        {
+          "role": "tool",
+          "content": {
+            "type": "tool_result",
+            "tool_use_id": "second",
+            "content": "{\"columns\":[\"id\"],\"rows\":[[2]]}",
+            "is_error": false
+          }
+        }
+      ],
+      "expected": {"kind": "complete"}
+    }
+  ]
+}

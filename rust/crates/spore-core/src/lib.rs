@@ -99,10 +99,11 @@ pub use sensor::{
     SensorTrigger, StandardSensorChain,
 };
 pub use termination::{
-    check_budget_default, BudgetValue, CompletionCheck, FixedCompletionCheck, NullCompletionCheck,
-    SessionStateSnapshot, StandardTerminationPolicy,
-    TerminationDecision as FullTerminationDecision, TerminationFailureReason, TerminationInput,
-    TerminationPolicy as FullTerminationPolicy,
+    check_budget_default, AlwaysComplete, BudgetValue, CompletionCheck, FeatureListCheck,
+    FixedCompletionCheck, NullCompletionCheck, QuestionAnsweredCheck, SessionStateSnapshot,
+    SqlResultCheck, StandardTerminationPolicy, TerminationDecision as FullTerminationDecision,
+    TerminationFailureReason, TerminationInput, TerminationPolicy as FullTerminationPolicy,
+    TestSuiteCheck,
 };
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
