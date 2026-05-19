@@ -23,10 +23,16 @@
 package sporecore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -645,29 +651,163 @@ func EnforceBudget(used uint32, budget *uint32) error {
 
 // RecordedExchange is one (request, response) pair serialised in the shared
 // fixtures/model_responses/ JSONL files. See fixtures/README.md.
+//
+// RequestHash (issue #37) is populated by RecordingModelInterface (#38) to
+// enable content-addressed replay. Fixtures recorded before #37 do not
+// include it; absence triggers positional fallback in ReplayModel.
 type RecordedExchange struct {
-	Request    ModelRequest  `json:"request"`
-	Response   ModelResponse `json:"response"`
-	Provider   string        `json:"provider"`
-	RecordedAt string        `json:"recorded_at,omitempty"`
+	RequestHash string        `json:"request_hash,omitempty"`
+	Request     ModelRequest  `json:"request"`
+	Response    ModelResponse `json:"response"`
+	Provider    string        `json:"provider"`
+	ModelID     string        `json:"model_id,omitempty"`
+	RecordedAt  string        `json:"recorded_at,omitempty"`
+	DurationMs  *uint64       `json:"duration_ms,omitempty"`
 }
 
-// ReplayModel returns recorded responses in order; the n-th Call returns the
-// n-th recorded response. Matching is positional and shared with the Rust /
-// TypeScript / Python implementations so fixtures remain portable.
+// ============================================================================
+// Cross-language request hashing (#37, #38)
+// ============================================================================
+
+// RequestHash returns the stable content hash of a ModelRequest. Produced by
+// canonicalizing the request to JSON (object keys sorted lexicographically,
+// no insignificant whitespace) and SHA-256 hashing the resulting bytes, then
+// hex-encoding the first 8 bytes (16 hex chars).
+//
+// All four language implementations of RecordingModelInterface and
+// ReplayModelInterface must produce the same hash for the same request. The
+// cross-language consistency fixture lives at
+// fixtures/model_hashing/cases.json.
+func RequestHash(req ModelRequest) string {
+	raw, err := json.Marshal(req)
+	if err != nil {
+		// ModelRequest is always serializable; this path is unreachable in
+		// practice. Hash the error string as a defensive fallback so that
+		// callers still get a stable, non-empty value.
+		sum := sha256.Sum256([]byte(err.Error()))
+		return hex.EncodeToString(sum[:8])
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var tree any
+	if err := dec.Decode(&tree); err != nil {
+		sum := sha256.Sum256(raw)
+		return hex.EncodeToString(sum[:8])
+	}
+	canon := canonicalizeJSON(tree)
+	sum := sha256.Sum256([]byte(canon))
+	return hex.EncodeToString(sum[:8])
+}
+
+// canonicalizeJSON walks a generic JSON tree (as produced by encoding/json
+// with UseNumber) and returns a stable canonical string representation.
+func canonicalizeJSON(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case json.Number:
+		return string(x)
+	case string:
+		b, _ := json.Marshal(x)
+		return string(b)
+	case []any:
+		parts := make([]string, len(x))
+		for i, e := range x {
+			parts[i] = canonicalizeJSON(e)
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			kb, _ := json.Marshal(k)
+			parts[i] = string(kb) + ":" + canonicalizeJSON(x[k])
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	default:
+		// Fallback: marshal and inline. Should not happen with UseNumber.
+		b, _ := json.Marshal(x)
+		return string(b)
+	}
+}
+
+// ReplayMode chooses how a ReplayModel matches incoming requests to recorded
+// responses (issue #37).
+type ReplayMode int
+
+const (
+	// ReplayModePositional is the pre-#37 behavior: the n-th Call returns
+	// the n-th recorded response. Fragile against loop-order changes but
+	// compatible with old fixtures.
+	ReplayModePositional ReplayMode = iota
+	// ReplayModeHashMatched is the new behavior: each Call hashes its
+	// request and looks up the matching recorded entry. Order-independent.
+	ReplayModeHashMatched
+)
+
+// String returns a human-readable name.
+func (m ReplayMode) String() string {
+	switch m {
+	case ReplayModeHashMatched:
+		return "HashMatched"
+	case ReplayModePositional:
+		return "Positional"
+	default:
+		return fmt.Sprintf("ReplayMode(%d)", int(m))
+	}
+}
+
+// ReplayModel returns recorded responses. Defaults to ReplayModeHashMatched
+// when every entry has a RequestHash and the slice is non-empty; otherwise
+// falls back to ReplayModePositional so pre-#37 fixtures continue to work.
 type ReplayModel struct {
 	exchanges []RecordedExchange
 	provider  ProviderInfo
+	mode      ReplayMode
 	mu        sync.Mutex
 	cursor    int
 }
 
-// NewReplayModel constructs a ReplayModel from a slice of exchanges.
+// NewReplayModel constructs a ReplayModel with the auto-detected mode.
 func NewReplayModel(exchanges []RecordedExchange, provider ProviderInfo) *ReplayModel {
-	return &ReplayModel{exchanges: exchanges, provider: provider}
+	mode := ReplayModePositional
+	if len(exchanges) > 0 {
+		all := true
+		for _, e := range exchanges {
+			if e.RequestHash == "" {
+				all = false
+				break
+			}
+		}
+		if all {
+			mode = ReplayModeHashMatched
+		}
+	}
+	return NewReplayModelWithMode(exchanges, provider, mode)
 }
 
-// ParseReplayJSONL parses a JSONL string of RecordedExchange records.
+// NewReplayModelWithMode constructs a ReplayModel with an explicit mode.
+// Useful when forcing positional replay against a hash-tagged fixture.
+func NewReplayModelWithMode(exchanges []RecordedExchange, provider ProviderInfo, mode ReplayMode) *ReplayModel {
+	return &ReplayModel{exchanges: exchanges, provider: provider, mode: mode}
+}
+
+// Mode reports the active ReplayMode.
+func (r *ReplayModel) Mode() ReplayMode {
+	return r.mode
+}
+
+// ParseReplayJSONL parses a JSONL string of RecordedExchange records and
+// auto-detects the replay mode.
 func ParseReplayJSONL(text string, provider ProviderInfo) (*ReplayModel, error) {
 	var exchanges []RecordedExchange
 	for i, line := range strings.Split(text, "\n") {
@@ -683,8 +823,13 @@ func ParseReplayJSONL(text string, provider ProviderInfo) (*ReplayModel, error) 
 	return NewReplayModel(exchanges, provider), nil
 }
 
-// Remaining reports how many recorded exchanges are left.
+// Remaining reports how many recorded exchanges are left. In hash-matched
+// mode this reports the total number of exchanges, since matching is not
+// cursor-based.
 func (r *ReplayModel) Remaining() int {
+	if r.mode == ReplayModeHashMatched {
+		return len(r.exchanges)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.cursor >= len(r.exchanges) {
@@ -693,16 +838,30 @@ func (r *ReplayModel) Remaining() int {
 	return len(r.exchanges) - r.cursor
 }
 
-// Call returns the next recorded response.
-func (r *ReplayModel) Call(_ context.Context, _ ModelRequest) (ModelResponse, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cursor >= len(r.exchanges) {
-		return ModelResponse{}, NewProviderError(0, "replay exhausted: no more recorded exchanges")
+// Call returns the recorded response matching the request, dispatching on
+// the active ReplayMode.
+func (r *ReplayModel) Call(_ context.Context, req ModelRequest) (ModelResponse, error) {
+	switch r.mode {
+	case ReplayModeHashMatched:
+		want := RequestHash(req)
+		for _, ex := range r.exchanges {
+			if ex.RequestHash == want {
+				return ex.Response, nil
+			}
+		}
+		return ModelResponse{}, NewProviderError(0, fmt.Sprintf("no matching fixture for request_hash=%s", want))
+	case ReplayModePositional:
+		fallthrough
+	default:
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.cursor >= len(r.exchanges) {
+			return ModelResponse{}, NewProviderError(0, "replay exhausted: no more recorded exchanges")
+		}
+		resp := r.exchanges[r.cursor].Response
+		r.cursor++
+		return resp, nil
 	}
-	resp := r.exchanges[r.cursor].Response
-	r.cursor++
-	return resp, nil
 }
 
 // CallStreaming synthesises a stream from the next recorded response.
@@ -895,3 +1054,146 @@ func (m *MockModel) Provider() ProviderInfo {
 
 // Compile-time interface check.
 var _ ModelInterface = (*MockModel)(nil)
+
+// ============================================================================
+// RecordingModelInterface (issue #38)
+// ============================================================================
+
+// RecordingMode controls how RecordingModel writes recorded exchanges.
+type RecordingMode int
+
+const (
+	// RecordingModeRecord appends every (request, response) pair to the
+	// output file.
+	RecordingModeRecord RecordingMode = iota
+	// RecordingModeRecordIfNew appends only if the output file does not
+	// yet exist. Useful when running tests for the first time against a
+	// real provider, then never re-recording.
+	RecordingModeRecordIfNew
+	// RecordingModePassthrough calls the inner ModelInterface but writes
+	// nothing. Used to disable recording without changing call sites.
+	RecordingModePassthrough
+)
+
+// String returns a human-readable name.
+func (m RecordingMode) String() string {
+	switch m {
+	case RecordingModeRecord:
+		return "Record"
+	case RecordingModeRecordIfNew:
+		return "RecordIfNew"
+	case RecordingModePassthrough:
+		return "Passthrough"
+	default:
+		return fmt.Sprintf("RecordingMode(%d)", int(m))
+	}
+}
+
+// RecordingModel is a transparent wrapper around a real ModelInterface that
+// appends each (request, response) pair to a JSONL fixture file as a
+// RecordedExchange with a stable RequestHash.
+type RecordingModel struct {
+	inner      ModelInterface
+	outputPath string
+	mode       RecordingMode
+	mu         sync.Mutex
+}
+
+// NewRecordingModel constructs a RecordingModel wrapping inner.
+func NewRecordingModel(inner ModelInterface, outputPath string, mode RecordingMode) *RecordingModel {
+	return &RecordingModel{inner: inner, outputPath: outputPath, mode: mode}
+}
+
+// OutputPath reports the configured JSONL output path.
+func (r *RecordingModel) OutputPath() string {
+	return r.outputPath
+}
+
+// Mode reports the configured RecordingMode.
+func (r *RecordingModel) Mode() RecordingMode {
+	return r.mode
+}
+
+// Call delegates to the inner ModelInterface and records the resulting
+// exchange (subject to the configured RecordingMode).
+func (r *RecordingModel) Call(ctx context.Context, req ModelRequest) (ModelResponse, error) {
+	start := time.Now()
+	resp, err := r.inner.Call(ctx, req)
+	if err != nil {
+		return ModelResponse{}, err
+	}
+	durMs := uint64(time.Since(start).Milliseconds())
+	if writeErr := r.record(req, resp, durMs); writeErr != nil {
+		return ModelResponse{}, NewProviderError(0, fmt.Sprintf("recorder write failed: %v", writeErr))
+	}
+	return resp, nil
+}
+
+// CallStreaming passes through to the inner ModelInterface. Streaming
+// recording is not implemented: the spec only requires the blocking Call
+// pair to be recorded.
+func (r *RecordingModel) CallStreaming(ctx context.Context, req ModelRequest) (<-chan StreamEventOrErr, error) {
+	return r.inner.CallStreaming(ctx, req)
+}
+
+// CountTokens delegates to the inner ModelInterface.
+func (r *RecordingModel) CountTokens(ctx context.Context, req ModelRequest) (uint32, error) {
+	return r.inner.CountTokens(ctx, req)
+}
+
+// Provider reports the inner ModelInterface's provider.
+func (r *RecordingModel) Provider() ProviderInfo {
+	return r.inner.Provider()
+}
+
+func (r *RecordingModel) record(req ModelRequest, resp ModelResponse, durationMs uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var shouldWrite bool
+	switch r.mode {
+	case RecordingModeRecord:
+		shouldWrite = true
+	case RecordingModeRecordIfNew:
+		_, statErr := os.Stat(r.outputPath)
+		shouldWrite = os.IsNotExist(statErr)
+	case RecordingModePassthrough:
+		shouldWrite = false
+	}
+	if !shouldWrite {
+		return nil
+	}
+	if parent := filepath.Dir(r.outputPath); parent != "" && parent != "." {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return err
+		}
+	}
+	provider := r.inner.Provider()
+	dur := durationMs
+	entry := RecordedExchange{
+		RequestHash: RequestHash(req),
+		Request:     req,
+		Response:    resp,
+		Provider:    provider.Name,
+		ModelID:     provider.ModelID,
+		DurationMs:  &dur,
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(r.outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(line); err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte("\n")); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Compile-time interface check.
+var _ ModelInterface = (*RecordingModel)(nil)
