@@ -347,6 +347,16 @@ from .prompt_chunk_registry import (
     new_chunk_id,
     standard_chunks,
 )
+from .verifier import (
+    CompositeVerifier,
+    EvaluatorResponseVerifier,
+    TestSuiteVerifier,
+    Verifier,
+    VerifierInput,
+    VerifierVerdict,
+    VerifierVerdictFailed,
+    VerifierVerdictPassed,
+)
 from .termination import (
     BudgetValue,
     BudgetValueDuration,
@@ -896,4 +906,13 @@ __all__ = [
     "ToolSet",
     "new_task_id",
     "sandbox_violation_is_always_halt",
+    # Verifier (#44)
+    "CompositeVerifier",
+    "EvaluatorResponseVerifier",
+    "TestSuiteVerifier",
+    "Verifier",
+    "VerifierInput",
+    "VerifierVerdict",
+    "VerifierVerdictFailed",
+    "VerifierVerdictPassed",
 ]
