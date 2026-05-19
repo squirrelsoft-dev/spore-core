@@ -151,15 +151,28 @@ func (b *BudgetValue) UnmarshalJSON(data []byte) error {
 // SessionStateSnapshot is a read-only snapshot of session state handed to
 // CompletionCheck.Check. The session/task ids let domain-specific checks key
 // into per-session scratchpads.
+//
+// WorkspaceRoot is populated by the harness from
+// SandboxProvider.WorkspaceRoot() so checks like FeatureListCheck can
+// resolve workspace-relative paths without being given a sandbox handle.
 type SessionStateSnapshot struct {
-	SessionID sporecore.SessionID    `json:"session_id"`
-	TaskID    sporecore.TaskID       `json:"task_id"`
-	State     sporecore.SessionState `json:"state"`
+	SessionID     sporecore.SessionID    `json:"session_id"`
+	TaskID        sporecore.TaskID       `json:"task_id"`
+	State         sporecore.SessionState `json:"state"`
+	WorkspaceRoot string                 `json:"workspace_root"`
 }
 
-// NewSessionStateSnapshot constructs a SessionStateSnapshot.
+// NewSessionStateSnapshot constructs a SessionStateSnapshot with an empty
+// workspace root. Use NewSessionStateSnapshotWithRoot when the workspace
+// root matters.
 func NewSessionStateSnapshot(sid sporecore.SessionID, tid sporecore.TaskID, state sporecore.SessionState) SessionStateSnapshot {
 	return SessionStateSnapshot{SessionID: sid, TaskID: tid, State: state}
+}
+
+// NewSessionStateSnapshotWithRoot constructs a SessionStateSnapshot with
+// the supplied workspace root.
+func NewSessionStateSnapshotWithRoot(sid sporecore.SessionID, tid sporecore.TaskID, state sporecore.SessionState, workspaceRoot string) SessionStateSnapshot {
+	return SessionStateSnapshot{SessionID: sid, TaskID: tid, State: state, WorkspaceRoot: workspaceRoot}
 }
 
 // ============================================================================
