@@ -218,13 +218,44 @@ impl CacheProvider for AnthropicCacheProvider {
 pub struct OpenAICacheProvider {
     /// Below this token count OpenAI will not cache.
     pub min_cacheable_tokens: u32,
+    /// USD per 1M cache-read tokens. OpenAI's prompt caching gives a ~50%
+    /// discount on cached input tokens; we charge `cache_read_tokens` at the
+    /// reduced rate. Default matches gpt-4o ($1.25/M cached).
+    pub cache_read_usd_per_million: f64,
 }
 
 impl Default for OpenAICacheProvider {
     fn default() -> Self {
         Self {
             min_cacheable_tokens: 1024,
+            cache_read_usd_per_million: 1.25,
         }
+    }
+}
+
+impl OpenAICacheProvider {
+    /// Override pricing per model id. OpenAI cache-read pricing (USD per 1M):
+    /// - gpt-4o:       1.25
+    /// - gpt-4o-mini:  0.075
+    /// - o3:           2.50
+    /// - o4-mini:      0.275
+    /// - o1:           7.50
+    ///
+    /// Unknown ids default to gpt-4o pricing.
+    pub fn with_model_pricing(mut self, model_id: &str) -> Self {
+        self.cache_read_usd_per_million = openai_cache_read_pricing(model_id);
+        self
+    }
+}
+
+fn openai_cache_read_pricing(model_id: &str) -> f64 {
+    match model_id {
+        id if id.starts_with("gpt-4o-mini") => 0.075,
+        id if id.starts_with("gpt-4o") => 1.25,
+        id if id.starts_with("o4-mini") => 0.275,
+        id if id.starts_with("o3") => 2.50,
+        id if id.starts_with("o1") => 7.50,
+        _ => 1.25,
     }
 }
 
@@ -251,7 +282,7 @@ impl CacheProvider for OpenAICacheProvider {
         Some(CacheStats {
             cache_read_tokens: read,
             cache_write_tokens: 0,
-            cache_read_cost_usd: 0.0,
+            cache_read_cost_usd: f64::from(read) / 1_000_000.0 * self.cache_read_usd_per_million,
             cache_write_cost_usd: 0.0,
         })
     }
