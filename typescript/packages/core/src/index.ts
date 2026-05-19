@@ -34,3 +34,4 @@ export * as termination from "./termination/index.js";
 export * as metric from "./metric/index.js";
 export * as promptChunkRegistry from "./prompt-chunk-registry/index.js";
 export * as cacheProvider from "./cache-provider/index.js";
+export * as verifier from "./verifier/index.js";
