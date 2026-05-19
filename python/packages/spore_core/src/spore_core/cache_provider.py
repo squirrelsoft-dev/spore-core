@@ -216,6 +216,33 @@ class AnthropicCacheProvider:
         return "anthropic"
 
 
+def _openai_cache_read_pricing(model_id: str) -> float:
+    """Return ``cache_read_usd_per_million`` for a given OpenAI model id.
+
+    OpenAI cache-read pricing (USD per 1M tokens):
+
+    - gpt-4o-mini: 0.075
+    - gpt-4o:      1.25
+    - o4-mini:     0.275
+    - o3:          2.50
+    - o1:          7.50
+
+    Prefix matching: unknown ids default to gpt-4o pricing (1.25).
+    """
+
+    if model_id.startswith("gpt-4o-mini"):
+        return 0.075
+    if model_id.startswith("gpt-4o"):
+        return 1.25
+    if model_id.startswith("o4-mini"):
+        return 0.275
+    if model_id.startswith("o3"):
+        return 2.50
+    if model_id.startswith("o1"):
+        return 7.50
+    return 1.25
+
+
 @dataclass(frozen=True)
 class OpenAICacheProvider:
     """OpenAI prefix caching.
@@ -229,6 +256,22 @@ class OpenAICacheProvider:
 
     #: Below this token count OpenAI will not cache.
     min_cacheable_tokens: int = 1024
+    #: USD per 1M cache-read tokens. OpenAI's prompt caching gives a ~50%
+    #: discount on cached input tokens; we charge ``cache_read_tokens`` at
+    #: the reduced rate. Default matches gpt-4o ($1.25/M cached).
+    cache_read_usd_per_million: float = 1.25
+
+    def with_model_pricing(self, model_id: str) -> OpenAICacheProvider:
+        """Return a copy with cache pricing overridden for ``model_id``.
+
+        See :func:`_openai_cache_read_pricing` for the model→price table.
+        Unknown ids default to gpt-4o pricing.
+        """
+
+        return OpenAICacheProvider(
+            min_cacheable_tokens=self.min_cacheable_tokens,
+            cache_read_usd_per_million=_openai_cache_read_pricing(model_id),
+        )
 
     def supports_caching(self) -> bool:
         return True
@@ -248,7 +291,7 @@ class OpenAICacheProvider:
         return CacheStats(
             cache_read_tokens=read,
             cache_write_tokens=0,
-            cache_read_cost_usd=0.0,
+            cache_read_cost_usd=read / 1_000_000.0 * self.cache_read_usd_per_million,
             cache_write_cost_usd=0.0,
         )
 
