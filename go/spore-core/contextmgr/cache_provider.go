@@ -239,12 +239,52 @@ type OpenAICacheProvider struct {
 	// MinCacheableTokens is the lower bound on context size for OpenAI to
 	// cache. Below this value the response will not include cache metadata.
 	MinCacheableTokens uint32
+	// CacheReadUSDPerMillion is the USD price per 1M cache-read tokens.
+	// OpenAI's prompt caching gives a discount on cached input tokens; we
+	// charge `cache_read_tokens` at the reduced rate. Default matches gpt-4o
+	// pricing (1.25 USD / 1M cached).
+	CacheReadUSDPerMillion float64
 }
 
 // NewOpenAICacheProvider returns an OpenAICacheProvider with the default
-// MinCacheableTokens of 1024.
+// MinCacheableTokens of 1024 and gpt-4o cache-read pricing. Callers can
+// override per model with WithModelPricing.
 func NewOpenAICacheProvider() OpenAICacheProvider {
-	return OpenAICacheProvider{MinCacheableTokens: 1024}
+	return OpenAICacheProvider{
+		MinCacheableTokens:     1024,
+		CacheReadUSDPerMillion: 1.25,
+	}
+}
+
+// WithModelPricing overrides cache-read pricing for a specific OpenAI model
+// id. OpenAI cache-read pricing (USD per 1M tokens):
+//   - gpt-4o-mini:  0.075
+//   - gpt-4o:       1.25
+//   - o4-mini:      0.275
+//   - o3:           2.50
+//   - o1:           7.50
+//
+// Unknown ids default to gpt-4o pricing.
+func (p OpenAICacheProvider) WithModelPricing(modelID string) OpenAICacheProvider {
+	p.CacheReadUSDPerMillion = openaiCacheReadPricing(modelID)
+	return p
+}
+
+func openaiCacheReadPricing(modelID string) float64 {
+	switch {
+	case strings.HasPrefix(modelID, "gpt-4o-mini"):
+		return 0.075
+	case strings.HasPrefix(modelID, "gpt-4o"):
+		return 1.25
+	case strings.HasPrefix(modelID, "o4-mini"):
+		return 0.275
+	case strings.HasPrefix(modelID, "o3"):
+		return 2.50
+	case strings.HasPrefix(modelID, "o1"):
+		return 7.50
+	default:
+		return 1.25
+	}
 }
 
 // SupportsCaching reports true.
@@ -266,14 +306,18 @@ func (p OpenAICacheProvider) Annotate(ctx *Context) CacheAnnotationResult {
 
 // ParseCacheStats returns (_, false) when cache_read_tokens is absent.
 // When present, cache_write_tokens is forced to zero — OpenAI does not
-// expose a write count.
-func (OpenAICacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
+// expose a write count — and cache_read_cost_usd is computed from the
+// provider's configured per-million pricing.
+func (p OpenAICacheProvider) ParseCacheStats(resp *sporecore.ModelResponse) (CacheStats, bool) {
 	if resp.Usage.CacheReadTokens == nil {
 		return CacheStats{}, false
 	}
+	read := *resp.Usage.CacheReadTokens
 	return CacheStats{
-		CacheReadTokens:  *resp.Usage.CacheReadTokens,
-		CacheWriteTokens: 0,
+		CacheReadTokens:   read,
+		CacheWriteTokens:  0,
+		CacheReadCostUSD:  float64(read) / 1_000_000.0 * p.CacheReadUSDPerMillion,
+		CacheWriteCostUSD: 0,
 	}, true
 }
 

@@ -344,3 +344,65 @@ func TestAnthropicParseWithUnknownModelFallsBackToSonnet(t *testing.T) {
 		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// OpenAICacheProvider.WithModelPricing — Rule: per-model cache cost (#40)
+// ---------------------------------------------------------------------------
+
+func TestOpenAIParseComputesCostDefaultGpt4o(t *testing.T) {
+	p := NewOpenAICacheProvider()
+	stats, ok := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	// gpt-4o default pricing: 1.25 per 1M read; write always 0.
+	if diff := stats.CacheReadCostUSD - 1.25; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+	if stats.CacheWriteCostUSD != 0 {
+		t.Fatalf("write cost = %v, want 0", stats.CacheWriteCostUSD)
+	}
+}
+
+func TestOpenAIParseWithGpt4oMiniPricing(t *testing.T) {
+	p := NewOpenAICacheProvider().WithModelPricing("gpt-4o-mini")
+	stats, ok := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if diff := stats.CacheReadCostUSD - 0.075; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}
+
+func TestOpenAIParseWithO3Pricing(t *testing.T) {
+	p := NewOpenAICacheProvider().WithModelPricing("o3")
+	stats, _ := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if diff := stats.CacheReadCostUSD - 2.50; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}
+
+func TestOpenAIParseWithO4MiniPricing(t *testing.T) {
+	p := NewOpenAICacheProvider().WithModelPricing("o4-mini")
+	stats, _ := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if diff := stats.CacheReadCostUSD - 0.275; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}
+
+func TestOpenAIParseWithO1Pricing(t *testing.T) {
+	p := NewOpenAICacheProvider().WithModelPricing("o1")
+	stats, _ := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if diff := stats.CacheReadCostUSD - 7.50; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}
+
+func TestOpenAIParseWithUnknownModelFallsBackToGpt4o(t *testing.T) {
+	p := NewOpenAICacheProvider().WithModelPricing("mystery-3")
+	stats, _ := p.ParseCacheStats(responseWith(u32p(1_000_000), nil))
+	if diff := stats.CacheReadCostUSD - 1.25; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("read cost = %v", stats.CacheReadCostUSD)
+	}
+}
