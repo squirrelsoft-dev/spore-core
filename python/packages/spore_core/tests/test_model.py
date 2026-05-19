@@ -30,6 +30,10 @@ from spore_core import (
     ProviderError,
     ProviderInfo,
     RateLimited,
+    RecordedExchange,
+    RecordingMode,
+    RecordingModelInterface,
+    ReplayMode,
     ReplayModelInterface,
     Role,
     SporeError,
@@ -43,6 +47,7 @@ from spore_core import (
     ToolUseBlock,
     enforce_budget,
     enforce_context_limit,
+    request_hash,
 )
 
 
@@ -316,3 +321,173 @@ async def test_replay_count_tokens_is_deterministic() -> None:
     replay = ReplayModelInterface([], ProviderInfo(name="x", model_id="y", context_window=100))
     req = ModelRequest(messages=[Message(role=Role.USER, content=TextContent(text="a" * 40))])
     assert await replay.count_tokens(req) == 10
+
+
+# ---------------------------------------------------------------------------
+# #37: request_hash + ReplayMode
+# ---------------------------------------------------------------------------
+
+
+def _req_text(s: str) -> ModelRequest:
+    return ModelRequest(messages=[Message(role=Role.USER, content=TextContent(text=s))])
+
+
+def _resp_text(s: str) -> ModelResponse:
+    return ModelResponse(
+        content=[TextBlock(text=s)],
+        usage=TokenUsage(),
+        stop_reason=StopReason.END_TURN,
+    )
+
+
+def test_request_hash_is_stable() -> None:
+    assert request_hash(_req_text("hello world")) == request_hash(_req_text("hello world"))
+
+
+def test_request_hash_changes_when_messages_change() -> None:
+    assert request_hash(_req_text("hello")) != request_hash(_req_text("hello!"))
+
+
+def test_request_hash_is_16_hex_chars() -> None:
+    h = request_hash(_req_text("x"))
+    assert len(h) == 16
+    assert all(c in "0123456789abcdef" for c in h)
+
+
+async def test_replay_auto_detects_positional_when_no_hashes() -> None:
+    exchanges = [
+        RecordedExchange(
+            request=_req_text("q1"),
+            response=_resp_text("r1"),
+            provider="fixture",
+        )
+    ]
+    r = ReplayModelInterface(exchanges, _provider())
+    assert r.mode() is ReplayMode.POSITIONAL
+    got = await r.call(_req_text("any"))
+    assert got == _resp_text("r1")
+
+
+async def test_replay_auto_detects_hash_matched_when_all_have_hashes() -> None:
+    q1, q2 = _req_text("q1"), _req_text("q2")
+    exchanges = [
+        RecordedExchange(
+            request_hash=request_hash(q1),
+            request=q1,
+            response=_resp_text("r1"),
+            provider="fixture",
+        ),
+        RecordedExchange(
+            request_hash=request_hash(q2),
+            request=q2,
+            response=_resp_text("r2"),
+            provider="fixture",
+        ),
+    ]
+    r = ReplayModelInterface(exchanges, _provider())
+    assert r.mode() is ReplayMode.HASH_MATCHED
+    # Out-of-order calls return the right response.
+    assert await r.call(q2) == _resp_text("r2")
+    assert await r.call(q1) == _resp_text("r1")
+    assert await r.call(q2) == _resp_text("r2")
+
+
+async def test_replay_hash_matched_no_match_returns_provider_error() -> None:
+    q1 = _req_text("q1")
+    exchanges = [
+        RecordedExchange(
+            request_hash=request_hash(q1),
+            request=q1,
+            response=_resp_text("r1"),
+            provider="fixture",
+        )
+    ]
+    r = ReplayModelInterface(exchanges, _provider())
+    with pytest.raises(ProviderError) as exc:
+        await r.call(_req_text("unrecorded"))
+    assert "no matching fixture" in exc.value.message
+
+
+# ---------------------------------------------------------------------------
+# #37: cross-language hash stability fixture
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_request_hash_stability() -> None:
+    import json
+
+    path = _repo_root() / "fixtures/model_hashing/cases.json"
+    suite = json.loads(path.read_text())
+    for case in suite["cases"]:
+        req = ModelRequest.model_validate(case["request"])
+        got = request_hash(req)
+        assert got == case["expected_hash"], (
+            f"case `{case['name']}`: hash mismatch (got {got}, expected {case['expected_hash']})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# #38: RecordingModelInterface
+# ---------------------------------------------------------------------------
+
+
+async def test_recording_appends_request_response_pair(tmp_path) -> None:
+    path = tmp_path / "recorded.jsonl"
+    inner = MockModelInterface(_provider())
+    inner.push_response(_resp_text("hello back")).push_response(_resp_text("hello again"))
+    r = RecordingModelInterface(inner, path, RecordingMode.RECORD)
+    await r.call(_req_text("hello"))
+    await r.call(_req_text("hello2"))
+    raw = path.read_text()
+    lines = [ln for ln in raw.splitlines() if ln]
+    assert len(lines) == 2
+    for line in lines:
+        entry = RecordedExchange.model_validate_json(line)
+        assert entry.request_hash is not None
+        assert entry.provider == "test"
+        assert entry.model_id == "test-1"
+
+
+async def test_recording_record_if_new_skips_when_file_exists(tmp_path) -> None:
+    path = tmp_path / "existing.jsonl"
+    path.write_text("preexisting line\n")
+    inner = MockModelInterface(_provider())
+    inner.push_response(_resp_text("ok"))
+    r = RecordingModelInterface(inner, path, RecordingMode.RECORD_IF_NEW)
+    await r.call(_req_text("q"))
+    assert path.read_text() == "preexisting line\n"
+
+
+async def test_recording_record_if_new_writes_when_file_absent(tmp_path) -> None:
+    path = tmp_path / "new.jsonl"
+    inner = MockModelInterface(_provider())
+    inner.push_response(_resp_text("ok"))
+    r = RecordingModelInterface(inner, path, RecordingMode.RECORD_IF_NEW)
+    await r.call(_req_text("q"))
+    assert path.exists()
+    assert len([ln for ln in path.read_text().splitlines() if ln]) == 1
+
+
+async def test_recording_passthrough_does_not_write(tmp_path) -> None:
+    path = tmp_path / "nope.jsonl"
+    inner = MockModelInterface(_provider())
+    inner.push_response(_resp_text("ok"))
+    r = RecordingModelInterface(inner, path, RecordingMode.PASSTHROUGH)
+    await r.call(_req_text("q"))
+    assert not path.exists()
+
+
+async def test_recording_then_replay_roundtrip(tmp_path) -> None:
+    path = tmp_path / "roundtrip.jsonl"
+    inner = MockModelInterface(_provider())
+    inner.push_response(_resp_text("answer1")).push_response(_resp_text("answer2"))
+    recorder = RecordingModelInterface(inner, path, RecordingMode.RECORD)
+    q1, q2 = _req_text("question 1"), _req_text("question 2")
+    await recorder.call(q1)
+    await recorder.call(q2)
+    jsonl = path.read_text()
+    replay = ReplayModelInterface.from_jsonl(jsonl, _provider())
+    assert replay.mode() is ReplayMode.HASH_MATCHED
+    # Replay out-of-order to confirm hash matching end-to-end.
+    assert await replay.call(q2) == _resp_text("answer2")
+    assert await replay.call(q1) == _resp_text("answer1")

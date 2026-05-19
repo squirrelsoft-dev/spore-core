@@ -456,6 +456,9 @@ from .model import (
     ProviderInfo,
     RateLimited,
     RecordedExchange,
+    RecordingMode,
+    RecordingModelInterface,
+    ReplayMode,
     ReplayModelInterface,
     Role,
     StopReason,
@@ -475,6 +478,7 @@ from .model import (
     ToolUseDelta,
     enforce_budget,
     enforce_context_limit,
+    request_hash,
 )
 
 __all__ = [
@@ -517,6 +521,9 @@ __all__ = [
     "ProviderInfo",
     "RateLimited",
     "RecordedExchange",
+    "RecordingMode",
+    "RecordingModelInterface",
+    "ReplayMode",
     "ReplayModelInterface",
     "Role",
     "SporeError",
@@ -537,6 +544,7 @@ __all__ = [
     "ToolUseDelta",
     "enforce_budget",
     "enforce_context_limit",
+    "request_hash",
     # Harness (#3)
     "AllowAllSandbox",
     "AlwaysContinuePolicy",

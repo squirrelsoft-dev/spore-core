@@ -20,10 +20,13 @@ Rules enforced here (per spec issue #1):
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from collections import deque
 from collections.abc import AsyncIterator
 from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import anyio
@@ -332,48 +335,149 @@ class ModelInterface(Protocol):
 
 
 # ============================================================================
+# Cross-language request hashing (#37, #38)
+# ============================================================================
+
+
+def _canonicalize_json(v: Any) -> str:
+    """Canonicalize a JSON-compatible value to a stable string.
+
+    Object keys are sorted lexicographically by ASCII codepoint and there is
+    no insignificant whitespace. Mirrors the Rust ``canonicalize_json`` in
+    ``rust/crates/spore-core/src/model.rs`` byte-for-byte.
+    """
+
+    if v is None:
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, (int, float)):
+        return json.dumps(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ",".join(_canonicalize_json(x) for x in v) + "]"
+    if isinstance(v, dict):
+        keys = sorted(v.keys())
+        return (
+            "{"
+            + ",".join(
+                json.dumps(k, ensure_ascii=False) + ":" + _canonicalize_json(v[k]) for k in keys
+            )
+            + "}"
+        )
+    raise TypeError(f"non-JSON value in canonicalize_json: {type(v).__name__}")
+
+
+def request_hash(request: ModelRequest) -> str:
+    """Stable content hash of a :class:`ModelRequest`.
+
+    Canonicalizes the request to JSON (object keys sorted lexicographically,
+    no insignificant whitespace), SHA-256 hashes the UTF-8 bytes, and
+    hex-encodes the first 8 bytes (16 lowercase hex characters representing
+    the leading u64). Identical across Rust / TypeScript / Python / Go for
+    the same request — see ``fixtures/model_hashing/cases.json``.
+    """
+
+    value = request.model_dump(mode="json")
+    canonical = _canonicalize_json(value)
+    digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+    return digest[:8].hex()
+
+
+# ============================================================================
 # Recorded exchange + replay
 # ============================================================================
 
 
 class RecordedExchange(_Model):
+    """A ``(ModelRequest, ModelResponse)`` pair as serialised in the shared
+    fixtures under ``fixtures/model_responses/``.
+
+    ``request_hash`` (issue #37) is populated by
+    :class:`RecordingModelInterface` (#38) to enable content-addressed
+    replay. Fixtures recorded before #37 do not include it; absence
+    triggers positional fallback in :class:`ReplayModelInterface`.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, ser_json_inf_nan="constants")
+
+    request_hash: str | None = Field(default=None)
     request: ModelRequest
     response: ModelResponse
     provider: str
-    recorded_at: str | None = None
+    model_id: str | None = Field(default=None)
+    recorded_at: str | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
 
 
 _RecordedExchangeAdapter = TypeAdapter(RecordedExchange)
 
 
-class ReplayModelInterface:
-    """Positional replay of recorded ``(request, response)`` pairs.
+class ReplayMode(str, Enum):
+    """How a :class:`ReplayModelInterface` matches incoming requests."""
 
-    Matching is positional — the n-th call returns the n-th recorded
-    response. Mirrors the Rust reference implementation; the shared
-    fixtures under ``fixtures/model_responses/`` exercise this code in
-    every language.
+    POSITIONAL = "positional"
+    HASH_MATCHED = "hash_matched"
+
+
+class ReplayModelInterface:
+    """Replay of recorded ``(request, response)`` pairs.
+
+    Defaults to :attr:`ReplayMode.HASH_MATCHED` when every entry has a
+    ``request_hash`` and the list is non-empty; otherwise falls back to
+    :attr:`ReplayMode.POSITIONAL` so pre-#37 fixtures continue to work.
     """
 
-    def __init__(self, exchanges: list[RecordedExchange], provider: ProviderInfo) -> None:
+    def __init__(
+        self,
+        exchanges: list[RecordedExchange],
+        provider: ProviderInfo,
+        mode: ReplayMode | None = None,
+    ) -> None:
         self._exchanges: list[RecordedExchange] = list(exchanges)
         self._cursor: int = 0
         self._lock = anyio.Lock()
         self._provider = provider
+        if mode is None:
+            if self._exchanges and all(e.request_hash is not None for e in self._exchanges):
+                mode = ReplayMode.HASH_MATCHED
+            else:
+                mode = ReplayMode.POSITIONAL
+        self._mode = mode
 
     @classmethod
-    def from_jsonl(cls, text: str, provider: ProviderInfo) -> ReplayModelInterface:
+    def from_jsonl(
+        cls,
+        text: str,
+        provider: ProviderInfo,
+        mode: ReplayMode | None = None,
+    ) -> ReplayModelInterface:
         exchanges: list[RecordedExchange] = []
         for line in text.splitlines():
             if not line.strip():
                 continue
             exchanges.append(_RecordedExchangeAdapter.validate_json(line))
-        return cls(exchanges, provider)
+        return cls(exchanges, provider, mode)
+
+    def mode(self) -> ReplayMode:
+        return self._mode
 
     def remaining(self) -> int:
         return max(0, len(self._exchanges) - self._cursor)
 
     async def call(self, request: ModelRequest) -> ModelResponse:
+        if self._mode is ReplayMode.HASH_MATCHED:
+            want = request_hash(request)
+            for exchange in self._exchanges:
+                if exchange.request_hash == want:
+                    return exchange.response.model_copy(deep=True)
+            raise ProviderError(
+                code=0,
+                message=f"no matching fixture for request_hash={want}",
+            )
         async with self._lock:
             if self._cursor >= len(self._exchanges):
                 raise ProviderError(
@@ -418,6 +522,93 @@ class ReplayModelInterface:
 
     def provider(self) -> ProviderInfo:
         return self._provider
+
+
+# ============================================================================
+# RecordingModelInterface (issue #38)
+# ============================================================================
+
+
+class RecordingMode(str, Enum):
+    """Modes for :class:`RecordingModelInterface`."""
+
+    RECORD = "record"
+    RECORD_IF_NEW = "record_if_new"
+    PASSTHROUGH = "passthrough"
+
+
+class RecordingModelInterface:
+    """Transparent wrapper around a real :class:`ModelInterface` that
+    appends each ``(request, response)`` pair to a JSONL fixture file as a
+    :class:`RecordedExchange` with a stable :func:`request_hash`.
+    """
+
+    def __init__(
+        self,
+        inner: ModelInterface,
+        output_path: str | Path,
+        mode: RecordingMode,
+    ) -> None:
+        self._inner = inner
+        self._output_path = Path(output_path)
+        self._mode = mode
+        self._lock = anyio.Lock()
+
+    @property
+    def output_path(self) -> Path:
+        return self._output_path
+
+    def mode(self) -> RecordingMode:
+        return self._mode
+
+    async def _record(
+        self,
+        request: ModelRequest,
+        response: ModelResponse,
+        duration_ms: int,
+    ) -> None:
+        async with self._lock:
+            if self._mode is RecordingMode.PASSTHROUGH:
+                return
+            if self._mode is RecordingMode.RECORD_IF_NEW and self._output_path.exists():
+                return
+            parent = self._output_path.parent
+            if str(parent) and not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
+            provider_info = self._inner.provider()
+            entry = RecordedExchange(
+                request_hash=request_hash(request),
+                request=request,
+                response=response,
+                provider=provider_info.name,
+                model_id=provider_info.model_id,
+                recorded_at=None,
+                duration_ms=duration_ms,
+            )
+            line = entry.model_dump_json(exclude_none=True)
+            with self._output_path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.write("\n")
+
+    async def call(self, request: ModelRequest) -> ModelResponse:
+        start = time.monotonic()
+        response = await self._inner.call(request)
+        duration_ms = int((time.monotonic() - start) * 1000)
+        try:
+            await self._record(request, response, duration_ms)
+        except OSError as e:
+            raise ProviderError(code=0, message=f"recorder write failed: {e}") from e
+        return response
+
+    def call_streaming(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
+        # Streaming recording is not implemented; pass through unchanged.
+        return self._inner.call_streaming(request)
+
+    async def count_tokens(self, request: ModelRequest) -> int:
+        return await self._inner.count_tokens(request)
+
+    def provider(self) -> ProviderInfo:
+        return self._inner.provider()
 
 
 # ============================================================================
@@ -494,6 +685,9 @@ __all__ = [
     "ProviderInfo",
     "RateLimited",
     "RecordedExchange",
+    "RecordingMode",
+    "RecordingModelInterface",
+    "ReplayMode",
     "ReplayModelInterface",
     "Role",
     "StopReason",
@@ -513,4 +707,5 @@ __all__ = [
     "ToolUseDelta",
     "enforce_budget",
     "enforce_context_limit",
+    "request_hash",
 ]
