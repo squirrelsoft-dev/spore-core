@@ -33,8 +33,11 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/guideregistry"
@@ -110,6 +113,9 @@ const (
 	SpanKindGuideSelection   SpanKind = "guide_selection"
 	SpanKindMemoryQuery      SpanKind = "memory_query"
 	SpanKindMemoryWrite      SpanKind = "memory_write"
+	// SpanKindPatch — emitted by PatchToolCallsMiddleware whenever it mutates
+	// a tool call (issue #28). Always carries a PatchSpan at SpanLevelWarn.
+	SpanKindPatch SpanKind = "patch"
 )
 
 // ============================================================================
@@ -326,6 +332,116 @@ type MiddlewareSpan struct {
 }
 
 // ============================================================================
+// Patch observability (issue #28)
+// ============================================================================
+//
+// PatchToolCallsMiddleware is an always-on, highest-priority BeforeTool action
+// mutator that silently rewrites malformed or dangling tool calls before the
+// sandbox and sensors see them. An always-on mutator with no observability is
+// a footgun: the trace would show the patched call as if the model had sent
+// it. Issue #28 closes that gap.
+//
+// Types added here:
+//   - SpanLevel  — severity tag; patch spans are ALWAYS Warn, never Info.
+//     Distinct from SpanStatus so the surrounding trace stays Ok while the
+//     patch event itself is flagged.
+//   - PatchType  — what kind of repair happened (MalformedJson,
+//     DanglingToolCall, ParameterCoercion), a tagged union keyed by "kind".
+//   - PatchSpan  — the full event: identity (Base), call id and tool name,
+//     the original parameters as the model sent them, the patched parameters
+//     that were actually dispatched, the classified PatchType, and the
+//     hardcoded Level Warn.
+//
+// Interface method added: ObservabilityProvider.EmitPatch — fire-and-forget,
+// synchronous, mirrors the other EmitX methods.
+
+// SpanLevel is the severity of an emitted span. Patch spans are always
+// SpanLevelWarn per issue #28; this enum keeps the level orthogonal to
+// SpanStatus so a successful (Ok) trace can still surface warn-level patch
+// events.
+type SpanLevel string
+
+const (
+	// SpanLevelInfo — informational severity.
+	SpanLevelInfo SpanLevel = "info"
+	// SpanLevelWarn — warning severity. Every patch span uses this.
+	SpanLevelWarn SpanLevel = "warn"
+)
+
+// PatchTypeKind discriminates PatchType variants.
+type PatchTypeKind string
+
+const (
+	// PatchKindMalformedJSON — the raw tool-call arguments failed to parse as
+	// JSON; a repair was attempted. Error is the parse error recovered from.
+	PatchKindMalformedJSON PatchTypeKind = "malformed_json"
+	// PatchKindDanglingToolCall — the call was structurally incomplete (e.g.
+	// empty tool name) and was completed with defaults. Reason explains what
+	// was missing.
+	PatchKindDanglingToolCall PatchTypeKind = "dangling_tool_call"
+	// PatchKindParameterCoercion — a parameter value was coerced from one type
+	// to another to satisfy the tool schema.
+	PatchKindParameterCoercion PatchTypeKind = "parameter_coercion"
+)
+
+// PatchType classifies a tool-call patch. It is a tagged union keyed by Kind;
+// only the field(s) matching Kind are meaningful.
+type PatchType struct {
+	Kind PatchTypeKind `json:"kind"`
+	// MalformedJson
+	Error string `json:"error,omitempty"`
+	// DanglingToolCall
+	Reason string `json:"reason,omitempty"`
+	// ParameterCoercion
+	Field string `json:"field,omitempty"`
+	From  string `json:"from,omitempty"`
+	To    string `json:"to,omitempty"`
+}
+
+// NewPatchMalformedJSON returns a MalformedJson patch type.
+func NewPatchMalformedJSON(parseErr string) PatchType {
+	return PatchType{Kind: PatchKindMalformedJSON, Error: parseErr}
+}
+
+// NewPatchDanglingToolCall returns a DanglingToolCall patch type.
+func NewPatchDanglingToolCall(reason string) PatchType {
+	return PatchType{Kind: PatchKindDanglingToolCall, Reason: reason}
+}
+
+// NewPatchParameterCoercion returns a ParameterCoercion patch type.
+func NewPatchParameterCoercion(field, from, to string) PatchType {
+	return PatchType{Kind: PatchKindParameterCoercion, Field: field, From: from, To: to}
+}
+
+// PatchSpan is one observability event per tool-call patch (issue #28). It
+// carries both the original parameters (what the model sent) and the patched
+// parameters (what was dispatched) so the trace shows the diff, never just the
+// patched call. Level is always SpanLevelWarn; construct via NewPatchSpan.
+type PatchSpan struct {
+	Base               SpanBase        `json:"base"`
+	CallID             string          `json:"call_id"`
+	ToolName           string          `json:"tool_name"`
+	OriginalParameters json.RawMessage `json:"original_parameters"`
+	PatchedParameters  json.RawMessage `json:"patched_parameters"`
+	PatchType          PatchType       `json:"patch_type"`
+	Level              SpanLevel       `json:"level"`
+}
+
+// NewPatchSpan builds a patch span. Level is forced to SpanLevelWarn; callers
+// cannot emit an Info-level patch.
+func NewPatchSpan(base SpanBase, callID, toolName string, original, patched json.RawMessage, patchType PatchType) PatchSpan {
+	return PatchSpan{
+		Base:               base,
+		CallID:             callID,
+		ToolName:           toolName,
+		OriginalParameters: original,
+		PatchedParameters:  patched,
+		PatchType:          patchType,
+		Level:              SpanLevelWarn,
+	}
+}
+
+// ============================================================================
 // Span interface (for GetTrace's heterogeneous return)
 // ============================================================================
 
@@ -350,6 +466,9 @@ func (s ContextSpan) GetBase() SpanBase { return s.Base }
 // GetBase implements Span.
 func (s MiddlewareSpan) GetBase() SpanBase { return s.Base }
 
+// GetBase implements Span.
+func (s PatchSpan) GetBase() SpanBase { return s.Base }
+
 // ============================================================================
 // SessionMetrics
 // ============================================================================
@@ -370,6 +489,13 @@ type SessionMetrics struct {
 	Compactions       uint32         `json:"compactions"`
 	Outcome           SessionOutcome `json:"outcome"`
 	GuidesUsed        []GuideID      `json:"guides_used"`
+	// PatchCount is the number of tool-call patches in the session (issue #28).
+	PatchCount uint32 `json:"patch_count"`
+	// PatchRate is PatchCount / ToolCalls. 0.0 when there are no tool calls
+	// (divide-by-zero guard).
+	PatchRate float32 `json:"patch_rate"`
+	// PatchesByTool breaks the patch count down per tool name.
+	PatchesByTool map[string]uint32 `json:"patches_by_tool"`
 }
 
 // ============================================================================
@@ -429,6 +555,9 @@ type ObservabilityProvider interface {
 	EmitSensor(span SensorSpan)
 	EmitContext(span ContextSpan)
 	EmitMiddleware(span MiddlewareSpan)
+	// EmitPatch records a warn-level tool-call patch event (issue #28).
+	// Fire-and-forget like the other EmitX methods.
+	EmitPatch(span PatchSpan)
 
 	// FlushSession is idempotent — calling it twice for the same session
 	// is a no-op the second time. Spans remain queryable after flush.
@@ -462,6 +591,7 @@ type InMemoryObservabilityProvider struct {
 	sensors     []SensorSpan
 	contexts    []ContextSpan
 	middlewares []MiddlewareSpan
+	patches     []PatchSpan
 	// Per-session insertion-ordered (kind, spanID) feed for GetTrace.
 	traceOrder map[SessionID][]traceEntry
 	flushed    map[SessionID]bool
@@ -559,6 +689,29 @@ func (p *InMemoryObservabilityProvider) EmitMiddleware(span MiddlewareSpan) {
 	p.middlewares = append(p.middlewares, span)
 }
 
+// EmitPatch implements ObservabilityProvider.
+func (p *InMemoryObservabilityProvider) EmitPatch(span PatchSpan) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushOrder(span.Base.SessionID, SpanKindPatch, span.Base.SpanID)
+	p.patches = append(p.patches, span)
+}
+
+// PatchSpans returns all recorded patch spans for a session, in insertion
+// order (issue #28). Lets callers inspect the original/patched diff and
+// classified PatchType without reconstructing them from the trace.
+func (p *InMemoryObservabilityProvider) PatchSpans(sessionID SessionID) []PatchSpan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []PatchSpan
+	for _, s := range p.patches {
+		if s.Base.SessionID == sessionID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // FlushSession implements ObservabilityProvider. Idempotent: the second
 // invocation for a given session is a no-op. Spans remain queryable after.
 func (p *InMemoryObservabilityProvider) FlushSession(_ context.Context, sessionID SessionID) error {
@@ -633,6 +786,20 @@ func (p *InMemoryObservabilityProvider) computeMetricsLocked(sessionID SessionID
 	if g, ok := p.guidesUsed[sessionID]; ok {
 		guides = append([]GuideID(nil), g...)
 	}
+	var patchCount uint32
+	patchesByTool := make(map[string]uint32)
+	for _, pt := range p.patches {
+		if pt.Base.SessionID != sessionID {
+			continue
+		}
+		patchCount++
+		patchesByTool[pt.ToolName]++
+	}
+	// Divide-by-zero guard: denominator is all tool-call spans.
+	var patchRate float32
+	if toolCalls != 0 {
+		patchRate = float32(patchCount) / float32(toolCalls)
+	}
 	return &SessionMetrics{
 		SessionID:         sessionID,
 		TaskID:            taskID,
@@ -647,6 +814,9 @@ func (p *InMemoryObservabilityProvider) computeMetricsLocked(sessionID SessionID
 		Compactions:       compactions,
 		Outcome:           outcome,
 		GuidesUsed:        guides,
+		PatchCount:        patchCount,
+		PatchRate:         patchRate,
+		PatchesByTool:     patchesByTool,
 	}
 }
 
@@ -732,6 +902,13 @@ func (p *InMemoryObservabilityProvider) GetTrace(_ context.Context, sessionID Se
 					break
 				}
 			}
+		case SpanKindPatch:
+			for _, pt := range p.patches {
+				if pt.Base.SpanID == entry.spanID {
+					out = append(out, pt)
+					break
+				}
+			}
 		}
 	}
 	return out, nil
@@ -739,3 +916,68 @@ func (p *InMemoryObservabilityProvider) GetTrace(_ context.Context, sessionID Se
 
 // Compile-time interface check.
 var _ ObservabilityProvider = (*InMemoryObservabilityProvider)(nil)
+
+// ============================================================================
+// PatchEmitterAdapter (issue #28)
+// ============================================================================
+
+// PatchEmitterAdapter bridges middleware.PatchToolCallsMiddleware to an
+// ObservabilityProvider. The middleware emits observability-independent
+// middleware.PatchEvent values (it cannot import this package — observability
+// imports middleware, not the reverse); this adapter stamps a SpanBase, maps
+// the PatchKind to a PatchType, and records a warn-level PatchSpan.
+//
+// Wire it with:
+//
+//	obs := NewInMemoryObservabilityProvider()
+//	mw := middleware.NewPatchToolCallsMiddleware("noop").
+//	    WithObservability(NewPatchEmitterAdapter(obs))
+type PatchEmitterAdapter struct {
+	provider ObservabilityProvider
+	seq      atomic.Uint64
+}
+
+// NewPatchEmitterAdapter wraps a provider so it can receive
+// middleware.PatchEvent values as warn-level PatchSpans.
+func NewPatchEmitterAdapter(provider ObservabilityProvider) *PatchEmitterAdapter {
+	return &PatchEmitterAdapter{provider: provider}
+}
+
+// EmitPatch implements middleware.PatchEmitter. Fire-and-forget.
+func (a *PatchEmitterAdapter) EmitPatch(event middleware.PatchEvent) {
+	seq := a.seq.Add(1) - 1
+	ts := memory.Timestamp("")
+	base := SpanBase{
+		SpanID:    SpanID(fmt.Sprintf("patch-%d", seq)),
+		SessionID: event.SessionID,
+		TaskID:    event.TaskID,
+		Kind:      SpanKindPatch,
+		StartedAt: ts,
+		EndedAt:   ts,
+		Status:    NewStatusOk(),
+	}
+	a.provider.EmitPatch(NewPatchSpan(
+		base,
+		event.CallID,
+		event.ToolName,
+		event.Original,
+		event.Patched,
+		patchTypeFromEvent(event),
+	))
+}
+
+// patchTypeFromEvent maps a middleware.PatchEvent to the canonical PatchType.
+func patchTypeFromEvent(event middleware.PatchEvent) PatchType {
+	switch event.Kind {
+	case middleware.PatchKindMalformedJSON:
+		return NewPatchMalformedJSON(event.Error)
+	case middleware.PatchKindParameterCoercion:
+		return NewPatchParameterCoercion(event.Field, event.From, event.To)
+	default:
+		// DanglingToolCall is the default classification.
+		return NewPatchDanglingToolCall(event.Reason)
+	}
+}
+
+// Compile-time interface check.
+var _ middleware.PatchEmitter = (*PatchEmitterAdapter)(nil)

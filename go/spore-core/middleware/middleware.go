@@ -644,40 +644,175 @@ func (t *TracingMiddleware) Name() string { return t.name }
 // Standard middleware: PatchToolCallsMiddleware
 // ============================================================================
 
+// PatchKind classifies a tool-call patch on a PatchEvent. The string values
+// match the observability.PatchType "kind" tags so the adapter can map them
+// without a cross-package import (observability imports middleware, not the
+// reverse).
+type PatchKind string
+
+const (
+	// PatchKindMalformedJSON — JSON parse error, repair attempted.
+	PatchKindMalformedJSON PatchKind = "malformed_json"
+	// PatchKindDanglingToolCall — structurally incomplete call (e.g. empty
+	// tool name) completed with defaults.
+	PatchKindDanglingToolCall PatchKind = "dangling_tool_call"
+	// PatchKindParameterCoercion — a parameter value was coerced.
+	PatchKindParameterCoercion PatchKind = "parameter_coercion"
+)
+
+// PatchEvent is the observability-independent description of a single
+// tool-call patch (issue #28). PatchToolCallsMiddleware hands one of these to
+// its PatchEmitter on every patch; the emitter (typically the observability
+// provider) stamps identity and records a warn-level PatchSpan.
+//
+// Carrying primitives here — rather than an observability.PatchSpan — keeps
+// the dependency direction one-way: observability imports middleware, so this
+// package must not import observability.
+type PatchEvent struct {
+	// SessionID and TaskID are the identity captured at BeforeSession.
+	SessionID sporecore.SessionID
+	TaskID    sporecore.TaskID
+	// CallID and ToolName identify the patched call (ToolName is the patched
+	// name actually dispatched).
+	CallID   string
+	ToolName string
+	// Original is the parameters as the model sent them; Patched is what was
+	// dispatched.
+	Original json.RawMessage
+	Patched  json.RawMessage
+	// Kind classifies the patch; Reason/Error/Field/From/To carry the
+	// variant-specific detail (only the fields relevant to Kind are set).
+	Kind   PatchKind
+	Reason string
+	Error  string
+	Field  string
+	From   string
+	To     string
+}
+
+// PatchEmitter is the consumer-side sink for PatchToolCallsMiddleware. The
+// observability provider implements it (see observability.PatchEmitterAdapter)
+// so a patch is recorded as a warn-level PatchSpan, but any backend may accept
+// these events. EmitPatch is fire-and-forget — it must not block.
+type PatchEmitter interface {
+	EmitPatch(event PatchEvent)
+}
+
 // PatchToolCallsMiddleware renames any tool call whose name is empty or
 // whitespace-only to a configurable fallback. Runs at math.MinInt32+1 on
 // BeforeTool so it always precedes other BeforeTool middleware (per spec).
+//
+// Observability (issue #28): this middleware is an always-on, highest-priority
+// action mutator. To keep it from silently rewriting calls, every patch emits
+// a warn-level PatchEvent (classified as DanglingToolCall for the empty-name
+// repair) to an injected PatchEmitter before the patched call proceeds. The
+// shared HookContext.BeforeTool does not carry session/task identity, so this
+// middleware captures it at BeforeSession into a guarded field and reads it at
+// BeforeTool — the same external-identity pattern used by other middleware.
 type PatchToolCallsMiddleware struct {
 	name     string
 	fallback string
+
+	emitter PatchEmitter
+
+	// identity is captured at BeforeSession, read at BeforeTool.
+	mu       sync.Mutex
+	identity *patchIdentity
+}
+
+type patchIdentity struct {
+	sessionID sporecore.SessionID
+	taskID    sporecore.TaskID
 }
 
 // NewPatchToolCallsMiddleware builds a patch middleware with the supplied
-// fallback name.
+// fallback name. No observability emitter is wired — patching is silent.
 func NewPatchToolCallsMiddleware(fallback string) *PatchToolCallsMiddleware {
 	return &PatchToolCallsMiddleware{name: "patch-tool-calls", fallback: fallback}
 }
 
+// WithObservability injects the patch emitter. Patches emitted after this is
+// set produce warn-level patch events (issue #28). Returns the receiver for
+// chaining.
+func (p *PatchToolCallsMiddleware) WithObservability(emitter PatchEmitter) *PatchToolCallsMiddleware {
+	p.emitter = emitter
+	return p
+}
+
+// Clear forgets the captured session identity. Tests use this to simulate
+// session boundaries.
+func (p *PatchToolCallsMiddleware) Clear() {
+	p.mu.Lock()
+	p.identity = nil
+	p.mu.Unlock()
+}
+
+// emitPatchEvent stamps identity and forwards a patch event. A no-op when no
+// emitter is wired (keeps NewPatchToolCallsMiddleware test-friendly).
+func (p *PatchToolCallsMiddleware) emitPatchEvent(callID, toolName string, original, patched json.RawMessage, kind PatchKind, reason string) {
+	if p.emitter == nil {
+		return
+	}
+	p.mu.Lock()
+	id := p.identity
+	p.mu.Unlock()
+	ev := PatchEvent{
+		CallID:   callID,
+		ToolName: toolName,
+		Original: original,
+		Patched:  patched,
+		Kind:     kind,
+		Reason:   reason,
+	}
+	if id != nil {
+		ev.SessionID = id.sessionID
+		ev.TaskID = id.taskID
+	}
+	p.emitter.EmitPatch(ev)
+}
+
 // Handle implements Middleware.
 func (p *PatchToolCallsMiddleware) Handle(_ context.Context, hctx HookContext) (MiddlewareDecision, error) {
-	if hctx.Point != HookBeforeTool || hctx.Calls == nil {
+	switch hctx.Point {
+	case HookBeforeSession:
+		if hctx.Task != nil && hctx.SessionID != nil {
+			p.mu.Lock()
+			p.identity = &patchIdentity{sessionID: *hctx.SessionID, taskID: hctx.Task.ID}
+			p.mu.Unlock()
+		}
+		return DecisionContinueVal(), nil
+	case HookBeforeTool:
+		if hctx.Calls == nil {
+			return DecisionContinueVal(), nil
+		}
+		modified := false
+		for i := range *hctx.Calls {
+			call := &(*hctx.Calls)[i]
+			if strings.TrimSpace(call.Name) == "" {
+				// Capture the original parameters before mutating the name.
+				original := call.Input
+				call.Name = p.fallback
+				modified = true
+				// Classify the empty-name repair as a dangling tool call and
+				// emit a warn-level patch event. The patched name is now on the
+				// call; parameters are unchanged for this repair.
+				p.emitPatchEvent(call.ID, call.Name, original, call.Input,
+					PatchKindDanglingToolCall, "empty tool name")
+			}
+		}
+		if modified {
+			return DecisionContinueWithModificationVal(), nil
+		}
+		return DecisionContinueVal(), nil
+	default:
 		return DecisionContinueVal(), nil
 	}
-	modified := false
-	for i := range *hctx.Calls {
-		if strings.TrimSpace((*hctx.Calls)[i].Name) == "" {
-			(*hctx.Calls)[i].Name = p.fallback
-			modified = true
-		}
-	}
-	if modified {
-		return DecisionContinueWithModificationVal(), nil
-	}
-	return DecisionContinueVal(), nil
 }
 
 // Hooks implements Middleware.
-func (p *PatchToolCallsMiddleware) Hooks() []HookPoint { return []HookPoint{HookBeforeTool} }
+func (p *PatchToolCallsMiddleware) Hooks() []HookPoint {
+	return []HookPoint{HookBeforeSession, HookBeforeTool}
+}
 
 // Priority implements Middleware.
 func (p *PatchToolCallsMiddleware) Priority() int { return math.MinInt32 + 1 }
