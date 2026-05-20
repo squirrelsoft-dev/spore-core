@@ -1,0 +1,27 @@
+{
+  "description": "PatchToolCallsMiddleware observability (issue #28). Input tool calls, two of which are dangling (empty / whitespace-only tool name). Each dangling call must emit one warn-level patch event classified as dangling_tool_call, with the name patched to the fallback. The third call is well-formed and must NOT emit a patch.",
+  "fallback_name": "noop",
+  "input_calls": [
+    { "id": "c1", "name": "", "input": { "command": "ls" } },
+    { "id": "c2", "name": "shell", "input": { "command": "pwd" } },
+    { "id": "c3", "name": "   ", "input": { "path": "/tmp/x" } }
+  ],
+  "expected_patches": [
+    {
+      "call_id": "c1",
+      "tool_name": "noop",
+      "patch_type": "dangling_tool_call",
+      "original": { "command": "ls" },
+      "patched": { "command": "ls" }
+    },
+    {
+      "call_id": "c3",
+      "tool_name": "noop",
+      "patch_type": "dangling_tool_call",
+      "original": { "path": "/tmp/x" },
+      "patched": { "path": "/tmp/x" }
+    }
+  ],
+  "expected_patch_count": 2,
+  "expected_patches_by_tool": { "noop": 2 }
+}

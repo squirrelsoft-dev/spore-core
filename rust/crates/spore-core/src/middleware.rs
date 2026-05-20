@@ -58,8 +58,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::harness::{BoxFut, HumanRequest, RunResult, SessionId, SessionState, Task, ToolResult};
+use crate::harness::{
+    BoxFut, HumanRequest, RunResult, SessionId, SessionState, Task, TaskId, ToolResult,
+};
 use crate::model::ToolCall;
+use crate::observability::{
+    ObservabilityProvider, PatchSpan, PatchType, SpanBase, SpanId, SpanKind,
+};
 
 // ============================================================================
 // HookPoint (full spec: 6 variants)
@@ -628,9 +633,39 @@ impl Middleware for TracingMiddleware {
 /// to a configurable fallback — production deployments swap in a richer
 /// JSON-repair routine. Runs at the highest `BeforeTool` priority so
 /// downstream middleware see clean calls.
+///
+/// ## Observability (issue #28)
+///
+/// This middleware is an always-on, highest-priority action mutator. To keep
+/// it from silently rewriting calls, **every patch emits a warn-level
+/// [`PatchSpan`]** via an injected [`ObservabilityProvider`] before the
+/// patched call proceeds. The span carries the original and patched
+/// parameters and a classified [`PatchType`] so the trace shows the diff,
+/// never just the patched call.
+///
+/// The shared [`HookContext::BeforeTool`] does not carry `session_id` /
+/// `task_id` (widening it would ripple across all four language ports), so
+/// this middleware captures identity at [`HookPoint::BeforeSession`] into an
+/// external `Mutex` and reads it at [`HookPoint::BeforeTool`] — the same
+/// external-identity pattern used by [`LoopDetectionMiddleware`].
+///
+/// Types: [`PatchSpan`], [`PatchType`].
+/// Trait method used: [`ObservabilityProvider::emit_patch`].
+/// Rules enforced: R1 (one warn span per patch), R2 (no patch → no span),
+/// R3 (original + patched recorded), R4 (patch_type classified),
+/// R9 (one span per patched call in a batch), R10 (still runs at the highest
+/// `BeforeTool` priority, `i32::MIN + 1`).
 pub struct PatchToolCallsMiddleware {
     pub name: String,
     pub fallback_name: String,
+    /// Optional observability sink. `None` keeps `new()` test-friendly and
+    /// makes the middleware a no-op observer when unwired.
+    observability: Option<Arc<dyn ObservabilityProvider>>,
+    /// Captured at `BeforeSession`, read at `BeforeTool`. Holds the session
+    /// and task identity needed to stamp a [`PatchSpan`].
+    identity: Mutex<Option<(SessionId, TaskId)>>,
+    /// Monotonic counter so emitted patch spans get distinct ids.
+    patch_seq: std::sync::atomic::AtomicU64,
 }
 
 impl PatchToolCallsMiddleware {
@@ -638,32 +673,107 @@ impl PatchToolCallsMiddleware {
         Self {
             name: "patch-tool-calls".into(),
             fallback_name: fallback_name.into(),
+            observability: None,
+            identity: Mutex::new(None),
+            patch_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Inject the observability sink. Patches emitted after this is set will
+    /// produce warn-level [`PatchSpan`]s (issue #28).
+    pub fn with_observability(mut self, obs: Arc<dyn ObservabilityProvider>) -> Self {
+        self.observability = Some(obs);
+        self
+    }
+
+    /// Tests expose this to simulate session boundaries.
+    pub fn clear(&self) {
+        *self.identity.lock().unwrap() = None;
+    }
+
+    fn emit_patch_event(
+        &self,
+        call: &ToolCall,
+        original: serde_json::Value,
+        patch_type: PatchType,
+    ) {
+        let Some(obs) = &self.observability else {
+            return;
+        };
+        // Identity captured at BeforeSession; fall back to empty ids if a tool
+        // patch somehow fires before any session began (defensive — the span
+        // still records the diff).
+        let (session_id, task_id) = self
+            .identity
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| (SessionId::new(""), TaskId::new("")));
+        let seq = self
+            .patch_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ts = crate::memory::Timestamp::new("");
+        let base = SpanBase {
+            span_id: SpanId::new(format!("patch-{seq}")),
+            parent_span_id: None,
+            session_id,
+            task_id,
+            kind: SpanKind::Patch,
+            started_at: ts.clone(),
+            ended_at: ts,
+            duration_ms: 0,
+            status: crate::observability::SpanStatus::Ok,
+        };
+        obs.emit_patch(PatchSpan::new(
+            base,
+            call.id.clone(),
+            call.name.clone(),
+            original,
+            call.input.clone(),
+            patch_type,
+        ));
     }
 }
 
 impl Middleware for PatchToolCallsMiddleware {
     fn handle<'a>(&'a self, ctx: HookContext<'a>) -> BoxFut<'a, MiddlewareDecision> {
-        let HookContext::BeforeTool { calls, .. } = ctx else {
-            return Box::pin(async { MiddlewareDecision::Continue });
-        };
-        let mut modified = false;
-        for call in calls.iter_mut() {
-            if call.name.trim().is_empty() {
-                call.name = self.fallback_name.clone();
-                modified = true;
+        match ctx {
+            HookContext::BeforeSession { task, session_id } => {
+                *self.identity.lock().unwrap() = Some((session_id.clone(), task.id.clone()));
+                Box::pin(async { MiddlewareDecision::Continue })
             }
+            HookContext::BeforeTool { calls, .. } => {
+                let mut modified = false;
+                for call in calls.iter_mut() {
+                    if call.name.trim().is_empty() {
+                        // Capture the original parameters before mutating.
+                        let original = call.input.clone();
+                        call.name = self.fallback_name.clone();
+                        modified = true;
+                        // R1/R4: classify the empty-name repair as a dangling
+                        // tool call and emit a real warn-level event.
+                        self.emit_patch_event(
+                            call,
+                            original,
+                            PatchType::DanglingToolCall {
+                                reason: "empty tool name".into(),
+                            },
+                        );
+                    }
+                }
+                Box::pin(async move {
+                    if modified {
+                        MiddlewareDecision::ContinueWithModification
+                    } else {
+                        MiddlewareDecision::Continue
+                    }
+                })
+            }
+            _ => Box::pin(async { MiddlewareDecision::Continue }),
         }
-        Box::pin(async move {
-            if modified {
-                MiddlewareDecision::ContinueWithModification
-            } else {
-                MiddlewareDecision::Continue
-            }
-        })
     }
     fn hooks(&self) -> Vec<HookPoint> {
-        vec![HookPoint::BeforeTool]
+        vec![HookPoint::BeforeSession, HookPoint::BeforeTool]
     }
     fn priority(&self) -> i32 {
         i32::MIN + 1
@@ -1407,5 +1517,208 @@ mod tests {
         required: Vec<String>,
         response: String,
         expected: String,
+    }
+
+    // ── Patch observability (issue #28) ──────────────────────────────────────
+
+    use crate::observability::{
+        InMemoryObservabilityProvider, ObservabilityProvider, PatchType, SpanKind,
+    };
+
+    fn wired_patch(obs: &Arc<InMemoryObservabilityProvider>) -> PatchToolCallsMiddleware {
+        let dyn_obs: Arc<dyn ObservabilityProvider> = obs.clone();
+        PatchToolCallsMiddleware::new("noop").with_observability(dyn_obs)
+    }
+
+    // Drive identity capture (BeforeSession) then a BeforeTool fire directly on
+    // the middleware so the test owns the calls vec.
+    async fn run_patch(
+        mw: &PatchToolCallsMiddleware,
+        calls: &mut Vec<ToolCall>,
+    ) -> MiddlewareDecision {
+        let task = task();
+        let sid = sid();
+        let _ = mw
+            .handle(HookContext::BeforeSession {
+                task: &task,
+                session_id: &sid,
+            })
+            .await;
+        mw.handle(HookContext::BeforeTool {
+            calls,
+            turn_number: 1,
+        })
+        .await
+    }
+
+    // R1 + R3: every patch emits exactly one warn-level span recording both the
+    // original and the patched parameters.
+    #[tokio::test]
+    async fn patch_emits_one_warn_span_with_original_and_patched() {
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = wired_patch(&obs);
+        let mut calls = vec![tool_call("c1", "")];
+        let d = run_patch(&mw, &mut calls).await;
+        assert!(matches!(d, MiddlewareDecision::ContinueWithModification));
+        let trace = obs.get_trace(&sid()).await;
+        let patches: Vec<_> = trace
+            .iter()
+            .filter(|s| s.base().kind == SpanKind::Patch)
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(obs.patch_spans(&sid()).len(), 1);
+    }
+
+    // R2: no patch needed → no span, decision is plain Continue.
+    #[tokio::test]
+    async fn no_patch_emits_no_span() {
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = wired_patch(&obs);
+        let mut calls = vec![tool_call("c1", "shell")];
+        let d = run_patch(&mw, &mut calls).await;
+        assert!(matches!(d, MiddlewareDecision::Continue));
+        let trace = obs.get_trace(&sid()).await;
+        assert!(trace.iter().all(|s| s.base().kind != SpanKind::Patch));
+    }
+
+    // R4: the empty-name repair is classified as DanglingToolCall.
+    #[tokio::test]
+    async fn empty_name_classified_as_dangling_tool_call() {
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = wired_patch(&obs);
+        let mut calls = vec![tool_call("c1", "")];
+        run_patch(&mw, &mut calls).await;
+        let patches = obs.patch_spans(&sid());
+        let p = &patches[0];
+        assert!(matches!(p.patch_type, PatchType::DanglingToolCall { .. }));
+        assert_eq!(p.tool_name, "noop"); // patched name on the span
+        assert_eq!(p.call_id, "c1");
+    }
+
+    // R5: the patch event is present in get_trace.
+    #[tokio::test]
+    async fn trace_contains_patch_event() {
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = wired_patch(&obs);
+        let mut calls = vec![tool_call("c1", "")];
+        run_patch(&mw, &mut calls).await;
+        let trace = obs.get_trace(&sid()).await;
+        assert!(trace.iter().any(|s| s.base().kind == SpanKind::Patch));
+    }
+
+    // R9: a batch of N patched calls emits N patch spans.
+    #[tokio::test]
+    async fn batch_emits_one_span_per_patch() {
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = wired_patch(&obs);
+        let mut calls = vec![
+            tool_call("c1", ""),
+            tool_call("c2", "shell"),
+            tool_call("c3", "  "),
+        ];
+        run_patch(&mw, &mut calls).await;
+        assert_eq!(obs.patch_spans(&sid()).len(), 2); // c1 and c3, not c2
+    }
+
+    // Without an injected provider, patching still works (Option keeps new()
+    // test-friendly) and emits nothing.
+    #[tokio::test]
+    async fn patch_without_observability_is_silent() {
+        let mw = PatchToolCallsMiddleware::new("noop");
+        let mut calls = vec![tool_call("c1", "")];
+        let d = run_patch(&mw, &mut calls).await;
+        assert!(matches!(d, MiddlewareDecision::ContinueWithModification));
+        assert_eq!(calls[0].name, "noop");
+    }
+
+    // R10 regression: still registers at the highest BeforeTool priority.
+    #[test]
+    fn patch_middleware_priority_is_highest_before_tool() {
+        let mw = PatchToolCallsMiddleware::new("noop");
+        assert_eq!(mw.priority(), i32::MIN + 1);
+        assert!(mw.hooks().contains(&HookPoint::BeforeTool));
+    }
+
+    // R11: fixture replay. Reads fixtures/patch/patch_events_basic.json, runs
+    // each input call through the middleware, and asserts the emitted patch
+    // events plus the rolled-up metrics match the fixture's expectations.
+    #[tokio::test]
+    async fn fixture_replay_patch_events() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/patch/patch_events_basic.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let case: PatchFixture = serde_json::from_str(&raw).unwrap();
+
+        let obs = Arc::new(InMemoryObservabilityProvider::new());
+        let mw = PatchToolCallsMiddleware::new(&case.fallback_name)
+            .with_observability(obs.clone() as Arc<dyn ObservabilityProvider>);
+
+        let mut calls: Vec<ToolCall> = case
+            .input_calls
+            .iter()
+            .map(|c| ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input: c.input.clone(),
+            })
+            .collect();
+        run_patch(&mw, &mut calls).await;
+
+        // Assert each expected patch event was recorded.
+        let patches = obs.patch_spans(&sid());
+        assert_eq!(patches.len(), case.expected_patches.len());
+        for exp in &case.expected_patches {
+            let found = patches
+                .iter()
+                .find(|p| p.call_id == exp.call_id)
+                .unwrap_or_else(|| panic!("no patch span for call {}", exp.call_id));
+            assert_eq!(found.tool_name, exp.tool_name);
+            assert_eq!(found.original_parameters, exp.original);
+            assert_eq!(found.patched_parameters, exp.patched);
+            match exp.patch_type.as_str() {
+                "dangling_tool_call" => {
+                    assert!(matches!(
+                        found.patch_type,
+                        PatchType::DanglingToolCall { .. }
+                    ))
+                }
+                other => panic!("unexpected patch_type {other}"),
+            }
+        }
+
+        // Record an outcome so SessionMetrics materializes for a session that
+        // emitted only patch spans (no turns).
+        obs.set_session_outcome(&sid(), crate::guide_registry::SessionOutcome::Success);
+        let m = obs.get_session_metrics(&sid()).await.unwrap();
+        // No tool-call spans were emitted in this middleware-only replay, so
+        // patch_rate is 0.0 by the divide-by-zero guard; the fixture asserts
+        // patch_count and patches_by_tool.
+        assert_eq!(m.patch_count, case.expected_patch_count);
+        for (tool, n) in &case.expected_patches_by_tool {
+            assert_eq!(m.patches_by_tool.get(tool), Some(n));
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PatchFixture {
+        fallback_name: String,
+        input_calls: Vec<FixtureCall>,
+        expected_patches: Vec<ExpectedPatch>,
+        expected_patch_count: u32,
+        expected_patches_by_tool: std::collections::HashMap<String, u32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct FixtureCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    }
+    #[derive(serde::Deserialize)]
+    struct ExpectedPatch {
+        call_id: String,
+        tool_name: String,
+        patch_type: String,
+        original: serde_json::Value,
+        patched: serde_json::Value,
     }
 }

@@ -91,8 +91,9 @@ pub use model::{
 };
 pub use observability::{
     ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
-    ObservabilityProvider as FullObservabilityProvider, PricingTable, SensorSpan, SessionMetrics,
-    Span, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan,
+    ObservabilityProvider as FullObservabilityProvider, PatchSpan, PatchType, PricingTable,
+    SensorSpan, SessionMetrics, Span, SpanBase, SpanId, SpanKind, SpanLevel, SpanStatus,
+    ToolCallSpan, TurnSpan,
 };
 pub use ollama::OllamaModelInterface;
 pub use openai::OpenAIModelInterface;

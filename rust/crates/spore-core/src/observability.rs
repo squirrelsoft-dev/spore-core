@@ -92,6 +92,9 @@ pub enum SpanKind {
     GuideSelection,
     MemoryQuery,
     MemoryWrite,
+    /// Emitted by `PatchToolCallsMiddleware` whenever it mutates a tool call
+    /// (issue #28). Always carries a [`PatchSpan`] at [`SpanLevel::Warn`].
+    Patch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +247,113 @@ pub struct MiddlewareSpan {
 }
 
 // ============================================================================
+// Patch observability (issue #28)
+// ============================================================================
+//
+// `PatchToolCallsMiddleware` is an always-on, highest-priority `BeforeTool`
+// action mutator that silently rewrites malformed or dangling tool calls
+// before the sandbox and sensors see them. An always-on mutator with no
+// observability is a footgun: the trace would show the patched call as if the
+// model had sent it. Issue #28 closes that gap.
+//
+// Types added here:
+//   - [`SpanLevel`]  — severity tag; patch spans are ALWAYS `Warn`, never
+//     `Info`. Distinct from [`SpanStatus`] so the surrounding trace stays
+//     `Ok` while the patch event itself is flagged.
+//   - [`PatchType`]  — what kind of repair happened (`MalformedJson`,
+//     `DanglingToolCall`, `ParameterCoercion`). `#[non_exhaustive]` so new
+//     repair classes can be added without breaking downstream matches.
+//   - [`PatchSpan`]  — the full event: identity (`base`), the call id and
+//     tool name, the original parameters as the model sent them, the patched
+//     parameters that were actually dispatched, the classified `patch_type`,
+//     and the hardcoded `level: SpanLevel::Warn`.
+//
+// Trait method added:
+//   - [`ObservabilityProvider::emit_patch`] — fire-and-forget, synchronous,
+//     mirrors the other `emit_*` methods.
+//
+// Rules enforced (mirrored by the inline tests):
+//   R1  every patch emits exactly one `Warn`-level patch span.
+//   R2  no patch → no span emitted.
+//   R3  the span records BOTH the original and the patched parameters.
+//   R4  `patch_type` is classified correctly for each variant.
+//   R5  the trace (`get_trace`) contains the patch event.
+//   R6  `SessionMetrics::patch_count` counts patch spans for the session.
+//   R7  `SessionMetrics::patch_rate` = patches / total tool calls
+//       (0.0 when there are no tool calls — never divides by zero).
+//   R8  `SessionMetrics::patches_by_tool` breaks the count down per tool.
+//   R9  a batch of N patched calls emits N patch spans.
+
+/// Severity of an emitted span. Patch spans are always [`SpanLevel::Warn`]
+/// per issue #28; this enum keeps the level orthogonal to [`SpanStatus`] so a
+/// successful (`Ok`) trace can still surface warn-level patch events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanLevel {
+    Info,
+    Warn,
+}
+
+/// Classification of a tool-call patch. `#[non_exhaustive]`: production
+/// JSON-repair routines add variants; downstream matches must keep a wildcard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PatchType {
+    /// The raw tool-call arguments failed to parse as JSON; a repair was
+    /// attempted. `error` is the parse error that was recovered from.
+    MalformedJson { error: String },
+    /// The call was structurally incomplete (e.g. empty tool name) and was
+    /// completed with defaults. `reason` explains what was missing.
+    DanglingToolCall { reason: String },
+    /// A parameter value was coerced from one type to another to satisfy the
+    /// tool schema.
+    ParameterCoercion {
+        field: String,
+        from: String,
+        to: String,
+    },
+}
+
+/// One observability event per tool-call patch (issue #28). Carries both the
+/// original parameters (what the model sent) and the patched parameters (what
+/// was dispatched) so the trace shows the diff, never just the patched call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatchSpan {
+    pub base: SpanBase,
+    pub call_id: String,
+    pub tool_name: String,
+    pub original_parameters: serde_json::Value,
+    pub patched_parameters: serde_json::Value,
+    pub patch_type: PatchType,
+    /// Always [`SpanLevel::Warn`]. Constructed via [`PatchSpan::new`].
+    pub level: SpanLevel,
+}
+
+impl PatchSpan {
+    /// Build a patch span. The level is forced to [`SpanLevel::Warn`]; callers
+    /// cannot emit an `Info`-level patch.
+    pub fn new(
+        base: SpanBase,
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        original_parameters: serde_json::Value,
+        patched_parameters: serde_json::Value,
+        patch_type: PatchType,
+    ) -> Self {
+        Self {
+            base,
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            original_parameters,
+            patched_parameters,
+            patch_type,
+            level: SpanLevel::Warn,
+        }
+    }
+}
+
+// ============================================================================
 // Span trait (for get_trace's heterogeneous return)
 // ============================================================================
 
@@ -279,6 +389,11 @@ impl Span for MiddlewareSpan {
         &self.base
     }
 }
+impl Span for PatchSpan {
+    fn base(&self) -> &SpanBase {
+        &self.base
+    }
+}
 
 // ============================================================================
 // SessionMetrics
@@ -300,6 +415,15 @@ pub struct SessionMetrics {
     pub outcome: SessionOutcome,
     #[serde(default)]
     pub guides_used: Vec<GuideId>,
+    /// Number of tool-call patches in the session (issue #28).
+    #[serde(default)]
+    pub patch_count: u32,
+    /// `patch_count / tool_calls`. `0.0` when there are no tool calls.
+    #[serde(default)]
+    pub patch_rate: f32,
+    /// Patch count broken down by tool name.
+    #[serde(default)]
+    pub patches_by_tool: HashMap<String, u32>,
 }
 
 // ============================================================================
@@ -355,6 +479,9 @@ pub trait ObservabilityProvider: Send + Sync {
     fn emit_sensor(&self, span: SensorSpan);
     fn emit_context(&self, span: ContextSpan);
     fn emit_middleware(&self, span: MiddlewareSpan);
+    /// Record a warn-level tool-call patch event (issue #28). Fire-and-forget
+    /// like the other `emit_*` methods.
+    fn emit_patch(&self, span: PatchSpan);
 
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()>;
 
@@ -389,6 +516,7 @@ struct Store {
     sensors: Vec<SensorSpan>,
     contexts: Vec<ContextSpan>,
     middlewares: Vec<MiddlewareSpan>,
+    patches: Vec<PatchSpan>,
     // Per-session insertion-ordered span ids — the trace-analyzer feed.
     trace_order: HashMap<SessionId, Vec<(SpanKind, SpanId)>>,
     flushed: HashMap<SessionId, bool>,
@@ -412,6 +540,20 @@ impl InMemoryObservabilityProvider {
             .unwrap()
             .outcomes
             .insert(session_id.clone(), outcome);
+    }
+
+    /// All recorded patch spans for a session, in insertion order (issue #28).
+    /// Lets callers inspect the original/patched diff and classified
+    /// [`PatchType`] without reconstructing them from the heterogeneous trace.
+    pub fn patch_spans(&self, session_id: &SessionId) -> Vec<PatchSpan> {
+        self.inner
+            .lock()
+            .unwrap()
+            .patches
+            .iter()
+            .filter(|p| p.base.session_id == *session_id)
+            .cloned()
+            .collect()
     }
 
     /// Record the guides selected for a session. Called once at session start.
@@ -487,6 +629,16 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         );
         s.middlewares.push(span);
     }
+    fn emit_patch(&self, span: PatchSpan) {
+        let mut s = self.inner.lock().unwrap();
+        push_order(
+            &mut s,
+            &span.base.session_id,
+            SpanKind::Patch,
+            span.base.span_id.clone(),
+        );
+        s.patches.push(span);
+    }
 
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
         Box::pin(async move {
@@ -545,6 +697,22 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
                         && matches!(c.operation, ContextOperation::Compaction { .. })
                 })
                 .count() as u32;
+            let session_patches: Vec<&PatchSpan> = s
+                .patches
+                .iter()
+                .filter(|p| p.base.session_id == *session_id)
+                .collect();
+            let patch_count = session_patches.len() as u32;
+            // R7: guard divide-by-zero; denominator is all tool-call spans.
+            let patch_rate = if tool_calls == 0 {
+                0.0
+            } else {
+                patch_count as f32 / tool_calls as f32
+            };
+            let mut patches_by_tool: HashMap<String, u32> = HashMap::new();
+            for p in &session_patches {
+                *patches_by_tool.entry(p.tool_name.clone()).or_insert(0) += 1;
+            }
             Some(SessionMetrics {
                 session_id: session_id.clone(),
                 task_id,
@@ -563,6 +731,9 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
                     .cloned()
                     .unwrap_or(SessionOutcome::Partial),
                 guides_used: s.guides_used.get(session_id).cloned().unwrap_or_default(),
+                patch_count,
+                patch_rate,
+                patches_by_tool,
             })
         })
     }
@@ -638,6 +809,11 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
                             out.push(Box::new(sp.clone()));
                         }
                     }
+                    SpanKind::Patch => {
+                        if let Some(sp) = s.patches.iter().find(|t| t.base.span_id == id) {
+                            out.push(Box::new(sp.clone()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -663,6 +839,9 @@ impl<T: ObservabilityProvider + ?Sized> ObservabilityProvider for Arc<T> {
     }
     fn emit_middleware(&self, span: MiddlewareSpan) {
         (**self).emit_middleware(span)
+    }
+    fn emit_patch(&self, span: PatchSpan) {
+        (**self).emit_patch(span)
     }
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
         (**self).flush_session(session_id)
@@ -1048,6 +1227,126 @@ mod tests {
         assert_eq!(m.total_turns, case.expected.total_turns);
         assert_eq!(m.total_input_tokens, case.expected.total_input_tokens);
         assert_eq!(m.total_output_tokens, case.expected.total_output_tokens);
+    }
+
+    // ── Patch spans (issue #28) ──────────────────────────────────────────────
+
+    fn patch_span(session: &str, span_id: &str, call_id: &str, tool: &str) -> PatchSpan {
+        PatchSpan::new(
+            SpanBase {
+                span_id: SpanId::new(span_id),
+                parent_span_id: None,
+                session_id: sid(session),
+                task_id: tid("t1"),
+                kind: SpanKind::Patch,
+                started_at: ts("2026-05-16T00:00:00Z"),
+                ended_at: ts("2026-05-16T00:00:00Z"),
+                duration_ms: 0,
+                status: SpanStatus::Ok,
+            },
+            call_id,
+            tool,
+            serde_json::json!({"a": "1"}),
+            serde_json::json!({"a": 1}),
+            PatchType::ParameterCoercion {
+                field: "a".into(),
+                from: "string".into(),
+                to: "number".into(),
+            },
+        )
+    }
+
+    fn tool_call_span(session: &str, span_id: &str, tool: &str) -> ToolCallSpan {
+        ToolCallSpan {
+            base: SpanBase {
+                span_id: SpanId::new(span_id),
+                parent_span_id: None,
+                session_id: sid(session),
+                task_id: tid("t1"),
+                kind: SpanKind::ToolCall,
+                started_at: ts("2026-05-16T00:00:00Z"),
+                ended_at: ts("2026-05-16T00:00:00Z"),
+                duration_ms: 0,
+                status: SpanStatus::Ok,
+            },
+            tool_name: tool.into(),
+            call_id: span_id.into(),
+            parameters_size_bytes: 0,
+            output_size_bytes: 0,
+            truncated: false,
+            sandbox_mode: "none".into(),
+            sandbox_violations: vec![],
+        }
+    }
+
+    // R1/R5: emit_patch records a warn-level span that appears in the trace.
+    #[tokio::test]
+    async fn emit_patch_appears_in_trace_as_warn() {
+        let obs = InMemoryObservabilityProvider::new();
+        let sp = patch_span("s1", "p1", "c1", "shell");
+        assert_eq!(sp.level, SpanLevel::Warn);
+        obs.emit_patch(sp);
+        let trace = obs.get_trace(&sid("s1")).await;
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].base().kind, SpanKind::Patch);
+        // R3: both original and patched present and different.
+        let patches = obs.inner.lock().unwrap();
+        let p = &patches.patches[0];
+        assert_ne!(p.original_parameters, p.patched_parameters);
+    }
+
+    // R6/R7/R8: patch metrics roll up.
+    #[tokio::test]
+    async fn patch_metrics_count_rate_and_by_tool() {
+        let obs = InMemoryObservabilityProvider::new();
+        obs.emit_turn(turn_span("s1", "t1", 1, 10, 5));
+        // 4 tool calls, 2 of which were patched (shell twice).
+        obs.emit_tool_call(tool_call_span("s1", "tc1", "shell"));
+        obs.emit_tool_call(tool_call_span("s1", "tc2", "shell"));
+        obs.emit_tool_call(tool_call_span("s1", "tc3", "edit"));
+        obs.emit_tool_call(tool_call_span("s1", "tc4", "edit"));
+        obs.emit_patch(patch_span("s1", "p1", "tc1", "shell"));
+        obs.emit_patch(patch_span("s1", "p2", "tc2", "shell"));
+        let m = obs.get_session_metrics(&sid("s1")).await.unwrap();
+        assert_eq!(m.patch_count, 2);
+        assert!((m.patch_rate - 0.5).abs() < 1e-6); // 2 / 4
+        assert_eq!(m.patches_by_tool.get("shell"), Some(&2));
+        assert_eq!(m.patches_by_tool.get("edit"), None);
+    }
+
+    // R7: zero tool calls → patch_rate is 0.0, never a divide-by-zero.
+    #[tokio::test]
+    async fn patch_rate_zero_when_no_tool_calls() {
+        let obs = InMemoryObservabilityProvider::new();
+        obs.emit_turn(turn_span("s1", "t1", 1, 10, 5));
+        obs.emit_patch(patch_span("s1", "p1", "c1", "shell"));
+        let m = obs.get_session_metrics(&sid("s1")).await.unwrap();
+        assert_eq!(m.patch_count, 1);
+        assert_eq!(m.patch_rate, 0.0);
+    }
+
+    // SessionMetrics with patch fields deserializes from a legacy fixture
+    // lacking them (serde default).
+    #[test]
+    fn session_metrics_patch_fields_default() {
+        let json = serde_json::json!({
+            "session_id": "s1",
+            "task_id": "t1",
+            "total_turns": 1,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost_usd": 0.0,
+            "total_duration_ms": 0,
+            "tool_calls": 0,
+            "sensor_fires": 0,
+            "sensor_halts": 0,
+            "compactions": 0,
+            "outcome": {"kind": "partial"}
+        });
+        let m: SessionMetrics = serde_json::from_value(json).unwrap();
+        assert_eq!(m.patch_count, 0);
+        assert_eq!(m.patch_rate, 0.0);
+        assert!(m.patches_by_tool.is_empty());
     }
 
     #[derive(serde::Deserialize)]
