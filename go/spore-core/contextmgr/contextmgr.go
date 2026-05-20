@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
@@ -165,15 +167,22 @@ type CompactionConfig struct {
 	PreserveRecentN uint32  `json:"preserve_recent_n"`
 	HeadTailTokens  uint32  `json:"head_tail_tokens"`
 	OffloadPath     string  `json:"offload_path"`
+	// MaxCompactionAttempts bounds how many times the harness re-requests a
+	// summary that fails post-compaction verification before accepting it
+	// as-is and emitting a warn-level event. Default 2. The harness loop that
+	// consumes this is deferred (issue #3); the verifier itself does not read
+	// this field.
+	MaxCompactionAttempts uint32 `json:"max_compaction_attempts"`
 }
 
 // DefaultCompactionConfig returns the spec defaults.
 func DefaultCompactionConfig() CompactionConfig {
 	return CompactionConfig{
-		Threshold:       0.80,
-		PreserveRecentN: 8,
-		HeadTailTokens:  512,
-		OffloadPath:     ".spore/offload",
+		Threshold:             0.80,
+		PreserveRecentN:       8,
+		HeadTailTokens:        512,
+		OffloadPath:           ".spore/offload",
+		MaxCompactionAttempts: 2,
 	}
 }
 
@@ -252,6 +261,106 @@ type CompactionResult struct {
 	TokensReclaimed uint32            `json:"tokens_reclaimed"`
 	MessagesRemoved uint32            `json:"messages_removed"`
 }
+
+// ============================================================================
+// Post-compaction verification (issue #29)
+// ============================================================================
+
+// CompactionVerificationResult is the outcome of a CompactionVerifier check.
+type CompactionVerificationResult struct {
+	Passed bool `json:"passed"`
+	// MissingItems are preservation terms not found in the summary, in
+	// first-occurrence order (already lowercased/normalized).
+	MissingItems []string `json:"missing_items"`
+	Detail       string   `json:"detail"`
+}
+
+// CompactionVerifier is a lightweight, synchronous post-compaction sensor. It
+// runs after the agent produces a summary and before the harness accepts it.
+// Implementations are purely computational and MUST NOT call the model — hence
+// no context.Context parameter.
+type CompactionVerifier interface {
+	Verify(summary string, hints CompactionPreserveHints, sessionState *SessionState) CompactionVerificationResult
+}
+
+// keyTermSplit matches runs of any character that is not an ASCII lowercase
+// letter or digit; used to tokenize a lowercased source string.
+var keyTermSplit = regexp.MustCompile("[^a-z0-9]+")
+
+// KeyTermVerifier is the standard CompactionVerifier. It extracts key terms
+// from the session state per the enabled hints and checks they appear in the
+// summary.
+//
+// v1 limitation: only KeepCurrentTaskState contributes source terms (from
+// SessionState.TaskInstruction). The other four hints have no structured
+// SessionState field, so they add no terms.
+type KeyTermVerifier struct{}
+
+// extractTerms tokenizes a source: lowercase, split on runs of non-[a-z0-9],
+// drop empty tokens and tokens shorter than 4 chars.
+func extractTerms(source string) []string {
+	lower := strings.ToLower(source)
+	var terms []string
+	for _, tok := range keyTermSplit.Split(lower, -1) {
+		if len(tok) < 4 {
+			continue
+		}
+		terms = append(terms, tok)
+	}
+	return terms
+}
+
+// Verify implements CompactionVerifier.
+func (KeyTermVerifier) Verify(summary string, hints CompactionPreserveHints, sessionState *SessionState) CompactionVerificationResult {
+	// Step 1: collect source strings from enabled hints. v1: only
+	// KeepCurrentTaskState contributes (and only when sessionState is set).
+	var sources []string
+	if hints.KeepCurrentTaskState && sessionState != nil {
+		sources = append(sources, sessionState.TaskInstruction)
+	}
+
+	// Step 2: build the term list, deduping preserving first-occurrence order.
+	var terms []string
+	seen := make(map[string]struct{})
+	for _, source := range sources {
+		for _, term := range extractTerms(source) {
+			if _, ok := seen[term]; ok {
+				continue
+			}
+			seen[term] = struct{}{}
+			terms = append(terms, term)
+		}
+	}
+
+	// Step 3: a term is present iff the lowercased summary contains it.
+	// Initialize non-nil so JSON marshals to [] not null.
+	summaryLower := strings.ToLower(summary)
+	missing := []string{}
+	for _, term := range terms {
+		if !strings.Contains(summaryLower, term) {
+			missing = append(missing, term)
+		}
+	}
+
+	// Steps 4 + 5.
+	total := len(terms)
+	passed := len(missing) == 0
+	var detail string
+	if passed {
+		detail = fmt.Sprintf("all %d key term(s) present", total)
+	} else {
+		detail = fmt.Sprintf("missing %d of %d key term(s): %s", len(missing), total, strings.Join(missing, ", "))
+	}
+
+	return CompactionVerificationResult{
+		Passed:       passed,
+		MissingItems: missing,
+		Detail:       detail,
+	}
+}
+
+// Compile-time interface check.
+var _ CompactionVerifier = KeyTermVerifier{}
 
 // ============================================================================
 // Errors
