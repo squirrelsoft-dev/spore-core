@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { middleware, SessionId } from "../src/index.js";
+import { middleware, observability, SessionId, TaskId } from "../src/index.js";
 import {
   emptyAggregateUsage,
   emptySessionState,
@@ -14,8 +14,11 @@ import {
   type HumanRequest,
   type RunResult,
   type SessionState,
+  type Task,
 } from "../src/harness/types.js";
 import type { ToolCall, ToolResult } from "../src/model/schemas.js";
+
+const { InMemoryObservabilityProvider } = observability;
 
 const {
   StandardMiddlewareChain,
@@ -245,6 +248,130 @@ describe("PatchToolCallsMiddleware", () => {
     expect(d.kind).toBe("continue_with_modification");
     expect(calls[0]!.name).toBe("noop");
     expect(observer.fired.length).toBe(1);
+  });
+});
+
+// ── PatchToolCallsMiddleware observability (issue #28) ───────────────────────
+
+describe("PatchToolCallsMiddleware observability", () => {
+  const sid = SessionId.of("sess");
+
+  function patchTask(): Task {
+    return newTask("test task", sid, { kind: "re_act", max_iterations: 5 });
+  }
+
+  // Drive identity capture (before_session) then a before_tool fire directly on
+  // the middleware so the test owns the calls vec.
+  async function runPatch(
+    mw: InstanceType<typeof PatchToolCallsMiddleware>,
+    calls: ToolCall[],
+  ): Promise<MiddlewareDecision> {
+    await mw.handle({ kind: "before_session", task: patchTask(), session_id: sid });
+    return mw.handle({ kind: "before_tool", calls, turn_number: 1 });
+  }
+
+  // R1 + R3: every patch emits exactly one warn-level span recording both the
+  // original and the patched parameters.
+  it("every patch emits one warn span with original + patched", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    const calls = [call("c1", "", { command: "ls" })];
+    const d = await runPatch(mw, calls);
+    expect(d.kind).toBe("continue_with_modification");
+
+    const patches = obs.patchSpans(sid);
+    expect(patches.length).toBe(1);
+    expect(patches[0]!.level).toBe("warn");
+    expect(patches[0]!.original_parameters).toEqual({ command: "ls" });
+    expect(patches[0]!.patched_parameters).toEqual({ command: "ls" });
+    const trace = await obs.getTrace(sid);
+    expect(trace.filter((s) => s.base.kind === "patch").length).toBe(1);
+  });
+
+  // R2: no patch needed → no span, decision is plain continue.
+  it("no patch emits no span", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    const calls = [call("c1", "shell")];
+    const d = await runPatch(mw, calls);
+    expect(d.kind).toBe("continue");
+    expect(obs.patchSpans(sid).length).toBe(0);
+    const trace = await obs.getTrace(sid);
+    expect(trace.every((s) => s.base.kind !== "patch")).toBe(true);
+  });
+
+  // R4: the empty-name repair is classified as dangling_tool_call, with the
+  // patched name + the original call id on the span.
+  it("classifies the empty-name repair as dangling_tool_call", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    await runPatch(mw, [call("c1", "")]);
+    const p = obs.patchSpans(sid)[0]!;
+    expect(p.patch_type.kind).toBe("dangling_tool_call");
+    if (p.patch_type.kind === "dangling_tool_call") {
+      expect(p.patch_type.reason).toBe("empty tool name");
+    }
+    expect(p.tool_name).toBe("noop"); // patched name on the span
+    expect(p.call_id).toBe("c1");
+  });
+
+  // R5: the patch event is present in getTrace.
+  it("trace contains the patch event", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    await runPatch(mw, [call("c1", "")]);
+    const trace = await obs.getTrace(sid);
+    expect(trace.some((s) => s.base.kind === "patch")).toBe(true);
+  });
+
+  // R9: a batch of N patched calls emits N patch spans (one per patch).
+  it("a batch emits one span per patch", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    const calls = [call("c1", ""), call("c2", "shell"), call("c3", "  ")];
+    await runPatch(mw, calls);
+    expect(obs.patchSpans(sid).length).toBe(2); // c1 and c3, not c2
+  });
+
+  // Without an injected provider, patching still works and emits nothing.
+  it("is silent without an observability provider", async () => {
+    const mw = new PatchToolCallsMiddleware("noop");
+    const calls = [call("c1", "")];
+    const d = await runPatch(mw, calls);
+    expect(d.kind).toBe("continue_with_modification");
+    expect(calls[0]!.name).toBe("noop");
+  });
+
+  // R10 regression: still registers at the highest before_tool priority and
+  // still listens for before_tool.
+  it("still registers at the highest before_tool priority", () => {
+    const mw = new PatchToolCallsMiddleware("noop");
+    expect(mw.priority()).toBe(middleware.PATCH_TOOL_CALLS_PRIORITY);
+    expect(mw.hooks()).toContain("before_tool");
+  });
+
+  // patches_by_tool rolls up under the patched (fallback) name.
+  it("patches_by_tool counts patches under the patched name", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    await runPatch(mw, [call("c1", ""), call("c2", "  ")]);
+    obs.setSessionOutcome(sid, { kind: "success" });
+    const m = await obs.getSessionMetrics(sid);
+    expect(m!.patch_count).toBe(2);
+    expect(m!.patches_by_tool["noop"]).toBe(2);
+  });
+
+  // Cross-uses TaskId so the import is exercised even when identity falls back.
+  it("captures session/task identity at before_session", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    const mw = new PatchToolCallsMiddleware("noop", obs);
+    const task = patchTask();
+    await mw.handle({ kind: "before_session", task, session_id: sid });
+    await mw.handle({ kind: "before_tool", calls: [call("c1", "")], turn_number: 1 });
+    const p = obs.patchSpans(sid)[0]!;
+    expect(p.base.session_id.equals(sid)).toBe(true);
+    expect(p.base.task_id.equals(task.id)).toBe(true);
+    expect(TaskId.of(task.id.asString()).equals(task.id)).toBe(true);
   });
 });
 

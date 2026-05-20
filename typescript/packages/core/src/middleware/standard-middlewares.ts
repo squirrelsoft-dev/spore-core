@@ -7,6 +7,17 @@
  * once the components they depend on land.
  */
 
+import { SessionId, TaskId } from "../harness/types.js";
+import { Timestamp } from "../memory/types.js";
+import {
+  newPatchSpan,
+  type ObservabilityProvider,
+  type PatchType,
+  type SpanBase,
+} from "../observability/types.js";
+import { SpanId } from "../observability/types.js";
+import type { ToolCall } from "../model/schemas.js";
+
 import {
   PATCH_TOOL_CALLS_PRIORITY,
   TRACING_PRIORITY,
@@ -59,28 +70,96 @@ export class TracingMiddleware implements Middleware {
 // PatchToolCallsMiddleware
 // ============================================================================
 
-/** Repairs empty / whitespace-only tool-call names to a configured fallback.
- *  Runs at the lowest BeforeTool priority so downstream middleware see
- *  clean calls (per spec). */
+/**
+ * Repairs empty / whitespace-only tool-call names to a configured fallback.
+ * Runs at the lowest BeforeTool priority so downstream middleware see clean
+ * calls (per spec).
+ *
+ * ## Observability (issue #28)
+ *
+ * This middleware is an always-on, highest-priority action mutator. To keep it
+ * from silently rewriting calls, **every patch emits a warn-level
+ * {@link PatchSpan}** via an injected {@link ObservabilityProvider} before the
+ * patched call proceeds. The span carries the original and patched parameters
+ * and a classified {@link PatchType} so the trace shows the diff, never just
+ * the patched call.
+ *
+ * The shared `before_tool` {@link HookContext} does not carry `session_id` /
+ * `task_id`, so this middleware captures identity at `before_session` into a
+ * private field and reads it at `before_tool` — the same external-identity
+ * pattern used by other middleware.
+ */
 export class PatchToolCallsMiddleware implements Middleware {
+  /** Captured at `before_session`, read at `before_tool`. */
+  private identity: { sessionId: SessionId; taskId: TaskId } | undefined;
+  /** Monotonic counter so emitted patch spans get distinct ids. */
+  private patchSeq = 0;
+
   constructor(
     private readonly fallbackName: string,
+    /** Optional observability sink. `undefined` keeps the middleware a no-op
+     *  observer when unwired and tests that don't care about spans simple. */
+    private readonly observability?: ObservabilityProvider,
     private readonly myName: string = "patch-tool-calls",
   ) {}
 
+  /** Tests expose this to simulate session boundaries. */
+  clear(): void {
+    this.identity = undefined;
+  }
+
   async handle(ctx: HookContext): Promise<MiddlewareDecision> {
+    if (ctx.kind === "before_session") {
+      this.identity = { sessionId: ctx.session_id, taskId: ctx.task.id };
+      return { kind: "continue" };
+    }
     if (ctx.kind !== "before_tool") return { kind: "continue" };
     let modified = false;
     for (const call of ctx.calls) {
       if (call.name.trim().length === 0) {
+        // Capture the original parameters before mutating the call.
+        const original = call.input;
         call.name = this.fallbackName;
         modified = true;
+        // R1/R4: classify the empty-name repair as a dangling tool call and
+        // emit a warn-level event recording both the original and the patched
+        // parameters.
+        this.emitPatchEvent(call, original, {
+          kind: "dangling_tool_call",
+          reason: "empty tool name",
+        });
       }
     }
     return modified ? { kind: "continue_with_modification" } : { kind: "continue" };
   }
+
+  private emitPatchEvent(call: ToolCall, original: unknown, patchType: PatchType): void {
+    const obs = this.observability;
+    if (!obs) return;
+    // Identity captured at before_session; fall back to empty ids if a tool
+    // patch somehow fires before any session began (defensive — the span still
+    // records the diff).
+    const sessionId = this.identity?.sessionId ?? SessionId.of("");
+    const taskId = this.identity?.taskId ?? TaskId.of("");
+    const seq = this.patchSeq;
+    this.patchSeq += 1;
+    const ts = Timestamp.of("");
+    const base: SpanBase = {
+      span_id: SpanId.of(`patch-${seq}`),
+      parent_span_id: null,
+      session_id: sessionId,
+      task_id: taskId,
+      kind: "patch",
+      started_at: ts,
+      ended_at: ts,
+      duration_ms: 0,
+      status: { kind: "ok" },
+    };
+    obs.emitPatch(newPatchSpan(base, call.id, call.name, original, call.input, patchType));
+  }
+
   hooks(): HookPoint[] {
-    return ["before_tool"];
+    return ["before_session", "before_tool"];
   }
   priority(): number {
     return PATCH_TOOL_CALLS_PRIORITY;

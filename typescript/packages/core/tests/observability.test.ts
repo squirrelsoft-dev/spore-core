@@ -331,4 +331,118 @@ describe("InMemoryObservabilityProvider", () => {
     expect(child.parent_span_id?.asString()).toBe("r");
     expect(child.session_id.asString()).toBe("s");
   });
+
+  // ── Patch spans (issue #28) ───────────────────────────────────────────────
+
+  function patchSpan(
+    session: string,
+    spanId: string,
+    callId: string,
+    tool: string,
+    patchType: observability.PatchType = {
+      kind: "parameter_coercion",
+      field: "a",
+      from: "string",
+      to: "number",
+    },
+  ): observability.PatchSpan {
+    const base: SpanBase = {
+      span_id: SpanId.of(spanId),
+      parent_span_id: null,
+      session_id: sid(session),
+      task_id: tid("t1"),
+      kind: "patch",
+      started_at: ts("2026-05-16T00:00:00Z"),
+      ended_at: ts("2026-05-16T00:00:00Z"),
+      duration_ms: 0,
+      status: { kind: "ok" },
+    };
+    return observability.newPatchSpan(base, callId, tool, { a: "1" }, { a: 1 }, patchType);
+  }
+
+  function toolCallSpan(session: string, spanId: string, tool: string): ToolCallSpan {
+    return {
+      base: {
+        span_id: SpanId.of(spanId),
+        parent_span_id: null,
+        session_id: sid(session),
+        task_id: tid("t1"),
+        kind: "tool_call",
+        started_at: ts("2026-05-16T00:00:00Z"),
+        ended_at: ts("2026-05-16T00:00:00Z"),
+        duration_ms: 0,
+        status: { kind: "ok" },
+      },
+      tool_name: tool,
+      call_id: spanId,
+      parameters_size_bytes: 0,
+      output_size_bytes: 0,
+      truncated: false,
+      sandbox_mode: "none",
+      sandbox_violations: [],
+    };
+  }
+
+  // newPatchSpan always forces the level to "warn", never "info".
+  it("newPatchSpan forces warn level and records original + patched", () => {
+    const sp = patchSpan("s1", "p1", "c1", "shell");
+    expect(sp.level).toBe("warn");
+    expect(sp.original_parameters).not.toEqual(sp.patched_parameters);
+  });
+
+  // R1/R5: emitPatch records a patch span that appears in the trace.
+  it("emitPatch appears in the trace as a patch span", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    obs.emitPatch(patchSpan("s1", "p1", "c1", "shell"));
+    const trace = await obs.getTrace(sid("s1"));
+    expect(trace.length).toBe(1);
+    expect(trace[0]!.base.kind).toBe("patch");
+    expect(obs.patchSpans(sid("s1")).length).toBe(1);
+  });
+
+  // All three PatchType variants are representable and round-trip on the span.
+  it("supports all three PatchType variants", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    obs.emitPatch(patchSpan("s1", "p1", "c1", "a", { kind: "malformed_json", error: "boom" }));
+    obs.emitPatch(
+      patchSpan("s1", "p2", "c2", "b", { kind: "dangling_tool_call", reason: "empty" }),
+    );
+    obs.emitPatch(
+      patchSpan("s1", "p3", "c3", "c", {
+        kind: "parameter_coercion",
+        field: "x",
+        from: "string",
+        to: "number",
+      }),
+    );
+    const kinds = obs.patchSpans(sid("s1")).map((p) => p.patch_type.kind);
+    expect(kinds).toEqual(["malformed_json", "dangling_tool_call", "parameter_coercion"]);
+  });
+
+  // R6/R7/R8: patch metrics roll up — count, rate (2/4), and by-tool.
+  it("patch metrics: count, rate, and patches_by_tool", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    obs.emitTurn(turnSpan("s1", "t1", 1, 10, 5));
+    obs.emitToolCall(toolCallSpan("s1", "tc1", "shell"));
+    obs.emitToolCall(toolCallSpan("s1", "tc2", "shell"));
+    obs.emitToolCall(toolCallSpan("s1", "tc3", "edit"));
+    obs.emitToolCall(toolCallSpan("s1", "tc4", "edit"));
+    obs.emitPatch(patchSpan("s1", "p1", "tc1", "shell"));
+    obs.emitPatch(patchSpan("s1", "p2", "tc2", "shell"));
+    const m = await obs.getSessionMetrics(sid("s1"));
+    expect(m!.patch_count).toBe(2);
+    expect(m!.patch_rate).toBeCloseTo(0.5, 6); // 2 / 4
+    expect(m!.patches_by_tool["shell"]).toBe(2);
+    expect(m!.patches_by_tool["edit"]).toBeUndefined();
+  });
+
+  // R7: zero tool calls → patch_rate is 0, never a divide-by-zero.
+  it("patch_rate is 0 when there are no tool calls", async () => {
+    const obs = new InMemoryObservabilityProvider();
+    obs.emitTurn(turnSpan("s1", "t1", 1, 10, 5));
+    obs.emitPatch(patchSpan("s1", "p1", "c1", "shell"));
+    const m = await obs.getSessionMetrics(sid("s1"));
+    expect(m!.patch_count).toBe(1);
+    expect(m!.patch_rate).toBe(0);
+  });
 });

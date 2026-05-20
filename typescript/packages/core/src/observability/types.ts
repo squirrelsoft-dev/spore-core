@@ -71,7 +71,11 @@ export type SpanKind =
   | "middleware_hook"
   | "guide_selection"
   | "memory_query"
-  | "memory_write";
+  | "memory_write"
+  /** Emitted by `PatchToolCallsMiddleware` whenever it mutates a tool call
+   *  (issue #28). Always carries a {@link PatchSpan} at {@link SpanLevel}
+   *  `"warn"`. */
+  | "patch";
 
 export type SpanStatus =
   | { kind: "ok" }
@@ -205,8 +209,79 @@ export interface MiddlewareSpan {
   decision: MiddlewareDecision;
 }
 
+// ============================================================================
+// Patch observability (issue #28)
+// ============================================================================
+//
+// `PatchToolCallsMiddleware` is an always-on, highest-priority `before_tool`
+// action mutator that silently rewrites malformed or dangling tool calls
+// before the sandbox and sensors see them. An always-on mutator with no
+// observability is a footgun: the trace would show the patched call as if the
+// model had sent it. Issue #28 closes that gap.
+
+/**
+ * Severity of an emitted span. Patch spans are always `"warn"` per issue #28;
+ * this stays orthogonal to {@link SpanStatus} so a successful (`ok`) trace can
+ * still surface warn-level patch events.
+ */
+export type SpanLevel = "info" | "warn";
+
+/**
+ * Classification of a tool-call patch. Production JSON-repair routines add
+ * variants; downstream `switch`es must keep a default branch.
+ */
+export type PatchType =
+  /** Raw tool-call arguments failed to parse as JSON; a repair was attempted.
+   *  `error` is the parse error that was recovered from. */
+  | { kind: "malformed_json"; error: string }
+  /** The call was structurally incomplete (e.g. empty tool name) and was
+   *  completed with defaults. `reason` explains what was missing. */
+  | { kind: "dangling_tool_call"; reason: string }
+  /** A parameter value was coerced from one type to another to satisfy the
+   *  tool schema. */
+  | { kind: "parameter_coercion"; field: string; from: string; to: string };
+
+/**
+ * One observability event per tool-call patch (issue #28). Carries both the
+ * original parameters (what the model sent) and the patched parameters (what
+ * was dispatched) so the trace shows the diff, never just the patched call.
+ *
+ * `level` is always `"warn"`; build via {@link newPatchSpan} so callers cannot
+ * emit an `"info"`-level patch.
+ */
+export interface PatchSpan {
+  base: SpanBase;
+  call_id: string;
+  tool_name: string;
+  original_parameters: unknown;
+  patched_parameters: unknown;
+  patch_type: PatchType;
+  /** Always `"warn"`. */
+  level: SpanLevel;
+}
+
+/** Build a patch span. The level is forced to `"warn"`. */
+export function newPatchSpan(
+  base: SpanBase,
+  callId: string,
+  toolName: string,
+  originalParameters: unknown,
+  patchedParameters: unknown,
+  patchType: PatchType,
+): PatchSpan {
+  return {
+    base,
+    call_id: callId,
+    tool_name: toolName,
+    original_parameters: originalParameters,
+    patched_parameters: patchedParameters,
+    patch_type: patchType,
+    level: "warn",
+  };
+}
+
 /** Heterogeneous return type for {@link ObservabilityProvider.getTrace}. */
-export type Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan;
+export type Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan | PatchSpan;
 
 // ============================================================================
 // SessionMetrics
@@ -226,6 +301,12 @@ export interface SessionMetrics {
   compactions: number;
   outcome: SessionOutcome;
   guides_used: GuideId[];
+  /** Number of tool-call patches in the session (issue #28). */
+  patch_count: number;
+  /** `patch_count / tool_calls`. `0.0` when there are no tool calls. */
+  patch_rate: number;
+  /** Patch count broken down by tool name. */
+  patches_by_tool: Record<string, number>;
 }
 
 // ============================================================================
@@ -287,6 +368,9 @@ export interface ObservabilityProvider {
   emitSensor(span: SensorSpan): void;
   emitContext(span: ContextSpan): void;
   emitMiddleware(span: MiddlewareSpan): void;
+  /** Record a warn-level tool-call patch event (issue #28). Fire-and-forget
+   *  like the other `emit*` methods. */
+  emitPatch(span: PatchSpan): void;
 
   flushSession(sessionId: SessionId): Promise<void>;
 

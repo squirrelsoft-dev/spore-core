@@ -27,6 +27,7 @@ import {
   type ContextSpan,
   type MiddlewareSpan,
   type ObservabilityProvider,
+  type PatchSpan,
   type SensorSpan,
   type SessionMetrics,
   type Span,
@@ -47,6 +48,7 @@ interface Store {
   sensors: SensorSpan[];
   contexts: ContextSpan[];
   middlewares: MiddlewareSpan[];
+  patches: PatchSpan[];
   /** Per-session insertion order of (kind, span_id) tuples. */
   traceOrder: Map<string, OrderEntry[]>;
   flushed: Set<string>;
@@ -63,6 +65,7 @@ function emptyStore(): Store {
     sensors: [],
     contexts: [],
     middlewares: [],
+    patches: [],
     traceOrder: new Map(),
     flushed: new Set(),
     outcomes: new Map(),
@@ -82,6 +85,13 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
   /** Record the guides selected for a session. Called once at session start. */
   recordGuidesUsed(sessionId: SessionId, guides: GuideId[]): void {
     this.store.guidesUsed.set(sessionId.asString(), guides.slice());
+  }
+
+  /** All recorded patch spans for a session, in insertion order (issue #28).
+   *  Lets callers inspect the original/patched diff and classified
+   *  {@link PatchType} without reconstructing them from the trace. */
+  patchSpans(sessionId: SessionId): PatchSpan[] {
+    return this.store.patches.filter((p) => p.base.session_id.equals(sessionId));
   }
 
   private pushOrder(sessionId: SessionId, kind: SpanKind, spanId: SpanId): void {
@@ -120,6 +130,11 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
     this.store.middlewares.push(span);
   }
 
+  emitPatch(span: PatchSpan): void {
+    this.pushOrder(span.base.session_id, "patch", span.base.span_id);
+    this.store.patches.push(span);
+  }
+
   async flushSession(sessionId: SessionId): Promise<void> {
     const key = sessionId.asString();
     if (this.store.flushed.has(key)) {
@@ -155,6 +170,15 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
       (c) => c.base.session_id.equals(sessionId) && c.operation.kind === "compaction",
     ).length;
 
+    const sessionPatches = this.store.patches.filter((p) => p.base.session_id.equals(sessionId));
+    const patchCount = sessionPatches.length;
+    // Guard divide-by-zero; denominator is all tool-call spans (issue #28).
+    const patchRate = sessionToolCalls.length === 0 ? 0 : patchCount / sessionToolCalls.length;
+    const patchesByTool: Record<string, number> = {};
+    for (const p of sessionPatches) {
+      patchesByTool[p.tool_name] = (patchesByTool[p.tool_name] ?? 0) + 1;
+    }
+
     return {
       session_id: sessionId,
       task_id: taskId,
@@ -169,6 +193,9 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
       compactions,
       outcome: this.store.outcomes.get(key) ?? { kind: "partial" },
       guides_used: this.store.guidesUsed.get(key)?.slice() ?? [],
+      patch_count: patchCount,
+      patch_rate: patchRate,
+      patches_by_tool: patchesByTool,
     };
   }
 
@@ -230,6 +257,8 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
         return this.store.contexts.find(match);
       case "middleware_hook":
         return this.store.middlewares.find(match);
+      case "patch":
+        return this.store.patches.find(match);
       default:
         return undefined;
     }
