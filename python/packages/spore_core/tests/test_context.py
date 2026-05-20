@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
@@ -15,11 +17,14 @@ from spore_core.context import (
     CompactionFailed,
     CompactionPreserveHints,
     CompactionResult,
+    CompactionVerificationResult,
+    CompactionVerifier,
     ComposedPrompt,
     Context,
     ContextSources,
     Guide,
     GuideId,
+    KeyTermVerifier,
     NullCacheProvider,
     SessionState,
     StandardContextManager,
@@ -504,3 +509,137 @@ async def test_assembled_tool_schemas_are_independent_copy() -> None:
     ctx = await mgr.assemble(_state(), srcs)
     schemas.append(ToolSchema(name="a", description="", input_schema={}))
     assert [s.name for s in ctx.tool_schemas] == ["b"]
+
+
+# ===========================================================================
+# Issue #29: CompactionVerifier / KeyTermVerifier
+# ===========================================================================
+
+
+def _verifier_state(task_instruction: str) -> SessionState:
+    return SessionState(
+        session_id=SessionId("s1"),
+        task_id=TaskId("t1"),
+        task_instruction=task_instruction,
+    )
+
+
+def test_config_default_max_compaction_attempts_is_two() -> None:
+    assert CompactionConfig().max_compaction_attempts == 2
+
+
+def test_key_term_verifier_satisfies_protocol() -> None:
+    assert isinstance(KeyTermVerifier(), CompactionVerifier)
+
+
+def test_all_terms_present_passes() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "We will refactor the parser module to be faster.",
+        CompactionPreserveHints(keep_current_task_state=True),
+        _verifier_state("Refactor the parser module"),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+    assert res.detail == "all 3 key term(s) present"
+
+
+def test_missing_term_is_listed() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "We will refactor the parser.",
+        CompactionPreserveHints(keep_current_task_state=True),
+        _verifier_state("Refactor the parser module"),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["module"]
+    assert res.detail == "missing 1 of 3 key term(s): module"
+
+
+def test_current_task_state_off_yields_zero_terms_and_passes() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "Nothing in particular here.",
+        CompactionPreserveHints(keep_current_task_state=False),
+        _verifier_state("Refactor the parser module"),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+    assert res.detail == "all 0 key term(s) present"
+
+
+def test_tokens_under_length_four_are_ignored() -> None:
+    v = KeyTermVerifier()
+    # "the", "api" (len 3), and the 1-char/3-char tokens drop out; only
+    # "test" and "endpoint" remain — both present.
+    res = v.verify(
+        "Wrote a test for the endpoint.",
+        CompactionPreserveHints(keep_current_task_state=True),
+        _verifier_state("Test the api endpoint"),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+
+
+def test_case_insensitive_matching() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "REFACTOR THE PARSER MODULE",
+        CompactionPreserveHints(keep_current_task_state=True),
+        _verifier_state("refactor the parser module"),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+
+
+def test_terms_are_deduped_first_occurrence_order() -> None:
+    v = KeyTermVerifier()
+    # "deploy" repeats in the source; it must appear once in missing_items.
+    res = v.verify(
+        "An unrelated note.",
+        CompactionPreserveHints(keep_current_task_state=True),
+        _verifier_state("Deploy deploy the service"),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["deploy", "service"]
+
+
+def test_non_task_hints_contribute_no_terms() -> None:
+    v = KeyTermVerifier()
+    # All four non-task hints True, keep_current_task_state False → no source
+    # terms regardless of task_instruction content.
+    res = v.verify(
+        "Totally unrelated summary.",
+        CompactionPreserveHints(
+            keep_architectural_decisions=True,
+            keep_open_problems=True,
+            keep_current_task_state=False,
+            keep_recent_file_list=True,
+            keep_thinking_blocks=True,
+        ),
+        _verifier_state("Refactor the parser module deployment pipeline"),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+    assert res.detail == "all 0 key term(s) present"
+
+
+# ---------------------------------------------------------------------------
+# Cross-language fixture replay (fixtures/compaction_verifier/cases.json)
+# ---------------------------------------------------------------------------
+
+
+def _compaction_verifier_cases() -> list[dict]:
+    # tests/ -> spore_core/ -> packages/ -> python/ -> repo_root/fixtures/...
+    path = Path(__file__).resolve().parents[4] / "fixtures" / "compaction_verifier" / "cases.json"
+    return json.loads(path.read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", _compaction_verifier_cases(), ids=lambda c: c["name"])
+def test_key_term_verifier_fixture_replay(case: dict) -> None:
+    v = KeyTermVerifier()
+    hints = CompactionPreserveHints(**case["hints"])
+    state = _verifier_state(case["task_instruction"])
+    res: CompactionVerificationResult = v.verify(case["summary"], hints, state)
+    assert res.passed == case["expected"]["passed"]
+    assert res.missing_items == case["expected"]["missing_items"]

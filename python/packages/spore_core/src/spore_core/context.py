@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -216,6 +217,11 @@ class CompactionConfig:
     preserve_recent_n: int = 8
     head_tail_tokens: int = 512
     offload_path: Path = field(default_factory=lambda: Path(".spore/offload"))
+    # Maximum revise-and-retry attempts the harness makes when the
+    # post-compaction verifier reports missing items before accepting the
+    # summary as-is and logging a warn-level event (issue #29). The verifier
+    # itself is NOT held here — the harness owns the verifier instance.
+    max_compaction_attempts: int = 2
 
 
 @dataclass
@@ -274,6 +280,112 @@ class CompactionResult:
     summary_message: Message
     tokens_reclaimed: int
     messages_removed: int
+
+
+# ============================================================================
+# Post-compaction verification (issue #29)
+# ============================================================================
+
+
+@dataclass
+class CompactionVerificationResult:
+    """Outcome of a :meth:`CompactionVerifier.verify` check.
+
+    ``missing_items`` lists preservation terms absent from the summary, in
+    first-occurrence order (already lowercased/normalized).
+    """
+
+    passed: bool
+    missing_items: list[str]
+    detail: str
+
+
+@runtime_checkable
+class CompactionVerifier(Protocol):
+    """A lightweight, *synchronous* post-compaction sensor.
+
+    Implementations run after the agent produces a compaction summary and
+    before the harness accepts it. They are purely computational and MUST
+    NOT call the model.
+    """
+
+    def verify(
+        self,
+        summary: str,
+        hints: CompactionPreserveHints,
+        session_state: SessionState,
+    ) -> CompactionVerificationResult: ...
+
+
+# Runs of characters that are NOT ASCII lowercase letters or digits — the
+# token separator used by :class:`KeyTermVerifier`. Source strings are
+# lowercased first, so uppercase letters are folded before splitting.
+_TERM_SEPARATOR = re.compile(r"[^a-z0-9]+")
+
+# Tokens shorter than this are discarded during term extraction.
+_MIN_TERM_LEN = 4
+
+
+class KeyTermVerifier:
+    """Standard :class:`CompactionVerifier`.
+
+    Extracts key terms from the session state per the enabled hints and
+    checks they appear in the summary.
+
+    v1 limitation: only ``keep_current_task_state`` contributes source terms
+    (from :attr:`SessionState.task_instruction`). The other four hints have
+    no structured ``SessionState`` field, so they add no terms.
+    """
+
+    @staticmethod
+    def _extract_terms(source: str) -> list[str]:
+        """Tokenize ``source`` into normalized key terms: lowercase, split on
+        runs of any non-``[a-z0-9]`` character, and discard tokens shorter
+        than four characters. Empty tokens (from leading/trailing/adjacent
+        separators) are dropped."""
+
+        return [tok for tok in _TERM_SEPARATOR.split(source.lower()) if len(tok) >= _MIN_TERM_LEN]
+
+    def verify(
+        self,
+        summary: str,
+        hints: CompactionPreserveHints,
+        session_state: SessionState,
+    ) -> CompactionVerificationResult:
+        # Step 1: collect source strings from enabled hints. v1: only
+        # ``keep_current_task_state`` contributes. The other four hints have
+        # no structured SessionState field, so they add no terms.
+        sources: list[str] = []
+        if hints.keep_current_task_state:
+            sources.append(session_state.task_instruction)
+
+        # Step 2: build the term list, deduping preserving first-occurrence
+        # order.
+        terms: list[str] = []
+        for source in sources:
+            for term in self._extract_terms(source):
+                if term not in terms:
+                    terms.append(term)
+
+        # Step 3: a term is present iff the lowercased summary contains it.
+        summary_lower = summary.lower()
+        missing_items = [term for term in terms if term not in summary_lower]
+
+        # Steps 4 + 5.
+        total = len(terms)
+        passed = not missing_items
+        if passed:
+            detail = f"all {total} key term(s) present"
+        else:
+            detail = (
+                f"missing {len(missing_items)} of {total} key term(s): {', '.join(missing_items)}"
+            )
+
+        return CompactionVerificationResult(
+            passed=passed,
+            missing_items=missing_items,
+            detail=detail,
+        )
 
 
 # ============================================================================
@@ -695,9 +807,12 @@ __all__ = [
     "CompactionPreserveHints",
     "CompactionRequest",
     "CompactionResult",
+    "CompactionVerificationResult",
+    "CompactionVerifier",
     "ComposedPrompt",
     "Context",
     "ContextError",
+    "KeyTermVerifier",
     "ContextManager",
     "ContextMeta",
     "ContextSources",
