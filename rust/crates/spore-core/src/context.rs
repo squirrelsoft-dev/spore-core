@@ -12,6 +12,29 @@
 //! placeholder trait of the same name in [`crate::harness`] is a narrower
 //! stub used by the in-tree `StandardHarness` while the wider rewrite lands
 //! (see the spec issue's "Implementor notes" for the migration plan).
+//!
+//! # Post-compaction verification (issue #29)
+//!
+//! [`CompactionVerifier`] is a lightweight, *synchronous* sensor that runs
+//! after the agent produces a compaction summary and before the harness
+//! accepts it. It MUST NOT call the model — it is purely computational.
+//! [`KeyTermVerifier`] is the standard implementation; it extracts key
+//! terms from [`SessionState`] according to the enabled
+//! [`CompactionPreserveHints`] and checks they appear in the summary,
+//! producing a [`CompactionVerificationResult`].
+//!
+//! v1 limitation: only `keep_current_task_state` extracts terms (from
+//! `SessionState::task_instruction`). The other four hints
+//! (`keep_open_problems`, `keep_architectural_decisions`,
+//! `keep_recent_file_list`, `keep_thinking_blocks`) contribute no source
+//! terms in v1 because no structured `SessionState` field exists for them.
+//!
+//! Note: [`CompactionConfig`] gains a `max_compaction_attempts` field but
+//! *intentionally* does NOT carry a `verifier` trait object — that would
+//! break its `Serialize`/`Deserialize`/`PartialEq` derives and fixture
+//! round-tripping. The harness-side retry loop that consumes the verifier
+//! is deferred to a follow-up issue; this module only provides the
+//! verification primitives.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -166,6 +189,10 @@ pub struct CompactionConfig {
     pub preserve_recent_n: u32,
     pub head_tail_tokens: u32,
     pub offload_path: PathBuf,
+    /// Maximum number of summarization attempts the harness retry loop
+    /// (deferred, see module docs / issue #29) makes before accepting a
+    /// failed-verification summary as-is and logging a warn-level event.
+    pub max_compaction_attempts: u32,
 }
 
 impl Default for CompactionConfig {
@@ -175,6 +202,7 @@ impl Default for CompactionConfig {
             preserve_recent_n: 8,
             head_tail_tokens: 512,
             offload_path: PathBuf::from(".spore/offload"),
+            max_compaction_attempts: 2,
         }
     }
 }
@@ -265,6 +293,112 @@ pub struct CompactionResult {
     pub summary_message: Message,
     pub tokens_reclaimed: u32,
     pub messages_removed: u32,
+}
+
+// ============================================================================
+// Post-compaction verification (issue #29)
+// ============================================================================
+
+/// Outcome of a [`CompactionVerifier::verify`] check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionVerificationResult {
+    pub passed: bool,
+    /// Items from the preservation list not found in the summary, in
+    /// first-occurrence order (already lowercased/normalized).
+    pub missing_items: Vec<String>,
+    pub detail: String,
+}
+
+/// A lightweight, synchronous post-compaction sensor.
+///
+/// Implementations run after the agent produces a summary and before the
+/// harness accepts it. They are purely computational and MUST NOT call the
+/// model.
+pub trait CompactionVerifier: Send + Sync {
+    fn verify(
+        &self,
+        summary: &str,
+        hints: &CompactionPreserveHints,
+        session_state: &SessionState,
+    ) -> CompactionVerificationResult;
+}
+
+/// Standard [`CompactionVerifier`]: extracts key terms from the session
+/// state per the enabled hints and checks they appear in the summary.
+///
+/// v1 limitation: only `keep_current_task_state` contributes source terms
+/// (from `SessionState::task_instruction`). See module docs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyTermVerifier;
+
+impl KeyTermVerifier {
+    /// Tokenize a source string into normalized key terms: lowercase, split
+    /// on runs of any character that is NOT an ASCII `a-z` letter or `0-9`
+    /// digit, and discard tokens shorter than 4 characters.
+    fn extract_terms(source: &str) -> Vec<String> {
+        source
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+            .filter(|tok| tok.len() >= 4)
+            .map(|tok| tok.to_string())
+            .collect()
+    }
+}
+
+impl CompactionVerifier for KeyTermVerifier {
+    fn verify(
+        &self,
+        summary: &str,
+        hints: &CompactionPreserveHints,
+        session_state: &SessionState,
+    ) -> CompactionVerificationResult {
+        // Step 1: collect source strings from enabled hints. v1: only
+        // `keep_current_task_state` contributes. The other four hints have
+        // no structured SessionState field, so they add no terms.
+        let mut sources: Vec<&str> = Vec::new();
+        if hints.keep_current_task_state {
+            sources.push(session_state.task_instruction.as_str());
+        }
+
+        // Step 2: build the term list and dedupe preserving first-occurrence
+        // order.
+        let mut terms: Vec<String> = Vec::new();
+        for source in sources {
+            for term in Self::extract_terms(source) {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+        }
+
+        // Step 3: a term is present iff the lowercased summary contains it.
+        let summary_lower = summary.to_lowercase();
+        let missing_items: Vec<String> = terms
+            .iter()
+            .filter(|term| !summary_lower.contains(term.as_str()))
+            .cloned()
+            .collect();
+
+        // Step 4 + 5.
+        let total_terms = terms.len();
+        let passed = missing_items.is_empty();
+        let detail = if passed {
+            format!("all {total_terms} key term(s) present")
+        } else {
+            format!(
+                "missing {} of {} key term(s): {}",
+                missing_items.len(),
+                total_terms,
+                missing_items.join(", ")
+            )
+        };
+
+        CompactionVerificationResult {
+            passed,
+            missing_items,
+            detail,
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1208,5 +1342,172 @@ mod tests {
             a.system_prompt.session_block_hash,
             b.system_prompt.session_block_hash
         );
+    }
+
+    // ── Issue #29: CompactionVerifier / KeyTermVerifier ──────────────────
+
+    fn state_with_task(task: &str) -> SessionState {
+        SessionState::new(SessionId::new("s1"), TaskId::new("t1"), task)
+    }
+
+    fn all_hints_on() -> CompactionPreserveHints {
+        CompactionPreserveHints::default()
+    }
+
+    fn only_task_state() -> CompactionPreserveHints {
+        CompactionPreserveHints {
+            keep_architectural_decisions: false,
+            keep_open_problems: false,
+            keep_current_task_state: true,
+            keep_recent_file_list: false,
+            keep_thinking_blocks: false,
+        }
+    }
+
+    #[test]
+    fn config_default_max_compaction_attempts_is_two() {
+        assert_eq!(CompactionConfig::default().max_compaction_attempts, 2);
+    }
+
+    #[test]
+    fn verifier_all_terms_present_passes() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("Refactor the parser module");
+        let r = v.verify(
+            "we will refactor the parser module",
+            &only_task_state(),
+            &st,
+        );
+        assert!(r.passed);
+        assert!(r.missing_items.is_empty());
+        assert_eq!(r.detail, "all 3 key term(s) present");
+    }
+
+    #[test]
+    fn verifier_missing_term_fails_and_lists_it() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("Refactor the parser module");
+        let r = v.verify("we will refactor the parser", &only_task_state(), &st);
+        assert!(!r.passed);
+        assert_eq!(r.missing_items, vec!["module".to_string()]);
+        assert_eq!(r.detail, "missing 1 of 3 key term(s): module");
+    }
+
+    #[test]
+    fn verifier_no_task_state_means_zero_terms_passes() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("Refactor the parser module");
+        let hints = CompactionPreserveHints {
+            keep_current_task_state: false,
+            ..CompactionPreserveHints::default()
+        };
+        let r = v.verify("anything at all", &hints, &st);
+        assert!(r.passed);
+        assert!(r.missing_items.is_empty());
+        assert_eq!(r.detail, "all 0 key term(s) present");
+    }
+
+    #[test]
+    fn verifier_ignores_tokens_under_length_four() {
+        // "do","the","api" (len 3) are dropped; only "thing" survives.
+        let v = KeyTermVerifier;
+        let st = state_with_task("do the api thing");
+        // summary omits "thing" but contains the short tokens.
+        let r = v.verify("do the api work", &only_task_state(), &st);
+        assert_eq!(r.missing_items, vec!["thing".to_string()]);
+        assert!(!r.passed);
+    }
+
+    #[test]
+    fn verifier_is_case_insensitive() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("Refactor PARSER");
+        let r = v.verify("REFACTOR the parser", &only_task_state(), &st);
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn verifier_dedupes_repeated_terms() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("Deploy deploy deploy service");
+        // "deploy" appears once in the term list; reported once when missing.
+        let r = v.verify("nothing relevant here", &only_task_state(), &st);
+        assert_eq!(
+            r.missing_items,
+            vec!["deploy".to_string(), "service".to_string()]
+        );
+        assert_eq!(r.detail, "missing 2 of 2 key term(s): deploy, service");
+    }
+
+    #[test]
+    fn verifier_non_task_hints_are_noops_even_when_true() {
+        let v = KeyTermVerifier;
+        // task_instruction empty so keep_current_task_state contributes nothing;
+        // all other hints on must still yield zero terms in v1.
+        let mut st = state_with_task("");
+        st.task_instruction = String::new();
+        let hints = CompactionPreserveHints {
+            keep_architectural_decisions: true,
+            keep_open_problems: true,
+            keep_current_task_state: true,
+            keep_recent_file_list: true,
+            keep_thinking_blocks: true,
+        };
+        let r = v.verify("empty summary", &hints, &st);
+        assert!(r.passed);
+        assert!(r.missing_items.is_empty());
+        // Sanity: with all hints on, a non-empty task still drives terms.
+        let st2 = state_with_task("Build widget");
+        let r2 = v.verify("nothing", &all_hints_on(), &st2);
+        assert_eq!(
+            r2.missing_items,
+            vec!["build".to_string(), "widget".to_string()]
+        );
+    }
+
+    // ── Fixture replay: cross-language consistency (issue #29) ───────────
+
+    #[test]
+    fn key_term_verifier_fixture_replay() {
+        #[derive(Deserialize)]
+        struct Expected {
+            passed: bool,
+            missing_items: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            summary: String,
+            hints: CompactionPreserveHints,
+            task_instruction: String,
+            expected: Expected,
+        }
+        #[derive(Deserialize)]
+        struct Suite {
+            cases: Vec<Case>,
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/compaction_verifier/cases.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let suite: Suite = serde_json::from_str(&raw).unwrap();
+        assert!(suite.cases.len() >= 5, "expected at least 5 fixture cases");
+
+        let verifier = KeyTermVerifier;
+        for case in &suite.cases {
+            let st = state_with_task(&case.task_instruction);
+            let result = verifier.verify(&case.summary, &case.hints, &st);
+            assert_eq!(
+                result.passed, case.expected.passed,
+                "case `{}`: passed mismatch",
+                case.name
+            );
+            assert_eq!(
+                result.missing_items, case.expected.missing_items,
+                "case `{}`: missing_items mismatch",
+                case.name
+            );
+        }
     }
 }

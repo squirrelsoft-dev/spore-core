@@ -1,0 +1,101 @@
+{
+  "description": "Cross-language consistency fixture for KeyTermVerifier (issue #29). Each case builds a SessionState from `task_instruction`, runs KeyTermVerifier::verify against `summary` with the given `hints`, and asserts `passed` and `missing_items` (normalized, lowercased, first-occurrence order). Term extraction: lowercase the source, split on runs of [^a-z0-9], drop tokens shorter than 4 chars, dedupe preserving first-occurrence order. v1 limitation: only keep_current_task_state contributes source terms (from task_instruction); the other four hints add no terms. ASCII only.",
+  "cases": [
+    {
+      "name": "full_pass_all_terms_present",
+      "summary": "We will refactor the parser module to be faster.",
+      "hints": {
+        "keep_architectural_decisions": true,
+        "keep_open_problems": true,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": true,
+        "keep_thinking_blocks": true
+      },
+      "task_instruction": "Refactor the parser module",
+      "expected": {
+        "passed": true,
+        "missing_items": []
+      }
+    },
+    {
+      "name": "single_miss",
+      "summary": "We will refactor the parser.",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "Refactor the parser module",
+      "expected": {
+        "passed": false,
+        "missing_items": ["module"]
+      }
+    },
+    {
+      "name": "multi_miss",
+      "summary": "We will refactor things.",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "Refactor the parser module",
+      "expected": {
+        "passed": false,
+        "missing_items": ["parser", "module"]
+      }
+    },
+    {
+      "name": "current_task_state_off_no_terms",
+      "summary": "Nothing in particular here.",
+      "hints": {
+        "keep_architectural_decisions": true,
+        "keep_open_problems": true,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": true,
+        "keep_thinking_blocks": true
+      },
+      "task_instruction": "Refactor the parser module",
+      "expected": {
+        "passed": true,
+        "missing_items": []
+      }
+    },
+    {
+      "name": "dedupe_and_short_tokens",
+      "summary": "Wrote a test for the endpoint.",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "Test test the api api endpoint",
+      "expected": {
+        "passed": true,
+        "missing_items": []
+      }
+    },
+    {
+      "name": "dedupe_repeated_missing_term_once",
+      "summary": "An unrelated note.",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "Deploy deploy the service",
+      "expected": {
+        "passed": false,
+        "missing_items": ["deploy", "service"]
+      }
+    }
+  ]
+}

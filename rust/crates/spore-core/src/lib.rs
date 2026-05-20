@@ -47,8 +47,9 @@ pub use cache_provider::{
 };
 pub use context::{
     BreakpointInfo, CacheBlockHits, CacheBlockStatus, CompactionConfig, CompactionPreserveHints,
-    CompactionRequest, CompactionResult, ComposedPrompt, Context, ContextError, ContextManager,
-    ContextMeta, ContextSources, PromptSegment, RenderedSystemPrompt, SegmentStability,
+    CompactionRequest, CompactionResult, CompactionVerificationResult, CompactionVerifier,
+    ComposedPrompt, Context, ContextError, ContextManager, ContextMeta, ContextSources,
+    KeyTermVerifier, PromptSegment, RenderedSystemPrompt, SegmentStability,
     SessionState as ContextSessionState, StandardContextManager,
 };
 pub use guide_registry::{
