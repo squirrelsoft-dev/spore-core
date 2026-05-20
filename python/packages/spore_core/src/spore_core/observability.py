@@ -43,7 +43,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Annotated, ClassVar, Literal, NewType, Protocol, runtime_checkable
+from typing import Annotated, Any, ClassVar, Literal, NewType, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -96,6 +96,10 @@ class SpanKind(str, Enum):
     GUIDE_SELECTION = "guide_selection"
     MEMORY_QUERY = "memory_query"
     MEMORY_WRITE = "memory_write"
+    # Emitted by ``PatchToolCallsMiddleware`` whenever it mutates a tool call
+    # (issue #28). Always carries a :class:`PatchSpan` at
+    # :attr:`SpanLevel.WARN`.
+    PATCH = "patch"
 
 
 # ============================================================================
@@ -287,7 +291,94 @@ class MiddlewareSpan:
     decision: MiddlewareDecision
 
 
-Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan
+# ============================================================================
+# Patch observability (issue #28)
+# ============================================================================
+#
+# ``PatchToolCallsMiddleware`` is an always-on, highest-priority ``BeforeTool``
+# action mutator that silently rewrites malformed or dangling tool calls before
+# the sandbox and sensors see them. An always-on mutator with no observability
+# is a footgun: the trace would show the patched call as if the model had sent
+# it. Issue #28 closes that gap with the types below.
+#
+# Rules enforced (mirrored by the unit tests):
+#   R1  every patch emits exactly one ``Warn``-level patch span.
+#   R2  no patch → no span emitted.
+#   R3  the span records BOTH the original and the patched parameters.
+#   R4  ``patch_type`` is classified correctly for each variant.
+#   R5  the trace (:meth:`get_trace`) contains the patch event.
+#   R6  :attr:`SessionMetrics.patch_count` counts patch spans for the session.
+#   R7  :attr:`SessionMetrics.patch_rate` = patches / total tool calls
+#       (0.0 when there are no tool calls — never divides by zero).
+#   R8  :attr:`SessionMetrics.patches_by_tool` breaks the count down per tool.
+#   R9  a batch of N patched calls emits N patch spans.
+
+
+class SpanLevel(str, Enum):
+    """Severity of an emitted span. Patch spans are always
+    :attr:`SpanLevel.WARN` per issue #28; this enum keeps the level
+    orthogonal to :data:`SpanStatus` so a successful (``ok``) trace can still
+    surface warn-level patch events."""
+
+    INFO = "info"
+    WARN = "warn"
+
+
+# PatchType — discriminated union on ``kind`` (snake_case tags).
+
+
+class PatchTypeMalformedJson(_Model):
+    """The raw tool-call arguments failed to parse as JSON; a repair was
+    attempted. ``error`` is the parse error that was recovered from."""
+
+    kind: Literal["malformed_json"] = "malformed_json"
+    error: str
+
+
+class PatchTypeDanglingToolCall(_Model):
+    """The call was structurally incomplete (e.g. empty tool name) and was
+    completed with defaults. ``reason`` explains what was missing."""
+
+    kind: Literal["dangling_tool_call"] = "dangling_tool_call"
+    reason: str
+
+
+class PatchTypeParameterCoercion(_Model):
+    """A parameter value was coerced from one type to another to satisfy the
+    tool schema."""
+
+    kind: Literal["parameter_coercion"] = "parameter_coercion"
+    field: str
+    from_: str = Field(alias="from")
+    to: str
+
+
+PatchType = Annotated[
+    PatchTypeMalformedJson | PatchTypeDanglingToolCall | PatchTypeParameterCoercion,
+    Field(discriminator="kind"),
+]
+
+
+@dataclass
+class PatchSpan:
+    """One observability event per tool-call patch (issue #28).
+
+    Carries both the original parameters (what the model sent) and the
+    patched parameters (what was dispatched) so the trace shows the diff,
+    never just the patched call. :attr:`level` is always
+    :attr:`SpanLevel.WARN`.
+    """
+
+    base: SpanBase
+    call_id: str
+    tool_name: str
+    original_parameters: dict[str, Any]
+    patched_parameters: dict[str, Any]
+    patch_type: PatchType
+    level: SpanLevel = SpanLevel.WARN
+
+
+Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan | PatchSpan
 """Heterogeneous span type returned by :meth:`ObservabilityProvider.get_trace`."""
 
 
@@ -311,6 +402,12 @@ class SessionMetrics:
     compactions: int
     outcome: SessionOutcome
     guides_used: list[GuideId] = field(default_factory=list)
+    # Number of tool-call patches in the session (issue #28).
+    patch_count: int = 0
+    # ``patch_count / tool_calls``. ``0.0`` when there are no tool calls.
+    patch_rate: float = 0.0
+    # Patch count broken down by tool name.
+    patches_by_tool: dict[str, int] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -379,6 +476,8 @@ class ObservabilityProvider(Protocol):
 
     def emit_middleware(self, span: MiddlewareSpan) -> None: ...
 
+    def emit_patch(self, span: PatchSpan) -> None: ...
+
     async def flush_session(self, session_id: SessionId) -> None: ...
 
     async def get_session_metrics(self, session_id: SessionId) -> SessionMetrics | None: ...
@@ -418,6 +517,7 @@ class InMemoryObservabilityProvider:
         self._sensors: list[SensorSpan] = []
         self._contexts: list[ContextSpan] = []
         self._middlewares: list[MiddlewareSpan] = []
+        self._patches: list[PatchSpan] = []
         # Per-session insertion-ordered (kind, span_id) tuples — the
         # trace-analyzer feed.
         self._trace_order: dict[SessionId, list[tuple[SpanKind, SpanId]]] = {}
@@ -441,6 +541,14 @@ class InMemoryObservabilityProvider:
         start."""
         with self._lock:
             self._guides_used[session_id] = list(guides)
+
+    def patch_spans(self, session_id: SessionId) -> list[PatchSpan]:
+        """All recorded patch spans for a session, in insertion order
+        (issue #28). Lets callers inspect the original/patched diff and the
+        classified :data:`PatchType` without reconstructing them from the
+        heterogeneous trace."""
+        with self._lock:
+            return [p for p in self._patches if p.base.session_id == session_id]
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -479,6 +587,11 @@ class InMemoryObservabilityProvider:
             self._push_order(span.base.session_id, SpanKind.MIDDLEWARE_HOOK, span.base.span_id)
             self._middlewares.append(span)
 
+    def emit_patch(self, span: PatchSpan) -> None:
+        with self._lock:
+            self._push_order(span.base.session_id, SpanKind.PATCH, span.base.span_id)
+            self._patches.append(span)
+
     # ── flush_session (idempotent) ─────────────────────────────────────────
 
     async def flush_session(self, session_id: SessionId) -> None:
@@ -493,6 +606,7 @@ class InMemoryObservabilityProvider:
             tool_calls = [c for c in self._tool_calls if c.base.session_id == session_id]
             sensors = [s for s in self._sensors if s.base.session_id == session_id]
             contexts = [c for c in self._contexts if c.base.session_id == session_id]
+            patches = [p for p in self._patches if p.base.session_id == session_id]
             outcome = self._outcomes.get(session_id)
             guides = list(self._guides_used.get(session_id, []))
 
@@ -511,6 +625,12 @@ class InMemoryObservabilityProvider:
         compactions = sum(
             1 for c in contexts if isinstance(c.operation, ContextOperationCompaction)
         )
+        patch_count = len(patches)
+        # R7: guard divide-by-zero; denominator is all tool-call spans.
+        patch_rate = patch_count / len(tool_calls) if tool_calls else 0.0
+        patches_by_tool: dict[str, int] = {}
+        for p in patches:
+            patches_by_tool[p.tool_name] = patches_by_tool.get(p.tool_name, 0) + 1
 
         return SessionMetrics(
             session_id=session_id,
@@ -526,6 +646,9 @@ class InMemoryObservabilityProvider:
             compactions=compactions,
             outcome=outcome if outcome is not None else SessionOutcomePartial(),
             guides_used=guides,
+            patch_count=patch_count,
+            patch_rate=patch_rate,
+            patches_by_tool=patches_by_tool,
         )
 
     # ── get_sessions ───────────────────────────────────────────────────────
@@ -572,6 +695,7 @@ class InMemoryObservabilityProvider:
             sensors = {s.base.span_id: s for s in self._sensors}
             contexts = {c.base.span_id: c for c in self._contexts}
             middlewares = {m.base.span_id: m for m in self._middlewares}
+            patches = {p.base.span_id: p for p in self._patches}
 
         out: list[Span] = []
         for kind, span_id in order:
@@ -585,6 +709,8 @@ class InMemoryObservabilityProvider:
                 out.append(contexts[span_id])
             elif kind is SpanKind.MIDDLEWARE_HOOK and span_id in middlewares:
                 out.append(middlewares[span_id])
+            elif kind is SpanKind.PATCH and span_id in patches:
+                out.append(patches[span_id])
         return out
 
 
@@ -598,6 +724,11 @@ __all__ = [
     "InMemoryObservabilityProvider",
     "MiddlewareSpan",
     "ObservabilityProvider",
+    "PatchSpan",
+    "PatchType",
+    "PatchTypeDanglingToolCall",
+    "PatchTypeMalformedJson",
+    "PatchTypeParameterCoercion",
     "PricingTable",
     "SensorSpan",
     "SessionMetrics",
@@ -605,6 +736,7 @@ __all__ = [
     "SpanBase",
     "SpanId",
     "SpanKind",
+    "SpanLevel",
     "SpanStatus",
     "SpanStatusError",
     "SpanStatusHalted",

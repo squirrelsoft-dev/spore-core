@@ -24,11 +24,15 @@ from spore_core.observability import (
     ContextSpan,
     InMemoryObservabilityProvider,
     MiddlewareSpan,
+    PatchSpan,
+    PatchTypeParameterCoercion,
     PricingTable,
     SensorSpan,
+    SessionMetrics,
     SpanBase,
     SpanId,
     SpanKind,
+    SpanLevel,
     SpanStatusOk,
     ToolCallSpan,
     TurnSpan,
@@ -433,3 +437,66 @@ async def test_fixture_replay_session_metrics() -> None:
     assert m.total_turns == expected["total_turns"]
     assert m.total_input_tokens == expected["total_input_tokens"]
     assert m.total_output_tokens == expected["total_output_tokens"]
+
+
+# ── Patch spans (issue #28) ────────────────────────────────────────────────
+
+
+def _patch_span(session: str, span_id: str, call_id: str, tool: str) -> PatchSpan:
+    base = SpanBase(
+        span_id=SpanId(span_id),
+        session_id=_sid(session),
+        task_id=_tid("t1"),
+        kind=SpanKind.PATCH,
+        started_at=_ts("2026-05-16T00:00:00Z"),
+        ended_at=_ts("2026-05-16T00:00:00Z"),
+        duration_ms=0,
+        status=SpanStatusOk(),
+    )
+    return PatchSpan(
+        base=base,
+        call_id=call_id,
+        tool_name=tool,
+        original_parameters={"a": "1"},
+        patched_parameters={"a": 1},
+        patch_type=PatchTypeParameterCoercion(**{"from": "string", "field": "a", "to": "number"}),
+    )
+
+
+def test_patch_span_level_is_always_warn() -> None:
+    sp = _patch_span("s1", "p1", "c1", "shell")
+    assert sp.level is SpanLevel.WARN
+
+
+# R1/R3/R5: emit_patch records a warn-level span that appears in the trace and
+# carries both the original and the patched parameters.
+async def test_emit_patch_appears_in_trace_as_warn() -> None:
+    obs = InMemoryObservabilityProvider()
+    obs.emit_patch(_patch_span("s1", "p1", "c1", "shell"))
+    trace = await obs.get_trace(_sid("s1"))
+    assert len(trace) == 1
+    assert trace[0].base.kind is SpanKind.PATCH
+    p = obs.patch_spans(_sid("s1"))[0]
+    assert p.level is SpanLevel.WARN
+    assert p.original_parameters != p.patched_parameters
+
+
+# SessionMetrics patch fields default to count 0 / rate 0.0 / empty map.
+def test_session_metrics_patch_fields_default() -> None:
+    m = SessionMetrics(
+        session_id=_sid("s1"),
+        task_id=_tid("t1"),
+        total_turns=1,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cost_usd=0.0,
+        total_duration_ms=0,
+        tool_calls=0,
+        sensor_fires=0,
+        sensor_halts=0,
+        compactions=0,
+        outcome=SessionOutcomePartial(),
+    )
+    assert m.patch_count == 0
+    assert m.patch_rate == 0.0
+    assert m.patches_by_tool == {}

@@ -27,6 +27,7 @@ from spore_core.harness import (
 from spore_core.middleware import (
     AlreadyRegisteredError,
     HookContext,
+    HookContextBeforeSession,
     HookContextBeforeTool,
     HookPoint,
     IllegalDecisionError,
@@ -46,6 +47,12 @@ from spore_core.middleware import (
     TracingMiddleware,
 )
 from spore_core.model import ToolCall
+from spore_core.observability import (
+    InMemoryObservabilityProvider,
+    ObservabilityProvider,
+    PatchTypeDanglingToolCall,
+    SpanKind,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -478,3 +485,195 @@ async def test_fixture_replay_before_completion_checklist() -> None:
         assert isinstance(d, MiddlewareForceAnotherTurn)
     else:
         pytest.fail(f"unexpected fixture outcome: {raw['expected']}")
+
+
+# ── Patch observability (issue #28) ────────────────────────────────────────
+
+
+def _wired_patch(obs: InMemoryObservabilityProvider) -> PatchToolCallsMiddleware:
+    return PatchToolCallsMiddleware("noop").with_observability(obs)
+
+
+async def _run_patch(mw: PatchToolCallsMiddleware, calls: list[ToolCall]) -> MiddlewareDecision:
+    """Drive identity capture (BeforeSession) then a BeforeTool fire directly
+    on the middleware so the test owns the calls list."""
+    await mw.handle(HookContextBeforeSession(task=_task(), session_id=_sid()))
+    return await mw.handle(HookContextBeforeTool(calls=calls, turn_number=1))
+
+
+# R1 + R3: every patch emits exactly one warn-level span recording both the
+# original and the patched parameters.
+async def test_patch_emits_one_warn_span_with_original_and_patched() -> None:
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [_tc(name="", input={"command": "ls"}, id="c1")]
+    d = await _run_patch(mw, calls)
+    assert isinstance(d, MiddlewareContinueWithModification)
+    spans = obs.patch_spans(_sid())
+    assert len(spans) == 1
+    p = spans[0]
+    assert p.level.value == "warn"
+    # R3: original preserved, patched reflects the dispatched call.
+    assert p.original_parameters == {"command": "ls"}
+    assert p.patched_parameters == {"command": "ls"}
+    # The mutation that triggered the patch (the name) is visible on the span.
+    assert p.tool_name == "noop"
+    assert p.call_id == "c1"
+
+
+# R2: no patch needed → no span, decision is plain Continue.
+async def test_no_patch_emits_no_span() -> None:
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [_tc(name="shell", id="c1")]
+    d = await _run_patch(mw, calls)
+    assert isinstance(d, MiddlewareContinue)
+    assert obs.patch_spans(_sid()) == []
+    trace = await obs.get_trace(_sid())
+    assert all(s.base.kind is not SpanKind.PATCH for s in trace)
+
+
+# R4: the empty-name repair is classified as DanglingToolCall.
+async def test_empty_name_classified_as_dangling_tool_call() -> None:
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [_tc(name="", id="c1")]
+    await _run_patch(mw, calls)
+    p = obs.patch_spans(_sid())[0]
+    assert isinstance(p.patch_type, PatchTypeDanglingToolCall)
+    assert p.patch_type.reason == "empty tool name"
+
+
+# R5: the patch event is present in get_trace.
+async def test_trace_contains_patch_event() -> None:
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [_tc(name="", id="c1")]
+    await _run_patch(mw, calls)
+    trace = await obs.get_trace(_sid())
+    assert any(s.base.kind is SpanKind.PATCH for s in trace)
+
+
+# R9: a batch of N patched calls emits N patch spans (one per patch).
+async def test_batch_emits_one_span_per_patch() -> None:
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [
+        _tc(name="", id="c1"),
+        _tc(name="shell", id="c2"),
+        _tc(name="  ", id="c3"),
+    ]
+    await _run_patch(mw, calls)
+    spans = obs.patch_spans(_sid())
+    assert len(spans) == 2  # c1 and c3, not c2
+    assert {s.call_id for s in spans} == {"c1", "c3"}
+
+
+# Silent without a provider: patching still works and emits nothing.
+async def test_patch_without_observability_is_silent() -> None:
+    mw = PatchToolCallsMiddleware("noop")
+    calls = [_tc(name="", id="c1")]
+    d = await _run_patch(mw, calls)
+    assert isinstance(d, MiddlewareContinueWithModification)
+    assert calls[0].name == "noop"
+
+
+# R10 regression: still registers at the highest BeforeTool priority and still
+# hooks BeforeTool. Also satisfies the ObservabilityProvider collaborator type.
+def test_patch_middleware_priority_is_highest_before_tool() -> None:
+    import sys
+
+    mw = PatchToolCallsMiddleware("noop")
+    assert mw.priority() == -sys.maxsize + 1
+    assert HookPoint.BEFORE_TOOL in mw.hooks()
+    assert isinstance(InMemoryObservabilityProvider(), ObservabilityProvider)
+
+
+# R6/R7/R8: patch metrics roll up: count, rate (2/4 = 0.5), and per-tool.
+async def test_patch_metrics_count_rate_and_by_tool() -> None:
+    from spore_core.guide_registry import SessionOutcomeSuccess
+    from spore_core.memory import Timestamp
+    from spore_core.observability import SpanBase, ToolCallSpan, new_span_id
+
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+
+    def _tool_call_span(span_id: str, tool: str) -> ToolCallSpan:
+        base = SpanBase(
+            span_id=new_span_id(span_id),
+            session_id=_sid(),
+            task_id=_task().id,
+            kind=SpanKind.TOOL_CALL,
+            started_at=Timestamp("2026-05-16T00:00:00Z"),
+            ended_at=Timestamp("2026-05-16T00:00:00Z"),
+        )
+        return ToolCallSpan(
+            base=base,
+            tool_name=tool,
+            call_id=span_id,
+            parameters_size_bytes=0,
+            output_size_bytes=0,
+            truncated=False,
+            sandbox_mode="none",
+        )
+
+    # 4 tool calls total, 2 of which (both "shell") will be patched.
+    for sid, tool in [("tc1", "shell"), ("tc2", "shell"), ("tc3", "edit"), ("tc4", "edit")]:
+        obs.emit_tool_call(_tool_call_span(sid, tool))
+    # Two empty-name shell calls get patched to the fallback "noop".
+    calls = [_tc(name="", id="tc1"), _tc(name="", id="tc2")]
+    await _run_patch(mw, calls)
+
+    obs.set_session_outcome(_sid(), SessionOutcomeSuccess())
+    m = await obs.get_session_metrics(_sid())
+    assert m is not None
+    assert m.patch_count == 2
+    assert abs(m.patch_rate - 0.5) < 1e-6  # 2 / 4
+    assert m.patches_by_tool.get("noop") == 2
+    assert "edit" not in m.patches_by_tool
+
+
+# R7: zero tool calls → patch_rate is 0.0, never a divide-by-zero.
+async def test_patch_rate_zero_when_no_tool_calls() -> None:
+    from spore_core.guide_registry import SessionOutcomeSuccess
+
+    obs = InMemoryObservabilityProvider()
+    mw = _wired_patch(obs)
+    calls = [_tc(name="", id="c1")]
+    await _run_patch(mw, calls)
+    obs.set_session_outcome(_sid(), SessionOutcomeSuccess())
+    m = await obs.get_session_metrics(_sid())
+    assert m is not None
+    assert m.patch_count == 1
+    assert m.patch_rate == 0.0
+
+
+# R11: fixture replay against the shared cross-language fixture.
+async def test_fixture_replay_patch_events() -> None:
+    from spore_core.guide_registry import SessionOutcomeSuccess
+
+    path = Path(__file__).resolve().parents[4] / "fixtures" / "patch" / "patch_events_basic.json"
+    case = json.loads(path.read_text())
+
+    obs = InMemoryObservabilityProvider()
+    mw = PatchToolCallsMiddleware(case["fallback_name"]).with_observability(obs)
+
+    calls = [ToolCall(id=c["id"], name=c["name"], input=c["input"]) for c in case["input_calls"]]
+    await _run_patch(mw, calls)
+
+    spans = obs.patch_spans(_sid())
+    assert len(spans) == len(case["expected_patches"])
+    for exp in case["expected_patches"]:
+        found = next(p for p in spans if p.call_id == exp["call_id"])
+        assert found.tool_name == exp["tool_name"]
+        assert found.original_parameters == exp["original"]
+        assert found.patched_parameters == exp["patched"]
+        assert exp["patch_type"] == "dangling_tool_call"
+        assert isinstance(found.patch_type, PatchTypeDanglingToolCall)
+
+    obs.set_session_outcome(_sid(), SessionOutcomeSuccess())
+    m = await obs.get_session_metrics(_sid())
+    assert m is not None
+    assert m.patch_count == case["expected_patch_count"]
+    for tool, n in case["expected_patches_by_tool"].items():
+        assert m.patches_by_tool.get(tool) == n

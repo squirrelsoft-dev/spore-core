@@ -49,10 +49,12 @@ middleware (per spec).
 from __future__ import annotations
 
 import asyncio
+import itertools
 import sys
+import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Annotated, Any, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,12 +65,21 @@ from .harness import (
     SessionId,
     SessionState,
     Task,
+    TaskId,
     ToolOutputSuccess,
 )
 from .harness import (
     HarnessToolResult as ToolResult,
 )
 from .model import ToolCall
+
+if TYPE_CHECKING:
+    # ``observability`` imports ``HookPoint`` / ``MiddlewareDecision`` from this
+    # module, so importing it at runtime here would create a cycle. The patch
+    # middleware (issue #28) takes an :class:`ObservabilityProvider` purely as a
+    # collaborator and imports the concrete span types lazily inside the method
+    # that emits them.
+    from .observability import ObservabilityProvider
 
 # ============================================================================
 # Pydantic base
@@ -588,24 +599,128 @@ class PatchToolCallsMiddleware:
     """Repairs syntactically invalid tool calls before they reach the
     registry. The shipped implementation patches empty or whitespace-only
     tool names to a configurable fallback. Runs at the second-lowest
-    ``BEFORE_TOOL`` priority so downstream middleware see clean calls."""
+    ``BEFORE_TOOL`` priority so downstream middleware see clean calls.
 
-    def __init__(self, fallback_name: str, *, name: str = "patch-tool-calls") -> None:
+    Observability (issue #28)
+    -------------------------
+    This middleware is an always-on, highest-priority action mutator. To keep
+    it from silently rewriting calls, **every patch emits a warn-level
+    ``PatchSpan``** via an injected :class:`ObservabilityProvider` before the
+    patched call proceeds. The span carries the original and patched
+    parameters and a classified ``PatchType`` so the trace shows the diff,
+    never just the patched call.
+
+    The shared :class:`HookContextBeforeTool` does not carry ``session_id`` /
+    ``task_id`` (widening it would ripple across all four language ports), so
+    this middleware captures identity at :attr:`HookPoint.BEFORE_SESSION` into
+    a local field and reads it at :attr:`HookPoint.BEFORE_TOOL` — the same
+    external-identity pattern used by :class:`LoopDetectionMiddleware`.
+
+    Rules enforced: R1 (one warn span per patch), R2 (no patch → no span),
+    R3 (original + patched recorded), R4 (patch_type classified), R9 (one span
+    per patched call in a batch), R10 (still runs at the highest ``BEFORE_TOOL``
+    priority, ``-sys.maxsize + 1``).
+    """
+
+    def __init__(
+        self,
+        fallback_name: str,
+        *,
+        name: str = "patch-tool-calls",
+        observability: ObservabilityProvider | None = None,
+    ) -> None:
         self._name = name
         self.fallback_name = fallback_name
+        # Optional observability sink. ``None`` keeps construction
+        # test-friendly and makes the middleware a no-op observer when unwired.
+        self._observability = observability
+        # Captured at BeforeSession, read at BeforeTool: the session/task
+        # identity needed to stamp a PatchSpan.
+        self._identity: tuple[SessionId, TaskId] | None = None
+        self._identity_lock = threading.Lock()
+        # Monotonic counter so emitted patch spans get distinct ids.
+        self._patch_seq = itertools.count()
+
+    def with_observability(self, obs: ObservabilityProvider) -> PatchToolCallsMiddleware:
+        """Inject the observability sink (fluent). Patches emitted after this
+        is set produce warn-level patch spans (issue #28)."""
+        self._observability = obs
+        return self
+
+    def clear(self) -> None:
+        """Reset captured identity — tests use this to simulate session
+        boundaries."""
+        with self._identity_lock:
+            self._identity = None
+
+    def _emit_patch_event(
+        self,
+        call: ToolCall,
+        original: dict[str, Any],
+        patch_type: Any,
+    ) -> None:
+        obs = self._observability
+        if obs is None:
+            return
+        # Lazy import to avoid the import cycle (observability imports this
+        # module for HookPoint / MiddlewareDecision).
+        from .memory import Timestamp
+        from .observability import PatchSpan, SpanBase, SpanKind, new_span_id
+
+        with self._identity_lock:
+            identity = self._identity
+        # Identity captured at BeforeSession; fall back to empty ids if a tool
+        # patch somehow fires before any session began (defensive — the span
+        # still records the diff).
+        session_id, task_id = identity if identity is not None else (SessionId(""), TaskId(""))
+        seq = next(self._patch_seq)
+        ts = Timestamp("")
+        base = SpanBase(
+            span_id=new_span_id(f"patch-{seq}"),
+            session_id=session_id,
+            task_id=task_id,
+            kind=SpanKind.PATCH,
+            started_at=ts,
+            ended_at=ts,
+        )
+        obs.emit_patch(
+            PatchSpan(
+                base=base,
+                call_id=call.id,
+                tool_name=call.name,
+                original_parameters=original,
+                patched_parameters=dict(call.input),
+                patch_type=patch_type,
+            )
+        )
 
     async def handle(self, ctx: HookContext) -> MiddlewareDecision:
+        if isinstance(ctx, HookContextBeforeSession):
+            with self._identity_lock:
+                self._identity = (ctx.session_id, ctx.task.id)
+            return MiddlewareContinue()
         if not isinstance(ctx, HookContextBeforeTool):
             return MiddlewareContinue()
+        # Classify the empty-name repair as a dangling tool call and emit a
+        # warn-level event per patched call.
+        from .observability import PatchTypeDanglingToolCall
+
         modified = False
         for call in ctx.calls:
             if not call.name.strip():
+                # Capture the original parameters before mutating.
+                original = dict(call.input)
                 call.name = self.fallback_name
                 modified = True
+                self._emit_patch_event(
+                    call,
+                    original,
+                    PatchTypeDanglingToolCall(reason="empty tool name"),
+                )
         return MiddlewareContinueWithModification() if modified else MiddlewareContinue()
 
     def hooks(self) -> list[HookPoint]:
-        return [HookPoint.BEFORE_TOOL]
+        return [HookPoint.BEFORE_SESSION, HookPoint.BEFORE_TOOL]
 
     def priority(self) -> int:
         return -sys.maxsize + 1
