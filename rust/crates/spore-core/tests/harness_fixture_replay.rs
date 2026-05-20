@@ -14,8 +14,8 @@ use spore_core::harness::testing::{
     AllowAllSandbox, AlwaysContinuePolicy, NoopContextManager, ScriptedToolRegistry,
 };
 use spore_core::{
-    AgentId, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy, ModelAgent, ProviderInfo,
-    ReplayModelInterface, RunResult, SessionId, StandardHarness, Task, ToolOutput,
+    Agent, AgentId, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy, ModelAgent,
+    ProviderInfo, ReplayModelInterface, RunResult, SessionId, StandardHarness, Task, ToolOutput,
 };
 
 fn fixture_path() -> std::path::PathBuf {
@@ -49,7 +49,7 @@ async fn react_loop_dispatches_tool_then_completes() {
     });
 
     let config = HarnessConfig {
-        agent: agent as Arc<ModelAgent<ReplayModelInterface>>,
+        agent: agent as Arc<dyn Agent>,
         tool_registry: tool_registry.clone(),
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),

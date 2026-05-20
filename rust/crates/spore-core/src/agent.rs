@@ -1,5 +1,10 @@
 //! Agent — executes a single turn against a `ModelInterface`.
 //!
+//! The [`Agent`] trait is **dyn-compatible**: `turn` returns a hand-rolled
+//! [`BoxFut`] (`Pin<Box<dyn Future + Send>>`) rather than using an async fn,
+//! matching every other component trait in `harness.rs`. The harness therefore
+//! holds the agent erased behind `Arc<dyn Agent>` (see issue #45).
+//!
 //! Implements issue #2. The agent is **one turn**: it accepts a fully
 //! assembled [`Context`] (produced upstream by the `ContextManager`, issue #7)
 //! and returns a [`TurnResult`] classifying what the model wants to do next.
@@ -47,6 +52,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::harness::BoxFut;
 use crate::model::{
     ContentBlock, Message, ModelError, ModelInterface, ModelParams, ModelRequest, StopReason,
     TokenUsage, ToolCall, ToolSchema,
@@ -152,9 +158,11 @@ pub enum TurnResult {
 // ============================================================================
 
 /// Executes a single turn given a fully assembled [`Context`].
-#[trait_variant::make(Send)]
+///
+/// Dyn-compatible via the hand-rolled [`BoxFut`] pattern, so the harness can
+/// hold it as `Arc<dyn Agent>`.
 pub trait Agent: Send + Sync {
-    async fn turn(&self, context: Context) -> TurnResult;
+    fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult>;
 
     fn id(&self) -> AgentId;
 }
@@ -182,76 +190,78 @@ impl<M: ModelInterface> ModelAgent<M> {
 }
 
 impl<M: ModelInterface + 'static> Agent for ModelAgent<M> {
-    async fn turn(&self, context: Context) -> TurnResult {
-        let request = context.into_request();
-        let response = match self.model.call(request).await {
-            Ok(r) => r,
-            Err(e) => {
-                return TurnResult::Error {
-                    error: AgentError::ModelError(e),
-                    usage: None,
-                };
-            }
-        };
-
-        let usage = response.usage;
-
-        // Extract any tool-use blocks regardless of stop_reason; the model
-        // may, in principle, request tool use without setting StopReason
-        // (different providers normalise this differently). The stop_reason
-        // determines the *classification*, but missing tool calls when
-        // stop_reason == ToolUse is itself a malformed response.
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut text_parts: Vec<String> = Vec::new();
-        for block in &response.content {
-            match block {
-                ContentBlock::ToolUse(tc) => tool_calls.push(tc.clone()),
-                ContentBlock::Text { text } => text_parts.push(text.clone()),
-                ContentBlock::Thinking { .. } => { /* observability only */ }
-            }
-        }
-
-        match response.stop_reason {
-            StopReason::ToolUse => {
-                if tool_calls.is_empty() {
+    fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+        Box::pin(async move {
+            let request = context.into_request();
+            let response = match self.model.call(request).await {
+                Ok(r) => r,
+                Err(e) => {
                     return TurnResult::Error {
-                        error: AgentError::MalformedToolCall {
-                            tool_name: String::new(),
-                            reason: "stop_reason=ToolUse but no ToolUse blocks present".into(),
-                        },
-                        usage: Some(usage),
+                        error: AgentError::ModelError(e),
+                        usage: None,
                     };
                 }
-                TurnResult::ToolCallRequested {
-                    calls: tool_calls,
-                    usage,
+            };
+
+            let usage = response.usage;
+
+            // Extract any tool-use blocks regardless of stop_reason; the model
+            // may, in principle, request tool use without setting StopReason
+            // (different providers normalise this differently). The stop_reason
+            // determines the *classification*, but missing tool calls when
+            // stop_reason == ToolUse is itself a malformed response.
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut text_parts: Vec<String> = Vec::new();
+            for block in &response.content {
+                match block {
+                    ContentBlock::ToolUse(tc) => tool_calls.push(tc.clone()),
+                    ContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ContentBlock::Thinking { .. } => { /* observability only */ }
                 }
             }
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                // If the provider returned no tool-use blocks AND no text,
-                // that is an empty response — surface it explicitly.
-                if text_parts.is_empty() && tool_calls.is_empty() {
-                    return TurnResult::Error {
-                        error: AgentError::EmptyResponse,
-                        usage: Some(usage),
-                    };
-                }
-                // If we somehow received tool-use blocks but stop_reason did
-                // not indicate tool use, prefer dispatching them — silently
-                // dropping a tool call is worse than a slightly surprising
-                // classification.
-                if !tool_calls.is_empty() {
-                    return TurnResult::ToolCallRequested {
+
+            match response.stop_reason {
+                StopReason::ToolUse => {
+                    if tool_calls.is_empty() {
+                        return TurnResult::Error {
+                            error: AgentError::MalformedToolCall {
+                                tool_name: String::new(),
+                                reason: "stop_reason=ToolUse but no ToolUse blocks present".into(),
+                            },
+                            usage: Some(usage),
+                        };
+                    }
+                    TurnResult::ToolCallRequested {
                         calls: tool_calls,
                         usage,
-                    };
+                    }
                 }
-                TurnResult::FinalResponse {
-                    content: text_parts.join(""),
-                    usage,
+                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                    // If the provider returned no tool-use blocks AND no text,
+                    // that is an empty response — surface it explicitly.
+                    if text_parts.is_empty() && tool_calls.is_empty() {
+                        return TurnResult::Error {
+                            error: AgentError::EmptyResponse,
+                            usage: Some(usage),
+                        };
+                    }
+                    // If we somehow received tool-use blocks but stop_reason did
+                    // not indicate tool use, prefer dispatching them — silently
+                    // dropping a tool call is worse than a slightly surprising
+                    // classification.
+                    if !tool_calls.is_empty() {
+                        return TurnResult::ToolCallRequested {
+                            calls: tool_calls,
+                            usage,
+                        };
+                    }
+                    TurnResult::FinalResponse {
+                        content: text_parts.join(""),
+                        usage,
+                    }
                 }
             }
-        }
+        })
     }
 
     fn id(&self) -> AgentId {
@@ -292,17 +302,19 @@ pub mod mock {
     }
 
     impl Agent for MockAgent {
-        async fn turn(&self, _context: Context) -> TurnResult {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(TurnResult::Error {
-                    error: AgentError::EmptyResponse,
-                    usage: None,
-                })
+        fn turn<'a>(&'a self, _context: Context) -> BoxFut<'a, TurnResult> {
+            Box::pin(async move {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(TurnResult::Error {
+                        error: AgentError::EmptyResponse,
+                        usage: None,
+                    })
+            })
         }
 
         fn id(&self) -> AgentId {

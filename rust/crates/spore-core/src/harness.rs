@@ -876,12 +876,11 @@ pub trait Harness: Send + Sync {
 /// Components not yet covered by their own issue are optional here so the
 /// harness can be exercised before #4–#13 land.
 ///
-/// `A: Agent` is a type parameter rather than `Arc<dyn Agent>` because the
-/// `Agent` trait (issue #2) uses `trait_variant::make` (RPITIT) and is not
-/// `dyn`-compatible. The other component traits in this module are hand-
-/// rolled `BoxFut` and stay erased.
-pub struct HarnessConfig<A: Agent> {
-    pub agent: Arc<A>,
+/// Every component, including the agent, is held erased behind `Arc<dyn _>`.
+/// The `Agent` trait (issue #2) is dyn-compatible via the hand-rolled `BoxFut`
+/// pattern, so no type parameter is needed (issue #45).
+pub struct HarnessConfig {
+    pub agent: Arc<dyn Agent>,
     pub tool_registry: Arc<dyn ToolRegistry>,
     pub sandbox: Arc<dyn SandboxProvider>,
     pub context_manager: Arc<dyn ContextManager>,
@@ -890,7 +889,7 @@ pub struct HarnessConfig<A: Agent> {
     pub observability: Option<Arc<dyn ObservabilityProvider>>,
 }
 
-impl<A: Agent> Clone for HarnessConfig<A> {
+impl Clone for HarnessConfig {
     fn clone(&self) -> Self {
         Self {
             agent: self.agent.clone(),
@@ -904,12 +903,12 @@ impl<A: Agent> Clone for HarnessConfig<A> {
     }
 }
 
-pub struct StandardHarness<A: Agent> {
-    config: HarnessConfig<A>,
+pub struct StandardHarness {
+    config: HarnessConfig,
 }
 
-impl<A: Agent + 'static> StandardHarness<A> {
-    pub fn new(config: HarnessConfig<A>) -> Self {
+impl StandardHarness {
+    pub fn new(config: HarnessConfig) -> Self {
         Self { config }
     }
 
@@ -1334,7 +1333,7 @@ impl<A: Agent + 'static> StandardHarness<A> {
     }
 }
 
-impl<A: Agent + 'static> Harness for StandardHarness<A> {
+impl Harness for StandardHarness {
     fn run<'a>(&'a self, options: HarnessRunOptions) -> BoxFut<'a, RunResult> {
         Box::pin(self.run_inner(options))
     }
@@ -1349,7 +1348,7 @@ impl<A: Agent + 'static> Harness for StandardHarness<A> {
     }
 }
 
-impl<A: Agent + 'static> StandardHarness<A> {
+impl StandardHarness {
     async fn run_inner(&self, options: HarnessRunOptions) -> RunResult {
         let HarnessRunOptions {
             task,
@@ -1746,7 +1745,7 @@ mod tests {
         Arc::new(MockAgent::new(AgentId::new("test")))
     }
 
-    fn standard_config(agent: Arc<MockAgent>) -> HarnessConfig<MockAgent> {
+    fn standard_config(agent: Arc<MockAgent>) -> HarnessConfig {
         HarnessConfig {
             agent,
             tool_registry: Arc::new(ScriptedToolRegistry::new()),
