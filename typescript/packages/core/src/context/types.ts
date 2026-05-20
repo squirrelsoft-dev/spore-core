@@ -182,6 +182,12 @@ export const CompactionConfigSchema = z.object({
   preserve_recent_n: z.number().int().nonnegative().default(8),
   head_tail_tokens: z.number().int().nonnegative().default(512),
   offload_path: z.string().default(".spore/offload"),
+  /**
+   * Max times the harness re-requests a revised compaction summary when the
+   * {@link CompactionVerifier} fails before accepting as-is and logging a
+   * warn (issue #29). Mapped to/from `max_compaction_attempts` on the wire.
+   */
+  max_compaction_attempts: z.number().int().nonnegative().default(2),
 });
 export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;
 
@@ -191,6 +197,7 @@ export function defaultCompactionConfig(): CompactionConfig {
     preserve_recent_n: 8,
     head_tail_tokens: 512,
     offload_path: ".spore/offload",
+    max_compaction_attempts: 2,
   };
 }
 
@@ -302,6 +309,93 @@ export interface CompactionResult {
   summary_message: Message;
   tokens_reclaimed: number;
   messages_removed: number;
+}
+
+// ============================================================================
+// Post-compaction verification (issue #29)
+// ============================================================================
+
+/** Outcome of a {@link CompactionVerifier.verify} check. */
+export interface CompactionVerificationResult {
+  passed: boolean;
+  /**
+   * Items from the preservation list not found in the summary, in
+   * first-occurrence order (already lowercased/normalized).
+   */
+  missingItems: string[];
+  detail: string;
+}
+
+/**
+ * A lightweight, SYNCHRONOUS post-compaction sensor. Implementations run
+ * after the agent produces a summary and before the harness accepts it.
+ * They are purely computational and MUST NOT call the model — hence the
+ * direct (non-`Promise`) return.
+ */
+export interface CompactionVerifier {
+  verify(
+    summary: string,
+    hints: CompactionPreserveHints,
+    sessionState: SessionState,
+  ): CompactionVerificationResult;
+}
+
+/**
+ * Standard {@link CompactionVerifier}: extracts key terms from the session
+ * state per the enabled hints and checks they appear in the summary.
+ *
+ * v1 limitation: only `keep_current_task_state` contributes source terms
+ * (from {@link SessionState.task_instruction}). The other four hints have no
+ * structured SessionState field, so they add no terms.
+ */
+export class KeyTermVerifier implements CompactionVerifier {
+  /**
+   * Tokenize a source string into normalized key terms: lowercase, split on
+   * runs of any char that is NOT `a-z` or `0-9`, drop empty tokens and tokens
+   * shorter than 4 characters.
+   */
+  private static extractTerms(source: string): string[] {
+    return source
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((tok) => tok.length >= 4);
+  }
+
+  verify(
+    summary: string,
+    hints: CompactionPreserveHints,
+    sessionState: SessionState,
+  ): CompactionVerificationResult {
+    // Step 1: collect source strings from enabled hints. v1: only
+    // keep_current_task_state contributes.
+    const sources: string[] = [];
+    if (hints.keep_current_task_state) {
+      sources.push(sessionState.task_instruction);
+    }
+
+    // Step 2: build the term list, deduped, first-occurrence order.
+    const terms: string[] = [];
+    for (const source of sources) {
+      for (const term of KeyTermVerifier.extractTerms(source)) {
+        if (!terms.includes(term)) {
+          terms.push(term);
+        }
+      }
+    }
+
+    // Step 3: a term is present iff the lowercased summary contains it.
+    const summaryLower = summary.toLowerCase();
+    const missingItems = terms.filter((term) => !summaryLower.includes(term));
+
+    // Steps 4 + 5.
+    const total = terms.length;
+    const passed = missingItems.length === 0;
+    const detail = passed
+      ? `all ${total} key term(s) present`
+      : `missing ${missingItems.length} of ${total} key term(s): ${missingItems.join(", ")}`;
+
+    return { passed, missingItems, detail };
+  }
 }
 
 // ============================================================================
