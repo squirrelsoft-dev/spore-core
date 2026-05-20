@@ -24,6 +24,8 @@ const {
   GuideId,
   newSessionState,
   defaultCompactionConfig,
+  defaultCompactionPreserveHints,
+  KeyTermVerifier,
   ContextErrorException,
 } = context;
 
@@ -426,6 +428,101 @@ describe("StandardContextManager.injectSkill", () => {
     expect(ctx.messages.length).toBe(beforeMessages);
     expect(ctx.system_prompt.content).toContain("[SKILL:rust-style]");
     expect(ctx.meta.skills_injected.length).toBe(1);
+  });
+});
+
+describe("CompactionConfig (issue #29)", () => {
+  it("defaults maxCompactionAttempts to 2", () => {
+    expect(defaultCompactionConfig().max_compaction_attempts).toBe(2);
+  });
+});
+
+describe("KeyTermVerifier (issue #29)", () => {
+  function hints(keepTask: boolean): context.CompactionPreserveHints {
+    return { ...defaultCompactionPreserveHints(), keep_current_task_state: keepTask };
+  }
+  function withTask(task: string): SessionState {
+    return newSessionState(SessionId.of("s1"), TaskId.of("t1"), task);
+  }
+
+  it("passes when all key terms are present", () => {
+    const v = new KeyTermVerifier();
+    const res = v.verify(
+      "We will refactor the parser module to be faster.",
+      hints(true),
+      withTask("Refactor the parser module"),
+    );
+    expect(res.passed).toBe(true);
+    expect(res.missingItems).toEqual([]);
+    expect(res.detail).toBe("all 3 key term(s) present");
+  });
+
+  it("lists a missing term", () => {
+    const v = new KeyTermVerifier();
+    const res = v.verify(
+      "We will refactor the parser.",
+      hints(true),
+      withTask("Refactor the parser module"),
+    );
+    expect(res.passed).toBe(false);
+    expect(res.missingItems).toEqual(["module"]);
+    expect(res.detail).toBe("missing 1 of 3 key term(s): module");
+  });
+
+  it("yields zero terms (and passes) when keepCurrentTaskState is false", () => {
+    const v = new KeyTermVerifier();
+    const res = v.verify("Nothing relevant.", hints(false), withTask("Refactor the parser module"));
+    expect(res.passed).toBe(true);
+    expect(res.missingItems).toEqual([]);
+    expect(res.detail).toBe("all 0 key term(s) present");
+  });
+
+  it("ignores tokens shorter than 4 characters", () => {
+    const v = new KeyTermVerifier();
+    // "the", "api" are <4 chars and dropped; only "endpoint" remains.
+    const res = v.verify(
+      "Wrote a test for the endpoint.",
+      hints(true),
+      withTask("Test the api endpoint"),
+    );
+    expect(res.missingItems).toEqual([]);
+    expect(res.passed).toBe(true);
+  });
+
+  it("is case-insensitive", () => {
+    const v = new KeyTermVerifier();
+    const res = v.verify(
+      "REFACTOR THE PARSER MODULE",
+      hints(true),
+      withTask("refactor the parser module"),
+    );
+    expect(res.passed).toBe(true);
+  });
+
+  it("dedupes repeated terms preserving first-occurrence order", () => {
+    const v = new KeyTermVerifier();
+    const res = v.verify("An unrelated note.", hints(true), withTask("Deploy deploy the service"));
+    expect(res.passed).toBe(false);
+    // "deploy" appears once despite being repeated in the task.
+    expect(res.missingItems).toEqual(["deploy", "service"]);
+  });
+
+  it("treats the four non-task hints as no-ops even when true", () => {
+    const v = new KeyTermVerifier();
+    const allButTaskOn: context.CompactionPreserveHints = {
+      keep_architectural_decisions: true,
+      keep_open_problems: true,
+      keep_current_task_state: false,
+      keep_recent_file_list: true,
+      keep_thinking_blocks: true,
+    };
+    const res = v.verify(
+      "Nothing in particular here.",
+      allButTaskOn,
+      withTask("Refactor the parser module"),
+    );
+    expect(res.passed).toBe(true);
+    expect(res.missingItems).toEqual([]);
   });
 });
 
