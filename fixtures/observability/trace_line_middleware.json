@@ -1,0 +1,36 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "mw-001",
+      "parent_span_id": null,
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "middleware_hook",
+      "started_at": "2026-05-26T18:00:00.0Z",
+      "ended_at": "2026-05-26T18:00:00.0Z",
+      "duration_ms": 0,
+      "status": { "kind": "ok" }
+    },
+    "hook": "before_turn",
+    "decision": { "kind": "continue" }
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "mw-001",
+    "parent_span_id": null,
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "middleware_hook",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:00.0Z",
+    "started_at": "2026-05-26T18:00:00.0Z",
+    "duration_ms": 0,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "hook": "before_turn",
+      "decision": { "kind": "continue" }
+    }
+  }
+}

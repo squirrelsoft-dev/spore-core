@@ -1,0 +1,42 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "sn-001",
+      "parent_span_id": "b7ad6b7169203331",
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "sensor_evaluation",
+      "started_at": "2026-05-26T18:00:02.2Z",
+      "ended_at": "2026-05-26T18:00:02.24Z",
+      "duration_ms": 40,
+      "status": { "kind": "ok" }
+    },
+    "sensor_id": "test-runner",
+    "sensor_kind": "computational",
+    "trigger": { "kind": "post_tool", "tool_name": "shell" },
+    "outcome": "pass",
+    "fired": true
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "sn-001",
+    "parent_span_id": "b7ad6b7169203331",
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "sensor_evaluation",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:02.24Z",
+    "started_at": "2026-05-26T18:00:02.2Z",
+    "duration_ms": 40,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "sensor_id": "test-runner",
+      "sensor_kind": "computational",
+      "trigger": { "kind": "post_tool", "tool_name": "shell" },
+      "outcome": "pass",
+      "fired": true
+    }
+  }
+}

@@ -22,6 +22,9 @@ Thumbs.db
 .env
 .env.local
 
+# Spore runtime — durable trace outbox written per session (#33)
+.spore/
+
 # Node / pnpm
 node_modules/
 **/node_modules/

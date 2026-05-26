@@ -195,6 +195,32 @@ Prompt chunks are the most visible artifact because they are human-readable text
 
 ---
 
+## Observability Stack
+
+A local, self-hosted observability stack (Grafana + Tempo + Loki + Alloy + Prometheus) ships with the repo under `observability/`. It receives OTLP traces from the harness, indexes the per-session trace JSONL, and provides Grafana dashboards for session outcomes, cost, cache hit rate, and sensor fire rate. All Grafana OSS — no vendor accounts, no API keys.
+
+```bash
+# Start the stack (Docker required)
+docker compose -f observability/docker-compose.observability.yml up -d
+
+# Point the harness at it
+export SPORE_OTLP_ENDPOINT=http://localhost:4317
+
+# Open Grafana (no login — anonymous admin)
+open http://localhost:3000      # dashboards live under the "Spore" folder
+
+# Stop the stack
+docker compose -f observability/docker-compose.observability.yml down
+```
+
+When `SPORE_OTLP_ENDPOINT` is set, the observability provider forwards spans to Tempo over OTLP gRPC on port 4317. When unset (CI, unit tests), it falls back to the local trace JSONL only — the harness never depends on the stack running. Alloy tails `.spore/sessions/**/*.jsonl` and ships every span to Loki automatically; click any trace in Tempo to jump straight to its raw log lines.
+
+The on-disk trace format is the source of truth and is documented in [`observability/TRACE_SCHEMA.md`](observability/TRACE_SCHEMA.md). Copy [`.env.observability.example`](.env.observability.example) to `.env` for the environment template.
+
+> **Status:** the stack and dashboards are ready. The emitting side — the durable-outbox provider that writes the trace JSONL and forwards to OTLP (issue #33) — is in progress; until it lands, the stack starts cleanly but dashboards stay empty.
+
+---
+
 ## Identity Model
 
 ```

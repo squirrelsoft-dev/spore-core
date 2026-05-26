@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
 
   # ── Trace storage ──────────────────────────────────────────────────────────
@@ -13,11 +11,9 @@ services:
       - "4317:4317"   # OTLP gRPC — harness sends spans here
       - "4318:4318"   # OTLP HTTP — alternative endpoint
       - "3200:3200"   # Tempo query API (Grafana reads from here)
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # NOTE: the tempo/loki images are distroless (no wget/curl), so an
+    # in-container HTTP healthcheck can't run. Alloy and Grafana retry their
+    # connections on startup, so plain service_started dependencies suffice.
 
   # ── Log aggregation ─────────────────────────────────────────────────────────
   loki:
@@ -27,25 +23,28 @@ services:
       - loki-data:/loki
     ports:
       - "3100:3100"
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   # ── Log shipping ─────────────────────────────────────────────────────────────
   # Watches .spore/sessions/**/*.jsonl and ships to Loki automatically.
   # No harness code changes needed — Alloy tails the files directly.
   alloy:
     image: grafana/alloy:latest
+    # The image's default entrypoint loads /etc/alloy/config.alloy. We mount our
+    # config there and pass an explicit `run` command so our pipeline (not the
+    # image's bundled default config) is what runs.
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
     volumes:
-      - ./alloy.river:/etc/alloy/config.river
+      - ./alloy.river:/etc/alloy/config.alloy
       - ${SPORE_WORKSPACE:-.}/..:/workspace:ro
     depends_on:
       loki:
-        condition: service_healthy
+        condition: service_started
       tempo:
-        condition: service_healthy
+        condition: service_started
 
   # ── Metrics ──────────────────────────────────────────────────────────────────
   prometheus:
@@ -75,9 +74,9 @@ services:
       - "3000:3000"   # open http://localhost:3000
     depends_on:
       tempo:
-        condition: service_healthy
+        condition: service_started
       loki:
-        condition: service_healthy
+        condition: service_started
       prometheus:
         condition: service_started
 

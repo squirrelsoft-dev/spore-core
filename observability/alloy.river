@@ -2,19 +2,20 @@
 // The harness writes traces here as the durable local buffer (#33).
 // Alloy tails these files and indexes them for full-text search in Grafana.
 
+// Labels live on the targets (keys not prefixed with "__" become Loki
+// labels). loki.source.file has no separate `labels` attribute.
 local.file_match "spore_sessions" {
-  path_targets = [{"__path__" = "/workspace/.spore/sessions/**/*.jsonl"}]
-  sync_period  = "10s"
+  path_targets = [{
+    "__path__" = "/workspace/.spore/sessions/**/*.jsonl",
+    "job"      = "spore-sessions",
+    "source"   = "jsonl",
+  }]
+  sync_period = "10s"
 }
 
 loki.source.file "spore_sessions" {
   targets    = local.file_match.spore_sessions.targets
   forward_to = [loki.write.default.receiver]
-
-  labels = {
-    job    = "spore-sessions",
-    source = "jsonl",
-  }
 }
 
 loki.write "default" {

@@ -1,0 +1,52 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "ctx-001",
+      "parent_span_id": null,
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "context_assembly",
+      "started_at": "2026-05-26T18:00:00.0Z",
+      "ended_at": "2026-05-26T18:00:00.05Z",
+      "duration_ms": 50,
+      "status": { "kind": "ok" }
+    },
+    "operation": {
+      "kind": "assembly",
+      "guides_loaded": 2,
+      "memory_items_loaded": 3,
+      "tools_loaded": 5
+    },
+    "tokens_before": 0,
+    "tokens_after": 1820,
+    "utilization_before": 0.0,
+    "utilization_after": 0.25
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "ctx-001",
+    "parent_span_id": null,
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "context_assembly",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:00.05Z",
+    "started_at": "2026-05-26T18:00:00.0Z",
+    "duration_ms": 50,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "operation": {
+        "kind": "assembly",
+        "guides_loaded": 2,
+        "memory_items_loaded": 3,
+        "tools_loaded": 5
+      },
+      "tokens_before": 0,
+      "tokens_after": 1820,
+      "utilization_before": 0.0,
+      "utilization_after": 0.25
+    }
+  }
+}
