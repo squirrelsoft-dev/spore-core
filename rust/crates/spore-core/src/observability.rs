@@ -498,6 +498,35 @@ pub trait ObservabilityProvider: Send + Sync {
     ) -> BoxFut<'a, Vec<SessionMetrics>>;
 
     fn get_trace<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, Vec<Box<dyn Span>>>;
+
+    /// Session ids whose durable outbox has a `trace.jsonl` but no `.flushed`
+    /// marker (issue #33). Default: empty — only the durable-outbox provider
+    /// has unflushed on-disk sessions.
+    fn list_unflushed_sessions<'a>(&'a self) -> BoxFut<'a, Vec<SessionId>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// Delete a session's durable outbox (issue #33). The provider NEVER
+    /// auto-deletes; the caller drives cleanup. Default: no-op `Ok`.
+    fn cleanup_session<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFut<'a, Result<(), ObservabilityError>> {
+        let _ = session_id;
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Errors surfaced by the durable-outbox provider (issue #33).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ObservabilityError {
+    /// An I/O error from the durable outbox.
+    #[error("observability I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// `cleanup_session` was called for a session with no outbox directory.
+    #[error("session not found: {session_id}")]
+    SessionNotFound { session_id: String },
 }
 
 // ============================================================================
@@ -862,6 +891,15 @@ impl<T: ObservabilityProvider + ?Sized> ObservabilityProvider for Arc<T> {
     }
     fn get_trace<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, Vec<Box<dyn Span>>> {
         (**self).get_trace(session_id)
+    }
+    fn list_unflushed_sessions<'a>(&'a self) -> BoxFut<'a, Vec<SessionId>> {
+        (**self).list_unflushed_sessions()
+    }
+    fn cleanup_session<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFut<'a, Result<(), ObservabilityError>> {
+        (**self).cleanup_session(session_id)
     }
 }
 

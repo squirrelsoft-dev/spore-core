@@ -1,0 +1,129 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["spore"],
+  "title": "Spore — Sensors",
+  "uid": "spore-sensors",
+  "time": { "from": "now-7d", "to": "now" },
+  "timezone": "browser",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Sensor evaluations (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" } }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Fire rate (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "description": "Fraction of sensor evaluations that fired.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_fired=`true` [$__range])) / sum(count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" } }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Halts (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_outcome=`halt` [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Fire rate by sensor kind over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (attributes_sensor_kind) (count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_fired=`true` [$__interval]))",
+          "legendFormat": "{{attributes_sensor_kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "Halt rate by sensor kind over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (attributes_sensor_kind) (count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_outcome=`halt` [$__interval]))",
+          "legendFormat": "{{attributes_sensor_kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } }, "color": { "mode": "palette-classic" } }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Evaluations by sensor kind (low-signal detection)",
+      "type": "bargauge",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "description": "Sensor kinds that rarely or never fire are candidates for removal — they cost evaluation time without producing signal.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum by (attributes_sensor_kind) (count_over_time({job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_fired=`true` [$__range]))",
+          "legendFormat": "{{attributes_sensor_kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "continuous-GrYlRd" } }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "Recent sensor halts",
+      "type": "logs",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{job=\"spore-sessions\"} | json | kind=`sensor_evaluation` | attributes_outcome=`halt`"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "patch-001",
+      "parent_span_id": "tc-001",
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "patch",
+      "started_at": "2026-05-26T18:00:02.1Z",
+      "ended_at": "2026-05-26T18:00:02.1Z",
+      "duration_ms": 0,
+      "status": { "kind": "ok" }
+    },
+    "call_id": "call_1",
+    "tool_name": "shell",
+    "original_parameters": { "timeout": "30" },
+    "patched_parameters": { "timeout": 30 },
+    "patch_type": {
+      "kind": "parameter_coercion",
+      "field": "timeout",
+      "from": "string",
+      "to": "number"
+    },
+    "level": "warn"
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "patch-001",
+    "parent_span_id": "tc-001",
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "patch",
+    "level": "warn",
+    "timestamp": "2026-05-26T18:00:02.1Z",
+    "started_at": "2026-05-26T18:00:02.1Z",
+    "duration_ms": 0,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "tool_name": "shell",
+      "call_id": "call_1",
+      "patch_type": {
+        "kind": "parameter_coercion",
+        "field": "timeout",
+        "from": "string",
+        "to": "number"
+      },
+      "original_parameters": { "timeout": "30" },
+      "patched_parameters": { "timeout": 30 }
+    }
+  }
+}

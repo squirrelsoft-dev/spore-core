@@ -1,0 +1,56 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "metrics": {
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "total_turns": 4,
+      "total_input_tokens": 7280,
+      "total_output_tokens": 560,
+      "total_cost_usd": 0.0456,
+      "total_duration_ms": 60000,
+      "tool_calls": 3,
+      "sensor_fires": 3,
+      "sensor_halts": 0,
+      "compactions": 1,
+      "outcome": { "kind": "success" },
+      "guides_used": [],
+      "patch_count": 0,
+      "patch_rate": 0.0,
+      "patches_by_tool": {}
+    },
+    "root": {
+      "span_id": "sess_a",
+      "parent_span_id": null,
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "session",
+      "started_at": "2026-05-26T18:00:00.0Z",
+      "ended_at": "2026-05-26T18:01:00.0Z",
+      "duration_ms": 60000,
+      "status": { "kind": "ok" }
+    }
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "sess_a",
+    "parent_span_id": null,
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "session",
+    "level": "info",
+    "timestamp": "2026-05-26T18:01:00.0Z",
+    "started_at": "2026-05-26T18:00:00.0Z",
+    "duration_ms": 60000,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "outcome": "success",
+      "total_turns": 4,
+      "total_cost_usd": 0.0456,
+      "sensor_fires": 3,
+      "sensor_halts": 0,
+      "patch_count": 0
+    }
+  }
+}

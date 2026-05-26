@@ -29,6 +29,7 @@ pub mod metric;
 pub mod middleware;
 pub mod model;
 pub mod observability;
+pub mod observability_outbox;
 pub mod ollama;
 pub mod openai;
 pub mod prompt_chunk_registry;
@@ -92,10 +93,11 @@ pub use model::{
 };
 pub use observability::{
     ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
-    ObservabilityProvider as FullObservabilityProvider, PatchSpan, PatchType, PricingTable,
-    SensorSpan, SessionMetrics, Span, SpanBase, SpanId, SpanKind, SpanLevel, SpanStatus,
-    ToolCallSpan, TurnSpan,
+    ObservabilityError, ObservabilityProvider as FullObservabilityProvider, PatchSpan, PatchType,
+    PricingTable, SensorSpan, SessionMetrics, Span, SpanBase, SpanId, SpanKind, SpanLevel,
+    SpanStatus, ToolCallSpan, TurnSpan,
 };
+pub use observability_outbox::{OutboxConfig, OutboxObservabilityProvider, TraceLine};
 pub use ollama::OllamaModelInterface;
 pub use openai::OpenAIModelInterface;
 pub use prompt_chunk_registry::{

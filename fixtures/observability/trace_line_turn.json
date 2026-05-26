@@ -1,0 +1,48 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "b7ad6b7169203331",
+      "parent_span_id": null,
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "turn",
+      "started_at": "2026-05-26T18:00:00.0Z",
+      "ended_at": "2026-05-26T18:00:02.1Z",
+      "duration_ms": 2100,
+      "status": { "kind": "ok" }
+    },
+    "turn_number": 1,
+    "input_tokens": 1820,
+    "output_tokens": 140,
+    "cache_read_tokens": 1600,
+    "cache_write_tokens": 0,
+    "cost_usd": 0.0123,
+    "stop_reason": "tool_use",
+    "tool_calls_requested": 1
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "b7ad6b7169203331",
+    "parent_span_id": null,
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "turn",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:02.1Z",
+    "started_at": "2026-05-26T18:00:00.0Z",
+    "duration_ms": 2100,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "turn_number": 1,
+      "input_tokens": 1820,
+      "output_tokens": 140,
+      "cache_read_tokens": 1600,
+      "cache_write_tokens": 0,
+      "cost_usd": 0.0123,
+      "stop_reason": "tool_use",
+      "tool_calls_requested": 1
+    }
+  }
+}

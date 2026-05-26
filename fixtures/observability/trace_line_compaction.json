@@ -1,0 +1,50 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "cmp-001",
+      "parent_span_id": null,
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "compaction",
+      "started_at": "2026-05-26T18:00:30.0Z",
+      "ended_at": "2026-05-26T18:00:30.2Z",
+      "duration_ms": 200,
+      "status": { "kind": "ok" }
+    },
+    "operation": {
+      "kind": "compaction",
+      "messages_removed": 12,
+      "tokens_reclaimed": 8000
+    },
+    "tokens_before": 16000,
+    "tokens_after": 8000,
+    "utilization_before": 0.75,
+    "utilization_after": 0.5
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "cmp-001",
+    "parent_span_id": null,
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "compaction",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:30.2Z",
+    "started_at": "2026-05-26T18:00:30.0Z",
+    "duration_ms": 200,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "operation": {
+        "kind": "compaction",
+        "messages_removed": 12,
+        "tokens_reclaimed": 8000
+      },
+      "tokens_before": 16000,
+      "tokens_after": 8000,
+      "utilization_before": 0.75,
+      "utilization_after": 0.5
+    }
+  }
+}

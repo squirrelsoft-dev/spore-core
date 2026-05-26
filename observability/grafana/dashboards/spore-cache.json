@@ -1,0 +1,119 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["spore"],
+  "title": "Spore — Cache",
+  "uid": "spore-cache",
+  "time": { "from": "now-7d", "to": "now" },
+  "timezone": "browser",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Cache hit rate (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "description": "cache_read_tokens / (cache_read_tokens + input_tokens) across all turns.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__range])) / (sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__range])) + sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_input_tokens [$__range])))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Cache read tokens (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Est. cache savings (range)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "description": "cache_read_tokens × 0.9 of input price (cache reads bill ~0.1× input). Assumes $3/1M input; adjust for your model.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "queryType": "instant",
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__range])) * 0.0000027"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "fixed", "fixedColor": "green" } }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Cache hit rate over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__interval])) / (sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__interval])) + sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_input_tokens [$__interval])))",
+          "legendFormat": "hit rate"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 20 } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "Cache read vs write tokens over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_read_tokens [$__interval]))",
+          "legendFormat": "read"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(sum_over_time({job=\"spore-sessions\"} | json | kind=`turn` | unwrap attributes_cache_write_tokens [$__interval]))",
+          "legendFormat": "write"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars" } }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Turns with zero cache read (possible cache miss)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "description": "Turns after the first with no cache read often indicate an unexpected mid-session cache miss (Block 2 invalidation).",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(count_over_time({job=\"spore-sessions\"} | json | kind=`turn` | attributes_cache_read_tokens=`0` | attributes_turn_number!=`1` [$__interval]))",
+          "legendFormat": "suspected misses"
+        }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 80 }, "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] }
+    }
+  ]
+}
