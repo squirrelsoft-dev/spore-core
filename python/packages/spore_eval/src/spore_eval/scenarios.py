@@ -57,7 +57,6 @@ from spore_core.harness import (
 from spore_core.model import (
     Message,
     ModelInterface,
-    ModelParams,
     Role,
     TextContent,
     ToolCall,

@@ -103,9 +103,7 @@ def _arg_value(args: list[str], flag: str) -> str | None:
 def _prepare_workspace(scenario: ScenarioId, workspace: Path) -> None:
     """Seed scenario-specific workspace files."""
     if scenario is ScenarioId.S1:
-        (workspace / "input.txt").write_text(
-            "hello from the spore harness end to end scenario\n"
-        )
+        (workspace / "input.txt").write_text("hello from the spore harness end to end scenario\n")
 
 
 async def _run_scenario(
@@ -262,9 +260,7 @@ def main() -> None:
         raise SystemExit(2)
 
     mock = "--mock" in args
-    model_id = (
-        _arg_value(args, "--model") or os.environ.get("SPORE_OLLAMA_MODEL") or "llama3.2"
-    )
+    model_id = _arg_value(args, "--model") or os.environ.get("SPORE_OLLAMA_MODEL") or "llama3.2"
 
     safe_ts = now().replace(":", "-").replace(".", "-")
     session_id = SessionId(f"e2e-{scenario.value}-{safe_ts}")
