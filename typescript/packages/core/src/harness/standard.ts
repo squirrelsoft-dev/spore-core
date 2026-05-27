@@ -38,7 +38,8 @@ import {
   type TurnSpan,
   type WarnEvent,
 } from "../observability/types.js";
-import type { ToolCall } from "../model/schemas.js";
+import type { Message, ToolCall } from "../model/schemas.js";
+import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 
@@ -129,6 +130,49 @@ export class StandardHarness implements Harness {
       arguments: truncated ? clipped : call.input,
       arguments_truncated: truncated,
     };
+  }
+
+  /**
+   * Snapshot the assembled INPUT messages (the full prompt the model saw) into
+   * {@link GenAiMessage}s for LLM-native tracing (issue #64). Each message's
+   * role maps to the conventional {@link GenAiRole}; the content is rendered to
+   * a plain string and truncated to `max` bytes:
+   *   - text        → the text verbatim
+   *   - tool_result → its result body (role stays `tool`)
+   *   - tool_call   → `"<name> <compact-json-args>"` (assistant)
+   *   - image       → `"[image <media_type>]"` — NEVER the base64 data
+   *
+   * System-first, then history order is preserved because the assembled
+   * `messages` already lead with the `system` prompt. Mirrors Rust's
+   * `capture_input_messages`.
+   */
+  private static captureInputMessages(messages: Message[], max: number): GenAiMessage[] {
+    return messages.map((m): GenAiMessage => {
+      const role: GenAiRole = m.role;
+      let rendered: string;
+      switch (m.content.type) {
+        case "text":
+          rendered = m.content.text;
+          break;
+        case "tool_result":
+          rendered = m.content.content;
+          break;
+        case "tool_call":
+          rendered = `${m.content.name} ${JSON.stringify(m.content.input ?? null)}`;
+          break;
+        case "image":
+          // NEVER dump the base64 `data` — placeholder only.
+          rendered = `[image ${m.content.media_type}]`;
+          break;
+        default: {
+          const _exhaustive: never = m.content;
+          rendered = String(_exhaustive);
+          break;
+        }
+      }
+      const [content, truncated] = truncateField(rendered, max);
+      return { role, content, truncated };
+    });
   }
 
   async run(options: HarnessRunOptions): Promise<RunResult> {
@@ -401,6 +445,13 @@ export class StandardHarness implements Harness {
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
       const turnStartedAt = Timestamp.now();
       const turnClock = Date.now();
+      // LLM-native content capture (issue #64): snapshot the assembled INPUT
+      // messages (the full prompt the model saw) BEFORE the agent turn. Guard
+      // off → no work (and no `input_messages` on the span).
+      const ccTurn = this.config.contentCapture ?? ContentCaptureConfig.default();
+      const inputMessages: GenAiMessage[] | null = ccTurn.enabled
+        ? StandardHarness.captureInputMessages(context.messages, ccTurn.maxFieldLen)
+        : null;
       const result = await this.config.agent.turn(context, signal);
       budgetUsed.turns += 1;
 
@@ -480,6 +531,7 @@ export class StandardHarness implements Harness {
             tool_calls_requested: toolCallsRequested,
             output_text: outputText,
             tool_calls: toolCalls,
+            input_messages: inputMessages,
           };
           this.config.observability.emitTurn(turnSpan);
         }

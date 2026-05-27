@@ -258,6 +258,13 @@ export const TraceLine = {
     if (span.tool_calls != null) {
       attrs["gen_ai.response.tool_calls"] = jsonValue(span.tool_calls);
     }
+    // Assembled INPUT prompt messages (issue #64). Per the OTel GenAI semantic
+    // conventions the input prompt is the canonical content; ride it as a
+    // `gen_ai.prompt` attribute alongside the metrics. Only present when capture
+    // populated it; absent keeps the line pre-#64-identical.
+    if (span.input_messages != null) {
+      attrs["gen_ai.prompt"] = jsonValue(span.input_messages);
+    }
     return envelopeFromBase(span.base, traceId, "turn", "info", attrs);
   },
 
@@ -512,6 +519,27 @@ export function emitGenaiEvents(line: TraceLine): GenAiSpanEvent[] {
   const attrs = line.attributes;
   if (attrs === null || attrs === undefined || typeof attrs !== "object") {
     return events;
+  }
+
+  // Turn INPUT: the assembled prompt messages (issue #64). Per the OTel GenAI
+  // semantic conventions these are the canonical prompt events. Emitted FIRST
+  // and in order (system first, then history) so the trace reads top-to-bottom.
+  const prompt = attrs["gen_ai.prompt"];
+  if (Array.isArray(prompt)) {
+    for (const msg of prompt) {
+      const m = msg as { role?: unknown; content?: unknown };
+      const role = typeof m.role === "string" ? m.role : "user";
+      const content = typeof m.content === "string" ? m.content : "";
+      const eventRole =
+        role === "system" || role === "assistant" || role === "tool" ? role : "user";
+      events.push({
+        name: GenAiRole.eventName(eventRole as GenAiRole),
+        attributes: {
+          "gen_ai.message.role": role,
+          "gen_ai.message.content": content,
+        },
+      });
+    }
   }
 
   // Turn: the assistant's output text + each requested tool call.

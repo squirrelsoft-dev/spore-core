@@ -307,6 +307,12 @@ export interface TurnSpan {
   /** The tool calls the model requested this turn (issue #64). Captured only
    *  when content capture is enabled. */
   tool_calls?: ToolCallContent[] | null;
+  /** The assembled INPUT messages the model saw this turn — the full prompt
+   *  (issue #64). First element is the system prompt; the rest mirror the
+   *  assembled conversation history in order. Serialized as `input_messages`.
+   *  Captured only when content capture is enabled; absent keeps the line
+   *  pre-#64-identical. */
+  input_messages?: GenAiMessage[] | null;
 }
 
 export interface ToolCallSpan {
