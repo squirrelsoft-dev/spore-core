@@ -40,7 +40,7 @@ use crate::harness::{
     TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult,
 };
 use crate::model::ModelInterface;
-use crate::model::{ToolCall, ToolSchema};
+use crate::model::{Content, Message, Role, ToolCall, ToolSchema};
 use crate::tool_registry::{
     StandardToolRegistry, Tool, ToolAnnotations, ToolRegistry, ToolSchema as RegistrySchema,
 };
@@ -118,11 +118,39 @@ impl HarnessToolRegistry for RealToolRegistry {
 // SchemaInjectingContextManager — fills assemble().tools from the registry
 // ============================================================================
 
+/// Operational system prompt for the live agent. The compaction adapter's
+/// `assemble` produces a context with **no system prompt** (it has no
+/// `ContextSources` to render one), so without this the model receives only the
+/// task as a user message and no guidance on how to behave. The three rules
+/// target the failure modes observed with small local models: describing
+/// actions instead of taking them, passing stringified arguments, and declaring
+/// success without checking the result.
+pub const AGENT_SYSTEM_PROMPT: &str = "\
+You are an autonomous agent that completes tasks by calling the provided tools. \
+Follow these rules:
+
+1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate tool. \
+Writing a shell command, code snippet, or file contents into your text reply \
+does NOT run it — only a real tool call has any effect. To transform a file, \
+call bash_command with the command itself; never write the command text into a \
+file as if it were the result.
+
+2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: booleans \
+as true/false (not \"true\"), numbers as 12 (not \"12\"), lists as [\"a\"] (not \
+\"[\\\"a\\\"]\"). Quoted-string scalars where a bool/number/array is expected \
+will be rejected.
+
+3. VERIFY BEFORE FINISHING. Before replying DONE, confirm your work actually \
+satisfies the request. If you wrote a file, read it back with read_file and \
+check its contents are exactly what was asked. If they do not match, fix it and \
+verify again. Only reply DONE once you have verified the result is correct.";
+
 /// Decorates a harness [`HarnessContextManager`], delegating every seam method
 /// to the inner manager but injecting the registry's tool schemas into
-/// `assemble().tools`. The compaction adapter's `assemble` returns an empty
-/// tool list, so without this decorator the model never sees any tools and can
-/// never emit a tool call in live mode.
+/// `assemble().tools` and prepending [`AGENT_SYSTEM_PROMPT`]. The compaction
+/// adapter's `assemble` returns an empty tool list and no system prompt, so
+/// without this decorator the model never sees any tools (and can never emit a
+/// tool call) nor any operational guidance in live mode.
 pub struct SchemaInjectingContextManager {
     inner: Arc<dyn HarnessContextManager>,
     tools: Vec<ToolSchema>,
@@ -147,6 +175,25 @@ impl HarnessContextManager for SchemaInjectingContextManager {
         Box::pin(async move {
             let mut ctx = self.inner.assemble(session, task).await;
             ctx.tools = tools;
+            // Prepend the operational system prompt. The adapter's assemble
+            // yields none, so the model would otherwise get no guidance. Guard
+            // against duplicates so a resumed/seeded session that already leads
+            // with a System message isn't given two.
+            let has_system = ctx
+                .messages
+                .first()
+                .is_some_and(|m| matches!(m.role, Role::System));
+            if !has_system {
+                ctx.messages.insert(
+                    0,
+                    Message {
+                        role: Role::System,
+                        content: Content::Text {
+                            text: AGENT_SYSTEM_PROMPT.to_string(),
+                        },
+                    },
+                );
+            }
             ctx
         })
     }
