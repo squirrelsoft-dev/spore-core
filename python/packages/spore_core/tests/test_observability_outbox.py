@@ -23,6 +23,8 @@ from spore_core.observability import (
     ContextOperationAssembly,
     ContextOperationCompaction,
     ContextSpan,
+    GenAiMessage,
+    GenAiRole,
     MiddlewareSpan,
     PatchSpan,
     PatchTypeParameterCoercion,
@@ -34,7 +36,9 @@ from spore_core.observability import (
     SpanStatusError,
     SpanStatusHalted,
     SpanStatusOk,
+    ToolCallContent,
     ToolCallSpan,
+    ToolResultContent,
     TurnSpan,
 )
 from spore_core.observability_outbox import (
@@ -400,9 +404,14 @@ def test_trace_id_stable_per_session_and_differs_across_sessions(tmp_path: Path)
 
 
 def _build_line(fixture_name: str, span: dict[str, Any], trace_id: str) -> TraceLine:
-    if fixture_name == "trace_line_turn.json":
+    if fixture_name in (
+        "trace_line_turn.json",
+        "trace_line_turn_with_content.json",
+        "trace_line_turn_truncated.json",
+        "trace_line_turn_content_off.json",
+    ):
         return TraceLine.from_turn(_load_turn(span), trace_id)
-    if fixture_name == "trace_line_tool_call.json":
+    if fixture_name in ("trace_line_tool_call.json", "trace_line_tool_call_with_content.json"):
         return TraceLine.from_tool_call(_load_tool_call(span), trace_id)
     if fixture_name == "trace_line_sensor.json":
         return TraceLine.from_sensor(_load_sensor(span), trace_id)
@@ -459,7 +468,26 @@ def _load_base(d: dict[str, Any]) -> SpanBase:
     )
 
 
+def _load_tool_call_content(d: dict[str, Any]) -> ToolCallContent:
+    return ToolCallContent(
+        name=d["name"],
+        arguments=d["arguments"],
+        arguments_truncated=d["arguments_truncated"],
+    )
+
+
 def _load_turn(d: dict[str, Any]) -> TurnSpan:
+    output_text = None
+    if "output_text" in d:
+        ot = d["output_text"]
+        output_text = GenAiMessage(
+            role=GenAiRole(ot["role"]),
+            content=ot["content"],
+            truncated=ot["truncated"],
+        )
+    tool_calls = None
+    if "tool_calls" in d:
+        tool_calls = [_load_tool_call_content(c) for c in d["tool_calls"]]
     return TurnSpan(
         base=_load_base(d["base"]),
         turn_number=d["turn_number"],
@@ -470,10 +498,21 @@ def _load_turn(d: dict[str, Any]) -> TurnSpan:
         cost_usd=d["cost_usd"],
         stop_reason=StopReason(d["stop_reason"]),
         tool_calls_requested=d["tool_calls_requested"],
+        output_text=output_text,
+        tool_calls=tool_calls,
     )
 
 
 def _load_tool_call(d: dict[str, Any]) -> ToolCallSpan:
+    arguments = None
+    if "arguments" in d:
+        arguments = _load_tool_call_content(d["arguments"])
+    result = None
+    if "result" in d:
+        result = ToolResultContent(
+            content=d["result"]["content"],
+            truncated=d["result"]["truncated"],
+        )
     return ToolCallSpan(
         base=_load_base(d["base"]),
         tool_name=d["tool_name"],
@@ -483,6 +522,8 @@ def _load_tool_call(d: dict[str, Any]) -> ToolCallSpan:
         truncated=d["truncated"],
         sandbox_mode=d["sandbox_mode"],
         sandbox_violations=list(d["sandbox_violations"]),
+        arguments=arguments,
+        result=result,
     )
 
 
@@ -546,7 +587,11 @@ def _load_patch(d: dict[str, Any]) -> PatchSpan:
     "fixture_name",
     [
         "trace_line_turn.json",
+        "trace_line_turn_with_content.json",
+        "trace_line_turn_truncated.json",
+        "trace_line_turn_content_off.json",
         "trace_line_tool_call.json",
+        "trace_line_tool_call_with_content.json",
         "trace_line_sensor.json",
         "trace_line_context_assembly.json",
         "trace_line_compaction.json",

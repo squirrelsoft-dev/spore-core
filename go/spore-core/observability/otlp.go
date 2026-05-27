@@ -151,6 +151,86 @@ func attributesToKeyValues(raw json.RawMessage) []attribute.KeyValue {
 	return out
 }
 
+// genAiEvent is one conventional OTel GenAI span event (issue #64).
+type genAiEvent struct {
+	name  string
+	attrs []attribute.KeyValue
+}
+
+// genAiEvents builds the conventional OTel GenAI span events for a built
+// TraceLine (issue #64). It returns one (name, attributes) per captured message,
+// using the conventional names gen_ai.<role>.message. Empty when the line
+// carries no gen_ai.* content (capture OFF, or a non turn/tool line).
+//
+// Unlike attributesToKeyValues (which flattens the line attributes into span
+// *attributes*), GenAI conventions also want one span *event* per message; this
+// helper produces those separately.
+func genAiEvents(line TraceLine) []genAiEvent {
+	if len(line.Attributes) == 0 {
+		return nil
+	}
+	var attrs map[string]json.RawMessage
+	if err := json.Unmarshal(line.Attributes, &attrs); err != nil {
+		return nil
+	}
+	var events []genAiEvent
+
+	// Turn: the assistant's output text.
+	if raw, ok := attrs["gen_ai.response.content"]; ok {
+		var content string
+		if json.Unmarshal(raw, &content) == nil {
+			role := string(GenAiRoleAssistant)
+			if r, ok := attrs["gen_ai.response.role"]; ok {
+				_ = json.Unmarshal(r, &role)
+			}
+			events = append(events, genAiEvent{
+				name: GenAiRoleAssistant.EventName(),
+				attrs: []attribute.KeyValue{
+					attribute.String("gen_ai.message.role", role),
+					attribute.String("gen_ai.message.content", content),
+				},
+			})
+		}
+	}
+	// Turn: each requested tool call.
+	if raw, ok := attrs["gen_ai.response.tool_calls"]; ok {
+		var calls []struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if json.Unmarshal(raw, &calls) == nil {
+			for _, c := range calls {
+				args := ""
+				if len(c.Arguments) > 0 {
+					args = string(c.Arguments)
+				}
+				events = append(events, genAiEvent{
+					name: GenAiRoleAssistant.EventName(),
+					attrs: []attribute.KeyValue{
+						attribute.String("gen_ai.message.role", string(GenAiRoleAssistant)),
+						attribute.String("gen_ai.tool.name", c.Name),
+						attribute.String("gen_ai.tool.call.arguments", args),
+					},
+				})
+			}
+		}
+	}
+	// Tool call: the tool result message.
+	if raw, ok := attrs["gen_ai.tool.message.content"]; ok {
+		var content string
+		if json.Unmarshal(raw, &content) == nil {
+			events = append(events, genAiEvent{
+				name: GenAiRoleTool.EventName(),
+				attrs: []attribute.KeyValue{
+					attribute.String("gen_ai.message.role", string(GenAiRoleTool)),
+					attribute.String("gen_ai.message.content", content),
+				},
+			})
+		}
+	}
+	return events
+}
+
 // forward emits one span carrying the harness trace id + derived span id.
 // Best-effort and non-blocking; never errors. A bad trace id skips the span.
 func (f *otlpSdkForwarder) forward(line TraceLine) {
@@ -192,6 +272,11 @@ func (f *otlpSdkForwarder) forward(line TraceLine) {
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(attrs...),
 	)
+	// GenAI span events — one per captured message, conventional names
+	// (gen_ai.<role>.message). Empty when content capture is off (#64).
+	for _, ev := range genAiEvents(line) {
+		span.AddEvent(ev.name, trace.WithAttributes(ev.attrs...))
+	}
 	if line.Status == "ok" {
 		span.SetStatus(codes.Ok, "")
 	} else {

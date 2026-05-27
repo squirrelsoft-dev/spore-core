@@ -227,6 +227,14 @@ type TurnSpan struct {
 	CostUSD            float64    `json:"cost_usd"`
 	StopReason         StopReason `json:"stop_reason"`
 	ToolCallsRequested uint32     `json:"tool_calls_requested"`
+	// OutputText is the model's output text for this turn (issue #64). Captured
+	// only when ContentCaptureConfig.Enabled; nil keeps the line pre-#64-identical
+	// (omitempty drops the key entirely).
+	OutputText *GenAiMessage `json:"output_text,omitempty"`
+	// ToolCalls are the tool calls the model requested this turn (issue #64).
+	// Captured only when content capture is enabled; nil keeps the line
+	// pre-#64-identical.
+	ToolCalls []ToolCallContent `json:"tool_calls,omitempty"`
 }
 
 // ToolCallSpan is one tool dispatch.
@@ -239,6 +247,12 @@ type ToolCallSpan struct {
 	Truncated           bool     `json:"truncated"`
 	SandboxMode         string   `json:"sandbox_mode"`
 	SandboxViolations   []string `json:"sandbox_violations"`
+	// Arguments is the tool-call arguments (issue #64). Captured only when
+	// content capture is enabled; nil keeps the line pre-#64-identical.
+	Arguments *ToolCallContent `json:"arguments,omitempty"`
+	// Result is the tool result body (issue #64). Captured only when content
+	// capture is enabled; nil keeps the line pre-#64-identical.
+	Result *ToolResultContent `json:"result,omitempty"`
 }
 
 // SensorSpan is one sensor evaluation.

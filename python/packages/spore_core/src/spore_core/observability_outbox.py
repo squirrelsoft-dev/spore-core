@@ -86,6 +86,7 @@ from .memory import Timestamp
 from .observability import (
     ContextOperationCompaction,
     ContextSpan,
+    GenAiRole,
     InMemoryObservabilityProvider,
     MiddlewareSpan,
     PatchSpan,
@@ -94,6 +95,7 @@ from .observability import (
     Span,
     SpanBase,
     SpanId,
+    ToolCallContent,
     WarnSpan,
     SpanKind,
     SpanStatusError,
@@ -173,6 +175,17 @@ def _to_json_value(value: Any) -> Any:
     return value
 
 
+def _tool_call_content_dict(call: ToolCallContent) -> dict[str, Any]:
+    """Serialize a :class:`ToolCallContent` to its verbatim JSON shape
+    (``name`` / ``arguments`` / ``arguments_truncated``) for the
+    ``gen_ai.response.tool_calls`` array (issue #64)."""
+    return {
+        "name": call.name,
+        "arguments": _to_json_value(call.arguments),
+        "arguments_truncated": call.arguments_truncated,
+    }
+
+
 def _status_pair(base: SpanBase) -> tuple[str, str | None]:
     """Map a :data:`SpanStatus` to the bare ``(status, status_detail)`` pair."""
     status = base.status
@@ -236,7 +249,7 @@ class TraceLine:
 
     @staticmethod
     def from_turn(span: TurnSpan, trace_id: str) -> TraceLine:
-        attributes = {
+        attributes: dict[str, Any] = {
             "turn_number": span.turn_number,
             "input_tokens": span.input_tokens,
             "output_tokens": span.output_tokens,
@@ -246,11 +259,25 @@ class TraceLine:
             "stop_reason": _to_json_value(span.stop_reason),
             "tool_calls_requested": span.tool_calls_requested,
         }
+        # GenAI content attributes (issue #64) — only when capture populated
+        # them. These ride as ``gen_ai.*`` keys alongside the metrics so the same
+        # line is readable in an LLM-native backend (Phoenix) without code
+        # changes. The content-OFF path leaves them absent → byte-identical to
+        # the pre-#64 output.
+        if span.output_text is not None:
+            msg = span.output_text
+            attributes["gen_ai.response.role"] = msg.role.value
+            attributes["gen_ai.response.content"] = msg.content
+            attributes["gen_ai.response.content_truncated"] = msg.truncated
+        if span.tool_calls is not None:
+            attributes["gen_ai.response.tool_calls"] = [
+                _tool_call_content_dict(c) for c in span.tool_calls
+            ]
         return TraceLine._from_base(span.base, trace_id, "turn", "info", attributes)
 
     @staticmethod
     def from_tool_call(span: ToolCallSpan, trace_id: str) -> TraceLine:
-        attributes = {
+        attributes: dict[str, Any] = {
             "tool_name": span.tool_name,
             "call_id": span.call_id,
             "parameters_size_bytes": span.parameters_size_bytes,
@@ -259,6 +286,15 @@ class TraceLine:
             "sandbox_mode": span.sandbox_mode,
             "sandbox_violations": list(span.sandbox_violations),
         }
+        # GenAI content attributes (issue #64) — only when capture populated them.
+        if span.arguments is not None:
+            args = span.arguments
+            attributes["gen_ai.tool.name"] = args.name
+            attributes["gen_ai.tool.call.arguments"] = _to_json_value(args.arguments)
+            attributes["gen_ai.tool.call.arguments_truncated"] = args.arguments_truncated
+        if span.result is not None:
+            attributes["gen_ai.tool.message.content"] = span.result.content
+            attributes["gen_ai.tool.message.content_truncated"] = span.result.truncated
         return TraceLine._from_base(span.base, trace_id, "tool_call", "info", attributes)
 
     @staticmethod
@@ -445,6 +481,68 @@ def _attributes_to_otlp(attributes: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _genai_events(line: TraceLine) -> list[tuple[str, dict[str, Any]]]:
+    """Build the conventional OTel GenAI span events for a built
+    :class:`TraceLine` (issue #64). Returns one ``(event_name, attributes)`` per
+    captured message, using the conventional names ``gen_ai.<role>.message``.
+    Empty when the line carries no ``gen_ai.*`` content (capture OFF, or a
+    non turn/tool line).
+
+    Note :func:`_attributes_to_otlp` only flattens the line's ``attributes`` into
+    span *attributes*; GenAI conventions also want one span *event* per message,
+    which this helper produces separately.
+    """
+    events: list[tuple[str, dict[str, Any]]] = []
+    attrs = line.attributes
+
+    # Turn: the assistant's output text + each requested tool call.
+    content = attrs.get("gen_ai.response.content")
+    if isinstance(content, str):
+        role = attrs.get("gen_ai.response.role")
+        if not isinstance(role, str):
+            role = GenAiRole.ASSISTANT.value
+        events.append(
+            (
+                GenAiRole.ASSISTANT.event_name(),
+                {"gen_ai.message.role": role, "gen_ai.message.content": content},
+            )
+        )
+    calls = attrs.get("gen_ai.response.tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name", "")
+            arguments = json.dumps(
+                call.get("arguments"), separators=(",", ":")
+            )
+            events.append(
+                (
+                    GenAiRole.ASSISTANT.event_name(),
+                    {
+                        "gen_ai.message.role": GenAiRole.ASSISTANT.value,
+                        "gen_ai.tool.name": name,
+                        "gen_ai.tool.call.arguments": arguments,
+                    },
+                )
+            )
+
+    # Tool call: the tool result message.
+    tool_content = attrs.get("gen_ai.tool.message.content")
+    if isinstance(tool_content, str):
+        events.append(
+            (
+                GenAiRole.TOOL.event_name(),
+                {
+                    "gen_ai.message.role": GenAiRole.TOOL.value,
+                    "gen_ai.message.content": tool_content,
+                },
+            )
+        )
+
+    return events
+
+
 class _OtlpSdkForwarder:
     """Real OTLP forwarder backed by ``opentelemetry-sdk`` + OTLP-gRPC with a
     ``BatchSpanProcessor`` so export is buffered and non-blocking."""
@@ -525,6 +623,10 @@ class _OtlpSdkForwarder:
                     ),
                 },
             )
+            # GenAI span events — one per captured message, conventional names
+            # (``gen_ai.<role>.message``). Empty when content capture is OFF (#64).
+            for event_name, event_attrs in _genai_events(line):
+                span.add_event(event_name, attributes=event_attrs)
             span.end()
         except Exception as exc:  # noqa: BLE001 - best-effort, never raise
             _LOG.warning("OTLP forward failed (JSONL is durable): %r", exc)

@@ -67,6 +67,7 @@ import type { SessionOutcome } from "../guide-registry/types.js";
 
 import { InMemoryObservabilityProvider } from "./in-memory.js";
 import {
+  GenAiRole,
   type ContextSpan,
   type MiddlewareSpan,
   type ObservabilityProvider,
@@ -236,7 +237,7 @@ function envelopeFromBase(
 
 export const TraceLine = {
   fromTurn(span: TurnSpan, traceId: string): TraceLine {
-    return envelopeFromBase(span.base, traceId, "turn", "info", {
+    const attrs: Record<string, unknown> = {
       turn_number: span.turn_number,
       input_tokens: span.input_tokens,
       output_tokens: span.output_tokens,
@@ -245,11 +246,23 @@ export const TraceLine = {
       cost_usd: span.cost_usd,
       stop_reason: jsonValue(span.stop_reason),
       tool_calls_requested: span.tool_calls_requested,
-    });
+    };
+    // GenAI content attributes (issue #64) — only when capture populated them.
+    // These ride as `gen_ai.*` keys alongside the metrics so the same line is
+    // readable in an LLM-native backend (Phoenix) without code changes.
+    if (span.output_text != null) {
+      attrs["gen_ai.response.role"] = span.output_text.role;
+      attrs["gen_ai.response.content"] = span.output_text.content;
+      attrs["gen_ai.response.content_truncated"] = span.output_text.truncated;
+    }
+    if (span.tool_calls != null) {
+      attrs["gen_ai.response.tool_calls"] = jsonValue(span.tool_calls);
+    }
+    return envelopeFromBase(span.base, traceId, "turn", "info", attrs);
   },
 
   fromToolCall(span: ToolCallSpan, traceId: string): TraceLine {
-    return envelopeFromBase(span.base, traceId, "tool_call", "info", {
+    const attrs: Record<string, unknown> = {
       tool_name: span.tool_name,
       call_id: span.call_id,
       parameters_size_bytes: span.parameters_size_bytes,
@@ -257,7 +270,18 @@ export const TraceLine = {
       truncated: span.truncated,
       sandbox_mode: span.sandbox_mode,
       sandbox_violations: jsonValue(span.sandbox_violations),
-    });
+    };
+    // GenAI content attributes (issue #64) — only when capture populated them.
+    if (span.arguments != null) {
+      attrs["gen_ai.tool.name"] = span.arguments.name;
+      attrs["gen_ai.tool.call.arguments"] = jsonValue(span.arguments.arguments);
+      attrs["gen_ai.tool.call.arguments_truncated"] = span.arguments.arguments_truncated;
+    }
+    if (span.result != null) {
+      attrs["gen_ai.tool.message.content"] = span.result.content;
+      attrs["gen_ai.tool.message.content_truncated"] = span.result.truncated;
+    }
+    return envelopeFromBase(span.base, traceId, "tool_call", "info", attrs);
   },
 
   fromSensor(span: SensorSpan, traceId: string): TraceLine {
@@ -391,6 +415,7 @@ class NullOtlpForwarder implements OtlpForwarder {
 // `@opentelemetry/*` type packages (which are intentionally not build deps).
 interface OtelSpan {
   setAttribute(key: string, value: unknown): void;
+  addEvent(name: string, attributes?: Record<string, unknown>): void;
   setStatus(status: { code: number; message?: string }): void;
   end(): void;
 }
@@ -465,6 +490,77 @@ export function attributesToOtelAttributes(
   return out;
 }
 
+/** One conventional OTel GenAI span event: an event name plus its attributes. */
+export interface GenAiSpanEvent {
+  name: string;
+  attributes: Record<string, string>;
+}
+
+/**
+ * Build the conventional OTel GenAI span events for a built {@link TraceLine}
+ * (issue #64). Returns one event per captured message using the conventional
+ * names `gen_ai.<role>.message`. Empty when the line carries no `gen_ai.*`
+ * content (content capture OFF, or a non-turn/tool line). Mirrors the Rust
+ * reference's `emit_genai_events`.
+ *
+ * This is what an LLM-native, OTel-native backend (e.g. Arize Phoenix) renders
+ * as the readable conversation. Distinct from {@link attributesToOtelAttributes},
+ * which only flattens the line's `attributes` into span *attributes*.
+ */
+export function emitGenaiEvents(line: TraceLine): GenAiSpanEvent[] {
+  const events: GenAiSpanEvent[] = [];
+  const attrs = line.attributes;
+  if (attrs === null || attrs === undefined || typeof attrs !== "object") {
+    return events;
+  }
+
+  // Turn: the assistant's output text + each requested tool call.
+  const responseContent = attrs["gen_ai.response.content"];
+  if (typeof responseContent === "string") {
+    const role =
+      typeof attrs["gen_ai.response.role"] === "string"
+        ? (attrs["gen_ai.response.role"] as string)
+        : "assistant";
+    events.push({
+      name: GenAiRole.eventName("assistant"),
+      attributes: {
+        "gen_ai.message.role": role,
+        "gen_ai.message.content": responseContent,
+      },
+    });
+  }
+  const toolCalls = attrs["gen_ai.response.tool_calls"];
+  if (Array.isArray(toolCalls)) {
+    for (const call of toolCalls) {
+      const c = call as { name?: unknown; arguments?: unknown };
+      const name = typeof c.name === "string" ? c.name : "";
+      const args = c.arguments === undefined ? "" : JSON.stringify(c.arguments);
+      events.push({
+        name: GenAiRole.eventName("assistant"),
+        attributes: {
+          "gen_ai.message.role": "assistant",
+          "gen_ai.tool.name": name,
+          "gen_ai.tool.call.arguments": args,
+        },
+      });
+    }
+  }
+
+  // Tool call: the tool result message.
+  const toolContent = attrs["gen_ai.tool.message.content"];
+  if (typeof toolContent === "string") {
+    events.push({
+      name: GenAiRole.eventName("tool"),
+      attributes: {
+        "gen_ai.message.role": "tool",
+        "gen_ai.message.content": toolContent,
+      },
+    });
+  }
+
+  return events;
+}
+
 class OtelSdkOtlpForwarder implements OtlpForwarder {
   private provider: { forceFlush(): Promise<void> } | null = null;
   private tracer: OtelTracer | null = null;
@@ -536,6 +632,11 @@ class OtelSdkOtlpForwarder implements OtlpForwarder {
         // the helper so the fixed envelope tags above always win.
         for (const [k, v] of Object.entries(attributesToOtelAttributes(line.attributes))) {
           span.setAttribute(k, v);
+        }
+        // GenAI span events — one per captured message, conventional names
+        // (`gen_ai.<role>.message`). Empty when content capture is off (#64).
+        for (const ev of emitGenaiEvents(line)) {
+          span.addEvent(ev.name, ev.attributes);
         }
 
         if (line.status === "ok") {

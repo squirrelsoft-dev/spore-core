@@ -343,8 +343,12 @@ interface Fixture {
 function buildLine(file: string, span: Record<string, unknown>, traceId: string): unknown {
   switch (file) {
     case "trace_line_turn.json":
+    case "trace_line_turn_with_content.json":
+    case "trace_line_turn_truncated.json":
+    case "trace_line_turn_content_off.json":
       return TraceLine.fromTurn(span as unknown as observability.TurnSpan, traceId);
     case "trace_line_tool_call.json":
+    case "trace_line_tool_call_with_content.json":
       return TraceLine.fromToolCall(span as unknown as observability.ToolCallSpan, traceId);
     case "trace_line_sensor.json":
       return TraceLine.fromSensor(span as unknown as observability.SensorSpan, traceId);
@@ -369,7 +373,11 @@ function buildLine(file: string, span: Record<string, unknown>, traceId: string)
 describe("OutboxObservabilityProvider — cross-language fixture replay", () => {
   const files = [
     "trace_line_turn.json",
+    "trace_line_turn_with_content.json",
+    "trace_line_turn_truncated.json",
+    "trace_line_turn_content_off.json",
     "trace_line_tool_call.json",
+    "trace_line_tool_call_with_content.json",
     "trace_line_sensor.json",
     "trace_line_context_assembly.json",
     "trace_line_compaction.json",

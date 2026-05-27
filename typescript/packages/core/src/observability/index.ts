@@ -12,6 +12,8 @@ export {
   SessionNotFoundError,
   TraceLine,
   attributesToOtelAttributes,
+  emitGenaiEvents,
   outboxConfig,
 } from "./outbox.js";
+export type { GenAiSpanEvent } from "./outbox.js";
 export type { OutboxConfig } from "./outbox.js";

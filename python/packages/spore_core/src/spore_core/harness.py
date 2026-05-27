@@ -1064,24 +1064,47 @@ from .guide_registry import (  # noqa: E402
 )
 from .memory import now as _now  # noqa: E402
 from .observability import (  # noqa: E402
+    ContentCaptureConfig,
     ContextOperationCompaction,
     ContextSpan,
+    GenAiMessage,
+    GenAiRole,
     ObservabilityProvider,
     PricingTable,
     SpanBase,
     SpanKind,
     SpanStatusError,
     SpanStatusOk,
+    ToolCallContent,
     ToolCallSpan,
+    ToolResultContent,
     TurnSpan,
     WarnEventCompactionVerificationFailed,
     WarnSpan,
     new_span_id,
+    truncate_field,
 )
 from .observability_outbox import (  # noqa: E402
     OutboxConfig,
     OutboxObservabilityProvider,
 )
+
+def _capture_tool_call_args(call: ToolCall, max_len: int) -> ToolCallContent:
+    """Capture a requested tool call as :class:`ToolCallContent`, truncating its
+    arguments to ``max_len`` UTF-8 bytes (issue #64). The arguments are measured
+    by their canonical JSON serialization; when over budget they are clipped and
+    stored as a JSON string carrying the truncation marker (a structured value
+    cannot be clipped in place), with ``arguments_truncated=True``. Mirrors the
+    Rust reference ``capture_tool_call_args``."""
+    serialized = json.dumps(call.input, separators=(",", ":"))
+    clipped, truncated = truncate_field(serialized, max_len)
+    arguments: Any = clipped if truncated else call.input
+    return ToolCallContent(
+        name=call.name,
+        arguments=arguments,
+        arguments_truncated=truncated,
+    )
+
 
 # ============================================================================
 # HarnessRunOptions
@@ -1148,6 +1171,7 @@ class HarnessConfig:
         compaction_verifier: CompactionVerifier | None = None,
         max_compaction_attempts: int = 2,
         pricing: PricingTable | None = None,
+        content_capture: ContentCaptureConfig | None = None,
     ) -> None:
         self.agent = agent
         self.tool_registry = tool_registry
@@ -1170,6 +1194,12 @@ class HarnessConfig:
         # Token → USD pricing used to stamp ``cost_usd`` on emitted turn spans.
         # Defaults to :attr:`PricingTable.DEFAULT` (zero cost) when unset.
         self.pricing: PricingTable = pricing if pricing is not None else PricingTable.DEFAULT
+        # LLM-native content capture config (issue #64). Defaults to OFF. When
+        # disabled the harness populates none of the ``gen_ai.*`` content fields,
+        # so the durable JSONL stays byte-identical to the pre-#64 output.
+        self.content_capture: ContentCaptureConfig = (
+            content_capture if content_capture is not None else ContentCaptureConfig()
+        )
 
 
 class HarnessBuilder:
@@ -1200,6 +1230,7 @@ class HarnessBuilder:
         self._compaction_verifier: CompactionVerifier | None = None
         self._max_compaction_attempts: int = 2
         self._pricing: PricingTable = PricingTable.DEFAULT
+        self._content_capture: ContentCaptureConfig | None = None
 
     def compaction_verifier(self, verifier: CompactionVerifier) -> HarnessBuilder:
         """Inject a post-compaction verifier (issue #46). Defaults to
@@ -1238,6 +1269,13 @@ class HarnessBuilder:
         self._pricing = pricing
         return self
 
+    def content_capture(self, content_capture: ContentCaptureConfig) -> HarnessBuilder:
+        """Set the LLM-native content-capture config (issue #64). OFF by
+        default. Use :meth:`ContentCaptureConfig.from_env` to honor
+        ``SPORE_TRACE_CONTENT`` / ``SPORE_TRACE_CONTENT_MAX_LEN``."""
+        self._content_capture = content_capture
+        return self
+
     def build_config(self) -> HarnessConfig:
         """Assemble the :class:`HarnessConfig` without wrapping it in a
         harness."""
@@ -1252,6 +1290,7 @@ class HarnessBuilder:
             compaction_verifier=self._compaction_verifier,
             max_compaction_attempts=self._max_compaction_attempts,
             pricing=self._pricing,
+            content_capture=self._content_capture,
         )
 
     def build(self) -> StandardHarness:
@@ -1572,6 +1611,26 @@ class StandardHarness:
                 int((time.monotonic() - turn_clock) * 1000),
             )
             if config.observability is not None:
+                # LLM-native content capture (issue #64): output text + requested
+                # tool calls, ONLY when the guard is enabled. Decision 4: the turn
+                # span carries output + tool calls; no assembled input history.
+                cc = config.content_capture
+                output_text: GenAiMessage | None = None
+                turn_tool_calls: list[ToolCallContent] | None = None
+                if cc.enabled:
+                    if isinstance(result, FinalResponse):
+                        content, content_truncated = truncate_field(
+                            result.content, cc.max_field_len
+                        )
+                        output_text = GenAiMessage(
+                            role=GenAiRole.ASSISTANT,
+                            content=content,
+                            truncated=content_truncated,
+                        )
+                    elif isinstance(result, ToolCallRequested):
+                        turn_tool_calls = [
+                            _capture_tool_call_args(c, cc.max_field_len) for c in result.calls
+                        ]
                 config.observability.emit_turn(
                     TurnSpan(
                         base=turn_base,
@@ -1588,6 +1647,8 @@ class StandardHarness:
                         ),
                         stop_reason=stop_reason,
                         tool_calls_requested=tool_calls_requested,
+                        output_text=output_text,
+                        tool_calls=turn_tool_calls,
                     )
                 )
             span_seq += 1
@@ -1763,6 +1824,19 @@ class StandardHarness:
                         else:
                             output_size_bytes = 0
                             out_truncated = False
+                        # LLM-native content capture (issue #64): tool args + tool
+                        # result, ONLY when the guard is enabled.
+                        cc = config.content_capture
+                        tool_args_content: ToolCallContent | None = None
+                        tool_result_content: ToolResultContent | None = None
+                        if cc.enabled:
+                            tool_args_content = _capture_tool_call_args(call, cc.max_field_len)
+                            if isinstance(output, ToolOutputSuccess):
+                                rc, rt = truncate_field(output.content, cc.max_field_len)
+                                tool_result_content = ToolResultContent(content=rc, truncated=rt)
+                            elif isinstance(output, ToolOutputError):
+                                rc, rt = truncate_field(output.message, cc.max_field_len)
+                                tool_result_content = ToolResultContent(content=rc, truncated=rt)
                         span_id = new_span_id(f"{session_id}-tool-{span_seq}")
                         if current_turn_base is not None:
                             tool_base = SpanBase.new_child(
@@ -1798,6 +1872,8 @@ class StandardHarness:
                                 truncated=out_truncated,
                                 sandbox_mode="",
                                 sandbox_violations=[],
+                                arguments=tool_args_content,
+                                result=tool_result_content,
                             )
                         )
                         span_seq += 1

@@ -36,11 +36,15 @@ func buildLine(t *testing.T, file string, span json.RawMessage, traceID string) 
 		}
 	}
 	switch file {
-	case "trace_line_turn.json":
+	case "trace_line_turn.json",
+		"trace_line_turn_with_content.json",
+		"trace_line_turn_truncated.json",
+		"trace_line_turn_content_off.json":
 		var s TurnSpan
 		dec(&s)
 		return TraceLineFromTurn(s, traceID)
-	case "trace_line_tool_call.json":
+	case "trace_line_tool_call.json",
+		"trace_line_tool_call_with_content.json":
 		var s ToolCallSpan
 		dec(&s)
 		return TraceLineFromToolCall(s, traceID)
@@ -85,6 +89,11 @@ func TestOutboxFixtureReplayAllKinds(t *testing.T) {
 		"trace_line_middleware.json",
 		"trace_line_patch.json",
 		"trace_line_session_summary.json",
+		// LLM-native content capture (issue #64).
+		"trace_line_turn_with_content.json",
+		"trace_line_tool_call_with_content.json",
+		"trace_line_turn_truncated.json",
+		"trace_line_turn_content_off.json",
 	}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {

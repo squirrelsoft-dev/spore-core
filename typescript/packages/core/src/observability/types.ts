@@ -152,6 +152,142 @@ export function finishSpanBase(
 }
 
 // ============================================================================
+// LLM-native content capture (issue #64)
+// ============================================================================
+//
+// Opt-in capture of conversation/tool-call **content** following the
+// OpenTelemetry GenAI semantic conventions. OFF by default. Plumbed into the
+// existing span payloads and serialized into the durable JSONL only when
+// present, so the content-OFF path stays byte-identical to the pre-#64 output.
+//
+// Resolved maintainer decisions (mirror the Rust reference exactly):
+//   1. Canonical convention is pure OTel `gen_ai.*` events (no OpenInference).
+//   2. Routing is the single configurable `SPORE_OTLP_ENDPOINT` (no fan-out).
+//   3. Truncation default is 8192 UTF-8 bytes, marker `...[truncated]`, clipped
+//      at a char boundary; override `SPORE_TRACE_CONTENT_MAX_LEN`; guard
+//      `SPORE_TRACE_CONTENT` (default OFF).
+//   4. Prompt source is output + tool spans only (no assembled input history).
+
+/** The exact ASCII marker appended to any captured field clipped by
+ *  {@link truncateField}. Cross-language ground truth — never change the bytes. */
+export const TRUNCATION_MARKER = "...[truncated]";
+
+/** Default content-field cap, in UTF-8 bytes (maintainer decision 3). */
+const DEFAULT_CONTENT_MAX_LEN = 8192;
+
+/**
+ * Opt-in guard + truncation limit for LLM-native content capture (issue #64).
+ *
+ * Content capture is OFF by default. When `enabled` is `false` the harness
+ * populates none of the `gen_ai.*` content fields, so the durable JSONL stays
+ * byte-identical to the pre-#64 metrics-only output.
+ */
+export interface ContentCaptureConfig {
+  /** Whether to capture message / tool-call content at all. Default `false`. */
+  enabled: boolean;
+  /** Maximum UTF-8 byte length of any single captured field before
+   *  {@link truncateField} clips it. Default `8192`. */
+  maxFieldLen: number;
+}
+
+export const ContentCaptureConfig = {
+  /** Default config: OFF, 8192-byte cap. */
+  default(): ContentCaptureConfig {
+    return { enabled: false, maxFieldLen: DEFAULT_CONTENT_MAX_LEN };
+  },
+
+  /**
+   * Read the config from the environment:
+   *   - `SPORE_TRACE_CONTENT` — `1`/`true`/`yes`/`on` (case-insensitive)
+   *     enables capture; anything else (or unset) leaves it OFF.
+   *   - `SPORE_TRACE_CONTENT_MAX_LEN` — parsed as a non-negative integer; falls
+   *     back to the 8192-byte default when unset or unparseable.
+   */
+  fromEnv(env: NodeJS.ProcessEnv = process.env): ContentCaptureConfig {
+    const raw = env.SPORE_TRACE_CONTENT;
+    const enabled =
+      raw !== undefined && ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+    const maxRaw = env.SPORE_TRACE_CONTENT_MAX_LEN;
+    let maxFieldLen = DEFAULT_CONTENT_MAX_LEN;
+    if (maxRaw !== undefined) {
+      const trimmed = maxRaw.trim();
+      // Match Rust `usize::from_str`: digits only, non-negative.
+      if (/^\d+$/.test(trimmed)) {
+        const parsed = Number.parseInt(trimmed, 10);
+        if (Number.isSafeInteger(parsed)) maxFieldLen = parsed;
+      }
+    }
+    return { enabled, maxFieldLen };
+  },
+} as const;
+
+/**
+ * Role of a captured message. Bare strings map onto the conventional GenAI
+ * span-event names (`gen_ai.<role>.message`).
+ */
+export type GenAiRole = "system" | "user" | "assistant" | "tool";
+
+export const GenAiRole = {
+  /** The conventional OTel GenAI span-event name for a role, e.g.
+   *  `gen_ai.assistant.message`. */
+  eventName(role: GenAiRole): string {
+    return `gen_ai.${role}.message`;
+  },
+} as const;
+
+/** One captured conversation message (issue #64). */
+export interface GenAiMessage {
+  role: GenAiRole;
+  content: string;
+  /** `true` when `content` was clipped by {@link truncateField}. */
+  truncated: boolean;
+}
+
+/** A requested tool call captured on a {@link TurnSpan} (issue #64). */
+export interface ToolCallContent {
+  name: string;
+  /** The tool-call arguments. When clipped, the arguments are stored as a JSON
+   *  string value carrying the truncation marker, and `arguments_truncated` is
+   *  `true`. */
+  arguments: unknown;
+  arguments_truncated: boolean;
+}
+
+/** A tool result body captured on a {@link ToolCallSpan} (issue #64). */
+export interface ToolResultContent {
+  content: string;
+  /** `true` when `content` was clipped by {@link truncateField}. */
+  truncated: boolean;
+}
+
+/**
+ * Clip `s` to at most `max` UTF-8 bytes, appending {@link TRUNCATION_MARKER}
+ * when (and only when) a clip occurred. Returns `[clipped, wasTruncated]`.
+ *
+ * Pure and deterministic — the cross-language ground truth:
+ *   - Measurement is in **UTF-8 bytes**, not UTF-16 code units / JS chars.
+ *   - When the UTF-8 byte length `<= max`, returns `s` unchanged with `false`.
+ *   - Otherwise clips to the largest valid UTF-8 char boundary `<= max` (never
+ *     splitting a multibyte char — backs off to the previous boundary) and
+ *     appends the marker. The marker is appended AFTER the byte budget, so the
+ *     returned string may exceed `max` bytes by the marker's length.
+ */
+export function truncateField(s: string, max: number): [string, boolean] {
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length <= max) {
+    return [s, false];
+  }
+  // Back off to the largest UTF-8 char boundary <= max. A boundary byte is one
+  // that is NOT a UTF-8 continuation byte (0b10xxxxxx).
+  let boundary = max;
+  while (boundary > 0 && (bytes[boundary] & 0xc0) === 0x80) {
+    boundary -= 1;
+  }
+  const clipped = new TextDecoder("utf-8").decode(bytes.subarray(0, boundary));
+  return [clipped + TRUNCATION_MARKER, true];
+}
+
+// ============================================================================
 // Span payload types
 // ============================================================================
 
@@ -165,6 +301,12 @@ export interface TurnSpan {
   cost_usd: number;
   stop_reason: StopReason;
   tool_calls_requested: number;
+  /** The model's output text for this turn (issue #64). Captured only when
+   *  content capture is enabled; absent keeps the line pre-#64-identical. */
+  output_text?: GenAiMessage | null;
+  /** The tool calls the model requested this turn (issue #64). Captured only
+   *  when content capture is enabled. */
+  tool_calls?: ToolCallContent[] | null;
 }
 
 export interface ToolCallSpan {
@@ -176,6 +318,12 @@ export interface ToolCallSpan {
   truncated: boolean;
   sandbox_mode: string;
   sandbox_violations: string[];
+  /** The tool-call arguments (issue #64). Captured only when content capture is
+   *  enabled; absent keeps the line pre-#64-identical. */
+  arguments?: ToolCallContent | null;
+  /** The tool result body (issue #64). Captured only when content capture is
+   *  enabled. */
+  result?: ToolResultContent | null;
 }
 
 export interface SensorSpan {

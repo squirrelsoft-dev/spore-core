@@ -20,19 +20,25 @@ import type { SessionOutcome } from "../guide-registry/types.js";
 import { Timestamp } from "../memory/types.js";
 import type { StopReason, TokenUsage } from "../model/schemas.js";
 import {
+  ContentCaptureConfig,
   PricingTable,
   SpanId,
   finishSpanBase,
   newRootSpanBase,
   newChildSpanBase,
   newWarnSpan,
+  truncateField,
   type ContextSpan,
+  type GenAiMessage,
   type SpanBase,
   type SpanStatus,
+  type ToolCallContent,
   type ToolCallSpan,
+  type ToolResultContent,
   type TurnSpan,
   type WarnEvent,
 } from "../observability/types.js";
+import type { ToolCall } from "../model/schemas.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 
@@ -96,10 +102,34 @@ export interface HarnessConfig {
    * when unset, mirroring Rust's `pricing: PricingTable::DEFAULT`.
    */
   pricing?: PricingTable;
+  /**
+   * LLM-native content capture (issue #64). Gates whether the turn/tool-call
+   * spans carry `gen_ai.*` conversation/tool content. Optional; defaults to
+   * {@link ContentCaptureConfig.default} (OFF) so the durable JSONL stays
+   * byte-identical to the pre-#64 output. Use {@link ContentCaptureConfig.fromEnv}
+   * to honor `SPORE_TRACE_CONTENT` / `SPORE_TRACE_CONTENT_MAX_LEN`.
+   */
+  contentCapture?: ContentCaptureConfig;
 }
 
 export class StandardHarness implements Harness {
   constructor(private readonly config: HarnessConfig) {}
+
+  /**
+   * Capture a requested tool call's arguments (issue #64). When the serialized
+   * arguments exceed the byte budget, the clipped marker-bearing string is
+   * stored as the `arguments` value; otherwise the raw input is preserved.
+   * Mirrors Rust's `capture_tool_call_args`.
+   */
+  private static captureToolCallArgs(call: ToolCall, max: number): ToolCallContent {
+    const serialized = JSON.stringify(call.input ?? null);
+    const [clipped, truncated] = truncateField(serialized, max);
+    return {
+      name: call.name,
+      arguments: truncated ? clipped : call.input,
+      arguments_truncated: truncated,
+    };
+  }
 
   async run(options: HarnessRunOptions): Promise<RunResult> {
     const sessionState = options.session_state ?? emptySessionState();
@@ -416,6 +446,22 @@ export class StandardHarness implements Harness {
           Date.now() - turnClock,
         );
         if (this.config.observability) {
+          // LLM-native content capture (issue #64): output text + requested
+          // tool calls, ONLY when the guard is enabled. Decision 4: the turn
+          // span carries output + tool calls; no assembled input-message history.
+          const cc = this.config.contentCapture ?? ContentCaptureConfig.default();
+          let outputText: GenAiMessage | null = null;
+          let toolCalls: ToolCallContent[] | null = null;
+          if (cc.enabled) {
+            if (result.kind === "final_response") {
+              const [content, truncated] = truncateField(result.content, cc.maxFieldLen);
+              outputText = { role: "assistant", content, truncated };
+            } else if (result.kind === "tool_call_requested") {
+              toolCalls = result.calls.map((c) =>
+                StandardHarness.captureToolCallArgs(c, cc.maxFieldLen),
+              );
+            }
+          }
           const turnSpan: TurnSpan = {
             base,
             turn_number: budgetUsed.turns,
@@ -432,6 +478,8 @@ export class StandardHarness implements Harness {
             ),
             stop_reason: stopReason,
             tool_calls_requested: toolCallsRequested,
+            output_text: outputText,
+            tool_calls: toolCalls,
           };
           this.config.observability.emitTurn(turnSpan);
         }
@@ -651,6 +699,21 @@ export class StandardHarness implements Harness {
               const status: SpanStatus = isError
                 ? { kind: "error", message: "tool returned a recoverable error" }
                 : { kind: "ok" };
+              // LLM-native content capture (issue #64): tool args + tool result,
+              // ONLY when the guard is enabled.
+              const cc = this.config.contentCapture ?? ContentCaptureConfig.default();
+              let argsContent: ToolCallContent | null = null;
+              let resultContent: ToolResultContent | null = null;
+              if (cc.enabled) {
+                argsContent = StandardHarness.captureToolCallArgs(call, cc.maxFieldLen);
+                if (output.kind === "success") {
+                  const [content, t] = truncateField(output.content, cc.maxFieldLen);
+                  resultContent = { content, truncated: t };
+                } else if (output.kind === "error") {
+                  const [content, t] = truncateField(output.message, cc.maxFieldLen);
+                  resultContent = { content, truncated: t };
+                }
+              }
               const toolSpan: ToolCallSpan = {
                 base: finishSpanBase(childBase, Timestamp.now(), status, Date.now() - toolClock),
                 tool_name: call.name,
@@ -660,6 +723,8 @@ export class StandardHarness implements Harness {
                 truncated,
                 sandbox_mode: "",
                 sandbox_violations: [],
+                arguments: argsContent,
+                result: resultContent,
               };
               this.config.observability.emitToolCall(toolSpan);
               spanSeq += 1;
@@ -925,6 +990,7 @@ export class HarnessBuilder {
   private _compactionVerifier: CompactionVerifier = new KeyTermVerifier();
   private _maxCompactionAttempts = 2;
   private _pricing: PricingTable = PricingTable.DEFAULT;
+  private _contentCapture: ContentCaptureConfig = ContentCaptureConfig.default();
 
   constructor(
     private readonly agent: Agent,
@@ -976,6 +1042,13 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Configure LLM-native content capture (issue #64). Defaults to OFF. Use
+   *  {@link ContentCaptureConfig.fromEnv} to honor the env guard. */
+  contentCapture(config: ContentCaptureConfig): this {
+    this._contentCapture = config;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -989,6 +1062,7 @@ export class HarnessBuilder {
       compactionVerifier: this._compactionVerifier,
       maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,
+      contentCapture: this._contentCapture,
     };
   }
 

@@ -16,6 +16,7 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
@@ -29,12 +30,30 @@ import (
 type HarnessObservabilityAdapter struct {
 	provider ObservabilityProvider
 	pricing  PricingTable
+	// content is the LLM-native content-capture guard + truncation limit (issue
+	// #64). Default OFF, so the adapter populates none of the gen_ai.* span
+	// fields and the durable JSONL stays pre-#64-identical.
+	content ContentCaptureConfig
 }
 
 // NewHarnessObserver wraps an ObservabilityProvider as a
-// sporecore.HarnessObserver, stamping turn-span cost via pricing.
+// sporecore.HarnessObserver, stamping turn-span cost via pricing. Content
+// capture defaults OFF; use NewHarnessObserverWithContent to enable it.
 func NewHarnessObserver(provider ObservabilityProvider, pricing PricingTable) *HarnessObservabilityAdapter {
-	return &HarnessObservabilityAdapter{provider: provider, pricing: pricing}
+	return &HarnessObservabilityAdapter{
+		provider: provider,
+		pricing:  pricing,
+		content:  DefaultContentCaptureConfig(),
+	}
+}
+
+// NewHarnessObserverWithContent is NewHarnessObserver plus an explicit
+// ContentCaptureConfig (issue #64). When content.Enabled is true the adapter
+// captures the model output text + requested tool calls on the turn span and
+// the tool arguments + result on the tool-call span, each truncated to
+// content.MaxFieldLen UTF-8 bytes.
+func NewHarnessObserverWithContent(provider ObservabilityProvider, pricing PricingTable, content ContentCaptureConfig) *HarnessObservabilityAdapter {
+	return &HarnessObservabilityAdapter{provider: provider, pricing: pricing, content: content}
 }
 
 // EmitTurn builds a root TurnSpan and forwards it. Mirrors the Rust loop's
@@ -52,6 +71,8 @@ func (a *HarnessObservabilityAdapter) EmitTurn(
 	stopReason sporecore.StopReason,
 	toolCallsRequested uint32,
 	errorMessage string,
+	outputText string,
+	calls []sporecore.ToolCall,
 ) {
 	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindTurn, Timestamp(startedAt))
 	status := NewStatusOk()
@@ -59,7 +80,7 @@ func (a *HarnessObservabilityAdapter) EmitTurn(
 		status = NewStatusError(errorMessage)
 	}
 	base.Finish(Timestamp(startedAt), status, durationMs)
-	a.provider.EmitTurn(TurnSpan{
+	span := TurnSpan{
 		Base:               base,
 		TurnNumber:         turnNumber,
 		InputTokens:        usage.InputTokens,
@@ -69,7 +90,46 @@ func (a *HarnessObservabilityAdapter) EmitTurn(
 		CostUSD:            costUSD,
 		StopReason:         stopReason,
 		ToolCallsRequested: toolCallsRequested,
-	})
+	}
+	// Content capture (issue #64): output text + requested tool calls on the
+	// turn span, gated on the guard and truncated to MaxFieldLen UTF-8 bytes.
+	if a.content.Enabled {
+		if outputText != "" {
+			clipped, truncated := TruncateField(outputText, a.content.MaxFieldLen)
+			span.OutputText = &GenAiMessage{
+				Role:      GenAiRoleAssistant,
+				Content:   clipped,
+				Truncated: truncated,
+			}
+		}
+		if len(calls) > 0 {
+			tcs := make([]ToolCallContent, 0, len(calls))
+			for _, c := range calls {
+				tcs = append(tcs, toolCallContent(c.Name, c.Input, a.content.MaxFieldLen))
+			}
+			span.ToolCalls = tcs
+		}
+	}
+	a.provider.EmitTurn(span)
+}
+
+// toolCallContent builds a captured ToolCallContent (issue #64), truncating the
+// arguments by their JSON-byte length. A truncated argument cannot be clipped
+// in place as JSON, so it is stored as a JSON string value carrying the marker.
+func toolCallContent(name string, args json.RawMessage, maxLen int) ToolCallContent {
+	if len(args) == 0 {
+		return ToolCallContent{Name: name, Arguments: json.RawMessage("null")}
+	}
+	clipped, truncated := TruncateField(string(args), maxLen)
+	if !truncated {
+		return ToolCallContent{Name: name, Arguments: append(json.RawMessage(nil), args...)}
+	}
+	// Store the clipped form as a JSON string value.
+	strBytes, err := json.Marshal(clipped)
+	if err != nil {
+		strBytes = json.RawMessage("null")
+	}
+	return ToolCallContent{Name: name, Arguments: strBytes, ArgumentsTruncated: true}
 }
 
 // EmitToolCall builds a child ToolCallSpan (parented to the turn span) and
@@ -87,6 +147,8 @@ func (a *HarnessObservabilityAdapter) EmitToolCall(
 	outputSizeBytes uint64,
 	truncated bool,
 	isError bool,
+	arguments json.RawMessage,
+	resultContent string,
 ) {
 	// Reconstruct the parent envelope so NewChild can stamp the parent id.
 	parent := NewRoot(SpanID(parentSpanID), sessionID, taskID, SpanKindTurn, Timestamp(startedAt))
@@ -96,7 +158,7 @@ func (a *HarnessObservabilityAdapter) EmitToolCall(
 		status = NewStatusError("tool returned a recoverable error")
 	}
 	base.Finish(Timestamp(startedAt), status, durationMs)
-	a.provider.EmitToolCall(ToolCallSpan{
+	span := ToolCallSpan{
 		Base:                base,
 		ToolName:            toolName,
 		CallID:              callID,
@@ -105,7 +167,16 @@ func (a *HarnessObservabilityAdapter) EmitToolCall(
 		Truncated:           truncated,
 		SandboxMode:         "",
 		SandboxViolations:   nil,
-	})
+	}
+	// Content capture (issue #64): tool arguments + result body on the tool-call
+	// span, gated on the guard and truncated to MaxFieldLen UTF-8 bytes.
+	if a.content.Enabled {
+		tc := toolCallContent(toolName, arguments, a.content.MaxFieldLen)
+		span.Arguments = &tc
+		clipped, resTruncated := TruncateField(resultContent, a.content.MaxFieldLen)
+		span.Result = &ToolResultContent{Content: clipped, Truncated: resTruncated}
+	}
+	a.provider.EmitToolCall(span)
 }
 
 // SetSessionOutcome records the terminal outcome on the wrapped provider.
@@ -202,6 +273,9 @@ type HarnessBuilder struct {
 	middleware        sporecore.MiddlewareChain
 	provider          ObservabilityProvider
 	pricing           PricingTable
+	// content is the LLM-native content-capture config (issue #64). Defaults to
+	// ContentCaptureConfigFromEnv() (OFF unless SPORE_TRACE_CONTENT is set).
+	content ContentCaptureConfig
 	// Compaction loop (issue #46). compactionVerifier defaults to
 	// contextmgr.NewKeyTermVerifier(); maxCompactionAttempts defaults to 2.
 	compactionVerifier    sporecore.CompactionVerifier
@@ -224,9 +298,18 @@ func NewHarnessBuilder(
 		contextManager:        contextManager,
 		terminationPolicy:     terminationPolicy,
 		pricing:               DefaultPricing(),
+		content:               ContentCaptureConfigFromEnv(),
 		compactionVerifier:    contextmgr.NewKeyTermVerifier(),
 		maxCompactionAttempts: 2,
 	}
+}
+
+// ContentCapture sets the LLM-native content-capture config (issue #64),
+// overriding the env-derived default. Use this to enable capture
+// programmatically (e.g. ContentCaptureConfig{Enabled: true, MaxFieldLen: 8192}).
+func (b *HarnessBuilder) ContentCapture(c ContentCaptureConfig) *HarnessBuilder {
+	b.content = c
+	return b
 }
 
 // CompactionVerifier injects a post-compaction verifier (issue #46). Defaults
@@ -285,7 +368,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		MaxCompactionAttempts: b.maxCompactionAttempts,
 	}
 	if b.provider != nil {
-		cfg.Observability = NewHarnessObserver(b.provider, b.pricing)
+		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)
 	}
 	return cfg
 }

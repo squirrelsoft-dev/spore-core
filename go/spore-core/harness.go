@@ -981,6 +981,12 @@ type HarnessObserver interface {
 		stopReason StopReason,
 		toolCallsRequested uint32,
 		errorMessage string,
+		// content (issue #64): the model's output text and the tool calls it
+		// requested this turn. Captured only when the observer's content-capture
+		// guard is ON; the observer truncates and gates these. outputText is ""
+		// when the turn produced no final text; calls is nil when no tool calls.
+		outputText string,
+		calls []ToolCall,
 	)
 
 	// EmitToolCall records one tool dispatch as a child of parentSpanID.
@@ -997,6 +1003,12 @@ type HarnessObserver interface {
 		outputSizeBytes uint64,
 		truncated bool,
 		isError bool,
+		// content (issue #64): the tool-call arguments and the tool result body.
+		// Captured only when the observer's content-capture guard is ON; the
+		// observer truncates and gates these. arguments is nil when unavailable;
+		// resultContent is "" when the tool produced no result body.
+		arguments json.RawMessage,
+		resultContent string,
 	)
 
 	// SetSessionOutcome records the terminal outcome (success / failure).
@@ -1820,6 +1832,8 @@ func (h *StandardHarness) runReActInner(
 				stopReason,
 				toolCallsRequested,
 				errMsg,
+				result.Content,
+				result.Calls,
 			)
 		}
 		currentTurnSpanID = turnSpanID
@@ -2015,6 +2029,13 @@ func (h *StandardHarness) runReActInner(
 					if call.Input != nil {
 						paramsSize = uint64(len(call.Input))
 					}
+					var resultContent string
+					switch output.Kind {
+					case ToolOutputSuccess:
+						resultContent = output.Content
+					case ToolOutputError:
+						resultContent = output.Message
+					}
 					toolSpanID := fmt.Sprintf("%s-tool-%d", sessionID, spanSeq)
 					h.config.Observability.EmitToolCall(
 						toolSpanID,
@@ -2029,6 +2050,8 @@ func (h *StandardHarness) runReActInner(
 						outputSize,
 						output.Truncated,
 						isError,
+						call.Input,
+						resultContent,
 					)
 					spanSeq++
 				}

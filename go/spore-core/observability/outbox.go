@@ -228,6 +228,11 @@ type turnAttrs struct {
 }
 
 // TraceLineFromTurn builds the TraceLine for a turn span.
+//
+// When content capture (issue #64) populated OutputText / ToolCalls, the
+// gen_ai.* attributes ride alongside the metrics keys so the same line is
+// readable in an LLM-native backend (Phoenix) without code changes. When
+// neither is set the attributes object is byte-identical to the pre-#64 output.
 func TraceLineFromTurn(span TurnSpan, traceID string) TraceLine {
 	attrs := turnAttrs{
 		TurnNumber:         span.TurnNumber,
@@ -239,7 +244,33 @@ func TraceLineFromTurn(span TurnSpan, traceID string) TraceLine {
 		StopReason:         span.StopReason,
 		ToolCallsRequested: span.ToolCallsRequested,
 	}
-	return fromBase(span.Base, traceID, "turn", "info", mustMarshal(attrs))
+	if span.OutputText == nil && span.ToolCalls == nil {
+		return fromBase(span.Base, traceID, "turn", "info", mustMarshal(attrs))
+	}
+	extra := make(map[string]any)
+	if msg := span.OutputText; msg != nil {
+		extra["gen_ai.response.role"] = string(msg.Role)
+		extra["gen_ai.response.content"] = msg.Content
+		extra["gen_ai.response.content_truncated"] = msg.Truncated
+	}
+	if span.ToolCalls != nil {
+		extra["gen_ai.response.tool_calls"] = span.ToolCalls
+	}
+	return fromBase(span.Base, traceID, "turn", "info", mergeAttrs(attrs, extra))
+}
+
+// mergeAttrs marshals base, then layers the extra gen_ai.* keys (issue #64) into
+// the resulting object. Fixture comparison is value-based, so the merged key
+// ordering is irrelevant; correctness is the union of keys and values.
+func mergeAttrs(base any, extra map[string]any) json.RawMessage {
+	merged := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(mustMarshal(base), &merged); err != nil {
+		return mustMarshal(base)
+	}
+	for k, v := range extra {
+		merged[k] = mustMarshal(v)
+	}
+	return mustMarshal(merged)
 }
 
 type toolCallAttrs struct {
@@ -267,7 +298,20 @@ func TraceLineFromToolCall(span ToolCallSpan, traceID string) TraceLine {
 		SandboxMode:         span.SandboxMode,
 		SandboxViolations:   violations,
 	}
-	return fromBase(span.Base, traceID, "tool_call", "info", mustMarshal(attrs))
+	if span.Arguments == nil && span.Result == nil {
+		return fromBase(span.Base, traceID, "tool_call", "info", mustMarshal(attrs))
+	}
+	extra := make(map[string]any)
+	if args := span.Arguments; args != nil {
+		extra["gen_ai.tool.name"] = args.Name
+		extra["gen_ai.tool.call.arguments"] = args.Arguments
+		extra["gen_ai.tool.call.arguments_truncated"] = args.ArgumentsTruncated
+	}
+	if res := span.Result; res != nil {
+		extra["gen_ai.tool.message.content"] = res.Content
+		extra["gen_ai.tool.message.content_truncated"] = res.Truncated
+	}
+	return fromBase(span.Base, traceID, "tool_call", "info", mergeAttrs(attrs, extra))
 }
 
 type sensorAttrs struct {

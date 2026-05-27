@@ -40,6 +40,7 @@ Rules enforced:
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
@@ -200,6 +201,145 @@ class SpanBase:
 
 
 # ============================================================================
+# LLM-native content capture (issue #64)
+# ============================================================================
+#
+# Opt-in capture of conversation/tool-call **content** following the
+# OpenTelemetry GenAI semantic conventions. OFF by default. Plumbed into the
+# existing span payloads (no Protocol-signature changes) and serialized into the
+# durable JSONL only when present.
+#
+# Resolved maintainer decisions (mirror the Rust reference byte-for-byte):
+#   1. Canonical convention is pure OTel ``gen_ai.*`` events (no OpenInference).
+#   2. Routing is the single configurable ``SPORE_OTLP_ENDPOINT`` (no fan-out).
+#   3. Truncation default is 8192 UTF-8 bytes, marker ``...[truncated]``,
+#      clipped at a char boundary; override ``SPORE_TRACE_CONTENT_MAX_LEN``;
+#      guard ``SPORE_TRACE_CONTENT`` (default OFF).
+#   4. The turn span carries the model output + requested tool calls only; the
+#      tool-call span carries the tool args + result. No assembled input history.
+
+TRUNCATION_MARKER = "...[truncated]"
+"""The exact ASCII marker appended to any captured field that was clipped by
+:func:`truncate_field`. Cross-language ground truth — never change the bytes."""
+
+_DEFAULT_CONTENT_MAX_LEN = 8192
+"""Default content-field cap, in UTF-8 bytes (maintainer decision 3)."""
+
+
+def truncate_field(s: str, max_len: int) -> tuple[str, bool]:
+    """Clip ``s`` to at most ``max_len`` UTF-8 **bytes**, appending
+    :data:`TRUNCATION_MARKER` when (and only when) a clip occurred. Returns
+    ``(clipped, was_truncated)``.
+
+    Pure and deterministic — this is the cross-language ground truth:
+
+    * Measurement is in UTF-8 bytes, not characters.
+    * When ``s`` fits the budget, returns ``s`` unchanged with ``False``.
+    * Otherwise clips to the largest valid UTF-8 char boundary ``<= max_len``
+      (never splitting a multibyte char — backs off to the previous boundary)
+      and appends the marker. The marker is appended AFTER the byte budget, so
+      the returned string may exceed ``max_len`` bytes by the marker's length;
+      the budget bounds the *captured payload*, not the marker.
+    """
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_len:
+        return (s, False)
+    # Back off to the largest char boundary <= max_len. A UTF-8 continuation
+    # byte has its top two bits set to ``10`` (``0b10xxxxxx``); a boundary is any
+    # index that is not a continuation byte.
+    boundary = max_len
+    while boundary > 0 and (encoded[boundary] & 0xC0) == 0x80:
+        boundary -= 1
+    clipped = encoded[:boundary].decode("utf-8")
+    return (clipped + TRUNCATION_MARKER, True)
+
+
+@dataclass(frozen=True)
+class ContentCaptureConfig:
+    """Opt-in guard + truncation limit for LLM-native content capture
+    (issue #64).
+
+    Content capture is OFF by default. When :attr:`enabled` is ``False`` the
+    harness populates none of the ``gen_ai.*`` content fields, so the durable
+    JSONL stays byte-identical to the pre-#64 metrics-only output.
+    """
+
+    enabled: bool = False
+    """Whether to capture message / tool-call content at all. Default ``False``."""
+    max_field_len: int = _DEFAULT_CONTENT_MAX_LEN
+    """Maximum UTF-8 byte length of any single captured field before
+    :func:`truncate_field` clips it. Default ``8192``."""
+
+    @classmethod
+    def from_env(cls) -> ContentCaptureConfig:
+        """Read the config from the environment:
+
+        * ``SPORE_TRACE_CONTENT`` — ``1``/``true``/``yes``/``on``
+          (case-insensitive) enables capture; anything else (or unset) leaves
+          it OFF.
+        * ``SPORE_TRACE_CONTENT_MAX_LEN`` — parsed as ``int``; falls back to the
+          8192-byte default when unset or unparseable.
+        """
+        raw = os.environ.get("SPORE_TRACE_CONTENT")
+        enabled = raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+        max_field_len = _DEFAULT_CONTENT_MAX_LEN
+        raw_max = os.environ.get("SPORE_TRACE_CONTENT_MAX_LEN")
+        if raw_max is not None:
+            try:
+                max_field_len = int(raw_max.strip())
+            except ValueError:
+                max_field_len = _DEFAULT_CONTENT_MAX_LEN
+        return cls(enabled=enabled, max_field_len=max_field_len)
+
+
+class GenAiRole(str, Enum):
+    """Role of a captured message. The bare-string values map onto the
+    conventional GenAI span-event names (``gen_ai.<role>.message``)."""
+
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+    def event_name(self) -> str:
+        """The conventional OTel GenAI span-event name for this role, e.g.
+        ``gen_ai.assistant.message``."""
+        return f"gen_ai.{self.value}.message"
+
+
+@dataclass
+class GenAiMessage:
+    """One captured conversation message (issue #64)."""
+
+    role: GenAiRole
+    content: str
+    truncated: bool
+    """``True`` when ``content`` was clipped by :func:`truncate_field`."""
+
+
+@dataclass
+class ToolCallContent:
+    """A requested tool call captured on a :class:`TurnSpan` (issue #64).
+
+    When clipped, the arguments are stored as a JSON string value carrying the
+    truncation marker (a structured value cannot be clipped in place), and
+    :attr:`arguments_truncated` is ``True``."""
+
+    name: str
+    arguments: Any
+    arguments_truncated: bool
+
+
+@dataclass
+class ToolResultContent:
+    """A tool result body captured on a :class:`ToolCallSpan` (issue #64)."""
+
+    content: str
+    truncated: bool
+    """``True`` when ``content`` was clipped by :func:`truncate_field`."""
+
+
+# ============================================================================
 # Span payload dataclasses
 # ============================================================================
 
@@ -215,6 +355,12 @@ class TurnSpan:
     tool_calls_requested: int
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    # The model's output text for this turn (issue #64). Captured only when
+    # ``ContentCaptureConfig.enabled``; ``None`` keeps the line pre-#64-identical.
+    output_text: GenAiMessage | None = None
+    # The tool calls the model requested this turn (issue #64). Captured only
+    # when content capture is enabled.
+    tool_calls: list[ToolCallContent] | None = None
 
 
 @dataclass
@@ -227,6 +373,12 @@ class ToolCallSpan:
     truncated: bool
     sandbox_mode: str
     sandbox_violations: list[str] = field(default_factory=list)
+    # The tool-call arguments (issue #64). Captured only when content capture is
+    # enabled; ``None`` keeps the line pre-#64-identical.
+    arguments: ToolCallContent | None = None
+    # The tool result body (issue #64). Captured only when content capture is
+    # enabled.
+    result: ToolResultContent | None = None
 
 
 @dataclass
@@ -837,12 +989,16 @@ class InMemoryObservabilityProvider:
 
 
 __all__ = [
+    "TRUNCATION_MARKER",
+    "ContentCaptureConfig",
     "ContextOperation",
     "ContextOperationAssembly",
     "ContextOperationCompaction",
     "ContextOperationSkillInjected",
     "ContextOperationToolResultAppended",
     "ContextSpan",
+    "GenAiMessage",
+    "GenAiRole",
     "InMemoryObservabilityProvider",
     "MiddlewareSpan",
     "ObservabilityProvider",
@@ -863,10 +1019,13 @@ __all__ = [
     "SpanStatusError",
     "SpanStatusHalted",
     "SpanStatusOk",
+    "ToolCallContent",
     "ToolCallSpan",
+    "ToolResultContent",
     "TurnSpan",
     "WarnEvent",
     "WarnEventCompactionVerificationFailed",
     "WarnSpan",
     "new_span_id",
+    "truncate_field",
 ]

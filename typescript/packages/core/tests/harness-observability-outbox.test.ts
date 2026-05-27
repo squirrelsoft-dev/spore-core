@@ -23,6 +23,7 @@ import {
   MockAgent,
   SessionId,
   newTask,
+  observability,
   type LoopStrategy,
   type TokenUsage,
   type ToolCall,
@@ -105,5 +106,93 @@ describe("Harness — spans through durable outbox (hermetic)", () => {
 
     // The `.flushed` marker exists.
     expect(existsSync(join(dir, ".flushed"))).toBe(true);
+  });
+
+  // ── LLM-native content capture (issue #64) ────────────────────────────────
+
+  it("content capture ON writes gen_ai.* content to the JSONL", async () => {
+    const root = mkdtempSync(join(tmpdir(), "spore-cc-on-"));
+
+    const agent = new MockAgent(AgentId.of("test"));
+    agent.push(tcr(toolCall("call-1", "shell")));
+    agent.push(fr("all done"));
+
+    const tools = new ScriptedToolRegistry();
+    tools.push({ kind: "success", content: "tool output", truncated: false });
+
+    const sessionId = SessionId.of("sess-cc-on");
+    const harness = new HarnessBuilder(
+      agent,
+      tools,
+      new AllowAllSandbox(),
+      new NoopContextManager(),
+      new AlwaysContinuePolicy(),
+    )
+      .withObservabilityOutbox(root)
+      .contentCapture({ enabled: true, maxFieldLen: 8192 })
+      .build();
+
+    const result = await harness.run({ task: newTask("do it", sessionId, react) });
+    expect(result.kind).toBe("success");
+
+    const lines = readFileSync(join(root, "sessions", sessionId.asString(), "trace.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    // The turn requesting a tool call carries gen_ai.response.tool_calls.
+    const turnWithCalls = lines.find((l) => {
+      const a = l.attributes as Record<string, unknown>;
+      return l.kind === "turn" && a["gen_ai.response.tool_calls"] != null;
+    });
+    expect(turnWithCalls).toBeDefined();
+    const calls = (turnWithCalls!.attributes as Record<string, unknown>)[
+      "gen_ai.response.tool_calls"
+    ] as Array<Record<string, unknown>>;
+    expect(calls[0].name).toBe("shell");
+
+    // The final-response turn carries gen_ai.response.content.
+    const turnFinal = lines.find((l) => {
+      const a = l.attributes as Record<string, unknown>;
+      return l.kind === "turn" && a["gen_ai.response.content"] === "all done";
+    });
+    expect(turnFinal).toBeDefined();
+
+    // The tool_call span carries the args + result content.
+    const toolLine = lines.find((l) => l.kind === "tool_call")!;
+    const ta = toolLine.attributes as Record<string, unknown>;
+    expect(ta["gen_ai.tool.name"]).toBe("shell");
+    expect(ta["gen_ai.tool.message.content"]).toBe("tool output");
+  });
+
+  it("content capture OFF (default) writes no gen_ai.* content", async () => {
+    const root = mkdtempSync(join(tmpdir(), "spore-cc-off-"));
+
+    const agent = new MockAgent(AgentId.of("test"));
+    agent.push(tcr(toolCall("call-1", "shell")));
+    agent.push(fr("all done"));
+
+    const tools = new ScriptedToolRegistry();
+    tools.push({ kind: "success", content: "tool output", truncated: false });
+
+    const sessionId = SessionId.of("sess-cc-off");
+    // Default builder → content capture OFF; also confirm fromEnv default is OFF.
+    expect(observability.ContentCaptureConfig.fromEnv({}).enabled).toBe(false);
+    const harness = new HarnessBuilder(
+      agent,
+      tools,
+      new AllowAllSandbox(),
+      new NoopContextManager(),
+      new AlwaysContinuePolicy(),
+    )
+      .withObservabilityOutbox(root)
+      .build();
+
+    const result = await harness.run({ task: newTask("do it", sessionId, react) });
+    expect(result.kind).toBe("success");
+
+    const raw = readFileSync(join(root, "sessions", sessionId.asString(), "trace.jsonl"), "utf8");
+    // No gen_ai.* key appears anywhere on disk (byte-identical to pre-#64).
+    expect(raw.includes("gen_ai.")).toBe(false);
   });
 });
