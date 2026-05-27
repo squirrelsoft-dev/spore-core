@@ -147,16 +147,25 @@ export class SchemaInjectingContextManager implements HarnessContextManager {
     private readonly inner: HarnessContextManager,
     tools: ModelToolSchema[],
   ) {
-    this.tools = tools.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    this.tools = tools
+      .slice()
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
-  async assemble(session: HarnessState, task: Task, signal?: AbortSignal): Promise<Context> {
+  async assemble(
+    session: HarnessState,
+    task: Task,
+    signal?: AbortSignal,
+  ): Promise<Context> {
     const ctx = await this.inner.assemble(session, task, signal);
     ctx.tools = this.tools.slice();
     return ctx;
   }
 
-  appendToolResult(session: HarnessState, result: ToolResultRecord): Promise<void> {
+  appendToolResult(
+    session: HarnessState,
+    result: ToolResultRecord,
+  ): Promise<void> {
     return this.inner.appendToolResult(session, result);
   }
 
@@ -253,7 +262,10 @@ export function buildRealToolRegistry(): toolRegistry.StandardToolRegistry {
   const registry = new toolRegistry.StandardToolRegistry();
   const reg = (tool: Tool, schema: RegistryToolSchema): void => {
     const err = registry.register(tool, schema);
-    if (err) throw new Error(`register ${schema.name}: ${toolRegistry.registrationErrorMessage(err)}`);
+    if (err)
+      throw new Error(
+        `register ${schema.name}: ${toolRegistry.registrationErrorMessage(err)}`,
+      );
   };
   reg(new ReadFileTool(), ReadFileTool.schema());
   reg(new WriteFileTool(), WriteFileTool.schema());
@@ -278,7 +290,9 @@ export function buildRichContextManager(
   cache: coreCacheProvider.CacheProvider,
   config: coreContext.CompactionConfig,
 ): HarnessContextManager {
-  return coreContext.intoHarnessAdapter(new StandardContextManager(model, cache, config));
+  return coreContext.intoHarnessAdapter(
+    new StandardContextManager(model, cache, config),
+  );
 }
 
 /**
@@ -373,7 +387,10 @@ export function buildScenario(args: {
   toolSchemas: ModelToolSchema[];
   observability?: ObservabilityProvider;
 }): StandardHarness {
-  const contextManager = new SchemaInjectingContextManager(args.contextManager, args.toolSchemas);
+  const contextManager = new SchemaInjectingContextManager(
+    args.contextManager,
+    args.toolSchemas,
+  );
   let builder = new HarnessBuilder(
     args.agent,
     args.tools,

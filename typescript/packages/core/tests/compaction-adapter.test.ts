@@ -194,6 +194,63 @@ describe("StandardCompactionAdapter — applyCompaction (issue #55)", () => {
   });
 });
 
+// ---- token accounting (issue #57 — Known Deviation #2 fix) ------------------
+
+/** A content-heavy rich state so the dropped span carries a real token estimate. */
+function richStateHeavy(messages: number, used: number, limit: number): RichSessionState {
+  const s = newSessionState(SID, TID, "deploy the payment service");
+  s.window_limit = limit;
+  s.token_budget_used = used;
+  s.message_history = Array.from({ length: messages }, (_, i) => ({
+    role: "user" as const,
+    content: {
+      type: "text" as const,
+      text: `message number ${i} with a fair amount of content to estimate tokens from`,
+    },
+  }));
+  return s;
+}
+
+describe("StandardCompactionAdapter — token accounting (issue #57)", () => {
+  it("reclaims real tokens so token_budget_used drops, and reports the seam value", () => {
+    const adapter = new StandardCompactionAdapter(richManager());
+    const session = sessionWith(richStateHeavy(10, 95, 100));
+
+    const before = contextNs.SessionStateSchema.parse(
+      session.extras[contextNs.RICH_STATE_KEY],
+    ).token_budget_used;
+    adapter.applyCompaction(session, "summary preserving payment deploy");
+    const after = contextNs.SessionStateSchema.parse(
+      session.extras[contextNs.RICH_STATE_KEY],
+    ).token_budget_used;
+
+    expect(after).toBeLessThan(before);
+    // The seam reports the post-compaction budget for span stamping.
+    expect(adapter.tokenBudgetUsed(session)).toBe(after);
+  });
+
+  it("keeps dropping the budget across a healthy multi-compaction session", () => {
+    const adapter = new StandardCompactionAdapter(richManager());
+    const session = sessionWith(richStateHeavy(10, 95, 100));
+
+    adapter.applyCompaction(session, "first summary about payment deploy");
+    const afterFirst = adapter.tokenBudgetUsed(session)!;
+    expect(afterFirst).toBeLessThan(95);
+
+    // Simulate the session growing again past threshold.
+    const grown = richStateHeavy(10, 95, 100);
+    seedRichState(session, grown);
+    adapter.applyCompaction(session, "second summary about payment deploy");
+    const afterSecond = adapter.tokenBudgetUsed(session)!;
+    expect(afterSecond).toBeLessThan(95);
+  });
+
+  it("returns undefined from tokenBudgetUsed without seeded rich state", () => {
+    const adapter = new StandardCompactionAdapter(richManager());
+    expect(adapter.tokenBudgetUsed(emptySessionState())).toBeUndefined();
+  });
+});
+
 // ---- end-to-end mock-model harness ------------------------------------------
 
 class SummaryAgent implements Agent {
