@@ -13,7 +13,8 @@
 //! - [`OllamaModelInterface`] — concrete `ModelInterface`
 //! - private wire-format structs: `OllamaRequest`, `OllamaMessage`,
 //!   `OllamaResponse`, `OllamaResponseMessage`, `OllamaTool`, `OllamaToolCall`,
-//!   `OllamaOptions`, `TagsResponse`, `EmbedRequest`, `EmbedResponse`
+//!   `OllamaOptions`, `TagsResponse`, `ShowRequest`, `ShowResponse`,
+//!   `ModelMeta`, `EmbedRequest`, `EmbedResponse`
 //!
 //! ## Trait methods
 //! - `call(request)`           — POST `/api/chat` with `stream: false`
@@ -45,6 +46,16 @@
 //! 4. Timeout → `ModelError::Timeout`.
 //! 5. Other 4xx/5xx → `ProviderError { code, message }`.
 //! 6. Lazy model availability check on first call; cached for instance lifetime.
+//! 7. On first call, a one-time `POST /api/show` discovery runs alongside the
+//!    `/api/tags` availability check: it reads the model's `*.context_length`
+//!    from `model_info` and the top-level `capabilities` array. `provider()`
+//!    returns the discovered context window when available (falling back to the
+//!    static [`OllamaModelInterface::context_window`] table), and `call` /
+//!    `call_streaming` reject tool-bearing requests with a
+//!    `does not support tool calling` `ProviderError` when the model lacks the
+//!    `"tools"` capability (falling back to the static `supports_tools` table
+//!    when discovery is unavailable). `/api/show` failures degrade gracefully —
+//!    they never fail the call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,8 +79,27 @@ pub struct OllamaModelInterface {
     timeout: Duration,
     keep_alive: Option<String>,
     http_client: Arc<reqwest::Client>,
-    /// Lazily set after the first successful availability check.
-    model_checked: Arc<OnceCell<()>>,
+    /// Lazily set after the first availability + discovery probe. Holds the
+    /// `/api/show`-discovered metadata (context length + capabilities); empty
+    /// `ModelMeta` when discovery failed but availability succeeded.
+    model_checked: Arc<OnceCell<ModelMeta>>,
+}
+
+/// `/api/show`-discovered metadata for the model. Populated once, alongside the
+/// `/api/tags` availability check. All fields are best-effort — `/api/show`
+/// failures leave them unset rather than failing the call.
+#[derive(Debug, Default, Clone)]
+struct ModelMeta {
+    /// Discovered context window (`*.context_length` in `model_info`).
+    context_length: Option<u32>,
+    /// Top-level `capabilities` array (may contain `"tools"`).
+    capabilities: Vec<String>,
+}
+
+impl ModelMeta {
+    fn supports_tools(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "tools")
+    }
 }
 
 impl std::fmt::Debug for OllamaModelInterface {
@@ -139,10 +169,12 @@ impl OllamaModelInterface {
             || model_id.starts_with("mistral")
     }
 
-    /// One-time availability probe against `/api/tags`. Cached via
-    /// [`OnceCell`] so subsequent calls are free. Surfaces a helpful
-    /// "ollama pull" message when the model is missing.
-    async fn ensure_model_available(&self) -> Result<(), ModelError> {
+    /// One-time availability + discovery probe. Cached via [`OnceCell`] so
+    /// subsequent calls are free. Checks `/api/tags` (surfacing a helpful
+    /// "ollama pull" message when the model is missing), then — best-effort —
+    /// fetches `/api/show` for the context window and capabilities. Returns the
+    /// discovered [`ModelMeta`] (empty when `/api/show` was unavailable).
+    async fn ensure_model_available(&self) -> Result<&ModelMeta, ModelError> {
         self.model_checked
             .get_or_try_init(|| async {
                 let url = format!("{}/api/tags", self.base_url);
@@ -174,10 +206,46 @@ impl OllamaModelInterface {
                         ),
                     });
                 }
-                Ok(())
+                // Best-effort discovery — never fails the call.
+                Ok(self.discover_meta().await)
             })
             .await
-            .map(|_| ())
+    }
+
+    /// Best-effort `POST /api/show` discovery. Returns an empty [`ModelMeta`]
+    /// on any failure (404, transport error, decode error, missing fields) so
+    /// discovery being unavailable never errors the whole call.
+    async fn discover_meta(&self) -> ModelMeta {
+        let url = format!("{}/api/show", self.base_url);
+        let body = ShowRequest {
+            model: self.model_id.clone(),
+        };
+        let resp = match self
+            .http_client
+            .post(&url)
+            .header("content-type", "application/json")
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return ModelMeta::default(),
+        };
+        let parsed: ShowResponse = match resp.json().await {
+            Ok(p) => p,
+            Err(_) => return ModelMeta::default(),
+        };
+        let context_length = parsed
+            .model_info
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length"))
+            .and_then(|(_, v)| v.as_u64())
+            .map(|n| n as u32);
+        ModelMeta {
+            context_length,
+            capabilities: parsed.capabilities,
+        }
     }
 }
 
@@ -315,6 +383,21 @@ struct TagsResponse {
 #[derive(Debug, Deserialize)]
 struct TagModel {
     name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShowRequest {
+    model: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ShowResponse {
+    /// Map of architecture-specific keys; we look for `*.context_length`.
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
+    /// Top-level capabilities array (may contain `"tools"`).
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -506,7 +589,8 @@ async fn map_status_error(resp: reqwest::Response, model_id: &str) -> ModelError
 
 impl ModelInterface for OllamaModelInterface {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        self.ensure_model_available().await?;
+        let meta = self.ensure_model_available().await?;
+        self.guard_tool_support(&request, meta)?;
         let body = build_request(&self.model_id, &self.keep_alive, &request, false);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -533,7 +617,8 @@ impl ModelInterface for OllamaModelInterface {
     }
 
     async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        self.ensure_model_available().await?;
+        let meta = self.ensure_model_available().await?;
+        self.guard_tool_support(&request, meta)?;
         let body = build_request(&self.model_id, &self.keep_alive, &request, true);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -568,15 +653,48 @@ impl ModelInterface for OllamaModelInterface {
     }
 
     fn provider(&self) -> ProviderInfo {
+        // `provider()` is synchronous, so it cannot await `/api/show`. Read the
+        // probe cache non-blockingly: prefer a discovered context length if the
+        // probe has already run; otherwise fall back to the static table.
+        let context_window = self
+            .model_checked
+            .get()
+            .and_then(|m| m.context_length)
+            .unwrap_or_else(|| Self::context_window(&self.model_id));
         ProviderInfo {
             name: "ollama".into(),
             model_id: self.model_id.clone(),
-            context_window: Self::context_window(&self.model_id),
+            context_window,
         }
     }
 }
 
 impl OllamaModelInterface {
+    /// Reject tool-bearing requests when the model does not support tools.
+    /// Capability source priority: the `/api/show` `capabilities` array when
+    /// discovery succeeded; otherwise the static `supports_tools` table.
+    fn guard_tool_support(
+        &self,
+        request: &ModelRequest,
+        meta: &ModelMeta,
+    ) -> Result<(), ModelError> {
+        if request.tools.is_empty() {
+            return Ok(());
+        }
+        let supported = if meta.capabilities.is_empty() {
+            Self::supports_tools(&self.model_id)
+        } else {
+            meta.supports_tools()
+        };
+        if !supported {
+            return Err(ModelError::ProviderError {
+                code: 0,
+                message: format!("Model {} does not support tool calling", self.model_id),
+            });
+        }
+        Ok(())
+    }
+
     async fn try_embed_count(&self, text: &str) -> Option<u32> {
         let url = format!("{}/api/embed", self.base_url);
         let body = EmbedRequest {
@@ -1307,6 +1425,167 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 10);
+    }
+
+    // ── /api/show discovery + tool-capability guard ─────────────────────────
+
+    fn tool_req() -> ModelRequest {
+        let mut r = req(vec![user("use a tool")]);
+        r.tools.push(ToolSchema {
+            name: "search".into(),
+            description: "search the web".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        r
+    }
+
+    async fn mock_show(server: &wiremock::MockServer, body: serde_json::Value, times: Option<u64>) {
+        let mut m = wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/show"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body));
+        if let Some(n) = times {
+            m = m.up_to_n_times(n).expect(n);
+        }
+        m.mount(server).await;
+    }
+
+    async fn mock_chat_ok(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn provider_reflects_discovered_context_window() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 16_384},
+                "capabilities": ["tools"]
+            }),
+            None,
+        )
+        .await;
+        mock_chat_ok(&server).await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        // Before the probe runs, provider() falls back to the static table.
+        assert_eq!(client.provider().context_window, 128_000);
+        client.call(req(vec![user("hi")])).await.unwrap();
+        // After the probe, provider() reflects the discovered value.
+        assert_eq!(client.provider().context_window, 16_384);
+    }
+
+    #[tokio::test]
+    async fn provider_falls_back_when_show_404s() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/show"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        mock_chat_ok(&server).await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        client.call(req(vec![user("hi")])).await.unwrap();
+        assert_eq!(client.provider().context_window, 128_000);
+    }
+
+    #[tokio::test]
+    async fn provider_falls_back_when_context_length_missing() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        // /api/show succeeds but has no *.context_length entry.
+        mock_show(
+            &server,
+            serde_json::json!({"model_info": {"general.architecture": "llama"}, "capabilities": ["tools"]}),
+            None,
+        )
+        .await;
+        mock_chat_ok(&server).await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        client.call(req(vec![user("hi")])).await.unwrap();
+        assert_eq!(client.provider().context_window, 128_000);
+    }
+
+    #[tokio::test]
+    async fn tool_request_rejected_when_capability_absent() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "gemma").await;
+        // capabilities lacks "tools"; no /api/chat mock — a call would 404.
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"gemma.context_length": 8_192},
+                "capabilities": ["completion"]
+            }),
+            None,
+        )
+        .await;
+        let client = OllamaModelInterface::with_base_url("gemma", server.uri());
+        let err = client.call(tool_req()).await.unwrap_err();
+        match err {
+            ModelError::ProviderError { code, message } => {
+                assert_eq!(code, 0);
+                assert!(
+                    message.contains("does not support tool calling"),
+                    "msg: {message}"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_request_proceeds_when_capability_present() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 128_000},
+                "capabilities": ["completion", "tools"]
+            }),
+            None,
+        )
+        .await;
+        mock_chat_ok(&server).await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        // Proceeds to /api/chat and returns a normal response.
+        let r = client.call(tool_req()).await.unwrap();
+        assert_eq!(r.content, vec![ContentBlock::Text { text: "ok".into() }]);
+    }
+
+    #[tokio::test]
+    async fn show_fetched_at_most_once() {
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        // /api/show expected exactly once across multiple call()s.
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 32_000},
+                "capabilities": ["tools"]
+            }),
+            Some(1),
+        )
+        .await;
+        mock_chat_ok(&server).await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        client.call(req(vec![user("a")])).await.unwrap();
+        client.call(req(vec![user("b")])).await.unwrap();
+        // wiremock's `.expect(1)` is verified on drop.
     }
 
     // ── #[ignore]-tagged live API tests ────────────────────────────────────

@@ -564,6 +564,164 @@ async def test_count_tokens_falls_back_to_heuristic() -> None:
 
 
 # ---------------------------------------------------------------------------
+# /api/show discovery + tool-capability guard
+# ---------------------------------------------------------------------------
+
+
+def _tool_req(model_msg: str = "use a tool") -> ModelRequest:
+    return _req(
+        [_user(model_msg)],
+        tools=[
+            ToolSchema(name="search", description="search the web", input_schema={"type": "object"})
+        ],
+    )
+
+
+def _chat_ok_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "message": {"role": "assistant", "content": "ok"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        },
+    )
+
+
+async def test_provider_reflects_discovered_context_window() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(
+                200,
+                json={"model_info": {"llama.context_length": 16_384}, "capabilities": ["tools"]},
+            )
+        if request.url.path == "/api/chat":
+            return _chat_ok_response()
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    # Before the probe runs, provider() falls back to the static table.
+    assert iface.provider().context_window == 128_000
+    await iface.call(_req([_user("hi")]))
+    # After the probe, provider() reflects the discovered value.
+    assert iface.provider().context_window == 16_384
+
+
+async def test_provider_falls_back_when_show_404s() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(404)
+        if request.url.path == "/api/chat":
+            return _chat_ok_response()
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    await iface.call(_req([_user("hi")]))
+    assert iface.provider().context_window == 128_000
+
+
+async def test_provider_falls_back_when_context_length_missing() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            # Succeeds but has no *.context_length entry.
+            return httpx.Response(
+                200,
+                json={"model_info": {"general.architecture": "llama"}, "capabilities": ["tools"]},
+            )
+        if request.url.path == "/api/chat":
+            return _chat_ok_response()
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    await iface.call(_req([_user("hi")]))
+    assert iface.provider().context_window == 128_000
+
+
+async def test_tool_request_rejected_when_capability_absent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "gemma:latest"}]})
+        if request.url.path == "/api/show":
+            # capabilities lacks "tools".
+            return httpx.Response(
+                200,
+                json={
+                    "model_info": {"gemma.context_length": 8_192},
+                    "capabilities": ["completion"],
+                },
+            )
+        raise AssertionError(f"should not POST {request.url.path}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("gemma", base_url="http://x.test", http_client=client)
+    with pytest.raises(ProviderError) as exc:
+        await iface.call(_tool_req())
+    assert exc.value.code == 0
+    assert "does not support tool calling" in exc.value.message
+
+
+async def test_tool_request_proceeds_when_capability_present() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(
+                200,
+                json={
+                    "model_info": {"llama.context_length": 128_000},
+                    "capabilities": ["completion", "tools"],
+                },
+            )
+        if request.url.path == "/api/chat":
+            return _chat_ok_response()
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    r = await iface.call(_tool_req())
+    assert isinstance(r.content[0], TextBlock)
+    assert r.content[0].text == "ok"
+
+
+async def test_show_fetched_at_most_once() -> None:
+    calls = {"tags": 0, "show": 0, "chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            calls["tags"] += 1
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            calls["show"] += 1
+            return httpx.Response(
+                200,
+                json={"model_info": {"llama.context_length": 32_000}, "capabilities": ["tools"]},
+            )
+        if request.url.path == "/api/chat":
+            calls["chat"] += 1
+            return _chat_ok_response()
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    await iface.call(_req([_user("a")]))
+    await iface.call(_req([_user("b")]))
+    assert calls["tags"] == 1
+    assert calls["show"] == 1
+    assert calls["chat"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Fixture replay (shared cross-language fixture)
 # ---------------------------------------------------------------------------
 

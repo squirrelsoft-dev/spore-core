@@ -43,6 +43,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
@@ -74,10 +75,34 @@ type ModelInterface struct {
 	keepAlive  string
 	httpClient *http.Client
 
-	// Lazy /api/tags availability probe. The first Call/CallStreaming
-	// triggers the check; the result is cached for the instance lifetime.
+	// Lazy /api/tags availability + /api/show discovery probe. The first
+	// Call/CallStreaming triggers the check; the result is cached for the
+	// instance lifetime. checkMeta holds the /api/show-discovered metadata
+	// (best-effort; empty when discovery failed but availability succeeded).
 	checkOnce sync.Once
 	checkErr  error
+	checkMeta modelMeta
+	metaReady atomic.Bool
+}
+
+// modelMeta is the /api/show-discovered metadata for the model. Populated once,
+// alongside the /api/tags availability check. All fields are best-effort —
+// /api/show failures leave them unset rather than failing the call.
+type modelMeta struct {
+	// contextLength is the discovered context window (*.context_length in
+	// model_info). nil when /api/show was unavailable or omitted it.
+	contextLength *uint32
+	// capabilities is the top-level capabilities array (may contain "tools").
+	capabilities []string
+}
+
+func (m modelMeta) supportsTools() bool {
+	for _, c := range m.capabilities {
+		if c == "tools" {
+			return true
+		}
+	}
+	return false
 }
 
 // New constructs a ModelInterface with localhost defaults.
@@ -129,9 +154,10 @@ func (c *ModelInterface) String() string {
 // GoString matches String.
 func (c *ModelInterface) GoString() string { return c.String() }
 
-// ContextWindow returns the known context window for an Ollama model id.
-// Unknown models return 0 so callers can detect them. The Rust reference
-// uses a static prefix table; we do the same — no /api/show probe.
+// ContextWindow returns the known context window for an Ollama model id from
+// the static prefix table. Unknown models return 0 so callers can detect them.
+// Provider prefers the /api/show-discovered value (when the probe has run and
+// produced one), falling back to this table.
 func ContextWindow(modelID string) uint32 {
 	switch {
 	case strings.HasPrefix(modelID, "llama3.2"):
@@ -147,12 +173,27 @@ func ContextWindow(modelID string) uint32 {
 	}
 }
 
-// Provider reports the underlying model identity.
+// SupportsTools reports whether a model id is known to support native tool
+// calling, using a static prefix table. Best-effort fallback used when
+// /api/show discovery is unavailable.
+func SupportsTools(modelID string) bool {
+	return strings.HasPrefix(modelID, "llama3.2") ||
+		strings.HasPrefix(modelID, "qwen2.5-coder") ||
+		strings.HasPrefix(modelID, "mistral")
+}
+
+// Provider reports the underlying model identity. The context window prefers
+// the /api/show-discovered value when the availability probe has already run
+// and produced one; otherwise it falls back to the static ContextWindow table.
 func (c *ModelInterface) Provider() sporecore.ProviderInfo {
+	cw := ContextWindow(c.modelID)
+	if c.metaReady.Load() && c.checkMeta.contextLength != nil {
+		cw = *c.checkMeta.contextLength
+	}
 	return sporecore.ProviderInfo{
 		Name:          "ollama",
 		ModelID:       c.modelID,
-		ContextWindow: ContextWindow(c.modelID),
+		ContextWindow: cw,
 	}
 }
 
@@ -239,6 +280,17 @@ type wireTagsResponse struct {
 
 type wireTagModel struct {
 	Name string `json:"name"`
+}
+
+type wireShowRequest struct {
+	Model string `json:"model"`
+}
+
+type wireShowResponse struct {
+	// ModelInfo holds architecture-specific keys; we look for *.context_length.
+	ModelInfo map[string]json.RawMessage `json:"model_info"`
+	// Capabilities is the top-level capabilities array (may contain "tools").
+	Capabilities []string `json:"capabilities"`
 }
 
 type wireEmbedRequest struct {
@@ -498,6 +550,11 @@ func (c *ModelInterface) mapStatusError(resp *http.Response) error {
 func (c *ModelInterface) ensureModelAvailable(ctx context.Context) error {
 	c.checkOnce.Do(func() {
 		c.checkErr = c.checkModel(ctx)
+		if c.checkErr == nil {
+			// Best-effort discovery — never fails the call.
+			c.checkMeta = c.discoverMeta(ctx)
+		}
+		c.metaReady.Store(true)
 	})
 	return c.checkErr
 }
@@ -531,6 +588,69 @@ func (c *ModelInterface) checkModel(ctx context.Context) error {
 	))
 }
 
+// discoverMeta performs a best-effort POST /api/show. It returns an empty
+// modelMeta on any failure (404, transport error, decode error, missing
+// fields) so that discovery being unavailable never errors the whole call.
+func (c *ModelInterface) discoverMeta(ctx context.Context) modelMeta {
+	payload, err := json.Marshal(wireShowRequest{Model: c.modelID})
+	if err != nil {
+		return modelMeta{}
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	r, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.baseURL+"/api/show", bytes.NewReader(payload))
+	if err != nil {
+		return modelMeta{}
+	}
+	r.Header.Set("content-type", "application/json")
+	resp, err := c.httpClient.Do(r)
+	if err != nil {
+		return modelMeta{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return modelMeta{}
+	}
+	var show wireShowResponse
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return modelMeta{}
+	}
+	meta := modelMeta{capabilities: show.Capabilities}
+	for k, v := range show.ModelInfo {
+		if !strings.HasSuffix(k, ".context_length") {
+			continue
+		}
+		var n uint64
+		if err := json.Unmarshal(v, &n); err == nil {
+			cl := uint32(n)
+			meta.contextLength = &cl
+		}
+		break
+	}
+	return meta
+}
+
+// guardToolSupport rejects tool-bearing requests when the model does not
+// support tools. Capability source priority: the /api/show capabilities array
+// when discovery succeeded; otherwise the static SupportsTools table.
+func (c *ModelInterface) guardToolSupport(req sporecore.ModelRequest) error {
+	if len(req.Tools) == 0 {
+		return nil
+	}
+	var supported bool
+	if len(c.checkMeta.capabilities) == 0 {
+		supported = SupportsTools(c.modelID)
+	} else {
+		supported = c.checkMeta.supportsTools()
+	}
+	if !supported {
+		return sporecore.NewProviderError(0, fmt.Sprintf(
+			"Model %s does not support tool calling", c.modelID,
+		))
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // ModelInterface impl
 // ---------------------------------------------------------------------------
@@ -538,6 +658,9 @@ func (c *ModelInterface) checkModel(ctx context.Context) error {
 // Call performs one blocking /api/chat call.
 func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (sporecore.ModelResponse, error) {
 	if err := c.ensureModelAvailable(ctx); err != nil {
+		return sporecore.ModelResponse{}, err
+	}
+	if err := c.guardToolSupport(req); err != nil {
 		return sporecore.ModelResponse{}, err
 	}
 	body := buildRequest(c.modelID, c.keepAlive, req, false)
@@ -634,6 +757,9 @@ func concatRequestText(req sporecore.ModelRequest) string {
 // CallStreaming opens an NDJSON stream and emits StreamEvents.
 func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelRequest) (<-chan sporecore.StreamEventOrErr, error) {
 	if err := c.ensureModelAvailable(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.guardToolSupport(req); err != nil {
 		return nil, err
 	}
 	body := buildRequest(c.modelID, c.keepAlive, req, true)

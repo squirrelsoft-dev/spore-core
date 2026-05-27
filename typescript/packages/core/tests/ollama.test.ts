@@ -635,6 +635,145 @@ describe("countTokens", () => {
 });
 
 // ---------------------------------------------------------------------------
+// /api/show discovery + tool-capability guard
+// ---------------------------------------------------------------------------
+
+function chatOk(): MockHandler {
+  return () => ({
+    status: 200,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message: { role: "assistant", content: "ok" },
+      done: true,
+      done_reason: "stop",
+      prompt_eval_count: 1,
+      eval_count: 1,
+    }),
+  });
+}
+
+function showOk(body: unknown): MockHandler {
+  return () => ({
+    status: 200,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+function toolReq(): ModelRequest {
+  const r = req([user("use a tool")]);
+  r.tools.push({ name: "search", description: "search the web", input_schema: { type: "object" } });
+  return r;
+}
+
+describe("/api/show discovery + tool guard", () => {
+  let server: MockServer;
+  beforeAll(async () => {
+    server = new MockServer();
+    await server.start();
+  });
+  afterAll(async () => {
+    await server.stop();
+  });
+
+  it("provider() reflects discovered context window after the probe", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({ model_info: { "llama.context_length": 16_384 }, capabilities: ["tools"] }),
+    );
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    // Before the probe runs, provider() falls back to the static table.
+    expect(client.provider().context_window).toBe(128_000);
+    await client.call(req([user("hi")]));
+    // After the probe, provider() reflects the discovered value.
+    expect(client.provider().context_window).toBe(16_384);
+  });
+
+  it("falls back to the static table when /api/show 404s", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route("POST", "/api/show", () => ({ status: 404, body: "" }));
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    await client.call(req([user("hi")]));
+    expect(client.provider().context_window).toBe(128_000);
+  });
+
+  it("falls back when context_length is missing from /api/show", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({ model_info: { "general.architecture": "llama" }, capabilities: ["tools"] }),
+    );
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    await client.call(req([user("hi")]));
+    expect(client.provider().context_window).toBe(128_000);
+  });
+
+  it("rejects tool requests when the model lacks the 'tools' capability", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("gemma"));
+    // capabilities lacks "tools"; no /api/chat route — a call would 404.
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({ model_info: { "gemma.context_length": 8_192 }, capabilities: ["completion"] }),
+    );
+    const client = OllamaModelInterface.withBaseUrl("gemma", server.baseUrl());
+    let err: unknown;
+    try {
+      await client.call(toolReq());
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).code).toBe(0);
+    expect((err as ProviderError).message).toContain("does not support tool calling");
+    expect(server.callCount("POST", "/api/chat")).toBe(0);
+  });
+
+  it("proceeds normally when the model has the 'tools' capability", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({
+        model_info: { "llama.context_length": 128_000 },
+        capabilities: ["completion", "tools"],
+      }),
+    );
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    const r = await client.call(toolReq());
+    expect(r.content).toEqual([{ type: "text", text: "ok" }]);
+  });
+
+  it("fetches /api/show at most once across multiple calls", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({ model_info: { "llama.context_length": 32_000 }, capabilities: ["tools"] }),
+    );
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    await client.call(req([user("a")]));
+    await client.call(req([user("b")]));
+    expect(server.callCount("POST", "/api/show")).toBe(1);
+    expect(server.callCount("POST", "/api/chat")).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Live-API tests — skipped by default
 // ---------------------------------------------------------------------------
 
