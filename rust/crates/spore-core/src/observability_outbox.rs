@@ -90,7 +90,7 @@ use crate::harness::{BoxFut, SessionId};
 use crate::observability::{
     ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
     ObservabilityError, ObservabilityProvider, PatchSpan, SensorSpan, SessionMetrics, Span,
-    SpanBase, SpanStatus, ToolCallSpan, TurnSpan,
+    SpanBase, SpanStatus, ToolCallSpan, TurnSpan, WarnSpan,
 };
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
@@ -336,6 +336,16 @@ impl TraceLine {
         ]);
         // Patch spans are ALWAYS warn-level.
         Self::from_base(&span.base, trace_id, "patch", "warn", attributes)
+    }
+
+    /// Build a `warn` envelope from a [`WarnSpan`] (issue #46). Warn spans are
+    /// ALWAYS warn-level; the event payload is serialized verbatim.
+    pub fn from_warn(span: &WarnSpan, trace_id: &str) -> Self {
+        let attributes = Self::attrs(vec![(
+            "event",
+            serde_json::to_value(&span.event).unwrap_or(Value::Null),
+        )]);
+        Self::from_base(&span.base, trace_id, "warn", "warn", attributes)
     }
 
     /// Build the trailing `session` summary line from rolled-up metrics. The
@@ -725,6 +735,14 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
         let line = TraceLine::from_patch(&span, &trace_id);
         let sid = span.base.session_id.clone();
         self.inner.emit_patch(span);
+        self.write_line(&sid, line);
+    }
+
+    fn emit_warn(&self, span: WarnSpan) {
+        let trace_id = self.trace_id_locked(&span.base.session_id);
+        let line = TraceLine::from_warn(&span, &trace_id);
+        let sid = span.base.session_id.clone();
+        self.inner.emit_warn(span);
         self.write_line(&sid, line);
     }
 

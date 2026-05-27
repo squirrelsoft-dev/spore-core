@@ -1,0 +1,76 @@
+{
+  "description": "Cross-language consistency fixture for the harness post-compaction verify->retry->warn loop (issue #46). Each case drives the loop with a scripted verifier whose per-attempt verdict is read from `verdicts` (one entry consumed per compaction turn; if the loop needs more turns than entries, the last entry repeats). `max_compaction_attempts` caps the number of compaction turns; the harness clamps it to a minimum of 1. The loop accepts the first passing summary, otherwise injects the missing items and retries, and after the cap is reached it emits exactly one warn-level CompactionVerificationFailed{missing_items, accepted_anyway:true} event and accepts the summary anyway (apply_compaction always runs once at the end). The injected retry message is `Your summary is missing these items: {missing joined by ', '}. Please revise.` This fixture isolates loop control flow from KeyTermVerifier term-extraction (see fixtures/compaction_verifier). ASCII only.",
+  "cases": [
+    {
+      "name": "passes_first_attempt",
+      "max_compaction_attempts": 2,
+      "verdicts": [
+        { "passed": true, "missing_items": [] }
+      ],
+      "expected": {
+        "attempts": 1,
+        "apply_compaction_calls": 1,
+        "warn_emitted": false,
+        "final_missing_items": []
+      }
+    },
+    {
+      "name": "fails_then_passes",
+      "max_compaction_attempts": 2,
+      "verdicts": [
+        { "passed": false, "missing_items": ["payment", "deploy"] },
+        { "passed": true, "missing_items": [] }
+      ],
+      "expected": {
+        "attempts": 2,
+        "apply_compaction_calls": 1,
+        "warn_emitted": false,
+        "retry_injected_missing": ["payment", "deploy"],
+        "final_missing_items": []
+      }
+    },
+    {
+      "name": "always_fails_warns_and_accepts",
+      "max_compaction_attempts": 2,
+      "verdicts": [
+        { "passed": false, "missing_items": ["payment"] }
+      ],
+      "expected": {
+        "attempts": 2,
+        "apply_compaction_calls": 1,
+        "warn_emitted": true,
+        "retry_injected_missing": ["payment"],
+        "final_missing_items": ["payment"],
+        "accepted_anyway": true
+      }
+    },
+    {
+      "name": "max_attempts_one_no_retry",
+      "max_compaction_attempts": 1,
+      "verdicts": [
+        { "passed": false, "missing_items": ["payment"] }
+      ],
+      "expected": {
+        "attempts": 1,
+        "apply_compaction_calls": 1,
+        "warn_emitted": true,
+        "final_missing_items": ["payment"],
+        "accepted_anyway": true
+      }
+    },
+    {
+      "name": "max_attempts_zero_clamped_to_one",
+      "max_compaction_attempts": 0,
+      "verdicts": [
+        { "passed": false, "missing_items": ["payment"] }
+      ],
+      "expected": {
+        "attempts": 1,
+        "apply_compaction_calls": 1,
+        "warn_emitted": true,
+        "final_missing_items": ["payment"],
+        "accepted_anyway": true
+      }
+    }
+  ]
+}
