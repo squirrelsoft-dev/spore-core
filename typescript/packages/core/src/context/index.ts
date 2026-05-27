@@ -10,3 +10,9 @@
 export * from "./types.js";
 export { StandardContextManager } from "./standard.js";
 export type { StandardContextManagerOptions } from "./standard.js";
+export {
+  StandardCompactionAdapter,
+  intoHarnessAdapter,
+  seedRichState,
+  RICH_STATE_KEY,
+} from "./compaction-adapter.js";

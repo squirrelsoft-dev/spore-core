@@ -192,6 +192,12 @@ from .context import (
     TokenCountFailed,
     new_guide_id as new_context_guide_id,
 )
+from .compaction_adapter import (
+    RICH_STATE_KEY,
+    StandardCompactionAdapter,
+    into_harness_adapter,
+    seed_rich_state,
+)
 from .guide_registry import (
     CONFLICT_THRESHOLD,
     Guide,
@@ -607,6 +613,11 @@ __all__ = [
     "StandardContextManager",
     "TokenCountFailed",
     "new_context_guide_id",
+    # Compaction adapter (#55)
+    "RICH_STATE_KEY",
+    "StandardCompactionAdapter",
+    "into_harness_adapter",
+    "seed_rich_state",
     # GuideRegistry (#9)
     "CONFLICT_THRESHOLD",
     "Guide",

@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod anthropic;
 pub mod cache_provider;
+pub mod compaction_adapter;
 pub mod context;
 pub mod guide_registry;
 pub mod harness;
@@ -45,6 +46,9 @@ pub use anthropic::AnthropicModelInterface;
 pub use cache_provider::{
     auto_detect as auto_detect_cache_provider, AnthropicCacheProvider, CacheAnnotationResult,
     CacheProvider, CacheStats, NullCacheProvider, OllamaCacheProvider, OpenAICacheProvider,
+};
+pub use compaction_adapter::{
+    seed_rich_state, HarnessContextManagerExt, StandardCompactionAdapter, RICH_STATE_KEY,
 };
 pub use context::{
     BreakpointInfo, CacheBlockHits, CacheBlockStatus, CompactionConfig, CompactionPreserveHints,

@@ -1128,6 +1128,24 @@ impl StandardHarness {
         &self.config
     }
 
+    /// Test-only hook: drive the post-compaction verify→retry→warn loop
+    /// directly, bypassing the full ReAct loop. Lets out-of-module tests (e.g.
+    /// the #55 compaction-adapter tests) exercise the seam end-to-end without
+    /// scripting a complete model conversation. `#[doc(hidden)]`: not part of
+    /// the stable surface.
+    #[doc(hidden)]
+    pub async fn run_compaction_for_test(
+        &self,
+        session_state: &mut SessionState,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        span_seq: &mut u64,
+        usage: &mut AggregateUsage,
+    ) {
+        self.run_compaction(session_state, session_id, task_id, span_seq, usage)
+            .await;
+    }
+
     fn emit(stream: &Option<StreamSink>, event: StreamEvent) {
         if let Some(s) = stream.as_ref() {
             s(event);
