@@ -886,6 +886,16 @@ type CompactingContextManager interface {
 	ApplyCompaction(session *SessionState, summary string)
 }
 
+// TokenBudgetReader is the OPTIONAL seam (issue #57) a ContextManager may also
+// implement so the harness can stamp the real post-compaction token budget onto
+// the Compaction span. The loop type-asserts its held ContextManager to this
+// interface after ApplyCompaction; a manager that does NOT implement it falls
+// back to TokensAfter == TokensBefore (the old behavior). The bool is false when
+// the manager tracks no budget for this session.
+type TokenBudgetReader interface {
+	TokenBudgetUsed(session *SessionState) (uint32, bool)
+}
+
 // CompactionVerificationResult is the verdict of a CompactionVerifier check,
 // in root-package terms (mirrors contextmgr.CompactionVerificationResult).
 type CompactionVerificationResult struct {
@@ -1009,6 +1019,8 @@ type HarnessObserver interface {
 		startedAt string,
 		messagesRemoved uint32,
 		tokensBefore uint32,
+		tokensAfter uint32,
+		tokensReclaimed uint32,
 	)
 
 	// EmitCompactionVerificationFailed records a warn-level event for a
@@ -2109,6 +2121,16 @@ func (h *StandardHarness) runCompaction(
 		return
 	}
 
+	// Capture the pre-compaction token budget for span stamping (issue #57).
+	// Managers that do not track tokens report (0, false); tokensBefore then
+	// stays 0 and the span reports zero reclamation (the old behavior).
+	var tokensBefore uint32
+	if reader, ok := h.config.ContextManager.(TokenBudgetReader); ok {
+		if v, present := reader.TokenBudgetUsed(session); present {
+			tokensBefore = v
+		}
+	}
+
 	maxAttempts := h.config.MaxCompactionAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -2147,7 +2169,7 @@ func (h *StandardHarness) runCompaction(
 
 		if verification.Passed {
 			cm.ApplyCompaction(session, summary)
-			h.emitCompactionSpan(sessionID, taskID, turn.MessagesRemoved, spanSeq)
+			h.emitCompactionSpan(session, sessionID, taskID, turn.MessagesRemoved, tokensBefore, spanSeq)
 			return
 		}
 
@@ -2171,20 +2193,36 @@ func (h *StandardHarness) runCompaction(
 			*spanSeq++
 		}
 		cm.ApplyCompaction(session, summary)
-		h.emitCompactionSpan(sessionID, taskID, turn.MessagesRemoved, spanSeq)
+		h.emitCompactionSpan(session, sessionID, taskID, turn.MessagesRemoved, tokensBefore, spanSeq)
 		return
 	}
 }
 
 // emitCompactionSpan emits the Compaction context span for an accepted summary.
+// It reads the post-compaction token budget from the manager (if it implements
+// TokenBudgetReader) so the span carries the real tokens_after / tokens_reclaimed
+// (issue #57). Managers that track no budget fall back to tokens_after ==
+// tokens_before and zero reclamation (the old behavior).
 func (h *StandardHarness) emitCompactionSpan(
+	session *SessionState,
 	sessionID SessionID,
 	taskID TaskID,
 	messagesRemoved uint32,
+	tokensBefore uint32,
 	spanSeq *uint64,
 ) {
 	if h.config.Observability == nil {
 		return
+	}
+	tokensAfter := tokensBefore
+	if reader, ok := h.config.ContextManager.(TokenBudgetReader); ok {
+		if v, present := reader.TokenBudgetUsed(session); present {
+			tokensAfter = v
+		}
+	}
+	var tokensReclaimed uint32
+	if tokensBefore > tokensAfter {
+		tokensReclaimed = tokensBefore - tokensAfter
 	}
 	spanID := fmt.Sprintf("%s-compaction-%d", sessionID, *spanSeq)
 	h.config.Observability.EmitCompaction(
@@ -2193,7 +2231,9 @@ func (h *StandardHarness) emitCompactionSpan(
 		taskID,
 		nowRFC3339(),
 		messagesRemoved,
-		0, // tokens_before — not tracked through the opaque bridge (mirrors Rust's 0).
+		tokensBefore,
+		tokensAfter,
+		tokensReclaimed,
 	)
 	*spanSeq++
 }

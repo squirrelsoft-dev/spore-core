@@ -68,6 +68,41 @@ import {
 export const RICH_STATE_KEY = "spore.compaction_adapter.rich_state";
 
 /**
+ * Rough token estimate for a single message: the character length of its
+ * textual content divided by four (the same chars/4 proxy
+ * {@link StandardContextManager} uses for cache-marker placement). Used by the
+ * adapter to compute real `tokens_reclaimed` from the messages a compaction
+ * drops, since the synchronous harness seam cannot call the async
+ * `countTokens`. Any non-empty message counts as at least one token so a drop
+ * is never accounted as zero reclamation.
+ */
+export function estimateMessageTokens(message: Message): number {
+  const c = message.content;
+  let chars: number;
+  switch (c.type) {
+    case "text":
+      chars = c.text.length;
+      break;
+    case "tool_call":
+      chars = c.name.length + JSON.stringify(c.input ?? null).length;
+      break;
+    case "tool_result":
+      chars = c.content.length;
+      break;
+    case "image":
+      chars = c.data.length;
+      break;
+  }
+  const tokens = Math.floor(chars / 4);
+  return chars > 0 ? Math.max(1, tokens) : 0;
+}
+
+/** Sum {@link estimateMessageTokens} over a list of messages. */
+export function estimateTokens(messages: Message[]): number {
+  return messages.reduce((acc, m) => acc + estimateMessageTokens(m), 0);
+}
+
+/**
  * Reconstruct the rich session state from `extras`. Returns `undefined` when no
  * rich state has been seeded yet or the blob is malformed — callers treat that
  * as "nothing to compact" so the loop is never blocked.
@@ -178,13 +213,24 @@ export class StandardCompactionAdapter implements HarnessContextManager {
       return;
     }
 
-    const messagesRemoved = this.inner.prepareCompaction(rich).messages_to_compact.length;
+    const dropped = this.inner.prepareCompaction(rich).messages_to_compact;
+    const messagesRemoved = dropped.length;
+    const summaryMessage: Message = { role: "assistant", content: { type: "text", text: summary } };
+
+    // Real token accounting (Known Deviation #2 fix): reclaim the tokens of the
+    // messages we drop, net of the summary that replaces them, and clamp to the
+    // live budget so `token_budget_used` never underflows. The rich
+    // `applyCompaction` (standard.ts) decrements `token_budget_used` by this
+    // amount, so utilization actually falls below threshold after a compaction
+    // and a long session can compact repeatedly.
+    const droppedTokens = estimateTokens(dropped);
+    const summaryTokens = estimateMessageTokens(summaryMessage);
+    const netReclaimed = Math.max(0, droppedTokens - summaryTokens);
+    const tokensReclaimed = Math.min(netReclaimed, rich.token_budget_used);
+
     const result: CompactionResult = {
-      summary_message: { role: "assistant", content: { type: "text", text: summary } },
-      // The rich manager recomputes the surviving history; token accounting is
-      // best-effort here (no fresh token count at the seam), so reclaim nothing
-      // rather than guess.
-      tokens_reclaimed: 0,
+      summary_message: summaryMessage,
+      tokens_reclaimed: tokensReclaimed,
       messages_removed: messagesRemoved,
     };
 
@@ -198,6 +244,11 @@ export class StandardCompactionAdapter implements HarnessContextManager {
       return;
     }
     writeRichState(session, rich);
+  }
+
+  tokenBudgetUsed(session: HarnessState): number | undefined {
+    const rich = readRichState(session);
+    return rich?.token_budget_used;
   }
 }
 

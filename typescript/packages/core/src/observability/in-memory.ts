@@ -97,6 +97,13 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
     return this.store.patches.filter((p) => p.base.session_id.equals(sessionId));
   }
 
+  /** All recorded context spans for a session, in insertion order. Lets callers
+   *  inspect compaction operations (reclaimed tokens, before/after budget)
+   *  without reconstructing them from the heterogeneous trace (issue #57). */
+  contextSpans(sessionId: SessionId): ContextSpan[] {
+    return this.store.contexts.filter((c) => c.base.session_id.equals(sessionId));
+  }
+
   /** All recorded warn spans for a session, in insertion order (issue #46).
    *  Lets callers inspect compaction-verification failures without
    *  reconstructing them from the heterogeneous trace. */

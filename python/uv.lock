@@ -505,6 +505,20 @@ dev = [
 name = "spore-eval"
 version = "0.0.0"
 source = { editable = "packages/spore_eval" }
+dependencies = [
+    { name = "anyio" },
+    { name = "pydantic" },
+    { name = "spore-core" },
+    { name = "spore-tools" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.13.0" },
+    { name = "pydantic", specifier = ">=2" },
+    { name = "spore-core", editable = "packages/spore_core" },
+    { name = "spore-tools", editable = "packages/spore_tools" },
+]
 
 [[package]]
 name = "spore-tools"

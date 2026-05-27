@@ -131,8 +131,10 @@ func (a *HarnessObservabilityAdapter) CostFor(usage sporecore.TokenUsage) float6
 
 // EmitCompaction builds the Compaction ContextSpan for an accepted summary and
 // forwards it (issue #46). Mirrors the Rust reference's accept_compaction span:
-// a root context span with a Compaction operation, tokens_before == tokens_after
-// and zero tokens_reclaimed (the bridge does not surface reclaim accounting).
+// a root context span with a Compaction operation carrying the real
+// tokens_before / tokens_after / tokens_reclaimed the harness computed from the
+// manager's post-compaction budget (issue #57). When the manager tracks no
+// budget the loop passes tokens_after == tokens_before and zero reclaimed.
 func (a *HarnessObservabilityAdapter) EmitCompaction(
 	spanID string,
 	sessionID sporecore.SessionID,
@@ -140,14 +142,16 @@ func (a *HarnessObservabilityAdapter) EmitCompaction(
 	startedAt string,
 	messagesRemoved uint32,
 	tokensBefore uint32,
+	tokensAfter uint32,
+	tokensReclaimed uint32,
 ) {
 	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindCompaction, Timestamp(startedAt))
 	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
 	a.provider.EmitContext(ContextSpan{
 		Base:              base,
-		Operation:         NewContextOpCompaction(messagesRemoved, 0),
+		Operation:         NewContextOpCompaction(messagesRemoved, tokensReclaimed),
 		TokensBefore:      tokensBefore,
-		TokensAfter:       tokensBefore,
+		TokensAfter:       tokensAfter,
 		UtilizationBefore: 0,
 		UtilizationAfter:  0,
 	})

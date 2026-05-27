@@ -71,10 +71,60 @@ from .harness import (
     ToolOutputError,
     ToolOutputSuccess,
 )
-from .model import Message, ModelParams, Role, TextContent
+from .model import (
+    ImageContent,
+    Message,
+    ModelParams,
+    Role,
+    TextContent,
+    ToolCallContent,
+    ToolResultContent,
+)
 from .tool_registry import TaskPhase
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token estimation (Known Deviation #2 fix)
+# ---------------------------------------------------------------------------
+
+
+def estimate_message_tokens(message: Message) -> int:
+    """Rough token estimate for a single message: the byte length of its
+    textual content divided by four (the same chars/4 proxy the rich
+    :class:`StandardContextManager` uses for cache-marker placement). Used by
+    the adapter to compute real ``tokens_reclaimed`` from the messages a
+    compaction drops, since the synchronous harness seam cannot call the async
+    ``count_tokens``.
+
+    Returns at least ``1`` token for any non-empty message so a dropped message
+    is never accounted as zero reclamation.
+    """
+    content = message.content
+    if isinstance(content, TextContent):
+        nbytes = len(content.text.encode("utf-8"))
+    elif isinstance(content, ToolCallContent):
+        import json as _json
+
+        nbytes = len(content.name.encode("utf-8")) + len(
+            _json.dumps(content.input, separators=(",", ":")).encode("utf-8")
+        )
+    elif isinstance(content, ToolResultContent):
+        nbytes = len(content.content.encode("utf-8"))
+    elif isinstance(content, ImageContent):
+        nbytes = len(content.data.encode("utf-8"))
+    else:  # pragma: no cover — exhaustive over the Content union
+        nbytes = 0
+    estimate = nbytes // 4
+    if estimate == 0 and nbytes > 0:
+        return 1
+    return estimate
+
+
+def estimate_tokens(messages: list[Message]) -> int:
+    """Sum :func:`estimate_message_tokens` over a list of messages."""
+    return sum(estimate_message_tokens(m) for m in messages)
 
 #: Reserved key under ``harness.SessionState.extras`` holding the serialized
 #: rich :class:`spore_core.context.SessionState`. The adapter is the only
@@ -263,13 +313,25 @@ class StandardCompactionAdapter:
             # No rich state to apply against — degrade safely; never raise.
             return
         request = self._inner.prepare_compaction(rich)
-        messages_removed = len(request.messages_to_compact)
+        dropped = request.messages_to_compact
+        messages_removed = len(dropped)
+
+        summary_message = Message(role=Role.ASSISTANT, content=TextContent(text=summary))
+
+        # Real token accounting (Known Deviation #2 fix): reclaim the tokens of
+        # the messages we drop, net of the summary that replaces them, and clamp
+        # to the live budget so ``token_budget_used`` never underflows. The rich
+        # ``apply_compaction`` (context.py) decrements ``token_budget_used`` by
+        # this amount, so utilization actually falls below threshold after a
+        # compaction and a long session can compact repeatedly.
+        dropped_tokens = estimate_tokens(dropped)
+        summary_tokens = estimate_message_tokens(summary_message)
+        net_reclaimed = max(0, dropped_tokens - summary_tokens)
+        tokens_reclaimed = min(net_reclaimed, rich.token_budget_used)
+
         result = CompactionResult(
-            summary_message=Message(role=Role.ASSISTANT, content=TextContent(text=summary)),
-            # The rich manager recomputes the surviving history; token
-            # accounting is best-effort at the seam (no fresh token count), so
-            # reclaim nothing rather than guess.
-            tokens_reclaimed=0,
+            summary_message=summary_message,
+            tokens_reclaimed=tokens_reclaimed,
             messages_removed=messages_removed,
         )
         try:
@@ -282,6 +344,16 @@ class StandardCompactionAdapter:
             return
         self._write_rich_state(session, rich)
 
+    def token_budget_used(self, session: HarnessState) -> int | None:
+        """Post-compaction budget seam (Known Deviation #2 fix). The harness
+        reads this after applying a compaction to stamp the real
+        ``tokens_after`` / ``tokens_reclaimed`` on the emitted ``Compaction``
+        span. Returns ``None`` when no rich state has been seeded."""
+        rich = self._read_rich_state(session)
+        if rich is None:
+            return None
+        return rich.token_budget_used
+
 
 def into_harness_adapter(inner: StandardContextManager) -> HarnessContextManager:
     """Ergonomic constructor: wrap a rich :class:`StandardContextManager` as the
@@ -293,6 +365,8 @@ def into_harness_adapter(inner: StandardContextManager) -> HarnessContextManager
 __all__ = [
     "RICH_STATE_KEY",
     "StandardCompactionAdapter",
+    "estimate_message_tokens",
+    "estimate_tokens",
     "into_harness_adapter",
     "seed_rich_state",
 ]

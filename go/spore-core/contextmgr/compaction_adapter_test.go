@@ -221,10 +221,9 @@ func TestApplyCompactionRoundTripsRichState(t *testing.T) {
 	if err := json.Unmarshal(raw, &restored); err != nil {
 		t.Fatal(err)
 	}
-	if !a.ShouldCompact(&restored) {
-		// Still 95/100 used (reclaimed 0) -> stays over threshold, proving the
-		// rich state survived the JSON round-trip.
-		t.Fatal("rich state did not survive pause/resume round-trip")
+	if got, ok := a.TokenBudgetUsed(&restored); !ok || got > 95 {
+		// The rich state (budget + history) must survive the JSON round-trip.
+		t.Fatalf("rich state did not survive pause/resume round-trip: used=%d present=%v", got, ok)
 	}
 }
 
@@ -458,5 +457,68 @@ func TestCompactionLoopFixtureParity(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ============================================================================
+// Real token reclamation + healthy multi-compaction (issue #57)
+// ============================================================================
+
+// richStateHeavy builds a rich state whose messages carry enough content to
+// produce a non-trivial token estimate (the chars/4 proxy), so a compaction
+// that drops them reclaims real tokens.
+func richStateHeavy(messages int, used, limit uint32) *contextmgr.SessionState {
+	s := contextmgr.NewSessionState("s1", "t1", "deploy the payment service")
+	s.WindowLimit = limit
+	s.TokenBudgetUsed = used
+	hist := make([]sporecore.Message, 0, messages)
+	for i := 0; i < messages; i++ {
+		hist = append(hist, sporecore.Message{
+			Role: sporecore.RoleUser,
+			Content: sporecore.NewTextContent(
+				"history message with a fair amount of content to estimate tokens from " +
+					string(rune('a'+i%26)),
+			),
+		})
+	}
+	s.MessageHistory = hist
+	return &s
+}
+
+func TestApplyCompactionReclaimsRealTokensAndDropsBudget(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	s := sessionWith(richStateHeavy(10, 95, 100))
+
+	before, ok := a.TokenBudgetUsed(&s)
+	if !ok || before != 95 {
+		t.Fatalf("before budget = %d present=%v, want 95", before, ok)
+	}
+	a.ApplyCompaction(&s, "summary preserving payment deploy")
+	after, ok := a.TokenBudgetUsed(&s)
+	if !ok {
+		t.Fatal("post-compaction budget not present")
+	}
+	if after >= before {
+		t.Fatalf("TokenBudgetUsed must drop after real reclamation: %d -> %d", before, after)
+	}
+}
+
+func TestApplyCompactionMultiCompactionKeepsDroppingBudget(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	s := sessionWith(richStateHeavy(10, 95, 100))
+
+	a.ApplyCompaction(&s, "first summary about payment deploy")
+	afterFirst, _ := a.TokenBudgetUsed(&s)
+	if afterFirst >= 95 {
+		t.Fatalf("first compaction did not reclaim: %d", afterFirst)
+	}
+
+	// Simulate the session growing again past threshold, then compact again.
+	grown := richStateHeavy(10, 95, 100)
+	contextmgr.SeedRichState(&s, grown)
+	a.ApplyCompaction(&s, "second summary about payment deploy")
+	afterSecond, _ := a.TokenBudgetUsed(&s)
+	if afterSecond >= 95 {
+		t.Fatalf("second compaction did not reclaim: %d", afterSecond)
 	}
 }

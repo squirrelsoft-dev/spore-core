@@ -848,10 +848,16 @@ export class StandardHarness implements Harness {
   ): number {
     // Default applyCompaction is a no-op (only compaction-capable managers
     // implement it).
-    this.config.contextManager.applyCompaction?.(sessionState, summary);
+    const cm = this.config.contextManager;
+    cm.applyCompaction?.(sessionState, summary);
 
     const obs = this.config.observability;
     if (obs) {
+      // Stamp real post-compaction budget when the manager exposes it (issue
+      // #57 token-accounting fix); otherwise fall back to the pre-compaction
+      // budget (no reclamation surfaced).
+      const tokensAfter = cm.tokenBudgetUsed?.(sessionState) ?? tokensBefore;
+      const tokensReclaimed = Math.max(0, tokensBefore - tokensAfter);
       const base = newRootSpanBase(
         SpanId.of(`${sessionId.asString()}-compaction-${spanSeq}`),
         sessionId,
@@ -861,9 +867,13 @@ export class StandardHarness implements Harness {
       );
       const span: ContextSpan = {
         base,
-        operation: { kind: "compaction", messages_removed: messagesRemoved, tokens_reclaimed: 0 },
+        operation: {
+          kind: "compaction",
+          messages_removed: messagesRemoved,
+          tokens_reclaimed: tokensReclaimed,
+        },
         tokens_before: tokensBefore,
-        tokens_after: tokensBefore,
+        tokens_after: tokensAfter,
         utilization_before: 0,
         utilization_after: 0,
       };

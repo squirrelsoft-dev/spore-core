@@ -319,7 +319,7 @@ func (o *capturingObserver) EmitToolCall(string, string, SessionID, TaskID, stri
 func (o *capturingObserver) SetSessionOutcome(SessionID, bool, string) {}
 func (o *capturingObserver) FlushSession(context.Context, SessionID)   {}
 func (o *capturingObserver) CostFor(TokenUsage) float64                { return 0 }
-func (o *capturingObserver) EmitCompaction(string, SessionID, TaskID, string, uint32, uint32) {
+func (o *capturingObserver) EmitCompaction(string, SessionID, TaskID, string, uint32, uint32, uint32, uint32) {
 	o.compactions++
 }
 func (o *capturingObserver) EmitCompactionVerificationFailed(_ string, _ SessionID, _ TaskID, _ string, missing []string, accepted bool) {
