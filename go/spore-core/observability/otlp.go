@@ -26,7 +26,9 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -86,6 +88,69 @@ func newOTLPSdkForwarder(endpoint string) (*otlpSdkForwarder, error) {
 	}, nil
 }
 
+// reservedAttrKeys are owned by the fixed envelope tags; a flattened attribute
+// with one of these names is skipped so it never duplicates a fixed tag.
+var reservedAttrKeys = map[string]struct{}{
+	"session_id":     {},
+	"task_id":        {},
+	"level":          {},
+	"status":         {},
+	"parent_span_id": {},
+}
+
+// attributesToKeyValues flattens a span's top-level attributes object into OTLP
+// KeyValues so the rich per-span detail (tokens, stop_reason, tool_name,
+// turn_number, …) reaches Tempo, not just the JSONL.
+//
+// Rules (shallow, no dotted-key deep-flatten), mirroring the Rust reference:
+//   - string → string attribute.
+//   - bool → bool attribute.
+//   - number → Int64 when integral (and within int64 range), else Float64.
+//   - null → skipped (no key emitted).
+//   - nested object/array → compact JSON string attribute.
+//   - non-object top-level (shouldn't happen) → nothing.
+//   - keys colliding with the fixed envelope tags (reservedAttrKeys) are skipped
+//     so the fixed tag wins.
+//
+// Numbers arrive as float64 from JSON unmarshal; integral detection uses
+// f == math.Trunc(f) bounded to the int64 range.
+func attributesToKeyValues(raw json.RawMessage) []attribute.KeyValue {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		// Not a JSON object (or invalid) → nothing to flatten.
+		return nil
+	}
+	out := make([]attribute.KeyValue, 0, len(obj))
+	for key, value := range obj {
+		if _, reserved := reservedAttrKeys[key]; reserved {
+			continue
+		}
+		switch v := value.(type) {
+		case nil:
+			continue
+		case string:
+			out = append(out, attribute.String(key, v))
+		case bool:
+			out = append(out, attribute.Bool(key, v))
+		case float64:
+			if v == math.Trunc(v) && v >= math.MinInt64 && v <= math.MaxInt64 {
+				out = append(out, attribute.Int64(key, int64(v)))
+			} else {
+				out = append(out, attribute.Float64(key, v))
+			}
+		default:
+			// Nested object or array → compact JSON string.
+			if js, err := json.Marshal(v); err == nil {
+				out = append(out, attribute.String(key, string(js)))
+			}
+		}
+	}
+	return out
+}
+
 // forward emits one span carrying the harness trace id + derived span id.
 // Best-effort and non-blocking; never errors. A bad trace id skips the span.
 func (f *otlpSdkForwarder) forward(line TraceLine) {
@@ -117,6 +182,9 @@ func (f *otlpSdkForwarder) forward(line TraceLine) {
 		// SpanID string as an attribute for cross-referencing (parity).
 		attrs = append(attrs, attribute.String("parent_span_id", *line.ParentSpanID))
 	}
+	// Flatten the rich per-kind payload so token/stop_reason/tool_name/etc.
+	// detail reaches Tempo, not just the JSONL. Fixed tags win via the skip list.
+	attrs = append(attrs, attributesToKeyValues(line.Attributes)...)
 
 	_, span := f.tracer.Start(
 		ctx,
