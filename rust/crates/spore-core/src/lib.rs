@@ -35,6 +35,7 @@ pub mod ollama;
 pub mod openai;
 pub mod prompt_chunk_registry;
 pub mod sandbox;
+pub mod scenarios;
 pub mod sensor;
 pub mod termination;
 pub mod tool_registry;
@@ -110,6 +111,11 @@ pub use prompt_chunk_registry::{
     ChunkValidationError, Mode, PromptChunk, PromptChunkRegistry, StandardPromptChunkRegistry,
 };
 pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
+pub use scenarios::{
+    build_real_tool_registry, build_rich_context_manager, build_scenario, seed_compaction_state,
+    CompleteOnFinalResponse, FailingTool, RealToolRegistry, ScenarioId,
+    SchemaInjectingContextManager,
+};
 pub use sensor::{
     Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
