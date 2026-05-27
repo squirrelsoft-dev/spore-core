@@ -1591,6 +1591,15 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 
 	switch task.LoopStrategy.Kind {
 	case StrategyReAct:
+		// Seed the task instruction as the initial user message of this run.
+		// The compaction adapter intentionally mirrors session.Messages and
+		// ignores task on Assemble, so the harness must own delivering the
+		// prompt. On a fresh run this turns an otherwise-empty conversation
+		// into a real user turn; on multi-turn runs over a carried
+		// SessionState each Run call appends its own follow-up instruction.
+		// The resume path is intentionally excluded — its conversation already
+		// exists, so it must not be re-seeded.
+		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
 		return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations, session, budget, options.OnStream)
 	case StrategyPlanExecute:
 		return strategyNotImplemented(task, "plan_execute")

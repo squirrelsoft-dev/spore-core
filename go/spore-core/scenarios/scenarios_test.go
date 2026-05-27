@@ -250,6 +250,66 @@ func TestS4FailingToolIsRecoverableNotAlwaysHalt(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Regression: the task instruction must reach the agent as the first user
+// message (issue #57). Unlike MockAgent, which ignores its Context, this agent
+// records every assembled Context so we can assert the model actually receives
+// the prompt. Backed by the real StandardCompactionAdapter context manager
+// (the same wiring a live run uses) — the adapter mirrors session.Messages and
+// ignores task on Assemble, so without the harness seeding the instruction the
+// captured first-turn context is EMPTY and this test fails (the bug we fix).
+// ---------------------------------------------------------------------------
+
+type capturingAgent struct {
+	id       sporecore.AgentID
+	contexts []sporecore.Context
+}
+
+func (a *capturingAgent) Turn(_ context.Context, c sporecore.Context) sporecore.TurnResult {
+	a.contexts = append(a.contexts, c)
+	return sporecore.NewFinalResponse("DONE", usage())
+}
+
+func (a *capturingAgent) ID() sporecore.AgentID { return a.id }
+
+func TestTaskInstructionDeliveredAsFirstUserMessage(t *testing.T) {
+	agent := &capturingAgent{id: "capture"}
+
+	// Real compaction-adapter-backed context manager (mirrors session.Messages,
+	// ignores task), so only the harness seeding can put the prompt on screen.
+	model := sporecore.NewMockModel(sporecore.ProviderInfo{Name: "mock", ModelID: "mock", ContextWindow: 4096})
+	cfg := contextmgr.CompactionConfig{Threshold: 0.80, PreserveRecentN: 2, HeadTailTokens: 64, OffloadPath: ".spore/offload", MaxCompactionAttempts: 2}
+	rich := contextmgr.NewStandardContextManager(model, nil, cfg)
+	cm := contextmgr.NewStandardCompactionAdapter(rich)
+
+	h := scenarios.BuildScenario(
+		agent, sporecore.NewScriptedToolRegistry(), sporecore.AllowAllSandbox{}, cm,
+		sporecore.AlwaysContinuePolicy{}, nil, nil, 2, nil,
+	)
+
+	const instruction = "summarize the quarterly payment report"
+	task := sporecore.NewTask(instruction, "seed-test", reactStrategy(4))
+	res := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
+	if res.Kind != sporecore.RunSuccess {
+		t.Fatalf("expected Success, got %v (%s)", res.Kind, res.Reason.Kind)
+	}
+
+	if len(agent.contexts) == 0 {
+		t.Fatal("agent must have been invoked at least once")
+	}
+	first := agent.contexts[0]
+	hasUserInstruction := false
+	for _, m := range first.Messages {
+		if m.Role == sporecore.RoleUser && m.Content.Type == sporecore.ContentTypeText && m.Content.Text == instruction {
+			hasUserInstruction = true
+			break
+		}
+	}
+	if !hasUserInstruction {
+		t.Fatalf("first-turn context must contain a User message equal to the task instruction; got messages: %+v", first.Messages)
+	}
+}
+
 // ParseScenarioID round-trips s1..s4 and rejects junk.
 func TestParseScenarioID(t *testing.T) {
 	for _, in := range []string{"s1", "S2", " s3 ", "S4"} {
