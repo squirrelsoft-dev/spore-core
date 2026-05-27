@@ -987,6 +987,11 @@ type HarnessObserver interface {
 		// when the turn produced no final text; calls is nil when no tool calls.
 		outputText string,
 		calls []ToolCall,
+		// inputMessages (issue #64): the assembled INPUT prompt the model saw
+		// this turn (system-first, then history order). Captured only when the
+		// observer's content-capture guard is ON; the observer maps roles,
+		// renders/truncates content, and gates these. nil when unavailable.
+		inputMessages []Message,
 	)
 
 	// EmitToolCall records one tool dispatch as a child of parentSpanID.
@@ -1834,6 +1839,7 @@ func (h *StandardHarness) runReActInner(
 				errMsg,
 				result.Content,
 				result.Calls,
+				c.Messages,
 			)
 		}
 		currentTurnSpanID = turnSpanID

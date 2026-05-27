@@ -175,6 +175,27 @@ func genAiEvents(line TraceLine) []genAiEvent {
 	}
 	var events []genAiEvent
 
+	// Turn: the assembled INPUT messages — emitted FIRST and in order, one
+	// gen_ai.<role>.message event per message (issue #64), before the output
+	// event.
+	if raw, ok := attrs["gen_ai.prompt"]; ok {
+		var msgs []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(raw, &msgs) == nil {
+			for _, m := range msgs {
+				events = append(events, genAiEvent{
+					name: GenAiRole(m.Role).EventName(),
+					attrs: []attribute.KeyValue{
+						attribute.String("gen_ai.message.role", m.Role),
+						attribute.String("gen_ai.message.content", m.Content),
+					},
+				})
+			}
+		}
+	}
+
 	// Turn: the assistant's output text.
 	if raw, ok := attrs["gen_ai.response.content"]; ok {
 		var content string

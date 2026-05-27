@@ -73,6 +73,7 @@ func (a *HarnessObservabilityAdapter) EmitTurn(
 	errorMessage string,
 	outputText string,
 	calls []sporecore.ToolCall,
+	inputMessages []sporecore.Message,
 ) {
 	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindTurn, Timestamp(startedAt))
 	status := NewStatusOk()
@@ -109,6 +110,9 @@ func (a *HarnessObservabilityAdapter) EmitTurn(
 			}
 			span.ToolCalls = tcs
 		}
+		if len(inputMessages) > 0 {
+			span.InputMessages = captureInputMessages(inputMessages, a.content.MaxFieldLen)
+		}
 	}
 	a.provider.EmitTurn(span)
 }
@@ -130,6 +134,60 @@ func toolCallContent(name string, args json.RawMessage, maxLen int) ToolCallCont
 		strBytes = json.RawMessage("null")
 	}
 	return ToolCallContent{Name: name, Arguments: strBytes, ArgumentsTruncated: true}
+}
+
+// captureInputMessages snapshots the assembled INPUT messages (the full prompt
+// the model saw) into GenAiMessages (issue #64). Each message's Role maps to the
+// conventional GenAiRole; Content is rendered to a plain string and truncated to
+// maxLen UTF-8 bytes:
+//   - text        → the text verbatim
+//   - tool_result → the result body (role stays Tool)
+//   - tool_call   → "<name> <compact-json-args>" (assistant)
+//   - image       → "[image <media_type>]" — NEVER the base64 data
+//
+// System-first, then history order is preserved because the assembled messages
+// already lead with the RoleSystem prompt; each message is mapped directly (no
+// synthesized system entry).
+func captureInputMessages(messages []sporecore.Message, maxLen int) []GenAiMessage {
+	out := make([]GenAiMessage, 0, len(messages))
+	for _, m := range messages {
+		role := genAiRoleFor(m.Role)
+		var rendered string
+		switch m.Content.Type {
+		case sporecore.ContentTypeText:
+			rendered = m.Content.Text
+		case sporecore.ContentTypeToolResult:
+			if m.Content.ToolResult != nil {
+				rendered = m.Content.ToolResult.Content
+			}
+		case sporecore.ContentTypeToolCall:
+			if m.Content.ToolCall != nil {
+				rendered = m.Content.ToolCall.Name + " " + string(m.Content.ToolCall.Input)
+			}
+		case sporecore.ContentTypeImage:
+			// NEVER dump the base64 data — placeholder only.
+			rendered = "[image " + m.Content.MediaType + "]"
+		}
+		clipped, truncated := TruncateField(rendered, maxLen)
+		out = append(out, GenAiMessage{Role: role, Content: clipped, Truncated: truncated})
+	}
+	return out
+}
+
+// genAiRoleFor maps a model Role to the conventional GenAiRole (issue #64).
+func genAiRoleFor(r sporecore.Role) GenAiRole {
+	switch r {
+	case sporecore.RoleSystem:
+		return GenAiRoleSystem
+	case sporecore.RoleUser:
+		return GenAiRoleUser
+	case sporecore.RoleAssistant:
+		return GenAiRoleAssistant
+	case sporecore.RoleTool:
+		return GenAiRoleTool
+	default:
+		return GenAiRole(string(r))
+	}
 }
 
 // EmitToolCall builds a child ToolCallSpan (parented to the turn span) and

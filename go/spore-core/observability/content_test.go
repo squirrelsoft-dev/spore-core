@@ -314,7 +314,7 @@ func TestAdapterContentOffEmitsNoContent(t *testing.T) {
 	provider := NewInMemoryObservabilityProvider()
 	obs := NewHarnessObserverWithContent(provider, DefaultPricing(), DefaultContentCaptureConfig())
 	obs.EmitTurn("sp1", "s1", "t1", 1, "ts", 1, sporecore.TokenUsage{}, 0, "end_turn", 0, "",
-		"the model said this", []sporecore.ToolCall{{ID: "c1", Name: "shell", Input: json.RawMessage(`{"command":"ls"}`)}})
+		"the model said this", []sporecore.ToolCall{{ID: "c1", Name: "shell", Input: json.RawMessage(`{"command":"ls"}`)}}, nil)
 	trace, _ := provider.GetTrace(nil, "s1")
 	if len(trace) != 1 {
 		t.Fatalf("expected 1 span, got %d", len(trace))
@@ -330,7 +330,7 @@ func TestAdapterContentOnPopulatesAndTruncates(t *testing.T) {
 	obs := NewHarnessObserverWithContent(provider, DefaultPricing(),
 		ContentCaptureConfig{Enabled: true, MaxFieldLen: 5})
 	obs.EmitTurn("sp1", "s1", "t1", 1, "ts", 1, sporecore.TokenUsage{}, 0, "end_turn", 0, "",
-		"abcdefghij", nil)
+		"abcdefghij", nil, nil)
 	turn := mustGetTurn(t, provider, "s1")
 	if turn.OutputText == nil {
 		t.Fatalf("content-ON adapter must populate OutputText")
@@ -426,5 +426,109 @@ func TestTurnSpanContentRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(span.OutputText, back.OutputText) {
 		t.Fatalf("OutputText round-trip mismatch: %+v vs %+v", span.OutputText, back.OutputText)
+	}
+}
+
+// ── Assembled INPUT-message capture (issue #64) ─────────────────────────────
+
+// inputMsgs is a representative assembled prompt: system-first, then a user
+// turn, an assistant tool_call, a tool result, and an image.
+func inputMsgs() []sporecore.Message {
+	return []sporecore.Message{
+		{Role: sporecore.RoleSystem, Content: sporecore.NewTextContent("You are a helpful coding agent.")},
+		{Role: sporecore.RoleUser, Content: sporecore.NewTextContent("List the files in the repo.")},
+		{Role: sporecore.RoleAssistant, Content: sporecore.NewToolCallContent(
+			sporecore.ToolCall{ID: "c1", Name: "shell", Input: json.RawMessage(`{"command":"ls"}`)})},
+		{Role: sporecore.RoleTool, Content: sporecore.NewToolResultContent(
+			sporecore.ToolResult{ToolUseID: "c1", Content: "Cargo.toml\nsrc/"})},
+		{Role: sporecore.RoleUser, Content: sporecore.NewImageContent("image/png", "BASE64DATASHOULDNEVERLEAK")},
+	}
+}
+
+func emitTurnWith(t *testing.T, content ContentCaptureConfig, msgs []sporecore.Message) (TurnSpan, *InMemoryObservabilityProvider) {
+	t.Helper()
+	provider := NewInMemoryObservabilityProvider()
+	obs := NewHarnessObserverWithContent(provider, DefaultPricing(), content)
+	obs.EmitTurn("sp1", "s1", "t1", 1, "ts", 1, sporecore.TokenUsage{}, 0, "end_turn", 0, "", "", nil, msgs)
+	return mustGetTurn(t, provider, "s1"), provider
+}
+
+func TestAdapterInputMessagesCapturedOnRolesAndOrder(t *testing.T) {
+	turn, _ := emitTurnWith(t, ContentCaptureConfig{Enabled: true, MaxFieldLen: DefaultContentMaxLen}, inputMsgs())
+	if turn.InputMessages == nil {
+		t.Fatal("content-ON adapter must populate InputMessages")
+	}
+	want := []GenAiMessage{
+		{Role: GenAiRoleSystem, Content: "You are a helpful coding agent."},
+		{Role: GenAiRoleUser, Content: "List the files in the repo."},
+		{Role: GenAiRoleAssistant, Content: `shell {"command":"ls"}`},
+		{Role: GenAiRoleTool, Content: "Cargo.toml\nsrc/"},
+		{Role: GenAiRoleUser, Content: "[image image/png]"},
+	}
+	if !reflect.DeepEqual(turn.InputMessages, want) {
+		t.Fatalf("input messages mismatch\n got: %+v\nwant: %+v", turn.InputMessages, want)
+	}
+}
+
+func TestAdapterInputImageNeverLeaksBase64(t *testing.T) {
+	turn, _ := emitTurnWith(t, ContentCaptureConfig{Enabled: true, MaxFieldLen: DefaultContentMaxLen}, inputMsgs())
+	for _, m := range turn.InputMessages {
+		if strings.Contains(m.Content, "BASE64DATASHOULDNEVERLEAK") {
+			t.Fatalf("base64 image data leaked into input capture: %q", m.Content)
+		}
+	}
+}
+
+func TestAdapterInputMessagesOffByGuard(t *testing.T) {
+	turn, _ := emitTurnWith(t, DefaultContentCaptureConfig(), inputMsgs())
+	if turn.InputMessages != nil {
+		t.Fatalf("content-OFF adapter must not populate InputMessages, got %+v", turn.InputMessages)
+	}
+	// Guard-off line must omit gen_ai.prompt entirely (byte-identical path).
+	line := TraceLineFromTurn(turn, "tid")
+	if strings.Contains(string(line.Attributes), "gen_ai.prompt") {
+		t.Fatalf("content-OFF line must not carry gen_ai.prompt: %s", line.Attributes)
+	}
+}
+
+func TestAdapterInputMessagesTruncated(t *testing.T) {
+	msgs := []sporecore.Message{
+		{Role: sporecore.RoleUser, Content: sporecore.NewTextContent("abcdefghij")},
+	}
+	turn, _ := emitTurnWith(t, ContentCaptureConfig{Enabled: true, MaxFieldLen: 5}, msgs)
+	if len(turn.InputMessages) != 1 {
+		t.Fatalf("want 1 input message, got %d", len(turn.InputMessages))
+	}
+	got := turn.InputMessages[0]
+	if !got.Truncated {
+		t.Errorf("over-budget input must be marked truncated")
+	}
+	if got.Content != "abcde"+TruncationMarker {
+		t.Errorf("input must be clipped to budget: got %q", got.Content)
+	}
+}
+
+func TestInputMessagesGenAiEventsFirstAndInOrder(t *testing.T) {
+	turn, _ := emitTurnWith(t, ContentCaptureConfig{Enabled: true, MaxFieldLen: DefaultContentMaxLen}, inputMsgs())
+	line := TraceLineFromTurn(turn, "tid")
+	if !strings.Contains(string(line.Attributes), "gen_ai.prompt") {
+		t.Fatalf("content-ON line must carry gen_ai.prompt: %s", line.Attributes)
+	}
+	events := genAiEvents(line)
+	// One event per input message; no output/tool-call events in this turn.
+	if len(events) != 5 {
+		t.Fatalf("want 5 input-message events, got %d", len(events))
+	}
+	wantNames := []string{
+		GenAiRoleSystem.EventName(),
+		GenAiRoleUser.EventName(),
+		GenAiRoleAssistant.EventName(),
+		GenAiRoleTool.EventName(),
+		GenAiRoleUser.EventName(),
+	}
+	for i, ev := range events {
+		if ev.name != wantNames[i] {
+			t.Errorf("event %d name: got %q want %q", i, ev.name, wantNames[i])
+		}
 	}
 }

@@ -235,6 +235,11 @@ type TurnSpan struct {
 	// Captured only when content capture is enabled; nil keeps the line
 	// pre-#64-identical.
 	ToolCalls []ToolCallContent `json:"tool_calls,omitempty"`
+	// InputMessages is the assembled INPUT prompt the model saw this turn,
+	// ordered system-first then history order (issue #64). Captured only when
+	// content capture is enabled; nil (omitempty) keeps the line
+	// pre-#64-identical.
+	InputMessages []GenAiMessage `json:"input_messages,omitempty"`
 }
 
 // ToolCallSpan is one tool dispatch.

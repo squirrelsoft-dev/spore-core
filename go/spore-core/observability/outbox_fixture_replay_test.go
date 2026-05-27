@@ -39,7 +39,8 @@ func buildLine(t *testing.T, file string, span json.RawMessage, traceID string) 
 	case "trace_line_turn.json",
 		"trace_line_turn_with_content.json",
 		"trace_line_turn_truncated.json",
-		"trace_line_turn_content_off.json":
+		"trace_line_turn_content_off.json",
+		"trace_line_turn_with_input.json":
 		var s TurnSpan
 		dec(&s)
 		return TraceLineFromTurn(s, traceID)
@@ -94,6 +95,7 @@ func TestOutboxFixtureReplayAllKinds(t *testing.T) {
 		"trace_line_tool_call_with_content.json",
 		"trace_line_turn_truncated.json",
 		"trace_line_turn_content_off.json",
+		"trace_line_turn_with_input.json",
 	}
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {

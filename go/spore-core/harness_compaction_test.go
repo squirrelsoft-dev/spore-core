@@ -312,7 +312,7 @@ type capturingObserver struct {
 
 func newCapturingObserver() *capturingObserver { return &capturingObserver{} }
 
-func (o *capturingObserver) EmitTurn(string, SessionID, TaskID, uint32, string, uint64, TokenUsage, float64, StopReason, uint32, string, string, []ToolCall) {
+func (o *capturingObserver) EmitTurn(string, SessionID, TaskID, uint32, string, uint64, TokenUsage, float64, StopReason, uint32, string, string, []ToolCall, []Message) {
 }
 func (o *capturingObserver) EmitToolCall(string, string, SessionID, TaskID, string, string, string, uint64, uint64, uint64, bool, bool, json.RawMessage, string) {
 }

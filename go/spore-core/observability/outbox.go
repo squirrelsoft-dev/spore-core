@@ -244,10 +244,13 @@ func TraceLineFromTurn(span TurnSpan, traceID string) TraceLine {
 		StopReason:         span.StopReason,
 		ToolCallsRequested: span.ToolCallsRequested,
 	}
-	if span.OutputText == nil && span.ToolCalls == nil {
+	if span.OutputText == nil && span.ToolCalls == nil && span.InputMessages == nil {
 		return fromBase(span.Base, traceID, "turn", "info", mustMarshal(attrs))
 	}
 	extra := make(map[string]any)
+	if span.InputMessages != nil {
+		extra["gen_ai.prompt"] = span.InputMessages
+	}
 	if msg := span.OutputText; msg != nil {
 		extra["gen_ai.response.role"] = string(msg.Role)
 		extra["gen_ai.response.content"] = msg.Content
