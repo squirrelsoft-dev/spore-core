@@ -256,8 +256,8 @@ func (b *HarnessBuilder) Observability(provider ObservabilityProvider) *HarnessB
 
 // WithObservabilityOutbox constructs and injects a durable-outbox
 // ObservabilityProvider rooted at root (typically the ".spore" directory),
-// using the spec defaults. Honors SPORE_OTLP_ENDPOINT for OTLP forwarding,
-// which in Go is an intentional no-op seam (JSONL only).
+// using the spec defaults. Honors SPORE_OTLP_ENDPOINT for OTLP forwarding to
+// Tempo over gRPC (issue #50); unset/empty means JSONL only.
 func (b *HarnessBuilder) WithObservabilityOutbox(root string) *HarnessBuilder {
 	return b.Observability(NewOutboxObservabilityProvider(NewOutboxConfig(root)))
 }

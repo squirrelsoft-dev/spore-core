@@ -90,6 +90,33 @@ CI runs with the race detector enabled.
 `go get <module>@<version>` from within the relevant module directory.
 Pin to a minor version. Run `go mod tidy` before committing.
 
+### Blessed dependencies
+
+`spore-core` favors the standard library plus a minimal set of blessed deps.
+The currently blessed third-party deps are the OpenTelemetry SDK + OTLP gRPC
+exporter, used solely by the observability outbox's OTLP forwarder:
+
+- `go.opentelemetry.io/otel`
+- `go.opentelemetry.io/otel/sdk`
+- `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc`
+- `go.opentelemetry.io/otel/trace`
+
+**Decision (issue #50, Option A): the core outbox is no longer zero-dep.**
+Issue #49 wired `ObservabilityProvider` into the harness loop across all four
+languages and explicitly *deferred* Go OTLP, leaving `newForwarder` as a no-op
+seam so the outbox stayed zero-dependency. #50 closes that parity gap: Rust,
+TypeScript, and Python already forward end-to-end traces to Tempo over OTLP
+gRPC, so Go must too. Rather than hide the SDK behind a build tag or an optional
+sub-module, we added the otel SDK + `otlptracegrpc` directly to
+`go/spore-core/go.mod` (matching how Python/Rust take the dependency). The
+accepted tradeoff: the reliability-critical outbox now pulls grpc/protobuf and
+their transitive deps. This is bounded because the OTLP surface is isolated in
+`observability/otlp.go` behind the internal `otlpForwarder` interface, and the
+durable JSONL path remains fully network-free — it appends the line *before*
+the best-effort OTLP forward, never blocks on it, and never fails the harness
+loop on OTLP errors. When `SPORE_OTLP_ENDPOINT` is unset/empty the forwarder is
+the no-op `nullForwarder` and no OTLP code runs.
+
 ## Cross-language consistency
 
 Public types (`ModelResponse`, `ToolOutput`, `PausedState`) must match

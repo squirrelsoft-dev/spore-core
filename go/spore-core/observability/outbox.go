@@ -51,17 +51,18 @@
 //     marker. OTLP force-flush is best-effort with a timeout and logs on
 //     failure — it NEVER returns an error for OTLP failure.
 //
-// Deviation — OTLP behind an internal interface (no-op default).
-// The blessed-dependency policy in go/CONVENTIONS.md ("standard library plus
-// minimal blessed deps only") and the zero-dependency spore-core go.mod make
-// pulling the full go.opentelemetry.io/otel SDK + otlptracegrpc tree
-// (dozens of transitive deps: grpc, protobuf, ...) disproportionately heavy
-// and destabilizing for the reliability-critical outbox. As explicitly
-// permitted by the issue, OTLP forwarding is isolated behind the small
-// internal otlpForwarder interface with a real-impl seam and a no-op default
-// (nullForwarder). The durable-JSONL path is fully implemented and tested
-// WITHOUT any live OTLP/network. A future wiring of the OTLP SDK only needs to
-// provide an otlpForwarder; nothing else changes.
+// OTLP forwarding behind an internal interface (issue #50).
+// OTLP forwarding is isolated behind the small internal otlpForwarder
+// interface with a real go.opentelemetry.io/otel SDK + otlptracegrpc
+// implementation (otlpSdkForwarder, see otlp.go) and a no-op default
+// (nullForwarder). When SPORE_OTLP_ENDPOINT is set, spans are also exported to
+// Tempo over OTLP gRPC, reaching parity with Rust/TS/Python. When unset/empty,
+// JSONL only. Per the #50 maintainer decision (Option A), the otel SDK is a
+// blessed dependency (see go/CONVENTIONS.md) — the core outbox is no longer
+// zero-dep, the accepted tradeoff for cross-language Tempo parity. The
+// durable-JSONL path remains fully network-free and is tested WITHOUT any live
+// OTLP/network; the JSONL append always happens before (and independent of)
+// the best-effort OTLP forward.
 package observability
 
 import (
@@ -434,14 +435,21 @@ func (nullForwarder) forward(TraceLine) {}
 func (nullForwarder) forceFlush()       {}
 
 // newForwarder resolves SPORE_OTLP_ENDPOINT once. Empty/whitespace is treated
-// as unset (JSONL only). Per the deviation note, a non-empty endpoint still
-// resolves to the no-op forwarder today; the durable JSONL path is unaffected.
+// as unset (JSONL only → nullForwarder). A non-empty endpoint constructs the
+// real OTLP gRPC forwarder (see otlp.go); if its initialization fails, it logs
+// and falls back to nullForwarder so the durable JSONL path is never affected.
 func newForwarder(endpoint string) otlpForwarder {
-	if strings.TrimSpace(endpoint) == "" {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
 		return nullForwarder{}
 	}
-	// Deviation: OTLP SDK is isolated behind this seam; no-op until wired.
-	return nullForwarder{}
+	f, err := newOTLPSdkForwarder(trimmed)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"[spore-core] failed to init OTLP forwarder for %q; JSONL only: %v\n", trimmed, err)
+		return nullForwarder{}
+	}
+	return f
 }
 
 // ============================================================================
