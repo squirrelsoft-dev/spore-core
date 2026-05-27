@@ -126,6 +126,7 @@ def estimate_tokens(messages: list[Message]) -> int:
     """Sum :func:`estimate_message_tokens` over a list of messages."""
     return sum(estimate_message_tokens(m) for m in messages)
 
+
 #: Reserved key under ``harness.SessionState.extras`` holding the serialized
 #: rich :class:`spore_core.context.SessionState`. The adapter is the only
 #: writer/reader.

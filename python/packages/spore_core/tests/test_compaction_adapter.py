@@ -204,6 +204,60 @@ def test_apply_compaction_shrinks_session() -> None:
     assert rich.message_history[0].role == Role.ASSISTANT
 
 
+def _content_heavy_state(messages: int, used: int, limit: int) -> RichSessionState:
+    s = _rich_state(messages, used, limit)
+    s.message_history = [
+        _msg(Role.USER, f"message number {i} with a fair amount of content to estimate tokens from")
+        for i in range(messages)
+    ]
+    return s
+
+
+def test_apply_compaction_reclaims_real_tokens_and_drops_budget() -> None:
+    """Known Deviation #2 fix: dropping messages reclaims real tokens so
+    ``token_budget_used`` falls, and the ``token_budget_used`` seam reports the
+    post-compaction budget for span stamping."""
+    adapter = StandardCompactionAdapter(_rich_manager())
+    session = _session_with(_content_heavy_state(10, 95, 100))
+
+    before = _rich_from_dict(session.extras[RICH_STATE_KEY]).token_budget_used
+    adapter.apply_compaction(session, "summary preserving payment deploy")
+    after = _rich_from_dict(session.extras[RICH_STATE_KEY]).token_budget_used
+
+    assert after < before, (
+        f"token_budget_used must drop after a real reclamation: {before} -> {after}"
+    )
+    # The seam reports the post-compaction budget for span stamping.
+    assert adapter.token_budget_used(session) == after
+
+
+def test_apply_compaction_multi_compaction_keeps_dropping_budget() -> None:
+    """Healthy multi-compaction: after compacting, growing history and budget
+    again must let a second compaction reclaim more tokens."""
+    adapter = StandardCompactionAdapter(_rich_manager())
+    session = _session_with(_content_heavy_state(10, 95, 100))
+
+    adapter.apply_compaction(session, "first summary about payment deploy")
+    after_first = adapter.token_budget_used(session)
+    assert after_first is not None and after_first < 95
+
+    # Simulate the session growing again past threshold.
+    grown = _content_heavy_state(10, 95, 100)
+    seed_rich_state(session, grown)
+    adapter.apply_compaction(session, "second summary about payment deploy")
+    after_second = adapter.token_budget_used(session)
+    assert after_second is not None and after_second < 95, (
+        "second compaction also reclaims real tokens"
+    )
+
+
+def test_token_budget_used_none_without_rich_state() -> None:
+    """The budget seam returns ``None`` when no rich state has been seeded, so
+    the harness leaves the span's pre-compaction estimate in place."""
+    adapter = StandardCompactionAdapter(_rich_manager())
+    assert adapter.token_budget_used(HarnessState()) is None
+
+
 def test_apply_compaction_swallows_without_rich_state() -> None:
     """No rich state -> no-op, no raise."""
     adapter = StandardCompactionAdapter(_rich_manager())
