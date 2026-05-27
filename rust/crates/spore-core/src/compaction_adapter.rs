@@ -66,6 +66,28 @@ use crate::model::{Content, Message, ModelInterface, ModelParams, Role};
 /// rich `context::SessionState`. The adapter is the only writer/reader.
 pub const RICH_STATE_KEY: &str = "spore.compaction_adapter.rich_state";
 
+/// Rough token estimate for a single message: the byte length of its textual
+/// content divided by four (the same chars/4 proxy `StandardContextManager`
+/// uses for cache-marker placement). Used by the adapter to compute real
+/// `tokens_reclaimed` from the messages a compaction drops, since the
+/// synchronous harness seam cannot call the async `count_tokens`.
+pub fn estimate_message_tokens(message: &Message) -> u32 {
+    let bytes = match &message.content {
+        Content::Text { text } => text.len(),
+        Content::ToolCall(tc) => tc.name.len() + tc.input.to_string().len(),
+        Content::ToolResult(tr) => tr.content.len(),
+        Content::Image { data, .. } => data.len(),
+    };
+    // chars/4 proxy, at least 1 token for any non-empty message so a drop is
+    // never accounted as zero reclamation.
+    ((bytes / 4) as u32).max(if bytes > 0 { 1 } else { 0 })
+}
+
+/// Sum [`estimate_message_tokens`] over a slice of messages.
+pub fn estimate_tokens(messages: &[Message]) -> u32 {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
 /// Stateless bridge from the rich [`StandardContextManager`] onto the
 /// harness-loop compaction seam ([`harness::ContextManager`]).
 ///
@@ -201,20 +223,32 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
             // No rich state to apply against — degrade safely; never panic.
             return;
         };
-        let messages_removed = self
-            .inner
-            .prepare_compaction(&rich)
-            .map(|r| r.messages_to_compact.len() as u32)
-            .unwrap_or(0);
+        let request = self.inner.prepare_compaction(&rich).ok();
+        let dropped: &[Message] = request
+            .as_ref()
+            .map(|r| r.messages_to_compact.as_slice())
+            .unwrap_or(&[]);
+        let messages_removed = dropped.len() as u32;
+
+        let summary_message = Message {
+            role: Role::Assistant,
+            content: Content::Text { text: summary },
+        };
+
+        // Real token accounting (Known Deviation #2 fix): reclaim the tokens of
+        // the messages we drop, net of the summary that replaces them, and clamp
+        // to the live budget so `token_budget_used` never underflows. The rich
+        // `apply_compaction` (context.rs) decrements `token_budget_used` by this
+        // amount, so utilization actually falls below threshold after a
+        // compaction and a long session can compact repeatedly.
+        let dropped_tokens = estimate_tokens(dropped);
+        let summary_tokens = estimate_message_tokens(&summary_message);
+        let net_reclaimed = dropped_tokens.saturating_sub(summary_tokens);
+        let tokens_reclaimed = net_reclaimed.min(rich.token_budget_used);
+
         let result = CompactionResult {
-            summary_message: Message {
-                role: Role::Assistant,
-                content: Content::Text { text: summary },
-            },
-            // The rich manager recomputes the surviving history; token
-            // accounting is best-effort here (no fresh token count at the
-            // seam), so reclaim nothing rather than guess.
-            tokens_reclaimed: 0,
+            summary_message,
+            tokens_reclaimed,
             messages_removed,
         };
         if let Err(err) = self.inner.apply_compaction(&mut rich, result) {
@@ -227,6 +261,10 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
             return;
         }
         Self::write_rich_state(session, &rich);
+    }
+
+    fn token_budget_used(&self, session: &HarnessState) -> Option<u32> {
+        Self::read_rich_state(session).map(|rich| rich.token_budget_used)
     }
 }
 
@@ -428,6 +466,91 @@ mod tests {
         let rich = StandardCompactionAdapter::<StubModel>::read_rich_state(&session).unwrap();
         assert_eq!(rich.message_history.len(), 3);
         assert_eq!(rich.message_history[0].role, Role::Assistant);
+    }
+
+    #[test]
+    fn apply_compaction_reclaims_real_tokens_and_drops_budget() {
+        // Known Deviation #2 fix: dropping messages must reclaim real tokens so
+        // `token_budget_used` falls. Seed long, content-heavy messages so the
+        // dropped span carries a non-trivial token estimate.
+        let adapter = StandardCompactionAdapter::new(rich_manager());
+        let mut rich = RichSessionState::new(
+            SessionId::new("s1"),
+            TaskId::new("t1"),
+            "deploy the payment service",
+        );
+        rich.window_limit = 100;
+        rich.token_budget_used = 95;
+        // 10 messages of ~80 bytes each ⇒ ~20 tokens each by the chars/4 proxy.
+        rich.message_history = (0..10)
+            .map(|i| {
+                msg(
+                    Role::User,
+                    &format!(
+                        "message number {i} with a fair amount of content to estimate tokens from"
+                    ),
+                )
+            })
+            .collect();
+        let mut session = session_with(&rich);
+
+        let before = StandardCompactionAdapter::<StubModel>::read_rich_state(&session)
+            .unwrap()
+            .token_budget_used;
+        adapter.apply_compaction(&mut session, "summary preserving payment deploy".into());
+        let after = StandardCompactionAdapter::<StubModel>::read_rich_state(&session)
+            .unwrap()
+            .token_budget_used;
+
+        assert!(
+            after < before,
+            "token_budget_used must drop after a real reclamation: {before} -> {after}"
+        );
+        // And the seam reports the post-compaction budget for span stamping.
+        assert_eq!(adapter.token_budget_used(&session), Some(after));
+    }
+
+    #[test]
+    fn apply_compaction_multi_compaction_keeps_dropping_budget() {
+        // Healthy multi-compaction: after compacting, growing history and
+        // budget again must let a second compaction reclaim more tokens.
+        let adapter = StandardCompactionAdapter::new(rich_manager());
+        let mk_history = |n: usize| -> Vec<Message> {
+            (0..n)
+                .map(|i| {
+                    msg(
+                        Role::User,
+                        &format!("turn {i} produced some output worth a handful of tokens here"),
+                    )
+                })
+                .collect()
+        };
+        let mut rich = RichSessionState::new(
+            SessionId::new("s1"),
+            TaskId::new("t1"),
+            "deploy the payment service",
+        );
+        rich.window_limit = 100;
+        rich.token_budget_used = 95;
+        rich.message_history = mk_history(10);
+        let mut session = session_with(&rich);
+
+        adapter.apply_compaction(&mut session, "first summary about payment deploy".into());
+        let after_first = adapter.token_budget_used(&session).unwrap();
+        assert!(after_first < 95);
+
+        // Simulate the session growing again past threshold.
+        let mut grown = StandardCompactionAdapter::<StubModel>::read_rich_state(&session).unwrap();
+        grown.token_budget_used = 95;
+        grown.message_history = mk_history(10);
+        seed_rich_state(&mut session, &grown);
+
+        adapter.apply_compaction(&mut session, "second summary about payment deploy".into());
+        let after_second = adapter.token_budget_used(&session).unwrap();
+        assert!(
+            after_second < 95,
+            "second compaction also reclaims real tokens"
+        );
     }
 
     #[test]

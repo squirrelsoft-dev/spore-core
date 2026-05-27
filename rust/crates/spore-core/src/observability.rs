@@ -683,6 +683,20 @@ impl InMemoryObservabilityProvider {
             .collect()
     }
 
+    /// All recorded context spans for a session, in insertion order. Includes
+    /// both `ContextAssembly` and `Compaction` operations — filter on
+    /// [`ContextOperation`] to inspect compaction reclamation (issue #57).
+    pub fn context_spans(&self, session_id: &SessionId) -> Vec<ContextSpan> {
+        self.inner
+            .lock()
+            .unwrap()
+            .contexts
+            .iter()
+            .filter(|c| c.base.session_id == *session_id)
+            .cloned()
+            .collect()
+    }
+
     /// Record the guides selected for a session. Called once at session start.
     pub fn record_guides_used(&self, session_id: &SessionId, guides: Vec<GuideId>) {
         self.inner

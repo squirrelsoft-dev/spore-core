@@ -722,6 +722,16 @@ pub trait ContextManager: Send + Sync {
     fn apply_compaction(&self, session: &mut SessionState, summary: String) {
         let _ = (session, summary);
     }
+
+    /// Current token budget used for this session, if the manager tracks one
+    /// (issue #57 — Known Deviation #2 token-accounting fix). The harness reads
+    /// this after [`apply_compaction`](Self::apply_compaction) to stamp the
+    /// compaction span with the real post-compaction utilization. Default:
+    /// `None` — managers that do not track tokens fall back to the pre-value.
+    fn token_budget_used(&self, session: &SessionState) -> Option<u32> {
+        let _ = session;
+        None
+    }
 }
 
 /// Issue #13 — TerminationPolicy.
@@ -923,6 +933,19 @@ impl HarnessRunOptions {
             on_stream: None,
             session_state: None,
         }
+    }
+
+    /// Carry an existing session state into the run (e.g. a resumed
+    /// conversation history for multi-turn scenarios — issue #57 S2).
+    pub fn with_session_state(mut self, session_state: SessionState) -> Self {
+        self.session_state = Some(session_state);
+        self
+    }
+
+    /// Attach a streaming sink for `StreamEvent`s emitted during the run.
+    pub fn with_stream(mut self, on_stream: StreamSink) -> Self {
+        self.on_stream = Some(on_stream);
+        self
     }
 }
 
@@ -1872,6 +1895,16 @@ impl StandardHarness {
             .context_manager
             .apply_compaction(session_state, summary);
 
+        // Real token accounting (issue #57): read the post-compaction budget the
+        // manager tracks. Managers that do not track tokens report `None`, in
+        // which case we fall back to the pre-compaction value (the old behavior).
+        let tokens_after = self
+            .config
+            .context_manager
+            .token_budget_used(session_state)
+            .unwrap_or(tokens_before);
+        let tokens_reclaimed = tokens_before.saturating_sub(tokens_after);
+
         if let Some(obs) = self.config.observability.as_ref() {
             let base = SpanBase::new_root(
                 SpanId::new(format!("{}-compaction-{}", session_id.as_str(), *span_seq)),
@@ -1884,10 +1917,10 @@ impl StandardHarness {
                 base,
                 operation: crate::observability::ContextOperation::Compaction {
                     messages_removed,
-                    tokens_reclaimed: 0,
+                    tokens_reclaimed,
                 },
                 tokens_before,
-                tokens_after: tokens_before,
+                tokens_after,
                 utilization_before: 0.0,
                 utilization_after: 0.0,
             });
