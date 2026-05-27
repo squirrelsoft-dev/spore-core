@@ -56,6 +56,8 @@ async fn react_loop_dispatches_tool_then_completes() {
         termination_policy: Arc::new(AlwaysContinuePolicy),
         middleware: None,
         observability: None,
+        compaction_verifier: Arc::new(spore_core::KeyTermVerifier),
+        max_compaction_attempts: 2,
         pricing: spore_core::PricingTable::DEFAULT,
     };
     let harness = StandardHarness::new(config);

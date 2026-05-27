@@ -94,6 +94,7 @@ from .observability import (
     Span,
     SpanBase,
     SpanId,
+    WarnSpan,
     SpanKind,
     SpanStatusError,
     SpanStatusHalted,
@@ -308,6 +309,13 @@ class TraceLine:
         }
         # Patch spans are ALWAYS warn-level.
         return TraceLine._from_base(span.base, trace_id, "patch", "warn", attributes)
+
+    @staticmethod
+    def from_warn(span: WarnSpan, trace_id: str) -> TraceLine:
+        """Build a ``warn`` envelope from a :class:`WarnSpan` (issue #46). Warn
+        spans are ALWAYS warn-level; the event payload is serialized verbatim."""
+        attributes = {"event": _to_json_value(span.event)}
+        return TraceLine._from_base(span.base, trace_id, "warn", "warn", attributes)
 
     @staticmethod
     def session_summary(
@@ -639,6 +647,12 @@ class OutboxObservabilityProvider:
         trace_id = self.trace_id_for(span.base.session_id)
         line = TraceLine.from_patch(span, trace_id)
         self._inner.emit_patch(span)
+        self._write_line(span.base.session_id, line)
+
+    def emit_warn(self, span: WarnSpan) -> None:
+        trace_id = self.trace_id_for(span.base.session_id)
+        line = TraceLine.from_warn(span, trace_id)
+        self._inner.emit_warn(span)
         self._write_line(span.base.session_id, line)
 
     # ── post-hoc recorders ────────────────────────────────────────────────────

@@ -60,11 +60,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::{Agent, AgentError, Context, TurnResult};
+use crate::context::{
+    CompactionPreserveHints, CompactionVerifier, KeyTermVerifier,
+    SessionState as ContextSessionState,
+};
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
 use crate::model::{Message, StopReason, TokenUsage, ToolCall, ToolSchema};
 use crate::observability::{
-    PricingTable, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan,
+    PricingTable, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan, WarnEvent,
+    WarnSpan,
 };
 use crate::observability_outbox::{OutboxConfig, OutboxObservabilityProvider};
 
@@ -632,7 +637,39 @@ pub struct FileRef {
     pub byte_len: u64,
 }
 
+/// Inputs the harness compaction loop (issue #46) needs to run one
+/// compaction turn and verify its result.
+///
+/// The harness loop operates on the opaque [`SessionState`] above; the rich
+/// compaction/verification API ([`crate::context::ContextManager`],
+/// [`CompactionVerifier`]) operates on [`crate::context::SessionState`]. This
+/// struct is the bridge: a [`ContextManager`] that supports compaction
+/// projects everything the loop needs into one value, so the loop never has
+/// to know which concrete state type its manager uses internally.
+///
+/// `context` is fed straight to `Agent::turn` to produce the summary;
+/// `preserve_hints` and `verification_state` are passed to
+/// [`CompactionVerifier::verify`]. On a verification failure the loop re-runs
+/// the turn with [`ContextManager::inject_missing_items`] applied to `context`.
+pub struct CompactionTurn {
+    /// Context to feed `Agent::turn` to elicit the summary.
+    pub context: Context,
+    /// Preservation hints to hand the verifier.
+    pub preserve_hints: CompactionPreserveHints,
+    /// Verifier-facing session state (rich `context::SessionState`).
+    pub verification_state: ContextSessionState,
+    /// Messages about to be removed — used to stamp the compaction span.
+    pub messages_removed: u32,
+}
+
 /// Issue #7 — ContextManager: assembles per-turn context.
+///
+/// Issue #46 adds the optional compaction-loop surface
+/// ([`prepare_compaction_turn`](Self::prepare_compaction_turn),
+/// [`inject_missing_items`](Self::inject_missing_items),
+/// [`apply_compaction`](Self::apply_compaction)). All three have defaults so
+/// managers that do not compact (the default `should_compact` returns `false`)
+/// need not implement them.
 pub trait ContextManager: Send + Sync {
     fn assemble<'a>(&'a self, session: &'a SessionState, task: &'a Task) -> BoxFut<'a, Context>;
 
@@ -651,6 +688,39 @@ pub trait ContextManager: Send + Sync {
     fn should_compact(&self, session: &SessionState) -> bool {
         let _ = session;
         false
+    }
+
+    /// Build the inputs for one compaction turn (issue #46). Returns `None`
+    /// when there is nothing to compact (e.g. history shorter than the
+    /// preserve window), in which case the harness skips compaction entirely.
+    ///
+    /// Default: `None` — managers that never compact need not override this.
+    fn prepare_compaction_turn(&self, session: &SessionState) -> Option<CompactionTurn> {
+        let _ = session;
+        None
+    }
+
+    /// Mutate a compaction [`Context`] in place to request a revised summary
+    /// on retry (issue #46). The harness calls this with the items the prior
+    /// summary failed to preserve. Default: append the standard "missing
+    /// these items … please revise" instruction as a user message.
+    fn inject_missing_items(&self, context: &mut Context, missing: &[String]) {
+        context.messages.push(Message {
+            role: crate::model::Role::User,
+            content: crate::model::Content::Text {
+                text: format!(
+                    "Your summary is missing these items: {}. Please revise.",
+                    missing.join(", ")
+                ),
+            },
+        });
+    }
+
+    /// Accept a verified (or accepted-anyway) summary into the session,
+    /// replacing the compacted span (issue #46). Default: no-op — only
+    /// compaction-capable managers implement it.
+    fn apply_compaction(&self, session: &mut SessionState, summary: String) {
+        let _ = (session, summary);
     }
 }
 
@@ -890,6 +960,13 @@ pub struct HarnessConfig {
     pub termination_policy: Arc<dyn TerminationPolicy>,
     pub middleware: Option<Arc<dyn MiddlewareChain>>,
     pub observability: Option<Arc<dyn ObservabilityProvider>>,
+    /// Post-compaction verifier (issue #29/#46). The harness runs it after
+    /// each compaction turn and retries up to `max_compaction_attempts` before
+    /// accepting a failing summary. Defaults to [`KeyTermVerifier`].
+    pub compaction_verifier: Arc<dyn CompactionVerifier>,
+    /// Maximum compaction-summary attempts before accepting a failing summary
+    /// anyway (issue #46). Defaults to `2` (mirrors `CompactionConfig`).
+    pub max_compaction_attempts: u32,
     /// Token → USD pricing used to stamp `cost_usd` on emitted [`TurnSpan`]s.
     /// Defaults to [`PricingTable::DEFAULT`] (zero cost) when unset.
     pub pricing: PricingTable,
@@ -905,6 +982,8 @@ impl Clone for HarnessConfig {
             termination_policy: self.termination_policy.clone(),
             middleware: self.middleware.clone(),
             observability: self.observability.clone(),
+            compaction_verifier: self.compaction_verifier.clone(),
+            max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing.clone(),
         }
     }
@@ -943,6 +1022,8 @@ pub struct HarnessBuilder {
     termination_policy: Arc<dyn TerminationPolicy>,
     middleware: Option<Arc<dyn MiddlewareChain>>,
     observability: Option<Arc<dyn ObservabilityProvider>>,
+    compaction_verifier: Arc<dyn CompactionVerifier>,
+    max_compaction_attempts: u32,
     pricing: PricingTable,
 }
 
@@ -964,8 +1045,24 @@ impl HarnessBuilder {
             termination_policy,
             middleware: None,
             observability: None,
+            compaction_verifier: Arc::new(KeyTermVerifier),
+            max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
         }
+    }
+
+    /// Inject a post-compaction verifier (issue #46). Defaults to
+    /// [`KeyTermVerifier`].
+    pub fn compaction_verifier(mut self, verifier: Arc<dyn CompactionVerifier>) -> Self {
+        self.compaction_verifier = verifier;
+        self
+    }
+
+    /// Set the maximum number of compaction-summary attempts before accepting
+    /// a failing summary anyway (issue #46). Defaults to `2`.
+    pub fn max_compaction_attempts(mut self, attempts: u32) -> Self {
+        self.max_compaction_attempts = attempts;
+        self
     }
 
     /// Inject a middleware chain.
@@ -1005,6 +1102,8 @@ impl HarnessBuilder {
             termination_policy: self.termination_policy,
             middleware: self.middleware,
             observability: self.observability,
+            compaction_verifier: self.compaction_verifier,
+            max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing,
         }
     }
@@ -1588,6 +1687,21 @@ impl StandardHarness {
                         }
                     }
 
+                    // Compaction (issue #46): after tool results are appended,
+                    // before the loop restarts — matches the concepts-doc loop
+                    // diagram's "compact if should_compact()" placement. Runs the
+                    // verify→retry→warn loop; never halts the run.
+                    if self.config.context_manager.should_compact(&session_state) {
+                        self.run_compaction(
+                            &mut session_state,
+                            &session_id,
+                            &task.id,
+                            &mut span_seq,
+                            &mut usage,
+                        )
+                        .await;
+                    }
+
                     continue;
                 }
 
@@ -1605,6 +1719,161 @@ impl StandardHarness {
                     };
                 }
             }
+        }
+    }
+
+    /// Run the post-compaction verify→retry→warn loop (issue #46/#29).
+    ///
+    /// Drives one compaction turn through the agent, verifies the summary,
+    /// and either accepts it, retries with the missing items injected, or —
+    /// after `max_compaction_attempts` — emits a warn event and accepts the
+    /// summary anyway. A blocked compaction is worse than an imperfect one, so
+    /// this method NEVER returns an error or halts the run; the worst case is
+    /// an accepted-anyway summary plus one warn span.
+    ///
+    /// Token usage from compaction turns folds into the run-level
+    /// [`AggregateUsage`]; each compaction turn that produces a summary is
+    /// surfaced as a `Compaction` [`ContextSpan`]. The
+    /// `compaction_verification_failures` metric is derived from the emitted
+    /// [`WarnSpan`].
+    async fn run_compaction(
+        &self,
+        session_state: &mut SessionState,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        span_seq: &mut u64,
+        usage: &mut AggregateUsage,
+    ) {
+        let Some(mut turn) = self
+            .config
+            .context_manager
+            .prepare_compaction_turn(session_state)
+        else {
+            // Nothing to compact (e.g. history shorter than preserve window).
+            return;
+        };
+        let tokens_before = turn.verification_state.token_budget_used;
+        let max_attempts = self.config.max_compaction_attempts.max(1);
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            // Run one compaction turn through the agent to produce a summary.
+            let result = self.config.agent.turn(turn.context.clone()).await;
+            let summary = match result {
+                TurnResult::FinalResponse { content, usage: u } => {
+                    usage.add_turn(&u);
+                    content
+                }
+                TurnResult::ToolCallRequested { usage: u, .. } => {
+                    // A compaction turn is expected to yield a summary, not a
+                    // tool call. Treat the (empty) response as the summary so
+                    // verification can run and the loop terminates predictably.
+                    usage.add_turn(&u);
+                    String::new()
+                }
+                TurnResult::Error { usage: u, .. } => {
+                    if let Some(u) = u.as_ref() {
+                        usage.add_turn(u);
+                    }
+                    String::new()
+                }
+            };
+
+            let verification = self.config.compaction_verifier.verify(
+                &summary,
+                &turn.preserve_hints,
+                &turn.verification_state,
+            );
+
+            if verification.passed {
+                self.accept_compaction(
+                    session_state,
+                    summary,
+                    turn.messages_removed,
+                    tokens_before,
+                    session_id,
+                    task_id,
+                    span_seq,
+                );
+                return;
+            }
+
+            if attempt < max_attempts {
+                // Inject the missing items and retry.
+                self.config
+                    .context_manager
+                    .inject_missing_items(&mut turn.context, &verification.missing_items);
+                continue;
+            }
+
+            // Exhausted attempts: warn, then accept anyway.
+            if let Some(obs) = self.config.observability.as_ref() {
+                let base = SpanBase::new_root(
+                    SpanId::new(format!("{}-warn-{}", session_id.as_str(), *span_seq)),
+                    session_id.clone(),
+                    task_id.clone(),
+                    SpanKind::Warn,
+                    Timestamp::now(),
+                );
+                obs.emit_warn(WarnSpan::new(
+                    base,
+                    WarnEvent::CompactionVerificationFailed {
+                        missing_items: verification.missing_items.clone(),
+                        accepted_anyway: true,
+                    },
+                ));
+                *span_seq += 1;
+            }
+            self.accept_compaction(
+                session_state,
+                summary,
+                turn.messages_removed,
+                tokens_before,
+                session_id,
+                task_id,
+                span_seq,
+            );
+            return;
+        }
+    }
+
+    /// Apply an accepted summary and emit the `Compaction` context span.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_compaction(
+        &self,
+        session_state: &mut SessionState,
+        summary: String,
+        messages_removed: u32,
+        tokens_before: u32,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        span_seq: &mut u64,
+    ) {
+        self.config
+            .context_manager
+            .apply_compaction(session_state, summary);
+
+        if let Some(obs) = self.config.observability.as_ref() {
+            let base = SpanBase::new_root(
+                SpanId::new(format!("{}-compaction-{}", session_id.as_str(), *span_seq)),
+                session_id.clone(),
+                task_id.clone(),
+                SpanKind::Compaction,
+                Timestamp::now(),
+            );
+            obs.emit_context(crate::observability::ContextSpan {
+                base,
+                operation: crate::observability::ContextOperation::Compaction {
+                    messages_removed,
+                    tokens_reclaimed: 0,
+                },
+                tokens_before,
+                tokens_after: tokens_before,
+                utilization_before: 0.0,
+                utilization_after: 0.0,
+            });
+            *span_seq += 1;
         }
     }
 }
@@ -2030,6 +2299,8 @@ mod tests {
             termination_policy: Arc::new(AlwaysContinuePolicy),
             middleware: None,
             observability: None,
+            compaction_verifier: Arc::new(KeyTermVerifier),
+            max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
         }
     }
@@ -2752,5 +3023,553 @@ mod tests {
         };
         let s = serde_json::to_string(&cs).unwrap();
         assert!(!s.contains("\"child_state\""));
+    }
+
+    // ====================================================================
+    // Compaction verify→retry→warn loop (issue #46)
+    // ====================================================================
+    mod compaction {
+        use super::*;
+        use crate::context::{
+            CompactionPreserveHints, CompactionVerificationResult, CompactionVerifier,
+            SessionState as ContextSessionState,
+        };
+        use crate::model::{Content, Role};
+        use crate::observability::{
+            InMemoryObservabilityProvider, ObservabilityProvider, SpanBase, WarnEvent, WarnSpan,
+        };
+        use crate::{SessionId, TaskId};
+        use std::sync::Mutex;
+
+        /// A `ContextManager` that always offers a compaction turn. Records how
+        /// many times `apply_compaction` ran and the contexts the agent saw.
+        struct CompactingContextManager {
+            applied: Mutex<u32>,
+            should: bool,
+        }
+        impl CompactingContextManager {
+            fn new(should: bool) -> Self {
+                Self {
+                    applied: Mutex::new(0),
+                    should,
+                }
+            }
+        }
+        impl ContextManager for CompactingContextManager {
+            fn assemble<'a>(
+                &'a self,
+                session: &'a SessionState,
+                _task: &'a Task,
+            ) -> BoxFut<'a, Context> {
+                let messages = session.messages.clone();
+                Box::pin(async move {
+                    Context {
+                        messages,
+                        tools: vec![],
+                        params: crate::model::ModelParams::default(),
+                    }
+                })
+            }
+            fn append_tool_result<'a>(
+                &'a self,
+                session: &'a mut SessionState,
+                _result: &'a ToolResult,
+            ) -> BoxFut<'a, ()> {
+                Box::pin(async move {
+                    session.messages.push(Message {
+                        role: Role::Tool,
+                        content: Content::Text {
+                            text: "tool".into(),
+                        },
+                    });
+                })
+            }
+            fn append_user_message<'a>(
+                &'a self,
+                _session: &'a mut SessionState,
+                _text: &'a str,
+            ) -> BoxFut<'a, ()> {
+                Box::pin(async {})
+            }
+            fn should_compact(&self, _session: &SessionState) -> bool {
+                self.should
+            }
+            fn prepare_compaction_turn(&self, _session: &SessionState) -> Option<CompactionTurn> {
+                let mut vs = ContextSessionState::new(
+                    SessionId::new("s1"),
+                    TaskId::new("t1"),
+                    "deploy the payment service",
+                );
+                vs.token_budget_used = 1000;
+                Some(CompactionTurn {
+                    context: Context {
+                        messages: vec![Message {
+                            role: Role::User,
+                            content: Content::Text {
+                                text: "please summarize".into(),
+                            },
+                        }],
+                        tools: vec![],
+                        params: crate::model::ModelParams::default(),
+                    },
+                    preserve_hints: CompactionPreserveHints::default(),
+                    verification_state: vs,
+                    messages_removed: 3,
+                })
+            }
+            fn apply_compaction(&self, _session: &mut SessionState, _summary: String) {
+                *self.applied.lock().unwrap() += 1;
+            }
+        }
+
+        /// Agent that records every context it is handed and replays a queue of
+        /// final-response summaries.
+        struct RecordingAgent {
+            summaries: Mutex<std::collections::VecDeque<String>>,
+            seen: Mutex<Vec<Context>>,
+        }
+        impl RecordingAgent {
+            fn new(summaries: Vec<&str>) -> Self {
+                Self {
+                    summaries: Mutex::new(summaries.iter().map(|s| s.to_string()).collect()),
+                    seen: Mutex::new(Vec::new()),
+                }
+            }
+        }
+        impl Agent for RecordingAgent {
+            fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+                self.seen.lock().unwrap().push(context);
+                let content = self
+                    .summaries
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default();
+                Box::pin(async move {
+                    TurnResult::FinalResponse {
+                        content,
+                        usage: TokenUsage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                        },
+                    }
+                })
+            }
+            fn id(&self) -> AgentId {
+                AgentId::new("recording")
+            }
+        }
+
+        /// Verifier that fails the first `fail_first` calls, then passes.
+        struct ScriptedVerifier {
+            fail_first: Mutex<u32>,
+            missing: Vec<String>,
+        }
+        impl ScriptedVerifier {
+            fn new(fail_first: u32, missing: Vec<&str>) -> Self {
+                Self {
+                    fail_first: Mutex::new(fail_first),
+                    missing: missing.iter().map(|s| s.to_string()).collect(),
+                }
+            }
+        }
+        impl CompactionVerifier for ScriptedVerifier {
+            fn verify(
+                &self,
+                _summary: &str,
+                _hints: &CompactionPreserveHints,
+                _state: &ContextSessionState,
+            ) -> CompactionVerificationResult {
+                let mut remaining = self.fail_first.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    CompactionVerificationResult {
+                        passed: false,
+                        missing_items: self.missing.clone(),
+                        detail: "scripted fail".into(),
+                    }
+                } else {
+                    CompactionVerificationResult {
+                        passed: true,
+                        missing_items: vec![],
+                        detail: "scripted pass".into(),
+                    }
+                }
+            }
+        }
+
+        fn harness_with(
+            cm: Arc<CompactingContextManager>,
+            agent: Arc<RecordingAgent>,
+            verifier: Arc<dyn CompactionVerifier>,
+            obs: Arc<dyn ObservabilityProvider>,
+            max_attempts: u32,
+        ) -> StandardHarness {
+            StandardHarness::new(HarnessConfig {
+                agent,
+                tool_registry: Arc::new(ScriptedToolRegistry::new()),
+                sandbox: Arc::new(AllowAllSandbox),
+                context_manager: cm,
+                termination_policy: Arc::new(AlwaysContinuePolicy),
+                middleware: None,
+                observability: Some(obs),
+                compaction_verifier: verifier,
+                max_compaction_attempts: max_attempts,
+                pricing: PricingTable::DEFAULT,
+            })
+        }
+
+        async fn drive(
+            h: &StandardHarness,
+            agent: &Arc<RecordingAgent>,
+            cm: &Arc<CompactingContextManager>,
+        ) {
+            let mut state = SessionState::default();
+            let mut usage = AggregateUsage::default();
+            let mut span_seq = 0u64;
+            // Pre-condition: should_compact gate is honored by the caller.
+            if h.config.context_manager.should_compact(&state) {
+                h.run_compaction(
+                    &mut state,
+                    &SessionId::new("s1"),
+                    &TaskId::new("t1"),
+                    &mut span_seq,
+                    &mut usage,
+                )
+                .await;
+            }
+            let _ = (agent, cm);
+        }
+
+        #[tokio::test]
+        async fn no_compaction_when_should_compact_false() {
+            let cm = Arc::new(CompactingContextManager::new(false));
+            let agent = Arc::new(RecordingAgent::new(vec!["summary"]));
+            let obs = Arc::new(InMemoryObservabilityProvider::new());
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(0, vec![])),
+                obs.clone(),
+                2,
+            );
+            drive(&h, &agent, &cm).await;
+            assert_eq!(agent.seen.lock().unwrap().len(), 0, "no compaction turn");
+            assert_eq!(*cm.applied.lock().unwrap(), 0);
+        }
+
+        #[tokio::test]
+        async fn passing_verifier_one_turn_one_apply_no_warn() {
+            let cm = Arc::new(CompactingContextManager::new(true));
+            let agent = Arc::new(RecordingAgent::new(vec!["good summary"]));
+            let obs = Arc::new(InMemoryObservabilityProvider::new());
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(0, vec![])),
+                obs.clone(),
+                2,
+            );
+            drive(&h, &agent, &cm).await;
+            assert_eq!(agent.seen.lock().unwrap().len(), 1, "exactly one turn");
+            assert_eq!(*cm.applied.lock().unwrap(), 1, "applied once");
+            assert!(
+                obs.warn_spans(&SessionId::new("s1")).is_empty(),
+                "no warn emitted"
+            );
+        }
+
+        #[tokio::test]
+        async fn failing_then_passing_retries_and_injects_missing_items() {
+            let cm = Arc::new(CompactingContextManager::new(true));
+            let agent = Arc::new(RecordingAgent::new(vec!["v1", "v2"]));
+            let obs = Arc::new(InMemoryObservabilityProvider::new());
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(1, vec!["payment", "deploy"])),
+                obs.clone(),
+                2,
+            );
+            drive(&h, &agent, &cm).await;
+            let seen = agent.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "two compaction turns");
+            // The retry context must contain the injected "missing these items"
+            // message with the actual missing items.
+            let retry_ctx = &seen[1];
+            let injected = retry_ctx.messages.iter().any(|m| {
+                matches!(&m.content, Content::Text { text }
+                    if text.contains("missing these items")
+                        && text.contains("payment")
+                        && text.contains("deploy"))
+            });
+            assert!(injected, "retry context carries the missing-items message");
+            assert_eq!(*cm.applied.lock().unwrap(), 1, "applied once after pass");
+            assert!(obs.warn_spans(&SessionId::new("s1")).is_empty());
+        }
+
+        #[tokio::test]
+        async fn always_failing_warns_and_accepts_anyway() {
+            let cm = Arc::new(CompactingContextManager::new(true));
+            let agent = Arc::new(RecordingAgent::new(vec!["v1", "v2"]));
+            let obs = Arc::new(InMemoryObservabilityProvider::new());
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(99, vec!["payment"])),
+                obs.clone(),
+                2,
+            );
+            drive(&h, &agent, &cm).await;
+            assert_eq!(agent.seen.lock().unwrap().len(), 2, "max attempts == 2");
+            // apply_compaction STILL called.
+            assert_eq!(*cm.applied.lock().unwrap(), 1, "accepted anyway");
+            let sid = SessionId::new("s1");
+            let warns = obs.warn_spans(&sid);
+            assert_eq!(warns.len(), 1, "exactly one warn span");
+            match &warns[0].event {
+                WarnEvent::CompactionVerificationFailed {
+                    missing_items,
+                    accepted_anyway,
+                } => {
+                    assert_eq!(missing_items, &vec!["payment".to_string()]);
+                    assert!(*accepted_anyway);
+                }
+            }
+            // SessionMetrics failure counter == 1. Seed an outcome so metrics
+            // are produced even though no turn span was emitted in this unit.
+            obs.set_session_outcome(&sid, SessionOutcome::Success);
+            let m = obs.get_session_metrics(&sid).await.unwrap();
+            assert_eq!(m.compaction_verification_failures, 1);
+        }
+
+        #[tokio::test]
+        async fn max_attempts_one_honored() {
+            let cm = Arc::new(CompactingContextManager::new(true));
+            let agent = Arc::new(RecordingAgent::new(vec!["v1", "v2", "v3"]));
+            let obs = Arc::new(InMemoryObservabilityProvider::new());
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(99, vec!["payment"])),
+                obs.clone(),
+                1,
+            );
+            drive(&h, &agent, &cm).await;
+            assert_eq!(
+                agent.seen.lock().unwrap().len(),
+                1,
+                "exactly one attempt with max=1"
+            );
+            assert_eq!(*cm.applied.lock().unwrap(), 1, "accepted after one attempt");
+            assert_eq!(obs.warn_spans(&SessionId::new("s1")).len(), 1);
+        }
+
+        /// A minimal provider that does NOT override `emit_warn`; proves the
+        /// default no-op body does not break it (W4).
+        #[derive(Default)]
+        struct BareProvider;
+        impl ObservabilityProvider for BareProvider {
+            fn emit_turn(&self, _s: crate::observability::TurnSpan) {}
+            fn emit_tool_call(&self, _s: ToolCallSpan) {}
+            fn emit_sensor(&self, _s: crate::observability::SensorSpan) {}
+            fn emit_context(&self, _s: crate::observability::ContextSpan) {}
+            fn emit_middleware(&self, _s: crate::observability::MiddlewareSpan) {}
+            fn emit_patch(&self, _s: crate::observability::PatchSpan) {}
+            fn flush_session<'a>(&'a self, _sid: &'a SessionId) -> BoxFut<'a, ()> {
+                Box::pin(async {})
+            }
+            fn get_session_metrics<'a>(
+                &'a self,
+                _sid: &'a SessionId,
+            ) -> BoxFut<'a, Option<crate::observability::SessionMetrics>> {
+                Box::pin(async { None })
+            }
+            fn get_sessions<'a>(
+                &'a self,
+                _since: Timestamp,
+                _domain: Option<String>,
+                _outcome: Option<SessionOutcome>,
+            ) -> BoxFut<'a, Vec<crate::observability::SessionMetrics>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn get_trace<'a>(
+                &'a self,
+                _sid: &'a SessionId,
+            ) -> BoxFut<'a, Vec<Box<dyn crate::observability::Span>>> {
+                Box::pin(async { Vec::new() })
+            }
+        }
+
+        #[tokio::test]
+        async fn emit_warn_default_noop_does_not_break_bare_provider() {
+            let cm = Arc::new(CompactingContextManager::new(true));
+            let agent = Arc::new(RecordingAgent::new(vec!["v1", "v2"]));
+            let obs = Arc::new(BareProvider);
+            let h = harness_with(
+                cm.clone(),
+                agent.clone(),
+                Arc::new(ScriptedVerifier::new(99, vec!["payment"])),
+                obs,
+                2,
+            );
+            // Reaching the warn path must not panic; bare provider ignores it.
+            drive(&h, &agent, &cm).await;
+            assert_eq!(*cm.applied.lock().unwrap(), 1);
+            // Construct a WarnSpan directly to lock W4: the default body runs.
+            let base = SpanBase::new_root(
+                crate::observability::SpanId::new("x"),
+                SessionId::new("s1"),
+                TaskId::new("t1"),
+                SpanKind::Warn,
+                Timestamp::now(),
+            );
+            BareProvider.emit_warn(WarnSpan::new(
+                base,
+                WarnEvent::CompactionVerificationFailed {
+                    missing_items: vec![],
+                    accepted_anyway: true,
+                },
+            ));
+        }
+
+        // ----------------------------------------------------------------
+        // Cross-language consistency fixture replay (issue #46)
+        // ----------------------------------------------------------------
+
+        /// Verifier driven by a fixture verdict queue; repeats the last verdict
+        /// once the queue is exhausted, matching the fixture contract.
+        struct FixtureVerifier {
+            verdicts: Mutex<Vec<CompactionVerificationResult>>,
+            idx: std::sync::atomic::AtomicUsize,
+        }
+        impl CompactionVerifier for FixtureVerifier {
+            fn verify(
+                &self,
+                _summary: &str,
+                _hints: &CompactionPreserveHints,
+                _state: &ContextSessionState,
+            ) -> CompactionVerificationResult {
+                let v = self.verdicts.lock().unwrap();
+                let i = self.idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                v.get(i).or_else(|| v.last()).cloned().unwrap()
+            }
+        }
+
+        #[tokio::test]
+        async fn fixture_replay_loop_outcomes() {
+            #[derive(serde::Deserialize)]
+            struct Verdict {
+                passed: bool,
+                missing_items: Vec<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Expected {
+                attempts: u32,
+                apply_compaction_calls: u32,
+                warn_emitted: bool,
+                #[serde(default)]
+                retry_injected_missing: Option<Vec<String>>,
+                final_missing_items: Vec<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Case {
+                name: String,
+                max_compaction_attempts: u32,
+                verdicts: Vec<Verdict>,
+                expected: Expected,
+            }
+            #[derive(serde::Deserialize)]
+            struct Suite {
+                cases: Vec<Case>,
+            }
+
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../fixtures/compaction_loop/cases.json");
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let suite: Suite = serde_json::from_str(&raw).unwrap();
+            assert!(suite.cases.len() >= 5, "expected >= 5 fixture cases");
+
+            for case in &suite.cases {
+                let cm = Arc::new(CompactingContextManager::new(true));
+                // Enough summaries that the agent never starves.
+                let agent = Arc::new(RecordingAgent::new(vec!["s1", "s2", "s3", "s4"]));
+                let obs = Arc::new(InMemoryObservabilityProvider::new());
+                let verifier = Arc::new(FixtureVerifier {
+                    verdicts: Mutex::new(
+                        case.verdicts
+                            .iter()
+                            .map(|v| CompactionVerificationResult {
+                                passed: v.passed,
+                                missing_items: v.missing_items.clone(),
+                                detail: String::new(),
+                            })
+                            .collect(),
+                    ),
+                    idx: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let h = harness_with(
+                    cm.clone(),
+                    agent.clone(),
+                    verifier,
+                    obs.clone(),
+                    case.max_compaction_attempts,
+                );
+                drive(&h, &agent, &cm).await;
+
+                let sid = SessionId::new("s1");
+                assert_eq!(
+                    agent.seen.lock().unwrap().len() as u32,
+                    case.expected.attempts,
+                    "case `{}`: attempts",
+                    case.name
+                );
+                assert_eq!(
+                    *cm.applied.lock().unwrap(),
+                    case.expected.apply_compaction_calls,
+                    "case `{}`: apply_compaction_calls",
+                    case.name
+                );
+                let warns = obs.warn_spans(&sid);
+                assert_eq!(
+                    !warns.is_empty(),
+                    case.expected.warn_emitted,
+                    "case `{}`: warn_emitted",
+                    case.name
+                );
+                if case.expected.warn_emitted {
+                    assert_eq!(warns.len(), 1, "case `{}`: exactly one warn", case.name);
+                    match &warns[0].event {
+                        WarnEvent::CompactionVerificationFailed {
+                            missing_items,
+                            accepted_anyway,
+                        } => {
+                            assert_eq!(
+                                missing_items, &case.expected.final_missing_items,
+                                "case `{}`: final_missing_items",
+                                case.name
+                            );
+                            assert!(*accepted_anyway, "case `{}`: accepted_anyway", case.name);
+                        }
+                    }
+                }
+                if let Some(expected_inject) = &case.expected.retry_injected_missing {
+                    let seen = agent.seen.lock().unwrap();
+                    let joined = expected_inject.join(", ");
+                    let found = seen.iter().skip(1).any(|c| {
+                        c.messages.iter().any(|m| {
+                            matches!(&m.content,
+                            Content::Text { text }
+                                if text.contains("missing these items")
+                                    && text.contains(&joined))
+                        })
+                    });
+                    assert!(found, "case `{}`: retry injection", case.name);
+                }
+            }
+        }
     }
 }

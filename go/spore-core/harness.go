@@ -838,6 +838,72 @@ type ContextManager interface {
 	ShouldCompact(session *SessionState) bool
 }
 
+// CompactionTurn bundles everything the harness compaction loop (issue #46)
+// needs to run one compaction turn and verify its result.
+//
+// The harness loop operates on the opaque SessionState; the rich
+// compaction/verification API (contextmgr.ContextManager, CompactionVerifier)
+// operates on contextmgr.SessionState. This struct is the bridge: a
+// CompactingContextManager projects everything the loop needs into one value,
+// so the loop never has to know which concrete state type its manager uses
+// internally — mirroring the Rust reference's CompactionTurn.
+//
+// Context is fed straight to Agent.Turn to produce the summary; PreserveHints
+// and VerificationState are opaque payloads handed to the CompactionVerifier
+// (the concrete verifier type-asserts them back to its own types, keeping the
+// root package free of an import cycle on contextmgr). On a verification
+// failure the loop re-runs the turn with InjectMissingItems applied to Context.
+type CompactionTurn struct {
+	// Context to feed Agent.Turn to elicit the summary.
+	Context Context
+	// PreserveHints are the preservation hints handed to the verifier. Opaque
+	// to the loop; the concrete verifier type-asserts the concrete type.
+	PreserveHints any
+	// VerificationState is the verifier-facing session state (the rich
+	// contextmgr.SessionState). Opaque to the loop.
+	VerificationState any
+	// MessagesRemoved is the count of messages about to be removed — used to
+	// stamp the compaction span.
+	MessagesRemoved uint32
+}
+
+// CompactingContextManager is the OPTIONAL compaction surface a ContextManager
+// may also implement (issue #46). The harness loop type-asserts its held
+// ContextManager to this interface; a manager that does NOT implement it has
+// compaction skipped entirely — Go's equivalent of the Rust reference's
+// default-bodied trait methods (should_compact defaults false / skip).
+type CompactingContextManager interface {
+	// PrepareCompactionTurn builds the inputs for one compaction turn. The
+	// bool is false when there is nothing to compact (e.g. history shorter
+	// than the preserve window), in which case the harness skips compaction.
+	PrepareCompactionTurn(session *SessionState) (*CompactionTurn, bool)
+	// InjectMissingItems mutates a compaction Context in place to request a
+	// revised summary on retry, appending the standard "Your summary is
+	// missing these items: {missing}. Please revise." user message.
+	InjectMissingItems(c *Context, missing []string)
+	// ApplyCompaction accepts a verified (or accepted-anyway) summary into the
+	// session, replacing the compacted span.
+	ApplyCompaction(session *SessionState, summary string)
+}
+
+// CompactionVerificationResult is the verdict of a CompactionVerifier check,
+// in root-package terms (mirrors contextmgr.CompactionVerificationResult).
+type CompactionVerificationResult struct {
+	Passed       bool
+	MissingItems []string
+}
+
+// CompactionVerifier is the harness-loop seam for post-compaction verification
+// (issue #29/#46). It is a lightweight, synchronous, computational sensor that
+// runs after the agent produces a compaction summary and before the summary is
+// applied. Defined in root-package terms so the loop needs no contextmgr
+// import; the standard KeyTermVerifier is adapted into this seam by
+// contextmgr.NewKeyTermVerifier (the adapter type-asserts the opaque bridge
+// fields back to its concrete types).
+type CompactionVerifier interface {
+	Verify(summary string, turn *CompactionTurn) CompactionVerificationResult
+}
+
 // TerminationPolicy (#13) decides whether the loop continues after a final
 // response.
 type TerminationPolicy interface {
@@ -933,6 +999,30 @@ type HarnessObserver interface {
 	// The loop calls this so cost is stamped at emit time (per spec); kept
 	// on the seam so the root package needs no PricingTable type.
 	CostFor(usage TokenUsage) float64
+
+	// EmitCompaction records an accepted-summary compaction as a context span
+	// (issue #46). spanID is the caller-chosen, stable span id.
+	EmitCompaction(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		messagesRemoved uint32,
+		tokensBefore uint32,
+	)
+
+	// EmitCompactionVerificationFailed records a warn-level event for a
+	// compaction summary that failed verification on every attempt and was
+	// accepted anyway (issue #46). acceptedAnyway is always true for this
+	// event. Fire-and-forget; never affects control flow.
+	EmitCompactionVerificationFailed(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		missingItems []string,
+		acceptedAnyway bool,
+	)
 }
 
 // ============================================================================
@@ -1429,6 +1519,17 @@ type HarnessConfig struct {
 	// `observability` package, which the root package cannot import (cycle).
 	// The builder in `observability` wires pricing into the observer.
 	Observability HarnessObserver // optional
+
+	// CompactionVerifier is the post-compaction verifier (issue #29/#46). The
+	// loop runs it after each compaction turn and retries up to
+	// MaxCompactionAttempts before accepting a failing summary. Optional; when
+	// nil every summary is treated as passing (no verification gate). The
+	// builder defaults this to contextmgr.NewKeyTermVerifier().
+	CompactionVerifier CompactionVerifier // optional
+	// MaxCompactionAttempts bounds compaction-summary attempts before accepting
+	// a failing summary anyway (issue #46). Clamped to a minimum of 1 by the
+	// loop. The builder defaults this to 2 (mirrors CompactionConfig).
+	MaxCompactionAttempts uint32
 }
 
 // StandardHarness is the canonical Harness implementation.
@@ -1934,6 +2035,15 @@ func (h *StandardHarness) runReActInner(
 					}
 				}
 			}
+
+			// Compaction (issue #46): after tool results are appended and the
+			// AfterTool middleware has fired, before the loop restarts — matches
+			// the concepts-doc loop diagram's "compact if should_compact()"
+			// placement. Runs the verify→retry→warn loop; never halts the run.
+			if h.config.ContextManager.ShouldCompact(&session) {
+				h.runCompaction(ctx, &session, sessionID, task.ID, &spanSeq, &usage)
+			}
+
 			// loop again
 			continue
 
@@ -1962,6 +2072,130 @@ func (h *StandardHarness) runReActInner(
 			}
 		}
 	}
+}
+
+// runCompaction runs the post-compaction verify→retry→warn loop (issue
+// #46/#29).
+//
+// It drives one compaction turn through the agent, verifies the summary, and
+// either accepts it, retries with the missing items injected, or — after
+// MaxCompactionAttempts (clamped to ≥1) — emits a warn event and accepts the
+// summary anyway. A blocked compaction is worse than an imperfect one, so this
+// method NEVER returns an error or halts the run; the worst case is an
+// accepted-anyway summary plus one warn span.
+//
+// Token usage from compaction turns folds into the run-level AggregateUsage;
+// each accepted summary is surfaced as a Compaction context span. The
+// compaction_verification_failures metric is derived from the emitted warn
+// span. Compaction is skipped entirely if the held ContextManager does not
+// implement CompactingContextManager.
+func (h *StandardHarness) runCompaction(
+	ctx context.Context,
+	session *SessionState,
+	sessionID SessionID,
+	taskID TaskID,
+	spanSeq *uint64,
+	usage *AggregateUsage,
+) {
+	cm, ok := h.config.ContextManager.(CompactingContextManager)
+	if !ok {
+		// Manager does not support compaction — skip (Go equivalent of the
+		// Rust default-bodied trait methods).
+		return
+	}
+	turn, ok := cm.PrepareCompactionTurn(session)
+	if !ok || turn == nil {
+		// Nothing to compact (e.g. history shorter than preserve window).
+		return
+	}
+
+	maxAttempts := h.config.MaxCompactionAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	for attempt := uint32(1); ; attempt++ {
+		// Run one compaction turn through the agent to produce a summary.
+		result := h.config.Agent.Turn(ctx, turn.Context)
+		var summary string
+		switch result.Kind {
+		case TurnFinalResponse:
+			if result.Usage != nil {
+				usage.AddTurn(*result.Usage)
+			}
+			summary = result.Content
+		case TurnToolCallRequested:
+			// A compaction turn is expected to yield a summary, not a tool
+			// call. Treat the (empty) response as the summary so verification
+			// can run and the loop terminates predictably.
+			if result.Usage != nil {
+				usage.AddTurn(*result.Usage)
+			}
+			summary = ""
+		default: // TurnError or unknown
+			if result.Usage != nil {
+				usage.AddTurn(*result.Usage)
+			}
+			summary = ""
+		}
+
+		// Verify. A nil verifier means no gate: treat every summary as passing.
+		verification := CompactionVerificationResult{Passed: true}
+		if h.config.CompactionVerifier != nil {
+			verification = h.config.CompactionVerifier.Verify(summary, turn)
+		}
+
+		if verification.Passed {
+			cm.ApplyCompaction(session, summary)
+			h.emitCompactionSpan(sessionID, taskID, turn.MessagesRemoved, spanSeq)
+			return
+		}
+
+		if attempt < maxAttempts {
+			// Inject the missing items and retry.
+			cm.InjectMissingItems(&turn.Context, verification.MissingItems)
+			continue
+		}
+
+		// Exhausted attempts: warn, then accept anyway.
+		if h.config.Observability != nil {
+			warnSpanID := fmt.Sprintf("%s-warn-%d", sessionID, *spanSeq)
+			h.config.Observability.EmitCompactionVerificationFailed(
+				warnSpanID,
+				sessionID,
+				taskID,
+				nowRFC3339(),
+				verification.MissingItems,
+				true,
+			)
+			*spanSeq++
+		}
+		cm.ApplyCompaction(session, summary)
+		h.emitCompactionSpan(sessionID, taskID, turn.MessagesRemoved, spanSeq)
+		return
+	}
+}
+
+// emitCompactionSpan emits the Compaction context span for an accepted summary.
+func (h *StandardHarness) emitCompactionSpan(
+	sessionID SessionID,
+	taskID TaskID,
+	messagesRemoved uint32,
+	spanSeq *uint64,
+) {
+	if h.config.Observability == nil {
+		return
+	}
+	spanID := fmt.Sprintf("%s-compaction-%d", sessionID, *spanSeq)
+	h.config.Observability.EmitCompaction(
+		spanID,
+		sessionID,
+		taskID,
+		nowRFC3339(),
+		messagesRemoved,
+		0, // tokens_before — not tracked through the opaque bridge (mirrors Rust's 0).
+	)
+	*spanSeq++
 }
 
 // Resume continues a paused run after a human response.

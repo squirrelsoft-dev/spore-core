@@ -347,6 +347,13 @@ func TraceLineFromPatch(span PatchSpan, traceID string) TraceLine {
 	return fromBase(span.Base, traceID, "patch", "warn", mustMarshal(attrs))
 }
 
+// TraceLineFromWarn builds the TraceLine for a warn span (issue #46). Warn
+// spans are ALWAYS warn-level; the WarnEvent payload is serialized verbatim as
+// the attributes object.
+func TraceLineFromWarn(span WarnSpan, traceID string) TraceLine {
+	return fromBase(span.Base, traceID, "warn", "warn", mustMarshal(span.Event))
+}
+
 type sessionAttrs struct {
 	Outcome      string  `json:"outcome"`
 	TotalTurns   uint32  `json:"total_turns"`
@@ -713,6 +720,20 @@ func (p *OutboxObservabilityProvider) EmitPatch(span PatchSpan) {
 	p.writeLine(sid, line)
 }
 
+// EmitWarn implements WarnEmitter (issue #46). Mirrors EmitPatch: it writes a
+// warn-level trace line and delegates to the inner provider so SessionMetrics
+// (CompactionVerificationFailures) surfaces the event. Per the Rust reference,
+// the trailing session_summary line does NOT carry the failure counter.
+func (p *OutboxObservabilityProvider) EmitWarn(span WarnSpan) {
+	sid := span.Base.SessionID
+	p.mu.Lock()
+	traceID := p.traceIDLocked(sid)
+	p.mu.Unlock()
+	line := TraceLineFromWarn(span, traceID)
+	p.inner.EmitWarn(span)
+	p.writeLine(sid, line)
+}
+
 // FlushSession implements ObservabilityProvider. It writes the trailing
 // session summary line (when FlushOnSessionEnd), flushes the file, force-
 // flushes OTLP best-effort, and creates the sibling .flushed marker. It then
@@ -831,3 +852,4 @@ func fileExists(path string) bool {
 
 // Compile-time interface check.
 var _ ObservabilityProvider = (*OutboxObservabilityProvider)(nil)
+var _ WarnEmitter = (*OutboxObservabilityProvider)(nil)

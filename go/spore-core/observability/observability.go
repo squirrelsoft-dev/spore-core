@@ -117,6 +117,10 @@ const (
 	// SpanKindPatch — emitted by PatchToolCallsMiddleware whenever it mutates
 	// a tool call (issue #28). Always carries a PatchSpan at SpanLevelWarn.
 	SpanKindPatch SpanKind = "patch"
+	// SpanKindWarn — emitted by the harness compaction loop when a summary is
+	// accepted despite failing verification (issue #46). Always carries a
+	// WarnSpan at SpanLevelWarn.
+	SpanKindWarn SpanKind = "warn"
 )
 
 // ============================================================================
@@ -443,6 +447,76 @@ func NewPatchSpan(base SpanBase, callID, toolName string, original, patched json
 }
 
 // ============================================================================
+// WarnEvent / WarnSpan (issue #46)
+// ============================================================================
+//
+// The harness compaction loop verifies every agent-produced summary with a
+// CompactionVerifier before accepting it. After MaxCompactionAttempts failed
+// verifications the harness accepts the summary anyway — a blocked compaction
+// is worse than an imperfect one — and emits exactly one warn-level WarnSpan
+// carrying WarnEventCompactionVerificationFailed{missing_items, accepted_anyway:
+// true}.
+//
+// Rules (mirrored by the harness loop tests):
+//   W1  a successful (or first-try-passing) compaction emits NO warn span.
+//   W2  exhausting attempts emits EXACTLY ONE warn span carrying the final
+//       missing_items and accepted_anyway = true.
+//   W3  SessionMetrics.CompactionVerificationFailures counts these spans for
+//       the session (mirrors how Compactions is derived from spans).
+//   W4  EmitWarn is exposed as an OPTIONAL WarnEmitter interface the harness
+//       adapter type-asserts, so providers predating #46 keep compiling and
+//       behave unchanged (Go equivalent of Rust's default-bodied emit_warn).
+
+// WarnEventKind discriminates WarnEvent variants. The "warn" JSON tag mirrors
+// the Rust enum's #[serde(tag = "warn")].
+type WarnEventKind string
+
+const (
+	// WarnKindCompactionVerificationFailed — a compaction summary failed
+	// verification on every attempt and was accepted as-is (issue #46).
+	WarnKindCompactionVerificationFailed WarnEventKind = "compaction_verification_failed"
+)
+
+// WarnEvent is a warn-level, fire-and-forget observability event. It is a
+// tagged union keyed by Kind (wire tag "warn"); only the field(s) matching Kind
+// are meaningful. The enum-as-event shape mirrors PatchSpan (always Warn) but
+// keeps warns that are not tied to a single tool call in their own type.
+type WarnEvent struct {
+	Kind WarnEventKind `json:"warn"`
+	// CompactionVerificationFailed fields.
+	MissingItems   []string `json:"missing_items,omitempty"`
+	AcceptedAnyway bool     `json:"accepted_anyway,omitempty"`
+}
+
+// NewWarnCompactionVerificationFailed builds a CompactionVerificationFailed
+// warn event. accepted_anyway is always true for this variant (the harness
+// never blocks on compaction).
+func NewWarnCompactionVerificationFailed(missingItems []string, acceptedAnyway bool) WarnEvent {
+	if missingItems == nil {
+		missingItems = []string{}
+	}
+	return WarnEvent{
+		Kind:           WarnKindCompactionVerificationFailed,
+		MissingItems:   missingItems,
+		AcceptedAnyway: acceptedAnyway,
+	}
+}
+
+// WarnSpan is one warn-level observability span (issue #46). It carries a
+// SpanBase for trace correlation, the classified WarnEvent, and a hardcoded
+// Level SpanLevelWarn. Construct via NewWarnSpan.
+type WarnSpan struct {
+	Base  SpanBase  `json:"base"`
+	Event WarnEvent `json:"event"`
+	Level SpanLevel `json:"level"`
+}
+
+// NewWarnSpan builds a warn span. Level is forced to SpanLevelWarn.
+func NewWarnSpan(base SpanBase, event WarnEvent) WarnSpan {
+	return WarnSpan{Base: base, Event: event, Level: SpanLevelWarn}
+}
+
+// ============================================================================
 // Span interface (for GetTrace's heterogeneous return)
 // ============================================================================
 
@@ -470,6 +544,9 @@ func (s MiddlewareSpan) GetBase() SpanBase { return s.Base }
 // GetBase implements Span.
 func (s PatchSpan) GetBase() SpanBase { return s.Base }
 
+// GetBase implements Span.
+func (s WarnSpan) GetBase() SpanBase { return s.Base }
+
 // ============================================================================
 // SessionMetrics
 // ============================================================================
@@ -477,19 +554,24 @@ func (s PatchSpan) GetBase() SpanBase { return s.Base }
 // SessionMetrics is the aggregated roll-up surfaced by GetSessionMetrics and
 // GetSessions for the improvement loop.
 type SessionMetrics struct {
-	SessionID         SessionID      `json:"session_id"`
-	TaskID            TaskID         `json:"task_id"`
-	TotalTurns        uint32         `json:"total_turns"`
-	TotalInputTokens  uint32         `json:"total_input_tokens"`
-	TotalOutputTokens uint32         `json:"total_output_tokens"`
-	TotalCostUSD      float64        `json:"total_cost_usd"`
-	TotalDurationMs   uint64         `json:"total_duration_ms"`
-	ToolCalls         uint32         `json:"tool_calls"`
-	SensorFires       uint32         `json:"sensor_fires"`
-	SensorHalts       uint32         `json:"sensor_halts"`
-	Compactions       uint32         `json:"compactions"`
-	Outcome           SessionOutcome `json:"outcome"`
-	GuidesUsed        []GuideID      `json:"guides_used"`
+	SessionID         SessionID `json:"session_id"`
+	TaskID            TaskID    `json:"task_id"`
+	TotalTurns        uint32    `json:"total_turns"`
+	TotalInputTokens  uint32    `json:"total_input_tokens"`
+	TotalOutputTokens uint32    `json:"total_output_tokens"`
+	TotalCostUSD      float64   `json:"total_cost_usd"`
+	TotalDurationMs   uint64    `json:"total_duration_ms"`
+	ToolCalls         uint32    `json:"tool_calls"`
+	SensorFires       uint32    `json:"sensor_fires"`
+	SensorHalts       uint32    `json:"sensor_halts"`
+	Compactions       uint32    `json:"compactions"`
+	// CompactionVerificationFailures is the number of compactions whose summary
+	// failed verification on every attempt and was accepted anyway (issue #46).
+	// Derived by counting WarnSpans carrying WarnEventCompactionVerificationFailed,
+	// mirroring how Compactions is derived from compaction spans.
+	CompactionVerificationFailures uint32         `json:"compaction_verification_failures"`
+	Outcome                        SessionOutcome `json:"outcome"`
+	GuidesUsed                     []GuideID      `json:"guides_used"`
 	// PatchCount is the number of tool-call patches in the session (issue #28).
 	PatchCount uint32 `json:"patch_count"`
 	// PatchRate is PatchCount / ToolCalls. 0.0 when there are no tool calls
@@ -594,6 +676,20 @@ type ObservabilityProvider interface {
 	CleanupSession(ctx context.Context, sessionID SessionID) error
 }
 
+// WarnEmitter is the OPTIONAL warn-emission surface (issue #46). It is kept
+// off the core ObservabilityProvider interface deliberately: Go interfaces
+// force every implementer to satisfy all methods, so adding EmitWarn there
+// would break any provider predating #46. Instead the harness adapter
+// type-asserts its wrapped provider to WarnEmitter and only emits a warn span
+// when the provider implements it — the Go equivalent of the Rust reference's
+// default-no-op emit_warn. The two standard providers (InMemory, Outbox) do
+// implement it; a bare provider that does not is simply skipped.
+type WarnEmitter interface {
+	// EmitWarn records a warn-level event. Fire-and-forget like the other
+	// EmitX methods.
+	EmitWarn(span WarnSpan)
+}
+
 // ErrSessionNotFound is returned by CleanupSession when the requested
 // session has no durable outbox directory (issue #33). Match with
 // errors.Is; SessionNotFoundError carries the offending session id.
@@ -628,6 +724,7 @@ type InMemoryObservabilityProvider struct {
 	contexts    []ContextSpan
 	middlewares []MiddlewareSpan
 	patches     []PatchSpan
+	warns       []WarnSpan
 	// Per-session insertion-ordered (kind, spanID) feed for GetTrace.
 	traceOrder map[SessionID][]traceEntry
 	flushed    map[SessionID]bool
@@ -733,6 +830,28 @@ func (p *InMemoryObservabilityProvider) EmitPatch(span PatchSpan) {
 	p.patches = append(p.patches, span)
 }
 
+// EmitWarn implements WarnEmitter (issue #46). Fire-and-forget.
+func (p *InMemoryObservabilityProvider) EmitWarn(span WarnSpan) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pushOrder(span.Base.SessionID, SpanKindWarn, span.Base.SpanID)
+	p.warns = append(p.warns, span)
+}
+
+// WarnSpans returns all recorded warn spans for a session, in insertion order
+// (issue #46).
+func (p *InMemoryObservabilityProvider) WarnSpans(sessionID SessionID) []WarnSpan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []WarnSpan
+	for _, s := range p.warns {
+		if s.Base.SessionID == sessionID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // PatchSpans returns all recorded patch spans for a session, in insertion
 // order (issue #28). Lets callers inspect the original/patched diff and
 // classified PatchType without reconstructing them from the trace.
@@ -814,6 +933,12 @@ func (p *InMemoryObservabilityProvider) computeMetricsLocked(sessionID SessionID
 			compactions++
 		}
 	}
+	var compactionVerificationFailures uint32
+	for _, w := range p.warns {
+		if w.Base.SessionID == sessionID && w.Event.Kind == WarnKindCompactionVerificationFailed {
+			compactionVerificationFailures++
+		}
+	}
 	outcome, ok := p.outcomes[sessionID]
 	if !ok {
 		outcome = guideregistry.NewOutcomePartial()
@@ -837,22 +962,23 @@ func (p *InMemoryObservabilityProvider) computeMetricsLocked(sessionID SessionID
 		patchRate = float32(patchCount) / float32(toolCalls)
 	}
 	return &SessionMetrics{
-		SessionID:         sessionID,
-		TaskID:            taskID,
-		TotalTurns:        uint32(len(turns)),
-		TotalInputTokens:  input,
-		TotalOutputTokens: output,
-		TotalCostUSD:      cost,
-		TotalDurationMs:   duration,
-		ToolCalls:         toolCalls,
-		SensorFires:       sensorFires,
-		SensorHalts:       sensorHalts,
-		Compactions:       compactions,
-		Outcome:           outcome,
-		GuidesUsed:        guides,
-		PatchCount:        patchCount,
-		PatchRate:         patchRate,
-		PatchesByTool:     patchesByTool,
+		SessionID:                      sessionID,
+		TaskID:                         taskID,
+		TotalTurns:                     uint32(len(turns)),
+		TotalInputTokens:               input,
+		TotalOutputTokens:              output,
+		TotalCostUSD:                   cost,
+		TotalDurationMs:                duration,
+		ToolCalls:                      toolCalls,
+		SensorFires:                    sensorFires,
+		SensorHalts:                    sensorHalts,
+		Compactions:                    compactions,
+		CompactionVerificationFailures: compactionVerificationFailures,
+		Outcome:                        outcome,
+		GuidesUsed:                     guides,
+		PatchCount:                     patchCount,
+		PatchRate:                      patchRate,
+		PatchesByTool:                  patchesByTool,
 	}
 }
 
@@ -945,6 +1071,13 @@ func (p *InMemoryObservabilityProvider) GetTrace(_ context.Context, sessionID Se
 					break
 				}
 			}
+		case SpanKindWarn:
+			for _, w := range p.warns {
+				if w.Base.SpanID == entry.spanID {
+					out = append(out, w)
+					break
+				}
+			}
 		}
 	}
 	return out, nil
@@ -964,6 +1097,10 @@ func (p *InMemoryObservabilityProvider) CleanupSession(_ context.Context, sessio
 
 // Compile-time interface check.
 var _ ObservabilityProvider = (*InMemoryObservabilityProvider)(nil)
+
+// Compile-time check: the standard providers implement the optional
+// WarnEmitter (issue #46).
+var _ WarnEmitter = (*InMemoryObservabilityProvider)(nil)
 
 // ============================================================================
 // PatchEmitterAdapter (issue #28)

@@ -95,6 +95,10 @@ pub enum SpanKind {
     /// Emitted by `PatchToolCallsMiddleware` whenever it mutates a tool call
     /// (issue #28). Always carries a [`PatchSpan`] at [`SpanLevel::Warn`].
     Patch,
+    /// Emitted by the harness compaction loop when a summary is accepted
+    /// despite failing verification (issue #46). Always carries a [`WarnSpan`]
+    /// at [`SpanLevel::Warn`].
+    Warn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +400,72 @@ impl Span for PatchSpan {
 }
 
 // ============================================================================
+// Compaction-verification warn (issue #46)
+// ============================================================================
+//
+// The harness compaction loop (issue #29 pseudocode, wired in #46) verifies
+// every agent-produced summary with a [`CompactionVerifier`] before accepting
+// it. After `max_compaction_attempts` failed verifications the harness accepts
+// the summary anyway — a blocked compaction is worse than an imperfect one —
+// and emits exactly one warn-level [`WarnSpan::CompactionVerificationFailed`]
+// recording the still-missing items and `accepted_anyway: true`.
+//
+// Rules (mirrored by inline tests in `harness`):
+//   W1  a successful (or first-try-passing) compaction emits NO warn span.
+//   W2  exhausting attempts emits EXACTLY ONE warn span carrying the final
+//       `missing_items` and `accepted_anyway = true`.
+//   W3  `SessionMetrics::compaction_verification_failures` counts these spans
+//       for the session (mirrors how `compactions` is derived from spans).
+//   W4  `emit_warn` has a default no-op body so providers predating #46 keep
+//       compiling and behave unchanged.
+
+/// A warn-level, fire-and-forget observability event. `#[non_exhaustive]`:
+/// future warn classes add variants; downstream matches must keep a wildcard.
+/// The enum-as-event shape mirrors [`PatchSpan`] (always [`SpanLevel::Warn`])
+/// but keeps warns that are not tied to a single tool call in their own type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "warn", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WarnEvent {
+    /// A compaction summary failed verification on every attempt and was
+    /// accepted as-is (issue #46). `missing_items` are the preservation-list
+    /// terms still absent from the final summary; `accepted_anyway` is always
+    /// `true` for this variant (the harness never blocks on compaction).
+    CompactionVerificationFailed {
+        missing_items: Vec<String>,
+        accepted_anyway: bool,
+    },
+}
+
+/// One warn-level observability span (issue #46). Carries a [`SpanBase`] for
+/// trace correlation, the classified [`WarnEvent`], and a hardcoded
+/// `level: SpanLevel::Warn` (constructed via [`WarnSpan::new`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WarnSpan {
+    pub base: SpanBase,
+    pub event: WarnEvent,
+    /// Always [`SpanLevel::Warn`]. Constructed via [`WarnSpan::new`].
+    pub level: SpanLevel,
+}
+
+impl WarnSpan {
+    /// Build a warn span. The level is forced to [`SpanLevel::Warn`].
+    pub fn new(base: SpanBase, event: WarnEvent) -> Self {
+        Self {
+            base,
+            event,
+            level: SpanLevel::Warn,
+        }
+    }
+}
+
+impl Span for WarnSpan {
+    fn base(&self) -> &SpanBase {
+        &self.base
+    }
+}
+
+// ============================================================================
 // SessionMetrics
 // ============================================================================
 
@@ -424,6 +494,12 @@ pub struct SessionMetrics {
     /// Patch count broken down by tool name.
     #[serde(default)]
     pub patches_by_tool: HashMap<String, u32>,
+    /// Number of compactions whose summary failed verification on every
+    /// attempt and was accepted anyway (issue #46). Derived from
+    /// [`WarnSpan`]s carrying [`WarnEvent::CompactionVerificationFailed`],
+    /// mirroring how `compactions` is derived from compaction spans.
+    #[serde(default)]
+    pub compaction_verification_failures: u32,
 }
 
 // ============================================================================
@@ -482,6 +558,14 @@ pub trait ObservabilityProvider: Send + Sync {
     /// Record a warn-level tool-call patch event (issue #28). Fire-and-forget
     /// like the other `emit_*` methods.
     fn emit_patch(&self, span: PatchSpan);
+
+    /// Record a warn-level event not tied to a single tool call (issue #46) —
+    /// e.g. an accepted-anyway compaction-verification failure. Fire-and-forget
+    /// like the other `emit_*` methods. Default: no-op, so providers predating
+    /// #46 keep compiling and behave unchanged.
+    fn emit_warn(&self, span: WarnSpan) {
+        let _ = span;
+    }
 
     /// Record the terminal [`SessionOutcome`] for a session so the trailing
     /// `session` summary line (and [`SessionMetrics`]) reflect it. The harness
@@ -555,6 +639,7 @@ struct Store {
     contexts: Vec<ContextSpan>,
     middlewares: Vec<MiddlewareSpan>,
     patches: Vec<PatchSpan>,
+    warns: Vec<WarnSpan>,
     // Per-session insertion-ordered span ids — the trace-analyzer feed.
     trace_order: HashMap<SessionId, Vec<(SpanKind, SpanId)>>,
     flushed: HashMap<SessionId, bool>,
@@ -580,6 +665,20 @@ impl InMemoryObservabilityProvider {
             .patches
             .iter()
             .filter(|p| p.base.session_id == *session_id)
+            .cloned()
+            .collect()
+    }
+
+    /// All recorded warn spans for a session, in insertion order (issue #46).
+    /// Lets callers inspect compaction-verification failures without
+    /// reconstructing them from the heterogeneous trace.
+    pub fn warn_spans(&self, session_id: &SessionId) -> Vec<WarnSpan> {
+        self.inner
+            .lock()
+            .unwrap()
+            .warns
+            .iter()
+            .filter(|w| w.base.session_id == *session_id)
             .cloned()
             .collect()
     }
@@ -667,6 +766,16 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
         );
         s.patches.push(span);
     }
+    fn emit_warn(&self, span: WarnSpan) {
+        let mut s = self.inner.lock().unwrap();
+        push_order(
+            &mut s,
+            &span.base.session_id,
+            SpanKind::Warn,
+            span.base.span_id.clone(),
+        );
+        s.warns.push(span);
+    }
 
     fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
         self.inner
@@ -749,6 +858,14 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
             for p in &session_patches {
                 *patches_by_tool.entry(p.tool_name.clone()).or_insert(0) += 1;
             }
+            let compaction_verification_failures = s
+                .warns
+                .iter()
+                .filter(|w| {
+                    w.base.session_id == *session_id
+                        && matches!(w.event, WarnEvent::CompactionVerificationFailed { .. })
+                })
+                .count() as u32;
             Some(SessionMetrics {
                 session_id: session_id.clone(),
                 task_id,
@@ -770,6 +887,7 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
                 patch_count,
                 patch_rate,
                 patches_by_tool,
+                compaction_verification_failures,
             })
         })
     }
@@ -850,6 +968,11 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
                             out.push(Box::new(sp.clone()));
                         }
                     }
+                    SpanKind::Warn => {
+                        if let Some(sp) = s.warns.iter().find(|t| t.base.span_id == id) {
+                            out.push(Box::new(sp.clone()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -878,6 +1001,9 @@ impl<T: ObservabilityProvider + ?Sized> ObservabilityProvider for Arc<T> {
     }
     fn emit_patch(&self, span: PatchSpan) {
         (**self).emit_patch(span)
+    }
+    fn emit_warn(&self, span: WarnSpan) {
+        (**self).emit_warn(span)
     }
     fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
         (**self).set_session_outcome(session_id, outcome)

@@ -53,8 +53,9 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, NewType, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -70,11 +71,22 @@ from .agent import (
 from .model import (
     Message,
     ModelParams,
+    Role,
     StopReason,
+    TextContent,
     TokenUsage,
     ToolCall,
     ToolSchema,
 )
+
+if TYPE_CHECKING:
+    from .context import (
+        CompactionPreserveHints,
+        CompactionVerifier,
+    )
+    from .context import (
+        SessionState as ContextSessionState,
+    )
 
 # ============================================================================
 # Identity newtypes
@@ -744,9 +756,43 @@ class BaseSandboxProvider:
         return Path("/")
 
 
+@dataclass
+class CompactionTurn:
+    """Inputs the harness compaction loop (issue #46) needs to run one
+    compaction turn and verify its result.
+
+    The harness loop operates on the opaque :class:`SessionState`; the rich
+    compaction/verification API
+    (:class:`spore_core.context.ContextManager`,
+    :class:`spore_core.context.CompactionVerifier`) operates on
+    :class:`spore_core.context.SessionState`. This struct is the bridge: a
+    :class:`ContextManager` that supports compaction projects everything the
+    loop needs into one value, so the loop never has to know which concrete
+    state type its manager uses internally.
+
+    ``context`` is fed straight to :meth:`Agent.turn` to produce the summary;
+    ``preserve_hints`` and ``verification_state`` are passed to
+    :meth:`CompactionVerifier.verify`. On a verification failure the loop
+    re-runs the turn with :meth:`ContextManager.inject_missing_items` applied
+    to ``context``.
+    """
+
+    context: Context
+    preserve_hints: CompactionPreserveHints
+    verification_state: ContextSessionState
+    messages_removed: int
+
+
 @runtime_checkable
 class ContextManager(Protocol):
-    """Issue #7 — assembles per-turn context."""
+    """Issue #7 — assembles per-turn context.
+
+    Issue #46 adds the optional compaction-loop surface
+    (:meth:`prepare_compaction_turn`, :meth:`inject_missing_items`,
+    :meth:`apply_compaction`). All three have defaults so managers that do not
+    compact (the default :meth:`should_compact` returns ``False``) need not
+    implement them.
+    """
 
     async def assemble(self, session: SessionState, task: Task) -> Context: ...
 
@@ -756,7 +802,57 @@ class ContextManager(Protocol):
 
     async def append_user_message(self, session: SessionState, text: str) -> None: ...
 
-    def should_compact(self, session: SessionState) -> bool: ...
+    def should_compact(self, session: SessionState) -> bool:
+        """Whether the session is over its compaction threshold. Default:
+        ``False`` — compaction stays opt-in behind this gate."""
+        _ = session
+        return False
+
+    def prepare_compaction_turn(self, session: SessionState) -> CompactionTurn | None:
+        """Build the inputs for one compaction turn (issue #46). Returns
+        ``None`` when there is nothing to compact (e.g. history shorter than
+        the preserve window), in which case the harness skips compaction
+        entirely. Default: ``None`` — managers that never compact need not
+        override this."""
+        _ = session
+        return None
+
+    def inject_missing_items(self, context: Context, missing: list[str]) -> None:
+        """Mutate a compaction :class:`Context` in place to request a revised
+        summary on retry (issue #46). The harness calls this with the items the
+        prior summary failed to preserve. Default: append the standard
+        "missing these items … please revise" instruction as a user message."""
+        context.messages.append(
+            Message(
+                role=Role.USER,
+                content=TextContent(
+                    text=(
+                        f"Your summary is missing these items: {', '.join(missing)}. Please revise."
+                    )
+                ),
+            )
+        )
+
+    def apply_compaction(self, session: SessionState, summary: str) -> None:
+        """Accept a verified (or accepted-anyway) summary into the session,
+        replacing the compacted span (issue #46). Default: no-op — only
+        compaction-capable managers implement it."""
+        _ = (session, summary)
+
+
+def _default_inject_missing_items(context: Context, missing: list[str]) -> None:
+    """Module-level twin of :meth:`ContextManager.inject_missing_items`'s
+    default body. Structural (non-inheriting) managers do not pick up Protocol
+    method defaults, so the harness loop falls back to this when a manager does
+    not override ``inject_missing_items`` (issue #46)."""
+    context.messages.append(
+        Message(
+            role=Role.USER,
+            content=TextContent(
+                text=(f"Your summary is missing these items: {', '.join(missing)}. Please revise.")
+            ),
+        )
+    )
 
 
 @runtime_checkable
@@ -958,6 +1054,8 @@ from .guide_registry import (  # noqa: E402
 )
 from .memory import now as _now  # noqa: E402
 from .observability import (  # noqa: E402
+    ContextOperationCompaction,
+    ContextSpan,
     ObservabilityProvider,
     PricingTable,
     SpanBase,
@@ -966,6 +1064,8 @@ from .observability import (  # noqa: E402
     SpanStatusOk,
     ToolCallSpan,
     TurnSpan,
+    WarnEventCompactionVerificationFailed,
+    WarnSpan,
     new_span_id,
 )
 from .observability_outbox import (  # noqa: E402
@@ -1035,6 +1135,8 @@ class HarnessConfig:
         termination_policy: TerminationPolicy,
         middleware: HarnessMiddlewareChain | None = None,
         observability: ObservabilityProvider | None = None,
+        compaction_verifier: CompactionVerifier | None = None,
+        max_compaction_attempts: int = 2,
         pricing: PricingTable | None = None,
     ) -> None:
         self.agent = agent
@@ -1044,6 +1146,17 @@ class HarnessConfig:
         self.termination_policy = termination_policy
         self.middleware = middleware
         self.observability = observability
+        # Post-compaction verifier (issue #29/#46). The harness runs it after
+        # each compaction turn and retries up to ``max_compaction_attempts``
+        # before accepting a failing summary. Defaults to ``KeyTermVerifier``.
+        if compaction_verifier is None:
+            from .context import KeyTermVerifier
+
+            compaction_verifier = KeyTermVerifier()
+        self.compaction_verifier: CompactionVerifier = compaction_verifier
+        # Maximum compaction-summary attempts before accepting a failing summary
+        # anyway (issue #46). Defaults to ``2`` (mirrors ``CompactionConfig``).
+        self.max_compaction_attempts = max_compaction_attempts
         # Token → USD pricing used to stamp ``cost_usd`` on emitted turn spans.
         # Defaults to :attr:`PricingTable.DEFAULT` (zero cost) when unset.
         self.pricing: PricingTable = pricing if pricing is not None else PricingTable.DEFAULT
@@ -1074,7 +1187,21 @@ class HarnessBuilder:
         self._termination_policy = termination_policy
         self._middleware: HarnessMiddlewareChain | None = None
         self._observability: ObservabilityProvider | None = None
+        self._compaction_verifier: CompactionVerifier | None = None
+        self._max_compaction_attempts: int = 2
         self._pricing: PricingTable = PricingTable.DEFAULT
+
+    def compaction_verifier(self, verifier: CompactionVerifier) -> HarnessBuilder:
+        """Inject a post-compaction verifier (issue #46). Defaults to
+        ``KeyTermVerifier``."""
+        self._compaction_verifier = verifier
+        return self
+
+    def max_compaction_attempts(self, attempts: int) -> HarnessBuilder:
+        """Set the maximum number of compaction-summary attempts before
+        accepting a failing summary anyway (issue #46). Defaults to ``2``."""
+        self._max_compaction_attempts = attempts
+        return self
 
     def middleware(self, middleware: HarnessMiddlewareChain) -> HarnessBuilder:
         """Inject a middleware chain."""
@@ -1112,6 +1239,8 @@ class HarnessBuilder:
             termination_policy=self._termination_policy,
             middleware=self._middleware,
             observability=self._observability,
+            compaction_verifier=self._compaction_verifier,
+            max_compaction_attempts=self._max_compaction_attempts,
             pricing=self._pricing,
         )
 
@@ -1673,6 +1802,19 @@ class StandardHarness:
                             budget_used.turns,
                         )
 
+                # Compaction (issue #46): after tool results are appended, before
+                # the loop restarts — matches the concepts-doc loop diagram's
+                # "compact if should_compact()" placement. Runs the
+                # verify→retry→warn loop; never halts the run.
+                if config.context_manager.should_compact(session_state):
+                    span_seq = await self._run_compaction(
+                        session_state,
+                        session_id,
+                        task.id,
+                        span_seq,
+                        usage,
+                    )
+
                 continue
 
             # ---- TurnError ------------------------------------------
@@ -1689,6 +1831,155 @@ class StandardHarness:
                 )
 
             raise AssertionError(f"unhandled TurnResult variant: {result!r}")
+
+    # ---- compaction loop (issue #46/#29) ----------------------------
+
+    async def _run_compaction(
+        self,
+        session_state: SessionState,
+        session_id: SessionId,
+        task_id: TaskId,
+        span_seq: int,
+        usage: AggregateUsage,
+    ) -> int:
+        """Run the post-compaction verify→retry→warn loop (issue #46/#29).
+
+        Drives one compaction turn through the agent, verifies the summary, and
+        either accepts it, retries with the missing items injected, or — after
+        ``max_compaction_attempts`` — emits a warn event and accepts the summary
+        anyway. A blocked compaction is worse than an imperfect one, so this
+        method NEVER raises or halts the run; the worst case is an
+        accepted-anyway summary plus one warn span.
+
+        Token usage from compaction turns folds into the run-level
+        :class:`AggregateUsage`; each accepted summary is surfaced as a
+        ``Compaction`` :class:`ContextSpan`. The
+        ``compaction_verification_failures`` metric is derived from the emitted
+        :class:`WarnSpan`. Returns the advanced ``span_seq``.
+        """
+        config = self._config
+        turn = config.context_manager.prepare_compaction_turn(session_state)
+        if turn is None:
+            # Nothing to compact (e.g. history shorter than preserve window).
+            return span_seq
+        tokens_before = turn.verification_state.token_budget_used
+        max_attempts = max(1, config.max_compaction_attempts)
+        attempt = 0
+
+        while True:
+            attempt += 1
+            # Run one compaction turn through the agent to produce a summary.
+            result = await config.agent.turn(turn.context)
+            if isinstance(result, FinalResponse):
+                usage.add_turn(result.usage)
+                summary = result.content
+            elif isinstance(result, ToolCallRequested):
+                # A compaction turn is expected to yield a summary, not a tool
+                # call. Treat the (empty) response as the summary so
+                # verification can run and the loop terminates predictably.
+                usage.add_turn(result.usage)
+                summary = ""
+            else:  # TurnError
+                if result.usage is not None:
+                    usage.add_turn(result.usage)
+                summary = ""
+
+            verification = config.compaction_verifier.verify(
+                summary, turn.preserve_hints, turn.verification_state
+            )
+
+            if verification.passed:
+                return self._accept_compaction(
+                    session_state,
+                    summary,
+                    turn.messages_removed,
+                    tokens_before,
+                    session_id,
+                    task_id,
+                    span_seq,
+                )
+
+            if attempt < max_attempts:
+                # Inject the missing items and retry. Use the manager's override
+                # if it provides one; otherwise the standard default body.
+                inject = getattr(config.context_manager, "inject_missing_items", None)
+                if inject is not None:
+                    inject(turn.context, verification.missing_items)
+                else:
+                    _default_inject_missing_items(turn.context, verification.missing_items)
+                continue
+
+            # Exhausted attempts: warn, then accept anyway.
+            if config.observability is not None:
+                base = SpanBase.new_root(
+                    new_span_id(f"{session_id}-warn-{span_seq}"),
+                    session_id,
+                    task_id,
+                    SpanKind.WARN,
+                    _now(),
+                )
+                warn_span = WarnSpan(
+                    base=base,
+                    event=WarnEventCompactionVerificationFailed(
+                        missing_items=list(verification.missing_items),
+                        accepted_anyway=True,
+                    ),
+                )
+                # ``emit_warn`` carries a Protocol default no-op (issue #46), but
+                # structural providers predating #46 may not define it at all —
+                # fall back to the default no-op so they keep working (W4).
+                emit_warn = getattr(config.observability, "emit_warn", None)
+                if emit_warn is not None:
+                    emit_warn(warn_span)
+                span_seq += 1
+            return self._accept_compaction(
+                session_state,
+                summary,
+                turn.messages_removed,
+                tokens_before,
+                session_id,
+                task_id,
+                span_seq,
+            )
+
+    def _accept_compaction(
+        self,
+        session_state: SessionState,
+        summary: str,
+        messages_removed: int,
+        tokens_before: int,
+        session_id: SessionId,
+        task_id: TaskId,
+        span_seq: int,
+    ) -> int:
+        """Apply an accepted summary and emit the ``Compaction`` context span.
+        Returns the advanced ``span_seq``."""
+        config = self._config
+        config.context_manager.apply_compaction(session_state, summary)
+
+        if config.observability is not None:
+            base = SpanBase.new_root(
+                new_span_id(f"{session_id}-compaction-{span_seq}"),
+                session_id,
+                task_id,
+                SpanKind.COMPACTION,
+                _now(),
+            )
+            config.observability.emit_context(
+                ContextSpan(
+                    base=base,
+                    operation=ContextOperationCompaction(
+                        messages_removed=messages_removed,
+                        tokens_reclaimed=0,
+                    ),
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_before,
+                    utilization_before=0.0,
+                    utilization_after=0.0,
+                )
+            )
+            span_seq += 1
+        return span_seq
 
 
 # ============================================================================

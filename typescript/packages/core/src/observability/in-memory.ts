@@ -35,6 +35,7 @@ import {
   type SpanKind,
   type ToolCallSpan,
   type TurnSpan,
+  type WarnSpan,
 } from "./types.js";
 
 interface OrderEntry {
@@ -49,6 +50,7 @@ interface Store {
   contexts: ContextSpan[];
   middlewares: MiddlewareSpan[];
   patches: PatchSpan[];
+  warns: WarnSpan[];
   /** Per-session insertion order of (kind, span_id) tuples. */
   traceOrder: Map<string, OrderEntry[]>;
   flushed: Set<string>;
@@ -66,6 +68,7 @@ function emptyStore(): Store {
     contexts: [],
     middlewares: [],
     patches: [],
+    warns: [],
     traceOrder: new Map(),
     flushed: new Set(),
     outcomes: new Map(),
@@ -92,6 +95,13 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
    *  {@link PatchType} without reconstructing them from the trace. */
   patchSpans(sessionId: SessionId): PatchSpan[] {
     return this.store.patches.filter((p) => p.base.session_id.equals(sessionId));
+  }
+
+  /** All recorded warn spans for a session, in insertion order (issue #46).
+   *  Lets callers inspect compaction-verification failures without
+   *  reconstructing them from the heterogeneous trace. */
+  warnSpans(sessionId: SessionId): WarnSpan[] {
+    return this.store.warns.filter((w) => w.base.session_id.equals(sessionId));
   }
 
   private pushOrder(sessionId: SessionId, kind: SpanKind, spanId: SpanId): void {
@@ -135,6 +145,11 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
     this.store.patches.push(span);
   }
 
+  emitWarn(span: WarnSpan): void {
+    this.pushOrder(span.base.session_id, "warn", span.base.span_id);
+    this.store.warns.push(span);
+  }
+
   async flushSession(sessionId: SessionId): Promise<void> {
     const key = sessionId.asString();
     if (this.store.flushed.has(key)) {
@@ -170,6 +185,11 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
       (c) => c.base.session_id.equals(sessionId) && c.operation.kind === "compaction",
     ).length;
 
+    const compactionVerificationFailures = this.store.warns.filter(
+      (w) =>
+        w.base.session_id.equals(sessionId) && w.event.warn === "compaction_verification_failed",
+    ).length;
+
     const sessionPatches = this.store.patches.filter((p) => p.base.session_id.equals(sessionId));
     const patchCount = sessionPatches.length;
     // Guard divide-by-zero; denominator is all tool-call spans (issue #28).
@@ -196,6 +216,7 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
       patch_count: patchCount,
       patch_rate: patchRate,
       patches_by_tool: patchesByTool,
+      compaction_verification_failures: compactionVerificationFailures,
     };
   }
 
@@ -259,6 +280,8 @@ export class InMemoryObservabilityProvider implements ObservabilityProvider {
         return this.store.middlewares.find(match);
       case "patch":
         return this.store.patches.find(match);
+      case "warn":
+        return this.store.warns.find(match);
       default:
         return undefined;
     }
