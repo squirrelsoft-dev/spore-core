@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -104,6 +105,36 @@ def context_window(model_id: str) -> int:
     if model_id.startswith("gemma"):
         return 8_192
     return 0
+
+
+def supports_tools(model_id: str) -> bool:
+    """Best-effort static capability table — ``llama3.2`` / ``qwen2.5-coder`` /
+    ``mistral`` are known to support native tool calling; others may or may
+    not. Used as a fallback when ``/api/show`` discovery is unavailable."""
+
+    return (
+        model_id.startswith("llama3.2")
+        or model_id.startswith("qwen2.5-coder")
+        or model_id.startswith("mistral")
+    )
+
+
+@dataclass
+class ModelMeta:
+    """``/api/show``-discovered metadata for the model.
+
+    Populated once, alongside the ``/api/tags`` availability check. All
+    fields are best-effort — ``/api/show`` failures leave them unset
+    (empty :class:`ModelMeta`) rather than failing the call.
+    """
+
+    #: Discovered context window (``*.context_length`` in ``model_info``).
+    context_length: int | None = None
+    #: Top-level ``capabilities`` array (may contain ``"tools"``).
+    capabilities: list[str] = field(default_factory=list)
+
+    def supports_tools(self) -> bool:
+        return "tools" in self.capabilities
 
 
 def _name_matches(tag: str, requested: str) -> bool:
@@ -432,6 +463,10 @@ class OllamaModelInterface:
         self._http_client = http_client
         self._owns_client = http_client is None
         self._model_checked = False
+        # Set once the availability + discovery probe has run. Holds the
+        # ``/api/show``-discovered metadata (empty when discovery failed but
+        # availability succeeded). ``None`` until the probe completes.
+        self._model_meta: ModelMeta | None = None
 
     def __repr__(self) -> str:  # pragma: no cover — trivial
         return (
@@ -520,12 +555,85 @@ class OllamaModelInterface:
                 code=404,
                 message=(f"Model {self._model_id} not found. Run: ollama pull {self._model_id}"),
             )
+        # Best-effort discovery — never fails the call.
+        self._model_meta = await self._discover_meta()
         self._model_checked = True
+
+    async def _discover_meta(self) -> ModelMeta:
+        """Best-effort ``POST /api/show`` discovery.
+
+        Returns an empty :class:`ModelMeta` on any failure (404, transport
+        error, decode error, missing fields) so discovery being unavailable
+        never errors the whole call. Reads the model's ``*.context_length``
+        from ``model_info`` and the top-level ``capabilities`` array.
+        """
+
+        url = f"{self._base_url}/api/show"
+        payload = json.dumps({"model": self._model_id}).encode("utf-8")
+        client = self._client()
+        try:
+            resp = await client.post(
+                url,
+                content=payload,
+                headers={"content-type": "application/json"},
+                timeout=self._timeout,
+            )
+        except Exception:  # noqa: BLE001 — discovery is best-effort
+            return ModelMeta()
+        try:
+            if resp.status_code < 200 or resp.status_code >= 300:
+                return ModelMeta()
+            try:
+                data = resp.json()
+            except ValueError:
+                return ModelMeta()
+        finally:
+            await resp.aclose()
+        if not isinstance(data, dict):
+            return ModelMeta()
+
+        context_length: int | None = None
+        model_info = data.get("model_info")
+        if isinstance(model_info, dict):
+            for key, value in model_info.items():
+                if key.endswith(".context_length") and isinstance(value, int):
+                    context_length = value
+                    break
+
+        capabilities_raw = data.get("capabilities")
+        capabilities = (
+            [c for c in capabilities_raw if isinstance(c, str)]
+            if isinstance(capabilities_raw, list)
+            else []
+        )
+        return ModelMeta(context_length=context_length, capabilities=capabilities)
+
+    def _guard_tool_support(self, request: ModelRequest) -> None:
+        """Reject tool-bearing requests when the model does not support tools.
+
+        Capability source priority: the ``/api/show`` ``capabilities`` array
+        when discovery succeeded; otherwise the static :func:`supports_tools`
+        table. Called after the availability + discovery probe.
+        """
+
+        if not request.tools:
+            return
+        meta = self._model_meta
+        if meta is not None and meta.capabilities:
+            supported = meta.supports_tools()
+        else:
+            supported = supports_tools(self._model_id)
+        if not supported:
+            raise ProviderError(
+                code=0,
+                message=f"Model {self._model_id} does not support tool calling",
+            )
 
     # ── ModelInterface protocol ─────────────────────────────────────────
 
     async def call(self, request: ModelRequest) -> ModelResponse:
         await self._ensure_model_available()
+        self._guard_tool_support(request)
         url = f"{self._base_url}/api/chat"
         body = build_request_body(self._model_id, self._keep_alive, request, stream=False)
         payload = json.dumps(body).encode("utf-8")
@@ -553,6 +661,7 @@ class OllamaModelInterface:
 
     async def call_streaming(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
         await self._ensure_model_available()
+        self._guard_tool_support(request)
         url = f"{self._base_url}/api/chat"
         body = build_request_body(self._model_id, self._keep_alive, request, stream=True)
         payload = json.dumps(body).encode("utf-8")
@@ -624,10 +733,16 @@ class OllamaModelInterface:
         return None
 
     def provider(self) -> ProviderInfo:
+        # Prefer the ``/api/show``-discovered context length when the probe has
+        # already run and produced one; otherwise fall back to the static
+        # table. ``provider()`` is synchronous, so it reads the cached probe
+        # result non-blockingly rather than triggering discovery itself.
+        discovered = self._model_meta.context_length if self._model_meta is not None else None
+        window = discovered if discovered is not None else context_window(self._model_id)
         return ProviderInfo(
             name="ollama",
             model_id=self._model_id,
-            context_window=context_window(self._model_id),
+            context_window=window,
         )
 
 
@@ -635,9 +750,11 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_KEEP_ALIVE",
     "DEFAULT_TIMEOUT_SECONDS",
+    "ModelMeta",
     "OllamaModelInterface",
     "build_request_body",
     "context_window",
     "parse_response_body",
     "parse_stop_reason",
+    "supports_tools",
 ]
