@@ -42,6 +42,7 @@ from spore_core.observability_outbox import (
     OutboxObservabilityProvider,
     SessionNotFound,
     TraceLine,
+    _attributes_to_otlp,
 )
 from spore_core.sensor import (
     SensorId,
@@ -111,6 +112,33 @@ def _provider(root: Path) -> OutboxObservabilityProvider:
 
 
 # ── one line per emit ──────────────────────────────────────────────────────
+
+
+def test_attributes_to_otlp_flattens_scalars_and_skips_null() -> None:
+    # Mirrors a turn span's ``attributes`` payload, plus a null field.
+    attrs: dict[str, Any] = {
+        "input_tokens": 386,
+        "output_tokens": 102,
+        "stop_reason": "tool_use",
+        "turn_number": 1,
+        "cache_read_tokens": None,
+        # Reserved envelope key must be skipped so the fixed tag wins.
+        "session_id": "should-be-dropped",
+    }
+    out = _attributes_to_otlp(attrs)
+
+    assert out["input_tokens"] == 386
+    assert isinstance(out["input_tokens"], int)
+    assert out["output_tokens"] == 102
+    assert isinstance(out["output_tokens"], int)
+    assert out["turn_number"] == 1
+    assert isinstance(out["turn_number"], int)
+    assert out["stop_reason"] == "tool_use"
+    # Null is skipped entirely.
+    assert "cache_read_tokens" not in out
+    # Reserved key is skipped so the fixed envelope tag wins.
+    assert "session_id" not in out
+    assert len(out) == 4
 
 
 def test_one_line_per_emit(tmp_path: Path) -> None:

@@ -404,6 +404,47 @@ class _NullForwarder:
         return None
 
 
+# Keys owned by the fixed envelope tags; a flattened attribute with one of these
+# names is skipped so it never duplicates (or clobbers) a fixed tag.
+_RESERVED_ATTR_KEYS = frozenset({"session_id", "task_id", "level", "status", "parent_span_id"})
+
+
+def _attributes_to_otlp(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a span's top-level ``attributes`` dict into an OTLP span-attribute
+    mapping so the rich per-span detail (tokens, stop_reason, tool_name,
+    turn_number, …) reaches Tempo, not just the JSONL.
+
+    Rules (shallow, no dotted-key deep-flatten), mirroring the Rust reference:
+
+    * ``str`` → string attribute.
+    * ``bool`` → bool attribute (checked BEFORE ``int`` since ``bool`` is a
+      subclass of ``int`` in Python).
+    * ``int`` → int attribute.
+    * ``float`` → float attribute.
+    * ``None`` → skipped (no key emitted).
+    * nested ``dict``/``list`` → compact JSON string attribute.
+    * Keys colliding with the fixed envelope tags (:data:`_RESERVED_ATTR_KEYS`)
+      are skipped so the fixed tag wins.
+    """
+    out: dict[str, Any] = {}
+    for key, value in attributes.items():
+        if key in _RESERVED_ATTR_KEYS:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str):
+            out[key] = value
+        elif isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, int):
+            out[key] = value
+        elif isinstance(value, float):
+            out[key] = value
+        elif isinstance(value, (dict, list)):
+            out[key] = json.dumps(value, separators=(",", ":"))
+    return out
+
+
 class _OtlpSdkForwarder:
     """Real OTLP forwarder backed by ``opentelemetry-sdk`` + OTLP-gRPC with a
     ``BatchSpanProcessor`` so export is buffered and non-blocking."""
@@ -464,6 +505,11 @@ class _OtlpSdkForwarder:
                 context=parent_ctx,
                 kind=OtelSpanKind.INTERNAL,
                 attributes={
+                    # Flatten the rich per-kind payload first so token /
+                    # stop_reason / tool_name / etc. detail reaches Tempo, not
+                    # just the JSONL. Reserved keys are skipped inside the helper
+                    # so the fixed envelope tags below always win.
+                    **_attributes_to_otlp(line.attributes),
                     "session_id": line.session_id,
                     "task_id": line.task_id,
                     "level": line.level,
