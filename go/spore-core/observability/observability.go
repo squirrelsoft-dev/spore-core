@@ -34,6 +34,7 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -575,7 +576,37 @@ type ObservabilityProvider interface {
 	// GetTrace returns the full span list for a session in insertion
 	// order; trace analyzer reconstructs hierarchy via Base.ParentSpanID.
 	GetTrace(ctx context.Context, sessionID SessionID) ([]Span, error)
+
+	// ListUnflushedSessions returns the session ids that have a durable
+	// outbox (trace.jsonl) but no .flushed marker (issue #33). Backends
+	// without a durable outbox return an empty slice.
+	ListUnflushedSessions(ctx context.Context) ([]SessionID, error)
+
+	// CleanupSession deletes a session's durable outbox directory (issue
+	// #33). It returns an error matching ErrSessionNotFound (via errors.Is)
+	// when the session has no outbox. The provider NEVER auto-deletes.
+	// Backends without a durable outbox treat every session as not found.
+	CleanupSession(ctx context.Context, sessionID SessionID) error
 }
+
+// ErrSessionNotFound is returned by CleanupSession when the requested
+// session has no durable outbox directory (issue #33). Match with
+// errors.Is; SessionNotFoundError carries the offending session id.
+var ErrSessionNotFound = errors.New("observability: session not found")
+
+// SessionNotFoundError is the typed error returned by CleanupSession for a
+// missing session. It wraps ErrSessionNotFound so errors.Is matches.
+type SessionNotFoundError struct {
+	SessionID SessionID
+}
+
+// Error implements error.
+func (e *SessionNotFoundError) Error() string {
+	return fmt.Sprintf("observability: session not found: %s", e.SessionID)
+}
+
+// Unwrap lets errors.Is(err, ErrSessionNotFound) match.
+func (e *SessionNotFoundError) Unwrap() error { return ErrSessionNotFound }
 
 // ============================================================================
 // InMemoryObservabilityProvider
@@ -912,6 +943,18 @@ func (p *InMemoryObservabilityProvider) GetTrace(_ context.Context, sessionID Se
 		}
 	}
 	return out, nil
+}
+
+// ListUnflushedSessions implements ObservabilityProvider. The in-memory
+// backend has no durable outbox, so it returns an empty slice (issue #33).
+func (p *InMemoryObservabilityProvider) ListUnflushedSessions(_ context.Context) ([]SessionID, error) {
+	return nil, nil
+}
+
+// CleanupSession implements ObservabilityProvider. The in-memory backend has
+// no durable outbox, so every session is reported as not found (issue #33).
+func (p *InMemoryObservabilityProvider) CleanupSession(_ context.Context, sessionID SessionID) error {
+	return &SessionNotFoundError{SessionID: sessionID}
 }
 
 // Compile-time interface check.
