@@ -15,6 +15,10 @@ import { z } from "zod";
 
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
+import type {
+  CompactionPreserveHints,
+  SessionState as ContextSessionState,
+} from "../context/types.js";
 import {
   MessageSchema,
   ToolCallSchema,
@@ -401,12 +405,68 @@ export interface SandboxProvider {
   workspaceRoot?(): string;
 }
 
-/** Issue #7 — ContextManager. */
+/**
+ * Inputs the harness compaction loop (issue #46) needs to run one compaction
+ * turn and verify its result.
+ *
+ * The harness loop operates on the opaque {@link SessionState} above; the rich
+ * compaction/verification API ({@link "../context/types.js".ContextManager},
+ * {@link "../context/types.js".CompactionVerifier}) operates on
+ * {@link "../context/types.js".SessionState}. This struct is the bridge: a
+ * compaction-capable {@link ContextManager} projects everything the loop needs
+ * into one value, so the loop never has to know which concrete state type its
+ * manager uses internally.
+ *
+ * `context` is fed straight to `Agent.turn` to produce the summary;
+ * `preserveHints` and `verificationState` are passed to
+ * {@link "../context/types.js".CompactionVerifier.verify}. On a verification
+ * failure the loop re-runs the turn with {@link ContextManager.injectMissingItems}
+ * applied to `context`.
+ */
+export interface CompactionTurn {
+  /** Context to feed `Agent.turn` to elicit the summary. */
+  context: Context;
+  /** Preservation hints to hand the verifier. */
+  preserveHints: CompactionPreserveHints;
+  /** Verifier-facing session state (rich `context` `SessionState`). */
+  verificationState: ContextSessionState;
+  /** Messages about to be removed — used to stamp the compaction span. */
+  messagesRemoved: number;
+}
+
+/**
+ * Issue #7 — ContextManager.
+ *
+ * Issue #46 adds the optional compaction-loop surface
+ * ({@link prepareCompactionTurn}, {@link injectMissingItems},
+ * {@link applyCompaction}). All three are OPTIONAL so managers that do not
+ * compact (the default `shouldCompact` returns `false`) need not implement
+ * them; the harness applies the spec defaults when a method is absent.
+ */
 export interface ContextManager {
   assemble(session: SessionState, task: Task, signal?: AbortSignal): Promise<Context>;
   appendToolResult(session: SessionState, result: ToolResultRecord): Promise<void>;
   appendUserMessage(session: SessionState, text: string): Promise<void>;
   shouldCompact(session: SessionState): boolean;
+
+  /** Build the inputs for one compaction turn (issue #46). Returns `undefined`
+   *  when there is nothing to compact (e.g. history shorter than the preserve
+   *  window), in which case the harness skips compaction entirely. Default
+   *  (when absent): `undefined` — managers that never compact need not
+   *  implement this. */
+  prepareCompactionTurn?(session: SessionState): CompactionTurn | undefined;
+
+  /** Mutate a compaction {@link Context} in place to request a revised summary
+   *  on retry (issue #46). The harness calls this with the items the prior
+   *  summary failed to preserve. Default (when absent): append the standard
+   *  "Your summary is missing these items: {missing}. Please revise." user
+   *  message. */
+  injectMissingItems?(context: Context, missing: string[]): void;
+
+  /** Accept a verified (or accepted-anyway) summary into the session, replacing
+   *  the compacted span (issue #46). Default (when absent): no-op — only
+   *  compaction-capable managers implement it. */
+  applyCompaction?(session: SessionState, summary: string): void;
 }
 
 /** Issue #13 — TerminationPolicy. */

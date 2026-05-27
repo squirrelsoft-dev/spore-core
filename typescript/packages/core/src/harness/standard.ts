@@ -15,6 +15,7 @@
  */
 
 import type { Agent } from "../agent/interface.js";
+import type { Context } from "../agent/types.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
 import { Timestamp } from "../memory/types.js";
 import type { StopReason, TokenUsage } from "../model/schemas.js";
@@ -22,14 +23,18 @@ import {
   PricingTable,
   SpanId,
   finishSpanBase,
-  newChildSpanBase,
   newRootSpanBase,
+  newChildSpanBase,
+  newWarnSpan,
+  type ContextSpan,
   type SpanBase,
   type SpanStatus,
   type ToolCallSpan,
   type TurnSpan,
+  type WarnEvent,
 } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
+import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 
 import type { Harness } from "./interface.js";
 import {
@@ -42,6 +47,7 @@ import {
   type BudgetLimits,
   type BudgetSnapshot,
   type ChildPausedState,
+  type CompactionTurn,
   type ContextManager,
   type HaltReason,
   type HarnessRunOptions,
@@ -57,6 +63,7 @@ import {
   type SessionState,
   type StreamSink,
   type Task,
+  type TaskId,
   type TerminationPolicy,
   type ToolOutput,
   type ToolRegistry,
@@ -72,6 +79,17 @@ export interface HarnessConfig {
   terminationPolicy: TerminationPolicy;
   middleware?: MiddlewareChain;
   observability?: ObservabilityProvider;
+  /**
+   * Post-compaction verifier (issue #29/#46). The harness runs it after each
+   * compaction turn and retries up to `maxCompactionAttempts` before accepting
+   * a failing summary. Optional; defaults to {@link KeyTermVerifier}.
+   */
+  compactionVerifier?: CompactionVerifier;
+  /**
+   * Maximum compaction-summary attempts before accepting a failing summary
+   * anyway (issue #46). Optional; defaults to `2`. Clamped to a minimum of `1`.
+   */
+  maxCompactionAttempts?: number;
   /**
    * Token → USD pricing used to stamp `cost_usd` on emitted {@link TurnSpan}s.
    * Optional; the loop falls back to {@link PricingTable.DEFAULT} (zero cost)
@@ -650,6 +668,20 @@ export class StandardHarness implements Harness {
             }
           }
 
+          // Compaction (issue #46): after tool results are appended and the
+          // AfterTool middleware fires, before the loop restarts. Runs the
+          // verify→retry→warn loop; never halts the run.
+          if (this.config.contextManager.shouldCompact(sessionState)) {
+            spanSeq = await this.runCompaction(
+              sessionState,
+              sessionId,
+              task.id,
+              spanSeq,
+              usage,
+              signal,
+            );
+          }
+
           continue;
         }
 
@@ -673,6 +705,172 @@ export class StandardHarness implements Harness {
         }
       }
     }
+  }
+
+  /**
+   * Run the post-compaction verify→retry→warn loop (issue #46/#29).
+   *
+   * Drives one compaction turn through the agent, verifies the summary, and
+   * either accepts it, retries with the missing items injected, or — after
+   * `maxCompactionAttempts` — emits a warn event and accepts the summary
+   * anyway. A blocked compaction is worse than an imperfect one, so this method
+   * NEVER throws or halts the run; the worst case is an accepted-anyway summary
+   * plus one warn span.
+   *
+   * Token usage from compaction turns folds into the run-level
+   * {@link AggregateUsage}; each compaction turn that produces a summary is
+   * surfaced as a `compaction` {@link ContextSpan}. The
+   * `compaction_verification_failures` metric is derived from the emitted
+   * {@link WarnSpan}. Returns the advanced `spanSeq`.
+   */
+  private async runCompaction(
+    sessionState: SessionState,
+    sessionId: SessionId,
+    taskId: TaskId,
+    spanSeq: number,
+    usage: AggregateUsage,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const cm = this.config.contextManager;
+    // Compaction is opt-in: managers that never compact do not implement
+    // prepareCompactionTurn (default `undefined` = skip).
+    const turn: CompactionTurn | undefined = cm.prepareCompactionTurn?.(sessionState);
+    if (!turn) {
+      // Nothing to compact (e.g. history shorter than the preserve window).
+      return spanSeq;
+    }
+
+    const tokensBefore = turn.verificationState.token_budget_used;
+    const verifier: CompactionVerifier = this.config.compactionVerifier ?? new KeyTermVerifier();
+    const maxAttempts = Math.max(1, this.config.maxCompactionAttempts ?? 2);
+    let attempt = 0;
+
+    for (;;) {
+      attempt += 1;
+      // Run one compaction turn through the agent to produce a summary.
+      const result = await this.config.agent.turn(turn.context, signal);
+      let summary: string;
+      switch (result.kind) {
+        case "final_response":
+          addTurnUsage(usage, result.usage);
+          summary = result.content;
+          break;
+        case "tool_call_requested":
+          // A compaction turn is expected to yield a summary, not a tool call.
+          // Treat the (empty) response as the summary so verification can run
+          // and the loop terminates predictably.
+          addTurnUsage(usage, result.usage);
+          summary = "";
+          break;
+        default:
+          if (result.usage != null) addTurnUsage(usage, result.usage);
+          summary = "";
+          break;
+      }
+
+      const verification = verifier.verify(summary, turn.preserveHints, turn.verificationState);
+
+      if (verification.passed) {
+        return this.acceptCompaction(
+          sessionState,
+          summary,
+          turn.messagesRemoved,
+          tokensBefore,
+          sessionId,
+          taskId,
+          spanSeq,
+        );
+      }
+
+      if (attempt < maxAttempts) {
+        // Inject the missing items and retry.
+        this.injectMissingItems(turn.context, verification.missingItems);
+        continue;
+      }
+
+      // Exhausted attempts: warn, then accept anyway.
+      const obs = this.config.observability;
+      if (obs?.emitWarn) {
+        const base = newRootSpanBase(
+          SpanId.of(`${sessionId.asString()}-warn-${spanSeq}`),
+          sessionId,
+          taskId,
+          "warn",
+          Timestamp.now(),
+        );
+        const event: WarnEvent = {
+          warn: "compaction_verification_failed",
+          missing_items: verification.missingItems.slice(),
+          accepted_anyway: true,
+        };
+        obs.emitWarn(newWarnSpan(base, event));
+        spanSeq += 1;
+      }
+      return this.acceptCompaction(
+        sessionState,
+        summary,
+        turn.messagesRemoved,
+        tokensBefore,
+        sessionId,
+        taskId,
+        spanSeq,
+      );
+    }
+  }
+
+  /** Apply the spec's default missing-items retry message when the manager
+   *  does not override {@link ContextManager.injectMissingItems}. */
+  private injectMissingItems(context: Context, missing: string[]): void {
+    const cm = this.config.contextManager;
+    if (cm.injectMissingItems) {
+      cm.injectMissingItems(context, missing);
+      return;
+    }
+    context.messages.push({
+      role: "user",
+      content: {
+        type: "text",
+        text: `Your summary is missing these items: ${missing.join(", ")}. Please revise.`,
+      },
+    });
+  }
+
+  /** Apply an accepted summary and emit the `compaction` context span. Returns
+   *  the advanced `spanSeq`. */
+  private acceptCompaction(
+    sessionState: SessionState,
+    summary: string,
+    messagesRemoved: number,
+    tokensBefore: number,
+    sessionId: SessionId,
+    taskId: TaskId,
+    spanSeq: number,
+  ): number {
+    // Default applyCompaction is a no-op (only compaction-capable managers
+    // implement it).
+    this.config.contextManager.applyCompaction?.(sessionState, summary);
+
+    const obs = this.config.observability;
+    if (obs) {
+      const base = newRootSpanBase(
+        SpanId.of(`${sessionId.asString()}-compaction-${spanSeq}`),
+        sessionId,
+        taskId,
+        "compaction",
+        Timestamp.now(),
+      );
+      const span: ContextSpan = {
+        base,
+        operation: { kind: "compaction", messages_removed: messagesRemoved, tokens_reclaimed: 0 },
+        tokens_before: tokensBefore,
+        tokens_after: tokensBefore,
+        utilization_before: 0,
+        utilization_after: 0,
+      };
+      obs.emitContext(span);
+      spanSeq += 1;
+    }
+    return spanSeq;
   }
 }
 
@@ -698,6 +896,8 @@ export class StandardHarness implements Harness {
 export class HarnessBuilder {
   private _middleware?: MiddlewareChain;
   private _observability?: ObservabilityProvider;
+  private _compactionVerifier: CompactionVerifier = new KeyTermVerifier();
+  private _maxCompactionAttempts = 2;
   private _pricing: PricingTable = PricingTable.DEFAULT;
 
   constructor(
@@ -730,6 +930,20 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Inject a post-compaction verifier (issue #46). Defaults to
+   *  {@link KeyTermVerifier}. */
+  compactionVerifier(verifier: CompactionVerifier): this {
+    this._compactionVerifier = verifier;
+    return this;
+  }
+
+  /** Set the maximum number of compaction-summary attempts before accepting a
+   *  failing summary anyway (issue #46). Defaults to `2`; clamped to `1`. */
+  maxCompactionAttempts(attempts: number): this {
+    this._maxCompactionAttempts = attempts;
+    return this;
+  }
+
   /** Set the token → USD pricing table used to stamp `cost_usd` on turn spans. */
   pricing(table: PricingTable): this {
     this._pricing = table;
@@ -746,6 +960,8 @@ export class HarnessBuilder {
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,
       observability: this._observability,
+      compactionVerifier: this._compactionVerifier,
+      maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,
     };
   }

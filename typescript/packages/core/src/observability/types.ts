@@ -75,7 +75,11 @@ export type SpanKind =
   /** Emitted by `PatchToolCallsMiddleware` whenever it mutates a tool call
    *  (issue #28). Always carries a {@link PatchSpan} at {@link SpanLevel}
    *  `"warn"`. */
-  | "patch";
+  | "patch"
+  /** Emitted by the harness compaction loop when a summary is accepted despite
+   *  failing verification (issue #46). Always carries a {@link WarnSpan} at
+   *  {@link SpanLevel} `"warn"`. */
+  | "warn";
 
 export type SpanStatus =
   | { kind: "ok" }
@@ -280,8 +284,71 @@ export function newPatchSpan(
   };
 }
 
+// ============================================================================
+// Compaction-verification warn (issue #46)
+// ============================================================================
+//
+// The harness compaction loop (issue #29 pseudocode, wired in #46) verifies
+// every agent-produced summary with a {@link CompactionVerifier} before
+// accepting it. After `maxCompactionAttempts` failed verifications the harness
+// accepts the summary anyway — a blocked compaction is worse than an imperfect
+// one — and emits exactly one warn-level {@link WarnSpan} recording the
+// still-missing items and `accepted_anyway: true`.
+//
+// Rules (mirrored by harness tests):
+//   W1  a successful (or first-try-passing) compaction emits NO warn span.
+//   W2  exhausting attempts emits EXACTLY ONE warn span carrying the final
+//       `missing_items` and `accepted_anyway = true`.
+//   W3  `SessionMetrics.compaction_verification_failures` counts these spans
+//       for the session (mirrors how `compactions` is derived from spans).
+//   W4  `emitWarn` has a default no-op so providers predating #46 keep working.
+
+/**
+ * A warn-level, fire-and-forget observability event. Discriminated on `warn`;
+ * future warn classes add members, so downstream `switch`es must keep a
+ * default branch. The event-as-payload shape mirrors {@link PatchType} but
+ * keeps warns that are not tied to a single tool call in their own type.
+ *
+ * Wire shape mirrors the Rust `WarnEvent` byte-for-byte: the tag key is
+ * `warn` and field names are `snake_case`.
+ */
+export type WarnEvent = {
+  /** A compaction summary failed verification on every attempt and was accepted
+   *  as-is (issue #46). `missing_items` are the preservation-list terms still
+   *  absent from the final summary; `accepted_anyway` is always `true` for this
+   *  variant (the harness never blocks on compaction). */
+  warn: "compaction_verification_failed";
+  missing_items: string[];
+  accepted_anyway: boolean;
+};
+
+/**
+ * One warn-level observability span (issue #46). Carries a {@link SpanBase}
+ * for trace correlation, the classified {@link WarnEvent}, and a hardcoded
+ * `level: "warn"` (constructed via {@link newWarnSpan}). Modeled on
+ * {@link PatchSpan}.
+ */
+export interface WarnSpan {
+  base: SpanBase;
+  event: WarnEvent;
+  /** Always `"warn"`. */
+  level: SpanLevel;
+}
+
+/** Build a warn span. The level is forced to `"warn"`. */
+export function newWarnSpan(base: SpanBase, event: WarnEvent): WarnSpan {
+  return { base, event, level: "warn" };
+}
+
 /** Heterogeneous return type for {@link ObservabilityProvider.getTrace}. */
-export type Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan | PatchSpan;
+export type Span =
+  | TurnSpan
+  | ToolCallSpan
+  | SensorSpan
+  | ContextSpan
+  | MiddlewareSpan
+  | PatchSpan
+  | WarnSpan;
 
 // ============================================================================
 // SessionMetrics
@@ -307,6 +374,11 @@ export interface SessionMetrics {
   patch_rate: number;
   /** Patch count broken down by tool name. */
   patches_by_tool: Record<string, number>;
+  /** Number of compactions whose summary failed verification on every attempt
+   *  and was accepted anyway (issue #46). Derived from {@link WarnSpan}s
+   *  carrying a `compaction_verification_failed` {@link WarnEvent}, mirroring
+   *  how `compactions` is derived from compaction spans. */
+  compaction_verification_failures: number;
 }
 
 // ============================================================================
@@ -371,6 +443,13 @@ export interface ObservabilityProvider {
   /** Record a warn-level tool-call patch event (issue #28). Fire-and-forget
    *  like the other `emit*` methods. */
   emitPatch(span: PatchSpan): void;
+
+  /** Record a warn-level event not tied to a single tool call (issue #46) —
+   *  e.g. an accepted-anyway compaction-verification failure. Fire-and-forget
+   *  like the other `emit*` methods. OPTIONAL: providers predating #46 need not
+   *  implement it; the harness treats a missing `emitWarn` as a no-op, so they
+   *  keep compiling and behave unchanged (rule W4). */
+  emitWarn?(span: WarnSpan): void;
 
   /** Record the terminal outcome for a session so {@link SessionMetrics} can
    *  surface it. The harness calls this once, on a terminal `run` outcome

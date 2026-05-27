@@ -78,6 +78,7 @@ import {
   type SpanStatus,
   type ToolCallSpan,
   type TurnSpan,
+  type WarnSpan,
 } from "./types.js";
 
 const DEFAULT_MAX_SIZE_BYTES = 50 * 1024 * 1024;
@@ -296,6 +297,14 @@ export const TraceLine = {
       patch_type: jsonValue(span.patch_type),
       original_parameters: jsonValue(span.original_parameters),
       patched_parameters: jsonValue(span.patched_parameters),
+    });
+  },
+
+  /** Build a `warn` envelope from a {@link WarnSpan} (issue #46). Warn spans
+   *  are ALWAYS warn-level; the event payload is serialized verbatim. */
+  fromWarn(span: WarnSpan, traceId: string): TraceLine {
+    return envelopeFromBase(span.base, traceId, "warn", "warn", {
+      event: jsonValue(span.event),
     });
   },
 
@@ -683,6 +692,13 @@ export class OutboxObservabilityProvider implements ObservabilityProvider {
     const sid = idToString(span.base.session_id);
     const line = TraceLine.fromPatch(span, this.traceIdLocked(sid));
     this.inner.emitPatch(span);
+    this.writeLine(sid, line);
+  }
+
+  emitWarn(span: WarnSpan): void {
+    const sid = idToString(span.base.session_id);
+    const line = TraceLine.fromWarn(span, this.traceIdLocked(sid));
+    this.inner.emitWarn(span);
     this.writeLine(sid, line);
   }
 
