@@ -12,11 +12,14 @@
 use std::sync::Arc;
 
 use spore_core::agent::mock::MockAgent;
+use spore_core::agent::Context as AgentContext;
 use spore_core::cache_provider::NullCacheProvider;
 use spore_core::context::CompactionConfig;
 use spore_core::harness::testing::NoopContextManager;
 use spore_core::harness::testing::{AllowAllSandbox, AlwaysContinuePolicy, ScriptedToolRegistry};
+use spore_core::harness::BoxFut;
 use spore_core::model::mock::MockModelInterface;
+use spore_core::model::{Content, Role};
 use spore_core::observability::{ContextOperation, InMemoryObservabilityProvider};
 use spore_core::scenarios::ScenarioId;
 use spore_core::scenarios::{
@@ -420,4 +423,99 @@ async fn s4_failing_tool_is_not_always_halt() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Regression: the task instruction must reach the agent as the first user
+// message (issue #57). Unlike `MockAgent`, which ignores its `Context`, this
+// agent records every assembled `Context` so we can assert the model actually
+// receives the prompt. Backed by the real `StandardCompactionAdapter` context
+// manager (via `build_rich_context_manager`), exactly like a live run — the
+// adapter mirrors `session.messages` and ignores `task`, so without the
+// harness seeding the instruction the captured first-turn context is EMPTY and
+// this test fails (which is the bug we are fixing).
+// ---------------------------------------------------------------------------
+
+struct CapturingAgent {
+    id: AgentId,
+    contexts: Arc<std::sync::Mutex<Vec<AgentContext>>>,
+}
+
+impl Agent for CapturingAgent {
+    fn turn<'a>(&'a self, context: AgentContext) -> BoxFut<'a, TurnResult> {
+        self.contexts.lock().unwrap().push(context);
+        Box::pin(async move {
+            TurnResult::FinalResponse {
+                content: "DONE".into(),
+                usage: usage(),
+            }
+        })
+    }
+
+    fn id(&self) -> AgentId {
+        self.id.clone()
+    }
+}
+
+#[tokio::test]
+async fn task_instruction_delivered_as_first_user_message() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = Arc::new(CapturingAgent {
+        id: AgentId::new("capture"),
+        contexts: captured.clone(),
+    });
+
+    // Real compaction-adapter-backed context manager (mirrors session.messages,
+    // ignores `task`), so only the harness seeding can put the prompt on screen.
+    let model = Arc::new(MockModelInterface::new(ProviderInfo {
+        name: "mock".into(),
+        model_id: "mock".into(),
+        context_window: 4096,
+    }));
+    let cfg = CompactionConfig {
+        threshold: 0.80,
+        preserve_recent_n: 2,
+        head_tail_tokens: 64,
+        offload_path: std::path::PathBuf::from(".spore/offload"),
+        max_compaction_attempts: 2,
+    };
+    let cm: Arc<dyn HarnessContextManager> =
+        build_rich_context_manager(model, Arc::new(NullCacheProvider), cfg);
+
+    let harness = build_scenario(
+        ScenarioId::S1,
+        agent as Arc<dyn Agent>,
+        Arc::new(ScriptedToolRegistry::new()) as Arc<dyn HarnessToolRegistry>,
+        Arc::new(AllowAllSandbox),
+        cm,
+        Arc::new(AlwaysContinuePolicy),
+        vec![],
+        None,
+    );
+
+    let instruction = "summarize the quarterly payment report";
+    let task = Task::new(
+        instruction,
+        SessionId::new("seed-test"),
+        LoopStrategy::ReAct { max_iterations: 4 },
+    );
+    let result = harness.run(HarnessRunOptions::new(task)).await;
+    assert!(
+        matches!(result, RunResult::Success { .. }),
+        "expected Success, got {result:?}"
+    );
+
+    let contexts = captured.lock().unwrap();
+    let first = contexts
+        .first()
+        .expect("agent must have been invoked at least once");
+    let has_user_instruction = first.messages.iter().any(|m| {
+        m.role == Role::User && matches!(&m.content, Content::Text { text } if text == instruction)
+    });
+    assert!(
+        has_user_instruction,
+        "first-turn context must contain a User message equal to the task \
+         instruction; got messages: {:?}",
+        first.messages
+    );
 }

@@ -1277,6 +1277,18 @@ impl StandardHarness {
             None => max_iterations,
         };
 
+        // Seed the task instruction as the initial user message of this run.
+        // The compaction adapter intentionally mirrors `session.messages` and
+        // ignores `task` on `assemble`, so the harness must own delivering the
+        // prompt. On a fresh run this turns an otherwise-empty conversation into
+        // a real user turn; on multi-turn runs over a carried `session_state`
+        // each `run()` call appends its own follow-up instruction. Resume paths
+        // do not seed — their conversation already exists.
+        self.config
+            .context_manager
+            .append_user_message(&mut session_state, &task.instruction)
+            .await;
+
         loop {
             // Layer-1 budget gates before the turn.
             if budget_used.turns >= effective_turn_cap {
