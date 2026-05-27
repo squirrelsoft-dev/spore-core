@@ -68,6 +68,22 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 export const DEFAULT_KEEP_ALIVE = "5m";
 
 // ============================================================================
+// Discovery metadata
+// ============================================================================
+
+/**
+ * `/api/show`-discovered metadata for the model. Populated once, alongside the
+ * `/api/tags` availability check. All fields are best-effort — `/api/show`
+ * failures leave them unset rather than failing the call.
+ */
+interface ModelMeta {
+  /** Discovered context window (`*.context_length` in `model_info`). */
+  contextLength?: number;
+  /** Top-level `capabilities` array (may contain `"tools"`). */
+  capabilities: string[];
+}
+
+// ============================================================================
 // OllamaModelInterface
 // ============================================================================
 
@@ -77,8 +93,14 @@ export class OllamaModelInterface implements ModelInterface {
   private readonly timeoutMs: number;
   private readonly keepAlive: string | null;
   private readonly fetchImpl: typeof fetch;
-  /** Lazy availability check — populated after first successful probe. */
-  private modelCheckPromise: Promise<void> | null = null;
+  /** Lazy availability + discovery check — populated after first successful probe. */
+  private modelCheckPromise: Promise<ModelMeta> | null = null;
+  /**
+   * The `/api/show`-discovered metadata, set synchronously once the probe
+   * resolves. Read non-blockingly by {@link provider}. `null` until the first
+   * successful probe completes.
+   */
+  private discoveredMeta: ModelMeta | null = null;
 
   constructor(modelId: string, options: OllamaModelInterfaceOptions = {}) {
     this.modelId = modelId;
@@ -106,11 +128,28 @@ export class OllamaModelInterface implements ModelInterface {
     return 0;
   }
 
+  /**
+   * Best-effort capability table — `llama3.2` / `qwen2.5-coder` / `mistral`
+   * are known to support native tool calling; others may or may not. Used as a
+   * fallback when `/api/show` discovery is unavailable.
+   */
+  static supportsTools(modelId: string): boolean {
+    return (
+      modelId.startsWith("llama3.2") ||
+      modelId.startsWith("qwen2.5-coder") ||
+      modelId.startsWith("mistral")
+    );
+  }
+
   provider(): ProviderInfo {
+    // `provider()` is synchronous so it cannot await `/api/show`. Read the probe
+    // cache non-blockingly: prefer a discovered context length if the probe has
+    // already run; otherwise fall back to the static table.
+    const discovered = this.discoveredMeta?.contextLength;
     return {
       name: "ollama",
       model_id: this.modelId,
-      context_window: OllamaModelInterface.contextWindow(this.modelId),
+      context_window: discovered ?? OllamaModelInterface.contextWindow(this.modelId),
     };
   }
 
@@ -124,7 +163,8 @@ export class OllamaModelInterface implements ModelInterface {
   }
 
   async call(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse> {
-    await this.ensureModelAvailable(signal);
+    const meta = await this.ensureModelAvailable(signal);
+    this.guardToolSupport(request, meta);
     const body = JSON.stringify(buildRequest(this.modelId, this.keepAlive, request, false));
     const url = `${this.baseUrl}/api/chat`;
     let resp: Response;
@@ -146,7 +186,8 @@ export class OllamaModelInterface implements ModelInterface {
   }
 
   async *callStreaming(request: ModelRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
-    await this.ensureModelAvailable(signal);
+    const meta = await this.ensureModelAvailable(signal);
+    this.guardToolSupport(request, meta);
     const body = JSON.stringify(buildRequest(this.modelId, this.keepAlive, request, true));
     const url = `${this.baseUrl}/api/chat`;
     let resp: Response;
@@ -175,7 +216,7 @@ export class OllamaModelInterface implements ModelInterface {
 
   // ── helpers ──────────────────────────────────────────────────────────────
 
-  private async ensureModelAvailable(signal?: AbortSignal): Promise<void> {
+  private async ensureModelAvailable(signal?: AbortSignal): Promise<ModelMeta> {
     if (this.modelCheckPromise != null) {
       return this.modelCheckPromise;
     }
@@ -188,7 +229,14 @@ export class OllamaModelInterface implements ModelInterface {
     return this.modelCheckPromise;
   }
 
-  private async probeModel(signal?: AbortSignal): Promise<void> {
+  /**
+   * One-time availability + discovery probe. Checks `/api/tags` (surfacing a
+   * helpful "ollama pull" message when the model is missing), then —
+   * best-effort — fetches `/api/show` for the context window and capabilities.
+   * Resolves to the discovered {@link ModelMeta} (empty when `/api/show` was
+   * unavailable). `/api/show` failures never fail the probe.
+   */
+  private async probeModel(signal?: AbortSignal): Promise<ModelMeta> {
     const url = `${this.baseUrl}/api/tags`;
     let resp: Response;
     try {
@@ -211,6 +259,69 @@ export class OllamaModelInterface implements ModelInterface {
         404,
         `Model ${this.modelId} not found. Run: ollama pull ${this.modelId}`,
       );
+    }
+    // Best-effort discovery — never fails the call.
+    const meta = await this.discoverMeta(signal);
+    this.discoveredMeta = meta;
+    return meta;
+  }
+
+  /**
+   * Best-effort `POST /api/show` discovery. Resolves to an empty
+   * {@link ModelMeta} on any failure (404, transport error, decode error,
+   * missing fields) so discovery being unavailable never errors the whole call.
+   */
+  private async discoverMeta(signal?: AbortSignal): Promise<ModelMeta> {
+    const url = `${this.baseUrl}/api/show`;
+    const body = JSON.stringify({ model: this.modelId });
+    let resp: Response;
+    try {
+      resp = await this.fetchOnce(url, body, signal);
+    } catch {
+      return { capabilities: [] };
+    }
+    if (!resp.ok) {
+      try {
+        await resp.text();
+      } catch {
+        /* ignore */
+      }
+      return { capabilities: [] };
+    }
+    let parsed: ShowResponse;
+    try {
+      parsed = (await resp.json()) as ShowResponse;
+    } catch {
+      return { capabilities: [] };
+    }
+    const modelInfo = parsed.model_info ?? {};
+    let contextLength: number | undefined;
+    for (const [k, v] of Object.entries(modelInfo)) {
+      if (k.endsWith(".context_length") && typeof v === "number") {
+        contextLength = v;
+        break;
+      }
+    }
+    const capabilities = Array.isArray(parsed.capabilities)
+      ? parsed.capabilities.filter((c): c is string => typeof c === "string")
+      : [];
+    return { contextLength, capabilities };
+  }
+
+  /**
+   * Reject tool-bearing requests when the model does not support tools.
+   * Capability source priority: the `/api/show` `capabilities` array when
+   * discovery succeeded; otherwise the static {@link OllamaModelInterface.supportsTools}
+   * table.
+   */
+  private guardToolSupport(request: ModelRequest, meta: ModelMeta): void {
+    if (request.tools.length === 0) return;
+    const supported =
+      meta.capabilities.length === 0
+        ? OllamaModelInterface.supportsTools(this.modelId)
+        : meta.capabilities.includes("tools");
+    if (!supported) {
+      throw new ProviderError(0, `Model ${this.modelId} does not support tool calling`);
     }
   }
 
@@ -388,6 +499,13 @@ interface TagsResponse {
 
 interface EmbedResponse {
   prompt_eval_count?: number;
+}
+
+interface ShowResponse {
+  /** Map of architecture-specific keys; we look for `*.context_length`. */
+  model_info?: Record<string, unknown>;
+  /** Top-level capabilities array (may contain `"tools"`). */
+  capabilities?: unknown[];
 }
 
 // ============================================================================
