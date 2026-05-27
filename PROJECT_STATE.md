@@ -56,7 +56,14 @@ example and produce a result — not to implement more components.
    compaction via the `Compactions` metric rather than a recomputed utilization. Real
    token reclamation accounting is not yet wired. No issue filed yet — file one if this
    blocks the end-to-end run.
-3. **Go outbox is no longer zero-dependency** — closing #50 (Option A) added
+3. **Only 1 of 5 loop strategies is implemented** — the README and
+   `docs/harness-engineering-concepts.md` advertise five loop strategies, but only
+   **ReAct** is executable. `PlanExecute`, `Ralph`, `SelfVerifying`, and `HillClimbing`
+   are spec'd enum variants that return `HaltReason::StrategyNotYetImplemented` at
+   `rust/crates/spore-core/src/harness.rs:1929-1960`. Now tracked: #59 (PlanExecute),
+   #58 (Ralph), #61 (SelfVerifying), #60 (HillClimbing) — all `scope: deferred` as a
+   post-#57 phase. #57's scenario suite is intentionally ReAct-only.
+4. **Go outbox is no longer zero-dependency** — closing #50 (Option A) added
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod`, walking back the original zero-dep stance for the
    reliability-critical outbox. Accepted and documented in `go/CONVENTIONS.md`; the deps
