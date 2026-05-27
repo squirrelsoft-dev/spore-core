@@ -18,6 +18,7 @@ import (
 	"context"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/guideregistry"
 )
 
@@ -128,6 +129,51 @@ func (a *HarnessObservabilityAdapter) CostFor(usage sporecore.TokenUsage) float6
 	return a.pricing.CostFor(usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.CacheWriteTokens)
 }
 
+// EmitCompaction builds the Compaction ContextSpan for an accepted summary and
+// forwards it (issue #46). Mirrors the Rust reference's accept_compaction span:
+// a root context span with a Compaction operation, tokens_before == tokens_after
+// and zero tokens_reclaimed (the bridge does not surface reclaim accounting).
+func (a *HarnessObservabilityAdapter) EmitCompaction(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	messagesRemoved uint32,
+	tokensBefore uint32,
+) {
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindCompaction, Timestamp(startedAt))
+	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
+	a.provider.EmitContext(ContextSpan{
+		Base:              base,
+		Operation:         NewContextOpCompaction(messagesRemoved, 0),
+		TokensBefore:      tokensBefore,
+		TokensAfter:       tokensBefore,
+		UtilizationBefore: 0,
+		UtilizationAfter:  0,
+	})
+}
+
+// EmitCompactionVerificationFailed builds a WarnSpan and forwards it via the
+// OPTIONAL WarnEmitter surface (issue #46). If the wrapped provider does not
+// implement WarnEmitter, the warn is silently dropped — the Go equivalent of
+// the Rust reference's default-no-op emit_warn, keeping providers predating #46
+// unaffected.
+func (a *HarnessObservabilityAdapter) EmitCompactionVerificationFailed(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	missingItems []string,
+	acceptedAnyway bool,
+) {
+	emitter, ok := a.provider.(WarnEmitter)
+	if !ok {
+		return
+	}
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindWarn, Timestamp(startedAt))
+	emitter.EmitWarn(NewWarnSpan(base, NewWarnCompactionVerificationFailed(missingItems, acceptedAnyway)))
+}
+
 // Compile-time interface check.
 var _ sporecore.HarnessObserver = (*HarnessObservabilityAdapter)(nil)
 
@@ -152,6 +198,10 @@ type HarnessBuilder struct {
 	middleware        sporecore.MiddlewareChain
 	provider          ObservabilityProvider
 	pricing           PricingTable
+	// Compaction loop (issue #46). compactionVerifier defaults to
+	// contextmgr.NewKeyTermVerifier(); maxCompactionAttempts defaults to 2.
+	compactionVerifier    sporecore.CompactionVerifier
+	maxCompactionAttempts uint32
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -164,13 +214,30 @@ func NewHarnessBuilder(
 	terminationPolicy sporecore.TerminationPolicy,
 ) *HarnessBuilder {
 	return &HarnessBuilder{
-		agent:             agent,
-		toolRegistry:      toolRegistry,
-		sandbox:           sandbox,
-		contextManager:    contextManager,
-		terminationPolicy: terminationPolicy,
-		pricing:           DefaultPricing(),
+		agent:                 agent,
+		toolRegistry:          toolRegistry,
+		sandbox:               sandbox,
+		contextManager:        contextManager,
+		terminationPolicy:     terminationPolicy,
+		pricing:               DefaultPricing(),
+		compactionVerifier:    contextmgr.NewKeyTermVerifier(),
+		maxCompactionAttempts: 2,
 	}
+}
+
+// CompactionVerifier injects a post-compaction verifier (issue #46). Defaults
+// to contextmgr.NewKeyTermVerifier().
+func (b *HarnessBuilder) CompactionVerifier(v sporecore.CompactionVerifier) *HarnessBuilder {
+	b.compactionVerifier = v
+	return b
+}
+
+// MaxCompactionAttempts sets the maximum number of compaction-summary attempts
+// before accepting a failing summary anyway (issue #46). Defaults to 2; the
+// loop clamps the effective value to a minimum of 1.
+func (b *HarnessBuilder) MaxCompactionAttempts(n uint32) *HarnessBuilder {
+	b.maxCompactionAttempts = n
+	return b
 }
 
 // Middleware injects a middleware chain.
@@ -204,12 +271,14 @@ func (b *HarnessBuilder) Pricing(p PricingTable) *HarnessBuilder {
 // BuildConfig assembles the HarnessConfig without wrapping it in a harness.
 func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 	cfg := sporecore.HarnessConfig{
-		Agent:             b.agent,
-		ToolRegistry:      b.toolRegistry,
-		Sandbox:           b.sandbox,
-		ContextManager:    b.contextManager,
-		TerminationPolicy: b.terminationPolicy,
-		Middleware:        b.middleware,
+		Agent:                 b.agent,
+		ToolRegistry:          b.toolRegistry,
+		Sandbox:               b.sandbox,
+		ContextManager:        b.contextManager,
+		TerminationPolicy:     b.terminationPolicy,
+		Middleware:            b.middleware,
+		CompactionVerifier:    b.compactionVerifier,
+		MaxCompactionAttempts: b.maxCompactionAttempts,
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserver(b.provider, b.pricing)
