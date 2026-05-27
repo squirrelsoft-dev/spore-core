@@ -122,7 +122,7 @@ none of the keys below appear (they serialize with `skip_serializing_if`).
 
 | kind | additional `gen_ai.*` attributes |
 |---|---|
-| `turn` | `gen_ai.response.role` (`assistant`), `gen_ai.response.content` (model output text), `gen_ai.response.content_truncated` (bool); and, when the turn requested tools, `gen_ai.response.tool_calls` — an array of `{ name, arguments, arguments_truncated }`. Per the maintainer decision, the turn span carries the model **output + requested tool calls only**; the assembled input-message history is NOT plumbed here. |
+| `turn` | `gen_ai.response.role` (`assistant`), `gen_ai.response.content` (model output text), `gen_ai.response.content_truncated` (bool); and, when the turn requested tools, `gen_ai.response.tool_calls` — an array of `{ name, arguments, arguments_truncated }`. **Input prompt:** `gen_ai.prompt` — an ordered array of the assembled INPUT messages the model saw this turn (the full prompt), each `{ role, content, truncated }`. System message first, then conversation history in order. `content` renders `Text` verbatim, `ToolResult` as its result body, an assistant `ToolCall` as `"<name> <compact-json-args>"`, and `Image` as the placeholder `"[image <media_type>]"` — the base64 `data` is NEVER captured. Each `content` is truncated per-field with the same `...[truncated]` marker / byte budget. (Per OTel GenAI semantic conventions the input prompt messages are the canonical content.) |
 | `tool_call` | `gen_ai.tool.name`, `gen_ai.tool.call.arguments` (the tool-call arguments — a JSON value, or a clipped JSON string carrying the marker when truncated), `gen_ai.tool.call.arguments_truncated` (bool), `gen_ai.tool.message.content` (the tool result body), `gen_ai.tool.message.content_truncated` (bool). |
 
 ### OTLP span events
@@ -131,7 +131,11 @@ In addition to the attributes above, the OTLP forwarder emits one **span event
 per message** using the conventional event names — `gen_ai.system.message`,
 `gen_ai.user.message`, `gen_ai.assistant.message`, `gen_ai.tool.message` — each
 carrying `gen_ai.message.role` plus the message content (and, for tool-call
-requests, `gen_ai.tool.name` / `gen_ai.tool.call.arguments`). This is what an
+requests, `gen_ai.tool.name` / `gen_ai.tool.call.arguments`). On a `turn` span,
+the assembled INPUT prompt messages (`gen_ai.prompt`) are emitted as these events
+**first**, in order (system first, then history) — per OTel GenAI conventions the
+input prompt messages are the canonical events — followed by the output event(s)
+(`gen_ai.response.content` and any requested tool calls). This is what an
 LLM-native, OTel-native backend (e.g. Arize Phoenix) renders as the readable
 conversation. The convention is vendor-neutral: the same OTLP stream is portable
 across Phoenix / Langfuse / LangSmith without code changes.

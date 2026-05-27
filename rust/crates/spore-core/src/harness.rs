@@ -66,7 +66,7 @@ use crate::context::{
 };
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
-use crate::model::{Message, StopReason, TokenUsage, ToolCall, ToolSchema};
+use crate::model::{Content, Message, Role, StopReason, TokenUsage, ToolCall, ToolSchema};
 use crate::observability::{
     truncate_field, ContentCaptureConfig, GenAiMessage, GenAiRole, PricingTable, SpanBase, SpanId,
     SpanKind, SpanStatus, ToolCallContent, ToolCallSpan, ToolResultContent, TurnSpan, WarnEvent,
@@ -1213,6 +1213,46 @@ impl StandardHarness {
         }
     }
 
+    /// Snapshot the assembled INPUT messages (the full prompt the model saw)
+    /// into [`GenAiMessage`]s for LLM-native tracing (issue #64). Each message's
+    /// [`Role`] maps to the conventional [`GenAiRole`]; the [`Content`] is
+    /// rendered to a plain string and truncated to `max` bytes:
+    ///   - `Text { text }`        → the text verbatim
+    ///   - `ToolResult(tr)`       → `tr.content` (role stays `Tool`)
+    ///   - `ToolCall(tc)`         → `"<name> <compact-json-args>"` (assistant)
+    ///   - `Image { media_type }` → `"[image <media_type>]"` — NEVER the base64
+    ///
+    /// System-first, then history order is preserved because the assembled
+    /// `messages` already lead with the `Role::System` prompt.
+    fn capture_input_messages(messages: &[Message], max: usize) -> Vec<GenAiMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    Role::System => GenAiRole::System,
+                    Role::User => GenAiRole::User,
+                    Role::Assistant => GenAiRole::Assistant,
+                    Role::Tool => GenAiRole::Tool,
+                };
+                let rendered = match &m.content {
+                    Content::Text { text } => text.clone(),
+                    Content::ToolResult(tr) => tr.content.clone(),
+                    Content::ToolCall(tc) => {
+                        format!("{} {}", tc.name, tc.input)
+                    }
+                    // NEVER dump the base64 `data` — placeholder only.
+                    Content::Image { media_type, .. } => format!("[image {media_type}]"),
+                };
+                let (content, truncated) = truncate_field(&rendered, max);
+                GenAiMessage {
+                    role,
+                    content,
+                    truncated,
+                }
+            })
+            .collect()
+    }
+
     fn budget_exceeded(
         budget: &BudgetLimits,
         used: &BudgetSnapshot,
@@ -1388,6 +1428,18 @@ impl StandardHarness {
             );
             let turn_started_at = Timestamp::now();
             let turn_clock = Instant::now();
+            // LLM-native content capture (issue #64): snapshot the assembled
+            // INPUT messages (the full prompt the model saw) BEFORE `context`
+            // is moved into `agent.turn`. Zero-cost when the guard is off (no
+            // clone of the message history).
+            let input_messages = if self.config.content_capture.enabled {
+                Some(Self::capture_input_messages(
+                    &context.messages,
+                    self.config.content_capture.max_field_len,
+                ))
+            } else {
+                None
+            };
             let result = self.config.agent.turn(context).await;
             budget_used.turns += 1;
             // Emit a turn span for every model call (issue #12). Fire-and-forget;
@@ -1478,6 +1530,7 @@ impl StandardHarness {
                         tool_calls_requested,
                         output_text,
                         tool_calls,
+                        input_messages,
                     });
                 }
                 span_seq += 1;
@@ -2740,6 +2793,133 @@ mod tests {
         assert!(!body.contains("sensitive output"));
         assert!(!body.contains("sensitive result"));
         assert!(!body.contains("\"value\""));
+        // No assembled-input prompt leaked either (issue #64).
+        assert!(!body.contains("gen_ai.prompt"));
+    }
+
+    // ── Input-message capture (issue #64) ──────────────────────────────────
+
+    /// `capture_input_messages` maps each role and renders each Content variant:
+    /// system + user + assistant tool-call + tool result, in order.
+    #[test]
+    fn capture_input_messages_maps_roles_and_renders_content() {
+        use crate::model::{Content, Role, ToolCall as MToolCall, ToolResult as MToolResult};
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: Content::Text {
+                    text: "be helpful".into(),
+                },
+            },
+            Message {
+                role: Role::User,
+                content: Content::Text {
+                    text: "list files".into(),
+                },
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content::ToolCall(MToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({ "command": "ls" }),
+                }),
+            },
+            Message {
+                role: Role::Tool,
+                content: Content::ToolResult(MToolResult {
+                    tool_use_id: "c1".into(),
+                    content: "file.txt".into(),
+                    is_error: false,
+                }),
+            },
+        ];
+        let out = StandardHarness::capture_input_messages(&msgs, 8192);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].role, GenAiRole::System);
+        assert_eq!(out[0].content, "be helpful");
+        assert_eq!(out[1].role, GenAiRole::User);
+        assert_eq!(out[1].content, "list files");
+        assert_eq!(out[2].role, GenAiRole::Assistant);
+        assert_eq!(out[2].content, "shell {\"command\":\"ls\"}");
+        assert_eq!(out[3].role, GenAiRole::Tool);
+        assert_eq!(out[3].content, "file.txt");
+        assert!(out.iter().all(|m| !m.truncated));
+    }
+
+    /// Image content renders as a placeholder — the base64 `data` is NEVER dumped.
+    #[test]
+    fn capture_input_messages_image_renders_placeholder_not_base64() {
+        use crate::model::{Content, Role};
+        let msgs = vec![Message {
+            role: Role::User,
+            content: Content::Image {
+                media_type: "image/png".into(),
+                data: "AAAABBBBCCCCDDDD_secret_base64".into(),
+            },
+        }];
+        let out = StandardHarness::capture_input_messages(&msgs, 8192);
+        assert_eq!(out[0].content, "[image image/png]");
+        assert!(!out[0].content.contains("secret_base64"));
+    }
+
+    /// Truncation applies to rendered input content (byte budget + marker).
+    #[test]
+    fn capture_input_messages_truncates_long_content() {
+        use crate::model::{Content, Role};
+        let long = "x".repeat(100);
+        let msgs = vec![Message {
+            role: Role::User,
+            content: Content::Text { text: long },
+        }];
+        let out = StandardHarness::capture_input_messages(&msgs, 10);
+        assert!(out[0].truncated);
+        assert!(out[0].content.ends_with("...[truncated]"));
+        assert!(out[0].content.starts_with("xxxxxxxxxx"));
+    }
+
+    /// End-to-end: guard ON → the assembled prompt rides as `gen_ai.prompt`
+    /// with the user message present and correct roles.
+    #[tokio::test]
+    async fn content_capture_on_writes_input_messages_to_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        let harness = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .with_observability_outbox(tmp.path())
+        .content_capture(ContentCaptureConfig {
+            enabled: true,
+            max_field_len: 8192,
+        })
+        .build();
+
+        harness.run(HarnessRunOptions::new(react(5))).await;
+
+        let body = std::fs::read_to_string(tmp.path().join("sessions/s1/trace.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let turn = lines
+            .iter()
+            .find(|l| l["kind"] == "turn" && !l["attributes"]["gen_ai.prompt"].is_null())
+            .expect("turn with captured input messages");
+        let prompt = turn["attributes"]["gen_ai.prompt"].as_array().unwrap();
+        assert!(!prompt.is_empty());
+        // The seeded user request is present as a user message.
+        assert!(prompt
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"].as_str().is_some()));
     }
 
     // Rule: parallel tool calls all dispatched in one turn.

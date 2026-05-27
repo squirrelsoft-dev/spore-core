@@ -374,6 +374,12 @@ pub struct TurnSpan {
     /// when content capture is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallContent>>,
+    /// The assembled INPUT messages the model saw this turn — the full prompt
+    /// (issue #64). First element is the system prompt; the rest mirror the
+    /// assembled conversation history in order. Captured only when content
+    /// capture is enabled; `None` keeps the line pre-#64-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_messages: Option<Vec<GenAiMessage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1289,6 +1295,7 @@ mod tests {
             tool_calls_requested: 0,
             output_text: None,
             tool_calls: None,
+            input_messages: None,
         }
     }
 

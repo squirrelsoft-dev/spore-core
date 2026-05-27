@@ -256,6 +256,17 @@ impl TraceLine {
                 serde_json::to_value(calls).unwrap_or(Value::Null),
             ));
         }
+        // Assembled INPUT prompt messages (issue #64). Per the OTel GenAI
+        // semantic conventions the input prompt is the canonical content; ride
+        // it as a `gen_ai.prompt` attribute alongside the metrics so the same
+        // line is readable in an LLM-native backend. Only present when capture
+        // populated it; absent keeps the line pre-#64-identical.
+        if let Some(input) = &span.input_messages {
+            pairs.push((
+                "gen_ai.prompt",
+                serde_json::to_value(input).unwrap_or(Value::Null),
+            ));
+        }
         let attributes = Self::attrs(pairs);
         Self::from_base(&span.base, trace_id, "turn", "info", attributes)
     }
@@ -566,6 +577,36 @@ fn emit_genai_events(line: &TraceLine) -> Vec<(&'static str, Vec<opentelemetry::
     let Some(attrs) = line.attributes.as_object() else {
         return events;
     };
+
+    // Turn INPUT: the assembled prompt messages (issue #64). Per the OTel GenAI
+    // semantic conventions these are the canonical prompt events. Emitted FIRST
+    // and in order (system first, then history) so the trace reads top-to-bottom.
+    if let Some(input) = attrs.get("gen_ai.prompt").and_then(|v| v.as_array()) {
+        for msg in input {
+            let role = msg
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or(GenAiRole::User.as_str());
+            let content = msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let event_name = match role {
+                "system" => GenAiRole::System.event_name(),
+                "assistant" => GenAiRole::Assistant.event_name(),
+                "tool" => GenAiRole::Tool.event_name(),
+                _ => GenAiRole::User.event_name(),
+            };
+            events.push((
+                event_name,
+                vec![
+                    KeyValue::new("gen_ai.message.role", role.to_string()),
+                    KeyValue::new("gen_ai.message.content", content),
+                ],
+            ));
+        }
+    }
 
     // Turn: the assistant's output text + each requested tool call.
     if let Some(content) = attrs
@@ -1127,6 +1168,7 @@ mod tests {
             tool_calls_requested: 1,
             output_text: None,
             tool_calls: None,
+            input_messages: None,
         }
     }
 
@@ -1419,6 +1461,7 @@ mod tests {
         match kind_file {
             "trace_line_turn.json"
             | "trace_line_turn_with_content.json"
+            | "trace_line_turn_with_input.json"
             | "trace_line_turn_truncated.json"
             | "trace_line_turn_content_off.json" => {
                 TraceLine::from_turn(&serde_json::from_value(span.clone()).unwrap(), trace_id)
@@ -1462,6 +1505,7 @@ mod tests {
             "trace_line_session_summary.json",
             // Issue #64 content-capture fixtures.
             "trace_line_turn_with_content.json",
+            "trace_line_turn_with_input.json",
             "trace_line_tool_call_with_content.json",
             "trace_line_turn_truncated.json",
             "trace_line_turn_content_off.json",
@@ -1611,5 +1655,94 @@ mod tests {
         // Content-off turn → no events.
         let empty = TraceLine::from_turn(&turn("s1", "x"), "0af7651916cd43dd8448eb211c80319c");
         assert!(emit_genai_events(&empty).is_empty());
+    }
+
+    /// Guard ON: assembled INPUT messages land as a `gen_ai.prompt` attribute,
+    /// system-first then history order, with roles preserved.
+    #[tokio::test]
+    async fn content_on_turn_emits_input_messages_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obs = provider(tmp.path());
+        let mut t = turn("s1", "sp1");
+        t.input_messages = Some(vec![
+            GenAiMessage {
+                role: GenAiRole::System,
+                content: "sys".into(),
+                truncated: false,
+            },
+            GenAiMessage {
+                role: GenAiRole::User,
+                content: "hi".into(),
+                truncated: false,
+            },
+            GenAiMessage {
+                role: GenAiRole::Assistant,
+                content: "shell {\"command\":\"ls\"}".into(),
+                truncated: false,
+            },
+            GenAiMessage {
+                role: GenAiRole::Tool,
+                content: "file.txt".into(),
+                truncated: false,
+            },
+        ]);
+        obs.emit_turn(t);
+        let l = &read_lines(tmp.path(), "s1")[0];
+        let prompt = l["attributes"]["gen_ai.prompt"].as_array().unwrap();
+        assert_eq!(prompt.len(), 4);
+        assert_eq!(prompt[0]["role"], "system");
+        assert_eq!(prompt[0]["content"], "sys");
+        assert_eq!(prompt[1]["role"], "user");
+        assert_eq!(prompt[2]["role"], "assistant");
+        assert_eq!(prompt[3]["role"], "tool");
+        assert_eq!(prompt[3]["content"], "file.txt");
+    }
+
+    /// Guard OFF: a turn with no captured content carries no `gen_ai.prompt`.
+    #[tokio::test]
+    async fn content_off_emits_no_input_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obs = provider(tmp.path());
+        obs.emit_turn(turn("s1", "sp1"));
+        let l = &read_lines(tmp.path(), "s1")[0];
+        let attrs = l["attributes"].as_object().unwrap();
+        assert!(!attrs.contains_key("gen_ai.prompt"));
+    }
+
+    /// `emit_genai_events` emits one event per INPUT message (conventional
+    /// `gen_ai.<role>.message` names, in order) plus the output event.
+    #[test]
+    fn genai_events_include_input_messages_in_order() {
+        let mut t = turn("s1", "sp1");
+        t.input_messages = Some(vec![
+            GenAiMessage {
+                role: GenAiRole::System,
+                content: "sys".into(),
+                truncated: false,
+            },
+            GenAiMessage {
+                role: GenAiRole::User,
+                content: "hi".into(),
+                truncated: false,
+            },
+            GenAiMessage {
+                role: GenAiRole::Tool,
+                content: "res".into(),
+                truncated: false,
+            },
+        ]);
+        t.output_text = Some(GenAiMessage {
+            role: GenAiRole::Assistant,
+            content: "done".into(),
+            truncated: false,
+        });
+        let line = TraceLine::from_turn(&t, "0af7651916cd43dd8448eb211c80319c");
+        let events = emit_genai_events(&line);
+        // 3 input events + 1 output event.
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].0, "gen_ai.system.message");
+        assert_eq!(events[1].0, "gen_ai.user.message");
+        assert_eq!(events[2].0, "gen_ai.tool.message");
+        assert_eq!(events[3].0, "gen_ai.assistant.message");
     }
 }
