@@ -117,7 +117,14 @@ async fn main() {
     let result = if mock {
         run_mock(scenario, &session_id).await
     } else {
-        run_live(scenario, &session_id, &model_id, &workspace, obs_root).await
+        run_live(
+            scenario,
+            &session_id,
+            &model_id,
+            &workspace,
+            obs_root.clone(),
+        )
+        .await
     };
 
     match result {
@@ -128,6 +135,43 @@ async fn main() {
         other => {
             eprintln!("result     : {other:?}");
             std::process::exit(1);
+        }
+    }
+
+    // Trace info: derive the on-disk JSONL path the outbox provider wrote and
+    // surface the trace_id so the user can jump straight to Grafana/Tempo. Mock
+    // runs use a no-op observability provider and write no JSONL, so guard the
+    // read and print a note instead of panicking. S2 runs twice under one
+    // session_id (one trace dir) — printing the single id once is sufficient.
+    let sid = session_id.as_str();
+    println!("session_id : {sid}");
+    let trace_path = obs_root.join(format!("sessions/{sid}/trace.jsonl"));
+    if mock {
+        println!("trace_path : (mock run — no trace)");
+    } else {
+        match std::fs::read_to_string(&trace_path) {
+            Ok(body) => {
+                let trace_id = body
+                    .lines()
+                    .next()
+                    .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .and_then(|v| v["trace_id"].as_str().map(str::to_string));
+                println!("trace_path : {}", trace_path.display());
+                match trace_id {
+                    Some(id) => {
+                        println!("trace_id   : {id}");
+                        if !endpoint.trim().is_empty() {
+                            println!(
+                                "verify     : curl -s http://localhost:3200/api/traces/{id} | jq '.batches | length'"
+                            );
+                        }
+                    }
+                    None => println!("trace_id   : (trace file empty or unparseable)"),
+                }
+            }
+            Err(_) => {
+                println!("trace_path : {} (not found)", trace_path.display());
+            }
         }
     }
 }
