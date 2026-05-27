@@ -383,4 +383,18 @@ export interface ObservabilityProvider {
   ): Promise<SessionMetrics[]>;
 
   getTrace(sessionId: SessionId): Promise<Span[]>;
+
+  /**
+   * Session ids whose durable outbox has a `trace.jsonl` but no `.flushed`
+   * marker (issue #33). Optional: only the durable-outbox provider has
+   * unflushed on-disk sessions. Providers without a durable outbox return `[]`.
+   */
+  listUnflushedSessions?(): Promise<SessionId[]>;
+
+  /**
+   * Delete a session's durable outbox (issue #33). The provider NEVER
+   * auto-deletes; the caller drives cleanup. Optional: in-memory providers
+   * have nothing to clean up and resolve to a no-op.
+   */
+  cleanupSession?(sessionId: SessionId): Promise<void>;
 }

@@ -7,3 +7,10 @@
 
 export * from "./types.js";
 export { InMemoryObservabilityProvider } from "./in-memory.js";
+export {
+  OutboxObservabilityProvider,
+  SessionNotFoundError,
+  TraceLine,
+  outboxConfig,
+} from "./outbox.js";
+export type { OutboxConfig } from "./outbox.js";
