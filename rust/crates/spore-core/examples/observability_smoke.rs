@@ -57,7 +57,7 @@ async fn main() {
             name: "read_file".into(),
             input: serde_json::json!({ "path": "src/auth.rs" }),
         }],
-        usage: usage.clone(),
+        usage,
     });
     agent.push(TurnResult::FinalResponse {
         content: "fixed the failing test".into(),

@@ -500,7 +500,7 @@ impl ToolRegistry for StandardToolRegistry {
                     .iter()
                     .map(|&i| self.dispatch(calls[i].clone(), sandbox));
                 let outs = futures_util::future::join_all(futs).await;
-                for (slot, out) in concurrent_idx.iter().zip(outs.into_iter()) {
+                for (slot, out) in concurrent_idx.iter().zip(outs) {
                     results[*slot] = Some(out);
                 }
             }
