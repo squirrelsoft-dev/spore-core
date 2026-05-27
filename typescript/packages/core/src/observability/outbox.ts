@@ -377,11 +377,32 @@ class NullOtlpForwarder implements OtlpForwarder {
  * non-blocking. If the SDK is not present this degrades to a no-op and logs a
  * warning — the durable JSONL file remains the source of truth either way.
  */
+// Minimal structural typings for the slice of the OpenTelemetry JS surface
+// used here. The SDK is dynamically imported, so these stand in for the
+// `@opentelemetry/*` type packages (which are intentionally not build deps).
+interface OtelSpan {
+  setAttribute(key: string, value: unknown): void;
+  setStatus(status: { code: number; message?: string }): void;
+  end(): void;
+}
+interface OtelTracer {
+  startSpan(name: string, options?: unknown, context?: unknown): OtelSpan;
+}
+interface OtelApi {
+  trace: {
+    setSpanContext(context: unknown, spanContext: unknown): unknown;
+  };
+  context: unknown;
+  ROOT_CONTEXT: unknown;
+  TraceFlags: { SAMPLED: number };
+  SpanKind: { INTERNAL: number };
+  SpanStatusCode: { OK: number; ERROR: number };
+}
+
 class OtelSdkOtlpForwarder implements OtlpForwarder {
-  // The SDK surface is intentionally untyped (`unknown`) so this module does
-  // not need the @opentelemetry/* type packages at build time.
-  private provider: { forceFlush(): Promise<void>; getTracer(name: string): unknown } | null = null;
-  private tracer: unknown = null;
+  private provider: { forceFlush(): Promise<void> } | null = null;
+  private tracer: OtelTracer | null = null;
+  private api: OtelApi | null = null;
   private readonly ready: Promise<void>;
 
   constructor(private readonly endpoint: string) {
@@ -390,17 +411,19 @@ class OtelSdkOtlpForwarder implements OtlpForwarder {
 
   private async init(): Promise<void> {
     try {
-      const [{ NodeTracerProvider }, { BatchSpanProcessor }, { OTLPTraceExporter }] =
+      const [{ NodeTracerProvider }, { BatchSpanProcessor }, { OTLPTraceExporter }, api] =
         await Promise.all([
           import(/* @vite-ignore */ "@opentelemetry/sdk-trace-node" as string),
           import(/* @vite-ignore */ "@opentelemetry/sdk-trace-base" as string),
           import(/* @vite-ignore */ "@opentelemetry/exporter-trace-otlp-grpc" as string),
+          import(/* @vite-ignore */ "@opentelemetry/api" as string),
         ]);
       const exporter = new OTLPTraceExporter({ url: this.endpoint });
       const provider = new NodeTracerProvider();
       provider.addSpanProcessor(new BatchSpanProcessor(exporter));
       this.provider = provider;
-      this.tracer = provider.getTracer("spore-core");
+      this.tracer = provider.getTracer("spore-core") as OtelTracer;
+      this.api = api as OtelApi;
     } catch (err) {
       console.warn(
         `[spore-core] OpenTelemetry SDK unavailable for '${this.endpoint}'; JSONL only`,
@@ -413,24 +436,44 @@ class OtelSdkOtlpForwarder implements OtlpForwarder {
   forward(line: TraceLine): void {
     // Fire-and-forget: wait for lazy init, then emit into the batch processor.
     void this.ready.then(() => {
-      const tracer = this.tracer as {
-        startSpan(
-          name: string,
-          opts?: unknown,
-        ): { setAttribute(k: string, v: unknown): void; end(): void };
-      } | null;
-      if (!tracer) return;
+      const tracer = this.tracer;
+      const api = this.api;
+      if (!tracer || !api) return;
       try {
-        // The Loki↔Tempo join uses trace_id only; the readable SpanId string is
-        // recorded as an attribute. The derived 8-byte id matches the Rust impl.
-        const span = tracer.startSpan(line.kind);
+        // Force the emitted OTLP span onto the harness 32-hex `trace_id` so all
+        // spans of a session collapse into one Tempo trace under that exact id
+        // (resolved decision #3). Without an explicit parent SpanContext the SDK
+        // would mint a fresh trace id per span and the Loki→Tempo derived-field
+        // join — which opens the trace whose id == the JSONL `trace_id` — would
+        // never resolve. The 8-byte parent span id is derived from the harness
+        // SpanId string by hashing, matching the Rust reference's `forward()`.
+        const parentSpanIdHex = deriveOtlpSpanId(line.span_id).toString("hex");
+        const spanContext = {
+          traceId: line.trace_id,
+          spanId: parentSpanIdHex,
+          traceFlags: api.TraceFlags.SAMPLED,
+          isRemote: true,
+        };
+        const ctx = api.trace.setSpanContext(api.ROOT_CONTEXT, spanContext);
+        const span = tracer.startSpan(line.kind, { kind: api.SpanKind.INTERNAL }, ctx);
+
         span.setAttribute("session_id", line.session_id);
         span.setAttribute("task_id", line.task_id);
         span.setAttribute("level", line.level);
         span.setAttribute("status", line.status);
+        // Harmless cross-ref: the readable harness trace_id / span id string.
         span.setAttribute("trace_id", line.trace_id);
-        span.setAttribute("span_id_hex", deriveOtlpSpanId(line.span_id).toString("hex"));
+        span.setAttribute("span_id_hex", parentSpanIdHex);
         if (line.parent_span_id) span.setAttribute("parent_span_id", line.parent_span_id);
+
+        if (line.status === "ok") {
+          span.setStatus({ code: api.SpanStatusCode.OK });
+        } else {
+          span.setStatus({
+            code: api.SpanStatusCode.ERROR,
+            message: line.status_detail ?? "",
+          });
+        }
         span.end();
       } catch {
         // best-effort; JSONL is durable
