@@ -16,8 +16,12 @@ use spore_core::agent::Context as AgentContext;
 use spore_core::cache_provider::NullCacheProvider;
 use spore_core::context::CompactionConfig;
 use spore_core::harness::testing::NoopContextManager;
-use spore_core::harness::testing::{AllowAllSandbox, AlwaysContinuePolicy, ScriptedToolRegistry};
-use spore_core::harness::BoxFut;
+use spore_core::harness::testing::{
+    AllowAllSandbox, AlwaysContinuePolicy, ScriptedMiddleware, ScriptedToolRegistry,
+};
+use spore_core::harness::{
+    BoxFut, HarnessBuilder, MiddlewareChain, MiddlewareDecision, TerminationPolicy,
+};
 use spore_core::model::mock::MockModelInterface;
 use spore_core::model::{Content, Role};
 use spore_core::observability::{ContextOperation, InMemoryObservabilityProvider};
@@ -28,8 +32,9 @@ use spore_core::scenarios::{
 };
 use spore_core::{
     Agent, AgentId, FullObservabilityProvider, Harness, HarnessContextManager, HarnessRunOptions,
-    HarnessToolRegistry, LoopStrategy, ProviderInfo, RunResult, SandboxProvider, SessionId,
-    SessionState, Task, TokenUsage, ToolCall, ToolOutput, TurnResult,
+    HarnessToolRegistry, HookPoint, HumanRequest, HumanResponse, LoopStrategy, ProviderInfo,
+    RunResult, SandboxProvider, SessionId, SessionState, Task, TokenUsage, ToolCall, ToolOutput,
+    TurnResult,
 };
 
 fn usage() -> TokenUsage {
@@ -517,5 +522,112 @@ async fn task_instruction_delivered_as_first_user_message() {
         "first-turn context must contain a User message equal to the task \
          instruction; got messages: {:?}",
         first.messages
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: resume must NOT re-seed the task instruction (issue #57).
+//
+// Seeding lives on the `run()` entry, NOT in the shared `run_react_inner` that
+// `resume_inner` also calls. To prove resume does not duplicate the prompt we:
+//   1. Pause a fresh run at `BeforeTurn` via a scripted middleware
+//      (`SurfaceToHuman`), so the instruction is seeded exactly once but no
+//      agent turn has run yet.
+//   2. Resume with `HumanResponse::Answer`, which appends the human text and
+//      re-enters `run_react` -> `run_react_inner`.
+//   3. Assert the captured post-resume context contains the task instruction
+//      EXACTLY ONCE. If seeding were in the shared inner path, the resume would
+//      append it a second time and this count would be 2 (test fails).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resume_does_not_reseed_task_instruction() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = Arc::new(CapturingAgent {
+        id: AgentId::new("capture"),
+        contexts: captured.clone(),
+    });
+
+    let model = Arc::new(MockModelInterface::new(ProviderInfo {
+        name: "mock".into(),
+        model_id: "mock".into(),
+        context_window: 4096,
+    }));
+    let cfg = CompactionConfig {
+        threshold: 0.80,
+        preserve_recent_n: 2,
+        head_tail_tokens: 64,
+        offload_path: std::path::PathBuf::from(".spore/offload"),
+        max_compaction_attempts: 2,
+    };
+    let cm: Arc<dyn HarnessContextManager> =
+        build_rich_context_manager(model, Arc::new(NullCacheProvider), cfg);
+
+    // Surface to human on the very first BeforeTurn so the run pauses before any
+    // agent turn. After resume the queue is empty -> Continue everywhere.
+    let mw = Arc::new(ScriptedMiddleware::new());
+    mw.push(
+        HookPoint::BeforeTurn,
+        MiddlewareDecision::SurfaceToHuman {
+            request: HumanRequest::Clarification {
+                question: "proceed?".into(),
+            },
+        },
+    );
+
+    let harness = HarnessBuilder::new(
+        agent as Arc<dyn Agent>,
+        Arc::new(ScriptedToolRegistry::new()) as Arc<dyn HarnessToolRegistry>,
+        Arc::new(AllowAllSandbox),
+        cm,
+        Arc::new(AlwaysContinuePolicy) as Arc<dyn TerminationPolicy>,
+    )
+    .middleware(mw as Arc<dyn MiddlewareChain>)
+    .build();
+
+    let instruction = "summarize the quarterly payment report";
+    let task = Task::new(
+        instruction,
+        SessionId::new("resume-test"),
+        LoopStrategy::ReAct { max_iterations: 4 },
+    );
+
+    // Fresh run: seeds the instruction once, then pauses at BeforeTurn.
+    let paused = match harness.run(HarnessRunOptions::new(task)).await {
+        RunResult::WaitingForHuman { state, .. } => *state,
+        other => panic!("expected WaitingForHuman pause, got {other:?}"),
+    };
+
+    // Resume with a human answer; this re-enters run_react via run_react_inner.
+    let result = harness
+        .resume(
+            paused,
+            HumanResponse::Answer {
+                text: "yes, proceed".into(),
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(result, RunResult::Success { .. }),
+        "expected Success after resume, got {result:?}"
+    );
+
+    // The post-resume turn must see the instruction exactly once.
+    let contexts = captured.lock().unwrap();
+    let post_resume = contexts.first().expect("agent must have run after resume");
+    let instruction_count = post_resume
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && matches!(&m.content, Content::Text { text } if text == instruction)
+        })
+        .count();
+    assert_eq!(
+        instruction_count, 1,
+        "task instruction must appear exactly once after resume (re-seeding \
+         in the shared inner path would make it 2); got messages: {:?}",
+        post_resume.messages
     );
 }

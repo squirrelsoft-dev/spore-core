@@ -1277,18 +1277,6 @@ impl StandardHarness {
             None => max_iterations,
         };
 
-        // Seed the task instruction as the initial user message of this run.
-        // The compaction adapter intentionally mirrors `session.messages` and
-        // ignores `task` on `assemble`, so the harness must own delivering the
-        // prompt. On a fresh run this turns an otherwise-empty conversation into
-        // a real user turn; on multi-turn runs over a carried `session_state`
-        // each `run()` call appends its own follow-up instruction. Resume paths
-        // do not seed — their conversation already exists.
-        self.config
-            .context_manager
-            .append_user_message(&mut session_state, &task.instruction)
-            .await;
-
         loop {
             // Layer-1 budget gates before the turn.
             if budget_used.turns >= effective_turn_cap {
@@ -1963,11 +1951,25 @@ impl StandardHarness {
             on_stream,
             session_state,
         } = options;
-        let session_state = session_state.unwrap_or_default();
+        let mut session_state = session_state.unwrap_or_default();
         let budget_used = BudgetSnapshot::default();
 
         match task.loop_strategy.clone() {
             LoopStrategy::ReAct { max_iterations } => {
+                // Seed the task instruction as the initial user message of this
+                // FRESH run only. The compaction adapter intentionally mirrors
+                // `session.messages` and ignores `task` on `assemble`, so the
+                // harness must own delivering the prompt. On a fresh run this
+                // turns an otherwise-empty conversation into a real user turn;
+                // on multi-turn runs over a carried `session_state` each `run()`
+                // call appends its own follow-up instruction. This lives on the
+                // `run()` entry — NOT in the shared `run_react_inner` — so that
+                // `resume_inner` (which also calls `run_react`) does not
+                // re-append the instruction after the human's response.
+                self.config
+                    .context_manager
+                    .append_user_message(&mut session_state, &task.instruction)
+                    .await;
                 self.run_react(task, max_iterations, session_state, budget_used, on_stream)
                     .await
             }
