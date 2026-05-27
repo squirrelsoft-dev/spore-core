@@ -432,7 +432,11 @@ pub fn build_scenario(
         // Honor SPORE_TRACE_CONTENT / SPORE_TRACE_CONTENT_MAX_LEN (#64) so a live
         // run can capture gen_ai.* conversation + tool content for Phoenix.
         // Defaults OFF when the env var is unset.
-        .content_capture(crate::ContentCaptureConfig::from_env());
+        .content_capture(crate::ContentCaptureConfig::from_env())
+        // Tool-call repair: weak models (e.g. llama3.2) emit stringified args
+        // ("false" for a bool, a string for a sequence); deterministic coercion
+        // repairs and re-dispatches so the agent recovers instead of looping.
+        .tool_call_repair(Arc::new(crate::tool_call_repair::StandardToolCallRepair));
     let builder = match observability {
         Some(obs) => builder.observability(obs),
         None => builder,
