@@ -728,6 +728,12 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
         self.write_line(&sid, line);
     }
 
+    fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
+        // Forward to the in-memory roll-up so the trailing `session` summary
+        // line written by `flush_session` reflects the terminal outcome.
+        self.inner.set_session_outcome(session_id, outcome);
+    }
+
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
         Box::pin(async move {
             // Build the trailing session summary line from rolled-up metrics.

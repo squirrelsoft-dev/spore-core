@@ -60,13 +60,14 @@ pub use guide_registry::{
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
-    CommandOutput, FileRef, HaltReason, Harness, HarnessConfig, HarnessError, HarnessRunOptions,
-    HookPoint, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain,
-    MiddlewareDecision, ModelConfig, NetworkPolicy, ObservabilityProvider, Operation,
-    OptimizationDirection, PausedState, RiskLevel, RunResult, SandboxProvider, SandboxViolation,
-    SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
-    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
-    ToolResult as HarnessToolResult, TruncatedOutput,
+    CommandOutput, ContextManager as HarnessContextManager, FileRef, HaltReason, Harness,
+    HarnessBuilder, HarnessConfig, HarnessError, HarnessRunOptions, HookPoint, HumanRequest,
+    HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig,
+    NetworkPolicy, ObservabilityProvider, Operation, OptimizationDirection, PausedState, RiskLevel,
+    RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState, StandardHarness,
+    StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
+    ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult,
+    TruncatedOutput,
 };
 pub use memory::{
     EpisodicMemory, MemoryError, MemoryId, MemoryItem, MemoryProvider, MemoryQuery, MemorySource,

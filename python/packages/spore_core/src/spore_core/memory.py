@@ -73,6 +73,17 @@ def new_timestamp(s: str) -> Timestamp:
     return Timestamp(s)
 
 
+def now() -> Timestamp:
+    """Current wall-clock time as an RFC 3339 timestamp string.
+
+    Mirrors Rust's ``Timestamp::now``. Used by the harness to stamp span
+    start/end times."""
+    from datetime import datetime, timezone
+
+    dt = datetime.now(tz=timezone.utc)
+    return Timestamp(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
 # ============================================================================
 # Pydantic base
 # ============================================================================

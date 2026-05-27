@@ -372,6 +372,11 @@ export interface ObservabilityProvider {
    *  like the other `emit*` methods. */
   emitPatch(span: PatchSpan): void;
 
+  /** Record the terminal outcome for a session so {@link SessionMetrics} can
+   *  surface it. The harness calls this once, on a terminal `run` outcome
+   *  (never on a `WaitingForHuman` pause). */
+  setSessionOutcome(sessionId: SessionId, outcome: SessionOutcome): void;
+
   flushSession(sessionId: SessionId): Promise<void>;
 
   getSessionMetrics(sessionId: SessionId): Promise<SessionMetrics | undefined>;

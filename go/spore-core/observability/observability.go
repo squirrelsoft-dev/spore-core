@@ -560,6 +560,11 @@ type ObservabilityProvider interface {
 	// Fire-and-forget like the other EmitX methods.
 	EmitPatch(span PatchSpan)
 
+	// SetSessionOutcome records the terminal outcome for a session so
+	// SessionMetrics can surface it. The harness calls this once, after the
+	// terminal turn (mirrors the Rust trait's set_session_outcome).
+	SetSessionOutcome(sessionID SessionID, outcome SessionOutcome)
+
 	// FlushSession is idempotent — calling it twice for the same session
 	// is a no-op the second time. Spans remain queryable after flush.
 	FlushSession(ctx context.Context, sessionID SessionID) error

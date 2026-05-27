@@ -50,6 +50,7 @@ issue lands its canonical definition will replace the stub here.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -69,6 +70,7 @@ from .agent import (
 from .model import (
     Message,
     ModelParams,
+    StopReason,
     TokenUsage,
     ToolCall,
     ToolSchema,
@@ -783,13 +785,13 @@ class HarnessMiddlewareChain(Protocol):
     async def fire(self, hook: HookPoint, session: SessionState) -> MiddlewareDecision: ...
 
 
-@runtime_checkable
-class LegacyObservabilityProvider(Protocol):
-    """Legacy per-turn observability sink retained for the existing harness
-    integration. The full :class:`spore_core.observability.ObservabilityProvider`
-    surface (issue #12) lives in ``spore_core.observability``."""
-
-    async def record_turn(self, turn: int, usage: TokenUsage) -> None: ...
+# Issue #12 — ``ObservabilityProvider`` is no longer a per-turn no-op stub
+# here. The canonical Protocol lives in :mod:`spore_core.observability`; the
+# harness loop emits real spans (turn spans, child tool-call spans) through it
+# and flushes on terminal outcomes. It is imported at the bottom of this module
+# (after this module's own types are defined) to avoid a circular import, since
+# :mod:`spore_core.observability` imports :class:`SessionId` / :class:`TaskId`
+# from here. See the deferred import block alongside the middleware import.
 
 
 # ============================================================================
@@ -942,6 +944,35 @@ from .middleware import (  # noqa: E402
     MiddlewareSurfaceToHuman,
 )
 
+# Canonical observability surface (issue #12). Imported here, after this
+# module's identity types are defined, because :mod:`spore_core.observability`
+# imports :class:`SessionId` / :class:`TaskId` from this module — a top-level
+# import would be circular. The harness loop emits real spans through this
+# provider and flushes on terminal outcomes (mirrors the Rust ``run_react``
+# wrapper). The durable-outbox provider is used by
+# :meth:`HarnessBuilder.with_observability_outbox`.
+from .guide_registry import (  # noqa: E402
+    SessionOutcome,
+    SessionOutcomeFailure,
+    SessionOutcomeSuccess,
+)
+from .memory import now as _now  # noqa: E402
+from .observability import (  # noqa: E402
+    ObservabilityProvider,
+    PricingTable,
+    SpanBase,
+    SpanKind,
+    SpanStatusError,
+    SpanStatusOk,
+    ToolCallSpan,
+    TurnSpan,
+    new_span_id,
+)
+from .observability_outbox import (  # noqa: E402
+    OutboxConfig,
+    OutboxObservabilityProvider,
+)
+
 # ============================================================================
 # HarnessRunOptions
 # ============================================================================
@@ -1003,7 +1034,8 @@ class HarnessConfig:
         context_manager: ContextManager,
         termination_policy: TerminationPolicy,
         middleware: HarnessMiddlewareChain | None = None,
-        observability: LegacyObservabilityProvider | None = None,
+        observability: ObservabilityProvider | None = None,
+        pricing: PricingTable | None = None,
     ) -> None:
         self.agent = agent
         self.tool_registry = tool_registry
@@ -1012,6 +1044,80 @@ class HarnessConfig:
         self.termination_policy = termination_policy
         self.middleware = middleware
         self.observability = observability
+        # Token → USD pricing used to stamp ``cost_usd`` on emitted turn spans.
+        # Defaults to :attr:`PricingTable.DEFAULT` (zero cost) when unset.
+        self.pricing: PricingTable = pricing if pricing is not None else PricingTable.DEFAULT
+
+
+class HarnessBuilder:
+    """Fluent assembler for a :class:`HarnessConfig` / :class:`StandardHarness`.
+
+    Mirrors the Rust ``HarnessBuilder``. The harness follows strict inversion
+    of control: every component is injected. The builder takes the five
+    required components up front and exposes fluent setters for the optional
+    ones (middleware, observability, pricing), including the durable outbox via
+    :meth:`with_observability_outbox`.
+    """
+
+    def __init__(
+        self,
+        agent: Agent,
+        tool_registry: ToolRegistry,
+        sandbox: SandboxProvider,
+        context_manager: ContextManager,
+        termination_policy: TerminationPolicy,
+    ) -> None:
+        self._agent = agent
+        self._tool_registry = tool_registry
+        self._sandbox = sandbox
+        self._context_manager = context_manager
+        self._termination_policy = termination_policy
+        self._middleware: HarnessMiddlewareChain | None = None
+        self._observability: ObservabilityProvider | None = None
+        self._pricing: PricingTable = PricingTable.DEFAULT
+
+    def middleware(self, middleware: HarnessMiddlewareChain) -> HarnessBuilder:
+        """Inject a middleware chain."""
+        self._middleware = middleware
+        return self
+
+    def observability(self, observability: ObservabilityProvider) -> HarnessBuilder:
+        """Inject an observability provider. The harness loop emits real spans
+        through it (turn spans, tool-call spans) and flushes on terminal
+        outcomes."""
+        self._observability = observability
+        return self
+
+    def with_observability_outbox(self, root: str | Path) -> HarnessBuilder:
+        """Construct and inject a durable-outbox observability provider rooted
+        at ``root`` (typically the ``.spore`` directory). Honors the
+        ``SPORE_OTLP_ENDPOINT`` env var for OTLP forwarding (issue #33)."""
+        provider = OutboxObservabilityProvider(OutboxConfig(root=Path(root)))
+        return self.observability(provider)
+
+    def pricing(self, pricing: PricingTable) -> HarnessBuilder:
+        """Set the token → USD pricing table used to stamp ``cost_usd`` on
+        turn spans."""
+        self._pricing = pricing
+        return self
+
+    def build_config(self) -> HarnessConfig:
+        """Assemble the :class:`HarnessConfig` without wrapping it in a
+        harness."""
+        return HarnessConfig(
+            agent=self._agent,
+            tool_registry=self._tool_registry,
+            sandbox=self._sandbox,
+            context_manager=self._context_manager,
+            termination_policy=self._termination_policy,
+            middleware=self._middleware,
+            observability=self._observability,
+            pricing=self._pricing,
+        )
+
+    def build(self) -> StandardHarness:
+        """Assemble a ready-to-run :class:`StandardHarness`."""
+        return StandardHarness(self.build_config())
 
 
 class StandardHarness:
@@ -1171,6 +1277,19 @@ class StandardHarness:
         )
         return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
 
+    # ---- observability finalization ---------------------------------
+
+    async def _finalize_observability(self, session_id: SessionId, outcome: SessionOutcome) -> None:
+        """Record the terminal outcome and flush the observability session.
+        Called at every terminal ``_run_react`` outcome (success or any halt)
+        — never on a ``WaitingForHuman`` pause, which is not terminal. No-op
+        when no provider is configured. Mirrors Rust's
+        ``finalize_observability``."""
+        obs = self._config.observability
+        if obs is not None:
+            obs.set_session_outcome(session_id, outcome)
+            await obs.flush_session(session_id)
+
     # ---- ReAct loop -------------------------------------------------
 
     async def _run_react(
@@ -1181,9 +1300,38 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
     ) -> RunResult:
+        """Drive the ReAct loop, then finalize observability for terminal
+        outcomes. A ``WaitingForHuman`` pause is not terminal, so it is never
+        flushed here — the eventual ``resume`` reaches a terminal outcome and
+        flushes then. Mirrors Rust's ``run_react`` wrapper."""
+        result = await self._run_react_inner(
+            task, max_iterations, session_state, budget_used, on_stream
+        )
+        if isinstance(result, RunResultSuccess):
+            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
+        elif isinstance(result, RunResultFailure):
+            await self._finalize_observability(
+                result.session_id,
+                SessionOutcomeFailure(reason=result.reason.kind),
+            )
+        # RunResultWaitingForHuman: not terminal, do not finalize.
+        return result
+
+    async def _run_react_inner(
+        self,
+        task: Task,
+        max_iterations: int,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
         session_id = task.session_id
         started_at = time.monotonic()
         usage = AggregateUsage()
+        # Monotonic per-run span counter for tool-call span ids, and the most
+        # recent turn span base — the parent for that turn's tool-call spans.
+        span_seq = 0
+        current_turn_base: SpanBase | None = None
         if task.budget.max_turns is not None:
             effective_turn_cap = min(task.budget.max_turns, max_iterations)
         else:
@@ -1237,18 +1385,65 @@ class StandardHarness:
             # Assemble + invoke agent for one turn.
             context = await config.context_manager.assemble(session_state, task)
             self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
+            turn_started_at = _now()
+            turn_clock = time.monotonic()
             result: TurnResult = await config.agent.turn(context)
             budget_used.turns += 1
 
+            # Emit a turn span for every model call (issue #12). Fire-and-forget;
+            # it never affects control flow. The span base is retained as the
+            # parent for any tool-call spans dispatched this turn.
+            zero = TokenUsage()
+            if isinstance(result, ToolCallRequested | FinalResponse):
+                u = result.usage
+            elif isinstance(result, TurnError):
+                u = result.usage or zero
+            else:
+                u = zero
+            if isinstance(result, FinalResponse):
+                stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+            elif isinstance(result, ToolCallRequested):
+                stop_reason, tool_calls_requested = StopReason.TOOL_USE, len(result.calls)
+            else:
+                stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+            turn_base = SpanBase.new_root(
+                new_span_id(f"{session_id}-turn-{budget_used.turns}"),
+                session_id,
+                task.id,
+                SpanKind.TURN,
+                turn_started_at,
+            )
+            turn_status: SpanStatusOk | SpanStatusError
+            if isinstance(result, TurnError):
+                turn_status = SpanStatusError(message=result.error.kind)
+            else:
+                turn_status = SpanStatusOk()
+            turn_base.finish(
+                _now(),
+                turn_status,
+                int((time.monotonic() - turn_clock) * 1000),
+            )
             if config.observability is not None:
-                zero = TokenUsage()
-                if isinstance(result, ToolCallRequested | FinalResponse):
-                    u = result.usage
-                elif isinstance(result, TurnError):
-                    u = result.usage or zero
-                else:
-                    u = zero
-                await config.observability.record_turn(budget_used.turns, u)
+                config.observability.emit_turn(
+                    TurnSpan(
+                        base=turn_base,
+                        turn_number=budget_used.turns,
+                        input_tokens=u.input_tokens,
+                        output_tokens=u.output_tokens,
+                        cache_read_tokens=u.cache_read_tokens,
+                        cache_write_tokens=u.cache_write_tokens,
+                        cost_usd=config.pricing.cost_for(
+                            u.input_tokens,
+                            u.output_tokens,
+                            u.cache_read_tokens,
+                            u.cache_write_tokens,
+                        ),
+                        stop_reason=stop_reason,
+                        tool_calls_requested=tool_calls_requested,
+                    )
+                )
+            span_seq += 1
+            current_turn_base = turn_base
 
             self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns))
 
@@ -1378,6 +1573,8 @@ class StandardHarness:
                         continue
 
                     self._emit(on_stream, StreamToolCall(call_id=call.id, name=call.name))
+                    tool_started_at = _now()
+                    tool_clock = time.monotonic()
                     output = await config.tool_registry.dispatch(call)
 
                     # Subagent pause propagation.
@@ -1406,6 +1603,56 @@ class StandardHarness:
                             usage,
                             budget_used.turns,
                         )
+
+                    # Tool-call span (issue #12), child of the current turn.
+                    if config.observability is not None:
+                        if isinstance(output, ToolOutputSuccess):
+                            output_size_bytes = len(output.content)
+                            out_truncated = output.truncated
+                        elif isinstance(output, ToolOutputError):
+                            output_size_bytes = len(output.message)
+                            out_truncated = False
+                        else:
+                            output_size_bytes = 0
+                            out_truncated = False
+                        span_id = new_span_id(f"{session_id}-tool-{span_seq}")
+                        if current_turn_base is not None:
+                            tool_base = SpanBase.new_child(
+                                span_id, current_turn_base, SpanKind.TOOL_CALL, tool_started_at
+                            )
+                        else:
+                            tool_base = SpanBase.new_root(
+                                span_id,
+                                session_id,
+                                task.id,
+                                SpanKind.TOOL_CALL,
+                                tool_started_at,
+                            )
+                        tool_status: SpanStatusOk | SpanStatusError = (
+                            SpanStatusError(message="tool returned a recoverable error")
+                            if is_error
+                            else SpanStatusOk()
+                        )
+                        tool_base.finish(
+                            _now(),
+                            tool_status,
+                            int((time.monotonic() - tool_clock) * 1000),
+                        )
+                        config.observability.emit_tool_call(
+                            ToolCallSpan(
+                                base=tool_base,
+                                tool_name=call.name,
+                                call_id=call.id,
+                                parameters_size_bytes=len(
+                                    json.dumps(call.input, separators=(",", ":"))
+                                ),
+                                output_size_bytes=output_size_bytes,
+                                truncated=out_truncated,
+                                sandbox_mode="",
+                                sandbox_violations=[],
+                            )
+                        )
+                        span_seq += 1
 
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     self._emit(
@@ -1596,6 +1843,7 @@ __all__ = [
     "HaltReasonTerminationPolicyHalt",
     "HaltReasonUnrecoverableToolError",
     "Harness",
+    "HarnessBuilder",
     "HarnessConfig",
     "HarnessRunOptions",
     "HarnessStreamEvent",
@@ -1628,7 +1876,6 @@ __all__ = [
     "MiddlewareSurfaceToHuman",
     "ModelConfig",
     "NoopContextManager",
-    "LegacyObservabilityProvider",
     "OptimizationDirection",
     "PausedState",
     "RiskLevel",
