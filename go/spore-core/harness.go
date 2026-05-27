@@ -867,9 +867,72 @@ type MiddlewareChain interface {
 	Fire(ctx context.Context, hook HookPoint, session *SessionState) MiddlewareDecision
 }
 
-// ObservabilityProvider (#12) records per-turn telemetry. No-op by default.
-type ObservabilityProvider interface {
-	RecordTurn(ctx context.Context, turn uint32, usage TokenUsage)
+// HarnessObserver (#12) is the consumer-side observability seam the ReAct
+// loop emits through.
+//
+// The canonical, full ObservabilityProvider (EmitTurn/EmitToolCall/
+// FlushSession/...) and its span types live in the `observability`
+// subpackage. That package imports this root package (it aliases SessionID,
+// TaskID, StopReason from here), so the root package CANNOT import
+// `observability` back — doing so is a compile-time import cycle. Following
+// the project's consumer-side-interface convention, the loop therefore emits
+// through this narrow interface, expressed entirely in root-package types.
+// The `observability` package supplies the adapter
+// (observability.NewHarnessObserver) that builds the real spans and forwards
+// to an observability.ObservabilityProvider.
+//
+// Mirrors the Rust reference's in-loop span emission: a TurnSpan after every
+// agent turn, a child ToolCallSpan after each tool dispatch, and a terminal
+// SetSessionOutcome + FlushSession finalize on Success/Failure (never on a
+// WaitingForHuman pause).
+//
+// Methods that take no context are fire-and-forget and must never block or
+// affect control flow.
+type HarnessObserver interface {
+	// EmitTurn records one agent turn. spanID is the caller-chosen,
+	// stable turn span id (mirrors Rust's "{session}-turn-{n}"); the adapter
+	// returns it as the parent handle for this turn's tool-call spans.
+	// errorMessage is non-empty only when the turn errored.
+	EmitTurn(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		turnNumber uint32,
+		startedAt string,
+		durationMs uint64,
+		usage TokenUsage,
+		costUSD float64,
+		stopReason StopReason,
+		toolCallsRequested uint32,
+		errorMessage string,
+	)
+
+	// EmitToolCall records one tool dispatch as a child of parentSpanID.
+	EmitToolCall(
+		spanID string,
+		parentSpanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		toolName string,
+		callID string,
+		startedAt string,
+		durationMs uint64,
+		parametersSizeBytes uint64,
+		outputSizeBytes uint64,
+		truncated bool,
+		isError bool,
+	)
+
+	// SetSessionOutcome records the terminal outcome (success / failure).
+	SetSessionOutcome(sessionID SessionID, success bool, failureReason string)
+
+	// FlushSession flushes the durable session record.
+	FlushSession(ctx context.Context, sessionID SessionID)
+
+	// CostFor computes USD cost for a turn using the observer's pricing.
+	// The loop calls this so cost is stamped at emit time (per spec); kept
+	// on the seam so the root package needs no PricingTable type.
+	CostFor(usage TokenUsage) float64
 }
 
 // ============================================================================
@@ -1358,8 +1421,14 @@ type HarnessConfig struct {
 	Sandbox           SandboxProvider
 	ContextManager    ContextManager
 	TerminationPolicy TerminationPolicy
-	Middleware        MiddlewareChain       // optional
-	Observability     ObservabilityProvider // optional
+	Middleware        MiddlewareChain // optional
+	// Observability is the loop's span-emission seam. Optional; when nil
+	// the loop emits nothing. The token→USD pricing used to stamp cost on
+	// turn spans is held by the observer (see HarnessObserver.CostFor) — it
+	// cannot live here because PricingTable is defined in the
+	// `observability` package, which the root package cannot import (cycle).
+	// The builder in `observability` wires pricing into the observer.
+	Observability HarnessObserver // optional
 }
 
 // StandardHarness is the canonical Harness implementation.
@@ -1434,8 +1503,80 @@ func strategyNotImplemented(task Task, strategy string) RunResult {
 	}
 }
 
-// runReAct is the workhorse loop for LoopStrategy ReAct.
+// nowRFC3339 returns the current UTC time as an RFC3339 string — the
+// timestamp form every span carries (mirrors guideregistry.nowTimestamp and
+// the observability backend's lexical timestamps).
+func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// finalizeObservability records the terminal outcome and flushes the session.
+// Called at every terminal runReAct outcome (Success or any Failure) — never
+// on a WaitingForHuman pause, which is not terminal. No-op when no observer is
+// configured. Mirrors the Rust `finalize_observability` wrapper.
+func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID SessionID, success bool, failureReason string) {
+	if h.config.Observability == nil {
+		return
+	}
+	h.config.Observability.SetSessionOutcome(sessionID, success, failureReason)
+	h.config.Observability.FlushSession(ctx, sessionID)
+}
+
+// runReAct drives the ReAct loop, then finalizes observability for terminal
+// outcomes. A WaitingForHuman pause is not terminal, so it is never flushed
+// here — the eventual Resume path reaches a terminal outcome and flushes then.
+// Mirrors the Rust `run_react` thin wrapper over `run_react_inner`.
 func (h *StandardHarness) runReAct(
+	ctx context.Context,
+	task Task,
+	maxIterations uint32,
+	session SessionState,
+	budget BudgetSnapshot,
+	onStream StreamSink,
+) RunResult {
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
+	switch result.Kind {
+	case RunSuccess:
+		h.finalizeObservability(ctx, result.SessionID, true, "")
+	case RunFailure:
+		h.finalizeObservability(ctx, result.SessionID, false, haltReasonString(result.Reason))
+	case RunWaitingForHuman:
+		// Not terminal — do not flush.
+	}
+	return result
+}
+
+// haltReasonString renders a HaltReason for the failure-outcome reason string,
+// mirroring Rust's `format!("{reason:?}")`.
+func haltReasonString(r HaltReason) string {
+	switch r.Kind {
+	case HaltBudgetExceeded:
+		return fmt.Sprintf("budget exceeded: %s", r.LimitType)
+	case HaltTerminationPolicyHalt:
+		return fmt.Sprintf("termination policy halt: %s", r.Reason)
+	case HaltMiddlewareHalt:
+		return fmt.Sprintf("middleware halt at %s: %s", r.Hook, r.Reason)
+	case HaltAgentError:
+		if r.AgentError != nil {
+			return fmt.Sprintf("agent error: %s", r.AgentError.Error())
+		}
+		return "agent error"
+	case HaltSandboxViolation:
+		if r.Violation != nil {
+			return fmt.Sprintf("sandbox violation: %s", r.Violation.Error())
+		}
+		return "sandbox violation"
+	case HaltUnrecoverableToolError:
+		return fmt.Sprintf("unrecoverable tool error (%s): %s", r.Tool, r.Error)
+	case HaltHumanHalted:
+		return "human halted"
+	case HaltStrategyNotYetImplemented:
+		return fmt.Sprintf("strategy not yet implemented: %s", r.Strategy)
+	default:
+		return string(r.Kind)
+	}
+}
+
+// runReActInner is the workhorse loop for LoopStrategy ReAct.
+func (h *StandardHarness) runReActInner(
 	ctx context.Context,
 	task Task,
 	maxIterations uint32,
@@ -1446,6 +1587,11 @@ func (h *StandardHarness) runReAct(
 	sessionID := task.SessionID
 	startedAt := time.Now()
 	usage := AggregateUsage{}
+
+	// Monotonic per-run span counter for tool-call span ids, and the parent
+	// span id of the most recent turn (parents this turn's tool-call spans).
+	var spanSeq uint64
+	var currentTurnSpanID string
 
 	effectiveTurnCap := maxIterations
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
@@ -1504,15 +1650,57 @@ func (h *StandardHarness) runReAct(
 		// Assemble + invoke agent for one turn.
 		c := h.config.ContextManager.Assemble(ctx, &session, &task)
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
+		turnStartedAt := nowRFC3339()
+		turnClock := time.Now()
 		result := h.config.Agent.Turn(ctx, c)
 		budget.Turns++
+		// Emit a turn span for every model call (issue #12). Fire-and-forget;
+		// it never affects control flow. The span id is retained as the
+		// parent for any tool-call spans dispatched this turn. EmitMiddleware/
+		// EmitSensor/EmitContext are intentionally NOT wired here: middleware
+		// spans are a separate forward-decl and there are no sensor/context
+		// call sites in the ReAct loop; EmitPatch is handled in the patch
+		// middleware. This mirrors the Rust reference's loop emission.
+		turnSpanID := fmt.Sprintf("%s-turn-%d", sessionID, budget.Turns)
 		if h.config.Observability != nil {
 			var u TokenUsage
 			if result.Usage != nil {
 				u = *result.Usage
 			}
-			h.config.Observability.RecordTurn(ctx, budget.Turns, u)
+			var (
+				stopReason         StopReason
+				toolCallsRequested uint32
+				errMsg             string
+			)
+			switch result.Kind {
+			case TurnFinalResponse:
+				stopReason = StopEndTurn
+			case TurnToolCallRequested:
+				stopReason = StopToolUse
+				toolCallsRequested = uint32(len(result.Calls))
+			case TurnError:
+				stopReason = StopEndTurn
+				if result.Err != nil {
+					errMsg = result.Err.Error()
+				}
+			default:
+				stopReason = StopEndTurn
+			}
+			h.config.Observability.EmitTurn(
+				turnSpanID,
+				sessionID,
+				task.ID,
+				budget.Turns,
+				turnStartedAt,
+				uint64(time.Since(turnClock).Milliseconds()),
+				u,
+				h.config.Observability.CostFor(u),
+				stopReason,
+				toolCallsRequested,
+				errMsg,
+			)
 		}
+		currentTurnSpanID = turnSpanID
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns})
 
 		switch result.Kind {
@@ -1657,6 +1845,8 @@ func (h *StandardHarness) runReAct(
 				emit(onStream, HarnessStreamEvent{
 					Kind: HarnessStreamToolCall, CallID: call.ID, Name: call.Name,
 				})
+				toolStartedAt := nowRFC3339()
+				toolClock := time.Now()
 				output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
 
 				// Pause propagation: WaitingForHuman from a subagent tool.
@@ -1688,6 +1878,37 @@ func (h *StandardHarness) runReAct(
 						},
 						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 					}
+				}
+
+				// Tool-call span (issue #12), child of the current turn.
+				if h.config.Observability != nil {
+					var outputSize uint64
+					switch output.Kind {
+					case ToolOutputSuccess:
+						outputSize = uint64(len(output.Content))
+					case ToolOutputError:
+						outputSize = uint64(len(output.Message))
+					}
+					var paramsSize uint64
+					if call.Input != nil {
+						paramsSize = uint64(len(call.Input))
+					}
+					toolSpanID := fmt.Sprintf("%s-tool-%d", sessionID, spanSeq)
+					h.config.Observability.EmitToolCall(
+						toolSpanID,
+						currentTurnSpanID,
+						sessionID,
+						task.ID,
+						call.Name,
+						call.ID,
+						toolStartedAt,
+						uint64(time.Since(toolClock).Milliseconds()),
+						paramsSize,
+						outputSize,
+						output.Truncated,
+						isError,
+					)
+					spanSeq++
 				}
 
 				tr := HarnessToolResult{CallID: call.ID, Output: output}

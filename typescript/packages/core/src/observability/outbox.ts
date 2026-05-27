@@ -686,6 +686,12 @@ export class OutboxObservabilityProvider implements ObservabilityProvider {
     this.writeLine(sid, line);
   }
 
+  /** Record the terminal outcome for a session; forwards to the wrapped
+   *  in-memory provider so the trailing `session` summary line reflects it. */
+  setSessionOutcome(sessionId: SessionId, outcome: SessionOutcome): void {
+    this.inner.setSessionOutcome(sessionId, outcome);
+  }
+
   async flushSession(sessionId: SessionId): Promise<void> {
     const sid = sessionId.asString();
 

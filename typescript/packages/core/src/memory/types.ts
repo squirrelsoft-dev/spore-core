@@ -50,6 +50,15 @@ export class Timestamp {
   static of(value: string): Timestamp {
     return new Timestamp(value);
   }
+  /**
+   * Current wall-clock time as an RFC 3339 UTC string with millisecond
+   * precision (e.g. `2026-05-26T18:00:00.123Z`), matching the trace schema and
+   * the Rust `Timestamp::now()`. Spans compare lexically; OTLP backends restamp
+   * at export time.
+   */
+  static now(): Timestamp {
+    return new Timestamp(new Date().toISOString());
+  }
   asString(): string {
     return this.value;
   }

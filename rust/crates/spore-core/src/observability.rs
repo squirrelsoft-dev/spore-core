@@ -483,6 +483,15 @@ pub trait ObservabilityProvider: Send + Sync {
     /// like the other `emit_*` methods.
     fn emit_patch(&self, span: PatchSpan);
 
+    /// Record the terminal [`SessionOutcome`] for a session so the trailing
+    /// `session` summary line (and [`SessionMetrics`]) reflect it. The harness
+    /// calls this once, immediately before [`flush_session`](Self::flush_session),
+    /// at every terminal run outcome. Default: no-op — providers that do not
+    /// roll up per-session metrics can ignore it.
+    fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
+        let _ = (session_id, outcome);
+    }
+
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()>;
 
     fn get_session_metrics<'a>(
@@ -559,16 +568,6 @@ struct Store {
 impl InMemoryObservabilityProvider {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Record the terminal outcome for a session so [`SessionMetrics`] can
-    /// surface it. The harness calls this once, after `fire_after_session`.
-    pub fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
-        self.inner
-            .lock()
-            .unwrap()
-            .outcomes
-            .insert(session_id.clone(), outcome);
     }
 
     /// All recorded patch spans for a session, in insertion order (issue #28).
@@ -667,6 +666,14 @@ impl ObservabilityProvider for InMemoryObservabilityProvider {
             span.base.span_id.clone(),
         );
         s.patches.push(span);
+    }
+
+    fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
+        self.inner
+            .lock()
+            .unwrap()
+            .outcomes
+            .insert(session_id.clone(), outcome);
     }
 
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
@@ -871,6 +878,9 @@ impl<T: ObservabilityProvider + ?Sized> ObservabilityProvider for Arc<T> {
     }
     fn emit_patch(&self, span: PatchSpan) {
         (**self).emit_patch(span)
+    }
+    fn set_session_outcome(&self, session_id: &SessionId, outcome: SessionOutcome) {
+        (**self).set_session_outcome(session_id, outcome)
     }
     fn flush_session<'a>(&'a self, session_id: &'a SessionId) -> BoxFut<'a, ()> {
         (**self).flush_session(session_id)

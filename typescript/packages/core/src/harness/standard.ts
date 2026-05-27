@@ -15,6 +15,21 @@
  */
 
 import type { Agent } from "../agent/interface.js";
+import type { SessionOutcome } from "../guide-registry/types.js";
+import { Timestamp } from "../memory/types.js";
+import type { StopReason, TokenUsage } from "../model/schemas.js";
+import {
+  PricingTable,
+  SpanId,
+  finishSpanBase,
+  newChildSpanBase,
+  newRootSpanBase,
+  type SpanBase,
+  type SpanStatus,
+  type ToolCallSpan,
+  type TurnSpan,
+} from "../observability/types.js";
+import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 
 import type { Harness } from "./interface.js";
 import {
@@ -57,6 +72,12 @@ export interface HarnessConfig {
   terminationPolicy: TerminationPolicy;
   middleware?: MiddlewareChain;
   observability?: ObservabilityProvider;
+  /**
+   * Token → USD pricing used to stamp `cost_usd` on emitted {@link TurnSpan}s.
+   * Optional; the loop falls back to {@link PricingTable.DEFAULT} (zero cost)
+   * when unset, mirroring Rust's `pricing: PricingTable::DEFAULT`.
+   */
+  pricing?: PricingTable;
 }
 
 export class StandardHarness implements Harness {
@@ -178,7 +199,63 @@ export class StandardHarness implements Harness {
   // ReAct loop
   // --------------------------------------------------------------------------
 
+  /**
+   * Record the terminal outcome and flush the observability session. Called at
+   * every terminal `runReact` outcome (success or any halt) — never on a
+   * `WaitingForHuman` pause, which is not terminal. No-op when no provider is
+   * configured. Mirrors Rust's `finalize_observability`.
+   */
+  private async finalizeObservability(
+    sessionId: SessionId,
+    outcome: SessionOutcome,
+  ): Promise<void> {
+    const obs = this.config.observability;
+    if (obs) {
+      obs.setSessionOutcome(sessionId, outcome);
+      await obs.flushSession(sessionId);
+    }
+  }
+
+  /**
+   * Drive the ReAct loop, then finalize observability for terminal outcomes. A
+   * `WaitingForHuman` pause is not terminal, so it is never flushed here — the
+   * eventual `resume` path reaches a terminal outcome and flushes then. Mirrors
+   * Rust's `run_react` / `run_react_inner` split.
+   */
   private async runReact(
+    task: Task,
+    maxIterations: number,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    const result = await this.runReactInner(
+      task,
+      maxIterations,
+      sessionState,
+      budgetUsed,
+      onStream,
+      signal,
+    );
+    switch (result.kind) {
+      case "success":
+        await this.finalizeObservability(result.session_id, { kind: "success" });
+        break;
+      case "failure":
+        await this.finalizeObservability(result.session_id, {
+          kind: "failure",
+          reason: haltReasonToString(result.reason),
+        });
+        break;
+      case "waiting_for_human":
+        // Not terminal — do not finalize.
+        break;
+    }
+    return result;
+  }
+
+  private async runReactInner(
     task: Task,
     maxIterations: number,
     sessionState: SessionState,
@@ -189,6 +266,11 @@ export class StandardHarness implements Harness {
     const sessionId = task.session_id;
     const startedAt = Date.now();
     const usage: AggregateUsage = emptyAggregateUsage();
+    const pricing = this.config.pricing ?? PricingTable.DEFAULT;
+    // Monotonic per-run span counter for turn / tool-call span ids, and the most
+    // recent turn span base — parent for the tool-call spans of that turn.
+    let spanSeq = 0;
+    let currentTurnBase: SpanBase | undefined;
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
@@ -253,17 +335,74 @@ export class StandardHarness implements Harness {
       // Assemble + invoke agent for one turn.
       const context = await this.config.contextManager.assemble(sessionState, task, signal);
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
+      const turnStartedAt = Timestamp.now();
+      const turnClock = Date.now();
       const result = await this.config.agent.turn(context, signal);
       budgetUsed.turns += 1;
 
-      // Record turn usage in observability (zero usage for typed error w/o usage).
-      if (this.config.observability) {
-        const zero = { input_tokens: 0, output_tokens: 0 };
+      // Emit a turn span for every model call (issue #12). Fire-and-forget; it
+      // never affects control flow. The span base is retained as the parent for
+      // any tool-call spans dispatched this turn.
+      {
+        const zero: TokenUsage = { input_tokens: 0, output_tokens: 0 };
         const u =
           result.kind === "tool_call_requested" || result.kind === "final_response"
             ? result.usage
             : (result.usage ?? zero);
-        await this.config.observability.recordTurn(budgetUsed.turns, u);
+        let stopReason: StopReason;
+        let toolCallsRequested: number;
+        switch (result.kind) {
+          case "final_response":
+            stopReason = "end_turn";
+            toolCallsRequested = 0;
+            break;
+          case "tool_call_requested":
+            stopReason = "tool_use";
+            toolCallsRequested = result.calls.length;
+            break;
+          default:
+            stopReason = "end_turn";
+            toolCallsRequested = 0;
+            break;
+        }
+        const status: SpanStatus =
+          result.kind === "error"
+            ? { kind: "error", message: JSON.stringify(result.error) }
+            : { kind: "ok" };
+        const base = finishSpanBase(
+          newRootSpanBase(
+            SpanId.of(`${sessionId.asString()}-turn-${budgetUsed.turns}`),
+            sessionId,
+            task.id,
+            "turn",
+            turnStartedAt,
+          ),
+          Timestamp.now(),
+          status,
+          Date.now() - turnClock,
+        );
+        if (this.config.observability) {
+          const turnSpan: TurnSpan = {
+            base,
+            turn_number: budgetUsed.turns,
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.cache_read_tokens ?? null,
+            cache_write_tokens: u.cache_write_tokens ?? null,
+            cost_usd: PricingTable.costFor(
+              pricing,
+              u.input_tokens,
+              u.output_tokens,
+              u.cache_read_tokens,
+              u.cache_write_tokens,
+            ),
+            stop_reason: stopReason,
+            tool_calls_requested: toolCallsRequested,
+          };
+          this.config.observability.emitTurn(turnSpan);
+        }
+        spanSeq += 1;
+        currentTurnBase = base;
       }
       emit(onStream, { kind: "turn_end", turn: budgetUsed.turns });
 
@@ -421,6 +560,8 @@ export class StandardHarness implements Harness {
             }
 
             emit(onStream, { kind: "tool_call", call_id: call.id, name: call.name });
+            const toolStartedAt = Timestamp.now();
+            const toolClock = Date.now();
             const output: ToolOutput = await this.config.toolRegistry.dispatch(call, signal);
 
             // WaitingForHuman from subagent tool
@@ -457,6 +598,39 @@ export class StandardHarness implements Harness {
             }
 
             const isError = output.kind === "error";
+
+            // Tool-call span (issue #12), child of the current turn. Fire-and-forget.
+            if (this.config.observability) {
+              let outputSizeBytes = 0;
+              let truncated = false;
+              if (output.kind === "success") {
+                outputSizeBytes = output.content.length;
+                truncated = output.truncated ?? false;
+              } else if (output.kind === "error") {
+                outputSizeBytes = output.message.length;
+              }
+              const spanId = SpanId.of(`${sessionId.asString()}-tool-${spanSeq}`);
+              const childBase =
+                currentTurnBase != null
+                  ? newChildSpanBase(spanId, currentTurnBase, "tool_call", toolStartedAt)
+                  : newRootSpanBase(spanId, sessionId, task.id, "tool_call", toolStartedAt);
+              const status: SpanStatus = isError
+                ? { kind: "error", message: "tool returned a recoverable error" }
+                : { kind: "ok" };
+              const toolSpan: ToolCallSpan = {
+                base: finishSpanBase(childBase, Timestamp.now(), status, Date.now() - toolClock),
+                tool_name: call.name,
+                call_id: call.id,
+                parameters_size_bytes: JSON.stringify(call.input).length,
+                output_size_bytes: outputSizeBytes,
+                truncated,
+                sandbox_mode: "",
+                sandbox_violations: [],
+              };
+              this.config.observability.emitToolCall(toolSpan);
+              spanSeq += 1;
+            }
+
             const tr: ToolResultRecord = { call_id: call.id, output };
             emit(onStream, { kind: "tool_result", call_id: call.id, is_error: isError });
             await this.config.contextManager.appendToolResult(sessionState, tr);
@@ -503,6 +677,86 @@ export class StandardHarness implements Harness {
 }
 
 // ============================================================================
+// HarnessBuilder
+// ============================================================================
+
+/**
+ * Fluent assembler for a {@link HarnessConfig} / {@link StandardHarness}.
+ *
+ * The harness follows strict inversion of control: every component is injected.
+ * `HarnessBuilder` takes the five required components up front and exposes
+ * fluent setters for the optional ones (middleware, observability, pricing).
+ * It is the intended caller that wires the {@link ObservabilityProvider} into
+ * the loop, including the durable outbox via {@link withObservabilityOutbox}.
+ * Mirrors Rust's `HarnessBuilder`.
+ *
+ * Note (issue #12): the harness deliberately does NOT emit `emitMiddleware` /
+ * `emitSensor` / `emitContext` from the loop — middleware uses a separate
+ * forward-declared surface and there are no sensor/context call sites here.
+ * `emitPatch` is emitted by the patch middleware separately.
+ */
+export class HarnessBuilder {
+  private _middleware?: MiddlewareChain;
+  private _observability?: ObservabilityProvider;
+  private _pricing: PricingTable = PricingTable.DEFAULT;
+
+  constructor(
+    private readonly agent: Agent,
+    private readonly toolRegistry: ToolRegistry,
+    private readonly sandbox: SandboxProvider,
+    private readonly contextManager: ContextManager,
+    private readonly terminationPolicy: TerminationPolicy,
+  ) {}
+
+  /** Inject a middleware chain. */
+  middleware(middleware: MiddlewareChain): this {
+    this._middleware = middleware;
+    return this;
+  }
+
+  /** Inject an observability provider. The harness loop emits real spans through
+   *  it (turn spans, tool-call spans) and flushes on terminal outcomes. */
+  observability(provider: ObservabilityProvider): this {
+    this._observability = provider;
+    return this;
+  }
+
+  /** Convenience: construct and inject a durable-outbox observability provider
+   *  rooted at `root` (typically the `.spore` directory). */
+  withObservabilityOutbox(root: string): this {
+    this._observability = new OutboxObservabilityProvider(
+      outboxConfig(root, { flushOnSessionEnd: true }),
+    );
+    return this;
+  }
+
+  /** Set the token → USD pricing table used to stamp `cost_usd` on turn spans. */
+  pricing(table: PricingTable): this {
+    this._pricing = table;
+    return this;
+  }
+
+  /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
+  buildConfig(): HarnessConfig {
+    return {
+      agent: this.agent,
+      toolRegistry: this.toolRegistry,
+      sandbox: this.sandbox,
+      contextManager: this.contextManager,
+      terminationPolicy: this.terminationPolicy,
+      middleware: this._middleware,
+      observability: this._observability,
+      pricing: this._pricing,
+    };
+  }
+
+  /** Assemble a ready-to-run {@link StandardHarness}. */
+  build(): StandardHarness {
+    return new StandardHarness(this.buildConfig());
+  }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -517,6 +771,12 @@ function failure(
   turns: number,
 ): RunResult {
   return { kind: "failure", reason, session_id: sessionId, usage, turns };
+}
+
+/** Derive the `SessionOutcome.failure.reason` string from a {@link HaltReason}.
+ *  Mirrors Rust's `format!("{reason:?}")` for the failure outcome. */
+function haltReasonToString(reason: HaltReason): string {
+  return JSON.stringify(reason);
 }
 
 function notYetImplemented(strategy: string, sessionId: SessionId): RunResult {

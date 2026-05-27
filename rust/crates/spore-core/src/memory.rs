@@ -66,6 +66,67 @@ impl Timestamp {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Current wall-clock time as an RFC 3339 UTC string with millisecond
+    /// precision (e.g. `2026-05-26T18:00:00.123Z`), matching the trace schema.
+    ///
+    /// Implemented with `std` only (no `chrono`/`time` dependency) via Howard
+    /// Hinnant's `civil_from_days` algorithm. Spans compare lexically, so this
+    /// is monotonic enough for ordering; OTLP backends restamp at export time.
+    pub fn now() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self::new(Self::format_rfc3339(
+            dur.as_secs() as i64,
+            dur.subsec_millis(),
+        ))
+    }
+
+    /// Format `secs` since the Unix epoch plus `millis` as RFC 3339 UTC.
+    /// Exposed at crate level so deterministic tests can pin a value.
+    pub(crate) fn format_rfc3339(secs: i64, millis: u32) -> String {
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        // civil_from_days (Hinnant): days since 1970-01-01 → (y, m, d).
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+        let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
+    }
+}
+
+#[cfg(test)]
+mod timestamp_now_tests {
+    use super::Timestamp;
+
+    #[test]
+    fn format_rfc3339_matches_known_epoch() {
+        // 2026-05-26T18:00:00.123Z = 1779818400 s since epoch.
+        assert_eq!(
+            Timestamp::format_rfc3339(1_779_818_400, 123),
+            "2026-05-26T18:00:00.123Z"
+        );
+        // Unix epoch.
+        assert_eq!(Timestamp::format_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn now_is_rfc3339_shaped() {
+        let s = Timestamp::now().0;
+        assert_eq!(s.len(), 24, "expected YYYY-MM-DDTHH:MM:SS.mmmZ, got {s}");
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+    }
 }
 
 // ============================================================================

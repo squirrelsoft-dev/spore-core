@@ -60,7 +60,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::{Agent, AgentError, Context, TurnResult};
-use crate::model::{Message, TokenUsage, ToolCall, ToolSchema};
+use crate::guide_registry::SessionOutcome;
+use crate::memory::Timestamp;
+use crate::model::{Message, StopReason, TokenUsage, ToolCall, ToolSchema};
+use crate::observability::{
+    PricingTable, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan,
+};
+use crate::observability_outbox::{OutboxConfig, OutboxObservabilityProvider};
 
 /// Boxed future alias used to make the component traits `dyn`-compatible.
 /// `trait_variant::make(Send)` generates RPITIT which is not dyn-safe; the
@@ -676,13 +682,10 @@ pub trait MiddlewareChain: Send + Sync {
     ) -> BoxFut<'a, MiddlewareDecision>;
 }
 
-/// Issue #12 — ObservabilityProvider. Stubbed to a no-op by default.
-pub trait ObservabilityProvider: Send + Sync {
-    fn record_turn<'a>(&'a self, turn: u32, usage: &'a TokenUsage) -> BoxFut<'a, ()> {
-        let _ = (turn, usage);
-        Box::pin(async {})
-    }
-}
+// Issue #12 — `ObservabilityProvider` is no longer a no-op stub here. The
+// canonical trait lives in [`crate::observability`]; the harness loop emits
+// real spans through it (see `run_react`). Re-exported below for ergonomics.
+pub use crate::observability::ObservabilityProvider;
 
 // ============================================================================
 // Human-in-the-loop
@@ -887,6 +890,9 @@ pub struct HarnessConfig {
     pub termination_policy: Arc<dyn TerminationPolicy>,
     pub middleware: Option<Arc<dyn MiddlewareChain>>,
     pub observability: Option<Arc<dyn ObservabilityProvider>>,
+    /// Token → USD pricing used to stamp `cost_usd` on emitted [`TurnSpan`]s.
+    /// Defaults to [`PricingTable::DEFAULT`] (zero cost) when unset.
+    pub pricing: PricingTable,
 }
 
 impl Clone for HarnessConfig {
@@ -899,7 +905,113 @@ impl Clone for HarnessConfig {
             termination_policy: self.termination_policy.clone(),
             middleware: self.middleware.clone(),
             observability: self.observability.clone(),
+            pricing: self.pricing.clone(),
         }
+    }
+}
+
+/// Fluent assembler for a [`HarnessConfig`] / [`StandardHarness`].
+///
+/// The harness follows strict inversion of control: every component is
+/// injected. `HarnessBuilder` is the canonical assembly point — it takes the
+/// required components up front and exposes fluent setters for the optional
+/// ones (middleware, observability, pricing). It is the intended caller that
+/// wires the [`ObservabilityProvider`] into the loop, including the durable
+/// outbox via [`with_observability_outbox`](Self::with_observability_outbox).
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use spore_core::{HarnessBuilder, PricingTable};
+/// # fn demo(
+/// #     agent: Arc<dyn spore_core::Agent>,
+/// #     tools: Arc<dyn spore_core::HarnessToolRegistry>,
+/// #     sandbox: Arc<dyn spore_core::SandboxProvider>,
+/// #     ctx: Arc<dyn spore_core::HarnessContextManager>,
+/// #     term: Arc<dyn spore_core::TerminationPolicy>,
+/// # ) {
+/// let harness = HarnessBuilder::new(agent, tools, sandbox, ctx, term)
+///     .with_observability_outbox(".spore")
+///     .pricing(PricingTable::DEFAULT)
+///     .build();
+/// # }
+/// ```
+pub struct HarnessBuilder {
+    agent: Arc<dyn Agent>,
+    tool_registry: Arc<dyn ToolRegistry>,
+    sandbox: Arc<dyn SandboxProvider>,
+    context_manager: Arc<dyn ContextManager>,
+    termination_policy: Arc<dyn TerminationPolicy>,
+    middleware: Option<Arc<dyn MiddlewareChain>>,
+    observability: Option<Arc<dyn ObservabilityProvider>>,
+    pricing: PricingTable,
+}
+
+impl HarnessBuilder {
+    /// Start a builder from the five required components. Optional components
+    /// default to `None`/[`PricingTable::DEFAULT`] until set.
+    pub fn new(
+        agent: Arc<dyn Agent>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        sandbox: Arc<dyn SandboxProvider>,
+        context_manager: Arc<dyn ContextManager>,
+        termination_policy: Arc<dyn TerminationPolicy>,
+    ) -> Self {
+        Self {
+            agent,
+            tool_registry,
+            sandbox,
+            context_manager,
+            termination_policy,
+            middleware: None,
+            observability: None,
+            pricing: PricingTable::DEFAULT,
+        }
+    }
+
+    /// Inject a middleware chain.
+    pub fn middleware(mut self, middleware: Arc<dyn MiddlewareChain>) -> Self {
+        self.middleware = Some(middleware);
+        self
+    }
+
+    /// Inject an observability provider. The harness loop emits real spans
+    /// through it (turn spans, tool-call spans) and flushes on terminal outcomes.
+    pub fn observability(mut self, observability: Arc<dyn ObservabilityProvider>) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Convenience: construct and inject a durable-outbox observability provider
+    /// rooted at `root` (typically the `.spore` directory). Honors the
+    /// `SPORE_OTLP_ENDPOINT` env var for OTLP forwarding (issue #33).
+    pub fn with_observability_outbox(self, root: impl Into<std::path::PathBuf>) -> Self {
+        let provider = Arc::new(OutboxObservabilityProvider::new(OutboxConfig::new(root)));
+        self.observability(provider)
+    }
+
+    /// Set the token→USD pricing table used to stamp `cost_usd` on turn spans.
+    pub fn pricing(mut self, pricing: PricingTable) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// Assemble the [`HarnessConfig`] without wrapping it in a harness.
+    pub fn build_config(self) -> HarnessConfig {
+        HarnessConfig {
+            agent: self.agent,
+            tool_registry: self.tool_registry,
+            sandbox: self.sandbox,
+            context_manager: self.context_manager,
+            termination_policy: self.termination_policy,
+            middleware: self.middleware,
+            observability: self.observability,
+            pricing: self.pricing,
+        }
+    }
+
+    /// Assemble a ready-to-run [`StandardHarness`].
+    pub fn build(self) -> StandardHarness {
+        StandardHarness::new(self.build_config())
     }
 }
 
@@ -910,6 +1022,11 @@ pub struct StandardHarness {
 impl StandardHarness {
     pub fn new(config: HarnessConfig) -> Self {
         Self { config }
+    }
+
+    /// Read-only access to the assembled config (used by builder tests).
+    pub fn config(&self) -> &HarnessConfig {
+        &self.config
     }
 
     fn emit(stream: &Option<StreamSink>, event: StreamEvent) {
@@ -951,7 +1068,53 @@ impl StandardHarness {
         None
     }
 
+    /// Record the terminal outcome and flush the observability session. Called
+    /// at every terminal `run_react` outcome (success or any halt) — never on a
+    /// `WaitingForHuman` pause, which is not terminal. No-op when no provider is
+    /// configured.
+    async fn finalize_observability(&self, session_id: &SessionId, outcome: SessionOutcome) {
+        if let Some(obs) = self.config.observability.as_ref() {
+            obs.set_session_outcome(session_id, outcome);
+            obs.flush_session(session_id).await;
+        }
+    }
+
+    /// Drive the ReAct loop, then finalize observability for terminal outcomes.
+    /// A `WaitingForHuman` pause is not terminal, so it is never flushed here —
+    /// the eventual `resume` path reaches a terminal outcome and flushes then.
     async fn run_react(
+        &self,
+        task: Task,
+        max_iterations: u32,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        let result = self
+            .run_react_inner(task, max_iterations, session_state, budget_used, on_stream)
+            .await;
+        match &result {
+            RunResult::Success { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Success)
+                    .await;
+            }
+            RunResult::Failure {
+                session_id, reason, ..
+            } => {
+                self.finalize_observability(
+                    session_id,
+                    SessionOutcome::Failure {
+                        reason: format!("{reason:?}"),
+                    },
+                )
+                .await;
+            }
+            RunResult::WaitingForHuman { .. } => {}
+        }
+        result
+    }
+
+    async fn run_react_inner(
         &self,
         task: Task,
         max_iterations: u32,
@@ -962,6 +1125,13 @@ impl StandardHarness {
         let session_id = task.session_id.clone();
         let started_at = Instant::now();
         let mut usage = AggregateUsage::default();
+        // Monotonic per-run span counter for turn / tool-call span ids, and the
+        // most recent turn span — parent for the tool-call spans of that turn.
+        let mut span_seq: u64 = 0;
+        // Set on every turn before any tool dispatch; the initial `None` only
+        // covers the (unreachable) case of a tool span with no preceding turn.
+        #[allow(unused_assignments)]
+        let mut current_turn_base: Option<SpanBase> = None;
         let effective_turn_cap = match task.budget.max_turns {
             Some(t) => t.min(max_iterations),
             None => max_iterations,
@@ -1038,16 +1208,69 @@ impl StandardHarness {
                     turn: budget_used.turns + 1,
                 },
             );
+            let turn_started_at = Timestamp::now();
+            let turn_clock = Instant::now();
             let result = self.config.agent.turn(context).await;
             budget_used.turns += 1;
-            if let Some(obs) = self.config.observability.as_ref() {
+            // Emit a turn span for every model call (issue #12). Fire-and-forget;
+            // it never affects control flow. The span base is retained as the
+            // parent for any tool-call spans dispatched this turn.
+            {
                 let zero = TokenUsage::default();
                 let u = match &result {
                     TurnResult::ToolCallRequested { usage, .. }
                     | TurnResult::FinalResponse { usage, .. } => usage,
                     TurnResult::Error { usage, .. } => usage.as_ref().unwrap_or(&zero),
                 };
-                obs.record_turn(budget_used.turns, u).await;
+                let (stop_reason, tool_calls_requested) = match &result {
+                    TurnResult::FinalResponse { .. } => (StopReason::EndTurn, 0),
+                    TurnResult::ToolCallRequested { calls, .. } => {
+                        (StopReason::ToolUse, calls.len() as u32)
+                    }
+                    TurnResult::Error { .. } => (StopReason::EndTurn, 0),
+                };
+                let mut base = SpanBase::new_root(
+                    SpanId::new(format!(
+                        "{}-turn-{}",
+                        session_id.as_str(),
+                        budget_used.turns
+                    )),
+                    session_id.clone(),
+                    task.id.clone(),
+                    SpanKind::Turn,
+                    turn_started_at,
+                );
+                let status = match &result {
+                    TurnResult::Error { error, .. } => SpanStatus::Error {
+                        message: format!("{error:?}"),
+                    },
+                    _ => SpanStatus::Ok,
+                };
+                base.finish(
+                    Timestamp::now(),
+                    status,
+                    turn_clock.elapsed().as_millis() as u64,
+                );
+                if let Some(obs) = self.config.observability.as_ref() {
+                    obs.emit_turn(TurnSpan {
+                        base: base.clone(),
+                        turn_number: budget_used.turns,
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_read_tokens: u.cache_read_tokens,
+                        cache_write_tokens: u.cache_write_tokens,
+                        cost_usd: self.config.pricing.cost_for(
+                            u.input_tokens,
+                            u.output_tokens,
+                            u.cache_read_tokens,
+                            u.cache_write_tokens,
+                        ),
+                        stop_reason,
+                        tool_calls_requested,
+                    });
+                }
+                span_seq += 1;
+                current_turn_base = Some(base);
             }
             Self::emit(
                 &on_stream,
@@ -1232,6 +1455,8 @@ impl StandardHarness {
                                 name: call.name.clone(),
                             },
                         );
+                        let tool_started_at = Timestamp::now();
+                        let tool_clock = Instant::now();
                         let output = self.config.tool_registry.dispatch(call.clone()).await;
 
                         // Pause propagation: WaitingForHuman from a subagent tool.
@@ -1275,6 +1500,57 @@ impl StandardHarness {
                                 usage,
                                 turns: budget_used.turns,
                             };
+                        }
+
+                        // Tool-call span (issue #12), child of the current turn.
+                        if let Some(obs) = self.config.observability.as_ref() {
+                            let (output_size_bytes, truncated) = match &output {
+                                ToolOutput::Success { content, truncated } => {
+                                    (content.len(), *truncated)
+                                }
+                                ToolOutput::Error { message, .. } => (message.len(), false),
+                                ToolOutput::WaitingForHuman { .. } => (0, false),
+                            };
+                            let span_id =
+                                SpanId::new(format!("{}-tool-{}", session_id.as_str(), span_seq));
+                            let mut base = match &current_turn_base {
+                                Some(parent) => SpanBase::new_child(
+                                    span_id,
+                                    parent,
+                                    SpanKind::ToolCall,
+                                    tool_started_at,
+                                ),
+                                None => SpanBase::new_root(
+                                    span_id,
+                                    session_id.clone(),
+                                    task.id.clone(),
+                                    SpanKind::ToolCall,
+                                    tool_started_at,
+                                ),
+                            };
+                            let status = if is_error {
+                                SpanStatus::Error {
+                                    message: "tool returned a recoverable error".into(),
+                                }
+                            } else {
+                                SpanStatus::Ok
+                            };
+                            base.finish(
+                                Timestamp::now(),
+                                status,
+                                tool_clock.elapsed().as_millis() as u64,
+                            );
+                            obs.emit_tool_call(ToolCallSpan {
+                                base,
+                                tool_name: call.name.clone(),
+                                call_id: call.id.clone(),
+                                parameters_size_bytes: call.input.to_string().len(),
+                                output_size_bytes,
+                                truncated,
+                                sandbox_mode: String::new(),
+                                sandbox_violations: Vec::new(),
+                            });
+                            span_seq += 1;
                         }
 
                         let tr = ToolResult {
@@ -1754,6 +2030,7 @@ mod tests {
             termination_policy: Arc::new(AlwaysContinuePolicy),
             middleware: None,
             observability: None,
+            pricing: PricingTable::DEFAULT,
         }
     }
 
@@ -1827,6 +2104,78 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    // Issue #12 — the harness emits real spans through an injected
+    // ObservabilityProvider and flushes a terminal session summary. Hermetic:
+    // SPORE_OTLP_ENDPOINT is left unset so the outbox writes JSONL only.
+    #[tokio::test]
+    async fn harness_emits_spans_through_outbox_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({ "k": "v" }),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "tool-ok".into(),
+            truncated: false,
+        });
+
+        let harness = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .with_observability_outbox(tmp.path())
+        .build();
+
+        match harness.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { turns, .. } => assert_eq!(turns, 2),
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let path = tmp.path().join("sessions/s1/trace.jsonl");
+        let body = std::fs::read_to_string(&path).expect("trace.jsonl written");
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert!(
+            kinds.contains(&"turn"),
+            "expected a turn span, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"tool_call"),
+            "expected a tool_call span, got {kinds:?}"
+        );
+        // The terminal summary line is written last.
+        assert_eq!(kinds.last(), Some(&"session"), "kinds: {kinds:?}");
+        let summary = lines.last().unwrap();
+        assert_eq!(summary["attributes"]["outcome"], "success");
+        assert_eq!(summary["attributes"]["total_turns"], 2);
+        let tool = lines.iter().find(|l| l["kind"] == "tool_call").unwrap();
+        assert_eq!(tool["attributes"]["tool_name"], "do_thing");
+        assert_eq!(tool["attributes"]["call_id"], "c1");
+        // Turn spans parent the tool-call spans within a shared trace.
+        let trace_ids: std::collections::HashSet<&str> = lines
+            .iter()
+            .map(|l| l["trace_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(trace_ids.len(), 1, "all spans share one trace id");
+        assert!(tmp.path().join("sessions/s1/.flushed").exists());
     }
 
     // Rule: parallel tool calls all dispatched in one turn.

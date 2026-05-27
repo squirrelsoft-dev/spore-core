@@ -28,6 +28,7 @@ from spore_core import (
     HaltReasonStrategyNotYetImplemented,
     HaltReasonTerminationPolicyHalt,
     HaltReasonUnrecoverableToolError,
+    HarnessBuilder,
     HarnessConfig,
     HarnessRunOptions,
     HumanRequestClarification,
@@ -573,3 +574,55 @@ async def test_react_loop_dispatches_tool_then_completes() -> None:
     assert r.usage.input_tokens == 30, "12 + 18 input tokens"
     assert r.usage.output_tokens == 14, "8 + 6 output tokens"
     assert reg.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Rule: the harness emits real spans through the durable outbox and flushes a
+# session-summary line on terminal success. Mirrors the Rust
+# ``harness_emits_spans_through_outbox_jsonl`` integration test.
+# ---------------------------------------------------------------------------
+
+
+async def test_harness_emits_spans_through_outbox_jsonl(tmp_path: Path) -> None:
+    """A tool-call-then-final run must write turn and tool_call spans plus a
+    trailing session-summary line to ``{root}/sessions/{sid}/trace.jsonl``,
+    sharing one trace_id, and drop a ``.flushed`` marker. SPORE_OTLP_ENDPOINT
+    is left unset so the run is hermetic (JSONL only)."""
+    import json
+
+    session_id = SessionId("outbox-sess")
+    agent = MockAgent(AgentId("outbox-agent"))
+    agent.push(ToolCallRequested(calls=[_tc("c1", "x")], usage=_usage()))
+    agent.push(FinalResponse(content="done", usage=_usage()))
+
+    harness = (
+        HarnessBuilder(
+            agent,
+            ScriptedToolRegistry(),
+            AllowAllSandbox(),
+            NoopContextManager(),
+            AlwaysContinuePolicy(),
+        )
+        .with_observability_outbox(tmp_path)
+        .build()
+    )
+    task = Task.new("do work", session_id, LoopStrategyReAct(max_iterations=5))
+    r = await harness.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultSuccess)
+
+    trace_path = tmp_path / "sessions" / str(session_id) / "trace.jsonl"
+    lines = [json.loads(line) for line in trace_path.read_text().splitlines() if line]
+
+    kinds = [line["kind"] for line in lines]
+    assert "turn" in kinds
+    assert "tool_call" in kinds
+
+    last = lines[-1]
+    assert last["kind"] == "session"
+    assert last["attributes"]["outcome"] == "success"
+    assert last["attributes"]["total_turns"] == 2
+
+    trace_ids = {line["trace_id"] for line in lines}
+    assert len(trace_ids) == 1, "all lines share one trace_id"
+
+    assert (tmp_path / "sessions" / str(session_id) / ".flushed").exists()

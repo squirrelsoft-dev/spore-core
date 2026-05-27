@@ -56,6 +56,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         termination_policy: Arc::new(AlwaysContinuePolicy),
         middleware: None,
         observability: None,
+        pricing: spore_core::PricingTable::DEFAULT,
     };
     let harness = StandardHarness::new(config);
 

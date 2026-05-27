@@ -478,6 +478,12 @@ class ObservabilityProvider(Protocol):
 
     def emit_patch(self, span: PatchSpan) -> None: ...
 
+    def set_session_outcome(self, session_id: SessionId, outcome: SessionOutcome) -> None:
+        """Record the terminal outcome for a session before flush. Default
+        no-op so providers that do not track outcomes still satisfy the
+        Protocol; :class:`InMemoryObservabilityProvider` overrides it."""
+        _ = (session_id, outcome)
+
     async def flush_session(self, session_id: SessionId) -> None: ...
 
     async def get_session_metrics(self, session_id: SessionId) -> SessionMetrics | None: ...

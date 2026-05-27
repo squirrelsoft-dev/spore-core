@@ -425,10 +425,11 @@ export interface MiddlewareChain {
   fire(hook: HookPoint, session: SessionState): Promise<MiddlewareDecision>;
 }
 
-/** Issue #12 — ObservabilityProvider. */
-export interface ObservabilityProvider {
-  recordTurn(turn: number, usage: TokenUsage): Promise<void>;
-}
+/** Issue #12 — ObservabilityProvider. Re-exported from the canonical
+ *  definition in {@link ../observability/types.js} so the harness loop and the
+ *  observability backends share one interface (emitTurn / emitToolCall / … /
+ *  setSessionOutcome / flushSession). */
+export type { ObservabilityProvider } from "../observability/types.js";
 
 // ============================================================================
 // Human-in-the-loop

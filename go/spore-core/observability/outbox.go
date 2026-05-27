@@ -575,9 +575,16 @@ func NewOutboxObservabilityProvider(config OutboxConfig) *OutboxObservabilityPro
 }
 
 // Inner exposes the wrapped in-memory provider (e.g. to call
-// SetSessionOutcome / RecordGuidesUsed).
+// RecordGuidesUsed).
 func (p *OutboxObservabilityProvider) Inner() *InMemoryObservabilityProvider {
 	return p.inner
+}
+
+// SetSessionOutcome records the terminal outcome, forwarding to the inner
+// provider so SessionMetrics (and the flushed session summary line) surface
+// it. Mirrors the Rust trait method.
+func (p *OutboxObservabilityProvider) SetSessionOutcome(sessionID SessionID, outcome SessionOutcome) {
+	p.inner.SetSessionOutcome(sessionID, outcome)
 }
 
 // TraceIDFor returns the per-session trace id, opening the session writer if

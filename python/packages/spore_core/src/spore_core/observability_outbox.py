@@ -641,6 +641,13 @@ class OutboxObservabilityProvider:
         self._inner.emit_patch(span)
         self._write_line(span.base.session_id, line)
 
+    # ── post-hoc recorders ────────────────────────────────────────────────────
+
+    def set_session_outcome(self, session_id: SessionId, outcome: SessionOutcome) -> None:
+        """Forward the terminal outcome to the wrapped in-memory provider so
+        the trailing session-summary line carries the correct outcome."""
+        self._inner.set_session_outcome(session_id, outcome)
+
     # ── flush_session ────────────────────────────────────────────────────────
 
     async def flush_session(self, session_id: SessionId) -> None:
