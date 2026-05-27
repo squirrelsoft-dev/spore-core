@@ -1320,6 +1320,15 @@ class StandardHarness:
 
         strategy = task.loop_strategy
         if isinstance(strategy, LoopStrategyReAct):
+            # Seed the task instruction as the initial user message of this run.
+            # The compaction adapter intentionally mirrors ``session.messages``
+            # and ignores ``task`` on ``assemble``, so the harness must own
+            # delivering the prompt. On a fresh run this turns an otherwise-empty
+            # conversation into a real user turn; on multi-turn runs over a
+            # carried ``session_state`` each ``run()`` call appends its own
+            # follow-up instruction. The resume path does not seed — its
+            # conversation already exists.
+            await self._config.context_manager.append_user_message(session_state, task.instruction)
             return await self._run_react(
                 task, strategy.max_iterations, session_state, budget_used, on_stream
             )
