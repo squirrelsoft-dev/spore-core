@@ -428,7 +428,11 @@ pub fn build_scenario(
         SchemaInjectingContextManager::new(context_manager, tool_schemas),
     );
 
-    let builder = HarnessBuilder::new(agent, tools, sandbox, context_manager, termination_policy);
+    let builder = HarnessBuilder::new(agent, tools, sandbox, context_manager, termination_policy)
+        // Honor SPORE_TRACE_CONTENT / SPORE_TRACE_CONTENT_MAX_LEN (#64) so a live
+        // run can capture gen_ai.* conversation + tool content for Phoenix.
+        // Defaults OFF when the env var is unset.
+        .content_capture(crate::ContentCaptureConfig::from_env());
     let builder = match observability {
         Some(obs) => builder.observability(obs),
         None => builder,

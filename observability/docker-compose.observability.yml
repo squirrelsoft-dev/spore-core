@@ -58,6 +58,22 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=7d"
 
+  # ── LLM-native trace backend (#64) ───────────────────────────────────────────
+  # Arize Phoenix renders the actual conversation + tool calls from the
+  # gen_ai.* span events the harness emits. It is an alternative OTLP target to
+  # Tempo, selected via SPORE_OTLP_ENDPOINT (single endpoint, no fan-out).
+  # Point the harness at Phoenix for LLM debugging:
+  #   SPORE_TRACE_CONTENT=1 SPORE_OTLP_ENDPOINT=http://localhost:6317 <run>
+  # then open the UI at http://localhost:6006. Tempo stays on 4317 for system
+  # telemetry; Phoenix's gRPC collector is remapped to 6317 to avoid the clash.
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "6006:6006"   # Phoenix UI + HTTP OTLP collector — open http://localhost:6006
+      - "6317:4317"   # OTLP gRPC collector — SPORE_OTLP_ENDPOINT=http://localhost:6317
+    volumes:
+      - phoenix-data:/mnt/data
+
   # ── UI ───────────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:latest
@@ -85,3 +101,4 @@ volumes:
   loki-data:
   prometheus-data:
   grafana-data:
+  phoenix-data:

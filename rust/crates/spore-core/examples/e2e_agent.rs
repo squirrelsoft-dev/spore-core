@@ -161,9 +161,20 @@ async fn main() {
                     Some(id) => {
                         println!("trace_id   : {id}");
                         if !endpoint.trim().is_empty() {
+                            // Tempo's query API is on :3200; Phoenix renders LLM
+                            // traces at its UI (:6006). Print the Tempo verify
+                            // probe, plus a Phoenix hint when content capture is on.
                             println!(
                                 "verify     : curl -s http://localhost:3200/api/traces/{id} | jq '.batches | length'"
                             );
+                            if std::env::var("SPORE_TRACE_CONTENT")
+                                .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+                                .unwrap_or(false)
+                            {
+                                println!(
+                                    "phoenix    : open http://localhost:6006 (gen_ai content capture ON)"
+                                );
+                            }
                         }
                     }
                     None => println!("trace_id   : (trace file empty or unparseable)"),
