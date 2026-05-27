@@ -3,9 +3,11 @@ package observability
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -197,5 +199,67 @@ func TestFlushSessionReturnsNilWhenOTLPFails(t *testing.T) {
 	// JSONL still durable: turn line + session summary.
 	if got := len(readLines(t, tmp, "s1")); got < 2 {
 		t.Fatalf("want >=2 durable lines, got %d", got)
+	}
+}
+
+// TestAttributesToKeyValuesFlattensScalarsAndSkipsNull mirrors the Rust pure
+// unit test: a turn-like attributes payload flattens to typed KeyValues, with
+// integral numbers as Int64, strings as String, null skipped entirely, and the
+// reserved envelope key skipped so the fixed tag wins.
+func TestAttributesToKeyValuesFlattensScalarsAndSkipsNull(t *testing.T) {
+	raw := json.RawMessage(`{
+		"input_tokens": 386,
+		"output_tokens": 102,
+		"stop_reason": "tool_use",
+		"turn_number": 1,
+		"cache_read_tokens": null,
+		"session_id": "should-be-skipped"
+	}`)
+
+	kvs := attributesToKeyValues(raw)
+	get := func(k string) (attribute.Value, bool) {
+		for _, kv := range kvs {
+			if string(kv.Key) == k {
+				return kv.Value, true
+			}
+		}
+		return attribute.Value{}, false
+	}
+
+	for _, k := range []string{"input_tokens", "output_tokens", "turn_number"} {
+		v, ok := get(k)
+		if !ok {
+			t.Fatalf("%s missing", k)
+		}
+		if v.Type() != attribute.INT64 {
+			t.Fatalf("%s type = %v, want INT64", k, v.Type())
+		}
+	}
+	if v, _ := get("input_tokens"); v.AsInt64() != 386 {
+		t.Fatalf("input_tokens = %d, want 386", v.AsInt64())
+	}
+	if v, _ := get("output_tokens"); v.AsInt64() != 102 {
+		t.Fatalf("output_tokens = %d, want 102", v.AsInt64())
+	}
+	if v, _ := get("turn_number"); v.AsInt64() != 1 {
+		t.Fatalf("turn_number = %d, want 1", v.AsInt64())
+	}
+
+	if v, ok := get("stop_reason"); !ok || v.Type() != attribute.STRING || v.AsString() != "tool_use" {
+		t.Fatalf("stop_reason = %v (ok=%v), want String tool_use", v, ok)
+	}
+
+	// Null is skipped entirely.
+	if _, ok := get("cache_read_tokens"); ok {
+		t.Fatal("cache_read_tokens (null) should be skipped")
+	}
+	// Reserved envelope key is skipped so the fixed tag wins.
+	if _, ok := get("session_id"); ok {
+		t.Fatal("session_id (reserved) should be skipped")
+	}
+
+	// 4 emitted: input_tokens, output_tokens, stop_reason, turn_number.
+	if len(kvs) != 4 {
+		t.Fatalf("len(kvs) = %d, want 4", len(kvs))
 	}
 }

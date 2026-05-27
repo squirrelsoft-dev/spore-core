@@ -53,3 +53,17 @@ export {
   SubagentTool,
   SubagentToolBuildError,
 } from "./subagent.js";
+export {
+  buildRealToolRegistry,
+  buildRichContextManager,
+  buildScenario,
+  CompleteOnFinalResponse,
+  FailingTool,
+  parseScenarioId,
+  RealToolRegistry,
+  type ScenarioId,
+  scenarioPrompt,
+  SchemaInjectingContextManager,
+  seedCompactionState,
+  toModelSchema,
+} from "./scenarios.js";

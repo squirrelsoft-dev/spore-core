@@ -6,6 +6,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "test": "vitest run",
+    "e2e": "tsx src/bin/e2e-agent.ts",
     "lint": "eslint src tests"
   },
   "dependencies": {

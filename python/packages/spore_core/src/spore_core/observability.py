@@ -641,6 +641,14 @@ class InMemoryObservabilityProvider:
         with self._lock:
             return [w for w in self._warns if w.base.session_id == session_id]
 
+    def context_spans(self, session_id: SessionId) -> list[ContextSpan]:
+        """All recorded context spans (assembly + compaction) for a session, in
+        insertion order. Lets callers spot-check a ``Compaction`` operation and
+        its reclaimed-token accounting without reconstructing it from the
+        heterogeneous trace (#57)."""
+        with self._lock:
+            return [c for c in self._contexts if c.base.session_id == session_id]
+
     # ── helpers ────────────────────────────────────────────────────────────
 
     def _push_order(self, sid: SessionId, kind: SpanKind, span_id: SpanId) -> None:

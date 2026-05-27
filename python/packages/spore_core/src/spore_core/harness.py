@@ -839,6 +839,16 @@ class ContextManager(Protocol):
         compaction-capable managers implement it."""
         _ = (session, summary)
 
+    def token_budget_used(self, session: SessionState) -> int | None:
+        """Post-compaction budget seam (#57 Known Deviation #2). The harness
+        reads this *after* applying a compaction so the emitted ``Compaction``
+        span can stamp the real ``tokens_after`` / ``tokens_reclaimed`` instead
+        of reporting zero reclamation. Default: ``None`` — managers that do not
+        track a token budget leave the span's pre-compaction estimate in
+        place."""
+        _ = session
+        return None
+
 
 def _default_inject_missing_items(context: Context, missing: list[str]) -> None:
     """Module-level twin of :meth:`ContextManager.inject_missing_items`'s
@@ -1310,6 +1320,15 @@ class StandardHarness:
 
         strategy = task.loop_strategy
         if isinstance(strategy, LoopStrategyReAct):
+            # Seed the task instruction as the initial user message of this run.
+            # The compaction adapter intentionally mirrors ``session.messages``
+            # and ignores ``task`` on ``assemble``, so the harness must own
+            # delivering the prompt. On a fresh run this turns an otherwise-empty
+            # conversation into a real user turn; on multi-turn runs over a
+            # carried ``session_state`` each ``run()`` call appends its own
+            # follow-up instruction. The resume path does not seed — its
+            # conversation already exists.
+            await self._config.context_manager.append_user_message(session_state, task.instruction)
             return await self._run_react(
                 task, strategy.max_iterations, session_state, budget_used, on_stream
             )
@@ -1957,6 +1976,19 @@ class StandardHarness:
         config = self._config
         config.context_manager.apply_compaction(session_state, summary)
 
+        # Real token accounting (#57 Known Deviation #2): read the
+        # post-compaction budget back through the optional ``token_budget_used``
+        # seam so the span reports what was actually reclaimed instead of zero.
+        # Structural managers do not inherit the Protocol default, so probe via
+        # ``getattr`` and fall back to the pre-compaction estimate when absent.
+        tokens_after = tokens_before
+        budget_seam = getattr(config.context_manager, "token_budget_used", None)
+        if budget_seam is not None:
+            after = budget_seam(session_state)
+            if after is not None:
+                tokens_after = after
+        tokens_reclaimed = max(0, tokens_before - tokens_after)
+
         if config.observability is not None:
             base = SpanBase.new_root(
                 new_span_id(f"{session_id}-compaction-{span_seq}"),
@@ -1965,17 +1997,19 @@ class StandardHarness:
                 SpanKind.COMPACTION,
                 _now(),
             )
+            util_before = 0.0
+            util_after = 0.0
             config.observability.emit_context(
                 ContextSpan(
                     base=base,
                     operation=ContextOperationCompaction(
                         messages_removed=messages_removed,
-                        tokens_reclaimed=0,
+                        tokens_reclaimed=tokens_reclaimed,
                     ),
                     tokens_before=tokens_before,
-                    tokens_after=tokens_before,
-                    utilization_before=0.0,
-                    utilization_after=0.0,
+                    tokens_after=tokens_after,
+                    utilization_before=util_before,
+                    utilization_after=util_after,
                 )
             )
             span_seq += 1

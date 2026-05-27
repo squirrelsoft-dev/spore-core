@@ -467,6 +467,13 @@ export interface ContextManager {
    *  the compacted span (issue #46). Default (when absent): no-op — only
    *  compaction-capable managers implement it. */
   applyCompaction?(session: SessionState, summary: string): void;
+
+  /** Report the manager's current token-budget usage for the session, so the
+   *  harness can stamp the post-compaction `tokens_after`/`tokens_reclaimed`
+   *  on the compaction span with real values (issue #57 token-accounting fix).
+   *  Default (when absent): `undefined` — the harness falls back to the
+   *  pre-compaction budget. */
+  tokenBudgetUsed?(session: SessionState): number | undefined;
 }
 
 /** Issue #13 — TerminationPolicy. */

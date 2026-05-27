@@ -462,6 +462,58 @@ impl OtlpSdkForwarder {
     }
 }
 
+/// Keys owned by the fixed envelope tags; a flattened attribute with one of
+/// these names is skipped so it never duplicates a fixed tag.
+const RESERVED_ATTR_KEYS: [&str; 5] =
+    ["session_id", "task_id", "level", "status", "parent_span_id"];
+
+/// Flatten a span's top-level `attributes` object into OTLP [`KeyValue`]s so the
+/// rich per-span detail (tokens, stop_reason, tool_name, turn_number, …) reaches
+/// Tempo, not just the JSONL.
+///
+/// Rules (shallow, no dotted-key deep-flatten):
+/// - String → string attribute.
+/// - Bool → bool attribute.
+/// - Number → `i64` when integral (signed or unsigned), else `f64`.
+/// - Null → skipped (no key emitted).
+/// - Nested object/array → compact JSON string attribute.
+/// - Non-object top-level (shouldn't happen) → nothing.
+/// - Keys colliding with the fixed envelope tags ([`RESERVED_ATTR_KEYS`]) are
+///   skipped so the fixed tag wins.
+fn attributes_to_keyvalues(attrs: &serde_json::Value) -> Vec<opentelemetry::KeyValue> {
+    use opentelemetry::KeyValue;
+
+    let Some(obj) = attrs.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        if RESERVED_ATTR_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        match value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(s) => out.push(KeyValue::new(key.clone(), s.clone())),
+            serde_json::Value::Bool(b) => out.push(KeyValue::new(key.clone(), *b)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    out.push(KeyValue::new(key.clone(), i));
+                } else if let Some(u) = n.as_u64() {
+                    // Out of i64 range; preserve as f64 (lossy but bounded).
+                    out.push(KeyValue::new(key.clone(), u as f64));
+                } else if let Some(f) = n.as_f64() {
+                    out.push(KeyValue::new(key.clone(), f));
+                }
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                let json = serde_json::to_string(value).unwrap_or_default();
+                out.push(KeyValue::new(key.clone(), json));
+            }
+        }
+    }
+    out
+}
+
 impl OtlpForwarder for OtlpSdkForwarder {
     fn forward(&self, line: &TraceLine) {
         use opentelemetry::trace::{SpanId as OtelSpanId, TraceId as OtelTraceId};
@@ -491,6 +543,9 @@ impl OtlpForwarder for OtlpSdkForwarder {
             // SpanId string as an attribute for cross-referencing.
             attrs.push(KeyValue::new("parent_span_id", parent.clone()));
         }
+        // Flatten the rich per-kind payload so token/stop_reason/tool_name/etc.
+        // detail reaches Tempo, not just the JSONL.
+        attrs.extend(attributes_to_keyvalues(&line.attributes));
         builder = builder.with_attributes(attrs);
         builder = builder.with_status(if line.status == "ok" {
             OtelStatus::Ok
@@ -887,6 +942,39 @@ mod tests {
     }
     fn tid(s: &str) -> TaskId {
         TaskId::new(s)
+    }
+
+    #[test]
+    fn attributes_to_keyvalues_flattens_scalars_and_skips_null() {
+        use opentelemetry::Value as OtelValue;
+
+        // Mirrors a turn span's `attributes` payload, plus a null field.
+        let attrs = serde_json::json!({
+            "input_tokens": 386,
+            "output_tokens": 102,
+            "stop_reason": "tool_use",
+            "turn_number": 1,
+            "cache_read_tokens": serde_json::Value::Null,
+        });
+        let kvs = attributes_to_keyvalues(&attrs);
+
+        let get = |k: &str| {
+            kvs.iter()
+                .find(|kv| kv.key.as_str() == k)
+                .map(|kv| &kv.value)
+        };
+
+        assert_eq!(get("input_tokens"), Some(&OtelValue::I64(386)));
+        assert_eq!(get("output_tokens"), Some(&OtelValue::I64(102)));
+        assert_eq!(
+            get("stop_reason"),
+            Some(&OtelValue::String("tool_use".into()))
+        );
+        assert_eq!(get("turn_number"), Some(&OtelValue::I64(1)));
+        // Null is skipped entirely.
+        assert!(get("cache_read_tokens").is_none());
+        // 4 emitted, 1 (null) skipped.
+        assert_eq!(kvs.len(), 4);
     }
 
     fn base(session: &str, span_id: &str, kind: SpanKind, status: SpanStatus) -> SpanBase {

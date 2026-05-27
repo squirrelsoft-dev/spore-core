@@ -115,6 +115,7 @@ export class StandardHarness implements Harness {
           budgetUsed,
           options.on_stream,
           options.signal,
+          true,
         );
       case "plan_execute":
         return notYetImplemented("plan_execute", task.session_id);
@@ -210,7 +211,7 @@ export class StandardHarness implements Harness {
       state.task.loop_strategy.kind === "re_act"
         ? state.task.loop_strategy.max_iterations
         : Number.MAX_SAFE_INTEGER;
-    return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal);
+    return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
   }
 
   // --------------------------------------------------------------------------
@@ -247,6 +248,7 @@ export class StandardHarness implements Harness {
     budgetUsed: BudgetSnapshot,
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
+    seedInstruction: boolean,
   ): Promise<RunResult> {
     const result = await this.runReactInner(
       task,
@@ -255,6 +257,7 @@ export class StandardHarness implements Harness {
       budgetUsed,
       onStream,
       signal,
+      seedInstruction,
     );
     switch (result.kind) {
       case "success":
@@ -280,6 +283,7 @@ export class StandardHarness implements Harness {
     budgetUsed: BudgetSnapshot,
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
+    seedInstruction: boolean,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     const startedAt = Date.now();
@@ -292,6 +296,18 @@ export class StandardHarness implements Harness {
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
+
+    // Seed the task instruction as the initial user message of this run.
+    // The compaction adapter intentionally mirrors `session.messages` and
+    // ignores `task` on `assemble`, so the harness must own delivering the
+    // prompt. On a fresh run this turns an otherwise-empty conversation into a
+    // real user turn; on multi-turn runs over a carried `session_state` each
+    // `run()` call appends its own follow-up instruction. The resume path does
+    // NOT seed (`seedInstruction === false`) — its conversation already exists
+    // and `resume` has already appended the human response.
+    if (seedInstruction) {
+      await this.config.contextManager.appendUserMessage(sessionState, task.instruction);
+    }
 
     // Outer loop
     for (;;) {
@@ -848,10 +864,16 @@ export class StandardHarness implements Harness {
   ): number {
     // Default applyCompaction is a no-op (only compaction-capable managers
     // implement it).
-    this.config.contextManager.applyCompaction?.(sessionState, summary);
+    const cm = this.config.contextManager;
+    cm.applyCompaction?.(sessionState, summary);
 
     const obs = this.config.observability;
     if (obs) {
+      // Stamp real post-compaction budget when the manager exposes it (issue
+      // #57 token-accounting fix); otherwise fall back to the pre-compaction
+      // budget (no reclamation surfaced).
+      const tokensAfter = cm.tokenBudgetUsed?.(sessionState) ?? tokensBefore;
+      const tokensReclaimed = Math.max(0, tokensBefore - tokensAfter);
       const base = newRootSpanBase(
         SpanId.of(`${sessionId.asString()}-compaction-${spanSeq}`),
         sessionId,
@@ -861,9 +883,13 @@ export class StandardHarness implements Harness {
       );
       const span: ContextSpan = {
         base,
-        operation: { kind: "compaction", messages_removed: messagesRemoved, tokens_reclaimed: 0 },
+        operation: {
+          kind: "compaction",
+          messages_removed: messagesRemoved,
+          tokens_reclaimed: tokensReclaimed,
+        },
         tokens_before: tokensBefore,
-        tokens_after: tokensBefore,
+        tokens_after: tokensAfter,
         utilization_before: 0,
         utilization_after: 0,
       };

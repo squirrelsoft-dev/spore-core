@@ -36,6 +36,44 @@ import (
 // the serialized rich SessionState. The adapter is the only writer/reader.
 const RichStateKey = "spore.compaction_adapter.rich_state"
 
+// EstimateMessageTokens is a rough token estimate for a single message: the
+// byte length of its textual content divided by four (the same chars/4 proxy
+// StandardContextManager uses for cache-marker placement). Used by the adapter
+// to compute real TokensReclaimed from the messages a compaction drops, since
+// the synchronous harness seam cannot call the async CountTokens. A non-empty
+// message is never accounted as zero tokens so a drop always reclaims something.
+func EstimateMessageTokens(m sporecore.Message) uint32 {
+	var n int
+	switch m.Content.Type {
+	case sporecore.ContentTypeText:
+		n = len(m.Content.Text)
+	case sporecore.ContentTypeToolCall:
+		if m.Content.ToolCall != nil {
+			n = len(m.Content.ToolCall.Name) + len(m.Content.ToolCall.Input)
+		}
+	case sporecore.ContentTypeToolResult:
+		if m.Content.ToolResult != nil {
+			n = len(m.Content.ToolResult.Content)
+		}
+	case sporecore.ContentTypeImage:
+		n = len(m.Content.Data)
+	}
+	t := uint32(n / 4)
+	if n > 0 && t == 0 {
+		return 1
+	}
+	return t
+}
+
+// EstimateTokens sums EstimateMessageTokens over a slice of messages.
+func EstimateTokens(msgs []sporecore.Message) uint32 {
+	var sum uint32
+	for _, m := range msgs {
+		sum += EstimateMessageTokens(m)
+	}
+	return sum
+}
+
 // summarizeInstruction is appended after the messages-to-compact to elicit the
 // summary from the agent during a compaction turn.
 const summarizeInstruction = "Summarize the conversation above, preserving the items in the preservation hints."
@@ -239,17 +277,37 @@ func (a *StandardCompactionAdapter) ApplyCompaction(session *sporecore.SessionSt
 		return
 	}
 
-	// Recompute messages-removed from a fresh prepare; token accounting is
-	// best-effort at the seam (no fresh count), so reclaim nothing (mirrors
-	// the Rust adapter).
+	// Recompute the dropped messages from a fresh prepare so token accounting
+	// reflects exactly what ApplyCompaction will remove.
 	var messagesRemoved uint32
+	var dropped []sporecore.Message
 	if req, err := a.inner.PrepareCompaction(rich); err == nil && req != nil {
-		messagesRemoved = uint32(len(req.MessagesToCompact))
+		dropped = req.MessagesToCompact
+		messagesRemoved = uint32(len(dropped))
+	}
+
+	summaryMessage := sporecore.Message{Role: sporecore.RoleAssistant, Content: sporecore.NewTextContent(summary)}
+
+	// Real token accounting (issue #57 / Known Deviation #2 fix): reclaim the
+	// tokens of the messages we drop, net of the summary that replaces them, and
+	// clamp to the live budget so TokenBudgetUsed never underflows. The rich
+	// ApplyCompaction decrements TokenBudgetUsed by this amount, so utilization
+	// actually falls below threshold after a compaction and a long session can
+	// compact, continue, drop below threshold, and compact again.
+	droppedTokens := EstimateTokens(dropped)
+	summaryTokens := EstimateMessageTokens(summaryMessage)
+	var netReclaimed uint32
+	if droppedTokens > summaryTokens {
+		netReclaimed = droppedTokens - summaryTokens
+	}
+	tokensReclaimed := netReclaimed
+	if tokensReclaimed > rich.TokenBudgetUsed {
+		tokensReclaimed = rich.TokenBudgetUsed
 	}
 
 	result := CompactionResult{
-		SummaryMessage:  sporecore.Message{Role: sporecore.RoleAssistant, Content: sporecore.NewTextContent(summary)},
-		TokensReclaimed: 0,
+		SummaryMessage:  summaryMessage,
+		TokensReclaimed: tokensReclaimed,
 		MessagesRemoved: messagesRemoved,
 	}
 
@@ -260,6 +318,17 @@ func (a *StandardCompactionAdapter) ApplyCompaction(session *sporecore.SessionSt
 		return
 	}
 	writeRichState(session, rich)
+}
+
+// TokenBudgetUsed reports the rich state's post-compaction token budget so the
+// harness can stamp the real TokensAfter / TokensReclaimed on the Compaction
+// span (issue #57). Returns (0, false) when no rich state has been seeded.
+func (a *StandardCompactionAdapter) TokenBudgetUsed(session *sporecore.SessionState) (uint32, bool) {
+	rich := readRichState(session)
+	if rich == nil {
+		return 0, false
+	}
+	return rich.TokenBudgetUsed, true
 }
 
 // ============================================================================
