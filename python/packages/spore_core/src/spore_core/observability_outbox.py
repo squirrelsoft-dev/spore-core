@@ -419,17 +419,49 @@ class _OtlpSdkForwarder:
         # Best-effort, fire-and-forget. The batch processor handles batching and
         # non-blocking export; the JSONL file is durable, so any failure is
         # swallowed.
+        #
+        # The emitted OTLP span MUST carry the harness 32-hex ``trace_id`` as its
+        # actual OTLP TraceId so that all spans of a session group into a single
+        # Tempo trace under that exact id (resolved-decision #3). This is what the
+        # Grafana Loki→Tempo derived-field join keys on. Mirrors the Rust
+        # reference ``forward()`` (``TraceId::from_hex`` + ``SpanId::from_bytes``
+        # + ``build_with_context``).
+        #
+        # Idiomatic opentelemetry-python: synthesize a parent ``SpanContext``
+        # carrying the harness trace id (and the derived 8-byte span id), wrap it
+        # in a ``NonRecordingSpan``, and start the real span inside that context.
+        # The child inherits the harness trace id as its OTLP TraceId; trace id
+        # correlation is the requirement.
         try:
-            from opentelemetry.trace import SpanKind as OtelSpanKind
+            from opentelemetry import trace as otel_trace
+            from opentelemetry.trace import (
+                NonRecordingSpan,
+                SpanContext,
+                SpanKind as OtelSpanKind,
+                TraceFlags,
+            )
+
+            otel_trace_id = int(line.trace_id, 16)
+            derived_span_id = int.from_bytes(derive_otlp_span_id(line.span_id), "big")
+            parent_ctx_obj = SpanContext(
+                trace_id=otel_trace_id,
+                span_id=derived_span_id,
+                is_remote=True,
+                trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            )
+            parent_ctx = otel_trace.set_span_in_context(NonRecordingSpan(parent_ctx_obj))
 
             span = self._tracer.start_span(
                 line.kind,
+                context=parent_ctx,
                 kind=OtelSpanKind.INTERNAL,
                 attributes={
                     "session_id": line.session_id,
                     "task_id": line.task_id,
                     "level": line.level,
                     "status": line.status,
+                    # Harmless cross-ref; the authoritative correlation id is now
+                    # the OTLP TraceId itself.
                     "trace_id": line.trace_id,
                     "span_id_str": line.span_id,
                     **(
