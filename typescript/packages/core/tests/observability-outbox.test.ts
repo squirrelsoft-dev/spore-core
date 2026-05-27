@@ -397,3 +397,45 @@ describe("InMemoryObservabilityProvider — optional outbox methods", () => {
     expect(obs.cleanupSession).toBeUndefined();
   });
 });
+
+describe("attributesToOtelAttributes — per-span attribute flattening", () => {
+  it("flattens scalars, skips null, and skips reserved envelope keys", () => {
+    // Mirrors a turn span's `attributes` payload, plus a null field and a
+    // reserved key that must never leak into the flattened output.
+    const out = observability.attributesToOtelAttributes({
+      input_tokens: 386,
+      output_tokens: 102,
+      stop_reason: "tool_use",
+      turn_number: 1,
+      cache_read_tokens: null,
+      session_id: "should-be-skipped",
+    });
+
+    expect(out.input_tokens).toBe(386);
+    expect(out.output_tokens).toBe(102);
+    expect(out.turn_number).toBe(1);
+    expect(typeof out.input_tokens).toBe("number");
+    expect(typeof out.output_tokens).toBe("number");
+    expect(typeof out.turn_number).toBe("number");
+    expect(out.stop_reason).toBe("tool_use");
+    // Null is skipped entirely.
+    expect("cache_read_tokens" in out).toBe(false);
+    // Reserved envelope key is skipped so the fixed tag wins.
+    expect("session_id" in out).toBe(false);
+    // 4 emitted, null + reserved skipped.
+    expect(Object.keys(out)).toHaveLength(4);
+  });
+
+  it("JSON-stringifies nested objects/arrays and tolerates non-objects", () => {
+    const out = observability.attributesToOtelAttributes({
+      nested: { a: 1 },
+      list: [1, "two"],
+      flag: true,
+    });
+    expect(out.nested).toBe('{"a":1}');
+    expect(out.list).toBe('[1,"two"]');
+    expect(out.flag).toBe(true);
+    expect(observability.attributesToOtelAttributes(null)).toEqual({});
+    expect(observability.attributesToOtelAttributes(undefined)).toEqual({});
+  });
+});

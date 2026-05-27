@@ -11,6 +11,7 @@ export {
   OutboxObservabilityProvider,
   SessionNotFoundError,
   TraceLine,
+  attributesToOtelAttributes,
   outboxConfig,
 } from "./outbox.js";
 export type { OutboxConfig } from "./outbox.js";

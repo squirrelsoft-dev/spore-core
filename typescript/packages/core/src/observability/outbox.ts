@@ -408,6 +408,63 @@ interface OtelApi {
   SpanStatusCode: { OK: number; ERROR: number };
 }
 
+/**
+ * Keys owned by the fixed envelope tags; a flattened attribute with one of
+ * these names is skipped so it never duplicates a fixed tag.
+ */
+const RESERVED_ATTR_KEYS: ReadonlySet<string> = new Set([
+  "session_id",
+  "task_id",
+  "level",
+  "status",
+  "parent_span_id",
+]);
+
+/**
+ * Flatten a span's top-level `attributes` object into OTLP attributes so the
+ * rich per-span detail (tokens, stop_reason, tool_name, turn_number, …) reaches
+ * Tempo, not just the JSONL.
+ *
+ * Rules (shallow, no dotted-key deep-flatten), mirroring the Rust reference:
+ * - string → string attribute.
+ * - boolean → boolean attribute.
+ * - number → number attribute (TS numbers are doubles; finite values only).
+ * - null/undefined → skipped (no key emitted).
+ * - nested object/array → compact `JSON.stringify` string attribute.
+ * - Keys colliding with the fixed envelope tags ({@link RESERVED_ATTR_KEYS})
+ *   are skipped so the fixed tag wins.
+ */
+export function attributesToOtelAttributes(
+  attrs: Record<string, unknown> | null | undefined,
+): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  if (attrs === null || attrs === undefined || typeof attrs !== "object") {
+    return out;
+  }
+  for (const [key, value] of Object.entries(attrs)) {
+    if (RESERVED_ATTR_KEYS.has(key)) continue;
+    if (value === null || value === undefined) continue;
+    switch (typeof value) {
+      case "string":
+        out[key] = value;
+        break;
+      case "boolean":
+        out[key] = value;
+        break;
+      case "number":
+        if (Number.isFinite(value)) out[key] = value;
+        break;
+      case "object":
+        out[key] = JSON.stringify(value);
+        break;
+      default:
+        // bigint / function / symbol — not expected in JSON payloads; skip.
+        break;
+    }
+  }
+  return out;
+}
+
 class OtelSdkOtlpForwarder implements OtlpForwarder {
   private provider: { forceFlush(): Promise<void> } | null = null;
   private tracer: OtelTracer | null = null;
@@ -474,6 +531,12 @@ class OtelSdkOtlpForwarder implements OtlpForwarder {
         span.setAttribute("trace_id", line.trace_id);
         span.setAttribute("span_id_hex", parentSpanIdHex);
         if (line.parent_span_id) span.setAttribute("parent_span_id", line.parent_span_id);
+        // Flatten the rich per-kind payload so token/stop_reason/tool_name/etc.
+        // detail reaches Tempo, not just the JSONL. Reserved keys are skipped by
+        // the helper so the fixed envelope tags above always win.
+        for (const [k, v] of Object.entries(attributesToOtelAttributes(line.attributes))) {
+          span.setAttribute(k, v);
+        }
 
         if (line.status === "ok") {
           span.setStatus({ code: api.SpanStatusCode.OK });
