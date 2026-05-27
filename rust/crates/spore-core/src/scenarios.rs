@@ -206,6 +206,14 @@ impl HarnessContextManager for SchemaInjectingContextManager {
         self.inner.append_tool_result(session, result)
     }
 
+    fn append_assistant_message<'a>(
+        &'a self,
+        session: &'a mut HarnessState,
+        message: &'a Message,
+    ) -> BoxFut<'a, ()> {
+        self.inner.append_assistant_message(session, message)
+    }
+
     fn append_user_message<'a>(
         &'a self,
         session: &'a mut HarnessState,
@@ -426,9 +434,21 @@ impl ScenarioId {
     pub fn prompt(self) -> &'static str {
         match self {
             Self::S1 => {
-                "Read the file input.txt, transform its contents to UPPERCASE, write the \
-                 result to output.txt, then read output.txt back to confirm it was written. \
-                 Use the read_file, write_file, and bash_command tools. When done, reply DONE."
+                "Complete this task step by step, using the provided tools:\n\
+                 1. Call read_file to read the contents of input.txt. Use the \
+                 exact text it returns — do not invent or substitute any text.\n\
+                 2. Take that exact text and rewrite it with every lowercase \
+                 letter changed to its capital form, keeping all other \
+                 characters, spaces, and punctuation the same.\n\
+                 3. Call write_file with path 'output.txt' and content set to \
+                 the uppercased text from step 2 — the literal capital letters \
+                 themselves. The content must be the transformed words from \
+                 input.txt, NOT a shell command, NOT a $(...) expression, and \
+                 NOT any code.\n\
+                 4. Call read_file on output.txt and check its contents equal \
+                 the uppercased text from step 2.\n\
+                 Reply DONE only once output.txt contains input.txt's contents \
+                 in all capital letters."
             }
             Self::S2 => {
                 "Create a file notes.md containing a TODO list with one item: 'set up the \

@@ -681,6 +681,18 @@ pub trait ContextManager: Send + Sync {
         result: &'a ToolResult,
     ) -> BoxFut<'a, ()>;
 
+    /// Append the assistant's turn (model output: text and/or the tool calls it
+    /// requested) to the conversation so the next assemble() reflects what the
+    /// agent already did. Without this the model loses track of its own actions.
+    fn append_assistant_message<'a>(
+        &'a self,
+        session: &'a mut SessionState,
+        message: &'a Message,
+    ) -> BoxFut<'a, ()> {
+        let _ = (session, message);
+        Box::pin(async {})
+    }
+
     fn append_user_message<'a>(
         &'a self,
         session: &'a mut SessionState,
@@ -1657,6 +1669,18 @@ impl StandardHarness {
                             };
                         }
                         TerminationDecision::Continue => {
+                            // Record the assistant's final text in history so a
+                            // continued session reflects what the agent said.
+                            let msg = Message {
+                                role: Role::Assistant,
+                                content: Content::Text {
+                                    text: content.clone(),
+                                },
+                            };
+                            self.config
+                                .context_manager
+                                .append_assistant_message(&mut session_state, &msg)
+                                .await;
                             Self::emit(
                                 &on_stream,
                                 StreamEvent::FinalResponse {
@@ -1733,6 +1757,22 @@ impl StandardHarness {
                             }
                         },
                     };
+
+                    // Record the assistant's turn (the tool calls it requested)
+                    // in the conversation BEFORE appending any tool results, so
+                    // the next assemble() reflects what the agent already did and
+                    // the conversation stays well-formed (assistant tool_use
+                    // precedes its tool result).
+                    for call in &calls {
+                        let msg = Message {
+                            role: Role::Assistant,
+                            content: Content::ToolCall(call.clone()),
+                        };
+                        self.config
+                            .context_manager
+                            .append_assistant_message(&mut session_state, &msg)
+                            .await;
+                    }
 
                     let mut approved_results: Vec<ToolResult> = Vec::new();
                     for (i, call) in calls.iter().enumerate() {
@@ -2441,6 +2481,16 @@ pub mod testing {
                     role: crate::model::Role::Tool,
                     content: crate::model::Content::Text { text },
                 });
+            })
+        }
+        fn append_assistant_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            message: &'a Message,
+        ) -> BoxFut<'a, ()> {
+            let message = message.clone();
+            Box::pin(async move {
+                session.messages.push(message);
             })
         }
         fn append_user_message<'a>(
@@ -4317,5 +4367,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Assistant-turn recording (regression for lost conversation history) ──
+
+    /// A ContextManager that records every message in a shared vector so tests
+    /// can inspect the conversation the loop builds. Mirrors
+    /// `NoopContextManager` but exposes the message log.
+    #[derive(Clone, Default)]
+    struct RecordingContextManager {
+        messages: Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+    impl ContextManager for RecordingContextManager {
+        fn assemble<'a>(
+            &'a self,
+            session: &'a SessionState,
+            _task: &'a Task,
+        ) -> BoxFut<'a, Context> {
+            let messages = session.messages.clone();
+            Box::pin(async move {
+                Context {
+                    messages,
+                    tools: vec![],
+                    params: crate::model::ModelParams::default(),
+                }
+            })
+        }
+        fn append_tool_result<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            result: &'a ToolResult,
+        ) -> BoxFut<'a, ()> {
+            let msg = Message {
+                role: Role::Tool,
+                content: Content::ToolResult(crate::model::ToolResult {
+                    tool_use_id: result.call_id.clone(),
+                    content: match &result.output {
+                        ToolOutput::Success { content, .. } => content.clone(),
+                        ToolOutput::Error { message, .. } => message.clone(),
+                        ToolOutput::WaitingForHuman { .. } => String::new(),
+                    },
+                    is_error: matches!(result.output, ToolOutput::Error { .. }),
+                }),
+            };
+            Box::pin(async move {
+                session.messages.push(msg.clone());
+                self.messages.lock().unwrap().push(msg);
+            })
+        }
+        fn append_assistant_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            message: &'a Message,
+        ) -> BoxFut<'a, ()> {
+            let message = message.clone();
+            Box::pin(async move {
+                session.messages.push(message.clone());
+                self.messages.lock().unwrap().push(message);
+            })
+        }
+        fn append_user_message<'a>(
+            &'a self,
+            session: &'a mut SessionState,
+            text: &'a str,
+        ) -> BoxFut<'a, ()> {
+            let msg = Message {
+                role: Role::User,
+                content: Content::Text { text: text.into() },
+            };
+            Box::pin(async move {
+                session.messages.push(msg.clone());
+                self.messages.lock().unwrap().push(msg);
+            })
+        }
+    }
+
+    /// Regression: a turn that requests a tool call must record the assistant's
+    /// tool-call message in history, positioned BEFORE the tool result, so the
+    /// next turn's assembled context reflects what the agent already did.
+    #[tokio::test]
+    async fn tool_call_records_assistant_message_before_result() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "a.txt" }),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let cm = RecordingContextManager::default();
+        let mut cfg = standard_config(a);
+        cfg.context_manager = Arc::new(cm.clone());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "contents".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        assert!(matches!(
+            h.run(HarnessRunOptions::new(react(5))).await,
+            RunResult::Success { .. }
+        ));
+
+        let msgs = cm.messages.lock().unwrap();
+        let assistant_idx = msgs.iter().position(|m| {
+            m.role == Role::Assistant && matches!(&m.content, Content::ToolCall(c) if c.id == "c1")
+        });
+        let tool_idx = msgs.iter().position(|m| {
+            m.role == Role::Tool
+                && matches!(&m.content, Content::ToolResult(r) if r.tool_use_id == "c1")
+        });
+        let assistant_idx = assistant_idx.expect("assistant tool-call message must be recorded");
+        let tool_idx = tool_idx.expect("tool result must be recorded");
+        assert!(
+            assistant_idx < tool_idx,
+            "assistant tool_use (idx {assistant_idx}) must precede its tool result (idx {tool_idx})"
+        );
+    }
+
+    /// Regression: a final response must append the assistant's text to history
+    /// so a continued session sees what the agent said.
+    #[tokio::test]
+    async fn final_response_records_assistant_text() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            content: "the final answer".into(),
+            usage: usage(),
+        });
+        let cm = RecordingContextManager::default();
+        let mut cfg = standard_config(a);
+        cfg.context_manager = Arc::new(cm.clone());
+        let h = StandardHarness::new(cfg);
+        assert!(matches!(
+            h.run(HarnessRunOptions::new(react(5))).await,
+            RunResult::Success { .. }
+        ));
+
+        let msgs = cm.messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.role == Role::Assistant
+                && matches!(&m.content, Content::Text { text } if text == "the final answer")),
+            "assistant final text must be recorded in history"
+        );
     }
 }

@@ -160,6 +160,17 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         })
     }
 
+    fn append_assistant_message<'a>(
+        &'a self,
+        session: &'a mut HarnessState,
+        message: &'a Message,
+    ) -> BoxFut<'a, ()> {
+        let message = message.clone();
+        Box::pin(async move {
+            session.messages.push(message);
+        })
+    }
+
     fn append_user_message<'a>(
         &'a self,
         session: &'a mut HarnessState,
