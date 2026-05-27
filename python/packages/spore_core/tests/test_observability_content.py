@@ -52,6 +52,19 @@ from spore_core.observability import (
     TurnSpan,
     truncate_field,
 )
+from spore_core.harness import _capture_input_messages
+from spore_core.model import (
+    ImageContent,
+    Message,
+    Role,
+    TextContent,
+)
+from spore_core.model import (
+    ToolCallContent as MsgToolCallContent,
+)
+from spore_core.model import (
+    ToolResultContent as MsgToolResultContent,
+)
 from spore_core.observability_outbox import TraceLine, _genai_events
 
 
@@ -424,3 +437,149 @@ async def test_harness_content_off_writes_no_genai_content(
         assert not any(k.startswith("gen_ai.") for k in line["attributes"]), (
             f"content leaked into {line['kind']} with guard OFF"
         )
+
+
+# ── capture_input_messages (issue #64) ──────────────────────────────────────
+
+
+def test_capture_input_messages_maps_roles_and_renders_content() -> None:
+    msgs = [
+        Message(role=Role.SYSTEM, content=TextContent(text="You are a helpful coding agent.")),
+        Message(role=Role.USER, content=TextContent(text="List the files in the repo.")),
+        Message(
+            role=Role.ASSISTANT,
+            content=MsgToolCallContent(id="c1", name="shell", input={"command": "ls"}),
+        ),
+        Message(
+            role=Role.TOOL,
+            content=MsgToolResultContent(tool_use_id="c1", content="Cargo.toml\nsrc/"),
+        ),
+    ]
+    out = _capture_input_messages(msgs, 8192)
+    assert [m.role for m in out] == [
+        GenAiRole.SYSTEM,
+        GenAiRole.USER,
+        GenAiRole.ASSISTANT,
+        GenAiRole.TOOL,
+    ]
+    assert out[0].content == "You are a helpful coding agent."
+    assert out[1].content == "List the files in the repo."
+    # Tool call → "<name> <compact-json-args>".
+    assert out[2].content == 'shell {"command":"ls"}'
+    # Tool result → its body, role stays Tool.
+    assert out[3].content == "Cargo.toml\nsrc/"
+    assert all(not m.truncated for m in out)
+
+
+def test_capture_input_messages_image_renders_placeholder_not_base64() -> None:
+    msgs = [
+        Message(
+            role=Role.USER,
+            content=ImageContent(media_type="image/png", data="QUJDREVGRw=="),
+        ),
+    ]
+    out = _capture_input_messages(msgs, 8192)
+    assert out[0].content == "[image image/png]"
+    assert "QUJDREVGRw==" not in out[0].content
+
+
+def test_capture_input_messages_truncates_long_content() -> None:
+    msgs = [Message(role=Role.USER, content=TextContent(text="x" * 100))]
+    out = _capture_input_messages(msgs, 10)
+    assert out[0].truncated is True
+    assert out[0].content == "x" * 10 + TRUNCATION_MARKER
+
+
+# ── gen_ai.prompt attribute + ordered input-message events (issue #64) ───────
+
+
+def _turn_with_input() -> TurnSpan:
+    return TurnSpan(
+        base=_base("b1", SpanKind.TURN),
+        turn_number=1,
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=None,
+        cache_write_tokens=None,
+        cost_usd=0.0,
+        stop_reason=StopReason.TOOL_USE,
+        tool_calls_requested=0,
+        input_messages=[
+            GenAiMessage(role=GenAiRole.SYSTEM, content="sys", truncated=False),
+            GenAiMessage(role=GenAiRole.USER, content="hi", truncated=False),
+            GenAiMessage(role=GenAiRole.TOOL, content="res", truncated=False),
+            GenAiMessage(role=GenAiRole.ASSISTANT, content="ack", truncated=False),
+        ],
+    )
+
+
+def test_from_turn_writes_gen_ai_prompt_when_present() -> None:
+    line = TraceLine.from_turn(_turn_with_input(), "tid")
+    prompt = line.attributes["gen_ai.prompt"]
+    assert prompt == [
+        {"role": "system", "content": "sys", "truncated": False},
+        {"role": "user", "content": "hi", "truncated": False},
+        {"role": "tool", "content": "res", "truncated": False},
+        {"role": "assistant", "content": "ack", "truncated": False},
+    ]
+
+
+def test_from_turn_omits_gen_ai_prompt_when_absent() -> None:
+    span = TurnSpan(
+        base=_base("b1", SpanKind.TURN),
+        turn_number=1,
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=None,
+        cache_write_tokens=None,
+        cost_usd=0.0,
+        stop_reason=StopReason.END_TURN,
+        tool_calls_requested=0,
+    )
+    assert "gen_ai.prompt" not in TraceLine.from_turn(span, "tid").attributes
+
+
+def test_genai_events_input_messages_first_and_in_order() -> None:
+    span = _turn_with_input()
+    span.output_text = GenAiMessage(role=GenAiRole.ASSISTANT, content="out", truncated=False)
+    events = _genai_events(TraceLine.from_turn(span, "tid"))
+    # Input messages emitted FIRST, in order (system, user, tool, assistant), then
+    # the output event.
+    assert events[0][0] == "gen_ai.system.message"
+    assert events[1][0] == "gen_ai.user.message"
+    assert events[2][0] == "gen_ai.tool.message"
+    assert events[3][0] == "gen_ai.assistant.message"
+    assert events[0][1] == {"gen_ai.message.role": "system", "gen_ai.message.content": "sys"}
+    # The trailing output event carries the assistant output text.
+    assert events[-1][1]["gen_ai.message.content"] == "out"
+
+
+async def test_harness_content_on_writes_input_messages_to_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SPORE_OTLP_ENDPOINT", raising=False)
+    agent = MockAgent(AgentId("test"))
+    agent.push(FinalResponse(content="done", usage=TokenUsage(input_tokens=1, output_tokens=1)))
+    reg = ScriptedToolRegistry()
+    harness = (
+        HarnessBuilder(
+            agent,
+            reg,
+            AllowAllSandbox(),
+            NoopContextManager(),
+            AlwaysContinuePolicy(),
+        )
+        .with_observability_outbox(tmp_path)
+        .content_capture(ContentCaptureConfig(enabled=True))
+        .build()
+    )
+    task = Task.new("List the files.", SessionId("s1"), LoopStrategyReAct(max_iterations=5))
+    await harness.run(HarnessRunOptions(task))
+
+    lines = _read_lines(tmp_path, "s1")
+    turn = next(
+        line for line in lines if line["kind"] == "turn" and "gen_ai.prompt" in line["attributes"]
+    )
+    prompt = turn["attributes"]["gen_ai.prompt"]
+    assert isinstance(prompt, list)
+    assert all({"role", "content", "truncated"} <= set(m) for m in prompt)

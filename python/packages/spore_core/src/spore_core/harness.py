@@ -69,6 +69,7 @@ from .agent import (
     TurnResult,
 )
 from .model import (
+    ImageContent,
     Message,
     ModelParams,
     Role,
@@ -76,6 +77,8 @@ from .model import (
     TextContent,
     TokenUsage,
     ToolCall,
+    ToolCallContent as MsgToolCallContent,
+    ToolResultContent as MsgToolResultContent,
     ToolSchema,
 )
 
@@ -1107,6 +1110,54 @@ def _capture_tool_call_args(call: ToolCall, max_len: int) -> ToolCallContent:
     )
 
 
+_ROLE_TO_GENAI: dict[Role, GenAiRole] = {
+    Role.SYSTEM: GenAiRole.SYSTEM,
+    Role.USER: GenAiRole.USER,
+    Role.ASSISTANT: GenAiRole.ASSISTANT,
+    Role.TOOL: GenAiRole.TOOL,
+}
+
+
+def _capture_input_messages(messages: list[Message], max_len: int) -> list[GenAiMessage]:
+    """Snapshot the assembled INPUT messages (the full prompt the model saw)
+    into :class:`GenAiMessage`s for LLM-native tracing (issue #64). Each
+    message's :class:`Role` maps to the conventional :class:`GenAiRole`; the
+    :class:`Content` is rendered to a plain string and truncated to ``max_len``
+    UTF-8 bytes:
+
+    * ``TextContent``       → the text verbatim
+    * ``ToolResultContent`` → its ``content`` body (role stays ``Tool``)
+    * ``ToolCallContent``   → ``"<name> <compact-json-args>"`` (assistant)
+    * ``ImageContent``      → ``"[image <media_type>]"`` — NEVER the base64 data
+
+    System-first, then history order is preserved because the assembled
+    ``messages`` already lead with the :class:`Role.SYSTEM` prompt. Mirrors the
+    Rust reference ``capture_input_messages``."""
+    out: list[GenAiMessage] = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, TextContent):
+            rendered = content.text
+        elif isinstance(content, MsgToolResultContent):
+            rendered = content.content
+        elif isinstance(content, MsgToolCallContent):
+            rendered = f"{content.name} {json.dumps(content.input, separators=(',', ':'))}"
+        elif isinstance(content, ImageContent):
+            # NEVER dump the base64 ``data`` — placeholder only.
+            rendered = f"[image {content.media_type}]"
+        else:  # pragma: no cover - exhaustive over the Content union
+            rendered = ""
+        clipped, truncated = truncate_field(rendered, max_len)
+        out.append(
+            GenAiMessage(
+                role=_ROLE_TO_GENAI[m.role],
+                content=clipped,
+                truncated=truncated,
+            )
+        )
+    return out
+
+
 # ============================================================================
 # HarnessRunOptions
 # ============================================================================
@@ -1575,6 +1626,14 @@ class StandardHarness:
             self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
             turn_started_at = _now()
             turn_clock = time.monotonic()
+            # LLM-native content capture (issue #64): snapshot the assembled
+            # INPUT messages (the full prompt the model saw) BEFORE the agent
+            # turn call. Zero work when the guard is off.
+            input_messages: list[GenAiMessage] | None = None
+            if config.content_capture.enabled:
+                input_messages = _capture_input_messages(
+                    context.messages, config.content_capture.max_field_len
+                )
             result: TurnResult = await config.agent.turn(context)
             budget_used.turns += 1
 
@@ -1650,6 +1709,7 @@ class StandardHarness:
                         tool_calls_requested=tool_calls_requested,
                         output_text=output_text,
                         tool_calls=turn_tool_calls,
+                        input_messages=input_messages,
                     )
                 )
             span_seq += 1

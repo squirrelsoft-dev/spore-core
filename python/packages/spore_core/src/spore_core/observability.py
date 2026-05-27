@@ -361,6 +361,11 @@ class TurnSpan:
     # The tool calls the model requested this turn (issue #64). Captured only
     # when content capture is enabled.
     tool_calls: list[ToolCallContent] | None = None
+    # The assembled INPUT messages the model saw this turn — the full prompt
+    # (issue #64). First element is the system prompt; the rest mirror the
+    # assembled conversation history in order. Captured only when content
+    # capture is enabled; ``None`` keeps the line pre-#64-identical.
+    input_messages: list[GenAiMessage] | None = None
 
 
 @dataclass

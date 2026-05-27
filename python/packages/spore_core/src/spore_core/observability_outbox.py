@@ -273,6 +273,16 @@ class TraceLine:
             attributes["gen_ai.response.tool_calls"] = [
                 _tool_call_content_dict(c) for c in span.tool_calls
             ]
+        # Assembled INPUT prompt messages (issue #64). Per the OTel GenAI
+        # semantic conventions the input prompt is the canonical content; ride
+        # it as a ``gen_ai.prompt`` attribute alongside the metrics so the same
+        # line is readable in an LLM-native backend. Only present when capture
+        # populated it; absent keeps the line pre-#64-identical.
+        if span.input_messages is not None:
+            attributes["gen_ai.prompt"] = [
+                {"role": m.role.value, "content": m.content, "truncated": m.truncated}
+                for m in span.input_messages
+            ]
         return TraceLine._from_base(span.base, trace_id, "turn", "info", attributes)
 
     @staticmethod
@@ -494,6 +504,35 @@ def _genai_events(line: TraceLine) -> list[tuple[str, dict[str, Any]]]:
     """
     events: list[tuple[str, dict[str, Any]]] = []
     attrs = line.attributes
+
+    # Turn INPUT: the assembled prompt messages (issue #64). Per the OTel GenAI
+    # semantic conventions these are the canonical prompt events. Emitted FIRST
+    # and in order (system first, then history) so the trace reads top-to-bottom.
+    prompt = attrs.get("gen_ai.prompt")
+    if isinstance(prompt, list):
+        for msg in prompt:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if not isinstance(role, str):
+                role = GenAiRole.USER.value
+            content = msg.get("content")
+            if not isinstance(content, str):
+                content = ""
+            if role == GenAiRole.SYSTEM.value:
+                event_name = GenAiRole.SYSTEM.event_name()
+            elif role == GenAiRole.ASSISTANT.value:
+                event_name = GenAiRole.ASSISTANT.event_name()
+            elif role == GenAiRole.TOOL.value:
+                event_name = GenAiRole.TOOL.event_name()
+            else:
+                event_name = GenAiRole.USER.event_name()
+            events.append(
+                (
+                    event_name,
+                    {"gen_ai.message.role": role, "gen_ai.message.content": content},
+                )
+            )
 
     # Turn: the assistant's output text + each requested tool call.
     content = attrs.get("gen_ai.response.content")

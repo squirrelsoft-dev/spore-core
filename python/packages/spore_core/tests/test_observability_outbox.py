@@ -409,6 +409,7 @@ def _build_line(fixture_name: str, span: dict[str, Any], trace_id: str) -> Trace
         "trace_line_turn_with_content.json",
         "trace_line_turn_truncated.json",
         "trace_line_turn_content_off.json",
+        "trace_line_turn_with_input.json",
     ):
         return TraceLine.from_turn(_load_turn(span), trace_id)
     if fixture_name in ("trace_line_tool_call.json", "trace_line_tool_call_with_content.json"):
@@ -488,6 +489,16 @@ def _load_turn(d: dict[str, Any]) -> TurnSpan:
     tool_calls = None
     if "tool_calls" in d:
         tool_calls = [_load_tool_call_content(c) for c in d["tool_calls"]]
+    input_messages = None
+    if "input_messages" in d:
+        input_messages = [
+            GenAiMessage(
+                role=GenAiRole(m["role"]),
+                content=m["content"],
+                truncated=m["truncated"],
+            )
+            for m in d["input_messages"]
+        ]
     return TurnSpan(
         base=_load_base(d["base"]),
         turn_number=d["turn_number"],
@@ -500,6 +511,7 @@ def _load_turn(d: dict[str, Any]) -> TurnSpan:
         tool_calls_requested=d["tool_calls_requested"],
         output_text=output_text,
         tool_calls=tool_calls,
+        input_messages=input_messages,
     )
 
 
@@ -590,6 +602,7 @@ def _load_patch(d: dict[str, Any]) -> PatchSpan:
         "trace_line_turn_with_content.json",
         "trace_line_turn_truncated.json",
         "trace_line_turn_content_off.json",
+        "trace_line_turn_with_input.json",
         "trace_line_tool_call.json",
         "trace_line_tool_call_with_content.json",
         "trace_line_sensor.json",
