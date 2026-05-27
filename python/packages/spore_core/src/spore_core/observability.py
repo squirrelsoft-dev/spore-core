@@ -100,6 +100,9 @@ class SpanKind(str, Enum):
     # (issue #28). Always carries a :class:`PatchSpan` at
     # :attr:`SpanLevel.WARN`.
     PATCH = "patch"
+    # Emitted when a compaction summary is accepted despite failing verification
+    # (issue #46). Always carries a :class:`WarnSpan` at :attr:`SpanLevel.WARN`.
+    WARN = "warn"
 
 
 # ============================================================================
@@ -378,7 +381,58 @@ class PatchSpan:
     level: SpanLevel = SpanLevel.WARN
 
 
-Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan | PatchSpan
+# ============================================================================
+# Warn observability (issue #46)
+# ============================================================================
+#
+# A compaction summary may fail post-compaction verification on every attempt.
+# A blocked compaction is worse than an imperfect one, so the harness accepts
+# the failing summary anyway and emits exactly one warn-level event recording
+# what was still missing. The shape mirrors :class:`PatchSpan` (always
+# :attr:`SpanLevel.WARN`) but keeps warns that are not tied to a single tool
+# call in their own type.
+#
+# Rules enforced (mirrored by the unit tests):
+#   W1  exhausting ``max_compaction_attempts`` emits exactly one warn span.
+#   W2  the warn span carries a :class:`WarnEventCompactionVerificationFailed`
+#       with the still-missing items and ``accepted_anyway=True``.
+#   W3  :attr:`SessionMetrics.compaction_verification_failures` counts these
+#       spans for the session (mirrors how ``compactions`` is derived).
+#   W4  :meth:`ObservabilityProvider.emit_warn` has a default no-op body so
+#       providers predating #46 keep compiling and behave unchanged.
+
+
+class WarnEventCompactionVerificationFailed(_Model):
+    """A compaction summary failed verification on every attempt and was
+    accepted as-is (issue #46). ``missing_items`` are the preservation-list
+    terms still absent from the final summary; ``accepted_anyway`` is always
+    ``True`` for this variant (the harness never blocks on compaction)."""
+
+    warn: Literal["compaction_verification_failed"] = "compaction_verification_failed"
+    missing_items: list[str]
+    accepted_anyway: bool
+
+
+WarnEvent = Annotated[
+    WarnEventCompactionVerificationFailed,
+    Field(discriminator="warn"),
+]
+"""A warn-level, fire-and-forget observability event. Future warn classes add
+members; consumers must keep a fallthrough."""
+
+
+@dataclass
+class WarnSpan:
+    """One warn-level observability span (issue #46). Carries a
+    :class:`SpanBase` for trace correlation, the classified :data:`WarnEvent`,
+    and a hardcoded :attr:`SpanLevel.WARN`."""
+
+    base: SpanBase
+    event: WarnEvent
+    level: SpanLevel = SpanLevel.WARN
+
+
+Span = TurnSpan | ToolCallSpan | SensorSpan | ContextSpan | MiddlewareSpan | PatchSpan | WarnSpan
 """Heterogeneous span type returned by :meth:`ObservabilityProvider.get_trace`."""
 
 
@@ -408,6 +462,12 @@ class SessionMetrics:
     patch_rate: float = 0.0
     # Patch count broken down by tool name.
     patches_by_tool: dict[str, int] = field(default_factory=dict)
+    # Number of compactions whose summary failed verification on every attempt
+    # and was accepted anyway (issue #46). Derived by counting
+    # :class:`WarnSpan`s carrying
+    # :class:`WarnEventCompactionVerificationFailed`, mirroring how
+    # ``compactions`` is derived from compaction context spans.
+    compaction_verification_failures: int = 0
 
 
 # ============================================================================
@@ -478,6 +538,13 @@ class ObservabilityProvider(Protocol):
 
     def emit_patch(self, span: PatchSpan) -> None: ...
 
+    def emit_warn(self, span: WarnSpan) -> None:
+        """Record a warn-level event (issue #46). Default no-op so providers
+        predating #46 keep satisfying the Protocol and behave unchanged;
+        :class:`InMemoryObservabilityProvider` and the durable outbox override
+        it."""
+        _ = span
+
     def set_session_outcome(self, session_id: SessionId, outcome: SessionOutcome) -> None:
         """Record the terminal outcome for a session before flush. Default
         no-op so providers that do not track outcomes still satisfy the
@@ -535,6 +602,7 @@ class InMemoryObservabilityProvider:
         self._contexts: list[ContextSpan] = []
         self._middlewares: list[MiddlewareSpan] = []
         self._patches: list[PatchSpan] = []
+        self._warns: list[WarnSpan] = []
         # Per-session insertion-ordered (kind, span_id) tuples — the
         # trace-analyzer feed.
         self._trace_order: dict[SessionId, list[tuple[SpanKind, SpanId]]] = {}
@@ -566,6 +634,12 @@ class InMemoryObservabilityProvider:
         heterogeneous trace."""
         with self._lock:
             return [p for p in self._patches if p.base.session_id == session_id]
+
+    def warn_spans(self, session_id: SessionId) -> list[WarnSpan]:
+        """All recorded warn spans for a session, in insertion order
+        (issue #46)."""
+        with self._lock:
+            return [w for w in self._warns if w.base.session_id == session_id]
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -609,6 +683,11 @@ class InMemoryObservabilityProvider:
             self._push_order(span.base.session_id, SpanKind.PATCH, span.base.span_id)
             self._patches.append(span)
 
+    def emit_warn(self, span: WarnSpan) -> None:
+        with self._lock:
+            self._push_order(span.base.session_id, SpanKind.WARN, span.base.span_id)
+            self._warns.append(span)
+
     # ── flush_session (idempotent) ─────────────────────────────────────────
 
     async def flush_session(self, session_id: SessionId) -> None:
@@ -624,6 +703,7 @@ class InMemoryObservabilityProvider:
             sensors = [s for s in self._sensors if s.base.session_id == session_id]
             contexts = [c for c in self._contexts if c.base.session_id == session_id]
             patches = [p for p in self._patches if p.base.session_id == session_id]
+            warns = [w for w in self._warns if w.base.session_id == session_id]
             outcome = self._outcomes.get(session_id)
             guides = list(self._guides_used.get(session_id, []))
 
@@ -648,6 +728,9 @@ class InMemoryObservabilityProvider:
         patches_by_tool: dict[str, int] = {}
         for p in patches:
             patches_by_tool[p.tool_name] = patches_by_tool.get(p.tool_name, 0) + 1
+        compaction_verification_failures = sum(
+            1 for w in warns if isinstance(w.event, WarnEventCompactionVerificationFailed)
+        )
 
         return SessionMetrics(
             session_id=session_id,
@@ -666,6 +749,7 @@ class InMemoryObservabilityProvider:
             patch_count=patch_count,
             patch_rate=patch_rate,
             patches_by_tool=patches_by_tool,
+            compaction_verification_failures=compaction_verification_failures,
         )
 
     # ── get_sessions ───────────────────────────────────────────────────────
@@ -713,6 +797,7 @@ class InMemoryObservabilityProvider:
             contexts = {c.base.span_id: c for c in self._contexts}
             middlewares = {m.base.span_id: m for m in self._middlewares}
             patches = {p.base.span_id: p for p in self._patches}
+            warns = {w.base.span_id: w for w in self._warns}
 
         out: list[Span] = []
         for kind, span_id in order:
@@ -728,6 +813,8 @@ class InMemoryObservabilityProvider:
                 out.append(middlewares[span_id])
             elif kind is SpanKind.PATCH and span_id in patches:
                 out.append(patches[span_id])
+            elif kind is SpanKind.WARN and span_id in warns:
+                out.append(warns[span_id])
         return out
 
     # ── outbox stubs (issue #33) ────────────────────────────────────────────
@@ -770,5 +857,8 @@ __all__ = [
     "SpanStatusOk",
     "ToolCallSpan",
     "TurnSpan",
+    "WarnEvent",
+    "WarnEventCompactionVerificationFailed",
+    "WarnSpan",
     "new_span_id",
 ]
