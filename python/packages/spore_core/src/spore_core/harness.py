@@ -1089,6 +1089,7 @@ from .observability_outbox import (  # noqa: E402
     OutboxObservabilityProvider,
 )
 
+
 def _capture_tool_call_args(call: ToolCall, max_len: int) -> ToolCallContent:
     """Capture a requested tool call as :class:`ToolCallContent`, truncating its
     arguments to ``max_len`` UTF-8 bytes (issue #64). The arguments are measured

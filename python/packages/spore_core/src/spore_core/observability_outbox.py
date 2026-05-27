@@ -513,9 +513,7 @@ def _genai_events(line: TraceLine) -> list[tuple[str, dict[str, Any]]]:
             if not isinstance(call, dict):
                 continue
             name = call.get("name", "")
-            arguments = json.dumps(
-                call.get("arguments"), separators=(",", ":")
-            )
+            arguments = json.dumps(call.get("arguments"), separators=(",", ":"))
             events.append(
                 (
                     GenAiRole.ASSISTANT.event_name(),

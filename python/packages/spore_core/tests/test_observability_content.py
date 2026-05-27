@@ -378,9 +378,7 @@ async def test_harness_content_on_writes_genai_content_to_jsonl(
     turn_lines = [line for line in lines if line["kind"] == "turn"]
     tool_lines = [line for line in lines if line["kind"] == "tool_call"]
     # The tool-requesting turn carries the requested tool calls.
-    assert any(
-        "gen_ai.response.tool_calls" in line["attributes"] for line in turn_lines
-    )
+    assert any("gen_ai.response.tool_calls" in line["attributes"] for line in turn_lines)
     # The final-response turn carries the assistant output text.
     assert any(
         line["attributes"].get("gen_ai.response.content") == "all done" for line in turn_lines
