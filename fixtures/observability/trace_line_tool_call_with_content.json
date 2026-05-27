@@ -1,0 +1,60 @@
+{
+  "trace_id": "0af7651916cd43dd8448eb211c80319c",
+  "span": {
+    "base": {
+      "span_id": "tc-001",
+      "parent_span_id": "b7ad6b7169203331",
+      "session_id": "sess_a",
+      "task_id": "task_a",
+      "kind": "tool_call",
+      "started_at": "2026-05-26T18:00:02.1Z",
+      "ended_at": "2026-05-26T18:00:02.35Z",
+      "duration_ms": 250,
+      "status": { "kind": "ok" }
+    },
+    "tool_name": "shell",
+    "call_id": "call_1",
+    "parameters_size_bytes": 64,
+    "output_size_bytes": 4096,
+    "truncated": false,
+    "sandbox_mode": "workspace_scoped",
+    "sandbox_violations": [],
+    "arguments": {
+      "name": "shell",
+      "arguments": { "command": "ls -la" },
+      "arguments_truncated": false
+    },
+    "result": {
+      "content": "total 0\ndrwxr-xr-x  2 user  staff   64 May 26 18:00 .",
+      "truncated": false
+    }
+  },
+  "expected_line": {
+    "trace_id": "0af7651916cd43dd8448eb211c80319c",
+    "span_id": "tc-001",
+    "parent_span_id": "b7ad6b7169203331",
+    "session_id": "sess_a",
+    "task_id": "task_a",
+    "kind": "tool_call",
+    "level": "info",
+    "timestamp": "2026-05-26T18:00:02.35Z",
+    "started_at": "2026-05-26T18:00:02.1Z",
+    "duration_ms": 250,
+    "status": "ok",
+    "status_detail": null,
+    "attributes": {
+      "tool_name": "shell",
+      "call_id": "call_1",
+      "parameters_size_bytes": 64,
+      "output_size_bytes": 4096,
+      "truncated": false,
+      "sandbox_mode": "workspace_scoped",
+      "sandbox_violations": [],
+      "gen_ai.tool.name": "shell",
+      "gen_ai.tool.call.arguments": { "command": "ls -la" },
+      "gen_ai.tool.call.arguments_truncated": false,
+      "gen_ai.tool.message.content": "total 0\ndrwxr-xr-x  2 user  staff   64 May 26 18:00 .",
+      "gen_ai.tool.message.content_truncated": false
+    }
+  }
+}

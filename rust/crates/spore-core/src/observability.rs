@@ -46,6 +46,39 @@
 //!     monotonic clocks.
 //!   - [`PricingTable::DEFAULT`] is a conservative pass-through that
 //!     reports zero cost — production callers inject a real table.
+//!
+//! ## LLM-native content capture (issue #64)
+//!
+//! Opt-in capture of conversation/tool-call **content** following the
+//! OpenTelemetry GenAI semantic conventions. OFF by default. Plumbed into the
+//! existing span payloads (no trait-signature changes) and serialized into the
+//! durable JSONL only when present.
+//!
+//! Types added here:
+//!   - [`ContentCaptureConfig`] — the opt-in guard + truncation limit, read
+//!     from `SPORE_TRACE_CONTENT` (default `false`) and
+//!     `SPORE_TRACE_CONTENT_MAX_LEN` (default `8192`) via
+//!     [`ContentCaptureConfig::from_env`].
+//!   - [`GenAiRole`] — `system` / `user` / `assistant` / `tool`; maps to the
+//!     conventional span-event names (`gen_ai.<role>.message`).
+//!   - [`GenAiMessage`] — one captured message (role + content + truncation flag).
+//!   - [`ToolCallContent`] — a requested tool call (name + arguments + flag).
+//!   - [`ToolResultContent`] — a tool result body + truncation flag.
+//!   - [`truncate_field`] — the pure, byte-based, char-boundary-safe clipper.
+//!     This function is the cross-language ground truth.
+//!
+//! Field additions ([`TurnSpan::output_text`], [`TurnSpan::tool_calls`],
+//! [`ToolCallSpan::arguments`], [`ToolCallSpan::result`]) are all
+//! `#[serde(default, skip_serializing_if = "Option::is_none")]` so legacy
+//! fixtures and the content-OFF path stay byte-identical to pre-#64.
+//!
+//! ## Resolved maintainer decisions (issue #64) — NO `// SPEC QUESTION:` markers remain
+//!   1. Canonical convention is pure OTel `gen_ai.*` events (no OpenInference).
+//!   2. Routing is the single configurable `SPORE_OTLP_ENDPOINT` (no fan-out).
+//!   3. Truncation default is 8192 UTF-8 bytes, marker `...[truncated]`, clipped
+//!      at a char boundary; override `SPORE_TRACE_CONTENT_MAX_LEN`; guard
+//!      `SPORE_TRACE_CONTENT` (default OFF).
+//!   4. Prompt source is output + tool spans only (no assembled input history).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -171,6 +204,152 @@ impl SpanBase {
 }
 
 // ============================================================================
+// LLM-native content capture (issue #64)
+// ============================================================================
+
+/// The exact ASCII marker appended to any captured field that was clipped by
+/// [`truncate_field`]. Cross-language ground truth — never change the bytes.
+pub const TRUNCATION_MARKER: &str = "...[truncated]";
+
+/// Default content-field cap, in UTF-8 bytes (maintainer decision 3).
+const DEFAULT_CONTENT_MAX_LEN: usize = 8192;
+
+/// Opt-in guard + truncation limit for LLM-native content capture (issue #64).
+///
+/// Content capture is OFF by default. When `enabled` is `false` the harness
+/// populates none of the `gen_ai.*` content fields, so the durable JSONL stays
+/// byte-identical to the pre-#64 metrics-only output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentCaptureConfig {
+    /// Whether to capture message / tool-call content at all. Default `false`.
+    pub enabled: bool,
+    /// Maximum UTF-8 byte length of any single captured field before
+    /// [`truncate_field`] clips it. Default [`DEFAULT_CONTENT_MAX_LEN`] (8192).
+    pub max_field_len: usize,
+}
+
+impl Default for ContentCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_field_len: DEFAULT_CONTENT_MAX_LEN,
+        }
+    }
+}
+
+impl ContentCaptureConfig {
+    /// Read the config from the environment:
+    ///   - `SPORE_TRACE_CONTENT` — `1`/`true`/`yes`/`on` (case-insensitive)
+    ///     enables capture; anything else (or unset) leaves it OFF.
+    ///   - `SPORE_TRACE_CONTENT_MAX_LEN` — parsed as `usize`; falls back to the
+    ///     8192-byte default when unset or unparseable.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("SPORE_TRACE_CONTENT")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        let max_field_len = std::env::var("SPORE_TRACE_CONTENT_MAX_LEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CONTENT_MAX_LEN);
+        Self {
+            enabled,
+            max_field_len,
+        }
+    }
+}
+
+/// Role of a captured message. Serde `snake_case` so the bare strings map onto
+/// the conventional GenAI span-event names (`gen_ai.<role>.message`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenAiRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl GenAiRole {
+    /// The conventional OTel GenAI span-event name for this role, e.g.
+    /// `gen_ai.assistant.message`.
+    pub fn event_name(self) -> &'static str {
+        match self {
+            GenAiRole::System => "gen_ai.system.message",
+            GenAiRole::User => "gen_ai.user.message",
+            GenAiRole::Assistant => "gen_ai.assistant.message",
+            GenAiRole::Tool => "gen_ai.tool.message",
+        }
+    }
+
+    /// The `gen_ai.*.role` attribute value (bare-string serde form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GenAiRole::System => "system",
+            GenAiRole::User => "user",
+            GenAiRole::Assistant => "assistant",
+            GenAiRole::Tool => "tool",
+        }
+    }
+}
+
+/// One captured conversation message (issue #64).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenAiMessage {
+    pub role: GenAiRole,
+    pub content: String,
+    /// `true` when `content` was clipped by [`truncate_field`].
+    pub truncated: bool,
+}
+
+/// A requested tool call captured on a [`TurnSpan`] (issue #64).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallContent {
+    pub name: String,
+    /// The tool-call arguments. When clipped, the arguments are stored as a JSON
+    /// string value carrying the truncation marker (a `Value` cannot be clipped
+    /// in place), and `arguments_truncated` is `true`.
+    pub arguments: serde_json::Value,
+    pub arguments_truncated: bool,
+}
+
+/// A tool result body captured on a [`ToolCallSpan`] (issue #64).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultContent {
+    pub content: String,
+    /// `true` when `content` was clipped by [`truncate_field`].
+    pub truncated: bool,
+}
+
+/// Clip `s` to at most `max` UTF-8 bytes, appending [`TRUNCATION_MARKER`] when
+/// (and only when) a clip occurred. Returns `(clipped, was_truncated)`.
+///
+/// Pure and deterministic — this is the cross-language ground truth:
+///   - Measurement is in **UTF-8 bytes**, not chars.
+///   - When `s.len() <= max`, returns `s` unchanged with `false`.
+///   - Otherwise clips to the largest valid UTF-8 char boundary `<= max`
+///     (never splitting a multibyte char — backs off to the previous boundary)
+///     and appends the marker. The marker is appended AFTER the byte budget, so
+///     the returned string may exceed `max` bytes by the marker's length; the
+///     budget bounds the *captured payload*, not the marker.
+pub fn truncate_field(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    // Back off to the largest char boundary <= max.
+    let mut boundary = max;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut out = String::with_capacity(boundary + TRUNCATION_MARKER.len());
+    out.push_str(&s[..boundary]);
+    out.push_str(TRUNCATION_MARKER);
+    (out, true)
+}
+
+// ============================================================================
 // Span payload types
 // ============================================================================
 
@@ -187,6 +366,14 @@ pub struct TurnSpan {
     pub cost_usd: f64,
     pub stop_reason: StopReason,
     pub tool_calls_requested: u32,
+    /// The model's output text for this turn (issue #64). Captured only when
+    /// [`ContentCaptureConfig::enabled`]; `None` keeps the line pre-#64-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_text: Option<GenAiMessage>,
+    /// The tool calls the model requested this turn (issue #64). Captured only
+    /// when content capture is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallContent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +387,14 @@ pub struct ToolCallSpan {
     pub sandbox_mode: String,
     #[serde(default)]
     pub sandbox_violations: Vec<String>,
+    /// The tool-call arguments (issue #64). Captured only when content capture
+    /// is enabled; `None` keeps the line pre-#64-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<ToolCallContent>,
+    /// The tool result body (issue #64). Captured only when content capture is
+    /// enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ToolResultContent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1092,6 +1287,8 @@ mod tests {
             cost_usd: 0.0,
             stop_reason: StopReason::EndTurn,
             tool_calls_requested: 0,
+            output_text: None,
+            tool_calls: None,
         }
     }
 
@@ -1136,6 +1333,8 @@ mod tests {
             truncated: false,
             sandbox_mode: "workspace_scoped".into(),
             sandbox_violations: vec![],
+            arguments: None,
+            result: None,
         });
         let m = obs.get_session_metrics(&sid("s1")).await.unwrap();
         assert_eq!(m.tool_calls, 1);
@@ -1270,6 +1469,8 @@ mod tests {
             truncated: false,
             sandbox_mode: "none".into(),
             sandbox_violations: vec![],
+            arguments: None,
+            result: None,
         });
         let trace = obs.get_trace(&sid("s1")).await;
         assert_eq!(trace.len(), 2);
@@ -1464,6 +1665,8 @@ mod tests {
             truncated: false,
             sandbox_mode: "none".into(),
             sandbox_violations: vec![],
+            arguments: None,
+            result: None,
         }
     }
 
@@ -1535,6 +1738,97 @@ mod tests {
         assert_eq!(m.patch_count, 0);
         assert_eq!(m.patch_rate, 0.0);
         assert!(m.patches_by_tool.is_empty());
+    }
+
+    // ── Content capture: truncate_field (issue #64) ─────────────────────────
+
+    #[test]
+    fn truncate_field_no_clip_when_within_budget() {
+        let (out, t) = truncate_field("hello", 8192);
+        assert_eq!(out, "hello");
+        assert!(!t);
+        // Exactly at the limit is not truncated.
+        let (out, t) = truncate_field("abcd", 4);
+        assert_eq!(out, "abcd");
+        assert!(!t);
+    }
+
+    #[test]
+    fn truncate_field_clips_and_marks_at_byte_boundary() {
+        let (out, t) = truncate_field("abcdefghij", 4);
+        assert!(t);
+        assert_eq!(out, format!("abcd{TRUNCATION_MARKER}"));
+        // The captured payload before the marker is exactly the byte budget.
+        assert!(out.starts_with("abcd"));
+        assert_eq!(out.len(), 4 + TRUNCATION_MARKER.len());
+    }
+
+    #[test]
+    fn truncate_field_backs_off_to_char_boundary_for_multibyte() {
+        // "é" is 2 bytes (0xC3 0xA9). With max=3 on "aéb" (bytes: a, é, é-cont, b)
+        // the budget 3 lands mid-"é" at index 2..3 — actually let's be precise:
+        // "a" = 1 byte, "é" = 2 bytes (indices 1,2), "b" = 1 byte (index 3).
+        // max=2 lands right after "a" at a boundary → "a".
+        let s = "aéb"; // 4 bytes total
+        let (out, t) = truncate_field(s, 2);
+        assert!(t);
+        assert_eq!(out, format!("a{TRUNCATION_MARKER}"));
+        // max=3 lands mid-é (index 3 is NOT a boundary: é occupies 1..3, so 3 IS
+        // a boundary). Use a case that forces back-off: max=2 within é.
+        // "é" alone is 2 bytes; max=1 must back off to 0 → empty + marker.
+        let (out, t) = truncate_field("é", 1);
+        assert!(t);
+        assert_eq!(out, TRUNCATION_MARKER.to_string());
+        // Never splits a multibyte char: the clipped prefix is always valid UTF-8.
+        let emoji = "😀😀😀"; // 4 bytes each, 12 total
+        let (out, t) = truncate_field(emoji, 5);
+        assert!(t);
+        // 5 bytes lands mid-second-emoji (4..8); back off to boundary 4 → one emoji.
+        assert_eq!(out, format!("😀{TRUNCATION_MARKER}"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn content_capture_config_default_is_off() {
+        let c = ContentCaptureConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.max_field_len, 8192);
+    }
+
+    #[test]
+    fn genai_role_event_names_are_conventional() {
+        assert_eq!(GenAiRole::System.event_name(), "gen_ai.system.message");
+        assert_eq!(GenAiRole::User.event_name(), "gen_ai.user.message");
+        assert_eq!(
+            GenAiRole::Assistant.event_name(),
+            "gen_ai.assistant.message"
+        );
+        assert_eq!(GenAiRole::Tool.event_name(), "gen_ai.tool.message");
+    }
+
+    #[test]
+    fn turn_span_content_off_serializes_identically_to_pre_64() {
+        // With output_text/tool_calls None, the new fields are skipped, so the
+        // serialized span is byte-identical to the pre-#64 shape.
+        let span = turn_span("s1", "sp1", 1, 10, 5);
+        let v = serde_json::to_value(&span).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("output_text"));
+        assert!(!obj.contains_key("tool_calls"));
+    }
+
+    #[test]
+    fn turn_span_content_on_serializes_genai_message() {
+        let mut span = turn_span("s1", "sp1", 1, 10, 5);
+        span.output_text = Some(GenAiMessage {
+            role: GenAiRole::Assistant,
+            content: "done".into(),
+            truncated: false,
+        });
+        let v = serde_json::to_value(&span).unwrap();
+        assert_eq!(v["output_text"]["role"], "assistant");
+        assert_eq!(v["output_text"]["content"], "done");
+        assert_eq!(v["output_text"]["truncated"], false);
     }
 
     #[derive(serde::Deserialize)]

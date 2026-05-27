@@ -68,7 +68,8 @@ use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
 use crate::model::{Message, StopReason, TokenUsage, ToolCall, ToolSchema};
 use crate::observability::{
-    PricingTable, SpanBase, SpanId, SpanKind, SpanStatus, ToolCallSpan, TurnSpan, WarnEvent,
+    truncate_field, ContentCaptureConfig, GenAiMessage, GenAiRole, PricingTable, SpanBase, SpanId,
+    SpanKind, SpanStatus, ToolCallContent, ToolCallSpan, ToolResultContent, TurnSpan, WarnEvent,
     WarnSpan,
 };
 use crate::observability_outbox::{OutboxConfig, OutboxObservabilityProvider};
@@ -993,6 +994,11 @@ pub struct HarnessConfig {
     /// Token → USD pricing used to stamp `cost_usd` on emitted [`TurnSpan`]s.
     /// Defaults to [`PricingTable::DEFAULT`] (zero cost) when unset.
     pub pricing: PricingTable,
+    /// LLM-native content capture guard + truncation limit (issue #64).
+    /// Defaults to [`ContentCaptureConfig::default`] (OFF). When disabled the
+    /// harness populates no `gen_ai.*` content and the JSONL stays
+    /// byte-identical to the pre-#64 metrics-only output.
+    pub content_capture: ContentCaptureConfig,
 }
 
 impl Clone for HarnessConfig {
@@ -1008,6 +1014,7 @@ impl Clone for HarnessConfig {
             compaction_verifier: self.compaction_verifier.clone(),
             max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing.clone(),
+            content_capture: self.content_capture,
         }
     }
 }
@@ -1048,6 +1055,7 @@ pub struct HarnessBuilder {
     compaction_verifier: Arc<dyn CompactionVerifier>,
     max_compaction_attempts: u32,
     pricing: PricingTable,
+    content_capture: ContentCaptureConfig,
 }
 
 impl HarnessBuilder {
@@ -1071,6 +1079,7 @@ impl HarnessBuilder {
             compaction_verifier: Arc::new(KeyTermVerifier),
             max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
+            content_capture: ContentCaptureConfig::default(),
         }
     }
 
@@ -1115,6 +1124,14 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set the LLM-native content-capture config (issue #64). Defaults to OFF.
+    /// Use [`ContentCaptureConfig::from_env`] to honor `SPORE_TRACE_CONTENT` /
+    /// `SPORE_TRACE_CONTENT_MAX_LEN`.
+    pub fn content_capture(mut self, content_capture: ContentCaptureConfig) -> Self {
+        self.content_capture = content_capture;
+        self
+    }
+
     /// Assemble the [`HarnessConfig`] without wrapping it in a harness.
     pub fn build_config(self) -> HarnessConfig {
         HarnessConfig {
@@ -1128,6 +1145,7 @@ impl HarnessBuilder {
             compaction_verifier: self.compaction_verifier,
             max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing,
+            content_capture: self.content_capture,
         }
     }
 
@@ -1172,6 +1190,26 @@ impl StandardHarness {
     fn emit(stream: &Option<StreamSink>, event: StreamEvent) {
         if let Some(s) = stream.as_ref() {
             s(event);
+        }
+    }
+
+    /// Capture a requested tool call as [`ToolCallContent`], truncating its
+    /// arguments to `max` UTF-8 bytes (issue #64). The arguments are measured by
+    /// their canonical JSON serialization; when over budget they are clipped and
+    /// stored as a JSON string carrying the truncation marker (a structured
+    /// `Value` cannot be clipped in place), with `arguments_truncated = true`.
+    fn capture_tool_call_args(call: &ToolCall, max: usize) -> ToolCallContent {
+        let serialized = call.input.to_string();
+        let (clipped, truncated) = truncate_field(&serialized, max);
+        let arguments = if truncated {
+            serde_json::Value::String(clipped)
+        } else {
+            call.input.clone()
+        };
+        ToolCallContent {
+            name: call.name.clone(),
+            arguments,
+            arguments_truncated: truncated,
         }
     }
 
@@ -1392,6 +1430,37 @@ impl StandardHarness {
                     turn_clock.elapsed().as_millis() as u64,
                 );
                 if let Some(obs) = self.config.observability.as_ref() {
+                    // LLM-native content capture (issue #64): output text +
+                    // requested tool calls, ONLY when the guard is enabled.
+                    // Decision 4: turn span carries output + tool calls; no
+                    // assembled input-message history.
+                    let cc = &self.config.content_capture;
+                    let (output_text, tool_calls) = if cc.enabled {
+                        let output_text = match &result {
+                            TurnResult::FinalResponse { content, .. } => {
+                                let (content, truncated) =
+                                    truncate_field(content, cc.max_field_len);
+                                Some(GenAiMessage {
+                                    role: GenAiRole::Assistant,
+                                    content,
+                                    truncated,
+                                })
+                            }
+                            _ => None,
+                        };
+                        let tool_calls = match &result {
+                            TurnResult::ToolCallRequested { calls, .. } => Some(
+                                calls
+                                    .iter()
+                                    .map(|c| Self::capture_tool_call_args(c, cc.max_field_len))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        };
+                        (output_text, tool_calls)
+                    } else {
+                        (None, None)
+                    };
                     obs.emit_turn(TurnSpan {
                         base: base.clone(),
                         turn_number: budget_used.turns,
@@ -1407,6 +1476,8 @@ impl StandardHarness {
                         ),
                         stop_reason,
                         tool_calls_requested,
+                        output_text,
+                        tool_calls,
                     });
                 }
                 span_seq += 1;
@@ -1644,6 +1715,34 @@ impl StandardHarness {
 
                         // Tool-call span (issue #12), child of the current turn.
                         if let Some(obs) = self.config.observability.as_ref() {
+                            // LLM-native content capture (issue #64): tool args +
+                            // tool result, ONLY when the guard is enabled.
+                            let cc = &self.config.content_capture;
+                            let (tool_args_content, tool_result_content) = if cc.enabled {
+                                let args = Self::capture_tool_call_args(call, cc.max_field_len);
+                                let result = match &output {
+                                    ToolOutput::Success { content, .. } => {
+                                        let (content, t) =
+                                            truncate_field(content, cc.max_field_len);
+                                        Some(ToolResultContent {
+                                            content,
+                                            truncated: t,
+                                        })
+                                    }
+                                    ToolOutput::Error { message, .. } => {
+                                        let (content, t) =
+                                            truncate_field(message, cc.max_field_len);
+                                        Some(ToolResultContent {
+                                            content,
+                                            truncated: t,
+                                        })
+                                    }
+                                    ToolOutput::WaitingForHuman { .. } => None,
+                                };
+                                (Some(args), result)
+                            } else {
+                                (None, None)
+                            };
                             let (output_size_bytes, truncated) = match &output {
                                 ToolOutput::Success { content, truncated } => {
                                     (content.len(), *truncated)
@@ -1689,6 +1788,8 @@ impl StandardHarness {
                                 truncated,
                                 sandbox_mode: String::new(),
                                 sandbox_violations: Vec::new(),
+                                arguments: tool_args_content,
+                                result: tool_result_content,
                             });
                             span_seq += 1;
                         }
@@ -2367,6 +2468,7 @@ mod tests {
             compaction_verifier: Arc::new(KeyTermVerifier),
             max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
+            content_capture: ContentCaptureConfig::default(),
         }
     }
 
@@ -2512,6 +2614,132 @@ mod tests {
             .collect();
         assert_eq!(trace_ids.len(), 1, "all spans share one trace id");
         assert!(tmp.path().join("sessions/s1/.flushed").exists());
+    }
+
+    // Issue #64 — content capture ON: the harness populates GenAI content on
+    // the turn (output text + tool calls) and tool-call (args + result) spans,
+    // and the outbox writes it into the JSONL as `gen_ai.*` attributes.
+    #[tokio::test]
+    async fn content_capture_on_writes_genai_content_to_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({ "k": "v" }),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "all finished".into(),
+            usage: usage(),
+        });
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "tool result body".into(),
+            truncated: false,
+        });
+
+        let harness = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .with_observability_outbox(tmp.path())
+        .content_capture(ContentCaptureConfig {
+            enabled: true,
+            max_field_len: 8192,
+        })
+        .build();
+
+        harness.run(HarnessRunOptions::new(react(5))).await;
+
+        let body = std::fs::read_to_string(tmp.path().join("sessions/s1/trace.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // The tool-requesting turn carries the requested tool call.
+        let turn_with_calls = lines
+            .iter()
+            .find(|l| {
+                l["kind"] == "turn" && !l["attributes"]["gen_ai.response.tool_calls"].is_null()
+            })
+            .expect("turn with captured tool calls");
+        assert_eq!(
+            turn_with_calls["attributes"]["gen_ai.response.tool_calls"][0]["name"],
+            "do_thing"
+        );
+
+        // The final turn carries the assistant output text.
+        let final_turn = lines
+            .iter()
+            .find(|l| {
+                l["kind"] == "turn" && l["attributes"]["gen_ai.response.content"] == "all finished"
+            })
+            .expect("turn with captured output text");
+        assert_eq!(
+            final_turn["attributes"]["gen_ai.response.role"],
+            "assistant"
+        );
+
+        // The tool-call span carries args + result.
+        let tool = lines.iter().find(|l| l["kind"] == "tool_call").unwrap();
+        assert_eq!(tool["attributes"]["gen_ai.tool.name"], "do_thing");
+        assert_eq!(tool["attributes"]["gen_ai.tool.call.arguments"]["k"], "v");
+        assert_eq!(
+            tool["attributes"]["gen_ai.tool.message.content"],
+            "tool result body"
+        );
+    }
+
+    // Issue #64 — content capture OFF (default): no `gen_ai.*` content reaches
+    // the JSONL. Byte-for-byte the same metrics-only output as pre-#64.
+    #[tokio::test]
+    async fn content_capture_off_writes_no_genai_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "do_thing".into(),
+                input: serde_json::json!({ "secret": "value" }),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "sensitive output".into(),
+            usage: usage(),
+        });
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "sensitive result".into(),
+            truncated: false,
+        });
+
+        // Default builder → content_capture OFF.
+        let harness = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .with_observability_outbox(tmp.path())
+        .build();
+
+        harness.run(HarnessRunOptions::new(react(5))).await;
+
+        let body = std::fs::read_to_string(tmp.path().join("sessions/s1/trace.jsonl")).unwrap();
+        // No `gen_ai.` keys and no leaked content strings anywhere in the file.
+        assert!(!body.contains("gen_ai."), "no gen_ai content keys when off");
+        assert!(!body.contains("sensitive output"));
+        assert!(!body.contains("sensitive result"));
+        assert!(!body.contains("\"value\""));
     }
 
     // Rule: parallel tool calls all dispatched in one turn.
@@ -3283,6 +3511,7 @@ mod tests {
                 compaction_verifier: verifier,
                 max_compaction_attempts: max_attempts,
                 pricing: PricingTable::DEFAULT,
+                content_capture: ContentCaptureConfig::default(),
             })
         }
 

@@ -59,6 +59,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         compaction_verifier: Arc::new(spore_core::KeyTermVerifier),
         max_compaction_attempts: 2,
         pricing: spore_core::PricingTable::DEFAULT,
+        content_capture: spore_core::ContentCaptureConfig::default(),
     };
     let harness = StandardHarness::new(config);
 

@@ -100,6 +100,48 @@ These names are the snake_case serializations of the span structs already
 defined in `spore-core` (`observability.rs` / equivalents). The emitter MUST NOT
 rename them — the dashboards depend on these exact keys.
 
+## LLM-native content capture (issue #64) — opt-in `gen_ai.*` content
+
+By default the trace is **metrics/structure only**: it carries no prompts, model
+output, tool arguments, or tool results. Issue #64 adds **opt-in** capture of
+conversation/tool-call content following the OpenTelemetry **GenAI semantic
+conventions**. It is gated and OFF by default because content can be large and
+may contain secrets/PII.
+
+### Env guard + truncation
+
+| env var | default | effect |
+|---|---|---|
+| `SPORE_TRACE_CONTENT` | `false` (OFF) | `1`/`true`/`yes`/`on` (case-insensitive) enables content capture. Anything else, or unset, leaves it OFF. |
+| `SPORE_TRACE_CONTENT_MAX_LEN` | `8192` | Max **UTF-8 bytes** of any single captured field. Over-budget fields are clipped at a valid UTF-8 char boundary (a multibyte char is never split — it backs off to the previous boundary) and the exact ASCII marker `...[truncated]` is appended. |
+
+**With the guard OFF the durable JSONL is byte-identical to the pre-#64 output** —
+none of the keys below appear (they serialize with `skip_serializing_if`).
+
+### Added `attributes` keys (only present when capture is ON)
+
+| kind | additional `gen_ai.*` attributes |
+|---|---|
+| `turn` | `gen_ai.response.role` (`assistant`), `gen_ai.response.content` (model output text), `gen_ai.response.content_truncated` (bool); and, when the turn requested tools, `gen_ai.response.tool_calls` — an array of `{ name, arguments, arguments_truncated }`. Per the maintainer decision, the turn span carries the model **output + requested tool calls only**; the assembled input-message history is NOT plumbed here. |
+| `tool_call` | `gen_ai.tool.name`, `gen_ai.tool.call.arguments` (the tool-call arguments — a JSON value, or a clipped JSON string carrying the marker when truncated), `gen_ai.tool.call.arguments_truncated` (bool), `gen_ai.tool.message.content` (the tool result body), `gen_ai.tool.message.content_truncated` (bool). |
+
+### OTLP span events
+
+In addition to the attributes above, the OTLP forwarder emits one **span event
+per message** using the conventional event names — `gen_ai.system.message`,
+`gen_ai.user.message`, `gen_ai.assistant.message`, `gen_ai.tool.message` — each
+carrying `gen_ai.message.role` plus the message content (and, for tool-call
+requests, `gen_ai.tool.name` / `gen_ai.tool.call.arguments`). This is what an
+LLM-native, OTel-native backend (e.g. Arize Phoenix) renders as the readable
+conversation. The convention is vendor-neutral: the same OTLP stream is portable
+across Phoenix / Langfuse / LangSmith without code changes.
+
+### Routing
+
+Content rides the existing single OTLP target configured by
+`SPORE_OTLP_ENDPOINT`. There is no fan-out / multi-forwarder — Phoenix is simply
+another OTLP endpoint you point that variable at.
+
 ## Example lines
 
 ```json

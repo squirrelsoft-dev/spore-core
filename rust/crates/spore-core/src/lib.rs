@@ -98,10 +98,11 @@ pub use model::{
     ToolSchema,
 };
 pub use observability::{
-    ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
-    ObservabilityError, ObservabilityProvider as FullObservabilityProvider, PatchSpan, PatchType,
-    PricingTable, SensorSpan, SessionMetrics, Span, SpanBase, SpanId, SpanKind, SpanLevel,
-    SpanStatus, ToolCallSpan, TurnSpan,
+    truncate_field, ContentCaptureConfig, ContextOperation, ContextSpan, GenAiMessage, GenAiRole,
+    InMemoryObservabilityProvider, MiddlewareSpan, ObservabilityError,
+    ObservabilityProvider as FullObservabilityProvider, PatchSpan, PatchType, PricingTable,
+    SensorSpan, SessionMetrics, Span, SpanBase, SpanId, SpanKind, SpanLevel, SpanStatus,
+    ToolCallContent, ToolCallSpan, ToolResultContent, TurnSpan, TRUNCATION_MARKER,
 };
 pub use observability_outbox::{OutboxConfig, OutboxObservabilityProvider, TraceLine};
 pub use ollama::OllamaModelInterface;

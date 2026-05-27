@@ -88,7 +88,7 @@ use sha2::{Digest, Sha256};
 use crate::guide_registry::SessionOutcome;
 use crate::harness::{BoxFut, SessionId};
 use crate::observability::{
-    ContextOperation, ContextSpan, InMemoryObservabilityProvider, MiddlewareSpan,
+    ContextOperation, ContextSpan, GenAiRole, InMemoryObservabilityProvider, MiddlewareSpan,
     ObservabilityError, ObservabilityProvider, PatchSpan, SensorSpan, SessionMetrics, Span,
     SpanBase, SpanStatus, ToolCallSpan, TurnSpan, WarnSpan,
 };
@@ -217,7 +217,7 @@ impl TraceLine {
     }
 
     pub fn from_turn(span: &TurnSpan, trace_id: &str) -> Self {
-        let attributes = Self::attrs(vec![
+        let mut pairs = vec![
             ("turn_number", Value::from(span.turn_number)),
             ("input_tokens", Value::from(span.input_tokens)),
             ("output_tokens", Value::from(span.output_tokens)),
@@ -238,12 +238,30 @@ impl TraceLine {
                 "tool_calls_requested",
                 Value::from(span.tool_calls_requested),
             ),
-        ]);
+        ];
+        // GenAI content attributes (issue #64) — only when capture populated them.
+        // These ride as `gen_ai.*` keys alongside the metrics so the same line
+        // is readable in an LLM-native backend (Phoenix) without code changes.
+        if let Some(msg) = &span.output_text {
+            pairs.push(("gen_ai.response.role", Value::from(msg.role.as_str())));
+            pairs.push(("gen_ai.response.content", Value::from(msg.content.clone())));
+            pairs.push((
+                "gen_ai.response.content_truncated",
+                Value::from(msg.truncated),
+            ));
+        }
+        if let Some(calls) = &span.tool_calls {
+            pairs.push((
+                "gen_ai.response.tool_calls",
+                serde_json::to_value(calls).unwrap_or(Value::Null),
+            ));
+        }
+        let attributes = Self::attrs(pairs);
         Self::from_base(&span.base, trace_id, "turn", "info", attributes)
     }
 
     pub fn from_tool_call(span: &ToolCallSpan, trace_id: &str) -> Self {
-        let attributes = Self::attrs(vec![
+        let mut pairs = vec![
             ("tool_name", Value::from(span.tool_name.clone())),
             ("call_id", Value::from(span.call_id.clone())),
             (
@@ -257,7 +275,27 @@ impl TraceLine {
                 "sandbox_violations",
                 serde_json::to_value(&span.sandbox_violations).unwrap_or(Value::Null),
             ),
-        ]);
+        ];
+        // GenAI content attributes (issue #64) — only when capture populated them.
+        if let Some(args) = &span.arguments {
+            pairs.push(("gen_ai.tool.name", Value::from(args.name.clone())));
+            pairs.push(("gen_ai.tool.call.arguments", args.arguments.clone()));
+            pairs.push((
+                "gen_ai.tool.call.arguments_truncated",
+                Value::from(args.arguments_truncated),
+            ));
+        }
+        if let Some(result) = &span.result {
+            pairs.push((
+                "gen_ai.tool.message.content",
+                Value::from(result.content.clone()),
+            ));
+            pairs.push((
+                "gen_ai.tool.message.content_truncated",
+                Value::from(result.truncated),
+            ));
+        }
+        let attributes = Self::attrs(pairs);
         Self::from_base(&span.base, trace_id, "tool_call", "info", attributes)
     }
 
@@ -514,6 +552,79 @@ fn attributes_to_keyvalues(attrs: &serde_json::Value) -> Vec<opentelemetry::KeyV
     out
 }
 
+/// Build the conventional OTel GenAI span events for a built [`TraceLine`]
+/// (issue #64). Returns one `(event_name, attributes)` per captured message,
+/// using the conventional names `gen_ai.<role>.message`. Empty when the line
+/// carries no `gen_ai.*` content (content capture OFF, or non turn/tool line).
+///
+/// Note `attributes_to_keyvalues` only flattens the line's `attributes` into
+/// span *attributes*; GenAI conventions also want one span *event* per message,
+/// which this helper produces separately.
+fn emit_genai_events(line: &TraceLine) -> Vec<(&'static str, Vec<opentelemetry::KeyValue>)> {
+    use opentelemetry::KeyValue;
+    let mut events = Vec::new();
+    let Some(attrs) = line.attributes.as_object() else {
+        return events;
+    };
+
+    // Turn: the assistant's output text + each requested tool call.
+    if let Some(content) = attrs
+        .get("gen_ai.response.content")
+        .and_then(|v| v.as_str())
+    {
+        let role = attrs
+            .get("gen_ai.response.role")
+            .and_then(|v| v.as_str())
+            .unwrap_or(GenAiRole::Assistant.as_str());
+        events.push((
+            GenAiRole::Assistant.event_name(),
+            vec![
+                KeyValue::new("gen_ai.message.role", role.to_string()),
+                KeyValue::new("gen_ai.message.content", content.to_string()),
+            ],
+        ));
+    }
+    if let Some(calls) = attrs.get("gen_ai.response.tool_calls") {
+        if let Some(arr) = calls.as_array() {
+            for call in arr {
+                let name = call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = call
+                    .get("arguments")
+                    .map(|v| serde_json::to_string(v).unwrap_or_default())
+                    .unwrap_or_default();
+                events.push((
+                    GenAiRole::Assistant.event_name(),
+                    vec![
+                        KeyValue::new("gen_ai.message.role", GenAiRole::Assistant.as_str()),
+                        KeyValue::new("gen_ai.tool.name", name),
+                        KeyValue::new("gen_ai.tool.call.arguments", arguments),
+                    ],
+                ));
+            }
+        }
+    }
+
+    // Tool call: the tool result message.
+    if let Some(content) = attrs
+        .get("gen_ai.tool.message.content")
+        .and_then(|v| v.as_str())
+    {
+        events.push((
+            GenAiRole::Tool.event_name(),
+            vec![
+                KeyValue::new("gen_ai.message.role", GenAiRole::Tool.as_str()),
+                KeyValue::new("gen_ai.message.content", content.to_string()),
+            ],
+        ));
+    }
+
+    events
+}
+
 impl OtlpForwarder for OtlpSdkForwarder {
     fn forward(&self, line: &TraceLine) {
         use opentelemetry::trace::{SpanId as OtelSpanId, TraceId as OtelTraceId};
@@ -547,6 +658,18 @@ impl OtlpForwarder for OtlpSdkForwarder {
         // detail reaches Tempo, not just the JSONL.
         attrs.extend(attributes_to_keyvalues(&line.attributes));
         builder = builder.with_attributes(attrs);
+        // GenAI span events — one per captured message, conventional names
+        // (`gen_ai.<role>.message`). Empty when content capture is off (#64).
+        let genai_events = emit_genai_events(line);
+        if !genai_events.is_empty() {
+            use opentelemetry::trace::Event;
+            use std::time::SystemTime;
+            let events: Vec<Event> = genai_events
+                .into_iter()
+                .map(|(name, kvs)| Event::new(name, SystemTime::now(), kvs, 0))
+                .collect();
+            builder = builder.with_events(events);
+        }
         builder = builder.with_status(if line.status == "ok" {
             OtelStatus::Ok
         } else {
@@ -1002,6 +1125,8 @@ mod tests {
             cost_usd: 0.0123,
             stop_reason: StopReason::ToolUse,
             tool_calls_requested: 1,
+            output_text: None,
+            tool_calls: None,
         }
     }
 
@@ -1292,10 +1417,13 @@ mod tests {
 
     fn build_line(kind_file: &str, span: &Value, trace_id: &str) -> TraceLine {
         match kind_file {
-            "trace_line_turn.json" => {
+            "trace_line_turn.json"
+            | "trace_line_turn_with_content.json"
+            | "trace_line_turn_truncated.json"
+            | "trace_line_turn_content_off.json" => {
                 TraceLine::from_turn(&serde_json::from_value(span.clone()).unwrap(), trace_id)
             }
-            "trace_line_tool_call.json" => {
+            "trace_line_tool_call.json" | "trace_line_tool_call_with_content.json" => {
                 TraceLine::from_tool_call(&serde_json::from_value(span.clone()).unwrap(), trace_id)
             }
             "trace_line_sensor.json" => {
@@ -1332,6 +1460,11 @@ mod tests {
             "trace_line_middleware.json",
             "trace_line_patch.json",
             "trace_line_session_summary.json",
+            // Issue #64 content-capture fixtures.
+            "trace_line_turn_with_content.json",
+            "trace_line_tool_call_with_content.json",
+            "trace_line_turn_truncated.json",
+            "trace_line_turn_content_off.json",
         ];
         for f in files {
             let raw = std::fs::read_to_string(fixture_path(f))
@@ -1341,5 +1474,142 @@ mod tests {
             let got = serde_json::to_value(&line).unwrap();
             assert_eq!(got, fx.expected_line, "mismatch in fixture {f}");
         }
+    }
+
+    // ── Content capture (issue #64) ──────────────────────────────────────────
+
+    use crate::observability::{GenAiMessage, GenAiRole, ToolCallContent, ToolResultContent};
+
+    /// Guard OFF: a turn with no captured content writes a JSONL line whose
+    /// `attributes` carry no `gen_ai.*` keys — byte-identical to pre-#64.
+    #[tokio::test]
+    async fn content_off_emits_no_genai_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obs = provider(tmp.path());
+        obs.emit_turn(turn("s1", "sp1")); // turn() leaves content fields None
+        let l = &read_lines(tmp.path(), "s1")[0];
+        let attrs = l["attributes"].as_object().unwrap();
+        assert!(attrs.keys().all(|k| !k.starts_with("gen_ai.")));
+        // No new top-level/payload keys leak.
+        assert!(!attrs.contains_key("gen_ai.response.content"));
+        assert!(!attrs.contains_key("gen_ai.response.tool_calls"));
+    }
+
+    /// Guard ON: output text + tool calls land as `gen_ai.*` attributes.
+    #[tokio::test]
+    async fn content_on_turn_emits_genai_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obs = provider(tmp.path());
+        let mut t = turn("s1", "sp1");
+        t.output_text = Some(GenAiMessage {
+            role: GenAiRole::Assistant,
+            content: "all done".into(),
+            truncated: false,
+        });
+        t.tool_calls = Some(vec![ToolCallContent {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            arguments_truncated: false,
+        }]);
+        obs.emit_turn(t);
+        let l = &read_lines(tmp.path(), "s1")[0];
+        assert_eq!(l["attributes"]["gen_ai.response.role"], "assistant");
+        assert_eq!(l["attributes"]["gen_ai.response.content"], "all done");
+        assert_eq!(l["attributes"]["gen_ai.response.content_truncated"], false);
+        assert_eq!(
+            l["attributes"]["gen_ai.response.tool_calls"][0]["name"],
+            "shell"
+        );
+    }
+
+    /// Guard ON: tool args + tool result land as `gen_ai.*` attributes.
+    #[tokio::test]
+    async fn content_on_tool_call_emits_genai_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obs = provider(tmp.path());
+        let mut span = ToolCallSpan {
+            base: base("s1", "tc1", SpanKind::ToolCall, SpanStatus::Ok),
+            tool_name: "shell".into(),
+            call_id: "c1".into(),
+            parameters_size_bytes: 12,
+            output_size_bytes: 42,
+            truncated: false,
+            sandbox_mode: "none".into(),
+            sandbox_violations: vec![],
+            arguments: None,
+            result: None,
+        };
+        span.arguments = Some(ToolCallContent {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            arguments_truncated: false,
+        });
+        span.result = Some(ToolResultContent {
+            content: "file.txt".into(),
+            truncated: false,
+        });
+        obs.emit_tool_call(span);
+        let l = &read_lines(tmp.path(), "s1")[0];
+        assert_eq!(l["attributes"]["gen_ai.tool.name"], "shell");
+        assert_eq!(
+            l["attributes"]["gen_ai.tool.call.arguments"]["command"],
+            "ls"
+        );
+        assert_eq!(l["attributes"]["gen_ai.tool.message.content"], "file.txt");
+        assert_eq!(
+            l["attributes"]["gen_ai.tool.message.content_truncated"],
+            false
+        );
+    }
+
+    /// `emit_genai_events` builds one event per message with the conventional
+    /// `gen_ai.<role>.message` names.
+    #[test]
+    fn genai_events_built_per_message_with_conventional_names() {
+        // A turn line with output text + one tool call → two assistant events.
+        let mut t = turn("s1", "sp1");
+        t.output_text = Some(GenAiMessage {
+            role: GenAiRole::Assistant,
+            content: "hi".into(),
+            truncated: false,
+        });
+        t.tool_calls = Some(vec![ToolCallContent {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            arguments_truncated: false,
+        }]);
+        let line = TraceLine::from_turn(&t, "0af7651916cd43dd8448eb211c80319c");
+        let events = emit_genai_events(&line);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|(n, _)| *n == "gen_ai.assistant.message"));
+
+        // A tool_call line with a result → one tool event.
+        let span = ToolCallSpan {
+            base: base("s1", "tc1", SpanKind::ToolCall, SpanStatus::Ok),
+            tool_name: "shell".into(),
+            call_id: "c1".into(),
+            parameters_size_bytes: 0,
+            output_size_bytes: 0,
+            truncated: false,
+            sandbox_mode: "none".into(),
+            sandbox_violations: vec![],
+            arguments: Some(ToolCallContent {
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+                arguments_truncated: false,
+            }),
+            result: Some(ToolResultContent {
+                content: "file.txt".into(),
+                truncated: false,
+            }),
+        };
+        let line = TraceLine::from_tool_call(&span, "0af7651916cd43dd8448eb211c80319c");
+        let events = emit_genai_events(&line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "gen_ai.tool.message");
+
+        // Content-off turn → no events.
+        let empty = TraceLine::from_turn(&turn("s1", "x"), "0af7651916cd43dd8448eb211c80319c");
+        assert!(emit_genai_events(&empty).is_empty());
     }
 }
