@@ -491,6 +491,17 @@ class ObservabilityProvider(Protocol):
 
     async def get_trace(self, session_id: SessionId) -> list[Span]: ...
 
+    async def list_unflushed_sessions(self) -> list[SessionId]:
+        """Session ids whose durable outbox has a ``trace.jsonl`` but no
+        ``.flushed`` marker (issue #33). Only the durable-outbox provider has
+        unflushed on-disk sessions; the default returns an empty list."""
+        return []
+
+    async def cleanup_session(self, session_id: SessionId) -> None:
+        """Delete a session's durable outbox (issue #33). The provider NEVER
+        auto-deletes; the caller drives cleanup. Default: no-op."""
+        _ = session_id
+
 
 # ============================================================================
 # InMemoryObservabilityProvider — reference implementation
@@ -712,6 +723,16 @@ class InMemoryObservabilityProvider:
             elif kind is SpanKind.PATCH and span_id in patches:
                 out.append(patches[span_id])
         return out
+
+    # ── outbox stubs (issue #33) ────────────────────────────────────────────
+    # The in-memory provider keeps no durable outbox; these satisfy the
+    # :class:`ObservabilityProvider` Protocol with the documented defaults.
+
+    async def list_unflushed_sessions(self) -> list[SessionId]:
+        return []
+
+    async def cleanup_session(self, session_id: SessionId) -> None:
+        _ = session_id
 
 
 __all__ = [
