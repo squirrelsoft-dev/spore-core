@@ -30,18 +30,30 @@ func req(msgs ...sporecore.Message) sporecore.ModelRequest {
 	return sporecore.ModelRequest{Messages: msgs}
 }
 
-// composite test server: dispatches /api/tags to tags, others to chat.
+// composite test server: dispatches /api/tags to tags, /api/show to show
+// (defaulting to 404 so discovery degrades gracefully), others to chat.
 type splitHandler struct {
 	tagsCount int64
+	showCount int64
 	chat      http.HandlerFunc
+	show      http.HandlerFunc // optional; nil → 404
 	model     string
 }
 
 func (s *splitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/api/tags" {
+	switch r.URL.Path {
+	case "/api/tags":
 		atomic.AddInt64(&s.tagsCount, 1)
 		w.Header().Set("content-type", "application/json")
 		_, _ = io.WriteString(w, `{"models":[{"name":"`+s.model+`:latest"}]}`)
+		return
+	case "/api/show":
+		atomic.AddInt64(&s.showCount, 1)
+		if s.show == nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.show(w, r)
 		return
 	}
 	s.chat(w, r)
@@ -344,6 +356,13 @@ func TestNameMatchesHandlesLatestTag(t *testing.T) {
 
 func newSplitServer(t *testing.T, model string, chat http.HandlerFunc) (*httptest.Server, *splitHandler) {
 	h := &splitHandler{chat: chat, model: model}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return srv, h
+}
+
+func newSplitServerWithShow(t *testing.T, model string, chat, show http.HandlerFunc) (*httptest.Server, *splitHandler) {
+	h := &splitHandler{chat: chat, show: show, model: model}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv, h
@@ -670,6 +689,119 @@ func TestFixtureReplayRoundTrip(t *testing.T) {
 	}
 	if r.StopReason != sporecore.StopEndTurn {
 		t.Fatalf("stop: %s", r.StopReason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /api/show discovery + tool-capability guard
+// ---------------------------------------------------------------------------
+
+func toolReq() sporecore.ModelRequest {
+	r := req(userMsg("use a tool"))
+	r.Tools = []sporecore.ToolSchema{{
+		Name:        "search",
+		Description: "search the web",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}}
+	return r
+}
+
+func chatOK(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`)
+}
+
+func showJSON(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+func TestProviderReflectsDiscoveredContextWindow(t *testing.T) {
+	srv, _ := newSplitServerWithShow(t, "llama3.2", chatOK,
+		showJSON(`{"model_info":{"llama.context_length":16384},"capabilities":["tools"]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+	// Before the probe runs, Provider falls back to the static table.
+	if got := c.Provider().ContextWindow; got != 128_000 {
+		t.Fatalf("pre-probe context window = %d, want 128000", got)
+	}
+	if _, err := c.Call(context.Background(), req(userMsg("hi"))); err != nil {
+		t.Fatal(err)
+	}
+	// After the probe, Provider reflects the discovered value.
+	if got := c.Provider().ContextWindow; got != 16_384 {
+		t.Fatalf("post-probe context window = %d, want 16384", got)
+	}
+}
+
+func TestProviderFallsBackWhenShow404s(t *testing.T) {
+	// show handler nil → splitHandler returns 404 for /api/show.
+	srv, _ := newSplitServer(t, "llama3.2", chatOK)
+	c := WithBaseURL("llama3.2", srv.URL)
+	if _, err := c.Call(context.Background(), req(userMsg("hi"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Provider().ContextWindow; got != 128_000 {
+		t.Fatalf("context window = %d, want 128000 (static fallback)", got)
+	}
+}
+
+func TestProviderFallsBackWhenContextLengthMissing(t *testing.T) {
+	srv, _ := newSplitServerWithShow(t, "llama3.2", chatOK,
+		showJSON(`{"model_info":{"general.architecture":"llama"},"capabilities":["tools"]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+	if _, err := c.Call(context.Background(), req(userMsg("hi"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Provider().ContextWindow; got != 128_000 {
+		t.Fatalf("context window = %d, want 128000 (static fallback)", got)
+	}
+}
+
+func TestToolRequestRejectedWhenCapabilityAbsent(t *testing.T) {
+	// capabilities lacks "tools"; chat handler fails the test if hit.
+	chat := func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("/api/chat must not be hit, path=%s", r.URL.Path)
+	}
+	srv, _ := newSplitServerWithShow(t, "gemma", chat,
+		showJSON(`{"model_info":{"gemma.context_length":8192},"capabilities":["completion"]}`))
+	c := WithBaseURL("gemma", srv.URL)
+	_, err := c.Call(context.Background(), toolReq())
+	var merr *sporecore.ModelError
+	if !errors.As(err, &merr) || merr.Kind != sporecore.ModelErrProviderError {
+		t.Fatalf("expected ProviderError, got %v", err)
+	}
+	if merr.Code != 0 || !strings.Contains(merr.Message, "does not support tool calling") {
+		t.Fatalf("err: %+v", merr)
+	}
+}
+
+func TestToolRequestProceedsWhenCapabilityPresent(t *testing.T) {
+	srv, _ := newSplitServerWithShow(t, "llama3.2", chatOK,
+		showJSON(`{"model_info":{"llama.context_length":128000},"capabilities":["completion","tools"]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+	r, err := c.Call(context.Background(), toolReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Content) != 1 || r.Content[0].Text != "ok" {
+		t.Fatalf("content: %+v", r.Content)
+	}
+}
+
+func TestShowFetchedAtMostOnce(t *testing.T) {
+	srv, h := newSplitServerWithShow(t, "llama3.2", chatOK,
+		showJSON(`{"model_info":{"llama.context_length":32000},"capabilities":["tools"]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+	if _, err := c.Call(context.Background(), req(userMsg("a"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Call(context.Background(), req(userMsg("b"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt64(&h.showCount); got != 1 {
+		t.Fatalf("/api/show hit %d times, want 1", got)
 	}
 }
 
