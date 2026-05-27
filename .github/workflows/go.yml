@@ -37,6 +37,12 @@ jobs:
             exit 1
           fi
       - name: Vet
-        run: go vet ./...
+        run: |
+          for m in spore-core spore-cli spore-eval; do
+            (cd "$m" && go vet ./...)
+          done
       - name: Test
-        run: go test ./...
+        run: |
+          for m in spore-core spore-cli spore-eval; do
+            (cd "$m" && go test ./...)
+          done

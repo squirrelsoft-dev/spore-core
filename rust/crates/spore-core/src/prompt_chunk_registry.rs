@@ -543,25 +543,21 @@ fn validate_slot_and_cache_block(chunk: &PromptChunk) -> Result<(), ChunkError> 
         });
     }
     match chunk.slot {
-        ChunkSlot::Budget | ChunkSlot::Ephemeral => {
-            if chunk.cache_block != CacheBlock::PerTurn {
-                return Err(ChunkError::ConflictingCacheBlock {
-                    id: chunk.id.clone(),
-                    slot: chunk.slot,
-                    expected: CacheBlock::PerTurn,
-                    actual: chunk.cache_block,
-                });
-            }
+        ChunkSlot::Budget | ChunkSlot::Ephemeral if chunk.cache_block != CacheBlock::PerTurn => {
+            return Err(ChunkError::ConflictingCacheBlock {
+                id: chunk.id.clone(),
+                slot: chunk.slot,
+                expected: CacheBlock::PerTurn,
+                actual: chunk.cache_block,
+            });
         }
-        ChunkSlot::Role | ChunkSlot::Mode => {
-            if chunk.cache_block != CacheBlock::Static {
-                return Err(ChunkError::ConflictingCacheBlock {
-                    id: chunk.id.clone(),
-                    slot: chunk.slot,
-                    expected: CacheBlock::Static,
-                    actual: chunk.cache_block,
-                });
-            }
+        ChunkSlot::Role | ChunkSlot::Mode if chunk.cache_block != CacheBlock::Static => {
+            return Err(ChunkError::ConflictingCacheBlock {
+                id: chunk.id.clone(),
+                slot: chunk.slot,
+                expected: CacheBlock::Static,
+                actual: chunk.cache_block,
+            });
         }
         _ => {}
     }

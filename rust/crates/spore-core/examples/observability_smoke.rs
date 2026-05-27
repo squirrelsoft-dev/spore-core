@@ -30,7 +30,10 @@ use spore_core::{
 #[tokio::main]
 async fn main() {
     // Unique per-run session id so repeated runs don't collide in Tempo.
-    let session_id = format!("live-smoke-{}", Timestamp::now().as_str().replace([':', '.'], "-"));
+    let session_id = format!(
+        "live-smoke-{}",
+        Timestamp::now().as_str().replace([':', '.'], "-")
+    );
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.spore");
 
     let endpoint = std::env::var("SPORE_OTLP_ENDPOINT").unwrap_or_default();
@@ -54,7 +57,7 @@ async fn main() {
             name: "read_file".into(),
             input: serde_json::json!({ "path": "src/auth.rs" }),
         }],
-        usage: usage.clone(),
+        usage,
     });
     agent.push(TurnResult::FinalResponse {
         content: "fixed the failing test".into(),
