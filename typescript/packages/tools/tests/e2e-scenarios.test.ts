@@ -14,8 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  type Agent,
   AgentId,
   cacheProvider,
+  type Context,
   context as coreContext,
   emptySessionState,
   harnessTesting,
@@ -29,6 +31,7 @@ import {
   type TaskId,
   type ToolCall,
   type ToolSchema,
+  type TurnResult,
 } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
@@ -348,5 +351,83 @@ describe("S4 — tool failure + recovery", () => {
     expect(names).toEqual(sorted);
     expect(names).toContain("flaky_op");
     expect(names).toContain("read_file");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: the task instruction must reach the agent as the first user
+// message (issue #57). Unlike MockAgent, which ignores its Context, this agent
+// records every assembled Context so we can assert the model actually receives
+// the prompt. Backed by the real compaction adapter (via
+// buildRichContextManager), exactly like a live run — the adapter mirrors
+// session.message_history and ignores `task`, so without the harness seeding
+// the instruction the captured first-turn context is EMPTY and this test fails
+// (which is the bug being fixed).
+// ---------------------------------------------------------------------------
+
+describe("regression — task instruction delivered as first user message", () => {
+  class CapturingAgent implements Agent {
+    readonly contexts: Context[] = [];
+    constructor(private readonly agentId: AgentId) {}
+    async turn(context: Context): Promise<TurnResult> {
+      // Snapshot the assembled messages so later turns can't mutate the record.
+      this.contexts.push({ ...context, messages: [...context.messages] });
+      return { kind: "final_response", content: "DONE", usage };
+    }
+    id(): AgentId {
+      return this.agentId;
+    }
+  }
+
+  it("seeds the instruction into the first-turn context", async () => {
+    const sessionId = SessionId.of("seed-test");
+    const agent = new CapturingAgent(AgentId.of("capture"));
+
+    // Real compaction-adapter-backed context manager (mirrors message history,
+    // ignores `task`), so only the harness seeding can put the prompt on screen.
+    const providerInfo: ProviderInfo = {
+      name: "mock",
+      model_id: "mock",
+      context_window: 4096,
+    };
+    const model = new MockModelInterface(providerInfo);
+    const cfg: coreContext.CompactionConfig = {
+      threshold: 0.8,
+      preserve_recent_n: 2,
+      head_tail_tokens: 64,
+      offload_path: ".spore/offload",
+      max_compaction_attempts: 2,
+    };
+    const cm = buildRichContextManager(model, new NullCacheProvider(), cfg);
+
+    const harness = buildScenario({
+      scenario: "s1",
+      agent,
+      tools: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: cm,
+      terminationPolicy: new AlwaysContinuePolicy(),
+      toolSchemas: [],
+    });
+
+    const instruction = "summarize the quarterly payment report";
+    const result = await harness.run({
+      task: newTask(instruction, sessionId, react(4)),
+    });
+    expect(result.kind).toBe("success");
+
+    const first = agent.contexts[0];
+    expect(first, "agent must have been invoked at least once").toBeDefined();
+    const hasUserInstruction = first!.messages.some(
+      (m) =>
+        m.role === "user" &&
+        m.content.type === "text" &&
+        m.content.text === instruction,
+    );
+    expect(
+      hasUserInstruction,
+      `first-turn context must contain a User message equal to the task ` +
+        `instruction; got messages: ${JSON.stringify(first!.messages)}`,
+    ).toBe(true);
   });
 });
