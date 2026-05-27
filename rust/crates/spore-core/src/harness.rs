@@ -73,6 +73,7 @@ use crate::observability::{
     WarnSpan,
 };
 use crate::observability_outbox::{OutboxConfig, OutboxObservabilityProvider};
+use crate::tool_call_repair::ToolCallRepair;
 
 /// Boxed future alias used to make the component traits `dyn`-compatible.
 /// `trait_variant::make(Send)` generates RPITIT which is not dyn-safe; the
@@ -999,6 +1000,14 @@ pub struct HarnessConfig {
     /// harness populates no `gen_ai.*` content and the JSONL stays
     /// byte-identical to the pre-#64 metrics-only output.
     pub content_capture: ContentCaptureConfig,
+    /// Optional deterministic tool-call repair provider. When set, recoverable
+    /// tool-dispatch errors trigger an argument-coercion + re-dispatch attempt
+    /// before falling back to error feedback. `None` (the default) preserves
+    /// today's behaviour byte-for-byte.
+    pub tool_call_repair: Option<Arc<dyn ToolCallRepair>>,
+    /// Maximum number of repair-and-re-dispatch attempts per tool call.
+    /// Defaults to `1`. Ignored when `tool_call_repair` is `None`.
+    pub max_repair_attempts: u32,
 }
 
 impl Clone for HarnessConfig {
@@ -1015,6 +1024,8 @@ impl Clone for HarnessConfig {
             max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing.clone(),
             content_capture: self.content_capture,
+            tool_call_repair: self.tool_call_repair.clone(),
+            max_repair_attempts: self.max_repair_attempts,
         }
     }
 }
@@ -1056,6 +1067,8 @@ pub struct HarnessBuilder {
     max_compaction_attempts: u32,
     pricing: PricingTable,
     content_capture: ContentCaptureConfig,
+    tool_call_repair: Option<Arc<dyn ToolCallRepair>>,
+    max_repair_attempts: u32,
 }
 
 impl HarnessBuilder {
@@ -1080,7 +1093,26 @@ impl HarnessBuilder {
             max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
             content_capture: ContentCaptureConfig::default(),
+            tool_call_repair: None,
+            max_repair_attempts: 1,
         }
+    }
+
+    /// Inject a deterministic tool-call repair provider (e.g.
+    /// [`StandardToolCallRepair`](crate::tool_call_repair::StandardToolCallRepair)).
+    /// When set, recoverable tool-dispatch errors trigger an argument-coercion
+    /// and re-dispatch attempt before falling back to enriched error feedback.
+    /// Defaults to `None` (behaviour byte-identical to today).
+    pub fn tool_call_repair(mut self, repair: Arc<dyn ToolCallRepair>) -> Self {
+        self.tool_call_repair = Some(repair);
+        self
+    }
+
+    /// Set the maximum number of repair-and-re-dispatch attempts per tool call.
+    /// Defaults to `1`. Ignored when no repair provider is set.
+    pub fn max_repair_attempts(mut self, attempts: u32) -> Self {
+        self.max_repair_attempts = attempts;
+        self
     }
 
     /// Inject a post-compaction verifier (issue #46). Defaults to
@@ -1146,6 +1178,8 @@ impl HarnessBuilder {
             max_compaction_attempts: self.max_compaction_attempts,
             pricing: self.pricing,
             content_capture: self.content_capture,
+            tool_call_repair: self.tool_call_repair,
+            max_repair_attempts: self.max_repair_attempts,
         }
     }
 
@@ -1251,6 +1285,29 @@ impl StandardHarness {
                 }
             })
             .collect()
+    }
+
+    /// Enrich a recoverable tool-error message that survived (or was not
+    /// eligible for) repair, so the model gets actionable feedback instead of a
+    /// bare serde message. Appends the tool's parameter schema (when available)
+    /// plus a short hint about supplying correctly-typed JSON arguments.
+    fn enrich_tool_error(message: &str, schema: Option<&ToolSchema>) -> ToolOutput {
+        let mut enriched = message.to_string();
+        if let Some(schema) = schema {
+            if let Ok(schema_json) = serde_json::to_string(&schema.input_schema) {
+                enriched.push_str("\n\nExpected parameter schema: ");
+                enriched.push_str(&schema_json);
+            }
+        }
+        enriched.push_str(
+            "\n\nHint: provide arguments as correctly-typed JSON \
+             (e.g. true/false as a bool, 42 as a number, [\"a\"] as an array) \
+             rather than as quoted strings.",
+        );
+        ToolOutput::Error {
+            message: enriched,
+            recoverable: true,
+        }
     }
 
     fn budget_exceeded(
@@ -1721,7 +1778,82 @@ impl StandardHarness {
                         );
                         let tool_started_at = Timestamp::now();
                         let tool_clock = Instant::now();
-                        let output = self.config.tool_registry.dispatch(call.clone()).await;
+                        // `effective_call` is the call actually dispatched. It
+                        // starts as the agent's call and may be replaced by a
+                        // repaired variant below. Spans/results are stamped from it.
+                        let mut effective_call = call.clone();
+                        let mut output = self
+                            .config
+                            .tool_registry
+                            .dispatch(effective_call.clone())
+                            .await;
+
+                        // Tool-call repair (additive): if the dispatch returned a
+                        // recoverable error and a repair provider is configured,
+                        // try to coerce the arguments and re-dispatch, bounded by
+                        // `max_repair_attempts`. If repair gives up or the retry
+                        // still errors, fall through to the existing behaviour but
+                        // with an enriched error message (schema + hint).
+                        if let Some(repair) = self.config.tool_call_repair.as_ref() {
+                            let mut attempts_left = self.config.max_repair_attempts;
+                            while attempts_left > 0 {
+                                let ToolOutput::Error {
+                                    ref message,
+                                    recoverable: true,
+                                } = output
+                                else {
+                                    break;
+                                };
+                                let schema = self
+                                    .config
+                                    .tool_registry
+                                    .schemas()
+                                    .into_iter()
+                                    .find(|s| s.name == effective_call.name);
+                                let Some(repaired_call) =
+                                    repair.repair(&effective_call, message, schema.as_ref())
+                                else {
+                                    // Repair gave up: enrich the error fed back to
+                                    // the model with the parameter schema + a hint.
+                                    output = Self::enrich_tool_error(message, schema.as_ref());
+                                    break;
+                                };
+                                attempts_left -= 1;
+                                effective_call = repaired_call;
+                                output = self
+                                    .config
+                                    .tool_registry
+                                    .dispatch(effective_call.clone())
+                                    .await;
+                                if !matches!(
+                                    output,
+                                    ToolOutput::Error {
+                                        recoverable: true,
+                                        ..
+                                    }
+                                ) {
+                                    break;
+                                }
+                                // Still a recoverable error and no budget left:
+                                // enrich before giving up.
+                                if attempts_left == 0 {
+                                    if let ToolOutput::Error {
+                                        message: ref m,
+                                        recoverable: true,
+                                    } = output
+                                    {
+                                        let schema = self
+                                            .config
+                                            .tool_registry
+                                            .schemas()
+                                            .into_iter()
+                                            .find(|s| s.name == effective_call.name);
+                                        output = Self::enrich_tool_error(m, schema.as_ref());
+                                    }
+                                }
+                            }
+                        }
+                        let call = &effective_call;
 
                         // Pause propagation: WaitingForHuman from a subagent tool.
                         if let ToolOutput::WaitingForHuman {
@@ -2408,6 +2540,56 @@ pub mod testing {
         }
     }
 
+    /// Tool registry that models a single tool taking one `flag: bool`
+    /// parameter. Dispatch deserializes `flag` strictly: a real JSON bool
+    /// succeeds, anything else (e.g. the string `"false"`) returns a
+    /// recoverable error — exactly the weak-model failure tool-call repair
+    /// targets. Exposes the tool's schema via [`ToolRegistry::schemas`] so the
+    /// repair provider can read expected types.
+    pub struct BoolToolRegistry {
+        pub call_count: std::sync::atomic::AtomicUsize,
+    }
+    impl Default for BoolToolRegistry {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl BoolToolRegistry {
+        pub fn new() -> Self {
+            Self {
+                call_count: Default::default(),
+            }
+        }
+    }
+    impl ToolRegistry for BoolToolRegistry {
+        fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let out = match call.input.get("flag") {
+                Some(serde_json::Value::Bool(b)) => ToolOutput::Success {
+                    content: format!("flag={b}"),
+                    truncated: false,
+                },
+                other => ToolOutput::Error {
+                    message: format!("invalid parameters: expected bool `flag`, got {other:?}"),
+                    recoverable: true,
+                },
+            };
+            Box::pin(async move { out })
+        }
+        fn schemas(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                name: "set_flag".into(),
+                description: "set a boolean flag".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "flag": { "type": "boolean" } },
+                    "required": ["flag"],
+                }),
+            }]
+        }
+    }
+
     pub struct AlwaysContinuePolicy;
     impl TerminationPolicy for AlwaysContinuePolicy {
         fn evaluate<'a>(
@@ -2522,6 +2704,8 @@ mod tests {
             max_compaction_attempts: 2,
             pricing: PricingTable::DEFAULT,
             content_capture: ContentCaptureConfig::default(),
+            tool_call_repair: None,
+            max_repair_attempts: 1,
         }
     }
 
@@ -3221,6 +3405,92 @@ mod tests {
         }
     }
 
+    // Tool-call repair: a `flag: "false"` string argument is coerced to a real
+    // bool and re-dispatched, so the tool succeeds and the run completes.
+    #[tokio::test]
+    async fn tool_call_repair_fixes_bad_bool_arg() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let a = make_agent();
+        // Turn 1: call the tool with a stringified bool (weak-model behaviour).
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "set_flag".into(),
+                input: serde_json::json!({ "flag": "false" }),
+            }],
+            usage: usage(),
+        });
+        // Turn 2: finish.
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(BoolToolRegistry::new());
+        cfg.tool_registry = reg.clone();
+        cfg.tool_call_repair = Some(Arc::new(crate::tool_call_repair::StandardToolCallRepair));
+
+        let last_tool_error = Arc::new(AtomicBool::new(false));
+        let sink_flag = last_tool_error.clone();
+        let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(move |ev| {
+            if let StreamEvent::ToolResult { is_error, .. } = ev {
+                sink_flag.store(is_error, Ordering::SeqCst);
+            }
+        }));
+
+        let h = StandardHarness::new(cfg);
+        match h.run(opts).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "done"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // Two dispatches: the failed original + the repaired retry.
+        assert_eq!(reg.call_count.load(Ordering::SeqCst), 2);
+        // Final tool result was a success, not an error.
+        assert!(!last_tool_error.load(Ordering::SeqCst));
+    }
+
+    // Without a repair provider, the same bad `flag: "false"` argument yields a
+    // recoverable tool error fed back to the model (today's behaviour).
+    #[tokio::test]
+    async fn without_repair_bad_bool_arg_errors() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "set_flag".into(),
+                input: serde_json::json!({ "flag": "false" }),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(BoolToolRegistry::new());
+        cfg.tool_registry = reg.clone();
+        // No repair provider configured.
+
+        let last_tool_error = Arc::new(AtomicBool::new(false));
+        let sink_flag = last_tool_error.clone();
+        let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(move |ev| {
+            if let StreamEvent::ToolResult { is_error, .. } = ev {
+                sink_flag.store(is_error, Ordering::SeqCst);
+            }
+        }));
+
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(opts).await;
+        // Exactly one dispatch, and it errored.
+        assert_eq!(reg.call_count.load(Ordering::SeqCst), 1);
+        assert!(last_tool_error.load(Ordering::SeqCst));
+    }
+
     // Rule: WaitingForHuman from a tool dispatch propagates to RunResult.
     #[tokio::test]
     async fn tool_waiting_for_human_propagates() {
@@ -3692,6 +3962,8 @@ mod tests {
                 max_compaction_attempts: max_attempts,
                 pricing: PricingTable::DEFAULT,
                 content_capture: ContentCaptureConfig::default(),
+                tool_call_repair: None,
+                max_repair_attempts: 1,
             })
         }
 

@@ -38,6 +38,7 @@ pub mod sandbox;
 pub mod scenarios;
 pub mod sensor;
 pub mod termination;
+pub mod tool_call_repair;
 pub mod tool_registry;
 pub mod tools;
 pub mod verifier;
@@ -129,6 +130,7 @@ pub use termination::{
     TerminationFailureReason, TerminationInput, TerminationPolicy as FullTerminationPolicy,
     TestSuiteCheck,
 };
+pub use tool_call_repair::{coerce_tool_args, StandardToolCallRepair, ToolCallRepair};
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
     ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,

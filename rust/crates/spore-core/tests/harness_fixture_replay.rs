@@ -60,6 +60,8 @@ async fn react_loop_dispatches_tool_then_completes() {
         max_compaction_attempts: 2,
         pricing: spore_core::PricingTable::DEFAULT,
         content_capture: spore_core::ContentCaptureConfig::default(),
+        tool_call_repair: None,
+        max_repair_attempts: 1,
     };
     let harness = StandardHarness::new(config);
 
