@@ -54,7 +54,7 @@ The examples in this project use coding tasks because they are concrete, verifia
 
 ## Quick Start
 
-> **Note**: Spore is in active design and pre-implementation. The interfaces below represent the target API. Implementations in Rust and TypeScript are in progress.
+> **Note**: The interfaces below represent the target API. Implementations are maintained at parity across all four languages — Rust, TypeScript, Python, and Go.
 
 ```rust
 // Rust
@@ -78,6 +78,32 @@ const result = await harness.run({
     task: Task.simple("Fix the failing tests in src/auth.rs"),
     onStream: (event) => printToken(event),
 });
+```
+
+```python
+# Python
+harness = (
+    HarnessBuilder.coding_agent(workspace, model)
+    .observability(OtelObservabilityProvider(endpoint))
+    .build()
+)
+
+result = await harness.run(HarnessRunOptions(
+    task=Task.simple("Fix the failing tests in src/auth.rs"),
+    on_stream=lambda event: print_token(event),
+))
+```
+
+```go
+// Go
+harness, err := sporecore.CodingAgent(workspace, model).
+    Observability(observability.NewOtelProvider(endpoint)).
+    Build()
+
+result := harness.Run(ctx, sporecore.RunOptions{
+    Task:     sporecore.SimpleTask("Fix the failing tests in src/auth.rs"),
+    OnStream: func(event sporecore.StreamEvent) { printToken(event) },
+})
 ```
 
 ---
@@ -261,17 +287,20 @@ Subprocess    → TypeScript REST API shells out to Rust binary (recommended v1 
 
 ## Project Status
 
-Spore is in the **design and specification phase**. All component interfaces, rules, identity models, and architectural decisions are fully specified. Implementation in Rust and TypeScript is beginning.
+All component interfaces, rules, identity models, and architectural decisions are fully specified, and the harness is implemented at **parity across all four languages**. The fifteen core components and the Mode/cache systems are landed; the remaining work is the non-ReAct loop strategies (#58–#61).
 
 | Area | Status |
 |---|---|
 | Language-agnostic spec | ✅ Complete |
 | Component interfaces | ✅ Complete (issues #1–#13) |
 | Design decisions | ✅ Resolved (issues #14–#22) |
-| PromptChunkRegistry + CacheProvider | 📋 Specified (#24, #25) |
+| PromptChunkRegistry + CacheProvider | ✅ Complete (#24, #25) |
 | Eval harness design | 📋 Discussion (#26) |
-| Rust implementation | 🔜 Starting |
-| TypeScript implementation | 🔜 Starting |
+| Rust implementation | ✅ Core complete |
+| TypeScript implementation | ✅ Core complete |
+| Python implementation | ✅ Core complete |
+| Go implementation | ✅ Core complete |
+| Loop strategies (ReAct landed; Ralph, PlanExecute, SelfVerifying, HillClimbing) | 🔜 In progress (#58–#61) |
 
 ---
 
