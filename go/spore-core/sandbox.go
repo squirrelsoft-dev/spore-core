@@ -134,11 +134,17 @@ func (s *WorkspaceScopedSandbox) ResolvePath(_ context.Context, raw string, op O
 	}
 	joined := filepath.Join(s.config.Root, rawPath)
 
-	// 2. Canonicalize. For Write/Execute on a missing target, canonicalize
-	// the parent and re-join the leaf.
+	// 2. Canonicalize. The target file may not yet exist — for *any*
+	// operation, including Read — so canonicalize the parent and re-join the
+	// leaf. Resolution is operation-agnostic on purpose: existence is
+	// orthogonal to the boundary check. A missing in-workspace path still
+	// resolves (via its canonicalized parent) and passes the boundary check;
+	// the actual read then naturally returns NotFound, surfaced as a
+	// recoverable error by the read tool rather than a PathEscape. A missing
+	// path that resolves *outside* the root is still a PathEscape.
 	canonical, err := canonicalize(joined)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && (op == OperationWrite || op == OperationExecute) {
+		if errors.Is(err, os.ErrNotExist) {
 			parent := filepath.Dir(joined)
 			leaf := filepath.Base(joined)
 			cp, parentErr := canonicalize(parent)

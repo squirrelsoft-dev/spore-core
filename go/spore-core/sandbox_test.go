@@ -163,6 +163,79 @@ func TestSandboxWriteToNonexistentFile(t *testing.T) {
 	}
 }
 
+// Regression for #63: a Read of a not-yet-created file *inside* the workspace
+// must resolve via its canonicalized parent (not be misclassified as
+// PathEscape). The file is absent; resolution still succeeds so the actual
+// read can surface a recoverable not-found.
+func TestSandboxReadOfMissingInWorkspaceFileResolves(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	sb, _ := NewWorkspaceScopedSandbox(cfg(root))
+	resolved, v := sb.ResolvePath(context.Background(), "output.txt", OperationRead)
+	if v != nil {
+		t.Fatalf("missing in-workspace read must resolve, got %v", v)
+	}
+	if filepath.Dir(resolved) != root {
+		t.Fatalf("parent mismatch: %s vs %s", filepath.Dir(resolved), root)
+	}
+	if filepath.Base(resolved) != "output.txt" {
+		t.Fatalf("leaf mismatch: %s", filepath.Base(resolved))
+	}
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Fatalf("expected file to be absent, stat err=%v", err)
+	}
+}
+
+// Regression for #63: parent dir exists, leaf file does not — still resolves
+// for Read.
+func TestSandboxReadOfMissingFileInSubdirResolves(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := NewWorkspaceScopedSandbox(cfg(root))
+	resolved, v := sb.ResolvePath(context.Background(), "sub/missing.txt", OperationRead)
+	if v != nil {
+		t.Fatalf("missing in-subdir read must resolve, got %v", v)
+	}
+	if filepath.Dir(resolved) != filepath.Join(root, "sub") {
+		t.Fatalf("parent mismatch: %s", filepath.Dir(resolved))
+	}
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Fatalf("expected file to be absent, stat err=%v", err)
+	}
+}
+
+// Regression for #63: a Read of a *non-existent* path that resolves outside
+// the workspace root must still be a PathEscape, not a not-found.
+func TestSandboxReadOfMissingFileOutsideRootStillPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	sb, _ := NewWorkspaceScopedSandbox(cfg(root))
+	_, v := sb.ResolvePath(context.Background(), "../nonexistent_passwd", OperationRead)
+	if v == nil || v.Kind != SandboxPathEscape {
+		t.Fatalf("expected PathEscape, got %v", v)
+	}
+}
+
+// Read of an existing in-workspace file still resolves to its real path.
+func TestSandboxReadOfExistingInWorkspaceFileResolves(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	if err := os.WriteFile(filepath.Join(root, "present.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := NewWorkspaceScopedSandbox(cfg(root))
+	resolved, v := sb.ResolvePath(context.Background(), "present.txt", OperationRead)
+	if v != nil {
+		t.Fatalf("existing read must resolve, got %v", v)
+	}
+	if resolved != filepath.Join(root, "present.txt") {
+		t.Fatalf("resolved mismatch: %s", resolved)
+	}
+}
+
 func TestSandboxViolationsRoundTripJSON(t *testing.T) {
 	cases := []SandboxViolation{
 		{Kind: SandboxPathEscape, Path: "/p"},

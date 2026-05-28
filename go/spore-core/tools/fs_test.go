@@ -76,6 +76,39 @@ func TestDeleteMissingIsRecoverable(t *testing.T) {
 	}
 }
 
+// Regression for #63: a read_file of a not-yet-created file *inside* the
+// workspace must surface a recoverable not-found, not a (non-recoverable)
+// sandbox path-escape violation.
+func TestReadMissingInWorkspaceFileIsRecoverableNotFound(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	sb, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewReadFileTool().Execute(context.Background(),
+		call("read_file", "c1", map[string]any{"path": "output.txt"}), sb)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable not-found error, got %+v", r)
+	}
+}
+
+// Regression for #63: a read_file of a path resolving *outside* the workspace
+// root must still be a (non-recoverable) sandbox path-escape violation.
+func TestReadOutsideRootIsPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	sb, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewReadFileTool().Execute(context.Background(),
+		call("read_file", "c1", map[string]any{"path": "../nonexistent_passwd"}), sb)
+	if r.Kind != sporecore.ToolOutputError || r.Recoverable {
+		t.Fatalf("expected non-recoverable path-escape error, got %+v", r)
+	}
+}
+
 func TestMoveFileRenames(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "s")
