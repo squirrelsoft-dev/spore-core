@@ -593,6 +593,16 @@ export class StandardHarness implements Harness {
             );
           }
 
+          // Record the assistant's final text in history so a continued
+          // session reflects what the agent said (multi-turn / S2 correctness).
+          {
+            const msg: Message = {
+              role: "assistant",
+              content: { type: "text", text: result.content },
+            };
+            await this.config.contextManager.appendAssistantMessage?.(sessionState, msg);
+          }
+
           emit(onStream, { kind: "final_response", content: result.content });
           return {
             kind: "success",
@@ -623,6 +633,22 @@ export class StandardHarness implements Harness {
               usage,
               budgetUsed.turns,
             );
+          }
+
+          // Record the assistant's turn (the tool calls the model requested) as
+          // soon as the calls are known — BEFORE the BeforeTool middleware
+          // (which may pause via SurfaceToHuman) and before any tool result.
+          // This keeps the conversation well-formed (assistant tool_use precedes
+          // its tool result) on every path, including human-in-the-loop resume,
+          // so the resume path never has to append it (and never double-records
+          // it). The recorded turn reflects the model's original request; a
+          // middleware or human modification changes only what is dispatched.
+          for (const call of result.calls) {
+            const msg: Message = {
+              role: "assistant",
+              content: { type: "tool_call", id: call.id, name: call.name, input: call.input },
+            };
+            await this.config.contextManager.appendAssistantMessage?.(sessionState, msg);
           }
 
           // Middleware: BeforeTool

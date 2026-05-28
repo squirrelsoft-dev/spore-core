@@ -162,6 +162,13 @@ export class StandardCompactionAdapter implements HarnessContextManager {
     session.messages.push({ role: "tool", content: { type: "text", text } });
   }
 
+  async appendAssistantMessage(session: HarnessState, message: Message): Promise<void> {
+    // Record the assistant's turn (text and/or requested tool calls) so the
+    // next assemble() reflects what the agent already did. Mirrors
+    // appendToolResult: push onto the harness-side message list.
+    session.messages.push(message);
+  }
+
   async appendUserMessage(session: HarnessState, text: string): Promise<void> {
     session.messages.push({ role: "user", content: { type: "text", text } });
   }

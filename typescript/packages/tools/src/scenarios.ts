@@ -34,6 +34,7 @@ import {
   type ContextManager as HarnessContextManager,
   type CompactionTurn,
   context as coreContext,
+  type Message,
   type ModelInterface,
   type ObservabilityProvider,
   type SandboxProvider,
@@ -134,11 +135,42 @@ export class RealToolRegistry implements HarnessToolRegistry {
 // ============================================================================
 
 /**
+ * Operational system prompt for the live agent. The compaction adapter's
+ * `assemble` produces a context with **no system prompt** (it has no
+ * `ContextSources` to render one), so without this the model receives only the
+ * task as a user message and no guidance on how to behave. The three rules
+ * target the failure modes observed with small local models: describing actions
+ * instead of taking them, passing stringified arguments, and declaring success
+ * without checking the result.
+ */
+export const AGENT_SYSTEM_PROMPT = `\
+You are an autonomous agent that completes tasks by calling the provided tools. \
+Follow these rules:
+
+1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate tool. \
+Writing a shell command, code snippet, or file contents into your text reply \
+does NOT run it — only a real tool call has any effect. To transform a file, \
+call bash_command with the command itself; never write the command text into a \
+file as if it were the result.
+
+2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: booleans \
+as true/false (not "true"), numbers as 12 (not "12"), lists as ["a"] (not \
+"[\\"a\\"]"). Quoted-string scalars where a bool/number/array is expected will \
+be rejected.
+
+3. VERIFY BEFORE FINISHING. Before replying DONE, confirm your work actually \
+satisfies the request. If you wrote a file, read it back with read_file and \
+check its contents are exactly what was asked. If they do not match, fix it and \
+verify again. Only reply DONE once you have verified the result is correct.`;
+
+/**
  * Decorates a harness {@link HarnessContextManager}, delegating every seam
  * method to the inner manager but injecting the registry's tool schemas (sorted
- * by name) into the assembled context's `tools`. Without it the compaction
- * adapter surfaces no tools and the model can never emit a tool call in live
- * mode.
+ * by name) into the assembled context's `tools` and prepending
+ * {@link AGENT_SYSTEM_PROMPT}. The compaction adapter's `assemble` returns an
+ * empty tool list and no system prompt, so without this decorator the model
+ * never sees any tools (and can never emit a tool call) nor any operational
+ * guidance in live mode.
  */
 export class SchemaInjectingContextManager implements HarnessContextManager {
   private readonly tools: ModelToolSchema[];
@@ -159,6 +191,17 @@ export class SchemaInjectingContextManager implements HarnessContextManager {
   ): Promise<Context> {
     const ctx = await this.inner.assemble(session, task, signal);
     ctx.tools = this.tools.slice();
+    // Prepend the operational system prompt. The adapter's assemble yields
+    // none, so the model would otherwise get no guidance. Guard against
+    // duplicates so a resumed/seeded session that already leads with a system
+    // message isn't given two.
+    const hasSystem = ctx.messages[0]?.role === "system";
+    if (!hasSystem) {
+      ctx.messages.unshift({
+        role: "system",
+        content: { type: "text", text: AGENT_SYSTEM_PROMPT },
+      });
+    }
     return ctx;
   }
 
@@ -167,6 +210,18 @@ export class SchemaInjectingContextManager implements HarnessContextManager {
     result: ToolResultRecord,
   ): Promise<void> {
     return this.inner.appendToolResult(session, result);
+  }
+
+  appendAssistantMessage(
+    session: HarnessState,
+    message: Message,
+  ): Promise<void> {
+    // Delegate to the inner manager. Without this delegation the loop (which
+    // holds this outer wrapper) would hit the optional method's absence and
+    // silently skip recording the assistant turn — the fix would be dead.
+    return (
+      this.inner.appendAssistantMessage?.(session, message) ?? Promise.resolve()
+    );
   }
 
   appendUserMessage(session: HarnessState, text: string): Promise<void> {
@@ -344,9 +399,20 @@ export function scenarioPrompt(id: ScenarioId): string {
   switch (id) {
     case "s1":
       return (
-        "Read the file input.txt, transform its contents to UPPERCASE, write the " +
-        "result to output.txt, then read output.txt back to confirm it was written. " +
-        "Use the read_file, write_file, and bash_command tools. When done, reply DONE."
+        "Complete this task step by step, using the provided tools:\n" +
+        "1. Call read_file to read the contents of input.txt. Use the exact " +
+        "text it returns — do not invent or substitute any text.\n" +
+        "2. Take that exact text and rewrite it with every lowercase letter " +
+        "changed to its capital form, keeping all other characters, spaces, " +
+        "and punctuation the same.\n" +
+        "3. Call write_file with path 'output.txt' and content set to the " +
+        "uppercased text from step 2 — the literal capital letters themselves. " +
+        "The content must be the transformed words from input.txt, NOT a shell " +
+        "command, NOT a $(...) expression, and NOT any code.\n" +
+        "4. Call read_file on output.txt and check its contents equal the " +
+        "uppercased text from step 2.\n" +
+        "Reply DONE only once output.txt contains input.txt's contents in all " +
+        "capital letters."
       );
     case "s2":
       return (

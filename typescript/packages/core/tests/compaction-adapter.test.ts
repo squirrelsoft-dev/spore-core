@@ -312,7 +312,11 @@ describe("StandardCompactionAdapter — end-to-end through the seam (issue #55)"
     await h.run({ task: task(), session_state: session });
 
     expect(session.messages.length).toBeLessThan(before);
-    expect(session.messages.length).toBe(3);
+    // The loop now records the assistant's turns in history (issue #65): the
+    // assistant tool-call for c1 and the assistant final text, in addition to
+    // the tool result. The post-compaction conversation is therefore one
+    // message longer than before that fix (was 3).
+    expect(session.messages.length).toBe(4);
     obs.setSessionOutcome(SID, { kind: "success" });
     const metrics = await obs.getSessionMetrics(SID);
     expect(metrics?.compactions).toBe(1);

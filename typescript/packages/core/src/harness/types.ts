@@ -449,6 +449,15 @@ export interface ContextManager {
   appendUserMessage(session: SessionState, text: string): Promise<void>;
   shouldCompact(session: SessionState): boolean;
 
+  /** Append the assistant's turn (model output: text and/or the tool calls it
+   *  requested) to the conversation so the next {@link assemble} reflects what
+   *  the agent already did. Without this the model loses track of its own
+   *  actions and the conversation is malformed (a tool result with no preceding
+   *  assistant tool_use). OPTIONAL so test-double / non-recording managers need
+   *  not implement it; the harness calls it via `?.` and treats absence as a
+   *  no-op (mirrors the Rust trait's default-no-op method). */
+  appendAssistantMessage?(session: SessionState, message: Message): Promise<void>;
+
   /** Build the inputs for one compaction turn (issue #46). Returns `undefined`
    *  when there is nothing to compact (e.g. history shorter than the preserve
    *  window), in which case the harness skips compaction entirely. Default

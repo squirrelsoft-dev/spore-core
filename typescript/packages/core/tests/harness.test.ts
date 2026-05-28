@@ -20,12 +20,18 @@ import {
   emptyBudgetSnapshot,
   emptySessionState,
   newTask,
+  type Context,
+  type ContextManager,
   type HarnessConfig,
+  type HumanResponse,
   type LoopStrategy,
+  type Message,
   type PausedState,
+  type SessionState,
   type Task,
   type TokenUsage,
   type ToolCall,
+  type ToolResultRecord,
   type TurnResult,
 } from "../src/index.js";
 
@@ -466,5 +472,143 @@ describe("Harness — ReAct loop", () => {
 
   it("HOOK_POINTS lists all four hook locations", () => {
     expect(HOOK_POINTS).toEqual(["before_turn", "before_tool", "after_tool", "before_completion"]);
+  });
+
+  // ── Assistant-turn recording (regression for lost conversation history) ──
+
+  /**
+   * A ContextManager that records every message it appends (assistant turns and
+   * tool results) in order, so tests can assert the conversation the loop
+   * builds. Tool results are recorded as a `tool_result` content block so the
+   * `call_id` is preserved for ordering assertions — this is a test-only shape
+   * and does NOT change the production tool-result shape (the standard adapter
+   * keeps its `role:"tool"` text content).
+   */
+  class RecordingContextManager implements ContextManager {
+    readonly recorded: Message[] = [];
+
+    async assemble(session: SessionState, _task: Task): Promise<Context> {
+      return { messages: session.messages.slice(), tools: [], params: { stop_sequences: [] } };
+    }
+
+    async appendToolResult(session: SessionState, result: ToolResultRecord): Promise<void> {
+      const content =
+        result.output.kind === "success"
+          ? result.output.content
+          : result.output.kind === "error"
+            ? result.output.message
+            : "";
+      const msg: Message = {
+        role: "tool",
+        content: {
+          type: "tool_result",
+          tool_use_id: result.call_id,
+          content,
+          is_error: result.output.kind === "error",
+        },
+      };
+      session.messages.push(msg);
+      this.recorded.push(msg);
+    }
+
+    async appendUserMessage(session: SessionState, text: string): Promise<void> {
+      const msg: Message = { role: "user", content: { type: "text", text } };
+      session.messages.push(msg);
+      this.recorded.push(msg);
+    }
+
+    async appendAssistantMessage(session: SessionState, message: Message): Promise<void> {
+      session.messages.push(message);
+      this.recorded.push(message);
+    }
+
+    shouldCompact(_session: SessionState): boolean {
+      return false;
+    }
+  }
+
+  it("regression: tool_call records an assistant tool-call message BEFORE its tool result", async () => {
+    const a = makeAgent();
+    a.push(tcr(toolCall("c1", "read_file")));
+    a.push(fr("done"));
+    const cfg = standardConfig(a);
+    const cm = new RecordingContextManager();
+    cfg.contextManager = cm;
+    cfg.toolRegistry = new ScriptedToolRegistry().push({ kind: "success", content: "contents" });
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+
+    const assistantIdx = cm.recorded.findIndex(
+      (m) => m.role === "assistant" && m.content.type === "tool_call" && m.content.id === "c1",
+    );
+    const toolIdx = cm.recorded.findIndex(
+      (m) =>
+        m.role === "tool" && m.content.type === "tool_result" && m.content.tool_use_id === "c1",
+    );
+    expect(assistantIdx, "assistant tool-call message must be recorded").toBeGreaterThanOrEqual(0);
+    expect(toolIdx, "tool result must be recorded").toBeGreaterThanOrEqual(0);
+    expect(assistantIdx).toBeLessThan(toolIdx);
+  });
+
+  it("regression: final_response records the assistant's final text in history", async () => {
+    const a = makeAgent();
+    a.push(fr("the final answer"));
+    const cfg = standardConfig(a);
+    const cm = new RecordingContextManager();
+    cfg.contextManager = cm;
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(5) });
+    expect(r.kind).toBe("success");
+
+    const hasFinalText = cm.recorded.some(
+      (m) =>
+        m.role === "assistant" &&
+        m.content.type === "text" &&
+        m.content.text === "the final answer",
+    );
+    expect(hasFinalText).toBe(true);
+  });
+
+  it("regression: resume after SurfaceToHuman records the assistant tool-call exactly once, before its result", async () => {
+    const a = makeAgent();
+    const calls = [toolCall("c1", "read_file")];
+    a.push({ kind: "tool_call_requested", calls, usage: usage() });
+    a.push(fr("done"));
+    const cfg = standardConfig(a);
+    const cm = new RecordingContextManager();
+    cfg.contextManager = cm;
+    cfg.toolRegistry = new ScriptedToolRegistry().push({ kind: "success", content: "contents" });
+    cfg.middleware = new ScriptedMiddleware().push("before_tool", {
+      kind: "surface_to_human",
+      request: { kind: "tool_approval", calls, risk_level: "medium" },
+    });
+    const h = new StandardHarness(cfg);
+
+    // Pause at BeforeTool — the assistant turn was recorded just before.
+    const paused = await h.run({ task: react(5) });
+    expect(paused.kind).toBe("waiting_for_human");
+    if (paused.kind !== "waiting_for_human") throw new Error("expected waiting_for_human");
+
+    // Resume with approval; the pending call is dispatched and its result
+    // appended after the already-recorded assistant turn.
+    const resumeResponse: HumanResponse = { kind: "allow" };
+    const resumed = await h.resume(paused.state, resumeResponse);
+    expect(resumed.kind).toBe("success");
+
+    const assistantHits = cm.recorded.filter(
+      (m) => m.role === "assistant" && m.content.type === "tool_call" && m.content.id === "c1",
+    );
+    expect(assistantHits.length, "assistant tool-call must be recorded exactly once").toBe(1);
+
+    const assistantIdx = cm.recorded.findIndex(
+      (m) => m.role === "assistant" && m.content.type === "tool_call" && m.content.id === "c1",
+    );
+    const toolIdx = cm.recorded.findIndex(
+      (m) =>
+        m.role === "tool" && m.content.type === "tool_result" && m.content.tool_use_id === "c1",
+    );
+    expect(toolIdx, "tool result must be recorded").toBeGreaterThanOrEqual(0);
+    expect(assistantIdx).toBeLessThan(toolIdx);
   });
 });
