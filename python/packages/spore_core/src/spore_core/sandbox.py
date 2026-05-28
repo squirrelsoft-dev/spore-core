@@ -158,24 +158,29 @@ class WorkspaceScopedSandbox:
         else:
             joined = root / raw_path
 
-        # 2. Canonicalize. For Write/Execute on missing files, canonicalize
-        #    the parent then rejoin the filename.
+        # 2. Canonicalize. The target file may not yet exist — for *any*
+        #    operation, including Read — so canonicalize the parent and
+        #    re-join the filename. Resolution is operation-agnostic on
+        #    purpose: existence is orthogonal to the boundary check. A missing
+        #    in-workspace path still resolves (via its canonicalized parent)
+        #    and passes the boundary check; the actual read then naturally
+        #    returns NotFound, surfaced as a recoverable error by the read
+        #    tool rather than a PathEscape. A missing path that resolves
+        #    *outside* the root is still a PathEscape (the boundary check in
+        #    step 3 rejects it).
         canonical: Path
         try:
             canonical = joined.resolve(strict=True)
         except FileNotFoundError:
-            if operation in ("write", "execute"):
-                parent = joined.parent
-                try:
-                    parent_canon = parent.resolve(strict=True)
-                except (FileNotFoundError, OSError):
-                    return SandboxPathEscape(path=raw)
-                file_name = joined.name
-                if not file_name:
-                    return SandboxPathEscape(path=raw)
-                canonical = parent_canon / file_name
-            else:
+            parent = joined.parent
+            try:
+                parent_canon = parent.resolve(strict=True)
+            except (FileNotFoundError, OSError):
                 return SandboxPathEscape(path=raw)
+            file_name = joined.name
+            if not file_name:
+                return SandboxPathEscape(path=raw)
+            canonical = parent_canon / file_name
         except OSError:
             return SandboxPathEscape(path=raw)
 

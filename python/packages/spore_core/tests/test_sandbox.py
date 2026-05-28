@@ -144,6 +144,48 @@ async def test_write_to_nonexistent_file_works(tmp_path: Path) -> None:
     assert resolved.parent == tmp_path.resolve()
 
 
+async def test_read_of_missing_in_workspace_file_resolves_not_path_escape(
+    tmp_path: Path,
+) -> None:
+    # Regression for #63: a Read of a not-yet-created file *inside* the
+    # workspace must resolve via its canonicalized parent (not be
+    # misclassified as PathEscape). The file is absent; resolution still
+    # succeeds so the actual read can surface a recoverable not-found.
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    resolved = await sb.resolve_path("output.txt", "read")
+    assert resolved.parent == tmp_path.resolve()
+    assert resolved.name == "output.txt"
+    assert not resolved.exists()
+
+
+async def test_read_of_missing_file_in_subdir_resolves(tmp_path: Path) -> None:
+    # Parent dir exists, leaf file does not — still resolves for Read.
+    (tmp_path / "sub").mkdir()
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    resolved = await sb.resolve_path("sub/missing.txt", "read")
+    assert resolved.parent == (tmp_path / "sub").resolve()
+    assert not resolved.exists()
+
+
+async def test_read_of_missing_file_outside_root_still_path_escape(
+    tmp_path: Path,
+) -> None:
+    # Regression for #63: a Read of a *non-existent* path that resolves
+    # outside the workspace root must still be a PathEscape, not a not-found.
+    # (`..` makes the canonicalized parent escape the root.)
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    with pytest.raises(SandboxViolationException) as ei:
+        await sb.resolve_path("../nonexistent_passwd", "read")
+    assert isinstance(ei.value.violation, SandboxPathEscape)
+
+
+async def test_read_of_existing_in_workspace_file_resolves(tmp_path: Path) -> None:
+    (tmp_path / "present.txt").write_text("hi")
+    sb = WorkspaceScopedSandbox(_cfg(tmp_path))
+    resolved = await sb.resolve_path("present.txt", "read")
+    assert resolved == (tmp_path / "present.txt").resolve()
+
+
 # ----- execute_command ----------------------------------------------------
 
 

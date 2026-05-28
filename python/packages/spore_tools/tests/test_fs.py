@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from spore_core.harness import ToolOutputError, ToolOutputSuccess
+from spore_core.harness import ToolOutputError, ToolOutputSuccess, WorkspaceConfig
 from spore_core.model import ToolCall
+from spore_core.sandbox import WorkspaceScopedSandbox
 from spore_core.tool_registry import AllowAllSandbox
 from spore_tools.tools.fs import (
     DeleteFileTool,
@@ -14,6 +15,20 @@ from spore_tools.tools.fs import (
     ReadFileTool,
     WriteFileTool,
 )
+
+
+def _workspace_sandbox(root: Path) -> WorkspaceScopedSandbox:
+    return WorkspaceScopedSandbox(
+        WorkspaceConfig(
+            root=root,
+            allowed_paths=[],
+            denied_paths=[],
+            allowed_extensions=None,
+            denied_extensions=[],
+            read_only=False,
+            max_file_size=0,
+        )
+    )
 
 
 def _call(name: str, input_: dict) -> ToolCall:
@@ -75,3 +90,26 @@ async def test_invalid_params_returns_recoverable_error() -> None:
     r = await ReadFileTool().execute(_call("read_file", {}), sb)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
+
+
+async def test_read_missing_in_workspace_file_is_recoverable_not_found(
+    tmp_path: Path,
+) -> None:
+    # Regression for #63: reading a not-yet-created file *inside* the
+    # workspace must surface a recoverable not-found, not a sandbox
+    # PathEscape, end to end through the real WorkspaceScopedSandbox.
+    sb = _workspace_sandbox(tmp_path)
+    r = await ReadFileTool().execute(_call("read_file", {"path": "output.txt"}), sb)
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable is True
+    assert "read failed" in r.message
+
+
+async def test_read_outside_workspace_is_path_escape(tmp_path: Path) -> None:
+    # Counterpart: a path that resolves outside the root is still a sandbox
+    # violation, even when the file does not exist.
+    sb = _workspace_sandbox(tmp_path)
+    r = await ReadFileTool().execute(_call("read_file", {"path": "../nonexistent_secret"}), sb)
+    assert isinstance(r, ToolOutputError)
+    lowered = r.message.lower()
+    assert "escape" in lowered or "sandbox" in lowered
