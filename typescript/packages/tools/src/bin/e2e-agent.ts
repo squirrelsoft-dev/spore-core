@@ -111,7 +111,7 @@ async function main(): Promise<void> {
   const scenario = args[0] ? parseScenarioId(args[0]) : undefined;
   if (!scenario) {
     process.stderr.write(
-      "usage: e2e-agent <s1|s2|s3|s4> [--model <id>] [--mock]\n",
+      "usage: e2e-agent <s1|s2|s3|s4|s5> [--model <id>] [--mock]\n",
     );
     process.exit(2);
   }
@@ -164,7 +164,7 @@ async function runLive(
   const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const agent: Agent = new ModelAgent(AgentId.of("e2e-agent"), model);
 
-  const registry = buildRealToolRegistry();
+  const registry = buildRealToolRegistry(scenario);
   const sandbox: SandboxProvider = new WorkspaceScopedSandbox({
     root: workspace,
     allowed_paths: [],
@@ -255,7 +255,7 @@ async function runScenario(
 }
 
 function prepareWorkspace(scenario: ScenarioId, workspace: string): void {
-  if (scenario === "s1") {
+  if (scenario === "s1" || scenario === "s5") {
     writeFileSync(
       join(workspace, "input.txt"),
       "hello from the spore harness end to end scenario\n",

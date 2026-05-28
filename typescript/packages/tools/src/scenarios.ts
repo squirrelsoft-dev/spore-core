@@ -55,7 +55,7 @@ import {
 } from "@spore/core";
 
 import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
-import { BashCommandTool } from "./exec.js";
+import { BashCommandTool, ExecTool } from "./exec.js";
 
 type RegistryToolSchema = toolRegistry.ToolSchema;
 type Tool = toolRegistry.Tool;
@@ -64,7 +64,7 @@ const { StandardContextManager } = coreContext;
 const { dispatchErrorMessage } = toolRegistry;
 
 // Re-export so callers can build a registry directly.
-export { ReadFileTool, WriteFileTool, ListDirTool, BashCommandTool };
+export { ReadFileTool, WriteFileTool, ListDirTool, ExecTool, BashCommandTool };
 
 // ============================================================================
 // Registry → model schema conversion
@@ -149,9 +149,10 @@ Follow these rules:
 
 1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate tool. \
 Writing a shell command, code snippet, or file contents into your text reply \
-does NOT run it — only a real tool call has any effect. To transform a file, \
-call bash_command with the command itself; never write the command text into a \
-file as if it were the result.
+does NOT run it — only a real tool call has any effect. When a task asks you to \
+produce a file or a result, call the tool that performs the action and let the \
+tool do the work; never paste the command, code, or expression you *would* run \
+as if it were the finished result.
 
 2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: booleans \
 as true/false (not "true"), numbers as 12 (not "12"), lists as ["a"] (not \
@@ -308,12 +309,18 @@ export class CompleteOnFinalResponse implements TerminationPolicy {
 // ============================================================================
 
 /**
- * Build a {@link StandardToolRegistry} populated with the real read/write/list/
- * bash tools plus the {@link FailingTool}. Shared by every scenario so the
- * agent always sees the same catalog. Registration errors are programming
- * errors (duplicate/invalid schema) — surfaced loudly via throw.
+ * Build a {@link StandardToolRegistry} for `scenario`. The base catalog is
+ * always `read_file`, `write_file`, `list_dir`, `exec`, and {@link FailingTool}
+ * (`flaky_op`). The real shell tool `bash_command` is added ONLY for scenario
+ * `s5` — S1/S2 measure reasoning + act-don't-describe, and a live model handed
+ * a shell could shortcut S1 with `cat … | tr … > …` without demonstrating the
+ * intended behavior. `exec` is safe everywhere because it cannot pipe or
+ * redirect. Registration errors are programming errors (duplicate/invalid
+ * schema) — surfaced loudly via throw.
  */
-export function buildRealToolRegistry(): toolRegistry.StandardToolRegistry {
+export function buildRealToolRegistry(
+  scenario: ScenarioId,
+): toolRegistry.StandardToolRegistry {
   const registry = new toolRegistry.StandardToolRegistry();
   const reg = (tool: Tool, schema: RegistryToolSchema): void => {
     const err = registry.register(tool, schema);
@@ -325,8 +332,11 @@ export function buildRealToolRegistry(): toolRegistry.StandardToolRegistry {
   reg(new ReadFileTool(), ReadFileTool.schema());
   reg(new WriteFileTool(), WriteFileTool.schema());
   reg(new ListDirTool(), ListDirTool.schema());
-  reg(new BashCommandTool(), BashCommandTool.schema());
+  reg(new ExecTool(), ExecTool.schema());
   reg(new FailingTool(), FailingTool.schema());
+  if (scenario === "s5") {
+    reg(new BashCommandTool(), BashCommandTool.schema());
+  }
   return registry;
 }
 
@@ -385,13 +395,15 @@ export function seedCompactionState(
 // Scenario builders
 // ============================================================================
 
-/** The scenario id, parsed from the CLI arg `s1`..`s4`. */
-export type ScenarioId = "s1" | "s2" | "s3" | "s4";
+/** The scenario id, parsed from the CLI arg `s1`..`s5`. */
+export type ScenarioId = "s1" | "s2" | "s3" | "s4" | "s5";
 
-/** Parse `s1`..`s4` (case-insensitive). */
+/** Parse `s1`..`s5` (case-insensitive). */
 export function parseScenarioId(s: string): ScenarioId | undefined {
   const v = s.trim().toLowerCase();
-  return v === "s1" || v === "s2" || v === "s3" || v === "s4" ? v : undefined;
+  return v === "s1" || v === "s2" || v === "s3" || v === "s4" || v === "s5"
+    ? v
+    : undefined;
 }
 
 /** The default prompt that drives this scenario. */
@@ -429,6 +441,19 @@ export function scenarioPrompt(id: ScenarioId): string {
         "Call the flaky_op tool. If it fails, do not give up: write a file " +
         "recovered.txt explaining that flaky_op failed and how you adapted, using " +
         "write_file. Reply DONE when finished."
+      );
+    case "s5":
+      return (
+        "Transform input.txt into output.txt with every lowercase letter " +
+        "uppercased, using the shell.\n" +
+        "1. Call bash_command with a real shell pipeline that reads input.txt, " +
+        "uppercases it, and writes output.txt — e.g. " +
+        "`cat input.txt | tr a-z A-Z > output.txt`. This is exactly what the " +
+        "bash_command tool is for: it runs your script via /bin/sh -c, so pipes " +
+        "(|) and redirects (>) work.\n" +
+        "2. Call read_file on output.txt and check its contents are input.txt's " +
+        "text in all capital letters.\n" +
+        "Reply DONE only once output.txt contains the uppercased text."
       );
   }
 }

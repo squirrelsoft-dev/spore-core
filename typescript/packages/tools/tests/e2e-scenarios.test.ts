@@ -9,7 +9,7 @@
  * `SPORE_OTLP_ENDPOINT` is read — there is no forwarding.
  */
 
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -40,6 +40,7 @@ import {
   buildRichContextManager,
   buildScenario,
   RealToolRegistry,
+  type ScenarioId,
   scenarioPrompt,
   seedCompactionState,
 } from "../src/index.js";
@@ -54,6 +55,8 @@ const { InMemoryObservabilityProvider } = coreObs;
 const { NullCacheProvider } = cacheProvider;
 
 const usage = { input_tokens: 10, output_tokens: 5 };
+
+const IS_UNIX = process.platform !== "win32";
 
 function toolCall(id: string, name: string, input: unknown): ToolCall {
   return { id, name, input };
@@ -303,7 +306,7 @@ describe("S4 — tool failure + recovery", () => {
     });
     agent.push({ kind: "final_response", content: "DONE recovered", usage });
 
-    const registry = buildRealToolRegistry();
+    const registry = buildRealToolRegistry("s4");
     const sandbox = new AllowAllSandbox();
     const bridge = new RealToolRegistry(registry, sandbox);
     const schemas = bridge.modelSchemas();
@@ -330,7 +333,7 @@ describe("S4 — tool failure + recovery", () => {
 
   it("does NOT hard-halt on the recoverable FailingTool error", async () => {
     const bridge = new RealToolRegistry(
-      buildRealToolRegistry(),
+      buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
     );
     expect(bridge.isAlwaysHalt("flaky_op")).toBe(false);
@@ -343,7 +346,7 @@ describe("S4 — tool failure + recovery", () => {
 
   it("exposes sorted model schemas including flaky_op and read_file", () => {
     const bridge = new RealToolRegistry(
-      buildRealToolRegistry(),
+      buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
     );
     const names = bridge.modelSchemas().map((s: ToolSchema) => s.name);
@@ -352,6 +355,95 @@ describe("S4 — tool failure + recovery", () => {
     expect(names).toContain("flaky_op");
     expect(names).toContain("read_file");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Per-scenario tool exposure — exec everywhere; bash_command only for S5.
+// ---------------------------------------------------------------------------
+
+describe("per-scenario tool catalog", () => {
+  function schemaNames(scenario: ScenarioId): string[] {
+    const bridge = new RealToolRegistry(
+      buildRealToolRegistry(scenario),
+      new AllowAllSandbox(),
+    );
+    return bridge.modelSchemas().map((s) => s.name);
+  }
+
+  it("S1 exposes exec and not bash_command", () => {
+    const names = schemaNames("s1");
+    expect(names).toContain("exec");
+    expect(names).not.toContain("bash_command");
+  });
+
+  it("S2 exposes exec and not bash_command", () => {
+    const names = schemaNames("s2");
+    expect(names).toContain("exec");
+    expect(names).not.toContain("bash_command");
+  });
+
+  it("S5 exposes both exec and bash_command", () => {
+    const names = schemaNames("s5");
+    expect(names).toContain("exec");
+    expect(names).toContain("bash_command");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5 — real shell pipeline via bash_command (uses the REAL registry)
+// ---------------------------------------------------------------------------
+
+describe("S5 — real shell pipeline", () => {
+  it.runIf(IS_UNIX)(
+    "transforms input.txt -> output.txt with a piped+redirected shell command",
+    async () => {
+      const workspace = mkdtempSync(join(tmpdir(), "spore-s5-"));
+      const input = join(workspace, "input.txt");
+      const output = join(workspace, "output.txt");
+      writeFileSync(input, "hello");
+
+      const sessionId = SessionId.of("s5-test");
+      const agent = new MockAgent(AgentId.of("mock"));
+      // turn 1: real shell pipeline with a literal pipe + redirect.
+      agent.push({
+        kind: "tool_call_requested",
+        calls: [
+          toolCall("c1", "bash_command", {
+            script: `cat ${input} | tr a-z A-Z > ${output}`,
+          }),
+        ],
+        usage,
+      });
+      // turn 2: read the result back to verify.
+      agent.push({
+        kind: "tool_call_requested",
+        calls: [toolCall("c2", "read_file", { path: output })],
+        usage,
+      });
+      // turn 3: done.
+      agent.push({ kind: "final_response", content: "DONE", usage });
+
+      const sandbox = new AllowAllSandbox();
+      const bridge = new RealToolRegistry(buildRealToolRegistry("s5"), sandbox);
+      const schemas = bridge.modelSchemas();
+
+      const harness = buildScenario({
+        scenario: "s5",
+        agent,
+        tools: bridge,
+        sandbox,
+        contextManager: new NoopContextManager(),
+        terminationPolicy: new AlwaysContinuePolicy(),
+        toolSchemas: schemas,
+      });
+
+      const result = await harness.run({
+        task: newTask(scenarioPrompt("s5"), sessionId, react(8)),
+      });
+      expect(result.kind).toBe("success");
+      expect(readFileSync(output, "utf8")).toBe("HELLO");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ export {
   WriteFileTool,
 } from "./fs.js";
 
-export { BashCommandTool, RunTestsTool } from "./exec.js";
+export { BashCommandTool, ExecTool, RunTestsTool } from "./exec.js";
 export { FindFilesTool, GrepFilesTool } from "./search.js";
 export {
   GitCommitTool,

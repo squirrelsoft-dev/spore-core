@@ -49,13 +49,29 @@ export type MoveFileParams = z.infer<typeof MoveFileParamsSchema>;
 
 // ---------- Exec ----------
 
-export const BashCommandParamsSchema = z.object({
+/**
+ * Parameters for the shell-free {@link import("./exec.js").ExecTool}: a program
+ * name plus a verbatim argument vector. No shell is involved.
+ */
+export const ExecParamsSchema = z.object({
   command: z.string(),
   args: z.array(z.string()).default([]),
   /** Timeout in whole seconds. */
   timeout: z.number().int().nonnegative().nullable().optional(),
 });
-export type BashCommandParams = z.infer<typeof BashCommandParamsSchema>;
+export type ExecParams = z.infer<typeof ExecParamsSchema>;
+
+/**
+ * Parameters for the real {@link import("./exec.js").BashCommandTool}: a single
+ * shell `script` run via `/bin/sh -c`, with an optional working directory.
+ */
+export const ShellCommandParamsSchema = z.object({
+  script: z.string(),
+  working_dir: z.string().nullable().optional(),
+  /** Timeout in whole seconds. */
+  timeout: z.number().int().nonnegative().nullable().optional(),
+});
+export type ShellCommandParams = z.infer<typeof ShellCommandParamsSchema>;
 
 export const RunTestsParamsSchema = z.object({
   command: z.string(),

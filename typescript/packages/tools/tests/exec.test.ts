@@ -2,10 +2,14 @@
  * Execution tool tests — mirror `rust/crates/spore-core/src/tools/exec.rs#tests`.
  */
 
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { harnessTesting, type ToolCall } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
-import { BashCommandTool } from "../src/index.js";
+import { BashCommandTool, ExecTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
 
@@ -15,11 +19,13 @@ function call(name: string, input: unknown): ToolCall {
 
 const IS_UNIX = process.platform !== "win32";
 
-describe("BashCommandTool", () => {
+// ---------------- ExecTool (shell-free) ----------------
+
+describe("ExecTool", () => {
   it.runIf(IS_UNIX)("echo returns stdout", async () => {
     const sb = new AllowAllSandbox();
-    const r = await new BashCommandTool().execute(
-      call("bash_command", { command: "echo", args: ["hi"] }),
+    const r = await new ExecTool().execute(
+      call("exec", { command: "echo", args: ["hi"] }),
       sb,
     );
     expect(r.kind).toBe("success");
@@ -27,10 +33,100 @@ describe("BashCommandTool", () => {
     expect(r.content).toContain("hi");
   });
 
+  // `exec` must NOT interpret shell syntax: pipe/`$(...)`/redirect tokens are
+  // passed to `echo` as literal arguments, and no file is created.
+  it.runIf(IS_UNIX)("has no shell semantics", async () => {
+    const sb = new AllowAllSandbox();
+    // Run in a temp dir so we can prove no `out` file appears.
+    const dir = mkdtempSync(join(tmpdir(), "spore-exec-noshell-"));
+    const prev = process.cwd();
+    process.chdir(dir);
+    let r;
+    try {
+      r = await new ExecTool().execute(
+        call("exec", {
+          command: "echo",
+          args: ["a|b", "$(whoami)", ">out"],
+        }),
+        sb,
+      );
+    } finally {
+      process.chdir(prev);
+    }
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+    expect(r.content).toContain("a|b $(whoami) >out");
+    expect(existsSync(join(dir, "out"))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.runIf(IS_UNIX)("nonzero exit is recoverable error", async () => {
+    const sb = new AllowAllSandbox();
+    const r = await new ExecTool().execute(
+      call("exec", { command: "false" }),
+      sb,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    expect(r.recoverable).toBe(true);
+  });
+
+  it.runIf(IS_UNIX)(
+    "timeout returns recoverable error",
+    async () => {
+      const sb = new AllowAllSandbox();
+      const r = await new ExecTool().execute(
+        call("exec", { command: "sleep", args: ["5"], timeout: 1 }),
+        sb,
+      );
+      expect(r.kind).toBe("error");
+      if (r.kind !== "error") throw new Error("unreachable");
+      expect(r.recoverable).toBe(true);
+      expect(r.message).toContain("timed out");
+    },
+    15000,
+  );
+
+  it("invalid params returns recoverable error", async () => {
+    const sb = new AllowAllSandbox();
+    const r = await new ExecTool().execute(call("exec", {}), sb);
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    expect(r.recoverable).toBe(true);
+  });
+});
+
+// ---------------- BashCommandTool (real shell) ----------------
+
+describe("BashCommandTool", () => {
+  it.runIf(IS_UNIX)("supports a pipeline", async () => {
+    const sb = new AllowAllSandbox();
+    const r = await new BashCommandTool().execute(
+      call("bash_command", { script: "printf 'hi' | tr a-z A-Z" }),
+      sb,
+    );
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+    expect(r.content).toBe("HI");
+  });
+
+  it.runIf(IS_UNIX)("supports a redirect", async () => {
+    const sb = new AllowAllSandbox();
+    const dir = mkdtempSync(join(tmpdir(), "spore-bash-redirect-"));
+    const target = join(dir, "out.txt");
+    const r = await new BashCommandTool().execute(
+      call("bash_command", { script: `printf 'data' > ${target}` }),
+      sb,
+    );
+    expect(r.kind).toBe("success");
+    expect(readFileSync(target, "utf8")).toBe("data");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it.runIf(IS_UNIX)("nonzero exit is recoverable error", async () => {
     const sb = new AllowAllSandbox();
     const r = await new BashCommandTool().execute(
-      call("bash_command", { command: "false" }),
+      call("bash_command", { script: "exit 3" }),
       sb,
     );
     expect(r.kind).toBe("error");
@@ -43,7 +139,7 @@ describe("BashCommandTool", () => {
     async () => {
       const sb = new AllowAllSandbox();
       const r = await new BashCommandTool().execute(
-        call("bash_command", { command: "sleep", args: ["5"], timeout: 1 }),
+        call("bash_command", { script: "sleep 5", timeout: 1 }),
         sb,
       );
       expect(r.kind).toBe("error");
