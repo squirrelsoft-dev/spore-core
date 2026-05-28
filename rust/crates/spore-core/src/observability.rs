@@ -567,11 +567,27 @@ pub trait Span: std::fmt::Debug + Send + Sync {
     fn kind(&self) -> SpanKind {
         self.base().kind
     }
+
+    /// Typed access to the turn payload; `None` for non-turn spans.
+    fn as_turn(&self) -> Option<&TurnSpan> {
+        None
+    }
+    /// Typed access to the sensor payload; `None` for non-sensor spans.
+    fn as_sensor(&self) -> Option<&SensorSpan> {
+        None
+    }
+    /// Typed access to the middleware payload; `None` for non-middleware spans.
+    fn as_middleware(&self) -> Option<&MiddlewareSpan> {
+        None
+    }
 }
 
 impl Span for TurnSpan {
     fn base(&self) -> &SpanBase {
         &self.base
+    }
+    fn as_turn(&self) -> Option<&TurnSpan> {
+        Some(self)
     }
 }
 impl Span for ToolCallSpan {
@@ -583,6 +599,9 @@ impl Span for SensorSpan {
     fn base(&self) -> &SpanBase {
         &self.base
     }
+    fn as_sensor(&self) -> Option<&SensorSpan> {
+        Some(self)
+    }
 }
 impl Span for ContextSpan {
     fn base(&self) -> &SpanBase {
@@ -592,6 +611,9 @@ impl Span for ContextSpan {
 impl Span for MiddlewareSpan {
     fn base(&self) -> &SpanBase {
         &self.base
+    }
+    fn as_middleware(&self) -> Option<&MiddlewareSpan> {
+        Some(self)
     }
 }
 impl Span for PatchSpan {

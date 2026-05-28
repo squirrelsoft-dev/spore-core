@@ -5,11 +5,14 @@
 //! [`SessionMetrics`] via `get_session_metrics`. Filtered metrics
 //! (`CacheHitRate{block}`, `SensorFireRate{sensor_id}`,
 //! `MiddlewareInterventionRate{hook}`) are computed from `get_trace` spans
-//! (Resolution 1). Issue #12's public surface is NOT modified.
+//! (Resolution 1) via the typed `Span::as_turn`/`as_sensor`/`as_middleware`
+//! accessors (issue #68) — the same clean typed read used by the
+//! TypeScript, Python, and Go EvalHarnesses.
 
 use serde::{Deserialize, Serialize};
 use spore_core::harness::OptimizationDirection;
-use spore_core::observability::{SessionMetrics, Span, SpanKind};
+use spore_core::middleware::MiddlewareDecision;
+use spore_core::observability::{SessionMetrics, Span};
 
 /// A metric the EvalHarness aggregates and compares (Rule 17).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,23 +119,15 @@ pub fn sample_for(
     }
 }
 
-// `get_trace()` returns `Box<dyn Span>`. Issue #12's `Span` trait exposes only
-// `base()` and `kind()` and is deliberately neither `Any`-downcastable nor
-// `Serialize` (Resolution 1 forbids modifying #12's surface). The concrete
-// payload fields are therefore read out of each span's stable `Debug`
-// representation, keyed by `kind()`. This is the only get_trace-compatible path
-// that does not touch #12.
-
 /// Cache-read hit rate from turn spans: cache_read_tokens / (input + cache_read)
 /// (Resolution 1, `TurnSpan.cache_read_tokens`). 0.0 with no tokens.
 fn cache_hit_rate(spans: &[Box<dyn Span>]) -> f64 {
     let mut cache_read = 0u64;
     let mut input = 0u64;
     for s in spans {
-        if s.kind() == SpanKind::Turn {
-            let dbg = format!("{s:?}");
-            cache_read += parse_opt_u64_field(&dbg, "cache_read_tokens").unwrap_or(0);
-            input += parse_u64_field(&dbg, "input_tokens").unwrap_or(0);
+        if let Some(t) = s.as_turn() {
+            cache_read += u64::from(t.cache_read_tokens.unwrap_or(0));
+            input += u64::from(t.input_tokens);
         }
     }
     let denom = input + cache_read;
@@ -149,11 +144,10 @@ fn sensor_fire_rate(spans: &[Box<dyn Span>], sensor_id: &str) -> f64 {
     let mut fired = 0u32;
     let mut total = 0u32;
     for s in spans {
-        if s.kind() == SpanKind::SensorEvaluation {
-            let dbg = format!("{s:?}");
-            if parse_string_field(&dbg, "sensor_id").as_deref() == Some(sensor_id) {
+        if let Some(ss) = s.as_sensor() {
+            if ss.sensor_id.as_str() == sensor_id {
                 total += 1;
-                if parse_bool_field(&dbg, "fired") == Some(true) {
+                if ss.fired {
                     fired += 1;
                 }
             }
@@ -168,20 +162,27 @@ fn sensor_fire_rate(spans: &[Box<dyn Span>], sensor_id: &str) -> f64 {
 
 /// Intervention rate of a named middleware hook: non-Continue decisions /
 /// total firings at that hook (Resolution 1, `MiddlewareSpan.hook`).
+///
+/// Hook names are matched case-insensitively against the `HookPoint` variant
+/// name (e.g. target `"beforeturn"` matches `HookPoint::BeforeTurn`). A decision
+/// counts as an intervention when it is neither `Continue` nor
+/// `ContinueWithModification` — i.e. `ForceAnotherTurn`, `Halt`, or
+/// `SurfaceToHuman`. This preserves the prior `!debug.contains("decision: Continue")`
+/// semantics byte-for-byte (the `ContinueWithModification` Debug form shares the
+/// `Continue` prefix, so the old scanner classified it as non-intervening).
 fn middleware_intervention_rate(spans: &[Box<dyn Span>], hook: &str) -> f64 {
     let mut interventions = 0u32;
     let mut total = 0u32;
+    let target = hook.to_lowercase();
     for s in spans {
-        if s.kind() == SpanKind::MiddlewareHook {
-            let dbg = format!("{s:?}");
-            // `hook: BeforeTurn` etc. — match case-insensitively.
-            if let Some(hook_name) = parse_ident_field(&dbg, "hook") {
-                if hook_name.to_lowercase() == hook.to_lowercase() {
-                    total += 1;
-                    // A non-`Continue` decision is an intervention.
-                    if !dbg.contains("decision: Continue") {
-                        interventions += 1;
-                    }
+        if let Some(ms) = s.as_middleware() {
+            if format!("{:?}", ms.hook).to_lowercase() == target {
+                total += 1;
+                if !matches!(
+                    ms.decision,
+                    MiddlewareDecision::Continue | MiddlewareDecision::ContinueWithModification
+                ) {
+                    interventions += 1;
                 }
             }
         }
@@ -193,86 +194,167 @@ fn middleware_intervention_rate(spans: &[Box<dyn Span>], hook: &str) -> f64 {
     }
 }
 
-// ---- Debug-representation field scanners (cross-span-kind reuse) ----
-
-fn field_slice<'a>(dbg: &'a str, field: &str) -> Option<&'a str> {
-    let needle = format!("{field}: ");
-    let idx = dbg.find(&needle)? + needle.len();
-    Some(&dbg[idx..])
-}
-
-fn parse_u64_field(dbg: &str, field: &str) -> Option<u64> {
-    let s = field_slice(dbg, field)?;
-    let num: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
-}
-
-fn parse_opt_u64_field(dbg: &str, field: &str) -> Option<u64> {
-    let s = field_slice(dbg, field)?;
-    if s.starts_with("None") {
-        return Some(0);
-    }
-    // `Some(123)`
-    let inner = s.strip_prefix("Some(")?;
-    let num: String = inner.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
-}
-
-fn parse_bool_field(dbg: &str, field: &str) -> Option<bool> {
-    let s = field_slice(dbg, field)?;
-    if s.starts_with("true") {
-        Some(true)
-    } else if s.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// Parse a string field that renders as a tuple-struct newtype, e.g.
-/// `sensor_id: SensorId("lint")` → `lint`, or a bare quoted string.
-fn parse_string_field(dbg: &str, field: &str) -> Option<String> {
-    let s = field_slice(dbg, field)?;
-    let q = s.find('"')? + 1;
-    let rest = &s[q..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// Parse a bare identifier field, e.g. `hook: BeforeTurn` → `BeforeTurn`.
-fn parse_ident_field(dbg: &str, field: &str) -> Option<String> {
-    let s = field_slice(dbg, field)?;
-    let ident: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    if ident.is_empty() {
-        None
-    } else {
-        Some(ident)
-    }
-}
-
 #[cfg(test)]
-mod field_tests {
+mod typed_access_tests {
     use super::*;
+    use spore_core::harness::HumanRequest;
+    use spore_core::harness::{SessionId, TaskId};
+    use spore_core::memory::Timestamp;
+    use spore_core::middleware::{HookPoint, MiddlewareDecision};
+    use spore_core::model::StopReason;
+    use spore_core::observability::{
+        MiddlewareSpan, SensorSpan, Span, SpanBase, SpanId, SpanKind, SpanStatus, TurnSpan,
+    };
+    use spore_core::sensor::{SensorId, SensorKind, SensorOutcome, SensorTrigger};
+
+    fn base(kind: SpanKind) -> SpanBase {
+        SpanBase {
+            span_id: SpanId::new("sp"),
+            parent_span_id: None,
+            session_id: SessionId::new("s1"),
+            task_id: TaskId::new("t1"),
+            kind,
+            started_at: Timestamp::new("2026-05-16T00:00:00Z"),
+            ended_at: Timestamp::new("2026-05-16T00:00:00Z"),
+            duration_ms: 0,
+            status: SpanStatus::Ok,
+        }
+    }
+
+    fn turn(input: u32, cache_read: Option<u32>) -> TurnSpan {
+        TurnSpan {
+            base: base(SpanKind::Turn),
+            turn_number: 1,
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: None,
+            cost_usd: 0.0,
+            stop_reason: StopReason::EndTurn,
+            tool_calls_requested: 0,
+            output_text: None,
+            tool_calls: None,
+            input_messages: None,
+        }
+    }
+
+    fn sensor(id: &str, fired: bool) -> SensorSpan {
+        SensorSpan {
+            base: base(SpanKind::SensorEvaluation),
+            sensor_id: SensorId::new(id),
+            sensor_kind: SensorKind::Computational,
+            trigger: SensorTrigger::PostTurn,
+            outcome: if fired {
+                SensorOutcome::Warn
+            } else {
+                SensorOutcome::Pass
+            },
+            fired,
+        }
+    }
+
+    fn middleware(hook: HookPoint, decision: MiddlewareDecision) -> MiddlewareSpan {
+        MiddlewareSpan {
+            base: base(SpanKind::MiddlewareHook),
+            hook,
+            decision,
+        }
+    }
 
     #[test]
-    fn scanners_parse_debug_fields() {
-        let dbg = "TurnSpan { input_tokens: 100, cache_read_tokens: Some(80), \
-                   fired: true, sensor_id: SensorId(\"lint\"), hook: BeforeTurn }";
-        assert_eq!(parse_u64_field(dbg, "input_tokens"), Some(100));
-        assert_eq!(parse_opt_u64_field(dbg, "cache_read_tokens"), Some(80));
-        assert_eq!(parse_bool_field(dbg, "fired"), Some(true));
-        assert_eq!(
-            parse_string_field(dbg, "sensor_id").as_deref(),
-            Some("lint")
-        );
-        assert_eq!(
-            parse_ident_field(dbg, "hook").as_deref(),
-            Some("BeforeTurn")
-        );
-        let none = "X { cache_read_tokens: None }";
-        assert_eq!(parse_opt_u64_field(none, "cache_read_tokens"), Some(0));
+    fn typed_accessors_return_some_only_for_matching_kind() {
+        let t: Box<dyn Span> = Box::new(turn(100, Some(80)));
+        assert!(t.as_turn().is_some());
+        assert!(t.as_sensor().is_none());
+        assert!(t.as_middleware().is_none());
+
+        let s: Box<dyn Span> = Box::new(sensor("lint", true));
+        assert!(s.as_sensor().is_some());
+        assert!(s.as_turn().is_none());
+        assert!(s.as_middleware().is_none());
+
+        let m: Box<dyn Span> = Box::new(middleware(
+            HookPoint::BeforeTurn,
+            MiddlewareDecision::Continue,
+        ));
+        assert!(m.as_middleware().is_some());
+        assert!(m.as_turn().is_none());
+        assert!(m.as_sensor().is_none());
+    }
+
+    #[test]
+    fn cache_hit_rate_typed() {
+        // cache_read = 80 + 0; input = 100 + 200 = 300; rate = 80 / 380.
+        let spans: Vec<Box<dyn Span>> = vec![
+            Box::new(turn(100, Some(80))),
+            Box::new(turn(200, None)),
+            Box::new(sensor("lint", true)), // ignored
+        ];
+        assert!((cache_hit_rate(&spans) - 80.0 / 380.0).abs() < 1e-12);
+        // Empty / no turn spans → 0.0.
+        assert_eq!(cache_hit_rate(&[]), 0.0);
+        let only_sensor: Vec<Box<dyn Span>> = vec![Box::new(sensor("lint", true))];
+        assert_eq!(cache_hit_rate(&only_sensor), 0.0);
+    }
+
+    #[test]
+    fn sensor_fire_rate_typed() {
+        let spans: Vec<Box<dyn Span>> = vec![
+            Box::new(sensor("lint", true)),
+            Box::new(sensor("lint", false)),
+            Box::new(sensor("other", true)), // non-matching id
+            Box::new(turn(1, None)),         // ignored
+        ];
+        // 1 fired of 2 matching "lint".
+        assert!((sensor_fire_rate(&spans, "lint") - 0.5).abs() < 1e-12);
+        // No match → 0.0.
+        assert_eq!(sensor_fire_rate(&spans, "missing"), 0.0);
+        assert_eq!(sensor_fire_rate(&[], "lint"), 0.0);
+    }
+
+    #[test]
+    fn middleware_intervention_rate_typed() {
+        let spans: Vec<Box<dyn Span>> = vec![
+            Box::new(middleware(
+                HookPoint::BeforeTurn,
+                MiddlewareDecision::Continue,
+            )),
+            Box::new(middleware(
+                HookPoint::BeforeTurn,
+                MiddlewareDecision::ContinueWithModification,
+            )),
+            Box::new(middleware(
+                HookPoint::BeforeTurn,
+                MiddlewareDecision::Halt {
+                    reason: "stop".into(),
+                },
+            )),
+            // non-matching hook
+            Box::new(middleware(
+                HookPoint::AfterTool,
+                MiddlewareDecision::Continue,
+            )),
+        ];
+        // 3 matching "beforeturn" (case-insensitive); only Halt intervenes → 1/3.
+        assert!((middleware_intervention_rate(&spans, "beforeturn") - 1.0 / 3.0).abs() < 1e-12);
+        // ContinueWithModification is NOT an intervention (prior behavior).
+        let cwm: Vec<Box<dyn Span>> = vec![Box::new(middleware(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::ContinueWithModification,
+        ))];
+        assert_eq!(middleware_intervention_rate(&cwm, "BeforeTool"), 0.0);
+        // SurfaceToHuman counts as an intervention.
+        let sth: Vec<Box<dyn Span>> = vec![Box::new(middleware(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::SurfaceToHuman {
+                request: HumanRequest::Clarification {
+                    question: "why".into(),
+                },
+            },
+        ))];
+        assert_eq!(middleware_intervention_rate(&sth, "beforetool"), 1.0);
+        // No match → 0.0.
+        assert_eq!(middleware_intervention_rate(&spans, "aftersession"), 0.0);
+        assert_eq!(middleware_intervention_rate(&[], "beforeturn"), 0.0);
     }
 }
