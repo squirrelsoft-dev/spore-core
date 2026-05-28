@@ -111,3 +111,95 @@ func TestKeyTermVerifierNonTaskHintsAreNoOps(t *testing.T) {
 		t.Fatalf("Detail = %q", res.Detail)
 	}
 }
+
+// ── Issue #47: structured fields feed the four additional hints ──────────────
+
+func hintOnly(set func(*CompactionPreserveHints)) CompactionPreserveHints {
+	h := CompactionPreserveHints{}
+	set(&h)
+	return h
+}
+
+func TestKeyTermVerifierOpenProblemsIsolated(t *testing.T) {
+	v := KeyTermVerifier{}
+	st := stateWith("ignored task")
+	st.OpenProblems = []string{"Resolve the deadlock issue"}
+	hints := hintOnly(func(h *CompactionPreserveHints) { h.KeepOpenProblems = true })
+	res := v.Verify("we noted the deadlock", hints, st)
+	if res.Passed {
+		t.Fatalf("expected fail, got %+v", res)
+	}
+	if !reflect.DeepEqual(res.MissingItems, []string{"resolve", "issue"}) {
+		t.Fatalf("MissingItems = %#v, want [resolve issue]", res.MissingItems)
+	}
+}
+
+func TestKeyTermVerifierArchitecturalDecisionsIsolated(t *testing.T) {
+	v := KeyTermVerifier{}
+	st := stateWith("ignored task")
+	st.ArchitecturalDecisions = []string{"Adopt hexagonal architecture"}
+	hints := hintOnly(func(h *CompactionPreserveHints) { h.KeepArchitecturalDecisions = true })
+	res := v.Verify("we will adopt hexagonal architecture", hints, st)
+	if !res.Passed {
+		t.Fatalf("expected pass, got %+v", res)
+	}
+	if !reflect.DeepEqual(res.MissingItems, []string{}) {
+		t.Fatalf("MissingItems = %#v, want []", res.MissingItems)
+	}
+}
+
+func TestKeyTermVerifierRecentFilesPathTokenization(t *testing.T) {
+	v := KeyTermVerifier{}
+	st := stateWith("ignored task")
+	st.RecentFiles = []string{"src/parser/mod.rs"}
+	// src, mod, rs are < 4 chars and dropped; only "parser" survives.
+	hints := hintOnly(func(h *CompactionPreserveHints) { h.KeepRecentFileList = true })
+	res := v.Verify("touched the lexer", hints, st)
+	if res.Passed {
+		t.Fatalf("expected fail, got %+v", res)
+	}
+	if !reflect.DeepEqual(res.MissingItems, []string{"parser"}) {
+		t.Fatalf("MissingItems = %#v, want [parser]", res.MissingItems)
+	}
+}
+
+func TestKeyTermVerifierReasoningSummaryIsolated(t *testing.T) {
+	v := KeyTermVerifier{}
+	st := stateWith("ignored task")
+	st.ReasoningSummary = "Considered caching strategy"
+	hints := hintOnly(func(h *CompactionPreserveHints) { h.KeepThinkingBlocks = true })
+	res := v.Verify("nothing relevant", hints, st)
+	if res.Passed {
+		t.Fatalf("expected fail, got %+v", res)
+	}
+	if !reflect.DeepEqual(res.MissingItems, []string{"considered", "caching", "strategy"}) {
+		t.Fatalf("MissingItems = %#v, want [considered caching strategy]", res.MissingItems)
+	}
+}
+
+func TestKeyTermVerifierMultiHintDedupOrdering(t *testing.T) {
+	v := KeyTermVerifier{}
+	// "parser" reachable via both task_instruction and open_problems;
+	// first-occurrence is the task position (pushed first). "bug" < 4 dropped.
+	st := stateWith("Refactor parser")
+	st.OpenProblems = []string{"parser bug remains"}
+	hints := CompactionPreserveHints{
+		KeepOpenProblems:     true,
+		KeepCurrentTaskState: true,
+	}
+	res := v.Verify("nothing matched", hints, st)
+	if !reflect.DeepEqual(res.MissingItems, []string{"refactor", "parser", "remains"}) {
+		t.Fatalf("MissingItems = %#v, want [refactor parser remains]", res.MissingItems)
+	}
+}
+
+func TestKeyTermVerifierEmptyListWithHintOn(t *testing.T) {
+	v := KeyTermVerifier{}
+	st := stateWith("ignored task")
+	// open_problems empty but its hint on ⇒ contributes nothing ⇒ passes.
+	hints := hintOnly(func(h *CompactionPreserveHints) { h.KeepOpenProblems = true })
+	res := v.Verify("anything", hints, st)
+	if !res.Passed || len(res.MissingItems) != 0 {
+		t.Fatalf("expected pass with no missing items, got %+v", res)
+	}
+}

@@ -15,11 +15,15 @@ import (
 // implementation instead.
 
 type cvFixtureCase struct {
-	Name            string                  `json:"name"`
-	Summary         string                  `json:"summary"`
-	Hints           CompactionPreserveHints `json:"hints"`
-	TaskInstruction string                  `json:"task_instruction"`
-	Expected        struct {
+	Name                   string                  `json:"name"`
+	Summary                string                  `json:"summary"`
+	Hints                  CompactionPreserveHints `json:"hints"`
+	TaskInstruction        string                  `json:"task_instruction"`
+	OpenProblems           []string                `json:"open_problems"`
+	ArchitecturalDecisions []string                `json:"architectural_decisions"`
+	RecentFiles            []string                `json:"recent_files"`
+	ReasoningSummary       string                  `json:"reasoning_summary"`
+	Expected               struct {
 		Passed       bool     `json:"passed"`
 		MissingItems []string `json:"missing_items"`
 	} `json:"expected"`
@@ -52,6 +56,10 @@ func TestCompactionVerifierFixtureReplay(t *testing.T) {
 	for _, c := range file.Cases {
 		t.Run(c.Name, func(t *testing.T) {
 			state := NewSessionState("sess", "task", c.TaskInstruction)
+			state.OpenProblems = c.OpenProblems
+			state.ArchitecturalDecisions = c.ArchitecturalDecisions
+			state.RecentFiles = c.RecentFiles
+			state.ReasoningSummary = c.ReasoningSummary
 			res := v.Verify(c.Summary, c.Hints, &state)
 			if res.Passed != c.Expected.Passed {
 				t.Fatalf("Passed = %v, want %v (detail: %s)", res.Passed, c.Expected.Passed, res.Detail)

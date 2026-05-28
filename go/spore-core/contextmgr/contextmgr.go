@@ -207,6 +207,16 @@ type SessionState struct {
 	// only.
 	PendingSkillInjections []Guide `json:"pending_skill_injections"`
 	BudgetWarningActive    bool    `json:"budget_warning_active"`
+	// OpenProblems feed the keep_open_problems hint (issue #47).
+	OpenProblems []string `json:"open_problems"`
+	// ArchitecturalDecisions feed the keep_architectural_decisions hint (#47).
+	ArchitecturalDecisions []string `json:"architectural_decisions"`
+	// RecentFiles feed the keep_recent_file_list hint (#47). Typed as []string,
+	// not a path type — keeps tokenization byte-identical across languages (no
+	// per-language path semantics).
+	RecentFiles []string `json:"recent_files"`
+	// ReasoningSummary feeds the keep_thinking_blocks hint (issue #47).
+	ReasoningSummary string `json:"reasoning_summary"`
 }
 
 // NewSessionState constructs a SessionState with spec defaults.
@@ -291,9 +301,18 @@ var keyTermSplit = regexp.MustCompile("[^a-z0-9]+")
 // from the session state per the enabled hints and checks they appear in the
 // summary.
 //
-// v1 limitation: only KeepCurrentTaskState contributes source terms (from
-// SessionState.TaskInstruction). The other four hints have no structured
-// SessionState field, so they add no terms.
+// All five hints contribute source terms, each gated on its hint and pushed in
+// this fixed order (issue #47) — this order is the cross-language invariant that
+// determines first-occurrence dedup:
+//
+//  1. KeepCurrentTaskState       → SessionState.TaskInstruction
+//  2. KeepOpenProblems           → each SessionState.OpenProblems element
+//  3. KeepArchitecturalDecisions → each SessionState.ArchitecturalDecisions element
+//  4. KeepRecentFileList         → each SessionState.RecentFiles element
+//  5. KeepThinkingBlocks         → SessionState.ReasoningSummary
+//
+// Each source string runs through the same extractTerms rule; an empty/unset
+// field contributes no terms.
 type KeyTermVerifier struct{}
 
 // extractTerms tokenizes a source: lowercase, split on runs of non-[a-z0-9],
@@ -312,11 +331,26 @@ func extractTerms(source string) []string {
 
 // Verify implements CompactionVerifier.
 func (KeyTermVerifier) Verify(summary string, hints CompactionPreserveHints, sessionState *SessionState) CompactionVerificationResult {
-	// Step 1: collect source strings from enabled hints. v1: only
-	// KeepCurrentTaskState contributes (and only when sessionState is set).
+	// Step 1: collect source strings from enabled hints, each gated on its hint
+	// and pushed in this fixed order (issue #47). This order is the
+	// cross-language invariant that determines first-occurrence dedup.
 	var sources []string
-	if hints.KeepCurrentTaskState && sessionState != nil {
-		sources = append(sources, sessionState.TaskInstruction)
+	if sessionState != nil {
+		if hints.KeepCurrentTaskState {
+			sources = append(sources, sessionState.TaskInstruction)
+		}
+		if hints.KeepOpenProblems {
+			sources = append(sources, sessionState.OpenProblems...)
+		}
+		if hints.KeepArchitecturalDecisions {
+			sources = append(sources, sessionState.ArchitecturalDecisions...)
+		}
+		if hints.KeepRecentFileList {
+			sources = append(sources, sessionState.RecentFiles...)
+		}
+		if hints.KeepThinkingBlocks {
+			sources = append(sources, sessionState.ReasoningSummary)
+		}
 	}
 
 	// Step 2: build the term list, deduping preserving first-occurrence order.
