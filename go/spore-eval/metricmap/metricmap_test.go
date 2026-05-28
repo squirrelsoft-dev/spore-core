@@ -84,6 +84,25 @@ func TestSampleFromTraceSpans(t *testing.T) {
 	}
 }
 
+// Regression guard (#68): a ContinueWithModification decision MUST count as an
+// intervention (predicate is "Kind != DecisionContinue"), keeping Go aligned
+// with Rust/TypeScript/Python. Rust had diverged here.
+func TestMiddlewareInterventionRateContinueWithModification(t *testing.T) {
+	cwm := []observability.Span{
+		observability.MiddlewareSpan{Hook: observability.HookPoint("before_turn"), Decision: middleware.MiddlewareDecision{Kind: middleware.DecisionContinueWithModification}},
+	}
+	if got := SampleFor(MiddlewareInterventionRate("before_turn"), nil, cwm, RunSampleInputs{}); got != 1.0 {
+		t.Errorf("continue_with_modification rate=%v want 1.0 (must count as intervention)", got)
+	}
+
+	cont := []observability.Span{
+		observability.MiddlewareSpan{Hook: observability.HookPoint("before_turn"), Decision: middleware.MiddlewareDecision{Kind: middleware.DecisionContinue}},
+	}
+	if got := SampleFor(MiddlewareInterventionRate("before_turn"), nil, cont, RunSampleInputs{}); got != 0.0 {
+		t.Errorf("continue rate=%v want 0.0 (must NOT count as intervention)", got)
+	}
+}
+
 func TestFromTrace(t *testing.T) {
 	if !CacheHitRate("x").FromTrace() || !SensorFireRate("x").FromTrace() || !MiddlewareInterventionRate("x").FromTrace() {
 		t.Error("filtered metrics should be from-trace")
