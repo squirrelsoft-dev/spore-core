@@ -7,7 +7,7 @@
 //!
 //! ## Families
 //! - [`fs`]       — `ReadFile`, `WriteFile`, `ListDir`, `DeleteFile`, `MoveFile`
-//! - [`exec`]     — `BashCommand`, `RunTests`
+//! - [`exec`]     — `Exec`, `BashCommand`, `RunTests`
 //! - [`search`]   — `GrepFiles`, `FindFiles`
 //! - [`git`]      — `GitLog`, `GitDiff`, `GitCommit`, `GitStatus`, `GitReset`
 //! - [`http`]     — `HttpGet`, `HttpPost`
@@ -26,7 +26,7 @@ pub mod search;
 pub mod subagent;
 
 pub use error::ToolExecutionError;
-pub use exec::{BashCommandTool, RunTestsTool};
+pub use exec::{BashCommandTool, ExecTool, RunTestsTool};
 pub use fs::{DeleteFileTool, ListDirTool, MoveFileTool, ReadFileTool, WriteFileTool};
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitResetMode, GitResetTool, GitStatusTool};
 pub use http::{HttpGetTool, HttpPostTool};

@@ -17,6 +17,9 @@
 //!   continue, and compact again.
 //! - `s4` — tool failure + recovery: call `flaky_op` (recoverable error), then
 //!   write recovered.txt explaining the adaptation.
+//! - `s5` — real shell: uppercase input.txt → output.txt via `bash_command`
+//!   with a `/bin/sh -c` pipeline (`cat … | tr … > …`), then read back +
+//!   confirm. Only S5 exposes the shell `bash_command` tool.
 //!
 //! ## Run recipe (live, against a local model + observability stack)
 //!
@@ -82,7 +85,7 @@ async fn main() {
         .first()
         .and_then(|s| ScenarioId::parse(s))
         .unwrap_or_else(|| {
-            eprintln!("usage: e2e_agent <s1|s2|s3|s4> [--model <id>] [--mock]");
+            eprintln!("usage: e2e_agent <s1|s2|s3|s4|s5> [--model <id>] [--mock]");
             std::process::exit(2);
         });
     let mock = args.iter().any(|a| a == "--mock");
@@ -207,7 +210,7 @@ async fn run_live(
     let agent: Arc<dyn Agent> = Arc::new(ModelAgent::new(AgentId::new("e2e-agent"), model.clone()));
 
     // Real tools + sandbox scoped to the workspace.
-    let registry = build_real_tool_registry();
+    let registry = build_real_tool_registry(scenario);
     let sandbox: Arc<dyn SandboxProvider> = Arc::new(
         WorkspaceScopedSandbox::new(WorkspaceConfig {
             root: workspace.to_path_buf(),
@@ -316,7 +319,7 @@ async fn run_scenario(
 
 /// Seed scenario-specific workspace files.
 fn prepare_workspace(scenario: ScenarioId, workspace: &std::path::Path) {
-    if scenario == ScenarioId::S1 {
+    if matches!(scenario, ScenarioId::S1 | ScenarioId::S5) {
         std::fs::write(
             workspace.join("input.txt"),
             "hello from the spore harness end to end scenario\n",

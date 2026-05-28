@@ -44,7 +44,7 @@ use crate::model::{Content, Message, Role, ToolCall, ToolSchema};
 use crate::tool_registry::{
     StandardToolRegistry, Tool, ToolAnnotations, ToolRegistry, ToolSchema as RegistrySchema,
 };
-use crate::tools::exec::BashCommandTool;
+use crate::tools::exec::{BashCommandTool, ExecTool};
 use crate::tools::fs::{ListDirTool, ReadFileTool, WriteFileTool};
 
 // ============================================================================
@@ -131,9 +131,10 @@ Follow these rules:
 
 1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate tool. \
 Writing a shell command, code snippet, or file contents into your text reply \
-does NOT run it — only a real tool call has any effect. To transform a file, \
-call bash_command with the command itself; never write the command text into a \
-file as if it were the result.
+does NOT run it — only a real tool call has any effect. When a task asks you to \
+produce a file or a result, call the tool that performs the action and let the \
+tool do the work; never paste the command, code, or expression you *would* run \
+as if it were the finished result.
 
 2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: booleans \
 as true/false (not \"true\"), numbers as 12 (not \"12\"), lists as [\"a\"] (not \
@@ -328,10 +329,14 @@ impl TerminationPolicy for CompleteOnFinalResponse {
 // Real tool registry construction
 // ============================================================================
 
-/// Build a [`StandardToolRegistry`] populated with the real read/write/list/
-/// bash tools plus the [`FailingTool`]. Shared by every scenario so the agent
-/// always sees the same catalog.
-pub fn build_real_tool_registry() -> Arc<StandardToolRegistry> {
+/// Build a [`StandardToolRegistry`] for `scenario`. The base catalog is always
+/// `read_file`, `write_file`, `list_dir`, `exec`, and [`FailingTool`]
+/// (`flaky_op`). The real shell tool `bash_command` is added ONLY for
+/// [`ScenarioId::S5`] — S1/S2 measure reasoning + act-don't-describe, and a
+/// live model handed a shell could shortcut S1 with `cat … | tr … > …` without
+/// demonstrating the intended behavior. `exec` is safe everywhere because it
+/// cannot pipe or redirect.
+pub fn build_real_tool_registry(scenario: ScenarioId) -> Arc<StandardToolRegistry> {
     let registry = StandardToolRegistry::new();
     // Registration errors here are programming errors (duplicate/invalid
     // schema) — surface them loudly via expect rather than silently.
@@ -345,11 +350,16 @@ pub fn build_real_tool_registry() -> Arc<StandardToolRegistry> {
         .register(Box::new(ListDirTool::new()), ListDirTool::schema())
         .expect("register list_dir");
     registry
-        .register(Box::new(BashCommandTool::new()), BashCommandTool::schema())
-        .expect("register bash_command");
+        .register(Box::new(ExecTool::new()), ExecTool::schema())
+        .expect("register exec");
     registry
         .register(Box::new(FailingTool::new()), FailingTool::schema())
         .expect("register flaky_op");
+    if matches!(scenario, ScenarioId::S5) {
+        registry
+            .register(Box::new(BashCommandTool::new()), BashCommandTool::schema())
+            .expect("register bash_command");
+    }
     Arc::new(registry)
 }
 
@@ -409,23 +419,25 @@ pub fn seed_compaction_state(
 // Scenario builders (generic over agent + tool registry)
 // ============================================================================
 
-/// The scenario id, parsed from the CLI arg `s1`..`s4`.
+/// The scenario id, parsed from the CLI arg `s1`..`s5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScenarioId {
     S1,
     S2,
     S3,
     S4,
+    S5,
 }
 
 impl ScenarioId {
-    /// Parse `s1`..`s4` (case-insensitive).
+    /// Parse `s1`..`s5` (case-insensitive).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "s1" => Some(Self::S1),
             "s2" => Some(Self::S2),
             "s3" => Some(Self::S3),
             "s4" => Some(Self::S4),
+            "s5" => Some(Self::S5),
             _ => None,
         }
     }
@@ -462,6 +474,18 @@ impl ScenarioId {
                 "Call the flaky_op tool. If it fails, do not give up: write a file \
                  recovered.txt explaining that flaky_op failed and how you adapted, using \
                  write_file. Reply DONE when finished."
+            }
+            Self::S5 => {
+                "Transform input.txt into output.txt with every lowercase letter \
+                 uppercased, using the shell.\n\
+                 1. Call bash_command with a real shell pipeline that reads \
+                 input.txt, uppercases it, and writes output.txt — e.g. \
+                 `cat input.txt | tr a-z A-Z > output.txt`. This is exactly what \
+                 the bash_command tool is for: it runs your script via /bin/sh \
+                 -c, so pipes (|) and redirects (>) work.\n\
+                 2. Call read_file on output.txt and check its contents are \
+                 input.txt's text in all capital letters.\n\
+                 Reply DONE only once output.txt contains the uppercased text."
             }
         }
     }
@@ -520,18 +544,23 @@ mod tests {
     fn scenario_id_parses() {
         assert_eq!(ScenarioId::parse("s1"), Some(ScenarioId::S1));
         assert_eq!(ScenarioId::parse("S4"), Some(ScenarioId::S4));
+        assert_eq!(ScenarioId::parse("s5"), Some(ScenarioId::S5));
         assert_eq!(ScenarioId::parse("nope"), None);
+    }
+
+    fn schema_names(scenario: ScenarioId) -> Vec<String> {
+        let reg = build_real_tool_registry(scenario);
+        let bridge = RealToolRegistry::new(reg, Arc::new(AllowAllSandbox));
+        bridge
+            .model_schemas()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
     }
 
     #[test]
     fn real_registry_exposes_sorted_schemas() {
-        let reg = build_real_tool_registry();
-        let bridge = RealToolRegistry::new(reg, Arc::new(AllowAllSandbox));
-        let names: Vec<String> = bridge
-            .model_schemas()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
+        let names = schema_names(ScenarioId::S1);
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "schemas must be sorted by name");
@@ -539,9 +568,33 @@ mod tests {
         assert!(names.contains(&"read_file".to_string()));
     }
 
+    #[test]
+    fn s1_registry_has_exec_not_bash_command() {
+        let names = schema_names(ScenarioId::S1);
+        assert!(names.contains(&"exec".to_string()));
+        assert!(!names.contains(&"bash_command".to_string()));
+    }
+
+    #[test]
+    fn s2_registry_lacks_bash_command() {
+        let names = schema_names(ScenarioId::S2);
+        assert!(names.contains(&"exec".to_string()));
+        assert!(!names.contains(&"bash_command".to_string()));
+    }
+
+    #[test]
+    fn s5_registry_has_bash_command() {
+        let names = schema_names(ScenarioId::S5);
+        assert!(names.contains(&"bash_command".to_string()));
+        assert!(names.contains(&"exec".to_string()));
+    }
+
     #[tokio::test]
     async fn failing_tool_returns_recoverable_error() {
-        let bridge = RealToolRegistry::new(build_real_tool_registry(), Arc::new(AllowAllSandbox));
+        let bridge = RealToolRegistry::new(
+            build_real_tool_registry(ScenarioId::S4),
+            Arc::new(AllowAllSandbox),
+        );
         let out = bridge
             .dispatch(ToolCall {
                 id: "c1".into(),

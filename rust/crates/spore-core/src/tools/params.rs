@@ -53,11 +53,25 @@ pub struct MoveFileParams {
 
 // ---------- Exec ----------
 
+/// Parameters for the shell-free [`crate::tools::exec::ExecTool`]: a program
+/// name plus verbatim argument vector. No shell is involved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BashCommandParams {
+pub struct ExecParams {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Timeout in whole seconds.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+/// Parameters for the real [`crate::tools::exec::BashCommandTool`]: a single
+/// shell `script` run via `/bin/sh -c`, with an optional working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellCommandParams {
+    pub script: String,
+    #[serde(default)]
+    pub working_dir: Option<String>,
     /// Timeout in whole seconds.
     #[serde(default)]
     pub timeout: Option<u64>,

@@ -376,7 +376,7 @@ async fn s4_tool_failure_then_recovery() {
         usage: usage(),
     });
 
-    let registry = build_real_tool_registry();
+    let registry = build_real_tool_registry(ScenarioId::S4);
     let sandbox: Arc<dyn SandboxProvider> = Arc::new(AllowAllSandbox);
     let bridge = RealToolRegistry::new(registry, sandbox.clone());
     let schemas = bridge.model_schemas();
@@ -416,7 +416,10 @@ async fn s4_tool_failure_then_recovery() {
 /// bridge reports `is_always_halt == false`.
 #[tokio::test]
 async fn s4_failing_tool_is_not_always_halt() {
-    let bridge = RealToolRegistry::new(build_real_tool_registry(), Arc::new(AllowAllSandbox));
+    let bridge = RealToolRegistry::new(
+        build_real_tool_registry(ScenarioId::S4),
+        Arc::new(AllowAllSandbox),
+    );
     assert!(!bridge.is_always_halt("flaky_op"));
     let out = bridge
         .dispatch(tool_call("c1", "flaky_op", serde_json::json!({})))
@@ -428,6 +431,96 @@ async fn s4_failing_tool_is_not_always_halt() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// S5 — real shell tool: bash_command with a pipe + redirect (uses the REAL
+// registry, which exposes bash_command only for S5).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s5_shell_pipeline_uppercases_via_bash_command() {
+    let workspace = std::env::temp_dir().join(format!(
+        "spore-s5-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let input = workspace.join("input.txt");
+    let output = workspace.join("output.txt");
+    std::fs::write(&input, "hello\n").unwrap();
+
+    let session_id = SessionId::new("s5-test");
+    let agent = Arc::new(MockAgent::new(AgentId::new("mock")));
+    // turn1: bash_command with a literal pipe AND redirect; turn2: read_file
+    // output.txt to verify; turn3: DONE.
+    let script = format!(
+        "cat {} | tr a-z A-Z > {}",
+        input.display(),
+        output.display()
+    );
+    agent.push(TurnResult::ToolCallRequested {
+        calls: vec![tool_call(
+            "c1",
+            "bash_command",
+            serde_json::json!({ "script": script }),
+        )],
+        usage: usage(),
+    });
+    agent.push(TurnResult::ToolCallRequested {
+        calls: vec![tool_call(
+            "c2",
+            "read_file",
+            serde_json::json!({ "path": output.display().to_string() }),
+        )],
+        usage: usage(),
+    });
+    agent.push(TurnResult::FinalResponse {
+        content: "DONE".into(),
+        usage: usage(),
+    });
+
+    let registry = build_real_tool_registry(ScenarioId::S5);
+    let sandbox: Arc<dyn SandboxProvider> = Arc::new(AllowAllSandbox);
+    let bridge = RealToolRegistry::new(registry, sandbox.clone());
+    let schemas = bridge.model_schemas();
+    let tools: Arc<dyn HarnessToolRegistry> = Arc::new(bridge);
+
+    let harness = build_scenario(
+        ScenarioId::S5,
+        agent as Arc<dyn Agent>,
+        tools,
+        sandbox,
+        Arc::new(NoopContextManager),
+        Arc::new(AlwaysContinuePolicy),
+        schemas,
+        None,
+    );
+
+    let task = Task::new(
+        ScenarioId::S5.prompt(),
+        session_id.clone(),
+        LoopStrategy::ReAct { max_iterations: 8 },
+    );
+    match harness.run(HarnessRunOptions::new(task)).await {
+        RunResult::Success { turns, .. } => {
+            assert!(
+                turns >= 3,
+                "S5: bash_command -> read_file -> done, got {turns}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                "HELLO\n",
+                "shell pipeline must uppercase input.txt into output.txt"
+            );
+        }
+        other => panic!("S5 expected Success, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 // ---------------------------------------------------------------------------
