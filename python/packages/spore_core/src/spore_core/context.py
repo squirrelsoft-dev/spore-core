@@ -249,6 +249,18 @@ class SessionState:
     # each assemble — skills are ephemeral, one turn only.
     pending_skill_injections: list[Guide] = field(default_factory=list)
     budget_warning_active: bool = False
+    # Structured fields feeding the four additional preserve hints (issue
+    # #47). All default to empty, so an unset field contributes no terms —
+    # identical to today's behavior.
+    open_problems: list[str] = field(default_factory=list)
+    architectural_decisions: list[str] = field(default_factory=list)
+    # Recently touched file paths feeding ``keep_recent_file_list``. Typed as
+    # plain strings, not path types — keeps tokenization byte-identical across
+    # languages (no per-language path semantics).
+    recent_files: list[str] = field(default_factory=list)
+    # Reasoning summary feeding ``keep_thinking_blocks``; treated
+    # byte-identically to ``task_instruction``.
+    reasoning_summary: str = ""
 
 
 @dataclass
@@ -332,9 +344,19 @@ class KeyTermVerifier:
     Extracts key terms from the session state per the enabled hints and
     checks they appear in the summary.
 
-    v1 limitation: only ``keep_current_task_state`` contributes source terms
-    (from :attr:`SessionState.task_instruction`). The other four hints have
-    no structured ``SessionState`` field, so they add no terms.
+    All five hints contribute source terms, each gated on its hint and pushed
+    in this fixed order (issue #47) — this order is the cross-language
+    invariant that determines first-occurrence dedup:
+
+    1. ``keep_current_task_state`` → :attr:`SessionState.task_instruction`
+    2. ``keep_open_problems`` → each :attr:`SessionState.open_problems`
+    3. ``keep_architectural_decisions`` →
+       each :attr:`SessionState.architectural_decisions`
+    4. ``keep_recent_file_list`` → each :attr:`SessionState.recent_files`
+    5. ``keep_thinking_blocks`` → :attr:`SessionState.reasoning_summary`
+
+    Each source string runs through the same :meth:`_extract_terms` rule; an
+    empty/unset field contributes no terms.
     """
 
     @staticmethod
@@ -352,12 +374,20 @@ class KeyTermVerifier:
         hints: CompactionPreserveHints,
         session_state: SessionState,
     ) -> CompactionVerificationResult:
-        # Step 1: collect source strings from enabled hints. v1: only
-        # ``keep_current_task_state`` contributes. The other four hints have
-        # no structured SessionState field, so they add no terms.
+        # Step 1: collect source strings from enabled hints, each gated on its
+        # hint and pushed in this fixed order (issue #47). This order is the
+        # cross-language invariant that determines first-occurrence dedup.
         sources: list[str] = []
         if hints.keep_current_task_state:
             sources.append(session_state.task_instruction)
+        if hints.keep_open_problems:
+            sources.extend(session_state.open_problems)
+        if hints.keep_architectural_decisions:
+            sources.extend(session_state.architectural_decisions)
+        if hints.keep_recent_file_list:
+            sources.extend(session_state.recent_files)
+        if hints.keep_thinking_blocks:
+            sources.append(session_state.reasoning_summary)
 
         # Step 2: build the term list, deduping preserving first-occurrence
         # order.

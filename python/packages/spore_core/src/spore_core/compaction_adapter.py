@@ -157,6 +157,10 @@ def _rich_to_dict(rich: RichSessionState) -> dict[str, Any]:
             {"id": str(g.id), "content": g.content} for g in rich.pending_skill_injections
         ],
         "budget_warning_active": rich.budget_warning_active,
+        "open_problems": list(rich.open_problems),
+        "architectural_decisions": list(rich.architectural_decisions),
+        "recent_files": list(rich.recent_files),
+        "reasoning_summary": rich.reasoning_summary,
     }
 
 
@@ -186,6 +190,10 @@ def _rich_from_dict(data: dict[str, Any]) -> RichSessionState:
             for g in data.get("pending_skill_injections", [])
         ],
         budget_warning_active=data.get("budget_warning_active", False),
+        open_problems=data.get("open_problems", []),
+        architectural_decisions=data.get("architectural_decisions", []),
+        recent_files=data.get("recent_files", []),
+        reasoning_summary=data.get("reasoning_summary", ""),
     )
     return state
 

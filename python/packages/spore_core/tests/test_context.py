@@ -516,11 +516,22 @@ async def test_assembled_tool_schemas_are_independent_copy() -> None:
 # ===========================================================================
 
 
-def _verifier_state(task_instruction: str) -> SessionState:
+def _verifier_state(
+    task_instruction: str,
+    *,
+    open_problems: list[str] | None = None,
+    architectural_decisions: list[str] | None = None,
+    recent_files: list[str] | None = None,
+    reasoning_summary: str = "",
+) -> SessionState:
     return SessionState(
         session_id=SessionId("s1"),
         task_id=TaskId("t1"),
         task_instruction=task_instruction,
+        open_problems=open_problems or [],
+        architectural_decisions=architectural_decisions or [],
+        recent_files=recent_files or [],
+        reasoning_summary=reasoning_summary,
     )
 
 
@@ -625,6 +636,93 @@ def test_non_task_hints_contribute_no_terms() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #47: structured fields feed the four additional hints
+# ---------------------------------------------------------------------------
+
+
+def _only(**overrides: bool) -> CompactionPreserveHints:
+    base = dict(
+        keep_architectural_decisions=False,
+        keep_open_problems=False,
+        keep_current_task_state=False,
+        keep_recent_file_list=False,
+        keep_thinking_blocks=False,
+    )
+    base.update(overrides)
+    return CompactionPreserveHints(**base)
+
+
+def test_open_problems_isolated() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "we noted the deadlock",
+        _only(keep_open_problems=True),
+        _verifier_state("ignored task", open_problems=["Resolve the deadlock issue"]),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["resolve", "issue"]
+
+
+def test_architectural_decisions_isolated() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "we will adopt hexagonal architecture",
+        _only(keep_architectural_decisions=True),
+        _verifier_state("ignored task", architectural_decisions=["Adopt hexagonal architecture"]),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+
+
+def test_recent_files_path_tokenization() -> None:
+    v = KeyTermVerifier()
+    # src, mod, rs are <4 chars and dropped; only "parser" survives.
+    res = v.verify(
+        "touched the lexer",
+        _only(keep_recent_file_list=True),
+        _verifier_state("ignored task", recent_files=["src/parser/mod.rs"]),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["parser"]
+
+
+def test_reasoning_summary_isolated() -> None:
+    v = KeyTermVerifier()
+    res = v.verify(
+        "nothing relevant",
+        _only(keep_thinking_blocks=True),
+        _verifier_state("ignored task", reasoning_summary="Considered caching strategy"),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["considered", "caching", "strategy"]
+
+
+def test_multi_hint_dedup_ordering() -> None:
+    v = KeyTermVerifier()
+    # "parser" reachable via both task_instruction and open_problems;
+    # first-occurrence is the task position (pushed first). "bug" <4 dropped.
+    res = v.verify(
+        "nothing matched",
+        _only(keep_open_problems=True, keep_current_task_state=True),
+        _verifier_state("Refactor parser", open_problems=["parser bug remains"]),
+    )
+    assert res.passed is False
+    assert res.missing_items == ["refactor", "parser", "remains"]
+
+
+def test_empty_list_with_hint_on_passes() -> None:
+    v = KeyTermVerifier()
+    # open_problems empty but its hint on ⇒ contributes nothing ⇒ passes.
+    res = v.verify(
+        "anything",
+        _only(keep_open_problems=True),
+        _verifier_state("ignored task", open_problems=[]),
+    )
+    assert res.passed is True
+    assert res.missing_items == []
+
+
+# ---------------------------------------------------------------------------
 # Cross-language fixture replay (fixtures/compaction_verifier/cases.json)
 # ---------------------------------------------------------------------------
 
@@ -639,7 +737,13 @@ def _compaction_verifier_cases() -> list[dict]:
 def test_key_term_verifier_fixture_replay(case: dict) -> None:
     v = KeyTermVerifier()
     hints = CompactionPreserveHints(**case["hints"])
-    state = _verifier_state(case["task_instruction"])
+    state = _verifier_state(
+        case["task_instruction"],
+        open_problems=case.get("open_problems", []),
+        architectural_decisions=case.get("architectural_decisions", []),
+        recent_files=case.get("recent_files", []),
+        reasoning_summary=case.get("reasoning_summary", ""),
+    )
     res: CompactionVerificationResult = v.verify(case["summary"], hints, state)
     assert res.passed == case["expected"]["passed"]
     assert res.missing_items == case["expected"]["missing_items"]
