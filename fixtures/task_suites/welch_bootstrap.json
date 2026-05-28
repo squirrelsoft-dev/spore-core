@@ -1,0 +1,19 @@
+{
+  "description": "Statistics oracle for the EvalHarness native stats (Rules 26-28). Cross-language ground truth: every language's welch_t_test + bootstrap_ci must reproduce these values. Seeded with the canonical SplitMix64 seed 0x5EED5EED5EED5EED, 1000 iterations, 95% percentile CI. Never edit to make a test pass.",
+  "bootstrap_seed": "0x5EED5EED5EED5EED",
+  "bootstrap_iterations": 1000,
+  "ci_level": 0.95,
+  "cases": [
+    {
+      "name": "candidate_clearly_better_than_baseline",
+      "baseline": [0.40, 0.45, 0.35, 0.50, 0.30],
+      "candidate": [0.80, 0.85, 0.90, 0.75, 0.95],
+      "welch_t": 9.0,
+      "welch_df": 8.0,
+      "welch_p_value": 0.000018531184296429943,
+      "welch_p_tolerance": 1e-9,
+      "candidate_bootstrap_ci": { "lower": 0.79, "upper": 0.9100000000000001 },
+      "baseline_bootstrap_ci": { "lower": 0.33999999999999997, "upper": 0.45999999999999996 }
+    }
+  ]
+}

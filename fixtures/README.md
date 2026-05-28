@@ -65,25 +65,62 @@ same verdict for every case.
 
 ### `task_suites/` — JSON
 
-EvalHarness task definitions (see the Improvement Flywheel section of
-the spec). Three classes:
+EvalHarness task definitions (issue #26). A suite manifest is a single
+JSON object carrying a required `suite_version` (loaders reject a manifest
+without it) and three disjoint task lists:
 
-- **Regression** — must stay passing across versions.
-- **Challenge** — measure improvement over time.
-- **Canary** — detect breakthroughs.
+- **regression** — must stay passing across versions.
+- **challenge** — measure improvement over time.
+- **canary** — detect breakthroughs.
 
-Schema:
+Suite schema:
 
 ```jsonc
 {
-  "suite": "regression",
-  "task_id": "regression_001",
-  "instruction": "...",
-  "setup": { /* workspace fixture */ },
-  "model_fixture": "model_responses/regression_001.jsonl",
-  "expected_outcome": { /* metric or terminal state */ }
+  "suite_version": 1,                    // REQUIRED — loaders reject if absent
+  "regression": [ /* EvalTask */ ],
+  "challenge":  [ /* EvalTask */ ],
+  "canary":     [ /* EvalTask */ ]
 }
 ```
+
+Each `EvalTask`:
+
+```jsonc
+{
+  "id": "regression_s1_uppercase",
+  "instruction": "...",
+  "workspace_snapshot": {                // restored fresh per run, then torn down
+    "kind": "files",                     // "files" | "git_ref" | "empty"
+    "files": { "input.txt": "hello\n" }  // canonical hermetic form
+  },
+  "verifier_spec": {                     // resolved to a TaskVerifier
+    "kind": "test_suite",                // test_suite | composite | metric_evaluator
+                                         //  | llm_judge | always_pass | always_fail
+    "command": "sh",
+    "args": ["-c", "grep -q HELLO output.txt"],
+    "timeout_secs": 30
+  },
+  "expected_turns": [2, 8],              // optional (min, max)
+  "expected_cost_usd": 0.01,            // optional
+  "tags": ["s1"],                        // free-form
+  "timeout": 60,                         // per-run timeout, seconds
+  "model_fixture": "model_responses/s1.jsonl"  // optional, for recorded replay
+}
+```
+
+`workspace_snapshot.kind`:
+- `files` — a `{ path: contents }` map written into a fresh tempdir. This is
+  the canonical hermetic form the shipped suites use (no real git repo needed
+  for cross-language replay).
+- `git_ref` — `{ "repo": "...", "reference": "..." }`; restored via
+  `git worktree add` for real snapshots.
+- `empty` — a bare workspace.
+
+> Note: the pre-#26 draft schema used `setup` / `expected_outcome` per task.
+> Those are superseded by `workspace_snapshot` + `verifier_spec`. The
+> `welch_bootstrap.json` manifest is a statistics oracle (hand-computed Welch
+> t/p and seeded bootstrap CI bounds), not a task suite.
 
 ## Adding a new fixture
 

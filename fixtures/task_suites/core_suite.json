@@ -1,0 +1,96 @@
+{
+  "suite_version": 1,
+  "regression": [
+    {
+      "id": "regression_s1_uppercase",
+      "instruction": "Complete this task step by step, using the provided tools:\n1. Call read_file to read the contents of input.txt. Use the exact text it returns.\n2. Take that exact text and rewrite it with every lowercase letter changed to its capital form.\n3. Call write_file with path 'output.txt' and content set to the uppercased text from step 2.\n4. Call read_file on output.txt and check its contents equal the uppercased text.\nReply DONE only once output.txt contains input.txt's contents in all capital letters.",
+      "workspace_snapshot": {
+        "kind": "files",
+        "files": {
+          "input.txt": "hello from the spore harness end to end scenario\n"
+        }
+      },
+      "verifier_spec": {
+        "kind": "test_suite",
+        "command": "sh",
+        "args": ["-c", "grep -qx 'HELLO FROM THE SPORE HARNESS END TO END SCENARIO' output.txt"],
+        "timeout_secs": 30
+      },
+      "expected_turns": [2, 8],
+      "expected_cost_usd": 0.01,
+      "tags": ["s1", "read-transform-write"],
+      "timeout": 60
+    },
+    {
+      "id": "regression_s2_write_notes",
+      "instruction": "Create a file notes.md containing a TODO list with one item: 'set up the project'. Use write_file. Reply DONE when written.",
+      "workspace_snapshot": {
+        "kind": "files",
+        "files": {}
+      },
+      "verifier_spec": {
+        "kind": "test_suite",
+        "command": "sh",
+        "args": ["-c", "test -f notes.md && grep -q 'set up the project' notes.md"],
+        "timeout_secs": 30
+      },
+      "expected_turns": [1, 4],
+      "expected_cost_usd": 0.005,
+      "tags": ["s2", "write"],
+      "timeout": 60
+    }
+  ],
+  "challenge": [
+    {
+      "id": "challenge_s4_recover",
+      "instruction": "Call the flaky_op tool. If it fails, do not give up: write a file recovered.txt explaining that flaky_op failed and how you adapted, using write_file. Reply DONE when finished.",
+      "workspace_snapshot": {
+        "kind": "files",
+        "files": {}
+      },
+      "verifier_spec": {
+        "kind": "test_suite",
+        "command": "sh",
+        "args": ["-c", "test -f recovered.txt && grep -qi 'flaky_op' recovered.txt"],
+        "timeout_secs": 30
+      },
+      "expected_turns": [2, 8],
+      "tags": ["s4", "recovery"],
+      "timeout": 60
+    },
+    {
+      "id": "challenge_s5_shell_pipeline",
+      "instruction": "Transform input.txt into output.txt with every lowercase letter uppercased, using the shell.\n1. Call bash_command with a real shell pipeline that reads input.txt, uppercases it, and writes output.txt — e.g. `cat input.txt | tr a-z A-Z > output.txt`.\n2. Call read_file on output.txt and check its contents are input.txt's text in all capital letters.\nReply DONE only once output.txt contains the uppercased text.",
+      "workspace_snapshot": {
+        "kind": "files",
+        "files": {
+          "input.txt": "hello from the spore harness end to end scenario\n"
+        }
+      },
+      "verifier_spec": {
+        "kind": "test_suite",
+        "command": "sh",
+        "args": ["-c", "grep -qx 'HELLO FROM THE SPORE HARNESS END TO END SCENARIO' output.txt"],
+        "timeout_secs": 30
+      },
+      "expected_turns": [2, 6],
+      "tags": ["s5", "shell"],
+      "timeout": 60
+    }
+  ],
+  "canary": [
+    {
+      "id": "canary_s3_compaction",
+      "instruction": "Summarize the long conversation so far and continue working on the deploy of the payment service. Reply DONE when finished.",
+      "workspace_snapshot": {
+        "kind": "empty"
+      },
+      "verifier_spec": {
+        "kind": "always_pass"
+      },
+      "expected_turns": [1, 12],
+      "tags": ["s3", "compaction"],
+      "timeout": 120
+    }
+  ]
+}

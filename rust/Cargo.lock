@@ -1335,6 +1335,15 @@ dependencies = [
 [[package]]
 name = "spore-eval"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "spore-core",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "stable_deref_trait"
