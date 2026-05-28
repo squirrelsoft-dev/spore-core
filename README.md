@@ -295,7 +295,7 @@ All component interfaces, rules, identity models, and architectural decisions ar
 | Component interfaces | ✅ Complete (issues #1–#13) |
 | Design decisions | ✅ Resolved (issues #14–#22) |
 | PromptChunkRegistry + CacheProvider | ✅ Complete (#24, #25) |
-| Eval harness design | 📋 Discussion (#26) |
+| EvalHarness (eval & feedback loop) | ✅ Core complete, four-language parity (#26) |
 | Rust implementation | ✅ Core complete |
 | TypeScript implementation | ✅ Core complete |
 | Python implementation | ✅ Core complete |

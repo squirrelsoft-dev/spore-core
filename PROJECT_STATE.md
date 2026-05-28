@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-27 by /close_
+_Last updated: 2026-05-28 by /implement (#26)_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -36,6 +36,20 @@ OTLP→Tempo / JSONL→Loki parity (#49/#50/#33), `OllamaModelInterface` +
 capability guard (#41), `StandardCompactionAdapter` wiring (#55), the
 compaction verify→retry→warn loop (#46), and `StandardContextManager` /
 verifiers (#29).
+
+**#26 (EvalHarness) just landed** — the evaluation harness / tight feedback loop is
+implemented at parity across all four languages (`rust/crates/spore-eval`,
+`typescript/packages/eval` (new `@spore/eval`), `python/packages/spore_eval`,
+`go/spore-eval`). It runs a `TaskSuite` (regression/challenge/canary) of `EvalTask`s
+against baseline vs candidate `HarnessConfig`s over fresh per-run git worktrees,
+sources task-level signals from `ObservabilityProvider`, and produces a
+`ComparisonReport` with native Welch's t-test + seeded-bootstrap CIs and an
+Adopt/Reject/NeedsMoreRuns/Ambiguous `Recommendation`. The #26 design discussion's
+five open questions were resolved into a numbered-rule spec (posted as a comment on
+the issue). Stats use no external library (incomplete-beta + inline SplitMix64), so a
+shared `fixtures/task_suites/welch_bootstrap.json` oracle replays byte-for-byte in all
+four. `TraceAnalyzer` and challenge→regression auto-promotion are interface-only /
+deferred; the nightly optimization-loop meta-agent is future work.
 
 **main CI is green** across all four languages.
 
@@ -82,6 +96,15 @@ later phase.
    not-exist fallback in `WorkspaceScopedSandbox` is gated to Write/Execute, so a
    Read of an absent (but in-bounds) path is misclassified as an escape. Makes S1
    brittle. Tracked in #63 (`scope: debt`).
+
+6. **EvalHarness trace-sourced metrics use a Debug-string workaround in Rust only** —
+   `CacheHitRate`/`SensorFireRate`/`MiddlewareInterventionRate` are computed from
+   `get_trace()` spans (Resolution 1 of #26). Rust's `Span` trait (#12) exposes only
+   `base()`/`kind()` and is not downcastable/`Serialize`-able, so
+   `rust/crates/spore-eval/src/metric_map.rs` parses fields out of `format!("{s:?}")`.
+   TS/Python/Go all read typed span fields directly. Fix is a typed `Span` accessor on
+   #12, after which the Debug parsing is removed (`scope: deferred` — issue filing was
+   declined; capture here).
 
 _(Former Deviation: compaction `tokens_reclaimed = 0` — **resolved** in #57.)_
 
