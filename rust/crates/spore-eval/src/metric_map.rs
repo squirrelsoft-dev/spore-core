@@ -164,12 +164,11 @@ fn sensor_fire_rate(spans: &[Box<dyn Span>], sensor_id: &str) -> f64 {
 /// total firings at that hook (Resolution 1, `MiddlewareSpan.hook`).
 ///
 /// Hook names are matched case-insensitively against the `HookPoint` variant
-/// name (e.g. target `"beforeturn"` matches `HookPoint::BeforeTurn`). A decision
-/// counts as an intervention when it is neither `Continue` nor
-/// `ContinueWithModification` — i.e. `ForceAnotherTurn`, `Halt`, or
-/// `SurfaceToHuman`. This preserves the prior `!debug.contains("decision: Continue")`
-/// semantics byte-for-byte (the `ContinueWithModification` Debug form shares the
-/// `Continue` prefix, so the old scanner classified it as non-intervening).
+/// name (e.g. target `"beforeturn"` matches `HookPoint::BeforeTurn`). An
+/// intervention is any decision other than plain `Continue` — i.e.
+/// `ContinueWithModification`, `ForceAnotherTurn`, `Halt`, or `SurfaceToHuman`.
+/// This matches the Go, TypeScript, and Python EvalHarness implementations:
+/// "continue with modification" is a modification, hence an intervention.
 fn middleware_intervention_rate(spans: &[Box<dyn Span>], hook: &str) -> f64 {
     let mut interventions = 0u32;
     let mut total = 0u32;
@@ -178,10 +177,7 @@ fn middleware_intervention_rate(spans: &[Box<dyn Span>], hook: &str) -> f64 {
         if let Some(ms) = s.as_middleware() {
             if format!("{:?}", ms.hook).to_lowercase() == target {
                 total += 1;
-                if !matches!(
-                    ms.decision,
-                    MiddlewareDecision::Continue | MiddlewareDecision::ContinueWithModification
-                ) {
+                if !matches!(ms.decision, MiddlewareDecision::Continue) {
                     interventions += 1;
                 }
             }
@@ -335,14 +331,15 @@ mod typed_access_tests {
                 MiddlewareDecision::Continue,
             )),
         ];
-        // 3 matching "beforeturn" (case-insensitive); only Halt intervenes → 1/3.
-        assert!((middleware_intervention_rate(&spans, "beforeturn") - 1.0 / 3.0).abs() < 1e-12);
-        // ContinueWithModification is NOT an intervention (prior behavior).
+        // 3 matching "beforeturn" (case-insensitive); CWM and Halt both
+        // intervene, only plain Continue does not → 2/3.
+        assert!((middleware_intervention_rate(&spans, "beforeturn") - 2.0 / 3.0).abs() < 1e-12);
+        // ContinueWithModification IS an intervention (cross-language parity).
         let cwm: Vec<Box<dyn Span>> = vec![Box::new(middleware(
             HookPoint::BeforeTool,
             MiddlewareDecision::ContinueWithModification,
         ))];
-        assert_eq!(middleware_intervention_rate(&cwm, "BeforeTool"), 0.0);
+        assert_eq!(middleware_intervention_rate(&cwm, "BeforeTool"), 1.0);
         // SurfaceToHuman counts as an intervention.
         let sth: Vec<Box<dyn Span>> = vec![Box::new(middleware(
             HookPoint::BeforeTool,
