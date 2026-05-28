@@ -1718,6 +1718,26 @@ impl StandardHarness {
                         };
                     }
 
+                    // Record the assistant's turn (the tool calls the model
+                    // requested) as soon as the calls are known — BEFORE the
+                    // BeforeTool middleware (which may pause via SurfaceToHuman)
+                    // and before any tool result. This keeps the conversation
+                    // well-formed (assistant tool_use precedes its tool result)
+                    // on every path, including human-in-the-loop resume, so
+                    // resume_inner never has to append it. The recorded turn
+                    // reflects the model's original request; a middleware or
+                    // human modification changes only what is dispatched.
+                    for call in &calls {
+                        let msg = Message {
+                            role: Role::Assistant,
+                            content: Content::ToolCall(call.clone()),
+                        };
+                        self.config
+                            .context_manager
+                            .append_assistant_message(&mut session_state, &msg)
+                            .await;
+                    }
+
                     // Middleware: BeforeTool.
                     let calls = match self.config.middleware.as_ref() {
                         None => calls,
@@ -1757,22 +1777,6 @@ impl StandardHarness {
                             }
                         },
                     };
-
-                    // Record the assistant's turn (the tool calls it requested)
-                    // in the conversation BEFORE appending any tool results, so
-                    // the next assemble() reflects what the agent already did and
-                    // the conversation stays well-formed (assistant tool_use
-                    // precedes its tool result).
-                    for call in &calls {
-                        let msg = Message {
-                            role: Role::Assistant,
-                            content: Content::ToolCall(call.clone()),
-                        };
-                        self.config
-                            .context_manager
-                            .append_assistant_message(&mut session_state, &msg)
-                            .await;
-                    }
 
                     let mut approved_results: Vec<ToolResult> = Vec::new();
                     for (i, call) in calls.iter().enumerate() {
@@ -4514,6 +4518,90 @@ mod tests {
             msgs.iter().any(|m| m.role == Role::Assistant
                 && matches!(&m.content, Content::Text { text } if text == "the final answer")),
             "assistant final text must be recorded in history"
+        );
+    }
+
+    /// Regression: when a run pauses at BeforeTool (SurfaceToHuman) and is then
+    /// resumed with Allow, the assistant tool-call message must already be in
+    /// history — recorded before the pause — and positioned before its tool
+    /// result, with no duplicate from the resume path. Guards the option-(a)
+    /// fix: the assistant turn is recorded as soon as the calls are known, so
+    /// resume_inner never has to (and never double-records) it.
+    #[tokio::test]
+    async fn resume_after_surface_to_human_records_assistant_once_before_result() {
+        let a = make_agent();
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({ "path": "a.txt" }),
+        }];
+        a.push(TurnResult::ToolCallRequested {
+            calls: calls.clone(),
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let cm = RecordingContextManager::default();
+        let mut cfg = standard_config(a);
+        cfg.context_manager = Arc::new(cm.clone());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "contents".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let mw = Arc::new(ScriptedMiddleware::new());
+        mw.push(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::SurfaceToHuman {
+                request: HumanRequest::ToolApproval {
+                    calls: calls.clone(),
+                    risk_level: RiskLevel::Medium,
+                },
+            },
+        );
+        cfg.middleware = Some(mw);
+        let h = StandardHarness::new(cfg);
+
+        // Pause at BeforeTool — the assistant turn was recorded just before.
+        let state = match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        };
+        // Resume with approval; the pending call is dispatched and its result
+        // appended after the already-recorded assistant turn.
+        assert!(matches!(
+            h.resume(state, HumanResponse::Allow, None).await,
+            RunResult::Success { .. }
+        ));
+
+        let msgs = cm.messages.lock().unwrap();
+        let assistant_idx = msgs.iter().position(|m| {
+            m.role == Role::Assistant && matches!(&m.content, Content::ToolCall(c) if c.id == "c1")
+        });
+        let tool_idx = msgs.iter().position(|m| {
+            m.role == Role::Tool
+                && matches!(&m.content, Content::ToolResult(r) if r.tool_use_id == "c1")
+        });
+        let assistant_idx =
+            assistant_idx.expect("assistant tool-call must be recorded on the resume path");
+        let tool_idx = tool_idx.expect("tool result must be recorded");
+        assert!(
+            assistant_idx < tool_idx,
+            "assistant tool_use (idx {assistant_idx}) must precede its tool result (idx {tool_idx})"
+        );
+        let count = msgs
+            .iter()
+            .filter(|m| {
+                m.role == Role::Assistant
+                    && matches!(&m.content, Content::ToolCall(c) if c.id == "c1")
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "assistant tool-call must be recorded exactly once, not duplicated by resume"
         );
     }
 }
