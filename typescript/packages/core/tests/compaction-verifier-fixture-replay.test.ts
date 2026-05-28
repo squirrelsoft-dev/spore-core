@@ -32,6 +32,10 @@ interface FixtureCase {
   summary: string;
   hints: FixtureHints;
   task_instruction: string;
+  open_problems?: string[];
+  architectural_decisions?: string[];
+  recent_files?: string[];
+  reasoning_summary?: string;
   expected: FixtureExpected;
 }
 interface FixtureFile {
@@ -50,6 +54,10 @@ describe("KeyTermVerifier fixture replay", () => {
   for (const c of fixture.cases) {
     it(c.name, () => {
       const session = newSessionState(SessionId.of("s1"), TaskId.of("t1"), c.task_instruction);
+      session.open_problems = c.open_problems ?? [];
+      session.architectural_decisions = c.architectural_decisions ?? [];
+      session.recent_files = c.recent_files ?? [];
+      session.reasoning_summary = c.reasoning_summary ?? "";
       const res = verifier.verify(c.summary, c.hints, session);
       expect(res.passed).toBe(c.expected.passed);
       expect(res.missingItems).toEqual(c.expected.missing_items);

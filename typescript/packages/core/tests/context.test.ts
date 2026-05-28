@@ -507,7 +507,7 @@ describe("KeyTermVerifier (issue #29)", () => {
     expect(res.missingItems).toEqual(["deploy", "service"]);
   });
 
-  it("treats the four non-task hints as no-ops even when true", () => {
+  it("contributes nothing when structured fields are empty even with all hints on", () => {
     const v = new KeyTermVerifier();
     const allButTaskOn: context.CompactionPreserveHints = {
       keep_architectural_decisions: true,
@@ -521,6 +521,87 @@ describe("KeyTermVerifier (issue #29)", () => {
       allButTaskOn,
       withTask("Refactor the parser module"),
     );
+    expect(res.passed).toBe(true);
+    expect(res.missingItems).toEqual([]);
+  });
+
+  // ── Issue #47: structured fields feed the four additional hints ──────
+
+  function onlyHint(key: keyof context.CompactionPreserveHints): context.CompactionPreserveHints {
+    return {
+      keep_architectural_decisions: false,
+      keep_open_problems: false,
+      keep_current_task_state: false,
+      keep_recent_file_list: false,
+      keep_thinking_blocks: false,
+      [key]: true,
+    };
+  }
+
+  it("open_problems isolated", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("ignored task");
+    st.open_problems = ["Resolve the deadlock issue"];
+    const res = v.verify("we noted the deadlock", onlyHint("keep_open_problems"), st);
+    expect(res.missingItems).toEqual(["resolve", "issue"]);
+    expect(res.passed).toBe(false);
+  });
+
+  it("architectural_decisions isolated", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("ignored task");
+    st.architectural_decisions = ["Adopt hexagonal architecture"];
+    const res = v.verify(
+      "we will adopt hexagonal architecture",
+      onlyHint("keep_architectural_decisions"),
+      st,
+    );
+    expect(res.passed).toBe(true);
+    expect(res.missingItems).toEqual([]);
+  });
+
+  it("recent_files path tokenization", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("ignored task");
+    st.recent_files = ["src/parser/mod.rs"];
+    // src, mod, rs are <4 chars and dropped; only `parser` survives.
+    const res = v.verify("touched the lexer", onlyHint("keep_recent_file_list"), st);
+    expect(res.missingItems).toEqual(["parser"]);
+    expect(res.passed).toBe(false);
+  });
+
+  it("reasoning_summary isolated", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("ignored task");
+    st.reasoning_summary = "Considered caching strategy";
+    const res = v.verify("nothing relevant", onlyHint("keep_thinking_blocks"), st);
+    expect(res.missingItems).toEqual(["considered", "caching", "strategy"]);
+    expect(res.passed).toBe(false);
+  });
+
+  it("multi-hint dedup ordering pins first occurrence", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("Refactor parser");
+    st.open_problems = ["parser bug remains"];
+    const h: context.CompactionPreserveHints = {
+      keep_architectural_decisions: false,
+      keep_open_problems: true,
+      keep_current_task_state: true,
+      keep_recent_file_list: false,
+      keep_thinking_blocks: false,
+    };
+    // refactor, parser (task), remains (open_problems). "bug" <4 dropped.
+    // parser appears once at its first (task) position.
+    const res = v.verify("nothing matched", h, st);
+    expect(res.missingItems).toEqual(["refactor", "parser", "remains"]);
+    expect(res.passed).toBe(false);
+  });
+
+  it("empty list with hint on passes", () => {
+    const v = new KeyTermVerifier();
+    const st = withTask("ignored task");
+    st.open_problems = [];
+    const res = v.verify("anything", onlyHint("keep_open_problems"), st);
     expect(res.passed).toBe(true);
     expect(res.missingItems).toEqual([]);
   });

@@ -233,6 +233,18 @@ export const SessionStateSchema = z.object({
     )
     .default([]),
   budget_warning_active: z.boolean().default(false),
+  /** Open problems feeding the `keep_open_problems` hint (issue #47). */
+  open_problems: z.array(z.string()).default([]),
+  /** Architectural decisions feeding `keep_architectural_decisions` (#47). */
+  architectural_decisions: z.array(z.string()).default([]),
+  /**
+   * Recently touched file paths feeding `keep_recent_file_list` (#47).
+   * Typed as strings, not path types — keeps tokenization byte-identical
+   * across languages (no per-language path semantics).
+   */
+  recent_files: z.array(z.string()).default([]),
+  /** Reasoning summary feeding the `keep_thinking_blocks` hint (issue #47). */
+  reasoning_summary: z.string().default(""),
 });
 export type SessionState = {
   session_id: SessionId;
@@ -249,6 +261,10 @@ export type SessionState = {
   guides_loaded: GuideId[];
   pending_skill_injections: Guide[];
   budget_warning_active: boolean;
+  open_problems: string[];
+  architectural_decisions: string[];
+  recent_files: string[];
+  reasoning_summary: string;
 };
 
 export function newSessionState(
@@ -271,6 +287,10 @@ export function newSessionState(
     guides_loaded: [],
     pending_skill_injections: [],
     budget_warning_active: false,
+    open_problems: [],
+    architectural_decisions: [],
+    recent_files: [],
+    reasoning_summary: "",
   };
 }
 
@@ -344,9 +364,18 @@ export interface CompactionVerifier {
  * Standard {@link CompactionVerifier}: extracts key terms from the session
  * state per the enabled hints and checks they appear in the summary.
  *
- * v1 limitation: only `keep_current_task_state` contributes source terms
- * (from {@link SessionState.task_instruction}). The other four hints have no
- * structured SessionState field, so they add no terms.
+ * All five hints contribute source terms, each gated on its hint and pushed
+ * in a fixed order (issue #47) — this order is the cross-language invariant
+ * that determines first-occurrence dedup:
+ *
+ * 1. `keep_current_task_state` → {@link SessionState.task_instruction}
+ * 2. `keep_open_problems` → each of {@link SessionState.open_problems}
+ * 3. `keep_architectural_decisions` → each of {@link SessionState.architectural_decisions}
+ * 4. `keep_recent_file_list` → each of {@link SessionState.recent_files}
+ * 5. `keep_thinking_blocks` → {@link SessionState.reasoning_summary}
+ *
+ * Each source string runs through the same `extractTerms` rule; an
+ * empty/unset field contributes no terms.
  */
 export class KeyTermVerifier implements CompactionVerifier {
   /**
@@ -366,11 +395,24 @@ export class KeyTermVerifier implements CompactionVerifier {
     hints: CompactionPreserveHints,
     sessionState: SessionState,
   ): CompactionVerificationResult {
-    // Step 1: collect source strings from enabled hints. v1: only
-    // keep_current_task_state contributes.
+    // Step 1: collect source strings from enabled hints, each gated on its
+    // hint and pushed in this fixed order (issue #47). This order is the
+    // cross-language invariant that determines first-occurrence dedup.
     const sources: string[] = [];
     if (hints.keep_current_task_state) {
       sources.push(sessionState.task_instruction);
+    }
+    if (hints.keep_open_problems) {
+      sources.push(...sessionState.open_problems);
+    }
+    if (hints.keep_architectural_decisions) {
+      sources.push(...sessionState.architectural_decisions);
+    }
+    if (hints.keep_recent_file_list) {
+      sources.push(...sessionState.recent_files);
+    }
+    if (hints.keep_thinking_blocks) {
+      sources.push(sessionState.reasoning_summary);
     }
 
     // Step 2: build the term list, deduped, first-occurrence order.
