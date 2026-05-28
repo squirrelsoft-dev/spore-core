@@ -154,12 +154,6 @@ async function runLive(
   modelId: string,
   workspace: string,
 ): Promise<RunResult> {
-  if (!OllamaModelInterface.supportsTools(modelId)) {
-    process.stderr.write(
-      `warning: model \`${modelId}\` is not in the known tool-capable whitelist; ` +
-        "the harness will guard against tool use if the model lacks the capability.\n",
-    );
-  }
   const baseUrl = process.env.SPORE_OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
   const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const agent: Agent = new ModelAgent(AgentId.of("e2e-agent"), model);

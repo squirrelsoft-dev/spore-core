@@ -128,19 +128,6 @@ export class OllamaModelInterface implements ModelInterface {
     return 0;
   }
 
-  /**
-   * Best-effort capability table — `llama3.2` / `qwen2.5-coder` / `mistral`
-   * are known to support native tool calling; others may or may not. Used as a
-   * fallback when `/api/show` discovery is unavailable.
-   */
-  static supportsTools(modelId: string): boolean {
-    return (
-      modelId.startsWith("llama3.2") ||
-      modelId.startsWith("qwen2.5-coder") ||
-      modelId.startsWith("mistral")
-    );
-  }
-
   provider(): ProviderInfo {
     // `provider()` is synchronous so it cannot await `/api/show`. Read the probe
     // cache non-blockingly: prefer a discovered context length if the probe has
@@ -310,16 +297,13 @@ export class OllamaModelInterface implements ModelInterface {
 
   /**
    * Reject tool-bearing requests when the model does not support tools.
-   * Capability source priority: the `/api/show` `capabilities` array when
-   * discovery succeeded; otherwise the static {@link OllamaModelInterface.supportsTools}
-   * table.
+   * Capability is determined solely by the `/api/show` `capabilities` array:
+   * the model is tool-capable iff `capabilities` contains `"tools"`. Empty or
+   * unavailable `/api/show` metadata ⟹ NOT tool-capable (fail closed).
    */
   private guardToolSupport(request: ModelRequest, meta: ModelMeta): void {
     if (request.tools.length === 0) return;
-    const supported =
-      meta.capabilities.length === 0
-        ? OllamaModelInterface.supportsTools(this.modelId)
-        : meta.capabilities.includes("tools");
+    const supported = meta.capabilities.includes("tools");
     if (!supported) {
       throw new ProviderError(0, `Model ${this.modelId} does not support tool calling`);
     }

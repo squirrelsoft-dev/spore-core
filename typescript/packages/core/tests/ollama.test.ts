@@ -756,6 +756,48 @@ describe("/api/show discovery + tool guard", () => {
     expect(r.content).toEqual([{ type: "text", text: "ok" }]);
   });
 
+  it("rejects tool requests when /api/show capabilities is empty (fail closed)", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    // Empty capabilities. With the static whitelist removed, this fails closed —
+    // even for a model id (`llama3.2`) the old prefix table would have allowed.
+    // No /api/chat route — a call would 404 if the guard let it through.
+    server.route(
+      "POST",
+      "/api/show",
+      showOk({ model_info: { "llama.context_length": 128_000 }, capabilities: [] }),
+    );
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    let err: unknown;
+    try {
+      await client.call(toolReq());
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).code).toBe(0);
+    expect((err as ProviderError).message).toContain("does not support tool calling");
+    expect(server.callCount("POST", "/api/chat")).toBe(0);
+  });
+
+  it("rejects tool requests when /api/show 404s (fail closed)", async () => {
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    // 404 ⟹ empty ModelMeta ⟹ NOT tool-capable. No /api/chat route.
+    server.route("POST", "/api/show", () => ({ status: 404, body: "" }));
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    let err: unknown;
+    try {
+      await client.call(toolReq());
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).code).toBe(0);
+    expect((err as ProviderError).message).toContain("does not support tool calling");
+    expect(server.callCount("POST", "/api/chat")).toBe(0);
+  });
+
   it("fetches /api/show at most once across multiple calls", async () => {
     server.reset();
     server.route("GET", "/api/tags", tagsOk("llama3.2"));
