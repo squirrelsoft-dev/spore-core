@@ -103,8 +103,7 @@ later phase.
    `base()`/`kind()` and is not downcastable/`Serialize`-able, so
    `rust/crates/spore-eval/src/metric_map.rs` parses fields out of `format!("{s:?}")`.
    TS/Python/Go all read typed span fields directly. Fix is a typed `Span` accessor on
-   #12, after which the Debug parsing is removed (`scope: deferred` — issue filing was
-   declined; capture here).
+   #12, after which the Debug parsing is removed. Tracked in #68 (`scope: deferred`).
 
 _(Former Deviation: compaction `tokens_reclaimed = 0` — **resolved** in #57.)_
 
