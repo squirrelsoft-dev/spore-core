@@ -435,3 +435,190 @@ func TestHaltReasonAgentErrorShape(t *testing.T) {
 		t.Fatalf("got %s", data)
 	}
 }
+
+// ── Assistant-turn recording (regression for lost conversation history) ──────
+
+// recordingContextManager is a ContextManager that records every message the
+// loop appends (tool results, user messages, and — via the optional
+// AssistantMessageAppender seam — assistant turns) into a flat ordered log so
+// tests can assert positional ordering. Mirrors NoopContextManager but exposes
+// the message log. The harness loop is single-goroutine, so no locking is
+// needed. Each recorded entry preserves its role; tool results keep the call id
+// so ordering can be asserted against the assistant tool-call message (Go's
+// production adapter renders tool results as plain text without a call_id, so
+// the double tracks the id itself — production shape is unchanged).
+type recordingContextManager struct {
+	roles   []Role
+	callIDs []string // tool-call id for assistant ToolCall / tool result rows; "" otherwise
+	texts   []string // text body for assistant Text / user rows; "" otherwise
+}
+
+func (m *recordingContextManager) Assemble(_ context.Context, session *SessionState, _ *Task) Context {
+	return Context{Messages: append([]Message(nil), session.Messages...)}
+}
+
+func (m *recordingContextManager) AppendToolResult(_ context.Context, session *SessionState, result *HarnessToolResult) {
+	msg := Message{Role: RoleTool, Content: NewTextContent(result.Output.Content)}
+	session.Messages = append(session.Messages, msg)
+	m.roles = append(m.roles, RoleTool)
+	m.callIDs = append(m.callIDs, result.CallID)
+	m.texts = append(m.texts, "")
+}
+
+func (m *recordingContextManager) AppendUserMessage(_ context.Context, session *SessionState, text string) {
+	msg := Message{Role: RoleUser, Content: NewTextContent(text)}
+	session.Messages = append(session.Messages, msg)
+	m.roles = append(m.roles, RoleUser)
+	m.callIDs = append(m.callIDs, "")
+	m.texts = append(m.texts, text)
+}
+
+func (m *recordingContextManager) ShouldCompact(*SessionState) bool { return false }
+
+func (m *recordingContextManager) AppendAssistantMessage(_ context.Context, session *SessionState, message Message) {
+	session.Messages = append(session.Messages, message)
+	m.roles = append(m.roles, message.Role)
+	id := ""
+	text := ""
+	if message.Content.ToolCall != nil {
+		id = message.Content.ToolCall.ID
+	}
+	if message.Content.Type == ContentTypeText {
+		text = message.Content.Text
+	}
+	m.callIDs = append(m.callIDs, id)
+	m.texts = append(m.texts, text)
+}
+
+// assistantToolCallIndex returns the index of the recorded assistant message
+// carrying tool-call id, or -1.
+func (m *recordingContextManager) assistantToolCallIndex(id string) int {
+	for i := range m.roles {
+		if m.roles[i] == RoleAssistant && m.callIDs[i] == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// toolResultIndex returns the index of the recorded tool result for call id, or -1.
+func (m *recordingContextManager) toolResultIndex(id string) int {
+	for i := range m.roles {
+		if m.roles[i] == RoleTool && m.callIDs[i] == id {
+			return i
+		}
+	}
+	return -1
+}
+
+var _ ContextManager = (*recordingContextManager)(nil)
+var _ AssistantMessageAppender = (*recordingContextManager)(nil)
+
+// Regression: a turn that requests a tool call must record the assistant's
+// tool-call message in history, positioned BEFORE the tool result, so the next
+// turn's assembled context reflects what the agent already did.
+func TestToolCallRecordsAssistantMessageBeforeResult(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c1", Name: "read_file", Input: json.RawMessage(`{"path":"a.txt"}`)},
+	}, turnUsage()))
+	a.Push(NewFinalResponse("done", turnUsage()))
+	cm := &recordingContextManager{}
+	cfg := standardCfg(a)
+	cfg.ContextManager = cm
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "contents"})
+	cfg.ToolRegistry = reg
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunSuccess {
+		t.Fatalf("got %+v", r)
+	}
+	ai := cm.assistantToolCallIndex("c1")
+	ti := cm.toolResultIndex("c1")
+	if ai < 0 {
+		t.Fatalf("assistant tool-call message must be recorded; roles=%v", cm.roles)
+	}
+	if ti < 0 {
+		t.Fatalf("tool result must be recorded; roles=%v", cm.roles)
+	}
+	if ai >= ti {
+		t.Fatalf("assistant tool_use (idx %d) must precede its tool result (idx %d)", ai, ti)
+	}
+}
+
+// Regression: a final response must append the assistant's text to history so a
+// continued session sees what the agent said.
+func TestFinalResponseRecordsAssistantText(t *testing.T) {
+	a := NewMockAgent("t")
+	a.Push(NewFinalResponse("the final answer", turnUsage()))
+	cm := &recordingContextManager{}
+	cfg := standardCfg(a)
+	cfg.ContextManager = cm
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunSuccess {
+		t.Fatalf("got %+v", r)
+	}
+	found := false
+	for i := range cm.roles {
+		if cm.roles[i] == RoleAssistant && cm.texts[i] == "the final answer" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("assistant final text must be recorded; roles=%v texts=%v", cm.roles, cm.texts)
+	}
+}
+
+// Regression: when a run pauses at BeforeTool (SurfaceToHuman) and is then
+// resumed with Allow, the assistant tool-call message must already be in history
+// — recorded before the pause — positioned before its tool result, with no
+// duplicate from the resume path.
+func TestResumeAfterSurfaceToHumanRecordsAssistantOnceBeforeResult(t *testing.T) {
+	a := NewMockAgent("t")
+	calls := []ToolCall{{ID: "c1", Name: "read_file", Input: json.RawMessage(`{"path":"a.txt"}`)}}
+	a.Push(NewToolCallRequested(calls, turnUsage()))
+	a.Push(NewFinalResponse("done", turnUsage()))
+	cm := &recordingContextManager{}
+	cfg := standardCfg(a)
+	cfg.ContextManager = cm
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "contents"})
+	cfg.ToolRegistry = reg
+	mw := NewScriptedMiddleware()
+	req := HumanRequest{Kind: HumanReqToolApproval, Calls: calls, RiskLevel: RiskMedium}
+	mw.Push(HookBeforeTool, MiddlewareDecision{Kind: MiddlewareSurfaceToHuman, Request: &req})
+	cfg.Middleware = mw
+	h := NewStandardHarness(cfg)
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(5)))
+	if r.Kind != RunWaitingForHuman || r.State == nil {
+		t.Fatalf("expected WaitingForHuman, got %+v", r)
+	}
+	r = h.Resume(context.Background(), *r.State, HumanResponse{Kind: HumanRespAllow}, nil)
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success on resume, got %+v", r)
+	}
+
+	ai := cm.assistantToolCallIndex("c1")
+	ti := cm.toolResultIndex("c1")
+	if ai < 0 {
+		t.Fatalf("assistant tool-call must be recorded on the resume path; roles=%v", cm.roles)
+	}
+	if ti < 0 {
+		t.Fatalf("tool result must be recorded; roles=%v", cm.roles)
+	}
+	if ai >= ti {
+		t.Fatalf("assistant tool_use (idx %d) must precede its tool result (idx %d)", ai, ti)
+	}
+	count := 0
+	for i := range cm.roles {
+		if cm.roles[i] == RoleAssistant && cm.callIDs[i] == "c1" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("assistant tool-call must be recorded exactly once, got %d", count)
+	}
+}

@@ -886,6 +886,19 @@ type CompactingContextManager interface {
 	ApplyCompaction(session *SessionState, summary string)
 }
 
+// AssistantMessageAppender is the OPTIONAL seam a ContextManager may also
+// implement to record the assistant's turn (the model's output text and/or the
+// tool calls it requested) in the conversation, so the next Assemble() reflects
+// what the agent already did. The harness loop type-asserts its held
+// ContextManager to this interface; a manager that does NOT implement it simply
+// skips the append — Go's equivalent of the Rust reference's default-no-op
+// ContextManager::append_assistant_message trait method. Without this the model
+// loses track of its own prior actions and the conversation is malformed (a tool
+// result with no preceding assistant tool_use).
+type AssistantMessageAppender interface {
+	AppendAssistantMessage(ctx context.Context, session *SessionState, message Message)
+}
+
 // TokenBudgetReader is the OPTIONAL seam (issue #57) a ContextManager may also
 // implement so the harness can stamp the real post-compaction token budget onto
 // the Compaction span. The loop type-asserts its held ContextManager to this
@@ -1890,6 +1903,11 @@ func (h *StandardHarness) runReActInner(
 					SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 				}
 			}
+			// Record the assistant's final text in history so a continued
+			// session reflects what the agent said (multi-turn / S2 correctness).
+			if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+				a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(result.Content)})
+			}
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: result.Content})
 			return RunResult{
 				Kind:      RunSuccess,
@@ -1919,6 +1937,20 @@ func (h *StandardHarness) runReActInner(
 						},
 						SessionID: sessionID, Usage: usage, Turns: budget.Turns,
 					}
+				}
+			}
+
+			// Record the assistant's turn (the tool calls the model requested)
+			// as soon as the calls are known — BEFORE the BeforeTool middleware
+			// (which may pause via SurfaceToHuman) and before any tool result.
+			// This keeps the conversation well-formed (assistant tool_use
+			// precedes its tool result) on every path, including human-in-the-
+			// loop resume, so the resume path never has to append it. The
+			// recorded turn reflects the model's original request; a middleware
+			// or human modification changes only what is dispatched.
+			if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+				for _, call := range calls {
+					a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewToolCallContent(call)})
 				}
 			}
 

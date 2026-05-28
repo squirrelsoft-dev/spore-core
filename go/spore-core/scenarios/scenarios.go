@@ -97,9 +97,21 @@ func toLowerTrim(s string) string {
 func (id ScenarioID) Prompt() string {
 	switch id {
 	case S1:
-		return "Read the file input.txt, transform its contents to UPPERCASE, write the " +
-			"result to output.txt, then read output.txt back to confirm it was written. " +
-			"Use the read_file, write_file, and bash_command tools. When done, reply DONE."
+		return "Complete this task step by step, using the provided tools:\n" +
+			"1. Call read_file to read the contents of input.txt. Use the exact " +
+			"text it returns — do not invent or substitute any text.\n" +
+			"2. Take that exact text and rewrite it with every lowercase letter " +
+			"changed to its capital form, keeping all other characters, spaces, " +
+			"and punctuation the same.\n" +
+			"3. Call write_file with path 'output.txt' and content set to the " +
+			"uppercased text from step 2 — the literal capital letters " +
+			"themselves. The content must be the transformed words from " +
+			"input.txt, NOT a shell command, NOT a $(...) expression, and NOT " +
+			"any code.\n" +
+			"4. Call read_file on output.txt and check its contents equal the " +
+			"uppercased text from step 2.\n" +
+			"Reply DONE only once output.txt contains input.txt's contents in " +
+			"all capital letters."
 	case S2:
 		return "Create a file notes.md containing a TODO list with one item: 'set up the " +
 			"project'. Use write_file. Reply DONE when written."
@@ -167,6 +179,30 @@ type SchemaInjectingContextManager struct {
 	tools []sporecore.ToolSchema
 }
 
+// AgentSystemPrompt is the operational system prompt for the live agent. The
+// compaction adapter's Assemble produces a context with no system prompt (it has
+// no ContextSources to render one), so without this the model receives only the
+// task as a user message and no guidance on how to behave. The three rules
+// target the failure modes observed with small local models: describing actions
+// instead of taking them, passing stringified arguments, and declaring success
+// without checking the result.
+const AgentSystemPrompt = "You are an autonomous agent that completes tasks by " +
+	"calling the provided tools. Follow these rules:\n\n" +
+	"1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate " +
+	"tool. Writing a shell command, code snippet, or file contents into your " +
+	"text reply does NOT run it — only a real tool call has any effect. To " +
+	"transform a file, call bash_command with the command itself; never write " +
+	"the command text into a file as if it were the result.\n\n" +
+	"2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: " +
+	"booleans as true/false (not \"true\"), numbers as 12 (not \"12\"), lists " +
+	"as [\"a\"] (not \"[\\\"a\\\"]\"). Quoted-string scalars where a " +
+	"bool/number/array is expected will be rejected.\n\n" +
+	"3. VERIFY BEFORE FINISHING. Before replying DONE, confirm your work " +
+	"actually satisfies the request. If you wrote a file, read it back with " +
+	"read_file and check its contents are exactly what was asked. If they do " +
+	"not match, fix it and verify again. Only reply DONE once you have verified " +
+	"the result is correct."
+
 // NewSchemaInjectingContextManager wraps inner, injecting toolSchemas (sorted by
 // name) into every assembled context.
 func NewSchemaInjectingContextManager(inner sporecore.ContextManager, toolSchemas []sporecore.ToolSchema) *SchemaInjectingContextManager {
@@ -180,6 +216,16 @@ func NewSchemaInjectingContextManager(inner sporecore.ContextManager, toolSchema
 func (m *SchemaInjectingContextManager) Assemble(ctx context.Context, session *sporecore.SessionState, task *sporecore.Task) sporecore.Context {
 	c := m.inner.Assemble(ctx, session, task)
 	c.Tools = append([]sporecore.ToolSchema(nil), m.tools...)
+	// Prepend the operational system prompt. The adapter's Assemble yields no
+	// system prompt, so the model would otherwise get no guidance. Guard against
+	// duplicates so a resumed/seeded session that already leads with a System
+	// message isn't given two.
+	if len(c.Messages) == 0 || c.Messages[0].Role != sporecore.RoleSystem {
+		c.Messages = append([]sporecore.Message{{
+			Role:    sporecore.RoleSystem,
+			Content: sporecore.NewTextContent(AgentSystemPrompt),
+		}}, c.Messages...)
+	}
 	return c
 }
 
@@ -191,6 +237,16 @@ func (m *SchemaInjectingContextManager) AppendToolResult(ctx context.Context, se
 // AppendUserMessage forwards to the inner manager.
 func (m *SchemaInjectingContextManager) AppendUserMessage(ctx context.Context, session *sporecore.SessionState, text string) {
 	m.inner.AppendUserMessage(ctx, session, text)
+}
+
+// AppendAssistantMessage forwards to the inner manager's AssistantMessageAppender
+// seam when it implements it (no-op otherwise). Without this forwarding the
+// harness loop — which calls the outer decorator — would silently drop every
+// assistant turn and the conversation-history fix would be dead.
+func (m *SchemaInjectingContextManager) AppendAssistantMessage(ctx context.Context, session *sporecore.SessionState, message sporecore.Message) {
+	if a, ok := m.inner.(sporecore.AssistantMessageAppender); ok {
+		a.AppendAssistantMessage(ctx, session, message)
+	}
 }
 
 // ShouldCompact forwards to the inner manager.
@@ -234,6 +290,7 @@ var (
 	_ sporecore.ContextManager           = (*SchemaInjectingContextManager)(nil)
 	_ sporecore.CompactingContextManager = (*SchemaInjectingContextManager)(nil)
 	_ sporecore.TokenBudgetReader        = (*SchemaInjectingContextManager)(nil)
+	_ sporecore.AssistantMessageAppender = (*SchemaInjectingContextManager)(nil)
 )
 
 // ============================================================================

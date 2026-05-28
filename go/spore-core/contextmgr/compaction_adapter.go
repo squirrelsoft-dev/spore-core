@@ -187,6 +187,14 @@ func (a *StandardCompactionAdapter) AppendToolResult(_ context.Context, session 
 	a.syncMessagesIntoRichState(session)
 }
 
+// AppendAssistantMessage appends the assistant's turn (its output text and/or a
+// requested tool call) to the session, keeping the rich state's message history
+// in sync. Mirrors AppendToolResult's state sync.
+func (a *StandardCompactionAdapter) AppendAssistantMessage(_ context.Context, session *sporecore.SessionState, message sporecore.Message) {
+	session.Messages = append(session.Messages, message)
+	a.syncMessagesIntoRichState(session)
+}
+
 // AppendUserMessage appends a user message to the session, keeping the rich
 // state's message history in sync.
 func (a *StandardCompactionAdapter) AppendUserMessage(_ context.Context, session *sporecore.SessionState, text string) {
@@ -362,4 +370,5 @@ func NewCompactingHarnessConfig(
 var (
 	_ sporecore.ContextManager           = (*StandardCompactionAdapter)(nil)
 	_ sporecore.CompactingContextManager = (*StandardCompactionAdapter)(nil)
+	_ sporecore.AssistantMessageAppender = (*StandardCompactionAdapter)(nil)
 )
