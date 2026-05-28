@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /close (#68; reconciled #64/#65/#26)_
+_Last updated: 2026-05-28 by /close (#47)_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -36,6 +36,21 @@ OTLP→Tempo / JSONL→Loki parity (#49/#50/#33), `OllamaModelInterface` +
 capability guard (#41), `StandardCompactionAdapter` wiring (#55), the
 compaction verify→retry→warn loop (#46), and `StandardContextManager` /
 verifiers (#29).
+
+**#47 (KeyTermVerifier honors all preserve hints) just landed** — `SessionState`
+gained four structured fields (`open_problems`, `architectural_decisions`,
+`recent_files` as lists, `reasoning_summary` as a string) at four-language parity,
+and `KeyTermVerifier` now collects source terms from all five `CompactionPreserveHints`
+in a pinned order (task_instruction → open_problems → architectural_decisions →
+recent_files → reasoning_summary), each gated on its hint. Previously only
+`keep_current_task_state` contributed terms and the other four hints were silent
+no-ops. The #29 extraction rule (lowercase → split `[^a-z0-9]` → drop <4-char tokens →
+first-occurrence dedupe → substring match) is unchanged and now applies uniformly to
+every field; file paths tokenize via the same rule (`src/parser/mod.rs` → `parser`).
+12 shared fixture cases in `fixtures/compaction_verifier/cases.json` replay identically
+across all four. Spec pinned on the issue before implementation; the Python compaction
+adapter's hand-rolled (de)serializer was extended for the new fields (commits 2d06fab,
+fe5fa02, 2db4894, 32232a3).
 
 **#26 (EvalHarness) just landed** — the evaluation harness / tight feedback loop is
 implemented at parity across all four languages (`rust/crates/spore-eval`,
@@ -133,13 +148,12 @@ This section is updated by /close after every PEE loop.]
    the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
    land so the docs stop overstating capability.
 
-_Note: this `/close` loop closed **#68** (typed `Span` accessor) `status: complete`,
-then corrected significant stale state the prior `#26` doc-update had missed — **#64**
-(LLM-native tracing) and **#65** (record assistant turns + operational system prompt)
-had both already landed and merged to main but were still listed as open/north-star.
-Reconciled: #64 labeled+`status: complete` (was unlabeled `enhancement`), #65
-relabeled `status: complete` (was a closed issue still marked `status: queued`), and
-**#26** (EvalHarness discussion) closed `status: complete` now that its implementation
-plus the #68 follow-up have all landed. Active Direction repointed from
-debuggability (#64, done) to capability breadth (loop strategies #58–#61) +
-correctness debt. Known Deviation "no message content" removed (resolved by #64)._
+_Note: this `/close` loop closed **#47** (KeyTermVerifier honors all preserve hints)
+`status: complete` — spec pinned on the issue, implemented Rust-reference-first then
+TS/Python/Go in parallel, verified cross-language (12 fixture cases identical), and
+fast-forward merged to main (`378dfe8..32232a3`). #47 was a queued correctness/
+completeness item outside the top-3 Next Actions; closing it leaves the board's open
+issues as the four loop strategies (#58–#61, deferred), correctness/safety debt
+(#30/#31/#32/#34, deferred), docs (#27/#35/#36, deferred), and the #45 Rust dyn-compat
+debt. Active Direction unchanged — capability breadth (loop strategies) remains the
+headline gap. No new issues spawned; no deviations added or resolved._
