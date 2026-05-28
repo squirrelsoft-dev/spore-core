@@ -178,14 +178,21 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
       joined = pathResolve(this.root, raw);
     }
 
-    // 2. Canonicalize (resolves .., symlinks). For Write/Execute on a
-    //    non-existent file, canonicalize the parent and re-join the leaf.
+    // 2. Canonicalize (resolves .., symlinks). The target file may not yet
+    //    exist — for *any* operation, including Read — so canonicalize the
+    //    parent and re-join the leaf. Resolution is operation-agnostic on
+    //    purpose: existence is orthogonal to the boundary check. A missing
+    //    in-workspace path still resolves (via its canonicalized parent) and
+    //    passes the boundary check; the actual read then naturally fails with
+    //    a not-found that the read tool surfaces as a recoverable error rather
+    //    than a PathEscape. A missing path that resolves *outside* the root is
+    //    still a PathEscape.
     let canonical: string;
     try {
       canonical = realpathSync(joined);
     } catch (e) {
       const enoent = (e as NodeJS.ErrnoException).code === "ENOENT" || !existsSync(joined);
-      if (enoent && (operation === "write" || operation === "execute")) {
+      if (enoent) {
         const parent = dirname(joined);
         const leaf = basename(joined);
         if (!parent || !leaf) {

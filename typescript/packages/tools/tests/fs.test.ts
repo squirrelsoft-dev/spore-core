@@ -3,10 +3,15 @@
  */
 
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { harnessTesting, type ToolCall } from "@spore/core";
+import {
+  harnessTesting,
+  WorkspaceScopedSandbox,
+  type ToolCall,
+} from "@spore/core";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -107,5 +112,36 @@ describe("filesystem tools", () => {
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);
+  });
+
+  it("read of missing in-workspace file is recoverable not-found, not path_escape", async () => {
+    // Regression for #63: reading a not-yet-created file *inside* the
+    // workspace must surface a recoverable not-found, not a sandbox
+    // path_escape, end to end through the real WorkspaceScopedSandbox.
+    const root = realpathSync(await tmp());
+    const sb = new WorkspaceScopedSandbox({ root });
+    const r = await new ReadFileTool().execute(
+      call("read_file", { path: "output.txt" }),
+      sb,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    expect(r.recoverable).toBe(true);
+    expect(r.message).toContain("read failed");
+  });
+
+  it("read of path outside root is a sandbox path_escape error", async () => {
+    // Counterpart: a path resolving outside the root is still a sandbox
+    // violation, even when the file does not exist.
+    const root = realpathSync(await tmp());
+    const sb = new WorkspaceScopedSandbox({ root });
+    const r = await new ReadFileTool().execute(
+      call("read_file", { path: "../nonexistent_secret" }),
+      sb,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    const msg = r.message.toLowerCase();
+    expect(msg.includes("escape") || msg.includes("sandbox")).toBe(true);
   });
 });

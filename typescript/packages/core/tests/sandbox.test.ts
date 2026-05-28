@@ -142,6 +142,45 @@ describe("WorkspaceScopedSandbox path resolution", () => {
     expect(r as string).toBe(join(root, "new_file.txt"));
   });
 
+  it("read of missing in-workspace file resolves (not path_escape)", async () => {
+    // Regression for #63: a Read of a not-yet-created file *inside* the
+    // workspace must resolve via its canonicalized parent, not be
+    // misclassified as path_escape. The file is absent; resolution still
+    // succeeds so the read can surface a recoverable not-found.
+    const root = tmp();
+    const sb = new WorkspaceScopedSandbox(cfg(root));
+    const r = await sb.resolvePath("output.txt", "read");
+    expect(typeof r).toBe("string");
+    expect(r as string).toBe(join(root, "output.txt"));
+  });
+
+  it("read of missing file in existing subdir resolves", async () => {
+    const root = tmp();
+    mkdirSync(join(root, "sub"));
+    const sb = new WorkspaceScopedSandbox(cfg(root));
+    const r = await sb.resolvePath("sub/missing.txt", "read");
+    expect(typeof r).toBe("string");
+    expect(r as string).toBe(join(root, "sub", "missing.txt"));
+  });
+
+  it("read of missing file outside root still path_escape", async () => {
+    // Regression for #63: a Read of a *non-existent* path that resolves
+    // outside the workspace root must still be a path_escape, not a
+    // not-found. (`..` makes the canonicalized parent escape the root.)
+    const sb = new WorkspaceScopedSandbox(cfg(tmp()));
+    const r = await sb.resolvePath("../nonexistent_passwd", "read");
+    expect((r as SandboxViolation).kind).toBe("path_escape");
+  });
+
+  it("read of existing in-workspace file resolves", async () => {
+    const root = tmp();
+    writeFileSync(join(root, "present.txt"), "hi");
+    const sb = new WorkspaceScopedSandbox(cfg(root));
+    const r = await sb.resolvePath("present.txt", "read");
+    expect(typeof r).toBe("string");
+    expect(r as string).toBe(join(root, "present.txt"));
+  });
+
   it("disallowed_command for bubblewrap mode", async () => {
     const root = tmp();
     const mode: IsolationMode = {
