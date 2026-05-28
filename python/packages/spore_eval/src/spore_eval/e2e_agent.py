@@ -65,7 +65,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-from spore_core import ollama
 from spore_core.agent import AgentId, ModelAgent
 from spore_core.cache_provider import OllamaCacheProvider
 from spore_core.context import CompactionConfig
@@ -166,12 +165,6 @@ async def _run_live(
     obs_root: Path,
 ) -> object:
     """Run the scenario against a live Ollama model."""
-    if not ollama.supports_tools(model_id):
-        print(
-            f"warning: model `{model_id}` is not in the known tool-capable whitelist; "
-            "the harness will guard against tool use if the model lacks the capability.",
-            file=sys.stderr,
-        )
     base_url = os.environ.get("SPORE_OLLAMA_BASE_URL", OllamaModelInterface.DEFAULT_BASE_URL)
     model = OllamaModelInterface.with_base_url(model_id, base_url)
     agent = ModelAgent(AgentId("e2e-agent"), model)

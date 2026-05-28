@@ -694,6 +694,31 @@ async def test_tool_request_proceeds_when_capability_present() -> None:
     assert r.content[0].text == "ok"
 
 
+async def test_tool_request_rejected_when_capabilities_empty() -> None:
+    # ``/api/show`` returns an empty ``capabilities`` array. With the static
+    # whitelist removed, empty capabilities fail closed — even for a model id
+    # (``llama3.2``) that the old prefix table would have allowed.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(
+                200,
+                json={
+                    "model_info": {"llama.context_length": 128_000},
+                    "capabilities": [],
+                },
+            )
+        raise AssertionError(f"should not POST {request.url.path}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    with pytest.raises(ProviderError) as exc:
+        await iface.call(_tool_req())
+    assert exc.value.code == 0
+    assert "does not support tool calling" in exc.value.message
+
+
 async def test_show_fetched_at_most_once() -> None:
     calls = {"tags": 0, "show": 0, "chat": 0}
 

@@ -107,18 +107,6 @@ def context_window(model_id: str) -> int:
     return 0
 
 
-def supports_tools(model_id: str) -> bool:
-    """Best-effort static capability table — ``llama3.2`` / ``qwen2.5-coder`` /
-    ``mistral`` are known to support native tool calling; others may or may
-    not. Used as a fallback when ``/api/show`` discovery is unavailable."""
-
-    return (
-        model_id.startswith("llama3.2")
-        or model_id.startswith("qwen2.5-coder")
-        or model_id.startswith("mistral")
-    )
-
-
 @dataclass
 class ModelMeta:
     """``/api/show``-discovered metadata for the model.
@@ -611,18 +599,17 @@ class OllamaModelInterface:
     def _guard_tool_support(self, request: ModelRequest) -> None:
         """Reject tool-bearing requests when the model does not support tools.
 
-        Capability source priority: the ``/api/show`` ``capabilities`` array
-        when discovery succeeded; otherwise the static :func:`supports_tools`
-        table. Called after the availability + discovery probe.
+        Capability is determined solely by the ``/api/show`` ``capabilities``
+        array: the model is tool-capable iff ``capabilities`` contains
+        ``"tools"``. Empty or unavailable ``/api/show`` metadata ⟹ NOT
+        tool-capable (fail closed). Called after the availability + discovery
+        probe.
         """
 
         if not request.tools:
             return
         meta = self._model_meta
-        if meta is not None and meta.capabilities:
-            supported = meta.supports_tools()
-        else:
-            supported = supports_tools(self._model_id)
+        supported = meta.supports_tools() if meta is not None else False
         if not supported:
             raise ProviderError(
                 code=0,
@@ -756,5 +743,4 @@ __all__ = [
     "context_window",
     "parse_response_body",
     "parse_stop_reason",
-    "supports_tools",
 ]
