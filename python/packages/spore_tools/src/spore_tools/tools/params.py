@@ -63,9 +63,22 @@ class MoveFileParams(_Params):
 # ---------- Exec ----------
 
 
-class BashCommandParams(_Params):
+class ExecParams(_Params):
+    """Parameters for the shell-free :class:`spore_tools.tools.exec.ExecTool`:
+    a program name plus a verbatim argument vector. No shell is involved."""
+
     command: str
     args: list[str] = Field(default_factory=list)
+    timeout: int | None = None
+
+
+class ShellCommandParams(_Params):
+    """Parameters for the real :class:`spore_tools.tools.exec.BashCommandTool`:
+    a single shell ``script`` run via ``/bin/sh -c``, with an optional working
+    directory."""
+
+    script: str
+    working_dir: str | None = None
     timeout: int | None = None
 
 
@@ -146,7 +159,6 @@ class SubagentParams(_Params):
 
 
 __all__ = [
-    "BashCommandParams",
     "DeleteFileParams",
     "FindFilesParams",
     "GitCommitParams",
@@ -155,6 +167,7 @@ __all__ = [
     "GitResetMode",
     "GitResetParams",
     "GitStatusParams",
+    "ExecParams",
     "GrepFilesParams",
     "HttpGetParams",
     "HttpPostParams",
@@ -162,6 +175,7 @@ __all__ = [
     "MoveFileParams",
     "ReadFileParams",
     "RunTestsParams",
+    "ShellCommandParams",
     "SubagentParams",
     "WriteFileParams",
     "parse_params",

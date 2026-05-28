@@ -10,9 +10,12 @@ reclamation). ``SPORE_OTLP_ENDPOINT`` stays unset, so there is no forwarding.
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+import pytest
 
 from spore_core.agent import AgentId, FinalResponse, MockAgent, ToolCallRequested
 from spore_core.cache_provider import NullCacheProvider
@@ -273,7 +276,7 @@ async def test_s4_tool_failure_then_recovery() -> None:
     )
     agent.push(FinalResponse(content="DONE recovered", usage=_usage()))
 
-    registry = build_real_tool_registry()
+    registry = build_real_tool_registry(ScenarioId.S4)
     sandbox = AllowAllSandbox()
     bridge = RealToolRegistry(registry, sandbox)
     schemas = bridge.model_schemas()
@@ -301,13 +304,69 @@ async def test_s4_tool_failure_then_recovery() -> None:
 async def test_s4_failing_tool_is_not_always_halt() -> None:
     """The harness must NOT hard-halt on the recoverable FailingTool error — the
     bridge reports ``is_always_halt == False``."""
-    bridge = RealToolRegistry(build_real_tool_registry(), AllowAllSandbox())
+    bridge = RealToolRegistry(build_real_tool_registry(ScenarioId.S4), AllowAllSandbox())
     assert not bridge.is_always_halt("flaky_op")
     out = await bridge.dispatch(_call("c1", "flaky_op", {}))
     from spore_core.harness import ToolOutputError
 
     assert isinstance(out, ToolOutputError)
     assert out.recoverable
+
+
+# ---------------------------------------------------------------------------
+# S5 — real shell tool: bash_command with a pipe + redirect (uses the REAL
+# registry, which exposes bash_command only for S5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell only")
+async def test_s5_shell_pipeline_uppercases_via_bash_command() -> None:
+    workspace = Path(tempfile.gettempdir()) / f"spore-s5-{time.time_ns()}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    input_path = workspace / "input.txt"
+    output_path = workspace / "output.txt"
+    input_path.write_text("hello\n")
+
+    session_id = SessionId("s5-test")
+    agent = MockAgent(AgentId("mock"))
+    # turn1: bash_command with a literal pipe AND redirect; turn2: read_file
+    # output.txt to verify; turn3: DONE.
+    script = f"cat {input_path} | tr a-z A-Z > {output_path}"
+    agent.push(
+        ToolCallRequested(calls=[_call("c1", "bash_command", {"script": script})], usage=_usage())
+    )
+    agent.push(
+        ToolCallRequested(
+            calls=[_call("c2", "read_file", {"path": str(output_path)})], usage=_usage()
+        )
+    )
+    agent.push(FinalResponse(content="DONE", usage=_usage()))
+
+    registry = build_real_tool_registry(ScenarioId.S5)
+    sandbox = AllowAllSandbox()
+    bridge = RealToolRegistry(registry, sandbox)
+    schemas = bridge.model_schemas()
+
+    harness = build_scenario(
+        ScenarioId.S5,
+        ScenarioComponents(
+            agent=agent,
+            tools=bridge,
+            sandbox=sandbox,
+            context_manager=NoopContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            tool_schemas=schemas,
+            observability=None,
+        ),
+    )
+
+    task = Task.new(ScenarioId.S5.prompt(), session_id, LoopStrategyReAct(max_iterations=8))
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess), f"S5 expected Success, got {result!r}"
+    assert result.turns >= 3, f"S5: bash_command -> read_file -> done, got {result.turns}"
+    assert output_path.read_text() == "HELLO\n", (
+        "shell pipeline must uppercase input.txt into output.txt"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +377,35 @@ async def test_s4_failing_tool_is_not_always_halt() -> None:
 def test_scenario_id_parses() -> None:
     assert ScenarioId.parse("s1") is ScenarioId.S1
     assert ScenarioId.parse("S4") is ScenarioId.S4
+    assert ScenarioId.parse("s5") is ScenarioId.S5
     assert ScenarioId.parse("nope") is None
 
 
+def _schema_names(scenario: ScenarioId) -> list[str]:
+    bridge = RealToolRegistry(build_real_tool_registry(scenario), AllowAllSandbox())
+    return [s.name for s in bridge.model_schemas()]
+
+
 def test_real_registry_exposes_sorted_schemas() -> None:
-    bridge = RealToolRegistry(build_real_tool_registry(), AllowAllSandbox())
-    names = [s.name for s in bridge.model_schemas()]
+    names = _schema_names(ScenarioId.S1)
     assert names == sorted(names), "schemas must be sorted by name"
     assert "flaky_op" in names
     assert "read_file" in names
+
+
+def test_s1_registry_has_exec_not_bash_command() -> None:
+    names = _schema_names(ScenarioId.S1)
+    assert "exec" in names
+    assert "bash_command" not in names
+
+
+def test_s2_registry_lacks_bash_command() -> None:
+    names = _schema_names(ScenarioId.S2)
+    assert "exec" in names
+    assert "bash_command" not in names
+
+
+def test_s5_registry_has_bash_command() -> None:
+    names = _schema_names(ScenarioId.S5)
+    assert "bash_command" in names
+    assert "exec" in names

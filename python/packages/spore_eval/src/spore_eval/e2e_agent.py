@@ -17,6 +17,9 @@ Scenarios
   continue, and compact again.
 * ``s4`` — tool failure + recovery: call ``flaky_op`` (recoverable error), then
   write recovered.txt explaining the adaptation.
+* ``s5`` — real shell tool: transform input.txt → output.txt with a
+  ``bash_command`` shell pipeline (``cat … | tr … > …``), then read back. Only
+  this scenario exposes the real ``bash_command`` tool.
 
 Run recipe (live, against a local model + observability stack)
 --------------------------------------------------------------
@@ -102,7 +105,7 @@ def _arg_value(args: list[str], flag: str) -> str | None:
 
 def _prepare_workspace(scenario: ScenarioId, workspace: Path) -> None:
     """Seed scenario-specific workspace files."""
-    if scenario is ScenarioId.S1:
+    if scenario in (ScenarioId.S1, ScenarioId.S5):
         (workspace / "input.txt").write_text("hello from the spore harness end to end scenario\n")
 
 
@@ -173,7 +176,7 @@ async def _run_live(
     model = OllamaModelInterface.with_base_url(model_id, base_url)
     agent = ModelAgent(AgentId("e2e-agent"), model)
 
-    registry = build_real_tool_registry()
+    registry = build_real_tool_registry(scenario)
     sandbox = WorkspaceScopedSandbox(
         WorkspaceConfig(root=workspace, read_only=False, max_file_size=0)
     )
@@ -256,7 +259,7 @@ def main() -> None:
     args = sys.argv[1:]
     scenario = ScenarioId.parse(args[0]) if args else None
     if scenario is None:
-        print("usage: spore-e2e-agent <s1|s2|s3|s4> [--model <id>] [--mock]", file=sys.stderr)
+        print("usage: spore-e2e-agent <s1|s2|s3|s4|s5> [--model <id>] [--mock]", file=sys.stderr)
         raise SystemExit(2)
 
     mock = "--mock" in args

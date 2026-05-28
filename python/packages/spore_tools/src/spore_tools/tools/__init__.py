@@ -7,7 +7,7 @@ receive a :class:`SandboxProvider` on every dispatch.
 Families:
 
 * :mod:`fs`       — ReadFile, WriteFile, ListDir, DeleteFile, MoveFile
-* :mod:`exec`     — BashCommand, RunTests
+* :mod:`exec`     — Exec, BashCommand, RunTests
 * :mod:`search`   — GrepFiles, FindFiles
 * :mod:`git`      — GitLog, GitDiff, GitCommit, GitStatus, GitReset
 * :mod:`http`     — HttpGet, HttpPost
@@ -22,7 +22,7 @@ from .error import (
     Timeout,
     ToolExecutionError,
 )
-from .exec import BashCommandTool, RunTestsTool
+from .exec import BashCommandTool, ExecTool, RunTestsTool
 from .fs import (
     DeleteFileTool,
     ListDirTool,
@@ -59,6 +59,7 @@ __all__ = [
     "DEFAULT_HEAD_TOKENS",
     "DEFAULT_TAIL_TOKENS",
     "DeleteFileTool",
+    "ExecTool",
     "ExecutionFailed",
     "FindFilesTool",
     "GitCommitTool",

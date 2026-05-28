@@ -71,6 +71,7 @@ from spore_core.tool_registry import ToolSchema as RegistrySchema
 from spore_core.agent import Context as AgentContext
 from spore_tools.tools import (
     BashCommandTool,
+    ExecTool,
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
@@ -140,9 +141,10 @@ AGENT_SYSTEM_PROMPT = (
     "\n"
     "1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate "
     "tool. Writing a shell command, code snippet, or file contents into your "
-    "text reply does NOT run it — only a real tool call has any effect. To "
-    "transform a file, call bash_command with the command itself; never write "
-    "the command text into a file as if it were the result.\n"
+    "text reply does NOT run it — only a real tool call has any effect. When a "
+    "task asks you to produce a file or a result, call the tool that performs "
+    "the action and let the tool do the work; never paste the command, code, or "
+    "expression you *would* run as if it were the finished result.\n"
     "\n"
     "2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: "
     'booleans as true/false (not "true"), numbers as 12 (not "12"), lists as '
@@ -297,17 +299,23 @@ class CompleteOnFinalResponse:
 # ============================================================================
 
 
-def build_real_tool_registry() -> StandardToolRegistry:
-    """Build a :class:`StandardToolRegistry` populated with the real
-    read/write/list/bash tools plus the :class:`FailingTool`. Shared by every
-    scenario so the agent always sees the same catalog. Registration errors
+def build_real_tool_registry(scenario: ScenarioId) -> StandardToolRegistry:
+    """Build a :class:`StandardToolRegistry` for ``scenario``. The base catalog
+    is always ``read_file``, ``write_file``, ``list_dir``, ``exec``, and the
+    :class:`FailingTool` (``flaky_op``). The real shell tool ``bash_command`` is
+    added ONLY for :attr:`ScenarioId.S5` — S1/S2 measure reasoning +
+    act-don't-describe, and a live model handed a shell could shortcut S1 with
+    ``cat … | tr … > …`` without demonstrating the intended behavior. ``exec``
+    is safe everywhere because it cannot pipe or redirect. Registration errors
     here are programming errors (duplicate/invalid schema) and propagate."""
     registry = StandardToolRegistry()
     registry.register(ReadFileTool(), ReadFileTool.schema())
     registry.register(WriteFileTool(), WriteFileTool.schema())
     registry.register(ListDirTool(), ListDirTool.schema())
-    registry.register(BashCommandTool(), BashCommandTool.schema())
+    registry.register(ExecTool(), ExecTool.schema())
     registry.register(FailingTool(), FailingTool.schema())
+    if scenario is ScenarioId.S5:
+        registry.register(BashCommandTool(), BashCommandTool.schema())
     return registry
 
 
@@ -372,12 +380,13 @@ def seed_compaction_state(
 
 
 class ScenarioId(str, Enum):
-    """The scenario id, parsed from the CLI arg ``s1``..``s4``."""
+    """The scenario id, parsed from the CLI arg ``s1``..``s5``."""
 
     S1 = "s1"
     S2 = "s2"
     S3 = "s3"
     S4 = "s4"
+    S5 = "s5"
 
     @classmethod
     def parse(cls, s: str) -> ScenarioId | None:
@@ -419,6 +428,18 @@ _PROMPTS: dict[ScenarioId, str] = {
         "Call the flaky_op tool. If it fails, do not give up: write a file "
         "recovered.txt explaining that flaky_op failed and how you adapted, using "
         "write_file. Reply DONE when finished."
+    ),
+    ScenarioId.S5: (
+        "Transform input.txt into output.txt with every lowercase letter "
+        "uppercased, using the shell.\n"
+        "1. Call bash_command with a real shell pipeline that reads input.txt, "
+        "uppercases it, and writes output.txt — e.g. "
+        "`cat input.txt | tr a-z A-Z > output.txt`. This is exactly what the "
+        "bash_command tool is for: it runs your script via /bin/sh -c, so pipes "
+        "(|) and redirects (>) work.\n"
+        "2. Call read_file on output.txt and check its contents are input.txt's "
+        "text in all capital letters.\n"
+        "Reply DONE only once output.txt contains the uppercased text."
     ),
 }
 
