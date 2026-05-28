@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 spore-e2e-agent = "spore_eval.e2e_agent:main"
+spore-eval = "spore_eval.eval_cli:main"
 
 [build-system]
 requires = ["hatchling"]
