@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /implement (#26)_
+_Last updated: 2026-05-28 by /close (#68; reconciled #64/#65/#26)_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -51,28 +51,46 @@ shared `fixtures/task_suites/welch_bootstrap.json` oracle replays byte-for-byte 
 four. `TraceAnalyzer` and challenge→regression auto-promotion are interface-only /
 deferred; the nightly optimization-loop meta-agent is future work.
 
+**#68 (typed `Span` accessor) just landed** — the Rust EvalHarness now reads
+`TurnSpan`/`SensorSpan`/`MiddlewareSpan` fields through `as_turn()`/`as_sensor()`/
+`as_middleware()` accessors on the `Span` trait instead of parsing
+`format!("{s:?}")` Debug strings. This removes the last cross-language divergence in
+the EvalHarness (former Known Deviation #6, now resolved) — all four implementations
+are structurally identical. The refactor also surfaced and fixed a latent parity bug
+the old Debug parser had hidden: `ContinueWithModification` was silently classified
+as non-intervening in Rust (`"ContinueWithModification"` contains the `"Continue"`
+substring) while Go/TS/Python all count it as an intervention. Rust was converged to
+the three-language majority and a regression guard test was added in all four
+languages (commits 10f00a8, 21c687f, cc09ec1, 387cf33, e826d4f).
+
+**#64 (LLM-native agent tracing) + #65 (record assistant turns) landed** — a run is
+now **debuggable**, not just runnable. Observability captures actual message and
+tool-call content (prompts, completions, tool args/results) following OTel **GenAI
+semantic conventions** — opt-in, truncated, env-guarded (`content_capture` from env),
+off by default — with an **Arize Phoenix** backend added as the LLM-trace viewer
+alongside the existing Tempo/Loki/Prometheus system telemetry, kept swappable over
+OTLP. Turn spans carry the assembled input messages, and assistant turns (plus the
+operational system prompt) are recorded in conversation history at parity across all
+four languages (#64 commits ccdf645/d37b881/c660208/f13cdeb, 3a06e90,
+7ea598e/9379854/9c7c921/8b68b09; #65 commits 1d07c45/497b8fb/e713e1d/00dbb77).
+
 **main CI is green** across all four languages.
 
 Known runnability limits: the harness is **ReAct-only** — the other four loop
-strategies return `StrategyNotYetImplemented` (#58–#61). The observability stack
-is **metrics-only**: it captures span structure + token/timing/outcome but **no
-message content**, so it cannot show the actual conversation or tool-call
-payloads — the standard agent-debugging view (tracked in #64). And reading a
-not-yet-created in-workspace file is misclassified as a sandbox `PathEscape`,
-making S1 model-nondeterministic (#63).
+strategies return `StrategyNotYetImplemented` (#58–#61). The sandbox
+missing-file misclassification that made S1 nondeterministic was fixed in #63, and
+the previous "no message content" observability gap is closed by #64.
 
 ## Active Direction
-With the harness now **runnable** end-to-end, the next bar is making a run
-**debuggable** and **robust**. The headline gap is observability that shows the
-actual conversation and tool usage (prompts, completions, tool args/results) —
-the thing every LLM-observability tool provides and ours currently can't.
-Decided approach: capture content via OpenTelemetry **GenAI semantic
-conventions** (opt-in, truncated, off by default) and view it in an
-**LLM-native, OTel-native, open-source backend (Arize Phoenix)**, keeping the
-Tempo/Loki/Prometheus stack for system telemetry and keeping the backend
-swappable over OTLP (#64). Alongside that, harden the pieces the live run
-exposed (sandbox read semantics, #63). Loop-strategy breadth (#58–#61) remains a
-later phase.
+The harness is now **runnable** (#57) and **debuggable** (#64/#65) end-to-end, and
+has a working **evaluation/feedback loop** (#26/#68). The next bar is **capability
+breadth and correctness**: make the harness deliver the loop strategies it already
+advertises, and close the queue of known correctness/safety gaps. The headline gap is
+that the harness is **ReAct-only** — `PlanExecute`, `Ralph`, `SelfVerifying`, and
+`HillClimbing` (#58–#61) still return `StrategyNotYetImplemented`, so the README and
+`docs/harness-engineering-concepts.md` overstate what runs. Implement those four at
+four-language parity (Rust reference first), then work down the accepted-debt
+correctness fixes (#30/#31/#32/#34). Observability backend stays swappable over OTLP.
 
 ## Known Deviations
 1. **Rust Agent dyn-compatibility** — Rust required a `BoxFut` workaround to make
@@ -88,45 +106,40 @@ later phase.
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod` (accepted tradeoff, documented in `go/CONVENTIONS.md`).
    The durable JSONL path stays network-free.
-4. **Observability captures no message content** — the trace pipeline records
-   span structure + metrics (tokens, timing, outcomes) but no prompts,
-   completions, or tool-call payloads, so it can't show the conversation. Tempo
-   is also the wrong tool for rendering LLM events. Tracked in #64.
-5. **Sandbox Read of a missing in-workspace file → `PathEscape`** — the
-   not-exist fallback in `WorkspaceScopedSandbox` is gated to Write/Execute, so a
-   Read of an absent (but in-bounds) path is misclassified as an escape. Makes S1
-   brittle. Tracked in #63 (`scope: debt`).
-
-6. **EvalHarness trace-sourced metrics use a Debug-string workaround in Rust only** —
-   `CacheHitRate`/`SensorFireRate`/`MiddlewareInterventionRate` are computed from
-   `get_trace()` spans (Resolution 1 of #26). Rust's `Span` trait (#12) exposes only
-   `base()`/`kind()` and is not downcastable/`Serialize`-able, so
-   `rust/crates/spore-eval/src/metric_map.rs` parses fields out of `format!("{s:?}")`.
-   TS/Python/Go all read typed span fields directly. Fix is a typed `Span` accessor on
-   #12, after which the Debug parsing is removed. Tracked in #68 (`scope: deferred`).
 
 _(Former Deviation: compaction `tokens_reclaimed = 0` — **resolved** in #57.)_
+_(Former Deviation: sandbox Read of a missing in-workspace file → `PathEscape` —
+**resolved** in #63.)_
+_(Former Deviation: EvalHarness Rust-only Debug-string metric workaround —
+**resolved** in #68 via a typed `Span` accessor; all four EvalHarnesses now
+structurally identical.)_
+_(Former Deviation: observability captured no message content — **resolved** in #64
+via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
 
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **#64 — LLM-native agent tracing (conversation + tool-call content via GenAI
-   conventions; view in Phoenix).** The north-star gap now that the harness runs:
-   make a run debuggable by capturing message + tool-call content (opt-in,
-   truncated) following OTel GenAI semantic conventions, add Arize Phoenix to the
-   stack as the LLM-trace viewer, and keep the backend swappable over OTLP. Rust
-   reference first, then TS/Python/Go parity. Resolve the OpenInference-vs-`gen_ai.*`
-   rendering question in Rust before fanning out.
-2. **#63 — Sandbox Read of a missing in-workspace file should return a recoverable
-   NotFound, not `PathEscape`.** Small, contained robustness fix across all four
-   languages; directly de-flakes S1 of the #57 suite. Good warm-up / parallel to #64.
-3. **Loop-strategy breadth (#58–#61)** — implement the remaining four strategies
-   (Ralph, PlanExecute, SelfVerifying, HillClimbing) so the harness matches its
-   advertised capability. Larger, `scope: deferred`; pick up after the agent is
-   debuggable.
+1. **Loop-strategy breadth (#58–#61)** — implement the remaining four strategies
+   (Ralph #58, PlanExecute #59, SelfVerifying #61, HillClimbing #60) so the harness
+   matches its advertised five-strategy capability. Rust reference first, then
+   TS/Python/Go parity. This is the largest remaining gap between docs and reality;
+   start with one strategy end-to-end across all four before fanning out.
+2. **Correctness/safety debt fixes (#30, #31, #32, #34)** — memory distillation
+   PendingReview gate (#30), read-only subagent context sharing (#31), halt on
+   mid-session Block 2 hash mismatch (#32), and the dangerous-feature-flag gate for
+   `Mode::Yolo`/`SandboxProvider::None` (#34). Contained `scope: deferred` fixes to
+   pull in opportunistically alongside the loop-strategy work.
+3. **Docs/spec cleanup (#27, #35, #36)** — README/spec clarifications (#27/#35) and
+   the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
+   land so the docs stop overstating capability.
 
-_Note: #57 closed `status: complete` (a48fe84, PR #62 squash-merged to main) — the
-harness runs end-to-end across all four languages, with the prompt-delivery,
-token-accounting, and OTLP-attribute fixes that the live run surfaced. New issues
-filed: #63 (sandbox debt) and #64 (LLM-native tracing, now the live north star).
-Former Known Deviation #2 (compaction reclaims 0) is resolved and removed._
+_Note: this `/close` loop closed **#68** (typed `Span` accessor) `status: complete`,
+then corrected significant stale state the prior `#26` doc-update had missed — **#64**
+(LLM-native tracing) and **#65** (record assistant turns + operational system prompt)
+had both already landed and merged to main but were still listed as open/north-star.
+Reconciled: #64 labeled+`status: complete` (was unlabeled `enhancement`), #65
+relabeled `status: complete` (was a closed issue still marked `status: queued`), and
+**#26** (EvalHarness discussion) closed `status: complete` now that its implementation
+plus the #68 follow-up have all landed. Active Direction repointed from
+debuggability (#64, done) to capability breadth (loop strategies #58–#61) +
+correctness debt. Known Deviation "no message content" removed (resolved by #64)._
