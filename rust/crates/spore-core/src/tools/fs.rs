@@ -537,6 +537,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_missing_in_workspace_file_is_recoverable_not_found() {
+        // Regression for #63: reading a not-yet-created file *inside* the
+        // workspace must surface a recoverable not-found, not a sandbox
+        // PathEscape, end to end through the real WorkspaceScopedSandbox.
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            root: root.clone(),
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 0,
+        })
+        .unwrap();
+        let r = ReadFileTool::new()
+            .execute(&call("read_file", json!({"path": "output.txt"})), &sb)
+            .await;
+        match r {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable, "missing-file read must be recoverable");
+                assert!(
+                    message.contains("read failed"),
+                    "expected a not-found read error, got: {message}"
+                );
+            }
+            other => panic!("expected recoverable not-found error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_outside_workspace_is_path_escape() {
+        // Counterpart to the above: a path that resolves outside the root is
+        // still a sandbox violation, even when the file does not exist.
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            root: root.clone(),
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 0,
+        })
+        .unwrap();
+        let r = ReadFileTool::new()
+            .execute(
+                &call("read_file", json!({"path": "../nonexistent_secret"})),
+                &sb,
+            )
+            .await;
+        match r {
+            ToolOutput::Error { message, .. } => {
+                assert!(
+                    message.to_lowercase().contains("escape")
+                        || message.to_lowercase().contains("sandbox"),
+                    "expected a sandbox/path-escape error, got: {message}"
+                );
+            }
+            other => panic!("expected sandbox violation error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_params_returns_recoverable_error() {
         let sb = AllowAllSandbox;
         let r = ReadFileTool::new()

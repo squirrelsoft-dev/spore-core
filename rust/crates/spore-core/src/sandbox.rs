@@ -159,14 +159,18 @@ impl WorkspaceScopedSandbox {
             self.config.root.join(raw_path)
         };
 
-        // 2. Canonicalize. For Write/Execute, the file may not yet exist —
-        //    canonicalize the parent and re-join the filename.
+        // 2. Canonicalize. The target file may not yet exist — for *any*
+        //    operation, including Read — so canonicalize the parent and
+        //    re-join the filename. Resolution is operation-agnostic on
+        //    purpose: existence is orthogonal to the boundary check. A
+        //    missing in-workspace path still resolves (via its canonicalized
+        //    parent) and passes the boundary check; the actual read then
+        //    naturally returns NotFound, surfaced as a recoverable error by
+        //    the read tool rather than a PathEscape. A missing path that
+        //    resolves *outside* the root is still a PathEscape.
         let canonical = match std::fs::canonicalize(&joined) {
             Ok(p) => p,
-            Err(e)
-                if matches!(operation, Operation::Write | Operation::Execute)
-                    && e.kind() == std::io::ErrorKind::NotFound =>
-            {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let parent = joined
                     .parent()
                     .ok_or_else(|| SandboxViolation::PathEscape {
@@ -621,6 +625,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.parent().unwrap(), root.as_path());
+    }
+
+    #[tokio::test]
+    async fn read_of_missing_in_workspace_file_resolves_not_path_escape() {
+        // Regression for #63: a Read of a not-yet-created file *inside* the
+        // workspace must resolve via its canonicalized parent (not be
+        // misclassified as PathEscape). The file is absent; resolution still
+        // succeeds so the actual read can surface a recoverable not-found.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let resolved = sb
+            .resolve_path("output.txt", Operation::Read)
+            .await
+            .expect("missing in-workspace read must resolve, not PathEscape");
+        assert_eq!(resolved.parent().unwrap(), root.as_path());
+        assert_eq!(resolved.file_name().unwrap(), "output.txt");
+        // And it really is absent on disk.
+        assert!(!resolved.exists());
+    }
+
+    #[tokio::test]
+    async fn read_of_missing_file_in_subdir_resolves() {
+        // Parent dir exists, leaf file does not — still resolves for Read.
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let resolved = sb
+            .resolve_path("sub/missing.txt", Operation::Read)
+            .await
+            .unwrap();
+        assert_eq!(resolved.parent().unwrap(), root.join("sub").as_path());
+        assert!(!resolved.exists());
+    }
+
+    #[tokio::test]
+    async fn read_of_missing_file_outside_root_still_path_escape() {
+        // Regression for #63: a Read of a *non-existent* path that resolves
+        // outside the workspace root must still be a PathEscape, not a
+        // not-found. (`..` makes the canonicalized parent escape the root.)
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let err = sb
+            .resolve_path("../nonexistent_passwd", Operation::Read)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxViolation::PathEscape { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_of_existing_in_workspace_file_resolves() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("present.txt"), "hi").unwrap();
+        let sb = WorkspaceScopedSandbox::new(cfg(&root)).unwrap();
+        let resolved = sb
+            .resolve_path("present.txt", Operation::Read)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("present.txt"));
     }
 
     #[tokio::test]
