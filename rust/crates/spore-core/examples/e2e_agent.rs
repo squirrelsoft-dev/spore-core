@@ -198,12 +198,6 @@ async fn run_live(
     workspace: &std::path::Path,
     obs_root: std::path::PathBuf,
 ) -> RunResult {
-    if !OllamaModelInterface::supports_tools(model_id) {
-        eprintln!(
-            "warning: model `{model_id}` is not in the known tool-capable whitelist; \
-             the harness will guard against tool use if the model lacks the capability."
-        );
-    }
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
     let model = Arc::new(OllamaModelInterface::with_base_url(model_id, base_url));

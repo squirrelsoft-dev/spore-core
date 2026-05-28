@@ -53,9 +53,10 @@
 //!    static [`OllamaModelInterface::context_window`] table), and `call` /
 //!    `call_streaming` reject tool-bearing requests with a
 //!    `does not support tool calling` `ProviderError` when the model lacks the
-//!    `"tools"` capability (falling back to the static `supports_tools` table
-//!    when discovery is unavailable). `/api/show` failures degrade gracefully —
-//!    they never fail the call.
+//!    `"tools"` capability. The `/api/show` `capabilities` array is the sole
+//!    authority for tool support: empty or unavailable metadata ⟹ NOT
+//!    tool-capable (fail closed). `/api/show` failures otherwise degrade
+//!    gracefully — they never fail the call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,14 +160,6 @@ impl OllamaModelInterface {
             id if id.starts_with("gemma") => 8_192,
             _ => 0,
         }
-    }
-
-    /// Best-effort capability table — `llama3.2` / `qwen2.5-coder` are
-    /// known to support native tool calling; others may or may not.
-    pub fn supports_tools(model_id: &str) -> bool {
-        model_id.starts_with("llama3.2")
-            || model_id.starts_with("qwen2.5-coder")
-            || model_id.starts_with("mistral")
     }
 
     /// One-time availability + discovery probe. Cached via [`OnceCell`] so
@@ -671,8 +664,9 @@ impl ModelInterface for OllamaModelInterface {
 
 impl OllamaModelInterface {
     /// Reject tool-bearing requests when the model does not support tools.
-    /// Capability source priority: the `/api/show` `capabilities` array when
-    /// discovery succeeded; otherwise the static `supports_tools` table.
+    /// Capability is determined solely by the `/api/show` `capabilities` array:
+    /// the model is tool-capable iff `capabilities` contains `"tools"`. Empty or
+    /// unavailable `/api/show` metadata ⟹ NOT tool-capable (fail closed).
     fn guard_tool_support(
         &self,
         request: &ModelRequest,
@@ -681,11 +675,7 @@ impl OllamaModelInterface {
         if request.tools.is_empty() {
             return Ok(());
         }
-        let supported = if meta.capabilities.is_empty() {
-            Self::supports_tools(&self.model_id)
-        } else {
-            meta.supports_tools()
-        };
+        let supported = meta.supports_tools();
         if !supported {
             return Err(ModelError::ProviderError {
                 code: 0,
@@ -1565,6 +1555,62 @@ mod tests {
         // Proceeds to /api/chat and returns a normal response.
         let r = client.call(tool_req()).await.unwrap();
         assert_eq!(r.content, vec![ContentBlock::Text { text: "ok".into() }]);
+    }
+
+    #[tokio::test]
+    async fn tool_request_rejected_when_capabilities_empty() {
+        // `/api/show` returns an empty `capabilities` array. With the static
+        // whitelist removed, empty capabilities fail closed — even for a model
+        // id (`llama3.2`) that the old prefix table would have allowed.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        // No /api/chat mock — a call would 404 if the guard let it through.
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 128_000},
+                "capabilities": []
+            }),
+            None,
+        )
+        .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let err = client.call(tool_req()).await.unwrap_err();
+        match err {
+            ModelError::ProviderError { code, message } => {
+                assert_eq!(code, 0);
+                assert!(
+                    message.contains("does not support tool calling"),
+                    "msg: {message}"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_request_rejected_when_show_404s() {
+        // `/api/show` 404s ⟹ empty ModelMeta ⟹ NOT tool-capable (fail closed).
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/show"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        // No /api/chat mock — a call would 404 if the guard let it through.
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let err = client.call(tool_req()).await.unwrap_err();
+        match err {
+            ModelError::ProviderError { code, message } => {
+                assert_eq!(code, 0);
+                assert!(
+                    message.contains("does not support tool calling"),
+                    "msg: {message}"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
