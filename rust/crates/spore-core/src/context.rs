@@ -23,11 +23,18 @@
 //! [`CompactionPreserveHints`] and checks they appear in the summary,
 //! producing a [`CompactionVerificationResult`].
 //!
-//! v1 limitation: only `keep_current_task_state` extracts terms (from
-//! `SessionState::task_instruction`). The other four hints
-//! (`keep_open_problems`, `keep_architectural_decisions`,
-//! `keep_recent_file_list`, `keep_thinking_blocks`) contribute no source
-//! terms in v1 because no structured `SessionState` field exists for them.
+//! All five hints contribute source terms, each gated on its hint and
+//! pushed in this fixed order (issue #47) — this order is the cross-language
+//! invariant that determines first-occurrence dedup:
+//!
+//! 1. `keep_current_task_state` → `SessionState::task_instruction`
+//! 2. `keep_open_problems` → each `SessionState::open_problems`
+//! 3. `keep_architectural_decisions` → each `SessionState::architectural_decisions`
+//! 4. `keep_recent_file_list` → each `SessionState::recent_files`
+//! 5. `keep_thinking_blocks` → `SessionState::reasoning_summary`
+//!
+//! Each source string runs through the same `extract_terms` rule; an
+//! empty/unset field contributes no terms.
 //!
 //! Note: [`CompactionConfig`] gains a `max_compaction_attempts` field but
 //! *intentionally* does NOT carry a `verifier` trait object — that would
@@ -225,6 +232,20 @@ pub struct SessionState {
     /// each assemble — skills are ephemeral, one turn only.
     pub pending_skill_injections: Vec<Guide>,
     pub budget_warning_active: bool,
+    /// Open problems feeding the `keep_open_problems` hint (issue #47).
+    #[serde(default)]
+    pub open_problems: Vec<String>,
+    /// Architectural decisions feeding `keep_architectural_decisions` (#47).
+    #[serde(default)]
+    pub architectural_decisions: Vec<String>,
+    /// Recently touched file paths feeding `keep_recent_file_list` (#47).
+    /// Typed as `String`, not `PathBuf` — keeps tokenization byte-identical
+    /// across languages (no per-language path semantics).
+    #[serde(default)]
+    pub recent_files: Vec<String>,
+    /// Reasoning summary feeding the `keep_thinking_blocks` hint (issue #47).
+    #[serde(default)]
+    pub reasoning_summary: String,
 }
 
 impl SessionState {
@@ -248,6 +269,10 @@ impl SessionState {
             guides_loaded: Vec::new(),
             pending_skill_injections: Vec::new(),
             budget_warning_active: false,
+            open_problems: Vec::new(),
+            architectural_decisions: Vec::new(),
+            recent_files: Vec::new(),
+            reasoning_summary: String::new(),
         }
     }
 }
@@ -326,8 +351,11 @@ pub trait CompactionVerifier: Send + Sync {
 /// Standard [`CompactionVerifier`]: extracts key terms from the session
 /// state per the enabled hints and checks they appear in the summary.
 ///
-/// v1 limitation: only `keep_current_task_state` contributes source terms
-/// (from `SessionState::task_instruction`). See module docs.
+/// All five hints contribute source terms, each gated on its hint and pushed
+/// in a fixed order (issue #47) — `keep_current_task_state` →
+/// `keep_open_problems` → `keep_architectural_decisions` →
+/// `keep_recent_file_list` → `keep_thinking_blocks`. This order pins the
+/// cross-language first-occurrence dedup. See module docs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyTermVerifier;
 
@@ -352,12 +380,30 @@ impl CompactionVerifier for KeyTermVerifier {
         hints: &CompactionPreserveHints,
         session_state: &SessionState,
     ) -> CompactionVerificationResult {
-        // Step 1: collect source strings from enabled hints. v1: only
-        // `keep_current_task_state` contributes. The other four hints have
-        // no structured SessionState field, so they add no terms.
+        // Step 1: collect source strings from enabled hints, each gated on
+        // its hint and pushed in this fixed order (issue #47). This order is
+        // the cross-language invariant that determines first-occurrence dedup.
         let mut sources: Vec<&str> = Vec::new();
         if hints.keep_current_task_state {
             sources.push(session_state.task_instruction.as_str());
+        }
+        if hints.keep_open_problems {
+            for item in &session_state.open_problems {
+                sources.push(item.as_str());
+            }
+        }
+        if hints.keep_architectural_decisions {
+            for item in &session_state.architectural_decisions {
+                sources.push(item.as_str());
+            }
+        }
+        if hints.keep_recent_file_list {
+            for item in &session_state.recent_files {
+                sources.push(item.as_str());
+            }
+        }
+        if hints.keep_thinking_blocks {
+            sources.push(session_state.reasoning_summary.as_str());
         }
 
         // Step 2: build the term list and dedupe preserving first-occurrence
@@ -1440,10 +1486,9 @@ mod tests {
     }
 
     #[test]
-    fn verifier_non_task_hints_are_noops_even_when_true() {
+    fn verifier_empty_fields_contribute_nothing_even_when_all_hints_on() {
         let v = KeyTermVerifier;
-        // task_instruction empty so keep_current_task_state contributes nothing;
-        // all other hints on must still yield zero terms in v1.
+        // All hints on but every structured field empty ⇒ zero terms.
         let mut st = state_with_task("");
         st.task_instruction = String::new();
         let hints = CompactionPreserveHints {
@@ -1465,6 +1510,140 @@ mod tests {
         );
     }
 
+    // ── Issue #47: structured fields feed the four additional hints ──────
+
+    fn only_open_problems() -> CompactionPreserveHints {
+        CompactionPreserveHints {
+            keep_architectural_decisions: false,
+            keep_open_problems: true,
+            keep_current_task_state: false,
+            keep_recent_file_list: false,
+            keep_thinking_blocks: false,
+        }
+    }
+
+    fn only_architectural_decisions() -> CompactionPreserveHints {
+        CompactionPreserveHints {
+            keep_architectural_decisions: true,
+            keep_open_problems: false,
+            keep_current_task_state: false,
+            keep_recent_file_list: false,
+            keep_thinking_blocks: false,
+        }
+    }
+
+    fn only_recent_files() -> CompactionPreserveHints {
+        CompactionPreserveHints {
+            keep_architectural_decisions: false,
+            keep_open_problems: false,
+            keep_current_task_state: false,
+            keep_recent_file_list: true,
+            keep_thinking_blocks: false,
+        }
+    }
+
+    fn only_thinking_blocks() -> CompactionPreserveHints {
+        CompactionPreserveHints {
+            keep_architectural_decisions: false,
+            keep_open_problems: false,
+            keep_current_task_state: false,
+            keep_recent_file_list: false,
+            keep_thinking_blocks: true,
+        }
+    }
+
+    #[test]
+    fn verifier_open_problems_isolated() {
+        let v = KeyTermVerifier;
+        let mut st = state_with_task("ignored task");
+        st.open_problems = vec!["Resolve the deadlock issue".into()];
+        let r = v.verify("we noted the deadlock", &only_open_problems(), &st);
+        assert_eq!(
+            r.missing_items,
+            vec!["resolve".to_string(), "issue".to_string()]
+        );
+        assert!(!r.passed);
+    }
+
+    #[test]
+    fn verifier_architectural_decisions_isolated() {
+        let v = KeyTermVerifier;
+        let mut st = state_with_task("ignored task");
+        st.architectural_decisions = vec!["Adopt hexagonal architecture".into()];
+        let r = v.verify(
+            "we will adopt hexagonal architecture",
+            &only_architectural_decisions(),
+            &st,
+        );
+        assert!(r.passed);
+        assert!(r.missing_items.is_empty());
+    }
+
+    #[test]
+    fn verifier_recent_files_path_tokenization() {
+        let v = KeyTermVerifier;
+        let mut st = state_with_task("ignored task");
+        st.recent_files = vec!["src/parser/mod.rs".into()];
+        // src, mod, rs are <4 chars and dropped; only `parser` survives.
+        let r = v.verify("touched the lexer", &only_recent_files(), &st);
+        assert_eq!(r.missing_items, vec!["parser".to_string()]);
+        assert!(!r.passed);
+    }
+
+    #[test]
+    fn verifier_reasoning_summary_isolated() {
+        let v = KeyTermVerifier;
+        let mut st = state_with_task("ignored task");
+        st.reasoning_summary = "Considered caching strategy".into();
+        let r = v.verify("nothing relevant", &only_thinking_blocks(), &st);
+        assert_eq!(
+            r.missing_items,
+            vec![
+                "considered".to_string(),
+                "caching".to_string(),
+                "strategy".to_string()
+            ]
+        );
+        assert!(!r.passed);
+    }
+
+    #[test]
+    fn verifier_multi_hint_dedup_ordering() {
+        let v = KeyTermVerifier;
+        // "parser" reachable via both task_instruction and open_problems;
+        // first-occurrence is the task position (pushed first).
+        let mut st = state_with_task("Refactor parser");
+        st.open_problems = vec!["parser bug remains".into()];
+        let hints = CompactionPreserveHints {
+            keep_architectural_decisions: false,
+            keep_open_problems: true,
+            keep_current_task_state: true,
+            keep_recent_file_list: false,
+            keep_thinking_blocks: false,
+        };
+        let r = v.verify("nothing matched", &hints, &st);
+        // refactor, parser (task), then remains (open_problems). "bug" <4 dropped.
+        // parser appears once at its first (task) position.
+        assert_eq!(
+            r.missing_items,
+            vec![
+                "refactor".to_string(),
+                "parser".to_string(),
+                "remains".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn verifier_empty_list_with_hint_on_passes() {
+        let v = KeyTermVerifier;
+        let st = state_with_task("ignored task");
+        // open_problems empty but its hint on ⇒ contributes nothing ⇒ passes.
+        let r = v.verify("anything", &only_open_problems(), &st);
+        assert!(r.passed);
+        assert!(r.missing_items.is_empty());
+    }
+
     // ── Fixture replay: cross-language consistency (issue #29) ───────────
 
     #[test]
@@ -1480,6 +1659,14 @@ mod tests {
             summary: String,
             hints: CompactionPreserveHints,
             task_instruction: String,
+            #[serde(default)]
+            open_problems: Vec<String>,
+            #[serde(default)]
+            architectural_decisions: Vec<String>,
+            #[serde(default)]
+            recent_files: Vec<String>,
+            #[serde(default)]
+            reasoning_summary: String,
             expected: Expected,
         }
         #[derive(Deserialize)]
@@ -1496,7 +1683,11 @@ mod tests {
 
         let verifier = KeyTermVerifier;
         for case in &suite.cases {
-            let st = state_with_task(&case.task_instruction);
+            let mut st = state_with_task(&case.task_instruction);
+            st.open_problems = case.open_problems.clone();
+            st.architectural_decisions = case.architectural_decisions.clone();
+            st.recent_files = case.recent_files.clone();
+            st.reasoning_summary = case.reasoning_summary.clone();
             let result = verifier.verify(&case.summary, &case.hints, &st);
             assert_eq!(
                 result.passed, case.expected.passed,

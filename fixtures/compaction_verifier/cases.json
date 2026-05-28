@@ -1,5 +1,5 @@
 {
-  "description": "Cross-language consistency fixture for KeyTermVerifier (issue #29). Each case builds a SessionState from `task_instruction`, runs KeyTermVerifier::verify against `summary` with the given `hints`, and asserts `passed` and `missing_items` (normalized, lowercased, first-occurrence order). Term extraction: lowercase the source, split on runs of [^a-z0-9], drop tokens shorter than 4 chars, dedupe preserving first-occurrence order. v1 limitation: only keep_current_task_state contributes source terms (from task_instruction); the other four hints add no terms. ASCII only.",
+  "description": "Cross-language consistency fixture for KeyTermVerifier (issues #29, #47). Each case builds a SessionState from `task_instruction` plus the optional structured fields `open_problems` (array), `architectural_decisions` (array), `recent_files` (array), `reasoning_summary` (string) — all default to empty when absent, so pre-#47 cases stay byte-valid. The verifier runs KeyTermVerifier::verify against `summary` with the given `hints`, and asserts `passed` and `missing_items` (normalized, lowercased, first-occurrence order). Term extraction: lowercase the source, split on runs of [^a-z0-9], drop tokens shorter than 4 chars, dedupe preserving first-occurrence order. Sources are collected per enabled hint in this fixed order (pins first-occurrence dedup): 1) keep_current_task_state -> task_instruction, 2) keep_open_problems -> each open_problems element, 3) keep_architectural_decisions -> each architectural_decisions element, 4) keep_recent_file_list -> each recent_files element, 5) keep_thinking_blocks -> reasoning_summary. ASCII only.",
   "cases": [
     {
       "name": "full_pass_all_terms_present",
@@ -95,6 +95,108 @@
       "expected": {
         "passed": false,
         "missing_items": ["deploy", "service"]
+      }
+    },
+    {
+      "name": "open_problems_isolated",
+      "summary": "we noted the deadlock",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": true,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "ignored task",
+      "open_problems": ["Resolve the deadlock issue"],
+      "expected": {
+        "passed": false,
+        "missing_items": ["resolve", "issue"]
+      }
+    },
+    {
+      "name": "architectural_decisions_isolated",
+      "summary": "we will adopt hexagonal architecture",
+      "hints": {
+        "keep_architectural_decisions": true,
+        "keep_open_problems": false,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "ignored task",
+      "architectural_decisions": ["Adopt hexagonal architecture"],
+      "expected": {
+        "passed": true,
+        "missing_items": []
+      }
+    },
+    {
+      "name": "recent_files_path_tokenization",
+      "summary": "touched the lexer",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": true,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "ignored task",
+      "recent_files": ["src/parser/mod.rs"],
+      "expected": {
+        "passed": false,
+        "missing_items": ["parser"]
+      }
+    },
+    {
+      "name": "reasoning_summary_isolated",
+      "summary": "nothing relevant",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": false,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": true
+      },
+      "task_instruction": "ignored task",
+      "reasoning_summary": "Considered caching strategy",
+      "expected": {
+        "passed": false,
+        "missing_items": ["considered", "caching", "strategy"]
+      }
+    },
+    {
+      "name": "multi_hint_dedup_ordering",
+      "summary": "nothing matched",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": true,
+        "keep_current_task_state": true,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "Refactor parser",
+      "open_problems": ["parser bug remains"],
+      "expected": {
+        "passed": false,
+        "missing_items": ["refactor", "parser", "remains"]
+      }
+    },
+    {
+      "name": "empty_list_with_hint_on",
+      "summary": "anything",
+      "hints": {
+        "keep_architectural_decisions": false,
+        "keep_open_problems": true,
+        "keep_current_task_state": false,
+        "keep_recent_file_list": false,
+        "keep_thinking_blocks": false
+      },
+      "task_instruction": "ignored task",
+      "open_problems": [],
+      "expected": {
+        "passed": true,
+        "missing_items": []
       }
     }
   ]
