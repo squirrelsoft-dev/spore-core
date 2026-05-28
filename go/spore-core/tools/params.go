@@ -36,9 +36,23 @@ type MoveFileParams struct {
 
 // ----- Exec -----
 
-type BashCommandParams struct {
+// ExecParams are the parameters for the shell-free ExecTool: a program name
+// plus a verbatim argument vector. No shell is involved, so the args are passed
+// literally (no pipes, redirects, globbing, or $(...)).
+type ExecParams struct {
 	Command string   `json:"command"`
 	Args    []string `json:"args,omitempty"`
+	// Timeout in whole seconds. *uint64 so the absence of the field is
+	// distinguishable from 0.
+	Timeout *uint64 `json:"timeout,omitempty"`
+}
+
+// ShellCommandParams are the parameters for the real BashCommandTool: a single
+// shell script run via /bin/sh -c, with an optional working directory.
+type ShellCommandParams struct {
+	Script string `json:"script"`
+	// Optional working directory; the only path that gets sandbox validation.
+	WorkingDir string `json:"working_dir,omitempty"`
 	// Timeout in whole seconds. *uint64 so the absence of the field is
 	// distinguishable from 0.
 	Timeout *uint64 `json:"timeout,omitempty"`

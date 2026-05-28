@@ -1,4 +1,23 @@
-// Execution tools: BashCommand, RunTests.
+// Execution tools: Exec, BashCommand, RunTests.
+//
+// Two distinct ways to run a process, with deliberately different contracts:
+//
+//   - ExecTool (tool name "exec") runs ONE program directly — no shell. command
+//     + args are passed verbatim to SandboxProvider.ExecuteCommand, so there are
+//     no pipes, redirects, globbing, or $(...). Every argument is literal. This
+//     is the path-validated, no-injection-surface option.
+//   - BashCommandTool (tool name "bash_command") runs a shell command line via
+//     /bin/sh -c <script>, so it supports pipes, redirects, globbing, and
+//     $(...). It is sugar over the same ExecuteCommand primitive
+//     (ExecuteCommand("/bin/sh", ["-c", script], …)).
+//
+//     TRADEOFF: because the shell itself opens any files the script touches,
+//     bash_command does NOT get the per-path sandbox validation that read_file /
+//     write_file / exec get — it relies on the outer sandbox/container for
+//     isolation. exec remains the path-validated choice. /bin/sh also assumes a
+//     Unix target (fine for this repo; no cmd.exe/PowerShell branch).
+//   - RunTestsTool (tool name "run_tests") splits a command string on whitespace
+//     and runs it shell-free inside a working directory.
 
 package tools
 
@@ -13,23 +32,26 @@ import (
 )
 
 // ============================================================================
-// BashCommand
+// Exec — shell-free: run one program directly
 // ============================================================================
 
-type BashCommandTool struct{}
+// ExecTool runs one program directly via SandboxProvider.ExecuteCommand. No
+// shell: command + args are passed verbatim (no pipes, redirects, globbing, or
+// $(...)). Path-validated through the sandbox.
+type ExecTool struct{}
 
-func NewBashCommandTool() *BashCommandTool { return &BashCommandTool{} }
+func NewExecTool() *ExecTool { return &ExecTool{} }
 
-const BashCommandToolName = "bash_command"
+const ExecToolName = "exec"
 
-func (*BashCommandTool) Name() string                { return BashCommandToolName }
-func (*BashCommandTool) IsSubagentTool() bool        { return false }
-func (*BashCommandTool) MayProduceLargeOutput() bool { return true }
+func (*ExecTool) Name() string                { return ExecToolName }
+func (*ExecTool) IsSubagentTool() bool        { return false }
+func (*ExecTool) MayProduceLargeOutput() bool { return true }
 
-func (*BashCommandTool) Schema() sporecore.RegistryToolSchema {
+func (*ExecTool) Schema() sporecore.RegistryToolSchema {
 	return sporecore.RegistryToolSchema{
-		Name:        BashCommandToolName,
-		Description: "Execute a shell command via the sandbox",
+		Name:        ExecToolName,
+		Description: "Run one program directly. No shell: no pipes, redirects, globbing, or $(...). Args are passed verbatim.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -43,8 +65,8 @@ func (*BashCommandTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
-	var params BashCommandParams
+func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+	var params ExecParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
 	}
@@ -53,6 +75,92 @@ func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, 
 		timeout = time.Duration(*params.Timeout) * time.Second
 	}
 	out, v := sandbox.ExecuteCommand(ctx, params.Command, params.Args, "", timeout)
+	if v != nil {
+		return SandboxViolationError(v).ToToolOutput()
+	}
+	if out.TimedOut {
+		secs := uint64(0)
+		if params.Timeout != nil {
+			secs = *params.Timeout
+		}
+		return sporecore.ToolOutput{
+			Kind:        sporecore.ToolOutputError,
+			Message:     fmt.Sprintf("command timed out after %ds", secs),
+			Recoverable: true,
+		}
+	}
+	if out.ExitCode == 0 {
+		return finishWithPossibleTruncation(ctx, out.Stdout, call.ID, sandbox)
+	}
+	return sporecore.ToolOutput{
+		Kind:        sporecore.ToolOutputError,
+		Message:     fmt.Sprintf("exit %d ; stderr: %s", out.ExitCode, strings.TrimRight(out.Stderr, "\n")),
+		Recoverable: true,
+	}
+}
+
+// ============================================================================
+// BashCommand — real shell: /bin/sh -c <script>
+// ============================================================================
+
+// BashCommandTool runs a shell command line via /bin/sh -c <script>, supporting
+// pipes, redirects, globbing, and $(...). It is sugar over the same
+// SandboxProvider.ExecuteCommand primitive ExecTool uses
+// (ExecuteCommand("/bin/sh", ["-c", script], workingDir?, timeout?)).
+//
+// TRADEOFF: the shell opens any files the script touches itself, so this tool
+// does NOT receive the per-path sandbox validation that read_file / write_file /
+// ExecTool get — it relies on the outer sandbox/container for isolation. exec
+// remains the path-validated choice. /bin/sh assumes a Unix target (no Windows
+// shell branch).
+type BashCommandTool struct{}
+
+func NewBashCommandTool() *BashCommandTool { return &BashCommandTool{} }
+
+const BashCommandToolName = "bash_command"
+
+func (*BashCommandTool) Name() string                { return BashCommandToolName }
+func (*BashCommandTool) IsSubagentTool() bool        { return false }
+func (*BashCommandTool) MayProduceLargeOutput() bool { return true }
+
+func (*BashCommandTool) Schema() sporecore.RegistryToolSchema {
+	return sporecore.RegistryToolSchema{
+		Name:        BashCommandToolName,
+		Description: "Execute a shell command line via /bin/sh -c. Supports pipes, redirects, globbing, and $(...).",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"script": {"type": "string"},
+				"working_dir": {"type": "string"},
+				"timeout": {"type": "integer"}
+			},
+			"required": ["script"]
+		}`),
+		Annotations: sporecore.ToolAnnotations{Destructive: true, OpenWorld: true},
+	}
+}
+
+func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+	var params ShellCommandParams
+	if e := parseParams(call, &params); e != nil {
+		return e.ToToolOutput()
+	}
+	var timeout time.Duration
+	if params.Timeout != nil {
+		timeout = time.Duration(*params.Timeout) * time.Second
+	}
+	// Only the optional working_dir is path-validated; the script's own file
+	// accesses go through the shell, unvalidated (see the type doc-comment).
+	working := ""
+	if params.WorkingDir != "" {
+		resolved, v := sandbox.ResolvePath(ctx, params.WorkingDir, sporecore.OperationRead)
+		if v != nil {
+			return SandboxViolationError(v).ToToolOutput()
+		}
+		working = resolved
+	}
+	args := []string{"-c", params.Script}
+	out, v := sandbox.ExecuteCommand(ctx, "/bin/sh", args, working, timeout)
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
@@ -154,6 +262,7 @@ func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 }
 
 var (
+	_ sporecore.Tool = (*ExecTool)(nil)
 	_ sporecore.Tool = (*BashCommandTool)(nil)
 	_ sporecore.Tool = (*RunTestsTool)(nil)
 )

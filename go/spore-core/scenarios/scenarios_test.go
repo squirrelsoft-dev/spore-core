@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -211,7 +212,7 @@ func TestS4ToolFailureThenRecovery(t *testing.T) {
 		fmt.Sprintf(`{"path":%q,"content":"flaky_op failed; adapted by writing this file"}`, recoveredPath))}, usage()))
 	agent.Push(sporecore.NewFinalResponse("DONE recovered", usage()))
 
-	registry := scenarios.BuildRealToolRegistry()
+	registry := scenarios.BuildRealToolRegistry(scenarios.S4)
 	sandbox := sporecore.AllowAllSandbox{}
 	schemas := scenarios.ModelSchemas(registry)
 
@@ -236,7 +237,7 @@ func TestS4ToolFailureThenRecovery(t *testing.T) {
 // The harness must NOT hard-halt on the recoverable FailingTool error — flaky_op
 // is not annotated always-halt, and its output is a recoverable error.
 func TestS4FailingToolIsRecoverableNotAlwaysHalt(t *testing.T) {
-	registry := scenarios.BuildRealToolRegistry()
+	registry := scenarios.BuildRealToolRegistry(scenarios.S4)
 	if registry.IsAlwaysHalt("flaky_op") {
 		t.Fatal("flaky_op must not be always-halt")
 	}
@@ -310,14 +311,126 @@ func TestTaskInstructionDeliveredAsFirstUserMessage(t *testing.T) {
 	}
 }
 
-// ParseScenarioID round-trips s1..s4 and rejects junk.
+// ParseScenarioID round-trips s1..s5 and rejects junk.
 func TestParseScenarioID(t *testing.T) {
-	for _, in := range []string{"s1", "S2", " s3 ", "S4"} {
+	for _, in := range []string{"s1", "S2", " s3 ", "S4", "s5"} {
 		if _, ok := scenarios.ParseScenarioID(in); !ok {
 			t.Fatalf("ParseScenarioID(%q) failed", in)
 		}
 	}
 	if _, ok := scenarios.ParseScenarioID("nope"); ok {
 		t.Fatal("ParseScenarioID should reject junk")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-scenario tool catalog: S1/S2 expose exec but NOT bash_command; S5 both.
+// ---------------------------------------------------------------------------
+
+func schemaNames(scenario scenarios.ScenarioID) []string {
+	reg := scenarios.BuildRealToolRegistry(scenario)
+	schemas := scenarios.ModelSchemas(reg)
+	names := make([]string, 0, len(schemas))
+	for _, s := range schemas {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+func hasName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCatalogS1HasExecNotBashCommand(t *testing.T) {
+	names := schemaNames(scenarios.S1)
+	if !hasName(names, "exec") {
+		t.Fatalf("S1 catalog must contain exec, got %v", names)
+	}
+	if hasName(names, "bash_command") {
+		t.Fatalf("S1 catalog must NOT contain bash_command, got %v", names)
+	}
+}
+
+func TestCatalogS2LacksBashCommand(t *testing.T) {
+	names := schemaNames(scenarios.S2)
+	if !hasName(names, "exec") {
+		t.Fatalf("S2 catalog must contain exec, got %v", names)
+	}
+	if hasName(names, "bash_command") {
+		t.Fatalf("S2 catalog must NOT contain bash_command, got %v", names)
+	}
+}
+
+func TestCatalogS5HasBashCommand(t *testing.T) {
+	names := schemaNames(scenarios.S5)
+	if !hasName(names, "exec") {
+		t.Fatalf("S5 catalog must contain exec, got %v", names)
+	}
+	if !hasName(names, "bash_command") {
+		t.Fatalf("S5 catalog must contain bash_command, got %v", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// S5 — real shell: bash_command pipeline (cat | tr > out) then read_file verify
+// ---------------------------------------------------------------------------
+
+func TestS5BashCommandShellPipeline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix only")
+	}
+	workspace := filepath.Join(os.TempDir(), fmt.Sprintf("spore-s5-%d", time.Now().UnixNano()))
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(workspace)
+
+	inPath := filepath.Join(workspace, "input.txt")
+	outPath := filepath.Join(workspace, "output.txt")
+	if err := os.WriteFile(inPath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := sporecore.SessionID("s5-test")
+	script := fmt.Sprintf("cat %s | tr a-z A-Z > %s", inPath, outPath)
+
+	agent := sporecore.NewMockAgent("mock")
+	// Turn 1: real shell pipeline (literal pipe + redirect) via bash_command.
+	agent.Push(sporecore.NewToolCallRequested([]sporecore.ToolCall{
+		toolCall("c1", "bash_command", fmt.Sprintf(`{"script":%q}`, script))}, usage()))
+	// Turn 2: read back output.txt to verify.
+	agent.Push(sporecore.NewToolCallRequested([]sporecore.ToolCall{
+		toolCall("c2", "read_file", fmt.Sprintf(`{"path":%q}`, outPath))}, usage()))
+	// Turn 3: final.
+	agent.Push(sporecore.NewFinalResponse("DONE", usage()))
+
+	registry := scenarios.BuildRealToolRegistry(scenarios.S5)
+	sandbox := sporecore.AllowAllSandbox{}
+	schemas := scenarios.ModelSchemas(registry)
+
+	h := scenarios.BuildScenario(
+		agent, registry, sandbox, sporecore.NoopContextManager{},
+		sporecore.AlwaysContinuePolicy{}, schemas, nil, 2, nil,
+	)
+
+	task := sporecore.NewTask(scenarios.S5.Prompt(), sessionID, reactStrategy(8))
+	res := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
+	if res.Kind != sporecore.RunSuccess {
+		t.Fatalf("S5 expected Success, got %v (%s)", res.Kind, res.Reason.Kind)
+	}
+	if res.Turns < 3 {
+		t.Fatalf("S5: shell -> read -> done expects >=3 turns, got %d", res.Turns)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("output.txt not written by shell pipeline: %v", err)
+	}
+	if string(got) != "HELLO" {
+		t.Fatalf("S5 output = %q, want %q", string(got), "HELLO")
 	}
 }

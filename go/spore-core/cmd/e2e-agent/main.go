@@ -127,7 +127,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: e2e-agent <s1|s2|s3|s4> [--model <id>] [--mock]")
+	fmt.Fprintln(os.Stderr, "usage: e2e-agent <s1|s2|s3|s4|s5> [--model <id>] [--mock]")
 }
 
 // runLive runs the scenario against a live Ollama model.
@@ -144,7 +144,7 @@ func runLive(scenario scenarios.ScenarioID, sessionID sporecore.SessionID, model
 	model := ollama.WithBaseURL(modelID, baseURL)
 	agent := sporecore.NewModelAgent("e2e-agent", model)
 
-	registry := scenarios.BuildRealToolRegistry()
+	registry := scenarios.BuildRealToolRegistry(scenario)
 	sandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: workspace})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build sandbox: %v\n", err)
@@ -222,7 +222,7 @@ func runScenario(scenario scenarios.ScenarioID, h sporecore.Harness, sessionID s
 
 // prepareWorkspace seeds scenario-specific workspace files.
 func prepareWorkspace(scenario scenarios.ScenarioID, workspace string) {
-	if scenario == scenarios.S1 {
+	if scenario == scenarios.S1 || scenario == scenarios.S5 {
 		_ = os.WriteFile(filepath.Join(workspace, "input.txt"),
 			[]byte("hello from the spore harness end to end scenario\n"), 0o644)
 	}
