@@ -34,7 +34,22 @@ from spore_core.model import (
     TextBlock,
     TokenUsage,
 )
-from spore_core.observability import InMemoryObservabilityProvider, SessionMetrics
+from spore_core.harness import TaskId
+from spore_core.memory import Timestamp
+from spore_core.middleware import (
+    HookPoint,
+    MiddlewareContinue,
+    MiddlewareContinueWithModification,
+    MiddlewareDecision,
+)
+from spore_core.observability import (
+    InMemoryObservabilityProvider,
+    MiddlewareSpan,
+    SessionMetrics,
+    SpanBase,
+    SpanId,
+    SpanKind,
+)
 from spore_core.guide_registry import SessionOutcomePartial
 
 from spore_eval.eval import (
@@ -46,6 +61,7 @@ from spore_eval.eval import (
     EvalMetricCacheHitRate,
     EvalMetricMeanCostUsd,
     EvalMetricMeanTurnsToCompletion,
+    EvalMetricMiddlewareInterventionRate,
     EvalMetricTaskSuccessRate,
     EvalMetricVerificationScore,
     HarnessConfigDiff,
@@ -478,6 +494,68 @@ def test_rule18_resource_metric_still_computes_for_waiting() -> None:
         RunSampleInputs(verifier_passed=False, verifier_score=0.0),
     )
     assert v == 2.0
+
+
+# ============================================================================
+# Regression (#68) — ContinueWithModification counts as an intervention
+# ============================================================================
+
+
+def _empty_session() -> SessionMetrics:
+    """A zeroed SessionMetrics; the intervention rate reads only ``spans``."""
+    return SessionMetrics(
+        session_id=SessionId("s"),
+        task_id="t",
+        total_turns=0,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cost_usd=0.0,
+        total_duration_ms=0,
+        tool_calls=0,
+        sensor_fires=0,
+        sensor_halts=0,
+        compactions=0,
+        outcome=SessionOutcomePartial(),
+    )
+
+
+def _middleware_span(decision: MiddlewareDecision) -> MiddlewareSpan:
+    return MiddlewareSpan(
+        base=SpanBase(
+            span_id=SpanId("mw1"),
+            session_id=SessionId("s"),
+            task_id=TaskId("t"),
+            kind=SpanKind.MIDDLEWARE_HOOK,
+            started_at=Timestamp("2026-05-16T00:00:00Z"),
+            ended_at=Timestamp("2026-05-16T00:00:00Z"),
+        ),
+        hook=HookPoint.BEFORE_TOOL,
+        decision=decision,
+    )
+
+
+def test_continue_with_modification_counts_as_intervention() -> None:
+    """Regression guard for #68: ``MiddlewareContinueWithModification`` is a
+    separate class (not a subclass of ``MiddlewareContinue``), so a CWM decision
+    must count as an intervention. Rust diverged here; pin Python's behavior."""
+    metric = EvalMetricMiddlewareInterventionRate(hook=HookPoint.BEFORE_TOOL.value)
+    inputs = RunSampleInputs(verifier_passed=True, verifier_score=1.0)
+
+    cwm = sample_for(
+        metric,
+        _empty_session(),
+        [_middleware_span(MiddlewareContinueWithModification())],
+        inputs,
+    )
+    assert cwm == 1.0
+
+    cont = sample_for(
+        metric,
+        _empty_session(),
+        [_middleware_span(MiddlewareContinue())],
+        inputs,
+    )
+    assert cont == 0.0
 
 
 # ============================================================================
