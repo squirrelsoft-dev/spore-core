@@ -22,6 +22,8 @@ import {
   MockModelInterface,
   SessionId,
   harnessTesting,
+  memory,
+  middleware,
   observability,
   type HarnessConfig,
   type RunResult,
@@ -104,11 +106,7 @@ function configWith(
     .buildConfig();
 }
 
-function task(
-  id: string,
-  snapshot: WorkspaceSnapshot,
-  spec: VerifierSpec,
-): EvalTask {
+function task(id: string, snapshot: WorkspaceSnapshot, spec: VerifierSpec): EvalTask {
   const t: EvalTask = {
     id,
     instruction: "do the thing",
@@ -166,9 +164,7 @@ describe("Rule 1 — three disjoint task lists", () => {
 
 describe("Rules 2-3 — workspace restore/teardown", () => {
   it("restores files into a fresh dir", async () => {
-    const ws = await Workspace.restore(
-      files({ "input.txt": "hello\n", "sub/x.md": "deep" }),
-    );
+    const ws = await Workspace.restore(files({ "input.txt": "hello\n", "sub/x.md": "deep" }));
     expect(await readFile(join(ws.path, "input.txt"), "utf8")).toBe("hello\n");
     expect(await readFile(join(ws.path, "sub/x.md"), "utf8")).toBe("deep");
     await ws.teardown();
@@ -198,10 +194,7 @@ describe("Rule 4 — timeout is a failed run", () => {
       canary: [],
     };
     const harness = new EvalHarnessBuilder(suite, configWith(obs, true, 5), obs)
-      .candidate(
-        "cand",
-        configWith(new InMemoryObservabilityProvider(), true, 5),
-      )
+      .candidate("cand", configWith(new InMemoryObservabilityProvider(), true, 5))
       .nRunsPerConfig(1)
       .build();
     const reports = await harness.run();
@@ -443,28 +436,17 @@ describe("Rules 14-16 — runs per config + metrics from obs", () => {
       canary: [],
     };
     const n = 3;
-    const harness = new EvalHarnessBuilder(
-      suite,
-      configWith(baseObs, true, n),
-      baseObs,
-    )
+    const harness = new EvalHarnessBuilder(suite, configWith(baseObs, true, n), baseObs)
       .candidate("cand", configWith(candObs, true, n))
       .nRunsPerConfig(n)
-      .metrics([
-        { kind: "task_success_rate" },
-        { kind: "mean_turns_to_completion" },
-      ])
+      .metrics([{ kind: "task_success_rate" }, { kind: "mean_turns_to_completion" }])
       .build();
 
     const reports = await harness.run();
     expect(reports.length).toBe(1);
-    const success = reports[0]!.metrics.find(
-      (m) => m.metricName === "task_success_rate",
-    )!;
+    const success = reports[0]!.metrics.find((m) => m.metricName === "task_success_rate")!;
     expect(success.baseline.n).toBe(n); // Rule 14
-    const turns = reports[0]!.metrics.find(
-      (m) => m.metricName === "mean_turns_to_completion",
-    )!;
+    const turns = reports[0]!.metrics.find((m) => m.metricName === "mean_turns_to_completion")!;
     expect(turns.baseline.mean).toBeGreaterThanOrEqual(1.0); // Rule 16
   });
 });
@@ -477,15 +459,9 @@ describe("Rule 17 — metric names + directions", () => {
   it("maps names and directions", () => {
     expect(metricDirection({ kind: "task_success_rate" })).toBe("maximize");
     expect(metricDirection({ kind: "mean_cost_usd" })).toBe("minimize");
-    expect(metricDirection({ kind: "mean_turns_to_completion" })).toBe(
-      "minimize",
-    );
-    expect(metricDirection({ kind: "cache_hit_rate", block: "sys" })).toBe(
-      "maximize",
-    );
-    expect(metricName({ kind: "cache_hit_rate", block: "sys" })).toBe(
-      "cache_hit_rate[sys]",
-    );
+    expect(metricDirection({ kind: "mean_turns_to_completion" })).toBe("minimize");
+    expect(metricDirection({ kind: "cache_hit_rate", block: "sys" })).toBe("maximize");
+    expect(metricName({ kind: "cache_hit_rate", block: "sys" })).toBe("cache_hit_rate[sys]");
     expect(metricDirection({ kind: "verification_score" })).toBe("maximize");
   });
 });
@@ -547,12 +523,7 @@ describe("Rules 19-22 — comparison primitives", () => {
 
 describe("Rule 21 — bootstrap CI", () => {
   it("brackets the resample means", () => {
-    const ci = bootstrapCi(
-      [0.5, 0.6, 0.4, 0.55],
-      1000,
-      0.95,
-      DEFAULT_BOOTSTRAP_SEED,
-    )!;
+    const ci = bootstrapCi([0.5, 0.6, 0.4, 0.55], 1000, 0.95, DEFAULT_BOOTSTRAP_SEED)!;
     expect(ci.lower).toBeLessThanOrEqual(ci.upper);
   });
 
@@ -562,21 +533,13 @@ describe("Rule 21 — bootstrap CI", () => {
     const suite: TaskSuite = {
       suite_version: 1,
       regression: [
-        task(
-          "t",
-          { kind: "empty" },
-          { kind: "llm_judge", rubric: "r", score_range: [0, 1] },
-        ),
+        task("t", { kind: "empty" }, { kind: "llm_judge", rubric: "r", score_range: [0, 1] }),
       ],
       challenge: [],
       canary: [],
     };
     const n = 4;
-    const harness = new EvalHarnessBuilder(
-      suite,
-      configWith(baseObs, true, n),
-      baseObs,
-    )
+    const harness = new EvalHarnessBuilder(suite, configWith(baseObs, true, n), baseObs)
       .candidate("cand", configWith(candObs, true, n))
       .nRunsPerConfig(n)
       .metrics([{ kind: "task_success_rate" }])
@@ -672,11 +635,7 @@ describe("Rule 25 — trace links", () => {
       challenge: [],
       canary: [],
     };
-    const harness = new EvalHarnessBuilder(
-      suite,
-      configWith(baseObs, true, 2),
-      baseObs,
-    )
+    const harness = new EvalHarnessBuilder(suite, configWith(baseObs, true, 2), baseObs)
       .candidate("cand", configWith(candObs, true, 2))
       .nRunsPerConfig(2)
       .build();
@@ -761,9 +720,7 @@ describe("Rule 31 — manual promotion", () => {
 
 describe("Rule 32 — no banned dependencies", () => {
   it("package.json names no Inspect AI / Langfuse / stats library", async () => {
-    const pkg = (
-      await readFile(join(HERE, "../package.json"), "utf8")
-    ).toLowerCase();
+    const pkg = (await readFile(join(HERE, "../package.json"), "utf8")).toLowerCase();
     expect(pkg).not.toContain("inspect-ai");
     expect(pkg).not.toContain("langfuse");
     expect(pkg).not.toContain("simple-statistics");
@@ -810,9 +767,7 @@ describe("E2E — regression flagged with sane p-value + recommendation", () => 
     const reports: ComparisonReport[] = await harness.run();
     expect(reports.length).toBe(1);
     const report = reports[0]!;
-    const success = report.metrics.find(
-      (m) => m.metricName === "task_success_rate",
-    )!;
+    const success = report.metrics.find((m) => m.metricName === "task_success_rate")!;
     expect(success.baseline.mean).toBeGreaterThan(success.candidate.mean);
     expect(success.direction).toBe("worse");
     expect(success.pValue).toBeGreaterThanOrEqual(0);
@@ -820,5 +775,109 @@ describe("E2E — regression flagged with sane p-value + recommendation", () => 
     expect(success.pValue).toBeLessThan(0.05);
     expect(["reject", "needs_more_runs"]).toContain(report.recommendation.kind);
     expect(report.traceLinks.length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================================
+// Regression guard (#68) — ContinueWithModification counts as an intervention
+//
+// `middleware_intervention_rate` is non-continue / total firings: any decision
+// whose kind is not `"continue"` is an intervention. A cross-language audit
+// (#68) found Rust had diverged so a `continue_with_modification` decision was
+// NOT counted; this test pins TS to the correct, four-language-aligned behavior
+// so it can never silently regress.
+// ============================================================================
+
+describe("#68 — middleware_intervention_rate counts ContinueWithModification", () => {
+  // The metric ignores `session`; a minimal SessionMetrics keeps the call typed.
+  function dummySession(): observability.SessionMetrics {
+    return {
+      session_id: SessionId.of("s"),
+      task_id: {
+        asString: () => "t",
+        value: "t",
+        toString: () => "t",
+        equals: () => false,
+        toJSON: () => "t",
+      } as never,
+      total_turns: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_cost_usd: 0,
+      total_duration_ms: 0,
+      tool_calls: 0,
+      sensor_fires: 0,
+      sensor_halts: 0,
+      compactions: 0,
+      outcome: { kind: "partial" as const },
+      guides_used: [],
+      patch_count: 0,
+      patch_rate: 0,
+      patches_by_tool: {},
+      compaction_verification_failures: 0,
+    };
+  }
+
+  function middlewareSpan(
+    hook: middleware.HookPoint,
+    decision: middleware.MiddlewareDecision,
+  ): observability.MiddlewareSpan {
+    return {
+      base: {
+        span_id: observability.SpanId.of("mw"),
+        parent_span_id: null,
+        session_id: SessionId.of("s"),
+        task_id: {
+          asString: () => "t",
+          value: "t",
+          toString: () => "t",
+          equals: () => false,
+          toJSON: () => "t",
+        } as never,
+        kind: "middleware_hook",
+        started_at: memory.Timestamp.of("2026-05-16T00:00:00Z"),
+        ended_at: memory.Timestamp.of("2026-05-16T00:00:00Z"),
+        duration_ms: 0,
+        status: { kind: "ok" },
+      },
+      hook,
+      decision,
+    };
+  }
+
+  const HOOK = "before_turn" as const;
+  const metric = {
+    kind: "middleware_intervention_rate" as const,
+    hook: HOOK,
+  };
+
+  it("counts a continue_with_modification decision as an intervention (rate 1.0)", () => {
+    const spans = [middlewareSpan(HOOK, { kind: "continue_with_modification" })];
+    const rate = sampleFor(metric, dummySession(), spans, {
+      verifierPassed: false,
+      verifierScore: 0,
+    });
+    expect(rate).toBe(1.0);
+  });
+
+  it("does not count a plain continue decision (rate 0.0)", () => {
+    const spans = [middlewareSpan(HOOK, { kind: "continue" })];
+    const rate = sampleFor(metric, dummySession(), spans, {
+      verifierPassed: false,
+      verifierScore: 0,
+    });
+    expect(rate).toBe(0.0);
+  });
+
+  it("yields the fraction for a mix (one CWM, one continue → 0.5)", () => {
+    const spans = [
+      middlewareSpan(HOOK, { kind: "continue_with_modification" }),
+      middlewareSpan(HOOK, { kind: "continue" }),
+    ];
+    const rate = sampleFor(metric, dummySession(), spans, {
+      verifierPassed: false,
+      verifierScore: 0,
+    });
+    expect(rate).toBe(0.5);
   });
 });
