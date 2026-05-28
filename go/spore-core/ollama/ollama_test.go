@@ -790,6 +790,46 @@ func TestToolRequestProceedsWhenCapabilityPresent(t *testing.T) {
 	}
 }
 
+func TestToolRequestRejectedWhenCapabilitiesEmpty(t *testing.T) {
+	// /api/show returns an empty capabilities array. With the static whitelist
+	// removed, empty capabilities fail closed — even for a model id (llama3.2)
+	// that the old prefix table would have allowed. The chat handler fails the
+	// test if hit, proving the guard rejected before any call.
+	chat := func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("/api/chat must not be hit, path=%s", r.URL.Path)
+	}
+	srv, _ := newSplitServerWithShow(t, "llama3.2", chat,
+		showJSON(`{"model_info":{"llama.context_length":128000},"capabilities":[]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+	_, err := c.Call(context.Background(), toolReq())
+	var merr *sporecore.ModelError
+	if !errors.As(err, &merr) || merr.Kind != sporecore.ModelErrProviderError {
+		t.Fatalf("expected ProviderError, got %v", err)
+	}
+	if merr.Code != 0 || !strings.Contains(merr.Message, "does not support tool calling") {
+		t.Fatalf("err: %+v", merr)
+	}
+}
+
+func TestToolRequestRejectedWhenShow404s(t *testing.T) {
+	// /api/show 404s ⟹ empty modelMeta ⟹ NOT tool-capable (fail closed).
+	// nil show handler ⟹ splitHandler returns 404 for /api/show. The chat
+	// handler fails the test if hit.
+	chat := func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("/api/chat must not be hit, path=%s", r.URL.Path)
+	}
+	srv, _ := newSplitServer(t, "llama3.2", chat)
+	c := WithBaseURL("llama3.2", srv.URL)
+	_, err := c.Call(context.Background(), toolReq())
+	var merr *sporecore.ModelError
+	if !errors.As(err, &merr) || merr.Kind != sporecore.ModelErrProviderError {
+		t.Fatalf("expected ProviderError, got %v", err)
+	}
+	if merr.Code != 0 || !strings.Contains(merr.Message, "does not support tool calling") {
+		t.Fatalf("err: %+v", merr)
+	}
+}
+
 func TestShowFetchedAtMostOnce(t *testing.T) {
 	srv, h := newSplitServerWithShow(t, "llama3.2", chatOK,
 		showJSON(`{"model_info":{"llama.context_length":32000},"capabilities":["tools"]}`))

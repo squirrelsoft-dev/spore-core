@@ -132,11 +132,6 @@ func usage() {
 
 // runLive runs the scenario against a live Ollama model.
 func runLive(scenario scenarios.ScenarioID, sessionID sporecore.SessionID, modelID, workspace string) sporecore.RunResult {
-	if !ollama.SupportsTools(modelID) {
-		fmt.Fprintf(os.Stderr,
-			"warning: model %q is not in the known tool-capable whitelist; "+
-				"the harness will guard against tool use if the model lacks the capability.\n", modelID)
-	}
 	baseURL := os.Getenv("SPORE_OLLAMA_BASE_URL")
 	if baseURL == "" {
 		baseURL = ollama.DefaultBaseURL

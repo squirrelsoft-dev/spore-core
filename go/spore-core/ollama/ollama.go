@@ -173,15 +173,6 @@ func ContextWindow(modelID string) uint32 {
 	}
 }
 
-// SupportsTools reports whether a model id is known to support native tool
-// calling, using a static prefix table. Best-effort fallback used when
-// /api/show discovery is unavailable.
-func SupportsTools(modelID string) bool {
-	return strings.HasPrefix(modelID, "llama3.2") ||
-		strings.HasPrefix(modelID, "qwen2.5-coder") ||
-		strings.HasPrefix(modelID, "mistral")
-}
-
 // Provider reports the underlying model identity. The context window prefers
 // the /api/show-discovered value when the availability probe has already run
 // and produced one; otherwise it falls back to the static ContextWindow table.
@@ -631,18 +622,14 @@ func (c *ModelInterface) discoverMeta(ctx context.Context) modelMeta {
 }
 
 // guardToolSupport rejects tool-bearing requests when the model does not
-// support tools. Capability source priority: the /api/show capabilities array
-// when discovery succeeded; otherwise the static SupportsTools table.
+// support tools. The /api/show capabilities array is the sole authority for
+// tool support: the model is tool-capable iff capabilities contains "tools".
+// Empty or unavailable /api/show metadata ⟹ NOT tool-capable (fail closed).
 func (c *ModelInterface) guardToolSupport(req sporecore.ModelRequest) error {
 	if len(req.Tools) == 0 {
 		return nil
 	}
-	var supported bool
-	if len(c.checkMeta.capabilities) == 0 {
-		supported = SupportsTools(c.modelID)
-	} else {
-		supported = c.checkMeta.supportsTools()
-	}
+	supported := c.checkMeta.supportsTools()
 	if !supported {
 		return sporecore.NewProviderError(0, fmt.Sprintf(
 			"Model %s does not support tool calling", c.modelID,
