@@ -71,7 +71,16 @@ from spore_core import (
     ToolOutputWaitingForHuman,
     TurnError,
 )
-from spore_core.agent import ModelAgent
+from spore_core.agent import Context, ModelAgent
+from spore_core.harness import HarnessToolResult
+from spore_core.model import (
+    Message,
+    ModelParams,
+    Role,
+    TextContent,
+    ToolCallContent,
+    ToolResultContent,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -626,3 +635,156 @@ async def test_harness_emits_spans_through_outbox_jsonl(tmp_path: Path) -> None:
     assert len(trace_ids) == 1, "all lines share one trace_id"
 
     assert (tmp_path / "sessions" / str(session_id) / ".flushed").exists()
+
+
+# ---------------------------------------------------------------------------
+# Assistant-turn recording (regression for lost conversation history, #65)
+# ---------------------------------------------------------------------------
+
+
+class RecordingContextManager:
+    """A context manager that records every appended message in a shared list so
+    tests can inspect the conversation the loop builds. Records assistant turns
+    (tool calls + final text) and tool results in order. Mirrors the Rust
+    reference ``RecordingContextManager``."""
+
+    def __init__(self) -> None:
+        self.messages: list[Message] = []
+
+    async def assemble(self, session: SessionState, task: Task) -> Context:
+        _ = task
+        return Context(messages=list(session.messages), tools=[], params=ModelParams())
+
+    async def append_tool_result(self, session: SessionState, result: HarnessToolResult) -> None:
+        output = result.output
+        if isinstance(output, ToolOutputSuccess):
+            content, is_error = output.content, False
+        elif isinstance(output, ToolOutputError):
+            content, is_error = output.message, True
+        else:
+            content, is_error = "", False
+        # Preserve the ``call_id`` on the recorded tool result so the assertion
+        # can match an assistant tool-call to its result by id (SPEC QUESTION 1):
+        # the recorded shape carries ``tool_use_id`` even though the production
+        # adapter's ``append_tool_result`` uses a role:"tool" text content.
+        msg = Message(
+            role=Role.TOOL,
+            content=ToolResultContent(
+                tool_use_id=result.call_id, content=content, is_error=is_error
+            ),
+        )
+        session.messages.append(msg)
+        self.messages.append(msg)
+
+    async def append_assistant_message(self, session: SessionState, message: Message) -> None:
+        session.messages.append(message)
+        self.messages.append(message)
+
+    async def append_user_message(self, session: SessionState, text: str) -> None:
+        msg = Message(role=Role.USER, content=TextContent(text=text))
+        session.messages.append(msg)
+        self.messages.append(msg)
+
+    def should_compact(self, session: SessionState) -> bool:
+        _ = session
+        return False
+
+
+def _assistant_tool_call_idx(messages: list[Message], call_id: str) -> int | None:
+    for i, m in enumerate(messages):
+        if (
+            m.role == Role.ASSISTANT
+            and isinstance(m.content, ToolCallContent)
+            and m.content.id == call_id
+        ):
+            return i
+    return None
+
+
+def _tool_result_idx(messages: list[Message], call_id: str) -> int | None:
+    for i, m in enumerate(messages):
+        if (
+            m.role == Role.TOOL
+            and isinstance(m.content, ToolResultContent)
+            and m.content.tool_use_id == call_id
+        ):
+            return i
+    return None
+
+
+async def test_tool_call_records_assistant_message_before_result() -> None:
+    """A turn that requests a tool call must record the assistant's tool-call
+    message in history, positioned BEFORE the tool result, so the next turn's
+    assembled context reflects what the agent already did."""
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc("c1", "read_file")], usage=_usage()))
+    a.push(FinalResponse(content="done", usage=_usage()))
+    cm = RecordingContextManager()
+    reg = ScriptedToolRegistry().push(ToolOutputSuccess(content="contents"))
+    h = StandardHarness(_config(a, context_manager=cm, tool_registry=reg))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+
+    assistant_idx = _assistant_tool_call_idx(cm.messages, "c1")
+    tool_idx = _tool_result_idx(cm.messages, "c1")
+    assert assistant_idx is not None, "assistant tool-call message must be recorded"
+    assert tool_idx is not None, "tool result must be recorded"
+    assert assistant_idx < tool_idx, (
+        f"assistant tool_use (idx {assistant_idx}) must precede its tool result (idx {tool_idx})"
+    )
+
+
+async def test_final_response_records_assistant_text() -> None:
+    """A final response must append the assistant's text to history so a
+    continued session sees what the agent said."""
+    a = _agent()
+    a.push(FinalResponse(content="the final answer", usage=_usage()))
+    cm = RecordingContextManager()
+    h = StandardHarness(_config(a, context_manager=cm))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+
+    assert any(
+        m.role == Role.ASSISTANT
+        and isinstance(m.content, TextContent)
+        and m.content.text == "the final answer"
+        for m in cm.messages
+    ), "assistant final text must be recorded in history"
+
+
+async def test_resume_after_surface_to_human_records_assistant_once_before_result() -> None:
+    """When a run pauses at BeforeTool (SurfaceToHuman) and is resumed with
+    Allow, the assistant tool-call message must already be in history — recorded
+    before the pause — and positioned before its tool result, with no duplicate
+    from the resume path."""
+    a = _agent()
+    calls = [_tc("c1", "read_file")]
+    a.push(ToolCallRequested(calls=calls, usage=_usage()))
+    a.push(FinalResponse(content="done", usage=_usage()))
+    cm = RecordingContextManager()
+    reg = ScriptedToolRegistry().push(ToolOutputSuccess(content="contents"))
+    req = HumanRequestToolApproval(calls=calls, risk_level="medium")
+    mw = ScriptedMiddleware().push("before_tool", MiddlewareSurfaceToHuman(request=req))
+    h = StandardHarness(_config(a, context_manager=cm, tool_registry=reg, middleware=mw))
+
+    paused = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(paused, RunResultWaitingForHuman)
+
+    resumed = await h.resume(paused.state, HumanResponseAllow())
+    assert isinstance(resumed, RunResultSuccess)
+
+    assistant_idx = _assistant_tool_call_idx(cm.messages, "c1")
+    tool_idx = _tool_result_idx(cm.messages, "c1")
+    assert assistant_idx is not None, "assistant tool-call must be recorded on the resume path"
+    assert tool_idx is not None, "tool result must be recorded"
+    assert assistant_idx < tool_idx, (
+        f"assistant tool_use (idx {assistant_idx}) must precede its tool result (idx {tool_idx})"
+    )
+    count = sum(
+        1
+        for m in cm.messages
+        if m.role == Role.ASSISTANT
+        and isinstance(m.content, ToolCallContent)
+        and m.content.id == "c1"
+    )
+    assert count == 1, "assistant tool-call must be recorded exactly once, not duplicated by resume"

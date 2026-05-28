@@ -260,6 +260,12 @@ class StandardCompactionAdapter:
             text = ""
         session.messages.append(Message(role=Role.TOOL, content=TextContent(text=text)))
 
+    async def append_assistant_message(self, session: HarnessState, message: Message) -> None:
+        # Record the assistant's turn (final text and/or the tool calls it
+        # requested) onto the harness-side message list so the next assemble()
+        # reflects what the agent already did. Mirrors ``append_tool_result``.
+        session.messages.append(message)
+
     async def append_user_message(self, session: HarnessState, text: str) -> None:
         session.messages.append(Message(role=Role.USER, content=TextContent(text=text)))
 

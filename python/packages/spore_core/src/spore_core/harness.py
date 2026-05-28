@@ -803,6 +803,15 @@ class ContextManager(Protocol):
         self, session: SessionState, result: HarnessToolResult
     ) -> None: ...
 
+    async def append_assistant_message(self, session: SessionState, message: Message) -> None:
+        """Append the assistant's turn (model output: text and/or the tool calls
+        it requested) to the conversation so the next :meth:`assemble` reflects
+        what the agent already did. Without this the model loses track of its own
+        actions and repeats them. Default: no-op — but structural (non-inheriting)
+        managers do not pick up this body, so the harness loop probes for the
+        method via ``getattr`` before calling it (see ``_run_react_inner``)."""
+        _ = (session, message)
+
     async def append_user_message(self, session: SessionState, text: str) -> None: ...
 
     def should_compact(self, session: SessionState) -> bool:
@@ -1758,6 +1767,16 @@ class StandardHarness:
                         budget_used.turns,
                     )
 
+                # Record the assistant's final text in history so a continued
+                # session reflects what the agent said. Structural managers do
+                # not inherit the Protocol default, so probe via ``getattr``.
+                appender = getattr(config.context_manager, "append_assistant_message", None)
+                if appender is not None:
+                    await appender(
+                        session_state,
+                        Message(role=Role.ASSISTANT, content=TextContent(text=result.content)),
+                    )
+
                 self._emit(on_stream, StreamFinalResponse(content=result.content))
                 return RunResultSuccess(
                     output=result.content,
@@ -1783,6 +1802,29 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                        )
+
+                # Record the assistant's turn (the tool calls the model
+                # requested) as soon as the calls are known — BEFORE the
+                # BeforeTool middleware (which may pause via SurfaceToHuman) and
+                # before any tool result. This keeps the conversation well-formed
+                # (assistant tool_use precedes its tool result) on every path,
+                # including human-in-the-loop resume, so the resume path never
+                # has to append it. The recorded turn reflects the model's
+                # original request; a middleware or human modification changes
+                # only what is dispatched. Structural managers do not inherit the
+                # Protocol default, so probe via ``getattr``.
+                appender = getattr(config.context_manager, "append_assistant_message", None)
+                if appender is not None:
+                    for call in result.calls:
+                        await appender(
+                            session_state,
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=MsgToolCallContent(
+                                    id=call.id, name=call.name, input=call.input
+                                ),
+                            ),
                         )
 
                 # Middleware: BeforeTool.

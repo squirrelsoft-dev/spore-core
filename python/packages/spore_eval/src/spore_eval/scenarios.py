@@ -127,12 +127,43 @@ class RealToolRegistry:
 # ============================================================================
 
 
+#: Operational system prompt for the live agent. The compaction adapter's
+#: ``assemble`` produces a context with **no system prompt** (it has no
+#: ``ContextSources`` to render one), so without this the model receives only
+#: the task as a user message and no guidance on how to behave. The three rules
+#: target the failure modes observed with small local models: describing actions
+#: instead of taking them, passing stringified arguments, and declaring success
+#: without checking the result.
+AGENT_SYSTEM_PROMPT = (
+    "You are an autonomous agent that completes tasks by calling the provided "
+    "tools. Follow these rules:\n"
+    "\n"
+    "1. ACT, DON'T DESCRIBE. To make something happen, call the appropriate "
+    "tool. Writing a shell command, code snippet, or file contents into your "
+    "text reply does NOT run it — only a real tool call has any effect. To "
+    "transform a file, call bash_command with the command itself; never write "
+    "the command text into a file as if it were the result.\n"
+    "\n"
+    "2. USE CORRECTLY-TYPED ARGUMENTS. Pass tool arguments as typed JSON: "
+    'booleans as true/false (not "true"), numbers as 12 (not "12"), lists as '
+    '["a"] (not "[\\"a\\"]"). Quoted-string scalars where a bool/number/array '
+    "is expected will be rejected.\n"
+    "\n"
+    "3. VERIFY BEFORE FINISHING. Before replying DONE, confirm your work "
+    "actually satisfies the request. If you wrote a file, read it back with "
+    "read_file and check its contents are exactly what was asked. If they do "
+    "not match, fix it and verify again. Only reply DONE once you have verified "
+    "the result is correct."
+)
+
+
 class SchemaInjectingContextManager:
     """Decorates a harness :class:`ContextManager`, delegating every seam
     method to the inner manager but injecting the registry's tool schemas into
-    ``assemble().tools``. The compaction adapter's ``assemble`` returns an empty
-    tool list, so without this decorator the model never sees any tools and can
-    never emit a tool call in live mode.
+    ``assemble().tools`` and prepending :data:`AGENT_SYSTEM_PROMPT`. The
+    compaction adapter's ``assemble`` returns an empty tool list and no system
+    prompt, so without this decorator the model never sees any tools (and can
+    never emit a tool call) nor any operational guidance in live mode.
     """
 
     def __init__(self, inner: HarnessContextManager, tools: list[ToolSchema]) -> None:
@@ -142,10 +173,29 @@ class SchemaInjectingContextManager:
     async def assemble(self, session: HarnessState, task: Task) -> AgentContext:
         ctx = await self._inner.assemble(session, task)
         ctx.tools = list(self._tools)
+        # Prepend the operational system prompt. The adapter's assemble yields
+        # none, so the model would otherwise get no guidance. Guard against
+        # duplicates so a resumed/seeded session that already leads with a System
+        # message isn't given two.
+        if not (ctx.messages and ctx.messages[0].role == Role.SYSTEM):
+            ctx.messages.insert(
+                0,
+                Message(role=Role.SYSTEM, content=TextContent(text=AGENT_SYSTEM_PROMPT)),
+            )
         return ctx
 
     async def append_tool_result(self, session: HarnessState, result: HarnessToolResult) -> None:
         await self._inner.append_tool_result(session, result)
+
+    async def append_assistant_message(self, session: HarnessState, message: Message) -> None:
+        # DELEGATE to the inner manager. The harness loop calls this outer
+        # decorator; without forwarding it the no-op Protocol default would run
+        # and the assistant-turn-recording fix would be dead. Probe via
+        # ``getattr`` mirroring this class's other optional-capability forwarding,
+        # since structural inner managers may not define the method.
+        appender = getattr(self._inner, "append_assistant_message", None)
+        if appender is not None:
+            await appender(session, message)
 
     async def append_user_message(self, session: HarnessState, text: str) -> None:
         await self._inner.append_user_message(session, text)
@@ -342,9 +392,20 @@ class ScenarioId(str, Enum):
 
 _PROMPTS: dict[ScenarioId, str] = {
     ScenarioId.S1: (
-        "Read the file input.txt, transform its contents to UPPERCASE, write the "
-        "result to output.txt, then read output.txt back to confirm it was written. "
-        "Use the read_file, write_file, and bash_command tools. When done, reply DONE."
+        "Complete this task step by step, using the provided tools:\n"
+        "1. Call read_file to read the contents of input.txt. Use the exact text "
+        "it returns — do not invent or substitute any text.\n"
+        "2. Take that exact text and rewrite it with every lowercase letter "
+        "changed to its capital form, keeping all other characters, spaces, and "
+        "punctuation the same.\n"
+        "3. Call write_file with path 'output.txt' and content set to the "
+        "uppercased text from step 2 — the literal capital letters themselves. "
+        "The content must be the transformed words from input.txt, NOT a shell "
+        "command, NOT a $(...) expression, and NOT any code.\n"
+        "4. Call read_file on output.txt and check its contents equal the "
+        "uppercased text from step 2.\n"
+        "Reply DONE only once output.txt contains input.txt's contents in all "
+        "capital letters."
     ),
     ScenarioId.S2: (
         "Create a file notes.md containing a TODO list with one item: 'set up the "
@@ -410,6 +471,7 @@ def build_scenario(scenario: ScenarioId, components: ScenarioComponents) -> Stan
 
 
 __all__ = [
+    "AGENT_SYSTEM_PROMPT",
     "CompleteOnFinalResponse",
     "FailingTool",
     "RealToolRegistry",
