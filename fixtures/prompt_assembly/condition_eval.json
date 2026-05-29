@@ -1,0 +1,261 @@
+{
+  "description": "Cross-language consistency fixture for the PromptAssemblyEngine condition evaluator (issue #79). Each case carries a serialized `condition` (a ChunkCondition; the `Custom` variant is intentionally excluded because it cannot serialize — see decision A3), an `assembly_context`, and the `expected` boolean result of evaluating the condition against the context. Covers rules R1-R8: R1 Always, R2 WhenMode, R3 WhenToolActive, R4 WhenToolCapability, R5 WhenPhase/WhenAgentType/WhenFeature (feature true iff present AND true), R6 OnTrigger (substring match; None message -> false), R7 OnEvent (event in pending_events), R8 All/Any/Not composition. Conditions use the internally-tagged `type` wire form. `active_capabilities` is encoded as an array of [tool, capability] pairs.",
+  "cases": [
+    {
+      "name": "r1_always_true",
+      "condition": { "type": "always" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected": true
+    },
+    {
+      "name": "r2_when_mode_match",
+      "condition": { "type": "when_mode", "mode": "plan" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning"
+      },
+      "expected": true
+    },
+    {
+      "name": "r2_when_mode_no_match",
+      "condition": { "type": "when_mode", "mode": "yolo" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning"
+      },
+      "expected": false
+    },
+    {
+      "name": "r3_when_tool_active_match",
+      "condition": { "type": "when_tool_active", "tool": "bash" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_tool_names": ["bash", "grep"]
+      },
+      "expected": true
+    },
+    {
+      "name": "r3_when_tool_active_no_match",
+      "condition": { "type": "when_tool_active", "tool": "browser" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_tool_names": ["bash", "grep"]
+      },
+      "expected": false
+    },
+    {
+      "name": "r4_when_tool_capability_match",
+      "condition": { "type": "when_tool_capability", "tool": "bash", "capability": "sandbox" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_capabilities": [["bash", "sandbox"]]
+      },
+      "expected": true
+    },
+    {
+      "name": "r4_when_tool_capability_no_match",
+      "condition": { "type": "when_tool_capability", "tool": "bash", "capability": "git" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_capabilities": [["bash", "sandbox"]]
+      },
+      "expected": false
+    },
+    {
+      "name": "r5_when_phase_match",
+      "condition": { "type": "when_phase", "phase": "verification" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "verification"
+      },
+      "expected": true
+    },
+    {
+      "name": "r5_when_agent_type_match",
+      "condition": { "type": "when_agent_type", "agent_type": "planner" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning",
+        "agent_type": "planner"
+      },
+      "expected": true
+    },
+    {
+      "name": "r5_when_agent_type_none",
+      "condition": { "type": "when_agent_type", "agent_type": "planner" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning"
+      },
+      "expected": false
+    },
+    {
+      "name": "r5_when_feature_present_true",
+      "condition": { "type": "when_feature", "feature": "beta" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "features": { "beta": true }
+      },
+      "expected": true
+    },
+    {
+      "name": "r5_when_feature_present_false",
+      "condition": { "type": "when_feature", "feature": "beta" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "features": { "beta": false }
+      },
+      "expected": false
+    },
+    {
+      "name": "r5_when_feature_absent",
+      "condition": { "type": "when_feature", "feature": "beta" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected": false
+    },
+    {
+      "name": "r6_on_trigger_substring_match",
+      "condition": { "type": "on_trigger", "words": ["deploy", "rollback"] },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "incoming_message": "please deploy the service now"
+      },
+      "expected": true
+    },
+    {
+      "name": "r6_on_trigger_no_match",
+      "condition": { "type": "on_trigger", "words": ["deploy"] },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "incoming_message": "fix the failing test"
+      },
+      "expected": false
+    },
+    {
+      "name": "r6_on_trigger_none_message_false",
+      "condition": { "type": "on_trigger", "words": ["deploy"] },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected": false
+    },
+    {
+      "name": "r7_on_event_match",
+      "condition": { "type": "on_event", "event": "pre_compact" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "pending_events": ["pre_turn", "pre_compact"]
+      },
+      "expected": true
+    },
+    {
+      "name": "r7_on_event_no_match",
+      "condition": { "type": "on_event", "event": "post_compact" },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "pending_events": ["pre_turn"]
+      },
+      "expected": false
+    },
+    {
+      "name": "r8_all_true",
+      "condition": {
+        "type": "all",
+        "conditions": [
+          { "type": "when_mode", "mode": "plan" },
+          { "type": "when_tool_active", "tool": "bash" }
+        ]
+      },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning",
+        "active_tool_names": ["bash"]
+      },
+      "expected": true
+    },
+    {
+      "name": "r8_all_false",
+      "condition": {
+        "type": "all",
+        "conditions": [
+          { "type": "when_mode", "mode": "plan" },
+          { "type": "when_tool_active", "tool": "grep" }
+        ]
+      },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning",
+        "active_tool_names": ["bash"]
+      },
+      "expected": false
+    },
+    {
+      "name": "r8_any_true",
+      "condition": {
+        "type": "any",
+        "conditions": [
+          { "type": "when_tool_active", "tool": "grep" },
+          { "type": "when_mode", "mode": "plan" }
+        ]
+      },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning",
+        "active_tool_names": ["bash"]
+      },
+      "expected": true
+    },
+    {
+      "name": "r8_not_true",
+      "condition": {
+        "type": "not",
+        "condition": { "type": "when_mode", "mode": "yolo" }
+      },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning"
+      },
+      "expected": true
+    },
+    {
+      "name": "r8_nested_all_any_not",
+      "condition": {
+        "type": "all",
+        "conditions": [
+          { "type": "when_phase", "phase": "execution" },
+          {
+            "type": "any",
+            "conditions": [
+              { "type": "when_tool_active", "tool": "bash" },
+              { "type": "not", "condition": { "type": "when_feature", "feature": "readonly" } }
+            ]
+          }
+        ]
+      },
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 2,
+        "mode": "safe_auto", "phase": "execution",
+        "features": { "readonly": true },
+        "active_tool_names": ["bash"]
+      },
+      "expected": true
+    }
+  ]
+}

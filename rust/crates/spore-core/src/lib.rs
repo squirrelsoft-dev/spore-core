@@ -35,6 +35,7 @@ pub mod observability_outbox;
 pub mod ollama;
 pub mod openai;
 pub mod plan;
+pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
 pub mod sandbox;
 pub mod scenarios;
@@ -119,6 +120,15 @@ pub use openai::OpenAIModelInterface;
 // `PlanArtifact` is re-exported via `hooks` above (it is the `OnPlanCreated`
 // payload); `plan` reuses that type and adds the capture step + phase error.
 pub use plan::{capture_plan_artifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
+// Prompt assembly engine (issue #79). `PromptChunk` and the chunk error type
+// collide by concept with #24's `prompt_chunk_registry` exports, so the
+// assembly-engine versions are re-exported under disambiguated aliases.
+pub use prompt_assembly::{
+    breakpoint_ids, chunks_to_segments, AssemblyBuckets, AssemblyContext, ChunkCondition,
+    ChunkProvider, ChunkProviderError, CompositeChunkProvider, ContextSourcesBuilder,
+    CustomCondition, EmbeddedChunkProvider, InMemoryChunkProvider,
+    PromptChunk as AssemblyPromptChunk, StorageScope, ToolAffinity,
+};
 pub use prompt_chunk_registry::{
     standard_chunks, ApprovalPolicy, CacheBlock, ChunkError, ChunkId, ChunkSlot,
     ChunkValidationError, Mode, PromptChunk, PromptChunkRegistry, StandardPromptChunkRegistry,

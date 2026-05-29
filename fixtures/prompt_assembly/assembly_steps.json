@@ -1,0 +1,215 @@
+{
+  "description": "Cross-language consistency fixture for the PromptAssemblyEngine assembly step (ContextSourcesBuilder::assemble) (issue #79). Each case carries `registered_chunks` (in registration order), an `assembly_context`, and the expected chunk-id lists in each stability bucket after assembly. A chunk is included when its `condition` evaluates true AND its `tool_affinity` AND `agent_affinity` gates pass. A chunk whose `triggers` match the incoming message is forced into the per_turn bucket regardless of its declared stability (R13); otherwise the bucket follows the chunk's `stability`. Covers R10 (bucketing), R11 (registration order within a bucket), R12 (tool-affinity 4-way matrix), R13 (trigger -> per_turn), R14 (OnEvent -> per_turn only when pending), R16 (cache_breakpoint preserved), R17 (inactive tool yields no chunk). The `Custom` condition variant is intentionally excluded (decision A3). Each PromptChunk requires `id`, `content`, `stability`; `condition` defaults to {\"type\":\"always\"}, `triggers`/`tool_affinity`/`agent_affinity`/`cache_breakpoint` default to empty/none/false. `active_capabilities` is an array of [tool, capability] pairs.",
+  "cases": [
+    {
+      "name": "r10_r11_bucketing_and_order",
+      "registered_chunks": [
+        { "id": "s1", "content": "static one", "stability": "static" },
+        { "id": "ps1", "content": "session one", "stability": "per_session" },
+        { "id": "s2", "content": "static two", "stability": "static" },
+        { "id": "pt1", "content": "turn one", "stability": "per_turn" },
+        { "id": "ps2", "content": "session two", "stability": "per_session" }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected_static": ["s1", "s2"],
+      "expected_per_session": ["ps1", "ps2"],
+      "expected_per_turn": ["pt1"]
+    },
+    {
+      "name": "r12_tool_affinity_tool_and_cap_active",
+      "registered_chunks": [
+        {
+          "id": "bash-git", "content": "git guide", "stability": "static",
+          "tool_affinity": { "tool_name": "bash", "capability": "git" }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_tool_names": ["bash"],
+        "active_capabilities": [["bash", "git"]]
+      },
+      "expected_static": ["bash-git"],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r12_tool_affinity_tool_active_cap_inactive",
+      "registered_chunks": [
+        {
+          "id": "bash-git", "content": "git guide", "stability": "static",
+          "tool_affinity": { "tool_name": "bash", "capability": "git" }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_tool_names": ["bash"]
+      },
+      "expected_static": [],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r12_tool_affinity_cap_present_tool_inactive",
+      "registered_chunks": [
+        {
+          "id": "bash-git", "content": "git guide", "stability": "static",
+          "tool_affinity": { "tool_name": "bash", "capability": "git" }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_capabilities": [["bash", "git"]]
+      },
+      "expected_static": [],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r12_tool_affinity_no_capability_tool_active",
+      "registered_chunks": [
+        {
+          "id": "bash-any", "content": "bash guide", "stability": "static",
+          "tool_affinity": { "tool_name": "bash", "capability": null }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "active_tool_names": ["bash"]
+      },
+      "expected_static": ["bash-any"],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r17_tool_inactive_no_description",
+      "registered_chunks": [
+        {
+          "id": "bash-desc", "content": "Bash tool description", "stability": "static",
+          "tool_affinity": { "tool_name": "bash", "capability": null }
+        },
+        { "id": "core", "content": "core identity", "stability": "static" }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected_static": ["core"],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r13_trigger_routes_static_to_per_turn",
+      "registered_chunks": [
+        {
+          "id": "playbook", "content": "rollback playbook", "stability": "static",
+          "condition": { "type": "on_trigger", "words": ["rollback"] },
+          "triggers": ["rollback"]
+        },
+        { "id": "core", "content": "core identity", "stability": "static" }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "incoming_message": "we must rollback now"
+      },
+      "expected_static": ["core"],
+      "expected_per_session": [],
+      "expected_per_turn": ["playbook"]
+    },
+    {
+      "name": "r13_trigger_no_match_excluded",
+      "registered_chunks": [
+        {
+          "id": "playbook", "content": "rollback playbook", "stability": "static",
+          "condition": { "type": "on_trigger", "words": ["rollback"] },
+          "triggers": ["rollback"]
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "incoming_message": "fix the bug"
+      },
+      "expected_static": [],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r14_on_event_injected_when_pending",
+      "registered_chunks": [
+        {
+          "id": "reminder", "content": "compaction reminder", "stability": "per_turn",
+          "condition": { "type": "on_event", "event": "pre_compact" }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "pending_events": ["pre_compact"]
+      },
+      "expected_static": [],
+      "expected_per_session": [],
+      "expected_per_turn": ["reminder"]
+    },
+    {
+      "name": "r14_on_event_absent_excluded",
+      "registered_chunks": [
+        {
+          "id": "reminder", "content": "compaction reminder", "stability": "per_turn",
+          "condition": { "type": "on_event", "event": "pre_compact" }
+        }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution",
+        "pending_events": ["pre_turn"]
+      },
+      "expected_static": [],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "r16_cache_breakpoint_preserved",
+      "registered_chunks": [
+        { "id": "a", "content": "a", "stability": "static" },
+        { "id": "b", "content": "b", "stability": "static", "cache_breakpoint": true },
+        { "id": "c", "content": "c", "stability": "static" }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "safe_auto", "phase": "execution"
+      },
+      "expected_static": ["a", "b", "c"],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    },
+    {
+      "name": "mode_and_phase_gating_combined",
+      "registered_chunks": [
+        {
+          "id": "plan-only", "content": "planning rules", "stability": "static",
+          "condition": { "type": "when_mode", "mode": "plan" }
+        },
+        {
+          "id": "exec-only", "content": "execution rules", "stability": "static",
+          "condition": { "type": "when_phase", "phase": "execution" }
+        },
+        { "id": "always", "content": "always", "stability": "static" }
+      ],
+      "assembly_context": {
+        "session_id": "s1", "task_id": "t1", "turn_number": 1,
+        "mode": "plan", "phase": "planning"
+      },
+      "expected_static": ["plan-only", "always"],
+      "expected_per_session": [],
+      "expected_per_turn": []
+    }
+  ]
+}

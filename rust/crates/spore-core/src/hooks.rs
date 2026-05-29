@@ -1749,6 +1749,7 @@ mod tests {
             hooks: None,
             planner_agent: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
+            chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
         }
     }
 }

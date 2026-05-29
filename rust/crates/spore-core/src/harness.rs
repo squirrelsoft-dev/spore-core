@@ -1213,6 +1213,11 @@ pub struct HarnessConfig {
     /// behave unchanged. v1 is expose-only — the run/resume loop is NOT
     /// modified to read/write sessions internally.
     pub storage: Arc<crate::storage::StorageProvider>,
+    /// Source of conditional prompt chunks (issue #79). Defaults to an empty
+    /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider).
+    /// The harness loads chunks from it at construction and feeds them through
+    /// a [`ContextSourcesBuilder`](crate::prompt_assembly::ContextSourcesBuilder).
+    pub chunk_provider: Arc<dyn crate::prompt_assembly::ChunkProvider>,
 }
 
 impl Clone for HarnessConfig {
@@ -1235,6 +1240,7 @@ impl Clone for HarnessConfig {
             hooks: self.hooks.clone(),
             planner_agent: self.planner_agent.clone(),
             storage: self.storage.clone(),
+            chunk_provider: self.chunk_provider.clone(),
         }
     }
 }
@@ -1282,6 +1288,10 @@ pub struct HarnessBuilder {
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     planner_agent: Option<Arc<dyn Agent>>,
     storage: Option<Arc<crate::storage::StorageProvider>>,
+    /// Conditional prompt-chunk source (issue #79). `None` resolves to an empty
+    /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider)
+    /// at build time.
+    chunk_provider: Option<Arc<dyn crate::prompt_assembly::ChunkProvider>>,
     /// Standard catalogue tools accumulated via [`HarnessBuilder::tool`] /
     /// [`HarnessBuilder::tools`] (issue #81). They are drained into a populated
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
@@ -1317,6 +1327,7 @@ impl HarnessBuilder {
             hooks: None,
             planner_agent: None,
             storage: None,
+            chunk_provider: None,
             standard_tools: Vec::new(),
         }
     }
@@ -1365,6 +1376,26 @@ impl HarnessBuilder {
     /// compile and behave unchanged.
     pub fn storage(mut self, storage: Arc<crate::storage::StorageProvider>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Set the conditional prompt-chunk provider (issue #79). Defaults to an
+    /// empty [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider).
+    pub fn chunk_provider(
+        mut self,
+        provider: Arc<dyn crate::prompt_assembly::ChunkProvider>,
+    ) -> Self {
+        self.chunk_provider = Some(provider);
+        self
+    }
+
+    /// Convenience: register chunks inline without constructing a provider
+    /// (issue #79). Resolves to an
+    /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider).
+    pub fn chunks(mut self, chunks: Vec<crate::prompt_assembly::PromptChunk>) -> Self {
+        self.chunk_provider = Some(Arc::new(
+            crate::prompt_assembly::InMemoryChunkProvider::new(chunks),
+        ));
         self
     }
 
@@ -1478,6 +1509,9 @@ impl HarnessBuilder {
             storage: self
                 .storage
                 .unwrap_or_else(|| Arc::new(crate::storage::StorageProvider::no_op())),
+            chunk_provider: self.chunk_provider.unwrap_or_else(|| {
+                Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
+            }),
         }
     }
 
@@ -3916,6 +3950,7 @@ mod tests {
             storage: Arc::new(crate::storage::StorageProvider::single(Arc::new(
                 crate::storage::InMemoryStorageProvider::new(),
             ))),
+            chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
         }
     }
 
@@ -4361,6 +4396,45 @@ mod tests {
             h2.storage().run().get(&sess, "plan").await.unwrap(),
             Some(serde_json::json!({"ok": true}))
         );
+    }
+
+    // Issue #79, R25: the builder defaults the chunk provider to an empty
+    // InMemoryChunkProvider, and `.chunks(...)` resolves to an
+    // InMemoryChunkProvider carrying the registered chunks.
+    #[tokio::test]
+    async fn default_chunk_provider_empty_and_chunks_setter_round_trips() {
+        use crate::prompt_assembly::PromptChunk;
+        let a = make_agent();
+        let reg = Arc::new(ScriptedToolRegistry::new());
+
+        // Default: empty provider.
+        let h = HarnessBuilder::new(
+            a.clone(),
+            reg.clone(),
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .build();
+        let loaded = h.config().chunk_provider.load().await.unwrap();
+        assert!(loaded.is_empty());
+
+        // `.chunks(...)` resolves to an InMemoryChunkProvider with those chunks.
+        let h2 = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .chunks(vec![
+            PromptChunk::new("core", "rules"),
+            PromptChunk::new("style", "be concise"),
+        ])
+        .build();
+        let loaded2 = h2.config().chunk_provider.load().await.unwrap();
+        assert_eq!(loaded2.len(), 2);
+        assert_eq!(loaded2[0].id, "core");
     }
 
     // Rule: parallel tool calls all dispatched in one turn.
@@ -6527,6 +6601,7 @@ mod tests {
                 hooks: None,
                 planner_agent: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
+                chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             })
         }
 

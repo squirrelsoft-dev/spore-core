@@ -72,6 +72,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         hooks: None,
         planner_agent: None,
         storage: Arc::new(spore_core::StorageProvider::no_op()),
+        chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
     };
     let harness = StandardHarness::new(config);
 
