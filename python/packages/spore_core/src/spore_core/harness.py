@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from .context import (
         SessionState as ContextSessionState,
     )
+    from .hooks import HookChain
 
 # ============================================================================
 # Identity newtypes
@@ -1233,6 +1234,8 @@ class HarnessConfig:
         max_compaction_attempts: int = 2,
         pricing: PricingTable | None = None,
         content_capture: ContentCaptureConfig | None = None,
+        max_stop_blocks: int = 8,
+        hooks: HookChain | None = None,
     ) -> None:
         self.agent = agent
         self.tool_registry = tool_registry
@@ -1241,6 +1244,14 @@ class HarnessConfig:
         self.termination_policy = termination_policy
         self.middleware = middleware
         self.observability = observability
+        # Lifecycle hook chain (issue #69). The harness fires registered Stop
+        # hooks when a loop strategy believes it is done; a Stop ``block``
+        # injects a reason and continues the loop. ``None`` means no hooks.
+        self.hooks: HookChain | None = hooks
+        # Maximum consecutive Stop-hook blocks honored per run before the loop
+        # terminates anyway (issue #69, R14). Per-run counter; resume starts
+        # fresh. Default 8, matching Claude Code's behavior.
+        self.max_stop_blocks = max_stop_blocks
         # Post-compaction verifier (issue #29/#46). The harness runs it after
         # each compaction turn and retries up to ``max_compaction_attempts``
         # before accepting a failing summary. Defaults to ``KeyTermVerifier``.
@@ -1292,6 +1303,20 @@ class HarnessBuilder:
         self._max_compaction_attempts: int = 2
         self._pricing: PricingTable = PricingTable.DEFAULT
         self._content_capture: ContentCaptureConfig | None = None
+        self._max_stop_blocks: int = 8
+        self._hooks: HookChain | None = None
+
+    def hooks(self, hooks: HookChain) -> HarnessBuilder:
+        """Inject a lifecycle hook chain (issue #69). The harness fires its
+        registered ``Stop`` hooks when a loop strategy believes it is done."""
+        self._hooks = hooks
+        return self
+
+    def max_stop_blocks(self, max_blocks: int) -> HarnessBuilder:
+        """Set the maximum consecutive Stop-hook blocks honored per run before
+        the loop terminates anyway (issue #69). Defaults to ``8``."""
+        self._max_stop_blocks = max_blocks
+        return self
 
     def compaction_verifier(self, verifier: CompactionVerifier) -> HarnessBuilder:
         """Inject a post-compaction verifier (issue #46). Defaults to
@@ -1352,6 +1377,8 @@ class HarnessBuilder:
             max_compaction_attempts=self._max_compaction_attempts,
             pricing=self._pricing,
             content_capture=self._content_capture,
+            max_stop_blocks=self._max_stop_blocks,
+            hooks=self._hooks,
         )
 
     def build(self) -> StandardHarness:
@@ -1409,6 +1436,54 @@ class StandardHarness:
             usage=usage,
             turns=turns,
         )
+
+    async def _fire_stop_hooks(
+        self,
+        session_id: SessionId,
+        task: Task,
+        turn_number: int,
+        last_output_text: str,
+        stop_blocks: int,
+    ) -> str | None:
+        """Fire registered ``Stop`` hooks (issue #69, R12-R14).
+
+        Returns the block ``reason`` to inject when the loop should continue (a
+        hook blocked and the per-run ``max_stop_blocks`` cap has not yet been
+        hit). Returns ``None`` to allow normal termination — no hook chain, no
+        block, the cap was reached, or a hook errored (a broken hook must not
+        loop forever, so its error is treated as a non-blocking outcome).
+        """
+        config = self._config
+        chain = config.hooks
+        if chain is None:
+            return None
+
+        from .context import SessionState as ContextSessionState
+        from .hooks import FireOutcome, StopContext, TurnOutput
+
+        rich_state = ContextSessionState(
+            session_id=session_id,
+            task_id=task.id,
+            task_instruction=task.instruction,
+        )
+        ctx = StopContext(
+            session_id=session_id,
+            turn_number=turn_number,
+            last_output=TurnOutput(text=last_output_text, had_tool_calls=False),
+            task_instruction=task.instruction,
+            session_state=rich_state,
+        )
+        try:
+            outcome = await chain.fire(ctx)
+        except Exception:  # noqa: BLE001 — a broken Stop hook must not loop forever
+            return None
+
+        if isinstance(outcome, FireOutcome) and outcome.kind == "block":
+            if stop_blocks >= config.max_stop_blocks:
+                return None  # R14: cap reached — terminate anyway.
+            return outcome.reason
+        # Continue / Inject / Deny → allow normal termination.
+        return None
 
     # ---- public API -------------------------------------------------
 
@@ -1580,6 +1655,10 @@ class StandardHarness:
         # recent turn span base — the parent for that turn's tool-call spans.
         span_seq = 0
         current_turn_base: SpanBase | None = None
+        # Per-run Stop-hook block counter (issue #69, R14). Resets on every
+        # run() — resume starts fresh. After ``max_stop_blocks`` consecutive
+        # blocks the loop terminates anyway.
+        stop_blocks = 0
         if task.budget.max_turns is not None:
             effective_turn_cap = min(task.budget.max_turns, max_iterations)
         else:
@@ -1776,6 +1855,22 @@ class StandardHarness:
                         session_state,
                         Message(role=Role.ASSISTANT, content=TextContent(text=result.content)),
                     )
+
+                # Stop hook (issue #69). The strategy believes the task is done;
+                # fire registered Stop hooks synchronously. If any blocks (and
+                # we are under ``max_stop_blocks``), inject the reason as a user
+                # message and continue the loop instead of terminating.
+                stop_reason = await self._fire_stop_hooks(
+                    session_id,
+                    task,
+                    budget_used.turns,
+                    result.content,
+                    stop_blocks,
+                )
+                if stop_reason is not None:
+                    stop_blocks += 1
+                    await config.context_manager.append_user_message(session_state, stop_reason)
+                    continue
 
                 self._emit(on_stream, StreamFinalResponse(content=result.content))
                 return RunResultSuccess(
