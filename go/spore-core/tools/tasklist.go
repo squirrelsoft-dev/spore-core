@@ -1,20 +1,43 @@
-// TaskList tool (#71): the single mutating tool over the persisted task list.
+// TaskList tool (#71, storage seam #75): the single mutating tool over the
+// persisted task list.
 //
 // One tool, TaskListTool (NAME = "task_list"), dispatched on an `action`
 // discriminator (add_task, update_task, complete_task, list_tasks). See the
-// parent package's tasklist.go for the types, the transition matrix, and the
-// disk-persistence helpers this tool drives.
+// parent package's tasklist.go for the types and the transition matrix.
 //
-// The tool is read-modify-write over the on-disk TaskListPath:
+// # Storage seam (#75)
+//
+// The tool persists via the *ToolContext's RunStore — NOT the sandbox
+// filesystem. It is read-modify-write keyed by the run's SessionID under
+// TaskListExtrasKey ("task_list"):
 //  1. parse params (bad input → recoverable error),
-//  2. load the current list (absent → default),
+//  2. toolCtx.Get(ctx, "task_list") (absent → DefaultTaskList),
 //  3. apply the action (domain errors → recoverable),
-//  4. persist the (possibly mutated) list,
+//  4. on a mutating action, toolCtx.Put(ctx, "task_list", value),
 //  5. return the serialized current list as success content.
+//
+// Shared key: this standalone tool and the harness-side PlanExecute execute loop
+// (#76) persist under the SAME RunStore key ("task_list"), keyed by SessionID. A
+// standalone tool call and a PlanExecute run on the same session intentionally
+// share one blob. The JSON shape is the canonical TaskList serialization
+// ({"tasks":[...],"next_id":N}), unchanged.
+//
+// Behavior change vs the retired sandbox path: previously the tool persisted to
+// .spore/task_list.json via the sandbox. That path is GONE. With the library's
+// default storage (storage.NoOp / a nil RunStore on the ToolContext) a standalone
+// tool call persists NOTHING across processes — the no-op run store silently
+// discards writes and returns "not found" on read. This is an accepted behavior
+// change: durable cross-process persistence now requires configuring a real
+// StorageProvider (and injecting it via StandardToolRegistry.SetToolContext).
+// There is NO migration shim for old on-disk .spore/task_list.json files.
+//
+// Storage-error mapping: a storage Get/Put error maps to a recoverable
+// ToolOutput error, as does a present-but-malformed blob (parse failure).
+// list_tasks never writes.
 //
 // CRITICAL: this tool is NOT annotated ReadOnly. Read-only tools are run
 // CONCURRENTLY by DispatchAll, and a concurrent read-modify-write over the same
-// file would race. Leaving ReadOnly false makes the registry dispatch it
+// key would race. Leaving ReadOnly false makes the registry dispatch it
 // sequentially. Destructive / OpenWorld are also left false so it is not
 // treated as an irreversible side effect.
 
@@ -69,7 +92,7 @@ func (*TaskListTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ sporecore.SandboxProvider, toolCtx *sporecore.ToolContext) sporecore.ToolOutput {
 	// 1. Parse params (bad input → recoverable).
 	var params TaskListParams
 	if e := parseParams(call, &params); e != nil {
@@ -79,13 +102,18 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 		return e.ToToolOutput()
 	}
 
-	// 2. Load current list (absent → default).
-	list, v, err := sporecore.LoadTaskList(ctx, sandbox)
-	if v != nil {
-		return SandboxViolationError(v).ToToolOutput()
-	}
+	// 2. Load current list from the run store, keyed by SessionID under the
+	//    shared TaskListExtrasKey (absent → default). A storage error or a
+	//    malformed blob is recoverable.
+	list := sporecore.DefaultTaskList()
+	value, found, err := toolCtx.Get(ctx, sporecore.TaskListExtrasKey)
 	if err != nil {
-		return ExecutionFailed(err.Error(), true).ToToolOutput()
+		return ExecutionFailed(fmt.Sprintf("could not load task list: %s", err), true).ToToolOutput()
+	}
+	if found {
+		if err := json.Unmarshal(value, &list); err != nil {
+			return ExecutionFailed(fmt.Sprintf("could not parse task list: %s", err), true).ToToolOutput()
+		}
 	}
 
 	// 3. Apply the action. Domain errors → recoverable. list_tasks does not mutate.
@@ -108,12 +136,15 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 		// No mutation.
 	}
 
-	// 4. Persist the (possibly mutated) list. list_tasks skips the write.
+	// 4. Persist the (possibly mutated) list through the run store under the
+	//    shared TaskListExtrasKey. list_tasks skips the write.
 	if mutated {
-		if v, err := sporecore.StoreTaskList(ctx, list, sandbox); v != nil {
-			return SandboxViolationError(v).ToToolOutput()
-		} else if err != nil {
-			return ExecutionFailed(err.Error(), true).ToToolOutput()
+		encoded, err := json.Marshal(list)
+		if err != nil {
+			return ExecutionFailed(fmt.Sprintf("could not serialize task list: %s", err), true).ToToolOutput()
+		}
+		if err := toolCtx.Put(ctx, sporecore.TaskListExtrasKey, encoded); err != nil {
+			return ExecutionFailed(fmt.Sprintf("could not persist task list: %s", err), true).ToToolOutput()
 		}
 	}
 

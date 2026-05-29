@@ -22,7 +22,7 @@ func TestExecEchoRunsAndReturnsStdout(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
-		call("exec", "c1", map[string]any{"command": "echo", "args": []string{"hi"}}), sb)
+		call("exec", "c1", map[string]any{"command": "echo", "args": []string{"hi"}}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -53,7 +53,7 @@ func TestExecHasNoShellSemantics(t *testing.T) {
 
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
-		call("exec", "c1", map[string]any{"command": "echo", "args": []string{"a|b", "$(whoami)", ">out"}}), sb)
+		call("exec", "c1", map[string]any{"command": "echo", "args": []string{"a|b", "$(whoami)", ">out"}}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -71,7 +71,7 @@ func TestExecNonzeroExitIsRecoverable(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
-		call("exec", "c1", map[string]any{"command": "false"}), sb)
+		call("exec", "c1", map[string]any{"command": "false"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}
@@ -83,7 +83,7 @@ func TestExecTimeoutRecoverable(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
-		call("exec", "c1", map[string]any{"command": "sleep", "args": []string{"5"}, "timeout": 1}), sb)
+		call("exec", "c1", map[string]any{"command": "sleep", "args": []string{"5"}, "timeout": 1}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable error, got %+v", r)
 	}
@@ -95,7 +95,7 @@ func TestExecTimeoutRecoverable(t *testing.T) {
 func TestExecInvalidParams(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewExecTool().Execute(context.Background(),
-		sporecore.ToolCall{ID: "c1", Name: "exec", Input: json.RawMessage(`{}`)}, sb)
+		sporecore.ToolCall{ID: "c1", Name: "exec", Input: json.RawMessage(`{}`)}, sb, nil)
 	// Empty command produces an exec error from the sandbox -> recoverable error.
 	if r.Kind != sporecore.ToolOutputError {
 		t.Fatalf("%+v", r)
@@ -110,7 +110,7 @@ func TestBashCommandSupportsPipeline(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewBashCommandTool().Execute(context.Background(),
-		call("bash_command", "c1", map[string]any{"script": "printf 'hi' | tr a-z A-Z"}), sb)
+		call("bash_command", "c1", map[string]any{"script": "printf 'hi' | tr a-z A-Z"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -128,7 +128,7 @@ func TestBashCommandSupportsRedirect(t *testing.T) {
 	defer os.Remove(tmp)
 	script := fmt.Sprintf("printf 'data' > %s", tmp)
 	r := NewBashCommandTool().Execute(context.Background(),
-		call("bash_command", "c1", map[string]any{"script": script}), sb)
+		call("bash_command", "c1", map[string]any{"script": script}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -147,7 +147,7 @@ func TestBashCommandNonzeroExitIsRecoverable(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewBashCommandTool().Execute(context.Background(),
-		call("bash_command", "c1", map[string]any{"script": "exit 3"}), sb)
+		call("bash_command", "c1", map[string]any{"script": "exit 3"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}
@@ -159,7 +159,7 @@ func TestBashCommandTimeoutRecoverable(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewBashCommandTool().Execute(context.Background(),
-		call("bash_command", "c1", map[string]any{"script": "sleep 5", "timeout": 1}), sb)
+		call("bash_command", "c1", map[string]any{"script": "sleep 5", "timeout": 1}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable error, got %+v", r)
 	}
@@ -171,7 +171,7 @@ func TestBashCommandTimeoutRecoverable(t *testing.T) {
 func TestBashCommandInvalidParams(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewBashCommandTool().Execute(context.Background(),
-		sporecore.ToolCall{ID: "c1", Name: "bash_command", Input: json.RawMessage(`{}`)}, sb)
+		sporecore.ToolCall{ID: "c1", Name: "bash_command", Input: json.RawMessage(`{}`)}, sb, nil)
 	// Missing script -> empty script via /bin/sh -c "" exits 0 with no output;
 	// guard only that it does not panic and returns a defined output kind.
 	if r.Kind != sporecore.ToolOutputSuccess && r.Kind != sporecore.ToolOutputError {

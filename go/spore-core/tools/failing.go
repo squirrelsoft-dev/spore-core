@@ -46,7 +46,7 @@ func (*FailingTool) Schema() sporecore.RegistryToolSchema {
 
 // Execute always returns a recoverable ToolOutputError so the loop surfaces it
 // to the agent instead of halting.
-func (*FailingTool) Execute(_ context.Context, _ sporecore.ToolCall, _ sporecore.SandboxProvider) sporecore.ToolOutput {
+func (*FailingTool) Execute(_ context.Context, _ sporecore.ToolCall, _ sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	return sporecore.ToolOutput{
 		Kind:        sporecore.ToolOutputError,
 		Message:     "flaky_op is unavailable right now; try a different approach",

@@ -1,11 +1,17 @@
-// Tool-boundary tests for the TaskList tool (#71), plus fixture replay against
-// the shared /fixtures/tasklist ground-truth files.
+// Tool-boundary tests for the TaskList tool (#71, storage seam #75), plus
+// fixture replay against the shared /fixtures/tasklist ground-truth files.
+//
+// The tool now persists via the *ToolContext's RunStore (keyed by SessionID
+// under TaskListExtrasKey), NOT the retired .spore/task_list.json sandbox path.
+// These tests drive over an in-memory RunStore; the sandbox is irrelevant to
+// persistence and is proven so by persists_to_run_store_not_sandbox below.
 
 package tools
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,22 +19,65 @@ import (
 	"testing"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/storage"
 )
 
-// tlSandbox roots resolved paths inside a tempdir so the read-modify-write hits
-// a real, isolated file. Embeds DefaultSandbox for the unused methods.
-type tlSandbox struct {
-	sporecore.AllowAllSandbox
-	root string
+const testSession = "test-session"
+
+// inMemCtx builds a ToolContext over a fresh in-memory run store and the default
+// test session id. Returns the context and the underlying store so a test can
+// read the persisted blob straight off the store.
+func inMemCtx() (*sporecore.ToolContext, *storage.InMemoryStorageProvider) {
+	store := storage.NewInMemoryStorageProvider()
+	return sporecore.NewToolContext(testSession, store), store
 }
 
-func (s tlSandbox) ResolvePath(_ context.Context, path string, _ sporecore.Operation) (string, *sporecore.SandboxViolation) {
-	return filepath.Join(s.root, path), nil
-}
-
-func newTLSandbox(t *testing.T) tlSandbox {
+// loadFromStore reads the persisted blob off a run store as a TaskList. found is
+// false when nothing has been persisted.
+func loadFromStore(t *testing.T, store *storage.InMemoryStorageProvider, session string) (sporecore.TaskList, bool) {
 	t.Helper()
-	return tlSandbox{root: t.TempDir()}
+	value, found, err := store.Get(context.Background(), sporecore.SessionID(session), sporecore.TaskListExtrasKey)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if !found {
+		return sporecore.TaskList{}, false
+	}
+	var l sporecore.TaskList
+	if err := json.Unmarshal(value, &l); err != nil {
+		t.Fatalf("unmarshal persisted blob %q: %v", value, err)
+	}
+	return l, true
+}
+
+// denyPathSandbox approves Validate but denies every ResolvePath, proving the
+// tool persists to the RunStore and never touches the filesystem sandbox.
+type denyPathSandbox struct{ sporecore.AllowAllSandbox }
+
+func (denyPathSandbox) ResolvePath(_ context.Context, path string, _ sporecore.Operation) (string, *sporecore.SandboxViolation) {
+	return "", &sporecore.SandboxViolation{Kind: sporecore.SandboxPathEscape, Path: path}
+}
+
+// failingRunStore always errors on Get/Put, to prove storage errors map to a
+// recoverable tool error.
+type failingRunStore struct{}
+
+func (failingRunStore) Get(context.Context, sporecore.SessionID, string) (json.RawMessage, bool, error) {
+	return nil, false, errors.New("boom")
+}
+func (failingRunStore) Put(context.Context, sporecore.SessionID, string, json.RawMessage) error {
+	return errors.New("boom")
+}
+
+// corruptRunStore returns a present-but-malformed blob for any key, to prove a
+// parse failure is recoverable.
+type corruptRunStore struct{}
+
+func (corruptRunStore) Get(context.Context, sporecore.SessionID, string) (json.RawMessage, bool, error) {
+	return json.RawMessage(`{"not":"a task list","tasks":42}`), true, nil
+}
+func (corruptRunStore) Put(context.Context, sporecore.SessionID, string, json.RawMessage) error {
+	return nil
 }
 
 func tlCall(input any) sporecore.ToolCall {
@@ -49,29 +98,36 @@ func parseList(t *testing.T, out sporecore.ToolOutput) sporecore.TaskList {
 }
 
 func TestAddThenListPersistsAndAssignsIDs(t *testing.T) {
-	sb := newTLSandbox(t)
+	tc, store := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
 
-	r1 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb)
+	r1 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
 	l1 := parseList(t, r1)
 	if len(l1.Tasks) != 1 || l1.Tasks[0].ID != 1 || l1.NextID != 2 {
 		t.Fatalf("after add a: %+v", l1)
 	}
 
-	r2 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b"}), sb)
+	r2 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b"}), sb, tc)
 	l2 := parseList(t, r2)
 	if len(l2.Tasks) != 2 || l2.Tasks[0].ID != 1 || l2.Tasks[1].ID != 2 {
 		t.Fatalf("after add b: %+v", l2)
 	}
 
-	// The file actually exists on disk.
-	if _, err := os.Stat(filepath.Join(sb.root, sporecore.TaskListPath)); err != nil {
-		t.Fatalf("task list file missing: %v", err)
+	// The blob actually exists in the run store under the shared key.
+	persisted, found := loadFromStore(t, store, testSession)
+	if !found {
+		t.Fatal("task_list blob not persisted to run store")
+	}
+	pa, _ := json.Marshal(persisted)
+	la, _ := json.Marshal(l2)
+	if string(pa) != string(la) {
+		t.Fatalf("persisted %s != tool %s", pa, la)
 	}
 
 	// list_tasks returns the same list and does not mutate.
-	r3 := tool.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb)
+	r3 := tool.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb, tc)
 	l3 := parseList(t, r3)
 	a, _ := json.Marshal(l2)
 	b, _ := json.Marshal(l3)
@@ -80,30 +136,103 @@ func TestAddThenListPersistsAndAssignsIDs(t *testing.T) {
 	}
 }
 
-func TestUpdateStatusAndComplete(t *testing.T) {
-	sb := newTLSandbox(t)
+// Storage seam: persists to the RunStore, NOT the sandbox. Even with a sandbox
+// that denies every path, add_task succeeds and persists.
+func TestPersistsToRunStoreNotSandbox(t *testing.T) {
+	tc, store := inMemCtx()
+	tool := NewTaskListTool()
+	r := tool.Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "via run store"}),
+		denyPathSandbox{}, tc)
+	list := parseList(t, r)
+	if len(list.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %+v", list)
+	}
+	persisted, found := loadFromStore(t, store, testSession)
+	if !found {
+		t.Fatal("persisted despite sandbox path denial: blob missing")
+	}
+	pa, _ := json.Marshal(persisted)
+	la, _ := json.Marshal(list)
+	if string(pa) != string(la) {
+		t.Fatalf("persisted %s != tool %s", pa, la)
+	}
+}
+
+// Keyed by SessionID: two sessions over the SAME run store keep separate lists.
+func TestListsAreKeyedBySessionID(t *testing.T) {
+	store := storage.NewInMemoryStorageProvider()
+	tcA := sporecore.NewToolContext("session-a", store)
+	tcB := sporecore.NewToolContext("session-b", store)
+	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
-	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb)
 
-	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "status": "in_progress"}), sb)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a1"}), sb, tcA)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b1"}), sb, tcB)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b2"}), sb, tcB)
+
+	a, foundA := loadFromStore(t, store, "session-a")
+	b, foundB := loadFromStore(t, store, "session-b")
+	if !foundA || !foundB {
+		t.Fatalf("both sessions should persist: a=%v b=%v", foundA, foundB)
+	}
+	if len(a.Tasks) != 1 || a.Tasks[0].Description != "a1" {
+		t.Fatalf("session-a: %+v", a)
+	}
+	if len(b.Tasks) != 2 || b.Tasks[0].Description != "b1" || b.Tasks[1].Description != "b2" {
+		t.Fatalf("session-b: %+v", b)
+	}
+}
+
+// Persist then reload with a FRESH tool over the SAME ctx yields the identical
+// list.
+func TestPersistThenReloadYieldsIdenticalList(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	ctx := context.Background()
+
+	tool1 := NewTaskListTool()
+	tool1.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "one"}), sb, tc)
+	r := tool1.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "two"}), sb, tc)
+	fromTool := parseList(t, r)
+
+	// Fresh tool instance, same ctx: list_tasks reads back identical state.
+	tool2 := NewTaskListTool()
+	reloaded := tool2.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb, tc)
+	a, _ := json.Marshal(fromTool)
+	b, _ := json.Marshal(parseList(t, reloaded))
+	if string(a) != string(b) {
+		t.Fatalf("reload differs: %s != %s", a, b)
+	}
+}
+
+func TestUpdateStatusAndComplete(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb, tc)
+
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "status": "in_progress"}), sb, tc)
 	if parseList(t, r).Tasks[0].Status != sporecore.TaskStatusInProgress {
 		t.Fatalf("update: %+v", r)
 	}
 
-	r = tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": 1}), sb)
+	r = tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": 1}), sb, tc)
 	if parseList(t, r).Tasks[0].Status != sporecore.TaskStatusCompleted {
 		t.Fatalf("complete: %+v", r)
 	}
 }
 
 func TestUpdateDescriptionViaTool(t *testing.T) {
-	sb := newTLSandbox(t)
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
-	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb, tc)
 
-	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "description": "y"}), sb)
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "description": "y"}), sb, tc)
 	l := parseList(t, r)
 	if l.Tasks[0].Description != "y" || l.Tasks[0].Status != sporecore.TaskStatusPending {
 		t.Fatalf("update description: %+v", l.Tasks[0])
@@ -111,9 +240,9 @@ func TestUpdateDescriptionViaTool(t *testing.T) {
 }
 
 func TestUnknownIDIsRecoverableError(t *testing.T) {
-	sb := newTLSandbox(t)
+	tc, _ := inMemCtx()
 	r := NewTaskListTool().Execute(context.Background(),
-		tlCall(map[string]any{"action": "complete_task", "id": 42}), sb)
+		tlCall(map[string]any{"action": "complete_task", "id": 42}), sporecore.AllowAllSandbox{}, tc)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable error, got %+v", r)
 	}
@@ -123,12 +252,13 @@ func TestUnknownIDIsRecoverableError(t *testing.T) {
 }
 
 func TestInvalidTransitionOutOfCompletedIsRecoverable(t *testing.T) {
-	sb := newTLSandbox(t)
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
-	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb)
-	tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": 1}), sb)
-	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "status": "pending"}), sb)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "x"}), sb, tc)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": 1}), sb, tc)
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "status": "pending"}), sb, tc)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable error, got %+v", r)
 	}
@@ -138,7 +268,8 @@ func TestInvalidTransitionOutOfCompletedIsRecoverable(t *testing.T) {
 }
 
 func TestBadParamsIsRecoverableError(t *testing.T) {
-	sb := newTLSandbox(t)
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
 	cases := []map[string]any{
@@ -148,47 +279,88 @@ func TestBadParamsIsRecoverableError(t *testing.T) {
 		{"action": "complete_task"}, // missing id
 	}
 	for _, c := range cases {
-		r := tool.Execute(ctx, tlCall(c), sb)
+		r := tool.Execute(ctx, tlCall(c), sb, tc)
 		if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 			t.Fatalf("%v: expected recoverable error, got %+v", c, r)
 		}
 	}
 	// Empty input is also recoverable.
-	r := tool.Execute(ctx, sporecore.ToolCall{ID: "c1", Name: TaskListToolName, Input: json.RawMessage(`{}`)}, sb)
+	r := tool.Execute(ctx, sporecore.ToolCall{ID: "c1", Name: TaskListToolName, Input: json.RawMessage(`{}`)}, sb, tc)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("empty input: expected recoverable error, got %+v", r)
+	}
+}
+
+// Storage failure (Get/Put) → recoverable error.
+func TestStorageFailureIsRecoverableError(t *testing.T) {
+	tc := sporecore.NewToolContext(testSession, failingRunStore{})
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "x"}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+}
+
+// Malformed persisted blob → recoverable parse error.
+func TestCorruptBlobIsRecoverableError(t *testing.T) {
+	tc := sporecore.NewToolContext(testSession, corruptRunStore{})
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "list_tasks"}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+}
+
+// list_tasks does not write: a fresh ctx with a never-written store stays empty
+// after a list_tasks call.
+func TestListTasksDoesNotWrite(t *testing.T) {
+	tc, store := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "list_tasks"}),
+		sporecore.AllowAllSandbox{}, tc)
+	// Returns the empty default list.
+	want, _ := json.Marshal(sporecore.DefaultTaskList())
+	if r.Content != string(want) {
+		t.Fatalf("list_tasks content %q != default %q", r.Content, want)
+	}
+	// Nothing was persisted (list_tasks must not write).
+	if _, found := loadFromStore(t, store, testSession); found {
+		t.Fatal("list_tasks must not write to the run store")
+	}
+}
+
+// No-op default: a ToolContext with no RunStore persists nothing across
+// dispatches. add_task succeeds (no error) but the next tool sees an empty list.
+func TestNoOpStoragePersistsNothing(t *testing.T) {
+	tc := sporecore.NewToolContext(testSession, nil)
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "ephemeral"}), sb, tc)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("add_task should succeed under no-op storage, got %+v", r)
+	}
+	// A subsequent list_tasks sees an empty list — the write was discarded.
+	r2 := tool.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb, tc)
+	want, _ := json.Marshal(sporecore.DefaultTaskList())
+	if r2.Content != string(want) {
+		t.Fatalf("no-op storage should not persist; got %q", r2.Content)
 	}
 }
 
 func TestSchemaIsNotReadOnly(t *testing.T) {
 	s := NewTaskListTool().Schema()
 	if s.Annotations.ReadOnly {
-		t.Fatal("task_list must NOT be read_only (it mutates shared on-disk state)")
+		t.Fatal("task_list must NOT be read_only (it mutates shared state)")
 	}
 	if s.Annotations.Destructive || s.Annotations.OpenWorld {
 		t.Fatalf("task_list should not be destructive/open_world: %+v", s.Annotations)
 	}
 	if !json.Valid(s.Parameters) {
 		t.Fatal("schema parameters are not valid JSON")
-	}
-}
-
-func TestPersistThenReloadYieldsIdenticalList(t *testing.T) {
-	sb := newTLSandbox(t)
-	tool := NewTaskListTool()
-	ctx := context.Background()
-	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "one"}), sb)
-	r := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "two"}), sb)
-	fromTool := parseList(t, r)
-
-	reloaded, v, err := sporecore.LoadTaskList(ctx, sb)
-	if v != nil || err != nil {
-		t.Fatalf("reload: v=%v err=%v", v, err)
-	}
-	a, _ := json.Marshal(fromTool)
-	b, _ := json.Marshal(reloaded)
-	if string(a) != string(b) {
-		t.Fatalf("tool vs disk differ: %s != %s", a, b)
 	}
 }
 
@@ -220,8 +392,9 @@ type opScenario struct {
 	Steps []opStep `json:"steps"`
 }
 
-// Replay each operations scenario step-by-step against a real on-disk
-// read-modify-write, asserting the resulting list (or error kind) per step.
+// Replay each operations scenario step-by-step against a read-modify-write over
+// a fresh in-memory RunStore, asserting the resulting list (or error kind) per
+// step. Must replay byte-identically to the retired sandbox path.
 func TestFixtureReplayOperations(t *testing.T) {
 	data, err := os.ReadFile(taskListFixturePath(t, "operations.json"))
 	if err != nil {
@@ -235,13 +408,14 @@ func TestFixtureReplayOperations(t *testing.T) {
 		t.Fatal("expected >=1 scenario")
 	}
 	tool := NewTaskListTool()
+	sb := sporecore.AllowAllSandbox{}
 	ctx := context.Background()
 
 	for _, sc := range scenarios {
-		// Fresh isolated workspace per scenario.
-		sb := newTLSandbox(t)
+		// Fresh isolated run store per scenario.
+		tc, _ := inMemCtx()
 		for i, step := range sc.Steps {
-			out := tool.Execute(ctx, sporecore.ToolCall{ID: "c1", Name: TaskListToolName, Input: step.Action}, sb)
+			out := tool.Execute(ctx, sporecore.ToolCall{ID: "c1", Name: TaskListToolName, Input: step.Action}, sb, tc)
 			if step.Expected.OK {
 				if out.Kind != sporecore.ToolOutputSuccess {
 					t.Fatalf("%s step %d: expected Success, got %+v", sc.Name, i, out)

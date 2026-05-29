@@ -41,7 +41,7 @@ func (*ReadFileTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *ReadFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *ReadFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ReadFileParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -88,7 +88,7 @@ func (*WriteFileTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *WriteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *WriteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params WriteFileParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -148,7 +148,7 @@ func (*ListDirTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ListDirParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -219,7 +219,7 @@ func (*DeleteFileTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *DeleteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *DeleteFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params DeleteFileParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -267,7 +267,7 @@ func (*MoveFileTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *MoveFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *MoveFileTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params MoveFileParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()

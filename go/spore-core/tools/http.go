@@ -75,7 +75,7 @@ func (*HttpGetTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *HttpGetTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *HttpGetTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params HttpGetParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -128,7 +128,7 @@ func (*HttpPostTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *HttpPostTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *HttpPostTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params HttpPostParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()

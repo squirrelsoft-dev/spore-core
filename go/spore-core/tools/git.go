@@ -70,7 +70,7 @@ func (*GitLogTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *GitLogTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GitLogTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	params := GitLogParams{N: 20, Format: "oneline"}
 	if len(call.Input) > 0 {
 		if e := parseParams(call, &params); e != nil {
@@ -123,7 +123,7 @@ func (*GitDiffTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *GitDiffTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GitDiffTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params GitDiffParams
 	if len(call.Input) > 0 {
 		if e := parseParams(call, &params); e != nil {
@@ -178,7 +178,7 @@ func (*GitCommitTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *GitCommitTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GitCommitTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params GitCommitParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -231,7 +231,7 @@ func (*GitStatusTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *GitStatusTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GitStatusTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	out, e := runGit(ctx, []string{"status", "--porcelain"}, sandbox)
 	if e != nil {
 		return e.ToToolOutput()
@@ -273,7 +273,7 @@ func (*GitResetTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *GitResetTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GitResetTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params GitResetParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()

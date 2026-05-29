@@ -139,7 +139,10 @@ func runLive(scenario scenarios.ScenarioID, sessionID sporecore.SessionID, model
 	model := ollama.WithBaseURL(modelID, baseURL)
 	agent := sporecore.NewModelAgent("e2e-agent", model)
 
-	registry := scenarios.BuildRealToolRegistry(scenario)
+	// No RunStore is configured for the e2e binary, so the standalone
+	// task_list tool runs with the no-op storage default (persists nothing
+	// across processes — the retired .spore sandbox path is gone, #75).
+	registry := scenarios.BuildRealToolRegistry(scenario, sessionID, nil)
 	sandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: workspace})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build sandbox: %v\n", err)

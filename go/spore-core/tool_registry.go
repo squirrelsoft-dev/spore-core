@@ -266,11 +266,100 @@ func (e *DispatchError) UnmarshalJSON(data []byte) error {
 }
 
 // ============================================================================
+// ToolContext — the storage seam handed to every tool (#75)
+// ============================================================================
+
+// ToolRunStore is the consumer-side view of the per-run structured-state store
+// a tool persists durable state through (issue #75). It is the read-modify-write
+// subset of storage.RunStore (Get + Put), so a *storage.StorageProvider's Run()
+// store satisfies it structurally — the sporecore package never imports the
+// storage package (which would be an import cycle). Values are opaque JSON blobs
+// keyed by (SessionID, key); the store never knows the schema — the tool owns
+// serialization.
+//
+// This is intentionally distinct from (and a superset of) the harness-side
+// RunStore interface in harness.go, which only needs Put: the standalone
+// task_list tool also reads the current list before mutating it.
+type ToolRunStore interface {
+	// Get returns the stored value and found=false when absent.
+	Get(ctx context.Context, sessionID SessionID, key string) (value json.RawMessage, found bool, err error)
+	Put(ctx context.Context, sessionID SessionID, key string, value json.RawMessage) error
+}
+
+// ToolContext is the per-dispatch storage seam handed to every Tool.Execute
+// call, alongside (but SEPARATE from) both Go's context.Context and the
+// SandboxProvider. It carries the minimum a tool needs to persist durable state
+// via the storage layer:
+//
+//   - SessionID — the run's SessionID, the key namespace for the RunStore.
+//   - RunStore  — the run-store domain of the configured storage provider.
+//
+// It is a struct (not a pair) so future fields can be added without breaking the
+// Tool.Execute signature again. The SandboxProvider is intentionally NOT folded
+// in here — storage is additive; tools still receive the sandbox as its own
+// parameter (some tools need the filesystem sandbox and no storage). Likewise
+// the new ToolContext is NOT folded into Go's context.Context: that stays the
+// leading cancellation argument.
+//
+// A nil RunStore behaves like the no-op store: Get returns (nil, false, nil) and
+// Put discards. This is the library default, so a standalone tool with default
+// storage persists nothing across processes (an accepted behavior change vs. the
+// retired .spore/task_list.json sandbox path — see tools/tasklist.go).
+type ToolContext struct {
+	SessionID SessionID
+	RunStore  ToolRunStore
+}
+
+// NewToolContext builds a ToolContext from the run's session id and the
+// run-store seam. A nil runStore yields a context whose RunStore reads empty and
+// discards writes.
+func NewToolContext(sessionID SessionID, runStore ToolRunStore) *ToolContext {
+	return &ToolContext{SessionID: sessionID, RunStore: runStore}
+}
+
+// runStoreOrNoOp returns the configured run store, or a no-op store when nil so
+// callers never have to nil-check.
+func (c *ToolContext) runStoreOrNoOp() ToolRunStore {
+	if c == nil || c.RunStore == nil {
+		return noOpToolRunStore{}
+	}
+	return c.RunStore
+}
+
+// Get reads through the context's run store (no-op when unset).
+func (c *ToolContext) Get(ctx context.Context, key string) (json.RawMessage, bool, error) {
+	var sid SessionID
+	if c != nil {
+		sid = c.SessionID
+	}
+	return c.runStoreOrNoOp().Get(ctx, sid, key)
+}
+
+// Put writes through the context's run store (no-op when unset).
+func (c *ToolContext) Put(ctx context.Context, key string, value json.RawMessage) error {
+	var sid SessionID
+	if c != nil {
+		sid = c.SessionID
+	}
+	return c.runStoreOrNoOp().Put(ctx, sid, key, value)
+}
+
+// noOpToolRunStore is the silent-discard run store used when a ToolContext has
+// no RunStore configured (the library default).
+type noOpToolRunStore struct{}
+
+func (noOpToolRunStore) Get(context.Context, SessionID, string) (json.RawMessage, bool, error) {
+	return nil, false, nil
+}
+func (noOpToolRunStore) Put(context.Context, SessionID, string, json.RawMessage) error { return nil }
+
+// ============================================================================
 // Tool interface
 // ============================================================================
 
 // Tool is a single tool implementation. Tools are stateless and receive a
-// SandboxProvider on every dispatch.
+// SandboxProvider (environment seam) and a *ToolContext (storage seam) on every
+// dispatch.
 type Tool interface {
 	// Name must match the registered RegistryToolSchema.Name.
 	Name() string
@@ -284,9 +373,11 @@ type Tool interface {
 	// large enough to warrant routing through SandboxProvider.HandleLargeOutput.
 	MayProduceLargeOutput() bool
 
-	// Execute runs the tool with validated input. The SandboxProvider is
-	// the only path to the environment.
-	Execute(ctx context.Context, call ToolCall, sandbox SandboxProvider) ToolOutput
+	// Execute runs the tool with validated input. The SandboxProvider is the
+	// only path to the environment; the *ToolContext is the only path to
+	// durable storage (RunStore, keyed by the run's SessionID). Tools that do
+	// not persist state ignore toolCtx.
+	Execute(ctx context.Context, call ToolCall, sandbox SandboxProvider, toolCtx *ToolContext) ToolOutput
 }
 
 // ============================================================================
@@ -347,15 +438,47 @@ type registered struct {
 // StandardToolRegistry is the default in-memory registry. Concurrency-safe:
 // register / lookup go through a RWMutex. The lock is held only briefly;
 // the tool itself executes lock-free.
+//
+// Storage seam (#75): the registry is the per-run bridge. It is constructed with
+// the run's SessionID + RunStore (construction-injection, see
+// SetToolContext / scenarios.BuildRealToolRegistry) and builds a *ToolContext
+// inside Dispatch / DispatchAll, forwarding it into every Tool.Execute. The
+// harness-loop Dispatch(ctx, call, sandbox) signature is UNCHANGED — the
+// ToolContext is assembled registry-side, never threaded through the harness
+// call sites. When no ToolContext is injected the registry forwards one whose
+// RunStore is the no-op store (persists nothing).
 type StandardToolRegistry struct {
-	mu    sync.RWMutex
-	tools map[string]*registered
-	sets  []ToolSet
+	mu      sync.RWMutex
+	tools   map[string]*registered
+	sets    []ToolSet
+	toolCtx *ToolContext
 }
 
-// NewStandardToolRegistry constructs a StandardToolRegistry.
+// NewStandardToolRegistry constructs a StandardToolRegistry with the default
+// (no-op storage) ToolContext. Use SetToolContext to inject the run's SessionID
+// and RunStore so the standalone task_list tool persists across dispatches.
 func NewStandardToolRegistry() *StandardToolRegistry {
 	return &StandardToolRegistry{tools: map[string]*registered{}}
+}
+
+// SetToolContext injects the storage seam (SessionID + RunStore) the registry
+// forwards to every Tool.Execute via the *ToolContext. This is the Go form of
+// the construction-injection decision (#75): call it once, before dispatch, with
+// the per-run session id and run store. Passing nil resets to the no-op default.
+func (r *StandardToolRegistry) SetToolContext(toolCtx *ToolContext) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toolCtx = toolCtx
+}
+
+// dispatchToolContext returns the injected ToolContext, or a fresh no-op one.
+func (r *StandardToolRegistry) dispatchToolContext() *ToolContext {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.toolCtx != nil {
+		return r.toolCtx
+	}
+	return NewToolContext("", nil)
 }
 
 // Register validates schema and annotations, then stores the tool.
@@ -481,7 +604,7 @@ func (r *StandardToolRegistry) Dispatch(
 		return HarnessToolResult{}, err
 	}
 
-	output := reg.tool.Execute(ctx, call, sandbox)
+	output := reg.tool.Execute(ctx, call, sandbox, r.dispatchToolContext())
 	return HarnessToolResult{CallID: call.ID, Output: output}, nil
 }
 

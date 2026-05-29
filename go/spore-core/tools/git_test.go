@@ -20,7 +20,7 @@ func TestGitStatusRuns(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewGitStatusTool().Execute(context.Background(),
-		call("git_status", "c1", map[string]any{}), sb)
+		call("git_status", "c1", map[string]any{}), sb, nil)
 	// Either Success (inside a repo) or Error (outside one) — both fine.
 	if r.Kind != sporecore.ToolOutputSuccess && r.Kind != sporecore.ToolOutputError {
 		t.Fatalf("%+v", r)

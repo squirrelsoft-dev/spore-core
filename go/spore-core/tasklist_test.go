@@ -1,33 +1,16 @@
-// Unit tests for the task-list primitive (#71): types, transition matrix,
-// mutation helpers, and disk persistence.
+// Unit tests for the task-list primitive (#71): types, transition matrix, and
+// mutation helpers. Persistence moved off the sandbox onto the RunStore (#75);
+// the standalone tool's persistence is covered in tools/tasklist_test.go.
 
 package sporecore
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 )
-
-// tempRootSandbox roots resolved paths inside a tempdir so the read-modify-write
-// hits a real, isolated file. It embeds DefaultSandbox for the methods the
-// task-list path never exercises.
-type tempRootSandbox struct {
-	AllowAllSandbox
-	root string
-}
-
-func (s tempRootSandbox) ResolvePath(_ context.Context, path string, _ Operation) (string, *SandboxViolation) {
-	return filepath.Join(s.root, path), nil
-}
-
-func newTempRootSandbox(t *testing.T) tempRootSandbox {
-	t.Helper()
-	return tempRootSandbox{root: t.TempDir()}
-}
 
 // listWith builds a list of len(statuses) tasks (descriptions "t") and sets
 // each task's status positionally.
@@ -346,38 +329,6 @@ func TestPopulatedSerializesCanonically(t *testing.T) {
 	want := `{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}`
 	if string(got) != want {
 		t.Fatalf("got %s", got)
-	}
-}
-
-// LoadTaskList on an absent file yields the default; store-then-reload is
-// identical.
-func TestPersistThenReloadIdentical(t *testing.T) {
-	sb := newTempRootSandbox(t)
-	ctx := context.Background()
-
-	// Absent file → default.
-	loaded, v, err := LoadTaskList(ctx, sb)
-	if v != nil || err != nil {
-		t.Fatalf("load absent: v=%v err=%v", v, err)
-	}
-	if loaded.NextID != 1 || len(loaded.Tasks) != 0 {
-		t.Fatalf("absent load not default: %+v", loaded)
-	}
-
-	loaded.Add("one")
-	loaded.Add("two")
-	if v, err := StoreTaskList(ctx, loaded, sb); v != nil || err != nil {
-		t.Fatalf("store: v=%v err=%v", v, err)
-	}
-
-	reloaded, v, err := LoadTaskList(ctx, sb)
-	if v != nil || err != nil {
-		t.Fatalf("reload: v=%v err=%v", v, err)
-	}
-	a, _ := json.Marshal(loaded)
-	b, _ := json.Marshal(reloaded)
-	if string(a) != string(b) {
-		t.Fatalf("persist/reload differ: %s != %s", a, b)
 	}
 }
 

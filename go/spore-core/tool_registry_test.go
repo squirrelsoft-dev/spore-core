@@ -19,7 +19,7 @@ type echoTool struct {
 func (e *echoTool) Name() string                { return e.name }
 func (e *echoTool) IsSubagentTool() bool        { return false }
 func (e *echoTool) MayProduceLargeOutput() bool { return false }
-func (e *echoTool) Execute(_ context.Context, call ToolCall, _ SandboxProvider) ToolOutput {
+func (e *echoTool) Execute(_ context.Context, call ToolCall, _ SandboxProvider, _ *ToolContext) ToolOutput {
 	e.calls.Add(1)
 	return ToolOutput{
 		Kind:    ToolOutputSuccess,
@@ -32,7 +32,7 @@ type subagentTool struct{ name string }
 func (s *subagentTool) Name() string                { return s.name }
 func (s *subagentTool) IsSubagentTool() bool        { return true }
 func (s *subagentTool) MayProduceLargeOutput() bool { return false }
-func (s *subagentTool) Execute(_ context.Context, _ ToolCall, _ SandboxProvider) ToolOutput {
+func (s *subagentTool) Execute(_ context.Context, _ ToolCall, _ SandboxProvider, _ *ToolContext) ToolOutput {
 	return ToolOutput{Kind: ToolOutputSuccess, Content: "subagent done"}
 }
 

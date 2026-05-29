@@ -56,7 +56,7 @@ func TestSubagentSuccessMaps(t *testing.T) {
 		{Kind: sporecore.RunSuccess, Output: "child done"},
 	}}
 	s := newSubagent(t, h, Isolated{})
-	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "do it"}), sporecore.AllowAllSandbox{})
+	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "do it"}), sporecore.AllowAllSandbox{}, nil)
 	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "child done" {
 		t.Fatalf("%+v", r)
 	}
@@ -67,7 +67,7 @@ func TestSubagentFailureMapsRecoverable(t *testing.T) {
 		{Kind: sporecore.RunFailure, Reason: sporecore.HaltReason{Kind: sporecore.HaltHumanHalted}},
 	}}
 	s := newSubagent(t, h, Isolated{})
-	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "x"}), sporecore.AllowAllSandbox{})
+	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "x"}), sporecore.AllowAllSandbox{}, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}
@@ -87,7 +87,7 @@ func TestSubagentWaitingForHumanPropagatesParentCallID(t *testing.T) {
 		{Kind: sporecore.RunWaitingForHuman, State: paused, Request: req},
 	}}
 	s := newSubagent(t, h, Isolated{})
-	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "x"}), sporecore.AllowAllSandbox{})
+	r := s.Execute(context.Background(), subagentCall(map[string]any{"instruction": "x"}), sporecore.AllowAllSandbox{}, nil)
 	if r.Kind != sporecore.ToolOutputWaitingForHuman {
 		t.Fatalf("%+v", r)
 	}
@@ -103,7 +103,7 @@ type subagentMockTool struct{}
 func (subagentMockTool) Name() string                { return "nested_sub" }
 func (subagentMockTool) IsSubagentTool() bool        { return true }
 func (subagentMockTool) MayProduceLargeOutput() bool { return false }
-func (subagentMockTool) Execute(context.Context, sporecore.ToolCall, sporecore.SandboxProvider) sporecore.ToolOutput {
+func (subagentMockTool) Execute(context.Context, sporecore.ToolCall, sporecore.SandboxProvider, *sporecore.ToolContext) sporecore.ToolOutput {
 	return sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess}
 }
 
@@ -135,7 +135,7 @@ func TestSubagentConstructionRejectsNestedChild(t *testing.T) {
 func TestSubagentMissingInstructionRecoverable(t *testing.T) {
 	h := &scriptedHarness{}
 	s := newSubagent(t, h, Isolated{})
-	r := s.Execute(context.Background(), subagentCall(map[string]any{}), sporecore.AllowAllSandbox{})
+	r := s.Execute(context.Background(), subagentCall(map[string]any{}), sporecore.AllowAllSandbox{}, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}

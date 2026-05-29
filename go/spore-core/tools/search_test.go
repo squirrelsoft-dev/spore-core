@@ -16,7 +16,7 @@ func TestGrepFindsMatches(t *testing.T) {
 	_ = os.WriteFile(p, []byte("alpha\nbeta\nalpha2"), 0o644)
 	sb := sporecore.AllowAllSandbox{}
 	r := NewGrepFilesTool().Execute(context.Background(),
-		call("grep_files", "c1", map[string]any{"pattern": "^alpha", "path": dir}), sb)
+		call("grep_files", "c1", map[string]any{"pattern": "^alpha", "path": dir}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -29,7 +29,7 @@ func TestGrepInvalidRegex(t *testing.T) {
 	dir := t.TempDir()
 	sb := sporecore.AllowAllSandbox{}
 	r := NewGrepFilesTool().Execute(context.Background(),
-		call("grep_files", "c1", map[string]any{"pattern": "(unclosed", "path": dir}), sb)
+		call("grep_files", "c1", map[string]any{"pattern": "(unclosed", "path": dir}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}
@@ -42,7 +42,7 @@ func TestFindFilesGlob(t *testing.T) {
 	}
 	sb := sporecore.AllowAllSandbox{}
 	r := NewFindFilesTool().Execute(context.Background(),
-		call("find_files", "c1", map[string]any{"glob": "*.go", "path": dir}), sb)
+		call("find_files", "c1", map[string]any{"glob": "*.go", "path": dir}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}

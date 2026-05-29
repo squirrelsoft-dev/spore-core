@@ -217,6 +217,7 @@ func (s *SubagentTool) Execute(
 	ctx context.Context,
 	call sporecore.ToolCall,
 	_ sporecore.SandboxProvider,
+	_ *sporecore.ToolContext,
 ) sporecore.ToolOutput {
 	// Extract instruction without insisting on full param parse — keep
 	// behaviour aligned with the Rust reference.

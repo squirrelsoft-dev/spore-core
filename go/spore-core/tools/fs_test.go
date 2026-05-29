@@ -21,11 +21,11 @@ func TestWriteThenReadRoundtrip(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	ctx := context.Background()
 
-	w := NewWriteFileTool().Execute(ctx, call("write_file", "c1", map[string]any{"path": p, "content": "hello"}), sb)
+	w := NewWriteFileTool().Execute(ctx, call("write_file", "c1", map[string]any{"path": p, "content": "hello"}), sb, nil)
 	if w.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("write: %+v", w)
 	}
-	r := NewReadFileTool().Execute(ctx, call("read_file", "c2", map[string]any{"path": p}), sb)
+	r := NewReadFileTool().Execute(ctx, call("read_file", "c2", map[string]any{"path": p}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "hello" {
 		t.Fatalf("read: %+v", r)
 	}
@@ -37,8 +37,8 @@ func TestAppendModeConcatenates(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	ctx := context.Background()
 	w := NewWriteFileTool()
-	w.Execute(ctx, call("write_file", "c1", map[string]any{"path": p, "content": "a"}), sb)
-	w.Execute(ctx, call("write_file", "c2", map[string]any{"path": p, "content": "b", "append": true}), sb)
+	w.Execute(ctx, call("write_file", "c1", map[string]any{"path": p, "content": "a"}), sb, nil)
+	w.Execute(ctx, call("write_file", "c2", map[string]any{"path": p, "content": "b", "append": true}), sb, nil)
 	got, _ := os.ReadFile(p)
 	if string(got) != "ab" {
 		t.Fatalf("got %q", got)
@@ -51,7 +51,7 @@ func TestListDirSorted(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(dir, n), nil, 0o644)
 	}
 	sb := sporecore.AllowAllSandbox{}
-	r := NewListDirTool().Execute(context.Background(), call("list_dir", "c1", map[string]any{"path": dir}), sb)
+	r := NewListDirTool().Execute(context.Background(), call("list_dir", "c1", map[string]any{"path": dir}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -70,7 +70,7 @@ func TestListDirSorted(t *testing.T) {
 func TestDeleteMissingIsRecoverable(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewDeleteFileTool().Execute(context.Background(),
-		call("delete_file", "c1", map[string]any{"path": "/no/such/path/here"}), sb)
+		call("delete_file", "c1", map[string]any{"path": "/no/such/path/here"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable error, got %+v", r)
 	}
@@ -87,7 +87,7 @@ func TestReadMissingInWorkspaceFileIsRecoverableNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewReadFileTool().Execute(context.Background(),
-		call("read_file", "c1", map[string]any{"path": "output.txt"}), sb)
+		call("read_file", "c1", map[string]any{"path": "output.txt"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("expected recoverable not-found error, got %+v", r)
 	}
@@ -103,7 +103,7 @@ func TestReadOutsideRootIsPathEscape(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewReadFileTool().Execute(context.Background(),
-		call("read_file", "c1", map[string]any{"path": "../nonexistent_passwd"}), sb)
+		call("read_file", "c1", map[string]any{"path": "../nonexistent_passwd"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || r.Recoverable {
 		t.Fatalf("expected non-recoverable path-escape error, got %+v", r)
 	}
@@ -116,7 +116,7 @@ func TestMoveFileRenames(t *testing.T) {
 	_ = os.WriteFile(src, []byte("hi"), 0o644)
 	sb := sporecore.AllowAllSandbox{}
 	r := NewMoveFileTool().Execute(context.Background(),
-		call("move_file", "c1", map[string]any{"src": src, "dst": dst}), sb)
+		call("move_file", "c1", map[string]any{"src": src, "dst": dst}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("%+v", r)
 	}
@@ -131,7 +131,7 @@ func TestMoveFileRenames(t *testing.T) {
 func TestInvalidParamsReturnsRecoverableError(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewReadFileTool().Execute(context.Background(),
-		sporecore.ToolCall{ID: "c1", Name: "read_file", Input: json.RawMessage(`{}`)}, sb)
+		sporecore.ToolCall{ID: "c1", Name: "read_file", Input: json.RawMessage(`{}`)}, sb, nil)
 	// Missing required field is decoded as zero-value path; the actual
 	// failure surfaces from os.ReadFile. We accept either recoverable error
 	// (Rust serde-style "missing field") or the os error path.

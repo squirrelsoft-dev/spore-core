@@ -199,7 +199,7 @@ func TestFixtureReplaySubagentScenarios(t *testing.T) {
 			t.Fatalf("[%s] new: %v", sc.Name, err)
 		}
 		callIn := sporecore.ToolCall{ID: sc.ParentCallID, Name: "subagent", Input: json.RawMessage(`{"instruction":"x"}`)}
-		out := sub.Execute(context.Background(), callIn, sporecore.AllowAllSandbox{})
+		out := sub.Execute(context.Background(), callIn, sporecore.AllowAllSandbox{}, nil)
 
 		switch sc.Expected.Kind {
 		case "success":

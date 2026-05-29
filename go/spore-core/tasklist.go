@@ -35,10 +35,13 @@
 //   - R6  Completed is terminal: ANY transition OUT of Completed is rejected
 //     (the idempotent Completed → Completed self-transition is allowed).
 //   - R7  Self-transitions X → X are idempotent and always allowed.
-//   - R8  Persistence is interim, through the FILESYSTEM via the
-//     SandboxProvider read-modify-write at TaskListPath (DECISION 2). The tool
-//     does NOT touch SessionState.Extras — the Tool interface has no access to
-//     it; #59 owns the extras mirror.
+//   - R8  Persistence is through the storage seam (#75): the standalone tool
+//     (tools/tasklist.go) persists via the RunStore on the *ToolContext, keyed
+//     by SessionID under TaskListExtrasKey. The retired interim sandbox path
+//     (.spore/task_list.json) is GONE; with the library's default no-op storage
+//     a standalone tool call persists nothing across processes (an accepted
+//     behavior change — no migration shim). #76's PlanExecute execute loop
+//     shares the same RunStore key.
 //
 // Both design forks (transition matrix, state seam) were resolved before
 // implementation; there are no open spec questions here.
@@ -46,23 +49,17 @@
 package sporecore
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
-// TaskListExtrasKey is the key under which the TaskList is mirrored into
-// SessionState.Extras (serialized JSON) by the harness / #59. Stable across all
-// four languages. NOTE: #71 itself does NOT write this key (the Tool interface
-// has no SessionState access); it is the contract the harness-side mirror uses.
+// TaskListExtrasKey is the key under which the TaskList is persisted in the
+// RunStore, keyed by SessionID. Both the harness-side #76 execute loop and the
+// standalone TaskListTool (tools/tasklist.go, #75) share this single key, so a
+// standalone tool call and a PlanExecute run on the same session intentionally
+// share one blob. Stable across all four languages. The JSON shape is the
+// canonical TaskList serialization ({"tasks":[...],"next_id":N}).
 const TaskListExtrasKey = "task_list"
-
-// TaskListPath is the canonical on-disk location of the persisted task list,
-// relative to the sandbox/workspace root. Resolved through ResolvePath.
-const TaskListPath = ".spore/task_list.json"
 
 // ============================================================================
 // Types
@@ -300,59 +297,4 @@ func PlanArtifactToTaskList(artifact PlanArtifact) TaskList {
 		list.Add(step) // verbatim; appends pending; bumps NextID
 	}
 	return list
-}
-
-// ============================================================================
-// Disk persistence (interim — DECISION 2, mirrors the plan.go precedent)
-// ============================================================================
-
-// LoadTaskListError signals a malformed persisted task list. An absent file is
-// NOT an error — it yields DefaultTaskList. A sandbox violation is surfaced via
-// the *SandboxViolation return; a parse failure via this error.
-var ErrTaskListParse = errors.New("could not parse task list")
-
-// LoadTaskList loads the persisted TaskList from TaskListPath via the sandbox.
-//
-// An absent file (the expected first-run path) yields DefaultTaskList with a
-// nil error and nil violation. A sandbox violation resolving the path returns a
-// non-nil *SandboxViolation. A present-but-malformed file returns an error
-// wrapping ErrTaskListParse so the tool boundary can map it to a recoverable
-// error rather than silently discarding state.
-func LoadTaskList(ctx context.Context, sandbox SandboxProvider) (TaskList, *SandboxViolation, error) {
-	resolved, v := sandbox.ResolvePath(ctx, TaskListPath, OperationRead)
-	if v != nil {
-		return TaskList{}, v, nil
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		// Absent (or unreadable) file → fresh list. First-run path.
-		return DefaultTaskList(), nil, nil
-	}
-	var list TaskList
-	if err := json.Unmarshal(data, &list); err != nil {
-		return TaskList{}, nil, fmt.Errorf("%w: %s", ErrTaskListParse, err)
-	}
-	return list, nil, nil
-}
-
-// StoreTaskList persists list to TaskListPath via the sandbox, creating the
-// parent directory (.spore/) if needed. Serialization is the canonical compact
-// form with field order tasks then next_id.
-func StoreTaskList(ctx context.Context, list TaskList, sandbox SandboxProvider) (*SandboxViolation, error) {
-	resolved, v := sandbox.ResolvePath(ctx, TaskListPath, OperationWrite)
-	if v != nil {
-		return v, nil
-	}
-	if parent := filepath.Dir(resolved); parent != "" {
-		// Best-effort: ignore "already exists"; a real failure surfaces on write.
-		_ = os.MkdirAll(parent, 0o755)
-	}
-	encoded, err := json.Marshal(list)
-	if err != nil {
-		return nil, fmt.Errorf("could not serialize task list: %w", err)
-	}
-	if err := os.WriteFile(resolved, encoded, 0o644); err != nil {
-		return nil, fmt.Errorf("could not persist task list: %w", err)
-	}
-	return nil, nil
 }

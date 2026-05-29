@@ -65,7 +65,7 @@ func (*ExecTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ExecParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -140,7 +140,7 @@ func (*BashCommandTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params ShellCommandParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -216,7 +216,7 @@ func (*RunTestsTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params RunTestsParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()

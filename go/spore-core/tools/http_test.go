@@ -19,7 +19,7 @@ func TestHttpGetReturnsBody(t *testing.T) {
 
 	sb := sporecore.AllowAllSandbox{}
 	r := NewHttpGetTool().Execute(context.Background(),
-		call("http_get", "c1", map[string]any{"url": srv.URL + "/hello"}), sb)
+		call("http_get", "c1", map[string]any{"url": srv.URL + "/hello"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "world" {
 		t.Fatalf("%+v", r)
 	}
@@ -32,7 +32,7 @@ func TestHttpPostSendsJSONBody(t *testing.T) {
 	defer srv.Close()
 	sb := sporecore.AllowAllSandbox{}
 	r := NewHttpPostTool().Execute(context.Background(),
-		call("http_post", "c1", map[string]any{"url": srv.URL + "/echo", "body": map[string]any{"x": 1}}), sb)
+		call("http_post", "c1", map[string]any{"url": srv.URL + "/echo", "body": map[string]any{"x": 1}}), sb, nil)
 	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "ok" {
 		t.Fatalf("%+v", r)
 	}
@@ -41,7 +41,7 @@ func TestHttpPostSendsJSONBody(t *testing.T) {
 func TestHttpGetInvalidURL(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewHttpGetTool().Execute(context.Background(),
-		call("http_get", "c1", map[string]any{"url": "not-a-url://////"}), sb)
+		call("http_get", "c1", map[string]any{"url": "not-a-url://////"}), sb, nil)
 	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
 		t.Fatalf("%+v", r)
 	}

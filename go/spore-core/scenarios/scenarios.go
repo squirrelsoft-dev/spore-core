@@ -155,8 +155,15 @@ func (id ScenarioID) Prompt() string {
 // intended behavior. exec is safe everywhere because it cannot pipe or redirect.
 // Registration failures are programming errors (duplicate / invalid schema) and
 // panic.
-func BuildRealToolRegistry(scenario ScenarioID) *sporecore.StandardToolRegistry {
+//
+// Storage seam (#75, construction-injection): the run's SessionID + RunStore are
+// injected via SetToolContext so the standalone task_list tool persists through
+// the RunStore (keyed by SessionID) rather than the retired .spore sandbox path.
+// Pass a nil runStore for the no-op default (task_list then persists nothing
+// across processes).
+func BuildRealToolRegistry(scenario ScenarioID, sessionID sporecore.SessionID, runStore sporecore.ToolRunStore) *sporecore.StandardToolRegistry {
 	reg := sporecore.NewStandardToolRegistry()
+	reg.SetToolContext(sporecore.NewToolContext(sessionID, runStore))
 	must := func(err error) {
 		if err != nil {
 			panic(err)

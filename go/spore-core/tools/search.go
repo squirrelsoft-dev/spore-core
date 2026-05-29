@@ -81,7 +81,7 @@ func splitLines(s string) []string {
 	return out
 }
 
-func (t *GrepFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *GrepFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params GrepFilesParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
@@ -170,7 +170,7 @@ func (*FindFilesTool) Schema() sporecore.RegistryToolSchema {
 	}
 }
 
-func (t *FindFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider) sporecore.ToolOutput {
+func (t *FindFilesTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
 	var params FindFilesParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
