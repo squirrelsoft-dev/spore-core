@@ -6,7 +6,9 @@ package sporecore
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -376,6 +378,159 @@ func TestPersistThenReloadIdentical(t *testing.T) {
 	b, _ := json.Marshal(reloaded)
 	if string(a) != string(b) {
 		t.Fatalf("persist/reload differ: %s != %s", a, b)
+	}
+}
+
+// ============================================================================
+// PlanArtifactToTaskList (#72)
+// ============================================================================
+
+// planArtifact is a small constructor for test inputs.
+func planArtifact(tasks []string, rationale string) PlanArtifact {
+	return PlanArtifact{Tasks: tasks, Rationale: rationale}
+}
+
+// One task per plan step, plan order preserved, all pending.
+func TestPlanOneTaskPerStepInOrderAllPending(t *testing.T) {
+	list := PlanArtifactToTaskList(planArtifact([]string{"first", "second", "third"}, ""))
+	want := []string{"first", "second", "third"}
+	if len(list.Tasks) != len(want) {
+		t.Fatalf("len(tasks) = %d, want %d", len(list.Tasks), len(want))
+	}
+	for i, w := range want {
+		if list.Tasks[i].Description != w {
+			t.Fatalf("task[%d].description = %q, want %q", i, list.Tasks[i].Description, w)
+		}
+		if list.Tasks[i].Status != TaskStatusPending {
+			t.Fatalf("task[%d].status = %q, want pending", i, list.Tasks[i].Status)
+		}
+	}
+}
+
+// Sequential ids [1,2,3] and next_id == 4.
+func TestPlanAssignsSequentialIDs(t *testing.T) {
+	list := PlanArtifactToTaskList(planArtifact([]string{"a", "b", "c"}, ""))
+	for i, want := range []uint32{1, 2, 3} {
+		if list.Tasks[i].ID != want {
+			t.Fatalf("task[%d].id = %d, want %d", i, list.Tasks[i].ID, want)
+		}
+	}
+	if list.NextID != 4 {
+		t.Fatalf("next_id = %d, want 4", list.NextID)
+	}
+}
+
+// Deterministic: same artifact parsed twice → byte-identical lists.
+func TestPlanIsDeterministic(t *testing.T) {
+	a := planArtifact([]string{"x", "y"}, "why")
+	j1, _ := json.Marshal(PlanArtifactToTaskList(a))
+	j2, _ := json.Marshal(PlanArtifactToTaskList(a))
+	if string(j1) != string(j2) {
+		t.Fatalf("nondeterministic: %s != %s", j1, j2)
+	}
+}
+
+// Descriptions copied VERBATIM — whitespace and empty strings preserved.
+func TestPlanKeepsDescriptionsVerbatim(t *testing.T) {
+	list := PlanArtifactToTaskList(planArtifact([]string{"  spaced  ", ""}, ""))
+	if list.Tasks[0].Description != "  spaced  " {
+		t.Fatalf("task[0].description = %q, want %q", list.Tasks[0].Description, "  spaced  ")
+	}
+	if list.Tasks[1].Description != "" {
+		t.Fatalf("task[1].description = %q, want empty", list.Tasks[1].Description)
+	}
+	if list.Tasks[0].ID != 1 || list.Tasks[1].ID != 2 {
+		t.Fatalf("ids = %d,%d want 1,2", list.Tasks[0].ID, list.Tasks[1].ID)
+	}
+}
+
+// Empty plan → the canonical empty list, byte-exact {"tasks":[],"next_id":1}.
+func TestPlanEmptyYieldsDefaultList(t *testing.T) {
+	for _, tasks := range [][]string{nil, {}} {
+		list := PlanArtifactToTaskList(planArtifact(tasks, ""))
+		if len(list.Tasks) != 0 || list.NextID != 1 {
+			t.Fatalf("empty plan list = %+v, want empty default", list)
+		}
+		got, _ := json.Marshal(list)
+		if string(got) != `{"tasks":[],"next_id":1}` {
+			t.Fatalf("got %s, want canonical empty", got)
+		}
+	}
+}
+
+// Rationale is DROPPED — it appears nowhere in the resulting TaskList JSON.
+func TestPlanDropsRationale(t *testing.T) {
+	list := PlanArtifactToTaskList(planArtifact([]string{"do thing"}, "SECRET_RATIONALE_TOKEN"))
+	got, _ := json.Marshal(list)
+	if s := string(got); contains(s, "SECRET_RATIONALE_TOKEN") || contains(s, "rationale") {
+		t.Fatalf("rationale leaked into %s", s)
+	}
+}
+
+// Serde round-trip of the parsed result is byte-identical / canonical.
+func TestPlanResultSerdeRoundTripByteIdentical(t *testing.T) {
+	list := PlanArtifactToTaskList(planArtifact([]string{"alpha", "beta"}, "r"))
+	json1, _ := json.Marshal(list)
+	want := `{"tasks":[{"id":1,"description":"alpha","status":"pending"},{"id":2,"description":"beta","status":"pending"}],"next_id":3}`
+	if string(json1) != want {
+		t.Fatalf("canonical = %s, want %s", json1, want)
+	}
+	var parsed TaskList
+	if err := json.Unmarshal(json1, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	json2, _ := json.Marshal(parsed)
+	if string(json1) != string(json2) {
+		t.Fatalf("round-trip not byte-identical: %s != %s", json1, json2)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Fixture replay (#72) — fixtures/plan_to_tasklist/cases.json is GROUND TRUTH.
+// For each case: unmarshal input into a PlanArtifact, run the function, and
+// assert the marshalled TaskList equals expected byte-for-byte (canonical
+// compact form, field order tasks then next_id). Never edit the fixture.
+// ----------------------------------------------------------------------------
+func TestFixtureReplayPlanToTaskList(t *testing.T) {
+	_, this, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(this)
+	path := filepath.Join(dir, "..", "..", "fixtures", "plan_to_tasklist", "cases.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	var cases []struct {
+		Name     string          `json:"name"`
+		Input    PlanArtifact    `json:"input"`
+		Expected json.RawMessage `json:"expected"`
+	}
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("expected >= 1 case")
+	}
+
+	for _, c := range cases {
+		got := PlanArtifactToTaskList(c.Input)
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("case %s: marshal: %v", c.Name, err)
+		}
+		// Re-marshal expected through TaskList so both sides use the canonical
+		// compact form (field order tasks then next_id, [] over null).
+		var want TaskList
+		if err := json.Unmarshal(c.Expected, &want); err != nil {
+			t.Fatalf("case %s: parse expected: %v", c.Name, err)
+		}
+		wantJSON, _ := json.Marshal(want)
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("case %s: got %s, want %s", c.Name, gotJSON, wantJSON)
+		}
 	}
 }
 

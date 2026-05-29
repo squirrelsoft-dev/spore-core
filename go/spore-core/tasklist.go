@@ -269,6 +269,40 @@ func (l *TaskList) find(id uint32) *TaskListItem {
 }
 
 // ============================================================================
+// Plan → TaskList parser (issue #72; the bridge between #70 and #59)
+// ============================================================================
+
+// PlanArtifactToTaskList parses an accepted PlanArtifact (#70) into a fresh,
+// ready-to-persist TaskList (#71). This is the bridge between the plan phase
+// and the execute loop: once a plan is produced and accepted, its steps become
+// the task list that #59's execute loop drains.
+//
+// Rules enforced:
+//   - One TaskListItem per plan step, in plan order (positional, via Add).
+//   - Every produced task is pending.
+//   - Step descriptions are copied VERBATIM — no trim, no normalize, no filter
+//     (even "  spaced  " and "" are kept exactly).
+//   - Ids are assigned 1..=n sequentially via the NextID scheme; NextID ends at
+//     n + 1.
+//   - An empty plan (Tasks == nil or len 0) yields DefaultTaskList —
+//     {"tasks":[],"next_id":1}. That is a valid EMPTY list, not an error and
+//     not "immediate completion"; the execute loop (#59) decides loop semantics.
+//   - Rationale is DROPPED — neither TaskListItem nor TaskList carries it.
+//
+// Pure and total: it never errors, never panics, performs no I/O, and always
+// builds a fresh list (replanning is out of scope — single parse per accepted
+// plan), so the same artifact always yields the same task list, byte-identical
+// across all four languages. Wiring this into the plan-acceptance seam is
+// DEFERRED to #59; #72 ships only this pure function.
+func PlanArtifactToTaskList(artifact PlanArtifact) TaskList {
+	list := DefaultTaskList() // NextID == 1, Tasks == []
+	for _, step := range artifact.Tasks {
+		list.Add(step) // verbatim; appends pending; bumps NextID
+	}
+	return list
+}
+
+// ============================================================================
 // Disk persistence (interim — DECISION 2, mirrors the plan.go precedent)
 // ============================================================================
 
