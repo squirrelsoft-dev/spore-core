@@ -48,6 +48,7 @@ from .subagent import (
     ContextSharingSummaryHandoff,
     SubagentTool,
 )
+from .tasklist import TaskListTool
 
 __all__ = [
     "BashCommandTool",
@@ -79,6 +80,7 @@ __all__ = [
     "RunTestsTool",
     "SandboxViolationError",
     "SubagentTool",
+    "TaskListTool",
     "Timeout",
     "ToolExecutionError",
     "WriteFileTool",

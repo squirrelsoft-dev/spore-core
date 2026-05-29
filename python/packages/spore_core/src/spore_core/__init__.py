@@ -249,6 +249,17 @@ from .plan import (
     PlanPhaseError,
     capture_plan_artifact,
 )
+from .tasklist import (
+    TASK_LIST_EXTRAS_KEY,
+    TASK_LIST_PATH,
+    Task as TaskListTask,
+    TaskList,
+    TaskListError,
+    TaskStatus,
+    load_task_list,
+    store_task_list,
+    validate_transition,
+)
 from .guide_registry import (
     CONFLICT_THRESHOLD,
     Guide,
@@ -576,6 +587,16 @@ __all__ = [
     "PlanArtifact",
     "PlanPhaseError",
     "capture_plan_artifact",
+    # TaskList (#71)
+    "TASK_LIST_EXTRAS_KEY",
+    "TASK_LIST_PATH",
+    "TaskList",
+    "TaskListError",
+    "TaskListTask",
+    "TaskStatus",
+    "load_task_list",
+    "store_task_list",
+    "validate_transition",
     "PostCompactContext",
     "PostToolBatchContext",
     "PostToolUseContext",
