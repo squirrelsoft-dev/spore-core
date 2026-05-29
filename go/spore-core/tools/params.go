@@ -81,6 +81,124 @@ type FindFilesParams struct {
 	Path string `json:"path"`
 }
 
+// ----- EditFile (#81, new) -----
+
+// EditFileParams are the parameters for EditFileTool: replace the FIRST and
+// ONLY occurrence of OldString with NewString in the file at Path. The match
+// must be unique — an absent or non-unique OldString is a recoverable error.
+type EditFileParams struct {
+	Path      string `json:"path"`
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
+}
+
+// ----- Grep (#81, new — output modes) -----
+
+// GrepOutputMode selects GrepTool's output shape. One of "content" (default),
+// "files_with_matches", or "count".
+type GrepOutputMode string
+
+const (
+	// GrepOutputContent emits each matching line as `path:line:text` (default).
+	GrepOutputContent GrepOutputMode = "content"
+	// GrepOutputFilesWithMatches emits the distinct file paths with a match.
+	GrepOutputFilesWithMatches GrepOutputMode = "files_with_matches"
+	// GrepOutputCount emits `path:count` for each file with matches.
+	GrepOutputCount GrepOutputMode = "count"
+)
+
+// GrepParams are the parameters for the net-new GrepTool. Distinct from
+// GrepFilesParams: adds OutputMode (defaulting to content).
+type GrepParams struct {
+	Pattern    string         `json:"pattern"`
+	Path       string         `json:"path"`
+	Recursive  bool           `json:"recursive,omitempty"`
+	OutputMode GrepOutputMode `json:"output_mode,omitempty"`
+}
+
+// UnmarshalJSON applies the default OutputMode=content when absent or empty.
+func (p *GrepParams) UnmarshalJSON(data []byte) error {
+	type alias GrepParams
+	a := alias{}
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	if a.OutputMode == "" {
+		a.OutputMode = GrepOutputContent
+	}
+	*p = GrepParams(a)
+	return nil
+}
+
+// ----- SendMessage (#81, new) -----
+
+// SendMessageParams are the parameters for SendMessageTool.
+type SendMessageParams struct {
+	Content string `json:"content"`
+}
+
+// ----- TodoWrite (#81, new) -----
+
+// TodoStatus is one of "pending" | "in_progress" | "completed".
+type TodoStatus string
+
+const (
+	TodoStatusPending    TodoStatus = "pending"
+	TodoStatusInProgress TodoStatus = "in_progress"
+	TodoStatusCompleted  TodoStatus = "completed"
+)
+
+// TodoItem is a single todo entry managed by TodoWriteTool.
+type TodoItem struct {
+	Content string     `json:"content"`
+	Status  TodoStatus `json:"status"`
+}
+
+// TodoWriteParams are the parameters for TodoWriteTool: the agent supplies the
+// FULL desired todo list, which replaces the persisted list wholesale.
+type TodoWriteParams struct {
+	Todos []TodoItem `json:"todos"`
+}
+
+// ----- WebFetch / WebSearch (#81, new) -----
+
+// WebFetchParams are the parameters for WebFetchTool.
+type WebFetchParams struct {
+	URL string `json:"url"`
+}
+
+// WebSearchParams are the parameters for WebSearchTool.
+type WebSearchParams struct {
+	Query string `json:"query"`
+}
+
+// ----- Tier 3: plan / clarify / abort (#81, new) -----
+
+// EnterPlanModeParams are the parameters for EnterPlanModeTool. Context is
+// optional (defaults to empty).
+type EnterPlanModeParams struct {
+	Context string `json:"context,omitempty"`
+}
+
+// ExitPlanModeParams are the parameters for ExitPlanModeTool. The agent supplies
+// the plan as a structured object that deserializes DIRECTLY into the existing
+// sporecore.PlanArtifact (issue #81, Q4a — no stub).
+type ExitPlanModeParams struct {
+	Plan sporecore.PlanArtifact `json:"plan"`
+}
+
+// AskUserQuestionParams are the parameters for AskUserQuestionTool. Options is
+// nil for a free-form clarification.
+type AskUserQuestionParams struct {
+	Question string    `json:"question"`
+	Options  *[]string `json:"options,omitempty"`
+}
+
+// AbortParams are the parameters for AbortTool.
+type AbortParams struct {
+	Reason string `json:"reason"`
+}
+
 // ----- Git -----
 
 type GitLogParams struct {

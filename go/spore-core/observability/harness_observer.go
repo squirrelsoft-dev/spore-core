@@ -352,6 +352,12 @@ type HarnessBuilder struct {
 	// to nil (no-op): the harness never null-checks; an unconfigured store leg
 	// simply contributes nothing.
 	spanStore SpanStore
+	// catalogueTools accumulates StandardTools (issue #81) added via Tool() /
+	// Tools(). They are drained into the configured ToolRegistry at build time
+	// via Register() — a last-wins upsert (issue #81, Q1) — so a tool added
+	// later (e.g. a custom override) wins over an earlier standard tool of the
+	// same name. This mirrors the Rust builder's drain_tools_into_registry seam.
+	catalogueTools []sporecore.StandardTool
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -452,8 +458,43 @@ func (b *HarnessBuilder) Pricing(p PricingTable) *HarnessBuilder {
 	return b
 }
 
+// Tool adds a single catalogue StandardTool (issue #81) to the builder. The
+// tool is registered into the configured ToolRegistry at build time via the
+// last-wins upsert (issue #81, Q1), so adding a custom tool under the same name
+// as a standard tool (e.g. after Tools(StandardTools{}.CodingSet())) overrides
+// it. Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) Tool(t sporecore.StandardTool) *HarnessBuilder {
+	b.catalogueTools = append(b.catalogueTools, t)
+	return b
+}
+
+// Tools adds many catalogue StandardTools at once (e.g. a preset like
+// StandardTools{}.CodingSet()). Registered in order at build time; last-wins on
+// name collisions (issue #81, Q1).
+func (b *HarnessBuilder) Tools(ts ...sporecore.StandardTool) *HarnessBuilder {
+	b.catalogueTools = append(b.catalogueTools, ts...)
+	return b
+}
+
+// drainToolsIntoRegistry registers every accumulated catalogue tool into the
+// configured ToolRegistry via Register() (a last-wins upsert). Mirrors the Rust
+// builder's drain_tools_into_registry. Best-effort: a registration error (e.g.
+// an invalid custom schema) is silently skipped here — the registry's own
+// validation is the gate, and the harness loop surfaces an unregistered tool at
+// dispatch time. Drains the accumulator so a second build does not double-register.
+func (b *HarnessBuilder) drainToolsIntoRegistry() {
+	if b.toolRegistry == nil {
+		return
+	}
+	for _, t := range b.catalogueTools {
+		_ = b.toolRegistry.Register(t.Implementation, t.Schema)
+	}
+	b.catalogueTools = nil
+}
+
 // BuildConfig assembles the HarnessConfig without wrapping it in a harness.
 func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
+	b.drainToolsIntoRegistry()
 	cfg := sporecore.HarnessConfig{
 		Agent:                 b.agent,
 		ToolRegistry:          b.toolRegistry,

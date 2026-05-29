@@ -354,6 +354,10 @@ const (
 	HarnessStreamToolResult    HarnessStreamEventKind = "tool_result"
 	HarnessStreamFinalResponse HarnessStreamEventKind = "final_response"
 	HarnessStreamBudgetWarning HarnessStreamEventKind = "budget_warning"
+	// HarnessStreamUserMessage — the send_message tool (#81) surfaces an
+	// out-of-band, prominent message to the user. The loop emits this instead
+	// of collapsing the content into a normal tool result.
+	HarnessStreamUserMessage HarnessStreamEventKind = "user_message"
 )
 
 // HarnessStreamEvent is one event emitted while the loop runs.
@@ -393,7 +397,7 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			CallID  string                 `json:"call_id"`
 			IsError bool                   `json:"is_error"`
 		}{e.Kind, e.CallID, e.IsError})
-	case HarnessStreamFinalResponse:
+	case HarnessStreamFinalResponse, HarnessStreamUserMessage:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			Content string                 `json:"content"`
@@ -410,6 +414,14 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 
 // StreamSink consumes harness stream events. May be nil.
 type StreamSink func(HarnessStreamEvent)
+
+// sendMessageToolName is the registered name of the catalogue's send_message
+// tool (issue #81). The harness loop recognizes this name to emit a
+// UserMessage stream event instead of collapsing the tool result. It is
+// duplicated here (rather than imported from the tools package) because the
+// tools package imports this one — importing it back would form a cycle. It
+// must stay in sync with tools.SendMessageToolName.
+const sendMessageToolName = "send_message"
 
 // ============================================================================
 // Forward-declared sibling types (full surfaces in their owning issues)
@@ -529,6 +541,12 @@ const (
 	// the signal to the caller via RunResult.Escalate. The escalation is NOT
 	// appended to message history.
 	ToolOutputEscalate ToolOutputKind = "escalate"
+	// ToolOutputAwaitingClarification — a tool (e.g. ask_user_question, #81 Q4b)
+	// needs a human answer before it can produce a result. UNLIKE the subagent
+	// WaitingForHuman path there is NO ChildPausedState: the loop pauses with a
+	// HumanRequest.Clarification, preserving the clarifying call as the head of
+	// PendingToolCalls, and on resume injects the answer as that call's result.
+	ToolOutputAwaitingClarification ToolOutputKind = "awaiting_clarification"
 )
 
 // ToolOutput is the result of dispatching one tool call. Full shape lives
@@ -547,6 +565,10 @@ type ToolOutput struct {
 	Request    *HumanRequest     `json:"-"`
 	// escalate (issue #80)
 	Signal *HarnessSignal `json:"-"`
+	// awaiting_clarification (issue #81, Q4b)
+	Question string `json:"-"`
+	// Options is nil for a free-form clarification.
+	Options *[]string `json:"-"`
 }
 
 // MarshalJSON serialises ToolOutput as a flat tagged object.
@@ -576,6 +598,18 @@ func (o ToolOutput) MarshalJSON() ([]byte, error) {
 			Kind   ToolOutputKind `json:"kind"`
 			Signal *HarnessSignal `json:"signal"`
 		}{o.Kind, o.Signal})
+	case ToolOutputAwaitingClarification:
+		// Options serialised as null (not omitted) when absent, matching the
+		// Rust Option<Vec<String>> wire form and the escalation_tools fixture.
+		var opts []string
+		if o.Options != nil {
+			opts = *o.Options
+		}
+		return json.Marshal(struct {
+			Kind     ToolOutputKind `json:"kind"`
+			Question string         `json:"question"`
+			Options  []string       `json:"options"`
+		}{o.Kind, o.Question, opts})
 	default:
 		return nil, fmt.Errorf("ToolOutput: unknown kind %q", o.Kind)
 	}
@@ -592,6 +626,8 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 		ChildState  *ChildPausedState `json:"child_state"`
 		Request     *HumanRequest     `json:"request"`
 		Signal      *HarnessSignal    `json:"signal"`
+		Question    string            `json:"question"`
+		Options     *[]string         `json:"options"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -604,6 +640,8 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	o.ChildState = probe.ChildState
 	o.Request = probe.Request
 	o.Signal = probe.Signal
+	o.Question = probe.Question
+	o.Options = probe.Options
 	return nil
 }
 
@@ -1224,6 +1262,10 @@ type HumanRequest struct {
 	RiskLevel RiskLevel  `json:"-"`
 	// clarification
 	Question string `json:"-"`
+	// Options are optional fixed choices for a clarification (issue #81, Q4b).
+	// nil for a free-form clarification; omitted from the wire form when nil so
+	// older Clarification blobs (no `options` field) round-trip unchanged.
+	Options *[]string `json:"-"`
 	// review
 	Content string `json:"-"`
 }
@@ -1242,10 +1284,19 @@ func (h HumanRequest) MarshalJSON() ([]byte, error) {
 			RiskLevel RiskLevel        `json:"risk_level"`
 		}{h.Kind, calls, h.RiskLevel})
 	case HumanReqClarification:
+		// Options omitted (not null) when absent, matching the Rust
+		// skip_serializing_if so back-compat Clarification blobs are byte-identical.
+		if h.Options == nil {
+			return json.Marshal(struct {
+				Kind     HumanRequestKind `json:"kind"`
+				Question string           `json:"question"`
+			}{h.Kind, h.Question})
+		}
 		return json.Marshal(struct {
 			Kind     HumanRequestKind `json:"kind"`
 			Question string           `json:"question"`
-		}{h.Kind, h.Question})
+			Options  []string         `json:"options"`
+		}{h.Kind, h.Question, *h.Options})
 	case HumanReqReview:
 		return json.Marshal(struct {
 			Kind    HumanRequestKind `json:"kind"`
@@ -1263,6 +1314,7 @@ func (h *HumanRequest) UnmarshalJSON(data []byte) error {
 		Calls     []ToolCall       `json:"calls"`
 		RiskLevel RiskLevel        `json:"risk_level"`
 		Question  string           `json:"question"`
+		Options   *[]string        `json:"options"`
 		Content   string           `json:"content"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
@@ -1272,6 +1324,7 @@ func (h *HumanRequest) UnmarshalJSON(data []byte) error {
 	h.Calls = probe.Calls
 	h.RiskLevel = probe.RiskLevel
 	h.Question = probe.Question
+	h.Options = probe.Options
 	h.Content = probe.Content
 	return nil
 }
@@ -2902,6 +2955,41 @@ func (h *StandardHarness) runReActInner(
 				toolClock := time.Now()
 				output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
 
+				// Clarification pause (issue #81, Q4b): a tool (e.g.
+				// ask_user_question) needs a human answer before it can produce a
+				// result. UNLIKE the subagent WaitingForHuman path there is NO
+				// ChildPausedState: the loop builds a PausedState directly with
+				// HumanRequest set to Clarification. The CLARIFYING call itself is
+				// preserved as the HEAD of PendingToolCalls (followed by the
+				// remaining batch) so that, on resume, the human's answer is
+				// injected as the tool RESULT for that pending call.
+				if output.Kind == ToolOutputAwaitingClarification {
+					pending := append([]ToolCall{call}, calls[i+1:]...)
+					req := HumanRequest{
+						Kind:     HumanReqClarification,
+						Question: output.Question,
+						Options:  output.Options,
+					}
+					state := &PausedState{
+						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
+						SessionState: session, PendingToolCalls: pending,
+						ApprovedResults: approved, HumanRequest: &req, Task: task,
+						BudgetUsed: budget, ChildState: nil,
+					}
+					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
+				}
+
+				// SendMessage (issue #81): the send_message tool surfaces an
+				// out-of-band message to the user. The loop emits a UserMessage
+				// stream event rather than collapsing the content into a normal
+				// tool result, then records the (minimal) success result so the
+				// loop continues. Recognized by tool name.
+				if call.Name == sendMessageToolName && output.Kind == ToolOutputSuccess {
+					emit(onStream, HarnessStreamEvent{
+						Kind: HarnessStreamUserMessage, Content: output.Content,
+					})
+				}
+
 				// Pause propagation: WaitingForHuman from a subagent tool.
 				if output.Kind == ToolOutputWaitingForHuman {
 					remaining := append([]ToolCall(nil), calls[i+1:]...)
@@ -3236,6 +3324,42 @@ func (h *StandardHarness) Resume(
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness
 	// itself just round-trips the field and continues the parent loop.
 	_ = state.ChildState
+
+	// Clarification resume (issue #81, Q4b): if this pause came from
+	// ToolOutput.AwaitingClarification, the human's answer is injected as the
+	// tool RESULT for the clarifying call (the head of PendingToolCalls) — NOT
+	// appended as a free-standing user message. Any remaining pending calls
+	// after the clarifying one are then dispatched normally before the loop
+	// resumes.
+	if state.HumanRequest != nil && state.HumanRequest.Kind == HumanReqClarification {
+		var answer string
+		switch response.Kind {
+		case HumanRespAnswer:
+			answer = response.Text
+		case HumanRespApproveWithFeedback:
+			answer = response.Feedback
+		}
+		if response.Kind == HumanRespAnswer || response.Kind == HumanRespApproveWithFeedback {
+			if len(pending) > 0 {
+				clarifying := pending[0]
+				tr := HarnessToolResult{
+					CallID: clarifying.ID,
+					Output: ToolOutput{Kind: ToolOutputSuccess, Content: answer},
+				}
+				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
+				for _, call := range pending[1:] {
+					output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
+					rtr := HarnessToolResult{CallID: call.ID, Output: output}
+					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
+				}
+				maxIterations := uint32(^uint32(0))
+				if task.LoopStrategy.Kind == StrategyReAct {
+					maxIterations = task.LoopStrategy.MaxIterations
+				}
+				return h.runReAct(ctx, task, maxIterations, session, budget, onStream)
+			}
+		}
+	}
 
 	switch response.Kind {
 	case HumanRespHalt:

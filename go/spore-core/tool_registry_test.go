@@ -92,17 +92,40 @@ func TestRegistryDispatchesRegisteredTool(t *testing.T) {
 	}
 }
 
-// Rule 3: duplicate names rejected.
-func TestRegistryDuplicateNameRejected(t *testing.T) {
+// Rule 3 (issue #81, Q1): duplicate names UPSERT — the last registration wins,
+// overwriting the prior tool/schema. This is what lets an architect override a
+// standard tool by registering their own under the same name after a preset.
+func TestRegistryDuplicateNameUpserts(t *testing.T) {
 	reg := NewStandardToolRegistry()
 	if err := reg.Register(&echoTool{name: "echo"}, makeSchema("echo", ToolAnnotations{})); err != nil {
 		t.Fatal(err)
 	}
-	err := reg.Register(&echoTool{name: "echo"}, makeSchema("echo", ToolAnnotations{}))
-	re, ok := err.(*RegistrationError)
-	if !ok || re.Kind != RegErrDuplicateName {
-		t.Fatalf("expected DuplicateName, got %v", err)
+	// Re-registering the same name must NOT error.
+	override := &constTool{name: "echo", content: "override-wins"}
+	if err := reg.Register(override, makeSchema("echo", ToolAnnotations{})); err != nil {
+		t.Fatalf("upsert must not error, got %v", err)
 	}
+	// The later registration is the one that dispatches.
+	res, err := reg.Dispatch(context.Background(), ToolCall{ID: "1", Name: "echo", Input: json.RawMessage(`{}`)}, allowAllSandbox{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Output.Content != "override-wins" {
+		t.Fatalf("last-wins upsert: expected override tool to dispatch, got %q", res.Output.Content)
+	}
+}
+
+// constTool returns a fixed content string, to prove which registration is live.
+type constTool struct {
+	name    string
+	content string
+}
+
+func (c *constTool) Name() string                { return c.name }
+func (c *constTool) IsSubagentTool() bool        { return false }
+func (c *constTool) MayProduceLargeOutput() bool { return false }
+func (c *constTool) Execute(_ context.Context, _ ToolCall, _ SandboxProvider, _ *ToolContext) ToolOutput {
+	return ToolOutput{Kind: ToolOutputSuccess, Content: c.content}
 }
 
 // Rule 2: invalid schema (no top-level "type") rejected.

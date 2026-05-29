@@ -427,6 +427,26 @@ type DispatchOutcome struct {
 }
 
 // ============================================================================
+// StandardTool — catalogue bundle (#81)
+// ============================================================================
+
+// StandardTool is a catalogue tool: a Tool implementation bundled with its
+// RegistryToolSchema so the two can never drift apart (issue #81, Q2). The
+// catalogue constructors in the tools package return these; the HarnessBuilder's
+// Tool() / Tools() destructure them into registry Register() calls.
+//
+// The type lives in the root sporecore package (not the tools package) so the
+// fluent HarnessBuilder — which lives in the observability package — can accept
+// it without importing tools. That import edge would form a test-time cycle
+// (tools_test → storage → observability → tools). Defining the bundle here keeps
+// the builder seam dependency-light while the tools package owns the
+// constructors and presets (StandardTools).
+type StandardTool struct {
+	Implementation Tool
+	Schema         RegistryToolSchema
+}
+
+// ============================================================================
 // StandardToolRegistry — canonical implementation
 // ============================================================================
 
@@ -499,9 +519,11 @@ func (r *StandardToolRegistry) Register(tool Tool, schema RegistryToolSchema) er
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.tools[schema.Name]; exists {
-		return &RegistrationError{Kind: RegErrDuplicateName, Tool: schema.Name}
-	}
+	// Last-wins upsert (issue #81, Q1): registering a tool under an existing
+	// name OVERWRITES the prior registration rather than erroring. This is what
+	// lets an architect override a standard tool by registering their own after
+	// a preset (e.g. StandardTools.CodingSet()). Per-name dedup of intra-set
+	// duplicates is enforced by RegisterSet, not here.
 	r.tools[schema.Name] = &registered{tool: tool, schema: schema}
 	return nil
 }
