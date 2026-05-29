@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /close — closed #69 (lifecycle hook system, four-language parity, merged to main); #70 remains the headline next item_
+_Last updated: 2026-05-28 by /close — closed #70 (plan phase / plan artifact, four-language parity, merged + pushed to main); #71 (task-list tool) is now the headline next item_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -100,6 +100,33 @@ out. Rust-only by nature (TS/Python/Go interfaces were already polymorphic). Thi
 means **#70 is already unblocked** — real `plan_model` routing can use the
 `Arc<dyn Agent>` seam today.
 
+**#70 (plan phase / plan artifact) just landed** — the first piece of PlanExecute is
+on `main` at four-language parity (Rust ref `f128e8f`, Go `d25b398`, TS `fd45e19`,
+Python `7cdcec6`), fast-forward-merged and **pushed to origin**. The `PlanExecute` arm
+no longer returns the generic `StrategyNotYetImplemented` stub: it now runs a real
+**one-shot plan phase** that seeds a planning directive, runs exactly one constrained
+turn on a planner agent, captures the model's JSON response into a `PlanArtifact`,
+fires `OnPlanCreated` synchronously (the hook may rewrite the artifact), stores it in
+`SessionState.extras["plan_execute"]` as `{"tasks":[...],"rationale":"..."}`, emits one
+`TurnSpan`, and counts the turn against the shared budget — then **halts with a new
+distinct `HaltReason::ExecutePhaseNotImplemented`** (separate from the generic stub the
+other three strategies still use), because the execute loop is #59. The four pinned
+spec decisions: **Q1** model routing is a new `planner_agent: Option<Arc<dyn Agent>>`
+field on `HarnessConfig` + builder (the only real-routing path with today's
+`Arc<dyn Agent>` types; `plan_model` stays descriptive metadata, no `ModelConfig`→agent
+factory); **Q2** plan phase always runs to completion, no HITL pause; **Q3** capture is
+a byte-identical JSON-in-response grammar (ASCII-trim → strip a single leading
+```/```json fence line + trailing fence → parse object with required string-array
+`tasks` kept verbatim, empty allowed, + optional `rationale`; malformed →
+`PlanPhaseError::UnparseablePlan`); **Q4** the distinct `ExecutePhaseNotImplemented`
+halt plus a `PlanPhaseFailed { error }` halt for capture/turn failure. `PlanArtifact`
+was **reused** from #69 (it was already the `OnPlanCreated` payload), not redefined —
+the new work was the phase, the capture step, and the arm wiring. Shared fixture
+`fixtures/model_responses/harness/plan_phase_basic.jsonl` (plain + fenced cases) replays
+identically across all four. One verification divergence fixed: Python originally
+flattened the `PlanPhaseFailed` halt-reason JSON (`error_kind`+`message`) — converged to
+the 3-language nested `error: {kind, message}` shape.
+
 **#69 (lifecycle hook system) just landed** — a `Hook`/`HookChain` system at
 four-language parity (Rust ref `ddbd8a4`, TS `b49c300`, Go `51bf7f4`, Python
 `6423740` + parity fix `c593956`), merged to `main` via fast-forward. It defines all
@@ -128,11 +155,14 @@ early and it unblocks the SelfVerifying-as-Stop-hook approach for #61.
 
 **main CI is green** across all four languages.
 
-Known runnability limits: the harness is **ReAct-only** — the other four loop
-strategies return `StrategyNotYetImplemented` (#58–#61). The sandbox
-missing-file misclassification that made S1 nondeterministic was fixed in #63, the
-previous "no message content" observability gap is closed by #64, and the lifecycle
-hook seams (#69) now exist but only `Stop` is loop-wired so far.
+Known runnability limits: the harness still runs only **ReAct end-to-end**.
+`PlanExecute` (#59) now runs its **plan phase** (#70, just landed) — it produces and
+stores a `PlanArtifact` then halts with `ExecutePhaseNotImplemented` because the execute
+loop isn't built yet; `Ralph`, `SelfVerifying`, and `HillClimbing` (#58/#60/#61) still
+return the generic `StrategyNotYetImplemented`. The sandbox missing-file
+misclassification that made S1 nondeterministic was fixed in #63, the previous "no
+message content" observability gap is closed by #64, and the lifecycle hook seams (#69)
+now exist with `Stop` loop-wired and `OnPlanCreated` fired by the new plan phase.
 
 ## Active Direction
 The harness is now **runnable** (#57) and **debuggable** (#64/#65) end-to-end, and
@@ -145,28 +175,34 @@ that the harness is **ReAct-only** — `PlanExecute`, `Ralph`, `SelfVerifying`, 
 
 **PlanExecute (#59) is the first strategy being built, and a design pass decomposed it
 into five separable concerns** rather than one large change. The build order is
-**#70 → #71 → #72 → #73 → #59**, with the lifecycle hook system (**#69, now done**)
-providing the `OnPlanCreated`/`OnTaskAdvance` seams the loop will fire. The plan phase
-produces a plan artifact (#70); a persisted task-list tool (#71) holds the work; an
-accepted plan is parsed into that task list (#72); a `StorageProvider` abstraction
-(#73) generalizes the hybrid in-memory+on-disk persistence (spore-core is a
-harness-building framework, so storage backends are a first-class seam); and #59
+**#70 → #71 → #72 → #73 → #59**, with the lifecycle hook system (#69) providing the
+`OnPlanCreated`/`OnTaskAdvance` seams the loop fires. The plan phase produces a plan
+artifact (**#70, now done** — it stores a `PlanArtifact` and fires `OnPlanCreated`); a
+persisted task-list tool (#71, next) holds the work; an accepted plan is parsed into
+that task list (#72); a `StorageProvider` abstraction (#73) generalizes the hybrid
+in-memory+on-disk persistence (spore-core is a harness-building framework, so storage
+backends are a first-class seam) — #70's plan artifact currently lives in
+`SessionState.extras["plan_execute"]` in-memory, and #73 generalizes that; and #59
 finally wires the two-phase loop together with a **pluggable executor** (ReAct by
 default, swappable for a future Ralph-style execute+verify), firing the #69 hooks at
-plan-created and task-advance. Two former chain heads are now cleared: #45 (Agent
-dyn-compatibility, already on `main`) and #69 (hook system, landed this loop). After
-PlanExecute lands this way, the remaining three strategies (#58/#60/#61) follow —
+plan-created and task-advance and replacing #70's `ExecutePhaseNotImplemented` halt with
+the real execute phase. Three former chain heads are now cleared: #45 (Agent
+dyn-compatibility, already on `main`), #69 (hook system), and #70 (plan phase, landed
+this loop). After PlanExecute lands this way, the remaining three strategies
+(#58/#60/#61) follow —
 SelfVerifying (#61) becomes a `Stop`-hook configuration now that #69 exists — then the
 accepted-debt correctness fixes (#30/#31/#32/#34). Observability backend stays
 swappable over OTLP.
 
 ## Known Deviations
-1. **Only ReAct is executable** — the README and
-   `docs/harness-engineering-concepts.md` advertise five loop strategies, but
-   only **ReAct** runs. `PlanExecute`, `Ralph`, `SelfVerifying`, and
-   `HillClimbing` return `HaltReason::StrategyNotYetImplemented` at
-   `rust/crates/spore-core/src/harness.rs`. Tracked: #59 / #58 / #61 / #60
-   (`scope: deferred`). #57's scenario suite is intentionally ReAct-only.
+1. **Only ReAct runs end-to-end** — the README and
+   `docs/harness-engineering-concepts.md` advertise five loop strategies, but only
+   **ReAct** completes a full run. As of #70, `PlanExecute` runs its **plan phase**
+   then halts with `HaltReason::ExecutePhaseNotImplemented` (the execute loop is #59);
+   `Ralph`, `SelfVerifying`, and `HillClimbing` still return
+   `HaltReason::StrategyNotYetImplemented` at `rust/crates/spore-core/src/harness.rs`.
+   Tracked: #59 / #58 / #61 / #60 (`scope: deferred`). #57's scenario suite is
+   intentionally ReAct-only.
 2. **Go outbox is not zero-dependency** — closing #50 added
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod` (accepted tradeoff, documented in `go/CONVENTIONS.md`).
@@ -187,15 +223,16 @@ via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **PlanExecute build chain (#70 → #71 → #72 → #73 → #59)** — build PlanExecute via
-   its decomposed prerequisites, in order. Next up is **#70** (plan phase: generate a
-   plan artifact via a one-shot planning turn), unblocked by the `Arc<dyn Agent>` seam
-   from the closed #45. Then #71 (task-list tool) → #72 (plan→task-list parse) → #73
-   (StorageProvider) → #59 (wire the two-phase loop, firing the #69 hooks at
-   plan-created/task-advance). The lifecycle hook system (#69) is **done** and dropped
-   from this chain. Rust reference first, then TS/Python/Go parity at each step.
-   PlanExecute goes deep first to establish the task-list/storage seams the other
-   strategies will reuse.
+1. **PlanExecute build chain (#71 → #72 → #73 → #59)** — build PlanExecute via its
+   decomposed prerequisites, in order. Next up is **#71** (a persisted task-list tool to
+   hold the work), now that the plan phase (#70) lands a `PlanArtifact`. Then #72
+   (parse the accepted plan artifact in `extras["plan_execute"]` into that task list) →
+   #73 (StorageProvider abstraction generalizing the in-memory+on-disk persistence) →
+   #59 (wire the two-phase loop with a pluggable executor, firing the #69 hooks at
+   plan-created/task-advance, replacing #70's `ExecutePhaseNotImplemented` halt). #70
+   (plan phase) is **done** and dropped from the chain head. Rust reference first, then
+   TS/Python/Go parity at each step. PlanExecute goes deep first to establish the
+   task-list/storage seams the other strategies will reuse.
 2. **Remaining loop strategies (#58, #60, #61)** — Ralph (#58), HillClimbing (#60),
    SelfVerifying (#61) follow once PlanExecute lands and the shared seams (pluggable
    executor, task list) exist. SelfVerifying (#61) in particular can now be built as a
@@ -209,20 +246,21 @@ This section is updated by /close after every PEE loop.]
    the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
    land so the docs stop overstating capability.
 
-_Note: this `/close` loop closed **#69** (lifecycle hook system) `status: complete`.
-A full `/implement 69` pass built it across all four languages (Rust ref `ddbd8a4`,
-TS `b49c300`, Go `51bf7f4`, Python `6423740` + cross-language parity fix `c593956`),
-cross-verified all four suites green, and fast-forward-merged the five commits to
-`main`. The issue was a conceptual design doc, so the planning phase reported BLOCKED
-on six contract ambiguities (middleware relationship, per-event context schemas,
-`HookDecision` shape, `max_stop_blocks` placement, Stop-vs-`ForceAnotherTurn`,
-Stop-vs-`Verifier`); all six were pinned by the maintainer before any code and
-documented on the issue. Phase-4 verification caught one divergence (Python
-`HookError.kind` unset for two categories), fixed in `c593956`. **#69 landed ahead of
-its scheduled slot in the PlanExecute chain** (was #70→#71→#72→#73→#69→#59); it was
-independent enough to build early, so the chain is now #70→#71→#72→#73→#59 with #69
-done. No new issues spawned; no new spec gaps. No re-triage needed — the rest of the
-open board (#70–#73 PlanExecute prerequisites, #58/#60/#61 strategies, #30–#36 debt)
-is unaffected and its `scope: deferred` labels still hold. Active Direction unchanged
-— capability breadth (loop strategies) remains the headline gap, PlanExecute first,
-#70 the next concrete step._
+_Note: this `/close` loop closed **#70** (plan phase / plan artifact) `status: complete`.
+A full `/implement 70` pass built it across all four languages (Rust ref `f128e8f`,
+Go `d25b398`, TS `fd45e19`, Python `7cdcec6` incl. an in-place parity amend),
+cross-verified all four suites green, fast-forward-merged the four commits to `main`,
+and **pushed to origin** (the maintainer authorized comment + merge + push this loop).
+Planning phase reported BLOCKED on four spec questions (model routing seam, HITL/
+`OnPlanCreated` behavior, the text→artifact capture grammar, the terminal `RunResult`);
+all four were pinned by the maintainer before any code — Q1=`planner_agent` seam
+(`plan_model` stays metadata), Q2=synchronous `OnPlanCreated`/no HITL, Q3=byte-identical
+JSON-in-response capture, Q4=distinct `ExecutePhaseNotImplemented` halt. A key discovery:
+`PlanArtifact` already existed (from #69 as the `OnPlanCreated` payload), so #70 reused
+it rather than defining a competing type. Phase-4 verification caught one divergence
+(Python flattened the `PlanPhaseFailed` halt-reason JSON), converged to the 3-language
+nested shape. No new issues spawned; no new spec gaps. No re-triage needed — the rest of
+the open board (#71–#73 PlanExecute prerequisites, #58/#60/#61 strategies, #27/#30–#36
+debt/docs) is unaffected and its `scope: deferred` labels still hold. Active Direction
+unchanged — capability breadth (loop strategies) remains the headline gap, PlanExecute
+first, **#71 (task-list tool) the next concrete step**._
