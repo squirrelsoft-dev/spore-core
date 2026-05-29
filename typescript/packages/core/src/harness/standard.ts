@@ -81,6 +81,7 @@ import {
   type HaltReason,
   type HarnessRunOptions,
   type HookPoint,
+  type HumanRequest,
   type HumanResponse,
   type LoopStrategy,
   type MiddlewareChain,
@@ -341,6 +342,44 @@ export class StandardHarness implements Harness {
     // This matches the Rust reference (placeholder until #4/#5 land).
     if (state.child_state != null) {
       // Intentional no-op; the full child.resume() dispatch lives in #4/#5.
+    }
+
+    // Clarification resume (issue #81, Q4b): if this pause came from
+    // `awaiting_clarification`, the human's answer is injected as the tool
+    // RESULT for the clarifying call (the head of `pending_tool_calls`) — NOT
+    // appended as a free-standing user message. Any remaining pending calls
+    // from the same batch are then dispatched normally before the loop resumes.
+    if (
+      state.human_request?.kind === "clarification" &&
+      (response.kind === "answer" || response.kind === "approve_with_feedback")
+    ) {
+      const text = response.kind === "answer" ? response.text : response.feedback;
+      const [clarifyingCall, ...remaining] = pendingCalls;
+      if (clarifyingCall) {
+        const tr: ToolResultRecord = {
+          call_id: clarifyingCall.id,
+          output: { kind: "success", content: text, truncated: false },
+        };
+        await this.config.contextManager.appendToolResult(sessionState, tr);
+      }
+      for (const call of remaining) {
+        const output = await this.config.toolRegistry.dispatch(call, signal);
+        const tr: ToolResultRecord = { call_id: call.id, output };
+        await this.config.contextManager.appendToolResult(sessionState, tr);
+      }
+      const maxIter =
+        state.task.loop_strategy.kind === "re_act"
+          ? state.task.loop_strategy.max_iterations
+          : Number.MAX_SAFE_INTEGER;
+      return this.runReact(
+        state.task,
+        maxIter,
+        sessionState,
+        state.budget_used,
+        onStream,
+        signal,
+        false,
+      );
     }
 
     switch (response.kind) {
@@ -1494,6 +1533,46 @@ export class StandardHarness implements Harness {
                 usage,
                 turns: budgetUsed.turns,
               };
+            }
+
+            // Clarification pause (issue #81, Q4b): a tool (e.g.
+            // `ask_user_question`) needs a human answer before it can produce a
+            // result. UNLIKE the subagent `waiting_for_human` path there is NO
+            // ChildPausedState: build a PausedState directly with `human_request`
+            // set to `clarification`. The CLARIFYING call itself is preserved as
+            // the head of `pending_tool_calls` (followed by the remaining batch)
+            // so that, on resume, the human's answer is injected as the tool
+            // RESULT for that pending call.
+            if (output.kind === "awaiting_clarification") {
+              const pending = [call, ...calls.slice(i + 1)];
+              const request: HumanRequest = {
+                kind: "clarification",
+                question: output.question,
+                options: output.options,
+              };
+              const ps: PausedState = {
+                session_id: sessionId,
+                task_id: task.id,
+                turn_number: budgetUsed.turns,
+                session_state: sessionState,
+                pending_tool_calls: pending,
+                approved_results: approvedResults,
+                human_request: request,
+                task,
+                budget_used: budgetUsed,
+                child_state: null,
+              };
+              return { kind: "waiting_for_human", state: ps, request };
+            }
+
+            // SendMessage (issue #81): the `send_message` tool surfaces an
+            // out-of-band message to the user. Emit a `user_message` stream
+            // event rather than collapsing the content into a normal tool
+            // result, then record a minimal success result so the loop
+            // continues. (Bad params produce an `error` output, not a success,
+            // and so no event is emitted.)
+            if (call.name === "send_message" && output.kind === "success") {
+              emit(onStream, { kind: "user_message", content: output.content });
             }
 
             // Layer-2: unrecoverable tool error halts immediately.

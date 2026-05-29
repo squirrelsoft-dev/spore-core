@@ -71,12 +71,19 @@ describe("StandardToolRegistry", () => {
     }
   });
 
-  // Rule 3: duplicate registration fails.
-  it("rejects duplicate registration", () => {
+  // Rule 3 (issue #81, Q1): duplicate tool registration is a last-wins upsert
+  // (NOT a DuplicateName error). The second registration overwrites the first
+  // and the registry holds exactly one entry under that name.
+  it("upserts duplicate registration (last wins)", () => {
     const reg = new StandardToolRegistry();
-    expect(reg.register(new EchoTool("echo"), schema("echo"))).toBeNull();
-    const err = reg.register(new EchoTool("echo"), schema("echo"));
-    expect(err?.kind).toBe("DuplicateName");
+    const first: ToolSchema = { ...schema("echo"), description: "first" };
+    const second: ToolSchema = { ...schema("echo"), description: "second" };
+    expect(reg.register(new EchoTool("echo"), first)).toBeNull();
+    // Re-registering the same name must upsert, not error.
+    expect(reg.register(new EchoTool("echo"), second)).toBeNull();
+    const schemas = reg.activeSchemas(null);
+    expect(schemas.length).toBe(1);
+    expect(schemas[0]?.description).toBe("second");
   });
 
   // Rule 2: schema validated at registration (missing top-level type).

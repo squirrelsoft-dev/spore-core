@@ -48,6 +48,11 @@ export class NoopContextManager implements ContextManager {
         // exhaustiveness.
         text = "[escalate]";
         break;
+      case "awaiting_clarification":
+        // Never reached at runtime: the harness pauses (waiting_for_human)
+        // before appending; present for exhaustiveness (#81).
+        text = "[awaiting clarification]";
+        break;
     }
     session.messages.push({ role: "tool", content: { type: "text", text } });
   }

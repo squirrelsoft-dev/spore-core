@@ -277,5 +277,7 @@ function renderToolOutput(result: ToolResultRecord): string {
       return "";
     case "escalate":
       return "";
+    case "awaiting_clarification":
+      return "";
   }
 }

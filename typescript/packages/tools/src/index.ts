@@ -37,7 +37,18 @@ export {
 } from "./fs.js";
 
 export { BashCommandTool, ExecTool, RunTestsTool } from "./exec.js";
-export { FindFilesTool, GrepFilesTool } from "./search.js";
+export { EditFileTool } from "./edit.js";
+export { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
+export { SendMessageTool } from "./message.js";
+export { WebFetchTool, WebSearchTool } from "./web.js";
+export { TODO_STORE_KEY, TodoWriteTool } from "./todo.js";
+export {
+  AbortTool,
+  AskUserQuestionTool,
+  EnterPlanModeTool,
+  ExitPlanModeTool,
+} from "./control.js";
+export { StandardTools } from "./catalogue.js";
 export {
   GitCommitTool,
   GitDiffTool,

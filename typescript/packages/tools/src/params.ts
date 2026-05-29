@@ -95,6 +95,97 @@ export const FindFilesParamsSchema = z.object({
 });
 export type FindFilesParams = z.infer<typeof FindFilesParamsSchema>;
 
+/** Output mode for the #81 `grep` tool. Defaults to `content`. */
+export const GrepOutputModeSchema = z
+  .enum(["content", "files_with_matches", "count"])
+  .default("content");
+export type GrepOutputMode = z.infer<typeof GrepOutputModeSchema>;
+
+/** Parameters for the #81 `grep` tool (regex search with output modes). */
+export const GrepParamsSchema = z.object({
+  pattern: z.string(),
+  path: z.string(),
+  recursive: z.boolean().default(false),
+  output_mode: GrepOutputModeSchema,
+});
+export type GrepParams = z.infer<typeof GrepParamsSchema>;
+
+// ---------- EditFile (#81) ----------
+
+export const EditFileParamsSchema = z.object({
+  path: z.string(),
+  old_string: z.string(),
+  new_string: z.string(),
+});
+export type EditFileParams = z.infer<typeof EditFileParamsSchema>;
+
+// ---------- SendMessage (#81) ----------
+
+export const SendMessageParamsSchema = z.object({ content: z.string() });
+export type SendMessageParams = z.infer<typeof SendMessageParamsSchema>;
+
+// ---------- Web (#81) ----------
+
+export const WebFetchParamsSchema = z.object({ url: z.string() });
+export type WebFetchParams = z.infer<typeof WebFetchParamsSchema>;
+
+export const WebSearchParamsSchema = z.object({ query: z.string() });
+export type WebSearchParams = z.infer<typeof WebSearchParamsSchema>;
+
+// ---------- TodoWrite (#81) ----------
+
+export const TodoStatusSchema = z.enum([
+  "completed",
+  "in_progress",
+  "pending",
+]);
+export type TodoStatus = z.infer<typeof TodoStatusSchema>;
+
+export const TodoItemSchema = z.object({
+  content: z.string(),
+  status: TodoStatusSchema,
+});
+export type TodoItem = z.infer<typeof TodoItemSchema>;
+
+export const TodoWriteParamsSchema = z.object({
+  todos: z.array(TodoItemSchema),
+});
+export type TodoWriteParams = z.infer<typeof TodoWriteParamsSchema>;
+
+// ---------- Tier 3 control tools (#81) ----------
+
+/** `enter_plan_mode` — `context` is optional; defaults to "". */
+export const EnterPlanModeParamsSchema = z.object({
+  context: z.string().default(""),
+});
+export type EnterPlanModeParams = z.infer<typeof EnterPlanModeParamsSchema>;
+
+/**
+ * `exit_plan_mode` — the agent supplies the structured plan, which deserializes
+ * directly into the existing {@link "@spore/core".PlanArtifact} shape (issue
+ * #81, Q4a — no stub). `tasks` required; `rationale` defaults to "".
+ */
+export const ExitPlanModeParamsSchema = z.object({
+  plan: z.object({
+    tasks: z.array(z.string()),
+    rationale: z.string().default(""),
+  }),
+});
+export type ExitPlanModeParams = z.infer<typeof ExitPlanModeParamsSchema>;
+
+/** `ask_user_question` — `question` required; `options` optional. */
+export const AskUserQuestionParamsSchema = z.object({
+  question: z.string(),
+  options: z.array(z.string()).optional(),
+});
+export type AskUserQuestionParams = z.infer<
+  typeof AskUserQuestionParamsSchema
+>;
+
+/** `abort` — graceful stop with a `reason`. */
+export const AbortParamsSchema = z.object({ reason: z.string() });
+export type AbortParams = z.infer<typeof AbortParamsSchema>;
+
 // ---------- Git ----------
 
 export const GitLogParamsSchema = z.object({

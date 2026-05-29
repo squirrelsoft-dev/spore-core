@@ -229,7 +229,15 @@ export type HarnessStreamEvent =
   | { kind: "tool_call"; call_id: string; name: string }
   | { kind: "tool_result"; call_id: string; is_error: boolean }
   | { kind: "final_response"; content: string }
-  | { kind: "budget_warning"; limit_type: BudgetLimitType };
+  | { kind: "budget_warning"; limit_type: BudgetLimitType }
+  /**
+   * Emitted by the harness loop when it dispatches the `send_message` tool
+   * (issue #81 — `SendMessageTool`). The loop surfaces the message content as
+   * this prominent event instead of collapsing it into a normal tool result;
+   * rendering it prominently is the architect's UI concern. A minimal success
+   * tool result is still recorded in history so the loop continues.
+   */
+  | { kind: "user_message"; content: string };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
 
@@ -293,7 +301,17 @@ export type ToolOutput =
    * The harness terminates cleanly and passes the signal to the caller via the
    * `escalate` {@link RunResult}. NOT appended to message history.
    */
-  | { kind: "escalate"; signal: HarnessSignal };
+  | { kind: "escalate"; signal: HarnessSignal }
+  /**
+   * Tool asks the user a clarifying question (issue #81, Q4b —
+   * `AskUserQuestionTool`). UNLIKE the subagent `waiting_for_human` path there
+   * is NO {@link ChildPausedState}: the loop builds a {@link PausedState}
+   * directly with `human_request` set to {@link HumanRequest} `clarification`,
+   * preserves the clarifying call as the head of `pending_tool_calls`, and
+   * returns a `waiting_for_human` {@link RunResult}. On resume the human's
+   * answer text is injected as the tool RESULT for that clarifying call.
+   */
+  | { kind: "awaiting_clarification"; question: string; options?: string[] };
 
 export interface ToolResultRecord {
   call_id: string;
@@ -575,7 +593,14 @@ export const HumanRequestSchema = z.discriminatedUnion("kind", [
     calls: z.array(ToolCallSchema),
     risk_level: RiskLevelSchema,
   }),
-  z.object({ kind: z.literal("clarification"), question: z.string() }),
+  z.object({
+    kind: z.literal("clarification"),
+    question: z.string(),
+    // Optional (#81, Q4b): multiple-choice options carried with the
+    // clarification. Absent on old `clarification` blobs (back-compat
+    // deserialization) and on free-form questions.
+    options: z.array(z.string()).nullable().optional(),
+  }),
   z.object({ kind: z.literal("review"), content: z.string() }),
 ]);
 export type HumanRequest = z.infer<typeof HumanRequestSchema>;

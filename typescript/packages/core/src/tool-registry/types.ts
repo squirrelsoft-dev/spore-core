@@ -200,6 +200,22 @@ export interface Tool {
 }
 
 // ============================================================================
+// StandardTool — catalogue bundle (issue #81, Q2)
+// ============================================================================
+
+/**
+ * A catalogue tool: its {@link Tool} implementation bundled with its
+ * {@link ToolSchema} so the two can never drift apart (issue #81, Q2). The
+ * `StandardTools` namespace in `@spore/tools` returns these; the registry's
+ * `tool()` / `tools()` upsert helpers destructure them internally. Architects
+ * build custom catalogue tools by constructing a `StandardTool` directly.
+ */
+export interface StandardTool {
+  implementation: Tool;
+  schema: ToolSchema;
+}
+
+// ============================================================================
 // ToolRegistry interface
 // ============================================================================
 

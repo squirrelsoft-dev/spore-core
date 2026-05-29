@@ -11,6 +11,7 @@ import {
   type DispatchError,
   type DispatchOutcome,
   type RegistrationError,
+  type StandardTool,
   type TaskPhase,
   type Tool,
   type ToolContext,
@@ -30,7 +31,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 export class StandardToolRegistry implements ToolRegistry {
-  private readonly tools = new Map<string, Registered>();
+  private readonly toolsByName = new Map<string, Registered>();
   private readonly sets: ToolSet[] = [];
 
   register(tool: Tool, schema: ToolSchema): RegistrationError | null {
@@ -45,10 +46,36 @@ export class StandardToolRegistry implements ToolRegistry {
     if (schemaErr) return schemaErr;
     const annoErr = validateAnnotations(schema);
     if (annoErr) return annoErr;
-    if (this.tools.has(schema.name)) {
-      return { kind: "DuplicateName", tool: schema.name };
+    // Last-wins upsert (issue #81, Q1): registering a tool whose name is already
+    // present OVERWRITES the prior entry instead of erroring. This is what lets
+    // an architect override a standard tool by registering their own after a
+    // `StandardTools` preset. (Tool-SET names still error on duplicates — see
+    // `registerSet`.)
+    this.toolsByName.set(schema.name, { tool, schema });
+    return null;
+  }
+
+  /**
+   * Register a single catalogue {@link StandardTool} (issue #81): destructures
+   * its bundled implementation + schema and forwards to {@link register} (a
+   * last-wins upsert). Mirrors Rust's `HarnessBuilder::tool` draining into the
+   * registry.
+   */
+  tool(t: StandardTool): RegistrationError | null {
+    return this.register(t.implementation, t.schema);
+  }
+
+  /**
+   * Register every catalogue {@link StandardTool} from an iterable (issue #81),
+   * e.g. a `StandardTools` preset bundle. Stops and returns the first
+   * {@link RegistrationError}; otherwise `null`. Mirrors Rust's
+   * `HarnessBuilder::tools`.
+   */
+  tools(ts: Iterable<StandardTool>): RegistrationError | null {
+    for (const t of ts) {
+      const err = this.tool(t);
+      if (err) return err;
     }
-    this.tools.set(schema.name, { tool, schema });
     return null;
   }
 
@@ -70,20 +97,20 @@ export class StandardToolRegistry implements ToolRegistry {
   activeSchemas(phase?: TaskPhase | null): ToolSchema[] {
     let out: ToolSchema[];
     if (phase == null) {
-      out = Array.from(this.tools.values(), (r) => r.schema);
+      out = Array.from(this.toolsByName.values(), (r) => r.schema);
     } else {
       // Union of: sets matching this phase OR sets with no phase
       // (always-active). If no set matches, fall back to the full catalog —
       // registering zero sets must not silently mask every tool.
       const matching = this.sets.filter((s) => s.phase == null || s.phase === phase);
       if (matching.length === 0) {
-        out = Array.from(this.tools.values(), (r) => r.schema);
+        out = Array.from(this.toolsByName.values(), (r) => r.schema);
       } else {
         const names = new Set<string>();
         for (const s of matching) for (const t of s.tools) names.add(t);
         out = [];
         for (const n of names) {
-          const r = this.tools.get(n);
+          const r = this.toolsByName.get(n);
           if (r) out.push(r.schema);
         }
       }
@@ -99,7 +126,7 @@ export class StandardToolRegistry implements ToolRegistry {
     ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<DispatchOutcome> {
-    const reg = this.tools.get(call.name);
+    const reg = this.toolsByName.get(call.name);
     if (!reg) {
       return { ok: false, error: { kind: "UnregisteredTool", name: call.name } };
     }
@@ -129,7 +156,7 @@ export class StandardToolRegistry implements ToolRegistry {
     // Classify each call. Unknown tools are scheduled sequentially so their
     // error surfaces deterministically alongside any other sequential failures.
     const classifications: boolean[] = calls.map((call) => {
-      const r = this.tools.get(call.name);
+      const r = this.toolsByName.get(call.name);
       if (!r) return false;
       const a = r.schema.annotations;
       return a.read_only && !a.destructive && !a.open_world;
@@ -166,7 +193,7 @@ export class StandardToolRegistry implements ToolRegistry {
   }
 
   hasSubagentTools(): boolean {
-    for (const r of this.tools.values()) {
+    for (const r of this.toolsByName.values()) {
       if (r.tool.isSubagentTool === true) return true;
     }
     return false;

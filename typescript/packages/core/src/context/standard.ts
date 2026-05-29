@@ -380,6 +380,8 @@ function renderToolOutput(result: ToolResult): string {
       return "[waiting]";
     case "escalate":
       return "[escalate]";
+    case "awaiting_clarification":
+      return "[awaiting clarification]";
   }
 }
 
