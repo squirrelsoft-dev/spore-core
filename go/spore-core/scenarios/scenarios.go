@@ -167,6 +167,7 @@ func BuildRealToolRegistry(scenario ScenarioID) *sporecore.StandardToolRegistry 
 	must(reg.Register(tools.NewListDirTool(), tools.NewListDirTool().Schema()))
 	must(reg.Register(tools.NewExecTool(), tools.NewExecTool().Schema()))
 	must(reg.Register(tools.NewFailingTool(), tools.NewFailingTool().Schema()))
+	must(reg.Register(tools.NewTaskListTool(), tools.NewTaskListTool().Schema()))
 	if scenario == S5 {
 		must(reg.Register(tools.NewBashCommandTool(), tools.NewBashCommandTool().Schema()))
 	}

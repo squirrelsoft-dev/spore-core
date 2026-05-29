@@ -6,7 +6,11 @@
 
 package tools
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+)
 
 // ----- Filesystem -----
 
@@ -144,4 +148,34 @@ type HttpPostParams struct {
 
 type SubagentParams struct {
 	Instruction string `json:"instruction"`
+}
+
+// ----- TaskList (#71) -----
+
+// TaskListAction is the action discriminator for TaskListParams. One of
+// "add_task" | "update_task" | "complete_task" | "list_tasks".
+type TaskListAction string
+
+const (
+	TaskListActionAddTask      TaskListAction = "add_task"
+	TaskListActionUpdateTask   TaskListAction = "update_task"
+	TaskListActionCompleteTask TaskListAction = "complete_task"
+	TaskListActionListTasks    TaskListAction = "list_tasks"
+)
+
+// TaskListParams are the parameters for the TaskListTool. Mirrors the Rust
+// internally-tagged TaskListParams enum: an `action` discriminator plus the
+// union of per-action fields. Pointer fields distinguish present-vs-absent so
+// update_task can apply status and/or description independently.
+//
+// Field requirements per action (validated in the tool, not by serde):
+//   - add_task:      description (required)
+//   - update_task:   id (required); status and/or description (both optional)
+//   - complete_task: id (required)
+//   - list_tasks:    no fields
+type TaskListParams struct {
+	Action      TaskListAction        `json:"action"`
+	Description *string               `json:"description,omitempty"`
+	ID          *uint32               `json:"id,omitempty"`
+	Status      *sporecore.TaskStatus `json:"status,omitempty"`
 }
