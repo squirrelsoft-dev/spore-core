@@ -1780,8 +1780,8 @@ class StandardHarness:
             await self._finalize_plan_execute(result)
             return result
 
-        # Q4: persist through the storage seam (RunStore) + the extras mirror.
-        await self._persist_task_list(session_state, session_id, task_list)
+        # Q4: persist through the storage seam (RunStore) — single source of truth.
+        await self._persist_task_list(session_id, task_list)
 
         # Carry the shared budget forward: the plan turn already consumed
         # ``outcome.turns`` turns and ``outcome.usage`` tokens (Q1).
@@ -1812,17 +1812,16 @@ class StandardHarness:
 
     async def _persist_task_list(
         self,
-        session_state: SessionState,
         session_id: SessionId,
         task_list: object,
     ) -> None:
         """Persist the parsed :class:`TaskList` for the run (Q4).
 
-        The DURABLE write goes through the :class:`RunStore` seam under
+        The write goes through the :class:`RunStore` seam under
         ``TASK_LIST_EXTRAS_KEY``; the #71 sandbox-filesystem path
         (``.spore/task_list.json``) is intentionally NOT used — one source of
-        truth. The list is also mirrored into
-        ``SessionState.extras[TASK_LIST_EXTRAS_KEY]``. Storage failures are
+        truth. The RunStore write is the single source of truth (#76 removed the
+        redundant ``SessionState.extras`` mirror). Storage failures are
         swallowed: a successful plan must not be lost to a storage hiccup (the
         default no-op provider never fails). Mirrors Rust's ``persist_task_list``.
         """
@@ -1830,13 +1829,10 @@ class StandardHarness:
 
         assert isinstance(task_list, TaskList)
         value = task_list.to_dict()
-        # Durable write through the storage seam (RunStore).
         try:
             await self._config.storage.run().put(session_id, TASK_LIST_EXTRAS_KEY, value)
         except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
             pass
-        # Extras mirror (in-session view).
-        session_state.extras[TASK_LIST_EXTRAS_KEY] = value
 
     async def _run_execute_phase(
         self,
@@ -1900,7 +1896,7 @@ class StandardHarness:
 
             # Mark InProgress (pending -> in_progress) and re-persist (Q4).
             task_list.update(task_id, TaskStatus.IN_PROGRESS)
-            await self._persist_task_list(session_state, session_id, task_list)
+            await self._persist_task_list(session_id, task_list)
 
             # Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
             # instruction via the carried Task; the (possibly mutated) instruction
@@ -1953,7 +1949,7 @@ class StandardHarness:
 
                 # Mark Completed and re-persist (Q4).
                 task_list.complete(task_id)
-                await self._persist_task_list(session_state, session_id, task_list)
+                await self._persist_task_list(session_id, task_list)
                 # Surface the completed step's final text at the parent-visible
                 # step boundary (the sub-loop runs with a suppressed sink).
                 self._emit(on_stream, StreamFinalResponse(content=last_output))
@@ -1969,7 +1965,7 @@ class StandardHarness:
                 total_usage.cost_usd += sub_result.usage.cost_usd
 
                 task_list.update(task_id, TaskStatus.BLOCKED)
-                await self._persist_task_list(session_state, session_id, task_list)
+                await self._persist_task_list(session_id, task_list)
 
                 if isinstance(sub_result.reason, HaltReasonBudgetExceeded):
                     terminal_reason: HaltReason = sub_result.reason
@@ -2179,10 +2175,19 @@ class StandardHarness:
             # The chain threads mutations through ``ctx.plan`` in place.
             artifact = ctx.plan
 
-        # R4: store the produced artifact in extras["plan_execute"] as a
-        # JSON-safe object (matches Rust's ``serde_json::to_value(&artifact)``:
-        # ``{"tasks": [...], "rationale": "..."}``).
-        session_state.extras[PLAN_EXECUTE_EXTRAS_KEY] = artifact.model_dump(mode="json")
+        # R4: persist the produced artifact to the RunStore seam under
+        # PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth; no
+        # longer mirrored into SessionState.extras). The JSON-safe object matches
+        # Rust's ``serde_json::to_value(&artifact)``: ``{"tasks": [...],
+        # "rationale": "..."}``. Storage failures are swallowed (matching the
+        # execute-phase persist): a successfully-captured plan must not be lost
+        # to a storage hiccup (the default no-op provider never fails).
+        try:
+            await self._config.storage.run().put(
+                session_id, PLAN_EXECUTE_EXTRAS_KEY, artifact.model_dump(mode="json")
+            )
+        except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
+            pass
 
         return _PlanPhaseOutcome(artifact=artifact, usage=usage, turns=budget_used.turns)
 

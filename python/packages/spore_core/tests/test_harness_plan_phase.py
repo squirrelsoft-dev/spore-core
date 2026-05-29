@@ -21,6 +21,7 @@ from spore_core import (
     HarnessBuilder,
     HarnessConfig,
     HarnessRunOptions,
+    InMemoryStorageProvider,
     LoopStrategyPlanExecute,
     MockAgent,
     ModelAgent,
@@ -33,6 +34,7 @@ from spore_core import (
     ScriptedToolRegistry,
     SessionId,
     StandardHarness,
+    StorageProvider,
     Task,
     TokenUsage,
     ToolCall,
@@ -57,6 +59,9 @@ def _agent() -> MockAgent:
 
 
 def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
+    # #76: the plan artifact now lives on the RunStore seam (not
+    # SessionState.extras), so the test harness needs a real (in-memory) run
+    # store for the readback assertions below to observe what the harness wrote.
     return HarnessConfig(
         agent=agent,
         tool_registry=overrides.get("tool_registry", ScriptedToolRegistry()),
@@ -66,7 +71,13 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
         observability=overrides.get("observability"),
         hooks=overrides.get("hooks"),
         planner_agent=overrides.get("planner_agent"),
+        storage=overrides.get("storage", StorageProvider.single(InMemoryStorageProvider())),
     )
+
+
+async def _stored_artifact(h: StandardHarness, session_id: SessionId) -> object:
+    """Read the plan artifact back through the harness's RunStore seam (#76)."""
+    return await h.storage().run().get(session_id, PLAN_EXECUTE_EXTRAS_KEY)
 
 
 def _plan_task(*, max_turns: int | None = None) -> Task:
@@ -118,22 +129,25 @@ async def test_plan_turn_tool_call_is_planning_failure() -> None:
     reg = ScriptedToolRegistry()
     h = StandardHarness(_config(a, tool_registry=reg))
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_plan_task(), session_state=state))
+    task = _plan_task()
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonPlanPhaseFailed)
     # Error nested under `error` (3-language parity), not flattened.
     assert r.reason.error.kind == "planning_turn_failed"
     assert reg.call_count == 0  # never dispatched
-    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras  # no artifact stored
+    assert await _stored_artifact(h, task.session_id) is None  # no artifact stored
+    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras  # never mirrored into extras
 
 
 # ---------------------------------------------------------------------------
 # R3: the artifact is captured from the response text.
-# R4: the artifact is stored in extras["plan_execute"] as a JSON object.
+# R4: the artifact is persisted to the RunStore under PLAN_EXECUTE_EXTRAS_KEY
+#     as a JSON object (#76 — no longer mirrored into extras).
 # ---------------------------------------------------------------------------
 
 
-async def test_artifact_captured_and_stored_in_extras() -> None:
+async def test_artifact_captured_and_stored_in_run_store() -> None:
     from spore_core import BudgetSnapshot, SessionState
     from spore_core.harness import _PlanPhaseOutcome
 
@@ -141,11 +155,14 @@ async def test_artifact_captured_and_stored_in_extras() -> None:
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a))
     state = SessionState()
-    outcome = await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    task = _plan_task()
+    outcome = await h._run_plan_phase(task, state, BudgetSnapshot(), None)
     assert isinstance(outcome, _PlanPhaseOutcome)
-    stored = state.extras[PLAN_EXECUTE_EXTRAS_KEY]
+    stored = await _stored_artifact(h, task.session_id)
     # Stored as a JSON-safe object (matches Rust's serde_json::to_value).
     assert stored == {"tasks": ["a", "b"], "rationale": "r"}
+    # #76: not mirrored into SessionState.extras anymore.
+    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +178,12 @@ async def test_unparseable_plan_fails_and_stores_nothing() -> None:
     a.push(FinalResponse(content="not json", usage=_usage()))
     h = StandardHarness(_config(a))
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_plan_task(), session_state=state))
+    task = _plan_task()
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonPlanPhaseFailed)
     assert r.reason.error.kind == "unparseable_plan"
+    assert await _stored_artifact(h, task.session_id) is None
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
     # Wire shape: the error is NESTED under `error` (parity with Rust's
     # HaltReason::PlanPhaseFailed { error } and Go's HaltPlanPhaseFailed), not
@@ -188,9 +207,11 @@ async def test_plan_turn_agent_error() -> None:
     a = _agent()  # empty MockAgent → returns AgentErrorEmpty
     h = StandardHarness(_config(a))
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_plan_task(), session_state=state))
+    task = _plan_task()
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonAgentError)
+    assert await _stored_artifact(h, task.session_id) is None
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
 
 
@@ -299,6 +320,7 @@ async def test_budget_exhausted_before_plan_turn() -> None:
     assert isinstance(r.reason, HaltReasonBudgetExceeded)
     assert r.reason.limit_type == "turns"
     assert a.call_count == 0
+    assert await _stored_artifact(h, task.session_id) is None
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
 
 
@@ -330,12 +352,14 @@ async def test_on_plan_created_mutation_reflected_in_stored_artifact() -> None:
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a, hooks=chain))
     state = SessionState()
-    outcome = await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    task = _plan_task()
+    outcome = await h._run_plan_phase(task, state, BudgetSnapshot(), None)
     assert isinstance(outcome, _PlanPhaseOutcome)
-    assert state.extras[PLAN_EXECUTE_EXTRAS_KEY] == {
+    assert await _stored_artifact(h, task.session_id) == {
         "tasks": ["a", "b", "extra"],
         "rationale": "rewritten",
     }
+    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
 
 
 # A non-mutating (Continue) OnPlanCreated hook leaves the captured plan intact.
@@ -357,10 +381,12 @@ async def test_on_plan_created_continue_keeps_captured_plan() -> None:
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a, hooks=chain))
     state = SessionState()
-    await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    task = _plan_task()
+    await h._run_plan_phase(task, state, BudgetSnapshot(), None)
     assert len(seen) == 1
     assert seen[0].tasks == ["a", "b"]
-    assert state.extras[PLAN_EXECUTE_EXTRAS_KEY] == {"tasks": ["a", "b"], "rationale": "r"}
+    assert await _stored_artifact(h, task.session_id) == {"tasks": ["a", "b"], "rationale": "r"}
+    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +501,11 @@ async def _drive_plan_phase(response_text: str) -> None:
     agent = ModelAgent(AgentId("planner"), replay)
     h = StandardHarness(_config_for_agent(agent))
     state = SessionState()
+    session_id = SessionId("plan-fixture")
     outcome = await h._run_plan_phase(
         Task.new(
             "build something",
-            SessionId("plan-fixture"),
+            session_id,
             LoopStrategyPlanExecute(plan_model=None),
         ),
         state,
@@ -487,11 +514,12 @@ async def _drive_plan_phase(response_text: str) -> None:
     )
     assert isinstance(outcome, _PlanPhaseOutcome)
     assert outcome.turns == 1
-    _LAST_EXTRAS.clear()
-    _LAST_EXTRAS.update(state.extras)
+    # #76: the artifact is read back from the RunStore seam, not extras.
+    _LAST_ARTIFACT.clear()
+    _LAST_ARTIFACT["value"] = await _stored_artifact(h, session_id)
 
 
-_LAST_EXTRAS: dict[str, object] = {}
+_LAST_ARTIFACT: dict[str, object] = {}
 
 
 def _config_for_agent(agent: ModelAgent) -> HarnessConfig:
@@ -501,6 +529,7 @@ def _config_for_agent(agent: ModelAgent) -> HarnessConfig:
         sandbox=AllowAllSandbox(),
         context_manager=NoopContextManager(),
         termination_policy=AlwaysContinuePolicy(),
+        storage=StorageProvider.single(InMemoryStorageProvider()),
     )
 
 
@@ -508,7 +537,7 @@ async def test_fixture_plain_json_captures_exact_artifact() -> None:
     texts = _fixture_responses()
     assert len(texts) >= 2
     await _drive_plan_phase(texts[0])
-    assert _LAST_EXTRAS[PLAN_EXECUTE_EXTRAS_KEY] == {
+    assert _LAST_ARTIFACT["value"] == {
         "tasks": [
             "scaffold the project",
             "add the argument parser",
@@ -522,7 +551,7 @@ async def test_fixture_fenced_json_captures_exact_artifact() -> None:
     texts = _fixture_responses()
     assert len(texts) >= 2
     await _drive_plan_phase(texts[1])
-    assert _LAST_EXTRAS[PLAN_EXECUTE_EXTRAS_KEY] == {
+    assert _LAST_ARTIFACT["value"] == {
         "tasks": ["draft the outline", "write the reference section"],
         "rationale": "docs follow the code",
     }

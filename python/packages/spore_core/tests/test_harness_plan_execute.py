@@ -29,6 +29,7 @@ from spore_core import (
     MockAgent,
     ModelAgent,
     NoopContextManager,
+    PLAN_EXECUTE_EXTRAS_KEY,
     ProviderInfo,
     ReplayModelInterface,
     RunResultFailure,
@@ -63,6 +64,9 @@ def _agent() -> MockAgent:
 
 
 def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
+    # #76: the task list now lives on the RunStore seam (not SessionState.extras),
+    # so the test harness defaults to a real (in-memory) run store for the
+    # readback assertions below to observe what the harness wrote.
     return HarnessConfig(
         agent=agent,
         tool_registry=overrides.get("tool_registry", ScriptedToolRegistry()),
@@ -72,8 +76,13 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
         observability=overrides.get("observability"),
         hooks=overrides.get("hooks"),
         planner_agent=overrides.get("planner_agent"),
-        storage=overrides.get("storage"),
+        storage=overrides.get("storage", StorageProvider.single(InMemoryStorageProvider())),
     )
+
+
+async def _stored_task_list(h: StandardHarness, session_id: SessionId) -> object:
+    """Read the persisted task list back through the harness's RunStore (#76)."""
+    return await h.storage().run().get(session_id, TASK_LIST_EXTRAS_KEY)
 
 
 def _task(*, max_turns: int | None = None) -> Task:
@@ -136,15 +145,20 @@ async def test_success_output_is_last_step_final_text() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_all_tasks_completed_in_extras() -> None:
+async def test_all_tasks_completed_in_run_store() -> None:
     a = _seed_two_tasks(_agent())
     h = StandardHarness(_config(a))
+    task = _task()
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_task(), session_state=state))
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultSuccess)
-    tl = TaskList.from_dict(state.extras[TASK_LIST_EXTRAS_KEY])  # type: ignore[arg-type]
+    stored = await _stored_task_list(h, task.session_id)
+    assert stored is not None
+    tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
     assert [t.description for t in tl.tasks] == ["task one", "task two"]
     assert all(t.status is TaskStatus.COMPLETED for t in tl.tasks)
+    # #76: not mirrored into SessionState.extras anymore.
+    assert TASK_LIST_EXTRAS_KEY not in state.extras
 
 
 # ---------------------------------------------------------------------------
@@ -156,13 +170,15 @@ async def test_empty_plan_fails_with_empty_plan() -> None:
     a = _agent()
     a.push(FinalResponse(content='{"tasks":[],"rationale":"nothing"}', usage=_usage()))
     h = StandardHarness(_config(a))
+    task = _task()
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_task(), session_state=state))
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonEmptyPlan)
     # Only the plan turn ran; no execute steps.
     assert a.call_count == 1
     # No task list persisted for an empty plan.
+    assert await _stored_task_list(h, task.session_id) is None
     assert TASK_LIST_EXTRAS_KEY not in state.extras
 
 
@@ -179,8 +195,9 @@ async def test_step_failure_aborts_with_step_failed() -> None:
     # error inside the sub-loop. (MockAgent then has nothing left for task two.)
     a.push(ToolCallRequested(calls=[ToolCall(id="c", name="missing", input={})], usage=_usage()))
     h = StandardHarness(_config(a))
+    task = _task()
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_task(), session_state=state))
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonStepFailed)
     assert r.reason.task_index == 0
@@ -188,7 +205,9 @@ async def test_step_failure_aborts_with_step_failed() -> None:
     assert r.reason.reason  # carries the underlying reason rendering
     # task two never ran: the failing task is marked blocked; the next stays
     # pending (never advanced to in_progress).
-    tl = TaskList.from_dict(state.extras[TASK_LIST_EXTRAS_KEY])  # type: ignore[arg-type]
+    stored = await _stored_task_list(h, task.session_id)
+    assert stored is not None
+    tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
     assert tl.tasks[0].status is TaskStatus.BLOCKED
     assert tl.tasks[1].status is TaskStatus.PENDING
 
@@ -361,6 +380,33 @@ async def test_run_store_persistence() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #76: after a plan/execute run, BOTH persistence keys live on the RunStore
+# seam and NEITHER is mirrored into SessionState.extras. The ephemeral extras
+# keys (``__rich_state``, ``subagent_handoff_summary``) are owned by other
+# components and are untouched here.
+# ---------------------------------------------------------------------------
+
+
+async def test_persistence_lives_on_run_store_not_extras() -> None:
+    backend = InMemoryStorageProvider()
+    provider = StorageProvider.single(backend)
+    a = _seed_two_tasks(_agent())
+    h = StandardHarness(_config(a, storage=provider))
+    task = _task()
+    state = SessionState()
+    r = await h.run(HarnessRunOptions(task, session_state=state))
+    assert isinstance(r, RunResultSuccess)
+
+    # Both keys are durable in the RunStore.
+    assert await provider.run().get(task.session_id, PLAN_EXECUTE_EXTRAS_KEY) is not None
+    assert await provider.run().get(task.session_id, TASK_LIST_EXTRAS_KEY) is not None
+
+    # Neither key is mirrored into SessionState.extras anymore.
+    assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras
+    assert TASK_LIST_EXTRAS_KEY not in state.extras
+
+
+# ---------------------------------------------------------------------------
 # Fixture-replay parity: drive the full two-phase loop off the shared fixture
 # and assert the SAME outcome as the Rust reference.
 # ---------------------------------------------------------------------------
@@ -386,26 +432,25 @@ async def test_fixture_replay_matches_rust() -> None:
             sandbox=AllowAllSandbox(),
             context_manager=NoopContextManager(),
             termination_policy=AlwaysContinuePolicy(),
+            storage=StorageProvider.single(InMemoryStorageProvider()),
         )
     )
     state = SessionState()
-    r = await h.run(
-        HarnessRunOptions(
-            Task.new(
-                "build a CLI",
-                SessionId("pe-fixture"),
-                LoopStrategyPlanExecute(plan_model=None),
-            ),
-            session_state=state,
-        )
+    task = Task.new(
+        "build a CLI",
+        SessionId("pe-fixture"),
+        LoopStrategyPlanExecute(plan_model=None),
     )
+    r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultSuccess)
     # Q2: output is the LAST completed step's final text.
     assert r.output == "wrote the integration tests"
     # 1 plan turn + 1 per task (2 tasks) = 3 turns.
     assert r.turns == 3
-    # Both fixture tasks completed.
-    tl = TaskList.from_dict(state.extras[TASK_LIST_EXTRAS_KEY])  # type: ignore[arg-type]
+    # Both fixture tasks completed (read back through the RunStore seam, #76).
+    stored = await _stored_task_list(h, task.session_id)
+    assert stored is not None
+    tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
     assert [t.description for t in tl.tasks] == [
         "scaffold the project",
         "write the integration tests",
