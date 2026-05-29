@@ -79,7 +79,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -92,6 +92,7 @@ use crate::observability::{
     ObservabilityError, ObservabilityProvider, PatchSpan, SensorSpan, SessionMetrics, Span,
     SpanBase, SpanStatus, ToolCallSpan, TurnSpan, WarnSpan,
 };
+use crate::storage::{parse_otlp_endpoints, ObservabilityStore};
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 const OTLP_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -479,13 +480,6 @@ trait OtlpForwarder: Send + Sync {
     fn force_flush(&self);
 }
 
-/// No-op forwarder used when `SPORE_OTLP_ENDPOINT` is unset/empty.
-struct NullForwarder;
-impl OtlpForwarder for NullForwarder {
-    fn forward(&self, _line: &TraceLine) {}
-    fn force_flush(&self) {}
-}
-
 /// Real OTLP forwarder backed by `opentelemetry-otlp` (gRPC/tonic) with a batch
 /// span processor so export is buffered and non-blocking.
 struct OtlpSdkForwarder {
@@ -732,6 +726,31 @@ impl OtlpForwarder for OtlpSdkForwarder {
     }
 }
 
+/// Drive a future to completion synchronously with a no-op waker. The
+/// [`ObservabilityStore`] append used by the fan-out store leg is a leaf future
+/// that performs its work and resolves without ever yielding (the in-memory and
+/// filesystem stores do sync I/O inside an `async move` block), so a single
+/// `poll` resolves it. This lets the sync `emit_*` surface call the async store
+/// inline without a nested runtime `block_on`.
+fn drive_to_completion<T>(mut fut: BoxFut<'_, T>) -> T {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: the vtable's clone/wake/drop are all no-ops on a null pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            // These leaf store futures never pend; spin defensively.
+            Poll::Pending => std::hint::spin_loop(),
+        }
+    }
+}
+
 // ============================================================================
 // SessionWriter — per-session open handle + rotation + trace_id
 // ============================================================================
@@ -824,32 +843,73 @@ pub struct OutboxObservabilityProvider {
     inner: InMemoryObservabilityProvider,
     config: OutboxConfig,
     writers: Mutex<HashMap<SessionId, SessionWriter>>,
-    otlp: Box<dyn OtlpForwarder>,
+    /// Fan-out OTLP leg: one forwarder per parsed `SPORE_OTLP_ENDPOINT` entry
+    /// (issue #73 multi-endpoint fan-out). Each `emit_*` forwards the built line
+    /// to ALL of them; a failure on any leg never blocks the others. Empty when
+    /// the env var is unset/empty/all-unparseable.
+    otlp: Vec<Box<dyn OtlpForwarder>>,
+    /// Optional [`ObservabilityStore`] leg. When set, each `emit_*` ALSO
+    /// serializes the built line to JSON and calls `append_span` inline. The
+    /// outbox's own JSONL writer remains the durable source of truth; this
+    /// delegates the span store to the pluggable abstraction (issue #73).
+    store: Option<Arc<dyn ObservabilityStore>>,
 }
 
 impl OutboxObservabilityProvider {
-    /// Construct a provider. Reads `SPORE_OTLP_ENDPOINT` once: empty/whitespace
-    /// is treated as unset (JSONL only); a non-empty value wires the OTLP
-    /// forwarder to that endpoint.
+    /// Construct a provider. Reads `SPORE_OTLP_ENDPOINT` once. The value is a
+    /// **comma-separated list**: `split(',')`, trim each segment, drop empties
+    /// (see [`parse_otlp_endpoints`]). Each parsed endpoint becomes one fan-out
+    /// forwarder; unparseable entries are logged + skipped. Empty/unset → JSONL
+    /// only (no OTLP leg).
     pub fn new(config: OutboxConfig) -> Self {
-        let otlp: Box<dyn OtlpForwarder> = match std::env::var("SPORE_OTLP_ENDPOINT") {
-            Ok(ep) if !ep.trim().is_empty() => match OtlpSdkForwarder::new(ep.trim()) {
-                Some(f) => Box::new(f),
-                None => {
-                    eprintln!(
-                        "[spore-core] failed to init OTLP forwarder for '{}'; JSONL only",
-                        ep.trim()
-                    );
-                    Box::new(NullForwarder)
-                }
-            },
-            _ => Box::new(NullForwarder),
+        let otlp = match std::env::var("SPORE_OTLP_ENDPOINT") {
+            Ok(raw) => Self::build_forwarders(&raw),
+            Err(_) => Vec::new(),
         };
         Self {
             inner: InMemoryObservabilityProvider::new(),
             config,
             writers: Mutex::new(HashMap::new()),
             otlp,
+            store: None,
+        }
+    }
+
+    /// Build one real OTLP forwarder per parsed endpoint. Parses + validates the
+    /// comma-separated list ONCE; unparseable entries are logged and skipped.
+    fn build_forwarders(raw: &str) -> Vec<Box<dyn OtlpForwarder>> {
+        let mut out: Vec<Box<dyn OtlpForwarder>> = Vec::new();
+        for endpoint in parse_otlp_endpoints(raw) {
+            match OtlpSdkForwarder::new(&endpoint) {
+                Some(f) => out.push(Box::new(f)),
+                None => eprintln!(
+                    "[spore-core] failed to init OTLP forwarder for '{endpoint}'; skipping"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Attach an [`ObservabilityStore`] leg (issue #73). Each subsequent
+    /// `emit_*` will ALSO call `append_span` on this store inline, in addition
+    /// to the durable JSONL writer and any OTLP forwarders. Returns `self` so it
+    /// chains with [`OutboxObservabilityProvider::new`].
+    pub fn with_store(mut self, store: Arc<dyn ObservabilityStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Test-only constructor that injects fan-out OTLP forwarders directly,
+    /// bypassing `SPORE_OTLP_ENDPOINT`. Keeps the fan-out routing-matrix tests
+    /// hermetic (a counting fake forwarder) without a live OTLP stack.
+    #[cfg(test)]
+    fn with_forwarders(config: OutboxConfig, otlp: Vec<Box<dyn OtlpForwarder>>) -> Self {
+        Self {
+            inner: InMemoryObservabilityProvider::new(),
+            config,
+            writers: Mutex::new(HashMap::new()),
+            otlp,
+            store: None,
         }
     }
 
@@ -879,7 +939,10 @@ impl OutboxObservabilityProvider {
         Ok(writers.get_mut(session_id).unwrap())
     }
 
-    /// Append a built line to the session's JSONL file + forward to OTLP.
+    /// Append a built line to the session's JSONL file, fan out to every OTLP
+    /// forwarder, and (when configured) append the span to the
+    /// [`ObservabilityStore`] leg. Every leg is independent: a failure on any
+    /// one is logged but never propagates or blocks the others (issue #73).
     fn write_line(&self, session_id: &SessionId, line: TraceLine) {
         let jsonl = line.to_jsonl_line();
         {
@@ -892,11 +955,23 @@ impl OutboxObservabilityProvider {
                 }
                 Err(e) => {
                     eprintln!("[spore-core] outbox open failed: {e}");
-                    return;
                 }
             }
         }
-        self.otlp.forward(&line);
+        // Fan out to every OTLP endpoint. Each forwarder is internally
+        // non-blocking (batch processor); failures are isolated per leg.
+        for forwarder in &self.otlp {
+            forwarder.forward(&line);
+        }
+        // ObservabilityStore leg (issue #73): serialize the line to JSON and
+        // append inline. Failure is logged, never propagated.
+        if let Some(store) = &self.store {
+            let value = serde_json::to_value(&line).unwrap_or(Value::Null);
+            let fut = store.append_span(session_id, value);
+            if let Err(e) = drive_to_completion(fut) {
+                eprintln!("[spore-core] observability store append failed: {e}");
+            }
+        }
     }
 
     fn trace_id_locked(&self, session_id: &SessionId) -> String {
@@ -1002,8 +1077,17 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
                 }
             }
 
-            // Best-effort OTLP force-flush; never errors out of flush_session.
-            self.otlp.force_flush();
+            // Best-effort OTLP force-flush across every fan-out leg; never
+            // errors out of flush_session.
+            for forwarder in &self.otlp {
+                forwarder.force_flush();
+            }
+            // Flush the ObservabilityStore leg's session marker too (issue #73).
+            if let Some(store) = &self.store {
+                if let Err(e) = store.flush_session(session_id).await {
+                    eprintln!("[spore-core] observability store flush failed: {e}");
+                }
+            }
             let provider_flush = tokio::time::timeout(OTLP_FLUSH_TIMEOUT, async {}).await;
             let _ = provider_flush;
 
@@ -1744,5 +1828,152 @@ mod tests {
         assert_eq!(events[1].0, "gen_ai.user.message");
         assert_eq!(events[2].0, "gen_ai.tool.message");
         assert_eq!(events[3].0, "gen_ai.assistant.message");
+    }
+
+    // ── Issue #73: OTLP multi-endpoint fan-out + ObservabilityStore leg ───────
+
+    use crate::storage::InMemoryStorageProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counting fake OTLP forwarder — increments a shared counter per `forward`.
+    /// Keeps the fan-out routing-matrix tests hermetic (no live OTLP stack).
+    struct CountingForwarder(Arc<AtomicUsize>);
+    impl OtlpForwarder for CountingForwarder {
+        fn forward(&self, _line: &TraceLine) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn force_flush(&self) {}
+    }
+
+    /// Forwarder that panics-free but does nothing — used to prove a failing
+    /// leg never blocks the others. (It "fails" by simply not counting; the
+    /// counting leg beside it must still tick.)
+    struct DeadForwarder;
+    impl OtlpForwarder for DeadForwarder {
+        fn forward(&self, _line: &TraceLine) {}
+        fn force_flush(&self) {}
+    }
+
+    fn counting(n: usize) -> (Vec<Box<dyn OtlpForwarder>>, Vec<Arc<AtomicUsize>>) {
+        let mut fwds: Vec<Box<dyn OtlpForwarder>> = Vec::new();
+        let mut counters = Vec::new();
+        for _ in 0..n {
+            let c = Arc::new(AtomicUsize::new(0));
+            counters.push(c.clone());
+            fwds.push(Box::new(CountingForwarder(c)));
+        }
+        (fwds, counters)
+    }
+
+    /// Routing matrix: OTLP yes + store yes → both legs receive every span.
+    #[tokio::test]
+    async fn fanout_both_otlp_and_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fwds, counters) = counting(2);
+        let store = Arc::new(InMemoryStorageProvider::new());
+        let obs = OutboxObservabilityProvider::with_forwarders(OutboxConfig::new(tmp.path()), fwds)
+            .with_store(store.clone());
+        obs.emit_turn(turn("s1", "sp1"));
+        obs.emit_turn(turn("s1", "sp2"));
+        // Each OTLP leg saw both spans.
+        assert_eq!(counters[0].load(Ordering::SeqCst), 2);
+        assert_eq!(counters[1].load(Ordering::SeqCst), 2);
+        // Store leg saw both spans.
+        assert_eq!(store.get_spans(&sid("s1")).await.unwrap().len(), 2);
+        // JSONL durable source of truth also has both.
+        assert_eq!(read_lines(tmp.path(), "s1").len(), 2);
+    }
+
+    /// Routing matrix: OTLP yes + store no → OTLP only (store leg absent).
+    #[tokio::test]
+    async fn fanout_otlp_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fwds, counters) = counting(1);
+        let obs = OutboxObservabilityProvider::with_forwarders(OutboxConfig::new(tmp.path()), fwds);
+        obs.emit_turn(turn("s1", "sp1"));
+        assert_eq!(counters[0].load(Ordering::SeqCst), 1);
+        assert_eq!(read_lines(tmp.path(), "s1").len(), 1);
+    }
+
+    /// Routing matrix: OTLP no + store yes → store only.
+    #[tokio::test]
+    async fn fanout_store_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var("SPORE_OTLP_ENDPOINT");
+        let store = Arc::new(InMemoryStorageProvider::new());
+        let obs = OutboxObservabilityProvider::new(OutboxConfig::new(tmp.path()))
+            .with_store(store.clone());
+        obs.emit_turn(turn("s1", "sp1"));
+        assert_eq!(store.get_spans(&sid("s1")).await.unwrap().len(), 1);
+    }
+
+    /// Routing matrix: OTLP no + store no → spans go only to the durable JSONL
+    /// (the outbox is always its own source of truth); no OTLP, no store.
+    #[tokio::test]
+    async fn fanout_dropped_when_neither_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var("SPORE_OTLP_ENDPOINT");
+        let obs = OutboxObservabilityProvider::new(OutboxConfig::new(tmp.path()));
+        assert!(obs.otlp.is_empty());
+        assert!(obs.store.is_none());
+        obs.emit_turn(turn("s1", "sp1"));
+        // Still durable on disk.
+        assert_eq!(read_lines(tmp.path(), "s1").len(), 1);
+    }
+
+    /// Failure isolation: a dead leg never blocks a live leg or the store.
+    #[tokio::test]
+    async fn fanout_failure_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let fwds: Vec<Box<dyn OtlpForwarder>> = vec![
+            Box::new(DeadForwarder),
+            Box::new(CountingForwarder(counter.clone())),
+            Box::new(DeadForwarder),
+        ];
+        let store = Arc::new(InMemoryStorageProvider::new());
+        let obs = OutboxObservabilityProvider::with_forwarders(OutboxConfig::new(tmp.path()), fwds)
+            .with_store(store.clone());
+        obs.emit_turn(turn("s1", "sp1"));
+        // The live leg still ticked despite dead legs on either side.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        // Store still received it.
+        assert_eq!(store.get_spans(&sid("s1")).await.unwrap().len(), 1);
+    }
+
+    /// Bad endpoint skipped: an unparseable entry is dropped, the good one
+    /// still wires a forwarder. (build_forwarders parses the comma list and
+    /// only keeps endpoints that init a forwarder.)
+    #[test]
+    fn fanout_bad_endpoint_skipped() {
+        // Comma-split + trim + drop-empties yields exactly the non-empty parts.
+        // An entry that fails OtlpSdkForwarder::new is logged and skipped — we
+        // can't init a live tonic exporter hermetically, so assert on parsing.
+        assert_eq!(
+            crate::storage::parse_otlp_endpoints(" good:4317 , , bad , "),
+            vec!["good:4317".to_string(), "bad".to_string()]
+        );
+        // Empty list builds zero forwarders.
+        let fwds = OutboxObservabilityProvider::build_forwarders("   ");
+        assert!(fwds.is_empty());
+    }
+
+    /// flush_session forwards to the store leg's flush (its `.flushed` marker).
+    #[tokio::test]
+    async fn fanout_flush_session_marks_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var("SPORE_OTLP_ENDPOINT");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::storage::FileSystemStorageProvider::new(
+            store_dir.path(),
+        ));
+        let obs = OutboxObservabilityProvider::new(OutboxConfig::new(tmp.path())).with_store(store);
+        obs.emit_turn(turn("s1", "sp1"));
+        obs.inner()
+            .set_session_outcome(&sid("s1"), SessionOutcome::Success);
+        obs.flush_session(&sid("s1")).await;
+        // Store leg got the span + the flush marker.
+        assert!(store_dir.path().join("sessions/s1/trace.jsonl").exists());
+        assert!(store_dir.path().join("sessions/s1/.flushed").exists());
     }
 }

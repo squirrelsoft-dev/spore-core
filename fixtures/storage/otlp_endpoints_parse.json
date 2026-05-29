@@ -1,0 +1,24 @@
+[
+  { "input": "a", "expected": ["a"] },
+  { "input": "a,b,c", "expected": ["a", "b", "c"] },
+  { "input": " a , b ", "expected": ["a", "b"] },
+  { "input": "a,,b,", "expected": ["a", "b"] },
+  { "input": "", "expected": [] },
+  { "input": "  ", "expected": [] },
+  {
+    "input": "http://localhost:4317",
+    "expected": ["http://localhost:4317"]
+  },
+  {
+    "input": "http://collector1:4317,http://collector2:4317,http://backup:4317",
+    "expected": [
+      "http://collector1:4317",
+      "http://collector2:4317",
+      "http://backup:4317"
+    ]
+  },
+  {
+    "input": " http://primary:4317 , , http://backup:4317 ,",
+    "expected": ["http://primary:4317", "http://backup:4317"]
+  }
+]

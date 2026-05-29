@@ -1,0 +1,32 @@
+[
+  { "key": "scalar_int", "value": 42 },
+  { "key": "scalar_float", "value": 3.5 },
+  { "key": "scalar_string", "value": "hello" },
+  { "key": "scalar_bool", "value": true },
+  { "key": "scalar_null", "value": null },
+  { "key": "empty_object", "value": {} },
+  { "key": "empty_array", "value": [] },
+  { "key": "flat_array", "value": [1, 2, 3] },
+  {
+    "key": "plan_artifact",
+    "value": {
+      "schema_version": "1.0",
+      "tasks": [
+        { "id": "t1", "title": "First", "done": false },
+        { "id": "t2", "title": "Second", "done": true }
+      ],
+      "metadata": { "created_by": "planner", "count": 2 }
+    }
+  },
+  {
+    "key": "nested_mixed",
+    "value": {
+      "n": 4.5,
+      "s": "x",
+      "b": false,
+      "nil": null,
+      "arr": [true, null, "deep", { "k": 1 }],
+      "obj": { "inner": { "leaf": [1, 2] } }
+    }
+  }
+]

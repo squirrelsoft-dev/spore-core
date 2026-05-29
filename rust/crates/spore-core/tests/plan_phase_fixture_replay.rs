@@ -66,6 +66,7 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
         max_stop_blocks: 8,
         hooks: None,
         planner_agent: None,
+        storage: Arc::new(spore_core::StorageProvider::no_op()),
     }
 }
 

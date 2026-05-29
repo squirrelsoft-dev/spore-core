@@ -1063,6 +1063,11 @@ pub struct HarnessConfig {
     /// [`agent`](Self::agent). `plan_model` on the strategy is descriptive
     /// metadata only — there is no `ModelConfig`→agent factory.
     pub planner_agent: Option<Arc<dyn Agent>>,
+    /// Pluggable per-domain persistence layer (issue #73). Defaults to an
+    /// all-no-op [`StorageProvider`] so existing callers/tests compile and
+    /// behave unchanged. v1 is expose-only — the run/resume loop is NOT
+    /// modified to read/write sessions internally.
+    pub storage: Arc<crate::storage::StorageProvider>,
 }
 
 impl Clone for HarnessConfig {
@@ -1084,6 +1089,7 @@ impl Clone for HarnessConfig {
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks.clone(),
             planner_agent: self.planner_agent.clone(),
+            storage: self.storage.clone(),
         }
     }
 }
@@ -1130,6 +1136,7 @@ pub struct HarnessBuilder {
     max_stop_blocks: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     planner_agent: Option<Arc<dyn Agent>>,
+    storage: Option<Arc<crate::storage::StorageProvider>>,
 }
 
 impl HarnessBuilder {
@@ -1159,7 +1166,17 @@ impl HarnessBuilder {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
+            storage: None,
         }
+    }
+
+    /// Inject a [`StorageProvider`](crate::storage::StorageProvider) (issue #73).
+    /// Mirrors [`observability`](Self::observability) — independent injection
+    /// point. Defaults to an all-no-op provider so existing callers/tests
+    /// compile and behave unchanged.
+    pub fn storage(mut self, storage: Arc<crate::storage::StorageProvider>) -> Self {
+        self.storage = Some(storage);
+        self
     }
 
     /// Inject an alternate agent for the PlanExecute plan phase (issue #70,
@@ -1269,6 +1286,9 @@ impl HarnessBuilder {
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks,
             planner_agent: self.planner_agent,
+            storage: self
+                .storage
+                .unwrap_or_else(|| Arc::new(crate::storage::StorageProvider::no_op())),
         }
     }
 
@@ -1290,6 +1310,19 @@ impl StandardHarness {
     /// Read-only access to the assembled config (used by builder tests).
     pub fn config(&self) -> &HarnessConfig {
         &self.config
+    }
+
+    /// The injected [`StorageProvider`](crate::storage::StorageProvider)
+    /// (issue #73). Defaults to an all-no-op provider when `.storage(...)` was
+    /// never set.
+    pub fn storage(&self) -> &Arc<crate::storage::StorageProvider> {
+        &self.config.storage
+    }
+
+    /// Convenience accessor for the storage layer's
+    /// [`SessionStore`](crate::storage::SessionStore) (issue #73, expose-only).
+    pub fn session_store(&self) -> &Arc<dyn crate::storage::SessionStore> {
+        self.config.storage.session()
     }
 
     /// Test-only hook: drive the post-compaction verify→retry→warn loop
@@ -3213,6 +3246,7 @@ mod tests {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
+            storage: Arc::new(crate::storage::StorageProvider::no_op()),
         }
     }
 
@@ -3611,6 +3645,53 @@ mod tests {
         assert!(prompt
             .iter()
             .any(|m| m["role"] == "user" && m["content"].as_str().is_some()));
+    }
+
+    // Issue #73: the builder defaults storage to an all-no-op StorageProvider,
+    // and `.storage(...)` / `storage()` / `session_store()` round-trip.
+    #[tokio::test]
+    async fn default_storage_is_no_op_and_setter_round_trips() {
+        use crate::storage::RunStore as _;
+        let a = make_agent();
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        // Default: no .storage() — must be no-op (reads empty).
+        let h = HarnessBuilder::new(
+            a.clone(),
+            reg.clone(),
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .build();
+        let sess = SessionId::new("s1");
+        assert!(h
+            .session_store()
+            .get_session(&sess)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(h.storage().run().get(&sess, "k").await.unwrap().is_none());
+
+        // Explicit injection round-trips through the accessor.
+        let backend = Arc::new(crate::storage::InMemoryStorageProvider::new());
+        backend
+            .put(&sess, "plan", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        let storage = Arc::new(crate::storage::StorageProvider::single(backend));
+        let h2 = HarnessBuilder::new(
+            a,
+            reg,
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        .storage(storage)
+        .build();
+        assert_eq!(
+            h2.storage().run().get(&sess, "plan").await.unwrap(),
+            Some(serde_json::json!({"ok": true}))
+        );
     }
 
     // Rule: parallel tool calls all dispatched in one turn.
@@ -4782,6 +4863,7 @@ mod tests {
                 max_stop_blocks: 8,
                 hooks: None,
                 planner_agent: None,
+                storage: Arc::new(crate::storage::StorageProvider::no_op()),
             })
         }
 

@@ -1748,6 +1748,7 @@ mod tests {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
+            storage: Arc::new(crate::storage::StorageProvider::no_op()),
         }
     }
 }

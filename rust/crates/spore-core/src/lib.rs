@@ -39,6 +39,7 @@ pub mod prompt_chunk_registry;
 pub mod sandbox;
 pub mod scenarios;
 pub mod sensor;
+pub mod storage;
 pub mod tasklist;
 pub mod termination;
 pub mod tool_call_repair;
@@ -132,6 +133,11 @@ pub use sensor::{
     Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
     SensorTrigger, StandardSensorChain,
+};
+pub use storage::{
+    parse_otlp_endpoints, CompositeStorageProvider, FileSystemStorageProvider,
+    InMemoryStorageProvider, MemoryEntry, MemoryStore, NoOpStorageProvider, ObservabilityStore,
+    RunStore, SessionStore, StorageError, StorageProvider,
 };
 pub use tasklist::{
     plan_artifact_to_task_list, Task as TaskListTask, TaskList, TaskListError, TaskStatus,

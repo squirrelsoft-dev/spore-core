@@ -1,0 +1,4 @@
+{"role":"user","content":"first message","timestamp":"2026-05-28T10:00:00Z","metadata":{}}
+{"role":"assistant","content":"second message","timestamp":"2026-05-28T10:00:01Z","metadata":{"tokens":12}}
+{"role":"user","content":"third message","timestamp":"2026-05-28T10:00:02Z","metadata":{}}
+{"role":"assistant","content":"fourth message","timestamp":"2026-05-28T10:00:03Z","metadata":{"tool":"shell","ok":true}}
