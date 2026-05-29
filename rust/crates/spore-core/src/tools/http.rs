@@ -78,6 +78,7 @@ impl Tool for HttpGetTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: HttpGetParams = match parse_params(call) {
@@ -152,6 +153,7 @@ impl Tool for HttpPostTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: HttpPostParams = match parse_params(call) {
@@ -192,7 +194,7 @@ impl Tool for HttpPostTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -216,7 +218,7 @@ mod tests {
         let sb = AllowAllSandbox;
         let url = format!("{}/hello", server.uri());
         let r = HttpGetTool::new()
-            .execute(&call("http_get", json!({"url": url})), &sb)
+            .execute(&call("http_get", json!({"url": url})), &sb, &test_ctx())
             .await;
         match r {
             ToolOutput::Success { content, .. } => assert_eq!(content, "world"),
@@ -238,6 +240,7 @@ mod tests {
             .execute(
                 &call("http_post", json!({"url": url, "body": {"x": 1}})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -250,7 +253,11 @@ mod tests {
     async fn http_get_invalid_url_is_recoverable() {
         let sb = AllowAllSandbox;
         let r = HttpGetTool::new()
-            .execute(&call("http_get", json!({"url": "not-a-url://////"})), &sb)
+            .execute(
+                &call("http_get", json!({"url": "not-a-url://////"})),
+                &sb,
+                &test_ctx(),
+            )
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),

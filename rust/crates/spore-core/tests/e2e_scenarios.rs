@@ -32,10 +32,15 @@ use spore_core::scenarios::{
 };
 use spore_core::{
     Agent, AgentId, FullObservabilityProvider, Harness, HarnessContextManager, HarnessRunOptions,
-    HarnessToolRegistry, HookPoint, HumanRequest, HumanResponse, LoopStrategy, ProviderInfo,
-    RunResult, SandboxProvider, SessionId, SessionState, Task, TokenUsage, ToolCall, ToolOutput,
-    TurnResult,
+    HarnessToolRegistry, HookPoint, HumanRequest, HumanResponse, InMemoryStorageProvider,
+    LoopStrategy, ProviderInfo, RunResult, RunStore, SandboxProvider, SessionId, SessionState,
+    Task, TokenUsage, ToolCall, ToolOutput, TurnResult,
 };
+
+/// A fresh in-memory `RunStore` for wiring `RealToolRegistry` in these tests.
+fn test_run_store() -> Arc<dyn RunStore> {
+    Arc::new(InMemoryStorageProvider::new())
+}
 
 fn usage() -> TokenUsage {
     TokenUsage {
@@ -378,7 +383,12 @@ async fn s4_tool_failure_then_recovery() {
 
     let registry = build_real_tool_registry(ScenarioId::S4);
     let sandbox: Arc<dyn SandboxProvider> = Arc::new(AllowAllSandbox);
-    let bridge = RealToolRegistry::new(registry, sandbox.clone());
+    let bridge = RealToolRegistry::new(
+        registry,
+        sandbox.clone(),
+        session_id.clone(),
+        test_run_store(),
+    );
     let schemas = bridge.model_schemas();
     let tools: Arc<dyn HarnessToolRegistry> = Arc::new(bridge);
 
@@ -419,6 +429,8 @@ async fn s4_failing_tool_is_not_always_halt() {
     let bridge = RealToolRegistry::new(
         build_real_tool_registry(ScenarioId::S4),
         Arc::new(AllowAllSandbox),
+        SessionId::new("s4-not-halt"),
+        test_run_store(),
     );
     assert!(!bridge.is_always_halt("flaky_op"));
     let out = bridge
@@ -485,7 +497,12 @@ async fn s5_shell_pipeline_uppercases_via_bash_command() {
 
     let registry = build_real_tool_registry(ScenarioId::S5);
     let sandbox: Arc<dyn SandboxProvider> = Arc::new(AllowAllSandbox);
-    let bridge = RealToolRegistry::new(registry, sandbox.clone());
+    let bridge = RealToolRegistry::new(
+        registry,
+        sandbox.clone(),
+        session_id.clone(),
+        test_run_store(),
+    );
     let schemas = bridge.model_schemas();
     let tools: Arc<dyn HarnessToolRegistry> = Arc::new(bridge);
 

@@ -88,6 +88,7 @@ impl Tool for GitLogTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: GitLogParams = match parse_params(call) {
@@ -159,6 +160,7 @@ impl Tool for GitDiffTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: GitDiffParams = match parse_params(call) {
@@ -229,6 +231,7 @@ impl Tool for GitCommitTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: GitCommitParams = match parse_params(call) {
@@ -311,6 +314,7 @@ impl Tool for GitStatusTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let _: GitStatusParams = parse_params(call).unwrap_or_default();
@@ -375,6 +379,7 @@ impl Tool for GitResetTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: GitResetParams = match parse_params(call) {
@@ -409,7 +414,7 @@ impl Tool for GitResetTool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use serde_json::json;
 
     fn git_available() -> bool {
@@ -435,7 +440,7 @@ mod tests {
         }
         let sb = AllowAllSandbox;
         let r = GitStatusTool::new()
-            .execute(&call("git_status", json!({})), &sb)
+            .execute(&call("git_status", json!({})), &sb, &test_ctx())
             .await;
         // Either Success (in a repo) or Error (outside a repo) — both fine.
         match r {

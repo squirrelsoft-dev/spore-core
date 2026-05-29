@@ -88,6 +88,7 @@ impl Tool for ExecTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ExecParams = match parse_params(call) {
@@ -183,6 +184,7 @@ impl Tool for BashCommandTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ShellCommandParams = match parse_params(call) {
@@ -275,6 +277,7 @@ impl Tool for RunTestsTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: RunTestsParams = match parse_params(call) {
@@ -332,7 +335,7 @@ impl Tool for RunTestsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use serde_json::json;
 
     fn call(name: &str, input: serde_json::Value) -> ToolCall {
@@ -353,6 +356,7 @@ mod tests {
             .execute(
                 &call("exec", json!({"command": "echo", "args": ["hi"]})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -385,6 +389,7 @@ mod tests {
                     json!({"command": "echo", "args": ["a|b", "$(whoami)", ">out"]}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         std::env::set_current_dir(&prev).unwrap();
@@ -409,7 +414,7 @@ mod tests {
     async fn exec_nonzero_exit_is_recoverable_error() {
         let sb = AllowAllSandbox;
         let r = ExecTool::new()
-            .execute(&call("exec", json!({"command": "false"})), &sb)
+            .execute(&call("exec", json!({"command": "false"})), &sb, &test_ctx())
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
@@ -428,6 +433,7 @@ mod tests {
                     json!({"command": "sleep", "args": ["5"], "timeout": 1}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -445,7 +451,9 @@ mod tests {
     #[tokio::test]
     async fn exec_invalid_params_returns_recoverable_error() {
         let sb = AllowAllSandbox;
-        let r = ExecTool::new().execute(&call("exec", json!({})), &sb).await;
+        let r = ExecTool::new()
+            .execute(&call("exec", json!({})), &sb, &test_ctx())
+            .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),
@@ -465,6 +473,7 @@ mod tests {
                     json!({"script": "printf 'hi' | tr a-z A-Z"}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -486,7 +495,11 @@ mod tests {
         ));
         let script = format!("printf 'data' > {}", tmp.display());
         let r = BashCommandTool::new()
-            .execute(&call("bash_command", json!({"script": script})), &sb)
+            .execute(
+                &call("bash_command", json!({"script": script})),
+                &sb,
+                &test_ctx(),
+            )
             .await;
         assert!(matches!(r, ToolOutput::Success { .. }), "got {r:?}");
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "data");
@@ -498,7 +511,11 @@ mod tests {
     async fn bash_command_nonzero_exit_is_recoverable_error() {
         let sb = AllowAllSandbox;
         let r = BashCommandTool::new()
-            .execute(&call("bash_command", json!({"script": "exit 3"})), &sb)
+            .execute(
+                &call("bash_command", json!({"script": "exit 3"})),
+                &sb,
+                &test_ctx(),
+            )
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
@@ -514,6 +531,7 @@ mod tests {
             .execute(
                 &call("bash_command", json!({"script": "sleep 5", "timeout": 1})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -532,7 +550,7 @@ mod tests {
     async fn bash_command_invalid_params_returns_recoverable_error() {
         let sb = AllowAllSandbox;
         let r = BashCommandTool::new()
-            .execute(&call("bash_command", json!({})), &sb)
+            .execute(&call("bash_command", json!({})), &sb, &test_ctx())
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),

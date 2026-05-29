@@ -57,6 +57,7 @@ impl Tool for ReadFileTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ReadFileParams = match parse_params(call) {
@@ -125,6 +126,7 @@ impl Tool for WriteFileTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: WriteFileParams = match parse_params(call) {
@@ -209,6 +211,7 @@ impl Tool for ListDirTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: ListDirParams = match parse_params(call) {
@@ -305,6 +308,7 @@ impl Tool for DeleteFileTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: DeleteFileParams = match parse_params(call) {
@@ -374,6 +378,7 @@ impl Tool for MoveFileTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: MoveFileParams = match parse_params(call) {
@@ -409,7 +414,7 @@ impl Tool for MoveFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -433,6 +438,7 @@ mod tests {
                     json!({"path": path.to_str().unwrap(), "content": "hello"}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         assert!(matches!(w, ToolOutput::Success { .. }));
@@ -440,6 +446,7 @@ mod tests {
             .execute(
                 &call("read_file", json!({"path": path.to_str().unwrap()})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -460,6 +467,7 @@ mod tests {
                     json!({"path": path.to_str().unwrap(), "content": "a"}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         WriteFileTool::new()
@@ -469,6 +477,7 @@ mod tests {
                     json!({"path": path.to_str().unwrap(), "content": "b", "append": true}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         let content = tokio::fs::read_to_string(&path).await.unwrap();
@@ -486,6 +495,7 @@ mod tests {
             .execute(
                 &call("list_dir", json!({"path": dir.path().to_str().unwrap()})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -507,6 +517,7 @@ mod tests {
             .execute(
                 &call("delete_file", json!({"path": "/no/such/path/here"})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -529,6 +540,7 @@ mod tests {
                     json!({"src": src.to_str().unwrap(), "dst": dst.to_str().unwrap()}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         assert!(matches!(r, ToolOutput::Success { .. }));
@@ -555,7 +567,11 @@ mod tests {
         })
         .unwrap();
         let r = ReadFileTool::new()
-            .execute(&call("read_file", json!({"path": "output.txt"})), &sb)
+            .execute(
+                &call("read_file", json!({"path": "output.txt"})),
+                &sb,
+                &test_ctx(),
+            )
             .await;
         match r {
             ToolOutput::Error {
@@ -593,6 +609,7 @@ mod tests {
             .execute(
                 &call("read_file", json!({"path": "../nonexistent_secret"})),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -611,7 +628,7 @@ mod tests {
     async fn invalid_params_returns_recoverable_error() {
         let sb = AllowAllSandbox;
         let r = ReadFileTool::new()
-            .execute(&call("read_file", json!({})), &sb)
+            .execute(&call("read_file", json!({})), &sb, &test_ctx())
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),

@@ -71,6 +71,7 @@ impl Tool for GrepFilesTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: GrepFilesParams = match parse_params(call) {
@@ -169,6 +170,7 @@ impl Tool for FindFilesTool {
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let params: FindFilesParams = match parse_params(call) {
@@ -207,7 +209,7 @@ impl Tool for FindFilesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -232,6 +234,7 @@ mod tests {
                     json!({"pattern": "^alpha", "path": dir.path().to_str().unwrap()}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -254,6 +257,7 @@ mod tests {
                     json!({"pattern": "(unclosed", "path": dir.path().to_str().unwrap()}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {
@@ -276,6 +280,7 @@ mod tests {
                     json!({"glob": "*.rs", "path": dir.path().to_str().unwrap()}),
                 ),
                 &sb,
+                &test_ctx(),
             )
             .await;
         match r {

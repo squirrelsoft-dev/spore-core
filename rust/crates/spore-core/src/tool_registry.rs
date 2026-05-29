@@ -17,6 +17,31 @@
 //! - Expose `has_subagent_tools()` so `SubagentTool::new()` can enforce
 //!   the depth-1 rule at construction time
 //!
+//! ## Storage seam — `ToolContext` (#75)
+//!
+//! Tools receive a [`ToolContext`] on every dispatch, *in addition to* the
+//! `SandboxProvider`. `ToolContext` is the storage seam: `{ session_id:
+//! SessionId, run_store: Arc<dyn RunStore> }`. The new `Tool::execute`
+//! signature is:
+//!
+//! ```ignore
+//! fn execute<'a>(
+//!     &'a self,
+//!     call: &'a ToolCall,
+//!     sandbox: &'a (dyn SandboxProvider + 'a),
+//!     ctx: &'a ToolContext,
+//! ) -> BoxFut<'a, ToolOutput>;
+//! ```
+//!
+//! `StandardToolRegistry::dispatch`/`dispatch_all` thread the `ToolContext`
+//! through to every tool. The canonical registry takes the `ToolContext` as a
+//! dispatch argument; the harness-side `RealToolRegistry` bridge (scenarios.rs)
+//! is constructed per-run with the `SessionId` + `Arc<dyn RunStore>` and builds
+//! the `ToolContext` itself before forwarding. The harness-loop
+//! `ToolRegistry::dispatch(call)` signature is UNCHANGED. `ToolContext` is a
+//! struct so future fields are non-breaking; `SandboxProvider` is NOT folded in
+//! (storage is additive).
+//!
 //! ## What this component does NOT do
 //!
 //! - Retry recoverable failures (middleware concern — issue #11)
@@ -66,8 +91,52 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::harness::{BoxFut, SandboxProvider, SandboxViolation, ToolOutput, ToolResult};
+use crate::harness::{
+    BoxFut, SandboxProvider, SandboxViolation, SessionId, ToolOutput, ToolResult,
+};
 use crate::model::ToolCall;
+use crate::storage::RunStore;
+
+// ============================================================================
+// ToolContext — the storage seam handed to every tool (#75)
+// ============================================================================
+
+/// The per-dispatch storage seam handed to every [`Tool::execute`] call,
+/// alongside (but separate from) the [`SandboxProvider`]. It carries the
+/// minimum a tool needs to persist durable state via the storage layer:
+///
+///   - `session_id` — the run's [`SessionId`], the key namespace for [`RunStore`].
+///   - `run_store`  — the [`RunStore`] domain of the configured storage provider.
+///
+/// It is a **struct** (not a tuple/pair) so future fields can be added without
+/// breaking the trait signature again. The `SandboxProvider` is intentionally
+/// NOT folded in here — storage is additive; tools still receive the sandbox as
+/// its own parameter (some tools need the filesystem sandbox and no storage).
+#[derive(Clone)]
+pub struct ToolContext {
+    session_id: SessionId,
+    run_store: Arc<dyn RunStore>,
+}
+
+impl ToolContext {
+    /// Build a context from the run's session id and the run-store seam.
+    pub fn new(session_id: SessionId, run_store: Arc<dyn RunStore>) -> Self {
+        Self {
+            session_id,
+            run_store,
+        }
+    }
+
+    /// The session id keying this run's persisted state.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// The run-store domain a tool persists durable state through.
+    pub fn run_store(&self) -> &Arc<dyn RunStore> {
+        &self.run_store
+    }
+}
 
 // ============================================================================
 // ToolAnnotations & ToolSchema
@@ -174,8 +243,9 @@ pub enum DispatchError {
 // ============================================================================
 
 /// A single tool implementation. Tools are stateless and receive a
-/// `SandboxProvider` on every dispatch. The trait is `dyn`-compatible:
-/// concrete impls return `BoxFut` so `Box<dyn Tool>` works.
+/// `SandboxProvider` (environment seam) and a [`ToolContext`] (storage seam) on
+/// every dispatch. The trait is `dyn`-compatible: concrete impls return
+/// `BoxFut` so `Box<dyn Tool>` works.
 pub trait Tool: Send + Sync {
     /// Tool name — must match the registered `ToolSchema.name`.
     fn name(&self) -> &str;
@@ -194,12 +264,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Execute the tool with validated input. The `SandboxProvider` is
-    /// the only path to the environment.
+    /// Execute the tool with validated input. The `SandboxProvider` is the only
+    /// path to the environment; the [`ToolContext`] is the only path to durable
+    /// storage (`RunStore`, keyed by the run's `SessionId`).
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
     ) -> BoxFut<'a, ToolOutput>;
 }
 
@@ -221,12 +293,14 @@ pub trait ToolRegistry: Send + Sync {
         &'a self,
         call: ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
     ) -> BoxFut<'a, Result<ToolResult, DispatchError>>;
 
     fn dispatch_all<'a>(
         &'a self,
         calls: Vec<ToolCall>,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
     ) -> BoxFut<'a, Vec<Result<ToolResult, DispatchError>>>;
 
     fn has_subagent_tools(&self) -> bool;
@@ -430,6 +504,7 @@ impl ToolRegistry for StandardToolRegistry {
         &'a self,
         call: ToolCall,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
     ) -> BoxFut<'a, Result<ToolResult, DispatchError>> {
         Box::pin(async move {
             let (tool, schema) = match self.lookup(&call.name).await {
@@ -450,7 +525,7 @@ impl ToolRegistry for StandardToolRegistry {
 
             Self::validate_input(&schema, &call)?;
 
-            let output = tool.execute(&call, sandbox).await;
+            let output = tool.execute(&call, sandbox, ctx).await;
             Ok(ToolResult {
                 call_id: call.id.clone(),
                 output,
@@ -462,6 +537,7 @@ impl ToolRegistry for StandardToolRegistry {
         &'a self,
         calls: Vec<ToolCall>,
         sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
     ) -> BoxFut<'a, Vec<Result<ToolResult, DispatchError>>> {
         Box::pin(async move {
             // Classify each call. Unknown tools are scheduled sequentially so
@@ -498,7 +574,7 @@ impl ToolRegistry for StandardToolRegistry {
             if !concurrent_idx.is_empty() {
                 let futs = concurrent_idx
                     .iter()
-                    .map(|&i| self.dispatch(calls[i].clone(), sandbox));
+                    .map(|&i| self.dispatch(calls[i].clone(), sandbox, ctx));
                 let outs = futures_util::future::join_all(futs).await;
                 for (slot, out) in concurrent_idx.iter().zip(outs) {
                     results[*slot] = Some(out);
@@ -507,7 +583,7 @@ impl ToolRegistry for StandardToolRegistry {
 
             // Sequential batch.
             for i in sequential_idx {
-                let out = self.dispatch(calls[i].clone(), sandbox).await;
+                let out = self.dispatch(calls[i].clone(), sandbox, ctx).await;
                 results[i] = Some(out);
             }
 
@@ -559,6 +635,7 @@ pub mod mock {
             &'a self,
             call: &'a ToolCall,
             _sandbox: &'a (dyn SandboxProvider + 'a),
+            _ctx: &'a ToolContext,
         ) -> BoxFut<'a, ToolOutput> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let content = call.input.to_string();
@@ -588,6 +665,7 @@ pub mod mock {
             &'a self,
             _call: &'a ToolCall,
             _sandbox: &'a (dyn SandboxProvider + 'a),
+            _ctx: &'a ToolContext,
         ) -> BoxFut<'a, ToolOutput> {
             Box::pin(async move {
                 ToolOutput::Error {
@@ -618,6 +696,7 @@ pub mod mock {
             &'a self,
             _call: &'a ToolCall,
             _sandbox: &'a (dyn SandboxProvider + 'a),
+            _ctx: &'a ToolContext,
         ) -> BoxFut<'a, ToolOutput> {
             Box::pin(async move {
                 ToolOutput::Success {
@@ -626,6 +705,17 @@ pub mod mock {
                 }
             })
         }
+    }
+
+    /// Build a throwaway [`ToolContext`] for tests: a fresh in-memory run store
+    /// and a fixed test session id. Available to every tool's `#[cfg(test)]`
+    /// module via `crate::tool_registry::mock::test_ctx`.
+    pub fn test_ctx() -> ToolContext {
+        use crate::storage::InMemoryStorageProvider;
+        ToolContext::new(
+            SessionId::new("test-session"),
+            Arc::new(InMemoryStorageProvider::new()),
+        )
     }
 
     /// Permissive sandbox stub — accepts everything.
@@ -710,7 +800,7 @@ mod tests {
         .unwrap();
         let sandbox = AllowAllSandbox;
         let out = reg
-            .dispatch(call("echo", "c1", json!({"x": 1})), &sandbox)
+            .dispatch(call("echo", "c1", json!({"x": 1})), &sandbox, &test_ctx())
             .await
             .unwrap();
         assert_eq!(out.call_id, "c1");
@@ -794,7 +884,7 @@ mod tests {
         let reg = StandardToolRegistry::new();
         let sandbox = AllowAllSandbox;
         let err = reg
-            .dispatch(call("missing", "c1", json!({})), &sandbox)
+            .dispatch(call("missing", "c1", json!({})), &sandbox, &test_ctx())
             .await
             .unwrap_err();
         assert!(matches!(err, DispatchError::UnregisteredTool { .. }));
@@ -811,7 +901,7 @@ mod tests {
         .unwrap();
         let sandbox = AllowAllSandbox;
         let err = reg
-            .dispatch(call("read", "c1", json!({})), &sandbox)
+            .dispatch(call("read", "c1", json!({})), &sandbox, &test_ctx())
             .await
             .unwrap_err();
         match err {
@@ -840,7 +930,7 @@ mod tests {
         .unwrap();
         let sandbox = DenyAllSandbox;
         let err = reg
-            .dispatch(call("echo", "c1", json!({})), &sandbox)
+            .dispatch(call("echo", "c1", json!({})), &sandbox, &test_ctx())
             .await
             .unwrap_err();
         match err {
@@ -860,7 +950,7 @@ mod tests {
         .unwrap();
         let sandbox = AllowAllSandbox;
         let out = reg
-            .dispatch(call("fail", "c1", json!({})), &sandbox)
+            .dispatch(call("fail", "c1", json!({})), &sandbox, &test_ctx())
             .await
             .unwrap();
         match out.output {
@@ -911,7 +1001,7 @@ mod tests {
             call("d", "3", json!({"v": "c"})),
             call("r", "4", json!({"v": "d"})),
         ];
-        let results = reg.dispatch_all(calls, &sandbox).await;
+        let results = reg.dispatch_all(calls, &sandbox, &test_ctx()).await;
         let ids: Vec<&str> = results
             .iter()
             .map(|r| r.as_ref().unwrap().call_id.as_str())
@@ -939,6 +1029,7 @@ mod tests {
             .dispatch_all(
                 vec![call("ok", "1", json!({})), call("missing", "2", json!({}))],
                 &sandbox,
+                &test_ctx(),
             )
             .await;
         assert!(results[0].is_ok());
@@ -1137,6 +1228,7 @@ mod tests {
                         input: sc.call.input.clone(),
                     },
                     &sandbox,
+                    &test_ctx(),
                 )
                 .await;
             match (result, sc.expected) {

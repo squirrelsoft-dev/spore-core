@@ -54,10 +54,14 @@
 //! - R6  `Completed` is terminal: ANY transition OUT of `Completed` is rejected
 //!   (the idempotent `Completed → Completed` self-transition is allowed).
 //! - R7  Self-transitions `X → X` are idempotent and always allowed.
-//! - R8  Persistence is interim, through the FILESYSTEM via the
-//!   [`SandboxProvider`] read-modify-write at [`TASK_LIST_PATH`]
-//!   (DECISION 2). The tool does NOT touch `SessionState.extras` — the
-//!   `Tool` trait has no access to it; #59 owns the extras mirror.
+//! - R8  Persistence is through the storage seam (#75): the standalone
+//!   [`TaskListTool`](crate::tools::TaskListTool) persists via the
+//!   [`RunStore`](crate::storage::RunStore) on the `ToolContext`, keyed by
+//!   `SessionId` under [`TASK_LIST_EXTRAS_KEY`]. The retired interim sandbox
+//!   path (`.spore/task_list.json`) is GONE; with the library's default no-op
+//!   storage a standalone tool call persists nothing across processes (an
+//!   accepted behavior change — no migration shim). #59's execute loop shares
+//!   the same `RunStore` key.
 //!
 //! There are no open `// SPEC QUESTION:` markers: both design forks
 //! (transition matrix, state seam) were resolved before implementation.
@@ -65,19 +69,17 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::harness::{Operation, SandboxProvider, SandboxViolation};
 use crate::plan::PlanArtifact;
 
-/// Key under which the [`TaskList`] is mirrored into `SessionState.extras`
-/// (serialized JSON) by the harness / #59. Mirrors `PLAN_EXECUTE_EXTRAS_KEY`.
-/// Stable across all four languages. NOTE: #71 itself does NOT write this key
-/// (the `Tool` trait has no `SessionState` access); it is the contract the
-/// harness-side mirror uses.
+/// Key under which the [`TaskList`] is persisted in the
+/// [`RunStore`](crate::storage::RunStore), keyed by `SessionId`. Both the
+/// harness-side #59 execute loop and the standalone
+/// [`TaskListTool`](crate::tools::TaskListTool) (#75) share this single key, so
+/// a standalone tool call and a PlanExecute run on the same session
+/// intentionally share one blob. Stable across all four languages. The JSON
+/// shape is the canonical serde form of [`TaskList`]
+/// (`{"tasks":[...],"next_id":N}`).
 pub const TASK_LIST_EXTRAS_KEY: &str = "task_list";
-
-/// Canonical on-disk location of the persisted task list, relative to the
-/// sandbox/workspace root. Resolved through [`SandboxProvider::resolve_path`].
-pub const TASK_LIST_PATH: &str = ".spore/task_list.json";
 
 // ============================================================================
 // Types
@@ -289,76 +291,15 @@ impl TaskList {
 /// # Re-parsing / wiring
 /// Always builds a fresh [`TaskList::default`]; it never merges into an
 /// existing list (replanning is out of scope — single parse per accepted plan).
-/// Wiring this into the plan-acceptance seam (read `extras["plan_execute"]` →
-/// parse → [`store_task_list`] + mirror into `extras["task_list"]`) is DEFERRED
-/// to #59's execute loop; #72 ships only this pure function.
+/// The accepted plan is mirrored into the [`RunStore`](crate::storage::RunStore)
+/// under [`TASK_LIST_EXTRAS_KEY`] by #59's execute loop; the standalone
+/// [`TaskListTool`](crate::tools::TaskListTool) shares that same key (#75).
 pub fn plan_artifact_to_task_list(artifact: &PlanArtifact) -> TaskList {
     let mut list = TaskList::default(); // next_id == 1
     for step in &artifact.tasks {
         list.add(step.clone()); // verbatim; appends Pending; bumps next_id
     }
     list
-}
-
-// ============================================================================
-// Disk persistence (interim — DECISION 2, mirrors the plan.rs precedent)
-// ============================================================================
-
-/// Load the persisted [`TaskList`] from [`TASK_LIST_PATH`] via the sandbox.
-///
-/// An absent file (or any read error — e.g. first run) yields
-/// [`TaskList::default`]. A present-but-malformed file surfaces a JSON parse
-/// error so the caller can decide; the tool boundary maps that to a recoverable
-/// error rather than silently discarding state.
-pub async fn load_task_list(sandbox: &(dyn SandboxProvider + '_)) -> Result<TaskList, LoadError> {
-    let resolved = sandbox
-        .resolve_path(TASK_LIST_PATH, Operation::Read)
-        .await
-        .map_err(LoadError::Sandbox)?;
-
-    match tokio::fs::read_to_string(&resolved).await {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| LoadError::Parse(e.to_string())),
-        // Absent file → fresh list. This is the expected first-run path.
-        Err(_) => Ok(TaskList::default()),
-    }
-}
-
-/// Persist `list` to [`TASK_LIST_PATH`] via the sandbox, creating the parent
-/// directory (`.spore/`) if needed. Serialization is the canonical
-/// serde_json form (compact, field order `tasks` then `next_id`).
-pub async fn store_task_list(
-    list: &TaskList,
-    sandbox: &(dyn SandboxProvider + '_),
-) -> Result<(), StoreError> {
-    let resolved = sandbox
-        .resolve_path(TASK_LIST_PATH, Operation::Write)
-        .await
-        .map_err(StoreError::Sandbox)?;
-
-    if let Some(parent) = resolved.parent() {
-        // Best-effort: ignore "already exists"; surface real failures on write.
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    let json = serde_json::to_string(list).map_err(|e| StoreError::Serialize(e.to_string()))?;
-    tokio::fs::write(&resolved, json.as_bytes())
-        .await
-        .map_err(|e| StoreError::Io(e.to_string()))
-}
-
-/// Failure modes of [`load_task_list`].
-#[derive(Debug)]
-pub enum LoadError {
-    Sandbox(SandboxViolation),
-    Parse(String),
-}
-
-/// Failure modes of [`store_task_list`].
-#[derive(Debug)]
-pub enum StoreError {
-    Sandbox(SandboxViolation),
-    Serialize(String),
-    Io(String),
 }
 
 // ============================================================================

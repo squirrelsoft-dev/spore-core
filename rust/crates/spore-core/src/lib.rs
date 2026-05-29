@@ -157,7 +157,7 @@ pub use termination::{
 pub use tool_call_repair::{coerce_tool_args, StandardToolCallRepair, ToolCallRepair};
 pub use tool_registry::{
     DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
-    ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
+    ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
 };
 pub use verifier::{
     CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,

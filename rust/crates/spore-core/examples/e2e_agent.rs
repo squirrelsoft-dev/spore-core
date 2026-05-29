@@ -73,9 +73,10 @@ use spore_core::scenarios::{
     CompleteOnFinalResponse, RealToolRegistry, ScenarioId,
 };
 use spore_core::{
-    Agent, FullObservabilityProvider, Harness, HarnessContextManager, HarnessRunOptions,
-    HarnessToolRegistry, LoopStrategy, OllamaModelInterface, RunResult, SandboxProvider, SessionId,
-    SessionState, Task, TerminationPolicy, Timestamp, WorkspaceConfig, WorkspaceScopedSandbox,
+    Agent, FileSystemStorageProvider, FullObservabilityProvider, Harness, HarnessContextManager,
+    HarnessRunOptions, HarnessToolRegistry, LoopStrategy, OllamaModelInterface, RunResult,
+    RunStore, SandboxProvider, SessionId, SessionState, Task, TerminationPolicy, Timestamp,
+    WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 #[tokio::main]
@@ -217,7 +218,13 @@ async fn run_live(
         })
         .expect("build sandbox"),
     );
-    let bridge = RealToolRegistry::new(registry, sandbox.clone());
+    // Durable run store rooted in the workspace so the standalone task_list
+    // tool persists across the multi-turn s2 run (#75 storage seam). With the
+    // default no-op store it would persist nothing across processes.
+    let run_store: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(
+        workspace.join(".spore/store"),
+    ));
+    let bridge = RealToolRegistry::new(registry, sandbox.clone(), session_id.clone(), run_store);
     let tool_schemas = bridge.model_schemas();
     let tools: Arc<dyn HarnessToolRegistry> = Arc::new(bridge);
 

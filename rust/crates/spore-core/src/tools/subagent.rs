@@ -96,6 +96,7 @@ impl Tool for SubagentTool {
         &'a self,
         call: &'a ToolCall,
         _sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a crate::tool_registry::ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             let instruction = match call.input.get("instruction").and_then(|v| v.as_str()) {
@@ -195,7 +196,7 @@ mod tests {
         AggregateUsage, HaltReason, HarnessRunOptions, HumanRequest, HumanResponse, PausedState,
         RunResult,
     };
-    use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
     use crate::tool_registry::StandardToolRegistry;
     use serde_json::json;
     use std::sync::Mutex;
@@ -274,7 +275,7 @@ mod tests {
         .unwrap();
         let sb = AllowAllSandbox;
         let r = sub
-            .execute(&call(json!({"instruction": "do it"})), &sb)
+            .execute(&call(json!({"instruction": "do it"})), &sb, &test_ctx())
             .await;
         match r {
             ToolOutput::Success { content, .. } => assert_eq!(content, "child done"),
@@ -302,7 +303,9 @@ mod tests {
         )
         .unwrap();
         let sb = AllowAllSandbox;
-        let r = sub.execute(&call(json!({"instruction": "x"})), &sb).await;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),
@@ -347,7 +350,9 @@ mod tests {
         )
         .unwrap();
         let sb = AllowAllSandbox;
-        let r = sub.execute(&call(json!({"instruction": "x"})), &sb).await;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
         match r {
             ToolOutput::WaitingForHuman { child_state, .. } => {
                 assert_eq!(child_state.parent_tool_call_id, "parent-call-1");
@@ -400,7 +405,7 @@ mod tests {
         )
         .unwrap();
         let sb = AllowAllSandbox;
-        let r = sub.execute(&call(json!({})), &sb).await;
+        let r = sub.execute(&call(json!({})), &sb, &test_ctx()).await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),

@@ -36,13 +36,16 @@ use crate::compaction_adapter::{seed_rich_state, HarnessContextManagerExt};
 use crate::context::{CompactionConfig, SessionState as RichSessionState, StandardContextManager};
 use crate::harness::{
     BoxFut, BudgetSnapshot, ContextManager as HarnessContextManager, HarnessBuilder,
-    SandboxProvider, SessionState as HarnessState, StandardHarness, Task, TerminationDecision,
-    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult,
+    SandboxProvider, SessionId, SessionState as HarnessState, StandardHarness, Task,
+    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    ToolResult,
 };
 use crate::model::ModelInterface;
 use crate::model::{Content, Message, Role, ToolCall, ToolSchema};
+use crate::storage::RunStore;
 use crate::tool_registry::{
-    StandardToolRegistry, Tool, ToolAnnotations, ToolRegistry, ToolSchema as RegistrySchema,
+    StandardToolRegistry, Tool, ToolAnnotations, ToolContext, ToolRegistry,
+    ToolSchema as RegistrySchema,
 };
 use crate::tools::exec::{BashCommandTool, ExecTool};
 use crate::tools::fs::{ListDirTool, ReadFileTool, WriteFileTool};
@@ -57,19 +60,38 @@ use crate::tools::tasklist::TaskListTool;
 ///
 /// The harness calls `dispatch(ToolCall) -> ToolOutput` with no sandbox (the
 /// sandbox is validated separately by the loop). This bridge forwards to the
-/// inner registry's `dispatch(call, &*sandbox)` and maps the result type. A
-/// `DispatchError` becomes a **recoverable** [`ToolOutput::Error`] so the loop
+/// inner registry's `dispatch(call, &*sandbox, &ctx)` and maps the result type.
+/// A `DispatchError` becomes a **recoverable** [`ToolOutput::Error`] so the loop
 /// appends it as a tool result rather than halting — except never for the
 /// always-halt case, which this bridge does not mark (see [`is_always_halt`]).
+///
+/// ## Storage seam (#75)
+///
+/// Per the construction-injection decision, the bridge is given the run's
+/// [`SessionId`] and an `Arc<dyn RunStore>` at construction time (it is already
+/// built per-run). On each dispatch it builds a [`ToolContext`] from those
+/// injected fields and forwards it into the inner registry. This keeps the
+/// harness-loop `dispatch(call)` signature unchanged while threading storage to
+/// tools.
 pub struct RealToolRegistry {
     inner: Arc<StandardToolRegistry>,
     sandbox: Arc<dyn SandboxProvider>,
+    ctx: ToolContext,
     schemas: Vec<ToolSchema>,
 }
 
 impl RealToolRegistry {
     /// Build a bridge over an already-populated [`StandardToolRegistry`].
-    pub fn new(inner: Arc<StandardToolRegistry>, sandbox: Arc<dyn SandboxProvider>) -> Self {
+    ///
+    /// `session_id` + `run_store` are injected here (the bridge is built once
+    /// per run) and used to construct the [`ToolContext`] forwarded on every
+    /// dispatch — see the storage-seam note on the type.
+    pub fn new(
+        inner: Arc<StandardToolRegistry>,
+        sandbox: Arc<dyn SandboxProvider>,
+        session_id: SessionId,
+        run_store: Arc<dyn RunStore>,
+    ) -> Self {
         // Snapshot the model-facing schemas (sorted by name) once at
         // construction; the catalog is fixed for a scenario run.
         let schemas = inner
@@ -80,6 +102,7 @@ impl RealToolRegistry {
         Self {
             inner,
             sandbox,
+            ctx: ToolContext::new(session_id, run_store),
             schemas,
         }
     }
@@ -93,7 +116,7 @@ impl RealToolRegistry {
 impl HarnessToolRegistry for RealToolRegistry {
     fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            match self.inner.dispatch(call, &*self.sandbox).await {
+            match self.inner.dispatch(call, &*self.sandbox, &self.ctx).await {
                 Ok(result) => result.output,
                 Err(err) => ToolOutput::Error {
                     message: format!("dispatch failed: {err}"),
@@ -296,6 +319,7 @@ impl Tool for FailingTool {
         &'a self,
         _call: &'a ToolCall,
         _sandbox: &'a (dyn SandboxProvider + 'a),
+        _ctx: &'a ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
             ToolOutput::Error {
@@ -542,7 +566,13 @@ pub fn build_scenario(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::InMemoryStorageProvider;
     use crate::tool_registry::mock::AllowAllSandbox;
+
+    /// A fresh in-memory run store for bridge tests.
+    fn test_run_store() -> Arc<dyn RunStore> {
+        Arc::new(InMemoryStorageProvider::new())
+    }
 
     #[test]
     fn scenario_id_parses() {
@@ -554,7 +584,12 @@ mod tests {
 
     fn schema_names(scenario: ScenarioId) -> Vec<String> {
         let reg = build_real_tool_registry(scenario);
-        let bridge = RealToolRegistry::new(reg, Arc::new(AllowAllSandbox));
+        let bridge = RealToolRegistry::new(
+            reg,
+            Arc::new(AllowAllSandbox),
+            SessionId::new("schema-test"),
+            test_run_store(),
+        );
         bridge
             .model_schemas()
             .iter()
@@ -598,6 +633,8 @@ mod tests {
         let bridge = RealToolRegistry::new(
             build_real_tool_registry(ScenarioId::S4),
             Arc::new(AllowAllSandbox),
+            SessionId::new("s4-test"),
+            test_run_store(),
         );
         let out = bridge
             .dispatch(ToolCall {
