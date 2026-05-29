@@ -1,0 +1,25 @@
+{
+  "description": "Cross-scope merged memory read (#78 R6): User ∪ Project, newest-first by timestamp, NO dedup. The 'dup' entry appears identically in both scopes and must survive twice in the merge. Local entries are NOT included in the merge.",
+  "limit": 10,
+  "user": [
+    { "role": "user", "content": "u-old", "timestamp": "2026-05-01T00:00:00Z", "metadata": {} },
+    { "role": "user", "content": "dup", "timestamp": "2026-05-03T00:00:00Z", "metadata": {} },
+    { "role": "user", "content": "u-new", "timestamp": "2026-05-05T00:00:00Z", "metadata": {} }
+  ],
+  "project": [
+    { "role": "assistant", "content": "p-old", "timestamp": "2026-05-02T00:00:00Z", "metadata": {} },
+    { "role": "assistant", "content": "dup", "timestamp": "2026-05-03T00:00:00Z", "metadata": {} },
+    { "role": "assistant", "content": "p-new", "timestamp": "2026-05-06T00:00:00Z", "metadata": {} }
+  ],
+  "local": [
+    { "role": "user", "content": "l-should-not-appear", "timestamp": "2026-05-09T00:00:00Z", "metadata": {} }
+  ],
+  "expected_merged_contents": [
+    "p-new",
+    "u-new",
+    "dup",
+    "dup",
+    "p-old",
+    "u-old"
+  ]
+}

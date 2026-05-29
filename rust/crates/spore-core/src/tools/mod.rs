@@ -484,7 +484,7 @@ mod fixture_tests {
     #[tokio::test]
     async fn fixture_replay_todo_write() {
         use crate::harness::SessionId;
-        use crate::storage::{InMemoryStorageProvider, RunStore};
+        use crate::storage::{InMemoryStorageProvider, MemoryStore, RunStore};
         use crate::tool_registry::ToolContext;
         use crate::tools::params::TodoItem;
         use crate::tools::todo::{TodoWriteTool, TODO_STORE_KEY};
@@ -495,7 +495,8 @@ mod fixture_tests {
         let sb = AllowAllSandbox;
         for sc in scenarios {
             let run_store: Arc<dyn RunStore> = Arc::new(InMemoryStorageProvider::new());
-            let ctx = ToolContext::new(SessionId::new("fx"), run_store.clone());
+            let memory_store: Arc<dyn MemoryStore> = Arc::new(InMemoryStorageProvider::new());
+            let ctx = ToolContext::new(SessionId::new("fx"), run_store.clone(), memory_store);
             let tool = TodoWriteTool::new();
             for step in &sc.steps {
                 let out = tool

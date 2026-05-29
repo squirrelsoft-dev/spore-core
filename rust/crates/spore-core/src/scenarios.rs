@@ -42,7 +42,7 @@ use crate::harness::{
 };
 use crate::model::ModelInterface;
 use crate::model::{Content, Message, Role, ToolCall, ToolSchema};
-use crate::storage::RunStore;
+use crate::storage::{MemoryStore, RunStore};
 use crate::tool_registry::{
     StandardToolRegistry, Tool, ToolAnnotations, ToolContext, ToolRegistry,
     ToolSchema as RegistrySchema,
@@ -68,11 +68,11 @@ use crate::tools::tasklist::TaskListTool;
 /// ## Storage seam (#75)
 ///
 /// Per the construction-injection decision, the bridge is given the run's
-/// [`SessionId`] and an `Arc<dyn RunStore>` at construction time (it is already
-/// built per-run). On each dispatch it builds a [`ToolContext`] from those
-/// injected fields and forwards it into the inner registry. This keeps the
-/// harness-loop `dispatch(call)` signature unchanged while threading storage to
-/// tools.
+/// [`SessionId`], an `Arc<dyn RunStore>` and an `Arc<dyn MemoryStore>` (#78) at
+/// construction time (it is already built per-run). On each dispatch it builds a
+/// [`ToolContext`] from those injected fields and forwards it into the inner
+/// registry. This keeps the harness-loop `dispatch(call)` signature unchanged
+/// while threading storage to tools.
 pub struct RealToolRegistry {
     inner: Arc<StandardToolRegistry>,
     sandbox: Arc<dyn SandboxProvider>,
@@ -91,6 +91,7 @@ impl RealToolRegistry {
         sandbox: Arc<dyn SandboxProvider>,
         session_id: SessionId,
         run_store: Arc<dyn RunStore>,
+        memory_store: Arc<dyn MemoryStore>,
     ) -> Self {
         // Snapshot the model-facing schemas (sorted by name) once at
         // construction; the catalog is fixed for a scenario run.
@@ -102,7 +103,7 @@ impl RealToolRegistry {
         Self {
             inner,
             sandbox,
-            ctx: ToolContext::new(session_id, run_store),
+            ctx: ToolContext::new(session_id, run_store, memory_store),
             schemas,
         }
     }
@@ -110,6 +111,13 @@ impl RealToolRegistry {
     /// The model-facing tool schemas, sorted by name.
     pub fn model_schemas(&self) -> Vec<ToolSchema> {
         self.schemas.clone()
+    }
+
+    /// The [`ToolContext`] this bridge threads into every dispatch — exposes the
+    /// `session_id`, `run_store` and (#78) `memory_store` seams it was wired
+    /// with. Lets callers verify the storage seams are live.
+    pub fn tool_context(&self) -> &ToolContext {
+        &self.ctx
     }
 }
 
@@ -574,6 +582,11 @@ mod tests {
         Arc::new(InMemoryStorageProvider::new())
     }
 
+    /// A fresh in-memory memory store for bridge tests (#78).
+    fn test_memory_store() -> Arc<dyn MemoryStore> {
+        Arc::new(InMemoryStorageProvider::new())
+    }
+
     #[test]
     fn scenario_id_parses() {
         assert_eq!(ScenarioId::parse("s1"), Some(ScenarioId::S1));
@@ -589,6 +602,7 @@ mod tests {
             Arc::new(AllowAllSandbox),
             SessionId::new("schema-test"),
             test_run_store(),
+            test_memory_store(),
         );
         bridge
             .model_schemas()
@@ -635,6 +649,7 @@ mod tests {
             Arc::new(AllowAllSandbox),
             SessionId::new("s4-test"),
             test_run_store(),
+            test_memory_store(),
         );
         let out = bridge
             .dispatch(ToolCall {

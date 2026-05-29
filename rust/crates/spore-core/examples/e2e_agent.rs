@@ -74,9 +74,9 @@ use spore_core::scenarios::{
 };
 use spore_core::{
     Agent, FileSystemStorageProvider, FullObservabilityProvider, Harness, HarnessContextManager,
-    HarnessRunOptions, HarnessToolRegistry, LoopStrategy, OllamaModelInterface, RunResult,
-    RunStore, SandboxProvider, SessionId, SessionState, Task, TerminationPolicy, Timestamp,
-    WorkspaceConfig, WorkspaceScopedSandbox,
+    HarnessRunOptions, HarnessToolRegistry, LoopStrategy, MemoryStore, OllamaModelInterface,
+    RunResult, RunStore, SandboxProvider, SessionId, SessionState, Task, TerminationPolicy,
+    Timestamp, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 #[tokio::main]
@@ -224,7 +224,18 @@ async fn run_live(
     let run_store: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(
         workspace.join(".spore/store"),
     ));
-    let bridge = RealToolRegistry::new(registry, sandbox.clone(), session_id.clone(), run_store);
+    // Project-scope memory rooted in the workspace (#78). FS is scope-dumb; the
+    // ToolContext carries the scope on each call.
+    let memory_store: Arc<dyn MemoryStore> = Arc::new(FileSystemStorageProvider::new(
+        workspace.join(".spore/store"),
+    ));
+    let bridge = RealToolRegistry::new(
+        registry,
+        sandbox.clone(),
+        session_id.clone(),
+        run_store,
+        memory_store,
+    );
     let tool_schemas = bridge.model_schemas();
     let tools: Arc<dyn HarnessToolRegistry> = Arc::new(bridge);
 

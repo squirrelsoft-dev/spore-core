@@ -97,7 +97,7 @@ use crate::harness::{
     BoxFut, SandboxProvider, SandboxViolation, SessionId, ToolOutput, ToolResult,
 };
 use crate::model::ToolCall;
-use crate::storage::RunStore;
+use crate::storage::{MemoryStore, RunStore};
 
 // ============================================================================
 // ToolContext — the storage seam handed to every tool (#75)
@@ -107,8 +107,13 @@ use crate::storage::RunStore;
 /// alongside (but separate from) the [`SandboxProvider`]. It carries the
 /// minimum a tool needs to persist durable state via the storage layer:
 ///
-///   - `session_id` — the run's [`SessionId`], the key namespace for [`RunStore`].
-///   - `run_store`  — the [`RunStore`] domain of the configured storage provider.
+///   - `session_id`   — the run's [`SessionId`], the key namespace for stores.
+///   - `run_store`    — the [`RunStore`] domain of the configured provider.
+///   - `memory_store` — the [`MemoryStore`] domain (#78). Scope-aware: the
+///     tool passes a [`crate::storage::StorageScope`] on every call. For a
+///     composite provider this is the scope-routing memory slot; for the
+///     never-null contract it is at worst a [`NoOpStorageProvider`]. `MemoryTool`
+///     (#82) picks up this already-threaded seam.
 ///
 /// It is a **struct** (not a tuple/pair) so future fields can be added without
 /// breaking the trait signature again. The `SandboxProvider` is intentionally
@@ -118,14 +123,20 @@ use crate::storage::RunStore;
 pub struct ToolContext {
     session_id: SessionId,
     run_store: Arc<dyn RunStore>,
+    memory_store: Arc<dyn MemoryStore>,
 }
 
 impl ToolContext {
-    /// Build a context from the run's session id and the run-store seam.
-    pub fn new(session_id: SessionId, run_store: Arc<dyn RunStore>) -> Self {
+    /// Build a context from the run's session id and the storage seams.
+    pub fn new(
+        session_id: SessionId,
+        run_store: Arc<dyn RunStore>,
+        memory_store: Arc<dyn MemoryStore>,
+    ) -> Self {
         Self {
             session_id,
             run_store,
+            memory_store,
         }
     }
 
@@ -137,6 +148,13 @@ impl ToolContext {
     /// The run-store domain a tool persists durable state through.
     pub fn run_store(&self) -> &Arc<dyn RunStore> {
         &self.run_store
+    }
+
+    /// The memory-store domain a tool reads/writes episodic memory through
+    /// (#78). Scope-aware — the caller passes a
+    /// [`crate::storage::StorageScope`] on each call.
+    pub fn memory_store(&self) -> &Arc<dyn MemoryStore> {
+        &self.memory_store
     }
 }
 
@@ -715,10 +733,10 @@ pub mod mock {
     /// module via `crate::tool_registry::mock::test_ctx`.
     pub fn test_ctx() -> ToolContext {
         use crate::storage::InMemoryStorageProvider;
-        ToolContext::new(
-            SessionId::new("test-session"),
-            Arc::new(InMemoryStorageProvider::new()),
-        )
+        // One in-memory backend serves both the run and (scope-aware) memory
+        // seams in tests.
+        let backend = Arc::new(InMemoryStorageProvider::new());
+        ToolContext::new(SessionId::new("test-session"), backend.clone(), backend)
     }
 
     /// Permissive sandbox stub — accepts everything.

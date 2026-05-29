@@ -216,7 +216,7 @@ impl Tool for TaskListTool {
 mod tests {
     use super::*;
     use crate::harness::{Operation, SandboxProvider, SandboxViolation, SessionId};
-    use crate::storage::{InMemoryStorageProvider, RunStore, StorageError};
+    use crate::storage::{InMemoryStorageProvider, NoOpStorageProvider, RunStore, StorageError};
     use crate::tasklist::{TaskList, TaskStatus};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -329,7 +329,12 @@ mod tests {
     }
 
     fn ctx_with(run_store: Arc<dyn RunStore>, session: &str) -> ToolContext {
-        ToolContext::new(SessionId::new(session), run_store)
+        // tasklist tests exercise the run store only; memory is a no-op seam.
+        ToolContext::new(
+            SessionId::new(session),
+            run_store,
+            Arc::new(NoOpStorageProvider),
+        )
     }
 
     /// A ToolContext over a fresh in-memory run store with a default session id.

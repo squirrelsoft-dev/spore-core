@@ -147,7 +147,7 @@ pub use sensor::{
 pub use storage::{
     parse_otlp_endpoints, CompositeStorageProvider, FileSystemStorageProvider,
     InMemoryStorageProvider, MemoryEntry, MemoryStore, NoOpStorageProvider, ObservabilityStore,
-    RunStore, SessionStore, StorageError, StorageProvider,
+    RunStore, ScopedMemoryRouter, SessionStore, StorageError, StorageProvider, WorkspaceId,
 };
 pub use tasklist::{
     plan_artifact_to_task_list, Task as TaskListTask, TaskList, TaskListError, TaskStatus,

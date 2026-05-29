@@ -1,0 +1,32 @@
+[
+  {
+    "description": "normal nested path",
+    "canonical_path": "/Users/sbeardsley/dev/spore-core",
+    "expected_workspace_id": "spore-core-a73a751e"
+  },
+  {
+    "description": "root path collapses to the literal basename 'root'",
+    "canonical_path": "/",
+    "expected_workspace_id": "root-8a5edab2"
+  },
+  {
+    "description": "basename with spaces and special chars is sanitized and collapsed",
+    "canonical_path": "/Users/me/My Project (v2)!",
+    "expected_workspace_id": "my-project-v2-8570de99"
+  },
+  {
+    "description": "deep path uses only the final basename",
+    "canonical_path": "/a/b/c/d/e/f/g/deep-leaf",
+    "expected_workspace_id": "deep-leaf-9248d78b"
+  },
+  {
+    "description": "windows path: drive letter stripped, backslashes normalized (distinct hash from the posix path)",
+    "canonical_path": "C:\\Users\\dev\\spore-core",
+    "expected_workspace_id": "spore-core-28c87fbe"
+  },
+  {
+    "description": "trailing slash is normalized away; same id as the no-slash form",
+    "canonical_path": "/Users/sbeardsley/dev/spore-core/",
+    "expected_workspace_id": "spore-core-a73a751e"
+  }
+]

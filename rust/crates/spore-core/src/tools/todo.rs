@@ -124,10 +124,8 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx() -> ToolContext {
-        ToolContext::new(
-            SessionId::new("todo-session"),
-            Arc::new(InMemoryStorageProvider::new()),
-        )
+        let backend = Arc::new(InMemoryStorageProvider::new());
+        ToolContext::new(SessionId::new("todo-session"), backend.clone(), backend)
     }
 
     fn call(input: serde_json::Value) -> ToolCall {
