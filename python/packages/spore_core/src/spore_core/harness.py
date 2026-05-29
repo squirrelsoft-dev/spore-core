@@ -1007,15 +1007,28 @@ class HaltReasonStrategyNotYetImplemented(_Model):
     strategy: str
 
 
-class HaltReasonExecutePhaseNotImplemented(_Model):
+class HaltReasonEmptyPlan(_Model):
     """Returned by :class:`StandardHarness` for the ``PlanExecute`` strategy
-    (issue #70). The plan phase ran to completion — an artifact was produced,
-    ``OnPlanCreated`` fired, and the artifact was stored — but the execute loop
-    itself is not yet wired (#59 / #72). Distinct from the generic
-    :class:`HaltReasonStrategyNotYetImplemented` so callers can tell "planned,
-    but execute is a stub" apart from "strategy entirely unimplemented"."""
+    (issue #59, Q3). The plan phase produced a well-formed artifact whose task
+    list is empty (``tasks: []``); the execute loop has nothing to drive, so the
+    run fails rather than silently succeeding. Mirrors Rust's
+    ``HaltReason::EmptyPlan`` and the Go/TypeScript equivalents."""
 
-    kind: Literal["execute_phase_not_implemented"] = "execute_phase_not_implemented"
+    kind: Literal["empty_plan"] = "empty_plan"
+
+
+class HaltReasonStepFailed(_Model):
+    """Returned by :class:`StandardHarness` for the ``PlanExecute`` strategy
+    (issue #59, Q5). A per-task execute sub-loop errored or returned a
+    blocked/failed outcome; this aborts the whole run (a plan is a dependency
+    chain, so later tasks do not run). Carries the failing step's index, its
+    description, and a debug rendering of the underlying terminal reason.
+    Mirrors Rust's ``HaltReason::StepFailed { task_index, task, reason }``."""
+
+    kind: Literal["step_failed"] = "step_failed"
+    task_index: int
+    task: str
+    reason: str
 
 
 class PlanPhaseErrorPayload(_Model):
@@ -1053,7 +1066,8 @@ HaltReason = Annotated[
     | HaltReasonHumanHalted
     | HaltReasonStagnationLimitReached
     | HaltReasonStrategyNotYetImplemented
-    | HaltReasonExecutePhaseNotImplemented
+    | HaltReasonEmptyPlan
+    | HaltReasonStepFailed
     | HaltReasonPlanPhaseFailed,
     Field(discriminator="kind"),
 ]
@@ -1705,7 +1719,7 @@ class StandardHarness:
             obs.set_session_outcome(session_id, outcome)
             await obs.flush_session(session_id)
 
-    # ---- PlanExecute plan phase (issue #70) -------------------------
+    # ---- PlanExecute strategy (issues #59 / #70) --------------------
 
     async def _run_plan_execute(
         self,
@@ -1714,29 +1728,79 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
     ) -> RunResult:
-        """Drive the PlanExecute strategy (issue #70).
+        """Drive the PlanExecute strategy (issue #59) — the two-phase loop.
 
-        Runs the one-shot plan phase (:meth:`_run_plan_phase`), then — per Q4 —
-        HALTS with the distinct :class:`HaltReasonExecutePhaseNotImplemented`
-        once an artifact has been produced, had ``OnPlanCreated`` fired on it,
-        and been stored. The execute loop itself ships with #59 / #72. On any
-        plan-phase failure the underlying :class:`RunResultFailure` is returned
-        unchanged (no artifact stored). Like ``_run_react``, this finalizes
+        Phase 1 (plan, runs EXACTLY once): :meth:`_run_plan_phase` seeds a
+        planning directive, runs one constrained planner turn, captures a
+        :class:`PlanArtifact`, fires ``OnPlanCreated``, and counts the turn
+        against the shared budget. Phase 2 (execute, loops):
+        :meth:`_run_execute_phase` drains the parsed task list, giving each task
+        its own bounded ReAct sub-loop.
+
+        Resolved spec decisions (issue #59, all FINAL):
+
+        * **Q1** — each task gets its own bounded, isolated, SEQUENTIAL ReAct
+          sub-loop; the per-task turn cap is derived at the START of each step as
+          ``remaining_turns // remaining_tasks`` (floored at 1). The shared
+          budget — turns, tokens, observability, compaction — is carried across
+          every step and the global budget is the hard stop.
+        * **Q2** — success ``output`` is the LAST completed step's final text.
+        * **Q3** — an empty plan (``tasks: []``) ⇒ :class:`HaltReasonEmptyPlan`.
+        * **Q4** — the task list/plan persist through the
+          :class:`StorageProvider` / :class:`RunStore` seam (plus the ``extras``
+          mirror); the #71 sandbox path is NOT used by the execute loop.
+        * **Q5** — a step erroring/blocked ABORTS the whole run with
+          :class:`HaltReasonStepFailed`; execution does not continue.
+
+        Mirrors Rust's ``run_plan_execute``. Like ``_run_react``, this finalizes
         observability for the terminal outcome.
         """
+        from .tasklist import plan_artifact_to_task_list
+
         session_id = task.session_id
+
+        # Phase 1: plan (runs exactly once).
         outcome = await self._run_plan_phase(task, session_state, budget_used, on_stream)
-        if isinstance(outcome, _PlanPhaseOutcome):
-            # Plan produced + stored. Q4: halt with the distinct reason.
+        if not isinstance(outcome, _PlanPhaseOutcome):
+            # Plan-phase failure: propagate unchanged (no task list persisted).
+            await self._finalize_plan_execute(outcome)
+            return outcome
+
+        # Bridge: parse the accepted plan into a TaskList (#72).
+        task_list = plan_artifact_to_task_list(outcome.artifact)
+
+        # Q3: an empty plan is a failure, not a silent success.
+        if not task_list.tasks:
             result: RunResult = self._fail(
-                HaltReasonExecutePhaseNotImplemented(),
+                HaltReasonEmptyPlan(),
                 session_id,
                 outcome.usage,
                 outcome.turns,
             )
-        else:
-            result = outcome
+            await self._finalize_plan_execute(result)
+            return result
 
+        # Q4: persist through the storage seam (RunStore) + the extras mirror.
+        await self._persist_task_list(session_state, session_id, task_list)
+
+        # Carry the shared budget forward: the plan turn already consumed
+        # ``outcome.turns`` turns and ``outcome.usage`` tokens (Q1).
+        carried = budget_used.model_copy(deep=True)
+        carried.turns = outcome.turns
+        carried.input_tokens += outcome.usage.input_tokens
+        carried.output_tokens += outcome.usage.output_tokens
+
+        # Phase 2: execute (loops over the task list).
+        result = await self._run_execute_phase(
+            task, session_state, task_list, carried, outcome.usage, on_stream
+        )
+        await self._finalize_plan_execute(result)
+        return result
+
+    async def _finalize_plan_execute(self, result: RunResult) -> None:
+        """Finalize observability for a terminal PlanExecute outcome. Mirrors the
+        tail of ``_run_react``: a ``WaitingForHuman`` pause is not terminal and is
+        never flushed here. Mirrors Rust's ``finalize_plan_execute``."""
         if isinstance(result, RunResultSuccess):
             await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
         elif isinstance(result, RunResultFailure):
@@ -1744,7 +1808,195 @@ class StandardHarness:
                 result.session_id,
                 SessionOutcomeFailure(reason=result.reason.kind),
             )
-        return result
+        # RunResultWaitingForHuman: not terminal, do not finalize.
+
+    async def _persist_task_list(
+        self,
+        session_state: SessionState,
+        session_id: SessionId,
+        task_list: object,
+    ) -> None:
+        """Persist the parsed :class:`TaskList` for the run (Q4).
+
+        The DURABLE write goes through the :class:`RunStore` seam under
+        ``TASK_LIST_EXTRAS_KEY``; the #71 sandbox-filesystem path
+        (``.spore/task_list.json``) is intentionally NOT used — one source of
+        truth. The list is also mirrored into
+        ``SessionState.extras[TASK_LIST_EXTRAS_KEY]``. Storage failures are
+        swallowed: a successful plan must not be lost to a storage hiccup (the
+        default no-op provider never fails). Mirrors Rust's ``persist_task_list``.
+        """
+        from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList
+
+        assert isinstance(task_list, TaskList)
+        value = task_list.to_dict()
+        # Durable write through the storage seam (RunStore).
+        try:
+            await self._config.storage.run().put(session_id, TASK_LIST_EXTRAS_KEY, value)
+        except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
+            pass
+        # Extras mirror (in-session view).
+        session_state.extras[TASK_LIST_EXTRAS_KEY] = value
+
+    async def _run_execute_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        task_list: object,
+        carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive the PlanExecute execute phase (issue #59), draining ``task_list``.
+
+        Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
+        sub-loop. The per-task turn cap is derived at the START of each step from
+        the shared budget: ``per_task_turns = remaining_turns // remaining_tasks``
+        floored at 1 (``remaining_tasks`` counts the not-yet-started tasks
+        including the current one). The shared budget (``carried``) is threaded
+        through every step so early tasks cannot starve later ones and the global
+        budget stays the hard stop.
+
+        Before each step the task is marked ``in_progress`` (and ``completed``
+        after), the list is re-persisted (Q4), and ``OnTaskAdvance`` fires with
+        the correct ``task_index`` / ``total_tasks`` (the hook may rewrite the
+        step instruction). Q2: on success ``output`` is the LAST completed step's
+        final text. Q5: a step that errors/blocks aborts the run with
+        :class:`HaltReasonStepFailed`. Mirrors Rust's ``run_execute_phase``.
+        """
+        from .hooks import OnTaskAdvanceContext
+        from .tasklist import TaskList, TaskStatus
+
+        assert isinstance(task_list, TaskList)
+        config = self._config
+        session_id = task.session_id
+        total_tasks = len(task_list.tasks)
+        # Cumulative usage across the plan turn + every execute step (Q1).
+        total_usage = plan_usage.model_copy(deep=True)
+        # Q2: the success handle is the LAST completed step's final text.
+        last_output = ""
+        # Global turn cap (the hard stop). ``None`` ⇒ no global turn ceiling.
+        global_max_turns = task.budget.max_turns
+
+        for index in range(total_tasks):
+            task_id = task_list.tasks[index].id
+            instruction = task_list.tasks[index].description
+
+            # Q1: per-task turn allocation, derived at the START of this step.
+            # remaining_tasks = not-yet-started tasks including this one.
+            remaining_tasks = total_tasks - index
+            if global_max_turns is not None:
+                remaining_turns = max(0, global_max_turns - carried.turns)
+                per_task_turns = max(1, remaining_turns // remaining_tasks)
+                # The sub-loop cap is RELATIVE to the carried turns:
+                # _run_react_inner gates on cumulative ``budget_used.turns``, so a
+                # per-task cap of K means "stop K turns from now" while the global
+                # budget (carried forward) remains the hard stop.
+                sub_loop_cap = carried.turns + per_task_turns
+            else:
+                # No global turn cap: each step's sub-loop is bounded only by the
+                # other (token / wall / cost) budget gates.
+                sub_loop_cap = 2**31 - 1
+
+            # Mark InProgress (pending -> in_progress) and re-persist (Q4).
+            task_list.update(task_id, TaskStatus.IN_PROGRESS)
+            await self._persist_task_list(session_state, session_id, task_list)
+
+            # Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
+            # instruction via the carried Task; the (possibly mutated) instruction
+            # seeds the sub-loop.
+            step_task = Task(
+                id=task.id,
+                instruction=instruction,
+                session_id=session_id,
+                budget=task.budget,
+                loop_strategy=task.loop_strategy,
+            )
+            if config.hooks is not None:
+                ctx = OnTaskAdvanceContext(
+                    session_id=session_id,
+                    task=step_task,
+                    task_index=index,
+                    total_tasks=total_tasks,
+                )
+                try:
+                    await config.hooks.fire(ctx)
+                except Exception:  # noqa: BLE001 — a broken hook must not abort the run
+                    pass
+                # The chain threads mutations through ``ctx.task`` in place.
+                step_task = ctx.task
+
+            # Seed the step instruction as a user message, then run the bounded
+            # ReAct sub-loop carrying the shared budget (Q1).
+            await config.context_manager.append_user_message(session_state, step_task.instruction)
+
+            sub_result = await self._run_react_inner(
+                step_task,
+                sub_loop_cap,
+                session_state,
+                carried.model_copy(deep=True),
+                None,
+            )
+
+            if isinstance(sub_result, RunResultSuccess):
+                # Carry the shared budget forward (Q1): cumulative turns are the
+                # sub-loop's absolute count; fold in its token usage.
+                carried.turns = sub_result.turns
+                carried.input_tokens += sub_result.usage.input_tokens
+                carried.output_tokens += sub_result.usage.output_tokens
+                total_usage.input_tokens += sub_result.usage.input_tokens
+                total_usage.output_tokens += sub_result.usage.output_tokens
+                total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
+                total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
+                total_usage.cost_usd += sub_result.usage.cost_usd
+                last_output = sub_result.output
+
+                # Mark Completed and re-persist (Q4).
+                task_list.complete(task_id)
+                await self._persist_task_list(session_state, session_id, task_list)
+                # Surface the completed step's final text at the parent-visible
+                # step boundary (the sub-loop runs with a suppressed sink).
+                self._emit(on_stream, StreamFinalResponse(content=last_output))
+
+            elif isinstance(sub_result, RunResultFailure):
+                # Q5: any non-success step aborts the whole run. A budget halt
+                # surfaces as BudgetExceeded (mid-execute exhaustion); other
+                # failures surface as StepFailed carrying the step context.
+                total_usage.input_tokens += sub_result.usage.input_tokens
+                total_usage.output_tokens += sub_result.usage.output_tokens
+                total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
+                total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
+                total_usage.cost_usd += sub_result.usage.cost_usd
+
+                task_list.update(task_id, TaskStatus.BLOCKED)
+                await self._persist_task_list(session_state, session_id, task_list)
+
+                if isinstance(sub_result.reason, HaltReasonBudgetExceeded):
+                    terminal_reason: HaltReason = sub_result.reason
+                else:
+                    terminal_reason = HaltReasonStepFailed(
+                        task_index=index,
+                        task=task_list.tasks[index].description,
+                        reason=repr(sub_result.reason),
+                    )
+                return self._fail(
+                    terminal_reason,
+                    session_id,
+                    total_usage,
+                    sub_result.turns,
+                )
+
+            else:
+                # A step surfacing to a human pauses the whole run; propagate.
+                return sub_result
+
+        # Q2: success output is the LAST completed step's final text.
+        return RunResultSuccess(
+            output=last_output,
+            session_id=session_id,
+            usage=total_usage,
+            turns=carried.turns,
+        )
 
     async def _run_plan_phase(
         self,
@@ -2755,10 +3007,12 @@ __all__ = [
     "HaltReason",
     "HaltReasonAgentError",
     "HaltReasonBudgetExceeded",
+    "HaltReasonEmptyPlan",
     "HaltReasonHumanHalted",
     "HaltReasonMiddlewareHalt",
     "HaltReasonSandboxViolation",
     "HaltReasonStagnationLimitReached",
+    "HaltReasonStepFailed",
     "HaltReasonStrategyNotYetImplemented",
     "HaltReasonTerminationPolicyHalt",
     "HaltReasonUnrecoverableToolError",

@@ -35,9 +35,9 @@ Resolved spec decisions (all four FINAL — match the Rust reference):
   (optional string, default ``""``). Any failure → :class:`PlanPhaseError`
   (``unparseable_plan``).
 * **Q4 (terminal RunResult):** After producing, firing ``OnPlanCreated``, and
-  storing the artifact, the ``PlanExecute`` arm HALTS with the DISTINCT
-  ``HaltReasonExecutePhaseNotImplemented`` — separate from the generic
-  ``StrategyNotYetImplemented`` the other strategies still use.
+  storing the artifact, the ``PlanExecute`` arm hands off to the execute loop
+  (issue #59), which drains the parsed task list. A well-formed but empty plan
+  halts with ``HaltReasonEmptyPlan``.
 """
 
 from __future__ import annotations

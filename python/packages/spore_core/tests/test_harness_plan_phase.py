@@ -17,7 +17,6 @@ from spore_core import (
     FinalResponse,
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
-    HaltReasonExecutePhaseNotImplemented,
     HaltReasonPlanPhaseFailed,
     HarnessBuilder,
     HarnessConfig,
@@ -92,13 +91,17 @@ _PLAN_JSON = '{"tasks":["a","b"],"rationale":"r"}'
 
 
 async def test_plan_phase_runs_exactly_once() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a))
-    r = await h.run(HarnessRunOptions(_plan_task()))
-    assert isinstance(r, RunResultFailure)
+    state = SessionState()
+    outcome = await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     assert a.call_count == 1
-    assert r.turns == 1
+    assert outcome.turns == 1
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +134,15 @@ async def test_plan_turn_tool_call_is_planning_failure() -> None:
 
 
 async def test_artifact_captured_and_stored_in_extras() -> None:
-    from spore_core import SessionState
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
 
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a))
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_plan_task(), session_state=state))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     stored = state.extras[PLAN_EXECUTE_EXTRAS_KEY]
     # Stored as a JSON-safe object (matches Rust's serde_json::to_value).
     assert stored == {"tasks": ["a", "b"], "rationale": "r"}
@@ -197,13 +201,16 @@ async def test_plan_turn_agent_error() -> None:
 
 
 async def test_plan_phase_routes_to_planner_agent() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+
     default = _agent()
     default.push(FinalResponse(content='{"tasks":["default ran"]}', usage=_usage()))
     planner = _agent()
     planner.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(default, planner_agent=planner))
-    r = await h.run(HarnessRunOptions(_plan_task()))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(_plan_task(), SessionState(), BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     assert planner.call_count == 1
     assert default.call_count == 0
 
@@ -214,11 +221,14 @@ async def test_plan_phase_routes_to_planner_agent() -> None:
 
 
 async def test_plan_phase_uses_default_agent_without_planner() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+
     default = _agent()
     default.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(default))
-    r = await h.run(HarnessRunOptions(_plan_task()))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(_plan_task(), SessionState(), BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     assert default.call_count == 1
 
 
@@ -228,14 +238,19 @@ async def test_plan_phase_uses_default_agent_without_planner() -> None:
 
 
 async def test_plan_turn_counts_against_budget() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage(in_t=4, out_t=2)))
     h = StandardHarness(_config(a))
-    r = await h.run(HarnessRunOptions(_plan_task(max_turns=5)))
-    assert isinstance(r, RunResultFailure)
-    assert r.turns == 1
-    assert r.usage.input_tokens == 4
-    assert r.usage.output_tokens == 2
+    outcome = await h._run_plan_phase(
+        _plan_task(max_turns=5), SessionState(), BudgetSnapshot(), None
+    )
+    assert isinstance(outcome, _PlanPhaseOutcome)
+    assert outcome.turns == 1
+    assert outcome.usage.input_tokens == 4
+    assert outcome.usage.output_tokens == 2
 
 
 # ---------------------------------------------------------------------------
@@ -244,15 +259,16 @@ async def test_plan_turn_counts_against_budget() -> None:
 
 
 async def test_one_turn_span_recorded() -> None:
-    from spore_core import InMemoryObservabilityProvider
+    from spore_core import BudgetSnapshot, InMemoryObservabilityProvider, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
 
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     obs = InMemoryObservabilityProvider()
     h = StandardHarness(_config(a, observability=obs))
     task = _plan_task()
-    r = await h.run(HarnessRunOptions(task))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(task, SessionState(), BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     metrics = await obs.get_session_metrics(task.session_id)
     assert metrics is not None
     assert metrics.total_turns == 1
@@ -305,14 +321,17 @@ async def test_on_plan_created_mutation_reflected_in_stored_artifact() -> None:
         ctx.plan.rationale = "rewritten"
         return HookContinue()
 
+    from spore_core import BudgetSnapshot
+    from spore_core.harness import _PlanPhaseOutcome
+
     chain = StandardHookChain()
     chain.register(FunctionHook("rewrite", [HookEvent.ON_PLAN_CREATED], handler))
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a, hooks=chain))
     state = SessionState()
-    r = await h.run(HarnessRunOptions(_plan_task(), session_state=state))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     assert state.extras[PLAN_EXECUTE_EXTRAS_KEY] == {
         "tasks": ["a", "b", "extra"],
         "rationale": "rewritten",
@@ -330,39 +349,48 @@ async def test_on_plan_created_continue_keeps_captured_plan() -> None:
         seen.append(ctx.plan)
         return HookContinue()
 
+    from spore_core import BudgetSnapshot
+
     chain = StandardHookChain()
     chain.register(FunctionHook("observe", [HookEvent.ON_PLAN_CREATED], handler))
     a = _agent()
     a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
     h = StandardHarness(_config(a, hooks=chain))
     state = SessionState()
-    await h.run(HarnessRunOptions(_plan_task(), session_state=state))
+    await h._run_plan_phase(_plan_task(), state, BudgetSnapshot(), None)
     assert len(seen) == 1
     assert seen[0].tasks == ["a", "b"]
     assert state.extras[PLAN_EXECUTE_EXTRAS_KEY] == {"tasks": ["a", "b"], "rationale": "r"}
 
 
 # ---------------------------------------------------------------------------
-# Q4: after producing+storing an artifact, the full PlanExecute run() halts with
-# the distinct ExecutePhaseNotImplemented reason (not StrategyNotYetImplemented).
+# The execute phase is now implemented (#59): ExecutePhaseNotImplemented is gone.
 # ---------------------------------------------------------------------------
 
 
-async def test_plan_execute_halts_execute_phase_not_implemented() -> None:
-    a = _agent()
-    a.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
-    h = StandardHarness(_config(a))
-    r = await h.run(HarnessRunOptions(_plan_task()))
-    assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonExecutePhaseNotImplemented)
+async def test_execute_phase_not_implemented_removed() -> None:
+    import spore_core
+
+    assert not hasattr(spore_core, "HaltReasonExecutePhaseNotImplemented")
+    # The discriminated HaltReason union no longer accepts the old tag.
+    import pytest
+    from pydantic import TypeAdapter
+
+    from spore_core.harness import HaltReason
+
+    with pytest.raises(Exception):
+        TypeAdapter(HaltReason).validate_python({"kind": "execute_phase_not_implemented"})
 
 
 # ---------------------------------------------------------------------------
-# Builder wires planner_agent.
+# Builder wires planner_agent: the planner runs the one-shot plan turn.
 # ---------------------------------------------------------------------------
 
 
 async def test_builder_planner_agent_setter() -> None:
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
+
     default = _agent()
     planner = _agent()
     planner.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
@@ -377,8 +405,8 @@ async def test_builder_planner_agent_setter() -> None:
         .planner_agent(planner)
         .build()
     )
-    r = await h.run(HarnessRunOptions(_plan_task()))
-    assert isinstance(r, RunResultFailure)
+    outcome = await h._run_plan_phase(_plan_task(), SessionState(), BudgetSnapshot(), None)
+    assert isinstance(outcome, _PlanPhaseOutcome)
     assert planner.call_count == 1
     assert default.call_count == 0
 
@@ -415,11 +443,12 @@ def _fixture_responses() -> list[str]:
     return texts
 
 
-async def _drive_plan_phase(response_text: str) -> RunResultFailure:
-    """Drive the full harness plan phase against a single replayed response and
-    assert it halts with ExecutePhaseNotImplemented (proving the harness
-    consumed the replayed planner response)."""
-    from spore_core import SessionState
+async def _drive_plan_phase(response_text: str) -> None:
+    """Drive the one-shot plan phase against a single replayed response and assert
+    it produces+stores the artifact (proving the harness consumed the replayed
+    planner response)."""
+    from spore_core import BudgetSnapshot, SessionState
+    from spore_core.harness import _PlanPhaseOutcome
     from spore_core.model import (
         ModelRequest,
         ModelResponse,
@@ -446,23 +475,20 @@ async def _drive_plan_phase(response_text: str) -> RunResultFailure:
     agent = ModelAgent(AgentId("planner"), replay)
     h = StandardHarness(_config_for_agent(agent))
     state = SessionState()
-    r = await h.run(
-        HarnessRunOptions(
-            Task.new(
-                "build something",
-                SessionId("plan-fixture"),
-                LoopStrategyPlanExecute(plan_model=None),
-            ),
-            session_state=state,
-        )
+    outcome = await h._run_plan_phase(
+        Task.new(
+            "build something",
+            SessionId("plan-fixture"),
+            LoopStrategyPlanExecute(plan_model=None),
+        ),
+        state,
+        BudgetSnapshot(),
+        None,
     )
-    assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonExecutePhaseNotImplemented)
-    assert r.turns == 1
-    # Stash the extras on the result object is not possible; assert directly.
+    assert isinstance(outcome, _PlanPhaseOutcome)
+    assert outcome.turns == 1
     _LAST_EXTRAS.clear()
     _LAST_EXTRAS.update(state.extras)
-    return r
 
 
 _LAST_EXTRAS: dict[str, object] = {}
