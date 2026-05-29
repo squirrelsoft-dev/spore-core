@@ -681,6 +681,7 @@ async fn resume_does_not_reseed_task_instruction() {
         MiddlewareDecision::SurfaceToHuman {
             request: HumanRequest::Clarification {
                 question: "proceed?".into(),
+                options: None,
             },
         },
     );

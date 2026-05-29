@@ -1,0 +1,52 @@
+[
+  {
+    "name": "enter_plan_mode",
+    "tool": "enter_plan_mode",
+    "input": { "context": "seed context" },
+    "expected": {
+      "tool_output_kind": "escalate",
+      "signal": { "kind": "enter_plan_mode", "context": "seed context" }
+    }
+  },
+  {
+    "name": "exit_plan_mode",
+    "tool": "exit_plan_mode",
+    "input": { "plan": { "tasks": ["a", "b"], "rationale": "because" } },
+    "expected": {
+      "tool_output_kind": "escalate",
+      "signal": {
+        "kind": "exit_plan_mode",
+        "plan": { "tasks": ["a", "b"], "rationale": "because" }
+      }
+    }
+  },
+  {
+    "name": "ask_user_question_with_options",
+    "tool": "ask_user_question",
+    "input": { "question": "which?", "options": ["a", "b"] },
+    "expected": {
+      "tool_output_kind": "awaiting_clarification",
+      "question": "which?",
+      "options": ["a", "b"]
+    }
+  },
+  {
+    "name": "ask_user_question_free_form",
+    "tool": "ask_user_question",
+    "input": { "question": "free form?" },
+    "expected": {
+      "tool_output_kind": "awaiting_clarification",
+      "question": "free form?",
+      "options": null
+    }
+  },
+  {
+    "name": "abort",
+    "tool": "abort",
+    "input": { "reason": "stop now" },
+    "expected": {
+      "tool_output_kind": "escalate",
+      "signal": { "kind": "abort", "reason": "stop now" }
+    }
+  }
+]

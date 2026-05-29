@@ -775,6 +775,7 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
                 ToolOutput::Error { message, .. } => format!("[error] {message}"),
                 ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                 ToolOutput::Escalate { .. } => "[escalate]".into(),
+                ToolOutput::AwaitingClarification { .. } => "[clarification]".into(),
             };
 
             // Spec rule: head+tail truncate, offload full to filesystem.

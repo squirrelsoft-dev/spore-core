@@ -54,7 +54,9 @@
 //! 1. Tools are always dispatched via the registry — never directly.
 //! 2. Schemas are validated at registration (basic structural check on
 //!    the JSON Schema document).
-//! 3. Duplicate tool names → `RegistrationError::DuplicateName`.
+//! 3. Duplicate tool names → **last-wins upsert** (issue #81, Q1): a second
+//!    `register()` for the same name OVERWRITES the first. (Duplicate tool-SET
+//!    names still error with `RegistrationError::DuplicateName`.)
 //! 4. `ToolAnnotations { destructive: true, read_only: true }` is
 //!    contradictory → `RegistrationError::ConflictingAnnotations`.
 //! 5. Active `ToolSet` can change between turns (selected by `TaskPhase`).
@@ -427,11 +429,12 @@ impl ToolRegistry for StandardToolRegistry {
             .tools
             .try_write()
             .expect("tool registration must not contend with dispatch");
-        if guard.contains_key(&schema.name) {
-            return Err(RegistrationError::DuplicateName {
-                tool: schema.name.clone(),
-            });
-        }
+        // Last-wins upsert (issue #81, Q1): registering a tool whose name is
+        // already present OVERWRITES the prior registration. This is what lets
+        // an architect override a standard tool by registering their own after
+        // `StandardTools::coding_set()` / `full_set()`. `RegistrationError`
+        // remains for the schema/annotation/name-mismatch cases above (and for
+        // `register_set`), but a duplicate name is no longer an error.
         let arc: Arc<dyn Tool> = Arc::from(tool);
         guard.insert(schema.name.clone(), Registered { tool: arc, schema });
         Ok(())
@@ -810,20 +813,59 @@ mod tests {
         }
     }
 
-    // Rule 3: duplicate registration fails.
+    // Rule 3 (issue #81, Q1): duplicate tool registration is a last-wins upsert,
+    // NOT an error. The second registration overwrites the first; the active
+    // schema reflects the latest registration.
     #[tokio::test]
-    async fn duplicate_registration_errors() {
+    async fn duplicate_registration_is_last_wins_upsert() {
         let reg = StandardToolRegistry::new();
         reg.register(
             Box::new(EchoTool::new("echo")),
-            schema("echo", ToolAnnotations::default()),
+            ToolSchema {
+                name: "echo".into(),
+                description: "first".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+                annotations: ToolAnnotations::default(),
+            },
         )
         .unwrap();
+        // Re-register the same name with a different description — must succeed
+        // (no DuplicateName error) and overwrite.
+        reg.register(
+            Box::new(EchoTool::new("echo")),
+            ToolSchema {
+                name: "echo".into(),
+                description: "second".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+                annotations: ToolAnnotations {
+                    read_only: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("re-register must upsert, not error");
+        let schemas = reg.active_schemas(None);
+        assert_eq!(schemas.len(), 1, "upsert must not duplicate the entry");
+        assert_eq!(schemas[0].description, "second", "last registration wins");
+        assert!(schemas[0].annotations.read_only);
+    }
+
+    // Duplicate tool-SET names still error (DuplicateName retained for sets).
+    #[tokio::test]
+    async fn duplicate_set_name_still_errors() {
+        let reg = StandardToolRegistry::new();
+        reg.register_set(ToolSet {
+            name: "s".into(),
+            tools: vec![],
+            phase: None,
+        })
+        .unwrap();
         let err = reg
-            .register(
-                Box::new(EchoTool::new("echo")),
-                schema("echo", ToolAnnotations::default()),
-            )
+            .register_set(ToolSet {
+                name: "s".into(),
+                tools: vec![],
+                phase: None,
+            })
             .unwrap_err();
         assert!(matches!(err, RegistrationError::DuplicateName { .. }));
     }

@@ -327,6 +327,7 @@ mod tests {
             approved_results: vec![],
             human_request: Some(HumanRequest::Clarification {
                 question: "yes?".into(),
+                options: None,
             }),
             task: Task::new(
                 "x",
@@ -340,6 +341,7 @@ mod tests {
             state: Box::new(paused),
             request: HumanRequest::Clarification {
                 question: "yes?".into(),
+                options: None,
             },
         }]));
         let child_reg = StandardToolRegistry::new();

@@ -1,0 +1,34 @@
+[
+  {
+    "name": "content_mode",
+    "files": { "a.txt": "alpha\nbeta\nalpha2\n" },
+    "pattern": "alpha",
+    "output_mode": "content",
+    "expected_lines": 2,
+    "expected_contains": [":1:alpha", ":3:alpha2"]
+  },
+  {
+    "name": "files_with_matches_mode",
+    "files": { "a.txt": "alpha\nalpha\n", "b.txt": "nope\n" },
+    "pattern": "alpha",
+    "output_mode": "files_with_matches",
+    "expected_lines": 1,
+    "expected_contains": ["a.txt"]
+  },
+  {
+    "name": "count_mode",
+    "files": { "a.txt": "alpha\nalpha\nx\n" },
+    "pattern": "alpha",
+    "output_mode": "count",
+    "expected_lines": 1,
+    "expected_contains": [":2"]
+  },
+  {
+    "name": "default_is_content",
+    "files": { "a.txt": "alpha\n" },
+    "pattern": "alpha",
+    "output_mode": "content",
+    "expected_lines": 1,
+    "expected_contains": [":1:alpha"]
+  }
+]

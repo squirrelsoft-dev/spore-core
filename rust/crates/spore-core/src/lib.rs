@@ -143,7 +143,11 @@ pub use tasklist::{
     plan_artifact_to_task_list, Task as TaskListTask, TaskList, TaskListError, TaskStatus,
     TASK_LIST_EXTRAS_KEY,
 };
-pub use tools::TaskListTool;
+pub use tools::{
+    AbortTool, AskUserQuestionTool, EditFileTool, EnterPlanModeTool, ExitPlanModeTool, GrepTool,
+    SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, TODO_STORE_KEY,
+};
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.
 #[allow(deprecated)]

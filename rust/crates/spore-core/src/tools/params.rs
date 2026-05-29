@@ -158,6 +158,118 @@ pub struct HttpPostParams {
     pub headers: Option<Map<String, Value>>,
 }
 
+// ---------- EditFile (#81, new) ----------
+
+/// Parameters for [`crate::tools::edit::EditFileTool`]: replace the FIRST and
+/// ONLY occurrence of `old_string` with `new_string` in the file at `path`.
+/// The match must be unique — an absent or non-unique `old_string` is a
+/// recoverable error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditFileParams {
+    pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+}
+
+// ---------- Grep (#81, new — output modes) ----------
+
+/// Output modes for [`crate::tools::search::GrepTool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepOutputMode {
+    /// Each matching line as `path:line:text` (default).
+    #[default]
+    Content,
+    /// Distinct file paths that contain at least one match.
+    FilesWithMatches,
+    /// `path:count` for each file with matches.
+    Count,
+}
+
+/// Parameters for the net-new [`crate::tools::search::GrepTool`]. Distinct from
+/// [`GrepFilesParams`]: adds `output_mode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepParams {
+    pub pattern: String,
+    pub path: String,
+    #[serde(default)]
+    pub recursive: bool,
+    #[serde(default)]
+    pub output_mode: GrepOutputMode,
+}
+
+// ---------- SendMessage (#81, new) ----------
+
+/// Parameters for [`crate::tools::message::SendMessageTool`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendMessageParams {
+    pub content: String,
+}
+
+// ---------- TodoWrite (#81, new) ----------
+
+/// A single todo item managed by [`crate::tools::todo::TodoWriteTool`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Parameters for [`crate::tools::todo::TodoWriteTool`]: the agent supplies the
+/// FULL desired todo list, which replaces the persisted list wholesale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoWriteParams {
+    pub todos: Vec<TodoItem>,
+}
+
+// ---------- WebFetch / WebSearch (#81, new) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchParams {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchParams {
+    pub query: String,
+}
+
+// ---------- Tier 3: plan / clarify / abort (#81, new) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnterPlanModeParams {
+    #[serde(default)]
+    pub context: String,
+}
+
+/// Parameters for [`crate::tools::plan::ExitPlanModeTool`]. The agent supplies
+/// the plan as a structured object that deserializes DIRECTLY into the existing
+/// [`PlanArtifact`](crate::hooks::PlanArtifact) (issue #81, Q4a — no stub).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitPlanModeParams {
+    pub plan: crate::hooks::PlanArtifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskUserQuestionParams {
+    pub question: String,
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortParams {
+    pub reason: String,
+}
+
 // ---------- Subagent ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

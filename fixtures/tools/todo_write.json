@@ -1,0 +1,49 @@
+[
+  {
+    "name": "write_two_items",
+    "steps": [
+      {
+        "input": {
+          "todos": [
+            { "content": "a", "status": "pending" },
+            { "content": "b", "status": "in_progress" }
+          ]
+        },
+        "expected_persisted": [
+          { "content": "a", "status": "pending" },
+          { "content": "b", "status": "in_progress" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "replace_wholesale",
+    "steps": [
+      {
+        "input": {
+          "todos": [
+            { "content": "old1", "status": "pending" },
+            { "content": "old2", "status": "pending" }
+          ]
+        },
+        "expected_persisted": [
+          { "content": "old1", "status": "pending" },
+          { "content": "old2", "status": "pending" }
+        ]
+      },
+      {
+        "input": { "todos": [{ "content": "new", "status": "completed" }] },
+        "expected_persisted": [{ "content": "new", "status": "completed" }]
+      }
+    ]
+  },
+  {
+    "name": "empty_list",
+    "steps": [
+      {
+        "input": { "todos": [] },
+        "expected_persisted": []
+      }
+    ]
+  }
+]

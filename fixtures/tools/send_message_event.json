@@ -1,0 +1,20 @@
+[
+  {
+    "name": "basic_message",
+    "input": { "content": "hello human" },
+    "expected_tool_output": { "kind": "success", "content": "hello human" },
+    "expected_stream_event": { "kind": "user_message", "content": "hello human" }
+  },
+  {
+    "name": "empty_content",
+    "input": { "content": "" },
+    "expected_tool_output": { "kind": "success", "content": "" },
+    "expected_stream_event": { "kind": "user_message", "content": "" }
+  },
+  {
+    "name": "missing_content_is_recoverable_error",
+    "input": {},
+    "expected_tool_output": { "kind": "error", "recoverable": true },
+    "expected_stream_event": null
+  }
+]

@@ -346,6 +346,7 @@ mod typed_access_tests {
             MiddlewareDecision::SurfaceToHuman {
                 request: HumanRequest::Clarification {
                     question: "why".into(),
+                    options: None,
                 },
             },
         ))];

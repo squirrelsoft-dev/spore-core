@@ -1228,6 +1228,7 @@ mod tests {
                     MiddlewareDecision::SurfaceToHuman {
                         request: HumanRequest::Clarification {
                             question: "?".into(),
+                            options: None,
                         },
                     },
                 ),

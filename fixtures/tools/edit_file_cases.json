@@ -1,0 +1,30 @@
+[
+  {
+    "name": "unique_match_replaced",
+    "initial_content": "hello world\n",
+    "old_string": "world",
+    "new_string": "there",
+    "expected": { "kind": "success", "final_content": "hello there\n" }
+  },
+  {
+    "name": "old_string_not_found",
+    "initial_content": "hello\n",
+    "old_string": "absent",
+    "new_string": "x",
+    "expected": { "kind": "error", "recoverable": true, "reason": "not_found" }
+  },
+  {
+    "name": "old_string_not_unique",
+    "initial_content": "x x x\n",
+    "old_string": "x",
+    "new_string": "y",
+    "expected": { "kind": "error", "recoverable": true, "reason": "not_unique" }
+  },
+  {
+    "name": "multiline_unique_block",
+    "initial_content": "line1\nline2\nline3\n",
+    "old_string": "line2\n",
+    "new_string": "LINE2\n",
+    "expected": { "kind": "success", "final_content": "line1\nLINE2\nline3\n" }
+  }
+]

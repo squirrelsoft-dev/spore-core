@@ -290,12 +290,34 @@ impl Task {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEvent {
-    TurnStart { turn: u32 },
-    TurnEnd { turn: u32 },
-    ToolCall { call_id: String, name: String },
-    ToolResult { call_id: String, is_error: bool },
-    FinalResponse { content: String },
-    BudgetWarning { limit_type: BudgetLimitType },
+    TurnStart {
+        turn: u32,
+    },
+    TurnEnd {
+        turn: u32,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+    },
+    ToolResult {
+        call_id: String,
+        is_error: bool,
+    },
+    FinalResponse {
+        content: String,
+    },
+    BudgetWarning {
+        limit_type: BudgetLimitType,
+    },
+    /// Emitted when a tool wants to surface a message to the user out-of-band
+    /// (issue #81 — `SendMessageTool`). The harness loop recognizes the
+    /// `send_message` tool, emits this event instead of collapsing the content
+    /// into a normal tool result, and records a minimal success tool result so
+    /// the loop continues.
+    UserMessage {
+        content: String,
+    },
 }
 
 pub type StreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
@@ -386,6 +408,20 @@ pub enum ToolOutput {
     /// to message history.
     Escalate {
         signal: HarnessSignal,
+    },
+    /// Tool requests a clarifying answer from the human before it can produce a
+    /// result (issue #81, Q4b — `AskUserQuestionTool`). UNLIKE
+    /// [`ToolOutput::WaitingForHuman`], there is NO [`ChildPausedState`]: the
+    /// harness loop builds a [`PausedState`] directly, sets its `human_request`
+    /// to [`HumanRequest::Clarification`], and returns
+    /// [`RunResult::WaitingForHuman`]. The clarifying tool call is preserved in
+    /// `pending_tool_calls`; on resume the human's [`HumanResponse::Answer`]
+    /// text is injected as the tool RESULT for that pending call (not appended
+    /// as a free-standing user message) and the loop continues.
+    AwaitingClarification {
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
     },
 }
 
@@ -869,6 +905,11 @@ pub enum HumanRequest {
     },
     Clarification {
         question: String,
+        /// Optional fixed-choice options offered to the human (issue #81, Q4b).
+        /// `None` for a free-form clarification. `#[serde(default)]` keeps older
+        /// `Clarification` blobs (no `options` field) deserializing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
     },
     Review {
         content: String,
@@ -1241,6 +1282,11 @@ pub struct HarnessBuilder {
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     planner_agent: Option<Arc<dyn Agent>>,
     storage: Option<Arc<crate::storage::StorageProvider>>,
+    /// Standard catalogue tools accumulated via [`HarnessBuilder::tool`] /
+    /// [`HarnessBuilder::tools`] (issue #81). They are drained into a populated
+    /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
+    /// [`HarnessBuilder::build_tool_registry`], applying last-wins upsert.
+    standard_tools: Vec<crate::tools::StandardTool>,
 }
 
 impl HarnessBuilder {
@@ -1271,7 +1317,46 @@ impl HarnessBuilder {
             hooks: None,
             planner_agent: None,
             storage: None,
+            standard_tools: Vec::new(),
         }
+    }
+
+    /// Add a single [`StandardTool`](crate::tools::StandardTool) to the
+    /// catalogue accumulated for this harness (issue #81, Q1/Q2). The bundled
+    /// implementation + schema are destructured when the registry is built via
+    /// [`build_tool_registry`](Self::build_tool_registry). Registration applies
+    /// LAST-WINS upsert: a later `.tool()` with the same name overrides an
+    /// earlier one (e.g. a custom tool registered after a preset).
+    pub fn tool(mut self, tool: crate::tools::StandardTool) -> Self {
+        self.standard_tools.push(tool);
+        self
+    }
+
+    /// Add many [`StandardTool`](crate::tools::StandardTool)s at once (e.g. a
+    /// preset like [`StandardTools::coding_set`](crate::tools::StandardTools::coding_set)).
+    /// Order is preserved, so last-wins upsert still applies across the batch.
+    pub fn tools(mut self, tools: impl IntoIterator<Item = crate::tools::StandardTool>) -> Self {
+        self.standard_tools.extend(tools);
+        self
+    }
+
+    /// Drain the accumulated catalogue tools into a populated
+    /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry),
+    /// registering each with last-wins upsert (issue #81, Q1/Q2). Consumes the
+    /// accumulated set. The harness-loop [`tool_registry`](Self) seam is
+    /// separate (it is the bridged dispatch trait); callers wire the returned
+    /// registry into a [`RealToolRegistry`](crate::scenarios::RealToolRegistry)
+    /// per run. Returns an empty registry if no catalogue tools were added.
+    pub fn drain_tools_into_registry(&mut self) -> Arc<crate::tool_registry::StandardToolRegistry> {
+        use crate::tool_registry::ToolRegistry as _;
+        let reg = crate::tool_registry::StandardToolRegistry::new();
+        for t in self.standard_tools.drain(..) {
+            // Upsert: a duplicate name overwrites (issue #81, Q1). Schema/name
+            // validation errors are ignored here since catalogue schemas are
+            // well-formed by construction.
+            let _ = reg.register(t.implementation, t.schema);
+        }
+        Arc::new(reg)
     }
 
     /// Inject a [`StorageProvider`](crate::storage::StorageProvider) (issue #73).
@@ -2260,6 +2345,56 @@ impl StandardHarness {
                             };
                         }
 
+                        // Clarification pause (issue #81, Q4b): a tool (e.g.
+                        // `ask_user_question`) needs a human answer before it can
+                        // produce a result. UNLIKE the subagent `WaitingForHuman`
+                        // path, there is NO `ChildPausedState`: the loop builds a
+                        // `PausedState` directly with `human_request` set to
+                        // `Clarification`. The CLARIFYING call itself is preserved
+                        // as the head of `pending_tool_calls` (followed by the
+                        // remaining batch) so that, on resume, the human's answer
+                        // is injected as the tool RESULT for that pending call.
+                        if let ToolOutput::AwaitingClarification { question, options } = output {
+                            let mut pending = vec![call.clone()];
+                            pending.extend_from_slice(&calls[i + 1..]);
+                            let request = HumanRequest::Clarification { question, options };
+                            let state = PausedState {
+                                session_id: session_id.clone(),
+                                task_id: task.id.clone(),
+                                turn_number: budget_used.turns,
+                                session_state,
+                                pending_tool_calls: pending,
+                                approved_results,
+                                human_request: Some(request.clone()),
+                                task,
+                                budget_used,
+                                child_state: None,
+                            };
+                            return RunResult::WaitingForHuman {
+                                state: Box::new(state),
+                                request,
+                            };
+                        }
+
+                        // SendMessage (issue #81): the `send_message` tool surfaces
+                        // an out-of-band message to the user. The loop emits a
+                        // `StreamEvent::UserMessage` rather than collapsing the
+                        // content into a normal tool result, then records a minimal
+                        // success result so the loop continues.
+                        let output = if call.name == crate::tools::SendMessageTool::NAME {
+                            if let ToolOutput::Success { content, .. } = &output {
+                                Self::emit(
+                                    &on_stream,
+                                    StreamEvent::UserMessage {
+                                        content: content.clone(),
+                                    },
+                                );
+                            }
+                            output
+                        } else {
+                            output
+                        };
+
                         let is_error = matches!(output, ToolOutput::Error { .. });
                         // Layer-2: unrecoverable tool error halts immediately.
                         if let ToolOutput::Error {
@@ -2303,9 +2438,11 @@ impl StandardHarness {
                                         })
                                     }
                                     ToolOutput::WaitingForHuman { .. } => None,
-                                    // Escalate is handled and returned above;
-                                    // it never reaches the capture path.
+                                    // Escalate / AwaitingClarification are handled
+                                    // and returned above; they never reach the
+                                    // capture path.
                                     ToolOutput::Escalate { .. } => None,
+                                    ToolOutput::AwaitingClarification { .. } => None,
                                 };
                                 (Some(args), result)
                             } else {
@@ -2318,6 +2455,7 @@ impl StandardHarness {
                                 ToolOutput::Error { message, .. } => (message.len(), false),
                                 ToolOutput::WaitingForHuman { .. } => (0, false),
                                 ToolOutput::Escalate { .. } => (0, false),
+                                ToolOutput::AwaitingClarification { .. } => (0, false),
                             };
                             let span_id =
                                 SpanId::new(format!("{}-tool-{}", session_id.as_str(), span_seq));
@@ -3310,11 +3448,57 @@ impl StandardHarness {
             mut session_state,
             pending_tool_calls,
             approved_results: _approved_results,
-            human_request: _hr,
+            human_request: hr,
             task,
             budget_used,
             child_state,
         } = state;
+
+        // Clarification resume (issue #81, Q4b): if this pause came from
+        // `ToolOutput::AwaitingClarification`, the human's answer is injected as
+        // the tool RESULT for the clarifying call (the head of
+        // `pending_tool_calls`) — NOT appended as a free-standing user message.
+        // Any remaining pending calls after the clarifying one are then
+        // dispatched normally before the loop resumes.
+        if matches!(hr, Some(HumanRequest::Clarification { .. })) {
+            if let HumanResponse::Answer { text }
+            | HumanResponse::ApproveWithFeedback { feedback: text } = &response
+            {
+                let mut pending = pending_tool_calls.into_iter();
+                if let Some(clarifying_call) = pending.next() {
+                    let tr = ToolResult {
+                        call_id: clarifying_call.id.clone(),
+                        output: ToolOutput::Success {
+                            content: text.clone(),
+                            truncated: false,
+                        },
+                    };
+                    self.config
+                        .context_manager
+                        .append_tool_result(&mut session_state, &tr)
+                        .await;
+                }
+                // Dispatch any remaining pending calls from the same batch.
+                for call in pending {
+                    let output = self.config.tool_registry.dispatch(call.clone()).await;
+                    let tr = ToolResult {
+                        call_id: call.id,
+                        output,
+                    };
+                    self.config
+                        .context_manager
+                        .append_tool_result(&mut session_state, &tr)
+                        .await;
+                }
+                let max_iterations = match task.loop_strategy {
+                    LoopStrategy::ReAct { max_iterations } => max_iterations,
+                    _ => u32::MAX,
+                };
+                return self
+                    .run_react(task, max_iterations, session_state, budget_used, on_stream)
+                    .await;
+            }
+        }
 
         // Subagent depth: if there's a child, route the response through it.
         // The actual child harness is owned by the caller-installed
@@ -3440,6 +3624,7 @@ pub mod testing {
                     ToolOutput::Error { message, .. } => format!("[error] {message}"),
                     ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                     ToolOutput::Escalate { .. } => "[escalate]".into(),
+                    ToolOutput::AwaitingClarification { .. } => "[clarification]".into(),
                 };
                 session.messages.push(Message {
                     role: crate::model::Role::Tool,
@@ -4588,6 +4773,7 @@ mod tests {
                 approved_results: vec![],
                 human_request: Some(HumanRequest::Clarification {
                     question: "?".into(),
+                    options: None,
                 }),
                 task: child_task,
                 budget_used: BudgetSnapshot::default(),
@@ -4595,6 +4781,7 @@ mod tests {
             }),
             request: HumanRequest::Clarification {
                 question: "?".into(),
+                options: None,
             },
         });
         cfg.tool_registry = reg;
@@ -4748,6 +4935,7 @@ mod tests {
                 approved_results: vec![],
                 human_request: Some(HumanRequest::Clarification {
                     question: "?".into(),
+                    options: None,
                 }),
                 task: task(LoopStrategy::ReAct { max_iterations: 1 }),
                 budget_used: BudgetSnapshot::default(),
@@ -4755,6 +4943,7 @@ mod tests {
             }),
             request: HumanRequest::Clarification {
                 question: "?".into(),
+                options: None,
             },
         });
         cfg.tool_registry = reg;
@@ -4842,6 +5031,133 @@ mod tests {
             }
             other => panic!("expected Success on resume (signal discarded), got {other:?}"),
         }
+    }
+
+    // Issue #81: a tool returning AwaitingClarification pauses the loop with a
+    // PausedState whose human_request is a Clarification (NO child_state) and
+    // returns WaitingForHuman. The clarifying call is preserved as the head of
+    // pending_tool_calls.
+    #[tokio::test]
+    async fn awaiting_clarification_pauses_without_child_state() {
+        let a = agent_with_tool_calls(2);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::AwaitingClarification {
+            question: "which option?".into(),
+            options: Some(vec!["a".into(), "b".into()]),
+        });
+        cfg.tool_registry = reg.clone();
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::WaitingForHuman { state, request } => {
+                // No subagent child state on a clarification pause.
+                assert!(state.child_state.is_none());
+                match &request {
+                    HumanRequest::Clarification { question, options } => {
+                        assert_eq!(question, "which option?");
+                        assert_eq!(
+                            options.as_ref().unwrap(),
+                            &vec!["a".to_string(), "b".to_string()]
+                        );
+                    }
+                    other => panic!("expected Clarification, got {other:?}"),
+                }
+                // The clarifying call (c0/t0) is the head of pending; c1 trails.
+                assert_eq!(state.pending_tool_calls.len(), 2);
+                assert_eq!(state.pending_tool_calls[0].id, "c0");
+                assert_eq!(state.pending_tool_calls[1].id, "c1");
+            }
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+        // Exactly one dispatch (the clarifying call); c1 was preserved, not run.
+        assert_eq!(reg.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Issue #81: resuming a Clarification pause injects the human's Answer as
+    // the TOOL RESULT for the clarifying call, then continues to Success.
+    #[tokio::test]
+    async fn clarification_resume_injects_answer_as_tool_result() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            content: "clarified-done".into(),
+            usage: usage(),
+        });
+        let cfg = standard_config(a);
+        let h = StandardHarness::new(cfg);
+        let state = PausedState {
+            session_id: SessionId::new("s"),
+            task_id: TaskId::new("t"),
+            turn_number: 1,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![ToolCall {
+                id: "ask".into(),
+                name: "ask_user_question".into(),
+                input: serde_json::json!({"question": "?"}),
+            }],
+            approved_results: vec![],
+            human_request: Some(HumanRequest::Clarification {
+                question: "?".into(),
+                options: None,
+            }),
+            task: react(5),
+            budget_used: BudgetSnapshot::default(),
+            child_state: None,
+        };
+        match h
+            .resume(
+                state,
+                HumanResponse::Answer {
+                    text: "use a".into(),
+                },
+                None,
+            )
+            .await
+        {
+            RunResult::Success { output, .. } => assert_eq!(output, "clarified-done"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // Issue #81: the send_message tool surfaces a StreamEvent::UserMessage and
+    // the loop records a success tool result (continuing, not pausing).
+    #[tokio::test]
+    async fn send_message_emits_user_message_event() {
+        use std::sync::Mutex;
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: crate::tools::SendMessageTool::NAME.into(),
+                input: serde_json::json!({"content": "hello human"}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "hello human".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg.clone();
+        let h = StandardHarness::new(cfg);
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(move |ev| {
+            if let StreamEvent::UserMessage { content } = ev {
+                sink.lock().unwrap().push(content);
+            }
+        }));
+        match h.run(opts).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "done"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        let msgs = captured.lock().unwrap();
+        assert_eq!(msgs.as_slice(), &["hello human".to_string()]);
     }
 
     // R7-adjacent: each `HarnessSignal` variant round-trips through serde
@@ -4938,6 +5254,7 @@ mod tests {
             approved_results: vec![],
             human_request: Some(HumanRequest::Clarification {
                 question: "?".into(),
+                options: None,
             }),
             task: react(5),
             budget_used: BudgetSnapshot::default(),
@@ -5967,6 +6284,7 @@ mod tests {
             approved_results: vec![],
             human_request: Some(HumanRequest::Clarification {
                 question: "what?".into(),
+                options: None,
             }),
             task: react(5),
             budget_used: BudgetSnapshot {
@@ -5999,6 +6317,7 @@ mod tests {
             approved_results: vec![],
             human_request: Some(HumanRequest::Clarification {
                 question: "?".into(),
+                options: None,
             }),
             task: react(1),
             budget_used: BudgetSnapshot::default(),
@@ -6601,6 +6920,7 @@ mod tests {
                         ToolOutput::Error { message, .. } => message.clone(),
                         ToolOutput::WaitingForHuman { .. } => String::new(),
                         ToolOutput::Escalate { .. } => String::new(),
+                        ToolOutput::AwaitingClarification { .. } => String::new(),
                     },
                     is_error: matches!(result.output, ToolOutput::Error { .. }),
                 }),
