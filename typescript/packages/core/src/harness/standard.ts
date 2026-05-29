@@ -41,6 +41,7 @@ import {
 import type { Message, ToolCall } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
+import { StorageProvider } from "../storage/index.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 import { newSessionState as newContextSessionState } from "../context/types.js";
 import {
@@ -100,6 +101,14 @@ export interface HarnessConfig {
   middleware?: MiddlewareChain;
   observability?: ObservabilityProvider;
   /**
+   * Pluggable per-domain persistence layer (issue #73). Optional; defaults to an
+   * all-no-op {@link StorageProvider} so existing callers compile and behave
+   * unchanged. v1 is expose-only: the harness does NOT read/write sessions
+   * internally on pause/resume — it only carries the provider for callers and
+   * for the observability fan-out.
+   */
+  storage?: StorageProvider;
+  /**
    * Post-compaction verifier (issue #29/#46). The harness runs it after each
    * compaction turn and retries up to `maxCompactionAttempts` before accepting
    * a failing summary. Optional; defaults to {@link KeyTermVerifier}.
@@ -151,6 +160,15 @@ const DEFAULT_MAX_STOP_BLOCKS = 8;
 
 export class StandardHarness implements Harness {
   constructor(private readonly config: HarnessConfig) {}
+
+  /**
+   * The configured {@link StorageProvider} (issue #73). Defaults to an all-no-op
+   * provider when `.storage(...)` was never set, so callers never null-check —
+   * they always get a usable provider and the store decides what to do.
+   */
+  storage(): StorageProvider {
+    return this.config.storage ?? StorageProvider.noOp();
+  }
 
   /**
    * Capture a requested tool call's arguments (issue #64). When the serialized
@@ -1469,6 +1487,7 @@ export class StandardHarness implements Harness {
 export class HarnessBuilder {
   private _middleware?: MiddlewareChain;
   private _observability?: ObservabilityProvider;
+  private _storage?: StorageProvider;
   private _compactionVerifier: CompactionVerifier = new KeyTermVerifier();
   private _maxCompactionAttempts = 2;
   private _pricing: PricingTable = PricingTable.DEFAULT;
@@ -1495,6 +1514,13 @@ export class HarnessBuilder {
    *  it (turn spans, tool-call spans) and flushes on terminal outcomes. */
   observability(provider: ObservabilityProvider): this {
     this._observability = provider;
+    return this;
+  }
+
+  /** Inject a {@link StorageProvider} (issue #73). Defaults to an all-no-op
+   *  provider when unset, so existing callers compile and behave unchanged. */
+  storage(provider: StorageProvider): this {
+    this._storage = provider;
     return this;
   }
 
@@ -1566,6 +1592,7 @@ export class HarnessBuilder {
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,
       observability: this._observability,
+      storage: this._storage ?? StorageProvider.noOp(),
       compactionVerifier: this._compactionVerifier,
       maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,

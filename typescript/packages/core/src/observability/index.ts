@@ -17,3 +17,4 @@ export {
 } from "./outbox.js";
 export type { GenAiSpanEvent } from "./outbox.js";
 export type { OutboxConfig } from "./outbox.js";
+export type { OtlpForwarder } from "./outbox.js";

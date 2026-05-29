@@ -64,6 +64,8 @@ import type { SessionId } from "../harness/types.js";
 import { SessionId as SessionIdClass } from "../harness/types.js";
 import type { Timestamp } from "../memory/types.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
+import { parseOtlpEndpoints } from "../storage/providers.js";
+import type { JsonValue, ObservabilityStore } from "../storage/types.js";
 
 import { InMemoryObservabilityProvider } from "./in-memory.js";
 import {
@@ -397,18 +399,11 @@ function deriveOtlpSpanId(spanId: string): Buffer {
  * does not depend on this interface; it exists only so the heavy/version-churny
  * OpenTelemetry SDK can be isolated and so tests run hermetically.
  */
-interface OtlpForwarder {
+export interface OtlpForwarder {
   /** Forward one already-built line. Best-effort, non-blocking, never throws. */
   forward(line: TraceLine): void;
   /** Best-effort force-flush with a timeout. Logs on failure; never throws. */
   forceFlush(): Promise<void>;
-}
-
-/** No-op forwarder used when `SPORE_OTLP_ENDPOINT` is unset/empty (and as the
- *  fallback when the OpenTelemetry SDK is not installed). */
-class NullOtlpForwarder implements OtlpForwarder {
-  forward(_line: TraceLine): void {}
-  async forceFlush(): Promise<void> {}
 }
 
 /**
@@ -700,13 +695,17 @@ class OtelSdkOtlpForwarder implements OtlpForwarder {
   }
 }
 
-/** Read `SPORE_OTLP_ENDPOINT` once: empty/whitespace is treated as unset. */
-function makeForwarder(): OtlpForwarder {
-  const ep = process.env.SPORE_OTLP_ENDPOINT;
-  if (ep && ep.trim().length > 0) {
-    return new OtelSdkOtlpForwarder(ep.trim());
-  }
-  return new NullOtlpForwarder();
+/**
+ * Build the fan-out OTLP forwarder list from `SPORE_OTLP_ENDPOINT` (issue #73
+ * multi-endpoint fan-out). The value is a COMMA-SEPARATED list: `split(',')`,
+ * trim each segment, drop empties (see {@link parseOtlpEndpoints}). Parsed ONCE
+ * at construction; each parsed endpoint becomes one fan-out forwarder. Empty /
+ * unset / all-empty-segments → an empty list (JSONL/store only, no OTLP leg).
+ */
+function makeForwarders(): OtlpForwarder[] {
+  const raw = process.env.SPORE_OTLP_ENDPOINT;
+  if (raw === undefined) return [];
+  return parseOtlpEndpoints(raw).map((endpoint) => new OtelSdkOtlpForwarder(endpoint));
 }
 
 // ============================================================================
@@ -797,13 +796,42 @@ class SessionWriter {
  */
 export class OutboxObservabilityProvider implements ObservabilityProvider {
   private readonly writers = new Map<string, SessionWriter>();
-  private readonly otlp: OtlpForwarder;
+  /**
+   * Fan-out OTLP leg (issue #73 multi-endpoint fan-out): one forwarder per
+   * parsed `SPORE_OTLP_ENDPOINT` entry. Each `emit*` forwards the built line to
+   * ALL of them; a failure on any leg never blocks the others. Empty when the
+   * env var is unset / empty / all-empty-segments.
+   */
+  private readonly otlp: OtlpForwarder[];
+  /**
+   * Optional {@link ObservabilityStore} leg (issue #73). When set, each `emit*`
+   * ALSO serializes the built line to JSON and calls `appendSpan` — fire-and-
+   * forget, with failures isolated and logged. The outbox's own JSONL writer
+   * remains the durable source of truth; this delegates the span store to the
+   * pluggable {@link StorageProvider} abstraction.
+   */
+  private store?: ObservabilityStore;
 
   constructor(
     private readonly config: OutboxConfig,
     private readonly inner: InMemoryObservabilityProvider = new InMemoryObservabilityProvider(),
+    forwarders?: OtlpForwarder[],
   ) {
-    this.otlp = makeForwarder();
+    // `forwarders` is a hermetic test seam: when provided it bypasses
+    // `SPORE_OTLP_ENDPOINT` so the fan-out routing-matrix tests can inject a
+    // counting fake. Production callers omit it and the list is built from env.
+    this.otlp = forwarders ?? makeForwarders();
+  }
+
+  /**
+   * Attach an {@link ObservabilityStore} leg (issue #73). Each subsequent
+   * `emit*` will ALSO append the built line to this store, in addition to the
+   * durable JSONL writer and any OTLP forwarders. Returns `this` so it chains
+   * off the constructor.
+   */
+  withStore(store: ObservabilityStore): this {
+    this.store = store;
+    return this;
   }
 
   /** Access the wrapped in-memory provider (e.g. to call `setSessionOutcome` /
@@ -826,15 +854,42 @@ export class OutboxObservabilityProvider implements ObservabilityProvider {
     return w;
   }
 
-  /** Append a built line to the session's JSONL file + forward to OTLP. */
+  /**
+   * Append a built line to the session's JSONL file, fan out to EVERY OTLP
+   * forwarder, and (when configured) append the span to the
+   * {@link ObservabilityStore} leg. Every leg is independent: a failure on any
+   * one is logged but never propagates or blocks the others (issue #73).
+   */
   private writeLine(sessionId: string, line: TraceLine): void {
     try {
       this.writerFor(sessionId).append(TraceLine.toJsonl(line));
     } catch (err) {
       console.error("[spore-core] outbox append failed:", err instanceof Error ? err.message : err);
-      return;
     }
-    this.otlp.forward(line);
+    // Fan out to every OTLP endpoint. Each forwarder is internally non-blocking;
+    // failures are isolated per leg.
+    for (const forwarder of this.otlp) {
+      try {
+        forwarder.forward(line);
+      } catch (err) {
+        console.error(
+          "[spore-core] OTLP forward failed (JSONL is durable):",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    // ObservabilityStore leg (issue #73): serialize the line to JSON and append.
+    // Fire-and-forget; a rejected promise is logged but never propagates.
+    if (this.store) {
+      const value = JSON.parse(JSON.stringify(line)) as JsonValue;
+      void Promise.resolve(this.store.appendSpan(SessionIdClass.of(sessionId), value)).catch(
+        (err) =>
+          console.error(
+            "[spore-core] observability store append failed:",
+            err instanceof Error ? err.message : err,
+          ),
+      );
+    }
   }
 
   private traceIdLocked(sessionId: string): string {
@@ -934,8 +989,21 @@ export class OutboxObservabilityProvider implements ObservabilityProvider {
       }
     }
 
-    // Best-effort OTLP force-flush; never throws out of flushSession.
-    await this.otlp.forceFlush();
+    // Best-effort OTLP force-flush across every fan-out leg; never throws out of
+    // flushSession.
+    await Promise.allSettled(this.otlp.map((f) => f.forceFlush()));
+
+    // Flush the ObservabilityStore leg's session marker too (issue #73).
+    if (this.store) {
+      try {
+        await this.store.flushSession(sessionId);
+      } catch (err) {
+        console.error(
+          "[spore-core] observability store flush failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
 
     // (c) Create the sibling `.flushed` marker.
     const dir = sessionDir(this.config, sid);

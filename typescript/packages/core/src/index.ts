@@ -38,3 +38,4 @@ export * as promptChunkRegistry from "./prompt-chunk-registry/index.js";
 export * as cacheProvider from "./cache-provider/index.js";
 export * as verifier from "./verifier/index.js";
 export * as hooks from "./hooks/index.js";
+export * as storage from "./storage/index.js";
