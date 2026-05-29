@@ -35,6 +35,18 @@
 //! 8. `approved_results` prevents double-execution on resume.
 //! 9. Subagents cannot spawn their own subagents — [`ChildPausedState`] has
 //!    no `child_state` field (compile-time depth-1 enforcement).
+//! 10. Tool Escalation Protocol (issue #80): a tool may return
+//!     [`ToolOutput::Escalate`] carrying a [`HarnessSignal`]. The harness is a
+//!     pure intermediary — it does NOT act on the signal. It terminates
+//!     cleanly WITHOUT appending the escalation to message history (it is a
+//!     control signal, not a turn), preserves remaining tool calls into
+//!     `pending_tool_calls`, finalizes observability with
+//!     [`SessionOutcome::Escalated`](crate::guide_registry::SessionOutcome::Escalated),
+//!     and returns [`RunResult::Escalate`]. The signal is NOT stored in
+//!     [`PausedState`], so it is discarded on `resume` — the harness never
+//!     re-acts on it. `HarnessSignal::Abort` surfaces as `RunResult::Escalate`,
+//!     NOT `RunResult::Failure`. (No `// SPEC QUESTION:` markers remain — all
+//!     four pre-implementation ambiguities were resolved.)
 //!
 //! ## Component dependencies (forward declarations)
 //!
@@ -293,9 +305,63 @@ pub type StreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
 // (full surfaces live in their owning issues)
 // ============================================================================
 
+/// Tool Escalation Protocol — the typed channel by which a tool signals the
+/// harness to terminate cleanly and pass a *structural* state change up to its
+/// caller (issue #80).
+///
+/// The harness is a pure intermediary: it never acts on a signal itself. Mode
+/// switching, plan approval, and graceful abort are the caller's concern. The
+/// harness terminates cleanly, surfaces the signal via
+/// [`RunResult::Escalate`], and the caller (CLI, chat UI, REST API, parent
+/// harness) owns the orchestration. This mirrors the [`RunResult::WaitingForHuman`]
+/// model — the harness does not resume itself either.
+///
+/// ## Variants
+/// - [`HarnessSignal::EnterPlanMode`] — agent requests entry into plan mode,
+///   carrying accumulated context as a seed for the planning harness.
+/// - [`HarnessSignal::ExitPlanMode`] — planning agent's terminal signal,
+///   carrying the produced [`PlanArtifact`](crate::plan::PlanArtifact) for
+///   human approval before an execution harness is instantiated.
+/// - [`HarnessSignal::SwitchMode`] — agent requests a mode switch; carries the
+///   target [`Mode`](crate::prompt_chunk_registry::Mode) (the EXISTING mode
+///   enum — there is no separate `HarnessMode` type).
+/// - [`HarnessSignal::Abort`] — agent requests a graceful, intentional stop
+///   with a reason. Distinct from `HaltReason::AgentError` — it surfaces as
+///   `RunResult::Escalate`, NOT `RunResult::Failure`.
+///
+/// Wire format: serde-tagged on `kind`, snake_case, byte-identical across the
+/// four language implementations. Round-tripped by
+/// `fixtures/harness/escalation_signals.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarnessSignal {
+    /// Agent requests entry into plan mode. Carries context the agent has
+    /// accumulated so far as seed for the planning harness.
+    EnterPlanMode { context: String },
+    /// Planning agent has produced a plan and requests exit from plan mode.
+    /// Carries the plan artifact for human approval before the execution
+    /// harness is instantiated. This is the planning agent's terminal signal.
+    ExitPlanMode { plan: crate::plan::PlanArtifact },
+    /// Agent requests a mode switch. The caller instantiates the appropriate
+    /// harness for the new mode.
+    SwitchMode {
+        mode: crate::prompt_chunk_registry::Mode,
+    },
+    /// Agent requests a graceful abort with a reason surfaced to the user.
+    /// Distinct from `HaltReason::AgentError` — this is an intentional,
+    /// agent-initiated stop and surfaces as `RunResult::Escalate`.
+    Abort { reason: String },
+}
+
 /// Output of a single tool dispatch. Full type lives in issue #4 (ToolRegistry)
 /// / #5 (Tool). The variants below cover what the harness loop needs to
 /// route; richer payloads are additive.
+///
+/// The [`ToolOutput::Escalate`] variant is the tool-side entry point of the
+/// Tool Escalation Protocol (issue #80): when a dispatched tool returns it, the
+/// harness terminates cleanly (NOT appending the escalation to message
+/// history — it is a control signal, not a conversation turn) and returns
+/// [`RunResult::Escalate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutput {
@@ -313,6 +379,13 @@ pub enum ToolOutput {
     WaitingForHuman {
         child_state: Box<ChildPausedState>,
         request: HumanRequest,
+    },
+    /// Tool requests a structural state change from the harness's parent
+    /// (issue #80). The harness terminates cleanly and passes the signal to
+    /// the caller via [`RunResult::Escalate`]. The escalation is NOT appended
+    /// to message history.
+    Escalate {
+        signal: HarnessSignal,
     },
 }
 
@@ -835,7 +908,12 @@ pub struct PausedState {
     pub session_state: SessionState,
     pub pending_tool_calls: Vec<ToolCall>,
     pub approved_results: Vec<ToolResult>,
-    pub human_request: HumanRequest,
+    /// `None` for an escalation-derived state (issue #80) — an escalation has
+    /// no human request. `WaitingForHuman` construction paths always set
+    /// `Some(..)`. `#[serde(default)]` keeps old `WaitingForHuman` blobs
+    /// deserializing (field present) while escalation blobs omit it.
+    #[serde(default)]
+    pub human_request: Option<HumanRequest>,
     pub task: Task,
     pub budget_used: BudgetSnapshot,
     #[serde(default)]
@@ -852,7 +930,10 @@ pub struct ChildPausedState {
     pub session_state: SessionState,
     pub pending_tool_calls: Vec<ToolCall>,
     pub approved_results: Vec<ToolResult>,
-    pub human_request: HumanRequest,
+    /// `None` for an escalation-derived state (issue #80). `WaitingForHuman`
+    /// construction paths always set `Some(..)`.
+    #[serde(default)]
+    pub human_request: Option<HumanRequest>,
     pub task: Task,
     pub budget_used: BudgetSnapshot,
     pub parent_tool_call_id: String,
@@ -944,6 +1025,20 @@ pub enum RunResult {
     WaitingForHuman {
         state: Box<PausedState>,
         request: HumanRequest,
+    },
+    /// Harness terminated cleanly due to a tool escalation signal (issue #80).
+    /// The caller handles the `signal` and decides whether to resume the
+    /// original harness, instantiate a new one, or present UI to the user. The
+    /// `state` preserves the full [`PausedState`] (with `human_request: None`)
+    /// so `harness.resume(state, ..)` continues the original session; the
+    /// signal is NOT stored in the state, so it is naturally discarded on
+    /// resume — the harness does not re-act on it.
+    Escalate {
+        signal: HarnessSignal,
+        state: Box<PausedState>,
+        session_id: SessionId,
+        usage: AggregateUsage,
+        turns: u32,
     },
 }
 
@@ -1567,6 +1662,14 @@ impl StandardHarness {
                 .await;
             }
             RunResult::WaitingForHuman { .. } => {}
+            // Escalation (issue #80) IS a terminal outcome — the harness has
+            // run to a clean stop and handed a signal up. Finalize
+            // observability with the dedicated `Escalated` outcome (NOT
+            // `Partial`). Contrast WaitingForHuman, which is NOT terminal.
+            RunResult::Escalate { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Escalated)
+                    .await;
+            }
         }
         result
     }
@@ -1644,7 +1747,7 @@ impl StandardHarness {
                             session_state,
                             pending_tool_calls: vec![],
                             approved_results: vec![],
-                            human_request: request.clone(),
+                            human_request: Some(request.clone()),
                             task,
                             budget_used,
                             child_state: None,
@@ -1815,7 +1918,7 @@ impl StandardHarness {
                                     session_state,
                                     pending_tool_calls: vec![],
                                     approved_results: vec![],
-                                    human_request: request.clone(),
+                                    human_request: Some(request.clone()),
                                     task,
                                     budget_used,
                                     child_state: None,
@@ -1963,7 +2066,7 @@ impl StandardHarness {
                                     session_state,
                                     pending_tool_calls: calls,
                                     approved_results: vec![],
-                                    human_request: request.clone(),
+                                    human_request: Some(request.clone()),
                                     task,
                                     budget_used,
                                     child_state: None,
@@ -2111,7 +2214,7 @@ impl StandardHarness {
                                 session_state,
                                 pending_tool_calls: remaining,
                                 approved_results,
-                                human_request: request.clone(),
+                                human_request: Some(request.clone()),
                                 task,
                                 budget_used,
                                 child_state: Some(*child_state),
@@ -2119,6 +2222,41 @@ impl StandardHarness {
                             return RunResult::WaitingForHuman {
                                 state: Box::new(state),
                                 request,
+                            };
+                        }
+
+                        // Escalation propagation (issue #80): a tool requests a
+                        // structural state change. The harness is a pure
+                        // intermediary — it does NOT act on the signal. It
+                        // terminates cleanly, preserves session state for a
+                        // possible resume, and returns RunResult::Escalate.
+                        // The escalation is a control signal, NOT a conversation
+                        // turn: it is never appended to message history, and the
+                        // remaining tool calls in this batch are preserved into
+                        // pending_tool_calls (mirroring WaitingForHuman). The
+                        // signal is NOT stored in PausedState, so it is
+                        // discarded on resume — the harness never re-acts on it.
+                        if let ToolOutput::Escalate { signal } = output {
+                            let remaining = calls[i + 1..].to_vec();
+                            let turns = budget_used.turns;
+                            let state = PausedState {
+                                session_id: session_id.clone(),
+                                task_id: task.id.clone(),
+                                turn_number: budget_used.turns,
+                                session_state,
+                                pending_tool_calls: remaining,
+                                approved_results,
+                                human_request: None,
+                                task,
+                                budget_used,
+                                child_state: None,
+                            };
+                            return RunResult::Escalate {
+                                signal,
+                                state: Box::new(state),
+                                session_id,
+                                usage,
+                                turns,
                             };
                         }
 
@@ -2165,6 +2303,9 @@ impl StandardHarness {
                                         })
                                     }
                                     ToolOutput::WaitingForHuman { .. } => None,
+                                    // Escalate is handled and returned above;
+                                    // it never reaches the capture path.
+                                    ToolOutput::Escalate { .. } => None,
                                 };
                                 (Some(args), result)
                             } else {
@@ -2176,6 +2317,7 @@ impl StandardHarness {
                                 }
                                 ToolOutput::Error { message, .. } => (message.len(), false),
                                 ToolOutput::WaitingForHuman { .. } => (0, false),
+                                ToolOutput::Escalate { .. } => (0, false),
                             };
                             let span_id =
                                 SpanId::new(format!("{}-tool-{}", session_id.as_str(), span_seq));
@@ -2428,6 +2570,11 @@ impl StandardHarness {
                 .await;
             }
             RunResult::WaitingForHuman { .. } => {}
+            // Escalation (issue #80) is a terminal outcome here too.
+            RunResult::Escalate { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Escalated)
+                    .await;
+            }
         }
     }
 
@@ -2629,6 +2776,23 @@ impl StandardHarness {
                 // A step surfacing to a human pauses the whole run; propagate.
                 RunResult::WaitingForHuman { state, request } => {
                     return RunResult::WaitingForHuman { state, request };
+                }
+                // A step escalating (issue #80) terminates the whole run
+                // cleanly; propagate the signal and preserved state up.
+                RunResult::Escalate {
+                    signal,
+                    state,
+                    session_id,
+                    usage,
+                    turns,
+                } => {
+                    return RunResult::Escalate {
+                        signal,
+                        state,
+                        session_id,
+                        usage,
+                        turns,
+                    };
                 }
             }
         }
@@ -3275,6 +3439,7 @@ pub mod testing {
                     ToolOutput::Success { content, .. } => content.clone(),
                     ToolOutput::Error { message, .. } => format!("[error] {message}"),
                     ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
+                    ToolOutput::Escalate { .. } => "[escalate]".into(),
                 };
                 session.messages.push(Message {
                     role: crate::model::Role::Tool,
@@ -4421,9 +4586,9 @@ mod tests {
                 session_state: SessionState::default(),
                 pending_tool_calls: vec![],
                 approved_results: vec![],
-                human_request: HumanRequest::Clarification {
+                human_request: Some(HumanRequest::Clarification {
                     question: "?".into(),
-                },
+                }),
                 task: child_task,
                 budget_used: BudgetSnapshot::default(),
                 parent_tool_call_id: "c".into(),
@@ -4442,6 +4607,323 @@ mod tests {
         }
     }
 
+    // ====================================================================
+    // Tool Escalation Protocol (issue #80) — rules R1–R9
+    // ====================================================================
+
+    /// Build a `MockAgent` whose first turn requests `n` tool calls (named
+    /// `t0..t{n-1}` with ids `c0..c{n-1}`), then a `FinalResponse` so a
+    /// resumed loop can terminate.
+    fn agent_with_tool_calls(n: usize) -> Arc<MockAgent> {
+        let a = make_agent();
+        let calls: Vec<ToolCall> = (0..n)
+            .map(|k| ToolCall {
+                id: format!("c{k}"),
+                name: format!("t{k}"),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        a.push(TurnResult::ToolCallRequested {
+            calls,
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "resumed-done".into(),
+            usage: usage(),
+        });
+        a
+    }
+
+    fn abort_signal() -> HarnessSignal {
+        HarnessSignal::Abort {
+            reason: "agent requested stop".into(),
+        }
+    }
+
+    // R1 + R8: a dispatched `Escalate { Abort }` terminates the run and
+    // returns `RunResult::Escalate`, NOT `RunResult::Failure`.
+    #[tokio::test]
+    async fn escalate_abort_terminates_with_escalate_not_failure() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Escalate {
+            signal: abort_signal(),
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate { signal, .. } => {
+                assert_eq!(signal, abort_signal());
+            }
+            RunResult::Failure { .. } => {
+                panic!("Abort must NOT surface as Failure (R8)")
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    // R2: the escalation is NOT appended to message history. With one
+    // escalating call, the only appended message is the assistant tool-call
+    // turn — there is no `Role::Tool` result message.
+    #[tokio::test]
+    async fn escalate_is_not_appended_to_history() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Escalate {
+            signal: abort_signal(),
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate { state, .. } => {
+                let tool_results = state
+                    .session_state
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Tool)
+                    .count();
+                assert_eq!(tool_results, 0, "escalation must not append a tool result");
+                // The assistant tool-call turn IS recorded (well-formed history).
+                let assistant_turns = state
+                    .session_state
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count();
+                assert_eq!(assistant_turns, 1);
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    // R3: observability is finalized with `SessionOutcome::Escalated`.
+    #[tokio::test]
+    async fn escalate_finalizes_observability_as_escalated() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
+        cfg.observability = Some(obs.clone());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Escalate {
+            signal: abort_signal(),
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        let sid = match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate { session_id, .. } => session_id,
+            other => panic!("expected Escalate, got {other:?}"),
+        };
+        let metrics = obs
+            .get_session_metrics(&sid)
+            .await
+            .expect("escalation must flush a finalized session");
+        assert_eq!(metrics.outcome, SessionOutcome::Escalated);
+    }
+
+    // R3 (contrast): `WaitingForHuman` does NOT finalize observability.
+    #[tokio::test]
+    async fn waiting_for_human_does_not_finalize_observability() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "subagent".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
+        cfg.observability = Some(obs.clone());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::WaitingForHuman {
+            child_state: Box::new(ChildPausedState {
+                session_id: SessionId::new("child"),
+                task_id: TaskId::new("ct"),
+                turn_number: 1,
+                session_state: SessionState::default(),
+                pending_tool_calls: vec![],
+                approved_results: vec![],
+                human_request: Some(HumanRequest::Clarification {
+                    question: "?".into(),
+                }),
+                task: task(LoopStrategy::ReAct { max_iterations: 1 }),
+                budget_used: BudgetSnapshot::default(),
+                parent_tool_call_id: "c".into(),
+            }),
+            request: HumanRequest::Clarification {
+                question: "?".into(),
+            },
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        let sid = match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::WaitingForHuman { state, .. } => state.session_id.clone(),
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        };
+        // Not finalized: `finalize_observability` was never called, so no
+        // terminal `SessionOutcome` was recorded. Metrics may still exist
+        // (a turn span was emitted) but the outcome defaults to `Partial` —
+        // crucially it is NOT `Escalated` (contrast the escalation path).
+        if let Some(m) = obs.get_session_metrics(&sid).await {
+            assert_ne!(
+                m.outcome,
+                SessionOutcome::Escalated,
+                "WaitingForHuman is not terminal — it must not finalize as Escalated"
+            );
+        }
+    }
+
+    // R4: `RunResult::Escalate` carries all five fields populated, and
+    // `turns == budget_used.turns`.
+    #[tokio::test]
+    async fn escalate_carries_all_five_fields() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Escalate {
+            signal: abort_signal(),
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate {
+                signal,
+                state,
+                session_id,
+                usage: agg,
+                turns,
+            } => {
+                assert_eq!(signal, abort_signal());
+                assert_eq!(session_id, SessionId::new("s1"));
+                assert_eq!(state.session_id, session_id);
+                assert_eq!(turns, state.budget_used.turns, "turns == budget_used.turns");
+                // One turn was consumed before the escalating dispatch.
+                assert_eq!(turns, 1);
+                // Usage is populated from the consumed turn.
+                assert_eq!(agg.input_tokens, 1);
+                assert_eq!(agg.output_tokens, 1);
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    // R5 + R6: the preserved `state` is resumable, and the signal is
+    // discarded on resume — the harness just continues the original session.
+    #[tokio::test]
+    async fn escalate_state_resumes_and_discards_signal() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Escalate {
+            signal: HarnessSignal::SwitchMode {
+                mode: crate::prompt_chunk_registry::Mode::Plan,
+            },
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        let state = match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate { state, .. } => *state,
+            other => panic!("expected Escalate, got {other:?}"),
+        };
+        // Escalation-derived state has no human request (R5 shape).
+        assert!(state.human_request.is_none());
+        // R6: resume continues the ORIGINAL session — it does NOT switch mode,
+        // enter plan mode, or abort. The MockAgent's next turn is a
+        // FinalResponse, so resume runs to Success.
+        match h.resume(state, HumanResponse::Allow, None).await {
+            RunResult::Success {
+                output, session_id, ..
+            } => {
+                assert_eq!(output, "resumed-done");
+                assert_eq!(session_id, SessionId::new("s1"));
+            }
+            other => panic!("expected Success on resume (signal discarded), got {other:?}"),
+        }
+    }
+
+    // R7-adjacent: each `HarnessSignal` variant round-trips through serde
+    // wrapped in `ToolOutput::Escalate` with the documented wire shape.
+    // (Full byte fixture lives in `fixtures/harness/escalation_signals.json`.)
+    #[test]
+    fn harness_signal_wire_format_round_trips() {
+        let cases = vec![
+            ToolOutput::Escalate {
+                signal: HarnessSignal::EnterPlanMode {
+                    context: "ctx".into(),
+                },
+            },
+            ToolOutput::Escalate {
+                signal: HarnessSignal::ExitPlanMode {
+                    plan: crate::plan::PlanArtifact {
+                        tasks: vec!["a".into(), "b".into()],
+                        rationale: "why".into(),
+                    },
+                },
+            },
+            ToolOutput::Escalate {
+                signal: HarnessSignal::SwitchMode {
+                    mode: crate::prompt_chunk_registry::Mode::Yolo,
+                },
+            },
+            ToolOutput::Escalate {
+                signal: abort_signal(),
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).unwrap();
+            let back: ToolOutput = serde_json::from_str(&json).unwrap();
+            assert_eq!(case, back);
+        }
+        // Spot-check the tag shape: snake_case `kind` on both layers.
+        let json = serde_json::to_value(&ToolOutput::Escalate {
+            signal: abort_signal(),
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "escalate");
+        assert_eq!(json["signal"]["kind"], "abort");
+        assert_eq!(json["signal"]["reason"], "agent requested stop");
+    }
+
+    // R7: `SwitchMode` carries the EXISTING `Mode` enum (no `HarnessMode`).
+    #[test]
+    fn switch_mode_uses_existing_mode_enum() {
+        let json = serde_json::to_value(&HarnessSignal::SwitchMode {
+            mode: crate::prompt_chunk_registry::Mode::SafeAuto,
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "switch_mode");
+        assert_eq!(json["mode"], "safe_auto");
+    }
+
+    // R9: remaining tool calls after the escalating call land in
+    // `state.pending_tool_calls` (escalate on call[0] of a 2-call batch →
+    // pending == [call_1]).
+    #[tokio::test]
+    async fn escalate_preserves_remaining_calls_as_pending() {
+        let a = agent_with_tool_calls(2);
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        // First dispatched call (c0) escalates.
+        reg.push(ToolOutput::Escalate {
+            signal: abort_signal(),
+        });
+        cfg.tool_registry = reg.clone();
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Escalate { state, .. } => {
+                assert_eq!(state.pending_tool_calls.len(), 1);
+                assert_eq!(state.pending_tool_calls[0].id, "c1");
+                assert_eq!(state.pending_tool_calls[0].name, "t1");
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        // Exactly one dispatch happened — c1 was preserved, not executed.
+        assert_eq!(reg.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     // Rule: resume() with Halt returns Failure(HumanHalted).
     #[tokio::test]
     async fn resume_with_halt_returns_human_halted() {
@@ -4454,9 +4936,9 @@ mod tests {
             session_state: SessionState::default(),
             pending_tool_calls: vec![],
             approved_results: vec![],
-            human_request: HumanRequest::Clarification {
+            human_request: Some(HumanRequest::Clarification {
                 question: "?".into(),
-            },
+            }),
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
@@ -4497,10 +4979,10 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             approved_results: vec![],
-            human_request: HumanRequest::ToolApproval {
+            human_request: Some(HumanRequest::ToolApproval {
                 calls: vec![],
                 risk_level: RiskLevel::Low,
-            },
+            }),
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
@@ -5483,9 +5965,9 @@ mod tests {
                 input: serde_json::json!({"k":1}),
             }],
             approved_results: vec![],
-            human_request: HumanRequest::Clarification {
+            human_request: Some(HumanRequest::Clarification {
                 question: "what?".into(),
-            },
+            }),
             task: react(5),
             budget_used: BudgetSnapshot {
                 turns: 4,
@@ -5515,9 +5997,9 @@ mod tests {
             session_state: SessionState::default(),
             pending_tool_calls: vec![],
             approved_results: vec![],
-            human_request: HumanRequest::Clarification {
+            human_request: Some(HumanRequest::Clarification {
                 question: "?".into(),
-            },
+            }),
             task: react(1),
             budget_used: BudgetSnapshot::default(),
             parent_tool_call_id: "p".into(),
@@ -6118,6 +6600,7 @@ mod tests {
                         ToolOutput::Success { content, .. } => content.clone(),
                         ToolOutput::Error { message, .. } => message.clone(),
                         ToolOutput::WaitingForHuman { .. } => String::new(),
+                        ToolOutput::Escalate { .. } => String::new(),
                     },
                     is_error: matches!(result.output, ToolOutput::Error { .. }),
                 }),

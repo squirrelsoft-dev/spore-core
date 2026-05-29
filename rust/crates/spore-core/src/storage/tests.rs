@@ -29,10 +29,10 @@ fn paused(session: &str) -> PausedState {
         session_state: SessionState::default(),
         pending_tool_calls: Vec::new(),
         approved_results: Vec::new(),
-        human_request: HumanRequest::ToolApproval {
+        human_request: Some(HumanRequest::ToolApproval {
             calls: Vec::new(),
             risk_level: RiskLevel::Low,
-        },
+        }),
         task: Task::new(
             "do the thing",
             sid(session),

@@ -105,6 +105,13 @@ fn view<'a>(label: &str, r: &'a RunResult) -> ResultView<'a> {
              before being verified)",
             label = label
         )),
+        // An escalation (issue #80) is a clean terminal stop, but the verifier
+        // expects a completed run — surface it as a misconfiguration like the
+        // paused case.
+        RunResult::Escalate { signal, .. } => ResultView::Failed(format!(
+            "{label} run escalated ({signal:?}) — verifier received an escalated \
+             harness; the caller must handle the signal before verification"
+        )),
     }
 }
 

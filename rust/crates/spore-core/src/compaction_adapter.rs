@@ -151,6 +151,7 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
             ToolOutput::Success { content, .. } => content.clone(),
             ToolOutput::Error { message, .. } => message.clone(),
             ToolOutput::WaitingForHuman { .. } => String::new(),
+            ToolOutput::Escalate { .. } => String::new(),
         };
         Box::pin(async move {
             session.messages.push(Message {

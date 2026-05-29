@@ -1,0 +1,162 @@
+{
+    "run_result_cases": [
+        {
+            "kind": "escalate",
+            "session_id": "escalation-session",
+            "signal": {
+                "kind": "exit_plan_mode",
+                "plan": {
+                    "rationale": "deliver a working CLI incrementally",
+                    "tasks": [
+                        "scaffold the project",
+                        "write the integration tests"
+                    ]
+                }
+            },
+            "state": {
+                "approved_results": [],
+                "budget_used": {
+                    "cost_usd": 0.0,
+                    "input_tokens": 24,
+                    "output_tokens": 28,
+                    "turns": 2,
+                    "wall_time": null
+                },
+                "child_state": null,
+                "human_request": null,
+                "pending_tool_calls": [
+                    {
+                        "id": "c1",
+                        "input": {},
+                        "name": "t1"
+                    }
+                ],
+                "session_id": "escalation-session",
+                "session_state": {
+                    "extras": {},
+                    "messages": []
+                },
+                "task": {
+                    "budget": {
+                        "max_cost_usd": null,
+                        "max_input_tokens": null,
+                        "max_output_tokens": null,
+                        "max_turns": null,
+                        "max_wall_time": null
+                    },
+                    "id": "task-0000000000000001",
+                    "instruction": "build a CLI",
+                    "loop_strategy": {
+                        "kind": "re_act",
+                        "max_iterations": 5
+                    },
+                    "session_id": "escalation-session"
+                },
+                "task_id": "escalation-task",
+                "turn_number": 2
+            },
+            "turns": 2,
+            "usage": {
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cost_usd": 0.0,
+                "input_tokens": 24,
+                "output_tokens": 28
+            }
+        },
+        {
+            "kind": "escalate",
+            "session_id": "escalation-session",
+            "signal": {
+                "kind": "abort",
+                "reason": "user asked to stop"
+            },
+            "state": {
+                "approved_results": [],
+                "budget_used": {
+                    "cost_usd": 0.0,
+                    "input_tokens": 24,
+                    "output_tokens": 28,
+                    "turns": 2,
+                    "wall_time": null
+                },
+                "child_state": null,
+                "human_request": null,
+                "pending_tool_calls": [
+                    {
+                        "id": "c1",
+                        "input": {},
+                        "name": "t1"
+                    }
+                ],
+                "session_id": "escalation-session",
+                "session_state": {
+                    "extras": {},
+                    "messages": []
+                },
+                "task": {
+                    "budget": {
+                        "max_cost_usd": null,
+                        "max_input_tokens": null,
+                        "max_output_tokens": null,
+                        "max_turns": null,
+                        "max_wall_time": null
+                    },
+                    "id": "task-0000000000000001",
+                    "instruction": "build a CLI",
+                    "loop_strategy": {
+                        "kind": "re_act",
+                        "max_iterations": 5
+                    },
+                    "session_id": "escalation-session"
+                },
+                "task_id": "escalation-task",
+                "turn_number": 2
+            },
+            "turns": 2,
+            "usage": {
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cost_usd": 0.0,
+                "input_tokens": 24,
+                "output_tokens": 28
+            }
+        }
+    ],
+    "tool_output_cases": [
+        {
+            "kind": "escalate",
+            "signal": {
+                "context": "investigated the auth module; ready to plan",
+                "kind": "enter_plan_mode"
+            }
+        },
+        {
+            "kind": "escalate",
+            "signal": {
+                "kind": "exit_plan_mode",
+                "plan": {
+                    "rationale": "deliver a working CLI incrementally",
+                    "tasks": [
+                        "scaffold the project",
+                        "write the integration tests"
+                    ]
+                }
+            }
+        },
+        {
+            "kind": "escalate",
+            "signal": {
+                "kind": "switch_mode",
+                "mode": "plan"
+            }
+        },
+        {
+            "kind": "escalate",
+            "signal": {
+                "kind": "abort",
+                "reason": "user asked to stop"
+            }
+        }
+    ]
+}

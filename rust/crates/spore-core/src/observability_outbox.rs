@@ -407,6 +407,7 @@ impl TraceLine {
             SessionOutcome::Success => "success",
             SessionOutcome::Failure { .. } => "failure",
             SessionOutcome::Partial => "partial",
+            SessionOutcome::Escalated => "escalated",
         };
         let attributes = Self::attrs(vec![
             ("outcome", Value::from(outcome)),

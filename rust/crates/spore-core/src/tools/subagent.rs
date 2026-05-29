@@ -162,6 +162,10 @@ impl Tool for SubagentTool {
                         request,
                     }
                 }
+                // A subagent escalation (issue #80) propagates as a tool-side
+                // escalation: the parent harness terminates cleanly and hands
+                // the signal up to its own caller.
+                RunResult::Escalate { signal, .. } => ToolOutput::Escalate { signal },
             }
         })
     }
@@ -321,9 +325,9 @@ mod tests {
             session_state: SessionState::default(),
             pending_tool_calls: vec![],
             approved_results: vec![],
-            human_request: HumanRequest::Clarification {
+            human_request: Some(HumanRequest::Clarification {
                 question: "yes?".into(),
-            },
+            }),
             task: Task::new(
                 "x",
                 SessionId::new("s"),

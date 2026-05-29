@@ -120,8 +120,15 @@ pub enum GuideStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionOutcome {
     Success,
-    Failure { reason: String },
+    Failure {
+        reason: String,
+    },
     Partial,
+    /// The session terminated cleanly because a tool escalated a structural
+    /// signal to the harness's caller (issue #80, Tool Escalation Protocol).
+    /// Distinct from `Partial` — an escalation is an intentional, clean
+    /// terminal outcome, not a partial success.
+    Escalated,
 }
 
 // ============================================================================

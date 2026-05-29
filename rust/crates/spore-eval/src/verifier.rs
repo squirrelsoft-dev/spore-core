@@ -382,9 +382,9 @@ impl TaskVerifier for MetricEvaluatorVerifier {
                 root: workspace.to_path_buf(),
             };
             let session_id = match run {
-                RunResult::Success { session_id, .. } | RunResult::Failure { session_id, .. } => {
-                    session_id.clone()
-                }
+                RunResult::Success { session_id, .. }
+                | RunResult::Failure { session_id, .. }
+                | RunResult::Escalate { session_id, .. } => session_id.clone(),
                 RunResult::WaitingForHuman { state, .. } => state.session_id.clone(),
             };
             let snapshot = SessionStateSnapshot::new(
