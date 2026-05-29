@@ -314,6 +314,7 @@ describe("S4 — tool failure + recovery", () => {
       sandbox,
       sessionId,
       new coreStorage.InMemoryStorageProvider(),
+      new coreStorage.InMemoryStorageProvider(),
     );
     const schemas = bridge.modelSchemas();
 
@@ -343,6 +344,7 @@ describe("S4 — tool failure + recovery", () => {
       new AllowAllSandbox(),
       SessionId.of("s4-halt"),
       new coreStorage.InMemoryStorageProvider(),
+      new coreStorage.InMemoryStorageProvider(),
     );
     expect(bridge.isAlwaysHalt("flaky_op")).toBe(false);
     const out = await bridge.dispatch(toolCall("c1", "flaky_op", {}));
@@ -357,6 +359,7 @@ describe("S4 — tool failure + recovery", () => {
       buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
       SessionId.of("s4-schemas"),
+      new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
     const names = bridge.modelSchemas().map((s: ToolSchema) => s.name);
@@ -377,6 +380,7 @@ describe("per-scenario tool catalog", () => {
       buildRealToolRegistry(scenario),
       new AllowAllSandbox(),
       SessionId.of("catalog-test"),
+      new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
     return bridge.modelSchemas().map((s) => s.name);
@@ -440,6 +444,7 @@ describe("S5 — real shell pipeline", () => {
         buildRealToolRegistry("s5"),
         sandbox,
         sessionId,
+        new coreStorage.InMemoryStorageProvider(),
         new coreStorage.InMemoryStorageProvider(),
       );
       const schemas = bridge.modelSchemas();

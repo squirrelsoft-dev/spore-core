@@ -109,7 +109,11 @@ function ctxWith(
   runStore: RunStore,
   session = "test-session",
 ): toolRegistry.ToolContext {
-  return new ToolContext(SessionId.of(session), runStore);
+  return new ToolContext(
+    SessionId.of(session),
+    runStore,
+    new InMemoryStorageProvider(),
+  );
 }
 
 function inMemoryCtx(): toolRegistry.ToolContext {

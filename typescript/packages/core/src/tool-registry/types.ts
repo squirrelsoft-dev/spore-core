@@ -16,7 +16,7 @@ import { z } from "zod";
 import type { ToolCall } from "../model/schemas.js";
 import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
 import type { SessionId } from "../harness/types.js";
-import type { RunStore } from "../storage/types.js";
+import type { MemoryStore, RunStore } from "../storage/types.js";
 
 // ============================================================================
 // ToolContext — the storage seam handed to every tool (#75)
@@ -27,10 +27,14 @@ import type { RunStore } from "../storage/types.js";
  * alongside (but separate from) the {@link SandboxProvider}. It carries the
  * minimum a tool needs to persist durable state via the storage layer:
  *
- *   - `sessionId` — the run's {@link SessionId}, the key namespace for
- *     {@link RunStore}.
- *   - `runStore`  — the {@link RunStore} domain of the configured storage
+ *   - `sessionId`   — the run's {@link SessionId}, the key namespace for stores.
+ *   - `runStore`    — the {@link RunStore} domain of the configured storage
  *     provider.
+ *   - `memoryStore` — the {@link MemoryStore} domain (#78). Scope-aware: the tool
+ *     passes a {@link StorageScope} on every call. For a composite provider this
+ *     is the scope-routing memory slot; for the never-null contract it is at
+ *     worst a `NoOpStorageProvider`. `MemoryTool` (#82) picks up this
+ *     already-threaded seam.
  *
  * It is a **class** (not a tuple/pair) so future fields can be added without
  * breaking the {@link Tool.execute} signature again. The {@link SandboxProvider}
@@ -40,12 +44,15 @@ import type { RunStore } from "../storage/types.js";
  */
 export class ToolContext {
   /**
-   * @param sessionId The session id keying this run's persisted state.
-   * @param runStore  The run-store domain a tool persists durable state through.
+   * @param sessionId   The session id keying this run's persisted state.
+   * @param runStore    The run-store domain a tool persists durable state through.
+   * @param memoryStore The scope-aware memory-store domain (#78) — the tool
+   *                    passes a {@link StorageScope} on each call.
    */
   constructor(
     readonly sessionId: SessionId,
     readonly runStore: RunStore,
+    readonly memoryStore: MemoryStore,
   ) {}
 }
 

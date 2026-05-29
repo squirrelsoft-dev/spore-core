@@ -28,6 +28,8 @@ import type { Timestamp } from "../memory/types.js";
 import type { SessionMetrics } from "../observability/types.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
 
+import type { StorageScope } from "../prompt-assembly/types.js";
+
 import { StorageIoError, StorageSerializationError } from "./errors.js";
 import type {
   FullStorageProvider,
@@ -50,6 +52,38 @@ import type {
 function mostRecentNewestFirst<T>(items: readonly T[], limit: number): T[] {
   const reversed = items.slice().reverse();
   return limit < 0 ? [] : reversed.slice(0, limit);
+}
+
+/**
+ * The `timestamp` field of a {@link MemoryEntry} as a comparable string. Entries
+ * from the in-memory backend carry a {@link Timestamp} instance; entries read
+ * back from a JSONL backend carry a plain string. Both are handled so the merge
+ * works regardless of backend (#78 R6).
+ */
+function timestampKey(entry: MemoryEntry): string {
+  const t = entry.timestamp as unknown;
+  if (typeof t === "string") return t;
+  if (t != null && typeof (t as { asString?: () => string }).asString === "function") {
+    return (t as { asString: () => string }).asString();
+  }
+  return String(t);
+}
+
+/**
+ * Merge step for the cross-scope memory read (#78 R6): sort newest-first by
+ * `timestamp` and truncate to `limit`. **No dedup** — identical-content entries
+ * are all retained. A *stable* sort (the spec's order among equal timestamps)
+ * keeps the merge deterministic cross-language: `Array.prototype.sort` is
+ * guaranteed stable in modern V8.
+ */
+function mergeNewestFirst(entries: readonly MemoryEntry[], limit: number): MemoryEntry[] {
+  const sorted = entries.slice().sort((a, b) => {
+    const ka = timestampKey(a);
+    const kb = timestampKey(b);
+    // Newest-first: descending by timestamp string.
+    return ka < kb ? 1 : ka > kb ? -1 : 0;
+  });
+  return limit < 0 ? [] : sorted.slice(0, limit);
 }
 
 /**
@@ -81,8 +115,16 @@ export class NoOpStorageProvider implements FullStorageProvider {
   }
 
   // MemoryStore
-  async appendMemory(_sessionId: SessionId, _entry: MemoryEntry): Promise<void> {}
-  async getMemories(_sessionId: SessionId, _limit: number): Promise<MemoryEntry[]> {
+  async appendMemory(
+    _scope: StorageScope,
+    _sessionId: SessionId,
+    _entry: MemoryEntry,
+  ): Promise<void> {}
+  async getMemories(
+    _scope: StorageScope,
+    _sessionId: SessionId,
+    _limit: number,
+  ): Promise<MemoryEntry[]> {
     return [];
   }
 
@@ -128,6 +170,12 @@ export class InMemoryStorageProvider implements FullStorageProvider {
     return `${sessionId.length}:${sessionId}/${key}`;
   }
 
+  private memoryKey(scope: StorageScope, sessionId: string): string {
+    // Key memory by (scope, sessionId) (#78). The scope is a closed enum string,
+    // so a simple `scope/sessionId` join is collision-free.
+    return `${scope}/${sessionId}`;
+  }
+
   // SessionStore
   async getSession(id: SessionId): Promise<PausedState | undefined> {
     return this.sessions.get(id.asString());
@@ -142,15 +190,19 @@ export class InMemoryStorageProvider implements FullStorageProvider {
     return [...this.sessions.keys()].sort().map((s) => SessionId.of(s));
   }
 
-  // MemoryStore
-  async appendMemory(sessionId: SessionId, entry: MemoryEntry): Promise<void> {
-    const key = sessionId.asString();
+  // MemoryStore — keyed by (scope, sessionId) (#78).
+  async appendMemory(scope: StorageScope, sessionId: SessionId, entry: MemoryEntry): Promise<void> {
+    const key = this.memoryKey(scope, sessionId.asString());
     const list = this.memories.get(key);
     if (list) list.push(entry);
     else this.memories.set(key, [entry]);
   }
-  async getMemories(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
-    const list = this.memories.get(sessionId.asString()) ?? [];
+  async getMemories(
+    scope: StorageScope,
+    sessionId: SessionId,
+    limit: number,
+  ): Promise<MemoryEntry[]> {
+    const list = this.memories.get(this.memoryKey(scope, sessionId.asString())) ?? [];
     return mostRecentNewestFirst(list, limit);
   }
 
@@ -357,11 +409,22 @@ export class FileSystemStorageProvider implements FullStorageProvider {
     return out.sort((a, b) => a.asString().localeCompare(b.asString()));
   }
 
-  // MemoryStore
-  async appendMemory(sessionId: SessionId, entry: MemoryEntry): Promise<void> {
+  // MemoryStore — **scope-dumb** (#78): the user-scope backend is pointed at the
+  // already-partitioned `{userRoot}/projects/{workspaceId}` at construction. The
+  // provider just writes under whatever root it was given; `scope` is ignored at
+  // the leaf.
+  async appendMemory(
+    _scope: StorageScope,
+    sessionId: SessionId,
+    entry: MemoryEntry,
+  ): Promise<void> {
     appendJsonl(this.memoryPath(sessionId), toJsonValue(entry));
   }
-  async getMemories(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+  async getMemories(
+    _scope: StorageScope,
+    sessionId: SessionId,
+    limit: number,
+  ): Promise<MemoryEntry[]> {
     const values = readJsonl(this.memoryPath(sessionId));
     const entries = values as unknown as MemoryEntry[];
     return mostRecentNewestFirst(entries, limit);
@@ -485,6 +548,24 @@ export class StorageProvider {
   memory(): MemoryStore {
     return this._memory;
   }
+
+  /**
+   * Merged memory read across scopes (#78 R6): **User ∪ Project, newest-first by
+   * `timestamp`, NO dedup**. `Local` is excluded from the merge in v1.
+   *
+   * Routes through the memory slot — when built via {@link CompositeStorageProvider}
+   * that slot is a {@link ScopedMemoryRouter} that fans out to the per-scope
+   * backends and merges; for `single`/`of` the one backend serves both scopes
+   * (keyed by scope) and merges identically. The merge always lives in this
+   * routing layer, never in a leaf backend.
+   */
+  async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+    const user = await this._memory.getMemories("user", sessionId, limit);
+    const project = await this._memory.getMemories("project", sessionId, limit);
+    const combined = [...user, ...project];
+    return mergeNewestFirst(combined, limit);
+  }
+
   run(): RunStore {
     return this._run;
   }
@@ -498,12 +579,28 @@ export class StorageProvider {
 // ============================================================================
 
 /**
- * Builder that routes each domain to its own backend, filling any unset domain
- * with {@link NoOpStorageProvider} on `.build()`.
+ * Builder that routes each domain to its own backend — and, for the memory
+ * domain, each {@link StorageScope} to its own backend (#78) — filling any unset
+ * slot with {@link NoOpStorageProvider} on `.build()`.
+ *
+ * Only the `memory` domain varies by scope. `session`, `run`, and
+ * `observability` are scope-flat — scope is wiring-only for them.
+ *
+ * @example
+ * ```ts
+ * new CompositeStorageProvider()
+ *   .session(fs(userRoot))                            // scope-flat
+ *   .run(fs(userRoot))                                // scope-flat
+ *   .observability(fs(userRoot))                      // scope-flat
+ *   .memory("user", fs(userWorkspaceRoot))            // scoped
+ *   .memory("project", fs(projectRoot))               // scoped
+ *   .memory("local", new NoOpStorageProvider())       // scoped (noop in v1)
+ *   .build();
+ * ```
  */
 export class CompositeStorageProvider {
   private _session?: SessionStore;
-  private _memory?: MemoryStore;
+  private readonly _memory = new Map<StorageScope, MemoryStore>();
   private _run?: RunStore;
   private _observability?: ObservabilityStore;
 
@@ -511,8 +608,13 @@ export class CompositeStorageProvider {
     this._session = store;
     return this;
   }
-  memory(store: MemoryStore): this {
-    this._memory = store;
+  /**
+   * Configure the memory backend for one {@link StorageScope}. Unconfigured
+   * `(memory, scope)` pairs fall back to {@link NoOpStorageProvider} on
+   * `.build()` (#78 R7/R11 — `Local` may be wired to no-op in v1).
+   */
+  memory(scope: StorageScope, store: MemoryStore): this {
+    this._memory.set(scope, store);
     return this;
   }
   run(store: RunStore): this {
@@ -524,16 +626,60 @@ export class CompositeStorageProvider {
     return this;
   }
 
-  /** Build a {@link StorageProvider}, filling each unset domain with a
-   *  {@link NoOpStorageProvider}. */
+  /**
+   * Build a {@link StorageProvider}, filling each unset domain — and each unset
+   * `(memory, scope)` pair — with a {@link NoOpStorageProvider}.
+   */
   build(): StorageProvider {
     const noop = new NoOpStorageProvider();
     return StorageProvider.of(
       this._session ?? noop,
-      this._memory ?? noop,
+      new ScopedMemoryRouter(this._memory),
       this._run ?? noop,
       this._observability ?? noop,
     );
+  }
+}
+
+// ============================================================================
+// ScopedMemoryRouter (#78) — the (memory, scope) routing layer
+// ============================================================================
+
+/**
+ * Routes {@link MemoryStore} traffic to a per-{@link StorageScope} backend,
+ * filling unconfigured scopes with {@link NoOpStorageProvider}. Leaf backends
+ * stay scope-dumb; the cross-scope merge lives one level up in
+ * {@link StorageProvider.getMemoriesMerged}.
+ *
+ * This is a {@link StorageProvider}'s memory slot when built via
+ * {@link CompositeStorageProvider}: a caller that passes a `scope` is routed to
+ * the right backend, and {@link StorageProvider.getMemoriesMerged} reaches each
+ * scope through it.
+ */
+export class ScopedMemoryRouter implements MemoryStore {
+  private readonly byScope: Map<StorageScope, MemoryStore>;
+  private readonly noop: MemoryStore = new NoOpStorageProvider();
+
+  constructor(byScope: Map<StorageScope, MemoryStore>) {
+    // Copy so later mutation of the builder's map cannot affect a built router.
+    this.byScope = new Map(byScope);
+  }
+
+  /** The backend for `scope`, or the shared no-op if unconfigured. */
+  private backend(scope: StorageScope): MemoryStore {
+    return this.byScope.get(scope) ?? this.noop;
+  }
+
+  async appendMemory(scope: StorageScope, sessionId: SessionId, entry: MemoryEntry): Promise<void> {
+    return this.backend(scope).appendMemory(scope, sessionId, entry);
+  }
+
+  async getMemories(
+    scope: StorageScope,
+    sessionId: SessionId,
+    limit: number,
+  ): Promise<MemoryEntry[]> {
+    return this.backend(scope).getMemories(scope, sessionId, limit);
   }
 }
 

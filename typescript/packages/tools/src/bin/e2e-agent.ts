@@ -173,6 +173,7 @@ async function runLive(
     sandbox,
     sessionId,
     new coreStorage.InMemoryStorageProvider(),
+    new coreStorage.InMemoryStorageProvider(),
   );
   const toolSchemas = bridge.modelSchemas();
   const tools: HarnessToolRegistry = bridge;

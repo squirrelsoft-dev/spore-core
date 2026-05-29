@@ -108,7 +108,11 @@ describe("EditFileTool", () => {
 
   it("missing file is a recoverable error", async () => {
     const r = await new EditFileTool().execute(
-      call("edit_file", { path: "/no/such/file", old_string: "a", new_string: "b" }),
+      call("edit_file", {
+        path: "/no/such/file",
+        old_string: "a",
+        new_string: "b",
+      }),
       new AllowAllSandbox(),
       ctx,
     );
@@ -162,11 +166,14 @@ describe("EditFileTool", () => {
       );
       expect(r.kind, c.name).toBe(c.expected.kind);
       if (c.expected.kind === "success") {
-        expect(await readFile(path, "utf8"), c.name).toBe(c.expected.final_content);
+        expect(await readFile(path, "utf8"), c.name).toBe(
+          c.expected.final_content,
+        );
       } else {
         if (r.kind !== "error") throw new Error("unreachable");
         expect(r.recoverable, c.name).toBe(c.expected.recoverable);
-        const token = c.expected.reason === "not_found" ? "not found" : "not unique";
+        const token =
+          c.expected.reason === "not_found" ? "not found" : "not unique";
         expect(r.message, c.name).toContain(token);
       }
     }
@@ -188,7 +195,8 @@ describe("GrepTool", () => {
       new AllowAllSandbox(),
       ctx,
     );
-    if (r.kind !== "success") throw new Error(`expected success, got ${r.kind}`);
+    if (r.kind !== "success")
+      throw new Error(`expected success, got ${r.kind}`);
     return r.content;
   }
 
@@ -348,7 +356,9 @@ describe("Tier 3 control tools", () => {
 
   it("exit_plan_mode escalates with plan", async () => {
     const r = await new ExitPlanModeTool().execute(
-      call("exit_plan_mode", { plan: { tasks: ["a", "b"], rationale: "because" } }),
+      call("exit_plan_mode", {
+        plan: { tasks: ["a", "b"], rationale: "because" },
+      }),
       new AllowAllSandbox(),
       ctx,
     );
@@ -469,7 +479,11 @@ describe("Tier 3 control tools", () => {
 
 describe("TodoWriteTool", () => {
   function inMemoryCtx(): toolRegistry.ToolContext {
-    return new ToolContext(SessionId.of("todo-session"), new InMemoryStorageProvider());
+    return new ToolContext(
+      SessionId.of("todo-session"),
+      new InMemoryStorageProvider(),
+      new InMemoryStorageProvider(),
+    );
   }
 
   it("writes and persists under the todo key", async () => {
@@ -622,7 +636,8 @@ describe("web tools", () => {
 // ============================================================================
 
 describe("StandardTools presets", () => {
-  const names = (set: { schema: { name: string } }[]) => set.map((t) => t.schema.name);
+  const names = (set: { schema: { name: string } }[]) =>
+    set.map((t) => t.schema.name);
 
   it("every constructor pairs a matching impl + schema", () => {
     for (const t of StandardTools.fullSet()) {
@@ -666,7 +681,12 @@ describe("StandardTools presets", () => {
 
   it("full_set adds the Tier-3 control tools", () => {
     const n = names(StandardTools.fullSet());
-    for (const t of ["enter_plan_mode", "exit_plan_mode", "ask_user_question", "abort"]) {
+    for (const t of [
+      "enter_plan_mode",
+      "exit_plan_mode",
+      "ask_user_question",
+      "abort",
+    ]) {
       expect(n).toContain(t);
     }
   });
@@ -676,7 +696,11 @@ describe("StandardTools presets", () => {
 // Minimal local HTTP server helper (mock backend; never the live network).
 // ----------------------------------------------------------------------------
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 
 async function startServer(

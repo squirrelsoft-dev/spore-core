@@ -12,5 +12,6 @@ export {
   FileSystemStorageProvider,
   StorageProvider,
   CompositeStorageProvider,
+  ScopedMemoryRouter,
   parseOtlpEndpoints,
 } from "./providers.js";

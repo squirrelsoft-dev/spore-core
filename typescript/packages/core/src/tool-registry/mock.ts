@@ -49,11 +49,13 @@ export class SubagentMockTool implements Tool {
 }
 
 /**
- * Build a throwaway {@link ToolContext} for tests: a fresh in-memory run store
- * and a fixed test session id. Mirrors Rust's `mock::test_ctx`.
+ * Build a throwaway {@link ToolContext} for tests: a fresh in-memory backend
+ * (serving both the run-store and the scope-aware memory-store seams) and a
+ * fixed test session id. Mirrors Rust's `mock::test_ctx`.
  */
 export function testCtx(): ToolContext {
-  return new ToolContext(SessionId.of("test-session"), new InMemoryStorageProvider());
+  const backend = new InMemoryStorageProvider();
+  return new ToolContext(SessionId.of("test-session"), backend, backend);
 }
 
 /** Permissive sandbox stub — accepts everything. */
