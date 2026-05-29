@@ -46,6 +46,7 @@ export {
   GitStatusTool,
 } from "./git.js";
 export { HttpGetTool, HttpPostTool } from "./http.js";
+export { TaskListTool } from "./tasklist.js";
 export {
   type BuildError as SubagentBuildError,
   type ContextSharing,

@@ -56,6 +56,7 @@ import {
 
 import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
 import { BashCommandTool, ExecTool } from "./exec.js";
+import { TaskListTool } from "./tasklist.js";
 
 type RegistryToolSchema = toolRegistry.ToolSchema;
 type Tool = toolRegistry.Tool;
@@ -333,6 +334,7 @@ export function buildRealToolRegistry(
   reg(new WriteFileTool(), WriteFileTool.schema());
   reg(new ListDirTool(), ListDirTool.schema());
   reg(new ExecTool(), ExecTool.schema());
+  reg(new TaskListTool(), TaskListTool.schema());
   reg(new FailingTool(), FailingTool.schema());
   if (scenario === "s5") {
     reg(new BashCommandTool(), BashCommandTool.schema());

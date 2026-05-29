@@ -23,6 +23,7 @@ export * from "./model/index.js";
 export * from "./agent/index.js";
 export * from "./harness/index.js";
 export * from "./plan/index.js";
+export * as tasklist from "./tasklist/index.js";
 export * as toolRegistry from "./tool-registry/index.js";
 export * from "./sandbox/index.js";
 export * as context from "./context/index.js";

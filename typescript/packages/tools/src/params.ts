@@ -146,3 +146,38 @@ export type HttpPostParams = z.infer<typeof HttpPostParamsSchema>;
 
 export const SubagentParamsSchema = z.object({ instruction: z.string() });
 export type SubagentParams = z.infer<typeof SubagentParamsSchema>;
+
+// ---------- TaskList (#71) ----------
+
+const TaskStatusParamSchema = z.enum([
+  "pending",
+  "in_progress",
+  "completed",
+  "blocked",
+]);
+
+/**
+ * Parameters for the {@link import("./tasklist.js").TaskListTool}, a
+ * discriminated union on `action`. Each variant carries exactly the fields that
+ * action consumes; mirrors the Rust `TaskListParams` enum.
+ */
+export const TaskListParamsSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("add_task"),
+    description: z.string(),
+  }),
+  z.object({
+    action: z.literal("update_task"),
+    id: z.number().int().nonnegative(),
+    status: TaskStatusParamSchema.optional(),
+    description: z.string().optional(),
+  }),
+  z.object({
+    action: z.literal("complete_task"),
+    id: z.number().int().nonnegative(),
+  }),
+  z.object({
+    action: z.literal("list_tasks"),
+  }),
+]);
+export type TaskListParams = z.infer<typeof TaskListParamsSchema>;
