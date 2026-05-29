@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /close — closed #72 (parse plan artifact into the task list, four-language parity); #73 (StorageProvider abstraction) is now the headline next item. ⚠️ #72's four commits are on local `main` but **not yet pushed to origin** (push pending maintainer go-ahead); #71's commits landed on origin last loop._
+_Last updated: 2026-05-28 by /close — closed #73 (StorageProvider abstraction, four-language parity, scope 1a); #59 (PlanExecute execute loop) is now the headline next item — every prerequisite (#69/#70/#71/#72/#73) is done. ⚠️ #73's four commits **and** #72's four commits are on local `main` but **not yet pushed to origin** (push pending maintainer go-ahead)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -207,6 +207,46 @@ replay identically across all four. **Note: #69 landed ahead of its place in the
 PlanExecute chain (#70→#71→#72→#73→#69→#59)** — it was independent enough to build
 early and it unblocks the SelfVerifying-as-Stop-hook approach for #61.
 
+**#73 (StorageProvider abstraction) just landed** — the fourth and final PlanExecute
+prerequisite is on local `main` at four-language parity (Rust ref `3dba8a3`, Python
+`442f694`, Go `15bf6ba`, TS `35988a1`) — **committed but not yet pushed to origin**.
+A pluggable per-domain persistence layer modeled on Mastra's storage architecture.
+Four domain stores — `SessionStore` (pause/resume `PausedState` keyed by `SessionId`),
+`MemoryStore` (append-only episodic `MemoryEntry{role,content,timestamp,metadata}`,
+`get_memories` returns most-recent-N newest-first), `RunStore` (opaque-JSON blobs keyed
+by `(SessionId, key)`), `ObservabilityStore` (append-only spans + `get_sessions`/
+`flush_session`). `StorageProvider` is a **struct of four `Arc<dyn _>` slots** (not a
+supertrait) with a `single()` convenience ctor that clones one backend into all four
+slots; `CompositeStorageProvider` is a builder with per-domain routing and silent no-op
+fallback for unconfigured domains. v1 ships **`NoOpStorageProvider`,
+`InMemoryStorageProvider`, and `FileSystemStorageProvider`** (atomic write-rename via
+sibling `.tmp` + fsync + rename; canonical `.spore/sessions/{id}/` layout —
+`state.json`/`run/{key}.json`/`memory.jsonl`/`trace.jsonl`; `.flushed` marker;
+last-writer-wins). `ObservabilityProvider`/`OutboxObservabilityProvider` were refactored
+into a **multi-endpoint OTLP fan-out**: `SPORE_OTLP_ENDPOINT` is now comma-separated
+(`split(',')` → trim → drop-empty, parsed once at construction, bad entries logged+
+skipped), each emit fans out one fire-and-forget task per endpoint **plus** one optional
+inline `ObservabilityStore::append_span` leg, all legs failure-isolated and non-blocking
+(routing matrix both/otlp-only/store-only/dropped). `.storage(...)` is wired into
+`HarnessBuilder`/`HarnessConfig` defaulting to all-no-op (existing callers compile
+unchanged) and is **expose-only** in v1 (`storage()`/`session_store()` accessors; the
+run/resume loop is not modified). **Scope was deliberately pinned to "1a" by the
+maintainer before coding** (recorded in the issue resolutions comment): deliver only the
+abstraction + wiring + OTLP fan-out. Migrating #70/#71 off `SessionState.extras` onto
+`RunStore` (and removing `extras`) and the `Sqlite`/`Postgres` providers are **deferred to
+follow-up issues** — the migration touches PlanExecute/compaction/subagent HITL and is out
+of scope for a storage abstraction. Tests: Rust 26, TS 27, Python 55-on-changed-surface,
+Go 29 — full suites green (722/859/829/721 = 3,131 total); three ground-truth fixtures
+`fixtures/storage/{otlp_endpoints_parse,run_store_values,memory_entries.jsonl}` replay
+byte-identically in all four. Three intentional language-idiomatic differences, all
+verified consistent: **Go** resolved an `observability→storage` import cycle by hosting the
+canonical `ParseOTLPEndpoints` in `observability` (storage delegates) and wiring
+`WithStorage` to the `SpanStore` seam (the only domain the harness loop touches);
+`ObservabilityStore::get_sessions` returns empty from the raw InMemory/FileSystem stores
+by design (roll-up is the `ObservabilityProvider`'s job); **TS** `getSession` returns the
+JSON-roundtripped opaque object (no `PausedState` deserializer, consistent with
+expose-only v1). No divergences, no spec gaps.
+
 **main CI is green** across all four languages.
 
 Known runnability limits: the harness still runs only **ReAct end-to-end**.
@@ -218,9 +258,12 @@ misclassification that made S1 nondeterministic was fixed in #63, the previous "
 message content" observability gap is closed by #64, and the lifecycle hook seams (#69)
 now exist with `Stop` loop-wired and `OnPlanCreated` fired by the new plan phase. The
 **`task_list` tool (#71) now exists** as a registered tool with disk-backed persistence,
-and the **`PlanArtifact → TaskList` parser (#72) now exists** as a pure function — but
-neither is yet consumed: #59's execute loop is the missing piece that will invoke the
-parser (artifact → task list), persist + mirror the list, and drain it.
+the **`PlanArtifact → TaskList` parser (#72) now exists** as a pure function, and the
+**`StorageProvider` abstraction (#73) now exists** as a pluggable persistence seam — but
+none of the three is yet consumed by a running loop: **#59's execute loop is the last
+missing piece** that will invoke the parser (artifact → task list), persist + mirror the
+list, and drain it. With #73 done, **all five PlanExecute prerequisites
+(#45/#69/#70/#71/#72/#73) are landed** — #59 is now unblocked with nothing ahead of it.
 
 ## Active Direction
 The harness is now **runnable** (#57) and **debuggable** (#64/#65) end-to-end, and
@@ -232,25 +275,28 @@ that the harness is **ReAct-only** — `PlanExecute`, `Ralph`, `SelfVerifying`, 
 `docs/harness-engineering-concepts.md` overstate what runs.
 
 **PlanExecute (#59) is the first strategy being built, and a design pass decomposed it
-into five separable concerns** rather than one large change. The build order is
-**#73 → #59**, with the lifecycle hook system (#69) providing the
+into separable concerns** rather than one large change. **Every prerequisite is now done,
+so #59 itself is the headline next item.** The lifecycle hook system (#69) provides the
 `OnPlanCreated`/`OnTaskAdvance` seams the loop fires. The plan phase produces a plan
 artifact (**#70, done** — it stores a `PlanArtifact` and fires `OnPlanCreated`); a
 persisted task-list tool (**#71, done** — `task_list` with disk persistence) holds the
 work; an accepted plan is parsed into that task list (**#72, done** — the pure
 `plan_artifact_to_task_list` bridge function); a `StorageProvider` abstraction (**#73,
-next**) generalizes the hybrid in-memory+on-disk persistence (spore-core is a
-harness-building framework, so storage backends are a first-class seam) — #70's plan
-artifact lives in `SessionState.extras["plan_execute"]` and #71's task list lives on disk
-at `.spore/task_list.json`, and #73 generalizes both; and #59
-finally wires the two-phase loop together with a **pluggable executor** (ReAct by
-default, swappable for a future Ralph-style execute+verify), invoking the #72 parser at
-plan-acceptance, firing the #69 hooks at plan-created and task-advance, mirroring the task
-list into `extras["task_list"]`, and replacing #70's `ExecutePhaseNotImplemented` halt with
-the real execute phase. Five former chain heads are now cleared: #45 (Agent
-dyn-compatibility, already on `main`), #69 (hook system), #70 (plan phase), #71 (task-list
-tool), and #72 (plan→tasklist parser, landed this loop). After PlanExecute
-lands this way, the remaining three strategies
+done this loop** — pluggable per-domain persistence with composite routing and a no-op
+default) generalizes the hybrid in-memory+on-disk persistence (spore-core is a
+harness-building framework, so storage backends are a first-class seam). Note #73 shipped
+the abstraction **only** (scope 1a); the actual migration of #70's
+`extras["plan_execute"]` and #71's `.spore/task_list.json` onto `RunStore` was deferred —
+so #59 can build on either the interim `extras`+disk paths or the new `StorageProvider`
+seam, a sequencing call at the top of the next loop. #59 finally wires the two-phase loop
+together with a **pluggable executor** (ReAct by default, swappable for a future
+Ralph-style execute+verify), invoking the #72 parser at plan-acceptance, firing the #69
+hooks at plan-created and task-advance, mirroring the task list into `extras["task_list"]`,
+and replacing #70's `ExecutePhaseNotImplemented` halt with the real execute phase. Six
+former chain heads are now cleared: #45 (Agent dyn-compatibility, already on `main`), #69
+(hook system), #70 (plan phase), #71 (task-list tool), #72 (plan→tasklist parser), and #73
+(StorageProvider, landed this loop). After PlanExecute lands this way, the remaining three
+strategies
 (#58/#60/#61) follow —
 SelfVerifying (#61) becomes a `Stop`-hook configuration now that #69 exists — then the
 accepted-debt correctness fixes (#30/#31/#32/#34). Observability backend stays
@@ -272,11 +318,23 @@ swappable over OTLP.
 3. **`task_list` persistence is interim, not the final seam** (`scope: debt`) — #71
    persists the task list to `.spore/task_list.json` directly via `SandboxProvider`
    because the `Tool` trait has no `SessionState`/shared-store access today. This is the
-   spec-endorsed interim path; migrate onto #73's `StorageProvider` when it lands. The
-   companion half — mirroring the list into `SessionState.extras["task_list"]` so the
-   harness can read it live — is **deferred to #59's execute loop** (the tool cannot reach
-   `SessionState`). Until #59, the disk file is the only cross-process source of truth.
-   Tracked: #73 (clean persistence) / #59 (extras mirror + drain).
+   spec-endorsed interim path; **#73's `StorageProvider`/`RunStore` now exists** as the
+   clean target, but the actual migration onto it was explicitly deferred out of #73
+   (scope 1a) — see Deviation #4. The companion half — mirroring the list into
+   `SessionState.extras["task_list"]` so the harness can read it live — is **deferred to
+   #59's execute loop** (the tool cannot reach `SessionState`). Until #59, the disk file
+   is the only cross-process source of truth. Tracked: #59 (extras mirror + drain) and the
+   #73 migration follow-up (Deviation #4).
+4. **#73 shipped the storage abstraction only; persistence migration + SQL backends are
+   deferred** (`scope: deferred`) — #73 (scope 1a, maintainer-pinned) delivered the
+   `StorageProvider` abstraction, `.storage()` wiring, and the OTLP fan-out, but
+   deliberately did **not** (a) migrate #70's `extras["plan_execute"]` or #71's
+   `.spore/task_list.json` onto `RunStore`, (b) remove `SessionState.extras`, or (c)
+   implement `SqliteStorageProvider`/`PostgresStorageProvider`. The migration touches
+   PlanExecute/compaction/subagent HITL (5+ sites) and belongs in its own change; the SQL
+   providers are a future phase. **These need discrete follow-up issues filed** (not yet
+   created — pending maintainer go-ahead). Until then they live only here. The interim
+   `extras`+disk paths from #70/#71 remain the live persistence.
 
 _(Former Deviation: Rust Agent dyn-compatibility / `BoxFut` workaround — **resolved**
 in #45 (commit `afe5ff8`); `Agent` is dyn-compatible and `StandardHarness` is
@@ -293,53 +351,60 @@ via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **PlanExecute build chain (#73 → #59)** — build PlanExecute via its decomposed
-   prerequisites, in order. Next up is **#73** (StorageProvider abstraction with composite
-   per-domain routing, generalizing the in-memory+on-disk persistence, subsuming both #70's
-   `extras["plan_execute"]` and #71's `.spore/task_list.json`) → #59 (wire the two-phase
-   loop with a pluggable executor, invoking the #72 parser at plan-acceptance, firing the
-   #69 hooks at plan-created/task-advance, mirroring the task list into `extras["task_list"]`,
-   replacing #70's `ExecutePhaseNotImplemented` halt). #70 (plan phase), #71 (task-list
-   tool), and **#72 (plan→tasklist parser, landed this loop)** are all **done** and dropped
-   from the chain head — the plan-phase → artifact → parser → task-list pipeline is now
-   complete as pure components; #73 generalizes their persistence and #59 wires them into a
-   running loop. Rust reference first, then TS/Python/Go parity at each step. PlanExecute
-   goes deep first to establish the task-list/storage seams the other strategies will reuse.
-   _Note: #73 is a soft dependency — #59 could be built directly on the interim
-   `extras`+disk persistence and migrated onto #73 later, if sequencing favors closing the
-   PlanExecute loop sooner. Decide #73-first vs #59-first at the top of the next loop._
-2. **Remaining loop strategies (#58, #60, #61)** — Ralph (#58), HillClimbing (#60),
+1. **Wire the PlanExecute execute loop (#59)** — the headline item; **every prerequisite
+   is now done** (#45/#69/#70/#71/#72/#73). Wire the two-phase loop with a **pluggable
+   executor** (ReAct by default, swappable for a future Ralph-style execute+verify):
+   invoke the #72 `plan_artifact_to_task_list` parser at plan-acceptance, fire the #69
+   hooks at plan-created/task-advance, persist + mirror the task list into
+   `extras["task_list"]`, drain it, and replace #70's `ExecutePhaseNotImplemented` halt with
+   the real execute phase. Rust reference first, then TS/Python/Go parity. PlanExecute goes
+   deep first to establish the task-list/executor seams the other strategies reuse.
+   _Sequencing call to make at the top of the loop: build #59 directly on the interim
+   `extras`+disk persistence (from #70/#71), or first migrate onto #73's `StorageProvider`/
+   `RunStore` seam. #73 shipped the abstraction but **not** the migration (Deviation #4), so
+   either path is open — interim-first likely closes the PlanExecute loop sooner, with the
+   `RunStore` migration as a clean follow-up._
+2. **File the #73 deferred follow-ups** — #73 (scope 1a) left two tracked-but-unfiled
+   items (Deviation #4): (a) migrate #70/#71 persistence onto `RunStore` + remove
+   `SessionState.extras`, and (b) `Sqlite`/`Postgres` storage providers. Create discrete
+   GH issues for these so they leave PROJECT_STATE-only tracking. Low effort, do
+   opportunistically (pending maintainer go-ahead on issue creation).
+3. **Remaining loop strategies (#58, #60, #61)** — Ralph (#58), HillClimbing (#60),
    SelfVerifying (#61) follow once PlanExecute lands and the shared seams (pluggable
    executor, task list) exist. SelfVerifying (#61) in particular can now be built as a
    `Stop`-hook configuration on the #69 hook system that just landed.
-3. **Correctness/safety debt fixes (#30, #31, #32, #34)** — memory distillation
+4. **Correctness/safety debt fixes (#30, #31, #32, #34)** — memory distillation
    PendingReview gate (#30), read-only subagent context sharing (#31), halt on
    mid-session Block 2 hash mismatch (#32), and the dangerous-feature-flag gate for
    `Mode::Yolo`/`SandboxProvider::None` (#34). Contained `scope: deferred` fixes to
    pull in opportunistically alongside the loop-strategy work.
-4. **Docs/spec cleanup (#27, #35, #36)** — README/spec clarifications (#27/#35) and
+5. **Docs/spec cleanup (#27, #35, #36)** — README/spec clarifications (#27/#35) and
    the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
    land so the docs stop overstating capability.
 
-_Note: this `/close` loop closed **#72** (parse plan artifact into the task list)
-`status: complete` (labels: removed `scope: deferred`, added `status: complete`).
-A full `/implement 72` pass built it across all four languages (Rust ref `79afeac`,
-TS `920db6f`, Python `c65b390`, Go `8f7d03b`) and cross-verified all four suites green
-(Rust 8 / TS 14 / Python 10 / Go 8 parser tests). **The four commits are on local `main`
-but NOT yet pushed to origin** — push pending the maintainer's explicit go-ahead (per the
-per-loop push authorization pattern). One scope fork was pinned by the maintainer before
-any code — **wiring ownership = defer to #59**: #72 ships only the pure
-`plan_artifact_to_task_list` function + fixtures + tests; the invocation lands in #59's
-execute loop (the just-landed #70 arm halts immediately with `ExecutePhaseNotImplemented`,
-so wiring now would pre-empt #59). The parser itself needed no new types or error type and
-is infallible — it consumes the already-validated #70 `PlanArtifact` and produces a #71
-`TaskList`, so there was no residual failure mode. The smaller forks resolved cleanly from
-the landed #70/#71 code: verbatim descriptions, rationale dropped, empty plan → valid empty
-list, single parse (no replanning). Phase-4 verification confirmed no harness files were
-touched (only public re-exports), no divergences, no spec gaps; no new issues spawned. No
-re-triage needed — the rest of the open board (#73 PlanExecute prerequisite, #59 the loop
-itself, #58/#60/#61 strategies, #27/#30–#36 debt/docs) is unaffected and its `scope:
-deferred` labels still hold. Active Direction unchanged — capability breadth (loop
-strategies) remains the headline gap, PlanExecute first. **Next concrete step: #73
-(StorageProvider) — or #59 directly on the interim persistence, a sequencing call to make
-at the top of the next loop (see Next Actions #1).**_
+_Note: this `/close` loop closed **#73** (StorageProvider abstraction) `status: complete`
+(labels: removed `scope: deferred`, added `status: complete`). A full `/implement 73` pass
+built it across all four languages (Rust ref `3dba8a3`, Python `442f694`, Go `15bf6ba`, TS
+`35988a1`) and cross-verified all four suites green (722 / 859 / 829 / 721 = 3,131 tests;
+three shared fixtures replay byte-identically). **Scope was pinned to "1a" by the maintainer
+before any code** (resolutions comment on the issue): deliver only the abstraction + four
+domain stores + four providers (NoOp/InMemory/FileSystem/Composite) + `.storage()` wiring +
+the multi-endpoint OTLP fan-out — explicitly **deferring** (a) the migration of #70/#71
+persistence onto `RunStore` and removal of `SessionState.extras`, and (b)
+`Sqlite`/`Postgres` providers, both to follow-ups (now Deviation #4). The four open design
+questions resolved cleanly (struct-of-four-`Arc` not supertrait; atomic temp+fsync+rename;
+expose-only harness wiring; `MemoryEntry{role,content,timestamp,metadata}`; most-recent-N
+newest-first; last-writer-wins FS). Phase-4 verification confirmed three intentional
+language-idiomatic differences (Go import-cycle resolution, empty `get_sessions` from raw
+stores, TS opaque `getSession`) — all behavior-consistent — and no divergences, no spec
+gaps. **The four #73 commits — and the four #72 commits from last loop — are on local
+`main` but NOT yet pushed to origin** (push pending the maintainer's explicit go-ahead, per
+the per-loop push authorization pattern). Re-triage: #73 closed; the rest of the open board
+(#59 the loop itself, #58/#60/#61 strategies, #27/#30–#36 debt/docs) is unaffected and its
+`scope: deferred` labels still hold — no issue hit the 2+-week stale threshold this loop.
+Active Direction shifted only in that **all PlanExecute prerequisites are now done — #59 is
+the unblocked headline item** with nothing ahead of it. **Next concrete step: #59
+(PlanExecute execute loop) — decide interim-persistence-first vs `RunStore`-migration-first
+at the top of the next loop (see Next Actions #1).** Decisions needed from maintainer: (1)
+push the 8 unpushed commits (#72 + #73) to origin? (2) authorize filing the two #73
+follow-up issues (Next Actions #2)?_
