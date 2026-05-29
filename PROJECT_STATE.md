@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-29 by /close — closed #75 (Tool-trait storage seam) `status: complete`, retiring Deviation #3. Pushed the four #76 + four #75 commits to origin (tip now `ba0e7f9`, was `3fe68f3`). New untriaged tool/prompt-architecture track surfaced (#79/#80/#81); #75 unblocks #81 — direction decision flagged below._
+_Last updated: 2026-05-29 by /close — closed #75 (Tool-trait storage seam) `status: complete`, retiring Deviation #3. Pushed the four #76 + four #75 commits to origin (tip now `ba0e7f9`, was `3fe68f3`). Triaged the new tool/prompt-architecture track #79/#80/#81 as `status: queued` and **chose Track A (tool/prompt architecture) as the next focus** — #80 is "work this next."_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -61,21 +61,20 @@ strategies (ReAct + PlanExecute), and now has a **clean, fully-pluggable
 persistence seam reaching all the way into tools** (#73 + #76 + #75). The bar
 remains **capability breadth and correctness**.
 
-Two capability tracks are now live and the next loop should pick between them:
+**Track A — tool/prompt architecture — is the chosen next focus** (decided this
+loop). #75 just unblocked it: #80 (tool escalation protocol —
+`ToolOutput::Escalate`/`HarnessSignal`), #81 (standard tool catalogue — Tier 1
+execution / Tier 2 session-aware via #75's `ToolContext` / Tier 3
+harness-escalating via #80), and #79 (prompt assembly engine —
+`ChunkProvider`/`PromptChunk`/`AssemblyContext`). #75 directly unblocked #81's
+Tier 2; #80 unblocks #81's Tier 3. All three are `status: queued`.
 
-1. **Tool/prompt architecture track (newly filed, just unblocked by #75).**
-   #80 (tool escalation protocol — `ToolOutput::Escalate`/`HarnessSignal`), #81
-   (standard tool catalogue — Tier 1 execution / Tier 2 session-aware via #75's
-   `ToolContext` / Tier 3 harness-escalating via #80), and #79 (prompt assembly
-   engine — `ChunkProvider`/`PromptChunk`/`AssemblyContext`). #75 directly
-   unblocked #81's Tier 2; #80 unblocks #81's Tier 3. This track has momentum and
-   fresh context.
-2. **Remaining loop strategies.** **SelfVerifying (#61)** is likely-cheapest
-   (buildable as a `Stop`-hook configuration on the #69 hook system),
-   **Ralph (#58)** is the natural pair to PlanExecute's execute phase, and
-   **HillClimbing (#60)** follows once the seams have a second consumer.
+The remaining **loop strategies** are deferred behind track A: **SelfVerifying
+(#61)** likely-cheapest (a `Stop`-hook configuration on the #69 hook system),
+**Ralph (#58)** the natural pair to PlanExecute's execute phase, **HillClimbing
+(#60)** once the seams have a second consumer.
 
-After whichever track: the accepted-debt correctness fixes (#30/#31/#32/#34) and
+After track A: the accepted-debt correctness fixes (#30/#31/#32/#34) and
 docs/spec cleanup (#27/#35/#36) so the docs stop overstating capability. Storage
 stays first-class: scope + workspace partitioning (#78) and SQL backends (#77)
 are filed, both deferred.
@@ -117,25 +116,26 @@ _(Former Deviation: observability captured no message content — **resolved** i
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **DECIDE next track, then start it.** Two live options:
-   (A) **Tool/prompt architecture** — start with **#80 (tool escalation protocol)**
-   as the keystone (it unblocks #81's Tier 3 and builds on `ToolOutput`, with
-   #75's `ToolContext` context still fresh), then **#81 (standard tool catalogue)**
-   whose Tier 2 #75 just unblocked, then **#79 (prompt assembly engine)**.
-   (B) **Loop strategies** — **#61 (SelfVerifying)** likely-cheapest, then
-   **#58 (Ralph)**, then **#60 (HillClimbing)**. #79/#80/#81 are untriaged on the
-   board (recommend `status: queued`); the loop strategies are `scope: deferred`.
-   Pick A or B at the top of the next loop.
-2. **Tool/prompt track (if A): #80 → #81 → #79.** Escalation protocol, then the
-   tiered standard tool catalogue (Tier 2 rides #75's `ToolContext`, Tier 3 rides
-   #80), then the prompt assembly engine extending #24.
-3. **Loop strategies (if B): #61 → #58 → #60.** Reuse the PlanExecute seams
-   (pluggable ReAct sub-loop executor, `task_list` drain, `OnTaskAdvance` hook,
-   `RunStore` persistence).
-4. **Correctness/safety debt + docs cleanup (#30/#31/#32/#34, #27/#35/#36)** —
+1. **#80 — Tool escalation protocol** (`status: queued`). The keystone of the
+   chosen track A: `HarnessSignal`, `ToolOutput::Escalate`, `RunResult::Escalate` —
+   the typed channel by which a tool signals the harness to terminate cleanly and
+   pass a structured signal to its caller (the harness never acts on it). Builds on
+   `ToolOutput` with #75's `ToolContext` context still fresh; unblocks #81's Tier 3.
+   Work this next.
+2. **#81 — Standard tool catalogue** (`status: queued`). Tier 1 execution /
+   Tier 2 session-aware (rides #75's `ToolContext`, already unblocked) / Tier 3
+   harness-escalating (rides #80). Opt-in default tool implementations.
+3. **#79 — Prompt assembly engine** (`status: queued`). `ChunkProvider`,
+   `PromptChunk`, `AssemblyContext`, `ContextSourcesBuilder` — conditional/
+   multi-backend chunk loading extending the #24 `PromptChunkRegistry`. Rounds out
+   track A; can also proceed in parallel as it's largely independent of #80/#81.
+4. **Loop strategies — #61 → #58 → #60** (`scope: deferred`, after track A).
+   SelfVerifying, Ralph, HillClimbing; reuse the PlanExecute seams (pluggable ReAct
+   sub-loop executor, `task_list` drain, `OnTaskAdvance` hook, `RunStore`).
+5. **Correctness/safety debt + docs cleanup (#30/#31/#32/#34, #27/#35/#36)** —
    memory distillation gate (#30), read-only subagent context (#31), Block 2 hash
    mismatch halt (#32), dangerous-feature-flag gate (#34); README/spec
    clarifications (#27/#35) and E2B data-residency note (#36). Fold in so docs stop
    overstating capability.
-5. **Storage future phases — #78 (scope + workspace partitioning), #77 (SQL
+6. **Storage future phases — #78 (scope + workspace partitioning), #77 (SQL
    backends)** — both `scope: deferred`; pick up once a consumer needs them.
