@@ -2381,10 +2381,9 @@ impl StandardHarness {
             return result;
         }
 
-        // Q4: persist the task list through the storage seam (RunStore) ONLY,
-        // plus the extras mirror. The #71 sandbox path is intentionally unused.
-        self.persist_task_list(&mut session_state, &session_id, &task_list)
-            .await;
+        // Q4: persist the task list through the storage seam (RunStore) ONLY.
+        // The #71 sandbox path is intentionally unused.
+        self.persist_task_list(&session_id, &task_list).await;
 
         // Carry the shared budget forward: the plan turn already consumed
         // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
@@ -2437,14 +2436,12 @@ impl StandardHarness {
     /// [`RunStore`](crate::storage::RunStore) seam under
     /// [`TASK_LIST_EXTRAS_KEY`](crate::tasklist::TASK_LIST_EXTRAS_KEY); the #71
     /// sandbox-filesystem path (`.spore/task_list.json`) is intentionally NOT
-    /// used — one source of truth. The list is also mirrored into
-    /// `SessionState.extras[TASK_LIST_EXTRAS_KEY]` (matching the existing
-    /// `extras["plan_execute"]` precedent). Serialization failures are swallowed:
-    /// a successful plan must not be lost to a storage hiccup (the default
-    /// no-op/in-memory provider never fails).
+    /// used — one source of truth. The RunStore write is the single source of
+    /// truth (#76 removed the redundant `SessionState.extras` mirror).
+    /// Serialization failures are swallowed: a successful plan must not be lost
+    /// to a storage hiccup (the default no-op/in-memory provider never fails).
     async fn persist_task_list(
         &self,
-        session_state: &mut SessionState,
         session_id: &SessionId,
         task_list: &crate::tasklist::TaskList,
     ) {
@@ -2454,16 +2451,8 @@ impl StandardHarness {
                 .config
                 .storage
                 .run()
-                .put(
-                    session_id,
-                    crate::tasklist::TASK_LIST_EXTRAS_KEY,
-                    value.clone(),
-                )
+                .put(session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY, value)
                 .await;
-            // Extras mirror (in-session view).
-            session_state
-                .extras
-                .insert(crate::tasklist::TASK_LIST_EXTRAS_KEY.to_string(), value);
         }
     }
 
@@ -2531,8 +2520,7 @@ impl StandardHarness {
 
             // Mark InProgress (Pending -> InProgress) and re-persist (Q4).
             let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
-            self.persist_task_list(session_state, &session_id, &task_list)
-                .await;
+            self.persist_task_list(&session_id, &task_list).await;
 
             // Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
             // instruction via the carried harness::Task; the (possibly mutated)
@@ -2592,8 +2580,7 @@ impl StandardHarness {
 
                     // Mark Completed and re-persist (Q4).
                     let _ = task_list.complete(task_id);
-                    self.persist_task_list(session_state, &session_id, &task_list)
-                        .await;
+                    self.persist_task_list(&session_id, &task_list).await;
                     // Surface the completed step's final text to the caller's
                     // sink. The per-step sub-loop runs with its own (suppressed)
                     // sink, so this is the parent-visible step boundary.
@@ -2620,8 +2607,7 @@ impl StandardHarness {
                     total_usage.cost_usd += usage.cost_usd;
 
                     let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
-                    self.persist_task_list(session_state, &session_id, &task_list)
-                        .await;
+                    self.persist_task_list(&session_id, &task_list).await;
 
                     let terminal_reason = match reason {
                         // Budget exhaustion mid-execute is its own halt — keep
@@ -2871,12 +2857,19 @@ impl StandardHarness {
             let _ = chain.fire(&mut ctx).await;
         }
 
-        // R4: store the produced artifact in extras["plan_execute"] as JSON.
+        // R4: persist the produced artifact to the RunStore seam under
+        // PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth;
+        // no longer mirrored into SessionState.extras). The put result is
+        // swallowed (matching the execute-phase persist): a successfully
+        // captured plan must not be lost to a storage hiccup.
         match serde_json::to_value(&artifact) {
             Ok(value) => {
-                session_state
-                    .extras
-                    .insert(crate::plan::PLAN_EXECUTE_EXTRAS_KEY.to_string(), value);
+                let _ = self
+                    .config
+                    .storage
+                    .run()
+                    .put(&session_id, crate::plan::PLAN_EXECUTE_EXTRAS_KEY, value)
+                    .await;
             }
             Err(e) => {
                 return Err(RunResult::Failure {
@@ -3566,7 +3559,13 @@ mod tests {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
-            storage: Arc::new(crate::storage::StorageProvider::no_op()),
+            // #76: plan_execute + task_list persistence now lives on the
+            // RunStore seam (not SessionState.extras), so the test harness
+            // needs a real (in-memory) run store for the readback helpers and
+            // assertions below to observe what the harness wrote.
+            storage: Arc::new(crate::storage::StorageProvider::single(Arc::new(
+                crate::storage::InMemoryStorageProvider::new(),
+            ))),
         }
     }
 
@@ -4557,12 +4556,17 @@ mod tests {
         }
     }
 
-    fn stored_artifact(state: &SessionState) -> PlanArtifact {
-        let v = state
-            .extras
-            .get(PLAN_EXECUTE_EXTRAS_KEY)
-            .expect("plan_execute extras present");
-        serde_json::from_value(v.clone()).expect("artifact deserializes")
+    // #76: the plan artifact now lives on the RunStore seam (not extras). Read
+    // it back through the harness's storage under PLAN_EXECUTE_EXTRAS_KEY.
+    async fn stored_artifact(h: &StandardHarness, session_id: &SessionId) -> PlanArtifact {
+        let v = h
+            .storage()
+            .run()
+            .get(session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .expect("plan_execute present in run store");
+        serde_json::from_value(v).expect("artifact deserializes")
     }
 
     // Issue #59 happy path: plan turn (2 tasks) then 2 execute completions. The
@@ -4610,7 +4614,7 @@ mod tests {
         // R7: counted against the budget.
         assert_eq!(outcome.turns, 1);
         // R3/R4: exact artifact stored.
-        let stored = stored_artifact(&state);
+        let stored = stored_artifact(&h, &t.session_id).await;
         assert_eq!(stored.tasks, vec!["a", "b", "c"]);
         assert_eq!(stored.rationale, "r");
         assert_eq!(stored, outcome.artifact);
@@ -4655,7 +4659,13 @@ mod tests {
             0,
             "tool registry must not be dispatched in the plan turn"
         );
-        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+        assert!(h
+            .storage()
+            .run()
+            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .is_none());
     }
 
     // R5: when planner_agent is set, the PLANNER runs the plan turn and the
@@ -4688,7 +4698,10 @@ mod tests {
             0,
             "default agent did not run the plan turn"
         );
-        assert_eq!(stored_artifact(&state).tasks, vec!["planner"]);
+        assert_eq!(
+            stored_artifact(&h, &t.session_id).await.tasks,
+            vec!["planner"]
+        );
     }
 
     // R6: with no planner_agent, the plan turn runs on the default agent.
@@ -4708,7 +4721,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
-        assert_eq!(stored_artifact(&state).tasks, vec!["default"]);
+        assert_eq!(
+            stored_artifact(&h, &t.session_id).await.tasks,
+            vec!["default"]
+        );
     }
 
     // R8 (#70): the plan turn records exactly one TurnSpan, and it is the FIRST
@@ -4773,7 +4789,13 @@ mod tests {
             0,
             "no planner turn ran"
         );
-        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+        assert!(h
+            .storage()
+            .run()
+            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .is_none());
     }
 
     // R11: an OnPlanCreated hook can rewrite the plan before storage; the
@@ -4810,7 +4832,7 @@ mod tests {
             .await
             .expect("plan phase succeeds");
 
-        let stored = stored_artifact(&state);
+        let stored = stored_artifact(&h, &t.session_id).await;
         assert_eq!(stored.tasks, vec!["rewritten"]);
         assert_eq!(stored.rationale, "mutated");
         assert_eq!(stored, outcome.artifact);
@@ -4827,7 +4849,10 @@ mod tests {
         h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
             .await
             .expect("plan phase succeeds");
-        assert_eq!(stored_artifact(&state).tasks, vec!["f1", "f2"]);
+        assert_eq!(
+            stored_artifact(&h, &t.session_id).await.tasks,
+            vec!["f1", "f2"]
+        );
     }
 
     // R3: an unparseable plan surfaces PlanPhaseFailed/UnparseablePlan and
@@ -4853,20 +4878,30 @@ mod tests {
             } => {}
             other => panic!("expected UnparseablePlan, got {other:?}"),
         }
-        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+        assert!(h
+            .storage()
+            .run()
+            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .is_none());
     }
 
     // ── PlanExecute execute phase (issue #59) ───────────────────────────────
 
     use crate::tasklist::{TaskList, TaskStatus, TASK_LIST_EXTRAS_KEY};
 
-    // Read the task list mirrored into SessionState.extras (Q4 mirror).
-    fn extras_task_list(state: &SessionState) -> TaskList {
-        let v = state
-            .extras
-            .get(TASK_LIST_EXTRAS_KEY)
-            .expect("task_list extras present");
-        serde_json::from_value(v.clone()).expect("task list deserializes")
+    // #76: the task list now lives on the RunStore seam (not extras). Read it
+    // back through the harness's storage under TASK_LIST_EXTRAS_KEY.
+    async fn run_store_task_list(h: &StandardHarness, session_id: &SessionId) -> TaskList {
+        let v = h
+            .storage()
+            .run()
+            .get(session_id, TASK_LIST_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .expect("task_list present in run store");
+        serde_json::from_value(v).expect("task list deserializes")
     }
 
     // Build a PlanExecute task carrying an explicit budget (e.g. a turn cap).
@@ -4932,7 +4967,7 @@ mod tests {
             other => panic!("expected Success, got {other:?}"),
         }
         // Final persisted list: every task Completed.
-        let final_list = extras_task_list(&state);
+        let final_list = run_store_task_list(&h, &t.session_id).await;
         assert!(
             final_list
                 .tasks
@@ -5231,6 +5266,63 @@ mod tests {
         let list: TaskList = serde_json::from_value(stored).expect("deserializes");
         assert_eq!(list.tasks.len(), 1);
         assert_eq!(list.tasks[0].status, TaskStatus::Completed);
+    }
+
+    // #76: after a plan/execute run, BOTH persistence keys live on the RunStore
+    // seam and NEITHER is mirrored into SessionState.extras. Drives the phases
+    // directly (rather than `run()`) so the post-run `state.extras` is
+    // observable. The ephemeral extras keys (`__rich_state`,
+    // `subagent_handoff_summary`) are owned by other components and untouched
+    // here.
+    #[tokio::test]
+    async fn plan_execute_persistence_lives_on_run_store_not_extras() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["one","two"],"rationale":"why"}"#));
+        a.push(final_resp("did one"));
+        a.push(final_resp("did two"));
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+        let mut state = SessionState::default();
+
+        let outcome = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        let task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
+        let result = h
+            .run_execute_phase(
+                &t,
+                &mut state,
+                task_list,
+                BudgetSnapshot {
+                    turns: outcome.turns,
+                    ..Default::default()
+                },
+                outcome.usage,
+                &None,
+            )
+            .await;
+        assert!(matches!(result, RunResult::Success { .. }));
+
+        // Both keys are durable in the RunStore.
+        assert!(h
+            .storage()
+            .run()
+            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .is_some());
+        assert!(h
+            .storage()
+            .run()
+            .get(&t.session_id, TASK_LIST_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .is_some());
+
+        // Neither key is mirrored into SessionState.extras anymore.
+        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+        assert!(state.extras.get(TASK_LIST_EXTRAS_KEY).is_none());
     }
 
     // Q2: success output is the LAST step's FinalResponse, not a concatenation

@@ -3,8 +3,9 @@
 //! Loads `fixtures/model_responses/harness/plan_phase_basic.jsonl` and drives a
 //! `StandardHarness` with `LoopStrategy::PlanExecute`, asserting that:
 //!   1. The plan turn's recorded `FinalResponse` is captured into the exact
-//!      `PlanArtifact` (tasks + rationale), stored under
-//!      `extras["plan_execute"]`.
+//!      `PlanArtifact` (tasks + rationale), persisted to the `RunStore` seam
+//!      under `PLAN_EXECUTE_EXTRAS_KEY` (#76 — no longer mirrored into
+//!      `extras["plan_execute"]`).
 //!   2. The fenced ```json variant is captured identically (fence-strip rule).
 //!   3. The plan turn is consumed and parsed into a non-empty task list, so the
 //!      run proceeds into the execute phase (issue #59). This fixture provides
