@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /close — closed #70 (plan phase / plan artifact, four-language parity, merged + pushed to main); #71 (task-list tool) is now the headline next item_
+_Last updated: 2026-05-28 by /close — closed #71 (persisted task-list tool, four-language parity); #72 (parse plan artifact into the task list) is now the headline next item. ⚠️ #71's four commits are on local `main` but **not yet pushed to origin** (push pending maintainer go-ahead)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -127,6 +127,37 @@ identically across all four. One verification divergence fixed: Python originall
 flattened the `PlanPhaseFailed` halt-reason JSON (`error_kind`+`message`) — converged to
 the 3-language nested `error: {kind, message}` shape.
 
+**#71 (persisted task-list tool) just landed** — the second piece of PlanExecute is on
+local `main` at four-language parity (Rust ref `837042e`, Python `00a2ac4`, TS `15b6e14`,
+Go `4b941e3`) — **committed but not yet pushed to origin**. A single tool **`task_list`**
+with an `action` discriminator (`add_task`/`update_task`/`complete_task`/`list_tasks`),
+generalizing the existing `GitResetTool` multi-mode pattern (chosen over four discrete
+tools because all four ops mutate one shared `TaskList`, so a single tool keeps the
+read-modify-write atomic per dispatch). The tool is deliberately **not `read_only`** so
+the registry dispatches it sequentially, avoiding a read-modify-write race with concurrent
+read-only tools. Types are byte-identical across all four: `TaskStatus`
+(`pending`/`in_progress`/`completed`/`blocked`, snake_case), flat
+`Task {id, description, status}` (sequential 1-based `u32` id, no hierarchy, no timestamps),
+`TaskList {"tasks":[...],"next_id":N}` (`next_id` monotonic, never reused; empty default
+`{"tasks":[],"next_id":1}`). Two errors `TaskNotFound`/`InvalidTransition` return as
+**recoverable** tool errors (never panic/throw at the boundary). The two spec forks were
+pinned before coding: **(1)** transition matrix = *permissive-except-terminal-Completed*
+(allowed: pending→{in_progress,completed,blocked}, in_progress→{completed,blocked},
+blocked→{in_progress,completed}, idempotent X→X; rejected: any transition **out of**
+completed); **(2)** the load-bearing state-access wrinkle — confirmed from the code that
+`Tool::execute` receives only `&ToolCall` + `&dyn SandboxProvider` and has **no
+`SessionState` access**, so options (a) [needs #73] and (c) [trait change, conflicts with
+#73] are infeasible for v1; #71 ships the spec-endorsed interim path — **tool + types +
+disk persistence** at `.spore/task_list.json` via `SandboxProvider` (mirroring the
+`plan.rs`/#70 precedent) and returns the serialized list as tool output, while the
+`extras["task_list"]` mirror is left to #59's execute loop (which already touches `extras`
+for `plan_execute`). Tests: Rust 31, TS 67, Python 37, Go 33 — all suites green; three
+ground-truth fixtures `fixtures/tasklist/{operations,transitions,serialization}.json`
+replay identically in all four. No divergences, no spec gaps, no new issues spawned.
+Naming-only note (JSON unaffected): Rust re-exports the record as `TaskListTask` and Go
+names it `TaskListItem` to avoid colliding with the pre-existing harness `Task` type; TS
+exposes the types under a `tasklist` namespace.
+
 **#69 (lifecycle hook system) just landed** — a `Hook`/`HookChain` system at
 four-language parity (Rust ref `ddbd8a4`, TS `b49c300`, Go `51bf7f4`, Python
 `6423740` + parity fix `c593956`), merged to `main` via fast-forward. It defines all
@@ -162,7 +193,10 @@ loop isn't built yet; `Ralph`, `SelfVerifying`, and `HillClimbing` (#58/#60/#61)
 return the generic `StrategyNotYetImplemented`. The sandbox missing-file
 misclassification that made S1 nondeterministic was fixed in #63, the previous "no
 message content" observability gap is closed by #64, and the lifecycle hook seams (#69)
-now exist with `Stop` loop-wired and `OnPlanCreated` fired by the new plan phase.
+now exist with `Stop` loop-wired and `OnPlanCreated` fired by the new plan phase. The
+**`task_list` tool (#71) now exists** as a registered tool with disk-backed persistence,
+but is not yet consumed — #72 will populate it from the plan artifact and #59's execute
+loop will drain it.
 
 ## Active Direction
 The harness is now **runnable** (#57) and **debuggable** (#64/#65) end-to-end, and
@@ -175,20 +209,23 @@ that the harness is **ReAct-only** — `PlanExecute`, `Ralph`, `SelfVerifying`, 
 
 **PlanExecute (#59) is the first strategy being built, and a design pass decomposed it
 into five separable concerns** rather than one large change. The build order is
-**#70 → #71 → #72 → #73 → #59**, with the lifecycle hook system (#69) providing the
+**#72 → #73 → #59**, with the lifecycle hook system (#69) providing the
 `OnPlanCreated`/`OnTaskAdvance` seams the loop fires. The plan phase produces a plan
-artifact (**#70, now done** — it stores a `PlanArtifact` and fires `OnPlanCreated`); a
-persisted task-list tool (#71, next) holds the work; an accepted plan is parsed into
-that task list (#72); a `StorageProvider` abstraction (#73) generalizes the hybrid
-in-memory+on-disk persistence (spore-core is a harness-building framework, so storage
-backends are a first-class seam) — #70's plan artifact currently lives in
-`SessionState.extras["plan_execute"]` in-memory, and #73 generalizes that; and #59
+artifact (**#70, done** — it stores a `PlanArtifact` and fires `OnPlanCreated`); a
+persisted task-list tool (**#71, done** — `task_list` with disk persistence) holds the
+work; an accepted plan is parsed into that task list (**#72, next** — read the
+`PlanArtifact` from `extras["plan_execute"]` and populate the `TaskList`); a
+`StorageProvider` abstraction (#73) generalizes the hybrid in-memory+on-disk persistence
+(spore-core is a harness-building framework, so storage backends are a first-class seam) —
+#70's plan artifact lives in `SessionState.extras["plan_execute"]` and #71's task list
+lives on disk at `.spore/task_list.json`, and #73 generalizes both; and #59
 finally wires the two-phase loop together with a **pluggable executor** (ReAct by
 default, swappable for a future Ralph-style execute+verify), firing the #69 hooks at
-plan-created and task-advance and replacing #70's `ExecutePhaseNotImplemented` halt with
-the real execute phase. Three former chain heads are now cleared: #45 (Agent
-dyn-compatibility, already on `main`), #69 (hook system), and #70 (plan phase, landed
-this loop). After PlanExecute lands this way, the remaining three strategies
+plan-created and task-advance, mirroring the task list into `extras["task_list"]`, and
+replacing #70's `ExecutePhaseNotImplemented` halt with the real execute phase. Four former
+chain heads are now cleared: #45 (Agent dyn-compatibility, already on `main`), #69 (hook
+system), #70 (plan phase), and #71 (task-list tool, landed this loop). After PlanExecute
+lands this way, the remaining three strategies
 (#58/#60/#61) follow —
 SelfVerifying (#61) becomes a `Stop`-hook configuration now that #69 exists — then the
 accepted-debt correctness fixes (#30/#31/#32/#34). Observability backend stays
@@ -207,6 +244,14 @@ swappable over OTLP.
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod` (accepted tradeoff, documented in `go/CONVENTIONS.md`).
    The durable JSONL path stays network-free.
+3. **`task_list` persistence is interim, not the final seam** (`scope: debt`) — #71
+   persists the task list to `.spore/task_list.json` directly via `SandboxProvider`
+   because the `Tool` trait has no `SessionState`/shared-store access today. This is the
+   spec-endorsed interim path; migrate onto #73's `StorageProvider` when it lands. The
+   companion half — mirroring the list into `SessionState.extras["task_list"]` so the
+   harness can read it live — is **deferred to #59's execute loop** (the tool cannot reach
+   `SessionState`). Until #59, the disk file is the only cross-process source of truth.
+   Tracked: #73 (clean persistence) / #59 (extras mirror + drain).
 
 _(Former Deviation: Rust Agent dyn-compatibility / `BoxFut` workaround — **resolved**
 in #45 (commit `afe5ff8`); `Agent` is dyn-compatible and `StandardHarness` is
@@ -223,16 +268,17 @@ via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **PlanExecute build chain (#71 → #72 → #73 → #59)** — build PlanExecute via its
-   decomposed prerequisites, in order. Next up is **#71** (a persisted task-list tool to
-   hold the work), now that the plan phase (#70) lands a `PlanArtifact`. Then #72
-   (parse the accepted plan artifact in `extras["plan_execute"]` into that task list) →
-   #73 (StorageProvider abstraction generalizing the in-memory+on-disk persistence) →
+1. **PlanExecute build chain (#72 → #73 → #59)** — build PlanExecute via its
+   decomposed prerequisites, in order. Next up is **#72** (parse the accepted plan
+   artifact in `extras["plan_execute"]` into the `task_list` the #71 tool now provides) →
+   #73 (StorageProvider abstraction generalizing the in-memory+on-disk persistence,
+   subsuming both #70's `extras["plan_execute"]` and #71's `.spore/task_list.json`) →
    #59 (wire the two-phase loop with a pluggable executor, firing the #69 hooks at
-   plan-created/task-advance, replacing #70's `ExecutePhaseNotImplemented` halt). #70
-   (plan phase) is **done** and dropped from the chain head. Rust reference first, then
-   TS/Python/Go parity at each step. PlanExecute goes deep first to establish the
-   task-list/storage seams the other strategies will reuse.
+   plan-created/task-advance, mirroring the task list into `extras["task_list"]`,
+   replacing #70's `ExecutePhaseNotImplemented` halt). #70 (plan phase) and **#71
+   (task-list tool, landed this loop)** are both **done** and dropped from the chain head.
+   Rust reference first, then TS/Python/Go parity at each step. PlanExecute goes deep
+   first to establish the task-list/storage seams the other strategies will reuse.
 2. **Remaining loop strategies (#58, #60, #61)** — Ralph (#58), HillClimbing (#60),
    SelfVerifying (#61) follow once PlanExecute lands and the shared seams (pluggable
    executor, task list) exist. SelfVerifying (#61) in particular can now be built as a
@@ -246,21 +292,23 @@ This section is updated by /close after every PEE loop.]
    the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
    land so the docs stop overstating capability.
 
-_Note: this `/close` loop closed **#70** (plan phase / plan artifact) `status: complete`.
-A full `/implement 70` pass built it across all four languages (Rust ref `f128e8f`,
-Go `d25b398`, TS `fd45e19`, Python `7cdcec6` incl. an in-place parity amend),
-cross-verified all four suites green, fast-forward-merged the four commits to `main`,
-and **pushed to origin** (the maintainer authorized comment + merge + push this loop).
-Planning phase reported BLOCKED on four spec questions (model routing seam, HITL/
-`OnPlanCreated` behavior, the text→artifact capture grammar, the terminal `RunResult`);
-all four were pinned by the maintainer before any code — Q1=`planner_agent` seam
-(`plan_model` stays metadata), Q2=synchronous `OnPlanCreated`/no HITL, Q3=byte-identical
-JSON-in-response capture, Q4=distinct `ExecutePhaseNotImplemented` halt. A key discovery:
-`PlanArtifact` already existed (from #69 as the `OnPlanCreated` payload), so #70 reused
-it rather than defining a competing type. Phase-4 verification caught one divergence
-(Python flattened the `PlanPhaseFailed` halt-reason JSON), converged to the 3-language
-nested shape. No new issues spawned; no new spec gaps. No re-triage needed — the rest of
-the open board (#71–#73 PlanExecute prerequisites, #58/#60/#61 strategies, #27/#30–#36
-debt/docs) is unaffected and its `scope: deferred` labels still hold. Active Direction
-unchanged — capability breadth (loop strategies) remains the headline gap, PlanExecute
-first, **#71 (task-list tool) the next concrete step**._
+_Note: this `/close` loop closed **#71** (persisted task-list tool) `status: complete`
+(labels: removed `status: queued` + `scope: deferred`, added `status: complete`).
+A full `/implement 71` pass built it across all four languages (Rust ref `837042e`,
+Python `00a2ac4`, TS `15b6e14`, Go `4b941e3`) and cross-verified all four suites green
+(Rust 31 / TS 67 / Python 37 / Go 33 tasklist tests). **The four commits are on local
+`main` but NOT yet pushed to origin** — push is pending the maintainer's explicit
+go-ahead (per the per-loop push authorization pattern; the #70 loop's push was
+separately authorized). The two spec forks were pinned by the maintainer before any
+code — (1) transition matrix = permissive-except-terminal-Completed, (2) state seam =
+ship tool + types + disk persistence only (the `Tool` trait has no `SessionState`
+access, ruling out the shared-store/trait-extension options pre-#73), with the
+`extras["task_list"]` mirror deferred to #59. A key finding confirmed from the code:
+`Tool::execute` receives only `&ToolCall` + `&dyn SandboxProvider`, which is the binding
+constraint behind the interim-persistence decision (now Known Deviation #3, `scope: debt`).
+Phase-4 verification found no divergences and no spec gaps; no new issues spawned. No
+re-triage needed — the rest of the open board (#72/#73 PlanExecute prerequisites,
+#58/#60/#61 strategies, #27/#30–#36 debt/docs) is unaffected and its `scope: deferred`
+labels still hold. Active Direction unchanged — capability breadth (loop strategies)
+remains the headline gap, PlanExecute first, **#72 (parse plan artifact into the task
+list) the next concrete step**._
