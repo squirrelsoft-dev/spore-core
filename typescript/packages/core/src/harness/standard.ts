@@ -42,6 +42,13 @@ import type { Message, ToolCall } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
+import { newSessionState as newContextSessionState } from "../context/types.js";
+import {
+  emptyTurnOutput,
+  type FireOutcome,
+  type HookChain,
+  type HookContext,
+} from "../hooks/index.js";
 
 import type { Harness } from "./interface.js";
 import {
@@ -111,7 +118,23 @@ export interface HarnessConfig {
    * to honor `SPORE_TRACE_CONTENT` / `SPORE_TRACE_CONTENT_MAX_LEN`.
    */
   contentCapture?: ContentCaptureConfig;
+  /**
+   * Lifecycle hook chain (issue #69). When set, the harness fires registered
+   * `stop` hooks synchronously when the loop strategy believes the task is
+   * complete. A `block` decision injects its reason into the next turn and the
+   * loop continues, up to {@link maxStopBlocks} times per run. Optional;
+   * absent means no hooks fire and the loop terminates normally.
+   */
+  hooks?: HookChain;
+  /**
+   * Maximum consecutive Stop-hook blocks honored within a single run before the
+   * loop terminates anyway (issue #69, R14). The counter is PER-RUN and resets
+   * each `run()`/`resume()` call. Optional; defaults to `8`.
+   */
+  maxStopBlocks?: number;
 }
+
+const DEFAULT_MAX_STOP_BLOCKS = 8;
 
 export class StandardHarness implements Harness {
   constructor(private readonly config: HarnessConfig) {}
@@ -173,6 +196,58 @@ export class StandardHarness implements Harness {
       const [content, truncated] = truncateField(rendered, max);
       return { role, content, truncated };
     });
+  }
+
+  /**
+   * Fire registered `stop` hooks (issue #69, R12–R14). The strategy believes
+   * the task is done; fire the chain synchronously. Returns the reason string
+   * to inject + continue the loop when a hook blocked AND the per-run
+   * `maxStopBlocks` cap has not yet been hit (incrementing `stopBlocks`).
+   * Returns `null` to allow normal termination — no chain configured, no hook
+   * blocked, the cap was reached, or a hook errored.
+   *
+   * A Stop-hook error (e.g. a failing command handler) is treated as a
+   * non-blocking outcome: the loop terminates normally rather than looping
+   * forever on a broken hook.
+   */
+  private async fireStopHooks(
+    sessionId: SessionId,
+    task: Task,
+    turnNumber: number,
+    lastOutputText: string,
+    stopBlocks: { value: number },
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    const chain = this.config.hooks;
+    if (!chain) return null;
+
+    const richState = newContextSessionState(sessionId, task.id, task.instruction);
+    const lastOutput = { ...emptyTurnOutput(), text: lastOutputText };
+    const ctx: HookContext = {
+      event: "stop",
+      session_id: sessionId,
+      turn_number: turnNumber,
+      last_output: lastOutput,
+      task_instruction: task.instruction,
+      session_state: richState,
+    };
+
+    let outcome: FireOutcome;
+    try {
+      outcome = await chain.fire(ctx, signal);
+    } catch {
+      // Broken hook → allow normal termination.
+      return null;
+    }
+
+    if (outcome.kind === "block") {
+      const cap = this.config.maxStopBlocks ?? DEFAULT_MAX_STOP_BLOCKS;
+      if (stopBlocks.value >= cap) return null; // R14: cap reached.
+      stopBlocks.value += 1;
+      return outcome.reason;
+    }
+    // continue / inject / deny → allow normal termination.
+    return null;
   }
 
   async run(options: HarnessRunOptions): Promise<RunResult> {
@@ -367,6 +442,11 @@ export class StandardHarness implements Harness {
     // recent turn span base — parent for the tool-call spans of that turn.
     let spanSeq = 0;
     let currentTurnBase: SpanBase | undefined;
+    // Per-run Stop-hook block counter (issue #69, R14). Resets on every
+    // run()/resume() — a resumed loop starts fresh. After `maxStopBlocks`
+    // consecutive blocks the loop terminates anyway. Boxed so `fireStopHooks`
+    // can mutate it.
+    const stopBlocks = { value: 0 };
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
@@ -601,6 +681,26 @@ export class StandardHarness implements Harness {
               content: { type: "text", text: result.content },
             };
             await this.config.contextManager.appendAssistantMessage?.(sessionState, msg);
+          }
+
+          // Stop hook (issue #69, R12). The strategy believes the task is done;
+          // fire registered `stop` hooks synchronously. If any blocks (and we
+          // are under `maxStopBlocks`), inject the reason as a user message —
+          // the same path `force_another_turn` injects through — and continue
+          // the loop instead of terminating.
+          {
+            const reason = await this.fireStopHooks(
+              sessionId,
+              task,
+              budgetUsed.turns,
+              result.content,
+              stopBlocks,
+              signal,
+            );
+            if (reason != null) {
+              await this.config.contextManager.appendUserMessage(sessionState, reason);
+              continue;
+            }
           }
 
           emit(onStream, { kind: "final_response", content: result.content });
@@ -1069,6 +1169,8 @@ export class HarnessBuilder {
   private _maxCompactionAttempts = 2;
   private _pricing: PricingTable = PricingTable.DEFAULT;
   private _contentCapture: ContentCaptureConfig = ContentCaptureConfig.default();
+  private _hooks?: HookChain;
+  private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
 
   constructor(
     private readonly agent: Agent,
@@ -1127,6 +1229,20 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Inject a lifecycle hook chain (issue #69). The harness fires registered
+   *  `stop` hooks at the loop's completion gate. */
+  hooks(hooks: HookChain): this {
+    this._hooks = hooks;
+    return this;
+  }
+
+  /** Set the per-run cap on honored Stop-hook blocks (issue #69, R14).
+   *  Defaults to `8`. */
+  maxStopBlocks(max: number): this {
+    this._maxStopBlocks = max;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -1141,6 +1257,8 @@ export class HarnessBuilder {
       maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,
       contentCapture: this._contentCapture,
+      hooks: this._hooks,
+      maxStopBlocks: this._maxStopBlocks,
     };
   }
 
