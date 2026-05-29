@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from spore_core.hooks import PlanArtifact
 from spore_core.model import ToolCall
 from spore_core.tasklist import TaskStatus
 
@@ -98,9 +99,98 @@ class GrepFilesParams(_Params):
     recursive: bool = False
 
 
+class GrepOutputMode(str, Enum):
+    """Output mode for the net-new :class:`GrepTool` (#81)."""
+
+    CONTENT = "content"
+    FILES_WITH_MATCHES = "files_with_matches"
+    COUNT = "count"
+
+
+class GrepParams(_Params):
+    """Parameters for the net-new :class:`GrepTool` (#81). ``output_mode``
+    defaults to ``content`` (``path:line:text`` per match)."""
+
+    pattern: str
+    path: str
+    recursive: bool = False
+    output_mode: GrepOutputMode = GrepOutputMode.CONTENT
+
+
 class FindFilesParams(_Params):
     glob: str
     path: str
+
+
+# ---------- EditFile (#81) ----------
+
+
+class EditFileParams(_Params):
+    path: str
+    old_string: str
+    new_string: str
+
+
+# ---------- SendMessage (#81) ----------
+
+
+class SendMessageParams(_Params):
+    content: str
+
+
+# ---------- Web (#81) ----------
+
+
+class WebFetchParams(_Params):
+    url: str
+
+
+class WebSearchParams(_Params):
+    query: str
+
+
+# ---------- TodoWrite (#81) ----------
+
+
+class TodoStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+
+class TodoItem(_Params):
+    content: str
+    status: TodoStatus
+
+
+class TodoWriteParams(_Params):
+    todos: list[TodoItem]
+
+
+# ---------- Tier-3 control tools (#81) ----------
+
+
+class EnterPlanModeParams(_Params):
+    """``enter_plan_mode`` — context is optional (defaults to empty)."""
+
+    context: str = ""
+
+
+class ExitPlanModeParams(_Params):
+    """``exit_plan_mode`` — the agent-constructed plan deserializes DIRECTLY
+    into the existing :class:`~spore_core.hooks.PlanArtifact` (issue #81, Q4a —
+    no stub). ``PlanArtifact.rationale`` defaults to ``""``."""
+
+    plan: PlanArtifact
+
+
+class AskUserQuestionParams(_Params):
+    question: str
+    options: list[str] | None = None
+
+
+class AbortParams(_Params):
+    reason: str
 
 
 # ---------- Git ----------
@@ -228,7 +318,12 @@ __all__ = [
     "TASK_LIST_PARAMS_BY_ACTION",
     "UpdateTaskParams",
     "parse_task_list_params",
+    "AbortParams",
+    "AskUserQuestionParams",
     "DeleteFileParams",
+    "EditFileParams",
+    "EnterPlanModeParams",
+    "ExitPlanModeParams",
     "FindFilesParams",
     "GitCommitParams",
     "GitDiffParams",
@@ -238,14 +333,22 @@ __all__ = [
     "GitStatusParams",
     "ExecParams",
     "GrepFilesParams",
+    "GrepOutputMode",
+    "GrepParams",
     "HttpGetParams",
     "HttpPostParams",
     "ListDirParams",
     "MoveFileParams",
     "ReadFileParams",
     "RunTestsParams",
+    "SendMessageParams",
     "ShellCommandParams",
     "SubagentParams",
+    "TodoItem",
+    "TodoStatus",
+    "TodoWriteParams",
+    "WebFetchParams",
+    "WebSearchParams",
     "WriteFileParams",
     "parse_params",
 ]

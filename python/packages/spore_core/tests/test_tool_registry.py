@@ -72,15 +72,29 @@ async def test_registered_tool_dispatches_through_registry() -> None:
     assert result.output.truncated is False
 
 
-# ----- Rule 3: duplicate registration ---------------------------------------
+# ----- Rule 3: duplicate registration is a last-wins upsert (issue #81, Q1) --
 
 
-async def test_duplicate_registration_errors() -> None:
+async def test_duplicate_registration_is_last_wins_upsert() -> None:
+    """A second ``register`` under the same name OVERWRITES the first (no
+    error). This lets an architect override a standard tool by registering
+    their own after a preset."""
     reg = StandardToolRegistry()
-    reg.register(EchoTool("echo"), _schema("echo"))
-    with pytest.raises(RegistrationError) as excinfo:
-        reg.register(EchoTool("echo"), _schema("echo"))
-    assert excinfo.value.kind == "DuplicateName"
+    first = EchoTool("echo")
+    second = EchoTool("echo")
+    reg.register(first, _schema("echo", ToolAnnotations(read_only=True)))
+    # No error on the second registration.
+    reg.register(second, _schema("echo", ToolAnnotations(destructive=True)))
+
+    # The LAST registration wins: the dispatched tool and the active schema are
+    # the second ones.
+    out = await reg.dispatch(_call("echo", "c1", {}), AllowAllSandbox(), _CTX)
+    assert isinstance(out.output, ToolOutputSuccess)
+    assert second.calls == 1
+    assert first.calls == 0
+    schemas = reg.active_schemas(None)
+    echo_schema = next(s for s in schemas if s.name == "echo")
+    assert echo_schema.annotations.destructive is True
 
 
 # ----- Rule 2: schema validated at registration ------------------------------

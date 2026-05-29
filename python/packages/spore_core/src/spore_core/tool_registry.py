@@ -43,7 +43,9 @@ Rules enforced here (mirror Rust reference byte-for-byte):
 2. Schemas are validated at registration (basic structural check on the
    JSON Schema document: nonempty name + ``parameters`` dict with a
    top-level ``"type"`` key).
-3. Duplicate tool names → :class:`RegistrationError` (kind=DuplicateName).
+3. Duplicate tool names → LAST-WINS upsert: the later ``register`` overwrites
+   the earlier one (issue #81, Q1). ``register_set`` still rejects duplicate
+   SET names with :class:`RegistrationError` (kind=DuplicateName).
 4. ``ToolAnnotations(read_only=True, destructive=True)`` is contradictory →
    :class:`RegistrationError` (kind=ConflictingAnnotations).
 5. Active :class:`ToolSet` can change between turns (selected by
@@ -376,8 +378,11 @@ class StandardToolRegistry:
             )
         self._validate_schema(schema)
         self._validate_annotations(schema)
-        if schema.name in self._tools:
-            raise RegistrationError.duplicate_name(schema.name)
+        # Last-wins upsert (issue #81, Q1): registering a tool with the same
+        # name as an existing one OVERWRITES it. This is what lets an architect
+        # override a standard catalogue tool by registering their own after a
+        # preset (e.g. ``StandardTools.coding_set()``). ``register_set`` keeps
+        # the duplicate-name error for intra-set duplicates.
         self._tools[schema.name] = _Registered(tool=tool, schema=schema)
 
     def register_set(self, set_: ToolSet) -> None:

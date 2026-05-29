@@ -52,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
@@ -91,6 +91,7 @@ if TYPE_CHECKING:
         SessionState as ContextSessionState,
     )
     from .hooks import HookChain
+    from .tool_registry import StandardToolRegistry
 
 # ============================================================================
 # Identity newtypes
@@ -275,13 +276,24 @@ class StreamBudgetWarning(_Model):
     limit_type: BudgetLimitTypeT
 
 
+class StreamUserMessage(_Model):
+    """Out-of-band, prominent message to the user (issue #81). Emitted by the
+    loop when the ``send_message`` tool runs, INSTEAD of collapsing the content
+    into a normal tool result. The harness only emits the event — rendering it
+    prominently is the architect's UI concern."""
+
+    kind: Literal["user_message"] = "user_message"
+    content: str
+
+
 HarnessStreamEvent = Annotated[
     StreamTurnStart
     | StreamTurnEnd
     | StreamToolCall
     | StreamToolResult
     | StreamFinalResponse
-    | StreamBudgetWarning,
+    | StreamBudgetWarning
+    | StreamUserMessage,
     Field(discriminator="kind"),
 ]
 
@@ -411,6 +423,11 @@ class HumanRequestToolApproval(_Model):
 class HumanRequestClarification(_Model):
     kind: Literal["clarification"] = "clarification"
     question: str
+    # Issue #81 (Q4b): an ``ask_user_question`` clarification may carry a fixed
+    # set of multiple-choice options. Optional / defaulted so older
+    # ``Clarification`` blobs (no ``options`` field) still deserialize —
+    # back-compat with the bare pre-#81 shape.
+    options: list[str] | None = None
 
 
 class HumanRequestReview(_Model):
@@ -556,10 +573,33 @@ class ToolOutputEscalate(_Model):
     signal: HarnessSignal
 
 
+class ToolOutputAwaitingClarification(_Model):
+    """Tool needs a human answer before it can produce a result (issue #81,
+    Q4b). UNLIKE :class:`ToolOutputWaitingForHuman` (the subagent-shaped pause
+    that carries a :class:`ChildPausedState`), this variant carries NO child
+    state: the loop pauses by building a :class:`PausedState` directly with
+    ``human_request`` set to :class:`HumanRequestClarification`. On resume the
+    human's answer is injected as the clarifying call's tool result."""
+
+    kind: Literal["awaiting_clarification"] = "awaiting_clarification"
+    question: str
+    options: list[str] | None = None
+
+
 ToolOutput = Annotated[
-    ToolOutputSuccess | ToolOutputError | ToolOutputWaitingForHuman | ToolOutputEscalate,
+    ToolOutputSuccess
+    | ToolOutputError
+    | ToolOutputWaitingForHuman
+    | ToolOutputEscalate
+    | ToolOutputAwaitingClarification,
     Field(discriminator="kind"),
 ]
+
+#: The registered name of the catalogue ``send_message`` tool (issue #81). The
+#: harness loop recognizes this name and emits a :class:`StreamUserMessage`
+#: event rather than collapsing the tool result. The implementation lives in
+#: ``spore_tools`` (``SendMessageTool``); the harness only needs the name.
+SEND_MESSAGE_TOOL_NAME = "send_message"
 
 
 class HarnessToolResult(_Model):
@@ -1470,6 +1510,45 @@ class HarnessBuilder:
         self._hooks: HookChain | None = None
         self._planner_agent: Agent | None = None
         self._storage: StorageProvider | None = None
+        # Standard catalogue tools accumulated via :meth:`tool` / :meth:`tools`
+        # (issue #81). Each is a ``StandardTool``-shaped object exposing
+        # ``implementation`` (a :class:`Tool`) and ``schema`` (a
+        # :class:`ToolSchema`). They are drained into a populated
+        # :class:`StandardToolRegistry` by :meth:`drain_tools_into_registry`,
+        # applying last-wins upsert. Typed structurally (the concrete
+        # ``StandardTool`` lives in ``spore_tools`` and must not be imported
+        # here — that would invert the package dependency).
+        self._standard_tools: list[Any] = []
+
+    def tool(self, tool: Any) -> HarnessBuilder:
+        """Accumulate a single ``StandardTool`` (issue #81, Q1/Q2) — an object
+        bundling ``implementation`` + ``schema``. The bundle is destructured
+        when the registry is built via :meth:`drain_tools_into_registry`.
+        Registration applies LAST-WINS upsert: a later ``.tool()`` with the same
+        name overrides an earlier one (e.g. a custom tool after a preset)."""
+        self._standard_tools.append(tool)
+        return self
+
+    def tools(self, tools: Iterable[Any]) -> HarnessBuilder:
+        """Accumulate many ``StandardTool``s at once (e.g. a preset like
+        ``StandardTools.coding_set()``). Order is preserved, so last-wins upsert
+        still applies across the batch."""
+        self._standard_tools.extend(tools)
+        return self
+
+    def drain_tools_into_registry(self) -> StandardToolRegistry:
+        """Drain the accumulated catalogue tools into a populated
+        :class:`StandardToolRegistry`, registering each with last-wins upsert
+        (issue #81, Q1/Q2). Consumes the accumulated set. Returns an empty
+        registry if no catalogue tools were added. Mirrors Rust's
+        ``HarnessBuilder::drain_tools_into_registry``."""
+        from .tool_registry import StandardToolRegistry as _Registry
+
+        reg = _Registry()
+        for t in self._standard_tools:
+            reg.register(t.implementation, t.schema)
+        self._standard_tools = []
+        return reg
 
     def storage(self, storage: StorageProvider) -> HarnessBuilder:
         """Inject a :class:`StorageProvider` (issue #73). Defaults to an
@@ -1748,6 +1827,38 @@ class StandardHarness:
         task = state.task
         budget_used = state.budget_used
         session_id = state.session_id
+
+        # Clarification resume (issue #81, Q4b): if this pause came from
+        # :class:`ToolOutputAwaitingClarification`, the human's answer is
+        # injected as the tool RESULT for the clarifying call (the HEAD of
+        # ``pending_tool_calls``) — NOT appended as a free-standing user message.
+        # Any remaining pending calls from the same batch are then dispatched
+        # normally before the loop resumes.
+        if isinstance(state.human_request, HumanRequestClarification) and isinstance(
+            response, HumanResponseAnswer | HumanResponseApproveWithFeedback
+        ):
+            answer = (
+                response.text if isinstance(response, HumanResponseAnswer) else response.feedback
+            )
+            if pending:
+                clarifying_call, *rest = pending
+                tr = HarnessToolResult(
+                    call_id=clarifying_call.id,
+                    output=ToolOutputSuccess(content=answer, truncated=False),
+                )
+                await self._config.context_manager.append_tool_result(session_state, tr)
+                for call in rest:
+                    output = await self._config.tool_registry.dispatch(call)
+                    tr = HarnessToolResult(call_id=call.id, output=output)
+                    await self._config.context_manager.append_tool_result(session_state, tr)
+            max_iterations = (
+                task.loop_strategy.max_iterations
+                if isinstance(task.loop_strategy, LoopStrategyReAct)
+                else 2**31 - 1
+            )
+            return await self._run_react(
+                task, max_iterations, session_state, budget_used, on_stream
+            )
 
         # Subagent depth: a full child.resume() dispatch lives with
         # SubagentTool (#5); for now we surface a placeholder and continue
@@ -2719,6 +2830,44 @@ class StandardHarness:
                             turns=turns,
                         )
 
+                    # Clarification pause (issue #81, Q4b): a tool (e.g.
+                    # ``ask_user_question``) needs a human answer before it can
+                    # produce a result. UNLIKE the subagent ``WaitingForHuman``
+                    # path, there is NO ``ChildPausedState``: the loop builds a
+                    # :class:`PausedState` directly with ``human_request`` set to
+                    # :class:`HumanRequestClarification`. The CLARIFYING call
+                    # itself is preserved as the HEAD of ``pending_tool_calls``
+                    # (followed by the remaining batch) so that, on resume, the
+                    # human's answer is injected as the tool RESULT for that call.
+                    if isinstance(output, ToolOutputAwaitingClarification):
+                        pending = [call, *calls[i + 1 :]]
+                        request = HumanRequestClarification(
+                            question=output.question, options=output.options
+                        )
+                        paused = PausedState(
+                            session_id=session_id,
+                            task_id=task.id,
+                            turn_number=budget_used.turns,
+                            session_state=session_state,
+                            pending_tool_calls=pending,
+                            approved_results=approved_results,
+                            human_request=request,
+                            task=task,
+                            budget_used=budget_used,
+                            child_state=None,
+                        )
+                        return RunResultWaitingForHuman(state=paused, request=request)
+
+                    # SendMessage (issue #81): the ``send_message`` tool surfaces
+                    # an out-of-band message to the user. The loop emits a
+                    # :class:`StreamUserMessage` rather than collapsing the
+                    # content into a normal tool result, then records a minimal
+                    # success result so the loop continues.
+                    if call.name == SEND_MESSAGE_TOOL_NAME and isinstance(
+                        output, ToolOutputSuccess
+                    ):
+                        self._emit(on_stream, StreamUserMessage(content=output.content))
+
                     is_error = isinstance(output, ToolOutputError)
                     # Layer-2: unrecoverable tool error halts immediately.
                     if isinstance(output, ToolOutputError) and not output.recoverable:
@@ -3265,6 +3414,8 @@ __all__ = [
     "StreamToolResult",
     "StreamTurnEnd",
     "StreamTurnStart",
+    "StreamUserMessage",
+    "SEND_MESSAGE_TOOL_NAME",
     "Task",
     "TaskId",
     "TerminationContinue",
@@ -3272,6 +3423,7 @@ __all__ = [
     "TerminationHalt",
     "TerminationPolicy",
     "ToolOutput",
+    "ToolOutputAwaitingClarification",
     "ToolOutputError",
     "ToolOutputEscalate",
     "ToolOutputSuccess",
