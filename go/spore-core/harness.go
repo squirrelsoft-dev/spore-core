@@ -1572,6 +1572,26 @@ type HarnessConfig struct {
 	// a failing summary anyway (issue #46). Clamped to a minimum of 1 by the
 	// loop. The builder defaults this to 2 (mirrors CompactionConfig).
 	MaxCompactionAttempts uint32
+
+	// Hooks is the lifecycle hook chain (issue #69). Optional; when nil no hooks
+	// fire. Of the 17 events, only Stop is wired into the ReAct loop in Go (its
+	// machinery exists) — Stop replaces the old ForceAnotherTurn / completion
+	// re-prompt path. See hooks.go for the full event catalogue and which events
+	// are defined-and-unit-tested but not yet loop-wired.
+	Hooks HookChain // optional
+
+	// MaxStopBlocks caps how many consecutive Stop-hook blocks the loop honours
+	// in a single Run before terminating anyway (issue #69). The counter is
+	// per-run (resets each Run call). Zero is treated as the default of 8.
+	MaxStopBlocks uint32
+}
+
+// effectiveMaxStopBlocks returns the Stop-block cap, defaulting 0 to 8.
+func (c HarnessConfig) effectiveMaxStopBlocks() uint32 {
+	if c.MaxStopBlocks == 0 {
+		return 8
+	}
+	return c.MaxStopBlocks
 }
 
 // StandardHarness is the canonical Harness implementation.
@@ -1728,6 +1748,53 @@ func haltReasonString(r HaltReason) string {
 }
 
 // runReActInner is the workhorse loop for LoopStrategy ReAct.
+// fireStopHooks fires registered Stop hooks (issue #69). It returns
+// (reason, true) when the loop should continue — a hook blocked and the per-run
+// MaxStopBlocks cap has not yet been hit — incrementing stopBlocks. It returns
+// ("", false) to allow normal termination: no hook chain is configured, no hook
+// blocked, the cap was reached, or a hook errored (a broken Stop hook must not
+// loop the harness forever, so its error is treated as non-blocking).
+//
+// Firing order is registration order; a wrapped strategy verifier (registered
+// as a Stop hook) fires in its registered position. The SelfVerifying verifier
+// is expressed this way rather than as bespoke loop logic.
+func (h *StandardHarness) fireStopHooks(
+	ctx context.Context,
+	sessionID SessionID,
+	task *Task,
+	turnNumber uint32,
+	lastOutputText string,
+	session *SessionState,
+	stopBlocks *uint32,
+) (string, bool) {
+	if h.config.Hooks == nil {
+		return "", false
+	}
+	instruction := task.Instruction
+	lastOutput := TurnOutput{Text: lastOutputText, HadToolCalls: false}
+	hctx := &HookContext{
+		Event:           HookEventStop,
+		SessionID:       sessionID,
+		TurnNumber:      turnNumber,
+		LastOutput:      &lastOutput,
+		TaskInstruction: &instruction,
+		SessionState:    session,
+	}
+	outcome, err := h.config.Hooks.Fire(ctx, hctx)
+	if err != nil {
+		return "", false
+	}
+	if outcome.Kind != FireBlock {
+		return "", false
+	}
+	if *stopBlocks >= h.config.effectiveMaxStopBlocks() {
+		// Cap reached — terminate anyway.
+		return "", false
+	}
+	*stopBlocks++
+	return outcome.Reason, true
+}
+
 func (h *StandardHarness) runReActInner(
 	ctx context.Context,
 	task Task,
@@ -1744,6 +1811,11 @@ func (h *StandardHarness) runReActInner(
 	// span id of the most recent turn (parents this turn's tool-call spans).
 	var spanSeq uint64
 	var currentTurnSpanID string
+
+	// Per-run Stop-hook block counter (issue #69). Resets each Run call — a
+	// resume starts fresh. After MaxStopBlocks consecutive blocks the loop
+	// terminates anyway.
+	var stopBlocks uint32
 
 	effectiveTurnCap := maxIterations
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
@@ -1908,6 +1980,17 @@ func (h *StandardHarness) runReActInner(
 			if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
 				a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(result.Content)})
 			}
+
+			// Stop hook (issue #69). The strategy believes the task is done;
+			// fire registered Stop hooks synchronously. If any blocks (and we
+			// are under MaxStopBlocks), inject the reason via the same path
+			// ForceAnotherTurn uses and continue the loop instead of
+			// terminating.
+			if reason, blocked := h.fireStopHooks(ctx, sessionID, &task, budget.Turns, result.Content, &session, &stopBlocks); blocked {
+				h.config.ContextManager.AppendUserMessage(ctx, &session, reason)
+				continue
+			}
+
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: result.Content})
 			return RunResult{
 				Kind:      RunSuccess,
