@@ -506,7 +506,7 @@ export class StandardHarness implements Harness {
 
     // Q4: persist the task list through the storage seam (RunStore) ONLY, plus
     // the extras mirror. The #71 sandbox path is intentionally unused.
-    await this.persistTaskList(sessionState, sessionId, taskList);
+    await this.persistTaskList(sessionId, taskList);
 
     // Carry the shared budget forward: the plan turn already consumed
     // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
@@ -554,20 +554,15 @@ export class StandardHarness implements Harness {
    * Persist the parsed {@link TaskList} for the run (Q4). The DURABLE write goes
    * through the `RunStore` seam under `TASK_LIST_EXTRAS_KEY`; the #71
    * sandbox-filesystem path (`.spore/task_list.json`) is intentionally NOT used
-   * — one source of truth. The list is also mirrored into
-   * `SessionState.extras[TASK_LIST_EXTRAS_KEY]` (matching the existing
-   * `extras["plan_execute"]` precedent). Failures are swallowed: a successful
-   * plan must not be lost to a storage hiccup (the default no-op / in-memory
-   * provider never fails).
+   * — the `RunStore` write is the single source of truth (#76 removed the
+   * redundant `SessionState.extras` mirror). Failures are swallowed: a
+   * successful plan must not be lost to a storage hiccup (the default no-op /
+   * in-memory provider never fails).
    */
-  private async persistTaskList(
-    sessionState: SessionState,
-    sessionId: SessionId,
-    taskList: TaskList,
-  ): Promise<void> {
+  private async persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void> {
     // Serialize via the canonical task-list form, then re-parse to a plain JSON
-    // value so the durable blob and the extras mirror are byte-identical to the
-    // cross-language `{ tasks, next_id }` shape.
+    // value so the durable blob is byte-identical to the cross-language
+    // `{ tasks, next_id }` shape.
     let value: unknown;
     try {
       value = JSON.parse(serializeTaskList(taskList));
@@ -579,9 +574,8 @@ export class StandardHarness implements Harness {
         .run()
         .put(sessionId, TASK_LIST_EXTRAS_KEY, value as never);
     } catch {
-      // Durable write failure is non-fatal; the extras mirror still records it.
+      // Durable write failure is non-fatal.
     }
-    sessionState.extras[TASK_LIST_EXTRAS_KEY] = value;
   }
 
   /**
@@ -651,7 +645,7 @@ export class StandardHarness implements Harness {
 
       // Mark in_progress (pending -> in_progress) and re-persist (Q4).
       updateTask(taskList, taskId, "in_progress");
-      await this.persistTaskList(sessionState, sessionId, taskList);
+      await this.persistTaskList(sessionId, taskList);
 
       // Fire on_task_advance (pre, mutable). The hook may rewrite the step's
       // instruction via the carried Task; the (possibly mutated) instruction
@@ -681,7 +675,7 @@ export class StandardHarness implements Harness {
       // Seed the (possibly mutated) step instruction as a user message, then run
       // the bounded ReAct sub-loop carrying the shared budget (Q1). The sub-loop
       // works on a CLONE of the session so each step is isolated; the parent
-      // session keeps the seeded message + extras mirror.
+      // session keeps the seeded message.
       await this.config.contextManager.appendUserMessage(sessionState, stepTask.instruction);
       const subState: SessionState = {
         messages: [...sessionState.messages],
@@ -714,7 +708,7 @@ export class StandardHarness implements Harness {
 
         // Mark completed and re-persist (Q4).
         completeTask(taskList, taskId);
-        await this.persistTaskList(sessionState, sessionId, taskList);
+        await this.persistTaskList(sessionId, taskList);
         // Surface the completed step's final text to the caller's sink — the
         // parent-visible step boundary.
         emit(onStream, { kind: "final_response", content: lastOutput });
@@ -729,7 +723,7 @@ export class StandardHarness implements Harness {
         totalUsage.cost_usd += subResult.usage.cost_usd;
 
         updateTask(taskList, taskId, "blocked");
-        await this.persistTaskList(sessionState, sessionId, taskList);
+        await this.persistTaskList(sessionId, taskList);
 
         const terminalReason: HaltReason =
           subResult.reason.kind === "budget_exceeded"
@@ -983,12 +977,20 @@ export class StandardHarness implements Harness {
     }
     const artifact: PlanArtifact = ctx.plan;
 
-    // R4: store the produced artifact in extras["plan_execute"] as a JSON value
-    // (the stable cross-language shape: `{ tasks, rationale }`).
-    sessionState.extras[PLAN_EXECUTE_EXTRAS_KEY] = {
-      tasks: artifact.tasks,
-      rationale: artifact.rationale,
-    };
+    // R4: persist the produced artifact to the RunStore seam under
+    // PLAN_EXECUTE_EXTRAS_KEY as a JSON value (the stable cross-language shape:
+    // `{ tasks, rationale }`). #76 — the durable single source of truth; no
+    // longer mirrored into SessionState.extras. The put failure is swallowed
+    // (matching persistTaskList): a successfully-captured plan must not be lost
+    // to a storage hiccup (the default no-op / in-memory provider never fails).
+    try {
+      await this.storage().run().put(sessionId, PLAN_EXECUTE_EXTRAS_KEY, {
+        tasks: artifact.tasks,
+        rationale: artifact.rationale,
+      });
+    } catch {
+      // Durable write failure is non-fatal.
+    }
 
     return { ok: true, artifact, usage, turns: budgetUsed.turns };
   }

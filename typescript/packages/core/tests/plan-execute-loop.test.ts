@@ -147,12 +147,16 @@ describe("PlanExecute execute phase (issue #59)", () => {
       .push(fr("done one"))
       .push(fr("done two"));
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a));
+    const provider = StorageProvider.single(new InMemoryStorageProvider());
+    const h = new StandardHarness(configWith(a, { storage: provider }));
     const r = await h.run({ task: planTask(), session_state: state });
     expect(r.kind).toBe("success");
-    const list = state.extras[TASK_LIST_EXTRAS_KEY] as TaskList;
+    // #76: the task list is persisted to the RunStore seam, not mirrored into
+    // SessionState.extras.
+    const list = (await provider.run().get(SID, TASK_LIST_EXTRAS_KEY)) as TaskList;
     expect(list.tasks.length).toBe(2);
     expect(list.tasks.every((t) => t.status === "completed")).toBe(true);
+    expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
   });
 
   it("per-task turn allocation + shared budget carried forward (Q1)", async () => {

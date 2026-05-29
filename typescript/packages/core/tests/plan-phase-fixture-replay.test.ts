@@ -37,6 +37,7 @@ import {
   type RecordedExchange,
 } from "../src/index.js";
 import { RecordedExchangeSchema } from "../src/model/schemas.js";
+import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
 import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
@@ -71,7 +72,7 @@ function responseText(exchange: RecordedExchange): string {
   return block.text;
 }
 
-function configFor(exchange: RecordedExchange): HarnessConfig {
+function configFor(exchange: RecordedExchange, storage: StorageProvider): HarnessConfig {
   // Positional single-exchange replay: each plan run consumes exactly one turn.
   const replay = new ReplayModelInterface([exchange], provider);
   const agent = new ModelAgent(AgentId.of("planner"), replay);
@@ -81,8 +82,13 @@ function configFor(exchange: RecordedExchange): HarnessConfig {
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    // #76: the plan artifact is persisted to the RunStore seam (not extras), so
+    // the replay needs a real in-memory run store for the readback below.
+    storage,
   };
 }
+
+const FIXTURE_SID = SessionId.of("plan-fixture");
 
 describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () => {
   it("captures the plain-JSON case identically to Rust", async () => {
@@ -90,8 +96,9 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     expect(exchanges.length).toBeGreaterThanOrEqual(2);
 
     const state = emptySessionState();
-    const harness = new StandardHarness(configFor(exchanges[0]!));
-    const task = newTask("build something", SessionId.of("plan-fixture"), {
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    const harness = new StandardHarness(configFor(exchanges[0]!, storage));
+    const task = newTask("build something", FIXTURE_SID, {
       kind: "plan_execute",
       plan_model: null,
     });
@@ -114,7 +121,9 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
       tasks: ["scaffold the project", "add the argument parser", "write the integration tests"],
       rationale: "deliver a working CLI incrementally",
     };
-    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toEqual(expected);
+    // #76: persisted to the RunStore seam, not mirrored into extras.
+    expect(await storage.run().get(FIXTURE_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
 
     const captured = capturePlanArtifact(responseText(exchanges[0]!));
     expect(captured.ok).toBe(true);
@@ -126,8 +135,9 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     expect(exchanges.length).toBeGreaterThanOrEqual(2);
 
     const state = emptySessionState();
-    const harness = new StandardHarness(configFor(exchanges[1]!));
-    const task = newTask("build something", SessionId.of("plan-fixture"), {
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    const harness = new StandardHarness(configFor(exchanges[1]!, storage));
+    const task = newTask("build something", FIXTURE_SID, {
       kind: "plan_execute",
       plan_model: null,
     });
@@ -146,7 +156,9 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
       tasks: ["draft the outline", "write the reference section"],
       rationale: "docs follow the code",
     };
-    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toEqual(expected);
+    // #76: persisted to the RunStore seam, not mirrored into extras.
+    expect(await storage.run().get(FIXTURE_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
 
     const captured = capturePlanArtifact(responseText(exchanges[1]!));
     expect(captured.ok).toBe(true);

@@ -41,6 +41,8 @@ import {
 import type { Hook, HookChain, HookContext, HookDecision, HookEvent } from "../src/hooks/index.js";
 import { StandardHookChain } from "../src/hooks/standard.js";
 import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js";
+import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
+import { TASK_LIST_EXTRAS_KEY } from "../src/tasklist/index.js";
 import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
@@ -102,10 +104,19 @@ function configWith(agent: Agent, overrides: Partial<HarnessConfig> = {}): Harne
   };
 }
 
+const PLAN_SID = SessionId.of("plan-s1");
+
 function planTask(instruction = "build a CLI", maxTurns?: number) {
-  return newTask(instruction, SessionId.of("plan-s1"), PLAN_STRATEGY, {
+  return newTask(instruction, PLAN_SID, PLAN_STRATEGY, {
     max_turns: maxTurns ?? null,
   });
+}
+
+/** #76: a fresh in-memory storage provider so tests can read the plan artifact
+ *  back off the RunStore seam (it is no longer mirrored into
+ *  `SessionState.extras`). */
+function inMemoryStorage(): StorageProvider {
+  return StorageProvider.single(new InMemoryStorageProvider());
 }
 
 const PLAN_JSON = '{"tasks":["a","b"],"rationale":"because"}';
@@ -205,17 +216,21 @@ describe("PlanExecute plan phase", () => {
     // execute_phase_not_implemented halt is gone and the artifact was stored).
     const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a));
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { storage }));
     const r = await h.run({ task: planTask(), session_state: state });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("step_failed");
     }
-    // The plan artifact was produced + stored before the execute phase ran.
-    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toEqual({
+    // #76: the plan artifact was produced + persisted to the RunStore seam
+    // before the execute phase ran (no longer mirrored into extras).
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
       tasks: ["a", "b"],
       rationale: "because",
     });
+    // #76: neither persistence key is mirrored into SessionState.extras.
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
   it("R1: the plan phase runs exactly once (single planner turn)", async () => {
@@ -247,24 +262,29 @@ describe("PlanExecute plan phase", () => {
     expect(reg.callCount).toBe(0); // R2: no tool dispatch.
   });
 
-  it("R3 + R4: artifact captured from response text and stored in extras", async () => {
+  it("R3 + R4: artifact captured from response text and persisted to the RunStore", async () => {
     const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a));
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { storage }));
     await h.run({ task: planTask(), session_state: state });
-    const stored = state.extras[PLAN_EXECUTE_EXTRAS_KEY];
+    const stored = await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY);
     expect(stored).toEqual({ tasks: ["a", "b"], rationale: "because" });
+    // #76: not mirrored into SessionState.extras.
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
   it("R3: an unparseable plan surfaces plan_phase_failed / unparseable_plan, no artifact", async () => {
     const a = new RecordingAgent(AgentId.of("default")).push(fr("not json"));
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a));
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { storage }));
     const r = await h.run({ task: planTask(), session_state: state });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure" && r.reason.kind === "plan_phase_failed") {
       expect(r.reason.error.kind).toBe("unparseable_plan");
     }
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -324,12 +344,14 @@ describe("PlanExecute plan phase", () => {
   it("R10: budget exhausted before the plan turn → budget_exceeded, no artifact", async () => {
     const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
     const state: SessionState = emptySessionState();
+    const storage = inMemoryStorage();
     // max_turns: 0 means the turn cap is already met before any turn.
-    const h = new StandardHarness(configWith(a));
+    const h = new StandardHarness(configWith(a, { storage }));
     const r = await h.run({ task: planTask("build a CLI", 0), session_state: state });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") expect(r.reason.kind).toBe("budget_exceeded");
     expect(a.ran).toBe(0); // never ran the plan turn.
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -347,11 +369,37 @@ describe("PlanExecute plan phase", () => {
       }),
     );
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a, { hooks: chain }));
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { hooks: chain, storage }));
     await h.run({ task: planTask(), session_state: state });
-    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toEqual({
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
       tasks: ["rewritten"],
       rationale: "by-hook",
     });
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
+  });
+
+  // #76: after a full plan/execute run, BOTH persistence keys live on the
+  // RunStore seam and NEITHER is mirrored into SessionState.extras. The
+  // ephemeral extras keys (`__rich_state`, `subagent_handoff_summary`) are
+  // owned by other components and untouched here.
+  it("#76: plan_execute + task_list persistence live on the RunStore, not extras", async () => {
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["one","two"],"rationale":"why"}'))
+      .push(fr("did one"))
+      .push(fr("did two"));
+    const state: SessionState = emptySessionState();
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { storage }));
+    const r = await h.run({ task: planTask(), session_state: state });
+    expect(r.kind).toBe("success");
+
+    // Both keys are durable in the RunStore.
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).not.toBeUndefined();
+    expect(await storage.run().get(PLAN_SID, TASK_LIST_EXTRAS_KEY)).not.toBeUndefined();
+
+    // Neither key is mirrored into SessionState.extras anymore.
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
+    expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
   });
 });
