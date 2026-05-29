@@ -1646,9 +1646,11 @@ type HarnessConfig struct {
 	PlannerAgent Agent // optional
 
 	// RunStore is the durable per-run structured-state seam (issue #59, Q4).
-	// The PlanExecute execute loop writes the parsed task list through this
-	// store under TaskListExtrasKey, keyed by SessionID. Optional; when nil the
-	// durable write is skipped (the in-session extras mirror is always kept).
+	// The PlanExecute plan phase writes the plan artifact under
+	// PlanExecuteExtrasKey and the execute loop writes the parsed task list
+	// under TaskListExtrasKey, both keyed by SessionID (#76 — the single source
+	// of truth; no SessionState.Extras mirror). Optional; when nil the durable
+	// write is skipped.
 	// This is a consumer-side interface (go/CONVENTIONS.md): the concrete
 	// storage.StorageProvider.Run() satisfies it structurally without the
 	// sporecore package importing the storage package (which would be a cycle).
@@ -1918,9 +1920,9 @@ func (h *StandardHarness) runPlanExecute(
 		return result
 	}
 
-	// Q4: persist the task list through the RunStore seam plus the extras
-	// mirror. The #71 sandbox path is intentionally unused.
-	h.persistTaskList(ctx, &session, sessionID, taskList)
+	// Q4: persist the task list through the RunStore seam ONLY. The #71 sandbox
+	// path is intentionally unused.
+	h.persistTaskList(ctx, sessionID, taskList)
 
 	// Carry the shared budget forward: the plan turn already consumed
 	// outcome.turns turns and outcome.usage tokens (Q1 — shared budget).
@@ -1952,12 +1954,11 @@ func (h *StandardHarness) finalizePlanExecute(ctx context.Context, result RunRes
 // persistTaskList persists the parsed TaskList for the run (Q4). The DURABLE
 // write goes through the RunStore seam under TaskListExtrasKey; the #71
 // sandbox-filesystem path (.spore/task_list.json) is intentionally NOT used —
-// one source of truth. The list is also mirrored into
-// SessionState.Extras[TaskListExtrasKey] (matching the existing
-// extras["plan_execute"] precedent). Serialization / store failures are
-// swallowed: a successful plan must not be lost to a storage hiccup (the default
-// nil/no-op store never fails).
-func (h *StandardHarness) persistTaskList(ctx context.Context, session *SessionState, sessionID SessionID, taskList TaskList) {
+// one source of truth. The RunStore write is the single source of truth (#76
+// removed the redundant SessionState.Extras mirror). Serialization / store
+// failures are swallowed: a successful plan must not be lost to a storage hiccup
+// (the default nil/no-op store never fails).
+func (h *StandardHarness) persistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList) {
 	value, err := json.Marshal(taskList)
 	if err != nil {
 		return
@@ -1966,11 +1967,6 @@ func (h *StandardHarness) persistTaskList(ctx context.Context, session *SessionS
 	if h.config.RunStore != nil {
 		_ = h.config.RunStore.Put(ctx, sessionID, TaskListExtrasKey, json.RawMessage(value))
 	}
-	// Extras mirror (in-session view).
-	if session.Extras == nil {
-		session.Extras = map[string]any{}
-	}
-	session.Extras[TaskListExtrasKey] = json.RawMessage(value)
 }
 
 // runExecutePhase drives the PlanExecute execute phase (issue #59), draining
@@ -2042,7 +2038,7 @@ func (h *StandardHarness) runExecutePhase(
 		// Mark InProgress (Pending -> InProgress) and re-persist (Q4).
 		ip := TaskStatusInProgress
 		_ = taskList.Update(taskID, &ip, nil)
-		h.persistTaskList(ctx, session, sessionID, taskList)
+		h.persistTaskList(ctx, sessionID, taskList)
 
 		// Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
 		// instruction via the carried Task; the (possibly mutated) instruction
@@ -2089,7 +2085,7 @@ func (h *StandardHarness) runExecutePhase(
 
 			// Mark Completed and re-persist (Q4).
 			_ = taskList.Complete(taskID)
-			h.persistTaskList(ctx, session, sessionID, taskList)
+			h.persistTaskList(ctx, sessionID, taskList)
 			// Surface the completed step's final text to the caller's sink.
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
 
@@ -2105,7 +2101,7 @@ func (h *StandardHarness) runExecutePhase(
 
 			blocked := TaskStatusBlocked
 			_ = taskList.Update(taskID, &blocked, nil)
-			h.persistTaskList(ctx, session, sessionID, taskList)
+			h.persistTaskList(ctx, sessionID, taskList)
 
 			var terminalReason HaltReason
 			if subResult.Reason.Kind == HaltBudgetExceeded {
@@ -2332,7 +2328,11 @@ func (h *StandardHarness) runPlanPhase(
 		_, _ = h.config.Hooks.Fire(ctx, hctx)
 	}
 
-	// R4: store the produced artifact in Extras["plan_execute"] as JSON.
+	// R4: persist the produced artifact to the RunStore seam under
+	// PlanExecuteExtrasKey (#76 — the durable single source of truth; no longer
+	// mirrored into SessionState.Extras). The Put result is swallowed (matching
+	// the execute-phase persist): a successfully-captured plan must not be lost
+	// to a storage hiccup (the default nil/no-op store never fails).
 	value, marshalErr := json.Marshal(artifact)
 	if marshalErr != nil {
 		return nil, &RunResult{
@@ -2346,10 +2346,9 @@ func (h *StandardHarness) runPlanPhase(
 			Turns:     budget.Turns,
 		}
 	}
-	if session.Extras == nil {
-		session.Extras = map[string]any{}
+	if h.config.RunStore != nil {
+		_ = h.config.RunStore.Put(ctx, sessionID, PlanExecuteExtrasKey, json.RawMessage(value))
 	}
-	session.Extras[PlanExecuteExtrasKey] = json.RawMessage(value)
 
 	return &planPhaseOutcome{
 		artifact: artifact,

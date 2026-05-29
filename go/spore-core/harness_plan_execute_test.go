@@ -41,16 +41,16 @@ func (s *fakeRunStore) get(sessionID SessionID, key string) (json.RawMessage, bo
 
 var _ RunStore = (*fakeRunStore)(nil)
 
-// extrasTaskList decodes the TaskList mirrored into SessionState.Extras.
-func extrasTaskList(t *testing.T, s SessionState) TaskList {
+// runStoreTaskList decodes the TaskList persisted to the RunStore seam under
+// TaskListExtrasKey (#76 — no longer mirrored into SessionState.Extras).
+func runStoreTaskList(t *testing.T, store *fakeRunStore, sessionID SessionID) TaskList {
 	t.Helper()
-	raw, ok := s.Extras[TaskListExtrasKey]
+	raw, ok := store.get(sessionID, TaskListExtrasKey)
 	if !ok {
-		t.Fatalf("no task list mirrored under %q; extras=%v", TaskListExtrasKey, s.Extras)
+		t.Fatalf("no task list present in run store under %q", TaskListExtrasKey)
 	}
-	b := mustJSON(t, raw)
 	var list TaskList
-	if err := json.Unmarshal(b, &list); err != nil {
+	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("decode task list: %v", err)
 	}
 	return list
@@ -88,7 +88,10 @@ func TestExecutePhaseDrainsPendingInProgressCompleted(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal("done one"))
 	a.Push(planFinal("done two"))
-	h := NewStandardHarness(standardCfg(a))
+	store := newFakeRunStore()
+	cfg := standardCfg(a)
+	cfg.RunStore = store
+	h := NewStandardHarness(cfg)
 	tk := planTask("build a CLI")
 	state := SessionState{}
 	list := PlanArtifactToTaskList(PlanArtifact{Tasks: []string{"one", "two"}})
@@ -102,7 +105,7 @@ func TestExecutePhaseDrainsPendingInProgressCompleted(t *testing.T) {
 	if r.Kind != RunSuccess || r.Output != "done two" {
 		t.Fatalf("got %+v", r)
 	}
-	final := extrasTaskList(t, state)
+	final := runStoreTaskList(t, store, tk.SessionID)
 	for _, x := range final.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("task %d status = %q, want completed", x.ID, x.Status)
@@ -374,6 +377,51 @@ func TestExecutePhasePlannerAgentRouting(t *testing.T) {
 	}
 	if len(def.results) != 0 {
 		t.Fatalf("default agent ran extra turns; want exactly the execute step")
+	}
+}
+
+// #76: after a plan/execute run, BOTH persistence keys live on the RunStore
+// seam and NEITHER is mirrored into SessionState.Extras. Drives the phases
+// directly (rather than Run) so the post-run state.Extras is observable. The
+// ephemeral extras keys (__rich_state, subagent_handoff_summary) are owned by
+// other components and untouched here.
+func TestPlanExecutePersistenceLivesOnRunStoreNotExtras(t *testing.T) {
+	a := NewMockAgent("planner")
+	a.Push(planFinal(`{"tasks":["one","two"],"rationale":"why"}`))
+	a.Push(planFinal("did one"))
+	a.Push(planFinal("did two"))
+	store := newFakeRunStore()
+	cfg := standardCfg(a)
+	cfg.RunStore = store
+	h := NewStandardHarness(cfg)
+
+	tk := planTask("build a CLI")
+	state := SessionState{}
+	outcome, failure := h.runPlanPhase(context.Background(), &tk, &state, BudgetSnapshot{}, nil)
+	if failure != nil {
+		t.Fatalf("unexpected plan-phase failure: %+v", *failure)
+	}
+	list := PlanArtifactToTaskList(outcome.artifact)
+	r := h.runExecutePhase(context.Background(), &tk, &state, list,
+		BudgetSnapshot{Turns: outcome.turns}, outcome.usage, nil)
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+
+	// Both keys are durable in the RunStore.
+	if _, ok := store.get(tk.SessionID, PlanExecuteExtrasKey); !ok {
+		t.Fatalf("plan artifact not present in run store under %q", PlanExecuteExtrasKey)
+	}
+	if _, ok := store.get(tk.SessionID, TaskListExtrasKey); !ok {
+		t.Fatalf("task list not present in run store under %q", TaskListExtrasKey)
+	}
+
+	// Neither key is mirrored into SessionState.Extras anymore.
+	if _, ok := state.Extras[PlanExecuteExtrasKey]; ok {
+		t.Fatalf("%q must not be mirrored into Extras", PlanExecuteExtrasKey)
+	}
+	if _, ok := state.Extras[TaskListExtrasKey]; ok {
+		t.Fatalf("%q must not be mirrored into Extras", TaskListExtrasKey)
 	}
 }
 

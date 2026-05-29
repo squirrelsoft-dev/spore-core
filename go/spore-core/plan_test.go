@@ -147,19 +147,16 @@ func planFinal(text string) TurnResult {
 	return NewFinalResponse(text, TokenUsage{InputTokens: 5, OutputTokens: 3})
 }
 
-// storedArtifact reads + decodes the artifact stored under PlanExecuteExtrasKey.
-func storedArtifact(t *testing.T, s SessionState) PlanArtifact {
+// storedArtifact reads + decodes the artifact persisted to the RunStore seam
+// under PlanExecuteExtrasKey (#76 — no longer mirrored into SessionState.Extras).
+func storedArtifact(t *testing.T, store *fakeRunStore, sessionID SessionID) PlanArtifact {
 	t.Helper()
-	raw, ok := s.Extras[PlanExecuteExtrasKey]
+	raw, ok := store.get(sessionID, PlanExecuteExtrasKey)
 	if !ok {
-		t.Fatalf("no artifact stored under %q; extras=%v", PlanExecuteExtrasKey, s.Extras)
-	}
-	b, err := json.Marshal(raw)
-	if err != nil {
-		t.Fatalf("re-marshal extras: %v", err)
+		t.Fatalf("no artifact present in run store under %q", PlanExecuteExtrasKey)
 	}
 	var a PlanArtifact
-	if err := json.Unmarshal(b, &a); err != nil {
+	if err := json.Unmarshal(raw, &a); err != nil {
 		t.Fatalf("decode artifact: %v", err)
 	}
 	return a
@@ -170,11 +167,14 @@ func storedArtifact(t *testing.T, s SessionState) PlanArtifact {
 func TestPlanPhaseRunsOnceAndStoresArtifact(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["one","two"],"rationale":"r"}`))
+	store := newFakeRunStore()
 	cfg := standardCfg(a)
+	cfg.RunStore = store
 	h := NewStandardHarness(cfg)
 
+	task := planTask("build it")
 	state := SessionState{}
-	outcome, failure := h.runPlanPhase(context.Background(), ptrTask(planTask("build it")), &state, BudgetSnapshot{}, nil)
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
 	if failure != nil {
 		t.Fatalf("unexpected failure: %+v", *failure)
 	}
@@ -182,7 +182,7 @@ func TestPlanPhaseRunsOnceAndStoresArtifact(t *testing.T) {
 		t.Fatalf("turns = %d, want 1", outcome.turns)
 	}
 	// R3 / R4
-	got := storedArtifact(t, state)
+	got := storedArtifact(t, store, task.SessionID)
 	if len(got.Tasks) != 2 || got.Tasks[0] != "one" || got.Tasks[1] != "two" || got.Rationale != "r" {
 		t.Fatalf("stored artifact = %+v", got)
 	}
@@ -217,13 +217,16 @@ func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
 	a.Push(NewToolCallRequested([]ToolCall{
 		{ID: "c1", Name: "x", Input: json.RawMessage(`{}`)},
 	}, TokenUsage{InputTokens: 1, OutputTokens: 1}))
+	store := newFakeRunStore()
 	cfg := standardCfg(a)
+	cfg.RunStore = store
 	reg := NewScriptedToolRegistry()
 	cfg.ToolRegistry = reg
 	h := NewStandardHarness(cfg)
 
+	task := planTask("do")
 	state := SessionState{}
-	outcome, failure := h.runPlanPhase(context.Background(), ptrTask(planTask("do")), &state, BudgetSnapshot{}, nil)
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
 	if outcome != nil || failure == nil {
 		t.Fatalf("expected failure, got outcome=%+v failure=%v", outcome, failure)
 	}
@@ -236,7 +239,7 @@ func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
 		t.Fatalf("tool registry dispatched %d times", reg.CallCount.Load())
 	}
 	// No artifact stored.
-	if _, ok := state.Extras[PlanExecuteExtrasKey]; ok {
+	if _, ok := store.get(task.SessionID, PlanExecuteExtrasKey); ok {
 		t.Fatal("artifact stored despite planning failure")
 	}
 }
@@ -246,10 +249,14 @@ func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
 func TestPlanPhaseUnparseableIsPlanPhaseFailed(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal("this is not json"))
-	h := NewStandardHarness(standardCfg(a))
+	store := newFakeRunStore()
+	cfg := standardCfg(a)
+	cfg.RunStore = store
+	h := NewStandardHarness(cfg)
 
+	task := planTask("do")
 	state := SessionState{}
-	outcome, failure := h.runPlanPhase(context.Background(), ptrTask(planTask("do")), &state, BudgetSnapshot{}, nil)
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
 	if outcome != nil || failure == nil {
 		t.Fatalf("expected failure, got outcome=%+v failure=%v", outcome, failure)
 	}
@@ -257,7 +264,7 @@ func TestPlanPhaseUnparseableIsPlanPhaseFailed(t *testing.T) {
 		failure.Reason.PlanError.Kind != PlanErrorUnparseablePlan {
 		t.Fatalf("got %+v", failure.Reason)
 	}
-	if _, ok := state.Extras[PlanExecuteExtrasKey]; ok {
+	if _, ok := store.get(task.SessionID, PlanExecuteExtrasKey); ok {
 		t.Fatal("artifact stored despite unparseable plan")
 	}
 }
@@ -357,7 +364,10 @@ func TestPlanPhaseRecordsOneTurnSpan(t *testing.T) {
 func TestPlanPhaseBudgetExhaustedBeforeTurn(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["x"]}`)) // should never be consumed
-	h := NewStandardHarness(standardCfg(a))
+	store := newFakeRunStore()
+	cfg := standardCfg(a)
+	cfg.RunStore = store
+	h := NewStandardHarness(cfg)
 
 	task := planTask("do")
 	max := uint32(1)
@@ -372,7 +382,7 @@ func TestPlanPhaseBudgetExhaustedBeforeTurn(t *testing.T) {
 	if failure.Reason.Kind != HaltBudgetExceeded || failure.Reason.LimitType != BudgetLimitTurns {
 		t.Fatalf("got %+v", failure.Reason)
 	}
-	if _, ok := state.Extras[PlanExecuteExtrasKey]; ok {
+	if _, ok := store.get(task.SessionID, PlanExecuteExtrasKey); ok {
 		t.Fatal("artifact stored despite budget exhaustion")
 	}
 	if len(a.results) != 1 {
@@ -384,7 +394,9 @@ func TestPlanPhaseBudgetExhaustedBeforeTurn(t *testing.T) {
 func TestPlanPhaseOnPlanCreatedMutationIsStored(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["a"],"rationale":"orig"}`))
+	store := newFakeRunStore()
 	cfg := standardCfg(a)
+	cfg.RunStore = store
 
 	chain := NewStandardHookChain()
 	if err := chain.Register(NewFunctionHook("mutate", []HookEvent{HookEventOnPlanCreated},
@@ -398,8 +410,9 @@ func TestPlanPhaseOnPlanCreatedMutationIsStored(t *testing.T) {
 	cfg.Hooks = chain
 	h := NewStandardHarness(cfg)
 
+	task := planTask("do")
 	state := SessionState{}
-	outcome, failure := h.runPlanPhase(context.Background(), ptrTask(planTask("do")), &state, BudgetSnapshot{}, nil)
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
 	if failure != nil {
 		t.Fatalf("unexpected failure: %+v", *failure)
 	}
@@ -408,7 +421,7 @@ func TestPlanPhaseOnPlanCreatedMutationIsStored(t *testing.T) {
 		t.Fatalf("outcome artifact = %+v", outcome.artifact)
 	}
 	// ...and the stored artifact reflects the mutation.
-	got := storedArtifact(t, state)
+	got := storedArtifact(t, store, task.SessionID)
 	if len(got.Tasks) != 2 || got.Tasks[1] != "injected" || got.Rationale != "rewritten" {
 		t.Fatalf("stored artifact = %+v", got)
 	}
