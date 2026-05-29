@@ -547,6 +547,11 @@ export class StandardHarness implements Harness {
         break;
       case "waiting_for_human":
         break;
+      case "escalate":
+        // Escalation propagated from an execute step (#80) is a clean terminal
+        // outcome; finalize with the dedicated `escalated` outcome.
+        await this.finalizeObservability(result.session_id, { kind: "escalated" });
+        break;
     }
   }
 
@@ -1032,6 +1037,11 @@ export class StandardHarness implements Harness {
       case "waiting_for_human":
         // Not terminal — do not finalize.
         break;
+      case "escalate":
+        // Escalation is a clean terminal outcome (#80). Finalize observability
+        // with the dedicated `escalated` outcome (NOT `partial`).
+        await this.finalizeObservability(result.session_id, { kind: "escalated" });
+        break;
     }
     return result;
   }
@@ -1452,6 +1462,38 @@ export class StandardHarness implements Harness {
                 child_state: child,
               };
               return { kind: "waiting_for_human", state: ps, request: output.request };
+            }
+
+            // Escalate (#80): the tool requests a structural state change from
+            // the harness's parent. The harness is a pure intermediary — it
+            // does NOT append the escalation to message history (it is a control
+            // signal, not a conversation turn), preserves the remaining batch
+            // tool calls into `pending_tool_calls` for a possible resume, and
+            // returns the `escalate` RunResult carrying the signal + full
+            // PausedState. The signal is NOT stored in PausedState, so it is
+            // discarded on resume — the harness never re-acts on it.
+            if (output.kind === "escalate") {
+              const remaining = calls.slice(i + 1);
+              const ps: PausedState = {
+                session_id: sessionId,
+                task_id: task.id,
+                turn_number: budgetUsed.turns,
+                session_state: sessionState,
+                pending_tool_calls: remaining,
+                approved_results: approvedResults,
+                // No human_request on an escalation pause (#80, optional field).
+                task,
+                budget_used: budgetUsed,
+                child_state: null,
+              };
+              return {
+                kind: "escalate",
+                signal: output.signal,
+                state: ps,
+                session_id: sessionId,
+                usage,
+                turns: budgetUsed.turns,
+              };
             }
 
             // Layer-2: unrecoverable tool error halts immediately.

@@ -484,7 +484,8 @@ export interface ToolResult {
   output:
     | { kind: "success"; content: string; truncated?: boolean }
     | { kind: "error"; message: string; recoverable?: boolean }
-    | { kind: "waiting_for_human"; [k: string]: unknown };
+    | { kind: "waiting_for_human"; [k: string]: unknown }
+    | { kind: "escalate"; [k: string]: unknown };
 }
 
 // ============================================================================

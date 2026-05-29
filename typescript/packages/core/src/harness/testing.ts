@@ -42,6 +42,12 @@ export class NoopContextManager implements ContextManager {
       case "waiting_for_human":
         text = "[waiting]";
         break;
+      case "escalate":
+        // Never reached at runtime: the harness returns RunResult.escalate
+        // before appending an escalation to history (#80). Present for
+        // exhaustiveness.
+        text = "[escalate]";
+        break;
     }
     session.messages.push({ role: "tool", content: { type: "text", text } });
   }

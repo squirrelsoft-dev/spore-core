@@ -275,5 +275,7 @@ function renderToolOutput(result: ToolResultRecord): string {
       return result.output.message;
     case "waiting_for_human":
       return "";
+    case "escalate":
+      return "";
   }
 }

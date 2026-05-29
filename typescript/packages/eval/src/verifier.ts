@@ -524,6 +524,7 @@ function sessionIdOf(run: RunResult): SessionId {
   switch (run.kind) {
     case "success":
     case "failure":
+    case "escalate":
       return run.session_id;
     case "waiting_for_human":
       return run.state.session_id;

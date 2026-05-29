@@ -378,6 +378,8 @@ function renderToolOutput(result: ToolResult): string {
       return `[error] ${result.output.message}`;
     case "waiting_for_human":
       return "[waiting]";
+    case "escalate":
+      return "[escalate]";
   }
 }
 

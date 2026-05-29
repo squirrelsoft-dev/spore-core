@@ -169,11 +169,19 @@ export const SessionOutcomeSchema = z.discriminatedUnion("kind", [
     reason: z.string(),
   }),
   z.object({ kind: z.literal("partial") }),
+  z.object({ kind: z.literal("escalated") }),
 ]);
 export type SessionOutcome =
   | { kind: "success" }
   | { kind: "failure"; reason: string }
-  | { kind: "partial" };
+  | { kind: "partial" }
+  /**
+   * The session terminated cleanly because a tool escalated a structural
+   * signal to the harness's caller (#80, Tool Escalation Protocol). Distinct
+   * from `partial` — an escalation is an intentional, clean terminal outcome,
+   * not a partial success.
+   */
+  | { kind: "escalated" };
 
 // ============================================================================
 // Guide

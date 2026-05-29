@@ -159,6 +159,11 @@ export class SubagentTool implements Tool {
           request: result.request,
         };
       }
+      // A child harness escalation (#80) re-escalates through the parent's
+      // dispatch: the parent loop recognizes `escalate` and terminates cleanly,
+      // propagating the same signal up. Mirrors the Rust subagent tool.
+      case "escalate":
+        return { kind: "escalate", signal: result.signal };
     }
   }
 }

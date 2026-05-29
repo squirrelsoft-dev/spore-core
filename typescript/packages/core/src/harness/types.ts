@@ -16,6 +16,8 @@ import { z } from "zod";
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
 import type { PlanPhaseErrorKind } from "../plan/types.js";
+import type { PlanArtifact } from "../plan/types.js";
+import type { Mode } from "../prompt-chunk-registry/types.js";
 import type {
   CompactionPreserveHints,
   SessionState as ContextSessionState,
@@ -235,11 +237,63 @@ export type StreamSink = (event: HarnessStreamEvent) => void;
 // Forward-declared sibling component types
 // ============================================================================
 
+/**
+ * Tool Escalation Protocol — the typed channel by which a tool signals the
+ * harness to terminate cleanly and pass a *structural* state change up to its
+ * caller (issue #80).
+ *
+ * The harness is a pure intermediary: it never acts on a signal itself. Mode
+ * switching, plan approval, and graceful abort are the caller's concern. The
+ * harness terminates cleanly, surfaces the signal via the `escalate`
+ * {@link RunResult}, and the caller (CLI, chat UI, REST API, parent harness)
+ * owns the orchestration. This mirrors the `waiting_for_human` model — the
+ * harness does not resume itself either.
+ *
+ * Variants:
+ * - `enter_plan_mode` — agent requests entry into plan mode, carrying
+ *   accumulated context as a seed for the planning harness.
+ * - `exit_plan_mode` — planning agent's terminal signal, carrying the produced
+ *   {@link PlanArtifact} for human approval before an execution harness is
+ *   instantiated.
+ * - `switch_mode` — agent requests a mode switch; carries the target
+ *   {@link Mode} (the EXISTING mode enum — there is no separate `HarnessMode`).
+ * - `abort` — agent requests a graceful, intentional stop with a reason.
+ *   Distinct from a `HaltReason` `agent_error` — it surfaces as an `escalate`
+ *   {@link RunResult}, NOT a `failure`.
+ *
+ * Wire format: tagged on `kind`, `snake_case`, byte-identical across the four
+ * language implementations. Round-tripped by
+ * `fixtures/harness/escalation_signals.json`.
+ */
+export const HarnessSignalSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("enter_plan_mode"), context: z.string() }),
+  z.object({
+    kind: z.literal("exit_plan_mode"),
+    plan: z.object({ tasks: z.array(z.string()), rationale: z.string() }),
+  }),
+  z.object({
+    kind: z.literal("switch_mode"),
+    mode: z.enum(["always_ask", "auto_edit", "plan", "safe_auto", "yolo"]),
+  }),
+  z.object({ kind: z.literal("abort"), reason: z.string() }),
+]);
+export type HarnessSignal =
+  | { kind: "enter_plan_mode"; context: string }
+  | { kind: "exit_plan_mode"; plan: PlanArtifact }
+  | { kind: "switch_mode"; mode: Mode }
+  | { kind: "abort"; reason: string };
+
 /** Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing. */
 export type ToolOutput =
   | { kind: "success"; content: string; truncated?: boolean }
   | { kind: "error"; message: string; recoverable: boolean }
-  | { kind: "waiting_for_human"; child_state: ChildPausedState; request: HumanRequest };
+  | { kind: "waiting_for_human"; child_state: ChildPausedState; request: HumanRequest }
+  /**
+   * Tool requests a structural state change from the harness's parent (#80).
+   * The harness terminates cleanly and passes the signal to the caller via the
+   * `escalate` {@link RunResult}. NOT appended to message history.
+   */
+  | { kind: "escalate"; signal: HarnessSignal };
 
 export interface ToolResultRecord {
   call_id: string;
@@ -550,7 +604,13 @@ export interface ChildPausedState {
   session_state: SessionState;
   pending_tool_calls: ToolCall[];
   approved_results: ToolResultRecord[];
-  human_request: HumanRequest;
+  /**
+   * Optional (#80): a `waiting_for_human` pause always sets it; an `escalate`
+   * pause omits it (the escalation carries no human request). Old
+   * `waiting_for_human` blobs still deserialize (field present); escalation
+   * blobs omit it (undefined/null on the wire).
+   */
+  human_request?: HumanRequest;
   task: Task;
   budget_used: BudgetSnapshot;
   parent_tool_call_id: string;
@@ -563,7 +623,13 @@ export interface PausedState {
   session_state: SessionState;
   pending_tool_calls: ToolCall[];
   approved_results: ToolResultRecord[];
-  human_request: HumanRequest;
+  /**
+   * Optional (#80): a `waiting_for_human` pause always sets it; an `escalate`
+   * pause omits it (the escalation carries no human request). The `escalate`
+   * {@link RunResult} preserves the full {@link PausedState} with this field
+   * absent.
+   */
+  human_request?: HumanRequest;
   task: Task;
   budget_used: BudgetSnapshot;
   child_state: ChildPausedState | null;
@@ -622,7 +688,23 @@ export type RunResult =
       usage: AggregateUsage;
       turns: number;
     }
-  | { kind: "waiting_for_human"; state: PausedState; request: HumanRequest };
+  | { kind: "waiting_for_human"; state: PausedState; request: HumanRequest }
+  /**
+   * Harness terminated cleanly due to a tool escalation signal (#80). The
+   * caller handles the signal and decides whether to resume, instantiate a new
+   * harness, or present UI. `state` preserves the full {@link PausedState}
+   * (with `human_request` absent) so the original harness can be resumed; the
+   * signal is NOT stored in `state`, so it is discarded on resume — the harness
+   * never re-acts on it.
+   */
+  | {
+      kind: "escalate";
+      signal: HarnessSignal;
+      state: PausedState;
+      session_id: SessionId;
+      usage: AggregateUsage;
+      turns: number;
+    };
 
 // ============================================================================
 // HarnessRunOptions

@@ -112,6 +112,15 @@ function view(label: string, r: RunResult): ResultView {
           `this is a misconfiguration signal (the ${label} should run to completion ` +
           `before being verified)`,
       };
+    // An escalation (#80) is a clean terminal stop, but the verifier expects a
+    // completed run — surface it as a misconfiguration like the paused case.
+    case "escalate":
+      return {
+        kind: "failed",
+        reason:
+          `${label} run escalated (${r.signal.kind}) — verifier received an escalated ` +
+          `harness; the caller must handle the signal before verification`,
+      };
   }
 }
 
