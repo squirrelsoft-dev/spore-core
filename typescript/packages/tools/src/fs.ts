@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { SandboxProvider, ToolCall, ToolOutput } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
 type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 type ToolSchema = toolRegistry.ToolSchema;
 
 import { toolExecutionErrorToOutput } from "./errors.js";
@@ -56,7 +57,11 @@ export class ReadFileTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(ReadFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const resolved = await sbResolvePath(sandbox, p.value.path, "read");
@@ -109,7 +114,11 @@ export class WriteFileTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(WriteFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const { path, content, append } = p.value;
@@ -170,7 +179,11 @@ export class ListDirTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(ListDirParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const resolved = await sbResolvePath(sandbox, p.value.path, "read");
@@ -247,7 +260,11 @@ export class DeleteFileTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(DeleteFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const resolved = await sbResolvePath(sandbox, p.value.path, "write");
@@ -299,7 +316,11 @@ export class MoveFileTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(MoveFileParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const src = await sbResolvePath(sandbox, p.value.src, "write");

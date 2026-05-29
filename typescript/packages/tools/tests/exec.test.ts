@@ -6,12 +6,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { harnessTesting, type ToolCall } from "@spore/core";
+import { harnessTesting, toolRegistry, type ToolCall } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
 import { BashCommandTool, ExecTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
+// Storage seam (#75): these tools ignore ctx, but the signature requires one.
+const ctx = toolRegistry.toolRegistryMock.testCtx();
 
 function call(name: string, input: unknown): ToolCall {
   return { id: "c1", name, input };
@@ -27,6 +29,7 @@ describe("ExecTool", () => {
     const r = await new ExecTool().execute(
       call("exec", { command: "echo", args: ["hi"] }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
@@ -49,6 +52,7 @@ describe("ExecTool", () => {
           args: ["a|b", "$(whoami)", ">out"],
         }),
         sb,
+        ctx,
       );
     } finally {
       process.chdir(prev);
@@ -65,6 +69,7 @@ describe("ExecTool", () => {
     const r = await new ExecTool().execute(
       call("exec", { command: "false" }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
@@ -78,6 +83,7 @@ describe("ExecTool", () => {
       const r = await new ExecTool().execute(
         call("exec", { command: "sleep", args: ["5"], timeout: 1 }),
         sb,
+        ctx,
       );
       expect(r.kind).toBe("error");
       if (r.kind !== "error") throw new Error("unreachable");
@@ -89,7 +95,7 @@ describe("ExecTool", () => {
 
   it("invalid params returns recoverable error", async () => {
     const sb = new AllowAllSandbox();
-    const r = await new ExecTool().execute(call("exec", {}), sb);
+    const r = await new ExecTool().execute(call("exec", {}), sb, ctx);
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);
@@ -104,6 +110,7 @@ describe("BashCommandTool", () => {
     const r = await new BashCommandTool().execute(
       call("bash_command", { script: "printf 'hi' | tr a-z A-Z" }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
@@ -117,6 +124,7 @@ describe("BashCommandTool", () => {
     const r = await new BashCommandTool().execute(
       call("bash_command", { script: `printf 'data' > ${target}` }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     expect(readFileSync(target, "utf8")).toBe("data");
@@ -128,6 +136,7 @@ describe("BashCommandTool", () => {
     const r = await new BashCommandTool().execute(
       call("bash_command", { script: "exit 3" }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
@@ -141,6 +150,7 @@ describe("BashCommandTool", () => {
       const r = await new BashCommandTool().execute(
         call("bash_command", { script: "sleep 5", timeout: 1 }),
         sb,
+        ctx,
       );
       expect(r.kind).toBe("error");
       if (r.kind !== "error") throw new Error("unreachable");
@@ -152,7 +162,11 @@ describe("BashCommandTool", () => {
 
   it("invalid params returns recoverable error", async () => {
     const sb = new AllowAllSandbox();
-    const r = await new BashCommandTool().execute(call("bash_command", {}), sb);
+    const r = await new BashCommandTool().execute(
+      call("bash_command", {}),
+      sb,
+      ctx,
+    );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);

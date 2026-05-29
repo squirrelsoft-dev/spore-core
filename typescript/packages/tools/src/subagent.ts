@@ -18,6 +18,7 @@ import type {
 import { newTask, SessionId, type toolRegistry } from "@spore/core";
 
 type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 type ToolRegistry = toolRegistry.ToolRegistry;
 
 /** How the subagent inherits / does not inherit context from its parent. */
@@ -96,6 +97,7 @@ export class SubagentTool implements Tool {
   async execute(
     call: ToolCall,
     _sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const input = call.input;

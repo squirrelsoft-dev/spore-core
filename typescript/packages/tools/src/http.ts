@@ -5,6 +5,7 @@
 import type { SandboxProvider, ToolCall, ToolOutput } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
 type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 type ToolSchema = toolRegistry.ToolSchema;
 
 import { toolExecutionErrorToOutput } from "./errors.js";
@@ -59,6 +60,7 @@ export class HttpGetTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(HttpGetParamsSchema, call);
@@ -115,6 +117,7 @@ export class HttpPostTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(HttpPostParamsSchema, call);

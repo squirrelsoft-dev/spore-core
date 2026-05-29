@@ -16,7 +16,7 @@ import { toolRegistry } from "../src/index.js";
 
 const {
   StandardToolRegistry,
-  toolRegistryMock: { EchoTool, AllowAllSandbox },
+  toolRegistryMock: { EchoTool, AllowAllSandbox, testCtx },
 } = toolRegistry;
 type ToolSchema = toolRegistry.ToolSchema;
 type ToolSet = toolRegistry.ToolSet;
@@ -54,6 +54,7 @@ describe("ToolRegistry fixture replay", () => {
       const result = await reg.dispatch(
         { id: sc.call.id, name: sc.call.name, input: sc.call.input },
         new AllowAllSandbox(),
+        testCtx(),
       );
       if (sc.expected.kind === "ok") {
         expect(result.ok).toBe(true);

@@ -38,37 +38,33 @@
  * - R6  `completed` is terminal: ANY transition OUT of `completed` is rejected
  *   (the idempotent `completed → completed` self-transition is allowed).
  * - R7  Self-transitions `X → X` are idempotent and always allowed.
- * - R8  Persistence is interim, through the FILESYSTEM via the
- *   {@link SandboxProvider} read-modify-write at {@link TASK_LIST_PATH}
- *   (DECISION 2). The tool does NOT touch `SessionState.extras`; #59 owns the
- *   extras mirror.
+ * - R8  Persistence is through the storage seam (#75): the standalone
+ *   `task_list` tool (in `@spore/tools`) persists via the
+ *   {@link "../storage/types.js".RunStore} on the `ToolContext`, keyed by
+ *   `SessionId` under {@link TASK_LIST_EXTRAS_KEY}. The retired interim sandbox
+ *   path (`.spore/task_list.json`) is GONE; with the library's default no-op
+ *   storage a standalone tool call persists nothing across processes (an
+ *   accepted behavior change — no migration shim). #59's execute loop shares the
+ *   same `RunStore` key.
  *
  * Both design forks (transition matrix, state seam) were resolved before
  * implementation.
  */
 
-import { promises as fs } from "node:fs";
-import { dirname } from "node:path";
-
 import { z } from "zod";
 
-import type { Operation, SandboxProvider, SandboxViolation } from "../harness/types.js";
 import type { PlanArtifact } from "../plan/index.js";
 
 /**
- * Key under which the {@link TaskList} is mirrored into `SessionState.extras`
- * (serialized JSON) by the harness / #59. Mirrors `PLAN_EXECUTE_EXTRAS_KEY`.
- * Stable across all four languages. NOTE: #71 itself does NOT write this key
- * (the `Tool` interface has no `SessionState` access); it is the contract the
- * harness-side mirror uses.
+ * Key under which the {@link TaskList} is persisted in the
+ * {@link "../storage/types.js".RunStore}, keyed by `SessionId`. Both the
+ * harness-side #59 execute loop and the standalone `task_list` tool (#75) share
+ * this single key, so a standalone tool call and a PlanExecute run on the same
+ * session intentionally share one blob. Stable across all four languages. The
+ * JSON shape is the canonical serialized {@link TaskList}
+ * (`{"tasks":[...],"next_id":N}`).
  */
 export const TASK_LIST_EXTRAS_KEY = "task_list";
-
-/**
- * Canonical on-disk location of the persisted task list, relative to the
- * sandbox/workspace root. Resolved through {@link SandboxProvider.resolvePath}.
- */
-export const TASK_LIST_PATH = ".spore/task_list.json";
 
 // ============================================================================
 // Types
@@ -322,111 +318,4 @@ export function planArtifactToTaskList(artifact: PlanArtifact): TaskList {
     addTask(list, step); // verbatim; appends pending; bumps next_id
   }
   return list;
-}
-
-// ============================================================================
-// Disk persistence (interim — DECISION 2, mirrors the plan-phase precedent)
-// ============================================================================
-
-/** Failure modes of {@link loadTaskList}. */
-export type LoadError =
-  | { kind: "sandbox"; violation: SandboxViolation }
-  | { kind: "parse"; reason: string };
-
-/** Failure modes of {@link storeTaskList}. */
-export type StoreError =
-  | { kind: "sandbox"; violation: SandboxViolation }
-  | { kind: "serialize"; reason: string }
-  | { kind: "io"; reason: string };
-
-export type LoadResult = { ok: true; list: TaskList } | { ok: false; error: LoadError };
-
-export type StoreResult = { ok: true } | { ok: false; error: StoreError };
-
-function isSandboxViolation(v: unknown): v is SandboxViolation {
-  return typeof v === "object" && v !== null && "kind" in v;
-}
-
-async function resolve(
-  sandbox: SandboxProvider,
-  op: Operation,
-): Promise<string | SandboxViolation> {
-  if (sandbox.resolvePath) return sandbox.resolvePath(TASK_LIST_PATH, op);
-  // Identity fallback for sandboxes that don't override resolvePath.
-  return TASK_LIST_PATH;
-}
-
-/**
- * Load the persisted {@link TaskList} from {@link TASK_LIST_PATH} via the
- * sandbox.
- *
- * An absent file (the expected first-run path) yields {@link defaultTaskList}.
- * A present-but-malformed file surfaces a `parse` error so the tool boundary can
- * map it to a recoverable error rather than silently discarding state.
- */
-export async function loadTaskList(sandbox: SandboxProvider): Promise<LoadResult> {
-  const resolved = await resolve(sandbox, "read");
-  if (isSandboxViolation(resolved)) {
-    return { ok: false, error: { kind: "sandbox", violation: resolved } };
-  }
-  let text: string;
-  try {
-    text = await fs.readFile(resolved, "utf8");
-  } catch {
-    // Absent (or unreadable) file → fresh list.
-    return { ok: true, list: defaultTaskList() };
-  }
-  try {
-    return { ok: true, list: parseTaskList(text) };
-  } catch (e) {
-    return {
-      ok: false,
-      error: {
-        kind: "parse",
-        reason: e instanceof Error ? e.message : String(e),
-      },
-    };
-  }
-}
-
-/**
- * Persist `list` to {@link TASK_LIST_PATH} via the sandbox, creating the parent
- * directory (`.spore/`) if needed. Serialization is the canonical compact form
- * (field order `tasks` then `next_id`).
- */
-export async function storeTaskList(
-  list: TaskList,
-  sandbox: SandboxProvider,
-): Promise<StoreResult> {
-  const resolved = await resolve(sandbox, "write");
-  if (isSandboxViolation(resolved)) {
-    return { ok: false, error: { kind: "sandbox", violation: resolved } };
-  }
-  let json: string;
-  try {
-    json = serializeTaskList(list);
-  } catch (e) {
-    return {
-      ok: false,
-      error: {
-        kind: "serialize",
-        reason: e instanceof Error ? e.message : String(e),
-      },
-    };
-  }
-  try {
-    // Best-effort parent creation; ignore "already exists".
-    await fs.mkdir(dirname(resolved), { recursive: true });
-  } catch {
-    // Ignore — a real write failure surfaces below.
-  }
-  try {
-    await fs.writeFile(resolved, json, "utf8");
-    return { ok: true };
-  } catch (e) {
-    return {
-      ok: false,
-      error: { kind: "io", reason: e instanceof Error ? e.message : String(e) },
-    };
-  }
 }

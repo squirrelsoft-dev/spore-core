@@ -3,15 +3,17 @@
  * fixture replay (spore-core issue #4).
  */
 
+import { SessionId } from "../harness/types.js";
 import type { ToolCall } from "../model/schemas.js";
 import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
-import type { Tool } from "./types.js";
+import { InMemoryStorageProvider } from "../storage/providers.js";
+import { ToolContext, type Tool } from "./types.js";
 
 /** Echo tool — returns its input serialised as JSON. Intended `read_only: true`. */
 export class EchoTool implements Tool {
   callCount = 0;
   constructor(readonly name: string) {}
-  async execute(call: ToolCall, _sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(call: ToolCall, _sandbox: SandboxProvider, _ctx: ToolContext): Promise<ToolOutput> {
     this.callCount += 1;
     return {
       kind: "success",
@@ -24,7 +26,11 @@ export class EchoTool implements Tool {
 /** Failing tool — returns a recoverable error. */
 export class FailingTool implements Tool {
   constructor(readonly name: string) {}
-  async execute(_call: ToolCall, _sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    _call: ToolCall,
+    _sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     return { kind: "error", message: "boom", recoverable: true };
   }
 }
@@ -33,9 +39,21 @@ export class FailingTool implements Tool {
 export class SubagentMockTool implements Tool {
   readonly isSubagentTool = true;
   constructor(readonly name: string) {}
-  async execute(_call: ToolCall, _sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    _call: ToolCall,
+    _sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     return { kind: "success", content: "subagent done", truncated: false };
   }
+}
+
+/**
+ * Build a throwaway {@link ToolContext} for tests: a fresh in-memory run store
+ * and a fixed test session id. Mirrors Rust's `mock::test_ctx`.
+ */
+export function testCtx(): ToolContext {
+  return new ToolContext(SessionId.of("test-session"), new InMemoryStorageProvider());
 }
 
 /** Permissive sandbox stub — accepts everything. */

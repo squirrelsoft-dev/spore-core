@@ -2,13 +2,14 @@
  * Public re-exports for the `tasklist` component (spore-core issue #71).
  *
  * The single mutating tool (`task_list`) lives in `@spore/tools`; this module
- * owns the types, the transition matrix, the mutation helpers, and the
- * disk-persistence helpers it drives.
+ * owns the types, the transition matrix, and the mutation helpers it drives.
+ * Persistence is the storage seam (#75): the tool reads/writes the
+ * {@link "../storage/types.js".RunStore} keyed by `SessionId` under
+ * {@link TASK_LIST_EXTRAS_KEY}.
  */
 
 export {
   TASK_LIST_EXTRAS_KEY,
-  TASK_LIST_PATH,
   TaskStatusSchema,
   type TaskStatus,
   TaskSchema,
@@ -27,10 +28,4 @@ export {
   updateTask,
   completeTask,
   planArtifactToTaskList,
-  type LoadError,
-  type StoreError,
-  type LoadResult,
-  type StoreResult,
-  loadTaskList,
-  storeTaskList,
 } from "./types.js";

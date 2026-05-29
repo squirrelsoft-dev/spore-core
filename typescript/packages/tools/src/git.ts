@@ -11,6 +11,7 @@ import type {
 } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
 type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 type ToolSchema = toolRegistry.ToolSchema;
 
 import { toolExecutionErrorToOutput } from "./errors.js";
@@ -82,6 +83,7 @@ export class GitLogTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(GitLogParamsSchema, call);
@@ -131,6 +133,7 @@ export class GitDiffTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(GitDiffParamsSchema, call);
@@ -181,6 +184,7 @@ export class GitCommitTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(GitCommitParamsSchema, call);
@@ -238,6 +242,7 @@ export class GitStatusTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const out = await runGit(["status", "--porcelain"], sandbox, signal);
@@ -283,6 +288,7 @@ export class GitResetTool implements Tool {
   async execute(
     call: ToolCall,
     sandbox: SandboxProvider,
+    _ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<ToolOutput> {
     const p = parseParams(GitResetParamsSchema, call);

@@ -50,9 +50,12 @@ import {
   type ToolSchema as ModelToolSchema,
   type ToolRegistry as HarnessToolRegistry,
   toolRegistry,
+  type storage,
   HarnessBuilder,
   type StandardHarness,
 } from "@spore/core";
+
+type RunStore = storage.RunStore;
 
 import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
 import { BashCommandTool, ExecTool } from "./exec.js";
@@ -92,17 +95,33 @@ export function toModelSchema(schema: RegistryToolSchema): ModelToolSchema {
  * A {@link DispatchError} becomes a **recoverable** error {@link ToolOutput} so
  * the loop appends it as a tool result rather than halting — S4 depends on
  * this. No bridged tool is marked always-halt.
+ *
+ * ## Storage seam (#75)
+ *
+ * Per the construction-injection decision, the bridge is given the run's
+ * {@link SessionId} and a {@link RunStore} at construction time (it is already
+ * built per-run). It builds a {@link toolRegistry.ToolContext} from those
+ * injected fields and forwards it into the inner registry on every dispatch.
+ * This keeps the harness-loop `dispatch(call)` signature unchanged while
+ * threading storage to tools. With the library's default no-op storage a
+ * standalone `task_list` call persists nothing across processes (accepted
+ * behavior change — see the tool's doc-comment).
  */
 export class RealToolRegistry implements HarnessToolRegistry {
   private readonly _schemas: ModelToolSchema[];
+  private readonly ctx: toolRegistry.ToolContext;
 
   constructor(
     private readonly inner: toolRegistry.StandardToolRegistry,
     private readonly sandbox: SandboxProvider,
+    sessionId: SessionId,
+    runStore: RunStore,
   ) {
     // Snapshot the model-facing schemas (sorted by name; activeSchemas already
     // sorts) once at construction; the catalog is fixed for a scenario run.
     this._schemas = inner.activeSchemas(null).map(toModelSchema);
+    // Build the storage seam once per run from the injected session + store.
+    this.ctx = new toolRegistry.ToolContext(sessionId, runStore);
   }
 
   /** The model-facing tool schemas, sorted by name. */
@@ -111,7 +130,12 @@ export class RealToolRegistry implements HarnessToolRegistry {
   }
 
   async dispatch(call: ToolCall, signal?: AbortSignal): Promise<ToolOutput> {
-    const outcome = await this.inner.dispatch(call, this.sandbox, signal);
+    const outcome = await this.inner.dispatch(
+      call,
+      this.sandbox,
+      this.ctx,
+      signal,
+    );
     if (outcome.ok) return outcome.result.output;
     return {
       kind: "error",

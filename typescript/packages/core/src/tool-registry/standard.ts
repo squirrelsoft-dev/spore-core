@@ -13,6 +13,7 @@ import {
   type RegistrationError,
   type TaskPhase,
   type Tool,
+  type ToolContext,
   type ToolRegistry,
   type ToolResult,
   type ToolSchema,
@@ -95,6 +96,7 @@ export class StandardToolRegistry implements ToolRegistry {
   async dispatch(
     call: ToolCall,
     sandbox: SandboxProvider,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<DispatchOutcome> {
     const reg = this.tools.get(call.name);
@@ -113,7 +115,7 @@ export class StandardToolRegistry implements ToolRegistry {
     const inputErr = validateInput(reg.schema, call);
     if (inputErr) return { ok: false, error: inputErr };
 
-    const output: ToolOutput = await reg.tool.execute(call, sandbox, signal);
+    const output: ToolOutput = await reg.tool.execute(call, sandbox, ctx, signal);
     const result: ToolResult = { call_id: call.id, output };
     return { ok: true, result };
   }
@@ -121,6 +123,7 @@ export class StandardToolRegistry implements ToolRegistry {
   async dispatchAll(
     calls: ToolCall[],
     sandbox: SandboxProvider,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<DispatchOutcome[]> {
     // Classify each call. Unknown tools are scheduled sequentially so their
@@ -145,7 +148,7 @@ export class StandardToolRegistry implements ToolRegistry {
 
     if (concurrentIdx.length > 0) {
       const outs = await Promise.all(
-        concurrentIdx.map((i) => this.dispatch(calls[i]!, sandbox, signal)),
+        concurrentIdx.map((i) => this.dispatch(calls[i]!, sandbox, ctx, signal)),
       );
       concurrentIdx.forEach((slot, j) => {
         results[slot] = outs[j];
@@ -153,7 +156,7 @@ export class StandardToolRegistry implements ToolRegistry {
     }
 
     for (const i of sequentialIdx) {
-      results[i] = await this.dispatch(calls[i]!, sandbox, signal);
+      results[i] = await this.dispatch(calls[i]!, sandbox, ctx, signal);
     }
 
     return results.map((r) => {

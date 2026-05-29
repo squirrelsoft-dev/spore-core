@@ -1,26 +1,15 @@
 /**
  * TaskList primitive tests (#71): types, transition matrix, mutation helpers,
- * serialization byte-identity, and disk persistence. Mirrors
- * `rust/crates/spore-core/src/tasklist.rs#tests`.
+ * and serialization byte-identity. Mirrors
+ * `rust/crates/spore-core/src/tasklist.rs#tests`. Persistence moved to the
+ * storage seam (#75) and is tested at the tool boundary in `@spore/tools`.
  */
-
-import { mkdtemp } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  tasklist,
-  type Operation,
-  type SandboxProvider,
-  type SandboxViolation,
-  type ToolCall,
-} from "../src/index.js";
+import { tasklist } from "../src/index.js";
 
 const {
-  TASK_LIST_PATH,
   defaultTaskList,
   serializeTaskList,
   parseTaskList,
@@ -28,27 +17,10 @@ const {
   addTask,
   updateTask,
   completeTask,
-  loadTaskList,
-  storeTaskList,
 } = tasklist;
 
 type TaskStatus = tasklist.TaskStatus;
 type TaskList = tasklist.TaskList;
-
-/** Sandbox that roots `.spore/task_list.json` inside a tempdir. */
-class TempRootSandbox implements SandboxProvider {
-  constructor(private readonly root: string) {}
-  async validate(_call: ToolCall): Promise<SandboxViolation | null> {
-    return null;
-  }
-  async resolvePath(path: string, _op: Operation): Promise<string | SandboxViolation> {
-    return join(this.root, path);
-  }
-}
-
-async function tmp(): Promise<string> {
-  return mkdtemp(join(tmpdir(), "spore-tasklist-"));
-}
 
 function listWith(statuses: TaskStatus[]): TaskList {
   const l = defaultTaskList();
@@ -252,41 +224,5 @@ describe("tasklist serialization", () => {
     expect(serializeTaskList(l)).toBe(
       '{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}',
     );
-  });
-});
-
-describe("tasklist persistence", () => {
-  it("load on absent file yields default", async () => {
-    const dir = await tmp();
-    const sb = new TempRootSandbox(dir);
-    const r = await loadTaskList(sb);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.list).toEqual(defaultTaskList());
-  });
-
-  it("persist then reload yields an identical list", async () => {
-    const dir = await tmp();
-    const sb = new TempRootSandbox(dir);
-    const l = defaultTaskList();
-    addTask(l, "one");
-    addTask(l, "two");
-    updateTask(l, 1, "in_progress");
-    const stored = await storeTaskList(l, sb);
-    expect(stored.ok).toBe(true);
-    expect(existsSync(join(dir, TASK_LIST_PATH))).toBe(true);
-    const reloaded = await loadTaskList(sb);
-    expect(reloaded.ok).toBe(true);
-    if (reloaded.ok) expect(reloaded.list).toEqual(l);
-  });
-
-  it("load on malformed file is a recoverable parse error", async () => {
-    const dir = await tmp();
-    const sb = new TempRootSandbox(dir);
-    const { promises: fs } = await import("node:fs");
-    await fs.mkdir(join(dir, ".spore"), { recursive: true });
-    await fs.writeFile(join(dir, TASK_LIST_PATH), "{ not json", "utf8");
-    const r = await loadTaskList(sb);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.kind).toBe("parse");
   });
 });

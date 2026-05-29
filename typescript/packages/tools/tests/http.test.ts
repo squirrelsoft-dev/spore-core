@@ -6,12 +6,14 @@
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 
-import { harnessTesting, type ToolCall } from "@spore/core";
+import { harnessTesting, toolRegistry, type ToolCall } from "@spore/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HttpGetTool, HttpPostTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
+// Storage seam (#75): these tools ignore ctx, but the signature requires one.
+const ctx = toolRegistry.toolRegistryMock.testCtx();
 
 let server: Server;
 let baseUrl: string;
@@ -56,6 +58,7 @@ describe("HttpGetTool", () => {
     const r = await new HttpGetTool().execute(
       call("http_get", { url: `${baseUrl}/hello` }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
@@ -67,6 +70,7 @@ describe("HttpGetTool", () => {
     const r = await new HttpGetTool().execute(
       call("http_get", { url: "not-a-url://////" }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
@@ -80,6 +84,7 @@ describe("HttpPostTool", () => {
     const r = await new HttpPostTool().execute(
       call("http_post", { url: `${baseUrl}/echo`, body: { x: 1 } }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");

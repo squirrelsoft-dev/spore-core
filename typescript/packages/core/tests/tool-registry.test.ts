@@ -12,7 +12,14 @@ import type { ToolCall } from "../src/index.js";
 
 const {
   StandardToolRegistry,
-  toolRegistryMock: { EchoTool, FailingTool, SubagentMockTool, AllowAllSandbox, DenyAllSandbox },
+  toolRegistryMock: {
+    EchoTool,
+    FailingTool,
+    SubagentMockTool,
+    AllowAllSandbox,
+    DenyAllSandbox,
+    testCtx,
+  },
 } = toolRegistry;
 type ToolAnnotations = toolRegistry.ToolAnnotations;
 type ToolSchema = toolRegistry.ToolSchema;
@@ -54,7 +61,7 @@ describe("StandardToolRegistry", () => {
   it("dispatches a registered tool through the registry", async () => {
     const reg = new StandardToolRegistry();
     expect(reg.register(new EchoTool("echo"), schema("echo", { read_only: true }))).toBeNull();
-    const out = await reg.dispatch(call("echo", "c1", { x: 1 }), new AllowAllSandbox());
+    const out = await reg.dispatch(call("echo", "c1", { x: 1 }), new AllowAllSandbox(), testCtx());
     expect(out.ok).toBe(true);
     if (!out.ok) throw new Error("expected ok");
     expect(out.result.call_id).toBe("c1");
@@ -118,7 +125,7 @@ describe("StandardToolRegistry", () => {
   // Rule 6: dispatching unknown tool errors.
   it("errors when dispatching an unregistered tool", async () => {
     const reg = new StandardToolRegistry();
-    const out = await reg.dispatch(call("missing", "c1", {}), new AllowAllSandbox());
+    const out = await reg.dispatch(call("missing", "c1", {}), new AllowAllSandbox(), testCtx());
     expect(out.ok).toBe(false);
     if (out.ok) throw new Error("expected err");
     expect(out.error.kind).toBe("UnregisteredTool");
@@ -128,7 +135,7 @@ describe("StandardToolRegistry", () => {
   it("errors on missing required field", async () => {
     const reg = new StandardToolRegistry();
     expect(reg.register(new EchoTool("read"), schemaWithRequired("read", ["path"]))).toBeNull();
-    const out = await reg.dispatch(call("read", "c1", {}), new AllowAllSandbox());
+    const out = await reg.dispatch(call("read", "c1", {}), new AllowAllSandbox(), testCtx());
     expect(out.ok).toBe(false);
     if (out.ok) throw new Error("expected err");
     expect(out.error.kind).toBe("SchemaValidationFailed");
@@ -142,7 +149,7 @@ describe("StandardToolRegistry", () => {
   it("surfaces sandbox violations as DispatchError", async () => {
     const reg = new StandardToolRegistry();
     expect(reg.register(new EchoTool("echo"), schema("echo", { read_only: true }))).toBeNull();
-    const out = await reg.dispatch(call("echo", "c1", {}), new DenyAllSandbox());
+    const out = await reg.dispatch(call("echo", "c1", {}), new DenyAllSandbox(), testCtx());
     expect(out.ok).toBe(false);
     if (out.ok) throw new Error("expected err");
     expect(out.error.kind).toBe("SandboxViolation");
@@ -155,7 +162,7 @@ describe("StandardToolRegistry", () => {
   it("returns a recoverable tool error as ToolOutput", async () => {
     const reg = new StandardToolRegistry();
     expect(reg.register(new FailingTool("fail"), schema("fail"))).toBeNull();
-    const out = await reg.dispatch(call("fail", "c1", {}), new AllowAllSandbox());
+    const out = await reg.dispatch(call("fail", "c1", {}), new AllowAllSandbox(), testCtx());
     expect(out.ok).toBe(true);
     if (!out.ok) throw new Error("expected ok");
     expect(out.result.output.kind).toBe("error");
@@ -178,6 +185,7 @@ describe("StandardToolRegistry", () => {
         call("r", "4", { v: "d" }),
       ],
       new AllowAllSandbox(),
+      testCtx(),
     );
     const ids = results.map((r) => {
       if (!r.ok) throw new Error("expected ok");
@@ -191,10 +199,11 @@ describe("StandardToolRegistry", () => {
     const reg = new StandardToolRegistry();
     // Slow read-only tools — measure wall time to assert concurrency.
     type Sandbox = Parameters<InstanceType<typeof EchoTool>["execute"]>[1];
+    type Ctx = Parameters<InstanceType<typeof EchoTool>["execute"]>[2];
     class SlowEcho extends EchoTool {
-      override async execute(c: ToolCall, s: Sandbox) {
+      override async execute(c: ToolCall, s: Sandbox, ctx: Ctx) {
         await new Promise<void>((resolve) => setTimeout(resolve, 60));
-        return super.execute(c, s);
+        return super.execute(c, s, ctx);
       }
     }
     expect(reg.register(new SlowEcho("r1"), schema("r1", { read_only: true }))).toBeNull();
@@ -204,6 +213,7 @@ describe("StandardToolRegistry", () => {
     const results = await reg.dispatchAll(
       [call("r1", "1", {}), call("r2", "2", {}), call("r3", "3", {})],
       new AllowAllSandbox(),
+      testCtx(),
     );
     const elapsed = Date.now() - start;
     expect(results.every((r) => r.ok)).toBe(true);
@@ -218,6 +228,7 @@ describe("StandardToolRegistry", () => {
     const results = await reg.dispatchAll(
       [call("ok", "1", {}), call("missing", "2", {})],
       new AllowAllSandbox(),
+      testCtx(),
     );
     expect(results[0]?.ok).toBe(true);
     expect(results[1]?.ok).toBe(false);

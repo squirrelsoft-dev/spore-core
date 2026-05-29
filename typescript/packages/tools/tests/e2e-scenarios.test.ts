@@ -27,6 +27,7 @@ import {
   observability as coreObs,
   type ProviderInfo,
   SessionId,
+  storage as coreStorage,
   type SessionState,
   type TaskId,
   type ToolCall,
@@ -308,7 +309,12 @@ describe("S4 — tool failure + recovery", () => {
 
     const registry = buildRealToolRegistry("s4");
     const sandbox = new AllowAllSandbox();
-    const bridge = new RealToolRegistry(registry, sandbox);
+    const bridge = new RealToolRegistry(
+      registry,
+      sandbox,
+      sessionId,
+      new coreStorage.InMemoryStorageProvider(),
+    );
     const schemas = bridge.modelSchemas();
 
     const harness = buildScenario({
@@ -335,6 +341,8 @@ describe("S4 — tool failure + recovery", () => {
     const bridge = new RealToolRegistry(
       buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
+      SessionId.of("s4-halt"),
+      new coreStorage.InMemoryStorageProvider(),
     );
     expect(bridge.isAlwaysHalt("flaky_op")).toBe(false);
     const out = await bridge.dispatch(toolCall("c1", "flaky_op", {}));
@@ -348,6 +356,8 @@ describe("S4 — tool failure + recovery", () => {
     const bridge = new RealToolRegistry(
       buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
+      SessionId.of("s4-schemas"),
+      new coreStorage.InMemoryStorageProvider(),
     );
     const names = bridge.modelSchemas().map((s: ToolSchema) => s.name);
     const sorted = [...names].sort();
@@ -366,6 +376,8 @@ describe("per-scenario tool catalog", () => {
     const bridge = new RealToolRegistry(
       buildRealToolRegistry(scenario),
       new AllowAllSandbox(),
+      SessionId.of("catalog-test"),
+      new coreStorage.InMemoryStorageProvider(),
     );
     return bridge.modelSchemas().map((s) => s.name);
   }
@@ -424,7 +436,12 @@ describe("S5 — real shell pipeline", () => {
       agent.push({ kind: "final_response", content: "DONE", usage });
 
       const sandbox = new AllowAllSandbox();
-      const bridge = new RealToolRegistry(buildRealToolRegistry("s5"), sandbox);
+      const bridge = new RealToolRegistry(
+        buildRealToolRegistry("s5"),
+        sandbox,
+        sessionId,
+        new coreStorage.InMemoryStorageProvider(),
+      );
       const schemas = bridge.modelSchemas();
 
       const harness = buildScenario({

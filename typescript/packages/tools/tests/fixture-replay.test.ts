@@ -161,6 +161,8 @@ import { SubagentTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
 const { StandardToolRegistry } = toolRegistry;
+// Storage seam (#75): SubagentTool ignores ctx, but the signature requires one.
+const ctx = toolRegistry.toolRegistryMock.testCtx();
 
 class ScriptedHarness implements Harness {
   constructor(private readonly r: RunResult) {}
@@ -243,6 +245,7 @@ describe("fixture: subagent_scenarios", () => {
           input: { instruction: "x" },
         },
         new AllowAllSandbox(),
+        ctx,
       );
 
       if (sc.expected.kind === "success") {

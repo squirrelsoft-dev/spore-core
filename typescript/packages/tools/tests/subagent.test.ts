@@ -26,6 +26,8 @@ import { SubagentTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
 const { StandardToolRegistry, toolRegistryMock } = toolRegistry;
+// Storage seam (#75): SubagentTool ignores ctx, but the signature requires one.
+const ctx = toolRegistryMock.testCtx();
 
 class ScriptedHarness implements Harness {
   constructor(private readonly results: RunResult[]) {}
@@ -88,6 +90,7 @@ describe("SubagentTool", () => {
     const r = await sub.execute(
       callWith({ instruction: "do it" }),
       new AllowAllSandbox(),
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
@@ -108,6 +111,7 @@ describe("SubagentTool", () => {
     const r = await sub.execute(
       callWith({ instruction: "x" }),
       new AllowAllSandbox(),
+      ctx,
     );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
@@ -139,6 +143,7 @@ describe("SubagentTool", () => {
     const r = await sub.execute(
       callWith({ instruction: "x" }, "parent-call-1"),
       new AllowAllSandbox(),
+      ctx,
     );
     expect(r.kind).toBe("waiting_for_human");
     if (r.kind !== "waiting_for_human") throw new Error("unreachable");
@@ -178,7 +183,7 @@ describe("SubagentTool", () => {
 
   it("missing instruction returns recoverable error", async () => {
     const sub = buildSubagent(new ScriptedHarness([]));
-    const r = await sub.execute(callWith({}), new AllowAllSandbox());
+    const r = await sub.execute(callWith({}), new AllowAllSandbox(), ctx);
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);

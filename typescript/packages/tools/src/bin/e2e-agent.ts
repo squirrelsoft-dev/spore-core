@@ -80,6 +80,7 @@ import {
   type ContextManager as HarnessContextManager,
   emptySessionState,
   WorkspaceScopedSandbox,
+  storage as coreStorage,
 } from "@spore/core";
 
 import {
@@ -167,7 +168,12 @@ async function runLive(
     read_only: false,
     max_file_size: 0,
   });
-  const bridge = new RealToolRegistry(registry, sandbox);
+  const bridge = new RealToolRegistry(
+    registry,
+    sandbox,
+    sessionId,
+    new coreStorage.InMemoryStorageProvider(),
+  );
   const toolSchemas = bridge.modelSchemas();
   const tools: HarnessToolRegistry = bridge;
 

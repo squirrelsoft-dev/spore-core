@@ -9,6 +9,7 @@ import picomatch from "picomatch";
 import type { SandboxProvider, ToolCall, ToolOutput } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
 type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 type ToolSchema = toolRegistry.ToolSchema;
 
 import { toolExecutionErrorToOutput } from "./errors.js";
@@ -95,7 +96,11 @@ export class GrepFilesTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(GrepFilesParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     let re: RegExp;
@@ -175,7 +180,11 @@ export class FindFilesTool implements Tool {
     };
   }
 
-  async execute(call: ToolCall, sandbox: SandboxProvider): Promise<ToolOutput> {
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    _ctx: ToolContext,
+  ): Promise<ToolOutput> {
     const p = parseParams(FindFilesParamsSchema, call);
     if (!p.ok) return toolExecutionErrorToOutput(p.error);
     const root = await sbResolvePath(sandbox, p.value.path, "read");

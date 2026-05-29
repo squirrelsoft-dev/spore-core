@@ -15,6 +15,39 @@ import { z } from "zod";
 
 import type { ToolCall } from "../model/schemas.js";
 import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
+import type { SessionId } from "../harness/types.js";
+import type { RunStore } from "../storage/types.js";
+
+// ============================================================================
+// ToolContext — the storage seam handed to every tool (#75)
+// ============================================================================
+
+/**
+ * The per-dispatch storage seam handed to every {@link Tool.execute} call,
+ * alongside (but separate from) the {@link SandboxProvider}. It carries the
+ * minimum a tool needs to persist durable state via the storage layer:
+ *
+ *   - `sessionId` — the run's {@link SessionId}, the key namespace for
+ *     {@link RunStore}.
+ *   - `runStore`  — the {@link RunStore} domain of the configured storage
+ *     provider.
+ *
+ * It is a **class** (not a tuple/pair) so future fields can be added without
+ * breaking the {@link Tool.execute} signature again. The {@link SandboxProvider}
+ * is intentionally NOT folded in here — storage is additive; tools still receive
+ * the sandbox as its own parameter (some tools need the filesystem sandbox and
+ * no storage).
+ */
+export class ToolContext {
+  /**
+   * @param sessionId The session id keying this run's persisted state.
+   * @param runStore  The run-store domain a tool persists durable state through.
+   */
+  constructor(
+    readonly sessionId: SessionId,
+    readonly runStore: RunStore,
+  ) {}
+}
 
 // ============================================================================
 // ToolAnnotations & ToolSchema
@@ -132,7 +165,8 @@ export function dispatchErrorMessage(e: DispatchError): string {
 
 /**
  * A single tool implementation. Tools are stateless and receive a
- * {@link SandboxProvider} on every dispatch.
+ * {@link SandboxProvider} (environment seam) and a {@link ToolContext} (storage
+ * seam) on every dispatch.
  */
 export interface Tool {
   /** Tool name — must match the registered {@link ToolSchema} `name`. */
@@ -146,10 +180,17 @@ export interface Tool {
   readonly isSubagentTool?: boolean;
 
   /**
-   * Execute the tool with validated input. The {@link SandboxProvider} is
-   * the only path to the environment.
+   * Execute the tool with validated input. The {@link SandboxProvider} is the
+   * only path to the environment; the {@link ToolContext} is the only path to
+   * durable storage ({@link RunStore}, keyed by the run's {@link SessionId}).
+   * Most tools ignore `ctx`.
    */
-  execute(call: ToolCall, sandbox: SandboxProvider, signal?: AbortSignal): Promise<ToolOutput>;
+  execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    ctx: ToolContext,
+    signal?: AbortSignal,
+  ): Promise<ToolOutput>;
 
   /**
    * `true` if this tool may produce a large output that should be routed
@@ -183,10 +224,11 @@ export interface ToolRegistry {
   /** Return schemas for tools active in the given phase (always sorted by name). */
   activeSchemas(phase?: TaskPhase | null): ToolSchema[];
 
-  /** Dispatch one tool call. */
+  /** Dispatch one tool call. `ctx` is the storage seam threaded to the tool. */
   dispatch(
     call: ToolCall,
     sandbox: SandboxProvider,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<DispatchOutcome>;
 
@@ -194,6 +236,7 @@ export interface ToolRegistry {
   dispatchAll(
     calls: ToolCall[],
     sandbox: SandboxProvider,
+    ctx: ToolContext,
     signal?: AbortSignal,
   ): Promise<DispatchOutcome[]>;
 

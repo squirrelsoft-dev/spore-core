@@ -6,12 +6,14 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { harnessTesting, type ToolCall } from "@spore/core";
+import { harnessTesting, toolRegistry, type ToolCall } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
 import { FindFilesTool, GrepFilesTool } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
+// Storage seam (#75): these tools ignore ctx, but the signature requires one.
+const ctx = toolRegistry.toolRegistryMock.testCtx();
 
 function call(name: string, input: unknown): ToolCall {
   return { id: "c1", name, input };
@@ -29,6 +31,7 @@ describe("search tools", () => {
     const r = await new GrepFilesTool().execute(
       call("grep_files", { pattern: "^alpha", path: dir }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
@@ -42,6 +45,7 @@ describe("search tools", () => {
     const r = await new GrepFilesTool().execute(
       call("grep_files", { pattern: "(unclosed", path: dir }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("error");
     if (r.kind !== "error") throw new Error("unreachable");
@@ -57,6 +61,7 @@ describe("search tools", () => {
     const r = await new FindFilesTool().execute(
       call("find_files", { glob: "*.rs", path: dir }),
       sb,
+      ctx,
     );
     expect(r.kind).toBe("success");
     if (r.kind !== "success") throw new Error("unreachable");
