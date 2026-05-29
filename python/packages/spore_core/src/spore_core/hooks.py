@@ -378,7 +378,10 @@ def _decision_validate_for(decision: HookDecision, event: HookEvent) -> None:
     else:  # pragma: no cover - exhaustive over the union
         ok = False
     if not ok:
-        raise HookError(f"hook '{decision.decision}' decision is illegal for event '{event.value}'")
+        raise HookError(
+            f"hook '{decision.decision}' decision is illegal for event '{event.value}'",
+            kind="illegal_decision",
+        )
 
 
 # ============================================================================
@@ -758,12 +761,13 @@ def _apply_mutation(ctx: HookContext, hook_name: str, data: JsonValue) -> None:
             ctx.preserve_hints = _hints_from_value(data)
         else:
             raise HookError(
-                f"hook 'mutate' decision is illegal for event '{context_event(ctx).value}'"
+                f"hook 'mutate' decision is illegal for event '{context_event(ctx).value}'",
+                kind="illegal_decision",
             )
     except HookError:
         raise
     except Exception as exc:  # noqa: BLE001 — surface any coercion failure
-        raise HookError(f"hook '{hook_name}' failed: {exc}") from exc
+        raise HookError(f"hook '{hook_name}' failed: {exc}", kind="handler_failed") from exc
 
 
 def _hints_from_value(data: JsonValue) -> CompactionPreserveHints:

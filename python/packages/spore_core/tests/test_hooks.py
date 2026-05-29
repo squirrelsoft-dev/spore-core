@@ -210,6 +210,18 @@ async def test_mutate_on_loop_start_coerces_string() -> None:
     assert ctx.task_instruction == "new instruction"
 
 
+async def test_mutate_coercion_failure_is_handler_failed() -> None:
+    """A Mutate whose data cannot be coerced into the target field type raises
+    HookError with kind ``handler_failed`` (matches Rust/TS/Go)."""
+    chain = StandardHookChain()
+    # PreTurn's mutable field is a ContextBlock; a scalar cannot validate into it.
+    chain.register(_fn("m", [HookEvent.PRE_TURN], HookMutate(data=123)))
+    ctx = PreTurnContext(_sid(), 1, ContextBlock())
+    with pytest.raises(HookError) as exc:
+        await chain.fire(ctx)
+    assert exc.value.kind == "handler_failed"
+
+
 # ── R15: PreToolUse deny ────────────────────────────────────────────────────
 
 
@@ -273,8 +285,9 @@ def test_on_pause_sync_rejected() -> None:
 async def test_illegal_block_on_post_turn() -> None:
     chain = StandardHookChain()
     chain.register(_fn("bad", [HookEvent.POST_TURN], HookBlock(reason="no")))
-    with pytest.raises(HookError):
+    with pytest.raises(HookError) as exc:
         await chain.fire(PostTurnContext(_sid(), 1, TurnOutput()))
+    assert exc.value.kind == "illegal_decision"
 
 
 # ── R5: Deny outside PreToolUse/OnSubagentSpawn rejected ─────────────────────
@@ -287,8 +300,9 @@ async def test_deny_validation() -> None:
 
     chain_bad = StandardHookChain()
     chain_bad.register(_fn("d", [HookEvent.PRE_TURN], HookDeny(reason="x")))
-    with pytest.raises(HookError):
+    with pytest.raises(HookError) as exc:
         await chain_bad.fire(PreTurnContext(_sid(), 1, ContextBlock()))
+    assert exc.value.kind == "illegal_decision"
 
 
 # ── R11: async fire-and-forget not awaited ──────────────────────────────────
