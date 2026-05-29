@@ -53,6 +53,7 @@ import { dirname } from "node:path";
 import { z } from "zod";
 
 import type { Operation, SandboxProvider, SandboxViolation } from "../harness/types.js";
+import type { PlanArtifact } from "../plan/index.js";
 
 /**
  * Key under which the {@link TaskList} is mirrored into `SessionState.extras`
@@ -274,6 +275,53 @@ export function completeTask(list: TaskList, id: number): MutationResult {
   if (!v.ok) return v;
   task.status = "completed";
   return { ok: true };
+}
+
+// ============================================================================
+// Plan → TaskList parser (issue #72; the bridge between #70 and #59)
+// ============================================================================
+
+/**
+ * Parse an accepted {@link PlanArtifact} (#70) into a fresh, ready-to-persist
+ * {@link TaskList} (#71). This is the bridge between the plan phase and the
+ * execute loop: once a plan is produced and accepted, its steps become the task
+ * list that #59's execute loop drains.
+ *
+ * # Types bridged
+ * - Input: {@link PlanArtifact} `{ tasks: string[]; rationale: string }`.
+ * - Output: {@link TaskList} `{ tasks: Task[]; next_id: number }`.
+ *
+ * # Rules enforced
+ * - One {@link Task} per plan step, in plan order (positional, via
+ *   {@link addTask}).
+ * - Every produced task is `pending`.
+ * - Step descriptions are copied VERBATIM — no trim, no normalize, no filter
+ *   (matches #70's verbatim contract: even `"  spaced  "` and `""` are kept).
+ * - Ids are assigned `1..=n` sequentially via the {@link TaskList.next_id}
+ *   scheme; `next_id` ends at `n + 1`.
+ * - An empty plan (`tasks: []`) yields {@link defaultTaskList} —
+ *   `{ tasks: [], next_id: 1 }`. That is a valid EMPTY list, not an error and
+ *   not "immediate completion"; the execute loop (#59) decides loop semantics.
+ * - `rationale` is DROPPED — neither {@link Task} nor {@link TaskList} carries
+ *   it.
+ *
+ * # Determinism
+ * Pure and total: `PlanArtifact -> TaskList`, no async, no I/O, never throws.
+ * The same artifact always yields the same task list, so the mapping is
+ * byte-identical across all four languages.
+ *
+ * # Re-parsing / wiring
+ * Always builds a fresh {@link defaultTaskList}; it never merges into an
+ * existing list (replanning is out of scope — single parse per accepted plan).
+ * Wiring this into the plan-acceptance seam is DEFERRED to #59's execute loop;
+ * #72 ships only this pure function.
+ */
+export function planArtifactToTaskList(artifact: PlanArtifact): TaskList {
+  const list = defaultTaskList(); // next_id === 1
+  for (const step of artifact.tasks) {
+    addTask(list, step); // verbatim; appends pending; bumps next_id
+  }
+  return list;
 }
 
 // ============================================================================

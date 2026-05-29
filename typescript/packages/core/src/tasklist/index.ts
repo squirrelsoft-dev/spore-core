@@ -26,6 +26,7 @@ export {
   addTask,
   updateTask,
   completeTask,
+  planArtifactToTaskList,
   type LoadError,
   type StoreError,
   type LoadResult,
