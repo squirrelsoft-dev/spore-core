@@ -36,9 +36,9 @@
 //     kept verbatim, may be empty) and `rationale` (optional string, default
 //     ""). Any failure → PlanPhaseError{Kind: PlanErrorUnparseablePlan}.
 //   - Q4 (terminal RunResult): after producing, firing OnPlanCreated, and
-//     storing the artifact, the PlanExecute arm HALTS with the distinct
-//     HaltExecutePhaseNotImplemented reason — separate from the generic
-//     HaltStrategyNotYetImplemented the other strategies still use.
+//     storing the artifact, the PlanExecute arm proceeds into the execute phase
+//     (issue #59), which drains the parsed task list. (Pre-#59 this arm halted
+//     with the now-removed HaltExecutePhaseNotImplemented reason.)
 
 package sporecore
 

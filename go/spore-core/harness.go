@@ -1306,13 +1306,19 @@ const (
 	HaltHumanHalted               HaltReasonKind = "human_halted"
 	HaltStagnationLimitReached    HaltReasonKind = "stagnation_limit_reached"
 	HaltStrategyNotYetImplemented HaltReasonKind = "strategy_not_yet_implemented"
-	// HaltExecutePhaseNotImplemented (issue #70, Q4) is returned by
-	// StandardHarness for the PlanExecute strategy AFTER the plan phase has
-	// produced, fired OnPlanCreated on, and stored a PlanArtifact. The execute
-	// loop itself ships with #59/#72; this distinct reason marks "plan
-	// produced, execute phase not implemented yet" so callers can tell it apart
-	// from the generic HaltStrategyNotYetImplemented stub.
-	HaltExecutePhaseNotImplemented HaltReasonKind = "execute_phase_not_implemented"
+	// HaltEmptyPlan (issue #59, Q3) is returned by StandardHarness for the
+	// PlanExecute strategy when the accepted plan parsed into an EMPTY task list
+	// (tasks: []). An empty plan is a failure — the run does NOT silently
+	// succeed.
+	HaltEmptyPlan HaltReasonKind = "empty_plan"
+	// HaltStepFailed (issue #59, Q5) is returned for the PlanExecute strategy
+	// when an execute step's bounded ReAct sub-loop errored or the agent
+	// returned a blocked/failed outcome. A plan is a dependency chain by
+	// assumption, so the whole run aborts at the failing step — execution does
+	// NOT continue to the next task. Carries the failing step's positional
+	// index, its instruction, and a human-readable reason derived from the
+	// underlying HaltReason.
+	HaltStepFailed HaltReasonKind = "step_failed"
 	// HaltPlanPhaseFailed (issue #70) is returned when the PlanExecute plan
 	// phase fails before producing an artifact: the planner's response was
 	// unparseable, the planner requested a tool call in the one-shot turn, or
@@ -1343,6 +1349,9 @@ type HaltReason struct {
 	Strategy string `json:"-"`
 	// plan_phase_failed (issue #70)
 	PlanError *PlanPhaseError `json:"-"`
+	// step_failed (issue #59, Q5)
+	TaskIndex int    `json:"-"`
+	Task      string `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1395,10 +1404,17 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind     HaltReasonKind `json:"kind"`
 			Strategy string         `json:"strategy"`
 		}{h.Kind, h.Strategy})
-	case HaltExecutePhaseNotImplemented:
+	case HaltEmptyPlan:
 		return json.Marshal(struct {
 			Kind HaltReasonKind `json:"kind"`
 		}{h.Kind})
+	case HaltStepFailed:
+		return json.Marshal(struct {
+			Kind      HaltReasonKind `json:"kind"`
+			TaskIndex int            `json:"task_index"`
+			Task      string         `json:"task"`
+			Reason    string         `json:"reason"`
+		}{h.Kind, h.TaskIndex, h.Task, h.Reason})
 	case HaltPlanPhaseFailed:
 		return json.Marshal(struct {
 			Kind  HaltReasonKind  `json:"kind"`
@@ -1422,6 +1438,8 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 		Iterations uint32            `json:"iterations"`
 		BestMetric float64           `json:"best_metric"`
 		Strategy   string            `json:"strategy"`
+		TaskIndex  int               `json:"task_index"`
+		Task       string            `json:"task"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1435,6 +1453,8 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 	h.Iterations = probe.Iterations
 	h.BestMetric = probe.BestMetric
 	h.Strategy = probe.Strategy
+	h.TaskIndex = probe.TaskIndex
+	h.Task = probe.Task
 
 	switch probe.Kind {
 	case HaltAgentError:
@@ -1624,6 +1644,25 @@ type HarnessConfig struct {
 	// default Agent. The plan_model field on the strategy stays DESCRIPTIVE
 	// metadata only — there is no ModelConfig→agent factory.
 	PlannerAgent Agent // optional
+
+	// RunStore is the durable per-run structured-state seam (issue #59, Q4).
+	// The PlanExecute execute loop writes the parsed task list through this
+	// store under TaskListExtrasKey, keyed by SessionID. Optional; when nil the
+	// durable write is skipped (the in-session extras mirror is always kept).
+	// This is a consumer-side interface (go/CONVENTIONS.md): the concrete
+	// storage.StorageProvider.Run() satisfies it structurally without the
+	// sporecore package importing the storage package (which would be a cycle).
+	RunStore RunStore // optional
+}
+
+// RunStore is the consumer-side view of the per-run structured-state store the
+// PlanExecute execute loop writes through (issue #59, Q4). It mirrors the Put
+// method of storage.RunStore so a *storage.StorageProvider's Run() store can be
+// dropped straight into HarnessConfig.RunStore without an import cycle. Values
+// are opaque JSON blobs keyed by (SessionID, key); the store never knows the
+// schema — the harness owns serialization.
+type RunStore interface {
+	Put(ctx context.Context, sessionID SessionID, key string, value json.RawMessage) error
 }
 
 // effectiveMaxStopBlocks returns the Stop-block cap, defaulting 0 to 8.
@@ -1782,8 +1821,10 @@ func haltReasonString(r HaltReason) string {
 		return "human halted"
 	case HaltStrategyNotYetImplemented:
 		return fmt.Sprintf("strategy not yet implemented: %s", r.Strategy)
-	case HaltExecutePhaseNotImplemented:
-		return "execute phase not implemented"
+	case HaltEmptyPlan:
+		return "empty plan"
+	case HaltStepFailed:
+		return fmt.Sprintf("step %d failed (%q): %s", r.TaskIndex, r.Task, r.Reason)
 	case HaltPlanPhaseFailed:
 		if r.PlanError != nil {
 			return fmt.Sprintf("plan phase failed: %s", r.PlanError.Error())
@@ -1804,13 +1845,44 @@ type planPhaseOutcome struct {
 	turns    uint32
 }
 
-// runPlanExecute drives the PlanExecute strategy (issue #70).
+// runPlanExecute drives the PlanExecute strategy (issues #70 + #59).
 //
-// Runs the one-shot plan phase (runPlanPhase), then — per Q4 — HALTS with the
-// distinct HaltExecutePhaseNotImplemented reason once an artifact has been
-// produced, had OnPlanCreated fired on it, and been stored. The execute loop
-// itself ships with #59/#72. On any plan-phase failure the underlying
-// RunResult failure is returned unchanged (no artifact stored).
+//  1. Plan phase (runs once): runPlanPhase seeds a planning directive, runs one
+//     constrained planner turn, captures a PlanArtifact, fires OnPlanCreated,
+//     and counts the turn against the shared budget.
+//  2. Execute phase (loops): runExecutePhase drains the parsed task list, giving
+//     each task its own bounded, isolated, SEQUENTIAL ReAct sub-loop.
+//
+// Between the phases the artifact is parsed into a TaskList via
+// PlanArtifactToTaskList and persisted through the RunStore seam (Q4) plus the
+// extras mirror.
+//
+// HaltReason variants:
+//   - NEW HaltEmptyPlan — the plan parsed to tasks: [] (Q3).
+//   - NEW HaltStepFailed — an execute step errored / blocked (Q5).
+//   - REMOVED HaltExecutePhaseNotImplemented — the execute phase is now
+//     implemented; the old "plan produced, execute not implemented" halt is gone.
+//   - Plan-phase failures still surface as HaltPlanPhaseFailed / HaltAgentError /
+//     HaltBudgetExceeded unchanged.
+//
+// Resolved spec decisions (issue #59 — all five FINAL):
+//   - Q1 (execute step model): each task gets its OWN bounded ReAct sub-loop,
+//     fully isolated and SEQUENTIAL (task N completes before N+1). The per-task
+//     turn cap is derived at the START of each step:
+//     per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
+//     division; remaining_tasks = not-yet-started tasks including the current
+//     one). The shared/parent budget — turns, tokens, observability spans,
+//     compaction — is carried across EVERY step, and the global budget is the
+//     hard stop.
+//   - Q2 (success output): RunResult.Output is the LAST completed step's final
+//     text — not a concatenation, not the plan rationale.
+//   - Q3 (empty plan): an empty task list ⇒ HaltEmptyPlan.
+//   - Q4 (persistence): the task list is persisted through the RunStore seam
+//     ONLY. The #71 sandbox-filesystem path (.spore/task_list.json) is NOT used
+//     by the execute loop — one source of truth. The extras mirror is kept.
+//   - Q5 (per-task failure): a step's ReAct sub-loop erroring or returning a
+//     blocked/failed outcome ABORTS the whole run with HaltStepFailed; execution
+//     does NOT continue to the next task (a plan is a dependency chain).
 //
 // Like runReAct, this finalizes observability for the terminal outcome.
 func (h *StandardHarness) runPlanExecute(
@@ -1821,21 +1893,52 @@ func (h *StandardHarness) runPlanExecute(
 	onStream StreamSink,
 ) RunResult {
 	sessionID := task.SessionID
+
+	// ── Phase 1: plan (runs exactly once) ──────────────────────────────────
 	outcome, failure := h.runPlanPhase(ctx, &task, &session, budget, onStream)
-	var result RunResult
 	if failure != nil {
-		// Plan-phase failure: propagate the terminal RunResult unchanged.
-		result = *failure
-	} else {
-		// Plan produced + stored. Q4: halt with the distinct reason.
-		result = RunResult{
+		// Plan-phase failure: propagate unchanged (no task list persisted).
+		h.finalizePlanExecute(ctx, *failure)
+		return *failure
+	}
+
+	// Bridge: parse the accepted plan into a TaskList (#72).
+	taskList := PlanArtifactToTaskList(outcome.artifact)
+
+	// Q3: an empty plan is a failure, not a silent success.
+	if len(taskList.Tasks) == 0 {
+		result := RunResult{
 			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltExecutePhaseNotImplemented},
+			Reason:    HaltReason{Kind: HaltEmptyPlan},
 			SessionID: sessionID,
 			Usage:     outcome.usage,
 			Turns:     outcome.turns,
 		}
+		h.finalizePlanExecute(ctx, result)
+		return result
 	}
+
+	// Q4: persist the task list through the RunStore seam plus the extras
+	// mirror. The #71 sandbox path is intentionally unused.
+	h.persistTaskList(ctx, &session, sessionID, taskList)
+
+	// Carry the shared budget forward: the plan turn already consumed
+	// outcome.turns turns and outcome.usage tokens (Q1 — shared budget).
+	carried := budget
+	carried.Turns = outcome.turns
+	carried.InputTokens += outcome.usage.InputTokens
+	carried.OutputTokens += outcome.usage.OutputTokens
+
+	// ── Phase 2: execute (loops over the task list) ────────────────────────
+	result := h.runExecutePhase(ctx, &task, &session, taskList, carried, outcome.usage, onStream)
+	h.finalizePlanExecute(ctx, result)
+	return result
+}
+
+// finalizePlanExecute finalizes observability for a terminal PlanExecute
+// outcome. Mirrors the tail of runReAct: WaitingForHuman is not terminal and is
+// never flushed here.
+func (h *StandardHarness) finalizePlanExecute(ctx context.Context, result RunResult) {
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, true, "")
@@ -1844,7 +1947,201 @@ func (h *StandardHarness) runPlanExecute(
 	case RunWaitingForHuman:
 		// Not terminal — do not flush.
 	}
-	return result
+}
+
+// persistTaskList persists the parsed TaskList for the run (Q4). The DURABLE
+// write goes through the RunStore seam under TaskListExtrasKey; the #71
+// sandbox-filesystem path (.spore/task_list.json) is intentionally NOT used —
+// one source of truth. The list is also mirrored into
+// SessionState.Extras[TaskListExtrasKey] (matching the existing
+// extras["plan_execute"] precedent). Serialization / store failures are
+// swallowed: a successful plan must not be lost to a storage hiccup (the default
+// nil/no-op store never fails).
+func (h *StandardHarness) persistTaskList(ctx context.Context, session *SessionState, sessionID SessionID, taskList TaskList) {
+	value, err := json.Marshal(taskList)
+	if err != nil {
+		return
+	}
+	// Durable write through the RunStore seam (optional).
+	if h.config.RunStore != nil {
+		_ = h.config.RunStore.Put(ctx, sessionID, TaskListExtrasKey, json.RawMessage(value))
+	}
+	// Extras mirror (in-session view).
+	if session.Extras == nil {
+		session.Extras = map[string]any{}
+	}
+	session.Extras[TaskListExtrasKey] = json.RawMessage(value)
+}
+
+// runExecutePhase drives the PlanExecute execute phase (issue #59), draining
+// taskList.
+//
+// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
+// sub-loop. The per-task turn cap is derived at the START of each step from the
+// shared budget: per_task_turns = remaining_turns / remaining_tasks, floored at
+// 1 (integer division; remaining_tasks counts the not-yet-started tasks
+// including the current one). The shared budget snapshot (carried) is threaded
+// through every step so early tasks cannot starve later ones and the global
+// budget stays the hard stop.
+//
+// Before each step the task is marked InProgress (and Completed after), the list
+// is re-persisted (Q4), and OnTaskAdvance fires with the correct task_index /
+// total_tasks (the hook may rewrite the step instruction).
+//
+// Q2: on success Output is the LAST completed step's final response.
+// Q5: a step that errors / blocks aborts the run with HaltStepFailed — no
+// further tasks run.
+//
+// planUsage seeds the cumulative AggregateUsage with the plan turn's usage so
+// the terminal RunResult reflects the WHOLE run.
+func (h *StandardHarness) runExecutePhase(
+	ctx context.Context,
+	task *Task,
+	session *SessionState,
+	taskList TaskList,
+	carried BudgetSnapshot,
+	planUsage AggregateUsage,
+	onStream StreamSink,
+) RunResult {
+	sessionID := task.SessionID
+	totalTasks := len(taskList.Tasks)
+	// Cumulative usage across the plan turn + every execute step (Q1).
+	totalUsage := planUsage
+	// Q2: the success handle is the LAST completed step's final text.
+	var lastOutput string
+
+	for index := 0; index < totalTasks; index++ {
+		taskID := taskList.Tasks[index].ID
+		instruction := taskList.Tasks[index].Description
+
+		// Q1: per-task turn allocation, derived at the START of this step.
+		// remaining_tasks = not-yet-started tasks including this one.
+		remainingTasks := uint32(totalTasks - index)
+		var subLoopCap uint32
+		if task.Budget.MaxTurns != nil {
+			max := *task.Budget.MaxTurns
+			var remainingTurns uint32
+			if max > carried.Turns {
+				remainingTurns = max - carried.Turns
+			}
+			perTaskTurns := remainingTurns / remainingTasks
+			if perTaskTurns < 1 {
+				perTaskTurns = 1
+			}
+			// The sub-loop's effective cap is RELATIVE to the carried turns:
+			// runReActInner gates on the cumulative budget.Turns, so a per-task
+			// cap of K means "stop K turns from now" while the global budget
+			// (carried forward) remains the hard stop.
+			subLoopCap = carried.Turns + perTaskTurns
+		} else {
+			// No global turn cap: each step's sub-loop is bounded only by the
+			// other (token / wall / cost) budget gates.
+			subLoopCap = ^uint32(0) // max uint32
+		}
+
+		// Mark InProgress (Pending -> InProgress) and re-persist (Q4).
+		ip := TaskStatusInProgress
+		_ = taskList.Update(taskID, &ip, nil)
+		h.persistTaskList(ctx, session, sessionID, taskList)
+
+		// Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
+		// instruction via the carried Task; the (possibly mutated) instruction
+		// seeds the sub-loop.
+		stepTask := Task{
+			ID:           task.ID,
+			Instruction:  instruction,
+			SessionID:    sessionID,
+			Budget:       task.Budget,
+			LoopStrategy: task.LoopStrategy,
+		}
+		if h.config.Hooks != nil {
+			hctx := &HookContext{
+				Event:      HookEventOnTaskAdvance,
+				SessionID:  sessionID,
+				Task:       &stepTask,
+				TaskIndex:  index,
+				TotalTasks: totalTasks,
+			}
+			_, _ = h.config.Hooks.Fire(ctx, hctx)
+		}
+
+		// Seed the step instruction as a user message, then run the bounded
+		// ReAct sub-loop carrying the shared budget (Q1). The sub-loop runs with
+		// a suppressed (nil) sink; the parent-visible step boundary is emitted
+		// below on completion.
+		h.config.ContextManager.AppendUserMessage(ctx, session, stepTask.Instruction)
+
+		subResult := h.runReActInner(ctx, stepTask, subLoopCap, *session, carried, nil)
+
+		switch subResult.Kind {
+		case RunSuccess:
+			// Carry the shared budget forward (Q1): cumulative turns are the
+			// sub-loop's absolute count; fold in its token usage.
+			carried.Turns = subResult.Turns
+			carried.InputTokens += subResult.Usage.InputTokens
+			carried.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.InputTokens += subResult.Usage.InputTokens
+			totalUsage.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
+			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
+			totalUsage.CostUSD += subResult.Usage.CostUSD
+			lastOutput = subResult.Output
+
+			// Mark Completed and re-persist (Q4).
+			_ = taskList.Complete(taskID)
+			h.persistTaskList(ctx, session, sessionID, taskList)
+			// Surface the completed step's final text to the caller's sink.
+			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
+
+		case RunFailure:
+			// Q5: any non-success step aborts the whole run. A budget halt
+			// surfaces as BudgetExceeded (mid-execute exhaustion); other
+			// failures surface as StepFailed carrying the step context.
+			totalUsage.InputTokens += subResult.Usage.InputTokens
+			totalUsage.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
+			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
+			totalUsage.CostUSD += subResult.Usage.CostUSD
+
+			blocked := TaskStatusBlocked
+			_ = taskList.Update(taskID, &blocked, nil)
+			h.persistTaskList(ctx, session, sessionID, taskList)
+
+			var terminalReason HaltReason
+			if subResult.Reason.Kind == HaltBudgetExceeded {
+				// Budget exhaustion mid-execute is its own halt — keep it
+				// distinct from a step's own failure.
+				terminalReason = subResult.Reason
+			} else {
+				terminalReason = HaltReason{
+					Kind:      HaltStepFailed,
+					TaskIndex: index,
+					Task:      taskList.Tasks[index].Description,
+					Reason:    haltReasonString(subResult.Reason),
+				}
+			}
+			return RunResult{
+				Kind:      RunFailure,
+				Reason:    terminalReason,
+				SessionID: sessionID,
+				Usage:     totalUsage,
+				Turns:     subResult.Turns,
+			}
+
+		case RunWaitingForHuman:
+			// A step surfacing to a human pauses the whole run; propagate.
+			return subResult
+		}
+	}
+
+	// Q2: success output is the LAST completed step's final response text.
+	return RunResult{
+		Kind:      RunSuccess,
+		Output:    lastOutput,
+		SessionID: sessionID,
+		Usage:     totalUsage,
+		Turns:     carried.Turns,
+	}
 }
 
 // runPlanPhase runs the one-shot PlanExecute plan phase (issue #70).

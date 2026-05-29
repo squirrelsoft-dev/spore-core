@@ -17,7 +17,11 @@ import (
 //  1. The plan turn's recorded FinalResponse is captured into the exact
 //     PlanArtifact (tasks + rationale), stored under extras["plan_execute"].
 //  2. The fenced ```json variant is captured identically (fence-strip rule).
-//  3. The run halts with the distinct ExecutePhaseNotImplemented reason.
+//  3. The plan turn is consumed and parsed into a non-empty task list, so the
+//     run proceeds into the execute phase (issue #59). This fixture provides
+//     ONLY the single plan turn, so the first execute step's ReAct sub-loop
+//     exhausts the replay and the run aborts with StepFailed{TaskIndex: 0} —
+//     proving the harness consumed the planner response and entered execute.
 //
 // Never edit the fixture to make a failing implementation pass.
 
@@ -61,8 +65,11 @@ func responseText(t *testing.T, ex RecordedExchange) string {
 	return ""
 }
 
-// drivePlanFixture replays a single exchange through the full harness plan
-// phase and asserts the distinct ExecutePhaseNotImplemented halt with one turn.
+// drivePlanFixture replays a single plan exchange through the full harness and
+// asserts the run consumes the planner turn, parses a non-empty task list, and
+// enters the execute phase — where the single-exchange replay exhausts on the
+// first step and aborts with StepFailed{TaskIndex: 0} (issue #59, Q5). Mirrors
+// the Rust plan_phase_fixture_replay drive_plan_phase.
 func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 	t.Helper()
 	replay := NewReplayModel([]RecordedExchange{ex}, ProviderInfo{
@@ -79,11 +86,14 @@ func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 	h := NewStandardHarness(cfg)
 	task := NewTask("build something", SessionID("plan-fixture"), LoopStrategy{Kind: StrategyPlanExecute})
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltExecutePhaseNotImplemented {
-		t.Fatalf("expected ExecutePhaseNotImplemented, got %+v", r)
+	if r.Kind != RunFailure || r.Reason.Kind != HaltStepFailed {
+		t.Fatalf("expected StepFailed, got %+v", r)
 	}
-	if r.Turns != 1 {
-		t.Fatalf("turns = %d, want 1", r.Turns)
+	if r.Reason.TaskIndex != 0 {
+		t.Fatalf("task index = %d, want 0", r.Reason.TaskIndex)
+	}
+	if r.Turns < 1 {
+		t.Fatalf("turns = %d, want >= 1 (at least the plan turn)", r.Turns)
 	}
 }
 

@@ -165,8 +165,8 @@ func storedArtifact(t *testing.T, s SessionState) PlanArtifact {
 	return a
 }
 
-// R1 + R3 + R4 + Q4: plan phase runs once, captures the artifact, stores it
-// under extras, and the full run halts with ExecutePhaseNotImplemented.
+// R1 + R3 + R4: plan phase runs once, captures the artifact, stores it under
+// extras (the full run continues into the execute phase — see harness_test.go).
 func TestPlanPhaseRunsOnceAndStoresArtifact(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["one","two"],"rationale":"r"}`))
@@ -192,18 +192,21 @@ func TestPlanPhaseRunsOnceAndStoresArtifact(t *testing.T) {
 	}
 }
 
-// Q4: the full Run() of a PlanExecute task halts with the distinct
-// ExecutePhaseNotImplemented reason (not the generic StrategyNotYetImplemented).
-func TestPlanExecuteHaltsWithExecutePhaseNotImplemented(t *testing.T) {
+// Confirms ExecutePhaseNotImplemented is gone (#59): a full PlanExecute run with
+// execute completions now SUCCEEDS (the old variant would have halted after the
+// plan phase). Mirrors the Rust execute_phase_not_implemented_is_gone test.
+func TestPlanExecuteExecutePhaseNotImplementedIsGone(t *testing.T) {
 	a := NewMockAgent("planner")
-	a.Push(planFinal(`{"tasks":["x"],"rationale":""}`))
+	a.Push(planFinal(`{"tasks":["only"],"rationale":""}`))
+	a.Push(planFinal("done"))
 	h := NewStandardHarness(standardCfg(a))
 	r := h.Run(context.Background(), NewHarnessRunOptions(planTask("do")))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltExecutePhaseNotImplemented {
+	if r.Kind != RunSuccess {
 		t.Fatalf("got %+v", r)
 	}
-	if r.Turns != 1 {
-		t.Fatalf("turns = %d, want 1", r.Turns)
+	// plan(1) + one execute step(1) = 2 turns.
+	if r.Turns != 2 {
+		t.Fatalf("turns = %d, want 2", r.Turns)
 	}
 }
 
