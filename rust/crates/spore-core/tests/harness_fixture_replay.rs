@@ -64,6 +64,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         hooks: None,
+        planner_agent: None,
     };
     let harness = StandardHarness::new(config);
 

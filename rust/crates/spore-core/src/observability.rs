@@ -878,6 +878,20 @@ impl InMemoryObservabilityProvider {
         Self::default()
     }
 
+    /// All recorded turn spans for a session, in insertion order. Lets callers
+    /// assert on per-turn emission (e.g. the one-shot PlanExecute plan turn,
+    /// issue #70) without reconstructing them from the heterogeneous trace.
+    pub fn turn_spans(&self, session_id: &SessionId) -> Vec<TurnSpan> {
+        self.inner
+            .lock()
+            .unwrap()
+            .turns
+            .iter()
+            .filter(|t| t.base.session_id == *session_id)
+            .cloned()
+            .collect()
+    }
+
     /// All recorded patch spans for a session, in insertion order (issue #28).
     /// Lets callers inspect the original/patched diff and classified
     /// [`PatchType`] without reconstructing them from the heterogeneous trace.

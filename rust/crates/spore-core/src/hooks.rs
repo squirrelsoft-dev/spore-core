@@ -1747,6 +1747,7 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
+            planner_agent: None,
         }
     }
 }

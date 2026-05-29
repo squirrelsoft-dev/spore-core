@@ -896,6 +896,22 @@ pub enum HaltReason {
     StrategyNotYetImplemented {
         strategy: String,
     },
+    /// Returned by [`StandardHarness`] for the `PlanExecute` strategy (issue
+    /// #70) AFTER the plan phase has produced, fired `OnPlanCreated` on, and
+    /// stored a [`PlanArtifact`](crate::plan::PlanArtifact). The execute loop
+    /// itself ships with #59/#72; this distinct reason marks "plan produced,
+    /// execute phase not implemented yet" so callers can tell it apart from the
+    /// generic [`StrategyNotYetImplemented`](Self::StrategyNotYetImplemented)
+    /// stub used by the other strategies.
+    ExecutePhaseNotImplemented,
+    /// The PlanExecute plan phase (issue #70) failed before producing an
+    /// artifact: the planner's response was unparseable, the planner requested
+    /// a tool call in the one-shot turn, or the artifact could not be
+    /// serialized for storage. Carries the underlying
+    /// [`PlanPhaseError`](crate::plan::PlanPhaseError).
+    PlanPhaseFailed {
+        error: crate::plan::PlanPhaseError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -919,6 +935,18 @@ pub enum RunResult {
         state: Box<PausedState>,
         request: HumanRequest,
     },
+}
+
+/// Internal result of a successful PlanExecute plan phase (issue #70). Carries
+/// the produced artifact plus the run accounting so the caller can build the
+/// terminal `RunResult`. Not part of the public surface — the artifact itself
+/// is observable via `SessionState.extras["plan_execute"]`.
+#[derive(Debug)]
+struct PlanPhaseOutcome {
+    #[allow(dead_code)]
+    artifact: crate::plan::PlanArtifact,
+    usage: AggregateUsage,
+    turns: u32,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -1029,6 +1057,12 @@ pub struct HarnessConfig {
     /// lifecycle events (`PreTurn`, `Stop`, `OnError`, …) through it.
     /// `None` (the default) preserves today's behaviour byte-for-byte.
     pub hooks: Option<Arc<dyn crate::hooks::HookChain>>,
+    /// Optional alternate agent used for the PlanExecute plan phase (issue #70,
+    /// Q1). When the loop strategy is `PlanExecute` and this is `Some`, the
+    /// one-shot plan turn runs on this agent; otherwise it runs on
+    /// [`agent`](Self::agent). `plan_model` on the strategy is descriptive
+    /// metadata only — there is no `ModelConfig`→agent factory.
+    pub planner_agent: Option<Arc<dyn Agent>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1049,6 +1083,7 @@ impl Clone for HarnessConfig {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks.clone(),
+            planner_agent: self.planner_agent.clone(),
         }
     }
 }
@@ -1094,6 +1129,7 @@ pub struct HarnessBuilder {
     max_repair_attempts: u32,
     max_stop_blocks: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
+    planner_agent: Option<Arc<dyn Agent>>,
 }
 
 impl HarnessBuilder {
@@ -1122,7 +1158,17 @@ impl HarnessBuilder {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
+            planner_agent: None,
         }
+    }
+
+    /// Inject an alternate agent for the PlanExecute plan phase (issue #70,
+    /// Q1). When set and the loop strategy is `PlanExecute`, the one-shot plan
+    /// turn runs on this agent; otherwise the plan turn runs on the default
+    /// agent. Defaults to `None`.
+    pub fn planner_agent(mut self, planner_agent: Arc<dyn Agent>) -> Self {
+        self.planner_agent = Some(planner_agent);
+        self
     }
 
     /// Inject a lifecycle hook chain (issue #69).
@@ -1222,6 +1268,7 @@ impl HarnessBuilder {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks,
+            planner_agent: self.planner_agent,
         }
     }
 
@@ -2202,6 +2249,303 @@ impl StandardHarness {
         }
     }
 
+    // (private outcome type for `run_plan_phase` is defined at module scope.)
+
+    /// Drive the PlanExecute strategy (issue #70).
+    ///
+    /// Runs the one-shot plan phase ([`run_plan_phase`](Self::run_plan_phase)),
+    /// then — per Q4 — HALTS with the distinct
+    /// [`HaltReason::ExecutePhaseNotImplemented`] once an artifact has been
+    /// produced, had `OnPlanCreated` fired on it, and been stored. The execute
+    /// loop itself ships with #59/#72. On any plan-phase failure the underlying
+    /// `RunResult::Failure` is returned unchanged (no artifact stored).
+    ///
+    /// Like `run_react`, this finalizes observability for the terminal outcome.
+    async fn run_plan_execute(
+        &self,
+        task: Task,
+        mut session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        let session_id = task.session_id.clone();
+        let result = match self
+            .run_plan_phase(&task, &mut session_state, budget_used, &on_stream)
+            .await
+        {
+            // Plan produced + stored. Q4: halt with the distinct reason.
+            Ok(outcome) => RunResult::Failure {
+                reason: HaltReason::ExecutePhaseNotImplemented,
+                session_id: session_id.clone(),
+                usage: outcome.usage,
+                turns: outcome.turns,
+            },
+            Err(failure) => failure,
+        };
+        match &result {
+            RunResult::Success { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Success)
+                    .await;
+            }
+            RunResult::Failure {
+                session_id, reason, ..
+            } => {
+                self.finalize_observability(
+                    session_id,
+                    SessionOutcome::Failure {
+                        reason: format!("{reason:?}"),
+                    },
+                )
+                .await;
+            }
+            RunResult::WaitingForHuman { .. } => {}
+        }
+        result
+    }
+
+    /// Run the one-shot PlanExecute plan phase (issue #70).
+    ///
+    /// Selects the planner agent (Q1: `config.planner_agent` if set, else the
+    /// default agent), seeds a planning directive as a user message, runs
+    /// EXACTLY ONE constrained turn (R1), expects a `FinalResponse` (a tool call
+    /// is a planning failure — R2 — never a dispatch loop), captures the
+    /// response via [`capture_plan_artifact`](crate::plan::capture_plan_artifact)
+    /// (R3), fires `OnPlanCreated` (which may rewrite the artifact — R11),
+    /// stores the result in `extras["plan_execute"]` (R4), emits the turn span
+    /// (R8), and counts the turn against the shared budget (R7). A budget
+    /// exhausted before the turn returns a budget-exceeded `Failure` with no
+    /// artifact stored (R10).
+    ///
+    /// On success returns the produced [`PlanArtifact`](crate::plan::PlanArtifact)
+    /// plus the run accounting. On any failure returns the terminal
+    /// `RunResult::Failure` to propagate.
+    async fn run_plan_phase(
+        &self,
+        task: &Task,
+        session_state: &mut SessionState,
+        mut budget_used: BudgetSnapshot,
+        on_stream: &Option<StreamSink>,
+    ) -> Result<PlanPhaseOutcome, RunResult> {
+        let session_id = task.session_id.clone();
+        let started_at = Instant::now();
+        let mut usage = AggregateUsage::default();
+
+        // R10: Layer-1 budget gate BEFORE the plan turn. Mirrors run_react_inner.
+        let effective_turn_cap = task.budget.max_turns.unwrap_or(u32::MAX).max(1);
+        if budget_used.turns >= effective_turn_cap {
+            return Err(RunResult::Failure {
+                reason: HaltReason::BudgetExceeded {
+                    limit_type: BudgetLimitType::Turns,
+                },
+                session_id,
+                usage,
+                turns: budget_used.turns,
+            });
+        }
+        if let Some(limit_type) = Self::budget_exceeded(&task.budget, &budget_used, started_at) {
+            return Err(RunResult::Failure {
+                reason: HaltReason::BudgetExceeded { limit_type },
+                session_id,
+                usage,
+                turns: budget_used.turns,
+            });
+        }
+
+        // Q1: select the planner agent (alternate if configured, else default).
+        let planner = self
+            .config
+            .planner_agent
+            .as_ref()
+            .unwrap_or(&self.config.agent);
+
+        // Seed the planning directive as a user message (reuse ContextManager).
+        let directive = format!(
+            "Produce a step-by-step plan for the following task. Respond with a \
+             single JSON object: {{\"tasks\": [<ordered step strings>], \
+             \"rationale\": <string>}}.\n\nTask:\n{}",
+            task.instruction
+        );
+        self.config
+            .context_manager
+            .append_user_message(session_state, &directive)
+            .await;
+
+        // Assemble + invoke the planner for exactly ONE turn (R1).
+        let context = self
+            .config
+            .context_manager
+            .assemble(session_state, task)
+            .await;
+        Self::emit(
+            on_stream,
+            StreamEvent::TurnStart {
+                turn: budget_used.turns + 1,
+            },
+        );
+        let turn_started_at = Timestamp::now();
+        let turn_clock = Instant::now();
+        let result = planner.turn(context).await;
+        budget_used.turns += 1; // R7: the plan turn counts against the budget.
+
+        // R8: emit exactly one TurnSpan for the plan turn. Mirrors the metrics
+        // path of run_react_inner; content capture intentionally omitted (the
+        // plan turn carries no tool calls and #64 content capture is wired in
+        // the ReAct loop only).
+        {
+            let zero = TokenUsage::default();
+            let u = match &result {
+                TurnResult::ToolCallRequested { usage, .. }
+                | TurnResult::FinalResponse { usage, .. } => usage,
+                TurnResult::Error { usage, .. } => usage.as_ref().unwrap_or(&zero),
+            };
+            let (stop_reason, tool_calls_requested) = match &result {
+                TurnResult::FinalResponse { .. } => (StopReason::EndTurn, 0),
+                TurnResult::ToolCallRequested { calls, .. } => {
+                    (StopReason::ToolUse, calls.len() as u32)
+                }
+                TurnResult::Error { .. } => (StopReason::EndTurn, 0),
+            };
+            let mut base = SpanBase::new_root(
+                SpanId::new(format!(
+                    "{}-turn-{}",
+                    session_id.as_str(),
+                    budget_used.turns
+                )),
+                session_id.clone(),
+                task.id.clone(),
+                SpanKind::Turn,
+                turn_started_at,
+            );
+            let status = match &result {
+                TurnResult::Error { error, .. } => SpanStatus::Error {
+                    message: format!("{error:?}"),
+                },
+                _ => SpanStatus::Ok,
+            };
+            base.finish(
+                Timestamp::now(),
+                status,
+                turn_clock.elapsed().as_millis() as u64,
+            );
+            if let Some(obs) = self.config.observability.as_ref() {
+                obs.emit_turn(TurnSpan {
+                    base,
+                    turn_number: budget_used.turns,
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_read_tokens: u.cache_read_tokens,
+                    cache_write_tokens: u.cache_write_tokens,
+                    cost_usd: self.config.pricing.cost_for(
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_tokens,
+                        u.cache_write_tokens,
+                    ),
+                    stop_reason,
+                    tool_calls_requested,
+                    output_text: None,
+                    tool_calls: None,
+                    input_messages: None,
+                });
+            }
+        }
+        Self::emit(
+            on_stream,
+            StreamEvent::TurnEnd {
+                turn: budget_used.turns,
+            },
+        );
+
+        // Classify the one-shot turn. R2: a tool call is a planning failure,
+        // NOT a dispatch loop.
+        let final_text = match result {
+            TurnResult::FinalResponse { content, usage: u } => {
+                usage.add_turn(&u);
+                budget_used.input_tokens += u.input_tokens as u64;
+                budget_used.output_tokens += u.output_tokens as u64;
+                content
+            }
+            TurnResult::ToolCallRequested { usage: u, .. } => {
+                usage.add_turn(&u);
+                return Err(RunResult::Failure {
+                    reason: HaltReason::PlanPhaseFailed {
+                        error: crate::plan::PlanPhaseError::PlanningTurnFailed {
+                            message: "planner requested a tool call in the one-shot plan turn"
+                                .into(),
+                        },
+                    },
+                    session_id,
+                    usage,
+                    turns: budget_used.turns,
+                });
+            }
+            TurnResult::Error { error, usage: u } => {
+                if let Some(u) = u.as_ref() {
+                    usage.add_turn(u);
+                }
+                return Err(RunResult::Failure {
+                    reason: HaltReason::AgentError { error },
+                    session_id,
+                    usage,
+                    turns: budget_used.turns,
+                });
+            }
+        };
+
+        // R3: capture the artifact from the response text.
+        let mut artifact = match crate::plan::capture_plan_artifact(&final_text) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(RunResult::Failure {
+                    reason: HaltReason::PlanPhaseFailed { error: e },
+                    session_id,
+                    usage,
+                    turns: budget_used.turns,
+                });
+            }
+        };
+
+        // R11: fire OnPlanCreated synchronously; the hook may rewrite `artifact`
+        // in place. The stored artifact reflects any mutation.
+        if let Some(chain) = self.config.hooks.as_ref() {
+            let mut ctx = crate::hooks::HookContext::OnPlanCreated {
+                session_id: &session_id,
+                plan: &mut artifact,
+            };
+            // Errors are non-fatal: an observability/handler error must not lose
+            // a successfully-captured plan. The (possibly mutated) artifact is
+            // still stored.
+            let _ = chain.fire(&mut ctx).await;
+        }
+
+        // R4: store the produced artifact in extras["plan_execute"] as JSON.
+        match serde_json::to_value(&artifact) {
+            Ok(value) => {
+                session_state
+                    .extras
+                    .insert(crate::plan::PLAN_EXECUTE_EXTRAS_KEY.to_string(), value);
+            }
+            Err(e) => {
+                return Err(RunResult::Failure {
+                    reason: HaltReason::PlanPhaseFailed {
+                        error: crate::plan::PlanPhaseError::UnparseablePlan {
+                            message: format!("failed to serialize plan artifact: {e}"),
+                        },
+                    },
+                    session_id,
+                    usage,
+                    turns: budget_used.turns,
+                });
+            }
+        }
+
+        Ok(PlanPhaseOutcome {
+            artifact,
+            usage,
+            turns: budget_used.turns,
+        })
+    }
+
     /// Run the post-compaction verify→retry→warn loop (issue #46/#29).
     ///
     /// Drives one compaction turn through the agent, verifies the summary,
@@ -2412,14 +2756,10 @@ impl StandardHarness {
                 self.run_react(task, max_iterations, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::PlanExecute { .. } => RunResult::Failure {
-                reason: HaltReason::StrategyNotYetImplemented {
-                    strategy: "plan_execute".into(),
-                },
-                session_id: task.session_id,
-                usage: AggregateUsage::default(),
-                turns: 0,
-            },
+            LoopStrategy::PlanExecute { .. } => {
+                self.run_plan_execute(task, session_state, budget_used, on_stream)
+                    .await
+            }
             LoopStrategy::Ralph => RunResult::Failure {
                 reason: HaltReason::StrategyNotYetImplemented {
                     strategy: "ralph".into(),
@@ -2872,6 +3212,7 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
+            planner_agent: None,
         }
     }
 
@@ -3776,10 +4117,12 @@ mod tests {
     async fn non_react_strategies_marked_not_yet_implemented() {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
+        // Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented;
+        // it is exercised separately below. Ralph / SelfVerifying / HillClimbing
+        // still return the generic stub.
         for s in [
             LoopStrategy::Ralph,
             LoopStrategy::SelfVerifying,
-            LoopStrategy::PlanExecute { plan_model: None },
             LoopStrategy::HillClimbing {
                 direction: OptimizationDirection::Maximize,
                 max_stagnation: None,
@@ -3796,6 +4139,312 @@ mod tests {
                 other => panic!("expected StrategyNotYetImplemented, got {other:?}"),
             }
         }
+    }
+
+    // ── PlanExecute plan phase (issue #70) ──────────────────────────────────
+
+    use crate::plan::{PlanArtifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
+
+    fn plan_task() -> Task {
+        task(LoopStrategy::PlanExecute { plan_model: None })
+    }
+
+    fn final_resp(text: &str) -> TurnResult {
+        TurnResult::FinalResponse {
+            content: text.into(),
+            usage: usage(),
+        }
+    }
+
+    fn stored_artifact(state: &SessionState) -> PlanArtifact {
+        let v = state
+            .extras
+            .get(PLAN_EXECUTE_EXTRAS_KEY)
+            .expect("plan_execute extras present");
+        serde_json::from_value(v.clone()).expect("artifact deserializes")
+    }
+
+    // Q4: after producing+storing an artifact, the full PlanExecute run() halts
+    // with the distinct ExecutePhaseNotImplemented reason (not the generic
+    // StrategyNotYetImplemented stub). Storage is asserted via run_plan_phase in
+    // the tests below, which can inspect the mutated session_state directly.
+    #[tokio::test]
+    async fn plan_execute_halts_with_distinct_reason() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["one","two"],"rationale":"why"}"#));
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::ExecutePhaseNotImplemented,
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 1, "exactly one plan turn counts against budget");
+            }
+            other => panic!("expected ExecutePhaseNotImplemented, got {other:?}"),
+        }
+    }
+
+    // R1/R3/R4: the plan turn runs exactly once and stores the exact artifact.
+    // Uses run_plan_phase directly so we can inspect the mutated session_state.
+    #[tokio::test]
+    async fn plan_phase_runs_once_and_stores_exact_artifact() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["a","b","c"],"rationale":"r"}"#));
+        let agent_for_count = a.clone();
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+        let mut state = SessionState::default();
+        let outcome = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        // R1: exactly one planner turn.
+        assert_eq!(
+            agent_for_count
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // R7: counted against the budget.
+        assert_eq!(outcome.turns, 1);
+        // R3/R4: exact artifact stored.
+        let stored = stored_artifact(&state);
+        assert_eq!(stored.tasks, vec!["a", "b", "c"]);
+        assert_eq!(stored.rationale, "r");
+        assert_eq!(stored, outcome.artifact);
+    }
+
+    // R2: a tool call in the one-shot plan turn is a planning failure — no
+    // dispatch loop runs (tool registry is never hit).
+    #[tokio::test]
+    async fn plan_phase_tool_call_is_planning_failure() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = reg.clone();
+        let h = StandardHarness::new(cfg);
+        let t = plan_task();
+        let mut state = SessionState::default();
+        let err = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect_err("tool call fails the plan phase");
+        match err {
+            RunResult::Failure {
+                reason:
+                    HaltReason::PlanPhaseFailed {
+                        error: PlanPhaseError::PlanningTurnFailed { .. },
+                    },
+                ..
+            } => {}
+            other => panic!("expected PlanningTurnFailed, got {other:?}"),
+        }
+        // No dispatch loop: registry never called, nothing stored.
+        assert_eq!(
+            reg.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "tool registry must not be dispatched in the plan turn"
+        );
+        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+    }
+
+    // R5: when planner_agent is set, the PLANNER runs the plan turn and the
+    // default agent does not.
+    #[tokio::test]
+    async fn plan_phase_routes_to_planner_agent() {
+        let default_agent = make_agent();
+        default_agent.push(final_resp(r#"{"tasks":["default"]}"#));
+        let planner = make_agent();
+        planner.push(final_resp(r#"{"tasks":["planner"]}"#));
+
+        let mut cfg = standard_config(default_agent.clone());
+        cfg.planner_agent = Some(planner.clone());
+        let h = StandardHarness::new(cfg);
+        let t = plan_task();
+        let mut state = SessionState::default();
+        h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+
+        assert_eq!(
+            planner.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "planner agent ran the plan turn"
+        );
+        assert_eq!(
+            default_agent
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default agent did not run the plan turn"
+        );
+        assert_eq!(stored_artifact(&state).tasks, vec!["planner"]);
+    }
+
+    // R6: with no planner_agent, the plan turn runs on the default agent.
+    #[tokio::test]
+    async fn plan_phase_routes_to_default_agent_when_unset() {
+        let default_agent = make_agent();
+        default_agent.push(final_resp(r#"{"tasks":["default"]}"#));
+        let h = StandardHarness::new(standard_config(default_agent.clone()));
+        let t = plan_task();
+        let mut state = SessionState::default();
+        h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        assert_eq!(
+            default_agent
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(stored_artifact(&state).tasks, vec!["default"]);
+    }
+
+    // R8: exactly one TurnSpan is recorded for the plan turn.
+    #[tokio::test]
+    async fn plan_phase_records_one_turn_span() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["a"]}"#));
+        let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
+        let mut cfg = standard_config(a);
+        cfg.observability = Some(obs.clone());
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+        let spans = obs.turn_spans(&SessionId::new("s1"));
+        assert_eq!(spans.len(), 1, "exactly one turn span for the plan turn");
+        assert_eq!(spans[0].turn_number, 1);
+    }
+
+    // R10: budget exhausted before the plan turn → budget-exceeded Failure with
+    // no artifact stored and no planner turn.
+    #[tokio::test]
+    async fn plan_phase_budget_exhausted_before_turn() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["a"]}"#));
+        let agent_for_count = a.clone();
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task().with_budget(BudgetLimits {
+            max_turns: Some(1),
+            ..Default::default()
+        });
+        let mut state = SessionState::default();
+        // Pre-consume the only allowed turn.
+        let used = BudgetSnapshot {
+            turns: 1,
+            ..Default::default()
+        };
+        let err = h
+            .run_plan_phase(&t, &mut state, used, &None)
+            .await
+            .expect_err("budget exhausted");
+        match err {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                ..
+            } => {}
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+        assert_eq!(
+            agent_for_count
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no planner turn ran"
+        );
+        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+    }
+
+    // R11: an OnPlanCreated hook can rewrite the plan before storage; the
+    // stored artifact reflects the mutation.
+    #[tokio::test]
+    async fn plan_phase_on_plan_created_rewrites_before_storage() {
+        use crate::hooks::{FunctionHook, HookDecision, HookEvent, StandardHookChain};
+
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["original"],"rationale":"orig"}"#));
+
+        let chain = StandardHookChain::new();
+        chain
+            .register(Arc::new(FunctionHook::new(
+                "rewrite-plan",
+                vec![HookEvent::OnPlanCreated],
+                |ctx| {
+                    if let crate::hooks::HookContext::OnPlanCreated { plan, .. } = ctx {
+                        plan.tasks = vec!["rewritten".to_string()];
+                        plan.rationale = "mutated".to_string();
+                    }
+                    Ok(HookDecision::Continue)
+                },
+            )))
+            .unwrap();
+
+        let mut cfg = standard_config(a);
+        cfg.hooks = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+        let t = plan_task();
+        let mut state = SessionState::default();
+        let outcome = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+
+        let stored = stored_artifact(&state);
+        assert_eq!(stored.tasks, vec!["rewritten"]);
+        assert_eq!(stored.rationale, "mutated");
+        assert_eq!(stored, outcome.artifact);
+    }
+
+    // R3 fence variant: a fenced ```json plan is captured through the harness.
+    #[tokio::test]
+    async fn plan_phase_captures_fenced_json() {
+        let a = make_agent();
+        a.push(final_resp("```json\n{\"tasks\":[\"f1\",\"f2\"]}\n```"));
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+        let mut state = SessionState::default();
+        h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        assert_eq!(stored_artifact(&state).tasks, vec!["f1", "f2"]);
+    }
+
+    // R3: an unparseable plan surfaces PlanPhaseFailed/UnparseablePlan and
+    // stores nothing.
+    #[tokio::test]
+    async fn plan_phase_unparseable_response_fails() {
+        let a = make_agent();
+        a.push(final_resp("this is not json"));
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+        let mut state = SessionState::default();
+        let err = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect_err("unparseable plan fails");
+        match err {
+            RunResult::Failure {
+                reason:
+                    HaltReason::PlanPhaseFailed {
+                        error: PlanPhaseError::UnparseablePlan { .. },
+                    },
+                ..
+            } => {}
+            other => panic!("expected UnparseablePlan, got {other:?}"),
+        }
+        assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
     }
 
     // Rule: Aggregate usage accumulates across turns.
@@ -4132,6 +4781,7 @@ mod tests {
                 max_repair_attempts: 1,
                 max_stop_blocks: 8,
                 hooks: None,
+                planner_agent: None,
             })
         }
 

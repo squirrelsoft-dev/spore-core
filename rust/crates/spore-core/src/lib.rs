@@ -34,6 +34,7 @@ pub mod observability;
 pub mod observability_outbox;
 pub mod ollama;
 pub mod openai;
+pub mod plan;
 pub mod prompt_chunk_registry;
 pub mod sandbox;
 pub mod scenarios;
@@ -113,6 +114,9 @@ pub use observability::{
 pub use observability_outbox::{OutboxConfig, OutboxObservabilityProvider, TraceLine};
 pub use ollama::OllamaModelInterface;
 pub use openai::OpenAIModelInterface;
+// `PlanArtifact` is re-exported via `hooks` above (it is the `OnPlanCreated`
+// payload); `plan` reuses that type and adds the capture step + phase error.
+pub use plan::{capture_plan_artifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
 pub use prompt_chunk_registry::{
     standard_chunks, ApprovalPolicy, CacheBlock, ChunkError, ChunkId, ChunkSlot,
     ChunkValidationError, Mode, PromptChunk, PromptChunkRegistry, StandardPromptChunkRegistry,
