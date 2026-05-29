@@ -43,6 +43,23 @@ import (
 // otlpFlushTimeout bounds the best-effort force-flush on FlushSession.
 const otlpFlushTimeout = 2 * time.Second
 
+// ParseOTLPEndpoints parses the comma-separated SPORE_OTLP_ENDPOINT value
+// (issue #73 multi-endpoint fan-out): strings.Split(","), TrimSpace each
+// segment, drop empty segments. This is the cross-language ground truth
+// (fixtures/storage/otlp_endpoints_parse.json) and MUST be byte-identical in
+// every language. It always returns a non-nil slice (possibly empty).
+func ParseOTLPEndpoints(raw string) []string {
+	out := []string{}
+	for _, seg := range strings.Split(raw, ",") {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		out = append(out, seg)
+	}
+	return out
+}
+
 // otlpTracerName is the instrumentation scope name for emitted spans.
 const otlpTracerName = "spore-core"
 

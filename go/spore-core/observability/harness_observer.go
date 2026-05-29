@@ -338,6 +338,13 @@ type HarnessBuilder struct {
 	// contextmgr.NewKeyTermVerifier(); maxCompactionAttempts defaults to 2.
 	compactionVerifier    sporecore.CompactionVerifier
 	maxCompactionAttempts uint32
+	// spanStore is the optional ObservabilityStore leg of a StorageProvider
+	// (issue #73), set via WithStorage. When present AND the configured
+	// observability provider is the durable outbox, the builder wires it into
+	// the outbox's fan-out so every span is ALSO appended to the store. Defaults
+	// to nil (no-op): the harness never null-checks; an unconfigured store leg
+	// simply contributes nothing.
+	spanStore SpanStore
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -401,10 +408,35 @@ func (b *HarnessBuilder) Observability(provider ObservabilityProvider) *HarnessB
 
 // WithObservabilityOutbox constructs and injects a durable-outbox
 // ObservabilityProvider rooted at root (typically the ".spore" directory),
-// using the spec defaults. Honors SPORE_OTLP_ENDPOINT for OTLP forwarding to
-// Tempo over gRPC (issue #50); unset/empty means JSONL only.
+// using the spec defaults. Honors SPORE_OTLP_ENDPOINT (comma-separated
+// multi-endpoint fan-out, issue #73) for OTLP forwarding to Tempo over gRPC
+// (issue #50); unset/empty means JSONL only. When a storage span-store leg was
+// set via WithStorage, it is wired into the outbox's fan-out here so every span
+// is ALSO appended to the store.
 func (b *HarnessBuilder) WithObservabilityOutbox(root string) *HarnessBuilder {
-	return b.Observability(NewOutboxObservabilityProvider(NewOutboxConfig(root)))
+	outbox := NewOutboxObservabilityProvider(NewOutboxConfig(root))
+	if b.spanStore != nil {
+		outbox = outbox.WithStore(b.spanStore)
+	}
+	return b.Observability(outbox)
+}
+
+// WithStorage wires the ObservabilityStore leg of a StorageProvider (issue #73)
+// into the builder. Pass storageProvider.Observability(); the observability
+// fan-out then ALSO appends every span to that store (in addition to the
+// durable JSONL outbox and any OTLP endpoints). The other three storage domains
+// (session, memory, run) are expose-only in v1 — the harness loop does not call
+// them — so the builder takes only the observability leg, the one with runtime
+// behavior. The split avoids an observability → storage import cycle: the store
+// is accepted via the SpanStore seam, which storage.ObservabilityStore
+// implementations satisfy structurally.
+//
+// Defaults to nil (no-op): an unconfigured store leg contributes nothing and
+// the harness never null-checks. Must be called BEFORE WithObservabilityOutbox
+// for the leg to be wired into a builder-constructed outbox.
+func (b *HarnessBuilder) WithStorage(observabilityStore SpanStore) *HarnessBuilder {
+	b.spanStore = observabilityStore
+	return b
 }
 
 // Pricing sets the token→USD pricing table used to stamp cost on turn spans.

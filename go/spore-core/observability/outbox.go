@@ -619,21 +619,64 @@ func (w *sessionWriter) close() {
 type OutboxObservabilityProvider struct {
 	inner   *InMemoryObservabilityProvider
 	config  OutboxConfig
-	otlp    otlpForwarder
+	otlp    []otlpForwarder
+	store   SpanStore
 	mu      sync.Mutex
 	writers map[SessionID]*sessionWriter
 }
 
+// SpanStore is the consumer-side seam (issue #73) the outbox delegates its span
+// storage to. The storage package's ObservabilityStore implementations
+// (FileSystem, InMemory, NoOp) satisfy it structurally; observability does not
+// import storage, keeping the dependency edge storage → observability only.
+//
+// It is the AppendSpan + FlushSession subset of storage.ObservabilityStore —
+// the only two methods the outbox calls on the store leg.
+type SpanStore interface {
+	AppendSpan(ctx context.Context, sessionID SessionID, span json.RawMessage) error
+	FlushSession(ctx context.Context, sessionID SessionID) error
+}
+
 // NewOutboxObservabilityProvider constructs a provider. It reads
-// SPORE_OTLP_ENDPOINT once: empty/whitespace is treated as unset (JSONL only);
-// a non-empty value wires the OTLP forwarder to that endpoint (see deviation).
+// SPORE_OTLP_ENDPOINT once as a COMMA-SEPARATED LIST (issue #73 multi-endpoint
+// fan-out): ParseOTLPEndpoints splits, trims, drops empties; each parsed
+// endpoint becomes one fan-out forwarder. Unparseable entries are logged and
+// skipped. Empty/unset → JSONL only (no OTLP leg).
 func NewOutboxObservabilityProvider(config OutboxConfig) *OutboxObservabilityProvider {
 	return &OutboxObservabilityProvider{
 		inner:   NewInMemoryObservabilityProvider(),
 		config:  config,
-		otlp:    newForwarder(os.Getenv("SPORE_OTLP_ENDPOINT")),
+		otlp:    buildForwarders(os.Getenv("SPORE_OTLP_ENDPOINT")),
 		writers: make(map[SessionID]*sessionWriter),
 	}
+}
+
+// buildForwarders builds one real OTLP forwarder per parsed endpoint, parsing
+// and validating the comma-separated list ONCE. Unparseable entries are logged
+// and skipped. Returns an empty slice when the env var is unset/empty/all-
+// unparseable (JSONL only — no OTLP leg).
+func buildForwarders(raw string) []otlpForwarder {
+	var out []otlpForwarder
+	for _, endpoint := range ParseOTLPEndpoints(raw) {
+		f, err := newOTLPSdkForwarder(strings.TrimSpace(endpoint))
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"[spore-core] failed to init OTLP forwarder for %q; skipping: %v\n", endpoint, err)
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// WithStore attaches a SpanStore leg (issue #73). Each subsequent EmitX ALSO
+// calls AppendSpan on this store, in addition to the durable JSONL writer and
+// any OTLP forwarders. The outbox's own JSONL writer remains the source of
+// truth; this delegates the span store to the pluggable abstraction. Returns
+// the receiver so it chains with NewOutboxObservabilityProvider.
+func (p *OutboxObservabilityProvider) WithStore(store SpanStore) *OutboxObservabilityProvider {
+	p.store = store
+	return p
 }
 
 // Inner exposes the wrapped in-memory provider (e.g. to call
@@ -685,8 +728,11 @@ func (p *OutboxObservabilityProvider) traceIDLocked(sessionID SessionID) string 
 	return w.traceID
 }
 
-// writeLine appends a built line to the session's JSONL file then forwards to
-// OTLP. The file write is the reliability guarantee; OTLP is best-effort.
+// writeLine appends a built line to the session's JSONL file, fans out to every
+// OTLP forwarder, and (when configured) appends the span to the SpanStore leg.
+// The JSONL write is the reliability guarantee; every other leg is independent
+// and best-effort — a failure on any one is logged but never propagates or
+// blocks the others (issue #73 fan-out failure isolation).
 func (p *OutboxObservabilityProvider) writeLine(sessionID SessionID, line TraceLine) {
 	jsonl, err := line.toJSONLLine()
 	if err != nil {
@@ -704,7 +750,22 @@ func (p *OutboxObservabilityProvider) writeLine(sessionID SessionID, line TraceL
 		fmt.Fprintf(os.Stderr, "[spore-core] outbox append failed: %v\n", err)
 	}
 	p.mu.Unlock()
-	p.otlp.forward(line)
+
+	// Fan out to every OTLP endpoint. Each forwarder is internally
+	// non-blocking (batch processor); failures are isolated per leg.
+	for _, f := range p.otlp {
+		f.forward(line)
+	}
+
+	// SpanStore leg (issue #73): serialize the line to JSON and append. The
+	// line minus the trailing newline is the span value. Failure is logged,
+	// never propagated.
+	if p.store != nil {
+		span := json.RawMessage(jsonl[:len(jsonl)-1])
+		if err := p.store.AppendSpan(context.Background(), sessionID, span); err != nil {
+			fmt.Fprintf(os.Stderr, "[spore-core] observability store append failed: %v\n", err)
+		}
+	}
 }
 
 // --- EmitX (build the line with the session trace id, delegate to inner) ---
@@ -820,8 +881,18 @@ func (p *OutboxObservabilityProvider) FlushSession(ctx context.Context, sessionI
 	}
 	p.mu.Unlock()
 
-	// Best-effort OTLP force-flush; never errors out of FlushSession.
-	p.otlp.forceFlush()
+	// Best-effort OTLP force-flush across every fan-out leg; never errors out
+	// of FlushSession.
+	for _, f := range p.otlp {
+		f.forceFlush()
+	}
+
+	// Flush the SpanStore leg's session marker too (issue #73). Best-effort.
+	if p.store != nil {
+		if err := p.store.FlushSession(ctx, sessionID); err != nil {
+			fmt.Fprintf(os.Stderr, "[spore-core] observability store flush failed: %v\n", err)
+		}
+	}
 
 	// Create the sibling .flushed marker.
 	dir := p.config.sessionDir(sessionID)
