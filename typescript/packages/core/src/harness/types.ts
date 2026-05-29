@@ -15,6 +15,7 @@ import { z } from "zod";
 
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
+import type { PlanPhaseErrorKind } from "../plan/types.js";
 import type {
   CompactionPreserveHints,
   SessionState as ContextSessionState,
@@ -581,7 +582,23 @@ export type HaltReason =
   | { kind: "unrecoverable_tool_error"; tool: string; error: string }
   | { kind: "human_halted" }
   | { kind: "stagnation_limit_reached"; iterations: number; best_metric: number }
-  | { kind: "strategy_not_yet_implemented"; strategy: string };
+  | { kind: "strategy_not_yet_implemented"; strategy: string }
+  /**
+   * Returned by {@link StandardHarness} for the `plan_execute` strategy (issue
+   * #70) AFTER the plan phase has produced, fired `on_plan_created` on, and
+   * stored a {@link "../plan/index.js".PlanArtifact}. The execute loop ships
+   * with #59/#72; this distinct reason marks "plan produced, execute phase not
+   * implemented yet" so callers can tell it apart from the generic
+   * `strategy_not_yet_implemented` stub the other strategies use.
+   */
+  | { kind: "execute_phase_not_implemented" }
+  /**
+   * The `plan_execute` plan phase (issue #70) failed before producing an
+   * artifact: the planner's response was unparseable, the planner requested a
+   * tool call in the one-shot turn, or the agent returned an error. Carries the
+   * underlying {@link "../plan/index.js".PlanPhaseError} detail.
+   */
+  | { kind: "plan_phase_failed"; error: PlanPhaseErrorKind };
 
 export type RunResult =
   | {

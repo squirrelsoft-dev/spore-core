@@ -49,6 +49,12 @@ import {
   type HookChain,
   type HookContext,
 } from "../hooks/index.js";
+import {
+  PLAN_EXECUTE_EXTRAS_KEY,
+  PlanPhaseError,
+  capturePlanArtifact,
+  type PlanArtifact,
+} from "../plan/index.js";
 
 import type { Harness } from "./interface.js";
 import {
@@ -132,6 +138,13 @@ export interface HarnessConfig {
    * each `run()`/`resume()` call. Optional; defaults to `8`.
    */
   maxStopBlocks?: number;
+  /**
+   * Optional alternate agent used for the `plan_execute` plan phase (issue #70,
+   * Q1). When the loop strategy is `plan_execute` and this is set, the one-shot
+   * plan turn runs on this agent; otherwise it runs on the default {@link agent}.
+   * `plan_model` on the strategy stays DESCRIPTIVE metadata only.
+   */
+  plannerAgent?: Agent;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -267,7 +280,13 @@ export class StandardHarness implements Harness {
           true,
         );
       case "plan_execute":
-        return notYetImplemented("plan_execute", task.session_id);
+        return this.runPlanExecute(
+          task,
+          sessionState,
+          budgetUsed,
+          options.on_stream,
+          options.signal,
+        );
       case "ralph":
         return notYetImplemented("ralph", task.session_id);
       case "self_verifying":
@@ -382,6 +401,291 @@ export class StandardHarness implements Harness {
       obs.setSessionOutcome(sessionId, outcome);
       await obs.flushSession(sessionId);
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // PlanExecute plan phase (issue #70)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Drive the `plan_execute` strategy (issue #70).
+   *
+   * Runs the one-shot plan phase ({@link runPlanPhase}), then — per Q4 — HALTS
+   * with the distinct {@link HaltReason} `execute_phase_not_implemented` once an
+   * artifact has been produced, had `on_plan_created` fired on it, and been
+   * stored. The execute loop itself ships with #59/#72. On any plan-phase
+   * failure the underlying `failure` `RunResult` is returned unchanged (no
+   * artifact stored). Like `runReact`, finalizes observability for the terminal
+   * outcome.
+   */
+  private async runPlanExecute(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    const sessionId = task.session_id;
+    const outcome = await this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
+
+    let result: RunResult;
+    if (outcome.ok) {
+      // Plan produced + stored. Q4: halt with the distinct reason.
+      result = {
+        kind: "failure",
+        reason: { kind: "execute_phase_not_implemented" },
+        session_id: sessionId,
+        usage: outcome.usage,
+        turns: outcome.turns,
+      };
+    } else {
+      result = outcome.failure;
+    }
+
+    switch (result.kind) {
+      case "success":
+        await this.finalizeObservability(result.session_id, { kind: "success" });
+        break;
+      case "failure":
+        await this.finalizeObservability(result.session_id, {
+          kind: "failure",
+          reason: haltReasonToString(result.reason),
+        });
+        break;
+      case "waiting_for_human":
+        break;
+    }
+    return result;
+  }
+
+  /**
+   * Run the one-shot `plan_execute` plan phase (issue #70).
+   *
+   * Selects the planner agent (Q1: {@link HarnessConfig.plannerAgent} if set,
+   * else the default agent), seeds a planning directive as a user message, runs
+   * EXACTLY ONE constrained turn (R1), expects a `final_response` (a tool call
+   * is a planning failure — R2 — never a dispatch loop), captures the response
+   * via {@link capturePlanArtifact} (R3), fires `on_plan_created` (which may
+   * rewrite the artifact — R11), stores the result in `extras["plan_execute"]`
+   * (R4), emits the turn span (R8), and counts the turn against the shared
+   * budget (R7). A budget exhausted before the turn returns a budget-exceeded
+   * `failure` with no artifact stored (R10).
+   *
+   * On success resolves `{ ok: true, artifact, usage, turns }`. On any failure
+   * resolves `{ ok: false, failure }` with the terminal `failure` `RunResult`.
+   */
+  private async runPlanPhase(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<
+    | { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number }
+    | { ok: false; failure: RunResult }
+  > {
+    const sessionId = task.session_id;
+    const startedAt = Date.now();
+    const usage: AggregateUsage = emptyAggregateUsage();
+    const pricing = this.config.pricing ?? PricingTable.DEFAULT;
+
+    // R10: Layer-1 budget gate BEFORE the plan turn. Mirrors runReactInner.
+    const taskMaxTurns = task.budget.max_turns ?? undefined;
+    const effectiveTurnCap =
+      taskMaxTurns != null ? Math.max(taskMaxTurns, 1) : Number.MAX_SAFE_INTEGER;
+    if (budgetUsed.turns >= effectiveTurnCap) {
+      return {
+        ok: false,
+        failure: failure(
+          { kind: "budget_exceeded", limit_type: "turns" },
+          sessionId,
+          usage,
+          budgetUsed.turns,
+        ),
+      };
+    }
+    const overrun = budgetExceeded(task.budget, budgetUsed, startedAt);
+    if (overrun != null) {
+      return {
+        ok: false,
+        failure: failure(
+          { kind: "budget_exceeded", limit_type: overrun },
+          sessionId,
+          usage,
+          budgetUsed.turns,
+        ),
+      };
+    }
+
+    // Q1: select the planner agent (alternate if configured, else default).
+    const planner = this.config.plannerAgent ?? this.config.agent;
+
+    // Seed the planning directive as a user message (reuse ContextManager).
+    const directive =
+      "Produce a step-by-step plan for the following task. Respond with a " +
+      'single JSON object: {"tasks": [<ordered step strings>], ' +
+      '"rationale": <string>}.\n\nTask:\n' +
+      task.instruction;
+    await this.config.contextManager.appendUserMessage(sessionState, directive);
+
+    // Assemble + invoke the planner for exactly ONE turn (R1).
+    const context = await this.config.contextManager.assemble(sessionState, task, signal);
+    emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
+    const turnStartedAt = Timestamp.now();
+    const turnClock = Date.now();
+    const result = await planner.turn(context, signal);
+    budgetUsed.turns += 1; // R7: the plan turn counts against the budget.
+
+    // R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
+    // of runReactInner; content capture intentionally omitted (the plan turn
+    // carries no tool calls and #64 content capture is wired in the ReAct loop).
+    {
+      const zero: TokenUsage = { input_tokens: 0, output_tokens: 0 };
+      const u =
+        result.kind === "tool_call_requested" || result.kind === "final_response"
+          ? result.usage
+          : (result.usage ?? zero);
+      let stopReason: StopReason;
+      let toolCallsRequested: number;
+      switch (result.kind) {
+        case "final_response":
+          stopReason = "end_turn";
+          toolCallsRequested = 0;
+          break;
+        case "tool_call_requested":
+          stopReason = "tool_use";
+          toolCallsRequested = result.calls.length;
+          break;
+        default:
+          stopReason = "end_turn";
+          toolCallsRequested = 0;
+          break;
+      }
+      const status: SpanStatus =
+        result.kind === "error"
+          ? { kind: "error", message: JSON.stringify(result.error) }
+          : { kind: "ok" };
+      const base = finishSpanBase(
+        newRootSpanBase(
+          SpanId.of(`${sessionId.asString()}-turn-${budgetUsed.turns}`),
+          sessionId,
+          task.id,
+          "turn",
+          turnStartedAt,
+        ),
+        Timestamp.now(),
+        status,
+        Date.now() - turnClock,
+      );
+      if (this.config.observability) {
+        const turnSpan: TurnSpan = {
+          base,
+          turn_number: budgetUsed.turns,
+          input_tokens: u.input_tokens,
+          output_tokens: u.output_tokens,
+          cache_read_tokens: u.cache_read_tokens ?? null,
+          cache_write_tokens: u.cache_write_tokens ?? null,
+          cost_usd: PricingTable.costFor(
+            pricing,
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_tokens,
+            u.cache_write_tokens,
+          ),
+          stop_reason: stopReason,
+          tool_calls_requested: toolCallsRequested,
+          output_text: null,
+          tool_calls: null,
+          input_messages: null,
+        };
+        this.config.observability.emitTurn(turnSpan);
+      }
+    }
+    emit(onStream, { kind: "turn_end", turn: budgetUsed.turns });
+
+    // Classify the one-shot turn. R2: a tool call is a planning failure, NOT a
+    // dispatch loop.
+    let finalText: string;
+    switch (result.kind) {
+      case "final_response":
+        addTurnUsage(usage, result.usage);
+        budgetUsed.input_tokens += result.usage.input_tokens;
+        budgetUsed.output_tokens += result.usage.output_tokens;
+        finalText = result.content;
+        break;
+      case "tool_call_requested": {
+        addTurnUsage(usage, result.usage);
+        const error = PlanPhaseError.planningTurnFailed(
+          "planner requested a tool call in the one-shot plan turn",
+        );
+        return {
+          ok: false,
+          failure: failure(
+            { kind: "plan_phase_failed", error: error.detail },
+            sessionId,
+            usage,
+            budgetUsed.turns,
+          ),
+        };
+      }
+      case "error": {
+        if (result.usage != null) addTurnUsage(usage, result.usage);
+        return {
+          ok: false,
+          failure: failure(
+            { kind: "agent_error", error: result.error },
+            sessionId,
+            usage,
+            budgetUsed.turns,
+          ),
+        };
+      }
+      default: {
+        const _exhaustive: never = result;
+        return _exhaustive;
+      }
+    }
+
+    // R3: capture the artifact from the response text.
+    const captured = capturePlanArtifact(finalText);
+    if (!captured.ok) {
+      return {
+        ok: false,
+        failure: failure(
+          { kind: "plan_phase_failed", error: captured.error.detail },
+          sessionId,
+          usage,
+          budgetUsed.turns,
+        ),
+      };
+    }
+    // R11: fire on_plan_created synchronously; the hook may rewrite the artifact
+    // — either by mutating it in place OR by returning a `mutate` decision that
+    // reassigns `ctx.plan` to a new object. Read the final value back off `ctx`
+    // so either path is honored. Errors are non-fatal: a successfully-captured
+    // plan is not lost to a handler error.
+    const ctx: HookContext = {
+      event: "on_plan_created",
+      session_id: sessionId,
+      plan: captured.artifact,
+    };
+    if (this.config.hooks) {
+      try {
+        await this.config.hooks.fire(ctx, signal);
+      } catch {
+        // Swallow — the (possibly mutated) artifact is still stored.
+      }
+    }
+    const artifact: PlanArtifact = ctx.plan;
+
+    // R4: store the produced artifact in extras["plan_execute"] as a JSON value
+    // (the stable cross-language shape: `{ tasks, rationale }`).
+    sessionState.extras[PLAN_EXECUTE_EXTRAS_KEY] = {
+      tasks: artifact.tasks,
+      rationale: artifact.rationale,
+    };
+
+    return { ok: true, artifact, usage, turns: budgetUsed.turns };
   }
 
   /**
@@ -1171,6 +1475,7 @@ export class HarnessBuilder {
   private _contentCapture: ContentCaptureConfig = ContentCaptureConfig.default();
   private _hooks?: HookChain;
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
+  private _plannerAgent?: Agent;
 
   constructor(
     private readonly agent: Agent,
@@ -1243,6 +1548,14 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Inject an alternate agent for the `plan_execute` plan phase (issue #70,
+   *  Q1). When set and the loop strategy is `plan_execute`, the one-shot plan
+   *  turn runs on this agent; otherwise it runs on the default agent. */
+  plannerAgent(agent: Agent): this {
+    this._plannerAgent = agent;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -1259,6 +1572,7 @@ export class HarnessBuilder {
       contentCapture: this._contentCapture,
       hooks: this._hooks,
       maxStopBlocks: this._maxStopBlocks,
+      plannerAgent: this._plannerAgent,
     };
   }
 

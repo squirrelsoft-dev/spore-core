@@ -359,11 +359,13 @@ describe("Harness — ReAct loop", () => {
   });
 
   it("rule: non-ReAct strategies marked StrategyNotYetImplemented", async () => {
+    // Q4 (issue #70): plan_execute no longer uses strategy_not_yet_implemented;
+    // it produces an artifact then halts with execute_phase_not_implemented
+    // (covered by the PlanExecute plan-phase tests below).
     const h = new StandardHarness(standardConfig(makeAgent()));
     const strategies: LoopStrategy[] = [
       { kind: "ralph" },
       { kind: "self_verifying" },
-      { kind: "plan_execute", plan_model: null },
       {
         kind: "hill_climbing",
         direction: "maximize",
