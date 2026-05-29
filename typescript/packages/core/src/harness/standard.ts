@@ -42,6 +42,11 @@ import type { Message, ToolCall } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { StorageProvider } from "../storage/index.js";
+import {
+  InMemoryChunkProvider,
+  type ChunkProvider,
+  type PromptChunk as AssemblyPromptChunk,
+} from "../prompt-assembly/index.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 import { newSessionState as newContextSessionState } from "../context/types.js";
 import {
@@ -163,6 +168,12 @@ export interface HarnessConfig {
    * `plan_model` on the strategy stays DESCRIPTIVE metadata only.
    */
   plannerAgent?: Agent;
+  /**
+   * Pluggable source of conditional prompt chunks (issue #79). Loaded at harness
+   * construction and fed through {@link "../prompt-assembly/index.js".ContextSourcesBuilder}.
+   * Optional; defaults to an empty {@link InMemoryChunkProvider}.
+   */
+  chunkProvider?: ChunkProvider;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -1905,6 +1916,7 @@ export class HarnessBuilder {
   private _hooks?: HookChain;
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
   private _plannerAgent?: Agent;
+  private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
 
   constructor(
     private readonly agent: Agent,
@@ -1992,6 +2004,20 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Set the conditional-chunk provider (issue #79). Defaults to an empty
+   *  {@link InMemoryChunkProvider}. */
+  chunkProvider(provider: ChunkProvider): this {
+    this._chunkProvider = provider;
+    return this;
+  }
+
+  /** Convenience: register chunks inline without constructing a provider
+   *  (issue #79). Resolves to an {@link InMemoryChunkProvider} internally. */
+  chunks(chunks: AssemblyPromptChunk[]): this {
+    this._chunkProvider = new InMemoryChunkProvider(chunks);
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -2010,6 +2036,7 @@ export class HarnessBuilder {
       hooks: this._hooks,
       maxStopBlocks: this._maxStopBlocks,
       plannerAgent: this._plannerAgent,
+      chunkProvider: this._chunkProvider,
     };
   }
 

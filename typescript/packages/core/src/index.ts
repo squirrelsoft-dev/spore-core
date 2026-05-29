@@ -35,6 +35,7 @@ export * as observability from "./observability/index.js";
 export * as termination from "./termination/index.js";
 export * as metric from "./metric/index.js";
 export * as promptChunkRegistry from "./prompt-chunk-registry/index.js";
+export * as promptAssembly from "./prompt-assembly/index.js";
 export * as cacheProvider from "./cache-provider/index.js";
 export * as verifier from "./verifier/index.js";
 export * as hooks from "./hooks/index.js";
