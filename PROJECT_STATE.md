@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-05-28 by /close — closed #45 (Agent dyn-compat already on main); #70 is now the headline next item_
+_Last updated: 2026-05-28 by /close — closed #69 (lifecycle hook system, four-language parity, merged to main); #70 remains the headline next item_
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -100,12 +100,39 @@ out. Rust-only by nature (TS/Python/Go interfaces were already polymorphic). Thi
 means **#70 is already unblocked** — real `plan_model` routing can use the
 `Arc<dyn Agent>` seam today.
 
+**#69 (lifecycle hook system) just landed** — a `Hook`/`HookChain` system at
+four-language parity (Rust ref `ddbd8a4`, TS `b49c300`, Go `51bf7f4`, Python
+`6423740` + parity fix `c593956`), merged to `main` via fast-forward. It defines all
+**17 lifecycle events** (`PreTurn`/`PostTurn`, `PreToolUse`/`PostToolUse`/
+`PostToolUseFailure`/`PostToolBatch`, `OnLoopStart`/`Stop`, `OnPause`/`OnResume`/
+`OnError`, `OnPlanCreated`/`OnTaskAdvance`/`OnSubagentSpawn`/`OnSubagentComplete`,
+`PreCompact`/`PostCompact`) with pinned per-event context schemas, a serde-tagged
+`HookDecision` (`continue`/`block`/`inject`/`deny`/`mutate`), and `FunctionHook` +
+`CommandHook` (stdin/stdout JSON) handlers. Hooks are a **higher-level layer above**
+the existing `MiddlewareChain` (which stays the lower-level context-assembly
+primitive), fire in registration order, and validate decision legality per event.
+Only **`Stop` is wired into the live ReAct loop** — its `block{reason}` replaces the
+old `ForceAnotherTurn`/`CompletionCheck`-returns-reason path and is bounded by a new
+`max_stop_blocks` field on `HarnessConfig` (default 8, **per-run** counter that
+resets each `run()`); `CompletionCheck` is kept for back-compat and marked deprecated
+in Rust. The other 16 events are defined + unit-tested in isolation but not yet
+loop-called — they activate when #59/#72 wire the two-phase loop and subagent
+spawning. The issue was a conceptual design doc; six contract ambiguities were pinned
+before implementation (recorded on the issue). One cross-language divergence surfaced
+in verification and was fixed: Python originally left `HookError.kind` unset for
+`illegal_decision`/`handler_failed` (`c593956`). Shared fixtures in `fixtures/hooks/`
+(decision wire format, Stop block/cap, PreToolUse mutation/deny, command handler I/O)
+replay identically across all four. **Note: #69 landed ahead of its place in the
+PlanExecute chain (#70→#71→#72→#73→#69→#59)** — it was independent enough to build
+early and it unblocks the SelfVerifying-as-Stop-hook approach for #61.
+
 **main CI is green** across all four languages.
 
 Known runnability limits: the harness is **ReAct-only** — the other four loop
 strategies return `StrategyNotYetImplemented` (#58–#61). The sandbox
-missing-file misclassification that made S1 nondeterministic was fixed in #63, and
-the previous "no message content" observability gap is closed by #64.
+missing-file misclassification that made S1 nondeterministic was fixed in #63, the
+previous "no message content" observability gap is closed by #64, and the lifecycle
+hook seams (#69) now exist but only `Stop` is loop-wired so far.
 
 ## Active Direction
 The harness is now **runnable** (#57) and **debuggable** (#64/#65) end-to-end, and
@@ -117,19 +144,21 @@ that the harness is **ReAct-only** — `PlanExecute`, `Ralph`, `SelfVerifying`, 
 `docs/harness-engineering-concepts.md` overstate what runs.
 
 **PlanExecute (#59) is the first strategy being built, and a design pass decomposed it
-into five separable concerns** rather than one large change. The agreed build order is
-**#70 → #71 → #72 → #73 → #69 → #59** (the chain's former head, #45 Agent
-dyn-compatibility, is now **done** — it was already on `main`, just unclosed — so real
-`plan_model` routing is unblocked). The plan phase produces a plan artifact (#70); a persisted
-task-list tool (#71) holds the work; an accepted plan is parsed into that task list
-(#72); a `StorageProvider` abstraction (#73) generalizes the hybrid in-memory+on-disk
-persistence (spore-core is a harness-building framework, so storage backends are a
-first-class seam); the lifecycle hook system (#69) provides the `OnPlanCreated`/
-`OnTaskAdvance` seams; and #59 finally wires the two-phase loop together with a
-**pluggable executor** (ReAct by default, swappable for a future Ralph-style
-execute+verify). After PlanExecute lands this way, the remaining three strategies
-(#58/#60/#61) follow, then the accepted-debt correctness fixes (#30/#31/#32/#34).
-Observability backend stays swappable over OTLP.
+into five separable concerns** rather than one large change. The build order is
+**#70 → #71 → #72 → #73 → #59**, with the lifecycle hook system (**#69, now done**)
+providing the `OnPlanCreated`/`OnTaskAdvance` seams the loop will fire. The plan phase
+produces a plan artifact (#70); a persisted task-list tool (#71) holds the work; an
+accepted plan is parsed into that task list (#72); a `StorageProvider` abstraction
+(#73) generalizes the hybrid in-memory+on-disk persistence (spore-core is a
+harness-building framework, so storage backends are a first-class seam); and #59
+finally wires the two-phase loop together with a **pluggable executor** (ReAct by
+default, swappable for a future Ralph-style execute+verify), firing the #69 hooks at
+plan-created and task-advance. Two former chain heads are now cleared: #45 (Agent
+dyn-compatibility, already on `main`) and #69 (hook system, landed this loop). After
+PlanExecute lands this way, the remaining three strategies (#58/#60/#61) follow —
+SelfVerifying (#61) becomes a `Stop`-hook configuration now that #69 exists — then the
+accepted-debt correctness fixes (#30/#31/#32/#34). Observability backend stays
+swappable over OTLP.
 
 ## Known Deviations
 1. **Only ReAct is executable** — the README and
@@ -158,18 +187,19 @@ via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **PlanExecute build chain (#70 → #71 → #72 → #73 → #69 → #59)** — build
-   PlanExecute via its decomposed prerequisites, in order. Next up is **#70** (plan
-   phase: generate a plan artifact via a one-shot planning turn), now unblocked by the
-   `Arc<dyn Agent>` seam from the closed #45. Then #71 (task-list tool) → #72
-   (plan→task-list parse) → #73 (StorageProvider) → #69 (hook system) → #59 (wire the
-   two-phase loop). Rust reference first, then TS/Python/Go parity at each step. This
-   replaces the earlier "do all four strategies" plan — PlanExecute goes deep first to
-   establish the task-list/storage/hook seams the other strategies will reuse.
+1. **PlanExecute build chain (#70 → #71 → #72 → #73 → #59)** — build PlanExecute via
+   its decomposed prerequisites, in order. Next up is **#70** (plan phase: generate a
+   plan artifact via a one-shot planning turn), unblocked by the `Arc<dyn Agent>` seam
+   from the closed #45. Then #71 (task-list tool) → #72 (plan→task-list parse) → #73
+   (StorageProvider) → #59 (wire the two-phase loop, firing the #69 hooks at
+   plan-created/task-advance). The lifecycle hook system (#69) is **done** and dropped
+   from this chain. Rust reference first, then TS/Python/Go parity at each step.
+   PlanExecute goes deep first to establish the task-list/storage seams the other
+   strategies will reuse.
 2. **Remaining loop strategies (#58, #60, #61)** — Ralph (#58), HillClimbing (#60),
    SelfVerifying (#61) follow once PlanExecute lands and the shared seams (pluggable
-   executor, task list, hooks) exist. SelfVerifying (#61) in particular becomes a Stop-hook
-   configuration once #69 lands.
+   executor, task list) exist. SelfVerifying (#61) in particular can now be built as a
+   `Stop`-hook configuration on the #69 hook system that just landed.
 3. **Correctness/safety debt fixes (#30, #31, #32, #34)** — memory distillation
    PendingReview gate (#30), read-only subagent context sharing (#31), halt on
    mid-session Block 2 hash mismatch (#32), and the dangerous-feature-flag gate for
@@ -179,14 +209,20 @@ This section is updated by /close after every PEE loop.]
    the E2BSandboxProvider data-residency note (#36); fold in once the loop strategies
    land so the docs stop overstating capability.
 
-_Note: this `/close` loop closed **#45** (Agent dyn-compatibility) `status: complete`.
-An `/implement 45` pass found the work was already on `main` (commit `afe5ff8`,
-2026-05-19) but the issue had never been closed — a bookkeeping desync, not new code.
-Verified the target state (dyn-compatible `Agent`, non-generic `StandardHarness`,
-`Arc<dyn Agent>` field; `cargo build --workspace` green), posted a resolution comment
-citing `afe5ff8`, and closed the issue. Retired Known Deviation #1 (the `BoxFut`
-workaround) to the Former Deviations list and renumbered the remainder. Promoted **#70**
-to the head of the PlanExecute chain (labeled `status: queued`) since #45 no longer
-gates it. No new issues spawned; no code committed this loop (the change predates it).
-Active Direction unchanged — capability breadth (loop strategies) remains the headline
-gap, with PlanExecute the first strategy being built._
+_Note: this `/close` loop closed **#69** (lifecycle hook system) `status: complete`.
+A full `/implement 69` pass built it across all four languages (Rust ref `ddbd8a4`,
+TS `b49c300`, Go `51bf7f4`, Python `6423740` + cross-language parity fix `c593956`),
+cross-verified all four suites green, and fast-forward-merged the five commits to
+`main`. The issue was a conceptual design doc, so the planning phase reported BLOCKED
+on six contract ambiguities (middleware relationship, per-event context schemas,
+`HookDecision` shape, `max_stop_blocks` placement, Stop-vs-`ForceAnotherTurn`,
+Stop-vs-`Verifier`); all six were pinned by the maintainer before any code and
+documented on the issue. Phase-4 verification caught one divergence (Python
+`HookError.kind` unset for two categories), fixed in `c593956`. **#69 landed ahead of
+its scheduled slot in the PlanExecute chain** (was #70→#71→#72→#73→#69→#59); it was
+independent enough to build early, so the chain is now #70→#71→#72→#73→#59 with #69
+done. No new issues spawned; no new spec gaps. No re-triage needed — the rest of the
+open board (#70–#73 PlanExecute prerequisites, #58/#60/#61 strategies, #30–#36 debt)
+is unaffected and its `scope: deferred` labels still hold. Active Direction unchanged
+— capability breadth (loop strategies) remains the headline gap, PlanExecute first,
+#70 the next concrete step._
