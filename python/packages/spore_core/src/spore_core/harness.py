@@ -490,8 +490,74 @@ class ToolOutputWaitingForHuman(_Model):
     request: HumanRequest
 
 
+# ----- HarnessSignal (issue #80, Tool Escalation Protocol) ----------------
+# The typed channel by which a tool signals the harness to terminate cleanly
+# and pass a structured signal up to its caller. The harness never acts on the
+# signal itself — it is a pure intermediary. Tagged union over ``kind`` with
+# snake_case discriminators (``enter_plan_mode``, ``exit_plan_mode``,
+# ``switch_mode``, ``abort``) byte-identical across the four languages.
+#
+# ``ExitPlanMode`` carries a :class:`PlanArtifact` (defined in
+# :mod:`spore_core.hooks`) and ``SwitchMode`` carries a :class:`Mode` (defined
+# in :mod:`spore_core.prompt_chunk_registry`). Both of those modules import from
+# this module, so the two types are pulled in via the deferred import block at
+# the bottom and these models are rebuilt there (forward references).
+
+
+class HarnessSignalEnterPlanMode(_Model):
+    """Agent requests entry into plan mode. Carries the context the agent has
+    accumulated so far as a seed for the planning harness."""
+
+    kind: Literal["enter_plan_mode"] = "enter_plan_mode"
+    context: str
+
+
+class HarnessSignalExitPlanMode(_Model):
+    """Planning agent has produced a plan and requests exit from plan mode.
+    Carries the plan artifact for human approval. The planning agent's terminal
+    signal."""
+
+    kind: Literal["exit_plan_mode"] = "exit_plan_mode"
+    plan: PlanArtifact
+
+
+class HarnessSignalSwitchMode(_Model):
+    """Agent requests a mode switch. The caller instantiates the appropriate
+    harness for the new mode."""
+
+    kind: Literal["switch_mode"] = "switch_mode"
+    mode: Mode
+
+
+class HarnessSignalAbort(_Model):
+    """Agent requests a graceful, intentional stop with a reason surfaced to the
+    user. Distinct from :class:`HaltReasonAgentError` — it surfaces as
+    :class:`RunResultEscalate`, NOT :class:`RunResultFailure`."""
+
+    kind: Literal["abort"] = "abort"
+    reason: str
+
+
+HarnessSignal = Annotated[
+    HarnessSignalEnterPlanMode
+    | HarnessSignalExitPlanMode
+    | HarnessSignalSwitchMode
+    | HarnessSignalAbort,
+    Field(discriminator="kind"),
+]
+
+
+class ToolOutputEscalate(_Model):
+    """Tool requests a structural state change from the harness's parent. The
+    harness loop recognizes this variant, terminates the current run cleanly,
+    and passes the signal up to the caller via :class:`RunResultEscalate`."""
+
+    kind: Literal["escalate"] = "escalate"
+    signal: HarnessSignal
+
+
 ToolOutput = Annotated[
-    ToolOutputSuccess | ToolOutputError | ToolOutputWaitingForHuman,
+    ToolOutputSuccess | ToolOutputError | ToolOutputWaitingForHuman | ToolOutputEscalate,
     Field(discriminator="kind"),
 ]
 
@@ -925,7 +991,11 @@ class PausedState(_Model):
     session_state: SessionState
     pending_tool_calls: list[ToolCall] = Field(default_factory=list)
     approved_results: list[HarnessToolResult] = Field(default_factory=list)
-    human_request: HumanRequest
+    # Optional (issue #80): a ``WaitingForHuman`` pause always sets this; an
+    # escalation pause sets it to ``None``. Omitted from serialization when
+    # ``None`` to match the Rust ``#[serde(default)]`` wire behavior — old
+    # ``WaitingForHuman`` blobs (field present) still deserialize.
+    human_request: HumanRequest | None = None
     task: Task
     budget_used: BudgetSnapshot
     child_state: ChildPausedState | None = None
@@ -941,15 +1011,21 @@ class ChildPausedState(_Model):
     session_state: SessionState
     pending_tool_calls: list[ToolCall] = Field(default_factory=list)
     approved_results: list[HarnessToolResult] = Field(default_factory=list)
-    human_request: HumanRequest
+    # Optional (issue #80): mirrors :class:`PausedState.human_request`.
+    human_request: HumanRequest | None = None
     task: Task
     budget_used: BudgetSnapshot
     parent_tool_call_id: str
 
 
-# Resolve forward refs.
-ToolOutputWaitingForHuman.model_rebuild()
-PausedState.model_rebuild()
+# Forward refs are resolved at the BOTTOM of the module (after the deferred
+# import block) rather than here: ``ToolOutputWaitingForHuman`` and
+# ``PausedState`` both transitively reach ``ToolOutputEscalate`` →
+# ``HarnessSignal`` → :class:`PlanArtifact` / :class:`Mode` (issue #80), and
+# those two types live in modules that import from this one — they are only
+# importable once ``HarnessConfig`` is defined. See the ``model_rebuild`` block
+# after the ``from .hooks import PlanArtifact`` / ``from .prompt_chunk_registry
+# import Mode`` imports.
 
 
 # ============================================================================
@@ -1095,8 +1171,25 @@ class RunResultWaitingForHuman(_Model):
     request: HumanRequest
 
 
+class RunResultEscalate(_Model):
+    """The harness terminated cleanly because a tool returned
+    :class:`ToolOutputEscalate` (issue #80). Carries the signal plus the
+    preserved :class:`PausedState` (with ``human_request = None``) so the caller
+    can handle the signal and decide whether to resume the original harness,
+    instantiate a new one, or present UI to the user. The signal is NOT stored
+    in the ``state`` — it is discarded on resume; the harness never re-acts on
+    it."""
+
+    kind: Literal["escalate"] = "escalate"
+    signal: HarnessSignal
+    state: PausedState
+    session_id: SessionId
+    usage: AggregateUsage
+    turns: int
+
+
 RunResult = Annotated[
-    RunResultSuccess | RunResultFailure | RunResultWaitingForHuman,
+    RunResultSuccess | RunResultFailure | RunResultWaitingForHuman | RunResultEscalate,
     Field(discriminator="kind"),
 ]
 
@@ -1124,6 +1217,7 @@ from .middleware import (  # noqa: E402
 # :meth:`HarnessBuilder.with_observability_outbox`.
 from .guide_registry import (  # noqa: E402
     SessionOutcome,
+    SessionOutcomeEscalated,
     SessionOutcomeFailure,
     SessionOutcomeSuccess,
 )
@@ -1808,6 +1902,8 @@ class StandardHarness:
                 result.session_id,
                 SessionOutcomeFailure(reason=result.reason.kind),
             )
+        elif isinstance(result, RunResultEscalate):
+            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
         # RunResultWaitingForHuman: not terminal, do not finalize.
 
     async def _persist_task_list(
@@ -1983,7 +2079,9 @@ class StandardHarness:
                 )
 
             else:
-                # A step surfacing to a human pauses the whole run; propagate.
+                # A step surfacing to a human pauses the whole run; a step
+                # escalating (issue #80) terminates it cleanly. Either way,
+                # propagate the sub-result up unchanged.
                 return sub_result
 
         # Q2: success output is the LAST completed step's final text.
@@ -2215,6 +2313,12 @@ class StandardHarness:
                 result.session_id,
                 SessionOutcomeFailure(reason=result.reason.kind),
             )
+        elif isinstance(result, RunResultEscalate):
+            # An escalation is a clean, intentional terminal outcome (issue #80)
+            # — finalize with the dedicated ``Escalated`` outcome, NOT
+            # ``Partial``. Contrast with ``WaitingForHuman``, which is a pause,
+            # not terminal, and is never finalized here.
+            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
         # RunResultWaitingForHuman: not terminal, do not finalize.
         return result
 
@@ -2578,6 +2682,42 @@ class StandardHarness:
                             child_state=output.child_state,
                         )
                         return RunResultWaitingForHuman(state=paused, request=output.request)
+
+                    # Escalation propagation (issue #80): a tool requests a
+                    # structural state change. The harness is a pure
+                    # intermediary — it does NOT act on the signal. It
+                    # terminates cleanly, preserves session state for a possible
+                    # resume, and returns :class:`RunResultEscalate`. The
+                    # escalation is a control signal, NOT a conversation turn: it
+                    # is never appended to message history (we ``return`` before
+                    # the ``append_tool_result`` below), and the remaining tool
+                    # calls in this batch are preserved into
+                    # ``pending_tool_calls`` (mirroring WaitingForHuman). The
+                    # signal is NOT stored in ``PausedState`` (``human_request``
+                    # is ``None``), so it is discarded on resume — the harness
+                    # never re-acts on it.
+                    if isinstance(output, ToolOutputEscalate):
+                        remaining = calls[i + 1 :]
+                        turns = budget_used.turns
+                        paused = PausedState(
+                            session_id=session_id,
+                            task_id=task.id,
+                            turn_number=budget_used.turns,
+                            session_state=session_state,
+                            pending_tool_calls=remaining,
+                            approved_results=approved_results,
+                            human_request=None,
+                            task=task,
+                            budget_used=budget_used,
+                            child_state=None,
+                        )
+                        return RunResultEscalate(
+                            signal=output.signal,
+                            state=paused,
+                            session_id=session_id,
+                            usage=usage,
+                            turns=turns,
+                        )
 
                     is_error = isinstance(output, ToolOutputError)
                     # Layer-2: unrecoverable tool error halts immediately.
@@ -2990,6 +3130,28 @@ class ScriptedMiddleware:
 
 
 # ============================================================================
+# Deferred forward-ref resolution (issue #80)
+# ============================================================================
+# ``PlanArtifact`` (from :mod:`spore_core.hooks`) and ``Mode`` (from
+# :mod:`spore_core.prompt_chunk_registry`) live in modules that import
+# ``HarnessConfig`` / ``PausedState`` from THIS module, so they can only be
+# imported after every class above is defined — hence at the very bottom. The
+# escalation types reach them directly, and ``ToolOutputWaitingForHuman`` /
+# ``ChildPausedState`` / ``PausedState`` reach them transitively through the
+# ``ToolOutput`` union, so all of these models are rebuilt here.
+from .hooks import PlanArtifact  # noqa: E402
+from .prompt_chunk_registry import Mode  # noqa: E402
+
+HarnessSignalExitPlanMode.model_rebuild()
+HarnessSignalSwitchMode.model_rebuild()
+ToolOutputEscalate.model_rebuild()
+ToolOutputWaitingForHuman.model_rebuild()
+RunResultEscalate.model_rebuild()
+ChildPausedState.model_rebuild()
+PausedState.model_rebuild()
+
+
+# ============================================================================
 # Internal helper exports
 # ============================================================================
 
@@ -3025,6 +3187,11 @@ __all__ = [
     "HarnessBuilder",
     "HarnessConfig",
     "HarnessRunOptions",
+    "HarnessSignal",
+    "HarnessSignalAbort",
+    "HarnessSignalEnterPlanMode",
+    "HarnessSignalExitPlanMode",
+    "HarnessSignalSwitchMode",
     "HarnessStreamEvent",
     "HarnessToolResult",
     "HookPoint",
@@ -3059,6 +3226,7 @@ __all__ = [
     "PausedState",
     "RiskLevel",
     "RunResult",
+    "RunResultEscalate",
     "RunResultFailure",
     "RunResultSuccess",
     "RunResultWaitingForHuman",
@@ -3105,6 +3273,7 @@ __all__ = [
     "TerminationPolicy",
     "ToolOutput",
     "ToolOutputError",
+    "ToolOutputEscalate",
     "ToolOutputSuccess",
     "ToolOutputWaitingForHuman",
     "ToolRegistry",

@@ -206,8 +206,17 @@ class SessionOutcomePartial(_Model):
     kind: Literal["partial"] = "partial"
 
 
+class SessionOutcomeEscalated(_Model):
+    """The session terminated cleanly because a tool escalated a structural
+    signal to the harness's caller (issue #80, Tool Escalation Protocol).
+    Distinct from ``Partial`` — an escalation is an intentional, clean terminal
+    outcome, not a partial success."""
+
+    kind: Literal["escalated"] = "escalated"
+
+
 SessionOutcome = Annotated[
-    SessionOutcomeSuccess | SessionOutcomeFailure | SessionOutcomePartial,
+    SessionOutcomeSuccess | SessionOutcomeFailure | SessionOutcomePartial | SessionOutcomeEscalated,
     Field(discriminator="kind"),
 ]
 
@@ -703,6 +712,7 @@ __all__ = [
     "PendingReasonManualFlag",
     "PendingReasonPerformanceDegradation",
     "SessionOutcome",
+    "SessionOutcomeEscalated",
     "SessionOutcomeFailure",
     "SessionOutcomePartial",
     "SessionOutcomeSuccess",

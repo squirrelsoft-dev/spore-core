@@ -33,7 +33,7 @@ signatures.
   :meth:`emit_context` (compaction → ``"compaction"``, else
   ``"context_assembly"``).
 * ``session`` summary ``attributes.outcome`` is the bare-string serialization of
-  :data:`SessionOutcome` (``success``/``failure``/``partial``).
+  :data:`SessionOutcome` (``success``/``failure``/``partial``/``escalated``).
 * ``trace_id``: a 32-hex (16 random bytes) string generated ONCE per session,
   reused in every line for that session and as the OTLP trace id. JSONL
   ``span_id``/``parent_span_id`` are the harness ``SpanId`` string VERBATIM. For
@@ -78,6 +78,7 @@ from pydantic import BaseModel
 from .errors import SporeError
 from .guide_registry import (
     SessionOutcome,
+    SessionOutcomeEscalated,
     SessionOutcomeFailure,
     SessionOutcomeSuccess,
 )
@@ -407,6 +408,8 @@ def _session_outcome_str(outcome: SessionOutcome) -> str:
         return "success"
     if isinstance(outcome, SessionOutcomeFailure):
         return "failure"
+    if isinstance(outcome, SessionOutcomeEscalated):
+        return "escalated"
     return "partial"
 
 
