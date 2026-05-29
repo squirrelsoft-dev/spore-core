@@ -12,9 +12,11 @@ from spore_tools.tools.todo import TODO_STORE_KEY, TodoWriteTool
 
 
 def _ctx() -> ToolContext:
+    backend = InMemoryStorageProvider()
     return ToolContext(
         session_id=SessionId("todo-session"),
-        run_store=InMemoryStorageProvider(),
+        run_store=backend,
+        memory_store=backend,
     )
 
 

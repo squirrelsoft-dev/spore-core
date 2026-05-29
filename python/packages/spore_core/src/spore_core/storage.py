@@ -66,11 +66,12 @@ per-domain via :class:`CompositeStorageProvider`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NewType, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -80,8 +81,34 @@ from .harness import PausedState, SessionId
 from .memory import Timestamp
 from .observability import SessionMetrics
 
+if TYPE_CHECKING:
+    # Re-export of the canonical :class:`StorageScope` (its home is
+    # ``prompt_assembly``, decision A2). It is imported lazily at runtime (see
+    # ``__getattr__`` below) to avoid an import cycle: this module is pulled in
+    # during ``harness`` initialization via ``observability_outbox``, while
+    # ``prompt_assembly`` transitively imports ``harness``. Type-checkers see
+    # the real symbol here; runtime resolves it on first attribute access.
+    from .prompt_assembly import StorageScope
+
 # A free-form opaque JSON value handled by the storage layer.
 JsonValue = Any
+
+
+def _storage_scope() -> type[StorageScope]:
+    """Lazily import the canonical :class:`StorageScope` enum, breaking the
+    ``storage`` ↔ ``prompt_assembly`` ↔ ``harness`` import cycle (#78)."""
+    from .prompt_assembly import StorageScope as _StorageScope
+
+    return _StorageScope
+
+
+def __getattr__(name: str) -> Any:
+    """Module-level lazy attribute resolution so
+    ``spore_core.storage.StorageScope`` resolves to the canonical enum without a
+    top-level import (decision A2; cycle-safe — #78)."""
+    if name == "StorageScope":
+        return _storage_scope()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ============================================================================
@@ -135,6 +162,76 @@ class MemoryEntry(BaseModel):
 
 
 # ============================================================================
+# WorkspaceId (#78)
+# ============================================================================
+
+
+#: A stable identifier for a workspace, derived purely from its canonical path.
+#: Form ``{sanitized_basename}-{8_hex_chars}``, lowercased. A ``NewType`` over
+#: ``str`` (Python conventions: IDs are ``NewType`` aliases).
+WorkspaceId = NewType("WorkspaceId", str)
+
+
+def _canonicalize_path_string(path: str) -> str:
+    """Steps 1–2 of the :func:`workspace_id_from_canonical_path` derivation:
+    produce the canonical path string used for both the hash input and the
+    basename. Forward slashes only, no trailing slash. On Windows the
+    drive-letter prefix is stripped and ``\\`` → ``/``."""
+    # Normalize Windows backslashes.
+    s = path.replace("\\", "/")
+    # Strip a leading drive-letter prefix like ``C:`` (only at the very start).
+    if len(s) >= 2 and s[1] == ":" and s[0].isascii() and s[0].isalpha():
+        s = s[2:]
+    # Strip a trailing slash, but keep a lone root ``/``.
+    while len(s) > 1 and s.endswith("/"):
+        s = s[:-1]
+    return s
+
+
+def _sanitize_basename(basename: str) -> str:
+    """Step 4 of the derivation: lowercase, replace each non-alphanumeric char
+    with ``-``, collapse consecutive ``-``, strip leading/trailing ``-``."""
+    lowered = basename.lower()
+    out: list[str] = []
+    prev_dash = False
+    for ch in lowered:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    return "".join(out).strip("-")
+
+
+def workspace_id_from_canonical_path(path: str) -> WorkspaceId:
+    """Derive a :data:`WorkspaceId` from an already-OS-canonicalized path.
+
+    This is a **pure string function** — it never touches the filesystem, so the
+    pinned fixture ``fixtures/storage/workspace_id_derivation.json`` is
+    host-independent. The cross-language parity anchor (#78).
+
+    Algorithm (pinned, byte-identical across languages):
+
+    1. Normalize separators to ``/``. On Windows strip the drive-letter prefix
+       (e.g. ``C:``) and convert ``\\`` → ``/``. The input is assumed already
+       OS-canonicalized; this function does NOT re-canonicalize.
+    2. Build the canonical path string: forward slashes only, NO trailing slash,
+       UTF-8.
+    3. SHA-256 that string; take the first 8 hex chars (lowercase).
+    4. Basename of the canonical path, lowercased; replace each non-alphanumeric
+       char with ``-``; collapse consecutive ``-``; strip leading/trailing
+       ``-``. Empty basename (root ``/``) → ``root``.
+    5. Concatenate ``{sanitized_basename}-{8hex}``.
+    """
+    canonical = _canonicalize_path_string(path)
+    hex8 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+    basename = canonical.rsplit("/", 1)[-1]
+    sanitized = _sanitize_basename(basename) or "root"
+    return WorkspaceId(f"{sanitized}-{hex8}")
+
+
+# ============================================================================
 # Domain protocols
 # ============================================================================
 
@@ -155,12 +252,30 @@ class SessionStore(Protocol):
 
 @runtime_checkable
 class MemoryStore(Protocol):
-    """Episodic memory store. Append-only log per session."""
+    """Episodic memory store. Append-only log per ``(scope, session)`` (#78).
 
-    async def append_memory(self, session_id: SessionId, entry: MemoryEntry) -> None: ...
+    A leaf backend is **scope-dumb**: it stores under whatever root it was
+    given. The ``scope`` argument is carried for symmetry (and so a single
+    backend *could* partition by scope), but the v1 wiring routes each scope to
+    its own backend via :class:`CompositeStorageProvider`, so leaf backends
+    receive a single scope's traffic. The cross-scope merge
+    (:meth:`StorageProvider.get_memories_merged`) lives in the routing layer,
+    never in a leaf.
 
-    async def get_memories(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
-        """Return the **most-recent ``limit`` entries, newest-first**."""
+    Known v1 limitation: memory addressing stays :class:`SessionId`-keyed. v2
+    should address session-independent / cross-session memory keying — do not
+    introduce it here.
+    """
+
+    async def append_memory(
+        self, scope: StorageScope, session_id: SessionId, entry: MemoryEntry
+    ) -> None: ...
+
+    async def get_memories(
+        self, scope: StorageScope, session_id: SessionId, limit: int
+    ) -> list[MemoryEntry]:
+        """Return the **most-recent ``limit`` entries, newest-first** for
+        ``scope``."""
         ...
 
 
@@ -222,10 +337,14 @@ class NoOpStorageProvider:
         return []
 
     # MemoryStore
-    async def append_memory(self, session_id: SessionId, entry: MemoryEntry) -> None:
+    async def append_memory(
+        self, scope: StorageScope, session_id: SessionId, entry: MemoryEntry
+    ) -> None:
         return None
 
-    async def get_memories(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+    async def get_memories(
+        self, scope: StorageScope, session_id: SessionId, limit: int
+    ) -> list[MemoryEntry]:
         return []
 
     # RunStore
@@ -299,6 +418,23 @@ class StorageProvider:
     def memory(self) -> MemoryStore:
         return self._memory
 
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        """Merged memory read across scopes (#78 R6): **User ∪ Project,
+        newest-first by ``timestamp``, NO dedup**. ``Local`` is excluded from
+        the merge in v1.
+
+        Routes through the memory slot — when built via
+        :class:`CompositeStorageProvider` that slot is a
+        :class:`ScopedMemoryRouter` that fans out to the per-scope backends; for
+        ``single``/``__init__`` the one backend serves both scopes (keyed by
+        scope) and merges identically. The merge always lives in the routing
+        layer, never in a leaf backend.
+        """
+        scope = _storage_scope()
+        combined = list(await self._memory.get_memories(scope.USER, session_id, limit))
+        combined.extend(await self._memory.get_memories(scope.PROJECT, session_id, limit))
+        return _merge_newest_first(combined, limit)
+
     def run(self) -> RunStore:
         return self._run
 
@@ -318,7 +454,10 @@ class InMemoryStorageProvider:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sessions: dict[SessionId, PausedState] = {}
-        self._memory: dict[SessionId, list[MemoryEntry]] = {}
+        # Memory is keyed by (scope, session_id) (#78): a single backend can hold
+        # multiple scopes, though the v1 composite wiring routes one scope per
+        # backend.
+        self._memory: dict[tuple[StorageScope, SessionId], list[MemoryEntry]] = {}
         self._run: dict[tuple[SessionId, str], JsonValue] = {}
         self._spans: dict[SessionId, list[JsonValue]] = {}
 
@@ -340,13 +479,17 @@ class InMemoryStorageProvider:
             return sorted(self._sessions.keys())
 
     # MemoryStore
-    async def append_memory(self, session_id: SessionId, entry: MemoryEntry) -> None:
+    async def append_memory(
+        self, scope: StorageScope, session_id: SessionId, entry: MemoryEntry
+    ) -> None:
         with self._lock:
-            self._memory.setdefault(session_id, []).append(entry)
+            self._memory.setdefault((scope, session_id), []).append(entry)
 
-    async def get_memories(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+    async def get_memories(
+        self, scope: StorageScope, session_id: SessionId, limit: int
+    ) -> list[MemoryEntry]:
         with self._lock:
-            entries = list(self._memory.get(session_id, []))
+            entries = list(self._memory.get((scope, session_id), []))
         return _most_recent_newest_first(entries, limit)
 
     # RunStore
@@ -527,11 +670,20 @@ class FileSystemStorageProvider:
         return sorted(out)
 
     # MemoryStore
-    async def append_memory(self, session_id: SessionId, entry: MemoryEntry) -> None:
+    #
+    # FS is **scope-dumb** (#78): the user-scope backend is pointed at the
+    # already-partitioned ``{user_root}/projects/{workspace_id}`` at
+    # construction. The provider just writes under whatever root it was given;
+    # ``scope`` is ignored at the leaf.
+    async def append_memory(
+        self, scope: StorageScope, session_id: SessionId, entry: MemoryEntry
+    ) -> None:
         value = entry.model_dump(mode="json")
         _append_jsonl(self._memory_path(session_id), value)
 
-    async def get_memories(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+    async def get_memories(
+        self, scope: StorageScope, session_id: SessionId, limit: int
+    ) -> list[MemoryEntry]:
         values = _read_jsonl(self._memory_path(session_id))
         try:
             entries = [MemoryEntry.model_validate(v) for v in values]
@@ -613,12 +765,28 @@ class FileSystemStorageProvider:
 
 
 class CompositeStorageProvider:
-    """Builder that routes each domain to its own backend, filling any unset
-    domain with :class:`NoOpStorageProvider` on :meth:`build`."""
+    """Builder that routes each domain to its own backend — and, for the memory
+    domain, each :class:`StorageScope` to its own backend (#78) — filling any
+    unset slot with :class:`NoOpStorageProvider` on :meth:`build`.
+
+    Only the ``memory`` domain varies by scope. ``session``, ``run`` and
+    ``observability`` are scope-flat — scope is wiring-only for them.
+
+    Example::
+
+        CompositeStorageProvider()                              \\
+            .session(fs(user_root))                             \\
+            .run(fs(user_root))                                 \\
+            .observability(fs(user_root))                       \\
+            .memory(StorageScope.USER, fs(user_workspace_root)) \\
+            .memory(StorageScope.PROJECT, fs(project_root))     \\
+            .memory(StorageScope.LOCAL, NoOpStorageProvider())  \\
+            .build()
+    """
 
     def __init__(self) -> None:
         self._session: SessionStore | None = None
-        self._memory: MemoryStore | None = None
+        self._memory: dict[StorageScope, MemoryStore] = {}
         self._run: RunStore | None = None
         self._observability: ObservabilityStore | None = None
 
@@ -626,8 +794,12 @@ class CompositeStorageProvider:
         self._session = store
         return self
 
-    def memory(self, store: MemoryStore) -> CompositeStorageProvider:
-        self._memory = store
+    def memory(self, scope: StorageScope, store: MemoryStore) -> CompositeStorageProvider:
+        """Configure the memory backend for one :class:`StorageScope`.
+        Unconfigured ``(memory, scope)`` pairs fall back to
+        :class:`NoOpStorageProvider` on :meth:`build` (#78 R7/R11 — ``Local``
+        may be wired to no-op in v1)."""
+        self._memory[scope] = store
         return self
 
     def run(self, store: RunStore) -> CompositeStorageProvider:
@@ -639,15 +811,51 @@ class CompositeStorageProvider:
         return self
 
     def build(self) -> StorageProvider:
-        """Build a :class:`StorageProvider`, filling each unset domain with a
-        :class:`NoOpStorageProvider`."""
+        """Build a :class:`StorageProvider`, filling each unset domain — and each
+        unset ``(memory, scope)`` pair — with a :class:`NoOpStorageProvider`."""
         no_op = NoOpStorageProvider()
         return StorageProvider(
             session=self._session if self._session is not None else no_op,
-            memory=self._memory if self._memory is not None else no_op,
+            memory=ScopedMemoryRouter(dict(self._memory)),
             run=self._run if self._run is not None else no_op,
             observability=(self._observability if self._observability is not None else no_op),
         )
+
+
+# ============================================================================
+# ScopedMemoryRouter (#78) — the (memory, scope) routing layer
+# ============================================================================
+
+
+class ScopedMemoryRouter:
+    """Routes :class:`MemoryStore` traffic to a per-:class:`StorageScope`
+    backend, filling unconfigured scopes with :class:`NoOpStorageProvider`. Leaf
+    backends stay scope-dumb; the cross-scope merge lives one level up in
+    :meth:`StorageProvider.get_memories_merged`.
+
+    This is the storage provider's memory slot when built via
+    :class:`CompositeStorageProvider`: :meth:`StorageProvider.memory` returns
+    this router, so a caller that passes a ``scope`` is routed to the right
+    backend. Satisfies the :class:`MemoryStore` protocol structurally.
+    """
+
+    def __init__(self, by_scope: dict[StorageScope, MemoryStore]) -> None:
+        self._by_scope = by_scope
+        self._noop = NoOpStorageProvider()
+
+    def _backend(self, scope: StorageScope) -> MemoryStore:
+        """The backend for ``scope``, or the shared no-op if unconfigured."""
+        return self._by_scope.get(scope, self._noop)
+
+    async def append_memory(
+        self, scope: StorageScope, session_id: SessionId, entry: MemoryEntry
+    ) -> None:
+        await self._backend(scope).append_memory(scope, session_id, entry)
+
+    async def get_memories(
+        self, scope: StorageScope, session_id: SessionId, limit: int
+    ) -> list[MemoryEntry]:
+        return await self._backend(scope).get_memories(scope, session_id, limit)
 
 
 # ============================================================================
@@ -662,6 +870,17 @@ def _most_recent_newest_first(items: list[Any], limit: int) -> list[Any]:
     if limit < 0:
         limit = 0
     return reversed_items[:limit]
+
+
+def _merge_newest_first(entries: list[MemoryEntry], limit: int) -> list[MemoryEntry]:
+    """Merge step for the cross-scope memory read (#78 R6): sort newest-first by
+    ``timestamp`` and truncate to ``limit``. **No dedup** — identical-content
+    entries are all retained. A *stable* sort preserves the input order among
+    equal timestamps, which keeps the merge deterministic cross-language."""
+    ordered = sorted(entries, key=lambda e: str(e.timestamp), reverse=True)
+    if limit < 0:
+        limit = 0
+    return ordered[:limit]
 
 
 # ============================================================================
@@ -687,12 +906,16 @@ __all__ = [
     "NoOpStorageProvider",
     "ObservabilityStore",
     "RunStore",
+    "ScopedMemoryRouter",
     "SessionStore",
     "StorageBackendError",
     "StorageError",
     "StorageIoError",
     "StorageNotFoundError",
     "StorageProvider",
+    "StorageScope",
     "StorageSerializationError",
+    "WorkspaceId",
     "parse_otlp_endpoints",
+    "workspace_id_from_canonical_path",
 ]

@@ -325,9 +325,11 @@ async def test_fixture_replay_todo_write(tmp_path: Path) -> None:
     cases = json.loads(path.read_text())
     assert cases
     for sc in cases:
+        _backend = InMemoryStorageProvider()
         ctx = ToolContext(
             session_id=SessionId(f"todo-{sc['name']}"),
-            run_store=InMemoryStorageProvider(),
+            run_store=_backend,
+            memory_store=_backend,
         )
         tool = TodoWriteTool()
         for step in sc["steps"]:

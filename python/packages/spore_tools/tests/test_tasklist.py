@@ -32,6 +32,7 @@ from spore_core.harness import (
 from spore_core.model import ToolCall
 from spore_core.storage import (
     InMemoryStorageProvider,
+    NoOpStorageProvider,
     RunStore,
     StorageBackendError,
 )
@@ -110,7 +111,11 @@ class _CorruptRunStore:
 
 
 def _ctx_with(run_store: RunStore, session: str = "test-session") -> ToolContext:
-    return ToolContext(session_id=SessionId(session), run_store=run_store)
+    return ToolContext(
+        session_id=SessionId(session),
+        run_store=run_store,
+        memory_store=NoOpStorageProvider(),
+    )
 
 
 def _in_memory_ctx() -> ToolContext:

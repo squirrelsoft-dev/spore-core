@@ -32,7 +32,10 @@ from spore_core.storage import (
     MemoryEntry,
     NoOpStorageProvider,
     StorageProvider,
+    StorageScope,
+    WorkspaceId,
     parse_otlp_endpoints,
+    workspace_id_from_canonical_path,
 )
 
 FIXTURES = Path(__file__).resolve().parents[4] / "fixtures" / "storage"
@@ -97,8 +100,8 @@ async def test_noop_reads_empty_writes_ok() -> None:
     assert await p.get_session(_sid("s")) is None
     assert await p.list_sessions() == []
     await p.put_session(_sid("s"), _paused("s"))  # no-op, no raise
-    assert await p.get_memories(_sid("s"), 10) == []
-    await p.append_memory(_sid("s"), _mem("user", "hi", "t"))
+    assert await p.get_memories(StorageScope.PROJECT, _sid("s"), 10) == []
+    await p.append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", "hi", "t"))
     assert await p.get(_sid("s"), "k") is None
     await p.put(_sid("s"), "k", 1)
     assert await p.list_keys(_sid("s")) == []
@@ -129,11 +132,11 @@ async def test_single_fills_all_slots() -> None:
     assert p.observability() is backend
     # Write through each accessor; reads see them — proving slots share backend.
     await p.session().put_session(_sid("s"), _paused("s"))
-    await p.memory().append_memory(_sid("s"), _mem("user", "hi", "t1"))
+    await p.memory().append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", "hi", "t1"))
     await p.run().put(_sid("s"), "plan", {"x": 1})
     await p.observability().append_span(_sid("s"), {"kind": "turn"})
     assert await p.session().get_session(_sid("s")) is not None
-    assert len(await p.memory().get_memories(_sid("s"), 10)) == 1
+    assert len(await p.memory().get_memories(StorageScope.PROJECT, _sid("s"), 10)) == 1
     assert await p.run().get(_sid("s"), "plan") == {"x": 1}
     assert len(await p.observability().get_spans(_sid("s"))) == 1
 
@@ -153,7 +156,7 @@ async def test_composite_routes_per_domain_and_falls_back_to_noop() -> None:
     # Unconfigured domains silently no-op.
     await p.session().put_session(_sid("s"), _paused("s"))
     assert await p.session().get_session(_sid("s")) is None
-    assert await p.memory().get_memories(_sid("s"), 5) == []
+    assert await p.memory().get_memories(StorageScope.PROJECT, _sid("s"), 5) == []
     assert await p.observability().get_spans(_sid("s")) == []
 
 
@@ -193,10 +196,10 @@ async def test_in_memory_run_roundtrip_list_delete() -> None:
 async def test_in_memory_memory_recency_and_limit() -> None:
     p = InMemoryStorageProvider()
     for i, c in enumerate(["m0", "m1", "m2", "m3"]):
-        await p.append_memory(_sid("s"), _mem("user", c, f"t{i}"))
-    got = await p.get_memories(_sid("s"), 2)
+        await p.append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", c, f"t{i}"))
+    got = await p.get_memories(StorageScope.PROJECT, _sid("s"), 2)
     assert [e.content for e in got] == ["m3", "m2"]  # most-recent 2, newest-first
-    all_entries = await p.get_memories(_sid("s"), 99)
+    all_entries = await p.get_memories(StorageScope.PROJECT, _sid("s"), 99)
     assert [e.content for e in all_entries] == ["m3", "m2", "m1", "m0"]
 
 
@@ -248,9 +251,9 @@ async def test_fs_run_roundtrip_list_delete(tmp_path: Path) -> None:
 async def test_fs_memory_append_recency_and_jsonl_path(tmp_path: Path) -> None:
     p = FileSystemStorageProvider(tmp_path)
     for i, c in enumerate(["a", "b", "c"]):
-        await p.append_memory(_sid("s"), _mem("user", c, f"t{i}"))
+        await p.append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", c, f"t{i}"))
     assert (tmp_path / "sessions/s/memory.jsonl").exists()
-    got = await p.get_memories(_sid("s"), 2)
+    got = await p.get_memories(StorageScope.PROJECT, _sid("s"), 2)
     assert [e.content for e in got] == ["c", "b"]
     assert got[0].metadata == {}  # metadata defaults to {}
 
@@ -302,13 +305,13 @@ async def test_memory_entries_fixture_replay() -> None:
 
     p = InMemoryStorageProvider()
     for e in entries:
-        await p.append_memory(_sid("s"), e)
-    got = await p.get_memories(_sid("s"), 2)
+        await p.append_memory(StorageScope.PROJECT, _sid("s"), e)
+    got = await p.get_memories(StorageScope.PROJECT, _sid("s"), 2)
     assert len(got) == 2
     assert got[0] == entries[-1]
     assert got[1] == entries[-2]
     # Full read is the reverse (newest-first) of the append order.
-    all_entries = await p.get_memories(_sid("s"), 999)
+    all_entries = await p.get_memories(StorageScope.PROJECT, _sid("s"), 999)
     assert all_entries == list(reversed(entries))
 
 
@@ -352,3 +355,234 @@ def test_memory_entry_json_shape_matches_fixture_first_row() -> None:
         "timestamp": "2026-05-28T10:00:00Z",
         "metadata": {},
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #78 — scope + workspace-partitioning extension
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ── R2: WorkspaceId derivation ───────────────────────────────────────────────
+
+
+def test_workspace_id_is_deterministic_and_pure() -> None:
+    a = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    b = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    assert a == b
+    # Form is `{sanitized_basename}-{8hex}`.
+    assert a.startswith("spore-core-")
+    assert len(a) == len("spore-core-") + 8
+
+
+def test_workspace_id_root_uses_literal_root_basename() -> None:
+    w = workspace_id_from_canonical_path("/")
+    assert w.startswith("root-")
+
+
+def test_workspace_id_sanitizes_special_chars_and_collapses_dashes() -> None:
+    w = workspace_id_from_canonical_path("/Users/me/My Project (v2)!")
+    assert w.startswith("my-project-v2-")
+    assert "--" not in w
+
+
+def test_workspace_id_ignores_trailing_slash() -> None:
+    a = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    b = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core/")
+    assert a == b
+
+
+def test_workspace_id_windows_path_strips_drive_and_normalizes_sep() -> None:
+    w = workspace_id_from_canonical_path("C:\\Users\\dev\\spore-core")
+    assert w.startswith("spore-core-")
+    # Distinct from the posix path (drive stripped but the rest differs).
+    posix = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    assert w != posix
+
+
+def test_workspace_id_returns_a_workspace_id_str() -> None:
+    # WorkspaceId is a NewType over str — usable anywhere a str is.
+    w: WorkspaceId = workspace_id_from_canonical_path("/a/b/leaf")
+    assert isinstance(w, str)
+
+
+def test_workspace_id_derivation_fixture_replay() -> None:
+    cases = json.loads((FIXTURES / "workspace_id_derivation.json").read_text())
+    assert len(cases) >= 4, "fixture should carry several rows"
+    for case in cases:
+        path = case["canonical_path"]
+        expected = case["expected_workspace_id"]
+        assert workspace_id_from_canonical_path(path) == expected, f"mismatch for path {path!r}"
+
+
+# ── R5: scope isolation — User and Project land in different backends ─────────
+
+
+async def test_scoped_writes_isolated_per_scope() -> None:
+    user = InMemoryStorageProvider()
+    project = InMemoryStorageProvider()
+    p = (
+        CompositeStorageProvider()
+        .memory(StorageScope.USER, user)
+        .memory(StorageScope.PROJECT, project)
+        .build()
+    )
+
+    await p.memory().append_memory(StorageScope.USER, _sid("s"), _mem("user", "U", "t1"))
+    await p.memory().append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", "P", "t1"))
+
+    # Each backend physically holds only its own scope's entry.
+    u = await user.get_memories(StorageScope.USER, _sid("s"), 10)
+    assert [e.content for e in u] == ["U"]
+    pr = await project.get_memories(StorageScope.PROJECT, _sid("s"), 10)
+    assert [e.content for e in pr] == ["P"]
+
+    # Scoped reads through the router return only own-scope entries.
+    ru = await p.memory().get_memories(StorageScope.USER, _sid("s"), 10)
+    assert [e.content for e in ru] == ["U"]
+    rp = await p.memory().get_memories(StorageScope.PROJECT, _sid("s"), 10)
+    assert [e.content for e in rp] == ["P"]
+
+
+# ── R6: merged read = User ∪ Project, newest-first by timestamp, no dedup ─────
+
+
+async def test_merged_read_unions_scopes_newest_first_no_dedup() -> None:
+    p = (
+        CompositeStorageProvider()
+        .memory(StorageScope.USER, InMemoryStorageProvider())
+        .memory(StorageScope.PROJECT, InMemoryStorageProvider())
+        .build()
+    )
+
+    # Identical-content "dup" entry in BOTH scopes (same timestamp) to prove no
+    # dedup. Local entry must NOT appear in the merge.
+    await p.memory().append_memory(
+        StorageScope.USER, _sid("s"), _mem("user", "u-old", "2026-05-01T00:00:00Z")
+    )
+    await p.memory().append_memory(
+        StorageScope.USER, _sid("s"), _mem("user", "dup", "2026-05-03T00:00:00Z")
+    )
+    await p.memory().append_memory(
+        StorageScope.USER, _sid("s"), _mem("user", "u-new", "2026-05-05T00:00:00Z")
+    )
+    await p.memory().append_memory(
+        StorageScope.PROJECT, _sid("s"), _mem("a", "p-old", "2026-05-02T00:00:00Z")
+    )
+    await p.memory().append_memory(
+        StorageScope.PROJECT, _sid("s"), _mem("a", "dup", "2026-05-03T00:00:00Z")
+    )
+    await p.memory().append_memory(
+        StorageScope.PROJECT, _sid("s"), _mem("a", "p-new", "2026-05-06T00:00:00Z")
+    )
+
+    merged = await p.get_memories_merged(_sid("s"), 10)
+    contents = [e.content for e in merged]
+    assert contents == ["p-new", "u-new", "dup", "dup", "p-old", "u-old"]
+    # No dedup: the identical-content "dup" entry is present twice.
+    assert contents.count("dup") == 2
+
+
+async def test_merged_read_fixture_replay() -> None:
+    f = json.loads((FIXTURES / "memory_scoped_merge.json").read_text())
+    limit = f["limit"]
+
+    p = (
+        CompositeStorageProvider()
+        .memory(StorageScope.USER, InMemoryStorageProvider())
+        .memory(StorageScope.PROJECT, InMemoryStorageProvider())
+        .memory(StorageScope.LOCAL, InMemoryStorageProvider())
+        .build()
+    )
+
+    for key, scope in [
+        ("user", StorageScope.USER),
+        ("project", StorageScope.PROJECT),
+        ("local", StorageScope.LOCAL),
+    ]:
+        for entry in f[key]:
+            await p.memory().append_memory(scope, _sid("s"), MemoryEntry.model_validate(entry))
+
+    merged = await p.get_memories_merged(_sid("s"), limit)
+    contents = [e.content for e in merged]
+    assert contents == f["expected_merged_contents"]
+    # Local scope entries are excluded from the merge.
+    assert not any("should-not-appear" in c for c in contents)
+
+
+# ── R7: unconfigured (memory, scope) → NoOp returns [] ───────────────────────
+
+
+async def test_unconfigured_memory_scope_falls_back_to_noop() -> None:
+    # Only User wired; Project + Local fall back to no-op.
+    p = CompositeStorageProvider().memory(StorageScope.USER, InMemoryStorageProvider()).build()
+
+    # Writes to an unconfigured scope silently no-op.
+    await p.memory().append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", "x", "t"))
+    # Reads from an unconfigured scope return [].
+    assert await p.memory().get_memories(StorageScope.PROJECT, _sid("s"), 10) == []
+
+
+# ── R8: scoped read newest-first recency (append 4, limit=2 → newest two) ─────
+
+
+async def test_scoped_read_recency_newest_first() -> None:
+    p = CompositeStorageProvider().memory(StorageScope.PROJECT, InMemoryStorageProvider()).build()
+    for i, c in enumerate(["m0", "m1", "m2", "m3"]):
+        await p.memory().append_memory(StorageScope.PROJECT, _sid("s"), _mem("user", c, f"t{i}"))
+    got = await p.memory().get_memories(StorageScope.PROJECT, _sid("s"), 2)
+    assert [e.content for e in got] == ["m3", "m2"]
+
+
+# ── R11: Local falls back to NoOp when not wired ─────────────────────────────
+
+
+async def test_local_scope_defaults_to_noop() -> None:
+    # Local intentionally not wired.
+    p = (
+        CompositeStorageProvider()
+        .memory(StorageScope.USER, InMemoryStorageProvider())
+        .memory(StorageScope.PROJECT, InMemoryStorageProvider())
+        .build()
+    )
+    await p.memory().append_memory(StorageScope.LOCAL, _sid("s"), _mem("user", "l", "t"))
+    assert await p.memory().get_memories(StorageScope.LOCAL, _sid("s"), 10) == []
+
+
+# ── R7/R11: an explicit NoOp wired to Local behaves like the fallback ─────────
+
+
+async def test_local_explicitly_wired_to_noop() -> None:
+    p = (
+        CompositeStorageProvider()
+        .memory(StorageScope.USER, InMemoryStorageProvider())
+        .memory(StorageScope.PROJECT, InMemoryStorageProvider())
+        .memory(StorageScope.LOCAL, NoOpStorageProvider())
+        .build()
+    )
+    await p.memory().append_memory(StorageScope.LOCAL, _sid("s"), _mem("user", "l", "t"))
+    assert await p.memory().get_memories(StorageScope.LOCAL, _sid("s"), 10) == []
+
+
+# ── R9: ToolContext exposes memory_store threaded by the registry ────────────
+#
+# The threading-by-registry assertion lives where ``RealToolRegistry`` does
+# (``spore_eval``): see ``packages/spore_eval/tests/test_scenarios.py::
+# test_real_tool_registry_threads_memory_store``. Here we only prove the
+# ``ToolContext`` carries a usable ``memory_store`` seam.
+
+
+async def test_tool_context_carries_memory_store_seam() -> None:
+    from spore_core.tool_registry import ToolContext
+
+    backend = InMemoryStorageProvider()
+    ctx = ToolContext(
+        session_id=_sid("ctx-test"),
+        run_store=backend,
+        memory_store=backend,
+    )
+    await ctx.memory_store.append_memory(
+        StorageScope.PROJECT, ctx.session_id, _mem("user", "via-ctx", "t1")
+    )
+    got = await backend.get_memories(StorageScope.PROJECT, _sid("ctx-test"), 10)
+    assert len(got) == 1
+    assert got[0].content == "via-ctx"

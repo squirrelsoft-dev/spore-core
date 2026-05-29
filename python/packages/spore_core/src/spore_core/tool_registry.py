@@ -90,7 +90,7 @@ from .model import ToolCall
 from .model import ToolSchema as ModelToolSchema
 
 if TYPE_CHECKING:
-    from .storage import RunStore
+    from .storage import MemoryStore, RunStore
 
 # ============================================================================
 # ToolContext — the storage seam handed to every tool (#75)
@@ -109,6 +109,11 @@ class ToolContext:
       :class:`RunStore`.
     * ``run_store`` — the :class:`RunStore` domain of the configured storage
       provider.
+    * ``memory_store`` — the :class:`MemoryStore` domain (#78). Scope-aware: the
+      tool passes a :class:`StorageScope` on every call. For a composite
+      provider this is the scope-routing memory slot; for the never-null
+      contract it is at worst a :class:`NoOpStorageProvider`. ``MemoryTool``
+      (#82) picks up this already-threaded seam.
 
     It is a **dataclass** (not a tuple) so future fields can be added without
     breaking the trait signature again. The :class:`SandboxProvider` is
@@ -119,6 +124,7 @@ class ToolContext:
 
     session_id: SessionId
     run_store: RunStore
+    memory_store: MemoryStore
 
 
 # ============================================================================
@@ -558,9 +564,11 @@ def make_test_ctx() -> ToolContext:
     (named ``make_test_ctx`` here so pytest does not collect it as a test)."""
     from .storage import InMemoryStorageProvider
 
+    backend = InMemoryStorageProvider()
     return ToolContext(
         session_id=SessionId("test-session"),
-        run_store=InMemoryStorageProvider(),
+        run_store=backend,
+        memory_store=backend,
     )
 
 

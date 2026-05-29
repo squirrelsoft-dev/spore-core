@@ -279,7 +279,8 @@ async def test_s4_tool_failure_then_recovery() -> None:
 
     registry = build_real_tool_registry(ScenarioId.S4)
     sandbox = AllowAllSandbox()
-    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
+    _storage = InMemoryStorageProvider()
+    bridge = RealToolRegistry(registry, sandbox, session_id, _storage, _storage)
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -305,11 +306,13 @@ async def test_s4_tool_failure_then_recovery() -> None:
 async def test_s4_failing_tool_is_not_always_halt() -> None:
     """The harness must NOT hard-halt on the recoverable FailingTool error — the
     bridge reports ``is_always_halt == False``."""
+    _storage = InMemoryStorageProvider()
     bridge = RealToolRegistry(
         build_real_tool_registry(ScenarioId.S4),
         AllowAllSandbox(),
         SessionId("s4-halt-test"),
-        InMemoryStorageProvider(),
+        _storage,
+        _storage,
     )
     assert not bridge.is_always_halt("flaky_op")
     out = await bridge.dispatch(_call("c1", "flaky_op", {}))
@@ -350,7 +353,8 @@ async def test_s5_shell_pipeline_uppercases_via_bash_command() -> None:
 
     registry = build_real_tool_registry(ScenarioId.S5)
     sandbox = AllowAllSandbox()
-    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
+    _storage = InMemoryStorageProvider()
+    bridge = RealToolRegistry(registry, sandbox, session_id, _storage, _storage)
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -388,11 +392,13 @@ def test_scenario_id_parses() -> None:
 
 
 def _schema_names(scenario: ScenarioId) -> list[str]:
+    _storage = InMemoryStorageProvider()
     bridge = RealToolRegistry(
         build_real_tool_registry(scenario),
         AllowAllSandbox(),
         SessionId("schema-test"),
-        InMemoryStorageProvider(),
+        _storage,
+        _storage,
     )
     return [s.name for s in bridge.model_schemas()]
 
@@ -420,3 +426,34 @@ def test_s5_registry_has_bash_command() -> None:
     names = _schema_names(ScenarioId.S5)
     assert "bash_command" in names
     assert "exec" in names
+
+
+# ---------------------------------------------------------------------------
+# #78 R9 — RealToolRegistry threads the configured memory store into ToolContext
+# ---------------------------------------------------------------------------
+
+
+async def test_real_tool_registry_threads_memory_store() -> None:
+    """The bridge must thread its injected ``memory_store`` into the
+    ``ToolContext`` it hands to every tool (#78). Prove the seam is live by
+    writing through the context's memory store and reading it back through the
+    same backend the registry was wired with."""
+    from spore_core.memory import Timestamp
+    from spore_core.storage import MemoryEntry, StorageScope
+    from spore_core.tool_registry import StandardToolRegistry
+
+    memory = InMemoryStorageProvider()
+    bridge = RealToolRegistry(
+        StandardToolRegistry(),
+        AllowAllSandbox(),
+        SessionId("ctx-test"),
+        InMemoryStorageProvider(),
+        memory,
+    )
+    ctx = bridge.tool_context()
+    entry = MemoryEntry(role="user", content="threaded", timestamp=Timestamp("t1"))
+    await ctx.memory_store.append_memory(StorageScope.PROJECT, ctx.session_id, entry)
+    # Read back through the same Arc/object the registry threaded in.
+    got = await memory.get_memories(StorageScope.PROJECT, SessionId("ctx-test"), 10)
+    assert len(got) == 1
+    assert got[0].content == "threaded"

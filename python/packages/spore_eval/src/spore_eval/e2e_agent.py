@@ -174,7 +174,8 @@ async def _run_live(
     sandbox = WorkspaceScopedSandbox(
         WorkspaceConfig(root=workspace, read_only=False, max_file_size=0)
     )
-    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
+    storage_backend = InMemoryStorageProvider()
+    bridge = RealToolRegistry(registry, sandbox, session_id, storage_backend, storage_backend)
     tool_schemas = bridge.model_schemas()
 
     window_limit = 200 if scenario is ScenarioId.S3 else 128_000

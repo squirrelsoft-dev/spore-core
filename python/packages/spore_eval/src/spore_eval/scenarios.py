@@ -62,7 +62,7 @@ from spore_core.model import (
     ToolCall,
     ToolSchema,
 )
-from spore_core.storage import RunStore
+from spore_core.storage import MemoryStore, RunStore
 from spore_core.tool_registry import (
     DispatchError,
     StandardToolRegistry,
@@ -94,14 +94,14 @@ class RealToolRegistry:
     ``DispatchError`` becomes a *recoverable* ``ToolOutputError`` so the loop
     appends it as a tool result rather than halting — S4 depends on this.
 
-    Storage seam (#75)
-    ------------------
+    Storage seam (#75, #78)
+    -----------------------
     Per the construction-injection decision, the bridge is given the run's
-    :class:`SessionId` and a :class:`RunStore` at construction time (it is
-    already built per-run). On each dispatch it builds a :class:`ToolContext`
-    from those injected fields and forwards it into the inner registry. This
-    keeps the harness-loop ``dispatch(call)`` signature unchanged while threading
-    storage to tools.
+    :class:`SessionId`, a :class:`RunStore`, and (#78) a :class:`MemoryStore` at
+    construction time (it is already built per-run). On each dispatch it forwards
+    a :class:`ToolContext` built from those injected fields into the inner
+    registry. This keeps the harness-loop ``dispatch(call)`` signature unchanged
+    while threading storage to tools.
     """
 
     def __init__(
@@ -110,10 +110,15 @@ class RealToolRegistry:
         sandbox: SandboxProvider,
         session_id: SessionId,
         run_store: RunStore,
+        memory_store: MemoryStore,
     ) -> None:
         self._inner = inner
         self._sandbox = sandbox
-        self._ctx = ToolContext(session_id=session_id, run_store=run_store)
+        self._ctx = ToolContext(
+            session_id=session_id,
+            run_store=run_store,
+            memory_store=memory_store,
+        )
         # Snapshot the model-facing schemas (sorted by name) once at
         # construction; the catalog is fixed for a scenario run.
         self._schemas: list[ToolSchema] = sorted(
@@ -124,6 +129,12 @@ class RealToolRegistry:
     def model_schemas(self) -> list[ToolSchema]:
         """The model-facing tool schemas, sorted by name."""
         return list(self._schemas)
+
+    def tool_context(self) -> ToolContext:
+        """The :class:`ToolContext` this bridge threads into every dispatch —
+        exposing the ``session_id``, ``run_store`` and (#78) ``memory_store``
+        seams it was wired with."""
+        return self._ctx
 
     async def dispatch(self, call: ToolCall) -> ToolOutput:
         try:
