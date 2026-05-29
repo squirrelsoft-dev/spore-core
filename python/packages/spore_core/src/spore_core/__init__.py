@@ -257,6 +257,7 @@ from .tasklist import (
     TaskListError,
     TaskStatus,
     load_task_list,
+    plan_artifact_to_task_list,
     store_task_list,
     validate_transition,
 )
@@ -595,6 +596,7 @@ __all__ = [
     "TaskListTask",
     "TaskStatus",
     "load_task_list",
+    "plan_artifact_to_task_list",
     "store_task_list",
     "validate_transition",
     "PostCompactContext",

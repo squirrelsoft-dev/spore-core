@@ -65,6 +65,7 @@ import anyio
 
 from .errors import SporeError
 from .harness import SandboxProvider
+from .hooks import PlanArtifact
 
 __all__ = [
     "TASK_LIST_EXTRAS_KEY",
@@ -74,6 +75,7 @@ __all__ = [
     "TaskListError",
     "TaskStatus",
     "load_task_list",
+    "plan_artifact_to_task_list",
     "store_task_list",
     "validate_transition",
 ]
@@ -317,6 +319,55 @@ def validate_transition(task_id: int, from_status: TaskStatus, to_status: TaskSt
     if (from_status, to_status) in _ALLOWED_TRANSITIONS:
         return
     raise TaskListError.invalid_transition(task_id, from_status, to_status)
+
+
+# ============================================================================
+# Plan → TaskList parser (issue #72; the bridge between #70 and #59)
+# ============================================================================
+
+
+def plan_artifact_to_task_list(artifact: PlanArtifact) -> TaskList:
+    """Parse an accepted :class:`PlanArtifact` (#70) into a fresh, ready-to-persist
+    :class:`TaskList` (#71).
+
+    This is the bridge between the plan phase and the execute loop: once a plan
+    is produced and accepted, its steps become the task list that #59's execute
+    loop drains.
+
+    Types bridged
+    -------------
+    * Input: :class:`PlanArtifact` ``{tasks: list[str], rationale: str}``.
+    * Output: :class:`TaskList` ``{tasks: list[Task], next_id: int}``.
+
+    Rules enforced
+    --------------
+    * One :class:`Task` per plan step, in plan order (positional, via
+      :meth:`TaskList.add`).
+    * Every produced task is :attr:`TaskStatus.PENDING`.
+    * Step descriptions are copied VERBATIM — no trim, no normalize, no filter
+      (even ``"  spaced  "`` and ``""`` are kept).
+    * Ids are assigned ``1..=n`` sequentially via the :attr:`TaskList.next_id`
+      scheme; ``next_id`` ends at ``n + 1``.
+    * An empty plan (``tasks: []``) yields the empty default ``TaskList``
+      (``{tasks: [], next_id: 1}``). That is a valid EMPTY list, not an error
+      and not "immediate completion"; the execute loop (#59) decides loop
+      semantics.
+    * ``rationale`` is DROPPED — neither :class:`Task` nor :class:`TaskList`
+      carries it.
+
+    Pure and total: ``PlanArtifact -> TaskList``, no async, no I/O, never raises.
+    The same artifact always yields the same task list, so the mapping is
+    byte-identical across all four languages.
+
+    Always builds a fresh default :class:`TaskList`; it never merges into an
+    existing list (replanning is out of scope — single parse per accepted plan).
+    Wiring this into the plan-acceptance seam is DEFERRED to #59's execute loop;
+    #72 ships only this pure function.
+    """
+    task_list = TaskList()  # next_id == 1
+    for step in artifact.tasks:
+        task_list.add(step)  # verbatim; appends pending; bumps next_id
+    return task_list
 
 
 # ============================================================================
