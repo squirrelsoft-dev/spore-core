@@ -66,6 +66,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::harness::{Operation, SandboxProvider, SandboxViolation};
+use crate::plan::PlanArtifact;
 
 /// Key under which the [`TaskList`] is mirrored into `SessionState.extras`
 /// (serialized JSON) by the harness / #59. Mirrors `PLAN_EXECUTE_EXTRAS_KEY`.
@@ -253,6 +254,50 @@ impl TaskList {
         task.status = TaskStatus::Completed;
         Ok(())
     }
+}
+
+// ============================================================================
+// Plan → TaskList parser (issue #72; the bridge between #70 and #59)
+// ============================================================================
+
+/// Parse an accepted [`PlanArtifact`] (#70) into a fresh, ready-to-persist
+/// [`TaskList`] (#71). This is the bridge between the plan phase and the
+/// execute loop: once a plan is produced and accepted, its steps become the
+/// task list that #59's execute loop drains.
+///
+/// # Types bridged
+/// - Input: [`PlanArtifact`] `{ tasks: Vec<String>, rationale: String }`.
+/// - Output: [`TaskList`] `{ tasks: Vec<Task>, next_id: u32 }`.
+///
+/// # Rules enforced
+/// - One [`Task`] per plan step, in plan order (positional, via [`TaskList::add`]).
+/// - Every produced task is [`TaskStatus::Pending`].
+/// - Step descriptions are copied VERBATIM — no trim, no normalize, no filter
+///   (matches #70's `tasks_kept_verbatim`: even `"  spaced  "` and `""` are kept).
+/// - Ids are assigned `1..=n` sequentially via the [`TaskList::next_id`] scheme;
+///   `next_id` ends at `n + 1`.
+/// - An empty plan (`tasks: []`) yields [`TaskList::default`] —
+///   `{ tasks: [], next_id: 1 }`. That is a valid EMPTY list, not an error and
+///   not "immediate completion"; the execute loop (#59) decides loop semantics.
+/// - `rationale` is DROPPED — neither [`Task`] nor [`TaskList`] carries it.
+///
+/// # Determinism
+/// Pure and total: `&PlanArtifact -> TaskList`, no async, no I/O, no `Result`,
+/// never panics. The same artifact always yields the same task list, so the
+/// mapping is byte-identical across all four languages.
+///
+/// # Re-parsing / wiring
+/// Always builds a fresh [`TaskList::default`]; it never merges into an
+/// existing list (replanning is out of scope — single parse per accepted plan).
+/// Wiring this into the plan-acceptance seam (read `extras["plan_execute"]` →
+/// parse → [`store_task_list`] + mirror into `extras["task_list"]`) is DEFERRED
+/// to #59's execute loop; #72 ships only this pure function.
+pub fn plan_artifact_to_task_list(artifact: &PlanArtifact) -> TaskList {
+    let mut list = TaskList::default(); // next_id == 1
+    for step in &artifact.tasks {
+        list.add(step.clone()); // verbatim; appends Pending; bumps next_id
+    }
+    list
 }
 
 // ============================================================================
@@ -584,5 +629,126 @@ mod tests {
             serde_json::to_string(&l).unwrap(),
             r#"{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}"#
         );
+    }
+
+    // ========================================================================
+    // plan_artifact_to_task_list (#72)
+    // ========================================================================
+
+    fn artifact(tasks: &[&str], rationale: &str) -> PlanArtifact {
+        PlanArtifact {
+            tasks: tasks.iter().map(|s| s.to_string()).collect(),
+            rationale: rationale.to_string(),
+        }
+    }
+
+    // One task per plan step, plan order preserved, all Pending.
+    #[test]
+    fn plan_one_task_per_step_in_order_all_pending() {
+        let list = plan_artifact_to_task_list(&artifact(&["first", "second", "third"], ""));
+        let descs: Vec<&str> = list.tasks.iter().map(|t| t.description.as_str()).collect();
+        assert_eq!(descs, ["first", "second", "third"]);
+        assert!(list.tasks.iter().all(|t| t.status == TaskStatus::Pending));
+    }
+
+    // Sequential ids [1,2,3] and next_id == 4.
+    #[test]
+    fn plan_assigns_sequential_ids() {
+        let list = plan_artifact_to_task_list(&artifact(&["a", "b", "c"], ""));
+        assert_eq!(
+            list.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(list.next_id, 4);
+    }
+
+    // Deterministic: same artifact parsed twice → equal lists.
+    #[test]
+    fn plan_is_deterministic() {
+        let a = artifact(&["x", "y"], "why");
+        assert_eq!(
+            plan_artifact_to_task_list(&a),
+            plan_artifact_to_task_list(&a)
+        );
+    }
+
+    // Descriptions copied VERBATIM — whitespace and empty strings preserved.
+    #[test]
+    fn plan_keeps_descriptions_verbatim() {
+        let list = plan_artifact_to_task_list(&artifact(&["  spaced  ", ""], ""));
+        assert_eq!(list.tasks[0].description, "  spaced  ");
+        assert_eq!(list.tasks[1].description, "");
+        assert_eq!(list.tasks[0].id, 1);
+        assert_eq!(list.tasks[1].id, 2);
+    }
+
+    // Empty plan → the canonical empty list {tasks:[], next_id:1}.
+    #[test]
+    fn plan_empty_yields_default_list() {
+        let list = plan_artifact_to_task_list(&artifact(&[], ""));
+        assert_eq!(list, TaskList::default());
+        assert!(list.tasks.is_empty());
+        assert_eq!(list.next_id, 1);
+    }
+
+    // rationale is DROPPED — it appears nowhere in the resulting TaskList.
+    #[test]
+    fn plan_drops_rationale() {
+        let list = plan_artifact_to_task_list(&artifact(&["do thing"], "SECRET_RATIONALE_TOKEN"));
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(!json.contains("SECRET_RATIONALE_TOKEN"));
+        assert!(!json.contains("rationale"));
+    }
+
+    // Serde round-trip of the parsed result is byte-identical / canonical.
+    #[test]
+    fn plan_result_serde_round_trip_byte_identical() {
+        let list = plan_artifact_to_task_list(&artifact(&["alpha", "beta"], "r"));
+        let json1 = serde_json::to_string(&list).unwrap();
+        assert_eq!(
+            json1,
+            r#"{"tasks":[{"id":1,"description":"alpha","status":"pending"},{"id":2,"description":"beta","status":"pending"}],"next_id":3}"#
+        );
+        let parsed: TaskList = serde_json::from_str(&json1).unwrap();
+        let json2 = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(json1, json2);
+        assert_eq!(list, parsed);
+    }
+
+    // ------------------------------------------------------------------------
+    // Fixture replay (#72)
+    // ------------------------------------------------------------------------
+
+    fn plan_fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/plan_to_tasklist")
+            .join(name)
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PlanCase {
+        name: String,
+        input: PlanArtifact,
+        expected: TaskList,
+    }
+
+    // Load cases.json, run plan_artifact_to_task_list on each input, and assert
+    // the serialized TaskList equals `expected` byte-for-byte (canonical compact
+    // form, field order tasks then next_id).
+    #[test]
+    fn fixture_replay_plan_to_tasklist() {
+        let data = std::fs::read_to_string(plan_fixture_path("cases.json")).unwrap();
+        let cases: Vec<PlanCase> = serde_json::from_str(&data).unwrap();
+        assert!(!cases.is_empty(), "expected >=1 case");
+
+        for case in cases {
+            let got = plan_artifact_to_task_list(&case.input);
+            // Structural equality with the fixture's expected list.
+            assert_eq!(got, case.expected, "case {}: structural", case.name);
+            // Byte-for-byte canonical serialization equality.
+            let got_json = serde_json::to_string(&got).unwrap();
+            let want_json = serde_json::to_string(&case.expected).unwrap();
+            assert_eq!(got_json, want_json, "case {}: canonical bytes", case.name);
+        }
     }
 }

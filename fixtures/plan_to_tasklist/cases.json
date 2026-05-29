@@ -1,0 +1,49 @@
+[
+  {
+    "name": "empty_plan",
+    "input": {"tasks": [], "rationale": ""},
+    "expected": {"tasks": [], "next_id": 1}
+  },
+  {
+    "name": "single_step",
+    "input": {"tasks": ["do the thing"], "rationale": ""},
+    "expected": {
+      "tasks": [{"id": 1, "description": "do the thing", "status": "pending"}],
+      "next_id": 2
+    }
+  },
+  {
+    "name": "multi_step",
+    "input": {"tasks": ["first", "second", "third"], "rationale": ""},
+    "expected": {
+      "tasks": [
+        {"id": 1, "description": "first", "status": "pending"},
+        {"id": 2, "description": "second", "status": "pending"},
+        {"id": 3, "description": "third", "status": "pending"}
+      ],
+      "next_id": 4
+    }
+  },
+  {
+    "name": "verbatim_whitespace",
+    "input": {"tasks": ["  spaced  ", ""], "rationale": ""},
+    "expected": {
+      "tasks": [
+        {"id": 1, "description": "  spaced  ", "status": "pending"},
+        {"id": 2, "description": "", "status": "pending"}
+      ],
+      "next_id": 3
+    }
+  },
+  {
+    "name": "rationale_ignored",
+    "input": {"tasks": ["alpha", "beta"], "rationale": "we chose this order because alpha must precede beta"},
+    "expected": {
+      "tasks": [
+        {"id": 1, "description": "alpha", "status": "pending"},
+        {"id": 2, "description": "beta", "status": "pending"}
+      ],
+      "next_id": 3
+    }
+  }
+]

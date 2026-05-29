@@ -134,7 +134,8 @@ pub use sensor::{
     SensorTrigger, StandardSensorChain,
 };
 pub use tasklist::{
-    Task as TaskListTask, TaskList, TaskListError, TaskStatus, TASK_LIST_EXTRAS_KEY,
+    plan_artifact_to_task_list, Task as TaskListTask, TaskList, TaskListError, TaskStatus,
+    TASK_LIST_EXTRAS_KEY,
 };
 pub use tools::TaskListTool;
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
