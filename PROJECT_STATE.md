@@ -1,98 +1,89 @@
 # PROJECT STATE
-_Last updated: 2026-05-29 by /close — closed #59 (PlanExecute execute loop) `status: complete`. **PlanExecute now runs end-to-end** across all four languages, completing the entire #45→#69→#70→#71→#72→#73→#59 chain. All commits (incl. the previously-unpushed #72/#73) are now on `origin/main` (tip `9b9acd6`)._
+_Last updated: 2026-05-29 by /close — closed #75 (Tool-trait storage seam) `status: complete`, retiring Deviation #3. Pushed the four #76 + four #75 commits to origin (tip now `ba0e7f9`, was `3fe68f3`). New untriaged tool/prompt-architecture track surfaced (#79/#80/#81); #75 unblocks #81 — direction decision flagged below._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
 component across four targets: Rust (reference), TypeScript, Python, and Go.
 
-**#59 (PlanExecute execute loop) just landed — the harness now runs TWO loop
-strategies end-to-end (ReAct + PlanExecute).** Rust ref `384ca28`, TS `6374749`,
-Python `0bd9562`, Go `9b9acd6`; merged to `main` and **pushed to origin** (tip
-`9b9acd6`). This was the last piece of the PlanExecute chain: `run_plan_execute`
-now runs the one-shot plan phase (#70) → parses the artifact into a `TaskList`
-via `plan_artifact_to_task_list` (#72) → persists it → drains it through a real
-execute phase, replacing the `ExecutePhaseNotImplemented` halt. The five spec
-forks were resolved by the maintainer before coding and applied identically in
-all four:
-- **Q1 — execute step model:** each task gets its own bounded, **isolated,
-  sequential** ReAct sub-loop (reusing `run_react_inner`); per-task turn cap is
-  derived at each step start as `floor(remaining_turns / remaining_tasks)`
-  floored at 1; the shared budget (turns/tokens/observability/compaction) is
-  carried across all steps as the global hard stop.
-- **Q2 — success output:** the last completed step's final-response text (not a
-  concatenation, not the plan rationale).
-- **Q3 — empty plan** (`tasks: []`): new `HaltReason::EmptyPlan` failure (no
-  silent success).
-- **Q4 — persistence migrated onto `StorageProvider`/`RunStore`:** the execute
-  loop writes the durable task-list/plan copy through `RunStore` (`storage.run().put`)
-  plus the `extras` mirror; it **no longer uses** the `.spore/task_list.json`
-  sandbox path. (The standalone `task_list` *tool* keeps its own sandbox seam —
-  unchanged.)
-- **Q5 — per-task failure:** new `HaltReason::StepFailed { task_index, task,
-  reason }` aborts the whole run (later tasks don't run); mid-execute budget
-  exhaustion stays `BudgetExceeded`.
+**#75 just landed — tools can now persist through the storage seam.** The `Tool`
+trait gained a `ToolContext { session_id, run_store }` parameter on `execute`
+(additive, after `sandbox`), construction-injected via the per-run registry
+bridge so the **harness-loop dispatch signature is unchanged** in all four
+languages. The standalone `task_list` tool is migrated off its
+`.spore/task_list.json` sandbox path onto `RunStore` (shared `"task_list"` key,
+keyed by `SessionId` — the same blob the PlanExecute loop uses); the sandbox path
+and its load/store helpers are deleted everywhere. Rust ref `ed932ac`, TS
+`ba0e7f9`, Python `35d609f`, Go `de97f80`. Cross-language verification: all four
+suites green (Rust full workspace suite, TS 968, Python 847, Go all packages ok),
+`fixtures/tasklist/operations.json` re-pointed to drive over an in-memory
+`RunStore` and replays byte-identically; no divergences. **Behavior change:** with
+the library default `no_op()` storage, a standalone `task_list` call now persists
+**nothing across processes** (it previously wrote a file) — durable persistence
+now requires wiring a real `StorageProvider`. No migration shim.
 
-`HaltReason` across all four: added `EmptyPlan` + `StepFailed`, removed
-`ExecutePhaseNotImplemented`. `OnTaskAdvance` (#69) fires once per task with
-correct `task_index`/`total_tasks`. Shared fixture
-`fixtures/model_responses/harness/plan_execute_loop.jsonl` (1 plan turn → 2 tasks,
-then 2 execute completions) replays identically in all four (output
-`"wrote the integration tests"`, 3 turns, both tasks completed). Cross-language
-verification: all four suites green (Rust 56 incl. fixture-replay, TS 828 core,
-Python 843, Go 875), no divergences, no spec gaps, no new issues spawned.
+**The persistence layer is clean** (#73 + #76 + #75): `StorageProvider`
+abstraction with per-domain composite routing; `plan_execute` and `task_list`
+persist solely through `RunStore`; the standalone `task_list` tool now does too.
+`SessionState.extras` is kept only for genuinely ephemeral scratch (`__rich_state`
+for compaction, `subagent_handoff_summary` for subagents).
 
-**The full PlanExecute prerequisite chain is now complete and on origin:** #45
-(Agent dyn-compatibility), #69 (lifecycle hook system — 17 events, `Stop` +
-`OnPlanCreated` + `OnTaskAdvance` now loop-wired), #70 (one-shot plan phase →
-`PlanArtifact`), #71 (`task_list` persisted tool), #72 (`plan_artifact_to_task_list`
-pure bridge), #73 (`StorageProvider` abstraction — four domain stores, NoOp/
-InMemory/FileSystem/Composite providers, multi-endpoint OTLP fan-out, scope "1a").
+**The full PlanExecute chain is complete and on origin**: #45 (Agent
+dyn-compatibility), #69 (lifecycle hooks — 17 events), #70 (one-shot plan phase →
+`PlanArtifact`), #71 (`task_list` persisted tool), #72
+(`plan_artifact_to_task_list` bridge), #73 (`StorageProvider`), #59 (PlanExecute
+execute loop), #76 (extras→RunStore), #75 (Tool storage seam). The harness runs
+**two of five** loop strategies (ReAct + PlanExecute) end-to-end.
 
 Foundation in place: the harness is **runnable** (#57 — shared e2e CLI driving
-the full ReAct loop against Ollama, proven by a 4-scenario hermetic suite, live
-against `llama3.2`) and **debuggable** (#64/#65 — GenAI-convention content
-capture, opt-in/truncated/env-guarded, Arize Phoenix LLM-trace viewer alongside
-Tempo/Loki/Prometheus, assistant turns recorded). It has a working
-**evaluation/feedback loop** (#26 EvalHarness — `TaskSuite` over fresh worktrees,
-native Welch's t-test + seeded-bootstrap CIs, Adopt/Reject recommendation; #68 —
-typed `Span` accessors, all four EvalHarnesses structurally identical). Earlier
-work: observability stack (#42/#49/#50/#33), `OllamaModelInterface` + capability
-guard (#41), `StandardCompactionAdapter` + verify→retry→warn loop (#55/#46),
-`StandardContextManager`/verifiers (#29), and KeyTermVerifier honoring all five
-preserve hints (#47).
+the full ReAct loop against Ollama, 4-scenario hermetic suite, live against
+`llama3.2`) and **debuggable** (#64/#65 — GenAI-convention content capture,
+opt-in/truncated/env-guarded, Arize Phoenix LLM-trace viewer alongside
+Tempo/Loki/Prometheus). It has a working **evaluation/feedback loop** (#26
+EvalHarness — `TaskSuite` over fresh worktrees, native Welch's t-test +
+seeded-bootstrap CIs, Adopt/Reject; #68 — typed `Span` accessors). Earlier work:
+observability stack (#42/#49/#50/#33), `OllamaModelInterface` + capability guard
+(#41), `StandardCompactionAdapter` + verify→retry→warn loop (#55/#46),
+`StandardContextManager`/verifiers (#29), KeyTermVerifier (#47).
 
-**main CI is green** across all four languages.
+**origin/main is at `ba0e7f9`** — all work through #75 is pushed. CI green across
+all four languages.
 
-Known runnability limits: the harness now runs **ReAct and PlanExecute**
-end-to-end. `Ralph`, `SelfVerifying`, and `HillClimbing` (#58/#60/#61) still
-return the generic `HaltReason::StrategyNotYetImplemented` — so the README and
+Known runnability limits: the harness runs **ReAct and PlanExecute** end-to-end.
+`Ralph`, `SelfVerifying`, and `HillClimbing` (#58/#61/#60) still return the generic
+`HaltReason::StrategyNotYetImplemented` — so the README and
 `docs/harness-engineering-concepts.md` still overstate what runs (3 of 5
 strategies remain stubs).
 
 ## Active Direction
-The harness is **runnable** (#57) and **debuggable** (#64/#65), has a working
-**evaluation/feedback loop** (#26/#68), and now runs **two** of its five
-advertised loop strategies (ReAct + PlanExecute #59). The bar remains
-**capability breadth and correctness**: deliver the remaining loop strategies
-and close the queue of known correctness/safety gaps.
+The harness is **runnable** (#57), **debuggable** (#64/#65), has a working
+**evaluation/feedback loop** (#26/#68), runs **two** of five advertised loop
+strategies (ReAct + PlanExecute), and now has a **clean, fully-pluggable
+persistence seam reaching all the way into tools** (#73 + #76 + #75). The bar
+remains **capability breadth and correctness**.
 
-PlanExecute (#59) was built deep-first specifically to establish the shared
-seams the other strategies reuse — the pluggable executor (ReAct sub-loop by
-default, swappable for a future Ralph-style execute+verify), the `task_list`
-drain, the `OnTaskAdvance` hook, and the `RunStore` persistence path. With those
-seams live, **the remaining three strategies follow**: Ralph (#58), HillClimbing
-(#60), and SelfVerifying (#61) — the last of which can now be built as a
-`Stop`-hook configuration on the #69 hook system rather than a bespoke loop.
-After the strategies come the accepted-debt correctness fixes (#30/#31/#32/#34)
-and the docs/spec cleanup (#27/#35/#36) so the docs stop overstating capability.
-Observability stays swappable over OTLP. Storage backends stay a first-class
-pluggable seam (#73), with the remaining persistence migration + SQL backends as
-follow-ups (Deviation #4).
+Two capability tracks are now live and the next loop should pick between them:
+
+1. **Tool/prompt architecture track (newly filed, just unblocked by #75).**
+   #80 (tool escalation protocol — `ToolOutput::Escalate`/`HarnessSignal`), #81
+   (standard tool catalogue — Tier 1 execution / Tier 2 session-aware via #75's
+   `ToolContext` / Tier 3 harness-escalating via #80), and #79 (prompt assembly
+   engine — `ChunkProvider`/`PromptChunk`/`AssemblyContext`). #75 directly
+   unblocked #81's Tier 2; #80 unblocks #81's Tier 3. This track has momentum and
+   fresh context.
+2. **Remaining loop strategies.** **SelfVerifying (#61)** is likely-cheapest
+   (buildable as a `Stop`-hook configuration on the #69 hook system),
+   **Ralph (#58)** is the natural pair to PlanExecute's execute phase, and
+   **HillClimbing (#60)** follows once the seams have a second consumer.
+
+After whichever track: the accepted-debt correctness fixes (#30/#31/#32/#34) and
+docs/spec cleanup (#27/#35/#36) so the docs stop overstating capability. Storage
+stays first-class: scope + workspace partitioning (#78) and SQL backends (#77)
+are filed, both deferred.
 
 ## Known Deviations
 1. **Three of five loop strategies are still stubs** — the README and
    `docs/harness-engineering-concepts.md` advertise five loop strategies; **ReAct
-   and PlanExecute (#59) now run end-to-end**, but `Ralph`, `SelfVerifying`, and
+   and PlanExecute run end-to-end**, but `Ralph`, `SelfVerifying`, and
    `HillClimbing` still return `HaltReason::StrategyNotYetImplemented` at
    `rust/crates/spore-core/src/harness.rs`. Tracked: #58 / #61 / #60
    (`scope: deferred`). #57's scenario suite is intentionally ReAct-only.
@@ -100,66 +91,51 @@ follow-ups (Deviation #4).
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod` (accepted tradeoff, documented in `go/CONVENTIONS.md`).
    The durable JSONL path stays network-free.
-3. **`task_list` *tool* persistence is still the interim sandbox path**
-   (`scope: debt`) — the standalone `task_list` tool persists to
-   `.spore/task_list.json` via `SandboxProvider` because the `Tool` trait has no
-   `SessionState`/shared-store access. **The PlanExecute execute loop (#59) no
-   longer uses this path** — it migrated to `RunStore` per Q4 (see resolution
-   below) — but the tool itself, when invoked standalone, still writes to the
-   sandbox file. Fully retiring the tool's sandbox path needs the `Tool` trait to
-   reach the storage seam; folded into the remaining persistence-migration
-   follow-up (Deviation #4a).
-4. **#73 deferred follow-ups — persistence migration partially done; SQL backends
-   not started** (`scope: deferred`) — #73 (scope "1a") shipped the
-   `StorageProvider` abstraction only, deferring (a) migrating #70/#71 persistence
-   onto `RunStore` + removing `SessionState.extras`, and (b)
-   `Sqlite`/`Postgres` providers. **(a) is now partially resolved by #59**, which
-   migrated the execute loop's task-list + plan persistence onto `RunStore`;
-   **still outstanding:** removing `SessionState.extras` entirely (the `extras`
-   mirror is still written for live readback) and migrating the remaining #70
-   plan-phase sites + the standalone `task_list` tool (Deviation #3). **(b)** SQL
-   providers remain a future phase. **These still need discrete follow-up issues
-   filed** (not yet created — pending maintainer go-ahead); until then they live
-   only here.
+3. **`task_list` tool default persistence is now no-op, not a file** (`scope: debt`,
+   minor) — #75 retired the `.spore/task_list.json` sandbox path; the standalone
+   tool persists via `RunStore`. With the library default `no_op()` storage, a
+   standalone tool invocation now persists **nothing across processes** (it
+   previously wrote a file). Durable standalone use requires wiring a real
+   `StorageProvider` (e.g. `FileSystemStorageProvider`). Accepted tradeoff for
+   retiring the sandbox path; no migration shim.
+   _(The original Deviation #3 — tool can't reach the storage seam — is **resolved**
+   by #75. This entry records the residual behavior change.)_
+4. **#73 deferred follow-ups — both filed.** (a) persistence migration off
+   `SessionState.extras` is **fully resolved** (#59 + #76 + #75). (b) SQL backends
+   filed as **#77** (`scope: deferred`). Storage scope + workspace partitioning
+   filed this milestone as **#78** (`scope: deferred`).
 
-_(Former Deviation: #72/#73 commits unpushed to origin — **resolved** this loop;
-all commits through `9b9acd6` are now on `origin/main`.)_
-_(Former Deviation: Rust Agent dyn-compatibility / `BoxFut` workaround — **resolved**
-in #45 (commit `afe5ff8`).)_
+_(Former Deviation #3 — tool stuck on sandbox path — **resolved** in #75.)_
+_(Former Deviation #4a — extras persistence mirror unmigrated — **resolved** in #76.)_
+_(Former Deviation: #72/#73 commits unpushed — **resolved** in the #59 loop.)_
+_(Former Deviation: Rust Agent dyn-compatibility / `BoxFut` — **resolved** in #45.)_
 _(Former Deviation: compaction `tokens_reclaimed = 0` — **resolved** in #57.)_
-_(Former Deviation: sandbox Read of a missing in-workspace file → `PathEscape` —
-**resolved** in #63.)_
-_(Former Deviation: EvalHarness Rust-only Debug-string metric workaround —
-**resolved** in #68 via a typed `Span` accessor.)_
-_(Former Deviation: observability captured no message content — **resolved** in #64
-via opt-in GenAI-convention content capture + an Arize Phoenix viewer.)_
+_(Former Deviation: sandbox Read of a missing in-workspace file → `PathEscape` — **resolved** in #63.)_
+_(Former Deviation: EvalHarness Rust-only Debug-string metric workaround — **resolved** in #68.)_
+_(Former Deviation: observability captured no message content — **resolved** in #64.)_
 
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **Next loop strategy — Ralph (#58) or SelfVerifying (#61)** — with the
-   PlanExecute seams now live (pluggable ReAct sub-loop executor, `task_list`
-   drain, `OnTaskAdvance` hook, `RunStore` persistence), the remaining strategies
-   can reuse them. **SelfVerifying (#61)** is the likely-cheapest next step: it
-   can be built as a `Stop`-hook configuration on the #69 hook system (separate
-   evaluator, Default-FAIL) rather than a bespoke loop. **Ralph (#58)**
-   (multi-context-window continuation) is the natural pair to PlanExecute's
-   execute phase. Sequencing call to make at the top of the next loop.
-2. **File the #73 deferred follow-ups** — now that #59 partially resolved the
-   persistence migration (Deviation #4a), file discrete GH issues for the
-   remainder: (a) remove `SessionState.extras` + migrate the remaining #70
-   plan-phase and standalone `task_list`-tool sites onto `RunStore`, and (b)
-   `Sqlite`/`Postgres` storage providers. Low effort, do opportunistically
-   (pending maintainer go-ahead on issue creation).
-3. **Remaining loop strategies (#60)** — HillClimbing (#60, iterative
-   optimization) follows the first two strategies once the shared seams are
-   exercised by more than one consumer.
-4. **Correctness/safety debt fixes (#30, #31, #32, #34)** — memory distillation
-   PendingReview gate (#30), read-only subagent context sharing (#31), halt on
-   mid-session Block 2 hash mismatch (#32), and the dangerous-feature-flag gate
-   for `Mode::Yolo`/`SandboxProvider::None` (#34). Contained `scope: deferred`
-   fixes to pull in opportunistically alongside the loop-strategy work.
-5. **Docs/spec cleanup (#27, #35, #36)** — README/spec clarifications (#27/#35)
-   and the E2BSandboxProvider data-residency note (#36); fold in once the loop
-   strategies land so the docs stop overstating capability (currently 3 of 5
-   strategies are still stubs — Deviation #1).
+1. **DECIDE next track, then start it.** Two live options:
+   (A) **Tool/prompt architecture** — start with **#80 (tool escalation protocol)**
+   as the keystone (it unblocks #81's Tier 3 and builds on `ToolOutput`, with
+   #75's `ToolContext` context still fresh), then **#81 (standard tool catalogue)**
+   whose Tier 2 #75 just unblocked, then **#79 (prompt assembly engine)**.
+   (B) **Loop strategies** — **#61 (SelfVerifying)** likely-cheapest, then
+   **#58 (Ralph)**, then **#60 (HillClimbing)**. #79/#80/#81 are untriaged on the
+   board (recommend `status: queued`); the loop strategies are `scope: deferred`.
+   Pick A or B at the top of the next loop.
+2. **Tool/prompt track (if A): #80 → #81 → #79.** Escalation protocol, then the
+   tiered standard tool catalogue (Tier 2 rides #75's `ToolContext`, Tier 3 rides
+   #80), then the prompt assembly engine extending #24.
+3. **Loop strategies (if B): #61 → #58 → #60.** Reuse the PlanExecute seams
+   (pluggable ReAct sub-loop executor, `task_list` drain, `OnTaskAdvance` hook,
+   `RunStore` persistence).
+4. **Correctness/safety debt + docs cleanup (#30/#31/#32/#34, #27/#35/#36)** —
+   memory distillation gate (#30), read-only subagent context (#31), Block 2 hash
+   mismatch halt (#32), dangerous-feature-flag gate (#34); README/spec
+   clarifications (#27/#35) and E2B data-residency note (#36). Fold in so docs stop
+   overstating capability.
+5. **Storage future phases — #78 (scope + workspace partitioning), #77 (SQL
+   backends)** — both `scope: deferred`; pick up once a consumer needs them.
