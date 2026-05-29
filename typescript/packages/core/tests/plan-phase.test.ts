@@ -16,7 +16,7 @@
  *   R9  capture deterministic & total
  *   R10 budget exhausted before plan turn → failure, no artifact
  *   R11 on_plan_created mutation reflected in stored artifact
- *   Q4  PlanExecute returns execute_phase_not_implemented after storing
+ *   Q4  PlanExecute hands the stored artifact off to the execute phase (#59)
  */
 
 import { describe, expect, it } from "vitest";
@@ -199,22 +199,36 @@ describe("capturePlanArtifact — Q3 grammar", () => {
 // --------------------------------------------------------------------------
 
 describe("PlanExecute plan phase", () => {
-  it("Q4: produces+stores an artifact, then halts execute_phase_not_implemented", async () => {
+  it("Q4: produces+stores an artifact, then hands off to the execute phase", async () => {
+    // Only the plan turn is scripted; the execute phase then drives the agent
+    // again, exhausts the script, and aborts with step_failed (proving the
+    // execute_phase_not_implemented halt is gone and the artifact was stored).
     const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
+    const state: SessionState = emptySessionState();
     const h = new StandardHarness(configWith(a));
-    const r = await h.run({ task: planTask() });
+    const r = await h.run({ task: planTask(), session_state: state });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("execute_phase_not_implemented");
-      expect(r.turns).toBe(1); // R1 + R7: exactly one plan turn counted.
+      expect(r.reason.kind).toBe("step_failed");
     }
+    // The plan artifact was produced + stored before the execute phase ran.
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toEqual({
+      tasks: ["a", "b"],
+      rationale: "because",
+    });
   });
 
   it("R1: the plan phase runs exactly once (single planner turn)", async () => {
-    const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
+    // Plan turn + one execute completion so the run progresses cleanly and only
+    // the plan turn is attributable to the plan phase.
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["only"]}'))
+      .push(fr("done"));
     const h = new StandardHarness(configWith(a));
-    await h.run({ task: planTask() });
-    expect(a.ran).toBe(1);
+    const r = await h.run({ task: planTask() });
+    expect(r.kind).toBe("success");
+    // 1 plan turn + 1 execute turn = 2 agent invocations.
+    expect(a.ran).toBe(2);
   });
 
   it("R2: a tool call in the plan turn → plan_phase_failed (no dispatch loop)", async () => {
@@ -254,39 +268,57 @@ describe("PlanExecute plan phase", () => {
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
-  it("R5: when plannerAgent is set, the PLANNER runs and the default does not", async () => {
-    const def = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
-    const planner = new RecordingAgent(AgentId.of("planner")).push(fr(PLAN_JSON));
+  it("R5: when plannerAgent is set, the PLANNER runs the plan turn; the default runs the steps", async () => {
+    // Single-task plan: the planner runs exactly the plan turn, the default runs
+    // exactly the one execute step — proving the plan turn did NOT use the
+    // default agent.
+    const def = new RecordingAgent(AgentId.of("default")).push(fr("did step"));
+    const planner = new RecordingAgent(AgentId.of("planner")).push(fr('{"tasks":["step"]}'));
     const h = new StandardHarness(configWith(def, { plannerAgent: planner }));
-    await h.run({ task: planTask() });
-    expect(planner.ran).toBe(1);
-    expect(def.ran).toBe(0);
+    const r = await h.run({ task: planTask() });
+    expect(r.kind).toBe("success");
+    expect(planner.ran).toBe(1); // planner ran exactly the plan turn
+    expect(def.ran).toBe(1); // default ran exactly the execute step
   });
 
   it("R6: with no plannerAgent, the plan turn runs on the default agent", async () => {
-    const def = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
+    // No planner: the default agent runs both the plan turn and the one step.
+    const def = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["step"]}'))
+      .push(fr("did step"));
     const h = new StandardHarness(configWith(def));
-    await h.run({ task: planTask() });
-    expect(def.ran).toBe(1);
+    const r = await h.run({ task: planTask() });
+    expect(r.kind).toBe("success");
+    expect(def.ran).toBe(2); // plan turn + one execute step
   });
 
-  it("R7: the plan turn counts against the budget (turns === 1)", async () => {
-    const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
+  it("R7: the plan turn counts against the budget (plan + one step ⇒ turns === 2)", async () => {
+    // Plan turn (1) + one execute completion (1): the plan turn is counted in
+    // the cumulative budget alongside the single execute step.
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["only"]}'))
+      .push(fr("done"));
     const h = new StandardHarness(configWith(a));
     const r = await h.run({ task: planTask() });
-    expect(r.kind === "failure" && r.turns).toBe(1);
+    expect(r.kind === "success" && r.turns).toBe(2);
   });
 
-  it("R8: exactly one turn span is recorded for the plan turn", async () => {
+  it("R8: the plan turn records a turn span as the FIRST span of the run", async () => {
     const obs = new InMemoryObservabilityProvider();
-    const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
+    // Plan turn + one execute completion so the run progresses cleanly.
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["only"]}'))
+      .push(fr("done"));
     const h = new StandardHarness(configWith(a, { observability: obs }));
     await h.run({ task: planTask() });
     const trace = await obs.getTrace(SessionId.of("plan-s1"));
-    // The plan phase emits exactly one turn span and nothing else (no tool
-    // calls, no context spans from NoopContextManager).
     const turnSpans = trace.filter((s) => "turn_number" in s);
-    expect(turnSpans.length).toBe(1);
+    // Plan turn (1) + the single execute step turn (1) = 2 spans total. A
+    // dedicated #59 test (execute_phase_span_count) covers per-step accounting.
+    expect(turnSpans.length).toBe(2);
+    // The plan turn is the first span, turn_number 1.
+    const first = turnSpans[0] as { turn_number: number };
+    expect(first.turn_number).toBe(1);
   });
 
   it("R10: budget exhausted before the plan turn → budget_exceeded, no artifact", async () => {

@@ -33,9 +33,11 @@
  *   verbatim, may be empty) and `rationale` (optional string, default `""`).
  *   Any failure → {@link PlanPhaseError} `unparseable_plan`.
  * - **Q4 (terminal RunResult):** After producing, firing `on_plan_created` on,
- *   and storing the artifact, the `plan_execute` arm HALTS with the DISTINCT
- *   {@link HaltReason} `execute_phase_not_implemented` — separate from the
- *   generic `strategy_not_yet_implemented` the other strategies still use.
+ *   and storing the artifact, the plan phase hands off to the execute phase
+ *   (issue #59), which parses the artifact into a `TaskList` and loops over the
+ *   steps. (Historically — before #59 — the `plan_execute` arm halted here with
+ *   an `execute_phase_not_implemented` marker; that variant has been removed now
+ *   that the execute phase exists.)
  */
 
 export type { PlanArtifact } from "../hooks/index.js";

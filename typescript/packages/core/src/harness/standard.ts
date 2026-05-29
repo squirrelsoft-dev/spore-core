@@ -56,6 +56,14 @@ import {
   capturePlanArtifact,
   type PlanArtifact,
 } from "../plan/index.js";
+import {
+  TASK_LIST_EXTRAS_KEY,
+  completeTask,
+  planArtifactToTaskList,
+  serializeTaskList,
+  updateTask,
+  type TaskList,
+} from "../tasklist/index.js";
 
 import type { Harness } from "./interface.js";
 import {
@@ -422,19 +430,46 @@ export class StandardHarness implements Harness {
   }
 
   // --------------------------------------------------------------------------
-  // PlanExecute plan phase (issue #70)
+  // PlanExecute (issues #70 plan phase + #59 execute phase)
   // --------------------------------------------------------------------------
 
   /**
-   * Drive the `plan_execute` strategy (issue #70).
+   * Drive the `plan_execute` strategy (issue #59) — the two-phase loop.
    *
-   * Runs the one-shot plan phase ({@link runPlanPhase}), then — per Q4 — HALTS
-   * with the distinct {@link HaltReason} `execute_phase_not_implemented` once an
-   * artifact has been produced, had `on_plan_created` fired on it, and been
-   * stored. The execute loop itself ships with #59/#72. On any plan-phase
-   * failure the underlying `failure` `RunResult` is returned unchanged (no
-   * artifact stored). Like `runReact`, finalizes observability for the terminal
-   * outcome.
+   * ## Phases
+   * 1. **Plan phase** (issue #70, runs EXACTLY ONCE): {@link runPlanPhase} seeds
+   *    a planning directive, runs one constrained planner turn, captures a
+   *    {@link PlanArtifact}, fires `on_plan_created`, and counts the turn against
+   *    the shared budget.
+   * 2. **Execute phase** (issue #59, loops): {@link runExecutePhase} drains the
+   *    task list, giving each task its own bounded ReAct sub-loop.
+   *
+   * Between the phases the artifact is parsed into a {@link TaskList} via
+   * `planArtifactToTaskList` and persisted through the storage seam (Q4) plus
+   * the `extras` mirror.
+   *
+   * ## Resolved spec decisions (issue #59 — all FINAL)
+   * - **Q1:** each task gets its OWN bounded, isolated, SEQUENTIAL ReAct sub-loop
+   *   (task N completes before N+1). The per-task turn cap is derived at the
+   *   START of each step: `per_task_turns = floor(remaining_turns /
+   *   remaining_tasks)`, floored at 1 (`remaining_tasks` counts the not-yet-
+   *   started tasks including the current one). The shared budget — turns,
+   *   tokens, observability spans, compaction — is carried across EVERY step and
+   *   the global budget is the hard stop.
+   * - **Q2:** on success `output` is the LAST completed step's `final_response`
+   *   text — not a concatenation, not the plan rationale.
+   * - **Q3:** an empty task list ⇒ {@link HaltReason} `empty_plan`.
+   * - **Q4:** the task list / plan are persisted through the {@link StorageProvider}
+   *   / `RunStore` seam ONLY; the #71 sandbox path (`.spore/task_list.json`) is
+   *   NOT used by the execute loop. The `extras` mirror is kept.
+   * - **Q5:** a step's sub-loop erroring or returning a blocked/failed outcome
+   *   ABORTS the whole run with {@link HaltReason} `step_failed`; execution does
+   *   NOT continue to the next task.
+   *
+   * The removed `execute_phase_not_implemented` halt no longer exists. On any
+   * plan-phase failure the underlying `failure` `RunResult` is returned
+   * unchanged (no task list persisted). Like `runReact`, finalizes
+   * observability for the terminal outcome.
    */
   private async runPlanExecute(
     task: Task,
@@ -444,22 +479,62 @@ export class StandardHarness implements Harness {
     signal: AbortSignal | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
-    const outcome = await this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
 
-    let result: RunResult;
-    if (outcome.ok) {
-      // Plan produced + stored. Q4: halt with the distinct reason.
-      result = {
+    // ── Phase 1: plan (runs exactly once) ───────────────────────────────────
+    const outcome = await this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
+    if (!outcome.ok) {
+      // Plan-phase failure: propagate unchanged (no task list persisted).
+      await this.finalizePlanExecute(outcome.failure);
+      return outcome.failure;
+    }
+
+    // Bridge: parse the accepted plan into a TaskList (#72).
+    const taskList = planArtifactToTaskList(outcome.artifact);
+
+    // Q3: an empty plan is a failure, not a silent success.
+    if (taskList.tasks.length === 0) {
+      const result: RunResult = {
         kind: "failure",
-        reason: { kind: "execute_phase_not_implemented" },
+        reason: { kind: "empty_plan" },
         session_id: sessionId,
         usage: outcome.usage,
         turns: outcome.turns,
       };
-    } else {
-      result = outcome.failure;
+      await this.finalizePlanExecute(result);
+      return result;
     }
 
+    // Q4: persist the task list through the storage seam (RunStore) ONLY, plus
+    // the extras mirror. The #71 sandbox path is intentionally unused.
+    await this.persistTaskList(sessionState, sessionId, taskList);
+
+    // Carry the shared budget forward: the plan turn already consumed
+    // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
+    const carried: BudgetSnapshot = { ...budgetUsed };
+    carried.turns = outcome.turns;
+    carried.input_tokens += outcome.usage.input_tokens;
+    carried.output_tokens += outcome.usage.output_tokens;
+
+    // ── Phase 2: execute (loops over the task list) ─────────────────────────
+    const result = await this.runExecutePhase(
+      task,
+      sessionState,
+      taskList,
+      carried,
+      outcome.usage,
+      onStream,
+      signal,
+    );
+    await this.finalizePlanExecute(result);
+    return result;
+  }
+
+  /**
+   * Finalize observability for a terminal PlanExecute outcome. Mirrors the tail
+   * of {@link runReact}: `waiting_for_human` is not terminal and is never
+   * flushed here.
+   */
+  private async finalizePlanExecute(result: RunResult): Promise<void> {
     switch (result.kind) {
       case "success":
         await this.finalizeObservability(result.session_id, { kind: "success" });
@@ -473,7 +548,219 @@ export class StandardHarness implements Harness {
       case "waiting_for_human":
         break;
     }
-    return result;
+  }
+
+  /**
+   * Persist the parsed {@link TaskList} for the run (Q4). The DURABLE write goes
+   * through the `RunStore` seam under `TASK_LIST_EXTRAS_KEY`; the #71
+   * sandbox-filesystem path (`.spore/task_list.json`) is intentionally NOT used
+   * — one source of truth. The list is also mirrored into
+   * `SessionState.extras[TASK_LIST_EXTRAS_KEY]` (matching the existing
+   * `extras["plan_execute"]` precedent). Failures are swallowed: a successful
+   * plan must not be lost to a storage hiccup (the default no-op / in-memory
+   * provider never fails).
+   */
+  private async persistTaskList(
+    sessionState: SessionState,
+    sessionId: SessionId,
+    taskList: TaskList,
+  ): Promise<void> {
+    // Serialize via the canonical task-list form, then re-parse to a plain JSON
+    // value so the durable blob and the extras mirror are byte-identical to the
+    // cross-language `{ tasks, next_id }` shape.
+    let value: unknown;
+    try {
+      value = JSON.parse(serializeTaskList(taskList));
+    } catch {
+      return; // Serialization hiccup — never lose a successful plan to it.
+    }
+    try {
+      await this.storage()
+        .run()
+        .put(sessionId, TASK_LIST_EXTRAS_KEY, value as never);
+    } catch {
+      // Durable write failure is non-fatal; the extras mirror still records it.
+    }
+    sessionState.extras[TASK_LIST_EXTRAS_KEY] = value;
+  }
+
+  /**
+   * Drive the PlanExecute execute phase (issue #59), draining `taskList`.
+   *
+   * Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
+   * sub-loop. The per-task turn cap is derived at the START of each step from the
+   * shared budget: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
+   * floored at 1 (`remaining_tasks` counts not-yet-started tasks including the
+   * current one). The shared budget snapshot (`carried`) is threaded through
+   * every step so early tasks cannot starve later ones and the global budget
+   * stays the hard stop.
+   *
+   * Before each step the task is marked `in_progress` (and `completed` after),
+   * the list is re-persisted (Q4), and `on_task_advance` fires with the correct
+   * `task_index` / `total_tasks` (the hook may rewrite the step instruction).
+   *
+   * Q2: on success `output` is the LAST completed step's `final_response`.
+   * Q5: a step that errors / blocks aborts the run with `step_failed` — no
+   * further tasks run.
+   *
+   * `planUsage` seeds the cumulative {@link AggregateUsage} with the plan turn's
+   * usage so the terminal `RunResult` reflects the WHOLE run.
+   */
+  private async runExecutePhase(
+    task: Task,
+    sessionState: SessionState,
+    taskList: TaskList,
+    carried: BudgetSnapshot,
+    planUsage: AggregateUsage,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    const sessionId = task.session_id;
+    const totalTasks = taskList.tasks.length;
+    // Cumulative usage across the plan turn + every execute step (Q1).
+    const totalUsage: AggregateUsage = { ...planUsage };
+    // Q2: the success handle is the LAST completed step's final text.
+    let lastOutput = "";
+    // Global turn cap (the hard stop). `null` ⇒ no global turn ceiling.
+    const globalMaxTurns = task.budget.max_turns ?? null;
+
+    for (let index = 0; index < totalTasks; index += 1) {
+      const taskId = taskList.tasks[index]!.id;
+      const instruction = taskList.tasks[index]!.description;
+
+      // Q1: per-task turn allocation, derived at the START of this step.
+      // remaining_tasks = not-yet-started tasks including this one.
+      const remainingTasks = totalTasks - index;
+      let perTaskTurns: number;
+      if (globalMaxTurns != null) {
+        const remainingTurns = Math.max(globalMaxTurns - carried.turns, 0);
+        perTaskTurns = Math.max(Math.floor(remainingTurns / remainingTasks), 1);
+      } else {
+        // No global turn cap: the sub-loop is bounded only by the other
+        // (token / wall / cost) budget gates.
+        perTaskTurns = Number.MAX_SAFE_INTEGER;
+      }
+      // The sub-loop's effective cap is RELATIVE to the carried turns:
+      // runReactInner gates on the cumulative `budgetUsed.turns`, so a per-task
+      // cap of K means "stop K turns from now" while the global budget (carried
+      // forward) remains the hard stop.
+      const subLoopCap =
+        perTaskTurns === Number.MAX_SAFE_INTEGER
+          ? Number.MAX_SAFE_INTEGER
+          : carried.turns + perTaskTurns;
+
+      // Mark in_progress (pending -> in_progress) and re-persist (Q4).
+      updateTask(taskList, taskId, "in_progress");
+      await this.persistTaskList(sessionState, sessionId, taskList);
+
+      // Fire on_task_advance (pre, mutable). The hook may rewrite the step's
+      // instruction via the carried Task; the (possibly mutated) instruction
+      // seeds the sub-loop.
+      const stepTask: Task = {
+        id: task.id,
+        instruction,
+        session_id: sessionId,
+        budget: task.budget,
+        loop_strategy: task.loop_strategy,
+      };
+      if (this.config.hooks) {
+        const ctx: HookContext = {
+          event: "on_task_advance",
+          session_id: sessionId,
+          task: stepTask,
+          task_index: index,
+          total_tasks: totalTasks,
+        };
+        try {
+          await this.config.hooks.fire(ctx, signal);
+        } catch {
+          // Hook errors are non-fatal; the step proceeds with the current task.
+        }
+      }
+
+      // Seed the (possibly mutated) step instruction as a user message, then run
+      // the bounded ReAct sub-loop carrying the shared budget (Q1). The sub-loop
+      // works on a CLONE of the session so each step is isolated; the parent
+      // session keeps the seeded message + extras mirror.
+      await this.config.contextManager.appendUserMessage(sessionState, stepTask.instruction);
+      const subState: SessionState = {
+        messages: [...sessionState.messages],
+        extras: { ...sessionState.extras },
+      };
+      const subBudget: BudgetSnapshot = { ...carried };
+
+      const subResult = await this.runReactInner(
+        stepTask,
+        subLoopCap,
+        subState,
+        subBudget,
+        onStream,
+        signal,
+        false,
+      );
+
+      if (subResult.kind === "success") {
+        // Carry the shared budget forward (Q1): cumulative turns are the
+        // sub-loop's absolute count; fold in its token usage.
+        carried.turns = subResult.turns;
+        carried.input_tokens += subResult.usage.input_tokens;
+        carried.output_tokens += subResult.usage.output_tokens;
+        totalUsage.input_tokens += subResult.usage.input_tokens;
+        totalUsage.output_tokens += subResult.usage.output_tokens;
+        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
+        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
+        totalUsage.cost_usd += subResult.usage.cost_usd;
+        lastOutput = subResult.output;
+
+        // Mark completed and re-persist (Q4).
+        completeTask(taskList, taskId);
+        await this.persistTaskList(sessionState, sessionId, taskList);
+        // Surface the completed step's final text to the caller's sink — the
+        // parent-visible step boundary.
+        emit(onStream, { kind: "final_response", content: lastOutput });
+      } else if (subResult.kind === "failure") {
+        // Q5: any non-success step aborts the whole run. A budget halt surfaces
+        // as budget_exceeded (mid-execute exhaustion); other failures surface as
+        // step_failed carrying the step context.
+        totalUsage.input_tokens += subResult.usage.input_tokens;
+        totalUsage.output_tokens += subResult.usage.output_tokens;
+        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
+        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
+        totalUsage.cost_usd += subResult.usage.cost_usd;
+
+        updateTask(taskList, taskId, "blocked");
+        await this.persistTaskList(sessionState, sessionId, taskList);
+
+        const terminalReason: HaltReason =
+          subResult.reason.kind === "budget_exceeded"
+            ? subResult.reason
+            : {
+                kind: "step_failed",
+                task_index: index,
+                task: taskList.tasks[index]!.description,
+                reason: haltReasonToString(subResult.reason),
+              };
+        return {
+          kind: "failure",
+          reason: terminalReason,
+          session_id: sessionId,
+          usage: totalUsage,
+          turns: subResult.turns,
+        };
+      } else {
+        // A step surfacing to a human pauses the whole run; propagate.
+        return subResult;
+      }
+    }
+
+    // Q2: success output is the LAST completed step's final_response text.
+    return {
+      kind: "success",
+      output: lastOutput,
+      session_id: sessionId,
+      usage: totalUsage,
+      turns: carried.turns,
+    };
   }
 
   /**

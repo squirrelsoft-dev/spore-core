@@ -6,7 +6,11 @@
  *   1. The plan turn's recorded `final_response` is captured into the exact
  *      `PlanArtifact` (tasks + rationale), stored under `extras["plan_execute"]`.
  *   2. The fenced ```json variant is captured identically (fence-strip rule).
- *   3. The run halts with the distinct `execute_phase_not_implemented` reason.
+ *   3. The plan turn is consumed and parsed into a non-empty task list, so the
+ *      run proceeds into the execute phase (issue #59). This fixture provides
+ *      ONLY the single plan turn, so the first execute step's ReAct sub-loop
+ *      exhausts the replay and the run aborts with `step_failed` (task_index 0)
+ *      — proving the harness consumed the planner response and entered execute.
  *
  * Must produce the same outcome as the Rust integration test
  * (`rust/crates/spore-core/tests/plan_phase_fixture_replay.rs`) — never edit the
@@ -93,10 +97,16 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     });
 
     const result = await harness.run({ task, session_state: state });
+    // The plan turn is consumed + parsed into a non-empty list, so the run
+    // enters the execute phase; the single-exchange replay then exhausts on the
+    // first step and aborts with step_failed (issue #59, Q5).
     expect(result.kind).toBe("failure");
     if (result.kind === "failure") {
-      expect(result.reason.kind).toBe("execute_phase_not_implemented");
-      expect(result.turns).toBe(1); // exactly one plan turn
+      expect(result.reason.kind).toBe("step_failed");
+      if (result.reason.kind === "step_failed") {
+        expect(result.reason.task_index).toBe(0);
+      }
+      expect(result.turns).toBeGreaterThanOrEqual(1); // at least the plan turn
     }
 
     // Stored artifact matches the recorded response (and the public capture).
@@ -125,8 +135,11 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     const result = await harness.run({ task, session_state: state });
     expect(result.kind).toBe("failure");
     if (result.kind === "failure") {
-      expect(result.reason.kind).toBe("execute_phase_not_implemented");
-      expect(result.turns).toBe(1);
+      expect(result.reason.kind).toBe("step_failed");
+      if (result.reason.kind === "step_failed") {
+        expect(result.reason.task_index).toBe(0);
+      }
+      expect(result.turns).toBeGreaterThanOrEqual(1);
     }
 
     const expected = {

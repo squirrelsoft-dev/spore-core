@@ -585,13 +585,20 @@ export type HaltReason =
   | { kind: "strategy_not_yet_implemented"; strategy: string }
   /**
    * Returned by {@link StandardHarness} for the `plan_execute` strategy (issue
-   * #70) AFTER the plan phase has produced, fired `on_plan_created` on, and
-   * stored a {@link "../plan/index.js".PlanArtifact}. The execute loop ships
-   * with #59/#72; this distinct reason marks "plan produced, execute phase not
-   * implemented yet" so callers can tell it apart from the generic
-   * `strategy_not_yet_implemented` stub the other strategies use.
+   * #59) when the accepted plan parsed into an EMPTY task list (`tasks: []`).
+   * Per Q3, an empty plan is a failure — the run does NOT silently succeed.
    */
-  | { kind: "execute_phase_not_implemented" }
+  | { kind: "empty_plan" }
+  /**
+   * Returned by {@link StandardHarness} for the `plan_execute` strategy (issue
+   * #59) when an execute step's bounded ReAct sub-loop errored or the agent
+   * returned a blocked/failed outcome (Q5). A plan is a dependency chain by
+   * assumption, so the whole run aborts at the failing step — execution does NOT
+   * continue to the next task. Carries the failing step's positional index, its
+   * instruction, and a human-readable reason derived from the underlying
+   * {@link HaltReason}.
+   */
+  | { kind: "step_failed"; task_index: number; task: string; reason: string }
   /**
    * The `plan_execute` plan phase (issue #70) failed before producing an
    * artifact: the planner's response was unparseable, the planner requested a
