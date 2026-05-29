@@ -83,6 +83,7 @@ from .guide_registry import (
 )
 from .harness import SessionId
 from .memory import Timestamp
+from .storage import ObservabilityStore, parse_otlp_endpoints
 from .observability import (
     ContextOperationCompaction,
     ContextSpan,
@@ -675,19 +676,45 @@ class _OtlpSdkForwarder:
             _LOG.warning("OTLP force_flush failed (JSONL is durable): %r", exc)
 
 
-def _build_forwarder() -> _OtlpForwarder:
-    endpoint = os.environ.get("SPORE_OTLP_ENDPOINT", "")
-    if not endpoint.strip():
-        return _NullForwarder()
+def _run_sync(coro: Any) -> Any:
+    """Drive a leaf coroutine to completion synchronously.
+
+    The :class:`ObservabilityStore` legs used by the fan-out store path
+    (in-memory + filesystem) do synchronous work inside an ``async def`` block
+    and resolve without ever awaiting, so a single ``send(None)`` completes
+    them. This lets the synchronous ``emit_*`` surface call the async store
+    inline without spinning up an event loop. Mirrors the Rust reference's
+    ``drive_to_completion``."""
     try:
-        return _OtlpSdkForwarder(endpoint.strip())
-    except Exception as exc:  # noqa: BLE001 - degrade to JSONL-only on any error
-        _LOG.warning(
-            "failed to init OTLP forwarder for %r; JSONL only: %r",
-            endpoint.strip(),
-            exc,
-        )
-        return _NullForwarder()
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    else:
+        # A genuinely-pending store leg would land here; the contract is that
+        # the v1 stores never await, so close defensively and surface nothing.
+        coro.close()
+        return None
+
+
+def _build_forwarders() -> list[_OtlpForwarder]:
+    """Build one OTLP forwarder per parsed ``SPORE_OTLP_ENDPOINT`` entry (issue
+    #73 multi-endpoint fan-out). The value is a **comma-separated list**:
+    :func:`parse_otlp_endpoints` does ``split(',')``, trims each segment, and
+    drops empties — parsed/validated ONCE here, at construction. Each parsed
+    endpoint becomes one fan-out forwarder; an entry that fails to init is
+    logged and skipped. Empty/unset → no OTLP leg (JSONL only)."""
+    raw = os.environ.get("SPORE_OTLP_ENDPOINT", "")
+    out: list[_OtlpForwarder] = []
+    for endpoint in parse_otlp_endpoints(raw):
+        try:
+            out.append(_OtlpSdkForwarder(endpoint))
+        except Exception as exc:  # noqa: BLE001 - skip an entry on any init error
+            _LOG.warning(
+                "failed to init OTLP forwarder for %r; skipping: %r",
+                endpoint,
+                exc,
+            )
+    return out
 
 
 # ============================================================================
@@ -764,7 +791,43 @@ class OutboxObservabilityProvider:
         self._inner = InMemoryObservabilityProvider()
         self._lock = threading.Lock()
         self._writers: dict[SessionId, _SessionWriter] = {}
-        self._otlp = _build_forwarder()
+        # Fan-out OTLP leg: one forwarder per parsed ``SPORE_OTLP_ENDPOINT``
+        # entry (issue #73 multi-endpoint fan-out). Each ``emit_*`` forwards the
+        # built line to ALL of them; a failure on any leg never blocks the
+        # others. Empty when the env var is unset/empty/all-unparseable.
+        self._otlp: list[_OtlpForwarder] = _build_forwarders()
+        # Optional ``ObservabilityStore`` leg (issue #73). When set, each
+        # ``emit_*`` ALSO serializes the built line to JSON and appends it via
+        # the store inline. The outbox's own JSONL writer remains the durable
+        # source of truth; this delegates the span store to the pluggable
+        # abstraction.
+        self._store: ObservabilityStore | None = None
+
+    def with_store(self, store: ObservabilityStore) -> OutboxObservabilityProvider:
+        """Attach an :class:`ObservabilityStore` leg (issue #73). Each
+        subsequent ``emit_*`` will ALSO append the span to this store, in
+        addition to the durable JSONL writer and any OTLP forwarders. Returns
+        ``self`` so it chains with construction."""
+        self._store = store
+        return self
+
+    @classmethod
+    def _with_forwarders(
+        cls,
+        config: OutboxConfig,
+        otlp: list[_OtlpForwarder],
+    ) -> OutboxObservabilityProvider:
+        """Test-only constructor that injects fan-out OTLP forwarders directly,
+        bypassing ``SPORE_OTLP_ENDPOINT``. Keeps the fan-out routing-matrix
+        tests hermetic (a counting fake forwarder) without a live OTLP stack."""
+        obs = cls.__new__(cls)
+        obs.config = config
+        obs._inner = InMemoryObservabilityProvider()
+        obs._lock = threading.Lock()
+        obs._writers = {}
+        obs._otlp = list(otlp)
+        obs._store = None
+        return obs
 
     @property
     def inner(self) -> InMemoryObservabilityProvider:
@@ -793,8 +856,21 @@ class OutboxObservabilityProvider:
                 self._writer_for(session_id).append(jsonl)
             except OSError as exc:
                 _LOG.warning("outbox append failed: %r", exc)
-                return
-        self._otlp.forward(line)
+        # Fan out to every OTLP endpoint. Each forwarder is internally
+        # best-effort / non-blocking; a failure on any one leg is isolated and
+        # never blocks the others (issue #73).
+        for forwarder in self._otlp:
+            try:
+                forwarder.forward(line)
+            except Exception as exc:  # noqa: BLE001 - per-leg isolation
+                _LOG.warning("OTLP forward leg failed (isolated): %r", exc)
+        # ObservabilityStore leg (issue #73): serialize the line to JSON and
+        # append inline. Failure is logged, never propagated.
+        if self._store is not None:
+            try:
+                _run_sync(self._store.append_span(session_id, line.to_dict()))
+            except Exception as exc:  # noqa: BLE001 - never block the harness
+                _LOG.warning("observability store append failed: %r", exc)
 
     # ── emit_* (fire-and-forget) ────────────────────────────────────────────
 
@@ -874,8 +950,20 @@ class OutboxObservabilityProvider:
             if writer is not None:
                 writer.flush()
 
-        # Best-effort OTLP force-flush; never raises out of flush_session.
-        self._otlp.force_flush()
+        # Best-effort OTLP force-flush across every fan-out leg; never raises
+        # out of flush_session.
+        for forwarder in self._otlp:
+            try:
+                forwarder.force_flush()
+            except Exception as exc:  # noqa: BLE001 - per-leg isolation
+                _LOG.warning("OTLP force_flush leg failed (isolated): %r", exc)
+
+        # Flush the ObservabilityStore leg's session marker too (issue #73).
+        if self._store is not None:
+            try:
+                await self._store.flush_session(session_id)
+            except Exception as exc:  # noqa: BLE001 - never block flush_session
+                _LOG.warning("observability store flush failed: %r", exc)
 
         # Create the sibling .flushed marker.
         session_dir = self.config.session_dir(session_id)

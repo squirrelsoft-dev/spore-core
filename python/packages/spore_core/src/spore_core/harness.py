@@ -1139,6 +1139,10 @@ from .observability_outbox import (  # noqa: E402
     OutboxConfig,
     OutboxObservabilityProvider,
 )
+from .storage import (  # noqa: E402
+    SessionStore,
+    StorageProvider,
+)
 
 
 def _capture_tool_call_args(call: ToolCall, max_len: int) -> ToolCallContent:
@@ -1275,6 +1279,7 @@ class HarnessConfig:
         max_stop_blocks: int = 8,
         hooks: HookChain | None = None,
         planner_agent: Agent | None = None,
+        storage: StorageProvider | None = None,
     ) -> None:
         self.agent = agent
         # Optional alternate agent used for the PlanExecute plan phase (issue
@@ -1316,6 +1321,12 @@ class HarnessConfig:
         self.content_capture: ContentCaptureConfig = (
             content_capture if content_capture is not None else ContentCaptureConfig()
         )
+        # Pluggable persistence layer (issue #73). Defaults to an all-no-op
+        # provider so existing callers/tests are unaffected; v1 is expose-only —
+        # the run/resume loop does NOT read/write sessions internally. Callers
+        # reach the four domain stores via :meth:`StandardHarness.storage` /
+        # :meth:`StandardHarness.session_store`.
+        self.storage: StorageProvider = storage if storage is not None else StorageProvider.no_op()
 
 
 class HarnessBuilder:
@@ -1350,6 +1361,15 @@ class HarnessBuilder:
         self._max_stop_blocks: int = 8
         self._hooks: HookChain | None = None
         self._planner_agent: Agent | None = None
+        self._storage: StorageProvider | None = None
+
+    def storage(self, storage: StorageProvider) -> HarnessBuilder:
+        """Inject a :class:`StorageProvider` (issue #73). Defaults to an
+        all-no-op provider when unset. v1 is expose-only — the harness loop does
+        not read/write sessions internally; callers reach the four domain stores
+        via :meth:`StandardHarness.storage` / :meth:`StandardHarness.session_store`."""
+        self._storage = storage
+        return self
 
     def planner_agent(self, planner_agent: Agent) -> HarnessBuilder:
         """Inject an alternate agent for the PlanExecute plan phase (issue #70,
@@ -1432,6 +1452,7 @@ class HarnessBuilder:
             max_stop_blocks=self._max_stop_blocks,
             hooks=self._hooks,
             planner_agent=self._planner_agent,
+            storage=self._storage,
         )
 
     def build(self) -> StandardHarness:
@@ -1462,6 +1483,16 @@ class StandardHarness:
 
     def __init__(self, config: HarnessConfig) -> None:
         self._config = config
+
+    def storage(self) -> StorageProvider:
+        """The injected :class:`StorageProvider` (issue #73). Defaults to an
+        all-no-op provider when ``.storage(...)`` was never set."""
+        return self._config.storage
+
+    def session_store(self) -> SessionStore:
+        """Convenience accessor for the storage layer's :class:`SessionStore`
+        (issue #73, expose-only)."""
+        return self._config.storage.session()
 
     # ---- helpers ----------------------------------------------------
 

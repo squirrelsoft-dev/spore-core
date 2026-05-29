@@ -48,6 +48,7 @@ from spore_core.observability_outbox import (
     TraceLine,
     _attributes_to_otlp,
 )
+from spore_core.storage import FileSystemStorageProvider, InMemoryStorageProvider
 from spore_core.sensor import (
     SensorId,
     SensorKind,
@@ -617,3 +618,139 @@ def test_fixture_replay(fixture_name: str) -> None:
     raw = json.loads((FIXTURES / fixture_name).read_text())
     line = _build_line(fixture_name, raw["span"], raw["trace_id"])
     assert line.to_dict() == raw["expected_line"], f"mismatch in {fixture_name}"
+
+
+# ── Issue #73: OTLP multi-endpoint fan-out + ObservabilityStore leg ──────────
+
+
+class _CountingForwarder:
+    """Counting fake OTLP forwarder — increments a shared counter per
+    ``forward``. Keeps the fan-out routing-matrix tests hermetic (no live OTLP
+    stack)."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def forward(self, line: TraceLine) -> None:
+        self.count += 1
+
+    def force_flush(self) -> None:
+        return None
+
+
+class _DeadForwarder:
+    """Does nothing — used to prove a failing leg never blocks the others."""
+
+    def forward(self, line: TraceLine) -> None:
+        return None
+
+    def force_flush(self) -> None:
+        return None
+
+
+def test_fanout_both_otlp_and_store(tmp_path: Path) -> None:
+    """Routing matrix: OTLP yes + store yes → both legs receive every span."""
+    f0, f1 = _CountingForwarder(), _CountingForwarder()
+    store = InMemoryStorageProvider()
+    obs = OutboxObservabilityProvider._with_forwarders(
+        OutboxConfig(root=tmp_path), [f0, f1]
+    ).with_store(store)
+    obs.emit_turn(_turn("s1", "sp1"))
+    obs.emit_turn(_turn("s1", "sp2"))
+    assert f0.count == 2
+    assert f1.count == 2
+    # Store leg saw both spans (drive the async getter synchronously).
+    import anyio
+
+    spans = anyio.run(store.get_spans, _sid("s1"))
+    assert len(spans) == 2
+    # Durable JSONL source of truth also has both.
+    assert len(_read_lines(tmp_path, "s1")) == 2
+
+
+def test_fanout_otlp_only(tmp_path: Path) -> None:
+    """Routing matrix: OTLP yes + store no → OTLP only (store leg absent)."""
+    f0 = _CountingForwarder()
+    obs = OutboxObservabilityProvider._with_forwarders(OutboxConfig(root=tmp_path), [f0])
+    obs.emit_turn(_turn("s1", "sp1"))
+    assert f0.count == 1
+    assert len(_read_lines(tmp_path, "s1")) == 1
+
+
+def test_fanout_store_only(tmp_path: Path) -> None:
+    """Routing matrix: OTLP no + store yes → store only."""
+    import anyio
+
+    store = InMemoryStorageProvider()
+    obs = OutboxObservabilityProvider(OutboxConfig(root=tmp_path)).with_store(store)
+    assert obs._otlp == []
+    obs.emit_turn(_turn("s1", "sp1"))
+    assert len(anyio.run(store.get_spans, _sid("s1"))) == 1
+
+
+def test_fanout_dropped_when_neither_configured(tmp_path: Path) -> None:
+    """Routing matrix: OTLP no + store no → spans go only to the durable JSONL
+    (the outbox is always its own source of truth)."""
+    obs = OutboxObservabilityProvider(OutboxConfig(root=tmp_path))
+    assert obs._otlp == []
+    assert obs._store is None
+    obs.emit_turn(_turn("s1", "sp1"))
+    assert len(_read_lines(tmp_path, "s1")) == 1
+
+
+def test_fanout_failure_isolation(tmp_path: Path) -> None:
+    """Failure isolation: a dead leg never blocks a live leg or the store."""
+    import anyio
+
+    live = _CountingForwarder()
+    store = InMemoryStorageProvider()
+    obs = OutboxObservabilityProvider._with_forwarders(
+        OutboxConfig(root=tmp_path), [_DeadForwarder(), live, _DeadForwarder()]
+    ).with_store(store)
+    obs.emit_turn(_turn("s1", "sp1"))
+    assert live.count == 1
+    assert len(anyio.run(store.get_spans, _sid("s1"))) == 1
+
+
+def test_fanout_bad_endpoint_skipped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Bad endpoint skipped: an unparseable / uninitializable entry is dropped,
+    the good one still wires a forwarder. ``_build_forwarders`` parses the comma
+    list and only keeps endpoints that init."""
+    from spore_core import observability_outbox as obx
+
+    inited: list[str] = []
+
+    class _Boom(Exception):
+        pass
+
+    def _fake_sdk(endpoint: str) -> object:
+        if endpoint == "bad":
+            raise _Boom("cannot init")
+        inited.append(endpoint)
+        return _CountingForwarder()
+
+    monkeypatch.setattr(obx, "_OtlpSdkForwarder", _fake_sdk)
+    monkeypatch.setenv("SPORE_OTLP_ENDPOINT", " good:4317 , , bad , ")
+    obs = OutboxObservabilityProvider(OutboxConfig(root=tmp_path))
+    # Only the good endpoint wired a forwarder; bad was logged + skipped.
+    assert inited == ["good:4317"]
+    assert len(obs._otlp) == 1
+
+
+def test_fanout_flush_session_marks_store(tmp_path: Path) -> None:
+    """flush_session forwards to the store leg's flush (its ``.flushed``
+    marker)."""
+
+    async def _run() -> None:
+        store_dir = tmp_path / "store"
+        store = FileSystemStorageProvider(store_dir)
+        obs = OutboxObservabilityProvider(OutboxConfig(root=tmp_path / "outbox")).with_store(store)
+        obs.emit_turn(_turn("s1", "sp1"))
+        obs.inner.set_session_outcome(_sid("s1"), SessionOutcomeSuccess())
+        await obs.flush_session(_sid("s1"))
+        assert (store_dir / "sessions/s1/trace.jsonl").exists()
+        assert (store_dir / "sessions/s1/.flushed").exists()
+
+    import anyio
+
+    anyio.run(_run)
