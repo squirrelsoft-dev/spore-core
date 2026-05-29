@@ -46,6 +46,7 @@ use crate::tool_registry::{
 };
 use crate::tools::exec::{BashCommandTool, ExecTool};
 use crate::tools::fs::{ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::tasklist::TaskListTool;
 
 // ============================================================================
 // RealToolRegistry — bridge between the two ToolRegistry traits
@@ -355,6 +356,9 @@ pub fn build_real_tool_registry(scenario: ScenarioId) -> Arc<StandardToolRegistr
     registry
         .register(Box::new(FailingTool::new()), FailingTool::schema())
         .expect("register flaky_op");
+    registry
+        .register(Box::new(TaskListTool::new()), TaskListTool::schema())
+        .expect("register task_list");
     if matches!(scenario, ScenarioId::S5) {
         registry
             .register(Box::new(BashCommandTool::new()), BashCommandTool::schema())

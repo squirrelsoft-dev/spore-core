@@ -1,0 +1,21 @@
+[
+  {"from": "pending", "to": "pending", "expected": "ok"},
+  {"from": "pending", "to": "in_progress", "expected": "ok"},
+  {"from": "pending", "to": "completed", "expected": "ok"},
+  {"from": "pending", "to": "blocked", "expected": "ok"},
+
+  {"from": "in_progress", "to": "in_progress", "expected": "ok"},
+  {"from": "in_progress", "to": "completed", "expected": "ok"},
+  {"from": "in_progress", "to": "blocked", "expected": "ok"},
+  {"from": "in_progress", "to": "pending", "expected": "invalid_transition"},
+
+  {"from": "blocked", "to": "blocked", "expected": "ok"},
+  {"from": "blocked", "to": "in_progress", "expected": "ok"},
+  {"from": "blocked", "to": "completed", "expected": "ok"},
+  {"from": "blocked", "to": "pending", "expected": "invalid_transition"},
+
+  {"from": "completed", "to": "completed", "expected": "ok"},
+  {"from": "completed", "to": "pending", "expected": "invalid_transition"},
+  {"from": "completed", "to": "in_progress", "expected": "invalid_transition"},
+  {"from": "completed", "to": "blocked", "expected": "invalid_transition"}
+]

@@ -1,0 +1,125 @@
+[
+  {
+    "name": "add_two_then_progress_and_complete",
+    "steps": [
+      {
+        "action": {"action": "add_task", "description": "first"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "first", "status": "pending"}],
+            "next_id": 2
+          }
+        }
+      },
+      {
+        "action": {"action": "add_task", "description": "second"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "first", "status": "pending"},
+              {"id": 2, "description": "second", "status": "pending"}
+            ],
+            "next_id": 3
+          }
+        }
+      },
+      {
+        "action": {"action": "list_tasks"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "first", "status": "pending"},
+              {"id": 2, "description": "second", "status": "pending"}
+            ],
+            "next_id": 3
+          }
+        }
+      },
+      {
+        "action": {"action": "update_task", "id": 1, "status": "in_progress"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "first", "status": "in_progress"},
+              {"id": 2, "description": "second", "status": "pending"}
+            ],
+            "next_id": 3
+          }
+        }
+      },
+      {
+        "action": {"action": "update_task", "id": 2, "description": "second (edited)"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "first", "status": "in_progress"},
+              {"id": 2, "description": "second (edited)", "status": "pending"}
+            ],
+            "next_id": 3
+          }
+        }
+      },
+      {
+        "action": {"action": "complete_task", "id": 1},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "first", "status": "completed"},
+              {"id": 2, "description": "second (edited)", "status": "pending"}
+            ],
+            "next_id": 3
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "errors_do_not_mutate",
+    "steps": [
+      {
+        "action": {"action": "add_task", "description": "task"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "task", "status": "pending"}],
+            "next_id": 2
+          }
+        }
+      },
+      {
+        "action": {"action": "complete_task", "id": 99},
+        "expected": {"ok": false, "error": "task_not_found"}
+      },
+      {
+        "action": {"action": "complete_task", "id": 1},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "task", "status": "completed"}],
+            "next_id": 2
+          }
+        }
+      },
+      {
+        "action": {"action": "update_task", "id": 1, "status": "in_progress"},
+        "expected": {"ok": false, "error": "invalid_transition"}
+      },
+      {
+        "action": {"action": "list_tasks"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "task", "status": "completed"}],
+            "next_id": 2
+          }
+        }
+      }
+    ]
+  }
+]

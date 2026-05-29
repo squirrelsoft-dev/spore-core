@@ -39,6 +39,7 @@ pub mod prompt_chunk_registry;
 pub mod sandbox;
 pub mod scenarios;
 pub mod sensor;
+pub mod tasklist;
 pub mod termination;
 pub mod tool_call_repair;
 pub mod tool_registry;
@@ -132,6 +133,10 @@ pub use sensor::{
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
     SensorTrigger, StandardSensorChain,
 };
+pub use tasklist::{
+    Task as TaskListTask, TaskList, TaskListError, TaskStatus, TASK_LIST_EXTRAS_KEY,
+};
+pub use tools::TaskListTool;
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.
 #[allow(deprecated)]

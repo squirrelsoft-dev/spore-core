@@ -1,0 +1,28 @@
+[
+  {
+    "name": "empty_default",
+    "list": {"tasks": [], "next_id": 1},
+    "json": "{\"tasks\":[],\"next_id\":1}"
+  },
+  {
+    "name": "single_pending",
+    "list": {
+      "tasks": [{"id": 1, "description": "write tests", "status": "pending"}],
+      "next_id": 2
+    },
+    "json": "{\"tasks\":[{\"id\":1,\"description\":\"write tests\",\"status\":\"pending\"}],\"next_id\":2}"
+  },
+  {
+    "name": "all_statuses",
+    "list": {
+      "tasks": [
+        {"id": 1, "description": "a", "status": "pending"},
+        {"id": 2, "description": "b", "status": "in_progress"},
+        {"id": 3, "description": "c", "status": "completed"},
+        {"id": 4, "description": "d", "status": "blocked"}
+      ],
+      "next_id": 5
+    },
+    "json": "{\"tasks\":[{\"id\":1,\"description\":\"a\",\"status\":\"pending\"},{\"id\":2,\"description\":\"b\",\"status\":\"in_progress\"},{\"id\":3,\"description\":\"c\",\"status\":\"completed\"},{\"id\":4,\"description\":\"d\",\"status\":\"blocked\"}],\"next_id\":5}"
+  }
+]

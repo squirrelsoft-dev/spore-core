@@ -164,3 +164,27 @@ pub struct HttpPostParams {
 pub struct SubagentParams {
     pub instruction: String,
 }
+
+// ---------- TaskList (#71) ----------
+
+/// Parameters for the [`crate::tools::tasklist::TaskListTool`], internally
+/// tagged on `action`. Each variant carries exactly the fields that action
+/// consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TaskListParams {
+    AddTask {
+        description: String,
+    },
+    UpdateTask {
+        id: u32,
+        #[serde(default)]
+        status: Option<crate::tasklist::TaskStatus>,
+        #[serde(default)]
+        description: Option<String>,
+    },
+    CompleteTask {
+        id: u32,
+    },
+    ListTasks {},
+}
