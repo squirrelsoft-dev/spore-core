@@ -1306,6 +1306,19 @@ const (
 	HaltHumanHalted               HaltReasonKind = "human_halted"
 	HaltStagnationLimitReached    HaltReasonKind = "stagnation_limit_reached"
 	HaltStrategyNotYetImplemented HaltReasonKind = "strategy_not_yet_implemented"
+	// HaltExecutePhaseNotImplemented (issue #70, Q4) is returned by
+	// StandardHarness for the PlanExecute strategy AFTER the plan phase has
+	// produced, fired OnPlanCreated on, and stored a PlanArtifact. The execute
+	// loop itself ships with #59/#72; this distinct reason marks "plan
+	// produced, execute phase not implemented yet" so callers can tell it apart
+	// from the generic HaltStrategyNotYetImplemented stub.
+	HaltExecutePhaseNotImplemented HaltReasonKind = "execute_phase_not_implemented"
+	// HaltPlanPhaseFailed (issue #70) is returned when the PlanExecute plan
+	// phase fails before producing an artifact: the planner's response was
+	// unparseable, the planner requested a tool call in the one-shot turn, or
+	// the artifact could not be serialized for storage. Carries the underlying
+	// PlanPhaseError.
+	HaltPlanPhaseFailed HaltReasonKind = "plan_phase_failed"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -1328,6 +1341,8 @@ type HaltReason struct {
 	BestMetric float64 `json:"-"`
 	// strategy_not_yet_implemented
 	Strategy string `json:"-"`
+	// plan_phase_failed (issue #70)
+	PlanError *PlanPhaseError `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1380,6 +1395,15 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind     HaltReasonKind `json:"kind"`
 			Strategy string         `json:"strategy"`
 		}{h.Kind, h.Strategy})
+	case HaltExecutePhaseNotImplemented:
+		return json.Marshal(struct {
+			Kind HaltReasonKind `json:"kind"`
+		}{h.Kind})
+	case HaltPlanPhaseFailed:
+		return json.Marshal(struct {
+			Kind  HaltReasonKind  `json:"kind"`
+			Error *PlanPhaseError `json:"error"`
+		}{h.Kind, h.PlanError})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -1430,6 +1454,15 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		h.Error = v.Error
+	case HaltPlanPhaseFailed:
+		// "error" is a PlanPhaseError object here (issue #70).
+		if len(probe.Error) > 0 && string(probe.Error) != "null" {
+			pe := &PlanPhaseError{}
+			if err := json.Unmarshal(probe.Error, pe); err != nil {
+				return err
+			}
+			h.PlanError = pe
+		}
 	}
 	return nil
 }
@@ -1584,6 +1617,13 @@ type HarnessConfig struct {
 	// in a single Run before terminating anyway (issue #69). The counter is
 	// per-run (resets each Run call). Zero is treated as the default of 8.
 	MaxStopBlocks uint32
+
+	// PlannerAgent is the optional alternate agent used for the PlanExecute plan
+	// phase (issue #70, Q1). When the loop strategy is PlanExecute and this is
+	// non-nil, the one-shot plan turn runs on it; otherwise it runs on the
+	// default Agent. The plan_model field on the strategy stays DESCRIPTIVE
+	// metadata only — there is no ModelConfig→agent factory.
+	PlannerAgent Agent // optional
 }
 
 // effectiveMaxStopBlocks returns the Stop-block cap, defaulting 0 to 8.
@@ -1652,7 +1692,7 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
 		return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations, session, budget, options.OnStream)
 	case StrategyPlanExecute:
-		return strategyNotImplemented(task, "plan_execute")
+		return h.runPlanExecute(ctx, task, session, budget, options.OnStream)
 	case StrategyRalph:
 		return strategyNotImplemented(task, "ralph")
 	case StrategySelfVerifying:
@@ -1742,9 +1782,283 @@ func haltReasonString(r HaltReason) string {
 		return "human halted"
 	case HaltStrategyNotYetImplemented:
 		return fmt.Sprintf("strategy not yet implemented: %s", r.Strategy)
+	case HaltExecutePhaseNotImplemented:
+		return "execute phase not implemented"
+	case HaltPlanPhaseFailed:
+		if r.PlanError != nil {
+			return fmt.Sprintf("plan phase failed: %s", r.PlanError.Error())
+		}
+		return "plan phase failed"
 	default:
 		return string(r.Kind)
 	}
+}
+
+// planPhaseOutcome is the internal result of a successful PlanExecute plan
+// phase (issue #70). Carries the produced artifact plus the run accounting so
+// the caller can build the terminal RunResult. Not part of the public surface —
+// the artifact itself is observable via SessionState.Extras["plan_execute"].
+type planPhaseOutcome struct {
+	artifact PlanArtifact
+	usage    AggregateUsage
+	turns    uint32
+}
+
+// runPlanExecute drives the PlanExecute strategy (issue #70).
+//
+// Runs the one-shot plan phase (runPlanPhase), then — per Q4 — HALTS with the
+// distinct HaltExecutePhaseNotImplemented reason once an artifact has been
+// produced, had OnPlanCreated fired on it, and been stored. The execute loop
+// itself ships with #59/#72. On any plan-phase failure the underlying
+// RunResult failure is returned unchanged (no artifact stored).
+//
+// Like runReAct, this finalizes observability for the terminal outcome.
+func (h *StandardHarness) runPlanExecute(
+	ctx context.Context,
+	task Task,
+	session SessionState,
+	budget BudgetSnapshot,
+	onStream StreamSink,
+) RunResult {
+	sessionID := task.SessionID
+	outcome, failure := h.runPlanPhase(ctx, &task, &session, budget, onStream)
+	var result RunResult
+	if failure != nil {
+		// Plan-phase failure: propagate the terminal RunResult unchanged.
+		result = *failure
+	} else {
+		// Plan produced + stored. Q4: halt with the distinct reason.
+		result = RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltExecutePhaseNotImplemented},
+			SessionID: sessionID,
+			Usage:     outcome.usage,
+			Turns:     outcome.turns,
+		}
+	}
+	switch result.Kind {
+	case RunSuccess:
+		h.finalizeObservability(ctx, result.SessionID, true, "")
+	case RunFailure:
+		h.finalizeObservability(ctx, result.SessionID, false, haltReasonString(result.Reason))
+	case RunWaitingForHuman:
+		// Not terminal — do not flush.
+	}
+	return result
+}
+
+// runPlanPhase runs the one-shot PlanExecute plan phase (issue #70).
+//
+// Selects the planner agent (Q1: config.PlannerAgent if set, else the default
+// agent), seeds a planning directive as a user message, runs EXACTLY ONE
+// constrained turn (R1), expects a FinalResponse (a tool call is a planning
+// failure — R2 — never a dispatch loop), captures the response via
+// CapturePlanArtifact (R3), fires OnPlanCreated (which may rewrite the artifact
+// — R11), stores the result in Extras["plan_execute"] (R4), emits the turn span
+// (R8), and counts the turn against the shared budget (R7). A budget exhausted
+// before the turn returns a budget-exceeded failure with no artifact stored
+// (R10).
+//
+// On success returns (*planPhaseOutcome, nil). On any failure returns
+// (nil, *RunResult) carrying the terminal failure to propagate.
+func (h *StandardHarness) runPlanPhase(
+	ctx context.Context,
+	task *Task,
+	session *SessionState,
+	budget BudgetSnapshot,
+	onStream StreamSink,
+) (*planPhaseOutcome, *RunResult) {
+	sessionID := task.SessionID
+	startedAt := time.Now()
+	usage := AggregateUsage{}
+
+	// R10: Layer-1 budget gate BEFORE the plan turn. Mirrors runReActInner.
+	effectiveTurnCap := uint32(1)
+	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns > effectiveTurnCap {
+		effectiveTurnCap = *task.Budget.MaxTurns
+	}
+	if budget.Turns >= effectiveTurnCap {
+		return nil, &RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	}
+	if lt, over := budgetExceeded(task.Budget, budget, startedAt); over {
+		return nil, &RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: lt},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	}
+
+	// Q1: select the planner agent (alternate if configured, else default).
+	planner := h.config.Agent
+	if h.config.PlannerAgent != nil {
+		planner = h.config.PlannerAgent
+	}
+
+	// Seed the planning directive as a user message (reuse ContextManager).
+	directive := fmt.Sprintf(
+		"Produce a step-by-step plan for the following task. Respond with a "+
+			"single JSON object: {\"tasks\": [<ordered step strings>], "+
+			"\"rationale\": <string>}.\n\nTask:\n%s",
+		task.Instruction,
+	)
+	h.config.ContextManager.AppendUserMessage(ctx, session, directive)
+
+	// Assemble + invoke the planner for exactly ONE turn (R1).
+	c := h.config.ContextManager.Assemble(ctx, session, task)
+	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
+	turnStartedAt := nowRFC3339()
+	turnClock := time.Now()
+	result := planner.Turn(ctx, c)
+	budget.Turns++ // R7: the plan turn counts against the budget.
+
+	// R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
+	// of runReActInner; content capture is intentionally omitted (the plan turn
+	// carries no tool calls and #64 content capture is wired in the ReAct loop
+	// only).
+	if h.config.Observability != nil {
+		var u TokenUsage
+		if result.Usage != nil {
+			u = *result.Usage
+		}
+		var (
+			stopReason         StopReason
+			toolCallsRequested uint32
+			errMsg             string
+		)
+		switch result.Kind {
+		case TurnFinalResponse:
+			stopReason = StopEndTurn
+		case TurnToolCallRequested:
+			stopReason = StopToolUse
+			toolCallsRequested = uint32(len(result.Calls))
+		case TurnError:
+			stopReason = StopEndTurn
+			if result.Err != nil {
+				errMsg = result.Err.Error()
+			}
+		default:
+			stopReason = StopEndTurn
+		}
+		h.config.Observability.EmitTurn(
+			fmt.Sprintf("%s-turn-%d", sessionID, budget.Turns),
+			sessionID,
+			task.ID,
+			budget.Turns,
+			turnStartedAt,
+			uint64(time.Since(turnClock).Milliseconds()),
+			u,
+			h.config.Observability.CostFor(u),
+			stopReason,
+			toolCallsRequested,
+			errMsg,
+			"",  // outputText — content capture omitted for the plan turn.
+			nil, // calls — the plan turn carries no tool calls.
+			nil, // inputMessages — content capture omitted.
+		)
+	}
+	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns})
+
+	// Classify the one-shot turn. R2: a tool call is a planning failure, NOT a
+	// dispatch loop.
+	var finalText string
+	switch result.Kind {
+	case TurnFinalResponse:
+		u := *result.Usage
+		usage.AddTurn(u)
+		budget.InputTokens += uint64(u.InputTokens)
+		budget.OutputTokens += uint64(u.OutputTokens)
+		finalText = result.Content
+	case TurnToolCallRequested:
+		if result.Usage != nil {
+			usage.AddTurn(*result.Usage)
+		}
+		return nil, &RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind: HaltPlanPhaseFailed,
+				PlanError: &PlanPhaseError{
+					Kind:    PlanErrorPlanningTurnFailed,
+					Message: "planner requested a tool call in the one-shot plan turn",
+				},
+			},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	case TurnError:
+		if result.Usage != nil {
+			usage.AddTurn(*result.Usage)
+		}
+		return nil, &RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltAgentError, AgentError: result.Err},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	}
+
+	// R3: capture the artifact from the response text.
+	artifact, err := CapturePlanArtifact(finalText)
+	if err != nil {
+		pe, ok := err.(*PlanPhaseError)
+		if !ok {
+			pe = newUnparseablePlan(err.Error())
+		}
+		return nil, &RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltPlanPhaseFailed, PlanError: pe},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	}
+
+	// R11: fire OnPlanCreated synchronously; the hook may rewrite `artifact` in
+	// place via the *PlanArtifact pointer. The stored artifact reflects any
+	// mutation. Hook errors are non-fatal: an observability/handler error must
+	// not lose a successfully-captured plan.
+	if h.config.Hooks != nil {
+		hctx := &HookContext{
+			Event:     HookEventOnPlanCreated,
+			SessionID: sessionID,
+			Plan:      &artifact,
+		}
+		_, _ = h.config.Hooks.Fire(ctx, hctx)
+	}
+
+	// R4: store the produced artifact in Extras["plan_execute"] as JSON.
+	value, marshalErr := json.Marshal(artifact)
+	if marshalErr != nil {
+		return nil, &RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind:      HaltPlanPhaseFailed,
+				PlanError: newUnparseablePlan(fmt.Sprintf("failed to serialize plan artifact: %s", marshalErr)),
+			},
+			SessionID: sessionID,
+			Usage:     usage,
+			Turns:     budget.Turns,
+		}
+	}
+	if session.Extras == nil {
+		session.Extras = map[string]any{}
+	}
+	session.Extras[PlanExecuteExtrasKey] = json.RawMessage(value)
+
+	return &planPhaseOutcome{
+		artifact: artifact,
+		usage:    usage,
+		turns:    budget.Turns,
+	}, nil
 }
 
 // runReActInner is the workhorse loop for LoopStrategy ReAct.

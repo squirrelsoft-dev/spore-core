@@ -295,13 +295,15 @@ func TestResumeWithAllowExecutesPendingAndContinues(t *testing.T) {
 }
 
 // Rule: non-ReAct strategies are explicitly marked NotYetImplemented.
+// Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented; it now
+// returns the distinct ExecutePhaseNotImplemented reason (see the plan-phase
+// tests in plan_test.go), so it is intentionally absent from this list.
 func TestNonReactStrategiesMarkedNotYetImplemented(t *testing.T) {
 	a := NewMockAgent("t")
 	h := NewStandardHarness(standardCfg(a))
 	strategies := []LoopStrategy{
 		{Kind: StrategyRalph},
 		{Kind: StrategySelfVerifying},
-		{Kind: StrategyPlanExecute},
 		{Kind: StrategyHillClimbing, Direction: OptimizationMaximize},
 	}
 	for _, s := range strategies {
