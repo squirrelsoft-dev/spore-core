@@ -286,6 +286,24 @@ type ToolRunStore interface {
 	Put(ctx context.Context, sessionID SessionID, key string, value json.RawMessage) error
 }
 
+// ToolMemoryStore is the consumer-side handle for the episodic-memory domain a
+// tool reads/writes through (#78). It is the seam MemoryTool (#82) picks up.
+//
+// It is an OPAQUE marker interface rather than a structural mirror of
+// storage.MemoryStore: the storage MemoryStore methods are typed in terms of
+// promptassembly.StorageScope (a defined string type, its canonical home being
+// promptassembly — decision A2). The root sporecore package CANNOT import
+// promptassembly (promptassembly imports sporecore, so naming that type here
+// would form an import cycle), and a defined type does not satisfy a
+// string-typed signature, so a structural mirror is impossible without
+// redefining StorageScope (forbidden). Tools that operate on memory therefore
+// assert the value back to storage.MemoryStore (or its scoped subset) in the
+// storage-aware package where promptassembly is importable — exactly how the
+// #82 MemoryTool will consume it. The contract guaranteed here is only that the
+// SAME store the registry threaded in is handed to every Tool.Execute, never
+// nil (at worst a no-op).
+type ToolMemoryStore interface{}
+
 // ToolContext is the per-dispatch storage seam handed to every Tool.Execute
 // call, alongside (but SEPARATE from) both Go's context.Context and the
 // SandboxProvider. It carries the minimum a tool needs to persist durable state
@@ -305,16 +323,23 @@ type ToolRunStore interface {
 // Put discards. This is the library default, so a standalone tool with default
 // storage persists nothing across processes (an accepted behavior change vs. the
 // retired .spore/task_list.json sandbox path — see tools/tasklist.go).
+//
+// MemoryStore (#78) is the episodic-memory seam threaded by the registry; see
+// ToolMemoryStore for why it is opaque. A nil MemoryStore is the never-null
+// library default — MemoryStore() returns it as-is and storage-aware callers
+// treat a nil/absent store as a no-op.
 type ToolContext struct {
-	SessionID SessionID
-	RunStore  ToolRunStore
+	SessionID   SessionID
+	RunStore    ToolRunStore
+	MemoryStore ToolMemoryStore
 }
 
-// NewToolContext builds a ToolContext from the run's session id and the
-// run-store seam. A nil runStore yields a context whose RunStore reads empty and
-// discards writes.
-func NewToolContext(sessionID SessionID, runStore ToolRunStore) *ToolContext {
-	return &ToolContext{SessionID: sessionID, RunStore: runStore}
+// NewToolContext builds a ToolContext from the run's session id and the storage
+// seams. A nil runStore yields a context whose RunStore reads empty and discards
+// writes; a nil memStore yields a context with no memory backend (callers treat
+// it as a no-op).
+func NewToolContext(sessionID SessionID, runStore ToolRunStore, memStore ToolMemoryStore) *ToolContext {
+	return &ToolContext{SessionID: sessionID, RunStore: runStore, MemoryStore: memStore}
 }
 
 // runStoreOrNoOp returns the configured run store, or a no-op store when nil so
@@ -498,7 +523,7 @@ func (r *StandardToolRegistry) dispatchToolContext() *ToolContext {
 	if r.toolCtx != nil {
 		return r.toolCtx
 	}
-	return NewToolContext("", nil)
+	return NewToolContext("", nil, nil)
 }
 
 // Register validates schema and annotations, then stores the tool.

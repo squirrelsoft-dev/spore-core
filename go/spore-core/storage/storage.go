@@ -1,9 +1,36 @@
-// Package storage — issue #73: a pluggable, per-domain persistence layer.
+// Package storage — issue #73: a pluggable, per-domain persistence layer, plus
+// the #78 scope + workspace-partitioning extension.
 //
 // This is the Go port of the Rust reference
 // (rust/crates/spore-core/src/storage.rs). It does NOT transliterate Rust; it
 // follows the idioms in go/CONVENTIONS.md (consumer-side interfaces,
 // context.Context first arg, sentinel + typed errors, defined ID types).
+//
+// # Scope + workspace partitioning (#78)
+//
+//   - StorageScope is REUSED from the promptassembly package (its canonical home,
+//     decision A2) via a type alias — the Go analog of Rust's
+//     `pub use crate::prompt_assembly::StorageScope`. It is NOT redefined here.
+//   - MemoryStore is the only domain that gained a scope: AppendMemory and
+//     GetMemories take a StorageScope. The other three domains stay scope-flat.
+//   - Leaf backends stay SCOPE-DUMB: a FileSystemStorageProvider never learns a
+//     WorkspaceID — the user-scope backend is pointed at the already-partitioned
+//     root {user_root}/projects/{workspace_id} at construction. InMemory keys
+//     memory by (scope, sessionID).
+//   - CompositeStorageProvider routes the memory domain per-scope
+//     (Memory(scope, store)); unconfigured (memory, scope) pairs fall back to
+//     NoOp on Build(). A ScopedMemoryRouter is the memory slot; it owns the
+//     cross-scope merge — leaf backends never merge.
+//   - StorageProvider.GetMemoriesMerged returns User ∪ Project, newest-first by
+//     timestamp, NO dedup, Local excluded — the merge lives in the routing layer.
+//   - WorkspaceID + WorkspaceIDFromCanonicalPath is a PURE STRING function (no
+//     filesystem access): the cross-language parity anchor pinned by
+//     fixtures/storage/workspace_id_derivation.json.
+//
+// # Known v1 limitation
+//
+// Memory addressing stays sessionID-keyed for v1. v2 should address
+// session-independent / cross-session memory keying — do not introduce it here.
 //
 // # Domains
 //
@@ -65,10 +92,16 @@ import (
 	"sort"
 	"sync"
 
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+	"unicode"
+
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/guideregistry"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/memory"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/observability"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/promptassembly"
 )
 
 // Re-exported type aliases so storage callers don't have to import every
@@ -86,6 +119,24 @@ type (
 	SessionOutcome = guideregistry.SessionOutcome
 	// SessionMetrics re-exported from observability.
 	SessionMetrics = observability.SessionMetrics
+)
+
+// StorageScope is REUSED from promptassembly (its canonical home, decision A2),
+// re-exported here as a type alias so storage callers can name it without
+// importing promptassembly. This is the Go analog of the Rust reference's
+// `pub use crate::prompt_assembly::StorageScope` — storage::StorageScope and
+// promptassembly.StorageScope resolve to the SAME type. The constants are
+// re-exported too so they read naturally at the storage call site.
+type StorageScope = promptassembly.StorageScope
+
+// Scope constants, re-exported from promptassembly (same underlying values).
+const (
+	// StorageScopeUser is the user-global scope.
+	StorageScopeUser = promptassembly.StorageScopeUser
+	// StorageScopeProject is the per-project scope (the default).
+	StorageScopeProject = promptassembly.StorageScopeProject
+	// StorageScopeLocal is the machine-local scope.
+	StorageScopeLocal = promptassembly.StorageScopeLocal
 )
 
 // ============================================================================
@@ -169,6 +220,96 @@ func (e *MemoryEntry) UnmarshalJSON(data []byte) error {
 }
 
 // ============================================================================
+// WorkspaceID (#78)
+// ============================================================================
+
+// WorkspaceID is a stable identifier for a workspace, derived purely from its
+// canonical path. Form: {sanitized_basename}-{8hex}, lowercased. It is the
+// cross-language parity anchor — WorkspaceIDFromCanonicalPath is a PURE STRING
+// function (it never touches the filesystem) so the pinned fixture
+// fixtures/storage/workspace_id_derivation.json is host-independent.
+//
+// Used at wiring time to partition the user-scope storage root:
+// {user_root}/projects/{workspace_id}. Backends never see it. Go initialism
+// convention uses ID (uppercase), so the exported name is WorkspaceID.
+type WorkspaceID string
+
+// WorkspaceIDFromCanonicalPath derives a WorkspaceID from an already-OS-canonical
+// path. The algorithm is pinned, byte-identical across all four languages:
+//
+//  1. Normalize separators to '/'. On Windows strip a leading drive-letter
+//     prefix (e.g. "C:") and convert '\' -> '/'. The input is assumed already
+//     OS-canonicalized; this function does NOT re-canonicalize or touch the
+//     filesystem.
+//  2. Build the canonical path string: forward slashes only, NO trailing slash,
+//     UTF-8.
+//  3. SHA-256 that string; take the first 8 hex chars (lowercase).
+//  4. Basename of the canonical path, lowercased; replace each non-alphanumeric
+//     char with '-'; collapse consecutive '-'; strip leading/trailing '-'. An
+//     empty basename (root "/") becomes "root".
+//  5. Concatenate {sanitized_basename}-{8hex}.
+func WorkspaceIDFromCanonicalPath(path string) WorkspaceID {
+	canonical := canonicalizePathString(path)
+
+	sum := sha256.Sum256([]byte(canonical))
+	hex8 := hex.EncodeToString(sum[:4]) // first 8 hex chars = first 4 bytes
+
+	basename := canonical
+	if idx := strings.LastIndex(canonical, "/"); idx >= 0 {
+		basename = canonical[idx+1:]
+	}
+	sanitized := sanitizeBasename(basename)
+	if sanitized == "" {
+		sanitized = "root"
+	}
+
+	return WorkspaceID(sanitized + "-" + hex8)
+}
+
+// String returns the underlying derived id string.
+func (w WorkspaceID) String() string { return string(w) }
+
+// canonicalizePathString performs steps 1–2 of the derivation: produce the
+// canonical path string used for both the hash input and the basename. Forward
+// slashes only, no trailing slash (a lone root "/" is preserved).
+func canonicalizePathString(path string) string {
+	// Normalize Windows backslashes.
+	s := strings.ReplaceAll(path, "\\", "/")
+	// Strip a leading drive-letter prefix like "C:" (only at the very start).
+	if len(s) >= 2 && s[1] == ':' &&
+		((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) {
+		s = s[2:]
+	}
+	// Strip trailing slashes, but keep a lone root "/".
+	for len(s) > 1 && strings.HasSuffix(s, "/") {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// sanitizeBasename performs step 4: lowercase, replace each non-alphanumeric
+// rune with '-', collapse consecutive '-', strip leading/trailing '-'.
+// "Alphanumeric" is ASCII a–z/0–9 after lowercasing (matching the Rust
+// is_ascii_alphanumeric check) so the cross-language hash/basename stays
+// byte-identical.
+func sanitizeBasename(basename string) string {
+	lowered := strings.ToLower(basename)
+	var b strings.Builder
+	b.Grow(len(lowered))
+	prevDash := false
+	for _, ch := range lowered {
+		if ch <= unicode.MaxASCII && (('a' <= ch && ch <= 'z') || ('0' <= ch && ch <= '9')) {
+			b.WriteRune(ch)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// ============================================================================
 // Domain interfaces
 // ============================================================================
 
@@ -182,11 +323,23 @@ type SessionStore interface {
 	ListSessions(ctx context.Context) ([]SessionID, error)
 }
 
-// MemoryStore is the episodic memory store. Append-only log per session.
+// MemoryStore is the episodic memory store. Append-only log per (scope,
+// session) (#78).
+//
+// A leaf backend is SCOPE-DUMB: it stores under whatever root it was given. The
+// scope argument is carried for symmetry and so a single backend could partition
+// by scope if it wished (the InMemory backend does), but the v1 wiring routes
+// each scope to its own backend via CompositeStorageProvider, so leaf backends
+// receive a single scope's traffic. The cross-scope merge
+// (StorageProvider.GetMemoriesMerged) lives in the routing layer, never in a
+// leaf.
+//
+// Memory addressing stays sessionID-keyed for v1 (known limitation); v2 should
+// address cross-session keying.
 type MemoryStore interface {
-	AppendMemory(ctx context.Context, sessionID SessionID, entry MemoryEntry) error
-	// GetMemories returns the most-recent limit entries, newest-first.
-	GetMemories(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error)
+	AppendMemory(ctx context.Context, scope StorageScope, sessionID SessionID, entry MemoryEntry) error
+	// GetMemories returns the most-recent limit entries, newest-first, for scope.
+	GetMemories(ctx context.Context, scope StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error)
 }
 
 // RunStore is per-run structured state keyed by (SessionID, key). Values are
@@ -256,6 +409,28 @@ func (p *StorageProvider) Session() SessionStore { return p.session }
 // Memory returns the memory-domain store.
 func (p *StorageProvider) Memory() MemoryStore { return p.memory }
 
+// GetMemoriesMerged is the cross-scope merged memory read (#78 R6): User ∪
+// Project, newest-first by timestamp, NO dedup (identical-content entries are
+// all retained). Local is excluded from the merge in v1.
+//
+// It routes through the memory slot. When the provider was built via
+// CompositeStorageProvider that slot is a *ScopedMemoryRouter fanning out to the
+// per-scope backends; for SingleStorageProvider / NewStorageProvider the one
+// backend serves both scopes (keyed by scope) and merges identically. The merge
+// always lives in this routing layer, never in a leaf backend.
+func (p *StorageProvider) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	user, err := p.memory.GetMemories(ctx, StorageScopeUser, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	project, err := p.memory.GetMemories(ctx, StorageScopeProject, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	combined := append(user, project...)
+	return mergeNewestFirst(combined, limit), nil
+}
+
 // Run returns the run-domain store.
 func (p *StorageProvider) Run() RunStore { return p.run }
 
@@ -282,8 +457,10 @@ func (NoOpStorageProvider) ListSessions(context.Context) ([]SessionID, error)   
 
 // MemoryStore.
 
-func (NoOpStorageProvider) AppendMemory(context.Context, SessionID, MemoryEntry) error { return nil }
-func (NoOpStorageProvider) GetMemories(context.Context, SessionID, int) ([]MemoryEntry, error) {
+func (NoOpStorageProvider) AppendMemory(context.Context, StorageScope, SessionID, MemoryEntry) error {
+	return nil
+}
+func (NoOpStorageProvider) GetMemories(context.Context, StorageScope, SessionID, int) ([]MemoryEntry, error) {
 	return nil, nil
 }
 
@@ -319,7 +496,7 @@ func (NoOpStorageProvider) FlushSession(context.Context, SessionID) error { retu
 type InMemoryStorageProvider struct {
 	mu       sync.Mutex
 	sessions map[SessionID]PausedState
-	memory   map[SessionID][]MemoryEntry
+	memory   map[memoryKey][]MemoryEntry
 	run      map[runKey]json.RawMessage
 	spans    map[SessionID][]json.RawMessage
 }
@@ -329,11 +506,18 @@ type runKey struct {
 	key     string
 }
 
+// memoryKey keys episodic memory by (scope, session) (#78): the InMemory backend
+// is scope-aware so a single instance handed all scopes still isolates them.
+type memoryKey struct {
+	scope   StorageScope
+	session SessionID
+}
+
 // NewInMemoryStorageProvider constructs an empty in-memory backend.
 func NewInMemoryStorageProvider() *InMemoryStorageProvider {
 	return &InMemoryStorageProvider{
 		sessions: make(map[SessionID]PausedState),
-		memory:   make(map[SessionID][]MemoryEntry),
+		memory:   make(map[memoryKey][]MemoryEntry),
 		run:      make(map[runKey]json.RawMessage),
 		spans:    make(map[SessionID][]json.RawMessage),
 	}
@@ -379,17 +563,18 @@ func (p *InMemoryStorageProvider) ListSessions(_ context.Context) ([]SessionID, 
 
 // MemoryStore.
 
-func (p *InMemoryStorageProvider) AppendMemory(_ context.Context, sessionID SessionID, entry MemoryEntry) error {
+func (p *InMemoryStorageProvider) AppendMemory(_ context.Context, scope StorageScope, sessionID SessionID, entry MemoryEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.memory[sessionID] = append(p.memory[sessionID], entry)
+	k := memoryKey{scope: scope, session: sessionID}
+	p.memory[k] = append(p.memory[k], entry)
 	return nil
 }
 
-func (p *InMemoryStorageProvider) GetMemories(_ context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+func (p *InMemoryStorageProvider) GetMemories(_ context.Context, scope StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	all := p.memory[sessionID]
+	all := p.memory[memoryKey{scope: scope, session: sessionID}]
 	return mostRecentNewestFirst(all, limit), nil
 }
 
@@ -478,16 +663,21 @@ func cloneRaw(v json.RawMessage) json.RawMessage {
 
 // CompositeStorageProvider is a builder that routes each domain to its own
 // backend, filling any unset domain with NoOpStorageProvider on Build().
+//
+// Only the memory domain varies by scope (#78): Memory(scope, store) configures
+// one StorageScope's backend, and unconfigured (memory, scope) pairs fall back
+// to NoOp on Build() via the ScopedMemoryRouter. session, run and observability
+// are scope-flat — scope is wiring-only for them.
 type CompositeStorageProvider struct {
 	session       SessionStore
-	memory        MemoryStore
+	memory        map[StorageScope]MemoryStore
 	run           RunStore
 	observability ObservabilityStore
 }
 
 // NewCompositeStorageProvider starts an empty composite builder.
 func NewCompositeStorageProvider() *CompositeStorageProvider {
-	return &CompositeStorageProvider{}
+	return &CompositeStorageProvider{memory: make(map[StorageScope]MemoryStore)}
 }
 
 // Session sets the session-domain backend and returns the receiver.
@@ -496,9 +686,14 @@ func (c *CompositeStorageProvider) Session(store SessionStore) *CompositeStorage
 	return c
 }
 
-// Memory sets the memory-domain backend and returns the receiver.
-func (c *CompositeStorageProvider) Memory(store MemoryStore) *CompositeStorageProvider {
-	c.memory = store
+// Memory configures the memory backend for one StorageScope and returns the
+// receiver. Unconfigured (memory, scope) pairs fall back to NoOpStorageProvider
+// on Build() (#78 R7/R11 — Local may be wired to no-op in v1).
+func (c *CompositeStorageProvider) Memory(scope StorageScope, store MemoryStore) *CompositeStorageProvider {
+	if c.memory == nil {
+		c.memory = make(map[StorageScope]MemoryStore)
+	}
+	c.memory[scope] = store
 	return c
 }
 
@@ -514,21 +709,20 @@ func (c *CompositeStorageProvider) Observability(store ObservabilityStore) *Comp
 	return c
 }
 
-// Build assembles a *StorageProvider, filling each unset domain with a
-// NoOpStorageProvider.
+// Build assembles a *StorageProvider, filling each unset domain — and each unset
+// (memory, scope) pair — with a NoOpStorageProvider. The memory slot is always a
+// *ScopedMemoryRouter so scoped reads/writes route by scope and
+// StorageProvider.GetMemoriesMerged reaches the routing-layer merge.
 func (c *CompositeStorageProvider) Build() *StorageProvider {
 	noop := NoOpStorageProvider{}
 	sp := &StorageProvider{
 		session:       c.session,
-		memory:        c.memory,
+		memory:        NewScopedMemoryRouter(c.memory),
 		run:           c.run,
 		observability: c.observability,
 	}
 	if sp.session == nil {
 		sp.session = noop
-	}
-	if sp.memory == nil {
-		sp.memory = noop
 	}
 	if sp.run == nil {
 		sp.run = noop
@@ -538,6 +732,53 @@ func (c *CompositeStorageProvider) Build() *StorageProvider {
 	}
 	return sp
 }
+
+// ============================================================================
+// ScopedMemoryRouter (#78) — the (memory, scope) routing + merge layer
+// ============================================================================
+
+// ScopedMemoryRouter routes MemoryStore traffic to a per-StorageScope backend,
+// filling unconfigured scopes with NoOpStorageProvider. It is the memory slot of
+// a composite StorageProvider: StorageProvider.Memory() returns this router so a
+// caller passing a scope is routed to the right backend, while
+// StorageProvider.GetMemoriesMerged reaches the merge in the routing layer. Leaf
+// backends stay scope-dumb — they never merge.
+type ScopedMemoryRouter struct {
+	byScope map[StorageScope]MemoryStore
+	noop    MemoryStore
+}
+
+// NewScopedMemoryRouter builds a router from a partial scope->backend map; unset
+// scopes resolve to a shared no-op. A nil map is treated as empty.
+func NewScopedMemoryRouter(byScope map[StorageScope]MemoryStore) *ScopedMemoryRouter {
+	cp := make(map[StorageScope]MemoryStore, len(byScope))
+	for k, v := range byScope {
+		if v != nil {
+			cp[k] = v
+		}
+	}
+	return &ScopedMemoryRouter{byScope: cp, noop: NoOpStorageProvider{}}
+}
+
+// backend returns the configured backend for scope, or the shared no-op.
+func (r *ScopedMemoryRouter) backend(scope StorageScope) MemoryStore {
+	if b, ok := r.byScope[scope]; ok {
+		return b
+	}
+	return r.noop
+}
+
+// AppendMemory routes to the scope's backend (no-op when unconfigured).
+func (r *ScopedMemoryRouter) AppendMemory(ctx context.Context, scope StorageScope, sessionID SessionID, entry MemoryEntry) error {
+	return r.backend(scope).AppendMemory(ctx, scope, sessionID, entry)
+}
+
+// GetMemories routes to the scope's backend (empty when unconfigured).
+func (r *ScopedMemoryRouter) GetMemories(ctx context.Context, scope StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	return r.backend(scope).GetMemories(ctx, scope, sessionID, limit)
+}
+
+var _ MemoryStore = (*ScopedMemoryRouter)(nil)
 
 // ============================================================================
 // Shared helpers
@@ -560,6 +801,23 @@ func mostRecentNewestFirst[T any](items []T, limit int) []T {
 		out = append(out, items[i])
 	}
 	return out
+}
+
+// mergeNewestFirst is the merge step for the cross-scope memory read (#78 R6):
+// sort newest-first by timestamp and truncate to limit. NO dedup — identical
+// entries are all retained. A STABLE sort preserves the input order among equal
+// timestamps, keeping the merge deterministic and byte-identical cross-language.
+func mergeNewestFirst(entries []MemoryEntry, limit int) []MemoryEntry {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return string(entries[i].Timestamp) > string(entries[j].Timestamp)
+	})
+	if limit < 0 {
+		limit = 0
+	}
+	if limit < len(entries) {
+		entries = entries[:limit]
+	}
+	return entries
 }
 
 // ============================================================================

@@ -195,8 +195,14 @@ func (p *FileSystemStorageProvider) ListSessions(_ context.Context) ([]SessionID
 }
 
 // MemoryStore.
+//
+// The FS backend is SCOPE-DUMB (#78): the user-scope backend is pointed at the
+// already-partitioned {user_root}/projects/{workspace_id} at construction, so it
+// just writes under whatever root it was given. The scope argument is ignored at
+// the leaf — the CompositeStorageProvider's ScopedMemoryRouter is what isolates
+// scopes by routing each to its own backend.
 
-func (p *FileSystemStorageProvider) AppendMemory(_ context.Context, sessionID SessionID, entry MemoryEntry) error {
+func (p *FileSystemStorageProvider) AppendMemory(_ context.Context, _ StorageScope, sessionID SessionID, entry MemoryEntry) error {
 	b, err := json.Marshal(entry)
 	if err != nil {
 		return err
@@ -204,7 +210,7 @@ func (p *FileSystemStorageProvider) AppendMemory(_ context.Context, sessionID Se
 	return appendJSONL(p.memoryPath(sessionID), b)
 }
 
-func (p *FileSystemStorageProvider) GetMemories(_ context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+func (p *FileSystemStorageProvider) GetMemories(_ context.Context, _ StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error) {
 	lines, err := readJSONL(p.memoryPath(sessionID))
 	if err != nil {
 		return nil, err

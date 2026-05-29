@@ -212,7 +212,7 @@ func TestS4ToolFailureThenRecovery(t *testing.T) {
 		fmt.Sprintf(`{"path":%q,"content":"flaky_op failed; adapted by writing this file"}`, recoveredPath))}, usage()))
 	agent.Push(sporecore.NewFinalResponse("DONE recovered", usage()))
 
-	registry := scenarios.BuildRealToolRegistry(scenarios.S4, sporecore.SessionID("test-session"), nil)
+	registry := scenarios.BuildRealToolRegistry(scenarios.S4, sporecore.SessionID("test-session"), nil, nil)
 	sandbox := sporecore.AllowAllSandbox{}
 	schemas := scenarios.ModelSchemas(registry)
 
@@ -237,7 +237,7 @@ func TestS4ToolFailureThenRecovery(t *testing.T) {
 // The harness must NOT hard-halt on the recoverable FailingTool error — flaky_op
 // is not annotated always-halt, and its output is a recoverable error.
 func TestS4FailingToolIsRecoverableNotAlwaysHalt(t *testing.T) {
-	registry := scenarios.BuildRealToolRegistry(scenarios.S4, sporecore.SessionID("test-session"), nil)
+	registry := scenarios.BuildRealToolRegistry(scenarios.S4, sporecore.SessionID("test-session"), nil, nil)
 	if registry.IsAlwaysHalt("flaky_op") {
 		t.Fatal("flaky_op must not be always-halt")
 	}
@@ -328,7 +328,7 @@ func TestParseScenarioID(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func schemaNames(scenario scenarios.ScenarioID) []string {
-	reg := scenarios.BuildRealToolRegistry(scenario, sporecore.SessionID("test-session"), nil)
+	reg := scenarios.BuildRealToolRegistry(scenario, sporecore.SessionID("test-session"), nil, nil)
 	schemas := scenarios.ModelSchemas(reg)
 	names := make([]string, 0, len(schemas))
 	for _, s := range schemas {
@@ -409,7 +409,7 @@ func TestS5BashCommandShellPipeline(t *testing.T) {
 	// Turn 3: final.
 	agent.Push(sporecore.NewFinalResponse("DONE", usage()))
 
-	registry := scenarios.BuildRealToolRegistry(scenarios.S5, sporecore.SessionID("test-session"), nil)
+	registry := scenarios.BuildRealToolRegistry(scenarios.S5, sporecore.SessionID("test-session"), nil, nil)
 	sandbox := sporecore.AllowAllSandbox{}
 	schemas := scenarios.ModelSchemas(registry)
 

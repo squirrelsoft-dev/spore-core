@@ -97,10 +97,10 @@ func TestNoOpReadsEmptyWritesOK(t *testing.T) {
 	if err := p.PutSession(ctx(), sid("s"), paused("s")); err != nil {
 		t.Fatalf("PutSession err=%v", err)
 	}
-	if ms, err := p.GetMemories(ctx(), sid("s"), 10); err != nil || len(ms) != 0 {
+	if ms, err := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 10); err != nil || len(ms) != 0 {
 		t.Fatalf("GetMemories=%v err=%v", ms, err)
 	}
-	if err := p.AppendMemory(ctx(), sid("s"), mem("user", "hi", "t")); err != nil {
+	if err := p.AppendMemory(ctx(), StorageScopeProject, sid("s"), mem("user", "hi", "t")); err != nil {
 		t.Fatalf("AppendMemory err=%v", err)
 	}
 	if _, found, err := p.Get(ctx(), sid("s"), "k"); found || err != nil {
@@ -126,7 +126,7 @@ func TestDefaultStorageProviderIsNoOp(t *testing.T) {
 	if _, found, _ := p.Session().GetSession(ctx(), sid("s")); found {
 		t.Fatal("session slot not no-op")
 	}
-	if ms, _ := p.Memory().GetMemories(ctx(), sid("s"), 1); len(ms) != 0 {
+	if ms, _ := p.Memory().GetMemories(ctx(), StorageScopeProject, sid("s"), 1); len(ms) != 0 {
 		t.Fatal("memory slot not no-op")
 	}
 	if _, found, _ := p.Run().Get(ctx(), sid("s"), "k"); found {
@@ -144,14 +144,14 @@ func TestSingleFillsAllSlots(t *testing.T) {
 	p := SingleStorageProvider(backend)
 
 	must(t, p.Session().PutSession(ctx(), sid("s"), paused("s")))
-	must(t, p.Memory().AppendMemory(ctx(), sid("s"), mem("user", "hi", "t1")))
+	must(t, p.Memory().AppendMemory(ctx(), StorageScopeProject, sid("s"), mem("user", "hi", "t1")))
 	must(t, p.Run().Put(ctx(), sid("s"), "plan", raw(`{"x":1}`)))
 	must(t, p.Observability().AppendSpan(ctx(), sid("s"), raw(`{"kind":"turn"}`)))
 
 	if _, found, _ := p.Session().GetSession(ctx(), sid("s")); !found {
 		t.Fatal("session not shared")
 	}
-	if ms, _ := p.Memory().GetMemories(ctx(), sid("s"), 10); len(ms) != 1 {
+	if ms, _ := p.Memory().GetMemories(ctx(), StorageScopeProject, sid("s"), 10); len(ms) != 1 {
 		t.Fatalf("memory len=%d", len(ms))
 	}
 	if v, found, _ := p.Run().Get(ctx(), sid("s"), "plan"); !found || string(v) != `{"x":1}` {
@@ -179,7 +179,7 @@ func TestCompositeRoutesPerDomainAndFallsBackToNoOp(t *testing.T) {
 	if _, found, _ := p.Session().GetSession(ctx(), sid("s")); found {
 		t.Fatal("session should be no-op")
 	}
-	if ms, _ := p.Memory().GetMemories(ctx(), sid("s"), 5); len(ms) != 0 {
+	if ms, _ := p.Memory().GetMemories(ctx(), StorageScopeProject, sid("s"), 5); len(ms) != 0 {
 		t.Fatal("memory should be no-op")
 	}
 	if spans, _ := p.Observability().GetSpans(ctx(), sid("s")); len(spans) != 0 {
@@ -239,13 +239,13 @@ func TestInMemoryRunRoundtripListDelete(t *testing.T) {
 func TestInMemoryMemoryRecencyAndLimit(t *testing.T) {
 	p := NewInMemoryStorageProvider()
 	for i, c := range []string{"m0", "m1", "m2", "m3"} {
-		must(t, p.AppendMemory(ctx(), sid("s"), mem("user", c, "t"+itoa(i))))
+		must(t, p.AppendMemory(ctx(), StorageScopeProject, sid("s"), mem("user", c, "t"+itoa(i))))
 	}
-	got, _ := p.GetMemories(ctx(), sid("s"), 2)
+	got, _ := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 2)
 	if len(got) != 2 || got[0].Content != "m3" || got[1].Content != "m2" {
 		t.Fatalf("recency 2 = %+v", contents(got))
 	}
-	all, _ := p.GetMemories(ctx(), sid("s"), 99)
+	all, _ := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 99)
 	if !reflect.DeepEqual(contents(all), []string{"m3", "m2", "m1", "m0"}) {
 		t.Fatalf("all newest-first = %v", contents(all))
 	}
@@ -330,12 +330,12 @@ func TestFSMemoryAppendRecencyAndJSONLPath(t *testing.T) {
 	tmp := t.TempDir()
 	p := NewFileSystemStorageProvider(tmp)
 	for i, c := range []string{"a", "b", "c"} {
-		must(t, p.AppendMemory(ctx(), sid("s"), mem("user", c, "t"+itoa(i))))
+		must(t, p.AppendMemory(ctx(), StorageScopeProject, sid("s"), mem("user", c, "t"+itoa(i))))
 	}
 	if !fsExists(filepath.Join(tmp, "sessions", "s", "memory.jsonl")) {
 		t.Fatal("memory.jsonl missing")
 	}
-	got, _ := p.GetMemories(ctx(), sid("s"), 2)
+	got, _ := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 2)
 	if len(got) != 2 || got[0].Content != "c" || got[1].Content != "b" {
 		t.Fatalf("recency = %v", contents(got))
 	}
@@ -436,16 +436,16 @@ func TestMemoryEntriesFixtureReplay(t *testing.T) {
 
 	p := NewInMemoryStorageProvider()
 	for _, e := range entries {
-		must(t, p.AppendMemory(ctx(), sid("s"), e))
+		must(t, p.AppendMemory(ctx(), StorageScopeProject, sid("s"), e))
 	}
-	got, _ := p.GetMemories(ctx(), sid("s"), 2)
+	got, _ := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 2)
 	if len(got) != 2 {
 		t.Fatalf("len=%d", len(got))
 	}
 	if got[0].Content != entries[len(entries)-1].Content || got[1].Content != entries[len(entries)-2].Content {
 		t.Fatalf("recency mismatch: %v", contents(got))
 	}
-	all, _ := p.GetMemories(ctx(), sid("s"), 999)
+	all, _ := p.GetMemories(ctx(), StorageScopeProject, sid("s"), 999)
 	for i := range all {
 		if all[i].Content != entries[len(entries)-1-i].Content {
 			t.Fatalf("order mismatch at %d: %v", i, contents(all))

@@ -29,7 +29,7 @@ const testSession = "test-session"
 // read the persisted blob straight off the store.
 func inMemCtx() (*sporecore.ToolContext, *storage.InMemoryStorageProvider) {
 	store := storage.NewInMemoryStorageProvider()
-	return sporecore.NewToolContext(testSession, store), store
+	return sporecore.NewToolContext(testSession, store, nil), store
 }
 
 // loadFromStore reads the persisted blob off a run store as a TaskList. found is
@@ -162,8 +162,8 @@ func TestPersistsToRunStoreNotSandbox(t *testing.T) {
 // Keyed by SessionID: two sessions over the SAME run store keep separate lists.
 func TestListsAreKeyedBySessionID(t *testing.T) {
 	store := storage.NewInMemoryStorageProvider()
-	tcA := sporecore.NewToolContext("session-a", store)
-	tcB := sporecore.NewToolContext("session-b", store)
+	tcA := sporecore.NewToolContext("session-a", store, nil)
+	tcB := sporecore.NewToolContext("session-b", store, nil)
 	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
@@ -293,7 +293,7 @@ func TestBadParamsIsRecoverableError(t *testing.T) {
 
 // Storage failure (Get/Put) → recoverable error.
 func TestStorageFailureIsRecoverableError(t *testing.T) {
-	tc := sporecore.NewToolContext(testSession, failingRunStore{})
+	tc := sporecore.NewToolContext(testSession, failingRunStore{}, nil)
 	r := NewTaskListTool().Execute(context.Background(),
 		tlCall(map[string]any{"action": "add_task", "description": "x"}),
 		sporecore.AllowAllSandbox{}, tc)
@@ -304,7 +304,7 @@ func TestStorageFailureIsRecoverableError(t *testing.T) {
 
 // Malformed persisted blob → recoverable parse error.
 func TestCorruptBlobIsRecoverableError(t *testing.T) {
-	tc := sporecore.NewToolContext(testSession, corruptRunStore{})
+	tc := sporecore.NewToolContext(testSession, corruptRunStore{}, nil)
 	r := NewTaskListTool().Execute(context.Background(),
 		tlCall(map[string]any{"action": "list_tasks"}),
 		sporecore.AllowAllSandbox{}, tc)
@@ -334,7 +334,7 @@ func TestListTasksDoesNotWrite(t *testing.T) {
 // No-op default: a ToolContext with no RunStore persists nothing across
 // dispatches. add_task succeeds (no error) but the next tool sees an empty list.
 func TestNoOpStoragePersistsNothing(t *testing.T) {
-	tc := sporecore.NewToolContext(testSession, nil)
+	tc := sporecore.NewToolContext(testSession, nil, nil)
 	sb := sporecore.AllowAllSandbox{}
 	tool := NewTaskListTool()
 	ctx := context.Background()
