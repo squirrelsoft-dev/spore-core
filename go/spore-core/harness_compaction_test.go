@@ -316,9 +316,9 @@ func (o *capturingObserver) EmitTurn(string, SessionID, TaskID, uint32, string, 
 }
 func (o *capturingObserver) EmitToolCall(string, string, SessionID, TaskID, string, string, string, uint64, uint64, uint64, bool, bool, json.RawMessage, string) {
 }
-func (o *capturingObserver) SetSessionOutcome(SessionID, bool, string) {}
-func (o *capturingObserver) FlushSession(context.Context, SessionID)   {}
-func (o *capturingObserver) CostFor(TokenUsage) float64                { return 0 }
+func (o *capturingObserver) SetSessionOutcome(SessionID, TerminalOutcome, string) {}
+func (o *capturingObserver) FlushSession(context.Context, SessionID)              {}
+func (o *capturingObserver) CostFor(TokenUsage) float64                           { return 0 }
 func (o *capturingObserver) EmitCompaction(string, SessionID, TaskID, string, uint32, uint32, uint32, uint32) {
 	o.compactions++
 }

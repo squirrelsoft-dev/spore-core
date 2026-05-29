@@ -231,6 +231,11 @@ const (
 	OutcomeKindFailure SessionOutcomeKind = "failure"
 	// OutcomeKindPartial — session partially succeeded.
 	OutcomeKindPartial SessionOutcomeKind = "partial"
+	// OutcomeKindEscalated — session terminated cleanly via a tool escalation
+	// signal (issue #80). Distinct from Partial: an escalation is an
+	// intentional, clean termination handing a structured signal to the caller,
+	// not a partial success.
+	OutcomeKindEscalated SessionOutcomeKind = "escalated"
 )
 
 // SessionOutcome is a tagged union.
@@ -252,6 +257,11 @@ func NewOutcomeFailure(reason string) SessionOutcome {
 // NewOutcomePartial returns a Partial outcome.
 func NewOutcomePartial() SessionOutcome {
 	return SessionOutcome{Kind: OutcomeKindPartial}
+}
+
+// NewOutcomeEscalated returns an Escalated outcome (issue #80).
+func NewOutcomeEscalated() SessionOutcome {
+	return SessionOutcome{Kind: OutcomeKindEscalated}
 }
 
 // ============================================================================

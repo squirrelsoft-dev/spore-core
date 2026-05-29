@@ -64,6 +64,18 @@ type TaskID = sporecore.TaskID
 // StopReason re-exported from sporecore.
 type StopReason = sporecore.StopReason
 
+// TerminalOutcome re-exported from sporecore (issue #80): the harness's
+// 3-state terminal outcome passed to the adapter's SetSessionOutcome.
+type TerminalOutcome = sporecore.TerminalOutcome
+
+// TerminalSuccess, TerminalFailure, TerminalEscalated re-exported from
+// sporecore for ergonomic use by observability consumers and tests.
+const (
+	TerminalSuccess   = sporecore.TerminalSuccess
+	TerminalFailure   = sporecore.TerminalFailure
+	TerminalEscalated = sporecore.TerminalEscalated
+)
+
 // GuideID re-exported from guideregistry (matches the Rust GuideId import
 // path for this component).
 type GuideID = guideregistry.GuideID

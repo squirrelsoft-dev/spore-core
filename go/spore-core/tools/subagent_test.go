@@ -77,7 +77,7 @@ func TestSubagentWaitingForHumanPropagatesParentCallID(t *testing.T) {
 	paused := &sporecore.PausedState{
 		SessionID: "s",
 		Task:      sporecore.NewTask("x", "s", sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 1}),
-		HumanRequest: sporecore.HumanRequest{
+		HumanRequest: &sporecore.HumanRequest{
 			Kind:     sporecore.HumanReqClarification,
 			Question: "yes?",
 		},

@@ -237,13 +237,20 @@ func (a *HarnessObservabilityAdapter) EmitToolCall(
 	a.provider.EmitToolCall(span)
 }
 
-// SetSessionOutcome records the terminal outcome on the wrapped provider.
-func (a *HarnessObservabilityAdapter) SetSessionOutcome(sessionID sporecore.SessionID, success bool, failureReason string) {
-	outcome := guideregistry.NewOutcomeSuccess()
-	if !success {
-		outcome = guideregistry.NewOutcomeFailure(failureReason)
+// SetSessionOutcome records the terminal outcome on the wrapped provider,
+// mapping the harness's 3-state TerminalOutcome onto the guideregistry
+// SessionOutcome enum (issue #80: TerminalEscalated -> Escalated).
+func (a *HarnessObservabilityAdapter) SetSessionOutcome(sessionID sporecore.SessionID, outcome sporecore.TerminalOutcome, failureReason string) {
+	var so guideregistry.SessionOutcome
+	switch outcome {
+	case sporecore.TerminalFailure:
+		so = guideregistry.NewOutcomeFailure(failureReason)
+	case sporecore.TerminalEscalated:
+		so = guideregistry.NewOutcomeEscalated()
+	default:
+		so = guideregistry.NewOutcomeSuccess()
 	}
-	a.provider.SetSessionOutcome(sessionID, outcome)
+	a.provider.SetSessionOutcome(sessionID, so)
 }
 
 // FlushSession flushes the wrapped provider's durable session record.

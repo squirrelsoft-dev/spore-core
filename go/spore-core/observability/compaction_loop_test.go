@@ -47,7 +47,7 @@ func TestEmitWarnOptionalPathDoesNotBreakBareProvider(t *testing.T) {
 	// A session with only warn spans has no turns/outcome, so metrics are nil
 	// until something else is recorded; record a terminal outcome (as a real
 	// run does) so GetSessionMetrics can surface the derived failure count.
-	obs.SetSessionOutcome("s2", true, "")
+	obs.SetSessionOutcome("s2", TerminalSuccess, "")
 
 	warns := mem.WarnSpans("s2")
 	if len(warns) != 1 {

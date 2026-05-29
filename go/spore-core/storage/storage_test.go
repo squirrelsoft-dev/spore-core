@@ -22,7 +22,7 @@ func paused(session string) *PausedState {
 		SessionID:    sid(session),
 		TaskID:       "task1",
 		TurnNumber:   3,
-		HumanRequest: sporecore.HumanRequest{Kind: sporecore.HumanReqToolApproval, RiskLevel: sporecore.RiskLow},
+		HumanRequest: &sporecore.HumanRequest{Kind: sporecore.HumanReqToolApproval, RiskLevel: sporecore.RiskLow},
 		Task:         sporecore.NewTask("do the thing", sid(session), sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 1}),
 	}
 }

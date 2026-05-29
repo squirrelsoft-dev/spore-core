@@ -244,7 +244,7 @@ func TestToolWaitingForHumanPropagates(t *testing.T) {
 	req := HumanRequest{Kind: HumanReqClarification, Question: "?"}
 	child := &ChildPausedState{
 		SessionID: "child", TaskID: "ct", TurnNumber: 1,
-		HumanRequest: req, Task: reactTask(1), ParentToolCallID: "c",
+		HumanRequest: &req, Task: reactTask(1), ParentToolCallID: "c",
 	}
 	reg.Push(ToolOutput{Kind: ToolOutputWaitingForHuman, ChildState: child, Request: &req})
 	cfg.ToolRegistry = reg
@@ -261,7 +261,7 @@ func TestResumeWithHaltReturnsHumanHalted(t *testing.T) {
 	h := NewStandardHarness(standardCfg(a))
 	state := PausedState{
 		SessionID: "s", TaskID: "t", TurnNumber: 1,
-		HumanRequest: HumanRequest{Kind: HumanReqClarification, Question: "?"},
+		HumanRequest: &HumanRequest{Kind: HumanReqClarification, Question: "?"},
 		Task:         reactTask(5),
 	}
 	r := h.Resume(context.Background(), state, HumanResponse{Kind: HumanRespHalt}, nil)
@@ -282,7 +282,7 @@ func TestResumeWithAllowExecutesPendingAndContinues(t *testing.T) {
 	state := PausedState{
 		SessionID: "s", TaskID: "t", TurnNumber: 1,
 		PendingToolCalls: []ToolCall{{ID: "c", Name: "x", Input: json.RawMessage(`{}`)}},
-		HumanRequest:     HumanRequest{Kind: HumanReqToolApproval, RiskLevel: RiskLow},
+		HumanRequest:     &HumanRequest{Kind: HumanReqToolApproval, RiskLevel: RiskLow},
 		Task:             reactTask(5),
 	}
 	r := h.Resume(context.Background(), state, HumanResponse{Kind: HumanRespAllow}, nil)
@@ -375,7 +375,7 @@ func TestPausedStateRoundtripJSON(t *testing.T) {
 	ps := PausedState{
 		SessionID: "s", TaskID: "t", TurnNumber: 4,
 		PendingToolCalls: []ToolCall{{ID: "c", Name: "x", Input: json.RawMessage(`{"k":1}`)}},
-		HumanRequest:     HumanRequest{Kind: HumanReqClarification, Question: "what?"},
+		HumanRequest:     &HumanRequest{Kind: HumanReqClarification, Question: "what?"},
 		Task:             reactTask(5),
 		BudgetUsed:       BudgetSnapshot{Turns: 4, InputTokens: 100, OutputTokens: 50},
 	}
@@ -399,7 +399,7 @@ func TestPausedStateRoundtripJSON(t *testing.T) {
 func TestChildPausedStateHasNoChildField(t *testing.T) {
 	cs := ChildPausedState{
 		SessionID: "c", TaskID: "ct", TurnNumber: 1,
-		HumanRequest:     HumanRequest{Kind: HumanReqClarification, Question: "?"},
+		HumanRequest:     &HumanRequest{Kind: HumanReqClarification, Question: "?"},
 		Task:             reactTask(1),
 		ParentToolCallID: "p",
 	}

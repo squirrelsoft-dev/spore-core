@@ -415,6 +415,108 @@ type StreamSink func(HarnessStreamEvent)
 // Forward-declared sibling types (full surfaces in their owning issues)
 // ============================================================================
 
+// Mode is the harness operating mode targeted by HarnessSignal.SwitchMode
+// (issue #80). It mirrors the existing prompt-chunk-registry Mode enum: the
+// wire format is the identical bare snake_case string, so a Mode value
+// round-trips byte-for-byte across the four language implementations. It is
+// defined here (not imported from promptchunkregistry) because that package
+// imports this one — taking the dependency the other way would form a cycle.
+type Mode string
+
+const (
+	ModeAlwaysAsk Mode = "always_ask"
+	ModeAutoEdit  Mode = "auto_edit"
+	ModePlan      Mode = "plan"
+	ModeSafeAuto  Mode = "safe_auto"
+	ModeYolo      Mode = "yolo"
+)
+
+// HarnessSignalKind discriminates HarnessSignal variants.
+type HarnessSignalKind string
+
+const (
+	SignalEnterPlanMode HarnessSignalKind = "enter_plan_mode"
+	SignalExitPlanMode  HarnessSignalKind = "exit_plan_mode"
+	SignalSwitchMode    HarnessSignalKind = "switch_mode"
+	SignalAbort         HarnessSignalKind = "abort"
+)
+
+// HarnessSignal is the set of signals a tool can escalate to the harness's
+// parent via ToolOutput.Escalate (issue #80). The harness is a pure
+// intermediary: it never acts on a signal itself. It terminates cleanly,
+// surfaces the signal via RunResult.Escalate, and the caller (CLI, chat UI,
+// REST API, parent harness) owns the orchestration. This mirrors the
+// WaitingForHuman model — the harness does not resume itself either.
+//
+// Wire format: serde-tagged on "kind", snake_case, byte-identical across the
+// four language implementations. Round-tripped by
+// fixtures/harness/escalation_signals.json.
+type HarnessSignal struct {
+	Kind HarnessSignalKind `json:"kind"`
+	// enter_plan_mode: context the agent has accumulated so far as a seed for
+	// the planning harness.
+	Context string `json:"-"`
+	// exit_plan_mode: the produced plan artifact for human approval before the
+	// execution harness is instantiated. This is the planning agent's terminal
+	// signal.
+	Plan *PlanArtifact `json:"-"`
+	// switch_mode: the target mode. The caller instantiates the appropriate
+	// harness for the new mode.
+	Mode Mode `json:"-"`
+	// abort: a graceful-abort reason surfaced to the user. Distinct from
+	// HaltAgentError — this is an intentional, agent-initiated stop and
+	// surfaces as RunResult.Escalate, NOT RunResult.Failure.
+	Reason string `json:"-"`
+}
+
+// MarshalJSON serialises HarnessSignal as a flat "kind"-tagged object.
+func (s HarnessSignal) MarshalJSON() ([]byte, error) {
+	switch s.Kind {
+	case SignalEnterPlanMode:
+		return json.Marshal(struct {
+			Kind    HarnessSignalKind `json:"kind"`
+			Context string            `json:"context"`
+		}{s.Kind, s.Context})
+	case SignalExitPlanMode:
+		return json.Marshal(struct {
+			Kind HarnessSignalKind `json:"kind"`
+			Plan *PlanArtifact     `json:"plan"`
+		}{s.Kind, s.Plan})
+	case SignalSwitchMode:
+		return json.Marshal(struct {
+			Kind HarnessSignalKind `json:"kind"`
+			Mode Mode              `json:"mode"`
+		}{s.Kind, s.Mode})
+	case SignalAbort:
+		return json.Marshal(struct {
+			Kind   HarnessSignalKind `json:"kind"`
+			Reason string            `json:"reason"`
+		}{s.Kind, s.Reason})
+	default:
+		return nil, fmt.Errorf("HarnessSignal: unknown kind %q", s.Kind)
+	}
+}
+
+// UnmarshalJSON decodes the flat "kind"-tagged form.
+func (s *HarnessSignal) UnmarshalJSON(data []byte) error {
+	var probe struct {
+		Kind    HarnessSignalKind `json:"kind"`
+		Context string            `json:"context"`
+		Plan    *PlanArtifact     `json:"plan"`
+		Mode    Mode              `json:"mode"`
+		Reason  string            `json:"reason"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	s.Kind = probe.Kind
+	s.Context = probe.Context
+	s.Plan = probe.Plan
+	s.Mode = probe.Mode
+	s.Reason = probe.Reason
+	return nil
+}
+
 // ToolOutputKind discriminates ToolOutput variants.
 type ToolOutputKind string
 
@@ -422,6 +524,11 @@ const (
 	ToolOutputSuccess         ToolOutputKind = "success"
 	ToolOutputError           ToolOutputKind = "error"
 	ToolOutputWaitingForHuman ToolOutputKind = "waiting_for_human"
+	// ToolOutputEscalate — tool requests a structural state change from the
+	// harness's parent (issue #80). The harness terminates cleanly and passes
+	// the signal to the caller via RunResult.Escalate. The escalation is NOT
+	// appended to message history.
+	ToolOutputEscalate ToolOutputKind = "escalate"
 )
 
 // ToolOutput is the result of dispatching one tool call. Full shape lives
@@ -438,6 +545,8 @@ type ToolOutput struct {
 	// waiting_for_human
 	ChildState *ChildPausedState `json:"-"`
 	Request    *HumanRequest     `json:"-"`
+	// escalate (issue #80)
+	Signal *HarnessSignal `json:"-"`
 }
 
 // MarshalJSON serialises ToolOutput as a flat tagged object.
@@ -461,6 +570,12 @@ func (o ToolOutput) MarshalJSON() ([]byte, error) {
 			ChildState *ChildPausedState `json:"child_state"`
 			Request    *HumanRequest     `json:"request"`
 		}{o.Kind, o.ChildState, o.Request})
+	case ToolOutputEscalate:
+		// Nested tagged union: signal is itself a "kind"-tagged HarnessSignal.
+		return json.Marshal(struct {
+			Kind   ToolOutputKind `json:"kind"`
+			Signal *HarnessSignal `json:"signal"`
+		}{o.Kind, o.Signal})
 	default:
 		return nil, fmt.Errorf("ToolOutput: unknown kind %q", o.Kind)
 	}
@@ -476,6 +591,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 		Recoverable bool              `json:"recoverable"`
 		ChildState  *ChildPausedState `json:"child_state"`
 		Request     *HumanRequest     `json:"request"`
+		Signal      *HarnessSignal    `json:"signal"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -487,6 +603,7 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	o.Recoverable = probe.Recoverable
 	o.ChildState = probe.ChildState
 	o.Request = probe.Request
+	o.Signal = probe.Signal
 	return nil
 }
 
@@ -750,15 +867,22 @@ type TerminationDecision struct {
 // (#8) own the schema.
 type SessionState struct {
 	Messages []Message      `json:"messages"`
-	Extras   map[string]any `json:"extras,omitempty"`
+	Extras   map[string]any `json:"extras"`
 }
 
-// MarshalJSON ensures Messages serialises as [] rather than null.
+// MarshalJSON ensures Messages serialises as [] and Extras as {} rather than
+// null/omitted. Extras is always emitted (matching the Rust serde-default and
+// Python default-factory siblings, both of which serialise an empty extras as
+// {}) so PausedState / SessionState round-trips are byte-identical across the
+// four languages — see the shared escalation fixture (issue #80).
 func (s SessionState) MarshalJSON() ([]byte, error) {
 	type alias SessionState
 	a := alias(s)
 	if a.Messages == nil {
 		a.Messages = []Message{}
+	}
+	if a.Extras == nil {
+		a.Extras = map[string]any{}
 	}
 	return json.Marshal(a)
 }
@@ -1029,8 +1153,10 @@ type HarnessObserver interface {
 		resultContent string,
 	)
 
-	// SetSessionOutcome records the terminal outcome (success / failure).
-	SetSessionOutcome(sessionID SessionID, success bool, failureReason string)
+	// SetSessionOutcome records the terminal outcome. outcome is the harness's
+	// 3-state terminal signal (success / failure / escalated, issue #80);
+	// failureReason is non-empty only for TerminalFailure.
+	SetSessionOutcome(sessionID SessionID, outcome TerminalOutcome, failureReason string)
 
 	// FlushSession flushes the durable session record.
 	FlushSession(ctx context.Context, sessionID SessionID)
@@ -1242,10 +1368,17 @@ type PausedState struct {
 	SessionState     SessionState        `json:"session_state"`
 	PendingToolCalls []ToolCall          `json:"pending_tool_calls"`
 	ApprovedResults  []HarnessToolResult `json:"approved_results"`
-	HumanRequest     HumanRequest        `json:"human_request"`
-	Task             Task                `json:"task"`
-	BudgetUsed       BudgetSnapshot      `json:"budget_used"`
-	ChildState       *ChildPausedState   `json:"child_state,omitempty"`
+	// HumanRequest is nil for an escalation-derived state (issue #80) — an
+	// escalation has no human request. The WaitingForHuman construction paths
+	// always set it. Serialised as null (not omitted) so the wire form matches
+	// the Rust Option<HumanRequest> with #[serde(default)] byte-for-byte.
+	HumanRequest *HumanRequest  `json:"human_request"`
+	Task         Task           `json:"task"`
+	BudgetUsed   BudgetSnapshot `json:"budget_used"`
+	// ChildState is serialised as null (not omitted) when absent, matching the
+	// Rust Option<ChildPausedState> with #[serde(default)] and the Python
+	// sibling so PausedState round-trips byte-identically across languages.
+	ChildState *ChildPausedState `json:"child_state"`
 }
 
 // MarshalJSON ensures slice fields serialise as [].
@@ -1270,10 +1403,13 @@ type ChildPausedState struct {
 	SessionState     SessionState        `json:"session_state"`
 	PendingToolCalls []ToolCall          `json:"pending_tool_calls"`
 	ApprovedResults  []HarnessToolResult `json:"approved_results"`
-	HumanRequest     HumanRequest        `json:"human_request"`
-	Task             Task                `json:"task"`
-	BudgetUsed       BudgetSnapshot      `json:"budget_used"`
-	ParentToolCallID string              `json:"parent_tool_call_id"`
+	// HumanRequest is nil for an escalation-derived state (issue #80). The
+	// WaitingForHuman construction paths always set it. Serialised as null
+	// (not omitted) to match the Rust Option<HumanRequest> wire form.
+	HumanRequest     *HumanRequest  `json:"human_request"`
+	Task             Task           `json:"task"`
+	BudgetUsed       BudgetSnapshot `json:"budget_used"`
+	ParentToolCallID string         `json:"parent_tool_call_id"`
 }
 
 // MarshalJSON ensures slice fields serialise as [].
@@ -1494,6 +1630,11 @@ const (
 	RunSuccess         RunResultKind = "success"
 	RunFailure         RunResultKind = "failure"
 	RunWaitingForHuman RunResultKind = "waiting_for_human"
+	// RunEscalate — harness terminated cleanly due to a tool escalation signal
+	// (issue #80). Carries the signal plus the preserved session state so the
+	// caller can resume the original harness, instantiate a new one, or present
+	// UI to the user.
+	RunEscalate RunResultKind = "escalate"
 )
 
 // RunResult is the outcome of Harness.Run / Harness.Resume.
@@ -1507,9 +1648,11 @@ type RunResult struct {
 	SessionID SessionID      `json:"-"`
 	Usage     AggregateUsage `json:"-"`
 	Turns     uint32         `json:"-"`
-	// waiting_for_human
+	// waiting_for_human, escalate (both carry State)
 	State   *PausedState  `json:"-"`
 	Request *HumanRequest `json:"-"`
+	// escalate (issue #80)
+	Signal *HarnessSignal `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1537,6 +1680,16 @@ func (r RunResult) MarshalJSON() ([]byte, error) {
 			State   *PausedState  `json:"state"`
 			Request *HumanRequest `json:"request"`
 		}{r.Kind, r.State, r.Request})
+	case RunEscalate:
+		// Nested tagged union: signal is itself a "kind"-tagged HarnessSignal.
+		return json.Marshal(struct {
+			Kind      RunResultKind  `json:"kind"`
+			Signal    *HarnessSignal `json:"signal"`
+			State     *PausedState   `json:"state"`
+			SessionID SessionID      `json:"session_id"`
+			Usage     AggregateUsage `json:"usage"`
+			Turns     uint32         `json:"turns"`
+		}{r.Kind, r.Signal, r.State, r.SessionID, r.Usage, r.Turns})
 	default:
 		return nil, fmt.Errorf("RunResult: unknown kind %q", r.Kind)
 	}
@@ -1553,6 +1706,7 @@ func (r *RunResult) UnmarshalJSON(data []byte) error {
 		Turns     uint32         `json:"turns"`
 		State     *PausedState   `json:"state"`
 		Request   *HumanRequest  `json:"request"`
+		Signal    *HarnessSignal `json:"signal"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1565,6 +1719,7 @@ func (r *RunResult) UnmarshalJSON(data []byte) error {
 	r.Turns = probe.Turns
 	r.State = probe.State
 	r.Request = probe.Request
+	r.Signal = probe.Signal
 	return nil
 }
 
@@ -1761,15 +1916,32 @@ func strategyNotImplemented(task Task, strategy string) RunResult {
 // the observability backend's lexical timestamps).
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// TerminalOutcome is the harness's 3-state terminal signal handed to the
+// observability seam (issue #80). It mirrors the Rust `SessionOutcome` arms the
+// harness loop produces: a clean success, a halt failure, or an escalation. An
+// escalation is NOT a failure and NOT a partial — it is an intentional, clean
+// termination that hands a structured HarnessSignal to the caller.
+type TerminalOutcome uint8
+
+const (
+	// TerminalSuccess — the run completed successfully.
+	TerminalSuccess TerminalOutcome = iota
+	// TerminalFailure — the run halted on a HaltReason.
+	TerminalFailure
+	// TerminalEscalated — the run terminated via a tool escalation signal.
+	TerminalEscalated
+)
+
 // finalizeObservability records the terminal outcome and flushes the session.
-// Called at every terminal runReAct outcome (Success or any Failure) — never
-// on a WaitingForHuman pause, which is not terminal. No-op when no observer is
-// configured. Mirrors the Rust `finalize_observability` wrapper.
-func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID SessionID, success bool, failureReason string) {
+// Called at every terminal runReAct outcome (Success, any Failure, or an
+// Escalation, issue #80) — never on a WaitingForHuman pause, which is not
+// terminal. No-op when no observer is configured. Mirrors the Rust
+// `finalize_observability` wrapper.
+func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID SessionID, outcome TerminalOutcome, failureReason string) {
 	if h.config.Observability == nil {
 		return
 	}
-	h.config.Observability.SetSessionOutcome(sessionID, success, failureReason)
+	h.config.Observability.SetSessionOutcome(sessionID, outcome, failureReason)
 	h.config.Observability.FlushSession(ctx, sessionID)
 }
 
@@ -1788,9 +1960,14 @@ func (h *StandardHarness) runReAct(
 	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
 	switch result.Kind {
 	case RunSuccess:
-		h.finalizeObservability(ctx, result.SessionID, true, "")
+		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
 	case RunFailure:
-		h.finalizeObservability(ctx, result.SessionID, false, haltReasonString(result.Reason))
+		h.finalizeObservability(ctx, result.SessionID, TerminalFailure, haltReasonString(result.Reason))
+	case RunEscalate:
+		// Escalation is a clean terminal outcome (issue #80) — finalize with
+		// the dedicated Escalated outcome (NOT Failure, NOT Partial), in
+		// contrast to WaitingForHuman which is not terminal and does not flush.
+		h.finalizeObservability(ctx, result.SessionID, TerminalEscalated, "")
 	case RunWaitingForHuman:
 		// Not terminal — do not flush.
 	}
@@ -1943,9 +2120,13 @@ func (h *StandardHarness) runPlanExecute(
 func (h *StandardHarness) finalizePlanExecute(ctx context.Context, result RunResult) {
 	switch result.Kind {
 	case RunSuccess:
-		h.finalizeObservability(ctx, result.SessionID, true, "")
+		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
 	case RunFailure:
-		h.finalizeObservability(ctx, result.SessionID, false, haltReasonString(result.Reason))
+		h.finalizeObservability(ctx, result.SessionID, TerminalFailure, haltReasonString(result.Reason))
+	case RunEscalate:
+		// Escalation is a clean terminal outcome (issue #80) — finalize with
+		// the dedicated Escalated outcome.
+		h.finalizeObservability(ctx, result.SessionID, TerminalEscalated, "")
 	case RunWaitingForHuman:
 		// Not terminal — do not flush.
 	}
@@ -2126,6 +2307,11 @@ func (h *StandardHarness) runExecutePhase(
 
 		case RunWaitingForHuman:
 			// A step surfacing to a human pauses the whole run; propagate.
+			return subResult
+
+		case RunEscalate:
+			// A step escalating (issue #80) terminates the whole run cleanly;
+			// propagate the signal and preserved state up.
 			return subResult
 		}
 	}
@@ -2475,7 +2661,7 @@ func (h *StandardHarness) runReActInner(
 				state := &PausedState{
 					SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 					SessionState: session, PendingToolCalls: nil, ApprovedResults: nil,
-					HumanRequest: req, Task: task, BudgetUsed: budget, ChildState: nil,
+					HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
 				}
 				return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 			}
@@ -2568,7 +2754,7 @@ func (h *StandardHarness) runReActInner(
 					state := &PausedState{
 						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 						SessionState: session, PendingToolCalls: nil, ApprovedResults: nil,
-						HumanRequest: req, Task: task, BudgetUsed: budget, ChildState: nil,
+						HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
@@ -2671,7 +2857,7 @@ func (h *StandardHarness) runReActInner(
 					state := &PausedState{
 						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 						SessionState: session, PendingToolCalls: calls, ApprovedResults: nil,
-						HumanRequest: req, Task: task, BudgetUsed: budget, ChildState: nil,
+						HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
@@ -2726,11 +2912,44 @@ func (h *StandardHarness) runReActInner(
 					state := &PausedState{
 						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 						SessionState: session, PendingToolCalls: remaining,
-						ApprovedResults: approved, HumanRequest: req, Task: task,
+						ApprovedResults: approved, HumanRequest: &req, Task: task,
 						BudgetUsed: budget, ChildState: output.ChildState,
 					}
 					_ = toolPause
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
+				}
+
+				// Escalation propagation (issue #80): a tool requests a
+				// structural state change. The harness is a pure intermediary —
+				// it does NOT act on the signal. It terminates cleanly,
+				// preserves session state for a possible resume, and returns
+				// RunResult.Escalate. The escalation is a control signal, NOT a
+				// conversation turn: it is never appended to message history,
+				// and the remaining tool calls in this batch are preserved into
+				// PendingToolCalls (mirroring WaitingForHuman). The signal is NOT
+				// stored in PausedState, so it is discarded on resume — the
+				// harness never re-acts on it. HumanRequest is nil: an
+				// escalation has no human request.
+				if output.Kind == ToolOutputEscalate {
+					remaining := append([]ToolCall(nil), calls[i+1:]...)
+					signal := HarnessSignal{}
+					if output.Signal != nil {
+						signal = *output.Signal
+					}
+					state := &PausedState{
+						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
+						SessionState: session, PendingToolCalls: remaining,
+						ApprovedResults: approved, HumanRequest: nil, Task: task,
+						BudgetUsed: budget, ChildState: nil,
+					}
+					return RunResult{
+						Kind:      RunEscalate,
+						Signal:    &signal,
+						State:     state,
+						SessionID: sessionID,
+						Usage:     usage,
+						Turns:     budget.Turns,
+					}
 				}
 
 				isError := output.Kind == ToolOutputError
