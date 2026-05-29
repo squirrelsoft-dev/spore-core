@@ -81,6 +81,7 @@ from spore_core.memory import now
 from spore_core.observability_outbox import OutboxConfig, OutboxObservabilityProvider
 from spore_core.ollama import OllamaModelInterface
 from spore_core.sandbox import WorkspaceScopedSandbox
+from spore_core.storage import InMemoryStorageProvider
 
 from .scenarios import (
     CompleteOnFinalResponse,
@@ -173,7 +174,7 @@ async def _run_live(
     sandbox = WorkspaceScopedSandbox(
         WorkspaceConfig(root=workspace, read_only=False, max_file_size=0)
     )
-    bridge = RealToolRegistry(registry, sandbox)
+    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
     tool_schemas = bridge.model_schemas()
 
     window_limit = 200 if scenario is ScenarioId.S3 else 128_000

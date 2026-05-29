@@ -34,6 +34,7 @@ from spore_core.harness import (
     ToolOutputSuccess,
 )
 from spore_core.model import MockModelInterface, ProviderInfo, TokenUsage, ToolCall
+from spore_core.storage import InMemoryStorageProvider
 from spore_core.observability import (
     ContextOperationCompaction,
     InMemoryObservabilityProvider,
@@ -278,7 +279,7 @@ async def test_s4_tool_failure_then_recovery() -> None:
 
     registry = build_real_tool_registry(ScenarioId.S4)
     sandbox = AllowAllSandbox()
-    bridge = RealToolRegistry(registry, sandbox)
+    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -304,7 +305,12 @@ async def test_s4_tool_failure_then_recovery() -> None:
 async def test_s4_failing_tool_is_not_always_halt() -> None:
     """The harness must NOT hard-halt on the recoverable FailingTool error — the
     bridge reports ``is_always_halt == False``."""
-    bridge = RealToolRegistry(build_real_tool_registry(ScenarioId.S4), AllowAllSandbox())
+    bridge = RealToolRegistry(
+        build_real_tool_registry(ScenarioId.S4),
+        AllowAllSandbox(),
+        SessionId("s4-halt-test"),
+        InMemoryStorageProvider(),
+    )
     assert not bridge.is_always_halt("flaky_op")
     out = await bridge.dispatch(_call("c1", "flaky_op", {}))
     from spore_core.harness import ToolOutputError
@@ -344,7 +350,7 @@ async def test_s5_shell_pipeline_uppercases_via_bash_command() -> None:
 
     registry = build_real_tool_registry(ScenarioId.S5)
     sandbox = AllowAllSandbox()
-    bridge = RealToolRegistry(registry, sandbox)
+    bridge = RealToolRegistry(registry, sandbox, session_id, InMemoryStorageProvider())
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -382,7 +388,12 @@ def test_scenario_id_parses() -> None:
 
 
 def _schema_names(scenario: ScenarioId) -> list[str]:
-    bridge = RealToolRegistry(build_real_tool_registry(scenario), AllowAllSandbox())
+    bridge = RealToolRegistry(
+        build_real_tool_registry(scenario),
+        AllowAllSandbox(),
+        SessionId("schema-test"),
+        InMemoryStorageProvider(),
+    )
     return [s.name for s in bridge.model_schemas()]
 
 

@@ -32,12 +32,15 @@ from spore_core.tool_registry import (
     SubagentMock,
     ToolAnnotations,
     ToolSchema,
+    make_test_ctx,
 )
 from spore_tools.tools.subagent import (
     BuildError,
     ContextSharingIsolated,
     SubagentTool,
 )
+
+_CTX = make_test_ctx()
 
 
 class _ScriptedHarness:
@@ -83,7 +86,7 @@ async def test_subagent_success_maps_to_tool_success() -> None:
         ]
     )
     sub = _subagent_tool(h)
-    r = await sub.execute(_call({"instruction": "do it"}), AllowAllSandbox())
+    r = await sub.execute(_call({"instruction": "do it"}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputSuccess)
     assert r.content == "child done"
 
@@ -100,7 +103,7 @@ async def test_subagent_failure_maps_to_recoverable_error() -> None:
         ]
     )
     sub = _subagent_tool(h)
-    r = await sub.execute(_call({"instruction": "x"}), AllowAllSandbox())
+    r = await sub.execute(_call({"instruction": "x"}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
 
@@ -133,7 +136,7 @@ async def test_subagent_waiting_for_human_propagates_with_parent_call_id() -> No
         ]
     )
     sub = _subagent_tool(h)
-    r = await sub.execute(_call({"instruction": "x"}), AllowAllSandbox())
+    r = await sub.execute(_call({"instruction": "x"}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputWaitingForHuman)
     assert r.child_state.parent_tool_call_id == "parent-call-1"
 
@@ -165,6 +168,6 @@ async def test_construction_rejects_child_with_subagent_tools() -> None:
 async def test_missing_instruction_returns_recoverable_error() -> None:
     h = _ScriptedHarness([])
     sub = _subagent_tool(h, timeout=1.0)
-    r = await sub.execute(_call({}), AllowAllSandbox())
+    r = await sub.execute(_call({}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True

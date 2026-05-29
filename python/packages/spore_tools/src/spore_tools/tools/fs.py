@@ -15,7 +15,7 @@ from spore_core.harness import (
 )
 from spore_core.sandbox import SandboxViolationException
 from spore_core.model import ToolCall
-from spore_core.tool_registry import ToolAnnotations, ToolSchema
+from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 
 from ._common import LARGE_OUTPUT_THRESHOLD, finish_with_possible_truncation
 from .error import (
@@ -63,7 +63,9 @@ class ReadFileTool:
             annotations=ToolAnnotations(read_only=True, idempotent=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(ReadFileParams, call)
             resolved = await _resolve(sandbox, params.path, "read")
@@ -112,7 +114,9 @@ class WriteFileTool:
             annotations=ToolAnnotations(destructive=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(WriteFileParams, call)
             resolved = await _resolve(sandbox, params.path, "write")
@@ -167,7 +171,9 @@ class ListDirTool:
             annotations=ToolAnnotations(read_only=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(ListDirParams, call)
             resolved = await _resolve(sandbox, params.path, "read")
@@ -228,7 +234,9 @@ class DeleteFileTool:
             annotations=ToolAnnotations(destructive=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(DeleteFileParams, call)
             resolved = await _resolve(sandbox, params.path, "write")
@@ -274,7 +282,9 @@ class MoveFileTool:
             annotations=ToolAnnotations(destructive=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(MoveFileParams, call)
             src = await _resolve(sandbox, params.src, "write")

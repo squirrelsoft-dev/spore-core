@@ -12,7 +12,7 @@ from spore_core.harness import (
     ToolOutput,
 )
 from spore_core.model import ToolCall
-from spore_core.tool_registry import ToolAnnotations, ToolSchema
+from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 
 from ._common import finish_with_possible_truncation
 from .error import InvalidParameters, ToolExecutionError
@@ -48,7 +48,9 @@ class GrepFilesTool:
             annotations=ToolAnnotations(read_only=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(GrepFilesParams, call)
         except ToolExecutionError as e:
@@ -116,7 +118,9 @@ class FindFilesTool:
             annotations=ToolAnnotations(read_only=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(FindFilesParams, call)
         except ToolExecutionError as e:

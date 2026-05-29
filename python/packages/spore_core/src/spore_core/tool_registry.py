@@ -16,6 +16,20 @@ What this component does:
 * Expose :meth:`ToolRegistry.has_subagent_tools` so ``SubagentTool``
   (issue #5) can enforce the depth-1 rule at construction time
 
+Storage seam — :class:`ToolContext` (#75)
+-----------------------------------------
+Tools receive a :class:`ToolContext` on every dispatch, *in addition to* the
+:class:`SandboxProvider`. :class:`ToolContext` is the storage seam:
+``{session_id: SessionId, run_store: RunStore}``. The new
+:meth:`Tool.execute` signature is ``execute(call, sandbox, ctx)`` — ``ctx`` is
+added *after* the sandbox (storage is additive; the sandbox is NOT folded in).
+:meth:`StandardToolRegistry.dispatch` / :meth:`dispatch_all` thread the
+:class:`ToolContext` through to every tool. The harness-side ``RealToolRegistry``
+bridge (``spore_eval.scenarios``) is constructed per-run with the
+:class:`SessionId` + :class:`RunStore` and builds the :class:`ToolContext` itself
+before forwarding; the harness-loop ``dispatch(call)`` signature is UNCHANGED.
+:class:`ToolContext` is a dataclass so future fields are non-breaking.
+
 What this component does NOT do:
 
 * Retry recoverable failures (middleware concern — issue #11)
@@ -54,7 +68,7 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 import anyio
 
@@ -66,11 +80,44 @@ from .harness import (
     BaseSandboxProvider,
     SandboxProvider,
     SandboxViolation,
+    SessionId,
     ToolOutput,
     ToolOutputSuccess,
 )
 from .model import ToolCall
 from .model import ToolSchema as ModelToolSchema
+
+if TYPE_CHECKING:
+    from .storage import RunStore
+
+# ============================================================================
+# ToolContext — the storage seam handed to every tool (#75)
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """The per-dispatch storage seam handed to every :meth:`Tool.execute` call,
+    alongside (but separate from) the :class:`SandboxProvider`.
+
+    It carries the minimum a tool needs to persist durable state via the
+    storage layer:
+
+    * ``session_id`` — the run's :class:`SessionId`, the key namespace for the
+      :class:`RunStore`.
+    * ``run_store`` — the :class:`RunStore` domain of the configured storage
+      provider.
+
+    It is a **dataclass** (not a tuple) so future fields can be added without
+    breaking the trait signature again. The :class:`SandboxProvider` is
+    intentionally NOT folded in here — storage is additive; tools still receive
+    the sandbox as its own parameter (some tools need the filesystem sandbox and
+    no storage).
+    """
+
+    session_id: SessionId
+    run_store: RunStore
+
 
 # ============================================================================
 # ToolAnnotations & ToolSchema (registry-side, richer than model.ToolSchema)
@@ -222,8 +269,9 @@ class DispatchError(SporeError):
 class Tool(Protocol):
     """A single tool implementation.
 
-    Tools are stateless and receive a :class:`SandboxProvider` on every
-    dispatch. The protocol is structural — concrete impls do not inherit.
+    Tools are stateless and receive a :class:`SandboxProvider` (environment
+    seam) and a :class:`ToolContext` (storage seam) on every dispatch. The
+    protocol is structural — concrete impls do not inherit.
     """
 
     def name(self) -> str: ...
@@ -232,7 +280,9 @@ class Tool(Protocol):
 
     def may_produce_large_output(self) -> bool: ...
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput: ...
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput: ...
 
 
 # ============================================================================
@@ -250,10 +300,12 @@ class ToolRegistry(Protocol):
 
     def active_schemas(self, phase: TaskPhase | None) -> list[ToolSchema]: ...
 
-    async def dispatch(self, call: ToolCall, sandbox: SandboxProvider) -> ToolResult: ...
+    async def dispatch(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolResult: ...
 
     async def dispatch_all(
-        self, calls: list[ToolCall], sandbox: SandboxProvider
+        self, calls: list[ToolCall], sandbox: SandboxProvider, ctx: ToolContext
     ) -> list[ToolResult | DispatchError]: ...
 
     def has_subagent_tools(self) -> bool: ...
@@ -353,7 +405,9 @@ class StandardToolRegistry:
         schemas.sort(key=lambda s: s.name)
         return schemas
 
-    async def dispatch(self, call: ToolCall, sandbox: SandboxProvider) -> ToolResult:
+    async def dispatch(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolResult:
         entry = self._tools.get(call.name)
         if entry is None:
             raise DispatchError.unregistered_tool(call.name)
@@ -365,11 +419,11 @@ class StandardToolRegistry:
 
         self._validate_input(entry.schema, call)
 
-        output = await entry.tool.execute(call, sandbox)
+        output = await entry.tool.execute(call, sandbox, ctx)
         return ToolResult(call_id=call.id, output=output)
 
     async def dispatch_all(
-        self, calls: list[ToolCall], sandbox: SandboxProvider
+        self, calls: list[ToolCall], sandbox: SandboxProvider, ctx: ToolContext
     ) -> list[ToolResult | DispatchError]:
         # Classify each call. Unknown tools schedule sequentially so their
         # error surfaces deterministically alongside other sequential
@@ -387,7 +441,7 @@ class StandardToolRegistry:
 
         async def run_one(idx: int) -> None:
             try:
-                results[idx] = await self.dispatch(calls[idx], sandbox)
+                results[idx] = await self.dispatch(calls[idx], sandbox, ctx)
             except DispatchError as e:
                 results[idx] = e
 
@@ -437,7 +491,9 @@ class EchoTool:
     def may_produce_large_output(self) -> bool:
         return False
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         import json as _json
 
         self.calls += 1
@@ -462,7 +518,9 @@ class FailingTool:
     def may_produce_large_output(self) -> bool:
         return False
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         from .harness import ToolOutputError
 
         return ToolOutputError(message="boom", recoverable=True)
@@ -483,8 +541,22 @@ class SubagentMock:
     def may_produce_large_output(self) -> bool:
         return False
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         return ToolOutputSuccess(content="subagent done", truncated=False)
+
+
+def make_test_ctx() -> ToolContext:
+    """Build a throwaway :class:`ToolContext` for tests: a fresh in-memory run
+    store and a fixed test session id. Mirrors the Rust ``mock::test_ctx``
+    (named ``make_test_ctx`` here so pytest does not collect it as a test)."""
+    from .storage import InMemoryStorageProvider
+
+    return ToolContext(
+        session_id=SessionId("test-session"),
+        run_store=InMemoryStorageProvider(),
+    )
 
 
 class AllowAllSandbox(BaseSandboxProvider):
@@ -522,8 +594,10 @@ __all__ = [
     "TaskPhase",
     "Tool",
     "ToolAnnotations",
+    "ToolContext",
     "ToolRegistry",
     "ToolResult",
     "ToolSchema",
     "ToolSet",
+    "make_test_ctx",
 ]

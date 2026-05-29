@@ -62,10 +62,12 @@ from spore_core.model import (
     ToolCall,
     ToolSchema,
 )
+from spore_core.storage import RunStore
 from spore_core.tool_registry import (
     DispatchError,
     StandardToolRegistry,
     ToolAnnotations,
+    ToolContext,
 )
 from spore_core.tool_registry import ToolSchema as RegistrySchema
 from spore_core.agent import Context as AgentContext
@@ -88,14 +90,30 @@ class RealToolRegistry:
 
     The harness calls ``dispatch(ToolCall) -> ToolOutput`` with no sandbox (the
     sandbox is validated separately by the loop). This bridge forwards to the
-    inner registry's ``dispatch(call, sandbox)`` and maps the result. A
+    inner registry's ``dispatch(call, sandbox, ctx)`` and maps the result. A
     ``DispatchError`` becomes a *recoverable* ``ToolOutputError`` so the loop
     appends it as a tool result rather than halting — S4 depends on this.
+
+    Storage seam (#75)
+    ------------------
+    Per the construction-injection decision, the bridge is given the run's
+    :class:`SessionId` and a :class:`RunStore` at construction time (it is
+    already built per-run). On each dispatch it builds a :class:`ToolContext`
+    from those injected fields and forwards it into the inner registry. This
+    keeps the harness-loop ``dispatch(call)`` signature unchanged while threading
+    storage to tools.
     """
 
-    def __init__(self, inner: StandardToolRegistry, sandbox: SandboxProvider) -> None:
+    def __init__(
+        self,
+        inner: StandardToolRegistry,
+        sandbox: SandboxProvider,
+        session_id: SessionId,
+        run_store: RunStore,
+    ) -> None:
         self._inner = inner
         self._sandbox = sandbox
+        self._ctx = ToolContext(session_id=session_id, run_store=run_store)
         # Snapshot the model-facing schemas (sorted by name) once at
         # construction; the catalog is fixed for a scenario run.
         self._schemas: list[ToolSchema] = sorted(
@@ -109,7 +127,7 @@ class RealToolRegistry:
 
     async def dispatch(self, call: ToolCall) -> ToolOutput:
         try:
-            result = await self._inner.dispatch(call, self._sandbox)
+            result = await self._inner.dispatch(call, self._sandbox, self._ctx)
         except DispatchError as err:
             return ToolOutputError(message=f"dispatch failed: {err}", recoverable=True)
         return result.output
@@ -268,8 +286,10 @@ class FailingTool:
             annotations=ToolAnnotations(idempotent=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
-        _ = (call, sandbox)
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
+        _ = (call, sandbox, ctx)
         return ToolOutputError(
             message="flaky_op is unavailable right now; try a different approach",
             recoverable=True,

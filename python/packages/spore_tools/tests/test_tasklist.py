@@ -1,10 +1,16 @@
-"""Tests for the TaskList primitive, tool, and disk persistence (issue #71).
+"""Tests for the TaskList primitive, tool, and storage seam (issues #71, #75).
 
 Mirrors the unit + fixture-replay tests in
 ``rust/crates/spore-core/src/tasklist.rs`` and
 ``rust/crates/spore-core/src/tools/tasklist.rs``. Outcomes MUST be byte-identical
 across all four languages — the shared fixtures under ``fixtures/tasklist/`` are
 ground truth.
+
+The standalone ``task_list`` tool persists via the ``ToolContext``'s
+``RunStore`` (#75), keyed by ``SessionId`` under ``TASK_LIST_EXTRAS_KEY`` —
+NOT the sandbox filesystem. ``operations.json`` is replayed over a fresh
+in-memory ``RunStore``; ``transitions.json`` / ``serialization.json`` are
+backend-agnostic.
 """
 
 from __future__ import annotations
@@ -17,21 +23,27 @@ import pytest
 from spore_core.harness import (
     BaseSandboxProvider,
     Operation,
+    SandboxPathEscape,
     SandboxViolation,
+    SessionId,
     ToolOutputError,
     ToolOutputSuccess,
 )
 from spore_core.model import ToolCall
+from spore_core.storage import (
+    InMemoryStorageProvider,
+    RunStore,
+    StorageBackendError,
+)
 from spore_core.tasklist import (
-    TASK_LIST_PATH,
+    TASK_LIST_EXTRAS_KEY,
     Task,
     TaskList,
     TaskListError,
     TaskStatus,
-    load_task_list,
-    store_task_list,
     validate_transition,
 )
+from spore_core.tool_registry import ToolContext
 from spore_tools.tools.tasklist import TaskListTool
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -43,23 +55,66 @@ FIXTURES = REPO_ROOT / "fixtures" / "tasklist"
 # ============================================================================
 
 
-class _TempRootSandbox(BaseSandboxProvider):
-    """Roots ``.spore/task_list.json`` inside a tempdir so the read-modify-write
-    hits a real (isolated) file. Mirrors the Rust ``TempRootSandbox``: no
-    boundary checks, the parent dir is created on write by ``store_task_list``."""
+class _AllowAllSandbox(BaseSandboxProvider):
+    """Permissive sandbox — the tool no longer touches the filesystem, so the
+    sandbox is irrelevant to persistence."""
 
-    def __init__(self, root: Path) -> None:
-        self._root = root
+    async def validate(self, call: ToolCall) -> SandboxViolation | None:
+        return None
+
+
+class _DenyPathSandbox(BaseSandboxProvider):
+    """Sandbox whose ``resolve_path`` denies every path. Proves the tool
+    persists to the RunStore, not the sandbox: ``add_task`` still succeeds even
+    though the sandbox would reject any filesystem path."""
 
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
 
     async def resolve_path(self, path: str, operation: Operation = "read") -> Path:
-        return self._root / path
+        raise AssertionError("task_list tool must not resolve any sandbox path")
 
 
-def _sandbox(root: Path) -> _TempRootSandbox:
-    return _TempRootSandbox(root)
+class _FailingRunStore:
+    """A RunStore that always fails, to prove storage errors map to a
+    recoverable tool error."""
+
+    async def get(self, session_id: SessionId, key: str) -> object | None:
+        raise StorageBackendError("boom")
+
+    async def put(self, session_id: SessionId, key: str, value: object) -> None:
+        raise StorageBackendError("boom")
+
+    async def delete(self, session_id: SessionId, key: str) -> None:
+        return None
+
+    async def list_keys(self, session_id: SessionId) -> list[str]:
+        return []
+
+
+class _CorruptRunStore:
+    """A RunStore whose blob for the task_list key is malformed for a
+    ``TaskList``, to prove a parse failure is recoverable."""
+
+    async def get(self, session_id: SessionId, key: str) -> object | None:
+        return {"tasks": "not an array"}
+
+    async def put(self, session_id: SessionId, key: str, value: object) -> None:
+        return None
+
+    async def delete(self, session_id: SessionId, key: str) -> None:
+        return None
+
+    async def list_keys(self, session_id: SessionId) -> list[str]:
+        return []
+
+
+def _ctx_with(run_store: RunStore, session: str = "test-session") -> ToolContext:
+    return ToolContext(session_id=SessionId(session), run_store=run_store)
+
+
+def _in_memory_ctx() -> ToolContext:
+    return _ctx_with(InMemoryStorageProvider())
 
 
 def _call(input_: dict) -> ToolCall:
@@ -78,6 +133,13 @@ def _list_with(*statuses: TaskStatus) -> TaskList:
 def _parse_list(out: object) -> TaskList:
     assert isinstance(out, ToolOutputSuccess), f"expected Success, got {out!r}"
     return TaskList.from_json(out.content)
+
+
+async def _load_from_store(run_store: RunStore, session: str = "test-session") -> TaskList | None:
+    value = await run_store.get(SessionId(session), TASK_LIST_EXTRAS_KEY)
+    if value is None:
+        return None
+    return TaskList.from_dict(value)
 
 
 # ============================================================================
@@ -276,113 +338,172 @@ def test_populated_serializes_canonically() -> None:
 
 
 # ============================================================================
-# Disk persistence (unit)
+# Tool — storage seam over a RunStore (#75)
 # ============================================================================
 
 
-async def test_load_absent_file_yields_default(tmp_path: Path) -> None:
-    tl = await load_task_list(_sandbox(tmp_path))
-    assert tl == TaskList()
-
-
-async def test_store_then_load_identical(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
-    tl = TaskList()
-    tl.add("one")
-    tl.update(1, TaskStatus.BLOCKED)
-    await store_task_list(tl, sb)
-    # File exists at the canonical path under the workspace root.
-    assert (tmp_path / TASK_LIST_PATH).exists()
-    reloaded = await load_task_list(sb)
-    assert reloaded == tl
-
-
-async def test_load_malformed_raises(tmp_path: Path) -> None:
-    target = tmp_path / TASK_LIST_PATH
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("not json", encoding="utf-8")
-    with pytest.raises(ValueError):
-        await load_task_list(_sandbox(tmp_path))
-
-
-# ============================================================================
-# Tool (integration over a real sandbox-backed file)
-# ============================================================================
-
-
-async def test_add_then_list_persists_and_assigns_ids(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
+async def test_add_then_list_persists_and_assigns_ids() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
     tool = TaskListTool()
 
-    r1 = await tool.execute(_call({"action": "add_task", "description": "a"}), sb)
+    r1 = await tool.execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
     l1 = _parse_list(r1)
     assert len(l1.tasks) == 1
     assert l1.tasks[0].id == 1
     assert l1.next_id == 2
 
-    r2 = await tool.execute(_call({"action": "add_task", "description": "b"}), sb)
+    r2 = await tool.execute(_call({"action": "add_task", "description": "b"}), sb, ctx)
     l2 = _parse_list(r2)
     assert [t.id for t in l2.tasks] == [1, 2]
 
-    assert (tmp_path / TASK_LIST_PATH).exists()
+    # The blob actually exists in the run store under the shared key.
+    persisted = await _load_from_store(ctx.run_store)
+    assert persisted == l2
 
-    r3 = await tool.execute(_call({"action": "list_tasks"}), sb)
+    r3 = await tool.execute(_call({"action": "list_tasks"}), sb, ctx)
     assert _parse_list(r3) == l2
 
 
-async def test_tool_update_status_and_complete(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
+# Storage seam: persists to the RunStore, NOT the sandbox. Even with a sandbox
+# that denies every path, add_task succeeds and persists.
+async def test_persists_to_run_store_not_sandbox() -> None:
+    ctx = _in_memory_ctx()
+    sb = _DenyPathSandbox()
     tool = TaskListTool()
-    await tool.execute(_call({"action": "add_task", "description": "x"}), sb)
 
-    r = await tool.execute(_call({"action": "update_task", "id": 1, "status": "in_progress"}), sb)
+    r = await tool.execute(_call({"action": "add_task", "description": "via run store"}), sb, ctx)
+    list_ = _parse_list(r)
+    assert len(list_.tasks) == 1
+    persisted = await _load_from_store(ctx.run_store)
+    assert persisted == list_
+
+
+# Keyed by SessionId: two sessions over the SAME run store keep separate lists.
+async def test_lists_are_keyed_by_session_id() -> None:
+    run_store = InMemoryStorageProvider()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+
+    ctx_a = _ctx_with(run_store, "session-a")
+    ctx_b = _ctx_with(run_store, "session-b")
+
+    await tool.execute(_call({"action": "add_task", "description": "a1"}), sb, ctx_a)
+    await tool.execute(_call({"action": "add_task", "description": "b1"}), sb, ctx_b)
+    await tool.execute(_call({"action": "add_task", "description": "b2"}), sb, ctx_b)
+
+    a = await _load_from_store(run_store, "session-a")
+    b = await _load_from_store(run_store, "session-b")
+    assert a is not None and b is not None
+    assert len(a.tasks) == 1
+    assert a.tasks[0].description == "a1"
+    assert [t.description for t in b.tasks] == ["b1", "b2"]
+
+
+# Persist then reload with a FRESH tool over the SAME ctx yields the identical
+# list.
+async def test_persist_then_reload_yields_identical_list() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+
+    tool1 = TaskListTool()
+    await tool1.execute(_call({"action": "add_task", "description": "one"}), sb, ctx)
+    r = await tool1.execute(_call({"action": "add_task", "description": "two"}), sb, ctx)
+    from_tool = _parse_list(r)
+
+    tool2 = TaskListTool()
+    reloaded = await tool2.execute(_call({"action": "list_tasks"}), sb, ctx)
+    assert _parse_list(reloaded) == from_tool
+
+
+async def test_tool_update_status_and_complete() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+    await tool.execute(_call({"action": "add_task", "description": "x"}), sb, ctx)
+
+    r = await tool.execute(
+        _call({"action": "update_task", "id": 1, "status": "in_progress"}), sb, ctx
+    )
     assert _parse_list(r).tasks[0].status == TaskStatus.IN_PROGRESS
 
-    r = await tool.execute(_call({"action": "complete_task", "id": 1}), sb)
+    r = await tool.execute(_call({"action": "complete_task", "id": 1}), sb, ctx)
     assert _parse_list(r).tasks[0].status == TaskStatus.COMPLETED
 
 
-async def test_tool_update_description(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
+async def test_tool_update_description() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
     tool = TaskListTool()
-    await tool.execute(_call({"action": "add_task", "description": "x"}), sb)
-    r = await tool.execute(_call({"action": "update_task", "id": 1, "description": "y"}), sb)
+    await tool.execute(_call({"action": "add_task", "description": "x"}), sb, ctx)
+    r = await tool.execute(_call({"action": "update_task", "id": 1, "description": "y"}), sb, ctx)
     assert _parse_list(r).tasks[0].description == "y"
 
 
-async def test_tool_unknown_id_is_recoverable_error(tmp_path: Path) -> None:
+async def test_tool_unknown_id_is_recoverable_error() -> None:
     r = await TaskListTool().execute(
-        _call({"action": "complete_task", "id": 42}), _sandbox(tmp_path)
+        _call({"action": "complete_task", "id": 42}), _AllowAllSandbox(), _in_memory_ctx()
     )
     assert isinstance(r, ToolOutputError)
     assert r.recoverable
 
 
-async def test_tool_invalid_transition_out_of_completed_is_recoverable(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
+async def test_tool_invalid_transition_out_of_completed_is_recoverable() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
     tool = TaskListTool()
-    await tool.execute(_call({"action": "add_task", "description": "x"}), sb)
-    await tool.execute(_call({"action": "complete_task", "id": 1}), sb)
-    r = await tool.execute(_call({"action": "update_task", "id": 1, "status": "pending"}), sb)
+    await tool.execute(_call({"action": "add_task", "description": "x"}), sb, ctx)
+    await tool.execute(_call({"action": "complete_task", "id": 1}), sb, ctx)
+    r = await tool.execute(_call({"action": "update_task", "id": 1, "status": "pending"}), sb, ctx)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable
 
 
-async def test_tool_bad_params_is_recoverable_error(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
+async def test_tool_bad_params_is_recoverable_error() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
     tool = TaskListTool()
     # Unknown action.
-    r = await tool.execute(_call({"action": "nope"}), sb)
+    r = await tool.execute(_call({"action": "nope"}), sb, ctx)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable
     # Missing required field for add_task.
-    r2 = await tool.execute(_call({"action": "add_task"}), sb)
+    r2 = await tool.execute(_call({"action": "add_task"}), sb, ctx)
     assert isinstance(r2, ToolOutputError)
     assert r2.recoverable
     # Extra/unknown field is rejected (extra=forbid).
-    r3 = await tool.execute(_call({"action": "list_tasks", "bogus": 1}), sb)
+    r3 = await tool.execute(_call({"action": "list_tasks", "bogus": 1}), sb, ctx)
     assert isinstance(r3, ToolOutputError)
     assert r3.recoverable
+
+
+# Storage failure (get/put) → recoverable error.
+async def test_storage_failure_is_recoverable_error() -> None:
+    ctx = _ctx_with(_FailingRunStore())
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "x"}), _AllowAllSandbox(), ctx
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable
+
+
+# Malformed persisted blob → recoverable parse error.
+async def test_corrupt_blob_is_recoverable_error() -> None:
+    ctx = _ctx_with(_CorruptRunStore())
+    r = await TaskListTool().execute(_call({"action": "list_tasks"}), _AllowAllSandbox(), ctx)
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable
+
+
+# list_tasks does not write: a fresh ctx with a never-written store stays empty.
+async def test_list_tasks_does_not_write() -> None:
+    ctx = _in_memory_ctx()
+    tool = TaskListTool()
+    r = await tool.execute(_call({"action": "list_tasks"}), _AllowAllSandbox(), ctx)
+    # Returns the empty default list.
+    assert _parse_list(r) == TaskList()
+    # Nothing was persisted (list_tasks must not write).
+    assert await _load_from_store(ctx.run_store) is None
 
 
 def test_schema_is_not_read_only() -> None:
@@ -390,16 +511,6 @@ def test_schema_is_not_read_only() -> None:
     assert not s.annotations.read_only
     assert not s.annotations.destructive
     assert not s.annotations.open_world
-
-
-async def test_persist_then_reload_yields_identical_list(tmp_path: Path) -> None:
-    sb = _sandbox(tmp_path)
-    tool = TaskListTool()
-    await tool.execute(_call({"action": "add_task", "description": "one"}), sb)
-    r = await tool.execute(_call({"action": "add_task", "description": "two"}), sb)
-    from_tool = _parse_list(r)
-    reloaded = await load_task_list(sb)
-    assert from_tool == reloaded
 
 
 def test_tool_registers_through_standard_registry() -> None:
@@ -412,22 +523,31 @@ def test_tool_registers_through_standard_registry() -> None:
     assert any(s.name == TaskListTool.NAME for s in schemas)
 
 
+# A denying sandbox (validate rejects) does not affect the standalone tool's
+# persistence path — sanity that SandboxPathEscape is unrelated to storage.
+def test_sandbox_path_escape_is_unrelated() -> None:
+    # Sanity: SandboxPathEscape is importable / distinct from storage errors.
+    assert SandboxPathEscape(path="x").kind == "path_escape"
+
+
 # ============================================================================
 # Fixture replay (ground truth — fixtures/tasklist/*.json)
 # ============================================================================
 
 
-async def test_fixture_replay_operations(tmp_path: Path) -> None:
+# Replay each operations scenario step-by-step against a read-modify-write over
+# a fresh in-memory RunStore. Must replay byte-identically to the retired
+# sandbox path.
+async def test_fixture_replay_operations() -> None:
     scenarios = json.loads((FIXTURES / "operations.json").read_text())
     assert scenarios, "expected >= 1 scenario"
     tool = TaskListTool()
+    sb = _AllowAllSandbox()
     for sc in scenarios:
-        # Fresh isolated workspace per scenario.
-        root = tmp_path / sc["name"]
-        root.mkdir()
-        sb = _sandbox(root)
+        # Fresh isolated run store per scenario.
+        ctx = _in_memory_ctx()
         for i, step in enumerate(sc["steps"]):
-            out = await tool.execute(_call(step["action"]), sb)
+            out = await tool.execute(_call(step["action"]), sb, ctx)
             expected = step["expected"]
             if expected["ok"]:
                 assert isinstance(out, ToolOutputSuccess), f"{sc['name']} step {i}: {out!r}"

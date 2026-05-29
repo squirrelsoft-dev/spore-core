@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from spore_core.tool_registry import AllowAllSandbox
+from spore_core.tool_registry import AllowAllSandbox, make_test_ctx
 from spore_tools.tools.error import ToolExecutionError
 from spore_tools.tools.params import (
     DeleteFileParams,
@@ -195,6 +195,7 @@ async def test_fixture_replay_subagent_scenarios() -> None:
         out = await sub.execute(
             ToolCall(id=parent_call_id, name="subagent", input={"instruction": "x"}),
             AllowAllSandbox(),
+            make_test_ctx(),
         )
         exp_kind = sc["expected"]["kind"]
         if exp_kind == "success":

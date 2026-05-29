@@ -1,24 +1,55 @@
-"""TaskList tool (#71): the single mutating tool over the persisted task list.
+"""TaskList tool (#71, storage seam #75): the single mutating tool over the
+persisted task list.
 
 Mirrors ``rust/crates/spore-core/src/tools/tasklist.rs``.
 
 One tool, :class:`TaskListTool` (``NAME = "task_list"``), dispatched on an
 ``action`` discriminator (``add_task``, ``update_task``, ``complete_task``,
-``list_tasks``). See :mod:`spore_core.tasklist` for the types, the transition
-matrix, and the disk-persistence helpers this tool drives.
+``list_tasks``). See :mod:`spore_core.tasklist` for the types and the transition
+matrix.
 
-The tool is read-modify-write over the on-disk
-:data:`spore_core.tasklist.TASK_LIST_PATH`:
+Storage seam (#75)
+------------------
+The tool persists via the :class:`ToolContext`'s
+:class:`~spore_core.storage.RunStore` — NOT the sandbox filesystem. It is
+read-modify-write keyed by the run's :class:`~spore_core.harness.SessionId`
+under :data:`~spore_core.tasklist.TASK_LIST_EXTRAS_KEY` (``"task_list"``):
 
 1. parse params (bad input → recoverable error),
-2. load the current list (absent → default),
+2. ``ctx.run_store.get(session_id, "task_list")`` (absent → default empty
+   :class:`~spore_core.tasklist.TaskList`),
 3. apply the action (domain errors → recoverable),
-4. persist the (possibly mutated) list,
+4. on a mutating action, ``ctx.run_store.put(session_id, "task_list", value)``,
 5. return the serialized current list as success content.
+
+Shared key
+~~~~~~~~~~
+This standalone tool and the harness-side PlanExecute execute loop persist
+under the SAME :class:`~spore_core.storage.RunStore` key (``"task_list"``),
+keyed by :class:`~spore_core.harness.SessionId`. A standalone tool call and a
+PlanExecute run on the same session intentionally share one blob. The JSON
+shape is the canonical serialized :class:`~spore_core.tasklist.TaskList`
+(``{"tasks":[...],"next_id":N}``), unchanged.
+
+Behavior change vs the retired sandbox path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Previously the tool persisted to ``.spore/task_list.json`` via the sandbox.
+That path is GONE. With the library's default storage (the no-op provider) a
+standalone tool call persists NOTHING across processes — the no-op run store
+silently discards writes and returns ``None`` on read. This is an accepted
+behavior change: durable cross-process persistence now requires configuring a
+real ``StorageProvider``. There is NO migration shim for old on-disk
+``.spore/task_list.json`` files.
+
+Storage-error mapping
+~~~~~~~~~~~~~~~~~~~~~~
+A :class:`~spore_core.storage.StorageError` from a get/put maps to a recoverable
+:class:`~spore_core.harness.ToolOutputError`. A present-but-malformed blob
+(parse failure) is likewise recoverable. ``list_tasks`` never writes.
 
 CRITICAL: this tool is NOT annotated ``read_only``. ``read_only`` tools are run
 CONCURRENTLY by ``dispatch_all``, and a concurrent read-modify-write over the
-same file would race. Leaving ``read_only`` false makes the registry dispatch it
+same key would race. Leaving ``read_only`` false makes the registry dispatch it
 sequentially. ``destructive`` / ``open_world`` are also left false so it is not
 treated as an irreversible side effect.
 """
@@ -32,15 +63,15 @@ from spore_core.harness import (
     ToolOutputSuccess,
 )
 from spore_core.model import ToolCall
-from spore_core.sandbox import SandboxViolationException
+from spore_core.storage import StorageError
 from spore_core.tasklist import (
+    TASK_LIST_EXTRAS_KEY,
+    TaskList,
     TaskListError,
-    load_task_list,
-    store_task_list,
 )
-from spore_core.tool_registry import ToolAnnotations, ToolSchema
+from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 
-from .error import SandboxViolationError, ToolExecutionError
+from .error import ToolExecutionError
 from .params import (
     AddTaskParams,
     CompleteTaskParams,
@@ -86,25 +117,36 @@ class TaskListTool:
                 },
                 "required": ["action"],
             },
-            # Intentionally NOT read_only: this tool mutates shared on-disk state
-            # and must dispatch sequentially. See module docs.
+            # Intentionally NOT read_only: this tool mutates shared persisted
+            # state and must dispatch sequentially. See module docs.
             annotations=ToolAnnotations(),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
+        session_id = ctx.session_id
+        run_store = ctx.run_store
+
         # 1. Parse params (bad input → recoverable).
         try:
             action, params = parse_task_list_params(call)
         except ToolExecutionError as e:
             return e.to_tool_output()
 
-        # 2. Load the current list (absent → default; malformed → recoverable).
+        # 2. Load the current list from the run store (absent → default). A
+        #    storage error or a malformed blob is recoverable.
         try:
-            task_list = await load_task_list(sandbox)
-        except SandboxViolationException as e:
-            return SandboxViolationError(violation=e.violation).to_tool_output()
-        except (ValueError, OSError) as e:
-            return ToolOutputError(message=f"could not parse task list: {e}", recoverable=True)
+            value = await run_store.get(session_id, TASK_LIST_EXTRAS_KEY)
+        except StorageError as e:
+            return ToolOutputError(message=f"could not load task list: {e}", recoverable=True)
+        if value is None:
+            task_list = TaskList()
+        else:
+            try:
+                task_list = TaskList.from_dict(value)
+            except (ValueError, KeyError, TypeError) as e:
+                return ToolOutputError(message=f"could not parse task list: {e}", recoverable=True)
 
         # 3. Apply the action. Domain errors → recoverable. `list_tasks` does not
         #    mutate.
@@ -124,13 +166,13 @@ class TaskListTool:
         except TaskListError as e:
             return ToolOutputError(message=e.message, recoverable=True)
 
-        # 4. Persist the (possibly mutated) list. list_tasks skips the write.
+        # 4. Persist the (possibly mutated) list to the run store, keyed by
+        #    SessionId under the shared TASK_LIST_EXTRAS_KEY. We always persist
+        #    on a mutating action; list_tasks skips the write.
         if mutated:
             try:
-                await store_task_list(task_list, sandbox)
-            except SandboxViolationException as e:
-                return SandboxViolationError(violation=e.violation).to_tool_output()
-            except OSError as e:
+                await run_store.put(session_id, TASK_LIST_EXTRAS_KEY, task_list.to_dict())
+            except StorageError as e:
                 return ToolOutputError(
                     message=f"could not persist task list: {e}", recoverable=True
                 )

@@ -27,7 +27,10 @@ from spore_core.tool_registry import (
     ToolAnnotations,
     ToolSchema,
     ToolSet,
+    make_test_ctx,
 )
+
+_CTX = make_test_ctx()
 
 
 def _schema(name: str, annotations: ToolAnnotations | None = None) -> ToolSchema:
@@ -62,7 +65,7 @@ def _call(name: str, id_: str, input_: dict[str, Any]) -> ToolCall:
 async def test_registered_tool_dispatches_through_registry() -> None:
     reg = StandardToolRegistry()
     reg.register(EchoTool("echo"), _schema("echo", ToolAnnotations(read_only=True)))
-    result = await reg.dispatch(_call("echo", "c1", {"x": 1}), AllowAllSandbox())
+    result = await reg.dispatch(_call("echo", "c1", {"x": 1}), AllowAllSandbox(), _CTX)
     assert result.call_id == "c1"
     assert isinstance(result.output, ToolOutputSuccess)
     assert result.output.content == '{"x":1}'
@@ -131,7 +134,7 @@ async def test_tool_and_schema_name_must_match() -> None:
 async def test_unregistered_tool_call_errors() -> None:
     reg = StandardToolRegistry()
     with pytest.raises(DispatchError) as excinfo:
-        await reg.dispatch(_call("missing", "c1", {}), AllowAllSandbox())
+        await reg.dispatch(_call("missing", "c1", {}), AllowAllSandbox(), _CTX)
     assert excinfo.value.kind == "UnregisteredTool"
 
 
@@ -142,7 +145,7 @@ async def test_missing_required_field_errors() -> None:
     reg = StandardToolRegistry()
     reg.register(EchoTool("read"), _schema_with_required("read", ["path"]))
     with pytest.raises(DispatchError) as excinfo:
-        await reg.dispatch(_call("read", "c1", {}), AllowAllSandbox())
+        await reg.dispatch(_call("read", "c1", {}), AllowAllSandbox(), _CTX)
     assert excinfo.value.kind == "SchemaValidationFailed"
     assert excinfo.value.tool == "read"
     assert "path" in (excinfo.value.reason or "")
@@ -151,7 +154,7 @@ async def test_missing_required_field_errors() -> None:
 async def test_required_field_present_succeeds() -> None:
     reg = StandardToolRegistry()
     reg.register(EchoTool("read"), _schema_with_required("read", ["path"]))
-    result = await reg.dispatch(_call("read", "c1", {"path": "/x"}), AllowAllSandbox())
+    result = await reg.dispatch(_call("read", "c1", {"path": "/x"}), AllowAllSandbox(), _CTX)
     assert result.call_id == "c1"
 
 
@@ -162,7 +165,7 @@ async def test_sandbox_violation_surfaces_as_dispatch_error() -> None:
     reg = StandardToolRegistry()
     reg.register(EchoTool("echo"), _schema("echo", ToolAnnotations(read_only=True)))
     with pytest.raises(DispatchError) as excinfo:
-        await reg.dispatch(_call("echo", "c1", {}), DenyAllSandbox())
+        await reg.dispatch(_call("echo", "c1", {}), DenyAllSandbox(), _CTX)
     assert excinfo.value.kind == "SandboxViolation"
     assert isinstance(excinfo.value.violation, SandboxPathEscape)
 
@@ -173,7 +176,7 @@ async def test_sandbox_violation_surfaces_as_dispatch_error() -> None:
 async def test_tool_error_returned_as_tool_output() -> None:
     reg = StandardToolRegistry()
     reg.register(FailingTool("fail"), _schema("fail"))
-    result = await reg.dispatch(_call("fail", "c1", {}), AllowAllSandbox())
+    result = await reg.dispatch(_call("fail", "c1", {}), AllowAllSandbox(), _CTX)
     assert isinstance(result.output, ToolOutputError)
     assert result.output.message == "boom"
     assert result.output.recoverable is True
@@ -192,7 +195,7 @@ async def test_dispatch_all_preserves_input_order() -> None:
         _call("d", "3", {"v": "c"}),
         _call("r", "4", {"v": "d"}),
     ]
-    results = await reg.dispatch_all(calls, AllowAllSandbox())
+    results = await reg.dispatch_all(calls, AllowAllSandbox(), _CTX)
     ids = [r.call_id for r in results if not isinstance(r, DispatchError)]
     assert ids == ["1", "2", "3", "4"]
 
@@ -203,6 +206,7 @@ async def test_dispatch_all_surfaces_individual_errors() -> None:
     results = await reg.dispatch_all(
         [_call("ok", "1", {}), _call("missing", "2", {})],
         AllowAllSandbox(),
+        _CTX,
     )
     assert not isinstance(results[0], DispatchError)
     assert isinstance(results[1], DispatchError)
@@ -217,6 +221,7 @@ async def test_dispatch_all_concurrent_read_only_completes() -> None:
     results = await reg.dispatch_all(
         [_call("a", "1", {}), _call("b", "2", {})],
         AllowAllSandbox(),
+        _CTX,
     )
     ids = [r.call_id for r in results if not isinstance(r, DispatchError)]
     assert ids == ["1", "2"]
@@ -331,11 +336,11 @@ async def test_fixture_replay_dispatch_scenarios() -> None:
         call = ToolCall(id=sc["call"]["id"], name=sc["call"]["name"], input=sc["call"]["input"])
         expected = sc["expected"]
         if expected["kind"] == "ok":
-            result = await reg.dispatch(call, sandbox)
+            result = await reg.dispatch(call, sandbox, _CTX)
             assert result.call_id == expected["call_id"], f"scenario {sc['name']}"
         elif expected["kind"] == "err":
             with pytest.raises(DispatchError) as excinfo:
-                await reg.dispatch(call, sandbox)
+                await reg.dispatch(call, sandbox, _CTX)
             assert excinfo.value.kind == expected["error"], f"scenario {sc['name']}"
         else:
             raise AssertionError(f"unknown expected kind: {expected['kind']!r}")

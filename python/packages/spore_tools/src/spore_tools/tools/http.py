@@ -10,7 +10,7 @@ from spore_core.harness import (
     ToolOutputError,
 )
 from spore_core.model import ToolCall
-from spore_core.tool_registry import ToolAnnotations, ToolSchema
+from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 
 from ._common import finish_with_possible_truncation
 from .error import ToolExecutionError
@@ -51,7 +51,9 @@ class HttpGetTool:
             annotations=ToolAnnotations(read_only=True, open_world=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(HttpGetParams, call)
         except ToolExecutionError as e:
@@ -96,7 +98,9 @@ class HttpPostTool:
             annotations=ToolAnnotations(open_world=True),
         )
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         try:
             params = parse_params(HttpPostParams, call)
         except ToolExecutionError as e:

@@ -45,10 +45,14 @@ Rules enforced
 * R6  ``completed`` is terminal: ANY transition OUT of ``completed`` is rejected
   (the idempotent ``completed → completed`` self-transition is allowed).
 * R7  Self-transitions ``X → X`` are idempotent and always allowed.
-* R8  Persistence is interim, through the FILESYSTEM via the
-  :class:`SandboxProvider` read-modify-write at :data:`TASK_LIST_PATH`
-  (DECISION 2). The tool does NOT touch ``SessionState.extras``; #59 owns the
-  extras mirror.
+* R8  Persistence is through the storage seam (#75): the standalone
+  :class:`~spore_tools.tools.TaskListTool` persists via the
+  :class:`~spore_core.storage.RunStore` on the ``ToolContext``, keyed by
+  :class:`SessionId` under :data:`TASK_LIST_EXTRAS_KEY`. The retired interim
+  sandbox path (``.spore/task_list.json``) is GONE; with the library's default
+  no-op storage a standalone tool call persists nothing across processes (an
+  accepted behavior change — no migration shim). #59's execute loop shares the
+  same ``RunStore`` key.
 
 Both design forks (transition matrix, state seam) were resolved before
 implementation.
@@ -59,37 +63,28 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-
-import anyio
 
 from .errors import SporeError
-from .harness import SandboxProvider
 from .hooks import PlanArtifact
 
 __all__ = [
     "TASK_LIST_EXTRAS_KEY",
-    "TASK_LIST_PATH",
     "Task",
     "TaskList",
     "TaskListError",
     "TaskStatus",
-    "load_task_list",
     "plan_artifact_to_task_list",
-    "store_task_list",
     "validate_transition",
 ]
 
-#: Key under which the :class:`TaskList` is mirrored into ``SessionState.extras``
-#: (serialized JSON) by the harness / #59. Mirrors ``PLAN_EXECUTE_EXTRAS_KEY``.
-#: Stable across all four languages. NOTE: #71 itself does NOT write this key
-#: (the ``Tool`` protocol has no ``SessionState`` access); it is the contract
-#: the harness-side mirror uses.
+#: Key under which the :class:`TaskList` is persisted in the
+#: :class:`~spore_core.storage.RunStore`, keyed by :class:`SessionId`. Both the
+#: harness-side #59 execute loop and the standalone
+#: :class:`~spore_tools.tools.TaskListTool` (#75) share this single key, so a
+#: standalone tool call and a PlanExecute run on the same session intentionally
+#: share one blob. Stable across all four languages. The JSON shape is the
+#: canonical serialized :class:`TaskList` (``{"tasks":[...],"next_id":N}``).
 TASK_LIST_EXTRAS_KEY = "task_list"
-
-#: Canonical on-disk location of the persisted task list, relative to the
-#: sandbox/workspace root. Resolved through :meth:`SandboxProvider.resolve_path`.
-TASK_LIST_PATH = ".spore/task_list.json"
 
 
 # ============================================================================
@@ -368,47 +363,3 @@ def plan_artifact_to_task_list(artifact: PlanArtifact) -> TaskList:
     for step in artifact.tasks:
         task_list.add(step)  # verbatim; appends pending; bumps next_id
     return task_list
-
-
-# ============================================================================
-# Disk persistence (interim — DECISION 2, mirrors the plan.rs precedent)
-# ============================================================================
-
-
-async def load_task_list(sandbox: SandboxProvider) -> TaskList:
-    """Load the persisted :class:`TaskList` from :data:`TASK_LIST_PATH` via the
-    sandbox.
-
-    An absent file (the expected first-run path) yields a fresh default list. A
-    present-but-malformed file raises :class:`ValueError` so the caller (the
-    tool boundary) can map it to a recoverable error rather than silently
-    discarding state.
-    """
-    resolved = await sandbox.resolve_path(TASK_LIST_PATH, "read")
-
-    def _read() -> str | None:
-        try:
-            return Path(resolved).read_text(encoding="utf-8")
-        except OSError:
-            # Absent file (or any read error) → fresh list.
-            return None
-
-    text = await anyio.to_thread.run_sync(_read)
-    if text is None:
-        return TaskList()
-    return TaskList.from_json(text)
-
-
-async def store_task_list(task_list: TaskList, sandbox: SandboxProvider) -> None:
-    """Persist ``task_list`` to :data:`TASK_LIST_PATH` via the sandbox, creating
-    the parent directory (``.spore/``) if needed. Serialization is the canonical
-    compact form (field order ``tasks`` then ``next_id``)."""
-    resolved = await sandbox.resolve_path(TASK_LIST_PATH, "write")
-    payload = task_list.to_json()
-
-    def _write() -> None:
-        path = Path(resolved)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(payload, encoding="utf-8")
-
-    await anyio.to_thread.run_sync(_write)

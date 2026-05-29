@@ -37,7 +37,7 @@ from spore_core.harness import (
     _Model,  # type: ignore[attr-defined]  # internal pydantic base
 )
 from spore_core.model import ToolCall
-from spore_core.tool_registry import ToolRegistry
+from spore_core.tool_registry import ToolContext, ToolRegistry
 
 
 # ============================================================================
@@ -135,7 +135,9 @@ class SubagentTool:
     def may_produce_large_output(self) -> bool:
         return False
 
-    async def execute(self, call: ToolCall, sandbox: SandboxProvider) -> ToolOutput:
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
         instruction = call.input.get("instruction") if isinstance(call.input, dict) else None
         if not isinstance(instruction, str):
             return ToolOutputError(

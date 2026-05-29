@@ -12,10 +12,12 @@ import pytest
 
 from spore_core.harness import ToolOutputError, ToolOutputSuccess
 from spore_core.model import ToolCall
-from spore_core.tool_registry import AllowAllSandbox
+from spore_core.tool_registry import AllowAllSandbox, make_test_ctx
 from spore_tools.tools.exec import BashCommandTool, ExecTool
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
+
+_CTX = make_test_ctx()
 
 
 def _call(name: str, input_: dict) -> ToolCall:
@@ -29,7 +31,7 @@ async def test_exec_echo_runs_and_returns_stdout() -> None:
     if not shutil.which("echo"):
         pytest.skip("no echo binary")
     sb = AllowAllSandbox()
-    r = await ExecTool().execute(_call("exec", {"command": "echo", "args": ["hi"]}), sb)
+    r = await ExecTool().execute(_call("exec", {"command": "echo", "args": ["hi"]}), sb, _CTX)
     assert isinstance(r, ToolOutputSuccess)
     assert "hi" in r.content
 
@@ -42,7 +44,7 @@ async def test_exec_has_no_shell_semantics(tmp_path: Path) -> None:
     sb = AllowAllSandbox()
     out_file = tmp_path / "out"
     r = await ExecTool().execute(
-        _call("exec", {"command": "echo", "args": ["a|b", "$(whoami)", ">out"]}), sb
+        _call("exec", {"command": "echo", "args": ["a|b", "$(whoami)", ">out"]}), sb, _CTX
     )
     assert isinstance(r, ToolOutputSuccess), r
     assert "a|b $(whoami) >out" in r.content, f"args must be literal, got {r.content!r}"
@@ -53,7 +55,7 @@ async def test_exec_nonzero_exit_is_recoverable_error() -> None:
     if not shutil.which("false"):
         pytest.skip("no false binary")
     sb = AllowAllSandbox()
-    r = await ExecTool().execute(_call("exec", {"command": "false"}), sb)
+    r = await ExecTool().execute(_call("exec", {"command": "false"}), sb, _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
 
@@ -63,7 +65,7 @@ async def test_exec_timeout_returns_recoverable_error() -> None:
         pytest.skip("no sleep binary")
     sb = AllowAllSandbox()
     r = await ExecTool().execute(
-        _call("exec", {"command": "sleep", "args": ["5"], "timeout": 1}), sb
+        _call("exec", {"command": "sleep", "args": ["5"], "timeout": 1}), sb, _CTX
     )
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
@@ -72,7 +74,7 @@ async def test_exec_timeout_returns_recoverable_error() -> None:
 
 async def test_exec_invalid_params_returns_recoverable_error() -> None:
     sb = AllowAllSandbox()
-    r = await ExecTool().execute(_call("exec", {}), sb)
+    r = await ExecTool().execute(_call("exec", {}), sb, _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
 
@@ -83,7 +85,7 @@ async def test_exec_invalid_params_returns_recoverable_error() -> None:
 async def test_bash_command_supports_pipeline() -> None:
     sb = AllowAllSandbox()
     r = await BashCommandTool().execute(
-        _call("bash_command", {"script": "printf 'hi' | tr a-z A-Z"}), sb
+        _call("bash_command", {"script": "printf 'hi' | tr a-z A-Z"}), sb, _CTX
     )
     assert isinstance(r, ToolOutputSuccess), r
     assert r.content == "HI"
@@ -94,7 +96,7 @@ async def test_bash_command_supports_redirect() -> None:
     tmp = Path(tempfile.gettempdir()) / f"spore-bash-redirect-{time.time_ns()}.txt"
     try:
         r = await BashCommandTool().execute(
-            _call("bash_command", {"script": f"printf 'data' > {tmp}"}), sb
+            _call("bash_command", {"script": f"printf 'data' > {tmp}"}), sb, _CTX
         )
         assert isinstance(r, ToolOutputSuccess), r
         assert tmp.read_text() == "data"
@@ -104,7 +106,7 @@ async def test_bash_command_supports_redirect() -> None:
 
 async def test_bash_command_nonzero_exit_is_recoverable_error() -> None:
     sb = AllowAllSandbox()
-    r = await BashCommandTool().execute(_call("bash_command", {"script": "exit 3"}), sb)
+    r = await BashCommandTool().execute(_call("bash_command", {"script": "exit 3"}), sb, _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
 
@@ -114,7 +116,7 @@ async def test_bash_command_timeout_returns_recoverable_error() -> None:
         pytest.skip("no sleep binary")
     sb = AllowAllSandbox()
     r = await BashCommandTool().execute(
-        _call("bash_command", {"script": "sleep 5", "timeout": 1}), sb
+        _call("bash_command", {"script": "sleep 5", "timeout": 1}), sb, _CTX
     )
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
@@ -123,6 +125,6 @@ async def test_bash_command_timeout_returns_recoverable_error() -> None:
 
 async def test_bash_command_invalid_params_returns_recoverable_error() -> None:
     sb = AllowAllSandbox()
-    r = await BashCommandTool().execute(_call("bash_command", {}), sb)
+    r = await BashCommandTool().execute(_call("bash_command", {}), sb, _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True

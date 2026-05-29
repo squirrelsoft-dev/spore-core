@@ -252,14 +252,11 @@ from .plan import (
 )
 from .tasklist import (
     TASK_LIST_EXTRAS_KEY,
-    TASK_LIST_PATH,
     Task as TaskListTask,
     TaskList,
     TaskListError,
     TaskStatus,
-    load_task_list,
     plan_artifact_to_task_list,
-    store_task_list,
     validate_transition,
 )
 from .guide_registry import (
@@ -529,6 +526,7 @@ from .tool_registry import (
     TaskPhase,
     Tool,
     ToolAnnotations,
+    ToolContext,
     ToolRegistry,
     ToolSchema as RegistryToolSchema,
     ToolSet,
@@ -609,14 +607,11 @@ __all__ = [
     "capture_plan_artifact",
     # TaskList (#71)
     "TASK_LIST_EXTRAS_KEY",
-    "TASK_LIST_PATH",
     "TaskList",
     "TaskListError",
     "TaskListTask",
     "TaskStatus",
-    "load_task_list",
     "plan_artifact_to_task_list",
-    "store_task_list",
     "validate_transition",
     "PostCompactContext",
     "PostToolBatchContext",
@@ -1099,6 +1094,7 @@ __all__ = [
     "TaskPhase",
     "Tool",
     "ToolAnnotations",
+    "ToolContext",
     "ToolRegistry",
     "ToolSet",
     "new_task_id",
