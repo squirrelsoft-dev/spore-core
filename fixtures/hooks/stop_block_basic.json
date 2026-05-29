@@ -1,0 +1,33 @@
+{
+  "description": "Cross-language consistency fixture for the Stop-hook divergence gate (issue #69, Decision 4/5). Each case configures a sequence of Stop-hook decisions (`hook_decisions`), a `max_stop_blocks` cap, and asserts the resulting per-run block-count behavior. `expected.blocks` is the number of Stop blocks the harness honored (each injects a reason and continues); `expected.terminated_by` is either `continue` (a hook allowed termination) or `cap` (max_stop_blocks reached). A `block` decision while under the cap consumes one block and continues; once `blocks == max_stop_blocks`, the next block is ignored and the loop terminates.",
+  "cases": [
+    {
+      "name": "first_blocks_then_continues",
+      "max_stop_blocks": 8,
+      "hook_decisions": [
+        { "decision": "block", "reason": "not done yet" },
+        { "decision": "continue" }
+      ],
+      "expected": { "blocks": 1, "terminated_by": "continue" }
+    },
+    {
+      "name": "all_continue_terminates_immediately",
+      "max_stop_blocks": 8,
+      "hook_decisions": [
+        { "decision": "continue" }
+      ],
+      "expected": { "blocks": 0, "terminated_by": "continue" }
+    },
+    {
+      "name": "cap_reached_terminates_anyway",
+      "max_stop_blocks": 3,
+      "hook_decisions": [
+        { "decision": "block", "reason": "again" },
+        { "decision": "block", "reason": "again" },
+        { "decision": "block", "reason": "again" },
+        { "decision": "block", "reason": "again" }
+      ],
+      "expected": { "blocks": 3, "terminated_by": "cap" }
+    }
+  ]
+}

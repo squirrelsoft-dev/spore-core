@@ -1,0 +1,25 @@
+{
+  "description": "Cross-language consistency fixture for HookDecision wire format (issue #69). Each case pins the serde-tagged JSON for one HookDecision variant: serializing the variant must produce `json`, and deserializing `json` must reproduce the variant. The tag key is `decision`, snake_case values.",
+  "cases": [
+    {
+      "name": "continue",
+      "json": { "decision": "continue" }
+    },
+    {
+      "name": "block",
+      "json": { "decision": "block", "reason": "tests are failing" }
+    },
+    {
+      "name": "inject",
+      "json": { "decision": "inject", "context": "remember to run the formatter" }
+    },
+    {
+      "name": "deny",
+      "json": { "decision": "deny", "reason": "path /etc is off-limits" }
+    },
+    {
+      "name": "mutate",
+      "json": { "decision": "mutate", "data": { "path": "/safe/file.txt" } }
+    }
+  ]
+}

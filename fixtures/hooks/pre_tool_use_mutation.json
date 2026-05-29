@@ -1,0 +1,33 @@
+{
+  "description": "Cross-language consistency fixture for the PreToolUse hook (issue #69). Each case starts with `tool_input`, applies an ordered chain of hook decisions (`hook_decisions`, fired in registration order), and asserts the outcome. A `mutate` decision replaces `tool_input` with its `data`; a chain threads each mutation to the next hook. A `deny` decision short-circuits the chain and rejects the tool call. `expected.outcome` is `continue` or `deny`; on `continue`, `expected.tool_input` is the final (possibly mutated) input.",
+  "cases": [
+    {
+      "name": "single_mutation_rewrites_input",
+      "tool_name": "read_file",
+      "tool_input": { "path": "/etc/passwd" },
+      "hook_decisions": [
+        { "decision": "mutate", "data": { "path": "/workspace/safe.txt" } }
+      ],
+      "expected": { "outcome": "continue", "tool_input": { "path": "/workspace/safe.txt" } }
+    },
+    {
+      "name": "chained_mutations_thread_through",
+      "tool_name": "write_file",
+      "tool_input": { "v": 0 },
+      "hook_decisions": [
+        { "decision": "mutate", "data": { "v": 1 } },
+        { "decision": "mutate", "data": { "v": 2 } }
+      ],
+      "expected": { "outcome": "continue", "tool_input": { "v": 2 } }
+    },
+    {
+      "name": "deny_rejects_call",
+      "tool_name": "run_command",
+      "tool_input": { "cmd": "rm -rf /" },
+      "hook_decisions": [
+        { "decision": "deny", "reason": "destructive command blocked" }
+      ],
+      "expected": { "outcome": "deny", "reason": "destructive command blocked" }
+    }
+  ]
+}

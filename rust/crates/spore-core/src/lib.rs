@@ -25,6 +25,7 @@ pub mod compaction_adapter;
 pub mod context;
 pub mod guide_registry;
 pub mod harness;
+pub mod hooks;
 pub mod memory;
 pub mod metric;
 pub mod middleware;
@@ -75,6 +76,10 @@ pub use harness::{
     ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult,
     TruncatedOutput,
 };
+pub use hooks::{
+    CommandHook, FireOutcome, FunctionHook, Hook, HookChain, HookContext, HookDecision, HookError,
+    HookEvent, HookSync, PlanArtifact, StandardHookChain, ToolCallSummary, TurnOutput,
+};
 pub use memory::{
     EpisodicMemory, MemoryError, MemoryId, MemoryItem, MemoryProvider, MemoryQuery, MemorySource,
     MemoryStatus, MergeStrategy, SemanticMemory, StandardMemoryProvider, Timestamp,
@@ -123,6 +128,9 @@ pub use sensor::{
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,
     SensorTrigger, StandardSensorChain,
 };
+// `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
+// re-exported for backward compatibility; external callers see the deprecation.
+#[allow(deprecated)]
 pub use termination::{
     check_budget_default, AlwaysComplete, BudgetValue, CompletionCheck, FeatureListCheck,
     FixedCompletionCheck, NullCompletionCheck, QuestionAnsweredCheck, SessionStateSnapshot,

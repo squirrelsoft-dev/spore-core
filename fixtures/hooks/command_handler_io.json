@@ -1,0 +1,49 @@
+{
+  "description": "Cross-language consistency fixture for the CommandHook stdin/stdout contract (issue #69). Each case pins the JSON payload a command handler receives on stdin and the serde-tagged HookDecision it returns on stdout. stdin is `{\"event\":\"<snake_case_event>\",\"context\":<per-event payload>}`. A handler that exits nonzero is a CommandFailed error (NOT an implicit block); malformed stdout is a CommandOutputInvalid error. `expected_stdin` pins the exact stdin shape; `stdout` is the handler's reply; `expected_decision` is the parsed HookDecision.",
+  "cases": [
+    {
+      "name": "stop_handler_blocks",
+      "event": "stop",
+      "expected_stdin": {
+        "event": "stop",
+        "context": {
+          "session_id": "sess-1",
+          "turn_number": 3,
+          "last_output": { "text": "I'm done", "had_tool_calls": false },
+          "task_instruction": "make the tests pass",
+          "session_state": null
+        }
+      },
+      "stdout": "{\"decision\":\"block\",\"reason\":\"3 tests still failing\"}",
+      "expected_decision": { "decision": "block", "reason": "3 tests still failing" }
+    },
+    {
+      "name": "pre_tool_use_handler_mutates",
+      "event": "pre_tool_use",
+      "expected_stdin": {
+        "event": "pre_tool_use",
+        "context": {
+          "session_id": "sess-1",
+          "turn_number": 1,
+          "tool_name": "read_file",
+          "tool_input": { "path": "/etc/passwd" }
+        }
+      },
+      "stdout": "{\"decision\":\"deny\",\"reason\":\"sensitive path\"}",
+      "expected_decision": { "decision": "deny", "reason": "sensitive path" }
+    },
+    {
+      "name": "nonzero_exit_is_command_failed",
+      "event": "stop",
+      "exit_code": 7,
+      "stdout": "",
+      "expected_error": "command_failed"
+    },
+    {
+      "name": "malformed_stdout_is_output_invalid",
+      "event": "stop",
+      "stdout": "not json at all",
+      "expected_error": "command_output_invalid"
+    }
+  ]
+}

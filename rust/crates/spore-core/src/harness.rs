@@ -1020,6 +1020,15 @@ pub struct HarnessConfig {
     /// Maximum number of repair-and-re-dispatch attempts per tool call.
     /// Defaults to `1`. Ignored when `tool_call_repair` is `None`.
     pub max_repair_attempts: u32,
+    /// Maximum number of consecutive Stop-hook blocks within a single `run()`
+    /// before the loop terminates anyway (issue #69, Decision 4/5). The
+    /// counter is PER-RUN — it resets on every `run()` call, so a resumed
+    /// session starts fresh. Defaults to `8` (matching Claude Code).
+    pub max_stop_blocks: u32,
+    /// Lifecycle hook chain (issue #69). When set, the harness fires the wired
+    /// lifecycle events (`PreTurn`, `Stop`, `OnError`, …) through it.
+    /// `None` (the default) preserves today's behaviour byte-for-byte.
+    pub hooks: Option<Arc<dyn crate::hooks::HookChain>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1038,6 +1047,8 @@ impl Clone for HarnessConfig {
             content_capture: self.content_capture,
             tool_call_repair: self.tool_call_repair.clone(),
             max_repair_attempts: self.max_repair_attempts,
+            max_stop_blocks: self.max_stop_blocks,
+            hooks: self.hooks.clone(),
         }
     }
 }
@@ -1081,6 +1092,8 @@ pub struct HarnessBuilder {
     content_capture: ContentCaptureConfig,
     tool_call_repair: Option<Arc<dyn ToolCallRepair>>,
     max_repair_attempts: u32,
+    max_stop_blocks: u32,
+    hooks: Option<Arc<dyn crate::hooks::HookChain>>,
 }
 
 impl HarnessBuilder {
@@ -1107,7 +1120,22 @@ impl HarnessBuilder {
             content_capture: ContentCaptureConfig::default(),
             tool_call_repair: None,
             max_repair_attempts: 1,
+            max_stop_blocks: 8,
+            hooks: None,
         }
+    }
+
+    /// Inject a lifecycle hook chain (issue #69).
+    pub fn hooks(mut self, hooks: Arc<dyn crate::hooks::HookChain>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Set the per-run cap on consecutive Stop-hook blocks (issue #69).
+    /// Defaults to `8`.
+    pub fn max_stop_blocks(mut self, max: u32) -> Self {
+        self.max_stop_blocks = max;
+        self
     }
 
     /// Inject a deterministic tool-call repair provider (e.g.
@@ -1192,6 +1220,8 @@ impl HarnessBuilder {
             content_capture: self.content_capture,
             tool_call_repair: self.tool_call_repair,
             max_repair_attempts: self.max_repair_attempts,
+            max_stop_blocks: self.max_stop_blocks,
+            hooks: self.hooks,
         }
     }
 
@@ -1366,6 +1396,57 @@ impl StandardHarness {
         }
     }
 
+    /// Fire registered `Stop` hooks (issue #69, Decision 5/6). Returns
+    /// `Some(reason)` when the loop should continue (a hook blocked and the
+    /// per-run `max_stop_blocks` cap has not yet been hit), incrementing
+    /// `stop_blocks`. Returns `None` to allow normal termination — either no
+    /// hooks blocked, no hook chain is configured, or the cap was reached.
+    ///
+    /// A Stop-hook error (e.g. a failing command handler) is treated as a
+    /// non-blocking outcome: the loop terminates normally rather than looping
+    /// forever on a broken hook.
+    async fn fire_stop_hooks(
+        &self,
+        session_id: &SessionId,
+        task: &Task,
+        turn_number: u32,
+        last_output_text: &str,
+        stop_blocks: &mut u32,
+    ) -> Option<String> {
+        let chain = self.config.hooks.as_ref()?;
+        // Build the rich SessionState the Stop contract requires from the data
+        // the ReAct loop has on hand.
+        let rich_state = ContextSessionState::new(
+            session_id.clone(),
+            task.id.clone(),
+            task.instruction.clone(),
+        );
+        let last_output = crate::hooks::TurnOutput {
+            text: last_output_text.to_string(),
+            had_tool_calls: false,
+        };
+        let mut ctx = crate::hooks::HookContext::Stop {
+            session_id,
+            turn_number,
+            last_output: &last_output,
+            task_instruction: &task.instruction,
+            session_state: &rich_state,
+        };
+        match chain.fire(&mut ctx).await {
+            Ok(crate::hooks::FireOutcome::Block { reason }) => {
+                if *stop_blocks >= self.config.max_stop_blocks {
+                    // R14: cap reached — terminate anyway.
+                    None
+                } else {
+                    *stop_blocks += 1;
+                    Some(reason)
+                }
+            }
+            // Continue / Inject / Deny / errors → allow normal termination.
+            _ => None,
+        }
+    }
+
     /// Drive the ReAct loop, then finalize observability for terminal outcomes.
     /// A `WaitingForHuman` pause is not terminal, so it is never flushed here —
     /// the eventual `resume` path reaches a terminal outcome and flushes then.
@@ -1412,6 +1493,10 @@ impl StandardHarness {
         let session_id = task.session_id.clone();
         let started_at = Instant::now();
         let mut usage = AggregateUsage::default();
+        // Per-run Stop-hook block counter (issue #69, Decision 4). Resets on
+        // every run() — resume starts fresh. After `max_stop_blocks` consecutive
+        // blocks the loop terminates anyway (R14).
+        let mut stop_blocks: u32 = 0;
         // Monotonic per-run span counter for turn / tool-call span ids, and the
         // most recent turn span — parent for the tool-call spans of that turn.
         let mut span_seq: u64 = 0;
@@ -1681,6 +1766,30 @@ impl StandardHarness {
                                 .context_manager
                                 .append_assistant_message(&mut session_state, &msg)
                                 .await;
+
+                            // Stop hook (issue #69, Decision 5). The strategy
+                            // believes the task is done; fire registered Stop
+                            // hooks synchronously. If any blocks (and we are
+                            // under `max_stop_blocks`), inject the reason via
+                            // the same path `ForceAnotherTurn` uses and continue
+                            // the loop instead of terminating.
+                            if let Some(reason) = self
+                                .fire_stop_hooks(
+                                    &session_id,
+                                    &task,
+                                    budget_used.turns,
+                                    &content,
+                                    &mut stop_blocks,
+                                )
+                                .await
+                            {
+                                self.config
+                                    .context_manager
+                                    .append_user_message(&mut session_state, &reason)
+                                    .await;
+                                continue;
+                            }
+
                             Self::emit(
                                 &on_stream,
                                 StreamEvent::FinalResponse {
@@ -2739,6 +2848,7 @@ mod tests {
     use super::testing::*;
     use super::*;
     use crate::agent::{mock::MockAgent, AgentId};
+    use crate::hooks::HookChain as _;
     use crate::model::{ModelError, ToolCall};
 
     fn make_agent() -> Arc<MockAgent> {
@@ -2760,6 +2870,8 @@ mod tests {
             content_capture: ContentCaptureConfig::default(),
             tool_call_repair: None,
             max_repair_attempts: 1,
+            max_stop_blocks: 8,
+            hooks: None,
         }
     }
 
@@ -4018,6 +4130,8 @@ mod tests {
                 content_capture: ContentCaptureConfig::default(),
                 tool_call_repair: None,
                 max_repair_attempts: 1,
+                max_stop_blocks: 8,
+                hooks: None,
             })
         }
 
@@ -4603,5 +4717,117 @@ mod tests {
             count, 1,
             "assistant tool-call must be recorded exactly once, not duplicated by resume"
         );
+    }
+
+    // ── Issue #69 — Stop-hook wiring into the ReAct loop ───────────────────
+
+    /// A Stop hook that blocks `block_n` times then continues, counting fires.
+    struct CountingStopHook {
+        block_first_n: u32,
+        fired: std::sync::atomic::AtomicU32,
+    }
+    impl crate::hooks::Hook for CountingStopHook {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a mut crate::hooks::HookContext<'a>,
+        ) -> BoxFut<'a, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
+            let n = self.fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let decision = if n < self.block_first_n {
+                crate::hooks::HookDecision::Block {
+                    reason: format!("not done yet (block {n})"),
+                }
+            } else {
+                crate::hooks::HookDecision::Continue
+            };
+            Box::pin(async move { Ok(decision) })
+        }
+        fn events(&self) -> Vec<crate::hooks::HookEvent> {
+            vec![crate::hooks::HookEvent::Stop]
+        }
+        fn name(&self) -> String {
+            "counting-stop".into()
+        }
+    }
+
+    // Stop block → inject → continue, then continue → terminate (R12/R13).
+    #[tokio::test]
+    async fn stop_hook_block_then_continue_loops() {
+        let a = make_agent();
+        // Two final responses: first one is blocked by the Stop hook and the
+        // loop continues; second one is allowed to terminate.
+        a.push(TurnResult::FinalResponse {
+            content: "first".into(),
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            content: "second".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let chain = Arc::new(crate::hooks::StandardHookChain::new());
+        chain
+            .register(Arc::new(CountingStopHook {
+                block_first_n: 1,
+                fired: std::sync::atomic::AtomicU32::new(0),
+            }))
+            .unwrap();
+        cfg.hooks = Some(chain);
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { output, turns, .. } => {
+                assert_eq!(output, "second");
+                assert_eq!(turns, 2, "loop should run a second turn after the block");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // No registered Stop hook → terminate immediately (R13 baseline).
+    #[tokio::test]
+    async fn stop_hook_absent_terminates() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.hooks = Some(Arc::new(crate::hooks::StandardHookChain::new()));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { turns, .. } => assert_eq!(turns, 1),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // max_stop_blocks cap: a hook that always blocks terminates anyway after
+    // `max_stop_blocks` consecutive blocks (R14).
+    #[tokio::test]
+    async fn stop_hook_max_blocks_cap() {
+        let a = make_agent();
+        // Always-final agent; the hook always blocks, so the cap must stop it.
+        for _ in 0..20 {
+            a.push(TurnResult::FinalResponse {
+                content: "again".into(),
+                usage: usage(),
+            });
+        }
+        let mut cfg = standard_config(a);
+        cfg.max_stop_blocks = 3;
+        let chain = Arc::new(crate::hooks::StandardHookChain::new());
+        chain
+            .register(Arc::new(CountingStopHook {
+                block_first_n: u32::MAX, // always block
+                fired: std::sync::atomic::AtomicU32::new(0),
+            }))
+            .unwrap();
+        cfg.hooks = Some(chain);
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(50))).await {
+            RunResult::Success { turns, .. } => {
+                // 3 blocks → 3 extra turns; turn 4 hits the cap and terminates.
+                assert_eq!(turns, 4, "should terminate after max_stop_blocks=3 blocks");
+            }
+            other => panic!("expected Success after cap, got {other:?}"),
+        }
     }
 }

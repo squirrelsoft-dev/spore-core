@@ -2,6 +2,14 @@
 //! continue, halt with success, halt with failure, or halt because a budget
 //! limit was breached.
 //!
+// `CompletionCheck` is `#[deprecated]` in favour of the `Stop` lifecycle hook
+// (issue #69), but the standard checks and `StandardTerminationPolicy` in this
+// module still implement/consume it for backward compatibility. Silence the
+// self-referential deprecation warnings module-wide; external callers still see
+// the deprecation on the public trait.
+#![allow(deprecated)]
+//!
+//!
 //! See `docs/harness-engineering-concepts.md` § "TerminationPolicy" for the
 //! authoritative rules. This module ships:
 //!   - The full [`TerminationDecision`] / [`TerminationFailureReason`] /
@@ -223,6 +231,18 @@ pub struct TerminationInput {
 ///
 /// Returns `None` if complete, `Some(reason)` if not yet done. The harness
 /// injects `reason` into the next turn's context when `Some` is returned.
+///
+/// # Deprecated
+///
+/// Superseded by the `Stop` lifecycle hook (issue #69). A `Stop` hook that
+/// returns [`crate::hooks::HookDecision::Block`] replaces the
+/// `CompletionCheck`-returns-`Some(reason)` path: the reason is injected into
+/// the next turn via the same mechanism, and the per-run `max_stop_blocks` cap
+/// prevents runaway loops. This trait remains for backward compatibility.
+#[deprecated(
+    since = "0.1.0",
+    note = "use the `Stop` lifecycle hook (issue #69) — register a Hook that returns HookDecision::Block"
+)]
 pub trait CompletionCheck: Send + Sync {
     fn check<'a>(&'a self, state: &'a SessionStateSnapshot) -> BoxFut<'a, Option<String>>;
     fn description(&self) -> String;
