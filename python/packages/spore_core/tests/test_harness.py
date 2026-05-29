@@ -36,7 +36,6 @@ from spore_core import (
     HumanResponseAllow,
     HumanResponseHalt,
     LoopStrategyHillClimbing,
-    LoopStrategyPlanExecute,
     LoopStrategyRalph,
     LoopStrategyReAct,
     LoopStrategySelfVerifying,
@@ -435,12 +434,14 @@ async def test_resume_with_allow_executes_pending_and_continues() -> None:
 
 
 async def test_non_react_strategies_marked_not_yet_implemented() -> None:
+    # Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented; it
+    # runs the plan phase and halts with ExecutePhaseNotImplemented. The other
+    # non-ReAct strategies remain stubbed.
     a = _agent()
     h = StandardHarness(_config(a))
     strategies = [
         LoopStrategyRalph(),
         LoopStrategySelfVerifying(),
-        LoopStrategyPlanExecute(plan_model=None),
         LoopStrategyHillClimbing(
             direction="maximize",
             max_stagnation=None,

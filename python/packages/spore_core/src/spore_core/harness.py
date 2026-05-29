@@ -1007,6 +1007,42 @@ class HaltReasonStrategyNotYetImplemented(_Model):
     strategy: str
 
 
+class HaltReasonExecutePhaseNotImplemented(_Model):
+    """Returned by :class:`StandardHarness` for the ``PlanExecute`` strategy
+    (issue #70). The plan phase ran to completion — an artifact was produced,
+    ``OnPlanCreated`` fired, and the artifact was stored — but the execute loop
+    itself is not yet wired (#59 / #72). Distinct from the generic
+    :class:`HaltReasonStrategyNotYetImplemented` so callers can tell "planned,
+    but execute is a stub" apart from "strategy entirely unimplemented"."""
+
+    kind: Literal["execute_phase_not_implemented"] = "execute_phase_not_implemented"
+
+
+class PlanPhaseErrorPayload(_Model):
+    """Serialized form of a :class:`spore_core.plan.PlanPhaseError` as it appears
+    nested under :class:`HaltReasonPlanPhaseFailed`. Wire shape matches Rust's
+    ``PlanPhaseError`` and Go's ``PlanPhaseError``:
+    ``{"kind": "unparseable_plan"|"planning_turn_failed", "message": "..."}``."""
+
+    kind: Literal["unparseable_plan", "planning_turn_failed"]
+    message: str
+
+
+class HaltReasonPlanPhaseFailed(_Model):
+    """The PlanExecute plan phase (issue #70) failed before producing an
+    artifact — the planning turn failed (R2: a tool call, or an agent error) or
+    the response text could not be parsed under the Q3 grammar.
+
+    Carries the underlying :class:`PlanPhaseError` NESTED under an ``error`` key,
+    matching the 3-language majority (Rust's
+    ``HaltReason::PlanPhaseFailed { error: PlanPhaseError }`` and Go's
+    ``HaltPlanPhaseFailed`` carrying ``*PlanPhaseError`` under ``json:"error"``,
+    and the TypeScript nested ``error``)."""
+
+    kind: Literal["plan_phase_failed"] = "plan_phase_failed"
+    error: PlanPhaseErrorPayload
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -1016,7 +1052,9 @@ HaltReason = Annotated[
     | HaltReasonUnrecoverableToolError
     | HaltReasonHumanHalted
     | HaltReasonStagnationLimitReached
-    | HaltReasonStrategyNotYetImplemented,
+    | HaltReasonStrategyNotYetImplemented
+    | HaltReasonExecutePhaseNotImplemented
+    | HaltReasonPlanPhaseFailed,
     Field(discriminator="kind"),
 ]
 
@@ -1236,8 +1274,14 @@ class HarnessConfig:
         content_capture: ContentCaptureConfig | None = None,
         max_stop_blocks: int = 8,
         hooks: HookChain | None = None,
+        planner_agent: Agent | None = None,
     ) -> None:
         self.agent = agent
+        # Optional alternate agent used for the PlanExecute plan phase (issue
+        # #70, Q1). When the loop strategy is ``PlanExecute`` and this is set,
+        # the one-shot plan turn runs on it; otherwise the plan turn runs on
+        # ``agent``. ``None`` means "use the default agent".
+        self.planner_agent = planner_agent
         self.tool_registry = tool_registry
         self.sandbox = sandbox
         self.context_manager = context_manager
@@ -1305,6 +1349,14 @@ class HarnessBuilder:
         self._content_capture: ContentCaptureConfig | None = None
         self._max_stop_blocks: int = 8
         self._hooks: HookChain | None = None
+        self._planner_agent: Agent | None = None
+
+    def planner_agent(self, planner_agent: Agent) -> HarnessBuilder:
+        """Inject an alternate agent for the PlanExecute plan phase (issue #70,
+        Q1). When set and the loop strategy is ``PlanExecute``, the one-shot
+        plan turn runs on this agent instead of the default agent."""
+        self._planner_agent = planner_agent
+        return self
 
     def hooks(self, hooks: HookChain) -> HarnessBuilder:
         """Inject a lifecycle hook chain (issue #69). The harness fires its
@@ -1379,6 +1431,7 @@ class HarnessBuilder:
             content_capture=self._content_capture,
             max_stop_blocks=self._max_stop_blocks,
             hooks=self._hooks,
+            planner_agent=self._planner_agent,
         )
 
     def build(self) -> StandardHarness:
@@ -1386,12 +1439,25 @@ class HarnessBuilder:
         return StandardHarness(self.build_config())
 
 
+@dataclass
+class _PlanPhaseOutcome:
+    """Internal result of a successful PlanExecute plan phase (issue #70).
+
+    Carries the produced (and possibly hook-mutated) :class:`PlanArtifact` plus
+    the run accounting so the ``PlanExecute`` arm can build its terminal
+    :class:`RunResult`. Private to the harness."""
+
+    artifact: Any  # PlanArtifact — typed Any to avoid a top-level hooks import
+    usage: AggregateUsage
+    turns: int
+
+
 class StandardHarness:
     """Canonical :class:`Harness` implementation.
 
-    Implements the ReAct loop fully; other :class:`LoopStrategy` variants
-    return :class:`HaltReasonStrategyNotYetImplemented` per the Rust
-    reference.
+    Implements the ReAct loop fully and the PlanExecute plan phase (issue #70,
+    phase 1 of 2); the remaining :class:`LoopStrategy` variants return
+    :class:`HaltReasonStrategyNotYetImplemented` per the Rust reference.
     """
 
     def __init__(self, config: HarnessConfig) -> None:
@@ -1508,12 +1574,7 @@ class StandardHarness:
                 task, strategy.max_iterations, session_state, budget_used, on_stream
             )
         if isinstance(strategy, LoopStrategyPlanExecute):
-            return self._fail(
-                HaltReasonStrategyNotYetImplemented(strategy="plan_execute"),
-                task.session_id,
-                AggregateUsage(),
-                0,
-            )
+            return await self._run_plan_execute(task, session_state, budget_used, on_stream)
         if isinstance(strategy, LoopStrategyRalph):
             return self._fail(
                 HaltReasonStrategyNotYetImplemented(strategy="ralph"),
@@ -1612,6 +1673,235 @@ class StandardHarness:
         if obs is not None:
             obs.set_session_outcome(session_id, outcome)
             await obs.flush_session(session_id)
+
+    # ---- PlanExecute plan phase (issue #70) -------------------------
+
+    async def _run_plan_execute(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive the PlanExecute strategy (issue #70).
+
+        Runs the one-shot plan phase (:meth:`_run_plan_phase`), then — per Q4 —
+        HALTS with the distinct :class:`HaltReasonExecutePhaseNotImplemented`
+        once an artifact has been produced, had ``OnPlanCreated`` fired on it,
+        and been stored. The execute loop itself ships with #59 / #72. On any
+        plan-phase failure the underlying :class:`RunResultFailure` is returned
+        unchanged (no artifact stored). Like ``_run_react``, this finalizes
+        observability for the terminal outcome.
+        """
+        session_id = task.session_id
+        outcome = await self._run_plan_phase(task, session_state, budget_used, on_stream)
+        if isinstance(outcome, _PlanPhaseOutcome):
+            # Plan produced + stored. Q4: halt with the distinct reason.
+            result: RunResult = self._fail(
+                HaltReasonExecutePhaseNotImplemented(),
+                session_id,
+                outcome.usage,
+                outcome.turns,
+            )
+        else:
+            result = outcome
+
+        if isinstance(result, RunResultSuccess):
+            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
+        elif isinstance(result, RunResultFailure):
+            await self._finalize_observability(
+                result.session_id,
+                SessionOutcomeFailure(reason=result.reason.kind),
+            )
+        return result
+
+    async def _run_plan_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> _PlanPhaseOutcome | RunResultFailure:
+        """Run the one-shot PlanExecute plan phase (issue #70).
+
+        Selects the planner agent (Q1: ``config.planner_agent`` if set, else the
+        default agent), seeds a planning directive as a user message, runs
+        EXACTLY ONE constrained turn (R1), expects a ``FinalResponse`` (a tool
+        call is a planning failure — R2 — never a dispatch loop), captures the
+        response via :func:`spore_core.plan.capture_plan_artifact` (R3), fires
+        ``OnPlanCreated`` (which may rewrite the artifact — R11), stores the
+        result in ``extras["plan_execute"]`` (R4), emits the turn span (R8), and
+        counts the turn against the shared budget (R7). A budget exhausted
+        before the turn returns a budget-exceeded :class:`RunResultFailure` with
+        no artifact stored (R10).
+
+        On success returns a :class:`_PlanPhaseOutcome`; on any failure returns
+        the terminal :class:`RunResultFailure` to propagate.
+        """
+        from .plan import PLAN_EXECUTE_EXTRAS_KEY, PlanPhaseError, capture_plan_artifact
+
+        config = self._config
+        session_id = task.session_id
+        started_at = time.monotonic()
+        usage = AggregateUsage()
+
+        # R10: Layer-1 budget gate BEFORE the plan turn. Mirrors _run_react_inner.
+        effective_turn_cap = max(task.budget.max_turns, 1) if task.budget.max_turns else 1
+        # ``max_turns is None`` ⇒ no explicit cap; one plan turn always allowed.
+        if task.budget.max_turns is not None and budget_used.turns >= effective_turn_cap:
+            return self._fail(
+                HaltReasonBudgetExceeded(limit_type="turns"),
+                session_id,
+                usage,
+                budget_used.turns,
+            )
+        limit_type = self._budget_exceeded(task.budget, budget_used, started_at)
+        if limit_type is not None:
+            return self._fail(
+                HaltReasonBudgetExceeded(limit_type=limit_type),
+                session_id,
+                usage,
+                budget_used.turns,
+            )
+
+        # Q1: select the planner agent (alternate if configured, else default).
+        planner = config.planner_agent if config.planner_agent is not None else config.agent
+
+        # Seed the planning directive as a user message (reuse ContextManager).
+        directive = (
+            "Produce a step-by-step plan for the following task. Respond with a "
+            'single JSON object: {"tasks": [<ordered step strings>], '
+            '"rationale": <string>}.\n\nTask:\n' + task.instruction
+        )
+        await config.context_manager.append_user_message(session_state, directive)
+
+        # Assemble + invoke the planner for exactly ONE turn (R1).
+        context = await config.context_manager.assemble(session_state, task)
+        self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
+        turn_started_at = _now()
+        turn_clock = time.monotonic()
+        result: TurnResult = await planner.turn(context)
+        budget_used.turns += 1  # R7: the plan turn counts against the budget.
+
+        # R8: emit exactly one turn span for the plan turn. Mirrors the metrics
+        # path of _run_react_inner; content capture is intentionally omitted (the
+        # plan turn carries no tool calls and #64 content capture is wired in the
+        # ReAct loop only).
+        zero = TokenUsage()
+        if isinstance(result, ToolCallRequested | FinalResponse):
+            u = result.usage
+        elif isinstance(result, TurnError):
+            u = result.usage or zero
+        else:
+            u = zero
+        if isinstance(result, FinalResponse):
+            stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+        elif isinstance(result, ToolCallRequested):
+            stop_reason, tool_calls_requested = StopReason.TOOL_USE, len(result.calls)
+        else:
+            stop_reason, tool_calls_requested = StopReason.END_TURN, 0
+        turn_base = SpanBase.new_root(
+            new_span_id(f"{session_id}-turn-{budget_used.turns}"),
+            session_id,
+            task.id,
+            SpanKind.TURN,
+            turn_started_at,
+        )
+        turn_status: SpanStatusOk | SpanStatusError
+        if isinstance(result, TurnError):
+            turn_status = SpanStatusError(message=result.error.kind)
+        else:
+            turn_status = SpanStatusOk()
+        turn_base.finish(_now(), turn_status, int((time.monotonic() - turn_clock) * 1000))
+        if config.observability is not None:
+            config.observability.emit_turn(
+                TurnSpan(
+                    base=turn_base,
+                    turn_number=budget_used.turns,
+                    input_tokens=u.input_tokens,
+                    output_tokens=u.output_tokens,
+                    cache_read_tokens=u.cache_read_tokens,
+                    cache_write_tokens=u.cache_write_tokens,
+                    cost_usd=config.pricing.cost_for(
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_tokens,
+                        u.cache_write_tokens,
+                    ),
+                    stop_reason=stop_reason,
+                    tool_calls_requested=tool_calls_requested,
+                    output_text=None,
+                    tool_calls=None,
+                    input_messages=None,
+                )
+            )
+        self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns))
+
+        # Classify the one-shot turn. R2: a tool call is a planning failure,
+        # NOT a dispatch loop.
+        if isinstance(result, FinalResponse):
+            usage.add_turn(result.usage)
+            budget_used.input_tokens += result.usage.input_tokens
+            budget_used.output_tokens += result.usage.output_tokens
+            final_text = result.content
+        elif isinstance(result, ToolCallRequested):
+            usage.add_turn(result.usage)
+            return self._fail(
+                HaltReasonPlanPhaseFailed(
+                    error=PlanPhaseErrorPayload(
+                        kind="planning_turn_failed",
+                        message="planner requested a tool call in the one-shot plan turn",
+                    ),
+                ),
+                session_id,
+                usage,
+                budget_used.turns,
+            )
+        else:  # TurnError
+            if result.usage is not None:
+                usage.add_turn(result.usage)
+            return self._fail(
+                HaltReasonAgentError(error=result.error),
+                session_id,
+                usage,
+                budget_used.turns,
+            )
+
+        # R3: capture the artifact from the response text.
+        try:
+            artifact = capture_plan_artifact(final_text)
+        except PlanPhaseError as e:
+            return self._fail(
+                HaltReasonPlanPhaseFailed(
+                    error=PlanPhaseErrorPayload(kind=e.kind, message=e.message),
+                ),
+                session_id,
+                usage,
+                budget_used.turns,
+            )
+
+        # R11: fire OnPlanCreated synchronously; the hook may rewrite the
+        # artifact. The stored artifact reflects any mutation. Errors are
+        # non-fatal: an observability/handler error must not lose a
+        # successfully-captured plan, so the (possibly mutated) artifact is
+        # still stored.
+        if config.hooks is not None:
+            from .hooks import OnPlanCreatedContext
+
+            ctx = OnPlanCreatedContext(session_id=session_id, plan=artifact)
+            try:
+                await config.hooks.fire(ctx)
+            except Exception:  # noqa: BLE001 — a broken hook must not lose the plan
+                pass
+            # The chain threads mutations through ``ctx.plan`` in place.
+            artifact = ctx.plan
+
+        # R4: store the produced artifact in extras["plan_execute"] as a
+        # JSON-safe object (matches Rust's ``serde_json::to_value(&artifact)``:
+        # ``{"tasks": [...], "rationale": "..."}``).
+        session_state.extras[PLAN_EXECUTE_EXTRAS_KEY] = artifact.model_dump(mode="json")
+
+        return _PlanPhaseOutcome(artifact=artifact, usage=usage, turns=budget_used.turns)
 
     # ---- ReAct loop -------------------------------------------------
 
