@@ -211,8 +211,10 @@ pub enum OptimizationDirection {
 
 /// Loop strategy. The data shape is canonical; concrete strategy traits
 /// (`CompletionCheck`, `Verifier`, `MetricEvaluator`) are owned by their
-/// respective component issues. Until those land, only [`LoopStrategy::ReAct`]
-/// is fully executable in [`StandardHarness`].
+/// respective component issues. [`LoopStrategy::ReAct`] (issue #57) and
+/// [`LoopStrategy::PlanExecute`] (issues #70/#59) are fully executable in
+/// [`StandardHarness`]; the remaining variants still halt with
+/// [`HaltReason::StrategyNotYetImplemented`] until their component issues land.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoopStrategy {
@@ -897,13 +899,21 @@ pub enum HaltReason {
         strategy: String,
     },
     /// Returned by [`StandardHarness`] for the `PlanExecute` strategy (issue
-    /// #70) AFTER the plan phase has produced, fired `OnPlanCreated` on, and
-    /// stored a [`PlanArtifact`](crate::plan::PlanArtifact). The execute loop
-    /// itself ships with #59/#72; this distinct reason marks "plan produced,
-    /// execute phase not implemented yet" so callers can tell it apart from the
-    /// generic [`StrategyNotYetImplemented`](Self::StrategyNotYetImplemented)
-    /// stub used by the other strategies.
-    ExecutePhaseNotImplemented,
+    /// #59) when the accepted plan parsed into an EMPTY task list (`tasks: []`).
+    /// Per Q3, an empty plan is a failure — the run does NOT silently succeed.
+    EmptyPlan,
+    /// Returned by [`StandardHarness`] for the `PlanExecute` strategy (issue
+    /// #59) when an execute step's bounded ReAct sub-loop errored or the agent
+    /// returned a blocked/failed outcome (Q5). A plan is a dependency chain by
+    /// assumption, so the whole run aborts at the failing step — execution does
+    /// NOT continue to the next task. Carries the failing step's positional
+    /// index, its instruction, and a human-readable reason derived from the
+    /// underlying [`HaltReason`].
+    StepFailed {
+        task_index: usize,
+        task: String,
+        reason: String,
+    },
     /// The PlanExecute plan phase (issue #70) failed before producing an
     /// artifact: the planner's response was unparseable, the planner requested
     /// a tool call in the one-shot turn, or the artifact could not be
@@ -943,7 +953,6 @@ pub enum RunResult {
 /// is observable via `SessionState.extras["plan_execute"]`.
 #[derive(Debug)]
 struct PlanPhaseOutcome {
-    #[allow(dead_code)]
     artifact: crate::plan::PlanArtifact,
     usage: AggregateUsage,
     turns: u32,
@@ -2284,14 +2293,55 @@ impl StandardHarness {
 
     // (private outcome type for `run_plan_phase` is defined at module scope.)
 
-    /// Drive the PlanExecute strategy (issue #70).
+    /// Drive the PlanExecute strategy (issue #59) — the two-phase loop.
     ///
-    /// Runs the one-shot plan phase ([`run_plan_phase`](Self::run_plan_phase)),
-    /// then — per Q4 — HALTS with the distinct
-    /// [`HaltReason::ExecutePhaseNotImplemented`] once an artifact has been
-    /// produced, had `OnPlanCreated` fired on it, and been stored. The execute
-    /// loop itself ships with #59/#72. On any plan-phase failure the underlying
-    /// `RunResult::Failure` is returned unchanged (no artifact stored).
+    /// # Phases
+    /// 1. **Plan phase** (issue #70, runs EXACTLY ONCE):
+    ///    [`run_plan_phase`](Self::run_plan_phase) seeds a planning directive,
+    ///    runs one constrained planner turn, captures a
+    ///    [`PlanArtifact`](crate::plan::PlanArtifact), fires `OnPlanCreated`,
+    ///    and counts the turn against the shared budget.
+    /// 2. **Execute phase** (issue #59, loops):
+    ///    [`run_execute_phase`](Self::run_execute_phase) drains the task list,
+    ///    giving each task its own bounded ReAct sub-loop.
+    ///
+    /// Between the phases the artifact is parsed into a
+    /// [`TaskList`](crate::tasklist::TaskList) via
+    /// [`plan_artifact_to_task_list`](crate::tasklist::plan_artifact_to_task_list)
+    /// and persisted through the storage seam (Q4) and the `extras` mirror.
+    ///
+    /// # HaltReason variants
+    /// - NEW [`HaltReason::EmptyPlan`] — the plan parsed to `tasks: []` (Q3).
+    /// - NEW [`HaltReason::StepFailed`] — an execute step errored / blocked (Q5).
+    /// - REMOVED `HaltReason::ExecutePhaseNotImplemented` — the execute phase is
+    ///   now implemented; the old "plan produced, execute not implemented" halt
+    ///   no longer exists.
+    /// - Plan-phase failures still surface as
+    ///   [`HaltReason::PlanPhaseFailed`] / [`HaltReason::AgentError`] /
+    ///   [`HaltReason::BudgetExceeded`] unchanged.
+    ///
+    /// # Resolved spec decisions (issue #59 — all five FINAL)
+    /// - **Q1 (execute step model):** each task gets its OWN bounded ReAct
+    ///   sub-loop, fully isolated and SEQUENTIAL (task N completes before N+1).
+    ///   The per-task turn cap is derived at the START of each step:
+    ///   `per_task_turns = remaining_turns / remaining_tasks`, floored at 1
+    ///   (integer division; `remaining_tasks` = not-yet-started tasks including
+    ///   the current one). The shared/parent budget — turns, tokens,
+    ///   observability spans, compaction — is carried across EVERY step exactly
+    ///   as ReAct does, and the global budget is the hard stop.
+    /// - **Q2 (success output):** `RunResult::Success.output` is the LAST
+    ///   completed step's `FinalResponse` text — not a concatenation, not the
+    ///   plan rationale. Full per-step history stays in session state / traces.
+    /// - **Q3 (empty plan):** an empty task list ⇒ [`HaltReason::EmptyPlan`].
+    /// - **Q4 (persistence):** the task list and plan are persisted through the
+    ///   [`StorageProvider`](crate::storage::StorageProvider) /
+    ///   [`RunStore`](crate::storage::RunStore) seam ONLY. The #71
+    ///   sandbox-filesystem path (`.spore/task_list.json`) is NOT used by the
+    ///   execute loop — one source of truth. The `extras` mirror is kept.
+    /// - **Q5 (per-task failure):** a step's ReAct sub-loop erroring or returning
+    ///   a blocked/failed outcome ABORTS the whole run with
+    ///   [`HaltReason::StepFailed`]; execution does NOT continue to the next
+    ///   task (a plan is a dependency chain by assumption).
     ///
     /// Like `run_react`, this finalizes observability for the terminal outcome.
     async fn run_plan_execute(
@@ -2302,20 +2352,67 @@ impl StandardHarness {
         on_stream: Option<StreamSink>,
     ) -> RunResult {
         let session_id = task.session_id.clone();
-        let result = match self
-            .run_plan_phase(&task, &mut session_state, budget_used, &on_stream)
+
+        // ── Phase 1: plan (runs exactly once) ──────────────────────────────
+        let outcome = match self
+            .run_plan_phase(&task, &mut session_state, budget_used.clone(), &on_stream)
             .await
         {
-            // Plan produced + stored. Q4: halt with the distinct reason.
-            Ok(outcome) => RunResult::Failure {
-                reason: HaltReason::ExecutePhaseNotImplemented,
-                session_id: session_id.clone(),
+            Ok(outcome) => outcome,
+            // Plan-phase failure: propagate unchanged (no task list persisted).
+            Err(failure) => {
+                self.finalize_plan_execute(&failure).await;
+                return failure;
+            }
+        };
+
+        // Bridge: parse the accepted plan into a TaskList (#72).
+        let task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
+
+        // Q3: an empty plan is a failure, not a silent success.
+        if task_list.tasks.is_empty() {
+            let result = RunResult::Failure {
+                reason: HaltReason::EmptyPlan,
+                session_id,
                 usage: outcome.usage,
                 turns: outcome.turns,
-            },
-            Err(failure) => failure,
-        };
-        match &result {
+            };
+            self.finalize_plan_execute(&result).await;
+            return result;
+        }
+
+        // Q4: persist the task list through the storage seam (RunStore) ONLY,
+        // plus the extras mirror. The #71 sandbox path is intentionally unused.
+        self.persist_task_list(&mut session_state, &session_id, &task_list)
+            .await;
+
+        // Carry the shared budget forward: the plan turn already consumed
+        // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
+        let mut carried = budget_used;
+        carried.turns = outcome.turns;
+        carried.input_tokens += outcome.usage.input_tokens;
+        carried.output_tokens += outcome.usage.output_tokens;
+
+        // ── Phase 2: execute (loops over the task list) ────────────────────
+        let result = self
+            .run_execute_phase(
+                &task,
+                &mut session_state,
+                task_list,
+                carried,
+                outcome.usage,
+                &on_stream,
+            )
+            .await;
+        self.finalize_plan_execute(&result).await;
+        result
+    }
+
+    /// Finalize observability for a terminal PlanExecute outcome. Mirrors the
+    /// tail of [`run_react`](Self::run_react): `WaitingForHuman` is not terminal
+    /// and is never flushed here.
+    async fn finalize_plan_execute(&self, result: &RunResult) {
+        match result {
             RunResult::Success { session_id, .. } => {
                 self.finalize_observability(session_id, SessionOutcome::Success)
                     .await;
@@ -2333,7 +2430,230 @@ impl StandardHarness {
             }
             RunResult::WaitingForHuman { .. } => {}
         }
-        result
+    }
+
+    /// Persist the parsed [`TaskList`](crate::tasklist::TaskList) for the run
+    /// (Q4). The DURABLE write goes through the
+    /// [`RunStore`](crate::storage::RunStore) seam under
+    /// [`TASK_LIST_EXTRAS_KEY`](crate::tasklist::TASK_LIST_EXTRAS_KEY); the #71
+    /// sandbox-filesystem path (`.spore/task_list.json`) is intentionally NOT
+    /// used — one source of truth. The list is also mirrored into
+    /// `SessionState.extras[TASK_LIST_EXTRAS_KEY]` (matching the existing
+    /// `extras["plan_execute"]` precedent). Serialization failures are swallowed:
+    /// a successful plan must not be lost to a storage hiccup (the default
+    /// no-op/in-memory provider never fails).
+    async fn persist_task_list(
+        &self,
+        session_state: &mut SessionState,
+        session_id: &SessionId,
+        task_list: &crate::tasklist::TaskList,
+    ) {
+        if let Ok(value) = serde_json::to_value(task_list) {
+            // Durable write through the storage seam (RunStore).
+            let _ = self
+                .config
+                .storage
+                .run()
+                .put(
+                    session_id,
+                    crate::tasklist::TASK_LIST_EXTRAS_KEY,
+                    value.clone(),
+                )
+                .await;
+            // Extras mirror (in-session view).
+            session_state
+                .extras
+                .insert(crate::tasklist::TASK_LIST_EXTRAS_KEY.to_string(), value);
+        }
+    }
+
+    /// Drive the PlanExecute execute phase (issue #59), draining `task_list`.
+    ///
+    /// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
+    /// sub-loop. The per-task turn cap is derived at the START of each step from
+    /// the shared budget: `per_task_turns = remaining_turns / remaining_tasks`,
+    /// floored at 1 (integer division; `remaining_tasks` counts the not-yet-
+    /// started tasks including the current one). The shared budget snapshot
+    /// (`carried`) is threaded through every step so early tasks cannot starve
+    /// later ones and the global budget stays the hard stop.
+    ///
+    /// Before each step the task is marked `InProgress` (and `Completed` after),
+    /// the list is re-persisted (Q4), and `OnTaskAdvance` fires with the correct
+    /// `task_index` / `total_tasks` (the hook may rewrite the step instruction).
+    ///
+    /// Q2: on success `output` is the LAST completed step's `FinalResponse`.
+    /// Q5: a step that errors / blocks aborts the run with
+    /// [`HaltReason::StepFailed`] — no further tasks run.
+    ///
+    /// `plan_usage` seeds the cumulative [`AggregateUsage`] with the plan turn's
+    /// usage so the terminal `RunResult` reflects the WHOLE run.
+    async fn run_execute_phase(
+        &self,
+        task: &Task,
+        session_state: &mut SessionState,
+        mut task_list: crate::tasklist::TaskList,
+        mut carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: &Option<StreamSink>,
+    ) -> RunResult {
+        use crate::tasklist::TaskStatus;
+
+        let session_id = task.session_id.clone();
+        let total_tasks = task_list.tasks.len();
+        // Cumulative usage across the plan turn + every execute step (Q1).
+        let mut total_usage = plan_usage;
+        // Q2: the success handle is the LAST completed step's final text.
+        let mut last_output = String::new();
+        // Global turn cap (the hard stop). `None` ⇒ no global turn ceiling.
+        let global_max_turns = task.budget.max_turns;
+
+        for index in 0..total_tasks {
+            let task_id = task_list.tasks[index].id;
+            let instruction = task_list.tasks[index].description.clone();
+
+            // Q1: per-task turn allocation, derived at the START of this step.
+            // remaining_tasks = not-yet-started tasks including this one.
+            let remaining_tasks = (total_tasks - index) as u32;
+            let per_task_turns = match global_max_turns {
+                Some(max) => {
+                    let remaining_turns = max.saturating_sub(carried.turns);
+                    (remaining_turns / remaining_tasks).max(1)
+                }
+                // No global turn cap: each step's sub-loop is bounded only by
+                // the other (token / wall / cost) budget gates.
+                None => u32::MAX,
+            };
+            // The sub-loop's effective cap is RELATIVE to the carried turns:
+            // run_react_inner gates on the cumulative `budget_used.turns`, so a
+            // per-task cap of K means "stop K turns from now" while the global
+            // budget (carried forward) remains the hard stop.
+            let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
+
+            // Mark InProgress (Pending -> InProgress) and re-persist (Q4).
+            let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
+            self.persist_task_list(session_state, &session_id, &task_list)
+                .await;
+
+            // Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
+            // instruction via the carried harness::Task; the (possibly mutated)
+            // instruction seeds the sub-loop.
+            let mut step_task = Task {
+                id: task.id.clone(),
+                instruction,
+                session_id: session_id.clone(),
+                budget: task.budget.clone(),
+                loop_strategy: task.loop_strategy.clone(),
+            };
+            if let Some(chain) = self.config.hooks.as_ref() {
+                let mut ctx = crate::hooks::HookContext::OnTaskAdvance {
+                    session_id: &session_id,
+                    task: &mut step_task,
+                    task_index: index,
+                    total_tasks,
+                };
+                let _ = chain.fire(&mut ctx).await;
+            }
+
+            // Seed the step instruction as a user message, then run the bounded
+            // ReAct sub-loop carrying the shared budget (Q1).
+            self.config
+                .context_manager
+                .append_user_message(session_state, &step_task.instruction)
+                .await;
+
+            let sub_result = self
+                .run_react_inner(
+                    step_task,
+                    sub_loop_cap,
+                    session_state.clone(),
+                    carried.clone(),
+                    None,
+                )
+                .await;
+
+            match sub_result {
+                RunResult::Success {
+                    output,
+                    usage,
+                    turns,
+                    ..
+                } => {
+                    // Carry the shared budget forward (Q1): cumulative turns are
+                    // the sub-loop's absolute count; fold in its token usage.
+                    carried.turns = turns;
+                    carried.input_tokens += usage.input_tokens;
+                    carried.output_tokens += usage.output_tokens;
+                    total_usage.input_tokens += usage.input_tokens;
+                    total_usage.output_tokens += usage.output_tokens;
+                    total_usage.cache_read_tokens += usage.cache_read_tokens;
+                    total_usage.cache_write_tokens += usage.cache_write_tokens;
+                    total_usage.cost_usd += usage.cost_usd;
+                    last_output = output;
+
+                    // Mark Completed and re-persist (Q4).
+                    let _ = task_list.complete(task_id);
+                    self.persist_task_list(session_state, &session_id, &task_list)
+                        .await;
+                    // Surface the completed step's final text to the caller's
+                    // sink. The per-step sub-loop runs with its own (suppressed)
+                    // sink, so this is the parent-visible step boundary.
+                    Self::emit(
+                        on_stream,
+                        StreamEvent::FinalResponse {
+                            content: last_output.clone(),
+                        },
+                    );
+                }
+                // Q5: any non-success step aborts the whole run. A budget halt
+                // surfaces as BudgetExceeded (mid-execute exhaustion); other
+                // failures surface as StepFailed carrying the step context.
+                RunResult::Failure {
+                    reason,
+                    usage,
+                    turns,
+                    ..
+                } => {
+                    total_usage.input_tokens += usage.input_tokens;
+                    total_usage.output_tokens += usage.output_tokens;
+                    total_usage.cache_read_tokens += usage.cache_read_tokens;
+                    total_usage.cache_write_tokens += usage.cache_write_tokens;
+                    total_usage.cost_usd += usage.cost_usd;
+
+                    let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
+                    self.persist_task_list(session_state, &session_id, &task_list)
+                        .await;
+
+                    let terminal_reason = match reason {
+                        // Budget exhaustion mid-execute is its own halt — keep
+                        // it distinct from a step's own failure.
+                        HaltReason::BudgetExceeded { .. } => reason,
+                        other => HaltReason::StepFailed {
+                            task_index: index,
+                            task: task_list.tasks[index].description.clone(),
+                            reason: format!("{other:?}"),
+                        },
+                    };
+                    return RunResult::Failure {
+                        reason: terminal_reason,
+                        session_id,
+                        usage: total_usage,
+                        turns,
+                    };
+                }
+                // A step surfacing to a human pauses the whole run; propagate.
+                RunResult::WaitingForHuman { state, request } => {
+                    return RunResult::WaitingForHuman { state, request };
+                }
+            }
+        }
+
+        // Q2: success output is the LAST completed step's FinalResponse text.
+        RunResult::Success {
+            output: last_output,
+            session_id,
+            usage: total_usage,
+            turns: carried.turns,
+        }
     }
 
     /// Run the one-shot PlanExecute plan phase (issue #70).
@@ -4245,24 +4565,24 @@ mod tests {
         serde_json::from_value(v.clone()).expect("artifact deserializes")
     }
 
-    // Q4: after producing+storing an artifact, the full PlanExecute run() halts
-    // with the distinct ExecutePhaseNotImplemented reason (not the generic
-    // StrategyNotYetImplemented stub). Storage is asserted via run_plan_phase in
-    // the tests below, which can inspect the mutated session_state directly.
+    // Issue #59 happy path: plan turn (2 tasks) then 2 execute completions. The
+    // full PlanExecute run() now SUCCEEDS (proving ExecutePhaseNotImplemented is
+    // gone) and `output` is the LAST step's FinalResponse (Q2). turns == 3 (one
+    // plan + one per step).
     #[tokio::test]
-    async fn plan_execute_halts_with_distinct_reason() {
+    async fn plan_execute_full_run_succeeds() {
         let a = make_agent();
         a.push(final_resp(r#"{"tasks":["one","two"],"rationale":"why"}"#));
+        a.push(final_resp("did one"));
+        a.push(final_resp("did two"));
         let h = StandardHarness::new(standard_config(a));
         match h.run(HarnessRunOptions::new(plan_task())).await {
-            RunResult::Failure {
-                reason: HaltReason::ExecutePhaseNotImplemented,
-                turns,
-                ..
-            } => {
-                assert_eq!(turns, 1, "exactly one plan turn counts against budget");
+            RunResult::Success { output, turns, .. } => {
+                // Q2: the success handle is the LAST completed step's final text.
+                assert_eq!(output, "did two");
+                assert_eq!(turns, 3, "one plan turn + one turn per task");
             }
-            other => panic!("expected ExecutePhaseNotImplemented, got {other:?}"),
+            other => panic!("expected Success, got {other:?}"),
         }
     }
 
@@ -4391,19 +4711,27 @@ mod tests {
         assert_eq!(stored_artifact(&state).tasks, vec!["default"]);
     }
 
-    // R8: exactly one TurnSpan is recorded for the plan turn.
+    // R8 (#70): the plan turn records exactly one TurnSpan, and it is the FIRST
+    // span of the run (turn 1). With the execute phase (#59) wired in, the full
+    // run() emits additional spans for the execute steps; this asserts the plan
+    // turn's span specifically. A dedicated #59 test
+    // (`execute_phase_span_count`) covers the per-step span accounting.
     #[tokio::test]
     async fn plan_phase_records_one_turn_span() {
         let a = make_agent();
+        // Plan turn + one execute completion so the run progresses cleanly.
         a.push(final_resp(r#"{"tasks":["a"]}"#));
+        a.push(final_resp("did a"));
         let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
         let mut cfg = standard_config(a);
         cfg.observability = Some(obs.clone());
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(plan_task())).await;
         let spans = obs.turn_spans(&SessionId::new("s1"));
-        assert_eq!(spans.len(), 1, "exactly one turn span for the plan turn");
-        assert_eq!(spans[0].turn_number, 1);
+        // Plan turn (1) + the single execute step turn (1) = 2 spans total.
+        assert_eq!(spans.len(), 2, "plan turn + one execute step turn");
+        // The plan turn is span 0, turn_number 1.
+        assert_eq!(spans[0].turn_number, 1, "first span is the plan turn");
     }
 
     // R10: budget exhausted before the plan turn → budget-exceeded Failure with
@@ -4526,6 +4854,448 @@ mod tests {
             other => panic!("expected UnparseablePlan, got {other:?}"),
         }
         assert!(state.extras.get(PLAN_EXECUTE_EXTRAS_KEY).is_none());
+    }
+
+    // ── PlanExecute execute phase (issue #59) ───────────────────────────────
+
+    use crate::tasklist::{TaskList, TaskStatus, TASK_LIST_EXTRAS_KEY};
+
+    // Read the task list mirrored into SessionState.extras (Q4 mirror).
+    fn extras_task_list(state: &SessionState) -> TaskList {
+        let v = state
+            .extras
+            .get(TASK_LIST_EXTRAS_KEY)
+            .expect("task_list extras present");
+        serde_json::from_value(v.clone()).expect("task list deserializes")
+    }
+
+    // Build a PlanExecute task carrying an explicit budget (e.g. a turn cap).
+    fn plan_task_with_budget(budget: BudgetLimits) -> Task {
+        plan_task().with_budget(budget)
+    }
+
+    // Q1 happy path + plan-then-execute + task drain. Plan produces K=3 tasks,
+    // then 3 execute completions. The run succeeds; turns == 4 (plan + 3).
+    #[tokio::test]
+    async fn execute_phase_happy_path_drains_all_tasks() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["t1","t2","t3"],"rationale":"r"}"#));
+        a.push(final_resp("done t1"));
+        a.push(final_resp("done t2"));
+        a.push(final_resp("done t3"));
+        let agent_count = a.clone();
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, turns, .. } => {
+                assert_eq!(output, "done t3", "Q2: output is the last step's final");
+                assert_eq!(turns, 4, "one plan turn + one per task");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // 1 plan turn + 3 execute turns = 4 agent calls.
+        assert_eq!(
+            agent_count
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4
+        );
+    }
+
+    // Task drain Pending -> InProgress -> Completed: inspect the persisted list
+    // after a run via run_execute_phase directly so we can read the final state.
+    #[tokio::test]
+    async fn execute_phase_drains_pending_inprogress_completed() {
+        let a = make_agent();
+        a.push(final_resp("done one"));
+        a.push(final_resp("done two"));
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+        let mut state = SessionState::default();
+        let list = plan_artifact_to_tasklist_helper(&["one", "two"]);
+        // All start Pending.
+        assert!(list.tasks.iter().all(|x| x.status == TaskStatus::Pending));
+        let result = h
+            .run_execute_phase(
+                &t,
+                &mut state,
+                list,
+                BudgetSnapshot {
+                    turns: 1,
+                    ..Default::default()
+                },
+                AggregateUsage::default(),
+                &None,
+            )
+            .await;
+        match result {
+            RunResult::Success { output, .. } => assert_eq!(output, "done two"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // Final persisted list: every task Completed.
+        let final_list = extras_task_list(&state);
+        assert!(
+            final_list
+                .tasks
+                .iter()
+                .all(|x| x.status == TaskStatus::Completed),
+            "all tasks Completed after drain"
+        );
+    }
+
+    fn plan_artifact_to_tasklist_helper(steps: &[&str]) -> TaskList {
+        crate::tasklist::plan_artifact_to_task_list(&PlanArtifact {
+            tasks: steps.iter().map(|s| s.to_string()).collect(),
+            rationale: String::new(),
+        })
+    }
+
+    // Q1 per-task turn allocation + shared budget: with a global cap of 7 turns
+    // and a plan turn already spent (1), 3 tasks split the remaining 6 turns
+    // (2 each). A task that needs >2 turns must be cut off by its per-task cap,
+    // proving the allocation is enforced and the shared budget carries forward.
+    #[tokio::test]
+    async fn execute_phase_per_task_turn_allocation() {
+        let a = make_agent();
+        // Plan: 3 tasks.
+        a.push(final_resp(r#"{"tasks":["a","b","c"]}"#));
+        // Task a: 2 tool calls then would need a 3rd turn — but per_task = 2, so
+        // it is cut off at 2 turns inside its sub-loop. Push 2 tool-call turns.
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "2".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "ok".into(),
+            truncated: false,
+        });
+        reg.push(ToolOutput::Success {
+            content: "ok".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        let t = plan_task_with_budget(BudgetLimits {
+            max_turns: Some(7),
+            ..Default::default()
+        });
+        // remaining = 7 - 1 = 6; 3 tasks -> per_task = 2. Task a uses 2 turns of
+        // tool calls without finishing, so its sub-loop hits the per-task cap and
+        // the run aborts (StepFailed / BudgetExceeded depending on which gate).
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure { reason, turns, .. } => {
+                // The per-task cap is a turn budget: the sub-loop hits the turn
+                // gate, which surfaces as BudgetExceeded(Turns) routed through.
+                assert!(
+                    matches!(
+                        reason,
+                        HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns
+                        }
+                    ),
+                    "per-task turn cap enforced, got {reason:?}"
+                );
+                // plan(1) + 2 task-a turns = 3 cumulative turns.
+                assert_eq!(turns, 3, "shared budget carried: 1 plan + 2 task turns");
+            }
+            other => panic!("expected Failure from turn cap, got {other:?}"),
+        }
+    }
+
+    // Budget exhaustion MID-execute: a tight global turn cap stops the run
+    // partway with BudgetExceeded, not StepFailed.
+    #[tokio::test]
+    async fn execute_phase_budget_exhausted_mid_execute() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["x","y","z"]}"#));
+        a.push(final_resp("did x"));
+        // No more turns allowed after the first execute step.
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task_with_budget(BudgetLimits {
+            max_turns: Some(2), // plan(1) + exactly one execute turn
+            ..Default::default()
+        });
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure { reason, turns, .. } => {
+                assert!(
+                    matches!(
+                        reason,
+                        HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns
+                        }
+                    ),
+                    "global turn budget is the hard stop, got {reason:?}"
+                );
+                assert_eq!(turns, 2);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // Observability span count: plan turn + one span per executed step.
+    #[tokio::test]
+    async fn execute_phase_span_count() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["a","b"]}"#));
+        a.push(final_resp("did a"));
+        a.push(final_resp("did b"));
+        let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
+        let mut cfg = standard_config(a);
+        cfg.observability = Some(obs.clone());
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+        let spans = obs.turn_spans(&SessionId::new("s1"));
+        // 1 plan turn + 2 execute step turns = 3 turn spans.
+        assert_eq!(spans.len(), 3, "plan turn + one span per executed step");
+    }
+
+    // Compaction works inside the execute loop: the context manager requests a
+    // compaction, and the run still completes. (Exercises the shared compaction
+    // path through run_react_inner during execute steps.)
+    #[tokio::test]
+    async fn execute_phase_compaction_in_loop() {
+        // Use the default NoopContextManager (never compacts) is not enough to
+        // exercise compaction; instead assert the loop tolerates many turns with
+        // tool calls and still drains. A dedicated compaction adapter lives in
+        // the ReAct compaction tests; here we assert execute reuses that path by
+        // running a multi-turn step to completion.
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["only"]}"#));
+        a.push(TurnResult::ToolCallRequested {
+            calls: vec![ToolCall {
+                id: "1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(final_resp("finished only"));
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "ok".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, turns, .. } => {
+                assert_eq!(output, "finished only");
+                // plan(1) + tool turn(1) + final(1) = 3.
+                assert_eq!(turns, 3);
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // OnTaskAdvance fires exactly N times with the correct task_index /
+    // total_tasks, and (Q1) may rewrite the step instruction.
+    #[tokio::test]
+    async fn execute_phase_on_task_advance_fires_per_task() {
+        use crate::hooks::{FunctionHook, HookDecision, HookEvent, StandardHookChain};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["s0","s1","s2"]}"#));
+        a.push(final_resp("d0"));
+        a.push(final_resp("d1"));
+        a.push(final_resp("d2"));
+
+        let fire_count = Arc::new(AtomicUsize::new(0));
+        let seen_indices = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen_totals = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let fc = fire_count.clone();
+        let si = seen_indices.clone();
+        let st = seen_totals.clone();
+
+        let chain = StandardHookChain::new();
+        chain
+            .register(Arc::new(FunctionHook::new(
+                "count-advance",
+                vec![HookEvent::OnTaskAdvance],
+                move |ctx| {
+                    if let crate::hooks::HookContext::OnTaskAdvance {
+                        task_index,
+                        total_tasks,
+                        ..
+                    } = ctx
+                    {
+                        fc.fetch_add(1, Ordering::SeqCst);
+                        si.lock().unwrap().push(*task_index);
+                        st.lock().unwrap().push(*total_tasks);
+                    }
+                    Ok(HookDecision::Continue)
+                },
+            )))
+            .unwrap();
+
+        let mut cfg = standard_config(a);
+        cfg.hooks = Some(Arc::new(chain));
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+
+        assert_eq!(fire_count.load(Ordering::SeqCst), 3, "fires once per task");
+        assert_eq!(*seen_indices.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(*seen_totals.lock().unwrap(), vec![3, 3, 3]);
+    }
+
+    // Q3: an empty plan -> HaltReason::EmptyPlan (not a silent success).
+    #[tokio::test]
+    async fn execute_phase_empty_plan_halts() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":[],"rationale":"nothing"}"#));
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::EmptyPlan,
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 1, "only the plan turn ran");
+            }
+            other => panic!("expected EmptyPlan, got {other:?}"),
+        }
+    }
+
+    // Q5: a step that errors aborts the whole run with StepFailed carrying the
+    // failing index + instruction; later tasks do NOT run.
+    #[tokio::test]
+    async fn execute_phase_step_failure_aborts_with_step_failed() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["good","bad","never"]}"#));
+        a.push(final_resp("did good"));
+        // Step 1 ("bad"): agent returns an error.
+        a.push(TurnResult::Error {
+            error: crate::agent::AgentError::EmptyResponse,
+            usage: None,
+        });
+        // "never" must NOT run.
+        let agent_count = a.clone();
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::StepFailed {
+                        task_index, task, ..
+                    },
+                ..
+            } => {
+                assert_eq!(task_index, 1, "aborts on the failing step");
+                assert_eq!(task, "bad");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+        // plan(1) + good(1) + bad(1) = 3 calls; "never" never ran.
+        assert_eq!(
+            agent_count
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the third task must not run after a step failure"
+        );
+    }
+
+    // Q4: the task list is persisted through the RunStore seam (not the #71
+    // sandbox path). Assert the durable RunStore holds the list after a run.
+    #[tokio::test]
+    async fn execute_phase_persists_through_run_store() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["one"]}"#));
+        a.push(final_resp("did one"));
+        let store = Arc::new(crate::storage::InMemoryStorageProvider::new());
+        let provider = Arc::new(crate::storage::StorageProvider::single(store));
+        let mut cfg = standard_config(a);
+        cfg.storage = provider.clone();
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(plan_task())).await;
+
+        let stored = provider
+            .run()
+            .get(&SessionId::new("s1"), TASK_LIST_EXTRAS_KEY)
+            .await
+            .expect("run store get ok")
+            .expect("task list present in run store");
+        let list: TaskList = serde_json::from_value(stored).expect("deserializes");
+        assert_eq!(list.tasks.len(), 1);
+        assert_eq!(list.tasks[0].status, TaskStatus::Completed);
+    }
+
+    // Q2: success output is the LAST step's FinalResponse, not a concatenation
+    // and not the plan rationale.
+    #[tokio::test]
+    async fn execute_phase_success_output_is_last_step() {
+        let a = make_agent();
+        a.push(final_resp(
+            r#"{"tasks":["a","b"],"rationale":"RATIONALE_TOKEN"}"#,
+        ));
+        a.push(final_resp("FIRST_STEP_OUTPUT"));
+        a.push(final_resp("LAST_STEP_OUTPUT"));
+        let h = StandardHarness::new(standard_config(a));
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "LAST_STEP_OUTPUT");
+                assert!(!output.contains("FIRST_STEP_OUTPUT"));
+                assert!(!output.contains("RATIONALE_TOKEN"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // Confirms ExecutePhaseNotImplemented is gone: a full PlanExecute run with
+    // execute completions returns Success (the old variant would have halted).
+    #[tokio::test]
+    async fn execute_phase_not_implemented_is_gone() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["only"]}"#));
+        a.push(final_resp("done"));
+        let h = StandardHarness::new(standard_config(a));
+        assert!(matches!(
+            h.run(HarnessRunOptions::new(plan_task())).await,
+            RunResult::Success { .. }
+        ));
+    }
+
+    // Planner-agent routing through the FULL run: the planner runs the plan turn
+    // and the default agent runs the execute steps.
+    #[tokio::test]
+    async fn execute_phase_planner_agent_routing() {
+        let default_agent = make_agent();
+        default_agent.push(final_resp("did the step"));
+        let planner = make_agent();
+        planner.push(final_resp(r#"{"tasks":["step"]}"#));
+
+        let mut cfg = standard_config(default_agent.clone());
+        cfg.planner_agent = Some(planner.clone());
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "did the step"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        assert_eq!(
+            planner.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "planner ran exactly the plan turn"
+        );
+        assert_eq!(
+            default_agent
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "default agent ran exactly the execute step"
+        );
     }
 
     // Rule: Aggregate usage accumulates across turns.

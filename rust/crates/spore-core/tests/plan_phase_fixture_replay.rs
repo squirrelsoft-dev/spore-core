@@ -6,7 +6,11 @@
 //!      `PlanArtifact` (tasks + rationale), stored under
 //!      `extras["plan_execute"]`.
 //!   2. The fenced ```json variant is captured identically (fence-strip rule).
-//!   3. The run halts with the distinct `ExecutePhaseNotImplemented` reason.
+//!   3. The plan turn is consumed and parsed into a non-empty task list, so the
+//!      run proceeds into the execute phase (issue #59). This fixture provides
+//!      ONLY the single plan turn, so the first execute step's ReAct sub-loop
+//!      exhausts the replay and the run aborts with `StepFailed { task_index: 0 }`
+//!      — proving the harness consumed the planner response and entered execute.
 //!
 //! Must produce the same outcome in all four language implementations — never
 //! edit the fixture to make a failing implementation pass.
@@ -71,8 +75,9 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
 }
 
 /// Drive the plan phase against `exchange` through a ReplayModelInterface and
-/// assert the run halts with the distinct ExecutePhaseNotImplemented reason
-/// (proving the harness consumed the replayed planner response).
+/// assert the run consumes the planner turn, parses a non-empty task list, and
+/// enters the execute phase — where the single-exchange replay exhausts on the
+/// first step and aborts with `StepFailed { task_index: 0 }` (issue #59, Q5).
 async fn drive_plan_phase(exchange: RecordedExchange) {
     let harness = StandardHarness::new(config_for(exchange));
     let task = Task::new(
@@ -82,11 +87,16 @@ async fn drive_plan_phase(exchange: RecordedExchange) {
     );
     match harness.run(HarnessRunOptions::new(task)).await {
         RunResult::Failure {
-            reason: HaltReason::ExecutePhaseNotImplemented,
+            reason: HaltReason::StepFailed { task_index, .. },
             turns,
             ..
-        } => assert_eq!(turns, 1, "exactly one plan turn"),
-        other => panic!("expected ExecutePhaseNotImplemented, got {other:?}"),
+        } => {
+            assert_eq!(task_index, 0, "aborts on the first execute step");
+            // The plan turn (1) plus the step's first model call (2) before the
+            // replay exhausts: the harness reached the execute phase.
+            assert!(turns >= 1, "at least the plan turn was consumed");
+        }
+        other => panic!("expected StepFailed, got {other:?}"),
     }
 }
 

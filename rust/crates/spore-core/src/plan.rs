@@ -56,10 +56,11 @@
 //!   (optional string, default `""`). Any failure →
 //!   [`PlanPhaseError::UnparseablePlan`].
 //! - **Q4 (terminal RunResult):** After producing, firing `OnPlanCreated`, and
-//!   storing the artifact, the `PlanExecute` arm HALTS with the DISTINCT
-//!   [`HaltReason::ExecutePhaseNotImplemented`](crate::harness::HaltReason::ExecutePhaseNotImplemented)
-//!   — separate from the generic `StrategyNotYetImplemented` the other
-//!   strategies still use.
+//!   storing the artifact, the plan phase hands off to the execute phase (issue
+//!   #59), which parses the artifact into a `TaskList` and loops over the steps.
+//!   (Historically — before #59 — the `PlanExecute` arm halted here with a
+//!   `HaltReason::ExecutePhaseNotImplemented` marker; that variant has been
+//!   removed now that the execute phase exists.)
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
