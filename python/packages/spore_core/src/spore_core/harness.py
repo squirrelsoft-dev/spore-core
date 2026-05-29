@@ -1428,6 +1428,7 @@ class HarnessConfig:
         hooks: HookChain | None = None,
         planner_agent: Agent | None = None,
         storage: StorageProvider | None = None,
+        chunk_provider: Any | None = None,
     ) -> None:
         self.agent = agent
         # Optional alternate agent used for the PlanExecute plan phase (issue
@@ -1475,6 +1476,14 @@ class HarnessConfig:
         # reach the four domain stores via :meth:`StandardHarness.storage` /
         # :meth:`StandardHarness.session_store`.
         self.storage: StorageProvider = storage if storage is not None else StorageProvider.no_op()
+        # Pluggable chunk source for the #79 prompt assembly engine. Defaults to
+        # an empty in-memory provider. Typed ``Any`` to avoid importing
+        # ``prompt_assembly`` at module load.
+        if chunk_provider is None:
+            from .prompt_assembly import InMemoryChunkProvider
+
+            chunk_provider = InMemoryChunkProvider.empty()
+        self.chunk_provider: Any = chunk_provider
 
 
 class HarnessBuilder:
@@ -1519,6 +1528,28 @@ class HarnessBuilder:
         # ``StandardTool`` lives in ``spore_tools`` and must not be imported
         # here — that would invert the package dependency).
         self._standard_tools: list[Any] = []
+        # Pluggable chunk source for the #79 prompt assembly engine. Defaults to
+        # an empty in-memory provider so existing callers are unaffected. Typed
+        # ``Any`` to avoid importing ``prompt_assembly`` at module load (that
+        # module imports ``SessionId``/``TaskId`` from here).
+        self._chunk_provider: Any | None = None
+
+    def chunk_provider(self, provider: Any) -> HarnessBuilder:
+        """Set the chunk provider for the #79 prompt assembly engine. Defaults
+        to an empty :class:`~spore_core.prompt_assembly.InMemoryChunkProvider`
+        when unset. Mirrors Rust's ``HarnessBuilder::chunk_provider``."""
+        self._chunk_provider = provider
+        return self
+
+    def chunks(self, chunks: Iterable[Any]) -> HarnessBuilder:
+        """Convenience: register chunks inline without constructing a provider
+        (issue #79). Resolves to an
+        :class:`~spore_core.prompt_assembly.InMemoryChunkProvider` internally.
+        Mirrors Rust's ``HarnessBuilder::chunks``."""
+        from .prompt_assembly import InMemoryChunkProvider
+
+        self._chunk_provider = InMemoryChunkProvider(list(chunks))
+        return self
 
     def tool(self, tool: Any) -> HarnessBuilder:
         """Accumulate a single ``StandardTool`` (issue #81, Q1/Q2) — an object
@@ -1640,6 +1671,7 @@ class HarnessBuilder:
             hooks=self._hooks,
             planner_agent=self._planner_agent,
             storage=self._storage,
+            chunk_provider=self._chunk_provider,
         )
 
     def build(self) -> StandardHarness:

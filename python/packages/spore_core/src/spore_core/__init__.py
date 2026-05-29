@@ -435,6 +435,24 @@ from .prompt_chunk_registry import (
     new_chunk_id,
     standard_chunks,
 )
+from .prompt_assembly import (
+    AssemblyBuckets,
+    AssemblyContext,
+    ChunkCondition,
+    ChunkProvider,
+    ChunkProviderError,
+    CompositeChunkProvider,
+    ContextSourcesBuilder,
+    EmbeddedChunkProvider,
+    InMemoryChunkProvider,
+    StorageScope,
+    ToolAffinity,
+    breakpoint_ids,
+    chunks_to_segments,
+)
+from .prompt_assembly import (
+    PromptChunk as AssemblyPromptChunk,
+)
 from .verifier import (
     CompositeVerifier,
     EvaluatorResponseVerifier,
@@ -1046,6 +1064,21 @@ __all__ = [
     "StandardPromptChunkRegistry",
     "new_chunk_id",
     "standard_chunks",
+    # PromptAssemblyEngine (#79)
+    "AssemblyBuckets",
+    "AssemblyContext",
+    "AssemblyPromptChunk",
+    "ChunkCondition",
+    "ChunkProvider",
+    "ChunkProviderError",
+    "CompositeChunkProvider",
+    "ContextSourcesBuilder",
+    "EmbeddedChunkProvider",
+    "InMemoryChunkProvider",
+    "StorageScope",
+    "ToolAffinity",
+    "breakpoint_ids",
+    "chunks_to_segments",
     "TruncatedOutput",
     "ToolOutput",
     "ToolOutputAwaitingClarification",
