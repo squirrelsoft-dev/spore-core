@@ -359,14 +359,12 @@ describe("Harness — ReAct loop", () => {
   });
 
   it("rule: non-ReAct strategies marked StrategyNotYetImplemented", async () => {
-    // plan_execute no longer uses strategy_not_yet_implemented; it runs the
-    // full two-phase loop (issue #59), covered by the PlanExecute plan-phase and
-    // execute-phase tests. Only the still-unimplemented strategies are checked
-    // here.
+    // plan_execute (issue #59) and self_verifying (issue #61) no longer use
+    // strategy_not_yet_implemented; they run their full loops, covered by their
+    // own test suites. Only the still-unimplemented strategies are checked here.
     const h = new StandardHarness(standardConfig(makeAgent()));
     const strategies: LoopStrategy[] = [
       { kind: "ralph" },
-      { kind: "self_verifying" },
       {
         kind: "hill_climbing",
         direction: "maximize",

@@ -696,7 +696,25 @@ export type HaltReason =
    * tool call in the one-shot turn, or the agent returned an error. Carries the
    * underlying {@link "../plan/index.js".PlanPhaseError} detail.
    */
-  | { kind: "plan_phase_failed"; error: PlanPhaseErrorKind };
+  | { kind: "plan_phase_failed"; error: PlanPhaseErrorKind }
+  /**
+   * Returned by {@link StandardHarness} for the `self_verifying` strategy
+   * (issue #61, D4) when the build↔evaluate loop ran out of the verifier's
+   * `maxIterations` round-trips without an explicit `passed` verdict. A RUNTIME
+   * limit — the work was attempted in good faith but never verified; a caller
+   * might retry with a different task decomposition. Carries the number of
+   * round-trips run and the last failure reason the verifier gave. PEER to
+   * {@link self_verify_misconfigured} (NOT a sub-case of it).
+   */
+  | { kind: "self_verify_exhausted"; iterations: number; last_reason: string }
+  /**
+   * Returned by {@link StandardHarness} for the `self_verifying` strategy
+   * (issue #61, D4) when the strategy cannot run because it is misconfigured —
+   * e.g. `config.verifier` is absent. Likely a BUILD-TIME bug in the caller's
+   * wiring. Surfaced as a typed halt, NOT a throw. PEER to
+   * {@link self_verify_exhausted} (NOT a sub-case of it).
+   */
+  | { kind: "self_verify_misconfigured"; reason: string };
 
 export type RunResult =
   | {

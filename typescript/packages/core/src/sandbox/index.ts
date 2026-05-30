@@ -9,3 +9,4 @@
  */
 
 export { WorkspaceScopedSandbox, BuildError } from "./workspace-sandbox.js";
+export { ReadOnlySandbox, DEFAULT_WRITE_TOOLS } from "./read-only-sandbox.js";

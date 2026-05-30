@@ -48,6 +48,8 @@ import {
   type PromptChunk as AssemblyPromptChunk,
 } from "../prompt-assembly/index.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
+import type { Verifier, VerifierInput } from "../verifier/types.js";
+import { ReadOnlySandbox } from "../sandbox/read-only-sandbox.js";
 import { newSessionState as newContextSessionState } from "../context/types.js";
 import {
   emptyTurnOutput,
@@ -71,6 +73,7 @@ import {
 } from "../tasklist/index.js";
 
 import type { Harness } from "./interface.js";
+import { SessionId, TaskId } from "./types.js";
 import {
   addTurnUsage,
   emptyAggregateUsage,
@@ -94,11 +97,9 @@ import {
   type PausedState,
   type RunResult,
   type SandboxProvider,
-  type SessionId,
   type SessionState,
   type StreamSink,
   type Task,
-  type TaskId,
   type TerminationPolicy,
   type ToolOutput,
   type ToolRegistry,
@@ -174,6 +175,23 @@ export interface HarnessConfig {
    * Optional; defaults to an empty {@link InMemoryChunkProvider}.
    */
   chunkProvider?: ChunkProvider;
+  /**
+   * Verdict oracle for the `self_verifying` loop strategy (issue #61, D2/D4).
+   * REQUIRED for that strategy: when absent, a `self_verifying` run halts with
+   * `self_verify_misconfigured` (a typed halt, NOT a throw). Its
+   * {@link "../verifier/types.js".Verifier.maxIterations} (default 3) caps the
+   * build↔evaluate round-trips (D3). Ignored by every other strategy.
+   */
+  verifier?: Verifier;
+  /**
+   * Optional alternate agent used for the `self_verifying` evaluate phase
+   * (issue #61, D2). Defaulting contract — IDENTICAL to {@link plannerAgent}
+   * (#70): when this is absent, the evaluate phase runs on the default
+   * {@link agent}. The read-only sandbox and the fresh, never-shared session id
+   * for the evaluate run are derived INTERNALLY by the strategy — callers do NOT
+   * supply an evaluator sandbox or chunk provider here.
+   */
+  evaluatorAgent?: Agent;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -328,7 +346,7 @@ export class StandardHarness implements Harness {
       case "ralph":
         return notYetImplemented("ralph", task.session_id);
       case "self_verifying":
-        return notYetImplemented("self_verifying", task.session_id);
+        return this.runSelfVerifying(task, sessionState, budgetUsed, options.on_stream);
       case "hill_climbing":
         return notYetImplemented("hill_climbing", task.session_id);
       default: {
@@ -1048,6 +1066,253 @@ export class StandardHarness implements Harness {
     }
 
     return { ok: true, artifact, usage, turns: budgetUsed.turns };
+  }
+
+  /**
+   * Drive the `self_verifying` loop strategy (issue #61).
+   *
+   * A loop-within-a-loop. Each iteration: (1) a bounded ReAct BUILD sub-loop runs
+   * until the agent claims done, carrying the shared budget; (2) a fresh EVALUATE
+   * run executes over a read-only sandbox in a never-shared session with the
+   * evaluator agent and the `role-evaluator` chunk; (3) the {@link Verifier}
+   * renders a verdict. `passed` ⇒ `success`; `failed` ⇒ the reason is injected
+   * into the build context (the SAME user-message path the Stop-block / reject
+   * resume uses — D1) and the loop continues. Running out of the verifier's
+   * `maxIterations` round-trips without a pass yields
+   * `failure { self_verify_exhausted }` (D4 — the stagnation guard / Default-FAIL
+   * contract). An absent `config.verifier` yields `failure
+   * { self_verify_misconfigured }` (D4 — a typed halt, NOT a throw).
+   *
+   * Budgets fold BOTH phases across ALL iterations (R8). Build and evaluate are
+   * distinguishable in traces via distinct session ids: the build keeps the
+   * task's session, each evaluate gets a freshly generated one (R2/R9).
+   */
+  private async runSelfVerifying(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    _onStream: StreamSink | undefined,
+  ): Promise<RunResult> {
+    const buildSessionId = task.session_id;
+
+    // D4/R11: a missing verifier is a typed halt, not a throw.
+    const verifier = this.config.verifier;
+    if (verifier == null) {
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "self_verify_misconfigured",
+          reason: "self_verifying requires `config.verifier`, but it is absent",
+        },
+        session_id: buildSessionId,
+        usage: emptyAggregateUsage(),
+        turns: 0,
+      };
+      await this.finalizeSelfVerifying(result);
+      return result;
+    }
+
+    const maxIterations = verifier.maxIterations();
+    // Shared budget threaded across every build + evaluate sub-run (R8).
+    const carried: BudgetSnapshot = { ...budgetUsed };
+    // Cumulative usage across ALL build + evaluate runs of ALL iterations (R8).
+    const totalUsage: AggregateUsage = emptyAggregateUsage();
+    // The most recent verifier failure reason (for self_verify_exhausted).
+    let lastReason = "";
+
+    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      // ── Build phase (R1): a bounded ReAct sub-loop carrying the shared
+      //    budget. Iteration 0's seed instruction is delivered by the sub-loop;
+      //    later iterations already have the prior verdict reason injected as a
+      //    user message (R6), so they do NOT re-seed.
+      const buildTask: Task = {
+        id: task.id,
+        instruction: task.instruction,
+        session_id: buildSessionId,
+        budget: task.budget,
+        loop_strategy: task.loop_strategy,
+      };
+      const buildCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+      const buildResult = await this.runReactInner(
+        buildTask,
+        buildCap,
+        sessionState,
+        { ...carried },
+        // Sub-loops run with a suppressed sink (mirrors PlanExecute); terminal
+        // observability is finalized by this strategy.
+        undefined,
+        undefined,
+        iteration === 0,
+      );
+      foldUsage(totalUsage, carried, buildResult);
+
+      // A build run that paused / escalated is propagated up unchanged — the
+      // caller must handle it before verification can resume.
+      if (buildResult.kind === "waiting_for_human") {
+        return buildResult;
+      }
+      if (buildResult.kind === "escalate") {
+        await this.finalizeSelfVerifying(buildResult);
+        return buildResult;
+      }
+
+      // ── Evaluate phase (R2/R3/R4): a fresh evaluator RUN. Distinct generated
+      //    session id (never shared with build — R2/R9), a read-only sandbox
+      //    derived internally (R3), the evaluator agent (D2 defaulting), and the
+      //    `role-evaluator` chunk (R4).
+      const evalResult = await this.runEvaluatePhase(task, carried, totalUsage);
+
+      // ── Verdict.
+      const input: VerifierInput = {
+        build_result: buildResult,
+        eval_result: evalResult,
+        workspace: this.config.sandbox.workspaceRoot?.() ?? "",
+        iteration,
+      };
+      const verdict = await verifier.verify(input);
+      if (verdict.kind === "passed") {
+        // Reuse the build run's output as the run's output.
+        const output = buildResult.kind === "success" ? buildResult.output : "";
+        const turns = buildResult.kind === "success" ? buildResult.turns : carried.turns;
+        const result: RunResult = {
+          kind: "success",
+          output,
+          session_id: buildSessionId,
+          usage: totalUsage,
+          turns,
+        };
+        await this.finalizeSelfVerifying(result);
+        return result;
+      }
+      // R5/R6: Default-FAIL keeps looping; inject the reason into the build
+      // context via the SAME path the Stop-block uses (append a user message) so
+      // the next build iteration sees it.
+      lastReason = verdict.reason;
+      await this.config.contextManager.appendUserMessage(sessionState, verdict.reason);
+    }
+
+    // R7: ran out of round-trips without a pass — clean exhaustion.
+    const result: RunResult = {
+      kind: "failure",
+      reason: { kind: "self_verify_exhausted", iterations: maxIterations, last_reason: lastReason },
+      session_id: buildSessionId,
+      usage: totalUsage,
+      turns: carried.turns,
+    };
+    await this.finalizeSelfVerifying(result);
+    return result;
+  }
+
+  /**
+   * Run the `self_verifying` evaluate phase (issue #61): a fresh evaluator RUN
+   * over a read-only sandbox in a never-shared session.
+   *
+   * Builds a child {@link StandardHarness} from a clone of `this.config` with the
+   * `agent` swapped to the evaluator agent (D2 defaulting) and the `sandbox`
+   * wrapped in a {@link ReadOnlySandbox} (R3). The evaluator runs a fresh ReAct
+   * loop seeded with the `role-evaluator` chunk (R4, presence-only) plus a review
+   * directive, in a freshly generated session (R2/R9). Folds the evaluate run's
+   * usage into `totalUsage` / `carried` (R8) and returns its terminal
+   * {@link RunResult}.
+   */
+  private async runEvaluatePhase(
+    task: Task,
+    carried: BudgetSnapshot,
+    totalUsage: AggregateUsage,
+  ): Promise<RunResult> {
+    // D2: evaluator-agent defaulting — identical contract to plannerAgent.
+    const evaluator = this.config.evaluatorAgent ?? this.config.agent;
+
+    // R3: derive a read-only sandbox internally from the build sandbox.
+    const readOnlySandbox: SandboxProvider = new ReadOnlySandbox(this.config.sandbox);
+
+    // R2/R9: fresh, never-shared session id for the evaluate run.
+    const evalSessionId = SessionId.generate();
+
+    // R4 (presence-only): prepend the `role-evaluator` chunk content (if the
+    // configured provider supplies it) to the review directive.
+    const roleChunk = await this.roleEvaluatorChunk();
+    const reviewBody =
+      "Review the work produced for the following task and report whether it is " +
+      "correct. You did NOT write this code; default to FAIL unless you can " +
+      `confirm it is right.\n\nTask:\n${task.instruction}`;
+    const directive = roleChunk != null ? `${roleChunk}\n\n${reviewBody}` : reviewBody;
+
+    const evalTask: Task = {
+      id: TaskId.generate(),
+      instruction: directive,
+      session_id: evalSessionId,
+      budget: task.budget,
+      loop_strategy: {
+        kind: "re_act",
+        max_iterations: task.budget.max_turns ?? Number.MAX_SAFE_INTEGER,
+      },
+    };
+
+    // Child harness: clone the config, swap agent + sandbox. Cloning shares the
+    // same observability/storage seams so the evaluate run's spans land in the
+    // SAME trace stream (distinguished by its distinct session id).
+    const evalConfig: HarnessConfig = {
+      ...this.config,
+      agent: evaluator,
+      sandbox: readOnlySandbox,
+    };
+    const evalHarness = new StandardHarness(evalConfig);
+
+    const evalState = emptySessionState();
+    const cap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+    const evalResult = await evalHarness.runReact(
+      evalTask,
+      cap,
+      evalState,
+      emptyBudgetSnapshot(),
+      undefined,
+      undefined,
+      true,
+    );
+
+    foldUsage(totalUsage, carried, evalResult);
+    return evalResult;
+  }
+
+  /**
+   * Look up the `role-evaluator` chunk content from the configured
+   * {@link ChunkProvider} (R4, presence-only). Returns `undefined` if no provider
+   * is configured, it has no such chunk, or it fails to load.
+   */
+  private async roleEvaluatorChunk(): Promise<string | undefined> {
+    const provider = this.config.chunkProvider;
+    if (provider == null) return undefined;
+    try {
+      const chunks = await provider.load();
+      return chunks.find((c) => c.id === "role-evaluator")?.content;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Finalize observability for a terminal `self_verifying` outcome. Mirrors the
+   * tail of {@link runReact} / {@link finalizePlanExecute}. `waiting_for_human`
+   * is not terminal and is never flushed here.
+   */
+  private async finalizeSelfVerifying(result: RunResult): Promise<void> {
+    switch (result.kind) {
+      case "success":
+        await this.finalizeObservability(result.session_id, { kind: "success" });
+        break;
+      case "failure":
+        await this.finalizeObservability(result.session_id, {
+          kind: "failure",
+          reason: haltReasonToString(result.reason),
+        });
+        break;
+      case "waiting_for_human":
+        break;
+      case "escalate":
+        await this.finalizeObservability(result.session_id, { kind: "escalated" });
+        break;
+    }
   }
 
   /**
@@ -1917,6 +2182,8 @@ export class HarnessBuilder {
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
   private _plannerAgent?: Agent;
   private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
+  private _verifier?: Verifier;
+  private _evaluatorAgent?: Agent;
 
   constructor(
     private readonly agent: Agent,
@@ -2018,6 +2285,23 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Inject the verdict oracle for the `self_verifying` strategy (issue #61).
+   *  REQUIRED for that strategy — absent it, a `self_verifying` run halts with
+   *  `self_verify_misconfigured`. Ignored by every other strategy. */
+  verifier(verifier: Verifier): this {
+    this._verifier = verifier;
+    return this;
+  }
+
+  /** Inject an alternate agent for the `self_verifying` evaluate phase (issue
+   *  #61, D2). Mirrors {@link plannerAgent}: when set and the strategy is
+   *  `self_verifying`, the evaluate run uses this agent; otherwise it runs on
+   *  the default agent. */
+  evaluatorAgent(agent: Agent): this {
+    this._evaluatorAgent = agent;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -2037,6 +2321,8 @@ export class HarnessBuilder {
       maxStopBlocks: this._maxStopBlocks,
       plannerAgent: this._plannerAgent,
       chunkProvider: this._chunkProvider,
+      verifier: this._verifier,
+      evaluatorAgent: this._evaluatorAgent,
     };
   }
 
@@ -2067,6 +2353,28 @@ function failure(
  *  Mirrors Rust's `format!("{reason:?}")` for the failure outcome. */
 function haltReasonToString(reason: HaltReason): string {
   return JSON.stringify(reason);
+}
+
+/**
+ * Fold a sub-run's token usage / turn count into the cumulative `totalUsage`
+ * and the shared `carried` budget snapshot (issue #61, R8). Mirrors the
+ * PlanExecute / Rust `fold_usage`. `carried.turns` becomes the running MAX of
+ * the absolute turn counts (the build sub-loop already gates on cumulative
+ * turns; the fresh-session evaluate run reports its own turns). `waiting_for_human`
+ * carries no usage and is skipped.
+ */
+function foldUsage(totalUsage: AggregateUsage, carried: BudgetSnapshot, r: RunResult): void {
+  if (r.kind === "waiting_for_human") return;
+  const usage = r.usage;
+  const turns = r.turns;
+  totalUsage.input_tokens += usage.input_tokens;
+  totalUsage.output_tokens += usage.output_tokens;
+  totalUsage.cache_read_tokens += usage.cache_read_tokens;
+  totalUsage.cache_write_tokens += usage.cache_write_tokens;
+  totalUsage.cost_usd += usage.cost_usd;
+  carried.input_tokens += usage.input_tokens;
+  carried.output_tokens += usage.output_tokens;
+  carried.turns = Math.max(carried.turns, turns);
 }
 
 function notYetImplemented(strategy: string, sessionId: SessionId): RunResult {
