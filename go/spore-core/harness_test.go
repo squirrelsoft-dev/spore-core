@@ -294,25 +294,20 @@ func TestResumeWithAllowExecutesPendingAndContinues(t *testing.T) {
 	}
 }
 
-// Rule: non-ReAct strategies are explicitly marked NotYetImplemented.
-// PlanExecute is fully implemented (issues #70 + #59) and runs a real two-phase
-// loop, so it is intentionally absent from this list — its behaviour is covered
-// by the plan-phase tests (plan_test.go) and the execute-phase tests below.
-// SelfVerifying is fully implemented (issue #61) and is likewise absent — its
-// behaviour is covered by self_verifying_test.go. Ralph is fully implemented
-// (issue #58) and is likewise absent — its behaviour is covered by ralph_test.go.
-func TestNonReactStrategiesMarkedNotYetImplemented(t *testing.T) {
+// Rule: an UNKNOWN loop strategy is explicitly marked NotYetImplemented.
+// All five spec'd strategies are now fully implemented: ReAct (this file),
+// PlanExecute (issues #70 + #59, plan_test.go + execute-phase tests below),
+// SelfVerifying (issue #61, self_verifying_test.go), Ralph (issue #58,
+// ralph_test.go), and HillClimbing (issue #60, hill_climbing_test.go). The
+// NotYetImplemented stub is now reached only by an unrecognized strategy kind —
+// the dispatch's default arm.
+func TestUnknownStrategyMarkedNotYetImplemented(t *testing.T) {
 	a := NewMockAgent("t")
 	h := NewStandardHarness(standardCfg(a))
-	strategies := []LoopStrategy{
-		{Kind: StrategyHillClimbing, Direction: OptimizationMaximize},
-	}
-	for _, s := range strategies {
-		task := NewTask("do it", SessionID("s"), s)
-		r := h.Run(context.Background(), NewHarnessRunOptions(task))
-		if r.Kind != RunFailure || r.Reason.Kind != HaltStrategyNotYetImplemented {
-			t.Fatalf("strategy %q got %+v", s.Kind, r)
-		}
+	task := NewTask("do it", SessionID("s"), LoopStrategy{Kind: LoopStrategyKind("not_a_real_strategy")})
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
+	if r.Kind != RunFailure || r.Reason.Kind != HaltStrategyNotYetImplemented {
+		t.Fatalf("got %+v", r)
 	}
 }
 

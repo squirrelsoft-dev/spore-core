@@ -690,10 +690,62 @@ func (j *LlmJudgeEvaluator) Description() string {
 	return fmt.Sprintf("llm judge (%s/%s)", j.JudgeModel.Provider, j.JudgeModel.ModelID)
 }
 
+// ============================================================================
+// Harness seam bridge (issue #60)
+// ============================================================================
+
+// harnessMetricEvaluator adapts a metric.MetricEvaluator to the consumer-side
+// sporecore.MetricEvaluator seam the HillClimbing loop reads from config. The
+// root sporecore package cannot import this package (metric imports sporecore —
+// cycle), so it declares its own narrow MetricEvaluator interface; this adapter
+// bridges the two and is the analogue of verifier.AsHarnessMetricEvaluator.
+type harnessMetricEvaluator struct {
+	inner MetricEvaluator
+}
+
+// AsHarnessMetricEvaluator wraps a metric.MetricEvaluator so it can be dropped
+// straight into sporecore.HarnessConfig.MetricEvaluator. Returns nil when inner
+// is nil so a nil evaluator stays nil through the seam (the HillClimbing
+// strategy treats a nil config.MetricEvaluator as HillClimbingMisconfigured).
+func AsHarnessMetricEvaluator(inner MetricEvaluator) sporecore.MetricEvaluator {
+	if inner == nil {
+		return nil
+	}
+	return harnessMetricEvaluator{inner: inner}
+}
+
+// Evaluate implements sporecore.MetricEvaluator. It rebuilds the
+// SessionStateSnapshot the metric evaluators expect from the loose
+// (sessionID, taskID, state) the harness threads through the seam, then
+// translates the metric.MetricResult / metric.MetricError into the root-package
+// mirror types.
+func (h harnessMetricEvaluator) Evaluate(
+	ctx context.Context,
+	sandbox sporecore.SandboxProvider,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	state sporecore.SessionState,
+) (*sporecore.HillClimbMetricResult, *sporecore.HillClimbMetricError) {
+	snapshot := termination.NewSessionStateSnapshotWithRoot(sessionID, taskID, state, sandbox.WorkspaceRoot())
+	res, merr := h.inner.Evaluate(ctx, sandbox, &snapshot)
+	if merr != nil {
+		status := sporecore.HillClimbCrashed
+		if IterationStatusFromError(merr) == IterationTimeout {
+			status = sporecore.HillClimbTimeout
+		}
+		return nil, &sporecore.HillClimbMetricError{Status: status, Message: merr.Error()}
+	}
+	return &sporecore.HillClimbMetricResult{Value: res.Value, Duration: res.Duration}, nil
+}
+
+// Description implements sporecore.MetricEvaluator.
+func (h harnessMetricEvaluator) Description() string { return h.inner.Description() }
+
 // Compile-time checks.
 var (
-	_ MetricEvaluator = (*CommandMetricEvaluator)(nil)
-	_ MetricEvaluator = (*TestPassRateEvaluator)(nil)
-	_ MetricEvaluator = (*LatencyEvaluator)(nil)
-	_ MetricEvaluator = (*LlmJudgeEvaluator)(nil)
+	_ MetricEvaluator           = (*CommandMetricEvaluator)(nil)
+	_ MetricEvaluator           = (*TestPassRateEvaluator)(nil)
+	_ MetricEvaluator           = (*LatencyEvaluator)(nil)
+	_ MetricEvaluator           = (*LlmJudgeEvaluator)(nil)
+	_ sporecore.MetricEvaluator = harnessMetricEvaluator{}
 )

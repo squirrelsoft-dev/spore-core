@@ -314,6 +314,40 @@ func (a *HarnessObservabilityAdapter) EmitCompactionVerificationFailed(
 	emitter.EmitWarn(NewWarnSpan(base, NewWarnCompactionVerificationFailed(missingItems, acceptedAnyway)))
 }
 
+// EmitHillClimbingIteration builds a WarnSpan and forwards it via the OPTIONAL
+// WarnEmitter surface (issue #60). If the wrapped provider does not implement
+// WarnEmitter, the warn is silently dropped — same contract as
+// EmitCompactionVerificationFailed.
+func (a *HarnessObservabilityAdapter) EmitHillClimbingIteration(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	iteration uint32,
+	metricValue float64,
+	hasMetric bool,
+	delta float64,
+	hasDelta bool,
+	status string,
+	reverted bool,
+) {
+	emitter, ok := a.provider.(WarnEmitter)
+	if !ok {
+		return
+	}
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindWarn, Timestamp(startedAt))
+	var mv, d *float64
+	if hasMetric {
+		v := metricValue
+		mv = &v
+	}
+	if hasDelta {
+		dv := delta
+		d = &dv
+	}
+	emitter.EmitWarn(NewWarnSpan(base, NewWarnHillClimbingIteration(iteration, mv, d, status, reverted)))
+}
+
 // Compile-time interface check.
 var _ sporecore.HarnessObserver = (*HarnessObservabilityAdapter)(nil)
 

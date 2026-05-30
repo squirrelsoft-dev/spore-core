@@ -1229,6 +1229,30 @@ type HarnessObserver interface {
 		missingItems []string,
 		acceptedAnyway bool,
 	)
+
+	// EmitHillClimbingIteration records one iteration of a HillClimbing loop
+	// strategy run as a warn-level span (issue #60). Emitted fire-and-forget
+	// after each iteration's metric evaluation so the run is traceable
+	// per-iteration with its metric value and delta. iteration is the 0-based
+	// index (0 = the pure baseline). hasMetric is false on crashed/timeout rows
+	// (no comparable metric) — when false, metricValue/delta are ignored.
+	// hasDelta is false for the baseline and for crashed/timeout rows. status is
+	// the snake_case IterationStatus string the harness recorded
+	// (kept/discarded/crashed/timeout). reverted is true when the harness ran a
+	// git reset for this iteration. Never affects control flow.
+	EmitHillClimbingIteration(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		iteration uint32,
+		metricValue float64,
+		hasMetric bool,
+		delta float64,
+		hasDelta bool,
+		status string,
+		reverted bool,
+	)
 }
 
 // ============================================================================
@@ -1536,6 +1560,13 @@ const (
 	// Carries the number of context-window resets performed (Iterations) and the
 	// last incompletion reason (Reason, serialized as last_reason).
 	HaltRalphCompletionUnmet HaltReasonKind = "ralph_completion_unmet"
+	// HaltHillClimbingMisconfigured (issue #60) is returned by the HillClimbing
+	// loop strategy when it cannot run because it is misconfigured — i.e.
+	// config.MetricEvaluator is nil, or the iteration-0 baseline evaluation
+	// itself errored (no current best to climb from). Likely a BUILD-TIME bug in
+	// the caller's wiring. Surfaced as a typed halt, NOT a panic. PEER to
+	// HaltSelfVerifyMisconfigured.
+	HaltHillClimbingMisconfigured HaltReasonKind = "hill_climbing_misconfigured"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -1648,6 +1679,11 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Iterations uint32         `json:"iterations"`
 			LastReason string         `json:"last_reason"`
 		}{h.Kind, h.Iterations, h.Reason})
+	case HaltHillClimbingMisconfigured:
+		return json.Marshal(struct {
+			Kind   HaltReasonKind `json:"kind"`
+			Reason string         `json:"reason"`
+		}{h.Kind, h.Reason})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -1946,6 +1982,17 @@ type HarnessConfig struct {
 	// storage.StorageProvider.Run() satisfies it structurally without the
 	// sporecore package importing the storage package (which would be a cycle).
 	RunStore RunStore // optional
+
+	// MetricEvaluator is the pluggable scoring strategy for the HillClimbing loop
+	// strategy (issue #60, owned by #23). REQUIRED for that strategy: when the
+	// loop strategy is HillClimbing and this is nil, the run halts with
+	// HaltHillClimbingMisconfigured — it does NOT panic. The harness calls
+	// Evaluate once for the iteration-0 baseline (no agent turn) and once after
+	// each iteration's agent turn, feeding the value into ShouldKeep. This is a
+	// consumer-side interface (go/CONVENTIONS.md): the standard metric.* evaluator
+	// family (#23) is bridged into it via metric.AsHarnessMetricEvaluator,
+	// avoiding a sporecore -> metric import cycle (metric imports sporecore).
+	MetricEvaluator MetricEvaluator // optional (required by HillClimbing)
 }
 
 // RunStore is the consumer-side view of the per-run structured-state store the
@@ -2065,7 +2112,12 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
 		return h.runSelfVerifying(ctx, task, session, budget, options.OnStream)
 	case StrategyHillClimbing:
-		return strategyNotImplemented(task, "hill_climbing")
+		// HillClimbing (issue #60) drives its own per-iteration agent sub-runs
+		// (each a fresh ReAct loop), so it owns seeding each iteration's session.
+		// The dispatch-level seed the other strategies do here is intentionally
+		// skipped — runHillClimbing owns iteration-0 (baseline, no agent turn) and
+		// each subsequent iteration's fresh session.
+		return h.runHillClimbing(ctx, task, budget, options.OnStream)
 	default:
 		return strategyNotImplemented(task, string(task.LoopStrategy.Kind))
 	}
@@ -2186,6 +2238,10 @@ func haltReasonString(r HaltReason) string {
 		return fmt.Sprintf("self-verify misconfigured: %s", r.Reason)
 	case HaltRalphCompletionUnmet:
 		return fmt.Sprintf("ralph completion unmet after %d windows: %s", r.Iterations, r.Reason)
+	case HaltStagnationLimitReached:
+		return fmt.Sprintf("stagnation limit reached after %d non-improvements (best %.6f)", r.Iterations, r.BestMetric)
+	case HaltHillClimbingMisconfigured:
+		return fmt.Sprintf("hill-climbing misconfigured: %s", r.Reason)
 	default:
 		return string(r.Kind)
 	}

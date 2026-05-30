@@ -327,6 +327,8 @@ func (o *capturingObserver) EmitCompactionVerificationFailed(_ string, _ Session
 	o.lastWarnMissing = missing
 	o.lastWarnAccepted = accepted
 }
+func (o *capturingObserver) EmitHillClimbingIteration(string, SessionID, TaskID, string, uint32, float64, bool, float64, bool, string, bool) {
+}
 
 var _ HarnessObserver = (*capturingObserver)(nil)
 

@@ -506,6 +506,10 @@ const (
 	// WarnKindCompactionVerificationFailed — a compaction summary failed
 	// verification on every attempt and was accepted as-is (issue #46).
 	WarnKindCompactionVerificationFailed WarnEventKind = "compaction_verification_failed"
+	// WarnKindHillClimbingIteration — one iteration of a HillClimbing loop
+	// strategy run (issue #60). Emitted fire-and-forget after each iteration's
+	// metric evaluation so the run is traceable per-iteration.
+	WarnKindHillClimbingIteration WarnEventKind = "hill_climbing_iteration"
 )
 
 // WarnEvent is a warn-level, fire-and-forget observability event. It is a
@@ -517,6 +521,14 @@ type WarnEvent struct {
 	// CompactionVerificationFailed fields.
 	MissingItems   []string `json:"missing_items,omitempty"`
 	AcceptedAnyway bool     `json:"accepted_anyway,omitempty"`
+	// HillClimbingIteration fields (issue #60). MetricValue/Delta are nil on
+	// crashed/timeout iterations (no comparable metric); Delta is also nil for
+	// the baseline iteration. Status is the snake_case IterationStatus string.
+	Iteration   uint32   `json:"iteration,omitempty"`
+	MetricValue *float64 `json:"metric_value,omitempty"`
+	Delta       *float64 `json:"delta,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Reverted    bool     `json:"reverted,omitempty"`
 }
 
 // NewWarnCompactionVerificationFailed builds a CompactionVerificationFailed
@@ -530,6 +542,20 @@ func NewWarnCompactionVerificationFailed(missingItems []string, acceptedAnyway b
 		Kind:           WarnKindCompactionVerificationFailed,
 		MissingItems:   missingItems,
 		AcceptedAnyway: acceptedAnyway,
+	}
+}
+
+// NewWarnHillClimbingIteration builds a HillClimbingIteration warn event (issue
+// #60). metricValue/delta are nil-passed for crashed/timeout iterations (and
+// delta nil for the baseline).
+func NewWarnHillClimbingIteration(iteration uint32, metricValue, delta *float64, status string, reverted bool) WarnEvent {
+	return WarnEvent{
+		Kind:        WarnKindHillClimbingIteration,
+		Iteration:   iteration,
+		MetricValue: metricValue,
+		Delta:       delta,
+		Status:      status,
+		Reverted:    reverted,
 	}
 }
 

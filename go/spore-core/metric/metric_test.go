@@ -436,3 +436,66 @@ func TestMetricErrorTimeoutWireFormat(t *testing.T) {
 		t.Fatalf("after: %v", probe["after"])
 	}
 }
+
+// ============================================================================
+// AsHarnessMetricEvaluator bridge (issue #60)
+// ============================================================================
+
+// bridgeFakeEvaluator returns a scripted result/error so the harness-seam
+// adapter's translation can be asserted.
+type bridgeFakeEvaluator struct {
+	result MetricResult
+	err    *MetricError
+	dir    sporecore.OptimizationDirection
+}
+
+func (e bridgeFakeEvaluator) Evaluate(context.Context, sporecore.SandboxProvider, *termination.SessionStateSnapshot) (MetricResult, *MetricError) {
+	if e.err != nil {
+		return MetricResult{}, e.err
+	}
+	return e.result, nil
+}
+func (e bridgeFakeEvaluator) Direction() sporecore.OptimizationDirection { return e.dir }
+func (e bridgeFakeEvaluator) Description() string                        { return "bridge fake" }
+
+func TestAsHarnessMetricEvaluatorNilStaysNil(t *testing.T) {
+	if AsHarnessMetricEvaluator(nil) != nil {
+		t.Fatal("nil evaluator should stay nil through the seam")
+	}
+}
+
+func TestAsHarnessMetricEvaluatorSuccess(t *testing.T) {
+	inner := bridgeFakeEvaluator{result: MetricResult{Value: 3.5, Duration: 2 * time.Second}, dir: sporecore.OptimizationMaximize}
+	bridged := AsHarnessMetricEvaluator(inner)
+	sb := newFakeSandbox(t, "")
+	res, hcErr := bridged.Evaluate(context.Background(), sb, "s", "task", sporecore.SessionState{})
+	if hcErr != nil {
+		t.Fatalf("unexpected error: %+v", hcErr)
+	}
+	if res.Value != 3.5 || res.Duration != 2*time.Second {
+		t.Fatalf("got %+v", res)
+	}
+	if bridged.Description() != "bridge fake" {
+		t.Fatalf("description = %q", bridged.Description())
+	}
+}
+
+func TestAsHarnessMetricEvaluatorCrashStatus(t *testing.T) {
+	inner := bridgeFakeEvaluator{err: NewCrashed("boom")}
+	bridged := AsHarnessMetricEvaluator(inner)
+	sb := newFakeSandbox(t, "")
+	_, hcErr := bridged.Evaluate(context.Background(), sb, "s", "task", sporecore.SessionState{})
+	if hcErr == nil || hcErr.Status != sporecore.HillClimbCrashed {
+		t.Fatalf("got %+v, want crashed", hcErr)
+	}
+}
+
+func TestAsHarnessMetricEvaluatorTimeoutStatus(t *testing.T) {
+	inner := bridgeFakeEvaluator{err: NewTimeout(time.Second)}
+	bridged := AsHarnessMetricEvaluator(inner)
+	sb := newFakeSandbox(t, "")
+	_, hcErr := bridged.Evaluate(context.Background(), sb, "s", "task", sporecore.SessionState{})
+	if hcErr == nil || hcErr.Status != sporecore.HillClimbTimeout {
+		t.Fatalf("got %+v, want timeout", hcErr)
+	}
+}
