@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from .context import (
         CompactionPreserveHints,
         CompactionVerifier,
+        ContextErrorModel,
     )
     from .context import (
         SessionState as ContextSessionState,
@@ -1276,6 +1277,20 @@ class HaltReasonAgentError(_Model):
     error: AgentError
 
 
+class HaltReasonContextError(_Model):
+    """A :class:`spore_core.context.ContextError` surfaced by the
+    ``ContextManager`` during assembly halts the run — e.g. a cache-hash
+    mismatch, where both Block 1 (``static``) and, as of #32, Block 2
+    (``per_session``) halt mid-session. This is the routing TYPE; mirrors
+    :class:`HaltReasonAgentError`. The live :class:`StandardHarness` loop does
+    not yet trigger it because its placeholder ``ContextManager.assemble`` is
+    infallible pending the #7 migration. Mirrors Rust's
+    ``HaltReason::ContextError { error: ContextError }``."""
+
+    kind: Literal["context_error"] = "context_error"
+    error: ContextErrorModel
+
+
 class HaltReasonSandboxViolation(_Model):
     kind: Literal["sandbox_violation"] = "sandbox_violation"
     violation: SandboxViolation
@@ -1413,6 +1428,7 @@ HaltReason = Annotated[
     | HaltReasonTerminationPolicyHalt
     | HaltReasonMiddlewareHalt
     | HaltReasonAgentError
+    | HaltReasonContextError
     | HaltReasonSandboxViolation
     | HaltReasonUnrecoverableToolError
     | HaltReasonHumanHalted
@@ -4649,6 +4665,13 @@ class ScriptedMiddleware:
 from .hooks import PlanArtifact  # noqa: E402
 from .prompt_chunk_registry import Mode  # noqa: E402
 
+# ``ContextErrorModel`` lives in :mod:`spore_core.context`, which imports this
+# module at its top — a top-level import here would be circular. It is imported
+# after this module is otherwise defined so ``HaltReasonContextError``'s
+# forward-ref ``error`` field can be resolved by the rebuild below.
+from .context import ContextErrorModel  # noqa: E402, F401
+
+HaltReasonContextError.model_rebuild()
 HarnessSignalExitPlanMode.model_rebuild()
 HarnessSignalSwitchMode.model_rebuild()
 ToolOutputEscalate.model_rebuild()
@@ -4681,6 +4704,7 @@ __all__ = [
     "HaltReason",
     "HaltReasonAgentError",
     "HaltReasonBudgetExceeded",
+    "HaltReasonContextError",
     "HaltReasonEmptyPlan",
     "HaltReasonHumanHalted",
     "HaltReasonMiddlewareHalt",

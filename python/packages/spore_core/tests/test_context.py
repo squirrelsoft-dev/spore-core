@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -38,6 +37,7 @@ from spore_core.harness import (
     ToolOutputError,
     ToolOutputSuccess,
 )
+from spore_core.prompt_chunk_registry import CacheBlock
 from spore_core.model import (
     Message,
     ModelRequest,
@@ -172,7 +172,9 @@ async def test_block_1_hash_mismatch_is_an_error() -> None:
     await mgr.assemble(_state(), _sources(h=0xAB))
     with pytest.raises(CacheHashMismatch) as ei:
         await mgr.assemble(_state(), _sources(h=0xCD))
-    assert ei.value.block == "static"
+    assert ei.value.block is CacheBlock.STATIC
+    assert ei.value.expected == 0xAB
+    assert ei.value.actual == 0xCD
 
 
 async def test_block_1_hash_match_succeeds_across_calls() -> None:
@@ -183,32 +185,48 @@ async def test_block_1_hash_match_succeeds_across_calls() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rule: mid-session Block-2 hash change logs a warning when turn > 1
+# Rule: mid-session Block-2 hash change HALTS when turn > 1 (#32) — consistent
+# with Block 1. A turn-1 baseline write never halts.
 # ---------------------------------------------------------------------------
 
 
-async def test_session_hash_change_mid_session_warns(caplog: pytest.LogCaptureFixture) -> None:
+async def test_session_hash_change_mid_session_halts() -> None:
     mgr = _mk()
     st = _state()
+    # Turn-1 baseline assemble records the session hash.
+    st.turn_number = 1
     await mgr.assemble(st, _sources())
+    # Mid-session (turn 2) the session content changes: must halt.
     st.turn_number = 2
     st.environment = "changed"
-    with caplog.at_level(logging.WARNING, logger="spore_core.context"):
+    with pytest.raises(CacheHashMismatch) as ei:
         await mgr.assemble(st, _sources())
-    assert any("session block hash changed" in r.message for r in caplog.records)
+    assert ei.value.block is CacheBlock.PER_SESSION
+    assert ei.value.turn_number == 2
 
 
-async def test_session_hash_change_first_turn_does_not_warn(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_stable_session_across_turns_does_not_halt() -> None:
     mgr = _mk()
     st = _state()
+    st.turn_number = 1
     await mgr.assemble(st, _sources())
+    # Identical session content on a later turn: no halt.
+    st.turn_number = 2
+    await mgr.assemble(st, _sources())
+    st.turn_number = 3
+    await mgr.assemble(st, _sources())
+
+
+async def test_session_hash_change_first_turn_does_not_halt() -> None:
+    mgr = _mk()
+    st = _state()
+    # First assemble records the baseline at turn 1.
+    st.turn_number = 1
+    await mgr.assemble(st, _sources())
+    # A change still at turn 1 must NOT halt (baseline guard: turn_number > 1).
     st.environment = "changed"
     st.turn_number = 1
-    with caplog.at_level(logging.WARNING, logger="spore_core.context"):
-        await mgr.assemble(st, _sources())
-    assert not any("session block hash changed" in r.message for r in caplog.records)
+    await mgr.assemble(st, _sources())
 
 
 # ---------------------------------------------------------------------------

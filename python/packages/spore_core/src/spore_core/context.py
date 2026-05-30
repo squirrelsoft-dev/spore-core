@@ -19,14 +19,15 @@ interface for issue #7. The narrower :class:`ContextManager` stub in
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 import sys
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import ClassVar, NewType, Protocol, runtime_checkable
+from typing import Annotated, ClassVar, Literal, NewType, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import SporeError
 
@@ -52,9 +53,8 @@ from .model import (
     TextContent,
     ToolSchema,
 )
+from .prompt_chunk_registry import CacheBlock
 from .tool_registry import TaskPhase
-
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -453,13 +453,93 @@ class AssemblyFailed(ContextError):
 
 
 class CacheHashMismatch(ContextError):
+    """A cache block's content hash changed when it was expected to be stable.
+
+    Both Block 1 (:attr:`CacheBlock.STATIC`) and Block 2
+    (:attr:`CacheBlock.PER_SESSION`) halt the run on a mid-session mismatch —
+    they are treated consistently (#32). A Block-2 change mid-session means
+    session-stable content mutated and every subsequent turn would silently pay
+    full input-token cost; rather than warn, the run stops so the caller can fix
+    the source.
+
+    ``turn_number`` is the turn on which the mismatch was detected (Block 2 only
+    halts when ``turn_number > 1``; the turn-1 assemble records the baseline).
+    Estimated cache-cost-delta tracking (``UnexpectedMiss``) is a separate
+    observability concern tracked in issue #90.
+    """
+
     kind: ClassVar[str] = "CacheHashMismatch"
 
-    def __init__(self, block: str, expected: int, actual: int) -> None:
+    def __init__(self, block: CacheBlock, expected: int, actual: int, turn_number: int) -> None:
         self.block = block
         self.expected = expected
         self.actual = actual
-        super().__init__(f"cache hash mismatch on block {block}: expected {expected}, got {actual}")
+        self.turn_number = turn_number
+        super().__init__(
+            f"cache hash mismatch on block {block.value} at turn {turn_number}: "
+            f"expected {expected}, got {actual}"
+        )
+
+
+# ============================================================================
+# Serialized ContextError tagged union (wire format)
+# ============================================================================
+#
+# Mirrors the Rust ``ContextError`` serde-tagged enum
+# (``#[serde(tag = "kind", rename_all = "snake_case")]``). The exception
+# classes above are what assembly raises in-process; these pydantic models are
+# the wire shape carried by ``HaltReason.ContextError`` so a run failure can be
+# round-tripped. The agent never re-raises these across the harness boundary —
+# they are reported as values, matching the ``AgentError`` wire union in
+# :mod:`spore_core.agent`.
+
+
+class _WireModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class ContextErrorTokenCountFailed(_WireModel):
+    """``ContextError::TokenCountFailed`` wire variant."""
+
+    kind: Literal["token_count_failed"] = "token_count_failed"
+
+
+class ContextErrorCompactionFailed(_WireModel):
+    """``ContextError::CompactionFailed`` wire variant."""
+
+    kind: Literal["compaction_failed"] = "compaction_failed"
+    reason: str
+
+
+class ContextErrorAssemblyFailed(_WireModel):
+    """``ContextError::AssemblyFailed`` wire variant."""
+
+    kind: Literal["assembly_failed"] = "assembly_failed"
+    reason: str
+
+
+class ContextErrorCacheHashMismatch(_WireModel):
+    """``ContextError::CacheHashMismatch`` wire variant.
+
+    ``block`` is the :class:`CacheBlock` that mismatched (``static`` for Block 1,
+    ``per_session`` for Block 2); ``turn_number`` is the turn the mismatch was
+    detected on. See :class:`CacheHashMismatch` for the halt semantics.
+    """
+
+    kind: Literal["cache_hash_mismatch"] = "cache_hash_mismatch"
+    block: CacheBlock
+    expected: int
+    actual: int
+    turn_number: int
+
+
+ContextErrorModel = Annotated[
+    ContextErrorTokenCountFailed
+    | ContextErrorCompactionFailed
+    | ContextErrorAssemblyFailed
+    | ContextErrorCacheHashMismatch,
+    Field(discriminator="kind"),
+]
 
 
 # ============================================================================
@@ -572,8 +652,9 @@ class StandardContextManager:
     from per-turn ephemera. Tool schemas are sorted by name.
 
     The Block-1 hash is memoized on first assemble; any subsequent change
-    raises :class:`CacheHashMismatch`. Mid-session Block-2 hash changes
-    log a warning when ``turn_number > 1``.
+    raises :class:`CacheHashMismatch`. Mid-session Block-2 hash changes raise
+    the same :class:`CacheHashMismatch` when ``turn_number > 1`` — Block 1 and
+    Block 2 halt consistently (#32). A turn-1 baseline write never halts.
     """
 
     DEFAULT_OFFLOAD_THRESHOLD_BYTES: ClassVar[int] = 32 * 1024
@@ -634,9 +715,10 @@ class StandardContextManager:
                 self._static_hash = static_hash
             elif self._static_hash != static_hash:
                 raise CacheHashMismatch(
-                    block="static",
+                    block=CacheBlock.STATIC,
                     expected=self._static_hash,
                     actual=static_hash,
+                    turn_number=state.turn_number,
                 )
 
         # ── BLOCK 2 (PerSession) ─────────────────────────────────────
@@ -645,10 +727,16 @@ class StandardContextManager:
         with self._lock:
             prev = self._session_hash
             if prev is not None and prev != session_hash and state.turn_number > 1:
-                logger.warning(
-                    "session block hash changed mid-session (%s -> %s)",
-                    prev,
-                    session_hash,
+                # Block 2 (PerSession) is expected to be stable for the life of
+                # the session. A mid-session change means cost would silently
+                # spike; halt consistently with Block 1 (#32). We raise BEFORE
+                # updating the memo — the run is halting, so there is no "rest of
+                # the session" to track.
+                raise CacheHashMismatch(
+                    block=CacheBlock.PER_SESSION,
+                    expected=prev,
+                    actual=session_hash,
+                    turn_number=state.turn_number,
                 )
             self._session_hash = session_hash
 
@@ -842,6 +930,11 @@ __all__ = [
     "ComposedPrompt",
     "Context",
     "ContextError",
+    "ContextErrorAssemblyFailed",
+    "ContextErrorCacheHashMismatch",
+    "ContextErrorCompactionFailed",
+    "ContextErrorModel",
+    "ContextErrorTokenCountFailed",
     "KeyTermVerifier",
     "ContextManager",
     "ContextMeta",

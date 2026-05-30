@@ -20,8 +20,11 @@ from spore_core import (
     BudgetSnapshot,
     ChildPausedState,
     FinalResponse,
+    ChunkCacheBlock,
+    ContextErrorCacheHashMismatch,
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
+    HaltReasonContextError,
     HaltReasonHillClimbingMisconfigured,
     HaltReasonHumanHalted,
     HaltReasonMiddlewareHalt,
@@ -498,6 +501,32 @@ def test_run_result_roundtrips_json() -> None:
     s = adapter.dump_json(r)
     back = adapter.validate_json(s)
     assert back == r
+
+
+def test_context_error_halt_reason_roundtrips_json() -> None:
+    """``HaltReason::ContextError`` is the routing type added in #32; it carries
+    a serialized ``ContextError`` (here the Block-2 ``CacheHashMismatch``) and
+    round-trips through the ``RunResult`` discriminated union."""
+    r = RunResultFailure(
+        reason=HaltReasonContextError(
+            error=ContextErrorCacheHashMismatch(
+                block=ChunkCacheBlock.PER_SESSION,
+                expected=1,
+                actual=2,
+                turn_number=2,
+            )
+        ),
+        session_id=SessionId("s"),
+        usage=AggregateUsage(),
+        turns=2,
+    )
+    adapter = TypeAdapter(RunResult)
+    back = adapter.validate_json(adapter.dump_json(r))
+    assert back == r
+    assert isinstance(back, RunResultFailure)
+    assert isinstance(back.reason, HaltReasonContextError)
+    assert back.reason.error.block is ChunkCacheBlock.PER_SESSION
+    assert back.reason.error.turn_number == 2
 
 
 def test_paused_state_roundtrips_json() -> None:
