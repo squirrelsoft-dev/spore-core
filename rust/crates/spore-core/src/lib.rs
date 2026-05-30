@@ -71,14 +71,15 @@ pub use guide_registry::{
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
-    CommandOutput, ContextManager as HarnessContextManager, FileRef, HaltReason, Harness,
-    HarnessBuilder, HarnessConfig, HarnessError, HarnessRunOptions, HarnessSignal, HookPoint,
-    HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision,
-    ModelConfig, NetworkPolicy, ObservabilityProvider, Operation, OptimizationDirection,
-    PausedState, ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider, SandboxViolation,
-    SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
-    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
-    ToolResult as HarnessToolResult, TruncatedOutput,
+    CommandOutput, ContextManager as HarnessContextManager, FileRef, GitVcsProvider, HaltReason,
+    Harness, HarnessBuilder, HarnessConfig, HarnessError, HarnessRunOptions, HarnessSignal,
+    HookPoint, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain,
+    MiddlewareDecision, ModelConfig, NetworkPolicy, ObservabilityProvider, Operation,
+    OptimizationDirection, PausedState, ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider,
+    SandboxViolation, SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent,
+    Task, TaskId, TerminationDecision, TerminationPolicy, ToolOutput,
+    ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult, TruncatedOutput,
+    VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{
     CommandHook, FireOutcome, FunctionHook, Hook, HookChain, HookContext, HookDecision, HookError,

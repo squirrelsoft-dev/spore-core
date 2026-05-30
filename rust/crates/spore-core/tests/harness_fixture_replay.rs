@@ -70,6 +70,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         storage: Arc::new(spore_core::StorageProvider::no_op()),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
+        vcs_provider: None,
     };
     let harness = StandardHarness::new(config);
 

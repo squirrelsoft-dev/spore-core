@@ -823,6 +823,148 @@ impl SandboxProvider for ReadOnlySandbox {
     }
 }
 
+// ============================================================================
+// VcsProvider seam (issue #58 v2) — git-log reload for the Ralph loop strategy
+// ============================================================================
+
+/// Read-only VCS abstraction the `Ralph` loop strategy uses to reload git
+/// history between context windows (issue #58 v2, decision B4).
+///
+/// The v1 Ralph reload (commit `927cc57`) re-seeded each fresh context window
+/// from `.spore/progress.json` + `.spore/feature_list.json` only; the spec's
+/// "reload git log" step was deferred (B4) because there was no hermetic,
+/// cross-language-testable seam for VCS reads. This trait IS that seam.
+///
+/// It mirrors how [`SandboxProvider`] abstracts filesystem/shell access:
+/// define a trait, ship a real implementation ([`GitVcsProvider`]) and a
+/// deterministic fixture double ([`FixtureVcsProvider`]), and inject the chosen
+/// one at construction via [`HarnessBuilder::vcs_provider`]. The harness owns an
+/// `Arc<dyn VcsProvider>` clone exactly as it does for every other component.
+///
+/// `Ralph` calls [`log`](Self::log) during its reload phase and injects the
+/// output into the next window's seed as a clearly delimited
+/// "Recent VCS history:" section. When NO provider is wired
+/// (`vcs_provider == None`, the default) the git-log section is OMITTED and
+/// Ralph behaves byte-for-byte like v1 — this is the B4→None decision.
+pub trait VcsProvider: Send + Sync {
+    /// Return the project's commit log, shaped by `args`. The returned string
+    /// is the verbatim VCS output (e.g. `git log` stdout); the caller does not
+    /// parse it, it is injected into the reloaded context block as-is.
+    fn log<'a>(&'a self, args: &'a VcsLogArgs) -> BoxFut<'a, Result<String, VcsError>>;
+
+    /// Return the working-tree status (e.g. `git status` stdout), verbatim.
+    fn status<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>>;
+}
+
+/// Parameters shaping a [`VcsProvider::log`] read. Each field maps to a
+/// `git log` flag in [`GitVcsProvider`]:
+///   - `max_entries` → `-n <N>` (cap the number of commits returned),
+///   - `since_ref`   → `<ref>..` (only commits AFTER `<ref>`),
+///   - `format`      → `--format=<fmt>` (custom pretty format).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VcsLogArgs {
+    /// Maximum number of commits to return (`git log -n <max_entries>`).
+    pub max_entries: usize,
+    /// Only commits reachable after this ref (`git log <since_ref>..`). `None`
+    /// returns the full history (subject to `max_entries`).
+    pub since_ref: Option<String>,
+    /// Custom `git log --format=<format>` string. `None` uses git's default
+    /// formatting.
+    pub format: Option<String>,
+}
+
+/// Error raised by a [`VcsProvider`]. Mirrors the per-component
+/// `<Component>Error` convention (`thiserror`, `#[non_exhaustive]`).
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VcsError {
+    /// The underlying VCS command failed (non-zero exit), carrying the captured
+    /// stderr.
+    #[error("vcs command failed: {message}")]
+    CommandFailed { message: String },
+    /// The VCS command was blocked or could not be spawned by the sandbox.
+    #[error("vcs command blocked by sandbox: {0:?}")]
+    Sandbox(SandboxViolation),
+}
+
+/// Real [`VcsProvider`] that shells out to `git` THROUGH a [`SandboxProvider`]
+/// (issue #58 v2). It wraps the sandbox and calls
+/// [`SandboxProvider::execute_command`] — it never bypasses sandboxing to spawn
+/// `git` directly. The command line is built from [`VcsLogArgs`] (see that
+/// type for the flag mapping); [`status`](VcsProvider::status) runs
+/// `git status`. All commands run in `workspace_root`.
+pub struct GitVcsProvider {
+    sandbox: Arc<dyn SandboxProvider>,
+    workspace_root: std::path::PathBuf,
+}
+
+impl GitVcsProvider {
+    /// Wrap `sandbox`, running `git` invocations in `workspace_root`.
+    pub fn new(
+        sandbox: Arc<dyn SandboxProvider>,
+        workspace_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            sandbox,
+            workspace_root: workspace_root.into(),
+        }
+    }
+
+    /// Build the `git log` argument vector from `args` (visible for testing the
+    /// flag mapping independently of process execution).
+    fn log_args(args: &VcsLogArgs) -> Vec<String> {
+        let mut out = vec![
+            "log".to_string(),
+            "-n".to_string(),
+            args.max_entries.to_string(),
+        ];
+        if let Some(fmt) = &args.format {
+            out.push(format!("--format={fmt}"));
+        }
+        if let Some(since) = &args.since_ref {
+            out.push(format!("{since}.."));
+        }
+        out
+    }
+}
+
+impl VcsProvider for GitVcsProvider {
+    fn log<'a>(&'a self, args: &'a VcsLogArgs) -> BoxFut<'a, Result<String, VcsError>> {
+        Box::pin(async move {
+            let argv = Self::log_args(args);
+            let out = self
+                .sandbox
+                .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(out.stdout)
+        })
+    }
+
+    fn status<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>> {
+        Box::pin(async move {
+            let argv = vec!["status".to_string()];
+            let out = self
+                .sandbox
+                .execute_command("git", &argv, Some(self.workspace_root.as_path()), None)
+                .await
+                .map_err(VcsError::Sandbox)?;
+            if out.exit_code != 0 {
+                return Err(VcsError::CommandFailed {
+                    message: out.stderr,
+                });
+            }
+            Ok(out.stdout)
+        })
+    }
+}
+
 /// Output of a subprocess executed through the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandOutput {
@@ -1464,6 +1606,15 @@ pub struct HarnessConfig {
     /// Defaults to `3` (matching the `SelfVerifying` verifier `max_iterations`
     /// precedent). Irrelevant for every other loop strategy.
     pub max_resets: u32,
+    /// Optional VCS read seam for the `Ralph` loop strategy (issue #58 v2). When
+    /// `Some`, Ralph's per-window reload phase ALSO calls
+    /// [`VcsProvider::log`] and injects the output into the fresh context window
+    /// as a delimited "Recent VCS history:" section — alongside the reloaded
+    /// `.spore/progress.json` + `.spore/feature_list.json` content. When `None`
+    /// (the default) the git-log section is OMITTED and Ralph behaves
+    /// byte-for-byte like v1 (the B4→None decision). Irrelevant for every other
+    /// loop strategy.
+    pub vcs_provider: Option<Arc<dyn VcsProvider>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1490,6 +1641,7 @@ impl Clone for HarnessConfig {
             storage: self.storage.clone(),
             chunk_provider: self.chunk_provider.clone(),
             max_resets: self.max_resets,
+            vcs_provider: self.vcs_provider.clone(),
         }
     }
 }
@@ -1546,6 +1698,9 @@ pub struct HarnessBuilder {
     /// Outer-loop reset cap for the `Ralph` loop strategy (issue #58, B3).
     /// Defaults to `3`.
     max_resets: u32,
+    /// Optional VCS read seam for the `Ralph` loop strategy (issue #58 v2).
+    /// `None` (the default) omits the git-log reload section (v1 behavior).
+    vcs_provider: Option<Arc<dyn VcsProvider>>,
     /// Standard catalogue tools accumulated via [`HarnessBuilder::tool`] /
     /// [`HarnessBuilder::tools`] (issue #81). They are drained into a populated
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
@@ -1585,6 +1740,7 @@ impl HarnessBuilder {
             storage: None,
             chunk_provider: None,
             max_resets: 3,
+            vcs_provider: None,
             standard_tools: Vec::new(),
         }
     }
@@ -1704,6 +1860,17 @@ impl HarnessBuilder {
         self
     }
 
+    /// Inject a [`VcsProvider`] for the `Ralph` loop strategy (issue #58 v2).
+    /// When set, Ralph's per-window reload phase also calls
+    /// [`VcsProvider::log`] and injects a delimited "Recent VCS history:"
+    /// section into the fresh context window. Defaults to `None`, which omits
+    /// the git-log section and preserves v1 Ralph behavior byte-for-byte (the
+    /// B4→None decision).
+    pub fn vcs_provider(mut self, provider: Arc<dyn VcsProvider>) -> Self {
+        self.vcs_provider = Some(provider);
+        self
+    }
+
     /// Inject a deterministic tool-call repair provider (e.g.
     /// [`StandardToolCallRepair`](crate::tool_call_repair::StandardToolCallRepair)).
     /// When set, recoverable tool-dispatch errors trigger an argument-coercion
@@ -1798,6 +1965,7 @@ impl HarnessBuilder {
                 Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
             }),
             max_resets: self.max_resets,
+            vcs_provider: self.vcs_provider,
         }
     }
 
@@ -3347,6 +3515,29 @@ impl StandardHarness {
                     .append_user_message(&mut session_state, &reload)
                     .await;
             }
+            // R3 (issue #58 v2): when a `VcsProvider` is wired, ALSO reload git
+            // history and inject it as a delimited "Recent VCS history:" section,
+            // exactly as the `.spore/` reload content is injected. When the
+            // provider is `None` (the default), this section is omitted entirely
+            // — Ralph's reloaded context is then byte-for-byte the v1 behavior
+            // (the B4→None decision).
+            if let Some(vcs) = &self.config.vcs_provider {
+                let args = VcsLogArgs {
+                    max_entries: 20,
+                    since_ref: None,
+                    format: None,
+                };
+                if let Ok(log) = vcs.log(&args).await {
+                    let trimmed = log.trim();
+                    if !trimmed.is_empty() {
+                        let block = format!("Recent VCS history:\n{trimmed}");
+                        self.config
+                            .context_manager
+                            .append_user_message(&mut session_state, &block)
+                            .await;
+                    }
+                }
+            }
 
             // The per-window bounded ReAct sub-loop. The registered Stop hook
             // (B1) fires inside it on each `FinalResponse`: while incomplete it
@@ -4608,6 +4799,37 @@ pub mod testing {
         }
     }
 
+    /// Deterministic [`VcsProvider`] double for tests and fixture replay (issue
+    /// #58 v2). It returns pre-loaded strings VERBATIM with no process spawning,
+    /// so multi-context-window Ralph continuation can be exercised hermetically.
+    /// [`log`](VcsProvider::log) ignores its [`VcsLogArgs`] and yields
+    /// `log_output`; [`status`](VcsProvider::status) yields `status_output`.
+    pub struct FixtureVcsProvider {
+        log_output: String,
+        status_output: String,
+    }
+
+    impl FixtureVcsProvider {
+        /// Construct a fixture provider returning `log_output` from `log` and
+        /// `status_output` from `status`.
+        pub fn new(log_output: impl Into<String>, status_output: impl Into<String>) -> Self {
+            Self {
+                log_output: log_output.into(),
+                status_output: status_output.into(),
+            }
+        }
+    }
+
+    impl VcsProvider for FixtureVcsProvider {
+        fn log<'a>(&'a self, _args: &'a VcsLogArgs) -> BoxFut<'a, Result<String, VcsError>> {
+            Box::pin(async move { Ok(self.log_output.clone()) })
+        }
+
+        fn status<'a>(&'a self) -> BoxFut<'a, Result<String, VcsError>> {
+            Box::pin(async move { Ok(self.status_output.clone()) })
+        }
+    }
+
     pub struct ScriptedSandbox {
         outcomes: Mutex<std::collections::VecDeque<Result<(), SandboxViolation>>>,
     }
@@ -4865,6 +5087,7 @@ mod tests {
             ))),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
+            vcs_provider: None,
         }
     }
 
@@ -7516,6 +7739,7 @@ mod tests {
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
                 max_resets: 3,
+                vcs_provider: None,
             })
         }
 
@@ -9061,6 +9285,171 @@ mod tests {
         assert_eq!(StandardHarness::ralph_completion_status(dir.path()), None);
     }
 
+    // ── VcsProvider seam (issue #58 v2) ─────────────────────────────────────
+
+    // (a) FixtureVcsProvider::log returns the seeded string verbatim.
+    #[tokio::test]
+    async fn fixture_vcs_log_verbatim() {
+        let log = "abc123 first\ndef456 second\n";
+        let provider = FixtureVcsProvider::new(log, "clean");
+        let args = VcsLogArgs {
+            max_entries: 5,
+            since_ref: Some("HEAD~3".into()),
+            format: Some("%h %s".into()),
+        };
+        let out = provider.log(&args).await.unwrap();
+        assert_eq!(out, log, "log output must be verbatim, args ignored");
+    }
+
+    // (e) status() round-trips the seeded string verbatim.
+    #[tokio::test]
+    async fn fixture_vcs_status_round_trips() {
+        let status = "On branch main\nnothing to commit\n";
+        let provider = FixtureVcsProvider::new("", status);
+        assert_eq!(provider.status().await.unwrap(), status);
+    }
+
+    /// A `SandboxProvider` that captures the `execute_command` invocation so the
+    /// `git log`/`git status` command lines can be asserted, and returns a
+    /// scripted stdout.
+    struct CapturingSandbox {
+        captured: StdMutex<Vec<(String, Vec<String>)>>,
+        stdout: String,
+    }
+    impl CapturingSandbox {
+        fn new(stdout: &str) -> Self {
+            Self {
+                captured: StdMutex::new(Vec::new()),
+                stdout: stdout.to_string(),
+            }
+        }
+        fn last(&self) -> (String, Vec<String>) {
+            self.captured.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+    impl SandboxProvider for CapturingSandbox {
+        fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn execute_command<'a>(
+            &'a self,
+            command: &'a str,
+            args: &'a [String],
+            _working_dir: Option<&'a std::path::Path>,
+            _timeout: Option<std::time::Duration>,
+        ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((command.to_string(), args.to_vec()));
+            let stdout = self.stdout.clone();
+            Box::pin(async move {
+                Ok(CommandOutput {
+                    stdout,
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                    truncated: false,
+                })
+            })
+        }
+    }
+
+    // (b) GitVcsProvider builds the correct `git log` command from VcsLogArgs,
+    // shelling out THROUGH the sandbox (never bypassing it).
+    #[tokio::test]
+    async fn git_vcs_builds_log_command() {
+        let sandbox = Arc::new(CapturingSandbox::new("log-output"));
+        let git = GitVcsProvider::new(sandbox.clone(), "/work");
+        let args = VcsLogArgs {
+            max_entries: 7,
+            since_ref: Some("main".into()),
+            format: Some("%h %s".into()),
+        };
+        let out = git.log(&args).await.unwrap();
+        assert_eq!(out, "log-output");
+        let (cmd, argv) = sandbox.last();
+        assert_eq!(cmd, "git");
+        assert_eq!(
+            argv,
+            vec![
+                "log".to_string(),
+                "-n".to_string(),
+                "7".to_string(),
+                "--format=%h %s".to_string(),
+                "main..".to_string(),
+            ],
+            "git log command line built from VcsLogArgs"
+        );
+
+        // status() runs `git status`.
+        let _ = git.status().await.unwrap();
+        let (cmd, argv) = sandbox.last();
+        assert_eq!(cmd, "git");
+        assert_eq!(argv, vec!["status".to_string()]);
+    }
+
+    // (b') Minimal args produce just `git log -n <N>` (no format/range flags).
+    #[tokio::test]
+    async fn git_vcs_log_command_minimal_args() {
+        let sandbox = Arc::new(CapturingSandbox::new(""));
+        let git = GitVcsProvider::new(sandbox.clone(), "/work");
+        let args = VcsLogArgs {
+            max_entries: 3,
+            since_ref: None,
+            format: None,
+        };
+        let _ = git.log(&args).await.unwrap();
+        let (_, argv) = sandbox.last();
+        assert_eq!(
+            argv,
+            vec!["log".to_string(), "-n".to_string(), "3".to_string()]
+        );
+    }
+
+    // (c) Ralph with a FixtureVcsProvider set injects the vcs_log string into the
+    // reloaded context across a reset.
+    #[tokio::test]
+    async fn ralph_injects_vcs_log_into_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        cfg.max_resets = 3;
+        cfg.vcs_provider = Some(Arc::new(FixtureVcsProvider::new(
+            "cafe123 implement login\nbeef456 add tests\n",
+            "clean",
+        )));
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
+        let texts = agent.seen_text();
+        assert!(
+            texts[0].contains("Recent VCS history:")
+                && texts[0].contains("cafe123 implement login"),
+            "vcs log not injected: {}",
+            texts[0]
+        );
+    }
+
+    // (d) Ralph with vcs_provider = None omits any git section (v1 unchanged).
+    #[tokio::test]
+    async fn ralph_none_vcs_omits_git_section() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![COMPLETE]);
+        let cfg = ralph_config(dir.path(), agent.clone());
+        // vcs_provider defaults to None.
+        assert!(cfg.vcs_provider.is_none());
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
+        let texts = agent.seen_text();
+        assert!(
+            !texts[0].contains("Recent VCS history:"),
+            "no git section expected when provider is None: {}",
+            texts[0]
+        );
+    }
+
     // ── Ralph cross-language fixture replay ─────────────────────────────────
     #[derive(serde::Deserialize)]
     struct RalphFixtureCase {
@@ -9069,6 +9458,12 @@ mod tests {
         windows: Vec<RalphWindow>,
         max_resets: u32,
         expected: RalphFixtureExpected,
+        /// Optional git-log string (issue #58 v2). When present a
+        /// [`FixtureVcsProvider`] seeded with it is wired into the harness and
+        /// the reloaded context is asserted to contain it. Absent ⇒ no provider
+        /// (None) ⇒ no git section (v1 behavior).
+        #[serde(default)]
+        vcs_log: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct RalphWindow {
@@ -9112,8 +9507,26 @@ mod tests {
                 ProgressWritingAgent::new(dir.path(), bodies.iter().map(|s| s.as_str()).collect());
             let mut cfg = ralph_config(dir.path(), agent.clone());
             cfg.max_resets = case.max_resets;
+            // issue #58 v2: when the case carries a `vcs_log`, wire a
+            // FixtureVcsProvider seeded with it; absent ⇒ None ⇒ no git section.
+            if let Some(log) = &case.vcs_log {
+                cfg.vcs_provider = Some(Arc::new(FixtureVcsProvider::new(log.clone(), "")));
+            }
             let h = StandardHarness::new(cfg);
             let r = h.run(HarnessRunOptions::new(ralph_task())).await;
+            // When a vcs_log is present, the first fresh window must include it.
+            if let Some(log) = &case.vcs_log {
+                let texts = agent.seen_text();
+                assert!(
+                    texts
+                        .first()
+                        .map(|t| t.contains("Recent VCS history:") && t.contains(log.trim()))
+                        .unwrap_or(false),
+                    "case `{}`: vcs_log not injected into reload: {:?}",
+                    case.name,
+                    texts.first()
+                );
+            }
             match (case.expected, r) {
                 (RalphFixtureExpected::Success { iterations }, RunResult::Success { .. }) => {
                     assert_eq!(
