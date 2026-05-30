@@ -31,6 +31,7 @@ import type { SessionOutcome } from "../guide-registry/types.js";
 import type { StorageScope } from "../prompt-assembly/types.js";
 
 import { StorageIoError, StorageSerializationError } from "./errors.js";
+import { getMemoriesMergedDefault } from "./types.js";
 import type {
   FullStorageProvider,
   JsonValue,
@@ -52,38 +53,6 @@ import type {
 function mostRecentNewestFirst<T>(items: readonly T[], limit: number): T[] {
   const reversed = items.slice().reverse();
   return limit < 0 ? [] : reversed.slice(0, limit);
-}
-
-/**
- * The `timestamp` field of a {@link MemoryEntry} as a comparable string. Entries
- * from the in-memory backend carry a {@link Timestamp} instance; entries read
- * back from a JSONL backend carry a plain string. Both are handled so the merge
- * works regardless of backend (#78 R6).
- */
-function timestampKey(entry: MemoryEntry): string {
-  const t = entry.timestamp as unknown;
-  if (typeof t === "string") return t;
-  if (t != null && typeof (t as { asString?: () => string }).asString === "function") {
-    return (t as { asString: () => string }).asString();
-  }
-  return String(t);
-}
-
-/**
- * Merge step for the cross-scope memory read (#78 R6): sort newest-first by
- * `timestamp` and truncate to `limit`. **No dedup** — identical-content entries
- * are all retained. A *stable* sort (the spec's order among equal timestamps)
- * keeps the merge deterministic cross-language: `Array.prototype.sort` is
- * guaranteed stable in modern V8.
- */
-function mergeNewestFirst(entries: readonly MemoryEntry[], limit: number): MemoryEntry[] {
-  const sorted = entries.slice().sort((a, b) => {
-    const ka = timestampKey(a);
-    const kb = timestampKey(b);
-    // Newest-first: descending by timestamp string.
-    return ka < kb ? 1 : ka > kb ? -1 : 0;
-  });
-  return limit < 0 ? [] : sorted.slice(0, limit);
 }
 
 /**
@@ -126,6 +95,9 @@ export class NoOpStorageProvider implements FullStorageProvider {
     _limit: number,
   ): Promise<MemoryEntry[]> {
     return [];
+  }
+  async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+    return getMemoriesMergedDefault(this, sessionId, limit);
   }
 
   // RunStore
@@ -204,6 +176,9 @@ export class InMemoryStorageProvider implements FullStorageProvider {
   ): Promise<MemoryEntry[]> {
     const list = this.memories.get(this.memoryKey(scope, sessionId.asString())) ?? [];
     return mostRecentNewestFirst(list, limit);
+  }
+  async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+    return getMemoriesMergedDefault(this, sessionId, limit);
   }
 
   // RunStore
@@ -429,6 +404,9 @@ export class FileSystemStorageProvider implements FullStorageProvider {
     const entries = values as unknown as MemoryEntry[];
     return mostRecentNewestFirst(entries, limit);
   }
+  async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+    return getMemoriesMergedDefault(this, sessionId, limit);
+  }
 
   // RunStore
   async get(sessionId: SessionId, key: string): Promise<JsonValue | undefined> {
@@ -556,14 +534,13 @@ export class StorageProvider {
    * Routes through the memory slot — when built via {@link CompositeStorageProvider}
    * that slot is a {@link ScopedMemoryRouter} that fans out to the per-scope
    * backends and merges; for `single`/`of` the one backend serves both scopes
-   * (keyed by scope) and merges identically. The merge always lives in this
-   * routing layer, never in a leaf backend.
+   * (keyed by scope) and merges identically. Delegates to the single
+   * {@link MemoryStore.getMemoriesMerged} (#82 D2) so there is exactly ONE merge
+   * implementation; the merge always lives in this routing layer, never in a
+   * leaf backend.
    */
   async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
-    const user = await this._memory.getMemories("user", sessionId, limit);
-    const project = await this._memory.getMemories("project", sessionId, limit);
-    const combined = [...user, ...project];
-    return mergeNewestFirst(combined, limit);
+    return this._memory.getMemoriesMerged(sessionId, limit);
   }
 
   run(): RunStore {
@@ -680,6 +657,15 @@ export class ScopedMemoryRouter implements MemoryStore {
     limit: number,
   ): Promise<MemoryEntry[]> {
     return this.backend(scope).getMemories(scope, sessionId, limit);
+  }
+
+  /**
+   * Cross-scope merge (#78 R6 / #82 D2). Delegates to the single shared merge,
+   * which fans out via this router's own `getMemories(user|project, …)` — so the
+   * merge reaches each per-scope backend while leaf backends stay scope-dumb.
+   */
+  async getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]> {
+    return getMemoriesMergedDefault(this, sessionId, limit);
   }
 }
 

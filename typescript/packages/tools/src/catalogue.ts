@@ -29,6 +29,7 @@
  * Tier 2 (storage via `ToolContext`):
  *   - `todoWrite` → `todo_write` (NEW, RunStore key `"todo"`)
  *   - `taskList` → `task_list` (EXISTING #71)
+ *   - `memory` → `memory` (#82, scope-aware MemoryStore read/write)
  *
  * Tier 3 (escalate / clarify):
  *   - `enterPlanMode` → `enter_plan_mode` (NEW)
@@ -50,9 +51,11 @@
  * upsert (issue #81, Q1), registering a preset and then a custom tool of the
  * same name lets the architect override a standard tool.
  *
- * ## Q3 — MemoryTool is DEFERRED
- * `MemoryTool` is intentionally NOT part of this catalogue; it depends on the
- * `StorageScope` work (#79) and lands in a follow-on issue.
+ * ## MemoryTool (#82 — landed)
+ * `MemoryTool` (`memory`) was deferred from #81 (Q3) pending the scoped
+ * `MemoryStore` seam (#78). It now ships here as a Tier-2 storage tool,
+ * included in {@link StandardTools.codingSet} (and {@link StandardTools.fullSet}
+ * via spread) alongside `task_list` / `todo_write`.
  */
 
 import type { toolRegistry } from "@spore/core";
@@ -63,6 +66,7 @@ import { BashCommandTool } from "./exec.js";
 import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
 import { SendMessageTool } from "./message.js";
 import { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
+import { MemoryTool } from "./memory.js";
 import { TaskListTool } from "./tasklist.js";
 import { TodoWriteTool } from "./todo.js";
 import {
@@ -83,17 +87,26 @@ export const StandardTools = {
 
   /** `read_file` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
   readFile(): StandardTool {
-    return { implementation: new ReadFileTool(), schema: ReadFileTool.schema() };
+    return {
+      implementation: new ReadFileTool(),
+      schema: ReadFileTool.schema(),
+    };
   },
 
   /** `write_file` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
   writeFile(): StandardTool {
-    return { implementation: new WriteFileTool(), schema: WriteFileTool.schema() };
+    return {
+      implementation: new WriteFileTool(),
+      schema: WriteFileTool.schema(),
+    };
   },
 
   /** `edit_file` — NEW unique-match in-place edit (alongside `write_file`). */
   editFile(): StandardTool {
-    return { implementation: new EditFileTool(), schema: EditFileTool.schema() };
+    return {
+      implementation: new EditFileTool(),
+      schema: EditFileTool.schema(),
+    };
   },
 
   /** `list_dir` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
@@ -103,7 +116,10 @@ export const StandardTools = {
 
   /** `grep_files` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
   grepFiles(): StandardTool {
-    return { implementation: new GrepFilesTool(), schema: GrepFilesTool.schema() };
+    return {
+      implementation: new GrepFilesTool(),
+      schema: GrepFilesTool.schema(),
+    };
   },
 
   /** `grep` — NEW regex search with output modes (alongside `grep_files`). */
@@ -113,22 +129,34 @@ export const StandardTools = {
 
   /** `find_files` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
   findFiles(): StandardTool {
-    return { implementation: new FindFilesTool(), schema: FindFilesTool.schema() };
+    return {
+      implementation: new FindFilesTool(),
+      schema: FindFilesTool.schema(),
+    };
   },
 
   /** `bash_command` — EXISTING #5 tool (Q5 overlap: reused, not renamed). */
   bashCommand(): StandardTool {
-    return { implementation: new BashCommandTool(), schema: BashCommandTool.schema() };
+    return {
+      implementation: new BashCommandTool(),
+      schema: BashCommandTool.schema(),
+    };
   },
 
   /** `send_message` — NEW; surfaces a `user_message` stream event via the loop. */
   sendMessage(): StandardTool {
-    return { implementation: new SendMessageTool(), schema: SendMessageTool.schema() };
+    return {
+      implementation: new SendMessageTool(),
+      schema: SendMessageTool.schema(),
+    };
   },
 
   /** `web_fetch` — NEW; GET a URL. */
   webFetch(): StandardTool {
-    return { implementation: new WebFetchTool(), schema: WebFetchTool.schema() };
+    return {
+      implementation: new WebFetchTool(),
+      schema: WebFetchTool.schema(),
+    };
   },
 
   /**
@@ -148,29 +176,49 @@ export const StandardTools = {
 
   /** `todo_write` — NEW; persists the todo list via RunStore key `"todo"`. */
   todoWrite(): StandardTool {
-    return { implementation: new TodoWriteTool(), schema: TodoWriteTool.schema() };
+    return {
+      implementation: new TodoWriteTool(),
+      schema: TodoWriteTool.schema(),
+    };
   },
 
   /** `task_list` — EXISTING #71 tool (Q5 overlap: reused, not renamed). */
   taskList(): StandardTool {
-    return { implementation: new TaskListTool(), schema: TaskListTool.schema() };
+    return {
+      implementation: new TaskListTool(),
+      schema: TaskListTool.schema(),
+    };
+  },
+
+  /** `memory` — NEW #82; scope-aware episodic memory read/write via MemoryStore. */
+  memory(): StandardTool {
+    return { implementation: new MemoryTool(), schema: MemoryTool.schema() };
   },
 
   // ---- Tier 3 ---------------------------------------------------------
 
   /** `enter_plan_mode` — NEW; escalates `enter_plan_mode`. */
   enterPlanMode(): StandardTool {
-    return { implementation: new EnterPlanModeTool(), schema: EnterPlanModeTool.schema() };
+    return {
+      implementation: new EnterPlanModeTool(),
+      schema: EnterPlanModeTool.schema(),
+    };
   },
 
   /** `exit_plan_mode` — NEW; escalates `exit_plan_mode { plan }`. */
   exitPlanMode(): StandardTool {
-    return { implementation: new ExitPlanModeTool(), schema: ExitPlanModeTool.schema() };
+    return {
+      implementation: new ExitPlanModeTool(),
+      schema: ExitPlanModeTool.schema(),
+    };
   },
 
   /** `ask_user_question` — NEW; returns `awaiting_clarification`. */
   askUserQuestion(): StandardTool {
-    return { implementation: new AskUserQuestionTool(), schema: AskUserQuestionTool.schema() };
+    return {
+      implementation: new AskUserQuestionTool(),
+      schema: AskUserQuestionTool.schema(),
+    };
   },
 
   /** `abort` — NEW; escalates `abort { reason }`. */
@@ -216,6 +264,7 @@ export const StandardTools = {
       this.webSearch(),
       this.todoWrite(),
       this.taskList(),
+      this.memory(),
     ];
   },
 

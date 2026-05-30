@@ -239,6 +239,57 @@ export interface MemoryStore {
   appendMemory(scope: StorageScope, sessionId: SessionId, entry: MemoryEntry): Promise<void>;
   /** Returns the MOST-RECENT `limit` entries, NEWEST-FIRST, for `scope`. */
   getMemories(scope: StorageScope, sessionId: SessionId, limit: number): Promise<MemoryEntry[]>;
+  /**
+   * Cross-scope merged read (#78 R6 / #82 D2): **User ∪ Project, newest-first by
+   * `timestamp`, NO dedup**. `Local` is excluded from the merge in v1.
+   *
+   * This is the SINGLE source of the merge algorithm. TypeScript interfaces
+   * cannot carry default method bodies, so every {@link MemoryStore} implementation
+   * delegates to the one shared helper {@link getMemoriesMergedDefault} — there
+   * is exactly one merge implementation. {@link StorageProvider.getMemoriesMerged}
+   * and {@link "@spore/tools".MemoryTool}'s merged `read` both reach this method.
+   */
+  getMemoriesMerged(sessionId: SessionId, limit: number): Promise<MemoryEntry[]>;
+}
+
+/**
+ * The `timestamp` field of a {@link MemoryEntry} as a comparable string. Entries
+ * from the in-memory backend carry a {@link Timestamp} instance; entries read
+ * back from a JSONL backend carry a plain string. Both are handled so the merge
+ * works regardless of backend (#78 R6).
+ */
+function memoryTimestampKey(entry: MemoryEntry): string {
+  const t = entry.timestamp as unknown;
+  if (typeof t === "string") return t;
+  if (t != null && typeof (t as { asString?: () => string }).asString === "function") {
+    return (t as { asString: () => string }).asString();
+  }
+  return String(t);
+}
+
+/**
+ * The SINGLE cross-scope merge implementation (#78 R6 / #82 D2). Reads
+ * `User` and `Project` from `store` (NEVER `Local`), concatenates them
+ * (**no dedup**), sorts newest-first by `timestamp`, and truncates to `limit`.
+ * A *stable* sort preserves input order among equal timestamps, keeping the
+ * merge deterministic cross-language (`Array.prototype.sort` is stable in
+ * modern V8). Every {@link MemoryStore.getMemoriesMerged} delegates here.
+ */
+export async function getMemoriesMergedDefault(
+  store: MemoryStore,
+  sessionId: SessionId,
+  limit: number,
+): Promise<MemoryEntry[]> {
+  const user = await store.getMemories("user", sessionId, limit);
+  const project = await store.getMemories("project", sessionId, limit);
+  const combined = [...user, ...project];
+  const sorted = combined.slice().sort((a, b) => {
+    const ka = memoryTimestampKey(a);
+    const kb = memoryTimestampKey(b);
+    // Newest-first: descending by timestamp string.
+    return ka < kb ? 1 : ka > kb ? -1 : 0;
+  });
+  return limit < 0 ? [] : sorted.slice(0, limit);
 }
 
 /** Per-run structured state keyed by `(SessionId, key)`. Values are opaque JSON

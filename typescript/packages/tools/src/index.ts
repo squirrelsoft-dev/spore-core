@@ -42,6 +42,7 @@ export { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
 export { SendMessageTool } from "./message.js";
 export { WebFetchTool, WebSearchTool } from "./web.js";
 export { TODO_STORE_KEY, TodoWriteTool } from "./todo.js";
+export { MEMORY_LOCAL_REJECTED_MESSAGE, MemoryTool } from "./memory.js";
 export {
   AbortTool,
   AskUserQuestionTool,

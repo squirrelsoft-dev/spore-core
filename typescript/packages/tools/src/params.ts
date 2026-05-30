@@ -134,11 +134,7 @@ export type WebSearchParams = z.infer<typeof WebSearchParamsSchema>;
 
 // ---------- TodoWrite (#81) ----------
 
-export const TodoStatusSchema = z.enum([
-  "completed",
-  "in_progress",
-  "pending",
-]);
+export const TodoStatusSchema = z.enum(["completed", "in_progress", "pending"]);
 export type TodoStatus = z.infer<typeof TodoStatusSchema>;
 
 export const TodoItemSchema = z.object({
@@ -178,9 +174,7 @@ export const AskUserQuestionParamsSchema = z.object({
   question: z.string(),
   options: z.array(z.string()).optional(),
 });
-export type AskUserQuestionParams = z.infer<
-  typeof AskUserQuestionParamsSchema
->;
+export type AskUserQuestionParams = z.infer<typeof AskUserQuestionParamsSchema>;
 
 /** `abort` — graceful stop with a `reason`. */
 export const AbortParamsSchema = z.object({ reason: z.string() });
@@ -272,3 +266,46 @@ export const TaskListParamsSchema = z.discriminatedUnion("action", [
   }),
 ]);
 export type TaskListParams = z.infer<typeof TaskListParamsSchema>;
+
+// ---------- Memory (#82) ----------
+
+/**
+ * The `scope` field on both Memory operations. `local` IS accepted by the
+ * schema (so a bad-scope call reaches the tool body and is rejected at runtime
+ * with the exact recoverable message), but the advertised schema enum omits
+ * `local`. Mirrors the Rust `MemoryToolParams` serde shape.
+ */
+const MemoryScopeSchema = z.enum(["user", "project", "local"]);
+
+/** Default `limit` for a Memory `read` (decision B). */
+export const MEMORY_DEFAULT_LIMIT = 50;
+
+/**
+ * Parameters for the {@link import("./memory.js").MemoryTool}, a discriminated
+ * union on `operation` (snake_case). `scope` is an explicit field on BOTH
+ * variants. `write` carries the entry payload (`metadata` optional, defaults to
+ * `{}`); `read` carries the recency `limit` (defaults to 50) and a `merged`
+ * flag (defaults to `false`). Mirrors the Rust `MemoryToolParams` enum.
+ */
+export const MemoryToolParamsSchema = z.discriminatedUnion("operation", [
+  z.object({
+    operation: z.literal("write"),
+    scope: MemoryScopeSchema,
+    role: z.string(),
+    content: z.string(),
+    /** Free-form metadata stored on the entry; defaults to `{}` (decision C). */
+    metadata: z.record(z.unknown()).default({}),
+  }),
+  z.object({
+    operation: z.literal("read"),
+    scope: MemoryScopeSchema,
+    /**
+     * When `true`, return the cross-scope merged view (User ∪ Project,
+     * newest-first, no dedup) instead of just `scope`. Defaults to `false`.
+     */
+    merged: z.boolean().default(false),
+    /** Recency cap; most-recent `limit` entries, newest-first. Defaults to 50. */
+    limit: z.number().int().nonnegative().default(MEMORY_DEFAULT_LIMIT),
+  }),
+]);
+export type MemoryToolParams = z.infer<typeof MemoryToolParamsSchema>;
