@@ -866,6 +866,89 @@ class BaseSandboxProvider:
         return Path("/")
 
 
+class ReadOnlySandbox:
+    """Read-only :class:`SandboxProvider` decorator (issue #61, R3).
+
+    Wraps an inner provider and blocks the standard mutating tools by name —
+    any :class:`ToolCall` whose ``name`` is in :attr:`DEFAULT_WRITE_TOOLS` is
+    rejected at :meth:`validate` with :class:`SandboxReadOnlyViolation`; every
+    other call (the read tools) is delegated to the inner provider. Subprocess
+    execution is forbidden outright (commands may have arbitrary write side
+    effects), and ``resolve_path`` rejects Write/Execute operations.
+
+    ``ReadOnlyViolation`` is a Layer-2 (recoverable) violation, so in the harness
+    loop a blocked write surfaces to the evaluator agent as a recoverable tool
+    error — it does NOT halt the evaluate run. Mirrors Rust's ``ReadOnlySandbox``
+    decorator in ``harness.rs``."""
+
+    #: Standard-catalogue tool names that MUTATE the workspace and are therefore
+    #: blocked by a read-only sandbox.
+    DEFAULT_WRITE_TOOLS: frozenset[str] = frozenset(
+        {
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "move_file",
+            "exec",
+            "bash_command",
+            "run_tests",
+        }
+    )
+
+    def __init__(
+        self,
+        inner: SandboxProvider,
+        write_tools: Iterable[str] | None = None,
+    ) -> None:
+        self._inner = inner
+        self._write_tools: frozenset[str] = (
+            frozenset(write_tools) if write_tools is not None else self.DEFAULT_WRITE_TOOLS
+        )
+
+    def _is_write(self, tool_name: str) -> bool:
+        return tool_name in self._write_tools
+
+    async def validate(self, call: ToolCall) -> SandboxViolation | None:
+        if self._is_write(call.name):
+            return SandboxReadOnlyViolation(path=call.name)
+        return await self._inner.validate(call)
+
+    async def execute_command(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+    ) -> CommandOutput:
+        # A read-only sandbox forbids subprocess execution outright. Deferred
+        # import: :mod:`spore_core.sandbox` imports from this module.
+        from .sandbox import SandboxViolationException
+
+        raise SandboxViolationException(SandboxReadOnlyViolation(path=command))
+
+    async def handle_large_output(
+        self,
+        content: str,
+        call_id: str,
+        head_tokens: int,
+        tail_tokens: int,
+    ) -> TruncatedOutput:
+        return await self._inner.handle_large_output(content, call_id, head_tokens, tail_tokens)
+
+    async def resolve_path(self, path: str, operation: Operation = "read") -> Path:
+        if operation in ("write", "execute"):
+            from .sandbox import SandboxViolationException
+
+            raise SandboxViolationException(SandboxReadOnlyViolation(path=path))
+        return await self._inner.resolve_path(path, operation)
+
+    def isolation_mode(self) -> IsolationMode:
+        return self._inner.isolation_mode()
+
+    def workspace_root(self) -> Path:
+        return self._inner.workspace_root()
+
+
 @dataclass
 class CompactionTurn:
     """Inputs the harness compaction loop (issue #46) needs to run one
@@ -1172,6 +1255,31 @@ class HaltReasonPlanPhaseFailed(_Model):
     error: PlanPhaseErrorPayload
 
 
+class HaltReasonSelfVerifyExhausted(_Model):
+    """Returned by :class:`StandardHarness` for the ``SelfVerifying`` strategy
+    (issue #61, D4) when the build↔evaluate loop ran out of the verifier's
+    ``max_iterations`` round-trips without an explicit ``Passed`` verdict — a
+    RUNTIME limit (the Default-FAIL stagnation guard). Carries the number of
+    round-trips run and the last failure reason the verifier gave. PEER to
+    :class:`HaltReasonSelfVerifyMisconfigured` (NOT a sub-case of it). Mirrors
+    Rust's ``HaltReason::SelfVerifyExhausted { iterations, last_reason }``."""
+
+    kind: Literal["self_verify_exhausted"] = "self_verify_exhausted"
+    iterations: int
+    last_reason: str
+
+
+class HaltReasonSelfVerifyMisconfigured(_Model):
+    """Returned by :class:`StandardHarness` for the ``SelfVerifying`` strategy
+    (issue #61, D4) when the strategy cannot run because it is misconfigured —
+    e.g. ``config.verifier`` is ``None``. A BUILD-TIME wiring bug, surfaced as a
+    typed halt, NOT a raise. PEER to :class:`HaltReasonSelfVerifyExhausted`.
+    Mirrors Rust's ``HaltReason::SelfVerifyMisconfigured { reason }``."""
+
+    kind: Literal["self_verify_misconfigured"] = "self_verify_misconfigured"
+    reason: str
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -1184,7 +1292,9 @@ HaltReason = Annotated[
     | HaltReasonStrategyNotYetImplemented
     | HaltReasonEmptyPlan
     | HaltReasonStepFailed
-    | HaltReasonPlanPhaseFailed,
+    | HaltReasonPlanPhaseFailed
+    | HaltReasonSelfVerifyExhausted
+    | HaltReasonSelfVerifyMisconfigured,
     Field(discriminator="kind"),
 ]
 
@@ -1427,6 +1537,8 @@ class HarnessConfig:
         max_stop_blocks: int = 8,
         hooks: HookChain | None = None,
         planner_agent: Agent | None = None,
+        verifier: Any | None = None,
+        evaluator_agent: Agent | None = None,
         storage: StorageProvider | None = None,
         chunk_provider: Any | None = None,
     ) -> None:
@@ -1436,6 +1548,21 @@ class HarnessConfig:
         # the one-shot plan turn runs on it; otherwise the plan turn runs on
         # ``agent``. ``None`` means "use the default agent".
         self.planner_agent = planner_agent
+        # The SelfVerifying oracle (issue #61, D2). REQUIRED for the
+        # ``SelfVerifying`` strategy: when ``None`` the run halts with
+        # :class:`HaltReasonSelfVerifyMisconfigured` (D4) — a typed halt, never a
+        # raise. Its ``max_iterations()`` (default 3) caps the build↔evaluate
+        # round-trips (D3); ``max_stop_blocks`` does NOT govern this strategy.
+        # Typed ``Any`` to avoid a top-level import of :mod:`spore_core.verifier`
+        # (that module imports from this one — a top-level import is circular).
+        self.verifier: Any | None = verifier
+        # Optional alternate agent for the SelfVerifying evaluate phase (issue
+        # #61, D2). Defaulting contract is IDENTICAL to ``planner_agent``: when
+        # ``None`` the evaluate phase runs on ``config.agent``
+        # (``evaluator_agent or agent``). The read-only sandbox and the fresh
+        # never-shared session id are derived INTERNALLY by the strategy — there
+        # are deliberately NO evaluator sandbox / chunk-provider config fields.
+        self.evaluator_agent = evaluator_agent
         self.tool_registry = tool_registry
         self.sandbox = sandbox
         self.context_manager = context_manager
@@ -1518,6 +1645,8 @@ class HarnessBuilder:
         self._max_stop_blocks: int = 8
         self._hooks: HookChain | None = None
         self._planner_agent: Agent | None = None
+        self._verifier: Any | None = None
+        self._evaluator_agent: Agent | None = None
         self._storage: StorageProvider | None = None
         # Standard catalogue tools accumulated via :meth:`tool` / :meth:`tools`
         # (issue #81). Each is a ``StandardTool``-shaped object exposing
@@ -1596,6 +1725,23 @@ class HarnessBuilder:
         self._planner_agent = planner_agent
         return self
 
+    def verifier(self, verifier: Any) -> HarnessBuilder:
+        """Inject the SelfVerifying oracle (issue #61, D2). REQUIRED for the
+        ``SelfVerifying`` strategy: without it the run halts with
+        :class:`HaltReasonSelfVerifyMisconfigured` (D4). Its ``max_iterations()``
+        caps the build↔evaluate round-trips (D3). Mirrors Rust's
+        ``HarnessBuilder::verifier``."""
+        self._verifier = verifier
+        return self
+
+    def evaluator_agent(self, evaluator_agent: Agent) -> HarnessBuilder:
+        """Inject an alternate agent for the SelfVerifying evaluate phase (issue
+        #61, D2). Mirrors :meth:`planner_agent`: when set and the loop strategy
+        is ``SelfVerifying``, the evaluate phase runs on this agent instead of
+        the default agent. Mirrors Rust's ``HarnessBuilder::evaluator_agent``."""
+        self._evaluator_agent = evaluator_agent
+        return self
+
     def hooks(self, hooks: HookChain) -> HarnessBuilder:
         """Inject a lifecycle hook chain (issue #69). The harness fires its
         registered ``Stop`` hooks when a loop strategy believes it is done."""
@@ -1670,6 +1816,8 @@ class HarnessBuilder:
             max_stop_blocks=self._max_stop_blocks,
             hooks=self._hooks,
             planner_agent=self._planner_agent,
+            verifier=self._verifier,
+            evaluator_agent=self._evaluator_agent,
             storage=self._storage,
             chunk_provider=self._chunk_provider,
         )
@@ -1833,12 +1981,10 @@ class StandardHarness:
                 0,
             )
         if isinstance(strategy, LoopStrategySelfVerifying):
-            return self._fail(
-                HaltReasonStrategyNotYetImplemented(strategy="self_verifying"),
-                task.session_id,
-                AggregateUsage(),
-                0,
-            )
+            # Seed the task instruction as the build loop's initial user message,
+            # mirroring the ReAct arm (the build phase is a ReAct sub-loop).
+            await self._config.context_manager.append_user_message(session_state, task.instruction)
+            return await self._run_self_verifying(task, session_state, budget_used, on_stream)
         if isinstance(strategy, LoopStrategyHillClimbing):
             return self._fail(
                 HaltReasonStrategyNotYetImplemented(strategy="hill_climbing"),
@@ -2038,6 +2184,288 @@ class StandardHarness:
         """Finalize observability for a terminal PlanExecute outcome. Mirrors the
         tail of ``_run_react``: a ``WaitingForHuman`` pause is not terminal and is
         never flushed here. Mirrors Rust's ``finalize_plan_execute``."""
+        if isinstance(result, RunResultSuccess):
+            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
+        elif isinstance(result, RunResultFailure):
+            await self._finalize_observability(
+                result.session_id,
+                SessionOutcomeFailure(reason=result.reason.kind),
+            )
+        elif isinstance(result, RunResultEscalate):
+            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
+        # RunResultWaitingForHuman: not terminal, do not finalize.
+
+    # ---- SelfVerifying strategy (issue #61) -------------------------
+
+    async def _run_self_verifying(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive the SelfVerifying strategy (issue #61) — the loop-within-a-loop.
+
+        Each round-trip runs a bounded BUILD ReAct sub-loop (the agent works
+        until it claims done — R1), then a fresh EVALUATE run (a separate
+        evaluator agent on a read-only sandbox in a never-shared session — R2,
+        R3, R4), then asks the injected :class:`Verifier` to translate
+        ``(build_result, eval_result)`` into a verdict. ``Passed`` ⇒ Success;
+        ``Failed { reason }`` ⇒ inject ``reason`` into the build context (the
+        same ``append_user_message`` path the Stop-block uses — R5/R6) and loop.
+
+        Config fields read (both default ``None``):
+
+        * ``config.verifier`` — the oracle. REQUIRED: ``None`` ⇒
+          :class:`HaltReasonSelfVerifyMisconfigured` (D4, R11) — a typed halt,
+          NOT a raise. Its ``max_iterations()`` (default 3) caps the round-trips
+          (D3); ``max_stop_blocks`` does NOT enter the picture.
+        * ``config.evaluator_agent`` — the evaluate-phase agent. Defaulting (D2):
+          ``evaluator_agent or agent``, identical to ``planner_agent``. The
+          read-only sandbox and the fresh session id are derived INTERNALLY.
+
+        Terminal halts (peers, D4): :class:`HaltReasonSelfVerifyExhausted`
+        (R7 — ran out of round-trips without a pass) and
+        :class:`HaltReasonSelfVerifyMisconfigured` (R11). Budgets fold BOTH
+        phases across ALL iterations (R8); build vs evaluate are distinguishable
+        by their distinct session ids (R9). Mirrors Rust's ``run_self_verifying``.
+        """
+        build_session_id = task.session_id
+
+        # D4/R11: a missing verifier is a typed halt, not a raise.
+        verifier = self._config.verifier
+        if verifier is None:
+            result: RunResult = self._fail(
+                HaltReasonSelfVerifyMisconfigured(
+                    reason="SelfVerifying requires `config.verifier`, but it is None"
+                ),
+                build_session_id,
+                AggregateUsage(),
+                0,
+            )
+            await self._finalize_self_verifying(result)
+            return result
+
+        max_iterations = verifier.max_iterations()
+        # Shared budget threaded across every build + evaluate sub-run (R8).
+        carried = budget_used.model_copy(deep=True)
+        # Cumulative usage across ALL build + evaluate runs of ALL iterations.
+        total_usage = AggregateUsage()
+        # The most recent verifier failure reason (for SelfVerifyExhausted).
+        last_reason = ""
+
+        from .verifier import VerifierInput, VerifierVerdictPassed
+
+        for iteration in range(max_iterations):
+            # Build phase (R1): bounded ReAct sub-loop carrying the shared budget.
+            # The first iteration's seed instruction is already in
+            # ``session_state``; later iterations have the prior verdict reason
+            # injected as a user message (R6).
+            build_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+            build_result = await self._run_react_inner(
+                task,
+                build_cap,
+                session_state,
+                carried.model_copy(deep=True),
+                # Sub-loops run with a suppressed sink (mirrors PlanExecute);
+                # terminal observability is finalized by this strategy.
+                None,
+            )
+            self._fold_usage(total_usage, carried, build_result)
+
+            # A build run that paused / escalated is propagated up unchanged —
+            # the caller must handle it before verification can resume.
+            if isinstance(build_result, RunResultWaitingForHuman):
+                return build_result
+            if isinstance(build_result, RunResultEscalate):
+                await self._finalize_self_verifying(build_result)
+                return build_result
+
+            # Evaluate phase (R2/R3/R4): a fresh evaluator RUN with a distinct
+            # generated session id (R2/R9), a read-only sandbox derived internally
+            # (R3), the evaluator agent (D2 defaulting), and the role-evaluator
+            # chunk (R4).
+            eval_result = await self._run_evaluate_phase(task, carried, total_usage)
+
+            # Verdict.
+            verdict = await verifier.verify(
+                VerifierInput(
+                    build_result=build_result,
+                    eval_result=eval_result,
+                    workspace=self._config.sandbox.workspace_root(),
+                    iteration=iteration,
+                )
+            )
+            if isinstance(verdict, VerifierVerdictPassed):
+                # Reuse the build run's output/turns as the run's handle.
+                if isinstance(build_result, RunResultSuccess):
+                    output, turns = build_result.output, build_result.turns
+                else:
+                    output, turns = "", carried.turns
+                result = RunResultSuccess(
+                    output=output,
+                    session_id=build_session_id,
+                    usage=total_usage,
+                    turns=turns,
+                )
+                await self._finalize_self_verifying(result)
+                return result
+
+            # R5/R6: Default-FAIL keeps looping; inject the reason into the build
+            # context via the SAME path the Stop-block uses so the next build
+            # iteration sees it.
+            last_reason = verdict.reason
+            await self._config.context_manager.append_user_message(session_state, verdict.reason)
+
+        # R7: ran out of round-trips without a pass — clean exhaustion.
+        result = self._fail(
+            HaltReasonSelfVerifyExhausted(
+                iterations=max_iterations,
+                last_reason=last_reason,
+            ),
+            build_session_id,
+            total_usage,
+            carried.turns,
+        )
+        await self._finalize_self_verifying(result)
+        return result
+
+    async def _run_evaluate_phase(
+        self,
+        task: Task,
+        carried: BudgetSnapshot,
+        total_usage: AggregateUsage,
+    ) -> RunResult:
+        """Run the SelfVerifying evaluate phase (issue #61): a fresh evaluator RUN
+        over a read-only sandbox in a never-shared session.
+
+        Builds a child :class:`StandardHarness` from a copy of ``self._config``
+        with the ``agent`` swapped to the evaluator agent (D2 defaulting) and the
+        ``sandbox`` wrapped in a :class:`ReadOnlySandbox` (R3). The evaluator runs
+        a fresh ReAct loop seeded with the ``role-evaluator`` chunk (R4,
+        presence-only) plus a review directive, in a freshly generated session
+        (R2/R9). Folds the evaluate run's usage into ``total_usage`` / ``carried``
+        (R8) and returns its terminal :class:`RunResult`. Mirrors Rust's
+        ``run_evaluate_phase``."""
+        config = self._config
+        # D2: evaluator agent defaulting — identical contract to ``planner_agent``.
+        evaluator = config.evaluator_agent if config.evaluator_agent is not None else config.agent
+
+        # R3: derive a read-only sandbox internally from the build sandbox.
+        read_only_sandbox = ReadOnlySandbox(config.sandbox)
+
+        # R2/R9: fresh, never-shared session id for the evaluate run.
+        eval_session_id = new_session_id()
+
+        # R4 (presence-only): prepend the role-evaluator chunk content (if the
+        # configured provider supplies it) to the review directive.
+        role_chunk = await self._role_evaluator_chunk()
+        review = (
+            "Review the work produced for the following task and report whether "
+            "it is correct. You did NOT write this code; default to FAIL unless "
+            f"you can confirm it is right.\n\nTask:\n{task.instruction}"
+        )
+        directive = f"{role_chunk}\n\n{review}" if role_chunk is not None else review
+
+        eval_task = Task(
+            id=new_task_id(),
+            instruction=directive,
+            session_id=eval_session_id,
+            budget=task.budget,
+            loop_strategy=LoopStrategyReAct(
+                max_iterations=(
+                    task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+                )
+            ),
+        )
+
+        # Child harness: copy the config, swap agent + sandbox. The copy shares
+        # the same observability / storage seams so the evaluate run's spans land
+        # in the SAME trace stream (distinguished by its distinct session id).
+        eval_config = self._clone_config_with(agent=evaluator, sandbox=read_only_sandbox)
+        eval_harness = StandardHarness(eval_config)
+
+        eval_state = SessionState()
+        await eval_config.context_manager.append_user_message(eval_state, directive)
+
+        cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+        eval_result = await eval_harness._run_react(
+            eval_task, cap, eval_state, BudgetSnapshot(), None
+        )
+
+        self._fold_usage(total_usage, carried, eval_result)
+        return eval_result
+
+    def _clone_config_with(self, *, agent: Agent, sandbox: SandboxProvider) -> HarnessConfig:
+        """Copy ``self._config`` swapping only ``agent`` and ``sandbox`` (issue
+        #61). Every other component (context manager, observability, storage,
+        verifier, …) is shared by reference so the evaluate run's spans land in
+        the same trace stream. Mirrors the Rust ``self.config.clone()`` + field
+        swap in ``run_evaluate_phase``."""
+        c = self._config
+        return HarnessConfig(
+            agent=agent,
+            tool_registry=c.tool_registry,
+            sandbox=sandbox,
+            context_manager=c.context_manager,
+            termination_policy=c.termination_policy,
+            middleware=c.middleware,
+            observability=c.observability,
+            compaction_verifier=c.compaction_verifier,
+            max_compaction_attempts=c.max_compaction_attempts,
+            pricing=c.pricing,
+            content_capture=c.content_capture,
+            max_stop_blocks=c.max_stop_blocks,
+            hooks=c.hooks,
+            planner_agent=c.planner_agent,
+            verifier=c.verifier,
+            evaluator_agent=c.evaluator_agent,
+            storage=c.storage,
+            chunk_provider=c.chunk_provider,
+        )
+
+    async def _role_evaluator_chunk(self) -> str | None:
+        """Look up the ``role-evaluator`` chunk content from the configured chunk
+        provider (R4, presence-only). Returns ``None`` if the provider has no such
+        chunk or fails to load. Mirrors Rust's ``role_evaluator_chunk``."""
+        provider = self._config.chunk_provider
+        if provider is None:
+            return None
+        try:
+            chunks = await provider.load()
+        except Exception:  # noqa: BLE001 — a broken provider must not abort the run
+            return None
+        for chunk in chunks:
+            if chunk.id == "role-evaluator":
+                return chunk.content
+        return None
+
+    @staticmethod
+    def _fold_usage(total_usage: AggregateUsage, carried: BudgetSnapshot, r: RunResult) -> None:
+        """Fold a sub-run's token usage / turn count into the cumulative
+        ``total_usage`` and the shared ``carried`` budget snapshot (R8). Mirrors
+        the PlanExecute budget fold and Rust's ``fold_usage``. ``carried.turns``
+        becomes the max of the sub-run's absolute turn count (the build sub-loop
+        gates on cumulative turns; the fresh-session evaluate run reports its own
+        turns)."""
+        if isinstance(r, RunResultWaitingForHuman):
+            return
+        usage = r.usage
+        turns = r.turns
+        total_usage.input_tokens += usage.input_tokens
+        total_usage.output_tokens += usage.output_tokens
+        total_usage.cache_read_tokens += usage.cache_read_tokens
+        total_usage.cache_write_tokens += usage.cache_write_tokens
+        total_usage.cost_usd += usage.cost_usd
+        carried.input_tokens += usage.input_tokens
+        carried.output_tokens += usage.output_tokens
+        carried.turns = max(carried.turns, turns)
+
+    async def _finalize_self_verifying(self, result: RunResult) -> None:
+        """Finalize observability for a terminal SelfVerifying outcome (issue
+        #61). Mirrors ``_finalize_plan_execute``: a ``WaitingForHuman`` pause is
+        not terminal and is never flushed here. Mirrors Rust's
+        ``finalize_self_verifying``."""
         if isinstance(result, RunResultSuccess):
             await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
         elif isinstance(result, RunResultFailure):
@@ -3361,6 +3789,8 @@ __all__ = [
     "HaltReasonSandboxViolation",
     "HaltReasonStagnationLimitReached",
     "HaltReasonStepFailed",
+    "HaltReasonSelfVerifyExhausted",
+    "HaltReasonSelfVerifyMisconfigured",
     "HaltReasonStrategyNotYetImplemented",
     "HaltReasonTerminationPolicyHalt",
     "HaltReasonUnrecoverableToolError",
@@ -3405,6 +3835,7 @@ __all__ = [
     "NoopContextManager",
     "OptimizationDirection",
     "PausedState",
+    "ReadOnlySandbox",
     "RiskLevel",
     "RunResult",
     "RunResultEscalate",
