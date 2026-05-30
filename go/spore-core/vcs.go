@@ -119,10 +119,7 @@ func NewGitVcsProvider(sandbox SandboxProvider, workspaceRoot string) *GitVcsPro
 // gitLogArgs builds the git log argument vector from args (a function so the flag
 // mapping can be asserted independently of process execution).
 func gitLogArgs(args VcsLogArgs) []string {
-	out := []string{"log"}
-	if args.MaxEntries > 0 {
-		out = append(out, "-n", strconv.Itoa(args.MaxEntries))
-	}
+	out := []string{"log", "-n", strconv.Itoa(args.MaxEntries)}
 	if args.Format != "" {
 		out = append(out, "--format="+args.Format)
 	}

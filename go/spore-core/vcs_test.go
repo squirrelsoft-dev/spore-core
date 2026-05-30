@@ -87,16 +87,31 @@ func TestGitVcsLogCommandLine(t *testing.T) {
 	}
 }
 
-// Minimal args (all optional fields unset) emit just `git log`.
+// Minimal args (all optional fields unset) emit `git log -n 0`. The `-n` flag
+// is emitted UNCONDITIONALLY, matching the Rust reference (and TypeScript and
+// Python), so MaxEntries == 0 yields ["log", "-n", "0"] — not ["log"]. This is
+// the cross-language consistency contract for the Ralph VcsProvider seam (#58).
 func TestGitVcsLogCommandMinimalArgs(t *testing.T) {
 	sb := &capturingSandbox{root: "/work", out: CommandOutput{Stdout: ""}}
 	git := NewGitVcsProvider(sb, "/work")
 	if _, err := git.Log(context.Background(), VcsLogArgs{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"log"}
+	want := []string{"log", "-n", "0"}
 	if !reflect.DeepEqual(sb.args, want) {
 		t.Fatalf("minimal git log argv = %v, want %v", sb.args, want)
+	}
+}
+
+// gitLogArgs emits `-n <MaxEntries>` unconditionally, matching the Rust
+// reference exactly: MaxEntries == 0 (with no SinceRef/Format) produces
+// ["log", "-n", "0"], NOT ["log"]. This pins the cross-language consistency
+// contract at the argv-builder level (#58), locking the seam against regression.
+func TestGitLogArgsMaxEntriesZeroUnconditional(t *testing.T) {
+	got := gitLogArgs(VcsLogArgs{MaxEntries: 0})
+	want := []string{"log", "-n", "0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("gitLogArgs(MaxEntries: 0) = %v, want %v", got, want)
 	}
 }
 
