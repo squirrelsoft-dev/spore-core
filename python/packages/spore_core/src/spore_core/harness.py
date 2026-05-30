@@ -1379,6 +1379,19 @@ class HaltReasonSelfVerifyMisconfigured(_Model):
     reason: str
 
 
+class HaltReasonHillClimbingMisconfigured(_Model):
+    """Returned by :class:`StandardHarness` for the ``HillClimbing`` strategy
+    (issue #60) when the strategy cannot run because it is misconfigured — e.g.
+    ``config.metric_evaluator`` is ``None`` (Decision 6), or the iteration-0
+    baseline evaluation itself errored so there is no current best to climb from
+    (Decision 7). A typed halt, NOT a raise. PEER to
+    :class:`HaltReasonSelfVerifyMisconfigured`. Mirrors Rust's
+    ``HaltReason::HillClimbingMisconfigured { reason }``."""
+
+    kind: Literal["hill_climbing_misconfigured"] = "hill_climbing_misconfigured"
+    reason: str
+
+
 class HaltReasonRalphCompletionUnmet(_Model):
     """Returned by :class:`StandardHarness` for the ``Ralph`` strategy (issue
     #58) when the multi-context-window continuation loop reached its
@@ -1410,6 +1423,7 @@ HaltReason = Annotated[
     | HaltReasonPlanPhaseFailed
     | HaltReasonSelfVerifyExhausted
     | HaltReasonSelfVerifyMisconfigured
+    | HaltReasonHillClimbingMisconfigured
     | HaltReasonRalphCompletionUnmet,
     Field(discriminator="kind"),
 ]
@@ -1505,6 +1519,7 @@ from .observability import (  # noqa: E402
     ToolResultContent,
     TurnSpan,
     WarnEventCompactionVerificationFailed,
+    WarnEventHillClimbingIteration,
     WarnSpan,
     new_span_id,
     truncate_field,
@@ -1659,8 +1674,19 @@ class HarnessConfig:
         evaluator_agent: Agent | None = None,
         storage: StorageProvider | None = None,
         chunk_provider: Any | None = None,
+        metric_evaluator: Any | None = None,
     ) -> None:
         self.agent = agent
+        # The HillClimbing scoring strategy (issue #60). REQUIRED for the
+        # ``HillClimbing`` strategy: when ``None`` the run halts with
+        # :class:`HaltReasonHillClimbingMisconfigured` (Decision 6) — a typed
+        # halt, never a raise. The harness calls ``evaluate`` once per iteration
+        # (iteration 0 is a pure baseline with NO agent turn) and routes the
+        # result through :func:`~spore_core.metric.should_keep`. Typed ``Any`` to
+        # avoid a top-level import of :mod:`spore_core.metric` (that module
+        # imports from this one — a top-level import is circular). Mirrors Rust's
+        # ``HarnessConfig::metric_evaluator``.
+        self.metric_evaluator: Any | None = metric_evaluator
         # Optional alternate agent used for the PlanExecute plan phase (issue
         # #70, Q1). When the loop strategy is ``PlanExecute`` and this is set,
         # the one-shot plan turn runs on it; otherwise the plan turn runs on
@@ -1781,6 +1807,7 @@ class HarnessBuilder:
         self._planner_agent: Agent | None = None
         self._verifier: Any | None = None
         self._evaluator_agent: Agent | None = None
+        self._metric_evaluator: Any | None = None
         self._storage: StorageProvider | None = None
         # Standard catalogue tools accumulated via :meth:`tool` / :meth:`tools`
         # (issue #81). Each is a ``StandardTool``-shaped object exposing
@@ -1874,6 +1901,17 @@ class HarnessBuilder:
         is ``SelfVerifying``, the evaluate phase runs on this agent instead of
         the default agent. Mirrors Rust's ``HarnessBuilder::evaluator_agent``."""
         self._evaluator_agent = evaluator_agent
+        return self
+
+    def metric_evaluator(self, evaluator: Any) -> HarnessBuilder:
+        """Inject the HillClimbing scoring strategy (issue #60). REQUIRED for the
+        ``HillClimbing`` strategy: without it the run halts with
+        :class:`HaltReasonHillClimbingMisconfigured` (Decision 6) — a typed halt,
+        never a raise. The harness calls ``evaluate`` once per iteration (with
+        iteration 0 the pure baseline) and routes the result through
+        :func:`~spore_core.metric.should_keep`. Mirrors Rust's
+        ``HarnessBuilder::metric_evaluator``."""
+        self._metric_evaluator = evaluator
         return self
 
     def hooks(self, hooks: HookChain) -> HarnessBuilder:
@@ -1975,6 +2013,7 @@ class HarnessBuilder:
             evaluator_agent=self._evaluator_agent,
             storage=self._storage,
             chunk_provider=self._chunk_provider,
+            metric_evaluator=self._metric_evaluator,
         )
 
     def build(self) -> StandardHarness:
@@ -2298,11 +2337,17 @@ class StandardHarness:
             await self._config.context_manager.append_user_message(session_state, task.instruction)
             return await self._run_self_verifying(task, session_state, budget_used, on_stream)
         if isinstance(strategy, LoopStrategyHillClimbing):
-            return self._fail(
-                HaltReasonStrategyNotYetImplemented(strategy="hill_climbing"),
-                task.session_id,
-                AggregateUsage(),
-                0,
+            # Each iteration runs its OWN bounded ReAct sub-run that seeds its own
+            # fresh session state (iteration 0 is a pure baseline with NO agent
+            # turn), so we do NOT pre-seed the instruction here.
+            return await self._run_hill_climbing(
+                task,
+                strategy.direction,
+                strategy.max_stagnation,
+                strategy.revert_on_no_improvement,
+                strategy.min_improvement_delta,
+                budget_used,
+                on_stream,
             )
         raise AssertionError(f"unknown loop strategy: {strategy!r}")
 
@@ -2736,6 +2781,7 @@ class StandardHarness:
             evaluator_agent=c.evaluator_agent,
             storage=c.storage,
             chunk_provider=c.chunk_provider,
+            metric_evaluator=c.metric_evaluator,
         )
 
     async def _role_evaluator_chunk(self) -> str | None:
@@ -2790,6 +2836,393 @@ class StandardHarness:
         elif isinstance(result, RunResultEscalate):
             await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
         # RunResultWaitingForHuman: not terminal, do not finalize.
+
+    async def _run_hill_climbing(
+        self,
+        task: Task,
+        direction: OptimizationDirection,
+        max_stagnation: int | None,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: float | None,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive the HillClimbing strategy (issue #60) — the iterative
+        optimization loop.
+
+        Iteration 0 is a PURE baseline: the evaluator is called with NO agent
+        turn (Decision 5); its value becomes ``current_best`` and the row is
+        recorded ``kept``. Iterations 1+ each run a bounded ReAct sub-run (one
+        proposed change), then evaluate the metric and route the result through
+        :func:`~spore_core.metric.should_keep` using the payload ``direction``
+        (Decision 4): an improvement keeps the change (status ``kept``, best
+        updated, stagnation reset); a non-improvement discards it (status
+        ``discarded``), optionally runs ``git reset --hard HEAD`` through the
+        sandbox (Decision 1), and increments the consecutive non-improvement
+        counter. A :data:`~spore_core.metric.MetricError` (crash/timeout) counts
+        as a non-improvement with an EMPTY metric value (Decision 3). When
+        ``max_stagnation`` is set, the run halts with
+        :class:`HaltReasonStagnationLimitReached` after that many consecutive
+        non-improvements; otherwise it runs until the turn/budget cap. The
+        harness writes the results TSV to ``.spore/results/{task_id}.tsv``
+        (Decisions 2/3); it NEVER commits.
+
+        Config fields read:
+
+        * ``config.metric_evaluator`` — the scorer. REQUIRED: ``None`` ⇒
+          :class:`HaltReasonHillClimbingMisconfigured` (Decision 6), a typed
+          halt, never a raise. A baseline (iteration-0) evaluation that itself
+          errors is ALSO :class:`HaltReasonHillClimbingMisconfigured` (Decision
+          7) — there is no current best to climb from.
+
+        Mirrors Rust's ``run_hill_climbing``.
+        """
+        from .metric import MetricResult, ResultsEntry, iteration_status_from_error, should_keep
+        from .termination import SessionStateSnapshot
+
+        session_id = task.session_id
+        workspace_root = self._config.sandbox.workspace_root()
+
+        # Decision 6: a missing evaluator is a typed halt, not a raise.
+        evaluator = self._config.metric_evaluator
+        if evaluator is None:
+            result: RunResult = self._fail(
+                HaltReasonHillClimbingMisconfigured(
+                    reason="HillClimbing requires `config.metric_evaluator`, but it is None"
+                ),
+                session_id,
+                AggregateUsage(),
+                0,
+            )
+            await self._finalize_self_verifying(result)
+            return result
+
+        description = evaluator.description()
+        # Per-iteration observability span counter.
+        span_seq = 0
+        # Cumulative usage + turns across ALL agent-turn iterations.
+        total_usage = AggregateUsage()
+        # Shared budget threaded across every agent sub-run.
+        carried = budget_used.model_copy(deep=True)
+        # The TSV rows, in iteration order.
+        rows: list[ResultsEntry] = []
+
+        # A snapshot for the evaluator. HillClimbing keeps no carried message
+        # state of its own (each iteration is a fresh sub-run), so a default
+        # SessionState is the right snapshot to hand the evaluator.
+        snapshot = SessionStateSnapshot(
+            session_id=session_id,
+            task_id=task.id,
+            state=SessionState(),
+            workspace_root=workspace_root,
+        )
+
+        # ── Iteration 0: pure baseline. No agent turn (Decision 5).
+        baseline = await evaluator.evaluate(self._config.sandbox, snapshot)
+        if isinstance(baseline, MetricResult):
+            current_best = baseline.value
+            rows.append(
+                ResultsEntry(
+                    iteration=0,
+                    commit_hash=self._hill_climbing_commit_hash(),
+                    metric_value=baseline.value,
+                    direction=direction,
+                    status="kept",
+                    duration=baseline.duration,
+                    description=description,
+                )
+            )
+            self._emit_hill_climbing_span(
+                session_id, task.id, span_seq, 0, baseline.value, None, "kept", False
+            )
+            span_seq += 1
+        else:
+            # Decision 7: a baseline that cannot even be measured is a
+            # misconfiguration of the experiment, not a non-improvement to climb
+            # away from — there is no ``current_best`` to compare against. Record
+            # the failed row, write the TSV, and halt.
+            status = iteration_status_from_error(baseline)
+            rows.append(
+                ResultsEntry(
+                    iteration=0,
+                    commit_hash=self._hill_climbing_commit_hash(),
+                    # Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+                    metric_value=float("nan"),
+                    direction=direction,
+                    status=status,
+                    duration=0.0,
+                    description=description,
+                )
+            )
+            self._emit_hill_climbing_span(
+                session_id, task.id, span_seq, 0, None, None, status, False
+            )
+            span_seq += 1
+            await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
+            result = self._fail(
+                HaltReasonHillClimbingMisconfigured(
+                    reason=f"baseline evaluation failed: {baseline.kind}"
+                ),
+                session_id,
+                total_usage,
+                carried.turns,
+            )
+            await self._finalize_self_verifying(result)
+            return result
+
+        # Consecutive non-improvement counter (Decision-driven stagnation halt).
+        stagnation = 0
+        # The 0-based iteration index; agent turns begin at 1.
+        iteration = 1
+        turn_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+        started_at = time.monotonic()
+
+        while True:
+            # Budget gate before the iteration's agent turn (mirrors run_react).
+            if carried.turns >= turn_cap:
+                break
+            limit_type = self._budget_exceeded(task.budget, carried, started_at)
+            if limit_type is not None:
+                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
+                result = self._fail(
+                    HaltReasonBudgetExceeded(limit_type=limit_type),
+                    session_id,
+                    total_usage,
+                    carried.turns,
+                )
+                await self._finalize_self_verifying(result)
+                return result
+
+            # ── One bounded agent turn proposes a change. The sub-run carries the
+            #    shared budget so per-iteration turns count toward the cap. It
+            #    seeds its OWN fresh session state with the instruction.
+            iter_state = SessionState()
+            await self._config.context_manager.append_user_message(iter_state, task.instruction)
+            turn_result = await self._run_react_inner(
+                task, turn_cap, iter_state, carried.model_copy(deep=True), None
+            )
+            self._fold_usage(total_usage, carried, turn_result)
+
+            # A turn that paused / escalated is propagated up unchanged.
+            if isinstance(turn_result, RunResultWaitingForHuman):
+                return turn_result
+            if isinstance(turn_result, RunResultEscalate):
+                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
+                await self._finalize_self_verifying(turn_result)
+                return turn_result
+
+            # ── Evaluate the metric after the change.
+            eval_result = await evaluator.evaluate(self._config.sandbox, snapshot)
+            if isinstance(eval_result, MetricResult):
+                value = eval_result.value
+                kept = should_keep(value, current_best, direction, min_improvement_delta)
+                delta = (
+                    (current_best - value) if direction == "minimize" else (value - current_best)
+                )
+                if kept:
+                    current_best = value
+                    stagnation = 0
+                    rows.append(
+                        ResultsEntry(
+                            iteration=iteration,
+                            commit_hash=self._hill_climbing_commit_hash(),
+                            metric_value=value,
+                            direction=direction,
+                            status="kept",
+                            duration=eval_result.duration,
+                            description=description,
+                        )
+                    )
+                    self._emit_hill_climbing_span(
+                        session_id, task.id, span_seq, iteration, value, delta, "kept", False
+                    )
+                    span_seq += 1
+                else:
+                    # No improvement (Decision 1: optionally revert).
+                    reverted = revert_on_no_improvement
+                    if reverted:
+                        await self._hill_climbing_revert()
+                    stagnation += 1
+                    rows.append(
+                        ResultsEntry(
+                            iteration=iteration,
+                            commit_hash=self._hill_climbing_commit_hash(),
+                            metric_value=value,
+                            direction=direction,
+                            status="discarded",
+                            duration=eval_result.duration,
+                            description=description,
+                        )
+                    )
+                    self._emit_hill_climbing_span(
+                        session_id,
+                        task.id,
+                        span_seq,
+                        iteration,
+                        value,
+                        delta,
+                        "discarded",
+                        reverted,
+                    )
+                    span_seq += 1
+            else:
+                # Crash/timeout/etc.: counts as a non-improvement. Optionally
+                # revert, increment stagnation, record an empty-metric row.
+                status = iteration_status_from_error(eval_result)
+                reverted = revert_on_no_improvement
+                if reverted:
+                    await self._hill_climbing_revert()
+                stagnation += 1
+                rows.append(
+                    ResultsEntry(
+                        iteration=iteration,
+                        commit_hash=self._hill_climbing_commit_hash(),
+                        # Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+                        metric_value=float("nan"),
+                        direction=direction,
+                        status=status,
+                        duration=0.0,
+                        description=description,
+                    )
+                )
+                self._emit_hill_climbing_span(
+                    session_id, task.id, span_seq, iteration, None, None, status, reverted
+                )
+                span_seq += 1
+
+            # ── Stagnation halt (only when a cap is configured).
+            if max_stagnation is not None and stagnation >= max_stagnation:
+                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
+                result = self._fail(
+                    HaltReasonStagnationLimitReached(
+                        iterations=stagnation,
+                        best_metric=current_best,
+                    ),
+                    session_id,
+                    total_usage,
+                    carried.turns,
+                )
+                await self._finalize_self_verifying(result)
+                return result
+
+            iteration += 1
+
+        # Budget/turn cap reached without a stagnation halt — clean budget halt.
+        await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
+        result = self._fail(
+            HaltReasonBudgetExceeded(limit_type="turns"),
+            session_id,
+            total_usage,
+            carried.turns,
+        )
+        await self._finalize_self_verifying(result)
+        return result
+
+    async def _hill_climbing_revert(self) -> None:
+        """Revert the working tree to current HEAD for a no-improvement iteration
+        (issue #60, Decision 1). Runs ``git reset --hard HEAD`` THROUGH the
+        sandbox; the harness NEVER spawns git directly. A sandbox rejection /
+        non-zero exit is best-effort: the loop continues (the next agent turn
+        re-derives state). Mirrors Rust's ``hill_climbing_revert``."""
+        try:
+            await self._config.sandbox.execute_command("git", ["reset", "--hard", "HEAD"])
+        except Exception:  # noqa: BLE001 — revert is best-effort; never abort the loop
+            pass
+
+    @staticmethod
+    def _hill_climbing_commit_hash() -> str | None:
+        """Resolve the ``commit_hash`` recorded on a HillClimbing TSV row (issue
+        #60, Decision 1). The harness never commits, so this is the EMPTY string
+        (``None`` serialized as empty in the TSV) unless a ``VcsProvider`` is
+        wired to supply a hash. v1 has no per-keep commit, so we always return
+        ``None``. Mirrors Rust's ``hill_climbing_commit_hash``."""
+        return None
+
+    def _emit_hill_climbing_span(
+        self,
+        session_id: SessionId,
+        task_id: TaskId,
+        span_seq: int,
+        iteration: int,
+        metric_value: float | None,
+        delta: float | None,
+        status: str,
+        reverted: bool,
+    ) -> None:
+        """Emit one fire-and-forget per-iteration observability span for a
+        HillClimbing run (issue #60). No-op when no provider is configured.
+        Mirrors Rust's ``emit_hill_climbing_span``."""
+        obs = self._config.observability
+        if obs is None:
+            return
+        emit_warn = getattr(obs, "emit_warn", None)
+        if emit_warn is None:
+            return
+        base = SpanBase.new_root(
+            new_span_id(f"{session_id}-hill-{span_seq}"),
+            session_id,
+            task_id,
+            SpanKind.WARN,
+            _now(),
+        )
+        emit_warn(
+            WarnSpan(
+                base=base,
+                event=WarnEventHillClimbingIteration(
+                    iteration=iteration,
+                    metric_value=metric_value,
+                    delta=delta,
+                    status=status,
+                    reverted=reverted,
+                ),
+            )
+        )
+
+    async def _write_hill_climbing_tsv(
+        self,
+        workspace_root: Path,
+        task_id: TaskId,
+        rows: list[Any],
+    ) -> None:
+        """Serialize the HillClimbing results log and write it to
+        ``{workspace_root}/.spore/results/{task_id}.tsv`` (issue #60, Decisions
+        2/3). Best-effort: a filesystem error is swallowed (the run outcome is
+        authoritative, the TSV is a diagnostic artifact). Mirrors Rust's
+        ``write_hill_climbing_tsv``."""
+        body = self._render_hill_climbing_tsv(rows)
+        try:
+            dir_path = workspace_root / ".spore" / "results"
+            dir_path.mkdir(parents=True, exist_ok=True)
+            (dir_path / f"{task_id}.tsv").write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _render_hill_climbing_tsv(rows: list[Any]) -> str:
+        """Render the HillClimbing results-log TSV body (issue #60, Decisions
+        2/3). Pure function over the rows so the exact byte content is
+        unit-testable and cross-language-comparable. Tab-separated, REQUIRED
+        header, one row per iteration in ascending order. Floats use exactly 6
+        decimal places for cross-language byte-identity. ``metric_value`` is the
+        empty string on crashed/timeout rows; ``commit_hash`` is empty when no
+        VCS. ``metadata`` is excluded. Trailing newline after every row.
+        Mirrors Rust's ``render_hill_climbing_tsv``."""
+        out = [
+            "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription"
+        ]
+        for r in rows:
+            # Decision 3: metric_value is EMPTY on crashed/timeout rows.
+            if r.status in ("crashed", "timeout"):
+                metric_value = ""
+            else:
+                metric_value = f"{r.metric_value:.6f}"
+            commit_hash = r.commit_hash if r.commit_hash is not None else ""
+            duration_secs = f"{r.duration:.6f}"
+            out.append(
+                f"{r.iteration}\t{commit_hash}\t{metric_value}\t{r.direction}\t"
+                f"{r.status}\t{duration_secs}\t{r.description}"
+            )
+        return "\n".join(out) + "\n"
 
     async def _run_ralph(
         self,
@@ -4256,6 +4689,7 @@ __all__ = [
     "HaltReasonStepFailed",
     "HaltReasonSelfVerifyExhausted",
     "HaltReasonSelfVerifyMisconfigured",
+    "HaltReasonHillClimbingMisconfigured",
     "HaltReasonRalphCompletionUnmet",
     "HaltReasonStrategyNotYetImplemented",
     "HaltReasonTerminationPolicyHalt",

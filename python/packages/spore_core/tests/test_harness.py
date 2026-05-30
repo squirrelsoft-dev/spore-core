@@ -22,6 +22,7 @@ from spore_core import (
     FinalResponse,
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
+    HaltReasonHillClimbingMisconfigured,
     HaltReasonHumanHalted,
     HaltReasonMiddlewareHalt,
     HaltReasonSandboxViolation,
@@ -433,24 +434,25 @@ async def test_resume_with_allow_executes_pending_and_continues() -> None:
 
 async def test_non_react_strategies_marked_not_yet_implemented() -> None:
     # PlanExecute no longer uses StrategyNotYetImplemented; it runs the full
-    # two-phase plan→execute loop (#59). SelfVerifying is now implemented (#61)
-    # and Ralph is implemented (#58). The remaining non-ReAct strategies stay
-    # stubbed.
+    # two-phase plan→execute loop (#59). SelfVerifying (#61), Ralph (#58), and
+    # HillClimbing (#60) are now all implemented. HillClimbing with no
+    # metric_evaluator wired returns the typed HillClimbingMisconfigured halt
+    # (Decision 6), NOT StrategyNotYetImplemented (mirrors the Rust reference
+    # test at harness.rs:7100). No non-ReAct strategy remains stubbed.
     a = _agent()
     h = StandardHarness(_config(a))
-    strategies = [
-        LoopStrategyHillClimbing(
-            direction="maximize",
-            max_stagnation=None,
-            revert_on_no_improvement=False,
-            min_improvement_delta=None,
-        ),
-    ]
-    for s in strategies:
-        t = Task.new("do", SessionId("s1"), s)
-        r = await h.run(HarnessRunOptions(t))
-        assert isinstance(r, RunResultFailure)
-        assert isinstance(r.reason, HaltReasonStrategyNotYetImplemented)
+    s = LoopStrategyHillClimbing(
+        direction="maximize",
+        max_stagnation=None,
+        revert_on_no_improvement=False,
+        min_improvement_delta=None,
+    )
+    t = Task.new("do", SessionId("s1"), s)
+    r = await h.run(HarnessRunOptions(t))
+    assert isinstance(r, RunResultFailure)
+    assert not isinstance(r.reason, HaltReasonStrategyNotYetImplemented)
+    assert isinstance(r.reason, HaltReasonHillClimbingMisconfigured)
+    assert "metric_evaluator" in r.reason.reason
 
 
 # ---------------------------------------------------------------------------

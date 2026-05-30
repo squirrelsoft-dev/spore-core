@@ -570,8 +570,27 @@ class WarnEventCompactionVerificationFailed(_Model):
     accepted_anyway: bool
 
 
+class WarnEventHillClimbingIteration(_Model):
+    """One iteration of a ``HillClimbing`` loop strategy run (issue #60). Emitted
+    fire-and-forget after each iteration's metric evaluation so the run is
+    traceable per-iteration with its metric value and delta. ``iteration`` is the
+    0-based iteration index (``0`` = the pure baseline). ``metric_value`` and
+    ``delta`` are ``None`` on crashed/timeout iterations (no comparable metric);
+    ``delta`` is also ``None`` for the baseline. ``status`` is the snake_case
+    :data:`~spore_core.metric.IterationStatus` string the harness recorded
+    (``kept``/``discarded``/``crashed``/``timeout``). Mirrors Rust's
+    ``WarnEvent::HillClimbingIteration``."""
+
+    warn: Literal["hill_climbing_iteration"] = "hill_climbing_iteration"
+    iteration: int
+    metric_value: float | None = None
+    delta: float | None = None
+    status: str
+    reverted: bool
+
+
 WarnEvent = Annotated[
-    WarnEventCompactionVerificationFailed,
+    WarnEventCompactionVerificationFailed | WarnEventHillClimbingIteration,
     Field(discriminator="warn"),
 ]
 """A warn-level, fire-and-forget observability event. Future warn classes add
@@ -1030,6 +1049,7 @@ __all__ = [
     "TurnSpan",
     "WarnEvent",
     "WarnEventCompactionVerificationFailed",
+    "WarnEventHillClimbingIteration",
     "WarnSpan",
     "new_span_id",
     "truncate_field",
