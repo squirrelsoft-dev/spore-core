@@ -36,8 +36,16 @@ from spore_core import (
     Task,
     TokenUsage,
     ToolCall,
+    VcsError,
+    VcsLogArgs,
 )
-from spore_core.harness import BaseSandboxProvider, NoopContextManager
+from spore_core.harness import (
+    BaseSandboxProvider,
+    CommandOutput,
+    FixtureVcsProvider,
+    GitVcsProvider,
+    NoopContextManager,
+)
 from spore_core.model import ModelParams
 
 INCOMPLETE = '{"complete": false, "remaining": ["task A"]}'
@@ -139,6 +147,7 @@ def _config(
     *,
     max_resets: int = 3,
     context_manager: Any = None,
+    vcs_provider: Any = None,
 ) -> HarnessConfig:
     return HarnessConfig(
         agent=agent,
@@ -147,6 +156,7 @@ def _config(
         context_manager=(context_manager if context_manager is not None else NoopContextManager()),
         termination_policy=AlwaysContinuePolicy(),
         max_resets=max_resets,
+        vcs_provider=vcs_provider,
     )
 
 
@@ -347,8 +357,27 @@ async def test_ralph_fixture_replay(tmp_path: Path) -> None:
             for w in case["windows"]
         ]
         agent = ProgressWritingAgent(case_dir, bodies)
-        h = StandardHarness(_config(case_dir, agent, max_resets=case["max_resets"]))
+        # issue #58 v2: when the case carries a ``vcs_log``, wire a
+        # FixtureVcsProvider seeded with it; absent ⇒ None ⇒ no git section. The
+        # PassThroughContextManager records seeds so we can assert injection.
+        vcs_log = case.get("vcs_log")
+        vcs_provider = FixtureVcsProvider(vcs_log, "") if vcs_log is not None else None
+        h = StandardHarness(
+            _config(
+                case_dir,
+                agent,
+                max_resets=case["max_resets"],
+                context_manager=PassThroughContextManager(),
+                vcs_provider=vcs_provider,
+            )
+        )
         r = await h.run(HarnessRunOptions(_ralph_task()))
+        # When a vcs_log is present, the first fresh window must include it.
+        if vcs_log is not None:
+            texts = agent.seen_text()
+            assert any("Recent VCS history:" in t and vcs_log.strip() in t for t in texts), (
+                f"case {case['name']}: vcs_log not injected into reload: {texts}"
+            )
         expected = case["expected"]
         name = case["name"]
         if expected["kind"] == "success":
@@ -360,3 +389,134 @@ async def test_ralph_fixture_replay(tmp_path: Path) -> None:
             assert r.reason.iterations == expected["iterations"], f"case {name}: iteration count"
         else:  # pragma: no cover - fixture schema guard
             raise AssertionError(f"case {name}: unknown expected kind {expected['kind']}")
+
+
+# ---------------------------------------------------------------------------
+# VcsProvider seam (issue #58 v2) — git-log reload for Ralph.
+# ---------------------------------------------------------------------------
+
+
+class CommandCapturingSandbox(BaseSandboxProvider):
+    """Mock sandbox that records the (command, args, working_dir) of the last
+    ``execute_command`` call and returns a canned :class:`CommandOutput`, so
+    :class:`GitVcsProvider`'s argv construction is asserted without spawning a
+    process."""
+
+    def __init__(self, root: Path, output: CommandOutput | None = None) -> None:
+        self._root = root
+        self._output = output if output is not None else CommandOutput(stdout="ok", exit_code=0)
+        self.command: str | None = None
+        self.args: list[str] | None = None
+        self.working_dir: Path | None = None
+
+    async def validate(self, call: ToolCall) -> SandboxViolation | None:
+        return None
+
+    def workspace_root(self) -> Path:
+        return self._root
+
+    async def execute_command(
+        self,
+        command: str,
+        args: list[str],
+        working_dir: Path | None = None,
+        timeout: float | None = None,
+    ) -> CommandOutput:
+        self.command = command
+        self.args = list(args)
+        self.working_dir = working_dir
+        return self._output
+
+
+# (a) FixtureVcsProvider.log returns the seeded string verbatim; status() too.
+async def test_vcs_fixture_log_verbatim() -> None:
+    log = "cafe123 implement login\nbeef456 add login tests"
+    provider = FixtureVcsProvider(log, "clean")
+    out = await provider.log(VcsLogArgs(max_entries=20, since_ref="HEAD~5", format="%h %s"))
+    assert out == log
+    # status() round-trips its seeded string verbatim (test (e)).
+    assert await provider.status() == "clean"
+
+
+# (b) GitVcsProvider builds the correct `git log` command from VcsLogArgs.
+async def test_vcs_git_log_command_built(tmp_path: Path) -> None:
+    sandbox = CommandCapturingSandbox(tmp_path, CommandOutput(stdout="LOG", exit_code=0))
+    git = GitVcsProvider(sandbox, "/work")
+    out = await git.log(VcsLogArgs(max_entries=20, since_ref="abc123", format="%h %s"))
+    assert out == "LOG"
+    assert sandbox.command == "git"
+    # -n N, then --format=, then <ref>.. — mirrors Rust's log_args ordering.
+    assert sandbox.args == ["log", "-n", "20", "--format=%h %s", "abc123.."]
+    assert sandbox.working_dir == Path("/work")
+
+
+async def test_vcs_git_log_command_minimal_args(tmp_path: Path) -> None:
+    sandbox = CommandCapturingSandbox(tmp_path, CommandOutput(stdout="LOG", exit_code=0))
+    git = GitVcsProvider(sandbox, "/work")
+    await git.log(VcsLogArgs(max_entries=5))
+    assert sandbox.args == ["log", "-n", "5"]
+
+
+# (e) status() runs `git status` and round-trips stdout.
+async def test_vcs_git_status_roundtrip(tmp_path: Path) -> None:
+    sandbox = CommandCapturingSandbox(
+        tmp_path, CommandOutput(stdout="nothing to commit", exit_code=0)
+    )
+    git = GitVcsProvider(sandbox, "/work")
+    out = await git.status()
+    assert out == "nothing to commit"
+    assert sandbox.command == "git"
+    assert sandbox.args == ["status"]
+
+
+# A non-zero exit raises VcsError carrying stderr.
+async def test_vcs_git_nonzero_exit_raises(tmp_path: Path) -> None:
+    sandbox = CommandCapturingSandbox(
+        tmp_path, CommandOutput(stderr="not a git repo", exit_code=128)
+    )
+    git = GitVcsProvider(sandbox, "/work")
+    try:
+        await git.status()
+    except VcsError as e:
+        assert "not a git repo" in str(e)
+    else:  # pragma: no cover - must raise
+        raise AssertionError("expected VcsError on non-zero exit")
+
+
+# (c) Ralph with a FixtureVcsProvider injects the vcs_log into reloaded context
+# across a reset.
+async def test_vcs_ralph_injects_log_into_reload(tmp_path: Path) -> None:
+    _write_progress(tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    vcs_log = "cafe123 implement login\nbeef456 add login tests"
+    h = StandardHarness(
+        _config(
+            tmp_path,
+            agent,
+            max_resets=3,
+            context_manager=PassThroughContextManager(),
+            vcs_provider=FixtureVcsProvider(vcs_log, ""),
+        )
+    )
+    await h.run(HarnessRunOptions(_ralph_task()))
+    texts = agent.seen_text()
+    assert "Recent VCS history:" in texts[0]
+    assert "cafe123 implement login" in texts[0]
+
+
+# (d) Ralph with vcs_provider=None omits any git section (v1 unchanged).
+async def test_vcs_ralph_none_omits_git_section(tmp_path: Path) -> None:
+    _write_progress(tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    h = StandardHarness(
+        _config(
+            tmp_path,
+            agent,
+            max_resets=3,
+            context_manager=PassThroughContextManager(),
+            vcs_provider=None,
+        )
+    )
+    await h.run(HarnessRunOptions(_ralph_task()))
+    texts = agent.seen_text()
+    assert all("Recent VCS history:" not in t for t in texts)

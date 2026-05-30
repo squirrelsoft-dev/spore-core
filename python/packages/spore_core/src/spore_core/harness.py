@@ -68,6 +68,7 @@ from .agent import (
     TurnError,
     TurnResult,
 )
+from .errors import SporeError
 from .model import (
     ImageContent,
     Message,
@@ -767,6 +768,104 @@ class SandboxProvider(Protocol):
     def isolation_mode(self) -> IsolationMode: ...
 
     def workspace_root(self) -> Path: ...
+
+
+# ----- VcsProvider seam (issue #58 v2) — git-log reload for Ralph ----------
+
+
+@dataclass
+class VcsLogArgs:
+    """Parameters shaping a :meth:`VcsProvider.log` read. Each field maps to a
+    ``git log`` flag in :class:`GitVcsProvider`:
+
+    - ``max_entries`` → ``-n <N>`` (cap the number of commits returned),
+    - ``since_ref``   → ``<ref>..`` (only commits AFTER ``<ref>``),
+    - ``format``      → ``--format=<fmt>`` (custom pretty format).
+
+    Mirrors Rust's ``VcsLogArgs``.
+    """
+
+    max_entries: int
+    since_ref: str | None = None
+    format: str | None = None
+
+
+class VcsError(SporeError):
+    """Error raised by a :class:`VcsProvider`. One exception class per
+    component, inheriting from the package root :class:`SporeError` — mirrors
+    Rust's ``VcsError`` (``CommandFailed`` / ``Sandbox`` variants). The
+    ``message`` carries the captured stderr or the sandbox-block detail."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+@runtime_checkable
+class VcsProvider(Protocol):
+    """Read-only VCS abstraction the ``Ralph`` loop strategy uses to reload git
+    history between context windows (issue #58 v2, decision B4).
+
+    Mirrors how :class:`SandboxProvider` abstracts filesystem/shell access:
+    a Protocol, a real implementation (:class:`GitVcsProvider`), and a
+    deterministic fixture double (:class:`FixtureVcsProvider`), injected at
+    construction via :meth:`HarnessBuilder.vcs_provider`. ``Ralph`` calls
+    :meth:`log` during its reload phase and injects the output into the next
+    window's seed as a clearly delimited "Recent VCS history:" section. When NO
+    provider is wired (``vcs_provider is None``, the default) the git-log
+    section is OMITTED and Ralph behaves exactly like v1. Raises
+    :class:`VcsError` on failure. Mirrors Rust's ``VcsProvider`` trait.
+    """
+
+    async def log(self, args: VcsLogArgs) -> str:
+        """Return the project's commit log, shaped by ``args``, verbatim."""
+        ...
+
+    async def status(self) -> str:
+        """Return the working-tree status (``git status`` stdout), verbatim."""
+        ...
+
+
+class GitVcsProvider:
+    """Real :class:`VcsProvider` that shells out to ``git`` THROUGH a
+    :class:`SandboxProvider` (issue #58 v2). It wraps the sandbox and calls
+    :meth:`SandboxProvider.execute_command` — it never bypasses sandboxing to
+    spawn ``git`` directly. The command line is built from :class:`VcsLogArgs`
+    (see that type for the flag mapping); :meth:`status` runs ``git status``.
+    All commands run in ``workspace_root``. Mirrors Rust's ``GitVcsProvider``.
+    """
+
+    def __init__(self, sandbox: SandboxProvider, workspace_root: str | Path) -> None:
+        self._sandbox = sandbox
+        self._workspace_root = Path(workspace_root)
+
+    @staticmethod
+    def _log_args(args: VcsLogArgs) -> list[str]:
+        """Build the ``git log`` argument vector from ``args`` (static so the
+        flag mapping is testable independently of process execution)."""
+        out = ["log", "-n", str(args.max_entries)]
+        if args.format is not None:
+            out.append(f"--format={args.format}")
+        if args.since_ref is not None:
+            out.append(f"{args.since_ref}..")
+        return out
+
+    async def _run(self, argv: list[str]) -> str:
+        from .sandbox import SandboxViolationException
+
+        try:
+            out = await self._sandbox.execute_command("git", argv, self._workspace_root)
+        except SandboxViolationException as exc:
+            raise VcsError(f"vcs command blocked by sandbox: {exc.violation!r}") from exc
+        if out.exit_code != 0:
+            raise VcsError(out.stderr)
+        return out.stdout
+
+    async def log(self, args: VcsLogArgs) -> str:
+        return await self._run(self._log_args(args))
+
+    async def status(self) -> str:
+        return await self._run(["status"])
 
 
 class BaseSandboxProvider:
@@ -1553,6 +1652,7 @@ class HarnessConfig:
         content_capture: ContentCaptureConfig | None = None,
         max_stop_blocks: int = 8,
         max_resets: int = 3,
+        vcs_provider: VcsProvider | None = None,
         hooks: HookChain | None = None,
         planner_agent: Agent | None = None,
         verifier: Any | None = None,
@@ -1601,6 +1701,14 @@ class HarnessConfig:
         # incomplete. Independent of ``budget.max_turns`` (which bounds the
         # per-window ReAct sub-loop). Default ``3``.
         self.max_resets = max_resets
+        # VcsProvider seam (issue #58 v2, decision B4). When set, the ``Ralph``
+        # reload phase ALSO calls ``vcs_provider.log(args)`` and injects the
+        # output into each fresh context window's seed as a delimited
+        # "Recent VCS history:" section, exactly the way the reloaded
+        # ``.spore/`` progress/feature-list content is injected. When ``None``
+        # (the default) the git-log section is OMITTED and Ralph behaves
+        # byte-for-byte like v1. Mirrors Rust's ``HarnessConfig::vcs_provider``.
+        self.vcs_provider: VcsProvider | None = vcs_provider
         # Post-compaction verifier (issue #29/#46). The harness runs it after
         # each compaction turn and retries up to ``max_compaction_attempts``
         # before accepting a failing summary. Defaults to ``KeyTermVerifier``.
@@ -1668,6 +1776,7 @@ class HarnessBuilder:
         self._content_capture: ContentCaptureConfig | None = None
         self._max_stop_blocks: int = 8
         self._max_resets: int = 3
+        self._vcs_provider: VcsProvider | None = None
         self._hooks: HookChain | None = None
         self._planner_agent: Agent | None = None
         self._verifier: Any | None = None
@@ -1788,6 +1897,16 @@ class HarnessBuilder:
         self._max_resets = max_resets
         return self
 
+    def vcs_provider(self, provider: VcsProvider) -> HarnessBuilder:
+        """Inject a :class:`VcsProvider` for the ``Ralph`` loop strategy (issue
+        #58 v2). When set, Ralph's reload phase calls :meth:`VcsProvider.log`
+        and injects a delimited "Recent VCS history:" section into each fresh
+        context window's seed. Unset (the default) ⇒ no git section is injected
+        and Ralph behaves exactly like v1. Mirrors Rust's
+        ``HarnessBuilder::vcs_provider``."""
+        self._vcs_provider = provider
+        return self
+
     def compaction_verifier(self, verifier: CompactionVerifier) -> HarnessBuilder:
         """Inject a post-compaction verifier (issue #46). Defaults to
         ``KeyTermVerifier``."""
@@ -1849,6 +1968,7 @@ class HarnessBuilder:
             content_capture=self._content_capture,
             max_stop_blocks=self._max_stop_blocks,
             max_resets=self._max_resets,
+            vcs_provider=self._vcs_provider,
             hooks=self._hooks,
             planner_agent=self._planner_agent,
             verifier=self._verifier,
@@ -2609,6 +2729,7 @@ class StandardHarness:
             content_capture=c.content_capture,
             max_stop_blocks=c.max_stop_blocks,
             max_resets=c.max_resets,
+            vcs_provider=c.vcs_provider,
             hooks=c.hooks,
             planner_agent=c.planner_agent,
             verifier=c.verifier,
@@ -2727,6 +2848,23 @@ class StandardHarness:
             reload = _ralph_reload_context(workspace_root)
             if reload is not None:
                 await self._config.context_manager.append_user_message(session_state, reload)
+            # R3 (issue #58 v2): when a ``VcsProvider`` is wired, ALSO reload git
+            # history and inject it as a delimited "Recent VCS history:" section,
+            # exactly as the ``.spore/`` reload content is injected. When the
+            # provider is ``None`` (the default), this section is omitted
+            # entirely — Ralph's reloaded context is then byte-for-byte the v1
+            # behavior (the B4→None decision).
+            vcs = self._config.vcs_provider
+            if vcs is not None:
+                args = VcsLogArgs(max_entries=20)
+                try:
+                    log = await vcs.log(args)
+                except VcsError:
+                    log = ""
+                trimmed = log.strip()
+                if trimmed:
+                    block = f"Recent VCS history:\n{trimmed}"
+                    await self._config.context_manager.append_user_message(session_state, block)
 
             window_task = Task(
                 id=task.id,
@@ -3960,6 +4098,25 @@ class AllowAllSandbox(BaseSandboxProvider):
         return None
 
 
+class FixtureVcsProvider:
+    """Deterministic :class:`VcsProvider` double for tests and fixture replay
+    (issue #58 v2). Returns pre-loaded strings VERBATIM with no process
+    spawning, so multi-context-window Ralph continuation can be exercised
+    hermetically. :meth:`log` ignores its :class:`VcsLogArgs` and yields
+    ``log_output``; :meth:`status` yields ``status_output``. Mirrors Rust's
+    ``FixtureVcsProvider``."""
+
+    def __init__(self, log_output: str, status_output: str) -> None:
+        self._log_output = log_output
+        self._status_output = status_output
+
+    async def log(self, args: VcsLogArgs) -> str:
+        return self._log_output
+
+    async def status(self) -> str:
+        return self._status_output
+
+
 class ScriptedSandbox(BaseSandboxProvider):
     """Pop-front queue of validation outcomes (None for allow)."""
 
@@ -4204,6 +4361,11 @@ __all__ = [
     "ToolOutputSuccess",
     "ToolOutputWaitingForHuman",
     "ToolRegistry",
+    "VcsError",
+    "VcsLogArgs",
+    "VcsProvider",
+    "GitVcsProvider",
+    "FixtureVcsProvider",
     "new_session_id",
     "new_task_id",
     "sandbox_violation_is_always_halt",
