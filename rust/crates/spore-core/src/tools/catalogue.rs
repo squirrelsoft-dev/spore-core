@@ -28,6 +28,7 @@
 //! Tier 2 (storage via `ToolContext`):
 //!   - [`todo_write`](StandardTools::todo_write) → `todo_write` (NEW, RunStore key `"todo"`)
 //!   - [`task_list`](StandardTools::task_list) → `task_list` (EXISTING #71)
+//!   - [`memory`](StandardTools::memory) → `memory` (NEW #82, scope-aware `MemoryStore`)
 //!
 //! Tier 3 (escalate / clarify):
 //!   - [`enter_plan_mode`](StandardTools::enter_plan_mode) → `enter_plan_mode` (NEW)
@@ -50,9 +51,10 @@
 //! is now a last-wins upsert (issue #81, Q1), registering a preset and then a
 //! custom tool of the same name lets the architect override a standard tool.
 //!
-//! ## Q3 — MemoryTool is DEFERRED
-//! `MemoryTool` is intentionally NOT part of this catalogue; it depends on the
-//! `StorageScope` work (#79) and lands in a follow-on issue.
+//! ## Q3 — MemoryTool (shipped in #82)
+//! `MemoryTool` (`memory`) was deferred from #81 and now ships in #82, on top of
+//! the scoped `MemoryStore` seam from #78. It joins the Tier-2 storage tools in
+//! `coding_set`/`full_set` alongside `task_list`/`todo_write`.
 //!
 //! Rules enforced: every constructor pairs the right impl with the right
 //! schema; presets reuse existing names on overlap; no `// SPEC QUESTION:`
@@ -63,6 +65,7 @@ use crate::tools::control::{AbortTool, AskUserQuestionTool, EnterPlanModeTool, E
 use crate::tools::edit::EditFileTool;
 use crate::tools::exec::BashCommandTool;
 use crate::tools::fs::{ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::memory::MemoryTool;
 use crate::tools::message::SendMessageTool;
 use crate::tools::search::{FindFilesTool, GrepFilesTool, GrepTool};
 use crate::tools::tasklist::TaskListTool;
@@ -163,6 +166,12 @@ impl StandardTools {
         StandardTool::new(Box::new(TaskListTool::new()), TaskListTool::schema())
     }
 
+    /// `memory` — NEW #82; scope-aware episodic memory read/write via the
+    /// `MemoryStore` seam (#78). Registered alongside `task_list`/`todo_write`.
+    pub fn memory() -> StandardTool {
+        StandardTool::new(Box::new(MemoryTool::new()), MemoryTool::schema())
+    }
+
     // ---- Tier 3 ---------------------------------------------------------
 
     /// `enter_plan_mode` — NEW; escalates `HarnessSignal::EnterPlanMode`.
@@ -228,6 +237,7 @@ impl StandardTools {
             Self::web_search(),
             Self::todo_write(),
             Self::task_list(),
+            Self::memory(),
         ]
     }
 

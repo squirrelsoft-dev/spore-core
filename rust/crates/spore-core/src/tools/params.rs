@@ -300,3 +300,43 @@ pub enum TaskListParams {
     },
     ListTasks {},
 }
+
+// ---------- Memory (#82) ----------
+
+/// Parameters for the [`crate::tools::memory::MemoryTool`], internally tagged on
+/// `operation`. `scope` is an explicit field on BOTH variants. `write` carries
+/// the entry payload; `read` carries the recency `limit` and a `merged` flag.
+///
+/// `StorageScope::Local` is accepted by serde (so a bad-scope call reaches the
+/// tool body) but rejected at runtime with a recoverable error — the advertised
+/// schema enum omits `local`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum MemoryToolParams {
+    Write {
+        scope: crate::storage::StorageScope,
+        role: String,
+        content: String,
+        /// Free-form metadata stored on the entry; defaults to `{}`.
+        #[serde(default = "memory_empty_metadata")]
+        metadata: Value,
+    },
+    Read {
+        scope: crate::storage::StorageScope,
+        /// When `true`, return the cross-scope merged view (User ∪ Project,
+        /// newest-first, no dedup) instead of just `scope`. Defaults to `false`.
+        #[serde(default)]
+        merged: bool,
+        /// Recency cap; most-recent `limit` entries, newest-first. Defaults to 50.
+        #[serde(default = "memory_default_limit")]
+        limit: usize,
+    },
+}
+
+fn memory_empty_metadata() -> Value {
+    Value::Object(Map::new())
+}
+
+fn memory_default_limit() -> usize {
+    50
+}

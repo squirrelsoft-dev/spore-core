@@ -1,0 +1,152 @@
+[
+  {
+    "name": "write_then_read_user",
+    "steps": [
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "first"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "second"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": { "operation": "read", "scope": "user" },
+        "expected": { "ok": true, "contents": ["second", "first"] }
+      }
+    ]
+  },
+  {
+    "name": "scope_isolation",
+    "steps": [
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "u-only"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": {
+          "operation": "write",
+          "scope": "project",
+          "role": "assistant",
+          "content": "p-only"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": { "operation": "read", "scope": "user" },
+        "expected": { "ok": true, "contents": ["u-only"] }
+      },
+      {
+        "input": { "operation": "read", "scope": "project" },
+        "expected": { "ok": true, "contents": ["p-only"] }
+      }
+    ]
+  },
+  {
+    "name": "merged_read_unions_user_and_project",
+    "steps": [
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "mu"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": {
+          "operation": "write",
+          "scope": "project",
+          "role": "assistant",
+          "content": "mp"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": { "operation": "read", "scope": "user", "merged": true },
+        "expected": { "ok": true, "contents": ["mp", "mu"], "unordered": true }
+      }
+    ]
+  },
+  {
+    "name": "read_respects_limit",
+    "steps": [
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "a"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "b"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": {
+          "operation": "write",
+          "scope": "user",
+          "role": "user",
+          "content": "c"
+        },
+        "expected": { "ok": true }
+      },
+      {
+        "input": { "operation": "read", "scope": "user", "limit": 2 },
+        "expected": { "ok": true, "contents": ["c", "b"] }
+      }
+    ]
+  },
+  {
+    "name": "local_rejected_on_write",
+    "steps": [
+      {
+        "input": {
+          "operation": "write",
+          "scope": "local",
+          "role": "user",
+          "content": "nope"
+        },
+        "expected": {
+          "ok": false,
+          "error": "Local scope is not supported by MemoryTool — use User or Project."
+        }
+      }
+    ]
+  },
+  {
+    "name": "local_rejected_on_read",
+    "steps": [
+      {
+        "input": { "operation": "read", "scope": "local" },
+        "expected": {
+          "ok": false,
+          "error": "Local scope is not supported by MemoryTool — use User or Project."
+        }
+      }
+    ]
+  }
+]

@@ -306,6 +306,35 @@ pub trait MemoryStore: Send + Sync {
         session_id: &'a SessionId,
         limit: usize,
     ) -> BoxFut<'a, Result<Vec<MemoryEntry>, StorageError>>;
+
+    /// Cross-scope merged read (#78 R6): **User ∪ Project, newest-first by
+    /// `timestamp`, NO dedup**. `Local` is excluded from the merge in v1.
+    ///
+    /// This is the SINGLE source of the merge algorithm. It is a **default**
+    /// trait method implemented in terms of `get_memories(User, …)` +
+    /// `get_memories(Project, …)` + the shared [`merge_newest_first`] helper, so
+    /// every `MemoryStore` impl (the [`ScopedMemoryRouter`], leaf backends,
+    /// [`NoOpStorageProvider`], test mocks) inherits identical semantics without
+    /// hand-editing each one. [`StorageProvider::get_memories_merged`] and
+    /// [`MemoryTool`](crate::tools::MemoryTool)'s merged `read` both delegate
+    /// here — there is exactly one merge implementation.
+    fn get_memories_merged<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        limit: usize,
+    ) -> BoxFut<'a, Result<Vec<MemoryEntry>, StorageError>> {
+        Box::pin(async move {
+            let mut combined = self
+                .get_memories(StorageScope::User, session_id, limit)
+                .await?;
+            let project = self
+                .get_memories(StorageScope::Project, session_id, limit)
+                .await?;
+            combined.extend(project);
+            merge_newest_first(&mut combined, limit);
+            Ok(combined)
+        })
+    }
 }
 
 /// Per-run structured state keyed by `(SessionId, key)`. Values are opaque JSON
@@ -424,22 +453,15 @@ impl StorageProvider {
     /// fans out to the per-scope backends and merges; for `single`/`new` the
     /// one backend serves both scopes (keyed by scope) and merges identically.
     /// The merge always lives in the routing layer, never in a leaf backend.
+    ///
+    /// Delegates to the single [`MemoryStore::get_memories_merged`] default
+    /// trait method (#82 D2) so there is exactly ONE merge implementation.
     pub async fn get_memories_merged(
         &self,
         session_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>, StorageError> {
-        let mut combined = self
-            .memory
-            .get_memories(StorageScope::User, session_id, limit)
-            .await?;
-        let project = self
-            .memory
-            .get_memories(StorageScope::Project, session_id, limit)
-            .await?;
-        combined.extend(project);
-        merge_newest_first(&mut combined, limit);
-        Ok(combined)
+        self.memory.get_memories_merged(session_id, limit).await
     }
     pub fn run(&self) -> &Arc<dyn RunStore> {
         &self.run

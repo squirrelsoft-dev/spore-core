@@ -24,6 +24,7 @@ pub mod exec;
 pub mod fs;
 pub mod git;
 pub mod http;
+pub mod memory;
 pub mod message;
 pub mod params;
 pub mod search;
@@ -40,6 +41,7 @@ pub use exec::{BashCommandTool, ExecTool, RunTestsTool};
 pub use fs::{DeleteFileTool, ListDirTool, MoveFileTool, ReadFileTool, WriteFileTool};
 pub use git::{GitCommitTool, GitDiffTool, GitLogTool, GitResetMode, GitResetTool, GitStatusTool};
 pub use http::{HttpGetTool, HttpPostTool};
+pub use memory::MemoryTool;
 pub use message::SendMessageTool;
 pub use search::{FindFilesTool, GrepFilesTool, GrepTool};
 pub use subagent::{BuildError, ContextSharing, SubagentTool};
@@ -133,6 +135,7 @@ mod fixture_tests {
                 regex::Regex::new(&p.pattern).is_ok()
             }
             "send_message" => ok::<SendMessageParams>(input),
+            "memory" => ok::<MemoryToolParams>(input),
             "todo_write" => ok::<TodoWriteParams>(input),
             "web_fetch" => ok::<WebFetchParams>(input),
             "web_search" => ok::<WebSearchParams>(input),
