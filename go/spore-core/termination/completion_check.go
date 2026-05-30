@@ -45,14 +45,15 @@ type AlwaysComplete = NullCompletionCheck
 // so the agent can learn to create / repair the file.
 type FeatureListCheck struct {
 	// Path is the workspace-relative path to feature_list.json. Defaults
-	// to "feature_list.json". Absolute paths are honoured verbatim.
+	// to ".spore/feature_list.json" (issue #58, B2 — agrees with the Ralph
+	// loop strategy's canonical path). Absolute paths are honoured verbatim.
 	Path string
 }
 
 // NewFeatureListCheck returns a FeatureListCheck targeting the default
-// "feature_list.json" name.
+// ".spore/feature_list.json" path (issue #58, B2).
 func NewFeatureListCheck() *FeatureListCheck {
-	return &FeatureListCheck{Path: "feature_list.json"}
+	return &FeatureListCheck{Path: ".spore/feature_list.json"}
 }
 
 // NewFeatureListCheckWithPath returns a FeatureListCheck targeting a

@@ -39,14 +39,18 @@ func snapshotIn(dir string) SessionStateSnapshot {
 
 func writeFile(t *testing.T, dir, name, body string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+	full := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestFeatureListCheckAllPassReturnsComplete(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, "feature_list.json", `[{"name":"a","passes":true},{"name":"b","passes":true}]`)
+	writeFile(t, dir, ".spore/feature_list.json", `[{"name":"a","passes":true},{"name":"b","passes":true}]`)
 	snap := snapshotIn(dir)
 	reason, complete, err := NewFeatureListCheck().Check(context.Background(), &snap)
 	if err != nil {
@@ -59,7 +63,7 @@ func TestFeatureListCheckAllPassReturnsComplete(t *testing.T) {
 
 func TestFeatureListCheckSomeFailReturnsReason(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, "feature_list.json",
+	writeFile(t, dir, ".spore/feature_list.json",
 		`[{"name":"a","passes":true},{"name":"b","passes":false},{"name":"c","passes":false}]`)
 	snap := snapshotIn(dir)
 	reason, complete, err := NewFeatureListCheck().Check(context.Background(), &snap)
@@ -91,7 +95,7 @@ func TestFeatureListCheckMissingFileReturnsReason(t *testing.T) {
 
 func TestFeatureListCheckInvalidJSONReturnsReason(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, "feature_list.json", `{not json`)
+	writeFile(t, dir, ".spore/feature_list.json", `{not json`)
 	snap := snapshotIn(dir)
 	reason, complete, err := NewFeatureListCheck().Check(context.Background(), &snap)
 	if err != nil {

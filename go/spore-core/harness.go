@@ -1527,6 +1527,15 @@ const (
 	// in the caller's wiring. Carries a human-readable Reason. PEER to
 	// HaltSelfVerifyExhausted (NOT a sub-case of it).
 	HaltSelfVerifyMisconfigured HaltReasonKind = "self_verify_misconfigured"
+	// HaltRalphCompletionUnmet (issue #58, B3) is returned by the Ralph loop
+	// strategy when the multi-context-window continuation loop reached its
+	// MaxResets cap with tasks still incomplete (the Ralph analogue of
+	// HaltSelfVerifyExhausted). A RUNTIME limit — the work was attempted across
+	// Iterations context windows but the filesystem-backed completion check (the
+	// registered Stop hook reading .spore/progress.json) never reported done.
+	// Carries the number of context-window resets performed (Iterations) and the
+	// last incompletion reason (Reason, serialized as last_reason).
+	HaltRalphCompletionUnmet HaltReasonKind = "ralph_completion_unmet"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -1633,6 +1642,12 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind   HaltReasonKind `json:"kind"`
 			Reason string         `json:"reason"`
 		}{h.Kind, h.Reason})
+	case HaltRalphCompletionUnmet:
+		return json.Marshal(struct {
+			Kind       HaltReasonKind `json:"kind"`
+			Iterations uint32         `json:"iterations"`
+			LastReason string         `json:"last_reason"`
+		}{h.Kind, h.Iterations, h.Reason})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -1699,6 +1714,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 		}
 	case HaltSelfVerifyExhausted:
 		// "last_reason" carries the verifier's final failure reason (#61).
+		h.Reason = probe.LastReason
+	case HaltRalphCompletionUnmet:
+		// "last_reason" carries the final incompletion reason (#58).
 		h.Reason = probe.LastReason
 	}
 	return nil
@@ -1874,6 +1892,14 @@ type HarnessConfig struct {
 	// per-run (resets each Run call). Zero is treated as the default of 8.
 	MaxStopBlocks uint32
 
+	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
+	// strategy (issue #58, B3): the maximum number of context windows the
+	// multi-context-window continuation loop runs before halting with
+	// HaltRalphCompletionUnmet when tasks are still incomplete. Independent of
+	// MaxTurns (which bounds turns WITHIN a single window). Zero is treated as
+	// the default of 3.
+	MaxResets uint32
+
 	// PlannerAgent is the optional alternate agent used for the PlanExecute plan
 	// phase (issue #70, Q1). When the loop strategy is PlanExecute and this is
 	// non-nil, the one-shot plan turn runs on it; otherwise it runs on the
@@ -1930,13 +1956,40 @@ func (c HarnessConfig) effectiveMaxStopBlocks() uint32 {
 	return c.MaxStopBlocks
 }
 
+// effectiveMaxResets returns the Ralph outer-loop reset cap, defaulting 0 to 3
+// (issue #58, B3).
+func (c HarnessConfig) effectiveMaxResets() uint32 {
+	if c.MaxResets == 0 {
+		return 3
+	}
+	return c.MaxResets
+}
+
 // StandardHarness is the canonical Harness implementation.
 type StandardHarness struct {
 	config HarnessConfig
 }
 
 // NewStandardHarness constructs a StandardHarness.
+//
+// Ralph completion mechanism (issue #58, B1): at construction a Stop hook is
+// registered that drives multi-context-window continuation off
+// .spore/progress.json. Registration is harmless for non-Ralph runs — the hook
+// only BLOCKS when a progress file is PRESENT and reports incomplete tasks; when
+// the file is absent it returns Continue and does not interfere with ReAct /
+// PlanExecute / SelfVerifying runs.
 func NewStandardHarness(c HarnessConfig) *StandardHarness {
+	workspaceRoot := ""
+	if c.Sandbox != nil {
+		workspaceRoot = c.Sandbox.WorkspaceRoot()
+	}
+	if c.Hooks == nil {
+		c.Hooks = NewStandardHookChain()
+	}
+	// Best-effort registration: a Stop hook can only fail registration on an
+	// event-class mismatch, which never applies to a sync Stop hook, so the
+	// error is intentionally ignored.
+	_ = c.Hooks.Register(newRalphStopHook(workspaceRoot))
 	return &StandardHarness{config: c}
 }
 
@@ -1990,7 +2043,11 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 	case StrategyPlanExecute:
 		return h.runPlanExecute(ctx, task, session, budget, options.OnStream)
 	case StrategyRalph:
-		return strategyNotImplemented(task, "ralph")
+		// Ralph (issue #58) re-seeds a FRESH SessionState per context window
+		// INSIDE runRalph (the context-window reset). The dispatch-level seed the
+		// other strategies do here would be discarded, so it is intentionally
+		// skipped — runRalph owns seeding each window.
+		return h.runRalph(ctx, task, budget, options.OnStream)
 	case StrategySelfVerifying:
 		// Seed the build phase's initial user message (the evaluate phase seeds
 		// its own fresh session internally). Mirrors the ReAct arm; the resume
@@ -2117,6 +2174,8 @@ func haltReasonString(r HaltReason) string {
 		return fmt.Sprintf("self-verify exhausted after %d iterations: %s", r.Iterations, r.Reason)
 	case HaltSelfVerifyMisconfigured:
 		return fmt.Sprintf("self-verify misconfigured: %s", r.Reason)
+	case HaltRalphCompletionUnmet:
+		return fmt.Sprintf("ralph completion unmet after %d windows: %s", r.Iterations, r.Reason)
 	default:
 		return string(r.Kind)
 	}

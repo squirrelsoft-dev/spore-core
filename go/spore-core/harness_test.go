@@ -299,12 +299,12 @@ func TestResumeWithAllowExecutesPendingAndContinues(t *testing.T) {
 // loop, so it is intentionally absent from this list — its behaviour is covered
 // by the plan-phase tests (plan_test.go) and the execute-phase tests below.
 // SelfVerifying is fully implemented (issue #61) and is likewise absent — its
-// behaviour is covered by self_verifying_test.go.
+// behaviour is covered by self_verifying_test.go. Ralph is fully implemented
+// (issue #58) and is likewise absent — its behaviour is covered by ralph_test.go.
 func TestNonReactStrategiesMarkedNotYetImplemented(t *testing.T) {
 	a := NewMockAgent("t")
 	h := NewStandardHarness(standardCfg(a))
 	strategies := []LoopStrategy{
-		{Kind: StrategyRalph},
 		{Kind: StrategyHillClimbing, Direction: OptimizationMaximize},
 	}
 	for _, s := range strategies {
