@@ -658,6 +658,21 @@ pub enum WarnEvent {
         missing_items: Vec<String>,
         accepted_anyway: bool,
     },
+    /// One iteration of a `HillClimbing` loop strategy run (issue #60). Emitted
+    /// fire-and-forget after each iteration's metric evaluation so the run is
+    /// traceable per-iteration with its metric value and delta. `iteration` is
+    /// the 0-based iteration index (0 = the pure baseline). `metric_value` and
+    /// `delta` are `None` on crashed/timeout iterations (no comparable metric);
+    /// `delta` is also `None` for the baseline. `status` is the snake_case
+    /// [`IterationStatus`](crate::metric::IterationStatus) string the harness
+    /// recorded (`kept`/`discarded`/`crashed`/`timeout`).
+    HillClimbingIteration {
+        iteration: u32,
+        metric_value: Option<f64>,
+        delta: Option<f64>,
+        status: String,
+        reverted: bool,
+    },
 }
 
 /// One warn-level observability span (issue #46). Carries a [`SpanBase`] for

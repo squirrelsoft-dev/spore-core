@@ -77,6 +77,7 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,
+        metric_evaluator: None,
     }
 }
 

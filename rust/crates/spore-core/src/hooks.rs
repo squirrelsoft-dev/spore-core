@@ -1754,6 +1754,7 @@ mod tests {
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,
+            metric_evaluator: None,
         }
     }
 }

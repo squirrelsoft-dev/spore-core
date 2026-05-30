@@ -1,0 +1,126 @@
+{
+  "_comment": "Issue #60 — HillClimbing loop strategy cross-language replay fixtures. Each scenario scripts a metric_sequence (element 0 is the iteration-0 BASELINE, measured with NO agent turn; status kept; duration = the baseline evaluator-call time only). Element index i (i>=1) is the metric AFTER iteration i's agent turn. A null element is a crash (counts as a non-improvement; metric_value EMPTY in the TSV). The payload `direction` is authoritative for the keep/revert decision via should_keep. All scripted MetricResults carry a ZERO duration, so every duration_secs renders as 0.000000 — this lets expected_tsv be asserted byte-identically across languages.",
+  "scenarios": [
+    {
+      "name": "keep_then_regress_stagnation_halt",
+      "_doc": "maximize: baseline 1.0 (kept), iter1 2.0 (kept, improve), iter2 1.5 (discarded, regress vs 2.0). max_stagnation 1 halts after the first non-improvement. best_metric stays 2.0.",
+      "metric_sequence": [1.0, 2.0, 1.5],
+      "payload": {
+        "direction": "maximize",
+        "max_stagnation": 1,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 2,
+        "revert_count": 0,
+        "best_metric": 2.0
+      },
+      "expected_tsv": "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n0\t\t1.000000\tmaximize\tkept\t0.000000\tscripted metric\n1\t\t2.000000\tmaximize\tkept\t0.000000\tscripted metric\n2\t\t1.500000\tmaximize\tdiscarded\t0.000000\tscripted metric\n"
+    },
+    {
+      "name": "stagnation_halt_three",
+      "_doc": "maximize: baseline 5.0 (kept), then three regresses to 4.0. max_stagnation 3 halts after the third consecutive non-improvement. best stays 5.0.",
+      "metric_sequence": [5.0, 4.0, 4.0, 4.0],
+      "payload": {
+        "direction": "maximize",
+        "max_stagnation": 3,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 1,
+        "revert_count": 0,
+        "best_metric": 5.0
+      }
+    },
+    {
+      "name": "stagnation_reset_on_improve",
+      "_doc": "maximize: baseline 1.0 (kept), iter1 0.5 (discard), iter2 0.5 (discard, stagnation=2), iter3 2.0 (kept, IMPROVE -> stagnation resets to 0), iter4 1.0 (discard, stagnation=1). With max_stagnation 3 and max_turns 4 the run ends on the turn budget, never hitting the stagnation cap.",
+      "metric_sequence": [1.0, 0.5, 0.5, 2.0, 1.0],
+      "max_turns": 4,
+      "payload": {
+        "direction": "maximize",
+        "max_stagnation": 3,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "budget_turns",
+        "kept_iterations": 2,
+        "revert_count": 0
+      }
+    },
+    {
+      "name": "crash_counts_as_non_improvement",
+      "_doc": "maximize: baseline 1.0 (kept), iter1 crash (null) -> non-improvement, metric_value EMPTY, status crashed. max_stagnation 1 halts.",
+      "metric_sequence": [1.0, null],
+      "payload": {
+        "direction": "maximize",
+        "max_stagnation": 1,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 1,
+        "revert_count": 0,
+        "best_metric": 1.0
+      },
+      "expected_tsv": "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n0\t\t1.000000\tmaximize\tkept\t0.000000\tscripted metric\n1\t\t\tmaximize\tcrashed\t0.000000\tscripted metric\n"
+    },
+    {
+      "name": "revert_on_regress",
+      "_doc": "minimize (lower is better): baseline 2.0 (kept), iter1 3.0 (worse -> discard). revert_on_no_improvement true issues exactly one git reset --hard HEAD. max_stagnation 1 halts.",
+      "metric_sequence": [2.0, 3.0],
+      "payload": {
+        "direction": "minimize",
+        "max_stagnation": 1,
+        "revert_on_no_improvement": true,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 1,
+        "revert_count": 1,
+        "best_metric": 2.0
+      }
+    },
+    {
+      "name": "revert_off_regress",
+      "_doc": "minimize: baseline 2.0 (kept), iter1 3.0 (worse -> discard). revert_on_no_improvement false -> NO git reset. max_stagnation 1 halts.",
+      "metric_sequence": [2.0, 3.0],
+      "payload": {
+        "direction": "minimize",
+        "max_stagnation": 1,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": null
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 1,
+        "revert_count": 0,
+        "best_metric": 2.0
+      }
+    },
+    {
+      "name": "strict_min_delta_boundary",
+      "_doc": "minimize: baseline 2.0 (kept), iter1 1.5 with min_improvement_delta 0.5. An improvement of EXACTLY min_delta is NOT progress -> discarded. max_stagnation 1 halts; best stays 2.0.",
+      "metric_sequence": [2.0, 1.5],
+      "payload": {
+        "direction": "minimize",
+        "max_stagnation": 1,
+        "revert_on_no_improvement": false,
+        "min_improvement_delta": 0.5
+      },
+      "expected": {
+        "halt_reason": "stagnation",
+        "kept_iterations": 1,
+        "revert_count": 0,
+        "best_metric": 2.0
+      }
+    }
+  ]
+}

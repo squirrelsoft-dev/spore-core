@@ -1334,6 +1334,14 @@ pub enum HaltReason {
         iterations: u32,
         last_reason: String,
     },
+    /// Returned by [`StandardHarness`] for the `HillClimbing` strategy (issue
+    /// #60) when the strategy cannot run because it is misconfigured — i.e.
+    /// `config.metric_evaluator` is `None`. Likely a BUILD-TIME bug in the
+    /// caller's wiring. Surfaced as a typed halt, NOT a panic. PEER to
+    /// [`SelfVerifyMisconfigured`](Self::SelfVerifyMisconfigured).
+    HillClimbingMisconfigured {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1615,6 +1623,15 @@ pub struct HarnessConfig {
     /// byte-for-byte like v1 (the B4→None decision). Irrelevant for every other
     /// loop strategy.
     pub vcs_provider: Option<Arc<dyn VcsProvider>>,
+    /// The scoring oracle for the `HillClimbing` loop strategy (issue #60).
+    /// When the loop strategy is `HillClimbing` and this is `Some`, the harness
+    /// evaluates the workspace metric at iteration 0 (the pure baseline, no
+    /// agent turn) and after every subsequent agent turn, feeding each result
+    /// through [`should_keep`](crate::metric::should_keep). When `None`,
+    /// `HillClimbing` is MISCONFIGURED: the run returns
+    /// `Failure { HillClimbingMisconfigured }` — it does NOT panic. Irrelevant
+    /// for every other loop strategy. Defaults to `None`.
+    pub metric_evaluator: Option<Arc<dyn crate::metric::MetricEvaluator>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1642,6 +1659,7 @@ impl Clone for HarnessConfig {
             chunk_provider: self.chunk_provider.clone(),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
+            metric_evaluator: self.metric_evaluator.clone(),
         }
     }
 }
@@ -1701,6 +1719,10 @@ pub struct HarnessBuilder {
     /// Optional VCS read seam for the `Ralph` loop strategy (issue #58 v2).
     /// `None` (the default) omits the git-log reload section (v1 behavior).
     vcs_provider: Option<Arc<dyn VcsProvider>>,
+    /// Scoring oracle for the `HillClimbing` loop strategy (issue #60). `None`
+    /// (the default) makes a `HillClimbing` run halt with
+    /// `HillClimbingMisconfigured`.
+    metric_evaluator: Option<Arc<dyn crate::metric::MetricEvaluator>>,
     /// Standard catalogue tools accumulated via [`HarnessBuilder::tool`] /
     /// [`HarnessBuilder::tools`] (issue #81). They are drained into a populated
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
@@ -1741,6 +1763,7 @@ impl HarnessBuilder {
             chunk_provider: None,
             max_resets: 3,
             vcs_provider: None,
+            metric_evaluator: None,
             standard_tools: Vec::new(),
         }
     }
@@ -1871,6 +1894,17 @@ impl HarnessBuilder {
         self
     }
 
+    /// Inject the scoring oracle for the `HillClimbing` loop strategy (issue
+    /// #60). Required for that strategy: without it a `HillClimbing` run halts
+    /// with `HillClimbingMisconfigured` (no panic). The evaluator is called once
+    /// at the iteration-0 baseline (no agent turn) and after every subsequent
+    /// agent turn; each result is routed through
+    /// [`should_keep`](crate::metric::should_keep). Defaults to `None`.
+    pub fn metric_evaluator(mut self, evaluator: Arc<dyn crate::metric::MetricEvaluator>) -> Self {
+        self.metric_evaluator = Some(evaluator);
+        self
+    }
+
     /// Inject a deterministic tool-call repair provider (e.g.
     /// [`StandardToolCallRepair`](crate::tool_call_repair::StandardToolCallRepair)).
     /// When set, recoverable tool-dispatch errors trigger an argument-coercion
@@ -1966,6 +2000,7 @@ impl HarnessBuilder {
             }),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider,
+            metric_evaluator: self.metric_evaluator,
         }
     }
 
@@ -3702,6 +3737,528 @@ impl StandardHarness {
         }
     }
 
+    // ========================================================================
+    // HillClimbing loop strategy (issue #60)
+    // ========================================================================
+    //
+    // Iterative optimization loop. Establishes a baseline metric over the
+    // starting workspace, then repeatedly: runs ONE agent turn proposing a
+    // change, evaluates the metric, and KEEPS or REVERTS based on whether the
+    // new value strictly beats the running best (per `should_keep`). Generalizes
+    // the autoresearch pattern.
+    //
+    // ## Loop semantics
+    //   - Iteration 0 is a PURE baseline measurement of the starting workspace —
+    //     NO agent turn. Its `ResultsEntry` has `status: kept`, and its
+    //     `duration_secs` is the wall-clock time of the baseline evaluator call
+    //     only. It seeds `current_best`. Agent turns begin at iteration 1.
+    //   - Iterations 1.. : run one bounded ReAct agent turn (proposes a change),
+    //     then evaluate. On a successful evaluation, route through
+    //     `should_keep(new, current_best, payload_direction, min_improvement_delta)`:
+    //       * keep   → status Kept, update `current_best`, reset the stagnation
+    //                  counter to 0.
+    //       * no keep → status Discarded; if `revert_on_no_improvement`, run
+    //                  `git reset --hard HEAD` via the sandbox; increment the
+    //                  stagnation counter.
+    //     On a MetricError (Crashed/Timeout/etc.), the iteration status is
+    //     `IterationStatus::from_error` (Crashed/Timeout), the metric value is
+    //     EMPTY in the TSV, the iteration counts as a non-improvement (increment
+    //     the stagnation counter), and the loop continues.
+    //   - `max_stagnation: Some(N)` ⇒ after N consecutive non-improvements, halt
+    //     `StagnationLimitReached { iterations, best_metric }`. Improvement resets
+    //     the counter. `max_stagnation: None` ⇒ run until the budget/turn limit
+    //     (no stagnation halt).
+    //   - Budget gates (turns/tokens/wall/cost) are honored per iteration exactly
+    //     as the other run_* methods do; each iteration emits a fire-and-forget
+    //     observability span carrying the metric value/delta.
+    //   - The harness writes the TSV after the run to
+    //     `{workspace_root}/.spore/results/{task_id}.tsv`.
+    //
+    // ## Six pinned spec decisions (resolved with the user — NOT relitigated)
+    //   1. REVERT: `revert_on_no_improvement: true` reverts via the sandbox
+    //      `git reset --hard HEAD` directly from the harness. The harness NEVER
+    //      git commits; `commit_hash` in the TSV stays empty unless a VcsProvider
+    //      supplies it (default empty). Revert discards uncommitted working-tree
+    //      changes back to current HEAD.
+    //   2. TSV FLOAT FORMAT: both `metric_value` and `duration_secs` are
+    //      formatted with exactly 6 decimal places (`format!("{:.6}", x)`) for
+    //      cross-language byte-identity.
+    //   3. TSV SCHEMA: written to `{workspace_root}/.spore/results/{task_id}.tsv`,
+    //      tab-separated, REQUIRED header then one row per iteration ascending.
+    //      Columns: iteration, commit_hash, metric_value, direction, status,
+    //      duration_secs, description. `commit_hash` empty when no VCS wired;
+    //      `metadata` EXCLUDED; `metric_value` EMPTY on crashed/timeout rows;
+    //      `direction` snake_case; `status` snake_case; `duration_secs` is
+    //      `MetricResult.duration.as_secs_f64()` formatted `{:.6}`.
+    //   4. DIRECTION: the strategy payload `direction` is authoritative for the
+    //      keep/revert decision via `should_keep`; the evaluator's `direction()`
+    //      is descriptive only. The TSV `direction` column records the payload
+    //      direction.
+    //   5. BASELINE: iteration 0 is a pure baseline (no agent turn); its row has
+    //      `status: kept` and `duration_secs` = the baseline evaluator-call time.
+    //   6. MISCONFIGURATION: a `None` `metric_evaluator` ⇒ halt
+    //      `HillClimbingMisconfigured { reason }` (peer to SelfVerifyMisconfigured).
+    //      No panic.
+    //
+    // No `// SPEC QUESTION:` markers — all six decisions are resolved.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_hill_climbing(
+        &self,
+        task: Task,
+        direction: OptimizationDirection,
+        max_stagnation: Option<u32>,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: Option<f64>,
+        budget_used: BudgetSnapshot,
+        _on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        use crate::metric::{should_keep, IterationStatus, MetricResult, ResultsEntry};
+        use crate::termination::SessionStateSnapshot;
+
+        let session_id = task.session_id.clone();
+        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+
+        // Decision 6: a missing evaluator is a typed halt, not a panic.
+        let evaluator = match self.config.metric_evaluator.as_ref() {
+            Some(e) => e.clone(),
+            None => {
+                let result = RunResult::Failure {
+                    reason: HaltReason::HillClimbingMisconfigured {
+                        reason: "HillClimbing requires `config.metric_evaluator`, but it is None"
+                            .to_string(),
+                    },
+                    session_id,
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                };
+                self.finalize_self_verifying(&result).await;
+                return result;
+            }
+        };
+
+        let description = evaluator.description();
+        // Per-iteration observability span counter.
+        let mut span_seq: u64 = 0;
+        // Cumulative usage + turns across ALL agent-turn iterations.
+        let mut total_usage = AggregateUsage::default();
+        // Shared budget threaded across every agent sub-run.
+        let mut carried = budget_used;
+        // The TSV rows, in iteration order.
+        let mut rows: Vec<ResultsEntry> = Vec::new();
+
+        // A snapshot for the evaluator. HillClimbing keeps no carried message
+        // state of its own (each iteration is a fresh sub-run), so a default
+        // SessionState is the right snapshot to hand the evaluator.
+        let snapshot = SessionStateSnapshot::new(
+            session_id.clone(),
+            task.id.clone(),
+            SessionState::default(),
+            workspace_root.clone(),
+        );
+
+        // ── Iteration 0: pure baseline. No agent turn (Decision 5).
+        let baseline = evaluator
+            .evaluate(self.config.sandbox.as_ref(), &snapshot)
+            .await;
+        let mut current_best = match baseline {
+            Ok(MetricResult {
+                value, duration, ..
+            }) => {
+                rows.push(ResultsEntry {
+                    iteration: 0,
+                    commit_hash: self.hill_climbing_commit_hash().await,
+                    metric_value: value,
+                    direction,
+                    status: IterationStatus::Kept,
+                    duration,
+                    description: description.clone(),
+                    metadata: Default::default(),
+                });
+                self.emit_hill_climbing_span(
+                    &session_id,
+                    &task.id,
+                    &mut span_seq,
+                    0,
+                    Some(value),
+                    None,
+                    IterationStatus::Kept,
+                    false,
+                );
+                value
+            }
+            Err(err) => {
+                // A baseline that cannot even be measured is a misconfiguration of
+                // the experiment, not a non-improvement to climb away from — there
+                // is no `current_best` to compare against. Record the failed row,
+                // write the TSV, and halt.
+                let status = IterationStatus::from_error(&err);
+                rows.push(ResultsEntry {
+                    iteration: 0,
+                    commit_hash: self.hill_climbing_commit_hash().await,
+                    // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+                    metric_value: f64::NAN,
+                    direction,
+                    status,
+                    duration: Duration::ZERO,
+                    description: description.clone(),
+                    metadata: Default::default(),
+                });
+                self.emit_hill_climbing_span(
+                    &session_id,
+                    &task.id,
+                    &mut span_seq,
+                    0,
+                    None,
+                    None,
+                    status,
+                    false,
+                );
+                self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
+                    .await;
+                let result = RunResult::Failure {
+                    reason: HaltReason::HillClimbingMisconfigured {
+                        reason: format!("baseline evaluation failed: {err}"),
+                    },
+                    session_id,
+                    usage: total_usage,
+                    turns: carried.turns,
+                };
+                self.finalize_self_verifying(&result).await;
+                return result;
+            }
+        };
+
+        // Consecutive non-improvement counter (Decision-driven stagnation halt).
+        let mut stagnation: u32 = 0;
+        // The 0-based iteration index; agent turns begin at 1.
+        let mut iteration: u32 = 1;
+
+        loop {
+            // Budget gate before the iteration's agent turn (mirrors run_react).
+            let turn_cap = task.budget.max_turns.unwrap_or(u32::MAX);
+            if carried.turns >= turn_cap {
+                break;
+            }
+            if let Some(limit_type) = Self::budget_exceeded(&task.budget, &carried, Instant::now())
+            {
+                // A wall-time/cost/token cap reached BEFORE any iteration work is a
+                // clean budget halt — but only surface it as a failure when no
+                // iteration has produced an improvement to report. We mirror
+                // run_react's contract: budget gates terminate with BudgetExceeded.
+                self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
+                    .await;
+                let result = RunResult::Failure {
+                    reason: HaltReason::BudgetExceeded { limit_type },
+                    session_id,
+                    usage: total_usage,
+                    turns: carried.turns,
+                };
+                self.finalize_self_verifying(&result).await;
+                return result;
+            }
+
+            // ── One bounded agent turn proposes a change. The sub-run carries the
+            //    shared budget so per-iteration turns count toward the cap.
+            let iter_task = Task {
+                id: task.id.clone(),
+                instruction: task.instruction.clone(),
+                session_id: session_id.clone(),
+                budget: task.budget.clone(),
+                loop_strategy: task.loop_strategy.clone(),
+            };
+            let mut iter_state = SessionState::default();
+            self.config
+                .context_manager
+                .append_user_message(&mut iter_state, &task.instruction)
+                .await;
+            let turn_result = self
+                .run_react_inner(iter_task, turn_cap, iter_state, carried.clone(), None)
+                .await;
+            Self::fold_usage(&mut total_usage, &mut carried, &turn_result);
+
+            // A turn that paused / escalated is propagated up unchanged.
+            match &turn_result {
+                RunResult::WaitingForHuman { state, request } => {
+                    return RunResult::WaitingForHuman {
+                        state: state.clone(),
+                        request: request.clone(),
+                    };
+                }
+                RunResult::Escalate { .. } => {
+                    self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
+                        .await;
+                    self.finalize_self_verifying(&turn_result).await;
+                    return turn_result;
+                }
+                _ => {}
+            }
+
+            // ── Evaluate the metric after the change.
+            let eval = evaluator
+                .evaluate(self.config.sandbox.as_ref(), &snapshot)
+                .await;
+            match eval {
+                Ok(MetricResult {
+                    value, duration, ..
+                }) => {
+                    let kept = should_keep(value, current_best, direction, min_improvement_delta);
+                    let delta = match direction {
+                        OptimizationDirection::Minimize => current_best - value,
+                        OptimizationDirection::Maximize => value - current_best,
+                    };
+                    if kept {
+                        current_best = value;
+                        stagnation = 0;
+                        rows.push(ResultsEntry {
+                            iteration,
+                            commit_hash: self.hill_climbing_commit_hash().await,
+                            metric_value: value,
+                            direction,
+                            status: IterationStatus::Kept,
+                            duration,
+                            description: description.clone(),
+                            metadata: Default::default(),
+                        });
+                        self.emit_hill_climbing_span(
+                            &session_id,
+                            &task.id,
+                            &mut span_seq,
+                            iteration,
+                            Some(value),
+                            Some(delta),
+                            IterationStatus::Kept,
+                            false,
+                        );
+                    } else {
+                        // No improvement (Decision 1: optionally revert).
+                        let reverted = if revert_on_no_improvement {
+                            self.hill_climbing_revert().await;
+                            true
+                        } else {
+                            false
+                        };
+                        stagnation += 1;
+                        rows.push(ResultsEntry {
+                            iteration,
+                            commit_hash: self.hill_climbing_commit_hash().await,
+                            metric_value: value,
+                            direction,
+                            status: IterationStatus::Discarded,
+                            duration,
+                            description: description.clone(),
+                            metadata: Default::default(),
+                        });
+                        self.emit_hill_climbing_span(
+                            &session_id,
+                            &task.id,
+                            &mut span_seq,
+                            iteration,
+                            Some(value),
+                            Some(delta),
+                            IterationStatus::Discarded,
+                            reverted,
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Crash/timeout/etc.: counts as a non-improvement. Optionally
+                    // revert, increment stagnation, record an empty-metric row.
+                    let status = IterationStatus::from_error(&err);
+                    let reverted = if revert_on_no_improvement {
+                        self.hill_climbing_revert().await;
+                        true
+                    } else {
+                        false
+                    };
+                    stagnation += 1;
+                    rows.push(ResultsEntry {
+                        iteration,
+                        commit_hash: self.hill_climbing_commit_hash().await,
+                        // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+                        metric_value: f64::NAN,
+                        direction,
+                        status,
+                        duration: Duration::ZERO,
+                        description: description.clone(),
+                        metadata: Default::default(),
+                    });
+                    self.emit_hill_climbing_span(
+                        &session_id,
+                        &task.id,
+                        &mut span_seq,
+                        iteration,
+                        None,
+                        None,
+                        status,
+                        reverted,
+                    );
+                }
+            }
+
+            // ── Stagnation halt (only when a cap is configured).
+            if let Some(limit) = max_stagnation {
+                if stagnation >= limit {
+                    self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
+                        .await;
+                    let result = RunResult::Failure {
+                        reason: HaltReason::StagnationLimitReached {
+                            iterations: stagnation,
+                            best_metric: current_best,
+                        },
+                        session_id,
+                        usage: total_usage,
+                        turns: carried.turns,
+                    };
+                    self.finalize_self_verifying(&result).await;
+                    return result;
+                }
+            }
+
+            iteration = iteration.saturating_add(1);
+        }
+
+        // Budget/turn cap reached without a stagnation halt — clean budget halt.
+        self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
+            .await;
+        let result = RunResult::Failure {
+            reason: HaltReason::BudgetExceeded {
+                limit_type: BudgetLimitType::Turns,
+            },
+            session_id,
+            usage: total_usage,
+            turns: carried.turns,
+        };
+        self.finalize_self_verifying(&result).await;
+        result
+    }
+
+    /// Revert the working tree to current HEAD for a no-improvement iteration
+    /// (issue #60, Decision 1). Runs `git reset --hard HEAD` THROUGH the sandbox;
+    /// the harness NEVER spawns git directly. A sandbox rejection / non-zero exit
+    /// is best-effort: the loop continues (the next agent turn re-derives state).
+    async fn hill_climbing_revert(&self) {
+        let args = [
+            "reset".to_string(),
+            "--hard".to_string(),
+            "HEAD".to_string(),
+        ];
+        let _ = self
+            .config
+            .sandbox
+            .execute_command("git", &args, None, None)
+            .await;
+    }
+
+    /// Resolve the `commit_hash` recorded on a HillClimbing TSV row (issue #60,
+    /// Decision 1). The harness never commits, so this is the EMPTY string unless
+    /// a [`VcsProvider`] is wired to supply a hash. v1 has no per-keep commit, so
+    /// we always return `None` (serialized as the empty string in the TSV); the
+    /// `VcsProvider` seam is reserved for a later revision.
+    async fn hill_climbing_commit_hash(&self) -> Option<String> {
+        None
+    }
+
+    /// Emit one fire-and-forget per-iteration observability span for a
+    /// HillClimbing run (issue #60). No-op when no provider is configured.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_hill_climbing_span(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        span_seq: &mut u64,
+        iteration: u32,
+        metric_value: Option<f64>,
+        delta: Option<f64>,
+        status: crate::metric::IterationStatus,
+        reverted: bool,
+    ) {
+        if let Some(obs) = self.config.observability.as_ref() {
+            let base = SpanBase::new_root(
+                SpanId::new(format!("{}-hill-{}", session_id.as_str(), *span_seq)),
+                session_id.clone(),
+                task_id.clone(),
+                SpanKind::Warn,
+                Timestamp::now(),
+            );
+            let status_str = serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+            obs.emit_warn(WarnSpan::new(
+                base,
+                WarnEvent::HillClimbingIteration {
+                    iteration,
+                    metric_value,
+                    delta,
+                    status: status_str,
+                    reverted,
+                },
+            ));
+            *span_seq += 1;
+        }
+    }
+
+    /// Serialize the HillClimbing results log and write it to
+    /// `{workspace_root}/.spore/results/{task_id}.tsv` (issue #60, Decisions 2/3).
+    /// Tab-separated, REQUIRED header, one row per iteration in ascending order.
+    /// Floats use exactly 6 decimal places for cross-language byte-identity.
+    /// `metric_value` is the empty string on crashed/timeout rows. `metadata` is
+    /// excluded. Best-effort: a filesystem error is swallowed (the run outcome is
+    /// authoritative, the TSV is a diagnostic artifact).
+    async fn write_hill_climbing_tsv(
+        &self,
+        workspace_root: &std::path::Path,
+        task_id: &TaskId,
+        rows: &[crate::metric::ResultsEntry],
+    ) {
+        let body = Self::render_hill_climbing_tsv(rows);
+        let dir = workspace_root.join(".spore/results");
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let path = dir.join(format!("{}.tsv", task_id.as_str()));
+        let _ = tokio::fs::write(&path, body).await;
+    }
+
+    /// Render the HillClimbing results-log TSV body (issue #60, Decisions 2/3).
+    /// Pure function over the rows so the exact byte content is unit-testable and
+    /// cross-language-comparable. Trailing newline after every row (including the
+    /// last) so appends and diffs stay line-oriented.
+    fn render_hill_climbing_tsv(rows: &[crate::metric::ResultsEntry]) -> String {
+        use crate::metric::IterationStatus;
+        let mut out = String::from(
+            "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n",
+        );
+        for r in rows {
+            // Decision 3: metric_value is EMPTY on crashed/timeout rows.
+            let metric_value = match r.status {
+                IterationStatus::Crashed | IterationStatus::Timeout => String::new(),
+                _ => format!("{:.6}", r.metric_value),
+            };
+            let commit_hash = r.commit_hash.clone().unwrap_or_default();
+            let direction = match r.direction {
+                OptimizationDirection::Minimize => "minimize",
+                OptimizationDirection::Maximize => "maximize",
+            };
+            let status = match r.status {
+                IterationStatus::Kept => "kept",
+                IterationStatus::Discarded => "discarded",
+                IterationStatus::Crashed => "crashed",
+                IterationStatus::Timeout => "timeout",
+            };
+            let duration_secs = format!("{:.6}", r.duration.as_secs_f64());
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                r.iteration,
+                commit_hash,
+                metric_value,
+                direction,
+                status,
+                duration_secs,
+                r.description
+            ));
+        }
+        out
+    }
+
     // (private outcome type for `run_plan_phase` is defined at module scope.)
 
     /// Drive the PlanExecute strategy (issue #59) — the two-phase loop.
@@ -4560,14 +5117,30 @@ impl StandardHarness {
                 self.run_self_verifying(task, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::HillClimbing { .. } => RunResult::Failure {
-                reason: HaltReason::StrategyNotYetImplemented {
-                    strategy: "hill_climbing".into(),
-                },
-                session_id: task.session_id,
-                usage: AggregateUsage::default(),
-                turns: 0,
-            },
+            LoopStrategy::HillClimbing {
+                direction,
+                max_stagnation,
+                revert_on_no_improvement,
+                min_improvement_delta,
+            } => {
+                // HillClimbing (issue #60) re-seeds a FRESH SessionState per
+                // agent-turn iteration INSIDE `run_hill_climbing` — the iteration-0
+                // baseline runs NO agent turn at all, and every subsequent
+                // iteration is its own bounded sub-run. The incoming
+                // `session_state` is intentionally discarded; the prompt is NOT
+                // seeded here.
+                let _ = session_state;
+                self.run_hill_climbing(
+                    task,
+                    direction,
+                    max_stagnation,
+                    revert_on_no_improvement,
+                    min_improvement_delta,
+                    budget_used,
+                    on_stream,
+                )
+                .await
+            }
         }
     }
 
@@ -5088,6 +5661,7 @@ mod tests {
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,
+            metric_evaluator: None,
         }
     }
 
@@ -6522,29 +7096,34 @@ mod tests {
         assert_eq!(reg.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    // Rule: non-ReAct strategies are explicitly marked NotYetImplemented.
+    // Rule (issue #60): HillClimbing is now implemented — it no longer returns
+    // StrategyNotYetImplemented. With no `metric_evaluator` wired it instead
+    // halts with the typed `HillClimbingMisconfigured` (Decision 6), exercised in
+    // the HillClimbing test block below. PlanExecute (#70), SelfVerifying (#61),
+    // and Ralph (#58) are likewise implemented and covered in their own blocks,
+    // so no loop strategy returns the generic stub anymore.
     #[tokio::test]
-    async fn non_react_strategies_marked_not_yet_implemented() {
+    async fn hill_climbing_no_longer_not_yet_implemented() {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
-        // Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented;
-        // it is exercised separately below. SelfVerifying (issue #61) and Ralph
-        // (issue #58) are now implemented and exercised in their own test blocks.
-        // Only HillClimbing still returns the generic stub.
-        for s in [LoopStrategy::HillClimbing {
+        let t = task(LoopStrategy::HillClimbing {
             direction: OptimizationDirection::Maximize,
             max_stagnation: None,
             revert_on_no_improvement: false,
             min_improvement_delta: None,
-        }] {
-            let t = task(s);
-            match h.run(HarnessRunOptions::new(t)).await {
-                RunResult::Failure {
-                    reason: HaltReason::StrategyNotYetImplemented { .. },
-                    ..
-                } => {}
-                other => panic!("expected StrategyNotYetImplemented, got {other:?}"),
+        });
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure { reason, .. } => {
+                assert!(
+                    !matches!(reason, HaltReason::StrategyNotYetImplemented { .. }),
+                    "HillClimbing must not return StrategyNotYetImplemented; got {reason:?}"
+                );
+                assert!(
+                    matches!(reason, HaltReason::HillClimbingMisconfigured { .. }),
+                    "expected HillClimbingMisconfigured with no evaluator wired; got {reason:?}"
+                );
             }
+            other => panic!("expected Failure, got {other:?}"),
         }
     }
 
@@ -7740,6 +8319,7 @@ mod tests {
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
                 max_resets: 3,
                 vcs_provider: None,
+                metric_evaluator: None,
             })
         }
 
@@ -7859,6 +8439,7 @@ mod tests {
                     assert_eq!(missing_items, &vec!["payment".to_string()]);
                     assert!(*accepted_anyway);
                 }
+                other => panic!("expected CompactionVerificationFailed, got {other:?}"),
             }
             // SessionMetrics failure counter == 1. Seed an outcome so metrics
             // are produced even though no turn span was emitted in this unit.
@@ -8076,6 +8657,10 @@ mod tests {
                             );
                             assert!(*accepted_anyway, "case `{}`: accepted_anyway", case.name);
                         }
+                        other => panic!(
+                            "case `{}`: expected CompactionVerificationFailed, got {other:?}",
+                            case.name
+                        ),
                     }
                 }
                 if let Some(expected_inject) = &case.expected.retry_injected_missing {
@@ -9549,6 +10134,618 @@ mod tests {
                     assert_eq!(got, iterations, "case `{}` iteration count", case.name);
                 }
                 (_, other) => panic!("case `{}`: unexpected result {other:?}", case.name),
+            }
+        }
+    }
+
+    // ========================================================================
+    // HillClimbing loop strategy (issue #60)
+    // ========================================================================
+
+    use crate::metric::{
+        IterationStatus, MetricError, MetricEvaluator, MetricResult, ResultsEntry,
+    };
+    use crate::termination::SessionStateSnapshot as HcSnapshot;
+
+    fn hill_task(
+        direction: OptimizationDirection,
+        max_stagnation: Option<u32>,
+        revert: bool,
+        min_delta: Option<f64>,
+    ) -> Task {
+        // Give a generous turn budget so the loop is bounded by stagnation, not
+        // turns, unless a test overrides it.
+        let mut t = task(LoopStrategy::HillClimbing {
+            direction,
+            max_stagnation,
+            revert_on_no_improvement: revert,
+            min_improvement_delta: min_delta,
+        });
+        t.budget.max_turns = Some(50);
+        t
+    }
+
+    /// A `MetricEvaluator` test double returning a pre-programmed sequence of
+    /// `Result<MetricResult, MetricError>` — one per `evaluate` call (call 0 is
+    /// the baseline). Records how many times it was evaluated.
+    struct ScriptedMetricEvaluator {
+        outcomes: StdMutex<std::collections::VecDeque<Result<MetricResult, MetricError>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        direction: OptimizationDirection,
+        description: String,
+    }
+    impl ScriptedMetricEvaluator {
+        fn new(values: Vec<Result<f64, MetricError>>, direction: OptimizationDirection) -> Self {
+            let outcomes = values
+                .into_iter()
+                .map(|v| v.map(MetricResult::new))
+                .collect();
+            Self {
+                outcomes: StdMutex::new(outcomes),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                direction,
+                description: "scripted metric".to_string(),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl MetricEvaluator for ScriptedMetricEvaluator {
+        fn evaluate<'a>(
+            &'a self,
+            _sandbox: &'a dyn SandboxProvider,
+            _session_state: &'a HcSnapshot,
+        ) -> BoxFut<'a, Result<MetricResult, MetricError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.outcomes.lock().unwrap().pop_front().unwrap_or(Err(
+                MetricError::ExecutionFailed {
+                    reason: "scripted evaluator exhausted".into(),
+                },
+            ));
+            Box::pin(async move { next })
+        }
+        fn direction(&self) -> OptimizationDirection {
+            self.direction
+        }
+        fn description(&self) -> String {
+            self.description.clone()
+        }
+    }
+
+    /// A `SandboxProvider` rooted at a tempdir that spies on `git reset --hard
+    /// HEAD` revert calls (issue #60, Decision 1). Counts every `execute_command`
+    /// whose argv is exactly the revert command and returns a clean exit.
+    struct HcSpySandbox {
+        root: tempfile::TempDir,
+        reverts: std::sync::atomic::AtomicUsize,
+    }
+    impl HcSpySandbox {
+        fn new() -> Self {
+            Self {
+                root: tempfile::tempdir().unwrap(),
+                reverts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn revert_count(&self) -> usize {
+            self.reverts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl SandboxProvider for HcSpySandbox {
+        fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn execute_command<'a>(
+            &'a self,
+            command: &'a str,
+            args: &'a [String],
+            _working_dir: Option<&'a std::path::Path>,
+            _timeout: Option<std::time::Duration>,
+        ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+            if command == "git" && args == ["reset", "--hard", "HEAD"] {
+                self.reverts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Box::pin(async {
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                    truncated: false,
+                })
+            })
+        }
+        fn workspace_root(&self) -> &std::path::Path {
+            self.root.path()
+        }
+    }
+
+    /// Build a HillClimbing config wired with the scripted evaluator and spy
+    /// sandbox. The agent always finishes a turn immediately (one final response
+    /// per iteration), so the loop is driven entirely by the metric sequence.
+    fn hc_config(
+        evaluator: Arc<ScriptedMetricEvaluator>,
+        sandbox: Arc<HcSpySandbox>,
+    ) -> HarnessConfig {
+        // A fresh "done" turn for every possible iteration (the agent is re-seeded
+        // per iteration, so each iteration pops exactly one turn).
+        let agent = RecordingTurnAgent::new(
+            "hc",
+            (0..64)
+                .map(|_| RecordingTurnAgent::final_resp("changed"))
+                .collect(),
+        );
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent;
+        cfg.sandbox = sandbox;
+        cfg.metric_evaluator = Some(evaluator);
+        cfg
+    }
+
+    // Decision 6: a None evaluator halts with HillClimbingMisconfigured (no panic).
+    #[tokio::test]
+    async fn hill_climbing_missing_evaluator_is_typed_halt() {
+        let cfg = standard_config(make_agent());
+        let h = StandardHarness::new(cfg);
+        let t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason: HaltReason::HillClimbingMisconfigured { reason },
+                ..
+            } => assert!(reason.contains("metric_evaluator"), "got: {reason}"),
+            other => panic!("expected HillClimbingMisconfigured, got {other:?}"),
+        }
+    }
+
+    // Decision 5: iteration 0 is a pure baseline (no agent turn) recorded Kept,
+    // and it seeds current_best. With max_stagnation = 1 and an immediate regress
+    // at iteration 1, the loop halts; we confirm the baseline row is Kept and the
+    // agent ran exactly once (only iteration 1's turn, never the baseline).
+    #[tokio::test]
+    async fn hill_climbing_baseline_first_status_kept_no_agent_turn() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        // baseline 1.0, then a worse value (regress) for maximize.
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(0.5)],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval.clone(), sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        let h = StandardHarness::new(cfg);
+        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let task_id = t.id.as_str().to_string();
+        let r = h.run(HarnessRunOptions::new(t)).await;
+        assert!(
+            matches!(
+                r,
+                RunResult::Failure {
+                    reason: HaltReason::StagnationLimitReached { .. },
+                    ..
+                }
+            ),
+            "got {r:?}"
+        );
+        // Two evaluator calls: baseline + iteration 1.
+        assert_eq!(eval.call_count(), 2);
+        // The TSV baseline row is Kept.
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .expect("tsv written");
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription"
+        );
+        assert!(lines[1].starts_with("0\t"), "baseline is iteration 0");
+        assert!(
+            lines[1].contains("\tkept\t"),
+            "baseline status kept: {}",
+            lines[1]
+        );
+    }
+
+    // keep-on-improve: a strictly better value updates current_best and resets
+    // stagnation. With maximize, baseline 1.0 then 2.0 (improve) then 1.5 (regress
+    // vs 2.0) then 3.0 (improve). max_stagnation None ⇒ runs to the turn budget.
+    #[tokio::test]
+    async fn hill_climbing_keeps_on_improvement() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(2.0), Ok(1.5), Ok(3.0)],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval.clone(), sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        // Cap turns at 3 so exactly iterations 1,2,3 run (then budget halt).
+        let mut t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        t.budget.max_turns = Some(3);
+        let task_id = t.id.as_str().to_string();
+        let _ = h_run(&cfg, t).await;
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .unwrap();
+        let lines: Vec<&str> = tsv.lines().collect();
+        // header + baseline(0) + iter1(2.0 kept) + iter2(1.5 discarded) + iter3(3.0 kept)
+        assert_eq!(lines.len(), 5, "tsv:\n{tsv}");
+        assert!(lines[1].contains("\t1.000000\t") && lines[1].contains("\tkept\t"));
+        assert!(lines[2].contains("\t2.000000\t") && lines[2].contains("\tkept\t"));
+        assert!(lines[3].contains("\t1.500000\t") && lines[3].contains("\tdiscarded\t"));
+        assert!(lines[4].contains("\t3.000000\t") && lines[4].contains("\tkept\t"));
+        let _ = eval;
+    }
+
+    // discard-on-regress with revert OFF: no git reset issued.
+    #[tokio::test]
+    async fn hill_climbing_discards_on_regress_no_revert() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(2.0), Ok(3.0)], // minimize: baseline 2.0, then 3.0 (worse)
+            OptimizationDirection::Minimize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let t = hill_task(OptimizationDirection::Minimize, Some(1), false, None);
+        let _ = h_run(&cfg, t).await;
+        assert_eq!(sandbox.revert_count(), 0, "revert OFF must not git reset");
+    }
+
+    // revert ON: a no-improvement iteration triggers exactly one git reset.
+    #[tokio::test]
+    async fn hill_climbing_reverts_on_no_improvement() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(2.0), Ok(3.0)], // minimize: baseline 2.0, then 3.0 (worse)
+            OptimizationDirection::Minimize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let t = hill_task(OptimizationDirection::Minimize, Some(1), true, None);
+        let _ = h_run(&cfg, t).await;
+        assert_eq!(sandbox.revert_count(), 1, "revert ON must git reset once");
+    }
+
+    // strict min_delta boundary: an improvement of exactly min_delta is NOT
+    // progress (discarded). Minimize, baseline 2.0, then 1.5 with min_delta 0.5.
+    #[tokio::test]
+    async fn hill_climbing_strict_min_delta_boundary() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(2.0), Ok(1.5)],
+            OptimizationDirection::Minimize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        let t = hill_task(OptimizationDirection::Minimize, Some(1), false, Some(0.5));
+        let task_id = t.id.as_str().to_string();
+        let r = h_run(&cfg, t).await;
+        // Exactly-min_delta improvement is discarded ⇒ stagnation hits 1 ⇒ halt.
+        match r {
+            RunResult::Failure {
+                reason: HaltReason::StagnationLimitReached { best_metric, .. },
+                ..
+            } => assert!((best_metric - 2.0).abs() < 1e-9, "best stays baseline 2.0"),
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .unwrap();
+        assert!(
+            tsv.lines().nth(2).unwrap().contains("\tdiscarded\t"),
+            "exactly-min_delta is discarded: {tsv}"
+        );
+    }
+
+    // stagnation halt after N consecutive non-improvements.
+    #[tokio::test]
+    async fn hill_climbing_stagnation_halt() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        // maximize, baseline 5.0, then three regresses.
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(5.0), Ok(4.0), Ok(4.0), Ok(4.0)],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let t = hill_task(OptimizationDirection::Maximize, Some(3), false, None);
+        match h_run(&cfg, t).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::StagnationLimitReached {
+                        iterations,
+                        best_metric,
+                    },
+                ..
+            } => {
+                assert_eq!(iterations, 3);
+                assert!((best_metric - 5.0).abs() < 1e-9);
+            }
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+    }
+
+    // stagnation counter resets on improvement: regress, regress, IMPROVE, regress
+    // never reaches a stagnation cap of 3.
+    #[tokio::test]
+    async fn hill_climbing_stagnation_resets_on_improve() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        // maximize: baseline 1.0; iters: 0.5(regress) 0.5(regress) 2.0(improve!) 1.0(regress)
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(0.5), Ok(0.5), Ok(2.0), Ok(1.0)],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        // Cap turns at 4 so the improve at iter 3 resets the counter and the run
+        // ends on the turn budget rather than stagnation.
+        let mut t = hill_task(OptimizationDirection::Maximize, Some(3), false, None);
+        t.budget.max_turns = Some(4);
+        match h_run(&cfg, t).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                ..
+            } => {}
+            other => panic!("expected Turns budget halt (counter reset), got {other:?}"),
+        }
+    }
+
+    // crash counts as a non-improvement: a Crashed evaluation increments
+    // stagnation and writes an EMPTY metric_value row.
+    #[tokio::test]
+    async fn hill_climbing_crash_counts_as_non_improvement() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Err(MetricError::Crashed { log: "boom".into() })],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let task_id = t.id.as_str().to_string();
+        match h_run(&cfg, t).await {
+            RunResult::Failure {
+                reason: HaltReason::StagnationLimitReached { .. },
+                ..
+            } => {}
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .unwrap();
+        let crash_row = tsv.lines().nth(2).unwrap();
+        // metric_value column (3rd, index 2) is EMPTY on a crashed row.
+        let cols: Vec<&str> = crash_row.split('\t').collect();
+        assert_eq!(cols[2], "", "crashed row metric_value empty: {crash_row}");
+        assert_eq!(cols[4], "crashed", "crashed status: {crash_row}");
+    }
+
+    // timeout counts as non-improvement and maps to the `timeout` status.
+    #[tokio::test]
+    async fn hill_climbing_timeout_status() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![
+                Ok(1.0),
+                Err(MetricError::Timeout {
+                    after: std::time::Duration::from_secs(1),
+                }),
+            ],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval, sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let task_id = t.id.as_str().to_string();
+        let _ = h_run(&cfg, t).await;
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .unwrap();
+        let cols: Vec<&str> = tsv.lines().nth(2).unwrap().split('\t').collect();
+        assert_eq!(cols[4], "timeout");
+        assert_eq!(cols[2], "", "timeout row metric_value empty");
+    }
+
+    // budget gate: max_turns = 0 halts before any agent turn (only the baseline
+    // runs). The result is a Turns budget halt with a baseline-only TSV.
+    #[tokio::test]
+    async fn hill_climbing_budget_turn_gate() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0)],
+            OptimizationDirection::Maximize,
+        ));
+        let cfg = hc_config(eval.clone(), sandbox.clone());
+        let workspace = sandbox.root.path().to_path_buf();
+        let mut t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        t.budget.max_turns = Some(0);
+        let task_id = t.id.as_str().to_string();
+        match h_run(&cfg, t).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                ..
+            } => {}
+            other => panic!("expected Turns budget halt, got {other:?}"),
+        }
+        // Only the baseline evaluation ran.
+        assert_eq!(eval.call_count(), 1);
+        let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+            .unwrap();
+        assert_eq!(tsv.lines().count(), 2, "header + baseline only: {tsv}");
+    }
+
+    // Exact TSV byte content for a representative keep/discard/crash scenario.
+    #[tokio::test]
+    async fn hill_climbing_exact_tsv_bytes() {
+        let rows = vec![
+            ResultsEntry {
+                iteration: 0,
+                commit_hash: None,
+                metric_value: 1.0,
+                direction: OptimizationDirection::Maximize,
+                status: IterationStatus::Kept,
+                duration: std::time::Duration::from_millis(1500),
+                description: "scripted metric".into(),
+                metadata: Default::default(),
+            },
+            ResultsEntry {
+                iteration: 1,
+                commit_hash: None,
+                metric_value: 2.5,
+                direction: OptimizationDirection::Maximize,
+                status: IterationStatus::Kept,
+                duration: std::time::Duration::from_secs(0),
+                description: "scripted metric".into(),
+                metadata: Default::default(),
+            },
+            ResultsEntry {
+                iteration: 2,
+                commit_hash: None,
+                metric_value: f64::NAN, // crashed ⇒ empty in TSV
+                direction: OptimizationDirection::Maximize,
+                status: IterationStatus::Crashed,
+                duration: std::time::Duration::from_secs(0),
+                description: "scripted metric".into(),
+                metadata: Default::default(),
+            },
+        ];
+        let tsv = StandardHarness::render_hill_climbing_tsv(&rows);
+        let expected =
+            "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n\
+0\t\t1.000000\tmaximize\tkept\t1.500000\tscripted metric\n\
+1\t\t2.500000\tmaximize\tkept\t0.000000\tscripted metric\n\
+2\t\t\tmaximize\tcrashed\t0.000000\tscripted metric\n";
+        assert_eq!(tsv, expected, "TSV byte mismatch");
+    }
+
+    /// Helper: build a StandardHarness from `cfg` and run `task` to completion.
+    async fn h_run(cfg: &HarnessConfig, t: Task) -> RunResult {
+        let h = StandardHarness::new(cfg.clone());
+        h.run(HarnessRunOptions::new(t)).await
+    }
+
+    // ── HillClimbing cross-language fixture replay ──────────────────────────
+    #[derive(serde::Deserialize)]
+    struct HcFixtureSuite {
+        scenarios: Vec<HcScenario>,
+    }
+    #[derive(serde::Deserialize)]
+    struct HcScenario {
+        name: String,
+        /// Scripted metric sequence; element 0 is the baseline. `null` = a crash.
+        metric_sequence: Vec<Option<f64>>,
+        payload: HcPayload,
+        expected: HcExpected,
+        /// Optional exact-TSV byte assertion for this scenario.
+        #[serde(default)]
+        expected_tsv: Option<String>,
+        /// Optional turn-budget override (defaults to a high cap).
+        #[serde(default)]
+        max_turns: Option<u32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct HcPayload {
+        direction: OptimizationDirection,
+        max_stagnation: Option<u32>,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: Option<f64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct HcExpected {
+        /// `"stagnation"` | `"budget_turns"` | `"misconfigured"`.
+        halt_reason: String,
+        kept_iterations: u32,
+        revert_count: usize,
+        #[serde(default)]
+        best_metric: Option<f64>,
+    }
+
+    #[tokio::test]
+    async fn hill_climbing_fixture_replay() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/metric_evaluator/hill_climbing_sequences.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let suite: HcFixtureSuite = serde_json::from_str(&raw).expect("fixture parses");
+        for sc in suite.scenarios {
+            let sandbox = Arc::new(HcSpySandbox::new());
+            let values: Vec<Result<f64, MetricError>> = sc
+                .metric_sequence
+                .iter()
+                .map(|v| match v {
+                    Some(x) => Ok(*x),
+                    None => Err(MetricError::Crashed {
+                        log: "scripted crash".into(),
+                    }),
+                })
+                .collect();
+            let eval = Arc::new(ScriptedMetricEvaluator::new(values, sc.payload.direction));
+            let cfg = hc_config(eval, sandbox.clone());
+            let workspace = sandbox.root.path().to_path_buf();
+            let mut t = hill_task(
+                sc.payload.direction,
+                sc.payload.max_stagnation,
+                sc.payload.revert_on_no_improvement,
+                sc.payload.min_improvement_delta,
+            );
+            if let Some(mt) = sc.max_turns {
+                t.budget.max_turns = Some(mt);
+            }
+            let task_id = t.id.as_str().to_string();
+            let r = h_run(&cfg, t).await;
+
+            // Halt reason.
+            match (sc.expected.halt_reason.as_str(), &r) {
+                (
+                    "stagnation",
+                    RunResult::Failure {
+                        reason: HaltReason::StagnationLimitReached { best_metric, .. },
+                        ..
+                    },
+                ) => {
+                    if let Some(exp) = sc.expected.best_metric {
+                        assert!(
+                            (best_metric - exp).abs() < 1e-9,
+                            "scenario `{}` best_metric: got {best_metric}, want {exp}",
+                            sc.name
+                        );
+                    }
+                }
+                (
+                    "budget_turns",
+                    RunResult::Failure {
+                        reason:
+                            HaltReason::BudgetExceeded {
+                                limit_type: BudgetLimitType::Turns,
+                            },
+                        ..
+                    },
+                ) => {}
+                (other_exp, other_got) => panic!(
+                    "scenario `{}`: expected halt `{other_exp}`, got {other_got:?}",
+                    sc.name
+                ),
+            }
+
+            // Kept-iteration count and revert count from the written TSV.
+            let tsv =
+                std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
+                    .unwrap_or_else(|e| panic!("scenario `{}` tsv: {e}", sc.name));
+            let kept = tsv
+                .lines()
+                .skip(1)
+                .filter(|l| l.contains("\tkept\t"))
+                .count() as u32;
+            assert_eq!(
+                kept, sc.expected.kept_iterations,
+                "scenario `{}` kept count; tsv:\n{tsv}",
+                sc.name
+            );
+            assert_eq!(
+                sandbox.revert_count(),
+                sc.expected.revert_count,
+                "scenario `{}` revert count",
+                sc.name
+            );
+
+            // Optional exact-TSV byte assertion.
+            if let Some(expected_tsv) = &sc.expected_tsv {
+                assert_eq!(&tsv, expected_tsv, "scenario `{}` TSV bytes", sc.name);
             }
         }
     }
