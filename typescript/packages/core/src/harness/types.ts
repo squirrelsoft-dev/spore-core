@@ -714,7 +714,16 @@ export type HaltReason =
    * wiring. Surfaced as a typed halt, NOT a throw. PEER to
    * {@link self_verify_exhausted} (NOT a sub-case of it).
    */
-  | { kind: "self_verify_misconfigured"; reason: string };
+  | { kind: "self_verify_misconfigured"; reason: string }
+  /**
+   * Returned by {@link StandardHarness} for the `ralph` strategy (issue #58, B3)
+   * when the multi-context-window continuation loop reached its `maxResets`
+   * outer-loop cap with tasks still incomplete (the external completion check —
+   * `.spore/progress.json` + `.spore/feature_list.json` — never passed). Carries
+   * the number of context windows run and the last incompletion reason. PEER to
+   * {@link self_verify_exhausted}.
+   */
+  | { kind: "ralph_completion_unmet"; iterations: number; last_reason: string };
 
 export type RunResult =
   | {

@@ -7,7 +7,7 @@
  * produces the same outcome on every target.
  */
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
@@ -83,10 +83,16 @@ describe("AlwaysComplete", () => {
 // ---------------------------------------------------------------------------
 
 describe("FeatureListCheck", () => {
+  // Default path is `.spore/feature_list.json` (issue #58, B2).
+  function writeDefaultFeatureList(dir: string, body: string): void {
+    mkdirSync(join(dir, ".spore"), { recursive: true });
+    writeFileSync(join(dir, ".spore", "feature_list.json"), body);
+  }
+
   it("returns null when all features pass", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-fl-"));
-    writeFileSync(
-      join(dir, "feature_list.json"),
+    writeDefaultFeatureList(
+      dir,
       JSON.stringify([
         { name: "a", passes: true },
         { name: "b", passes: true },
@@ -97,8 +103,8 @@ describe("FeatureListCheck", () => {
 
   it("returns a reason listing failing features", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-fl-"));
-    writeFileSync(
-      join(dir, "feature_list.json"),
+    writeDefaultFeatureList(
+      dir,
       JSON.stringify([
         { name: "a", passes: true },
         { name: "b", passes: false },
@@ -121,7 +127,7 @@ describe("FeatureListCheck", () => {
 
   it("returns an invalid-JSON reason when the file is malformed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-fl-"));
-    writeFileSync(join(dir, "feature_list.json"), "not json");
+    writeDefaultFeatureList(dir, "not json");
     const r = await new FeatureListCheck().check(snapshotIn(dir));
     expect(r).not.toBeNull();
     expect(r).toContain("invalid JSON");

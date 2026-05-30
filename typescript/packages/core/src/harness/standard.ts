@@ -14,6 +14,9 @@
  * 9. Subagents cannot spawn subagents (depth-1 enforcement in types).
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import type { Agent } from "../agent/interface.js";
 import type { Context } from "../agent/types.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
@@ -52,6 +55,8 @@ import type { Verifier, VerifierInput } from "../verifier/types.js";
 import { ReadOnlySandbox } from "../sandbox/read-only-sandbox.js";
 import { newSessionState as newContextSessionState } from "../context/types.js";
 import {
+  FunctionHook,
+  StandardHookChain,
   emptyTurnOutput,
   type FireOutcome,
   type HookChain,
@@ -192,12 +197,55 @@ export interface HarnessConfig {
    * supply an evaluator sandbox or chunk provider here.
    */
   evaluatorAgent?: Agent;
+  /**
+   * Outer-loop reset cap for the `ralph` loop strategy (issue #58, B3). The
+   * maximum number of context-window RESETS the multi-context-window
+   * continuation loop runs before halting with {@link HaltReason}
+   * `ralph_completion_unmet` when tasks are still incomplete. Independent of
+   * `max_turns` (the per-window ReAct turn budget) and {@link maxStopBlocks}.
+   * Optional; defaults to `3`. Clamped to a minimum of `1`. Ignored by every
+   * other strategy.
+   */
+  maxResets?: number;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
+const DEFAULT_MAX_RESETS = 3;
 
 export class StandardHarness implements Harness {
-  constructor(private readonly config: HarnessConfig) {}
+  constructor(private readonly config: HarnessConfig) {
+    // Issue #58, B1: drive Ralph off the Stop hook. Register a `stop` hook at
+    // construction that reads `.spore/progress.json` under the sandbox's
+    // workspace root: while tasks remain incomplete it blocks (the loop
+    // continues into a new context window); all complete ⇒ continue (the loop
+    // terminates). Absent progress file ⇒ continue, so the hook is INERT for a
+    // non-Ralph run over the same workspace (matching the Rust reference, which
+    // registers the hook at construction).
+    //
+    // Registered ONLY when the sandbox exposes a concrete workspace root —
+    // without one, `.spore/progress.json` cannot be resolved deterministically,
+    // and registering would perturb the `config.hooks`-absent contract every
+    // non-Ralph caller relies on. Goes into the configured chain, or a fresh
+    // `StandardHookChain` when none was supplied.
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    if (workspaceRoot.length > 0) {
+      const chain = this.config.hooks ?? new StandardHookChain();
+      chain.register(
+        new FunctionHook("ralph-stop", ["stop"], (ctx) => {
+          if (ctx.event !== "stop") return { decision: "continue" };
+          // Absent progress file ⇒ do not interfere with non-Ralph runs over
+          // this workspace (the completion mechanism only engages once a
+          // `.spore/progress.json` is present). Mirrors the Rust RalphStopHook.
+          if (!StandardHarness.ralphProgressFilePresent(workspaceRoot)) {
+            return { decision: "continue" };
+          }
+          const reason = StandardHarness.ralphCompletionStatus(workspaceRoot);
+          return reason == null ? { decision: "continue" } : { decision: "block", reason };
+        }),
+      );
+      this.config = { ...this.config, hooks: chain };
+    }
+  }
 
   /**
    * The configured {@link StorageProvider} (issue #73). Defaults to an all-no-op
@@ -344,7 +392,7 @@ export class StandardHarness implements Harness {
           options.signal,
         );
       case "ralph":
-        return notYetImplemented("ralph", task.session_id);
+        return this.runRalph(task, budgetUsed, options.on_stream);
       case "self_verifying":
         return this.runSelfVerifying(task, sessionState, budgetUsed, options.on_stream);
       case "hill_climbing":
@@ -1313,6 +1361,240 @@ export class StandardHarness implements Harness {
         await this.finalizeObservability(result.session_id, { kind: "escalated" });
         break;
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Ralph (issue #58) — multi-context-window continuation loop
+  // --------------------------------------------------------------------------
+
+  /**
+   * Drive the `ralph` loop strategy (issue #58) — the multi-context-window
+   * continuation loop. Each OUTER iteration is ONE context window: a FRESH
+   * {@link SessionState} (no message carryover) re-seeded with the instruction
+   * plus the reloaded `.spore/` state, then a bounded inner ReAct sub-loop. The
+   * external completion check (B1) reads `.spore/progress.json` +
+   * `.spore/feature_list.json` — the SAME files the registered `ralph-stop` hook
+   * reads. Incomplete ⇒ reset into a new window; all complete ⇒ `success`.
+   *
+   * ## Resolved spec decisions (issue #58 — all FINAL)
+   * - **B1:** completion is driven off the Stop hook; the OUTER loop consults the
+   *   SAME filesystem check ({@link ralphCompletionStatus}) to decide reset vs
+   *   success. No `completion_check` config field; the deprecated CompletionCheck
+   *   trait is NOT reused.
+   * - **B2:** canonical paths `.spore/progress.json` + `.spore/feature_list.json`.
+   * - **B3:** {@link HarnessConfig.maxResets} (default 3) caps the OUTER loop,
+   *   independent of `max_turns`. Exhausting it with tasks incomplete yields
+   *   {@link HaltReason} `ralph_completion_unmet { iterations, last_reason }`.
+   * - **B4:** v1 reloads ONLY progress + feature_list (no git). Hermetic.
+   *
+   * ## Rules enforced (each maps to a test):
+   * - R1 the model's exit attempt RESETS the context window instead of
+   *   terminating, while tasks remain incomplete.
+   * - R2 each reset builds a FRESH {@link SessionState} — no message carryover.
+   * - R3 the filesystem reload injects the reloaded `.spore/` content into the
+   *   fresh seed.
+   * - R4 `incomplete,incomplete,complete` ⇒ `success` at iteration 3.
+   * - R5 always-incomplete ⇒ exactly `maxResets` iterations ⇒
+   *   `failure { ralph_completion_unmet }`.
+   * - R6 budgets fold across ALL context windows.
+   * - R7 each reset is traceable (a distinct generated session id per window).
+   */
+  private async runRalph(
+    task: Task,
+    _budgetUsed: BudgetSnapshot,
+    _onStream: StreamSink | undefined,
+  ): Promise<RunResult> {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    const maxResets = Math.max(this.config.maxResets ?? DEFAULT_MAX_RESETS, 1);
+
+    // Cumulative usage + turns across ALL context windows (R6). Each window is a
+    // fresh start with its own per-window turn budget; token/turn accounting is
+    // accumulated separately for terminal reporting.
+    const totalUsage: AggregateUsage = emptyAggregateUsage();
+    const carriedAccounting: BudgetSnapshot = emptyBudgetSnapshot();
+    // The most recent incompletion reason (for ralph_completion_unmet).
+    let lastReason = ".spore/progress.json missing";
+    // Session id of the most recent context window (terminal accounting).
+    let lastSessionId = task.session_id;
+
+    // The OUTER loop: each iteration is ONE context window (R1). `maxResets`
+    // caps the number of windows (B3).
+    for (let iteration = 0; iteration < maxResets; iteration += 1) {
+      // R7: a fresh, distinct session id per context window so each reset is
+      // independently traceable. Window 0 keeps the task's session id.
+      const windowSessionId = iteration === 0 ? task.session_id : SessionId.generate();
+      lastSessionId = windowSessionId;
+
+      // R2: a FRESH SessionState per window — no message carryover.
+      const sessionState = emptySessionState();
+
+      // R2: seed the instruction, then R3: reload the deterministic `.spore/`
+      // state from the filesystem and inject it as context so the fresh window
+      // knows what is already done / still outstanding.
+      await this.config.contextManager.appendUserMessage(sessionState, task.instruction);
+      const reload = StandardHarness.ralphReloadContext(workspaceRoot);
+      if (reload != null) {
+        await this.config.contextManager.appendUserMessage(sessionState, reload);
+      }
+
+      // The per-window bounded ReAct sub-loop. The registered `ralph-stop` hook
+      // (B1) fires inside it on each final response; this strategy's OUTER loop
+      // then decides reset vs success. FRESH per-window budget (the reset
+      // discards the turn budget); token fold is accumulated via `totalUsage`.
+      const windowTask: Task = {
+        id: task.id,
+        instruction: task.instruction,
+        session_id: windowSessionId,
+        budget: task.budget,
+        loop_strategy: task.loop_strategy,
+      };
+      const windowCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+      const windowResult = await this.runReactInner(
+        windowTask,
+        windowCap,
+        sessionState,
+        emptyBudgetSnapshot(),
+        undefined,
+        undefined,
+        // The instruction is seeded above; the sub-loop must NOT re-seed it.
+        false,
+      );
+      foldUsage(totalUsage, carriedAccounting, windowResult);
+
+      // A window that paused / escalated is propagated up unchanged.
+      if (windowResult.kind === "waiting_for_human") {
+        return windowResult;
+      }
+      if (windowResult.kind === "escalate") {
+        await this.finalizeSelfVerifying(windowResult);
+        return windowResult;
+      }
+
+      // External completion check (B1): consult the SAME filesystem state the
+      // Stop hook reads. `null` ⇒ done ⇒ success; otherwise tasks remain ⇒ reset
+      // into the next window (R1) unless the cap is reached (R5).
+      const status = StandardHarness.ralphCompletionStatus(workspaceRoot);
+      if (status == null) {
+        const output = windowResult.kind === "success" ? windowResult.output : "";
+        const result: RunResult = {
+          kind: "success",
+          output,
+          session_id: windowSessionId,
+          usage: totalUsage,
+          turns: carriedAccounting.turns,
+        };
+        await this.finalizeSelfVerifying(result);
+        return result;
+      }
+      lastReason = status;
+    }
+
+    // R5: ran out of context-window resets without completion.
+    const result: RunResult = {
+      kind: "failure",
+      reason: { kind: "ralph_completion_unmet", iterations: maxResets, last_reason: lastReason },
+      session_id: lastSessionId,
+      usage: totalUsage,
+      turns: carriedAccounting.turns,
+    };
+    await this.finalizeSelfVerifying(result);
+    return result;
+  }
+
+  /**
+   * Ralph external completion check (issue #58, B1). Reads the deterministic
+   * `.spore/` files under `workspaceRoot` and reports whether the task is
+   * complete: `null` when complete, a reason string when tasks remain. This is
+   * the SAME logic the registered `ralph-stop` hook applies — one source of
+   * truth for the completion mechanism.
+   *
+   * Contract (B4 — no git):
+   *   - `.spore/progress.json`: `{ "complete": boolean, "remaining": string[] }`.
+   *     `complete: true` with empty `remaining` ⇒ progress satisfied.
+   *     Missing/unreadable/invalid ⇒ incomplete (so the agent learns to write it).
+   *   - `.spore/feature_list.json`: a JSON array of `{ "name", "passes" }`. Any
+   *     `passes: false` ⇒ incomplete. A MISSING feature list is tolerated here
+   *     (progress.json is the primary signal); an invalid one is not.
+   */
+  /**
+   * Whether `.spore/progress.json` exists under `workspaceRoot` (issue #58).
+   * The registered `ralph-stop` hook uses this to stay INERT for non-Ralph runs
+   * over the same workspace: with no progress file the completion mechanism does
+   * not engage. Mirrors the Rust RalphStopHook's `progress_path.exists()` guard.
+   */
+  static ralphProgressFilePresent(workspaceRoot: string): boolean {
+    return existsSync(join(workspaceRoot, ".spore", "progress.json"));
+  }
+
+  static ralphCompletionStatus(workspaceRoot: string): string | null {
+    const progressPath = join(workspaceRoot, ".spore", "progress.json");
+    let raw: string;
+    try {
+      raw = readFileSync(progressPath, "utf-8");
+    } catch {
+      return ".spore/progress.json missing";
+    }
+    let progress: { complete?: unknown; remaining?: unknown };
+    try {
+      progress = JSON.parse(raw) as { complete?: unknown; remaining?: unknown };
+    } catch (e) {
+      return `.spore/progress.json invalid JSON: ${(e as Error).message}`;
+    }
+    const remaining = Array.isArray(progress.remaining)
+      ? (progress.remaining as unknown[]).map(String)
+      : [];
+    if (progress.complete !== true) {
+      return remaining.length === 0
+        ? "task not marked complete"
+        : `remaining: ${remaining.join(", ")}`;
+    }
+    if (remaining.length > 0) {
+      return `remaining: ${remaining.join(", ")}`;
+    }
+
+    // Progress says done — corroborate against the feature list when present.
+    const featurePath = join(workspaceRoot, ".spore", "feature_list.json");
+    let featureRaw: string;
+    try {
+      featureRaw = readFileSync(featurePath, "utf-8");
+    } catch {
+      return null; // A missing feature list is tolerated.
+    }
+    let entries: { name?: unknown; passes?: unknown }[];
+    try {
+      entries = JSON.parse(featureRaw) as { name?: unknown; passes?: unknown }[];
+    } catch (e) {
+      return `.spore/feature_list.json invalid JSON: ${(e as Error).message}`;
+    }
+    const incomplete = entries.filter((x) => x.passes !== true).map((x) => String(x.name));
+    if (incomplete.length > 0) {
+      return `incomplete features: ${incomplete.join(", ")}`;
+    }
+    return null;
+  }
+
+  /**
+   * Build the filesystem-reload context block injected into each fresh context
+   * window (issue #58, R3). Returns the verbatim `.spore/progress.json` and
+   * `.spore/feature_list.json` contents (when present) so the re-seeded window
+   * knows what is already done and what remains. Returns `null` when neither
+   * file exists (nothing to reload).
+   */
+  static ralphReloadContext(workspaceRoot: string): string | null {
+    const parts: string[] = [];
+    try {
+      const raw = readFileSync(join(workspaceRoot, ".spore", "progress.json"), "utf-8");
+      parts.push(`Reloaded .spore/progress.json:\n${raw.trim()}`);
+    } catch {
+      // Absent — nothing to reload from this file.
+    }
+    try {
+      const raw = readFileSync(join(workspaceRoot, ".spore", "feature_list.json"), "utf-8");
+      parts.push(`Reloaded .spore/feature_list.json:\n${raw.trim()}`);
+    } catch {
+      // Absent — nothing to reload from this file.
+    }
+    return parts.length === 0 ? null : parts.join("\n\n");
   }
 
   /**

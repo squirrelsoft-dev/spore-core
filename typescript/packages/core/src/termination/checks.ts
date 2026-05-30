@@ -56,7 +56,7 @@ interface FeatureEntry {
 }
 
 /**
- * Reads `feature_list.json` under the snapshot's `workspace_root` (or an
+ * Reads `.spore/feature_list.json` under the snapshot's `workspace_root` (or an
  * absolute path if `path` is absolute). Returns a reason listing
  * incomplete feature names if any entry has `passes: false`; returns
  * `null` when all entries pass.
@@ -66,8 +66,12 @@ interface FeatureEntry {
  * learns to create it).
  */
 export class FeatureListCheck implements CompletionCheck {
-  /** Default location: `<workspace_root>/feature_list.json`. */
-  constructor(readonly path: string = "feature_list.json") {}
+  /**
+   * Default location: `<workspace_root>/.spore/feature_list.json` (issue #58,
+   * B2 — the canonical `.spore/`-prefixed path, agreeing with the Ralph
+   * strategy's completion check).
+   */
+  constructor(readonly path: string = ".spore/feature_list.json") {}
 
   async check(state: SessionStateSnapshot): Promise<string | null> {
     const full = isAbsolute(this.path) ? this.path : join(state.workspace_root, this.path);
