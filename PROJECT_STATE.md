@@ -1,5 +1,7 @@
 # PROJECT STATE
-_Last updated: 2026-05-30 by /close — closed #60 (HillClimbing loop strategy) `status: complete`. This loop landed the **fifth and final loop strategy** across all four languages: the harness now runs **5 of 5** advertised strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing). #60 was the harness-wiring issue, not the trait-design one — the `MetricEvaluator` trait, `should_keep`, `MetricResult`/`MetricError`, `IterationStatus`, `ResultsEntry`, the four production evaluators, and `HaltReason::StagnationLimitReached` all already shipped under #23. #60 drives them from `StandardHarness::run`: baseline-first measurement (iteration 0, no agent turn) → agent turn → evaluate → keep/revert via payload-direction `should_keep`, plus a harness-written TSV results log at `.spore/results/{task_id}.tsv` and a misconfiguration guard. New public surface (mirrored ×4): `HaltReason::HillClimbingMisconfigured`, the `metric_evaluator` config field (injected like `verifier`/`vcs_provider`), the `hill_climbing_iteration` observability span. Seven spec ambiguities (git-reset seam, TSV float byte-identity at 6 decimals, TSV schema, direction source-of-truth, baseline semantics, misconfig halt, baseline-error) were pinned with the maintainer before fan-out. Cross-language verification PASS, byte-identical TSV confirmed, no divergences. Commits rust `5da525f`, python `e21c745`, ts `7d632bc`, go `d53e221` — all on `main`, pushed (`origin/main` == `d53e221`). **Both feature tracks (Track A tool/prompt + loop-strategy track) are now CLOSED.** Next: a maintainer fork — correctness/safety debt + docs cleanup vs. opening the protocol-integration track (#83–87)._
+_Last updated: 2026-05-30 by /close — closed #32 (Block-2 cache-hash mismatch must halt) `status: complete`. **The maintainer chose Track-a — correctness/safety debt + docs cleanup — as the post-breadth track**, and #32 is its first gate landed. The fix makes a Block-2 (PerSession) cache-hash mismatch mid-session **halt** with `ContextError::CacheHashMismatch` instead of an `eprintln!`/`console.warn`/`logger.warning`/`log.Printf` warning, exactly mirroring the Block-1 (Static) halt that already existed one branch above it. The `CacheHashMismatch` variant was reshaped (`block: String` → `block: CacheBlock`, added `turn_number`); a `HaltReason::ContextError` routing variant was added in all four (immediately after `AgentError`, mirroring its shape, byte-identical wire `{"kind":"context_error","error":{"kind":"cache_hash_mismatch","block":"per_session",…,"turn_number":…}}`). The `turn_number > 1` baseline guard is preserved (turn-1 rebaseline never halts). **Tight scope, two maintainer-pinned deferrals:** (1) live-loop routing deferred to the #7 ContextManager migration — the live `StandardHarness` calls a separate *infallible* placeholder `ContextManager`, and Block-1's halt isn't live-wired either, so this makes Block-2 *consistent with Block-1* without pulling #7 in; (2) the `UnexpectedMiss`/`estimated_cost_delta_usd` cost-spike observability (the issue's own "separate concern") split out to **new issue #90**, which pins the real formula `(base_input_rate − cache_read_rate) × missed_block_tokens` and flags that `base_input_rate` isn't stored in the pricing path today. Inline unit tests only (Block-1 has no fixture either); cross-language verification PASS, no scope overreach, Go's import-cycle bridge split (rich `CacheBlock`-typed error in `contextmgr`, thin string-block routing error in root pkg) confirmed wire-identical. Commits rust `f3dd41a`, ts `81cd902`, python `62963e0`, go `c60102b` — all on `main`, pushed (`origin/main` == `62963e0`). Next correctness gate: **#34** (Yolo/None behind a dangerous feature flag).
+
+_(Prior loop: closed #60 (HillClimbing loop strategy) `status: complete`.) This loop landed the **fifth and final loop strategy** across all four languages: the harness now runs **5 of 5** advertised strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing). #60 was the harness-wiring issue, not the trait-design one — the `MetricEvaluator` trait, `should_keep`, `MetricResult`/`MetricError`, `IterationStatus`, `ResultsEntry`, the four production evaluators, and `HaltReason::StagnationLimitReached` all already shipped under #23. #60 drives them from `StandardHarness::run`: baseline-first measurement (iteration 0, no agent turn) → agent turn → evaluate → keep/revert via payload-direction `should_keep`, plus a harness-written TSV results log at `.spore/results/{task_id}.tsv` and a misconfiguration guard. New public surface (mirrored ×4): `HaltReason::HillClimbingMisconfigured`, the `metric_evaluator` config field (injected like `verifier`/`vcs_provider`), the `hill_climbing_iteration` observability span. Seven spec ambiguities (git-reset seam, TSV float byte-identity at 6 decimals, TSV schema, direction source-of-truth, baseline semantics, misconfig halt, baseline-error) were pinned with the maintainer before fan-out. Cross-language verification PASS, byte-identical TSV confirmed, no divergences. Commits rust `5da525f`, python `e21c745`, ts `7d632bc`, go `d53e221` — all on `main`, pushed (`origin/main` == `d53e221`). **Both feature tracks (Track A tool/prompt + loop-strategy track) are now CLOSED.** Next: a maintainer fork — correctness/safety debt + docs cleanup vs. opening the protocol-integration track (#83–87)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
@@ -125,24 +127,20 @@ reaching into tools and exercised by a real `memory` tool (#73 + #76 + #75 + #78
 catalogue** (#81 + #82), and a **conditional prompt assembly engine** (#79) — all
 across four languages. The bar remains **capability breadth and correctness**.
 
-**Both feature tracks are now CLOSED** — Track A (tool/prompt architecture, #79 +
+**Both feature tracks are CLOSED** — Track A (tool/prompt architecture, #79 +
 #80 + #81 + #82) and the loop-strategy track (#61 → #58 → #60). The harness has
-its full advertised core capability surface. What remains is a genuine fork that
-**needs a maintainer decision** before the next loop:
+its full advertised core capability surface. **The maintainer has chosen the
+post-breadth track: correctness/safety debt + docs cleanup** (the "correctness"
+half of the bar — concrete, in-repo, no new architecture). The protocol-integration
+track (#83–87) was the alternative and is NOT being pursued for now.
 
-1. **Correctness/safety debt + docs cleanup** (the "correctness" half of the bar).
-   Safety gates — #32 (Block-2 hash mismatch must *halt*, not just warn — a real
-   correctness bug), #34 (`Mode::Yolo` / `SandboxProvider::None` behind a dangerous
-   feature flag), #31 (SharedSession subagent context read-only by default), #30
-   (memory distillation through the PendingReview gate). Docs — #27/#35/#36 (stop
-   overstating / clarify spec; the strategy *count* is now accurate but other drift
-   remains). Lower-glamour, all `scope: deferred` today, but tightens correctness
-   now that breadth is done. **Default recommendation — this is concrete,
-   in-repo, and needs no new architecture.**
-2. **Open the protocol-integration track (#83–87)** — MCP (#83), A2A (#84), ACP
-   (#85), AG-UI (#86), A2UI (#87), all still unlabeled. A new interop/ecosystem
-   track that would broaden reach beyond the core runtime. **Needs a maintainer
-   decision to commit to it and set ordering before triage.**
+**Correctness/safety gates — progress.** ✅ **#32 done** (Block-2 hash mismatch now
+halts, consistent with Block-1). Remaining, in priority order: **#34** (`Mode::Yolo`
+/ `SandboxProvider::None` behind a dangerous feature flag), **#31** (SharedSession
+subagent context read-only by default), **#30** (memory distillation through the
+PendingReview gate). Then docs — **#27/#35/#36** (stop overstating / clarify spec;
+the strategy *count* is now accurate but other drift remains). All remaining gates
+are still `scope: deferred`-labelled; relabel `status: queued` as picked up.
 
 Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
 #89 cross-session memory keying — all `scope: deferred`.
@@ -197,6 +195,19 @@ Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
    `ChunkCondition::Custom(predicate)` is first-class in the API but serializes
    to null/absent; architects using it knowingly opt that chunk out of the
    byte-identical cross-language contract.
+8. **Cache-hash-mismatch halts are not live-wired (#32, depends on #7)** (`scope:
+   deferred`, intentional) — BOTH Block-1 (Static) and Block-2 (PerSession)
+   `CacheHashMismatch` halts live in `StandardContextManager::assemble` (fallible,
+   the #7 canonical trait), but the live `StandardHarness` loop calls a separate,
+   *infallible* placeholder `ContextManager` whose `assemble` returns `Context`
+   not `Result`. So neither halt can fire end-to-end until the deferred #7
+   ContextManager migration widens the live trait. #32 added the
+   `HaltReason::ContextError` routing variant (all four) so the type is ready;
+   wiring the live loop is #7's job. Go models this with a thin routing-level
+   `sporecore.ContextError` (block as snake_case string) bridging to the rich
+   `CacheBlock`-typed `contextmgr.ContextError`, to avoid an import cycle — same
+   consumer-side-seam pattern as `MetricEvaluator`/`Verifier`/`VcsProvider`;
+   wire-identical.
 
 _(Former Deviation — HillClimbing loop strategy stub, #60 (was Deviation #1: harness ran only 4/5 strategies) — **resolved** this loop; HillClimbing runs end-to-end across all four, harness now at 5/5, stub removed.)_
 _(Former Deviation — push blocked on local SSH auth (13 unpushed commits) — **resolved**; SSH fixed, all pushed.)_
@@ -213,22 +224,19 @@ _(Former Deviation — observability captured no message content — **resolved*
 ## Next Actions
 [3-5 items max, highest priority first. Each references a GH issue # where
 possible. /next surfaces item 1 as "work this next."]
-1. **MAINTAINER DECISION — pick the next track.** Both feature tracks are closed,
-   so there is no single forced next issue. Choose: **(a) correctness/safety debt +
-   docs** (concrete, in-repo, no new architecture — recommended) or **(b) open the
-   protocol-integration track (#83–87)** (new interop scope). `/next` will surface
-   this fork until a track is chosen.
-2. **Correctness/safety gates** (track-a candidate) — **#32 first** (Block-2 hash
-   mismatch must *halt* mid-session, not just warn — a genuine correctness bug),
-   then #34 (`Mode::Yolo`/`SandboxProvider::None` behind a dangerous feature flag),
-   #31 (SharedSession subagent context read-only by default), #30 (memory
-   distillation through the PendingReview gate). All `scope: deferred` today; relabel
-   `status: queued` if this track is chosen.
-3. **Docs cleanup** (track-a candidate) — #27 (README: strategy count is now
-   accurate at 5/5, but sweep remaining spec-vs-code drift), #35
-   (`harness-engineering-concepts.md` drift), #36 (E2B data-residency/privacy doc).
-4. **Protocol-integration track (#83–87)** (alternative to 2/3) — MCP (#83), A2A
-   (#84), ACP (#85), AG-UI (#86), A2UI (#87), all unlabeled. Triage/label and set
-   ordering **only if the maintainer commits to this track.**
-5. **Deferred storage/memory phases** — #77 (SQL backends), #88 (deferred chunk
-   providers), #89 (cross-session memory keying). All `scope: deferred`.
+1. **#34 — `Mode::Yolo` / `SandboxProvider::None` behind a dangerous feature flag**
+   (next correctness/safety gate). With #32 done, this is the highest-priority
+   remaining gate on the chosen track: dangerous no-sandbox execution modes must be
+   gated so they can't be reached by accident. Relabel `status: queued` when grabbed.
+2. **#31 — SharedSession subagent context read-only by default** — subagents
+   sharing a parent session must not mutate it unless explicitly granted write.
+3. **#30 — memory distillation through the PendingReview gate** — distilled memory
+   writes must pass the review gate rather than landing directly.
+4. **Docs cleanup** — #27 (README: strategy count now accurate at 5/5, but sweep
+   remaining spec-vs-code drift), #35 (`harness-engineering-concepts.md` drift),
+   #36 (E2B data-residency/privacy doc). Do after the correctness gates.
+5. **Deferred follow-ups (not on the active track)** — #90 (cache cost-spike
+   `UnexpectedMiss`, split from #32), #7 (ContextManager migration — would live-wire
+   the #32/#Block-1 halts), #77 (SQL backends), #88 (deferred chunk providers),
+   #89 (cross-session memory keying). All `scope: deferred`. The
+   protocol-integration track (#83–87) is parked — not chosen.
