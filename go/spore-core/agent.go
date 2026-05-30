@@ -217,6 +217,61 @@ func NewMalformedToolCallError(toolName, reason string) *AgentError {
 }
 
 // ============================================================================
+// ContextError (routing type — issue #32)
+// ============================================================================
+//
+// The rich ContextError that ContextManager methods return lives in the
+// contextmgr subpackage (which imports this package). HaltReason — defined
+// here — cannot reference that type without an import cycle, so this package
+// carries a routing-level ContextError that HaltReason::ContextError wraps.
+// This mirrors the established Go divergence pattern (consumer-side seam +
+// bridge) already documented in PROJECT_STATE for MetricEvaluator/Verifier.
+// The variant exists so the routing TYPE exists; the live StandardHarness loop
+// does not yet trigger it (its placeholder ContextManager.Assemble is
+// infallible pending the #7 migration), mirroring Block 1.
+
+// ContextErrorKind discriminates ContextError variants. Tag values match the
+// Rust serde tag (rename_all = "snake_case") for cross-language wire
+// compatibility.
+type ContextErrorKind string
+
+const (
+	ContextErrTokenCountFailed  ContextErrorKind = "token_count_failed"
+	ContextErrCompactionFailed  ContextErrorKind = "compaction_failed"
+	ContextErrAssemblyFailed    ContextErrorKind = "assembly_failed"
+	ContextErrCacheHashMismatch ContextErrorKind = "cache_hash_mismatch"
+)
+
+// ContextError is the typed error surfaced by a ContextManager and routed by
+// HaltReason::ContextError. CacheHashMismatch carries the offending cache
+// block (as the same snake_case string the CacheBlock enum serialises to),
+// the expected/actual hashes, and the turn the mismatch was detected on.
+type ContextError struct {
+	Kind       ContextErrorKind `json:"kind"`
+	Reason     string           `json:"reason,omitempty"`
+	Block      string           `json:"block,omitempty"`
+	Expected   uint64           `json:"expected,omitempty"`
+	Actual     uint64           `json:"actual,omitempty"`
+	TurnNumber uint32           `json:"turn_number,omitempty"`
+}
+
+// Error implements the error interface.
+func (e *ContextError) Error() string {
+	switch e.Kind {
+	case ContextErrTokenCountFailed:
+		return "token count failed"
+	case ContextErrCompactionFailed:
+		return fmt.Sprintf("compaction failed: %s", e.Reason)
+	case ContextErrAssemblyFailed:
+		return fmt.Sprintf("assembly failed: %s", e.Reason)
+	case ContextErrCacheHashMismatch:
+		return fmt.Sprintf("cache hash mismatch on block %s at turn %d: expected %d, got %d", e.Block, e.TurnNumber, e.Expected, e.Actual)
+	default:
+		return fmt.Sprintf("context error: %s", e.Kind)
+	}
+}
+
+// ============================================================================
 // TurnResult
 // ============================================================================
 

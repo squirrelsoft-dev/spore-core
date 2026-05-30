@@ -434,6 +434,38 @@ func TestHaltReasonAgentErrorShape(t *testing.T) {
 	}
 }
 
+// HaltReason context_error embeds the ContextError under "error" and
+// round-trips (issue #32). Mirrors the agent_error shape exactly.
+func TestHaltReasonContextErrorShape(t *testing.T) {
+	r := HaltReason{Kind: HaltContextError, ContextError: &ContextError{
+		Kind:       ContextErrCacheHashMismatch,
+		Block:      "per_session",
+		Expected:   1,
+		Actual:     2,
+		TurnNumber: 2,
+	}}
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"kind":"context_error","error":{"kind":"cache_hash_mismatch","block":"per_session","expected":1,"actual":2,"turn_number":2}}`
+	if string(data) != want {
+		t.Fatalf("got %s", data)
+	}
+
+	var back HaltReason
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Kind != HaltContextError || back.ContextError == nil {
+		t.Fatalf("round-trip lost variant: %+v", back)
+	}
+	ce := back.ContextError
+	if ce.Kind != ContextErrCacheHashMismatch || ce.Block != "per_session" || ce.TurnNumber != 2 || ce.Expected != 1 || ce.Actual != 2 {
+		t.Fatalf("round-trip mismatch: %+v", ce)
+	}
+}
+
 // ── Assistant-turn recording (regression for lost conversation history) ──────
 
 // recordingContextManager is a ContextManager that records every message the

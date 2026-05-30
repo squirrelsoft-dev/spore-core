@@ -20,13 +20,13 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/promptchunkregistry"
 )
 
 // ============================================================================
@@ -415,13 +415,27 @@ const (
 )
 
 // ContextError is the typed error returned by ContextManager methods.
+//
+// CacheHashMismatch carries the offending CacheBlock (not a raw string) plus
+// the turn on which the mismatch was detected. Both Block 1
+// (CacheBlockStatic) and Block 2 (CacheBlockPerSession) halt the run on a
+// mid-session mismatch — they are treated consistently (issue #32). A Block-2
+// change mid-session means session-stable content mutated and every
+// subsequent turn would silently pay full input-token cost; rather than warn,
+// the run stops so the caller can fix the source. Block 2 only halts when
+// TurnNumber > 1 (the turn-1 assemble records the baseline). Estimated
+// cache-cost-delta tracking (UnexpectedMiss) is a separate observability
+// concern tracked in issue #90.
 type ContextError struct {
-	Kind     ContextErrorKind `json:"kind"`
-	Reason   string           `json:"reason,omitempty"`
-	Block    string           `json:"block,omitempty"`
-	Expected uint64           `json:"expected,omitempty"`
-	Actual   uint64           `json:"actual,omitempty"`
-	Err      error            `json:"-"`
+	Kind   ContextErrorKind `json:"kind"`
+	Reason string           `json:"reason,omitempty"`
+	// Block is the cache block whose content hash unexpectedly changed
+	// (CacheHashMismatch only). Typed as promptchunkregistry.CacheBlock.
+	Block      promptchunkregistry.CacheBlock `json:"block,omitempty"`
+	Expected   uint64                         `json:"expected,omitempty"`
+	Actual     uint64                         `json:"actual,omitempty"`
+	TurnNumber uint32                         `json:"turn_number,omitempty"`
+	Err        error                          `json:"-"`
 }
 
 // Error implements error.
@@ -437,7 +451,7 @@ func (e *ContextError) Error() string {
 	case ErrKindAssemblyFailed:
 		return fmt.Sprintf("assembly failed: %s", e.Reason)
 	case ErrKindCacheHashMismatch:
-		return fmt.Sprintf("cache hash mismatch on block %s: expected %d, got %d", e.Block, e.Expected, e.Actual)
+		return fmt.Sprintf("cache hash mismatch on block %s at turn %d: expected %d, got %d", e.Block, e.TurnNumber, e.Expected, e.Actual)
 	default:
 		return fmt.Sprintf("context error: %s", e.Kind)
 	}
@@ -453,8 +467,8 @@ func newTokenCountFailed(cause error) *ContextError {
 func newCompactionFailed(reason string) *ContextError {
 	return &ContextError{Kind: ErrKindCompactionFailed, Reason: reason}
 }
-func newCacheHashMismatch(block string, expected, actual uint64) *ContextError {
-	return &ContextError{Kind: ErrKindCacheHashMismatch, Block: block, Expected: expected, Actual: actual}
+func newCacheHashMismatch(block promptchunkregistry.CacheBlock, expected, actual uint64, turnNumber uint32) *ContextError {
+	return &ContextError{Kind: ErrKindCacheHashMismatch, Block: block, Expected: expected, Actual: actual, TurnNumber: turnNumber}
 }
 
 // ============================================================================
@@ -530,7 +544,7 @@ func (m *StandardContextManager) Assemble(
 		if *m.staticHash != staticHash {
 			prev := *m.staticHash
 			m.mu.Unlock()
-			return nil, newCacheHashMismatch("static", prev, staticHash)
+			return nil, newCacheHashMismatch(promptchunkregistry.CacheBlockStatic, prev, staticHash, state.TurnNumber)
 		}
 	} else {
 		h := staticHash
@@ -543,7 +557,12 @@ func (m *StandardContextManager) Assemble(
 	sessionHash := segmentsHash(segments)
 	m.mu.Lock()
 	if m.sessionHash != nil && *m.sessionHash != sessionHash && state.TurnNumber > 1 {
-		log.Printf("warn: session block hash changed mid-session (%d → %d)", *m.sessionHash, sessionHash)
+		// Block 2 mid-session change: same as Block 1, halt the run rather than
+		// warn (issue #32). The turn-1 assemble (guarded by TurnNumber > 1)
+		// records the baseline and never halts.
+		prev := *m.sessionHash
+		m.mu.Unlock()
+		return nil, newCacheHashMismatch(promptchunkregistry.CacheBlockPerSession, prev, sessionHash, state.TurnNumber)
 	}
 	{
 		h := sessionHash

@@ -1510,10 +1510,17 @@ func (c ChildPausedState) MarshalJSON() ([]byte, error) {
 type HaltReasonKind string
 
 const (
-	HaltBudgetExceeded            HaltReasonKind = "budget_exceeded"
-	HaltTerminationPolicyHalt     HaltReasonKind = "termination_policy_halt"
-	HaltMiddlewareHalt            HaltReasonKind = "middleware_halt"
-	HaltAgentError                HaltReasonKind = "agent_error"
+	HaltBudgetExceeded        HaltReasonKind = "budget_exceeded"
+	HaltTerminationPolicyHalt HaltReasonKind = "termination_policy_halt"
+	HaltMiddlewareHalt        HaltReasonKind = "middleware_halt"
+	HaltAgentError            HaltReasonKind = "agent_error"
+	// HaltContextError (issue #32) routes a ContextError surfaced by the
+	// ContextManager during assembly (e.g. a Block-1 or Block-2 cache-hash
+	// mismatch) into a halt. Mirrors HaltAgentError. This is the routing type;
+	// the live StandardHarness loop does not yet trigger it because its
+	// placeholder ContextManager.Assemble is infallible pending the #7
+	// migration.
+	HaltContextError              HaltReasonKind = "context_error"
 	HaltSandboxViolation          HaltReasonKind = "sandbox_violation"
 	HaltUnrecoverableToolError    HaltReasonKind = "unrecoverable_tool_error"
 	HaltHumanHalted               HaltReasonKind = "human_halted"
@@ -1579,6 +1586,8 @@ type HaltReason struct {
 	Hook   HookPoint `json:"-"`
 	// agent_error
 	AgentError *AgentError `json:"-"`
+	// context_error (issue #32)
+	ContextError *ContextError `json:"-"`
 	// sandbox_violation
 	Violation *SandboxViolation `json:"-"`
 	// unrecoverable_tool_error
@@ -1620,6 +1629,11 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind  HaltReasonKind `json:"kind"`
 			Error *AgentError    `json:"error"`
 		}{h.Kind, h.AgentError})
+	case HaltContextError:
+		return json.Marshal(struct {
+			Kind  HaltReasonKind `json:"kind"`
+			Error *ContextError  `json:"error"`
+		}{h.Kind, h.ContextError})
 	case HaltSandboxViolation:
 		return json.Marshal(struct {
 			Kind      HaltReasonKind    `json:"kind"`
@@ -1729,6 +1743,15 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			h.AgentError = ae
+		}
+	case HaltContextError:
+		// "error" is a ContextError object here (issue #32).
+		if len(probe.Error) > 0 && string(probe.Error) != "null" {
+			ce := &ContextError{}
+			if err := json.Unmarshal(probe.Error, ce); err != nil {
+				return err
+			}
+			h.ContextError = ce
 		}
 	case HaltUnrecoverableToolError:
 		// "error" is a string here, not an object — re-read as string.

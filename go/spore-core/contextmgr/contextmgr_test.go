@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/promptchunkregistry"
 )
 
 // ── Test doubles ───────────────────────────────────────────────────────────
@@ -153,8 +154,82 @@ func TestBlock1HashMismatchIsError(t *testing.T) {
 	if !errors.As(err, &ce) {
 		t.Fatalf("expected *ContextError, got %T", err)
 	}
-	if ce.Kind != ErrKindCacheHashMismatch || ce.Block != "static" {
+	if ce.Kind != ErrKindCacheHashMismatch || ce.Block != promptchunkregistry.CacheBlockStatic {
 		t.Errorf("got %+v", ce)
+	}
+}
+
+// ── Rule: Block 2 (PerSession) change mid-session halts with a
+//          CacheHashMismatch carrying block=per_session and the turn number
+//          (issue #32) — consistent with Block 1. ────────────────────────────
+
+func TestBlock2HashMismatchMidSessionIsError(t *testing.T) {
+	mgr := newMgr()
+	st := newState()
+
+	// Turn 1: baseline write of the session hash, must NOT halt.
+	st.TurnNumber = 1
+	if _, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil)); err != nil {
+		t.Fatalf("turn-1 assemble: %v", err)
+	}
+
+	// Turn 2: mutate session-stable content (TaskInstruction feeds Block 2).
+	st.TurnNumber = 2
+	st.TaskInstruction = "do a DIFFERENT thing"
+	_, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil))
+	if err == nil {
+		t.Fatalf("expected error on mid-session Block-2 change")
+	}
+	var ce *ContextError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected *ContextError, got %T", err)
+	}
+	if ce.Kind != ErrKindCacheHashMismatch {
+		t.Errorf("kind=%q want cache_hash_mismatch", ce.Kind)
+	}
+	if ce.Block != promptchunkregistry.CacheBlockPerSession {
+		t.Errorf("block=%q want per_session", ce.Block)
+	}
+	if ce.TurnNumber != 2 {
+		t.Errorf("turn=%d want 2", ce.TurnNumber)
+	}
+}
+
+// ── Rule: Stable Block 2 across turns does NOT halt. ──────────────────────────
+
+func TestBlock2StableAcrossTurnsOK(t *testing.T) {
+	mgr := newMgr()
+	st := newState()
+
+	st.TurnNumber = 1
+	if _, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil)); err != nil {
+		t.Fatalf("turn-1 assemble: %v", err)
+	}
+	// Turn 2+ with identical session content (TaskInstruction unchanged).
+	for _, turn := range []uint32{2, 3, 4} {
+		st.TurnNumber = turn
+		if _, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil)); err != nil {
+			t.Fatalf("turn-%d assemble should not halt: %v", turn, err)
+		}
+	}
+}
+
+// ── Rule: Block 2 change AT turn 1 does NOT halt (baseline guard). ───────────
+
+func TestBlock2ChangeAtTurn1DoesNotHalt(t *testing.T) {
+	mgr := newMgr()
+	st := newState()
+
+	// Two assembles both at turn 1 with different session content: the second
+	// must NOT halt because the mid-session guard requires TurnNumber > 1. It
+	// simply re-baselines.
+	st.TurnNumber = 1
+	if _, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil)); err != nil {
+		t.Fatalf("first turn-1 assemble: %v", err)
+	}
+	st.TaskInstruction = "completely different baseline"
+	if _, err := mgr.Assemble(context.Background(), st, newSources("BLOCK1", 0xAB, nil)); err != nil {
+		t.Fatalf("second turn-1 assemble should not halt: %v", err)
 	}
 }
 
