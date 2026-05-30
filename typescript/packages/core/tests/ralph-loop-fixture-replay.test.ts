@@ -39,6 +39,7 @@ import {
 } from "../src/index.js";
 import {
   AlwaysContinuePolicy,
+  FixtureVcsProvider,
   NoopContextManager,
   ScriptedToolRegistry,
 } from "../src/harness/testing.js";
@@ -58,6 +59,10 @@ interface Case {
   name: string;
   windows: Window[];
   max_resets: number;
+  /** Optional git-log string (issue #58 v2). When present a FixtureVcsProvider
+   *  seeded with it is wired into the harness and the reloaded context of the
+   *  first fresh window MUST contain it. Absent ⇒ no provider ⇒ no git section. */
+  vcs_log?: string;
   expected: { kind: "success" | "completion_unmet"; iterations: number };
 }
 
@@ -83,6 +88,7 @@ function writeProgress(root: string, body: string): void {
 /** Writes the next scripted progress body each turn, then claims done. */
 class ProgressWritingAgent implements Agent {
   ran = 0;
+  readonly contexts: Context[] = [];
   private i = 0;
   constructor(
     private readonly root: string,
@@ -91,13 +97,26 @@ class ProgressWritingAgent implements Agent {
   id(): AgentId {
     return AgentId.of("ralph");
   }
-  async turn(_ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+  async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
     this.ran += 1;
+    this.contexts.push(ctx);
     const body = this.bodies[this.i] ?? this.bodies[this.bodies.length - 1] ?? INCOMPLETE;
     this.i += 1;
     writeProgress(this.root, body);
     return { kind: "final_response", content: "done", usage: usage() };
   }
+}
+
+/** Flatten a Context's text content for substring assertions. */
+function contextText(ctx: Context): string {
+  return ctx.messages
+    .map((m) => {
+      const c = m.content;
+      if (Array.isArray(c)) return c.map((p) => ("text" in p ? p.text : "")).join(" ");
+      if (typeof c === "object" && c != null && "text" in c) return (c as { text: string }).text;
+      return typeof c === "string" ? c : "";
+    })
+    .join("\n");
 }
 
 function loadCases(): Case[] {
@@ -122,6 +141,10 @@ describe("Ralph loop fixture replay — ralph.json", () => {
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
         maxResets: c.max_resets,
+        // issue #58 v2: when the case carries a `vcs_log`, wire a
+        // FixtureVcsProvider seeded with it; absent ⇒ no provider ⇒ no git
+        // section (v1 behavior).
+        vcsProvider: c.vcs_log != null ? new FixtureVcsProvider(c.vcs_log) : undefined,
       };
       const h = new StandardHarness(config);
       // One ReAct turn per context window (mirrors Rust's `ralph_task`): the
@@ -131,6 +154,14 @@ describe("Ralph loop fixture replay — ralph.json", () => {
         max_turns: 1,
       });
       const r = await h.run({ task });
+
+      // issue #58 v2: when a vcs_log is present, the first fresh window must
+      // include it under a delimited "Recent VCS history:" section.
+      if (c.vcs_log != null) {
+        const w0 = contextText(agent.contexts[0]!);
+        expect(w0).toContain("Recent VCS history:");
+        expect(w0).toContain(c.vcs_log.trim());
+      }
 
       if (c.expected.kind === "success") {
         expect(r.kind).toBe("success");

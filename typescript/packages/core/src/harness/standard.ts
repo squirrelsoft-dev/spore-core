@@ -78,6 +78,7 @@ import {
 } from "../tasklist/index.js";
 
 import type { Harness } from "./interface.js";
+import type { VcsLogArgs, VcsProvider } from "./vcs.js";
 import { SessionId, TaskId } from "./types.js";
 import {
   addTurnUsage,
@@ -207,6 +208,16 @@ export interface HarnessConfig {
    * other strategy.
    */
   maxResets?: number;
+  /**
+   * Optional VCS read seam for the `ralph` loop strategy (issue #58 v2). When
+   * set, Ralph's per-window reload phase ALSO calls {@link VcsProvider.log} and
+   * injects the output into the fresh context window as a delimited
+   * "Recent VCS history:" section — alongside the reloaded `.spore/progress.json`
+   * + `.spore/feature_list.json` content. When unset (the default) the git-log
+   * section is OMITTED and Ralph behaves byte-for-byte like v1 (the B4→none
+   * decision). Ignored by every other strategy.
+   */
+  vcsProvider?: VcsProvider;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -1436,6 +1447,25 @@ export class StandardHarness implements Harness {
       if (reload != null) {
         await this.config.contextManager.appendUserMessage(sessionState, reload);
       }
+      // R3 (issue #58 v2): when a VcsProvider is wired, ALSO reload git history
+      // and inject it as a delimited "Recent VCS history:" section, exactly as
+      // the `.spore/` reload content is injected. When the provider is unset
+      // (the default), this section is omitted entirely — Ralph's reloaded
+      // context is then byte-for-byte the v1 behavior (the B4→none decision).
+      if (this.config.vcsProvider != null) {
+        const args: VcsLogArgs = { maxEntries: 20 };
+        try {
+          const trimmed = (await this.config.vcsProvider.log(args)).trim();
+          if (trimmed.length > 0) {
+            await this.config.contextManager.appendUserMessage(
+              sessionState,
+              `Recent VCS history:\n${trimmed}`,
+            );
+          }
+        } catch {
+          // A VCS read failure is non-fatal: skip the git section and continue.
+        }
+      }
 
       // The per-window bounded ReAct sub-loop. The registered `ralph-stop` hook
       // (B1) fires inside it on each final response; this strategy's OUTER loop
@@ -2466,6 +2496,7 @@ export class HarnessBuilder {
   private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
   private _verifier?: Verifier;
   private _evaluatorAgent?: Agent;
+  private _vcsProvider?: VcsProvider;
 
   constructor(
     private readonly agent: Agent,
@@ -2584,6 +2615,16 @@ export class HarnessBuilder {
     return this;
   }
 
+  /** Inject a {@link VcsProvider} for the `ralph` loop strategy (issue #58 v2).
+   *  When set, Ralph's per-window reload phase also calls {@link VcsProvider.log}
+   *  and injects a delimited "Recent VCS history:" section into the fresh context
+   *  window. Defaults to unset, which omits the git-log section and preserves v1
+   *  Ralph behavior byte-for-byte (the B4→none decision). */
+  vcsProvider(provider: VcsProvider): this {
+    this._vcsProvider = provider;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     return {
@@ -2605,6 +2646,7 @@ export class HarnessBuilder {
       chunkProvider: this._chunkProvider,
       verifier: this._verifier,
       evaluatorAgent: this._evaluatorAgent,
+      vcsProvider: this._vcsProvider,
     };
   }
 

@@ -11,4 +11,12 @@ export {
   HOOK_POINTS,
   isReact,
 } from "./standard.js";
+export {
+  GitVcsProvider,
+  VcsError,
+  VcsCommandFailedError,
+  VcsSandboxError,
+  type VcsProvider,
+  type VcsLogArgs,
+} from "./vcs.js";
 export * as harnessTesting from "./testing.js";

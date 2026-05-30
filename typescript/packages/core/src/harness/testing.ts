@@ -6,6 +6,7 @@
 import type { Context } from "../agent/types.js";
 import type { ToolCall, ToolSchema } from "../model/schemas.js";
 
+import type { VcsLogArgs, VcsProvider } from "./vcs.js";
 import type {
   ContextManager,
   HookPoint,
@@ -61,6 +62,26 @@ export class NoopContextManager implements ContextManager {
   }
   shouldCompact(_session: SessionState): boolean {
     return false;
+  }
+}
+
+/**
+ * Deterministic {@link VcsProvider} double for tests and fixture replay (issue
+ * #58 v2). It returns pre-loaded strings VERBATIM with no process spawning, so
+ * multi-context-window Ralph continuation can be exercised hermetically.
+ * {@link log} ignores its {@link VcsLogArgs} and yields `logOutput`;
+ * {@link status} yields `statusOutput`.
+ */
+export class FixtureVcsProvider implements VcsProvider {
+  constructor(
+    private readonly logOutput: string,
+    private readonly statusOutput: string = "",
+  ) {}
+  async log(_args: VcsLogArgs): Promise<string> {
+    return this.logOutput;
+  }
+  async status(): Promise<string> {
+    return this.statusOutput;
   }
 }
 
