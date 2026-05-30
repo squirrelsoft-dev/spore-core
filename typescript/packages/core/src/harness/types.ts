@@ -723,7 +723,17 @@ export type HaltReason =
    * the number of context windows run and the last incompletion reason. PEER to
    * {@link self_verify_exhausted}.
    */
-  | { kind: "ralph_completion_unmet"; iterations: number; last_reason: string };
+  | { kind: "ralph_completion_unmet"; iterations: number; last_reason: string }
+  /**
+   * Returned by {@link StandardHarness} for the `hill_climbing` strategy
+   * (issue #60, Decision 6) when the strategy cannot run because it is
+   * misconfigured — `config.metricEvaluator` is absent — OR the iteration-0
+   * baseline evaluation itself errored (Decision 7: there is no `current_best`
+   * to climb from, so a failed baseline is a misconfiguration of the experiment,
+   * NOT a stagnation increment). Likely a BUILD-TIME bug in the caller's wiring.
+   * Surfaced as a typed halt, NOT a throw.
+   */
+  | { kind: "hill_climbing_misconfigured"; reason: string };
 
 export type RunResult =
   | {

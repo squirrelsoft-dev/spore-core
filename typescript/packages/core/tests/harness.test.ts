@@ -358,10 +358,12 @@ describe("Harness — ReAct loop", () => {
     expect(reg.callCount).toBe(1);
   });
 
-  it("rule: non-ReAct strategies marked StrategyNotYetImplemented", async () => {
-    // plan_execute (#59), self_verifying (#61), and ralph (#58) no longer use
-    // strategy_not_yet_implemented; they run their full loops, covered by their
-    // own test suites. Only the still-unimplemented strategies are checked here.
+  it("rule: every loop strategy is implemented — none returns StrategyNotYetImplemented", async () => {
+    // plan_execute (#59), self_verifying (#61), ralph (#58), and hill_climbing
+    // (#60) all run their full loops now, covered by their own test suites.
+    // hill_climbing is the last to land: with no metricEvaluator wired it halts
+    // with the typed hill_climbing_misconfigured (#60, Decision 6) — NEVER
+    // strategy_not_yet_implemented.
     const h = new StandardHarness(standardConfig(makeAgent()));
     const strategies: LoopStrategy[] = [
       {
@@ -375,7 +377,10 @@ describe("Harness — ReAct loop", () => {
     for (const s of strategies) {
       const r = await h.run({ task: task(s) });
       expect(r.kind).toBe("failure");
-      if (r.kind === "failure") expect(r.reason.kind).toBe("strategy_not_yet_implemented");
+      if (r.kind === "failure") {
+        expect(r.reason.kind).not.toBe("strategy_not_yet_implemented");
+        expect(r.reason.kind).toBe("hill_climbing_misconfigured");
+      }
     }
   });
 

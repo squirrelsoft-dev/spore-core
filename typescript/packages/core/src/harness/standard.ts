@@ -15,6 +15,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Agent } from "../agent/interface.js";
@@ -52,6 +53,15 @@ import {
 } from "../prompt-assembly/index.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
 import type { Verifier, VerifierInput } from "../verifier/types.js";
+import {
+  shouldKeep,
+  iterationStatusFromError,
+  metricErrorMessage,
+  type IterationStatus,
+  type MetricEvaluator,
+  type ResultsEntry,
+} from "../metric/types.js";
+import { newSessionStateSnapshot } from "../termination/types.js";
 import { ReadOnlySandbox } from "../sandbox/read-only-sandbox.js";
 import { newSessionState as newContextSessionState } from "../context/types.js";
 import {
@@ -100,6 +110,7 @@ import {
   type LoopStrategy,
   type MiddlewareChain,
   type ObservabilityProvider,
+  type OptimizationDirection,
   type PausedState,
   type RunResult,
   type SandboxProvider,
@@ -218,6 +229,15 @@ export interface HarnessConfig {
    * decision). Ignored by every other strategy.
    */
   vcsProvider?: VcsProvider;
+  /**
+   * Metric oracle for the `hill_climbing` loop strategy (issue #60). REQUIRED
+   * for that strategy: when absent, a `hill_climbing` run halts with
+   * {@link HaltReason} `hill_climbing_misconfigured` (a typed halt, NOT a throw —
+   * Decision 6). The evaluator is called once at iteration 0 to establish the
+   * baseline (no agent turn) and again after each agent turn to score the change.
+   * Ignored by every other strategy.
+   */
+  metricEvaluator?: MetricEvaluator;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -407,7 +427,16 @@ export class StandardHarness implements Harness {
       case "self_verifying":
         return this.runSelfVerifying(task, sessionState, budgetUsed, options.on_stream);
       case "hill_climbing":
-        return notYetImplemented("hill_climbing", task.session_id);
+        return this.runHillClimbing(
+          task,
+          task.loop_strategy.direction,
+          task.loop_strategy.max_stagnation ?? null,
+          task.loop_strategy.revert_on_no_improvement,
+          task.loop_strategy.min_improvement_delta ?? null,
+          budgetUsed,
+          options.on_stream,
+          options.signal,
+        );
       default: {
         const _exhaustive: never = task.loop_strategy;
         return _exhaustive;
@@ -1356,6 +1385,459 @@ export class StandardHarness implements Harness {
    * is not terminal and is never flushed here.
    */
   private async finalizeSelfVerifying(result: RunResult): Promise<void> {
+    switch (result.kind) {
+      case "success":
+        await this.finalizeObservability(result.session_id, { kind: "success" });
+        break;
+      case "failure":
+        await this.finalizeObservability(result.session_id, {
+          kind: "failure",
+          reason: haltReasonToString(result.reason),
+        });
+        break;
+      case "waiting_for_human":
+        break;
+      case "escalate":
+        await this.finalizeObservability(result.session_id, { kind: "escalated" });
+        break;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // HillClimbing (issue #60) — iterative optimization loop
+  // --------------------------------------------------------------------------
+
+  /**
+   * Drive the `hill_climbing` loop strategy (issue #60) — the iterative
+   * optimization loop. Establish a baseline metric (iteration 0, NO agent turn),
+   * then for each subsequent iteration: run one bounded ReAct agent turn to
+   * propose a change, re-evaluate the metric, and keep or revert based on
+   * {@link shouldKeep}. The harness — never the agent — writes the results log
+   * to `{workspace_root}/.spore/results/{task_id}.tsv`.
+   *
+   * ## Resolved spec decisions (issue #60 — all FINAL, mirror Rust exactly)
+   * - **D1 (revert):** `revert_on_no_improvement` ⇒ `git reset --hard HEAD` runs
+   *   through the sandbox's `executeCommand` seam directly from the harness. The
+   *   harness NEVER commits; `commit_hash` is the empty string (no VcsProvider).
+   * - **D2/D3 (TSV):** tab-separated, REQUIRED header, one row per iteration in
+   *   ascending order. Floats (`metric_value`, `duration_secs`) use EXACTLY 6
+   *   decimals; `metric_value` is the empty string on crashed/timeout rows;
+   *   `metadata` is excluded. `direction`/`status` are snake_case.
+   * - **D4 (direction):** the payload `direction` is authoritative for the
+   *   keep/revert decision and is the value recorded in the TSV.
+   * - **D5 (baseline):** iteration 0 is a pure baseline measurement — no agent
+   *   turn, `status: kept`, `current_best` set. Agent turns start at iteration 1.
+   * - **D6 (misconfiguration):** an absent `config.metricEvaluator` ⇒ a typed
+   *   halt `hill_climbing_misconfigured`, NOT a throw.
+   * - **D7 (baseline error):** if the iteration-0 baseline evaluation itself
+   *   errors, it is treated as `hill_climbing_misconfigured` (no `current_best`
+   *   to climb from), NOT a stagnation increment.
+   *
+   * ## Loop semantics
+   * Iterations 1+: agent turn → evaluate → `shouldKeep(new, currentBest,
+   * payloadDirection, minImprovementDelta)`. Keep ⇒ `status: kept`, update best,
+   * reset the stagnation counter. No keep ⇒ `status: discarded`, optional revert,
+   * increment the counter. An evaluator error (crashed/timeout) records an
+   * empty-metric row, counts as a non-improvement, and the loop continues.
+   * `max_stagnation = N` ⇒ halt `stagnation_limit_reached { iterations,
+   * best_metric }` after N consecutive non-improvements (an improvement resets
+   * the counter); `null` ⇒ run until the budget / turn cap is hit.
+   */
+  private async runHillClimbing(
+    task: Task,
+    direction: OptimizationDirection,
+    maxStagnation: number | null,
+    revertOnNoImprovement: boolean,
+    minImprovementDelta: number | null,
+    budgetUsed: BudgetSnapshot,
+    _onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    const sessionId = task.session_id;
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+
+    // D6: a missing evaluator is a typed halt, not a throw.
+    const evaluator = this.config.metricEvaluator;
+    if (evaluator == null) {
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "hill_climbing_misconfigured",
+          reason: "hill_climbing requires `config.metricEvaluator`, but it is absent",
+        },
+        session_id: sessionId,
+        usage: emptyAggregateUsage(),
+        turns: 0,
+      };
+      await this.finalizeHillClimbing(result);
+      return result;
+    }
+
+    const description = evaluator.description();
+    // Per-iteration observability span counter.
+    const spanSeq = { value: 0 };
+    // Cumulative usage + turns across ALL agent-turn iterations.
+    const totalUsage: AggregateUsage = emptyAggregateUsage();
+    // Shared budget threaded across every agent sub-run.
+    const carried: BudgetSnapshot = { ...budgetUsed };
+    // The TSV rows, in iteration order.
+    const rows: ResultsEntry[] = [];
+
+    // A snapshot for the evaluator. HillClimbing keeps no carried message state
+    // of its own (each iteration is a fresh sub-run), so a default SessionState
+    // is the right snapshot to hand the evaluator.
+    const snapshot = newSessionStateSnapshot(
+      sessionId,
+      task.id,
+      emptySessionState(),
+      workspaceRoot,
+    );
+
+    // ── Iteration 0: pure baseline. No agent turn (D5).
+    const baseline = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
+    let currentBest: number;
+    if (baseline.kind === "ok") {
+      currentBest = baseline.result.value;
+      rows.push({
+        iteration: 0,
+        commit_hash: await this.hillClimbingCommitHash(),
+        metric_value: currentBest,
+        direction,
+        status: "kept",
+        duration: baseline.result.duration,
+        description,
+        metadata: {},
+      });
+      this.emitHillClimbingSpan(sessionId, task.id, spanSeq, 0, currentBest, null, "kept", false);
+    } else {
+      // D7: a baseline that cannot even be measured is a misconfiguration of the
+      // experiment, not a non-improvement to climb away from — there is no
+      // `current_best` to compare against. Record the failed row, write the TSV,
+      // and halt.
+      const status = iterationStatusFromError(baseline.error);
+      rows.push({
+        iteration: 0,
+        commit_hash: await this.hillClimbingCommitHash(),
+        // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+        metric_value: NaN,
+        direction,
+        status,
+        duration: 0,
+        description,
+        metadata: {},
+      });
+      this.emitHillClimbingSpan(sessionId, task.id, spanSeq, 0, null, null, status, false);
+      await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "hill_climbing_misconfigured",
+          reason: `baseline evaluation failed: ${metricErrorMessage(baseline.error)}`,
+        },
+        session_id: sessionId,
+        usage: totalUsage,
+        turns: carried.turns,
+      };
+      await this.finalizeHillClimbing(result);
+      return result;
+    }
+
+    // Consecutive non-improvement counter (the stagnation halt).
+    let stagnation = 0;
+    // The 0-based iteration index; agent turns begin at 1.
+    let iteration = 1;
+
+    for (;;) {
+      // Budget gate before the iteration's agent turn (mirrors runReactInner).
+      const turnCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+      if (carried.turns >= turnCap) {
+        break;
+      }
+      const overrun = budgetExceeded(task.budget, carried, Date.now());
+      if (overrun != null) {
+        // A wall-time/cost/token cap reached BEFORE any iteration work is a clean
+        // budget halt. Mirrors runReactInner's contract.
+        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
+        const result: RunResult = {
+          kind: "failure",
+          reason: { kind: "budget_exceeded", limit_type: overrun },
+          session_id: sessionId,
+          usage: totalUsage,
+          turns: carried.turns,
+        };
+        await this.finalizeHillClimbing(result);
+        return result;
+      }
+
+      // ── One bounded agent turn proposes a change. The sub-run carries the
+      //    shared budget so per-iteration turns count toward the cap. Each
+      //    iteration is a fresh, isolated ReAct sub-loop.
+      const iterTask: Task = {
+        id: task.id,
+        instruction: task.instruction,
+        session_id: sessionId,
+        budget: task.budget,
+        loop_strategy: task.loop_strategy,
+      };
+      const iterState = emptySessionState();
+      const turnResult = await this.runReactInner(
+        iterTask,
+        turnCap,
+        iterState,
+        { ...carried },
+        undefined,
+        signal,
+        true,
+      );
+      foldUsage(totalUsage, carried, turnResult);
+
+      // A turn that paused / escalated is propagated up unchanged.
+      if (turnResult.kind === "waiting_for_human") {
+        return turnResult;
+      }
+      if (turnResult.kind === "escalate") {
+        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
+        await this.finalizeHillClimbing(turnResult);
+        return turnResult;
+      }
+
+      // ── Evaluate the metric after the change.
+      const evalOutcome = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
+      if (evalOutcome.kind === "ok") {
+        const value = evalOutcome.result.value;
+        const kept = shouldKeep(value, currentBest, direction, minImprovementDelta);
+        const delta = direction === "minimize" ? currentBest - value : value - currentBest;
+        if (kept) {
+          currentBest = value;
+          stagnation = 0;
+          rows.push({
+            iteration,
+            commit_hash: await this.hillClimbingCommitHash(),
+            metric_value: value,
+            direction,
+            status: "kept",
+            duration: evalOutcome.result.duration,
+            description,
+            metadata: {},
+          });
+          this.emitHillClimbingSpan(
+            sessionId,
+            task.id,
+            spanSeq,
+            iteration,
+            value,
+            delta,
+            "kept",
+            false,
+          );
+        } else {
+          // No improvement (D1: optionally revert).
+          const reverted = revertOnNoImprovement;
+          if (reverted) {
+            await this.hillClimbingRevert(signal);
+          }
+          stagnation += 1;
+          rows.push({
+            iteration,
+            commit_hash: await this.hillClimbingCommitHash(),
+            metric_value: value,
+            direction,
+            status: "discarded",
+            duration: evalOutcome.result.duration,
+            description,
+            metadata: {},
+          });
+          this.emitHillClimbingSpan(
+            sessionId,
+            task.id,
+            spanSeq,
+            iteration,
+            value,
+            delta,
+            "discarded",
+            reverted,
+          );
+        }
+      } else {
+        // Crash/timeout/etc.: counts as a non-improvement. Optionally revert,
+        // increment stagnation, record an empty-metric row.
+        const status = iterationStatusFromError(evalOutcome.error);
+        const reverted = revertOnNoImprovement;
+        if (reverted) {
+          await this.hillClimbingRevert(signal);
+        }
+        stagnation += 1;
+        rows.push({
+          iteration,
+          commit_hash: await this.hillClimbingCommitHash(),
+          // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
+          metric_value: NaN,
+          direction,
+          status,
+          duration: 0,
+          description,
+          metadata: {},
+        });
+        this.emitHillClimbingSpan(
+          sessionId,
+          task.id,
+          spanSeq,
+          iteration,
+          null,
+          null,
+          status,
+          reverted,
+        );
+      }
+
+      // ── Stagnation halt (only when a cap is configured).
+      if (maxStagnation != null && stagnation >= maxStagnation) {
+        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
+        const result: RunResult = {
+          kind: "failure",
+          reason: {
+            kind: "stagnation_limit_reached",
+            iterations: stagnation,
+            best_metric: currentBest,
+          },
+          session_id: sessionId,
+          usage: totalUsage,
+          turns: carried.turns,
+        };
+        await this.finalizeHillClimbing(result);
+        return result;
+      }
+
+      iteration += 1;
+    }
+
+    // Budget/turn cap reached without a stagnation halt — clean budget halt.
+    await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
+    const result: RunResult = {
+      kind: "failure",
+      reason: { kind: "budget_exceeded", limit_type: "turns" },
+      session_id: sessionId,
+      usage: totalUsage,
+      turns: carried.turns,
+    };
+    await this.finalizeHillClimbing(result);
+    return result;
+  }
+
+  /**
+   * Revert the working tree to current HEAD for a no-improvement iteration
+   * (issue #60, D1). Runs `git reset --hard HEAD` THROUGH the sandbox; the
+   * harness NEVER spawns git directly. A sandbox rejection / non-zero exit is
+   * best-effort: the loop continues (the next agent turn re-derives state).
+   */
+  private async hillClimbingRevert(signal?: AbortSignal): Promise<void> {
+    const exec = this.config.sandbox.executeCommand;
+    if (exec == null) return;
+    try {
+      await exec.call(this.config.sandbox, "git", ["reset", "--hard", "HEAD"], null, null, signal);
+    } catch {
+      // Best-effort — swallow exactly like the Rust impl.
+    }
+  }
+
+  /**
+   * Resolve the `commit_hash` recorded on a HillClimbing TSV row (issue #60,
+   * D1). The harness never commits, so this is `null` (serialized as the empty
+   * string in the TSV) unless a {@link VcsProvider} is wired to supply a hash.
+   * v1 has no per-keep commit, so we always return `null`; the VcsProvider seam
+   * is reserved for a later revision.
+   */
+  private async hillClimbingCommitHash(): Promise<string | null> {
+    return null;
+  }
+
+  /**
+   * Emit one fire-and-forget per-iteration observability span for a HillClimbing
+   * run (issue #60). No-op when no provider is configured.
+   */
+  private emitHillClimbingSpan(
+    sessionId: SessionId,
+    taskId: TaskId,
+    spanSeq: { value: number },
+    iteration: number,
+    metricValue: number | null,
+    delta: number | null,
+    status: IterationStatus,
+    reverted: boolean,
+  ): void {
+    const obs = this.config.observability;
+    if (obs?.emitWarn) {
+      const base = newRootSpanBase(
+        SpanId.of(`${sessionId.asString()}-hill-${spanSeq.value}`),
+        sessionId,
+        taskId,
+        "warn",
+        Timestamp.now(),
+      );
+      const event: WarnEvent = {
+        warn: "hill_climbing_iteration",
+        iteration,
+        metric_value: metricValue,
+        delta,
+        status,
+        reverted,
+      };
+      obs.emitWarn(newWarnSpan(base, event));
+      spanSeq.value += 1;
+    }
+  }
+
+  /**
+   * Serialize the HillClimbing results log and write it to
+   * `{workspace_root}/.spore/results/{task_id}.tsv` (issue #60, D2/D3).
+   * Best-effort: a filesystem error is swallowed (the run outcome is
+   * authoritative, the TSV is a diagnostic artifact). Skipped entirely when no
+   * workspace root is known.
+   */
+  private async writeHillClimbingTsv(
+    workspaceRoot: string,
+    taskId: TaskId,
+    rows: ResultsEntry[],
+  ): Promise<void> {
+    if (workspaceRoot.length === 0) return;
+    const body = StandardHarness.renderHillClimbingTsv(rows);
+    const dir = join(workspaceRoot, ".spore", "results");
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, `${taskId.asString()}.tsv`), body);
+    } catch {
+      // Best-effort — swallow exactly like the Rust impl.
+    }
+  }
+
+  /**
+   * Render the HillClimbing results-log TSV body (issue #60, D2/D3). Pure
+   * function over the rows so the exact byte content is unit-testable and
+   * cross-language-comparable. Trailing newline after every row (including the
+   * last) so appends and diffs stay line-oriented. Floats use exactly 6 decimal
+   * places; `metric_value` is the empty string on crashed/timeout rows; the
+   * empty commit hash and snake_case direction/status mirror Rust byte-for-byte.
+   */
+  static renderHillClimbingTsv(rows: ResultsEntry[]): string {
+    let out =
+      "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n";
+    for (const r of rows) {
+      // D3: metric_value is EMPTY on crashed/timeout rows.
+      const metricValue =
+        r.status === "crashed" || r.status === "timeout" ? "" : r.metric_value.toFixed(6);
+      const commitHash = r.commit_hash ?? "";
+      const durationSecs = r.duration.toFixed(6);
+      out += `${r.iteration}\t${commitHash}\t${metricValue}\t${r.direction}\t${r.status}\t${durationSecs}\t${r.description}\n`;
+    }
+    return out;
+  }
+
+  /**
+   * Finalize observability for a terminal `hill_climbing` outcome. Mirrors the
+   * tail of {@link runReact} / {@link finalizeSelfVerifying}. `waiting_for_human`
+   * is not terminal and is never flushed here.
+   */
+  private async finalizeHillClimbing(result: RunResult): Promise<void> {
     switch (result.kind) {
       case "success":
         await this.finalizeObservability(result.session_id, { kind: "success" });
@@ -2699,16 +3181,6 @@ function foldUsage(totalUsage: AggregateUsage, carried: BudgetSnapshot, r: RunRe
   carried.input_tokens += usage.input_tokens;
   carried.output_tokens += usage.output_tokens;
   carried.turns = Math.max(carried.turns, turns);
-}
-
-function notYetImplemented(strategy: string, sessionId: SessionId): RunResult {
-  return {
-    kind: "failure",
-    reason: { kind: "strategy_not_yet_implemented", strategy },
-    session_id: sessionId,
-    usage: emptyAggregateUsage(),
-    turns: 0,
-  };
 }
 
 function budgetExceeded(

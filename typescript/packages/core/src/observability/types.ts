@@ -466,15 +466,32 @@ export function newPatchSpan(
  * Wire shape mirrors the Rust `WarnEvent` byte-for-byte: the tag key is
  * `warn` and field names are `snake_case`.
  */
-export type WarnEvent = {
-  /** A compaction summary failed verification on every attempt and was accepted
-   *  as-is (issue #46). `missing_items` are the preservation-list terms still
-   *  absent from the final summary; `accepted_anyway` is always `true` for this
-   *  variant (the harness never blocks on compaction). */
-  warn: "compaction_verification_failed";
-  missing_items: string[];
-  accepted_anyway: boolean;
-};
+export type WarnEvent =
+  | {
+      /** A compaction summary failed verification on every attempt and was
+       *  accepted as-is (issue #46). `missing_items` are the preservation-list
+       *  terms still absent from the final summary; `accepted_anyway` is always
+       *  `true` for this variant (the harness never blocks on compaction). */
+      warn: "compaction_verification_failed";
+      missing_items: string[];
+      accepted_anyway: boolean;
+    }
+  | {
+      /** One iteration of a `HillClimbing` loop strategy run (issue #60).
+       *  Emitted fire-and-forget after each iteration's metric evaluation so the
+       *  run is traceable per-iteration with its metric value and delta.
+       *  `iteration` is the 0-based iteration index (0 = the pure baseline).
+       *  `metric_value` and `delta` are `null` on crashed/timeout iterations (no
+       *  comparable metric); `delta` is also `null` for the baseline. `status` is
+       *  the snake_case {@link "../metric/types.js".IterationStatus} string the
+       *  harness recorded (`kept`/`discarded`/`crashed`/`timeout`). */
+      warn: "hill_climbing_iteration";
+      iteration: number;
+      metric_value: number | null;
+      delta: number | null;
+      status: string;
+      reverted: boolean;
+    };
 
 /**
  * One warn-level observability span (issue #46). Carries a {@link SpanBase}
