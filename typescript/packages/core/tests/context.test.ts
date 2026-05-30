@@ -5,7 +5,7 @@
  * same verdicts, parallel structure.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { context, SessionId, TaskId } from "../src/index.js";
 import type {
@@ -172,23 +172,58 @@ describe("StandardContextManager.assemble", () => {
     const err = (caught as InstanceType<typeof ContextErrorException>).error;
     expect(err.kind).toBe("CacheHashMismatch");
     if (err.kind === "CacheHashMismatch") {
+      // `block` is now the CacheBlock value (Static), not a raw string (#32).
       expect(err.block).toBe("static");
     }
   });
 
-  // Rule: session block hash change mid-session emits a warning.
-  it("warns when session block changes mid-session", async () => {
+  // Rule (#32): a Block 2 (PerSession) change mid-session (turn > 1) halts the
+  // run with a CacheHashMismatch — consistent with Block 1, not just a warning.
+  it("Block 2 change mid-session halts (turn 2)", async () => {
+    const mgr = mk();
+    const s1 = state();
+    s1.turn_number = 1;
+    await mgr.assemble(s1, sources("BLOCK1", 0xab));
+    const s2 = state();
+    s2.turn_number = 2;
+    s2.task_instruction = "different task"; // changes session hash
+    let caught: unknown = null;
+    try {
+      await mgr.assemble(s2, sources("BLOCK1", 0xab));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ContextErrorException);
+    const err = (caught as InstanceType<typeof ContextErrorException>).error;
+    expect(err.kind).toBe("CacheHashMismatch");
+    if (err.kind === "CacheHashMismatch") {
+      expect(err.block).toBe("per_session");
+      expect(err.turn_number).toBe(2);
+    }
+  });
+
+  // Rule (#32): a stable Block 2 across turns does NOT halt.
+  it("stable Block 2 across turns does not halt", async () => {
+    const mgr = mk();
+    const s1 = state();
+    s1.turn_number = 1;
+    await mgr.assemble(s1, sources("BLOCK1", 0xab));
+    const s2 = state();
+    s2.turn_number = 2; // identical session content
+    await expect(mgr.assemble(s2, sources("BLOCK1", 0xab))).resolves.toBeDefined();
+  });
+
+  // Rule (#32): the mid-session guard — a Block 2 change at turn 1 records the
+  // baseline and does NOT halt (turn_number > 1 is required to halt).
+  it("Block 2 change at turn 1 does not halt (baseline guard)", async () => {
     const mgr = mk();
     const s1 = state();
     s1.turn_number = 0;
     await mgr.assemble(s1, sources("BLOCK1", 0xab));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const s2 = state();
-    s2.turn_number = 2;
+    s2.turn_number = 1; // turn 1 baseline write — must not halt
     s2.task_instruction = "different task"; // changes session hash
-    await mgr.assemble(s2, sources("BLOCK1", 0xab));
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+    await expect(mgr.assemble(s2, sources("BLOCK1", 0xab))).resolves.toBeDefined();
   });
 
   // Rule: Tool schemas sorted by name.

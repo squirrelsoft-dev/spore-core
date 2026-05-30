@@ -20,6 +20,7 @@ import type { PlanArtifact } from "../plan/types.js";
 import type { Mode } from "../prompt-chunk-registry/types.js";
 import type {
   CompactionPreserveHints,
+  ContextError,
   SessionState as ContextSessionState,
 } from "../context/types.js";
 import {
@@ -669,6 +670,15 @@ export type HaltReason =
   | { kind: "termination_policy_halt"; reason: string }
   | { kind: "middleware_halt"; hook: HookPoint; reason: string }
   | { kind: "agent_error"; error: AgentError }
+  /**
+   * A {@link ContextError} surfaced by the {@link ContextManager} during
+   * assembly halts the run (e.g. a cache-hash mismatch — both Block 1
+   * `"static"` and, as of #32, Block 2 `"per_session"` halt mid-session). This
+   * is the routing type; mirrors `agent_error`. The live {@link StandardHarness}
+   * loop does not yet trigger it because its placeholder `ContextManager`
+   * assemble is infallible pending the #7 migration.
+   */
+  | { kind: "context_error"; error: ContextError }
   | { kind: "sandbox_violation"; violation: SandboxViolation }
   | { kind: "unrecoverable_tool_error"; tool: string; error: string }
   | { kind: "human_halted" }

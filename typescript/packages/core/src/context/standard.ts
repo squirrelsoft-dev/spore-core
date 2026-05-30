@@ -151,6 +151,7 @@ export class StandardContextManager implements ContextManager {
           block: "static",
           expected: this.memo.static_hash,
           actual: staticHash,
+          turn_number: state.turn_number,
         });
       }
     } else {
@@ -162,10 +163,17 @@ export class StandardContextManager implements ContextManager {
     const sessionHash = segmentsHash(segments);
     if (this.memo.session_hash !== null) {
       if (this.memo.session_hash !== sessionHash && state.turn_number > 1) {
-        // Warn — spec rule. Do not fail.
-        console.warn(
-          `warn: session block hash changed mid-session (${this.memo.session_hash} → ${sessionHash})`,
-        );
+        // Block 2 (PerSession) is expected to be stable for the life of the
+        // session. A mid-session change means cost would silently spike; halt
+        // consistently with Block 1 (#32). We throw BEFORE updating the memo —
+        // the run is halting, so there is no "rest of the session" to track.
+        throw new ContextErrorException({
+          kind: "CacheHashMismatch",
+          block: "per_session",
+          expected: this.memo.session_hash,
+          actual: sessionHash,
+          turn_number: state.turn_number,
+        });
       }
     }
     this.memo.session_hash = sessionHash;

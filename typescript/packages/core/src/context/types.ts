@@ -18,6 +18,7 @@ import type { SandboxProvider } from "../harness/types.js";
 import { SessionId, TaskId, SessionIdSchema, TaskIdSchema } from "../harness/types.js";
 import { TaskPhaseSchema, type TaskPhase } from "../tool-registry/types.js";
 import { MessageSchema } from "../model/schemas.js";
+import type { CacheBlock } from "../prompt-chunk-registry/types.js";
 
 // ============================================================================
 // Forward-declared sibling types (issues #8, #9, #14)
@@ -448,7 +449,27 @@ export type ContextError =
   | { kind: "TokenCountFailed" }
   | { kind: "CompactionFailed"; reason: string }
   | { kind: "AssemblyFailed"; reason: string }
-  | { kind: "CacheHashMismatch"; block: string; expected: number; actual: number };
+  /**
+   * A cache block's content hash changed when it was expected to be stable.
+   *
+   * Both Block 1 ({@link CacheBlock} `"static"`) and Block 2 (`"per_session"`)
+   * halt the run on a mid-session mismatch — they are treated consistently
+   * (issue #32). A Block-2 change mid-session means session-stable content
+   * mutated and every subsequent turn would silently pay full input-token
+   * cost; rather than warn, the run stops so the caller can fix the source.
+   *
+   * `turn_number` is the turn on which the mismatch was detected (Block 2 only
+   * halts when `turn_number > 1`; the turn-1 assemble records the baseline).
+   * Estimated cache-cost-delta tracking (`UnexpectedMiss`) is a separate
+   * observability concern tracked in issue #90.
+   */
+  | {
+      kind: "CacheHashMismatch";
+      block: CacheBlock;
+      expected: number;
+      actual: number;
+      turn_number: number;
+    };
 
 export function contextErrorMessage(e: ContextError): string {
   switch (e.kind) {
@@ -459,7 +480,7 @@ export function contextErrorMessage(e: ContextError): string {
     case "AssemblyFailed":
       return `assembly failed: ${e.reason}`;
     case "CacheHashMismatch":
-      return `cache hash mismatch on block ${e.block}: expected ${e.expected}, got ${e.actual}`;
+      return `cache hash mismatch on block ${e.block} at turn ${e.turn_number}: expected ${e.expected}, got ${e.actual}`;
   }
 }
 
