@@ -1,11 +1,38 @@
 # PROJECT STATE
-_Last updated: 2026-05-29 by /close — closed #82 (MemoryTool) `status: complete`. All four #82 commits are on `main` and pushed (`origin/main` now `5dd91c9`). **#82 closes the tool surface for the storage track** — the scope-aware `memory` tool ships at parity across all four languages on top of #78's seam. The notable architectural outcome: merged-read (`get_memories_merged`) was promoted onto the `MemoryStore` trait/interface/protocol itself (decision D2) so there is exactly one merge implementation per language. Memory remains `SessionId`-keyed — the #78 Q7 v2 cross-session-keying follow-up is now **forced** and needs filing (issue-create was permission-blocked this loop; drafted body ready). Track A is closed, #82 is done — the direction call (tool surface vs. loop strategies vs. protocol track) is **now genuinely open** with the obvious tool-surface increment consumed (see Next Actions)._
+_Last updated: 2026-05-30 by /close — closed #61 (SelfVerifying loop strategy) `status: complete`. All four #61 commits are on `main` **locally, not yet pushed** (`c4f607a` rust, `856736b` ts, `cc2bab0` python, `f5b2f21` go; `origin/main` still at `5dd91c9`). **#61 brings the harness to 3 of 5 loop strategies running end-to-end** (ReAct + PlanExecute + SelfVerifying) — it was strategy-wiring only on top of the existing `Verifier` family (#44), `planner_agent` defaulting (#70), Stop-hook seam (#69), `role-evaluator` chunk, and read-only sandbox flag. Four spec forks were resolved & pinned in Rust before fan-out (D1 bespoke strategy not Stop-hook adapter; D2 minimal `evaluator_agent` config w/ #70 defaulting; D3 `Verifier::max_iterations()`=3 caps round-trips; D4 two peer halts `SelfVerifyExhausted`/`SelfVerifyMisconfigured`). Notable new reusable seam: a **`ReadOnlySandbox` decorator** (all four languages) enforcing the read-only evaluate phase. The #78 Q7 v2 follow-up was **filed as #89** this prior loop. **Two strategy stubs remain** — #58 (Ralph), #60 (HillClimbing); finishing them closes the last advertised-vs-actual core gap (see Next Actions)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
 component across four targets: Rust (reference), TypeScript, Python, and Go.
 
-**#82 just landed — the scope-aware `memory` tool ships across all four
+**#61 just landed — the SelfVerifying loop strategy runs end-to-end across all
+four languages**, taking the harness to **3 of 5 loop strategies** (ReAct +
+PlanExecute + SelfVerifying). It was strategy-wiring only: a `run_self_verifying`
+method replaced the `StrategyNotYetImplemented` stub, orchestrating a build ReAct
+sub-loop → a fresh evaluator run (fresh `SessionId`, read-only sandbox,
+`role-evaluator` chunk) → the existing `Verifier` (#44), reusing the
+failure-reason → user-message injection path to resume the build loop on FAIL.
+Four spec forks were pinned in the Rust reference before fan-out: **D1** bespoke
+strategy (not a Stop-hook adapter — the evaluate phase is a sibling *run* a Stop
+hook can't express); **D2** one new `evaluator_agent` config field following the
+#70 `planner_agent` defaulting contract (`None` → `config.agent`, documented on
+the field), plus a `verifier` oracle field; **D3** `Verifier::max_iterations()`
+(default 3) governs the build↔evaluate round-trip cap (not `max_stop_blocks`);
+**D4** two **peer** `HaltReason` variants — `SelfVerifyExhausted { iterations,
+last_reason }` (runtime limit) and `SelfVerifyMisconfigured { reason }`
+(build-time bug, e.g. absent verifier; typed halt, never a panic). New reusable
+seam: a **`ReadOnlySandbox` decorator** (all four) rejecting the seven mutating
+tool names (`write_file`/`edit_file`/`delete_file`/`move_file`/`exec`/
+`bash_command`/`run_tests`) with a recoverable `ReadOnlyViolation` and delegating
+reads. New fixture `fixtures/harness/self_verifying.json` (7 cases, identical
+outcomes all four). Cross-language verification PASS, no divergences;
+`role-evaluator` chunk verified byte-identical across all four (incl. Go's
+hardcoded constant, since Go can't import the registry). Rust `c4f607a` (787 lib
++ 12 new), TS `856736b` (+18), Python `cc2bab0` (978 passed, +14), Go `f5b2f21`
+(+12 funcs/22 cases, `-race` clean). **These four commits are on `main` locally
+but NOT pushed** — `origin/main` is still at `5dd91c9`.
+
+**#82 (the prior loop) — the scope-aware `memory` tool ships across all four
 languages**, built on #78's scoped `MemoryStore` API + `ToolContext` memory
 seam. A single `memory` tool, `operation`-discriminated (`write`/`read`) like
 `TaskListParams`, `scope` explicit on both ops, registered in the
@@ -32,8 +59,7 @@ second); reuses `fixtures/storage/memory_scoped_merge.json` for strict
 newest-first ordering through the tool. Cross-language verification PASS, no
 divergences. **Known v1 limit (#78 Q7): memory stays `SessionId`-keyed — the
 tool can only address the current session; session-independent cross-session
-memory addressing is the v2 follow-up, now forced and needing an issue (filing
-was permission-blocked this loop).**
+memory addressing is the v2 follow-up, now forced and **filed as #89**.**
 
 **#78 (the storage seam #82 built on)** shipped `StorageScope { User, Project,
 Local }`, a fixture-pinned `WorkspaceId` derivation
@@ -91,54 +117,55 @@ Earlier: observability stack (#42/#49/#50/#33), `OllamaModelInterface` +
 capability guard (#41), `StandardCompactionAdapter` + verify→retry→warn loop
 (#55/#46), `StandardContextManager`/verifiers (#29), KeyTermVerifier (#47).
 
-**origin/main is at `5dd91c9`** — all work through #82 is pushed. CI green
-across all four languages.
+**origin/main is at `5dd91c9`** — work through #82 is pushed, but the **four #61
+commits (`c4f607a`/`856736b`/`cc2bab0`/`f5b2f21`) are local-only and NOT yet
+pushed**. All four language suites pass locally; push before the next loop.
 
-Known runnability limits: the harness runs **ReAct and PlanExecute** end-to-end.
-`Ralph`, `SelfVerifying`, and `HillClimbing` (#58/#61/#60) still return the generic
-`HaltReason::StrategyNotYetImplemented` — so the README and
-`docs/harness-engineering-concepts.md` still overstate what runs (3 of 5
-strategies remain stubs).
+Known runnability limits: the harness runs **ReAct, PlanExecute, and
+SelfVerifying** end-to-end (3 of 5). `Ralph` and `HillClimbing` (#58/#60) still
+return the generic `HaltReason::StrategyNotYetImplemented` — so the README and
+`docs/harness-engineering-concepts.md` still overstate what runs (2 of 5
+strategies remain stubs, down from 3).
 
 ## Active Direction
 The harness is **runnable** (#57), **debuggable** (#64/#65), has a working
-**evaluation/feedback loop** (#26/#68), runs **two** of five advertised loop
-strategies (ReAct + PlanExecute), has a **clean, fully-pluggable persistence seam
+**evaluation/feedback loop** (#26/#68), runs **three** of five advertised loop
+strategies (ReAct + PlanExecute + SelfVerifying, #61), has a **clean, fully-pluggable persistence seam
 reaching all the way into tools, scope-aware, and now exercised by a real
 `memory` tool** (#73 + #76 + #75 + #78 + #82), a **typed tool→caller escalation
 channel** (#80), a **complete standard tool catalogue** (#81 + #82), and a
 **conditional prompt assembly engine** (#79) — all across four languages. The bar
 remains **capability breadth and correctness**.
 
-**Track A — tool/prompt architecture — is CLOSED, and the tool surface is now
-complete** (#79 + #80 + #81 + #82). #82 consumed the obvious smallest increment,
-so the **direction call is now genuinely open** between two remaining
-core-capability tracks plus an interop track:
-1. **Light up the remaining loop strategies** — #61 (SelfVerifying, likely
-   cheapest — a `Stop`-hook config on the #69 hook system), then #58 (Ralph),
-   then #60 (HillClimbing). This is what stops the docs overstating capability
-   (3 of 5 strategies are still stubs) — the only remaining gap between
-   advertised and actual *core* capability. **Default recommendation.**
+**Track A — tool/prompt architecture — is CLOSED** (#79 + #80 + #81 + #82). #61
+started the **loop-strategy track** — the recommended next bite after #82 — and
+took the harness to 3 of 5 strategies. The active track is now finishing that:
+1. **Finish the remaining loop strategies** — #58 (Ralph), then #60
+   (HillClimbing). With #61 done, these two are the **only remaining gap between
+   advertised and actual *core* capability** (the docs claim five strategies; two
+   are still stubs). Each reuses the same seams #61/#69/#70/PlanExecute
+   established. **Default recommendation — finish what #61 started.**
 2. **Protocol integrations (#83–87)** — MCP (#83), A2A (#84), ACP (#85),
    AG-UI (#86), A2UI (#87) remain on the board unlabeled. A potential new track
    (interop/ecosystem) rather than core-capability depth. **Needs a maintainer
    decision before triage/prioritization.**
 3. **Correctness/safety debt + docs cleanup** — #30/#31/#32/#34 (safety gates)
-   and #27/#35/#36 (docs stop overstating). Lower-glamour but tightens the
-   "correctness" half of the bar.
+   and #27/#35/#36 (docs stop overstating). #27 specifically partially relieved
+   by #61 (the count is now 3/5, not 2/5) but still overstates until #58/#60
+   land. Lower-glamour but tightens the "correctness" half of the bar.
 
 Storage remaining: SQL backends (#77, deferred) and the #88 deferred chunk
 providers. The **#78 Q7 v2 follow-up — session-independent cross-session memory
-keying — is now forced by #82 and needs an issue filed** (issue-create was
-permission-blocked this loop; drafted body is ready).
+keying — was filed as #89** (`scope: deferred`); interacts with #30.
 
 ## Known Deviations
-1. **Three of five loop strategies are still stubs** — the README and
-   `docs/harness-engineering-concepts.md` advertise five loop strategies; **ReAct
-   and PlanExecute run end-to-end**, but `Ralph`, `SelfVerifying`, and
+1. **Two of five loop strategies are still stubs** (down from three) — the README
+   and `docs/harness-engineering-concepts.md` advertise five loop strategies;
+   **ReAct, PlanExecute, and SelfVerifying (#61) run end-to-end**, but `Ralph` and
    `HillClimbing` still return `HaltReason::StrategyNotYetImplemented` at
-   `rust/crates/spore-core/src/harness.rs`. Tracked: #58 / #61 / #60
+   `rust/crates/spore-core/src/harness.rs`. Tracked: #58 / #60
    (`scope: deferred`). #57's scenario suite is intentionally ReAct-only.
+   (#61 **resolved** — see Current State.)
 2. **Go outbox is not zero-dependency** — closing #50 added
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps to
    `go/spore-core/go.mod` (accepted tradeoff, documented in `go/CONVENTIONS.md`).
@@ -153,13 +180,12 @@ permission-blocked this loop; drafted body is ready).
    future phase) — `MemoryStore` is still `SessionId`-keyed, so #82's `MemoryTool`
    can only address the *current* session's memory; durable session-independent
    cross-session addressing is the v2 feature that makes memory useful across
-   runs. Documented in each language's `MemoryTool` module header. **#82 forces
-   the question** — a v2 issue needs filing (drafted this loop; issue-create was
-   permission-blocked, body held). No SQL backend yet either (#77,
-   `scope: deferred`). _(Storage scope + workspace partitioning, formerly filed
+   runs. Documented in each language's `MemoryTool` module header. **#82 forced
+   the question — now filed as #89** (`scope: deferred`). No SQL backend yet
+   either (#77, `scope: deferred`). _(Storage scope + workspace partitioning, formerly filed
    as #78, **resolved**; `MemoryTool` itself, #82, **resolved** — see Current
    State.)_
-5. **Go-specific divergences (#80 + #81 + #79 + #78 + #82)** (`scope: debt`,
+5. **Go-specific divergences (#80 + #81 + #79 + #78 + #82 + #61)** (`scope: debt`,
    minor, documented on the issues) — (a) the Go target defines a local `Mode`
    string newtype rather than importing it; (b) `HarnessObserver.SetSessionOutcome`
    is a 3-state `TerminalOutcome`; (c) `StandardTool` defined in root `sporecore`
@@ -174,8 +200,15 @@ permission-blocked this loop; drafted body is ready).
    helper that every `MemoryStore.GetMemoriesMerged` delegates to (Rust uses a
    default trait method, TS/Python a shared helper) — and `MemoryTool` performs
    the (g) `ToolMemoryStore`→`storage.MemoryStore` assertion to reach the store,
-   exactly as it already consumes `ToolRunStore`. All wire/behavior-identical to
-   the other three (verified).
+   exactly as it already consumes `ToolRunStore`. New in #61: (i) the `Verifier`
+   and `EvaluatorAgent` config fields are set directly on the config struct
+   (`cfg.Verifier = …`) with **no builder setters** — Go has no `PlannerAgent`
+   setter either, so this matches the established pattern (the other three add
+   `.verifier()`/`.evaluator_agent()` setters); and (j) the `role-evaluator`
+   chunk is a `RoleEvaluatorChunk` constant in `sporecore` (verified
+   byte-identical to the registry) because `sporecore` can't import
+   `promptchunkregistry`. All wire/behavior-identical to the other three
+   (verified).
 6. **#78/#82 test-placement divergences** (benign, not spec violations) — the
    #78 R9 registry-seam test lives in `@spore/tools` (TS) and in the eval suite
    (Python) to avoid inverted package dependencies; Rust and Go keep theirs in
@@ -213,27 +246,25 @@ _(Former Deviation — observability captured no message content — **resolved*
 ## Next Actions
 [3-5 items max. Each references a GH issue # where possible.
 This section is updated by /close after every PEE loop.]
-1. **DIRECTION CALL — now genuinely open** (no issue; maintainer decision).
-   Track A is closed and #82 consumed the obvious tool-surface increment, so
-   there's no longer a default "smallest gap" item. Pick the next track:
-   (a) **loop strategies #61→#58→#60** — the only remaining gap between
-   advertised and actual *core* capability (3 of 5 strategies still stubs);
-   **recommended**; (b) **protocol-integration track #83–87** — interop/ecosystem,
-   still unlabeled, needs triage; (c) **correctness/safety debt + docs**
-   (#30/#31/#32/#34, #27/#35/#36).
-2. **File the #78 Q7 v2 follow-up** — session-independent cross-session memory
-   keying, **now forced by #82** (the `memory` tool can only see the current
-   session). Drafted this loop; `gh issue create` was permission-blocked, body
-   held — file it (label `scope: deferred`) so the board reflects the forced
-   question. Interacts with #30 (memory distillation PendingReview gate).
-3. **Loop strategies — #61 → #58 → #60** (`scope: deferred`). SelfVerifying
-   (likely cheapest — `Stop`-hook config on #69), Ralph, HillClimbing; reuse the
-   PlanExecute seams (pluggable ReAct sub-loop executor, `task_list` drain,
-   `OnTaskAdvance` hook, `RunStore`). The pick that stops the docs overstating.
-4. **#83–87 — protocol integrations** (unlabeled). MCP (#83), A2A (#84),
-   ACP (#85), AG-UI (#86), A2UI (#87). Triage and label once the direction call
-   lands — a new track or `scope: deferred`.
-5. **Correctness/safety debt + docs cleanup + storage phases** —
-   #30/#31/#32/#34 (safety gates), #27/#35/#36 (docs stop overstating
-   capability), #77 (SQL backends), #88 (deferred Remote + FileSystem chunk
-   providers, once a constrained-frontmatter fixture contract is pinned).
+1. **Push the #61 commits** — `c4f607a`/`856736b`/`cc2bab0`/`f5b2f21` are on
+   `main` **locally only**; `origin/main` is still `5dd91c9`. All four suites pass
+   locally. Push before starting the next strategy so the board, CI, and `main`
+   agree. (No issue — release hygiene.)
+2. **#58 — Ralph loop strategy** (`scope: deferred`). The next strategy after
+   #61, and the recommended track: finishing #58 + #60 closes the last
+   advertised-vs-actual core gap (2 of 5 still stubs). Reuse the seams #61
+   exercised — pluggable ReAct sub-loop executor (`run_react_inner`), the
+   failure-reason→user-message injection path, `RunStore`, the #69 hooks, and the
+   #70 alternate-agent defaulting pattern. Resolve spec forks in Rust before
+   fan-out, same as #61.
+3. **#60 — HillClimbing loop strategy** (`scope: deferred`). The last strategy
+   stub; lands the harness at 5 of 5 and lets #27/#35 docs stop overstating.
+4. **Docs + correctness debt** — #27 (README strategy count: now 3/5, finish to
+   5/5 then update), #35 (`harness-engineering-concepts.md` drift), #36
+   (observability docs); #30/#31/#32/#34 (safety gates). Tightens the
+   "correctness" half of the bar once the strategies land.
+5. **#83–87 — protocol integrations** (unlabeled) + storage phases. MCP (#83),
+   A2A (#84), ACP (#85), AG-UI (#86), A2UI (#87) — triage/label as a new
+   interop track or `scope: deferred` (needs a maintainer decision). Plus #77
+   (SQL backends), #88 (deferred chunk providers), #89 (cross-session memory
+   keying), all `scope: deferred`.
