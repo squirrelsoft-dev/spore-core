@@ -1,11 +1,28 @@
 # PROJECT STATE
-_Last updated: 2026-05-30 by /close — re-closed #58 (Ralph loop strategy + v2 `VcsProvider` seam) `status: complete`. This loop landed the **v2 `VcsProvider` seam** that closes the original B4 git-log gap: Ralph now reloads all three spec'd filesystem sources (progress, feature list, **opt-in git log**). A `VcsProvider` trait/interface (`log`/`status`) with two impls — `GitVcsProvider` (shells `git` **through** `SandboxProvider::execute_command`, never a raw spawn) and `FixtureVcsProvider` (deterministic test double, returns seeded strings verbatim — this is what makes git-log reload hermetically fixture-replayable across four languages). Wired as `vcs_provider: Option<…>` on the Ralph config surface (alongside `max_resets`), default **none** → git context omitted, preserving v1 byte-for-byte; when set, the reload phase injects a delimited `Recent VCS history:` block. **PUSH BLOCKER RESOLVED** — SSH auth was fixed and all 13 backlog commits (#61 ×4, Ralph v1 ×4, VcsProvider ×4 + 1 Go fix) are pushed; `origin/main` == local == `bfeba21`. The harness runs **4 of 5 loop strategies**; only HillClimbing (#60) remains stubbed. Next: **#60** to reach 5/5._
+_Last updated: 2026-05-30 by /close — closed #60 (HillClimbing loop strategy) `status: complete`. This loop landed the **fifth and final loop strategy** across all four languages: the harness now runs **5 of 5** advertised strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing). #60 was the harness-wiring issue, not the trait-design one — the `MetricEvaluator` trait, `should_keep`, `MetricResult`/`MetricError`, `IterationStatus`, `ResultsEntry`, the four production evaluators, and `HaltReason::StagnationLimitReached` all already shipped under #23. #60 drives them from `StandardHarness::run`: baseline-first measurement (iteration 0, no agent turn) → agent turn → evaluate → keep/revert via payload-direction `should_keep`, plus a harness-written TSV results log at `.spore/results/{task_id}.tsv` and a misconfiguration guard. New public surface (mirrored ×4): `HaltReason::HillClimbingMisconfigured`, the `metric_evaluator` config field (injected like `verifier`/`vcs_provider`), the `hill_climbing_iteration` observability span. Seven spec ambiguities (git-reset seam, TSV float byte-identity at 6 decimals, TSV schema, direction source-of-truth, baseline semantics, misconfig halt, baseline-error) were pinned with the maintainer before fan-out. Cross-language verification PASS, byte-identical TSV confirmed, no divergences. Commits rust `5da525f`, python `e21c745`, ts `7d632bc`, go `d53e221` — all on `main`, pushed (`origin/main` == `d53e221`). **Both feature tracks (Track A tool/prompt + loop-strategy track) are now CLOSED.** Next: a maintainer fork — correctness/safety debt + docs cleanup vs. opening the protocol-integration track (#83–87)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime built component by
 component across four targets: Rust (reference), TypeScript, Python, and Go.
-**Everything is pushed — `origin/main` == local == `bfeba21`** (the prior
-multi-loop unpushed-commit backlog is cleared).
+**Everything is pushed — `origin/main` == local == `d53e221`.**
+
+**The harness now runs all 5 of 5 advertised loop strategies end-to-end across
+all four languages** (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing).
+The final one, **HillClimbing (#60)**, is an iterative-optimization loop:
+iteration 0 establishes a baseline metric with no agent turn (`status: kept`),
+then each iteration runs one agent turn → evaluates the metric → keeps or reverts
+based on strict improvement (`should_keep`, payload `direction` authoritative).
+`revert_on_no_improvement` discards the working tree via `git reset --hard HEAD`
+through the sandbox seam (no commit-per-keep; harness never commits).
+`max_stagnation` halts with `StagnationLimitReached` after N consecutive
+non-improvements (counter resets on improvement); crash/timeout count as
+non-improvements. The harness (not the agent) writes a TSV results log to
+`.spore/results/{task_id}.tsv` — header + one row per iteration, 6-decimal float
+formatting pinned for cross-language byte-identity, `metadata` excluded. Built on
+#23's already-shipped `MetricEvaluator`/`should_keep`/`ResultsEntry` surface; #60
+added only the harness wiring, the `metric_evaluator` config field, the
+`HillClimbingMisconfigured` halt, and the `hill_climbing_iteration` span. The
+`StrategyNotYetImplemented` stub is gone — **no loop strategy is stubbed anymore.**
 
 **The Ralph loop strategy (#58) is complete end-to-end across all four
 languages, including its v2 `VcsProvider` seam.** Ralph is a
@@ -93,67 +110,60 @@ Earlier: observability stack (#42/#49/#50/#33), `OllamaModelInterface` +
 capability guard (#41), `StandardCompactionAdapter` + verify→retry→warn loop
 (#55/#46), `StandardContextManager`/verifiers (#29), KeyTermVerifier (#47).
 
-Known runnability limit: the harness runs **ReAct, PlanExecute, SelfVerifying,
-and Ralph** end-to-end (4 of 5). Only `HillClimbing` (#60) still returns the
-generic `HaltReason::StrategyNotYetImplemented` — so the README and
-`docs/harness-engineering-concepts.md` still overstate by one strategy.
+Runnability: the harness runs **all five** advertised loop strategies (ReAct,
+PlanExecute, SelfVerifying, Ralph, HillClimbing) end-to-end. The README and
+`docs/harness-engineering-concepts.md` no longer overstate the *count* of working
+strategies — but #27/#35 still track other spec-vs-code drift surfaced in review.
 
 ## Active Direction
 The harness is **runnable** (#57), **debuggable** (#64/#65), has a working
-**evaluation/feedback loop** (#26/#68), runs **four** of five advertised loop
-strategies (ReAct + PlanExecute + SelfVerifying + Ralph, #61/#58 — Ralph now
-complete with full git-log reload), has a **clean, fully-pluggable, scope-aware
-persistence seam** reaching into tools and exercised by a real `memory` tool (#73
-+ #76 + #75 + #78 + #82), a **typed tool→caller escalation channel** (#80), a
-**complete standard tool catalogue** (#81 + #82), and a **conditional prompt
-assembly engine** (#79) — all across four languages. The bar remains **capability
-breadth and correctness**.
+**evaluation/feedback loop** (#26/#68), runs **all five** advertised loop
+strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing,
+#61/#58/#60), has a **clean, fully-pluggable, scope-aware persistence seam**
+reaching into tools and exercised by a real `memory` tool (#73 + #76 + #75 + #78 +
+#82), a **typed tool→caller escalation channel** (#80), a **complete standard tool
+catalogue** (#81 + #82), and a **conditional prompt assembly engine** (#79) — all
+across four languages. The bar remains **capability breadth and correctness**.
 
-**Track A — tool/prompt architecture — is CLOSED.** The **loop-strategy track**
-(#61 → #58) is **one issue from done**:
-1. **Finish the last loop strategy — #60 (HillClimbing).** With #58 fully
-   complete, this is the **only remaining gap between advertised and actual
-   *core* capability** (the docs claim five strategies; one is still a stub).
-   Lands the harness at 5 of 5 and lets #27/#35 docs stop overstating. Reuse the
-   seams #61/#58 exercised — the `run_react_inner` sub-loop executor, the
-   failure-reason→user-message injection path, `RunStore`, the #69 Stop hooks, the
-   #70 alternate-agent defaulting pattern, the `max_resets`-style config-driven
-   outer cap, and (if it needs to read external state) the new `VcsProvider`-style
-   provider-seam pattern. Resolve spec forks in Rust before fan-out. **Default
-   recommendation — finish the track.**
-2. **Protocol integrations (#83–87)** — MCP (#83), A2A (#84), ACP (#85), AG-UI
-   (#86), A2UI (#87) remain unlabeled. A potential new interop/ecosystem track.
-   **Needs a maintainer decision before triage/prioritization.**
-3. **Correctness/safety debt + docs cleanup** — #30/#31/#32/#34 (safety gates)
-   and #27/#35/#36 (docs stop overstating). #27 is now only one strategy from
-   accurate (4/5). Lower-glamour but tightens the "correctness" half of the bar.
+**Both feature tracks are now CLOSED** — Track A (tool/prompt architecture, #79 +
+#80 + #81 + #82) and the loop-strategy track (#61 → #58 → #60). The harness has
+its full advertised core capability surface. What remains is a genuine fork that
+**needs a maintainer decision** before the next loop:
+
+1. **Correctness/safety debt + docs cleanup** (the "correctness" half of the bar).
+   Safety gates — #32 (Block-2 hash mismatch must *halt*, not just warn — a real
+   correctness bug), #34 (`Mode::Yolo` / `SandboxProvider::None` behind a dangerous
+   feature flag), #31 (SharedSession subagent context read-only by default), #30
+   (memory distillation through the PendingReview gate). Docs — #27/#35/#36 (stop
+   overstating / clarify spec; the strategy *count* is now accurate but other drift
+   remains). Lower-glamour, all `scope: deferred` today, but tightens correctness
+   now that breadth is done. **Default recommendation — this is concrete,
+   in-repo, and needs no new architecture.**
+2. **Open the protocol-integration track (#83–87)** — MCP (#83), A2A (#84), ACP
+   (#85), AG-UI (#86), A2UI (#87), all still unlabeled. A new interop/ecosystem
+   track that would broaden reach beyond the core runtime. **Needs a maintainer
+   decision to commit to it and set ordering before triage.**
 
 Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
 #89 cross-session memory keying — all `scope: deferred`.
 
 ## Known Deviations
-1. **One of five loop strategies is still a stub** — the README and
-   `docs/harness-engineering-concepts.md` advertise five loop strategies;
-   **ReAct, PlanExecute, SelfVerifying (#61), and Ralph (#58) run end-to-end**,
-   but `HillClimbing` still returns `HaltReason::StrategyNotYetImplemented` at
-   `rust/crates/spore-core/src/harness.rs`. Tracked: #60 (`scope: deferred`).
-   #57's scenario suite is intentionally ReAct-only.
-2. **Go outbox is not zero-dependency** — closing #50 added
+1. **Go outbox is not zero-dependency** — closing #50 added
    `go.opentelemetry.io/otel` + `otlptracegrpc` (v1.28.0) as blessed deps
    (accepted tradeoff, documented in `go/CONVENTIONS.md`). The durable JSONL path
    stays network-free.
-3. **`task_list` / `todo_write` tool default persistence is no-op, not a file**
+2. **`task_list` / `todo_write` tool default persistence is no-op, not a file**
    (`scope: debt`, minor) — #75 retired the `.spore/task_list.json` sandbox path;
    the standalone tools persist via `RunStore`. With the library default
    `no_op()` storage, a standalone invocation persists nothing across processes.
    Durable standalone use requires wiring a real `StorageProvider`. Accepted
    tradeoff; no migration shim.
-4. **v1 memory keying limitation (#78 Q7), filed as #89** (`scope: deferred`,
+3. **v1 memory keying limitation (#78 Q7), filed as #89** (`scope: deferred`,
    future phase) — `MemoryStore` is still `SessionId`-keyed, so #82's
    `MemoryTool` can only address the current session; durable session-independent
    cross-session addressing is the v2 feature. Documented in each language's
    `MemoryTool` module header. No SQL backend yet either (#77).
-5. **Go-specific divergences (#80 + #81 + #79 + #78 + #82 + #61 + #58)**
+4. **Go-specific divergences (#80 + #81 + #79 + #78 + #82 + #61 + #58 + #60)**
    (`scope: debt`, minor, documented on the issues) — (a) local `Mode` newtype;
    (b) 3-state `TerminalOutcome`; (c) `StandardTool` in root `sporecore`
    type-aliased into `tools`; (d) `sendMessageToolName` duplicated in
@@ -167,25 +177,30 @@ Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
    is a `RoleEvaluatorChunk` constant in `sporecore` (can't import the registry);
    (k) the Ralph Stop hook is registered in `NewStandardHarness`, and
    `MaxResets`/the Ralph types / the v2 `VcsProvider` field are set directly on
-   the config struct (no builder setter), same as (i). All wire/behavior-identical
-   to the other three (verified).
-6. **Test-placement divergences (#78/#82)** (benign) — the #78 R9 registry-seam
+   the config struct (no builder setter), same as (i). (l) #60 required a
+   consumer-side `MetricEvaluator` seam interface in the root `sporecore` package
+   (with an `AsHarnessMetricEvaluator` bridge in `metric`) to avoid an import cycle
+   — same pattern as `Verifier`/`VcsProvider`; `MetricEvaluator` config + the
+   `HillClimbing` fields set on the struct, no builder setter. All
+   wire/behavior-identical to the other three (verified).
+5. **Test-placement divergences (#78/#82)** (benign) — the #78 R9 registry-seam
    test lives in `@spore/tools` (TS) / the eval suite (Python); #82 reused TS
    `@spore/tools` `tool-context-memory-seam.test.ts` and keeps the Python
    catalogue test in `spore_tools`. Behavior identical.
-7. **#79 cross-language divergences — both verified benign.** (a)
+6. **#79 cross-language divergences — both verified benign.** (a)
    `ContextSources.composed_prompt` carries the full `ComposedPrompt` in
    Rust/Python but a narrowed stub in TS/Go (outcomes identical). (b) The Block-1
    hash is not byte-identical (Rust SipHash vs. FNV-1a elsewhere) — the
    intentional #24 decision; #79 fixtures assert no hash values, only condition
    booleans and ordered bucket id lists.
-8. **`Custom` condition is invisible in fixtures by design** (#79) —
+7. **`Custom` condition is invisible in fixtures by design** (#79) —
    `ChunkCondition::Custom(predicate)` is first-class in the API but serializes
    to null/absent; architects using it knowingly opt that chunk out of the
    byte-identical cross-language contract.
 
-_(Former Deviation — push blocked on local SSH auth (13 unpushed commits) — **resolved** this loop; SSH fixed, all pushed, `origin/main` == `bfeba21`.)_
-_(Former Deviation — Ralph git-log reload deferred to v2 (#58 B4) — **resolved** this loop by the `VcsProvider` seam; Ralph now reloads all three spec'd sources.)_
+_(Former Deviation — HillClimbing loop strategy stub, #60 (was Deviation #1: harness ran only 4/5 strategies) — **resolved** this loop; HillClimbing runs end-to-end across all four, harness now at 5/5, stub removed.)_
+_(Former Deviation — push blocked on local SSH auth (13 unpushed commits) — **resolved**; SSH fixed, all pushed.)_
+_(Former Deviation — Ralph git-log reload deferred to v2 (#58 B4) — **resolved** by the `VcsProvider` seam; Ralph now reloads all three spec'd sources.)_
 _(Former Deviation — SelfVerifying strategy stub, #61 — **resolved** in #61.)_
 _(Former Deviation — `MemoryTool` deferred/blocked — **resolved** in #82.)_
 _(Former Deviation — storage scope + partitioning, #78 — **resolved** in #78.)_
@@ -198,19 +213,22 @@ _(Former Deviation — observability captured no message content — **resolved*
 ## Next Actions
 [3-5 items max, highest priority first. Each references a GH issue # where
 possible. /next surfaces item 1 as "work this next."]
-1. **#60 — HillClimbing loop strategy** (`scope: deferred`). The last strategy
-   stub; lands the harness at 5 of 5 and closes the final advertised-vs-actual
-   core gap. Reuse the seams #58/#61 exercised — `run_react_inner` sub-loop, the
-   failure-reason→user-message injection path, `RunStore`, #69 Stop hooks, #70
-   alternate-agent defaulting, a `max_resets`-style config-driven outer cap, and
-   the new `VcsProvider`-style provider-seam pattern if it needs external state.
-   Resolve spec forks in Rust before fan-out. **Work this next.**
-2. **Docs + correctness debt** — #27 (README strategy count: now 4/5, finish #60
-   then update to 5/5), #35 (`harness-engineering-concepts.md` drift), #36
-   (observability docs); #30/#31/#32/#34 (safety gates). Tightens the
-   "correctness" half of the bar once #60 lands.
-3. **#83–87 — protocol integrations** (unlabeled) — MCP (#83), A2A (#84), ACP
-   (#85), AG-UI (#86), A2UI (#87). Triage/label as a new interop track or
-   `scope: deferred` — **needs a maintainer decision** before prioritization.
-4. **Deferred storage/memory phases** — #77 (SQL backends), #88 (deferred chunk
+1. **MAINTAINER DECISION — pick the next track.** Both feature tracks are closed,
+   so there is no single forced next issue. Choose: **(a) correctness/safety debt +
+   docs** (concrete, in-repo, no new architecture — recommended) or **(b) open the
+   protocol-integration track (#83–87)** (new interop scope). `/next` will surface
+   this fork until a track is chosen.
+2. **Correctness/safety gates** (track-a candidate) — **#32 first** (Block-2 hash
+   mismatch must *halt* mid-session, not just warn — a genuine correctness bug),
+   then #34 (`Mode::Yolo`/`SandboxProvider::None` behind a dangerous feature flag),
+   #31 (SharedSession subagent context read-only by default), #30 (memory
+   distillation through the PendingReview gate). All `scope: deferred` today; relabel
+   `status: queued` if this track is chosen.
+3. **Docs cleanup** (track-a candidate) — #27 (README: strategy count is now
+   accurate at 5/5, but sweep remaining spec-vs-code drift), #35
+   (`harness-engineering-concepts.md` drift), #36 (E2B data-residency/privacy doc).
+4. **Protocol-integration track (#83–87)** (alternative to 2/3) — MCP (#83), A2A
+   (#84), ACP (#85), AG-UI (#86), A2UI (#87), all unlabeled. Triage/label and set
+   ordering **only if the maintainer commits to this track.**
+5. **Deferred storage/memory phases** — #77 (SQL backends), #88 (deferred chunk
    providers), #89 (cross-session memory keying). All `scope: deferred`.
