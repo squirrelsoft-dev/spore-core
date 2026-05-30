@@ -65,6 +65,8 @@ async fn react_loop_dispatches_tool_then_completes() {
         max_stop_blocks: 8,
         hooks: None,
         planner_agent: None,
+        verifier: None,
+        evaluator_agent: None,
         storage: Arc::new(spore_core::StorageProvider::no_op()),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
     };

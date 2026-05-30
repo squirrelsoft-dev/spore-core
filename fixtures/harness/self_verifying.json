@@ -1,0 +1,47 @@
+{
+  "description": "Cross-language consistency fixture for the SelfVerifying loop strategy (issue #61).\n\nEach case scripts a sequence of verifier verdicts (`verdicts`: \"pass\" means Passed, any other string is a Failed reason) replayed across the build<->evaluate round-trips, the verifier's `max_iterations` cap, and the expected terminal RunResult. The harness build/evaluate agents are scripted to always claim done, so the verdict sequence fully determines the outcome:\n  - the first `pass` verdict at iteration i => Success.\n  - all verdicts Failed up to `max_iterations` => Failure { SelfVerifyExhausted { iterations: max_iterations } } (the stagnation guard / Default-FAIL contract).\n  - `misconfigured` cases run with NO verifier configured => Failure { SelfVerifyMisconfigured }.\n\nExpected.kind is one of: success | exhausted | misconfigured. `iterations` documents the round-trip count.",
+  "cases": [
+    {
+      "name": "pass_first_iteration",
+      "verdicts": ["pass"],
+      "max_iterations": 3,
+      "expected": {"kind": "success", "iterations": 1}
+    },
+    {
+      "name": "fail_then_pass",
+      "verdicts": ["needs a null check", "pass"],
+      "max_iterations": 3,
+      "expected": {"kind": "success", "iterations": 2}
+    },
+    {
+      "name": "fail_fail_then_pass",
+      "verdicts": ["finding A", "finding B", "pass"],
+      "max_iterations": 3,
+      "expected": {"kind": "success", "iterations": 3}
+    },
+    {
+      "name": "always_fail_exhausts_default_cap",
+      "verdicts": ["never good enough", "still wrong", "nope"],
+      "max_iterations": 3,
+      "expected": {"kind": "exhausted", "iterations": 3}
+    },
+    {
+      "name": "always_fail_single_iteration_cap",
+      "verdicts": ["wrong"],
+      "max_iterations": 1,
+      "expected": {"kind": "exhausted", "iterations": 1}
+    },
+    {
+      "name": "default_fail_indeterminate_exhausts",
+      "verdicts": ["indeterminate", "indeterminate"],
+      "max_iterations": 2,
+      "expected": {"kind": "exhausted", "iterations": 2}
+    },
+    {
+      "name": "no_verifier_is_misconfigured",
+      "verdicts": [],
+      "max_iterations": 3,
+      "expected": {"kind": "misconfigured"}
+    }
+  ]
+}

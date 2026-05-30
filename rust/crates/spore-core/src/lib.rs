@@ -75,9 +75,9 @@ pub use harness::{
     HarnessBuilder, HarnessConfig, HarnessError, HarnessRunOptions, HarnessSignal, HookPoint,
     HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision,
     ModelConfig, NetworkPolicy, ObservabilityProvider, Operation, OptimizationDirection,
-    PausedState, RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState,
-    StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
-    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    PausedState, ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider, SandboxViolation,
+    SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
+    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, TruncatedOutput,
 };
 pub use hooks::{

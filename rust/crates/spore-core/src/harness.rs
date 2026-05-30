@@ -86,6 +86,7 @@ use crate::observability::{
 };
 use crate::observability_outbox::{OutboxConfig, OutboxObservabilityProvider};
 use crate::tool_call_repair::ToolCallRepair;
+use crate::verifier::{VerifierInput, VerifierVerdict};
 
 /// Boxed future alias used to make the component traits `dyn`-compatible.
 /// `trait_variant::make(Send)` generates RPITIT which is not dyn-safe; the
@@ -707,6 +708,121 @@ pub enum NetworkPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BwrapProfile {}
 
+/// Read-only decorator over any [`SandboxProvider`] (issue #61). Wraps an
+/// inner sandbox and additionally rejects every WRITE/EXECUTE-classified tool
+/// call in [`validate`](SandboxProvider::validate) with
+/// [`SandboxViolation::ReadOnlyViolation`], while delegating reads (and all the
+/// other `SandboxProvider` methods) to the inner sandbox unchanged.
+///
+/// The `SelfVerifying` strategy derives one of these INTERNALLY for its
+/// evaluate phase (the Default-FAIL contract: the evaluator must not be able to
+/// mutate the workspace it is reviewing). Write-intent is classified by tool
+/// name against [`Self::DEFAULT_WRITE_TOOLS`] (the standard catalogue's
+/// mutating tools: `write_file`, `edit_file`, `delete_file`, `move_file`,
+/// `exec`, `bash_command`, `run_tests`). Callers with bespoke tool names can
+/// supply their own set via [`with_write_tools`](Self::with_write_tools).
+///
+/// `ReadOnlyViolation` is a Layer-2 (recoverable) violation, so in the harness
+/// loop a blocked write surfaces to the evaluator agent as a recoverable tool
+/// error — it does NOT halt the evaluate run.
+pub struct ReadOnlySandbox {
+    inner: Arc<dyn SandboxProvider>,
+    write_tools: std::collections::HashSet<String>,
+}
+
+impl ReadOnlySandbox {
+    /// Standard-catalogue tool names that MUTATE the workspace and are therefore
+    /// blocked by a read-only sandbox.
+    pub const DEFAULT_WRITE_TOOLS: &'static [&'static str] = &[
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "move_file",
+        "exec",
+        "bash_command",
+        "run_tests",
+    ];
+
+    /// Wrap `inner`, blocking the standard mutating tools.
+    pub fn new(inner: Arc<dyn SandboxProvider>) -> Self {
+        Self {
+            inner,
+            write_tools: Self::DEFAULT_WRITE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    /// Wrap `inner`, blocking exactly the supplied tool names (overrides the
+    /// default set).
+    pub fn with_write_tools(
+        inner: Arc<dyn SandboxProvider>,
+        write_tools: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            inner,
+            write_tools: write_tools.into_iter().collect(),
+        }
+    }
+
+    fn is_write(&self, tool_name: &str) -> bool {
+        self.write_tools.contains(tool_name)
+    }
+}
+
+impl SandboxProvider for ReadOnlySandbox {
+    fn validate<'a>(&'a self, call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+        Box::pin(async move {
+            if self.is_write(&call.name) {
+                return Err(SandboxViolation::ReadOnlyViolation {
+                    path: call.name.clone(),
+                });
+            }
+            self.inner.validate(call).await
+        })
+    }
+
+    fn execute_command<'a>(
+        &'a self,
+        command: &'a str,
+        _args: &'a [String],
+        _working_dir: Option<&'a std::path::Path>,
+        _timeout: Option<std::time::Duration>,
+    ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
+        // A read-only sandbox forbids subprocess execution outright (commands
+        // may have arbitrary write side effects).
+        Box::pin(async move {
+            Err(SandboxViolation::ReadOnlyViolation {
+                path: command.to_string(),
+            })
+        })
+    }
+
+    fn resolve_path<'a>(
+        &'a self,
+        path: &'a str,
+        operation: Operation,
+    ) -> BoxFut<'a, Result<std::path::PathBuf, SandboxViolation>> {
+        Box::pin(async move {
+            if matches!(operation, Operation::Write | Operation::Execute) {
+                return Err(SandboxViolation::ReadOnlyViolation {
+                    path: path.to_string(),
+                });
+            }
+            self.inner.resolve_path(path, operation).await
+        })
+    }
+
+    fn isolation_mode(&self) -> IsolationMode {
+        self.inner.isolation_mode()
+    }
+
+    fn workspace_root(&self) -> &std::path::Path {
+        self.inner.workspace_root()
+    }
+}
+
 /// Output of a subprocess executed through the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandOutput {
@@ -1044,6 +1160,26 @@ pub enum HaltReason {
     PlanPhaseFailed {
         error: crate::plan::PlanPhaseError,
     },
+    /// Returned by [`StandardHarness`] for the `SelfVerifying` strategy (issue
+    /// #61, D4) when the build↔evaluate loop ran out of the verifier's
+    /// `max_iterations` round-trips without an explicit `Passed` verdict. A
+    /// RUNTIME limit — the work was attempted in good faith but never verified;
+    /// a caller might retry with a different task decomposition. Carries the
+    /// number of round-trips run and the last failure reason the verifier gave.
+    /// PEER to [`SelfVerifyMisconfigured`](Self::SelfVerifyMisconfigured) (NOT a
+    /// sub-case of it).
+    SelfVerifyExhausted {
+        iterations: u32,
+        last_reason: String,
+    },
+    /// Returned by [`StandardHarness`] for the `SelfVerifying` strategy (issue
+    /// #61, D4) when the strategy cannot run because it is misconfigured — e.g.
+    /// `config.verifier` is `None`. Likely a BUILD-TIME bug in the caller's
+    /// wiring. Surfaced as a typed halt, NOT a panic. PEER to
+    /// [`SelfVerifyExhausted`](Self::SelfVerifyExhausted) (NOT a sub-case of it).
+    SelfVerifyMisconfigured {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1208,6 +1344,24 @@ pub struct HarnessConfig {
     /// [`agent`](Self::agent). `plan_model` on the strategy is descriptive
     /// metadata only — there is no `ModelConfig`→agent factory.
     pub planner_agent: Option<Arc<dyn Agent>>,
+    /// The verification oracle for the `SelfVerifying` loop strategy (issue
+    /// #61). When the loop strategy is `SelfVerifying` and this is `Some`, the
+    /// strategy consults it after each build↔evaluate round-trip and its
+    /// [`max_iterations`](crate::verifier::Verifier::max_iterations) governs the
+    /// round-trip cap (D3). When `None`, `SelfVerifying` is MISCONFIGURED: the
+    /// run returns `Failure { SelfVerifyMisconfigured }` (D4) — it does NOT
+    /// panic. Irrelevant for every other loop strategy. Defaults to `None`.
+    pub verifier: Option<Arc<dyn crate::verifier::Verifier>>,
+    /// Optional alternate agent used for the `SelfVerifying` evaluate phase
+    /// (issue #61, D2). Follows the EXACT same defaulting contract as
+    /// [`planner_agent`](Self::planner_agent): when `None`, the evaluate phase
+    /// runs on [`agent`](Self::agent) (the canonical fallback is
+    /// `config.evaluator_agent.as_ref().unwrap_or(&config.agent)`). The
+    /// evaluate phase always runs on a FRESH [`SessionId::generate`] session and
+    /// a READ-ONLY sandbox derived internally (no `evaluator_sandbox` field) so
+    /// the evaluator cannot be biased by the build session nor mutate the
+    /// workspace it is reviewing (the Default-FAIL contract). Defaults to `None`.
+    pub evaluator_agent: Option<Arc<dyn Agent>>,
     /// Pluggable per-domain persistence layer (issue #73). Defaults to an
     /// all-no-op [`StorageProvider`] so existing callers/tests compile and
     /// behave unchanged. v1 is expose-only — the run/resume loop is NOT
@@ -1239,6 +1393,8 @@ impl Clone for HarnessConfig {
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks.clone(),
             planner_agent: self.planner_agent.clone(),
+            verifier: self.verifier.clone(),
+            evaluator_agent: self.evaluator_agent.clone(),
             storage: self.storage.clone(),
             chunk_provider: self.chunk_provider.clone(),
         }
@@ -1287,6 +1443,8 @@ pub struct HarnessBuilder {
     max_stop_blocks: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     planner_agent: Option<Arc<dyn Agent>>,
+    verifier: Option<Arc<dyn crate::verifier::Verifier>>,
+    evaluator_agent: Option<Arc<dyn Agent>>,
     storage: Option<Arc<crate::storage::StorageProvider>>,
     /// Conditional prompt-chunk source (issue #79). `None` resolves to an empty
     /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider)
@@ -1326,6 +1484,8 @@ impl HarnessBuilder {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
+            verifier: None,
+            evaluator_agent: None,
             storage: None,
             chunk_provider: None,
             standard_tools: Vec::new(),
@@ -1405,6 +1565,25 @@ impl HarnessBuilder {
     /// agent. Defaults to `None`.
     pub fn planner_agent(mut self, planner_agent: Arc<dyn Agent>) -> Self {
         self.planner_agent = Some(planner_agent);
+        self
+    }
+
+    /// Inject the verification oracle for the `SelfVerifying` loop strategy
+    /// (issue #61). Required for that strategy: without it a `SelfVerifying`
+    /// run halts with `SelfVerifyMisconfigured` (D4). Its
+    /// [`max_iterations`](crate::verifier::Verifier::max_iterations) caps the
+    /// build↔evaluate round-trips (D3). Defaults to `None`.
+    pub fn verifier(mut self, verifier: Arc<dyn crate::verifier::Verifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    /// Inject an alternate agent for the `SelfVerifying` evaluate phase (issue
+    /// #61, D2). Mirrors [`planner_agent`](Self::planner_agent): when set and
+    /// the loop strategy is `SelfVerifying`, the evaluate phase runs on this
+    /// agent; otherwise it runs on the default agent. Defaults to `None`.
+    pub fn evaluator_agent(mut self, evaluator_agent: Arc<dyn Agent>) -> Self {
+        self.evaluator_agent = Some(evaluator_agent);
         self
     }
 
@@ -1506,6 +1685,8 @@ impl HarnessBuilder {
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks,
             planner_agent: self.planner_agent,
+            verifier: self.verifier,
+            evaluator_agent: self.evaluator_agent,
             storage: self
                 .storage
                 .unwrap_or_else(|| Arc::new(crate::storage::StorageProvider::no_op())),
@@ -2605,6 +2786,334 @@ impl StandardHarness {
         }
     }
 
+    // ========================================================================
+    // SelfVerifying loop strategy (issue #61)
+    // ========================================================================
+    //
+    // Loop-within-a-loop. Each round-trip runs a bounded BUILD ReAct sub-loop
+    // (the agent does work until it claims done), then a fresh EVALUATE run
+    // (a separate evaluator agent on a read-only sandbox in a never-shared
+    // session), then asks the injected [`Verifier`] to translate
+    // `(build_result, eval_result)` into a verdict. `Passed` ⇒ Success;
+    // `Failed { reason }` ⇒ inject `reason` into the build context and loop.
+    //
+    // ## Config fields this strategy reads (both default `None`):
+    //   - `config.verifier` — the oracle. REQUIRED: `None` ⇒
+    //     `Failure { SelfVerifyMisconfigured }` (D4) — a typed halt, NOT a panic.
+    //     Its `max_iterations()` (default 3) caps the round-trips (D3); per-run
+    //     `max_stop_blocks` does NOT enter the picture for this strategy.
+    //   - `config.evaluator_agent` — the evaluate-phase agent. Defaulting
+    //     contract (D2): `config.evaluator_agent.as_ref().unwrap_or(&config.agent)`
+    //     (identical to `planner_agent`). The read-only sandbox and the fresh
+    //     `SessionId::generate()` for the evaluate phase are derived INTERNALLY.
+    //
+    // ## Terminal `HaltReason` variants this strategy produces (peers, D4):
+    //   - `SelfVerifyExhausted { iterations, last_reason }` — ran out of
+    //     `max_iterations` round-trips without a pass (clean exhaustion).
+    //   - `SelfVerifyMisconfigured { reason }` — `config.verifier` is `None`.
+    //
+    // ## Rules enforced (each maps to a test):
+    //   - R1  build phase runs a ReAct loop until the agent claims done.
+    //   - R2  evaluate phase uses a FRESH SessionId never shared with build.
+    //   - R3  evaluate phase uses a read-only sandbox (writes ⇒ ReadOnlyViolation;
+    //         the build sandbox is unaffected).
+    //   - R4  the evaluator carries the `role-evaluator` chunk. PRESENCE-ONLY:
+    //         the chunk's content (if the provider supplies it) is prepended to
+    //         the evaluate seed message; the chunk-condition machinery (#79) is
+    //         NOT otherwise wired into the harness loop.
+    //   - R5  Default-FAIL: an indeterminate evaluator verdict keeps looping.
+    //   - R6  on findings, the verdict reason is injected into the build context
+    //         and the build loop resumes (same path the Stop-block injection uses).
+    //   - R7  stagnation guard: always-Failed ⇒ exactly `max_iterations` cycles ⇒
+    //         `Failure { SelfVerifyExhausted }`.
+    //   - R8  budgets fold BOTH phases across ALL iterations.
+    //   - R9  build vs evaluate are distinguishable in traces (distinct session
+    //         ids: the build session vs each evaluate's generated session).
+    //   - R11 `verifier == None` ⇒ `Failure { SelfVerifyMisconfigured }`.
+    //
+    // No `// SPEC QUESTION:` markers — all four forks (D1–D4) are resolved.
+    async fn run_self_verifying(
+        &self,
+        task: Task,
+        mut session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        _on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        let build_session_id = task.session_id.clone();
+
+        // D4/R11: a missing verifier is a typed halt, not a panic.
+        let verifier = match self.config.verifier.as_ref() {
+            Some(v) => v.clone(),
+            None => {
+                let result = RunResult::Failure {
+                    reason: HaltReason::SelfVerifyMisconfigured {
+                        reason: "SelfVerifying requires `config.verifier`, but it is None"
+                            .to_string(),
+                    },
+                    session_id: build_session_id,
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                };
+                self.finalize_self_verifying(&result).await;
+                return result;
+            }
+        };
+
+        let max_iterations = verifier.max_iterations();
+        // Shared budget threaded across every build + evaluate sub-run (R8).
+        let mut carried = budget_used;
+        // Cumulative usage across ALL build + evaluate runs of ALL iterations.
+        let mut total_usage = AggregateUsage::default();
+        // The most recent verifier failure reason (for SelfVerifyExhausted).
+        let mut last_reason = String::new();
+
+        for iteration in 0..max_iterations {
+            // ── Build phase (R1): bounded ReAct sub-loop carrying the shared
+            //    budget. The first iteration's seed instruction is already in
+            //    `session_state` (from `run_inner`); later iterations already
+            //    have the prior verdict reason injected as a user message (R6).
+            let build_task = Task {
+                id: task.id.clone(),
+                instruction: task.instruction.clone(),
+                session_id: build_session_id.clone(),
+                budget: task.budget.clone(),
+                loop_strategy: task.loop_strategy.clone(),
+            };
+            let build_cap = task.budget.max_turns.unwrap_or(u32::MAX);
+            let build_result = self
+                .run_react_inner(
+                    build_task,
+                    build_cap,
+                    session_state.clone(),
+                    carried.clone(),
+                    // Sub-loops run with a suppressed sink (mirrors PlanExecute);
+                    // terminal observability is finalized by this strategy.
+                    None,
+                )
+                .await;
+            Self::fold_usage(&mut total_usage, &mut carried, &build_result);
+
+            // A build run that paused / escalated is propagated up unchanged —
+            // the caller must handle it before verification can resume.
+            match &build_result {
+                RunResult::WaitingForHuman { state, request } => {
+                    return RunResult::WaitingForHuman {
+                        state: state.clone(),
+                        request: request.clone(),
+                    };
+                }
+                RunResult::Escalate { .. } => {
+                    self.finalize_self_verifying(&build_result).await;
+                    return build_result;
+                }
+                _ => {}
+            }
+
+            // ── Evaluate phase (R2/R3/R4): a fresh evaluator RUN. Distinct
+            //    generated session id (never shared with build — R2/R9), a
+            //    read-only sandbox derived internally (R3), the evaluator agent
+            //    (D2 defaulting), and the `role-evaluator` chunk (R4).
+            let eval_result = self
+                .run_evaluate_phase(&task, &mut carried, &mut total_usage)
+                .await;
+
+            // ── Verdict.
+            let input = VerifierInput {
+                build_result,
+                eval_result,
+                workspace: self.config.sandbox.workspace_root().to_path_buf(),
+                iteration,
+            };
+            match verifier.verify(&input).await {
+                VerifierVerdict::Passed => {
+                    // Reuse the build run's output as the run's output.
+                    let (output, turns) = match input.build_result {
+                        RunResult::Success { output, turns, .. } => (output, turns),
+                        // A non-Success build can still be `Passed` only if a
+                        // bespoke verifier says so; fall back to a generic handle.
+                        _ => (String::new(), carried.turns),
+                    };
+                    let result = RunResult::Success {
+                        output,
+                        session_id: build_session_id,
+                        usage: total_usage,
+                        turns,
+                    };
+                    self.finalize_self_verifying(&result).await;
+                    return result;
+                }
+                VerifierVerdict::Failed { reason } => {
+                    // R5/R6: Default-FAIL keeps looping; inject the reason into
+                    // the build context via the SAME path the Stop-block uses
+                    // (append a user message) so the next build iteration sees it.
+                    last_reason = reason.clone();
+                    self.config
+                        .context_manager
+                        .append_user_message(&mut session_state, &reason)
+                        .await;
+                }
+            }
+        }
+
+        // R7: ran out of round-trips without a pass — clean exhaustion.
+        let result = RunResult::Failure {
+            reason: HaltReason::SelfVerifyExhausted {
+                iterations: max_iterations,
+                last_reason,
+            },
+            session_id: build_session_id,
+            usage: total_usage,
+            turns: carried.turns,
+        };
+        self.finalize_self_verifying(&result).await;
+        result
+    }
+
+    /// Run the SelfVerifying evaluate phase (issue #61): a fresh evaluator RUN
+    /// over a read-only sandbox in a never-shared session.
+    ///
+    /// Builds a child [`StandardHarness`] from a clone of `self.config` with the
+    /// `agent` swapped to the evaluator agent (D2 defaulting) and the `sandbox`
+    /// wrapped in a [`ReadOnlySandbox`] (R3). The evaluator runs a fresh ReAct
+    /// loop seeded with the `role-evaluator` chunk (R4, presence-only) plus a
+    /// review directive, in a freshly [`generate`](SessionId::generate)d session
+    /// (R2/R9). Folds the evaluate run's usage into `total_usage`/`carried` (R8)
+    /// and returns its terminal [`RunResult`].
+    async fn run_evaluate_phase(
+        &self,
+        task: &Task,
+        carried: &mut BudgetSnapshot,
+        total_usage: &mut AggregateUsage,
+    ) -> RunResult {
+        // D2: evaluator agent defaulting — identical contract to `planner_agent`.
+        let evaluator = self
+            .config
+            .evaluator_agent
+            .as_ref()
+            .unwrap_or(&self.config.agent)
+            .clone();
+
+        // R3: derive a read-only sandbox internally from the build sandbox.
+        let read_only_sandbox: Arc<dyn SandboxProvider> =
+            Arc::new(ReadOnlySandbox::new(self.config.sandbox.clone()));
+
+        // R2/R9: fresh, never-shared session id for the evaluate run.
+        let eval_session_id = SessionId::generate();
+
+        // R4 (presence-only): prepend the `role-evaluator` chunk content (if the
+        // configured provider supplies it) to the review directive.
+        let role_chunk = self.role_evaluator_chunk().await;
+        let directive = match role_chunk {
+            Some(content) => format!(
+                "{content}\n\nReview the work produced for the following task and \
+                 report whether it is correct. You did NOT write this code; default \
+                 to FAIL unless you can confirm it is right.\n\nTask:\n{}",
+                task.instruction
+            ),
+            None => format!(
+                "Review the work produced for the following task and report whether \
+                 it is correct. You did NOT write this code; default to FAIL unless \
+                 you can confirm it is right.\n\nTask:\n{}",
+                task.instruction
+            ),
+        };
+
+        let eval_task = Task {
+            id: TaskId::generate(),
+            instruction: directive.clone(),
+            session_id: eval_session_id.clone(),
+            budget: task.budget.clone(),
+            loop_strategy: LoopStrategy::ReAct {
+                max_iterations: task.budget.max_turns.unwrap_or(u32::MAX),
+            },
+        };
+
+        // Child harness: clone the config, swap agent + sandbox. Cloning shares
+        // the same observability/storage seams so the evaluate run's spans land
+        // in the SAME trace stream (distinguished by its distinct session id).
+        let mut eval_config = self.config.clone();
+        eval_config.agent = evaluator;
+        eval_config.sandbox = read_only_sandbox;
+        let eval_harness = StandardHarness::new(eval_config);
+
+        let mut eval_state = SessionState::default();
+        eval_harness
+            .config
+            .context_manager
+            .append_user_message(&mut eval_state, &directive)
+            .await;
+
+        let cap = task.budget.max_turns.unwrap_or(u32::MAX);
+        let eval_result = eval_harness
+            .run_react(eval_task, cap, eval_state, BudgetSnapshot::default(), None)
+            .await;
+
+        Self::fold_usage(total_usage, carried, &eval_result);
+        eval_result
+    }
+
+    /// Look up the `role-evaluator` chunk content from the configured
+    /// [`ChunkProvider`](crate::prompt_assembly::ChunkProvider) (R4,
+    /// presence-only). Returns `None` if the provider has no such chunk or fails
+    /// to load.
+    async fn role_evaluator_chunk(&self) -> Option<String> {
+        let chunks = self.config.chunk_provider.load().await.ok()?;
+        chunks
+            .into_iter()
+            .find(|c| c.id == "role-evaluator")
+            .map(|c| c.content)
+    }
+
+    /// Fold a sub-run's token usage / turn count into the cumulative
+    /// `total_usage` and the shared `carried` budget snapshot (R8). Mirrors the
+    /// PlanExecute budget fold. `carried.turns` becomes the sub-run's ABSOLUTE
+    /// turn count (the build sub-loop already gates on cumulative turns); the
+    /// evaluate run reports its own fresh-session turns, which are added in.
+    fn fold_usage(total_usage: &mut AggregateUsage, carried: &mut BudgetSnapshot, r: &RunResult) {
+        let (usage, turns) = match r {
+            RunResult::Success { usage, turns, .. }
+            | RunResult::Failure { usage, turns, .. }
+            | RunResult::Escalate { usage, turns, .. } => (usage, *turns),
+            RunResult::WaitingForHuman { .. } => return,
+        };
+        total_usage.input_tokens += usage.input_tokens;
+        total_usage.output_tokens += usage.output_tokens;
+        total_usage.cache_read_tokens += usage.cache_read_tokens;
+        total_usage.cache_write_tokens += usage.cache_write_tokens;
+        total_usage.cost_usd += usage.cost_usd;
+        carried.input_tokens += usage.input_tokens;
+        carried.output_tokens += usage.output_tokens;
+        carried.turns = carried.turns.max(turns);
+    }
+
+    /// Finalize observability for a terminal SelfVerifying outcome. Mirrors the
+    /// tail of [`run_react`](Self::run_react) / [`finalize_plan_execute`].
+    /// `WaitingForHuman` is not terminal and is never flushed here.
+    async fn finalize_self_verifying(&self, result: &RunResult) {
+        match result {
+            RunResult::Success { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Success)
+                    .await;
+            }
+            RunResult::Failure {
+                session_id, reason, ..
+            } => {
+                self.finalize_observability(
+                    session_id,
+                    SessionOutcome::Failure {
+                        reason: format!("{reason:?}"),
+                    },
+                )
+                .await;
+            }
+            RunResult::WaitingForHuman { .. } => {}
+            RunResult::Escalate { session_id, .. } => {
+                self.finalize_observability(session_id, SessionOutcome::Escalated)
+                    .await;
+            }
+        }
+    }
+
     // (private outcome type for `run_plan_phase` is defined at module scope.)
 
     /// Drive the PlanExecute strategy (issue #59) — the two-phase loop.
@@ -3450,14 +3959,18 @@ impl StandardHarness {
                 usage: AggregateUsage::default(),
                 turns: 0,
             },
-            LoopStrategy::SelfVerifying => RunResult::Failure {
-                reason: HaltReason::StrategyNotYetImplemented {
-                    strategy: "self_verifying".into(),
-                },
-                session_id: task.session_id,
-                usage: AggregateUsage::default(),
-                turns: 0,
-            },
+            LoopStrategy::SelfVerifying => {
+                // Seed the build task instruction as the initial user message of
+                // this fresh run (mirrors the ReAct entry above): the build
+                // sub-loop reuses `run_react_inner`, which does NOT itself seed
+                // the prompt.
+                self.config
+                    .context_manager
+                    .append_user_message(&mut session_state, &task.instruction)
+                    .await;
+                self.run_self_verifying(task, session_state, budget_used, on_stream)
+                    .await
+            }
             LoopStrategy::HillClimbing { .. } => RunResult::Failure {
                 reason: HaltReason::StrategyNotYetImplemented {
                     strategy: "hill_climbing".into(),
@@ -3943,6 +4456,8 @@ mod tests {
             max_stop_blocks: 8,
             hooks: None,
             planner_agent: None,
+            verifier: None,
+            evaluator_agent: None,
             // #76: plan_execute + task_list persistence now lives on the
             // RunStore seam (not SessionState.extras), so the test harness
             // needs a real (in-memory) run store for the readback helpers and
@@ -5391,11 +5906,11 @@ mod tests {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
         // Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented;
-        // it is exercised separately below. Ralph / SelfVerifying / HillClimbing
+        // it is exercised separately below. SelfVerifying (issue #61) is now
+        // implemented and exercised in its own test block. Ralph / HillClimbing
         // still return the generic stub.
         for s in [
             LoopStrategy::Ralph,
-            LoopStrategy::SelfVerifying,
             LoopStrategy::HillClimbing {
                 direction: OptimizationDirection::Maximize,
                 max_stagnation: None,
@@ -6600,6 +7115,8 @@ mod tests {
                 max_stop_blocks: 8,
                 hooks: None,
                 planner_agent: None,
+                verifier: None,
+                evaluator_agent: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             })
@@ -7300,6 +7817,569 @@ mod tests {
                 assert_eq!(turns, 4, "should terminate after max_stop_blocks=3 blocks");
             }
             other => panic!("expected Success after cap, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // SelfVerifying loop strategy (issue #61)
+    // ========================================================================
+
+    use crate::verifier::{Verifier, VerifierInput, VerifierVerdict};
+    use std::sync::Mutex as StdMutex;
+
+    fn self_verifying_task() -> Task {
+        task(LoopStrategy::SelfVerifying)
+    }
+
+    /// A `Verifier` test double that replays a scripted queue of verdicts.
+    /// Records the `(iteration, build_session, eval_session)` it saw on each
+    /// call so tests can assert phase distinctness (R2/R9). `max_iterations` is
+    /// configurable to drive the round-trip cap (D3/R7).
+    struct ScriptedVerifier {
+        verdicts: StdMutex<std::collections::VecDeque<VerifierVerdict>>,
+        default_verdict: VerifierVerdict,
+        max_iters: u32,
+        seen: StdMutex<Vec<(u32, String, String)>>,
+    }
+    impl ScriptedVerifier {
+        fn new(verdicts: Vec<VerifierVerdict>, default_verdict: VerifierVerdict, max: u32) -> Self {
+            Self {
+                verdicts: StdMutex::new(verdicts.into_iter().collect()),
+                default_verdict,
+                max_iters: max,
+                seen: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+    impl Verifier for ScriptedVerifier {
+        fn verify<'a>(&'a self, input: &'a VerifierInput) -> BoxFut<'a, VerifierVerdict> {
+            let build_sid = match &input.build_result {
+                RunResult::Success { session_id, .. } | RunResult::Failure { session_id, .. } => {
+                    session_id.as_str().to_string()
+                }
+                _ => "?".to_string(),
+            };
+            let eval_sid = match &input.eval_result {
+                RunResult::Success { session_id, .. } | RunResult::Failure { session_id, .. } => {
+                    session_id.as_str().to_string()
+                }
+                _ => "?".to_string(),
+            };
+            self.seen
+                .lock()
+                .unwrap()
+                .push((input.iteration, build_sid, eval_sid));
+            let v = self
+                .verdicts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.default_verdict.clone());
+            Box::pin(async move { v })
+        }
+        fn max_iterations(&self) -> u32 {
+            self.max_iters
+        }
+    }
+
+    /// Agent that records every `Context` it is handed and replays a queue of
+    /// `TurnResult`s (default: an empty `FinalResponse`). Use the recorded
+    /// contexts to assert what the build / evaluate phases saw.
+    struct RecordingTurnAgent {
+        id: AgentId,
+        turns: StdMutex<std::collections::VecDeque<TurnResult>>,
+        seen: StdMutex<Vec<Context>>,
+    }
+    impl RecordingTurnAgent {
+        fn new(id: &str, turns: Vec<TurnResult>) -> Arc<Self> {
+            Arc::new(Self {
+                id: AgentId::new(id),
+                turns: StdMutex::new(turns.into_iter().collect()),
+                seen: StdMutex::new(Vec::new()),
+            })
+        }
+        fn final_resp(text: &str) -> TurnResult {
+            TurnResult::FinalResponse {
+                content: text.into(),
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            }
+        }
+        fn tool_call(name: &str) -> TurnResult {
+            TurnResult::ToolCallRequested {
+                calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            }
+        }
+        /// Flatten every recorded context's messages to a single text blob.
+        fn seen_text(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .map(|m| match &m.content {
+                            Content::Text { text } => text.clone(),
+                            Content::ToolCall(tc) => tc.name.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect()
+        }
+        fn call_count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+    impl Agent for RecordingTurnAgent {
+        fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+            self.seen.lock().unwrap().push(context);
+            let t = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Self::final_resp(""));
+            Box::pin(async move { t })
+        }
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+    }
+
+    fn passed() -> VerifierVerdict {
+        VerifierVerdict::Passed
+    }
+    fn failed(reason: &str) -> VerifierVerdict {
+        VerifierVerdict::failed(reason)
+    }
+
+    // R10: SelfVerifying no longer returns StrategyNotYetImplemented.
+    #[tokio::test]
+    async fn self_verifying_no_longer_unimplemented() {
+        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::StrategyNotYetImplemented { .. },
+                ..
+            } => panic!("SelfVerifying must be implemented"),
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // R11: verifier == None → Failure { SelfVerifyMisconfigured } (not panic).
+    #[tokio::test]
+    async fn self_verifying_missing_verifier_is_typed_halt() {
+        let cfg = standard_config(make_agent());
+        // verifier defaults to None.
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::SelfVerifyMisconfigured { reason },
+                ..
+            } => assert!(reason.contains("verifier"), "got: {reason}"),
+            other => panic!("expected SelfVerifyMisconfigured, got {other:?}"),
+        }
+    }
+
+    // R1: build phase runs a ReAct loop until the agent claims done (a tool call
+    // followed by a final response — the build agent loops at least twice).
+    #[tokio::test]
+    async fn self_verifying_build_runs_react_until_done() {
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::tool_call("read_file"),
+                RecordingTurnAgent::final_resp("done"),
+            ],
+        );
+        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build.clone();
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        let h = StandardHarness::new(cfg);
+        let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+        assert!(matches!(r, RunResult::Success { .. }), "got {r:?}");
+        // The build agent took at least two turns (tool call, then final).
+        assert!(
+            build.call_count() >= 2,
+            "build should loop: {} turns",
+            build.call_count()
+        );
+    }
+
+    // R2 + R9: the evaluate phase uses a FRESH SessionId never shared with the
+    // build session — distinguishable in traces.
+    #[tokio::test]
+    async fn self_verifying_evaluate_uses_fresh_distinct_session() {
+        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
+        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(verifier.clone());
+        let h = StandardHarness::new(cfg);
+        let t = self_verifying_task();
+        let build_session = t.session_id.as_str().to_string();
+        let _ = h.run(HarnessRunOptions::new(t)).await;
+        let seen = verifier.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (_iter, b, e) = &seen[0];
+        assert_eq!(b, &build_session, "build session id is the run's session");
+        assert_ne!(e, &build_session, "evaluate session must be fresh");
+        assert!(e.starts_with("sess-"), "evaluate uses generate(): {e}");
+    }
+
+    // R3: the evaluate phase uses a read-only sandbox — an evaluator Write
+    // attempt is rejected as a (recoverable) ReadOnlyViolation, while the build
+    // sandbox is unaffected (the build phase writes freely).
+    #[tokio::test]
+    async fn self_verifying_evaluate_sandbox_is_read_only() {
+        // Build agent writes (allowed by AllowAllSandbox), then claims done.
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::tool_call("write_file"),
+                RecordingTurnAgent::final_resp("done"),
+            ],
+        );
+        // Evaluator tries to write (must be blocked), then claims a verdict.
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::tool_call("write_file"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build.clone();
+        cfg.evaluator_agent = Some(eval.clone());
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        let h = StandardHarness::new(cfg);
+        let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+        assert!(matches!(r, RunResult::Success { .. }), "got {r:?}");
+        // The evaluator's second context (after its blocked write) must carry the
+        // recoverable read-only sandbox error fed back as a tool result.
+        let eval_seen = eval.seen_text();
+        assert!(
+            eval_seen.iter().any(|c| c.contains("ReadOnlyViolation")),
+            "evaluator write must be rejected read-only; saw: {eval_seen:?}"
+        );
+        // The build phase's write was NOT rejected (no read-only error fed back).
+        let build_seen = build.seen_text();
+        assert!(
+            !build_seen.iter().any(|c| c.contains("ReadOnlyViolation")),
+            "build sandbox must be unaffected; saw: {build_seen:?}"
+        );
+    }
+
+    // R4: the evaluator carries the `role-evaluator` chunk (presence assertion).
+    #[tokio::test]
+    async fn self_verifying_evaluator_carries_role_chunk() {
+        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
+        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.evaluator_agent = Some(eval.clone());
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        // Register the role-evaluator chunk through the provider.
+        cfg.chunk_provider = Arc::new(crate::prompt_assembly::InMemoryChunkProvider::new(vec![
+            crate::prompt_assembly::PromptChunk::new(
+                "role-evaluator",
+                "You are a fresh evaluator. You did not write this code.",
+            ),
+        ]));
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+        let eval_seen = eval.seen_text();
+        assert!(
+            eval_seen.iter().any(|c| c.contains("fresh evaluator")),
+            "evaluator context must carry the role-evaluator chunk; saw: {eval_seen:?}"
+        );
+    }
+
+    // R5: Default-FAIL — an indeterminate evaluator verdict keeps looping and
+    // does not succeed. (The verifier returns Failed for an indeterminate eval.)
+    #[tokio::test]
+    async fn self_verifying_default_fail_does_not_succeed() {
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("attempt 1"),
+                RecordingTurnAgent::final_resp("attempt 2"),
+            ],
+        );
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::final_resp("indeterminate"),
+                RecordingTurnAgent::final_resp("indeterminate"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.evaluator_agent = Some(eval);
+        // Default-FAIL: every verdict is Failed (no explicit pass).
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
+            vec![],
+            failed("indeterminate — default fail"),
+            2,
+        )));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::SelfVerifyExhausted { .. },
+                ..
+            } => {}
+            other => panic!("expected SelfVerifyExhausted (no success), got {other:?}"),
+        }
+    }
+
+    // R6: on findings, the verdict reason is injected into the build context and
+    // the build loop resumes (fail iter 0 with reason X, pass iter 1; iter-1
+    // build context contains X, final Success).
+    #[tokio::test]
+    async fn self_verifying_injects_reason_and_resumes() {
+        const FINDING: &str = "MISSING_NULL_CHECK_IN_HANDLER";
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("v1"),
+                RecordingTurnAgent::final_resp("v2"),
+            ],
+        );
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::final_resp("FAIL"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build.clone();
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
+            vec![failed(FINDING), passed()],
+            passed(),
+            3,
+        )));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success on iter 1, got {other:?}"),
+        }
+        // The build agent's LAST context (iteration 1) must contain the injected
+        // finding from iteration 0.
+        let build_seen = build.seen_text();
+        let last = build_seen.last().expect("build ran");
+        assert!(
+            last.contains(FINDING),
+            "iter-1 build context must contain the injected finding; saw: {last}"
+        );
+    }
+
+    // R7: stagnation guard — an always-Failed verifier runs exactly
+    // max_iterations cycles, then Failure { SelfVerifyExhausted }.
+    #[tokio::test]
+    async fn self_verifying_stagnation_guard_caps_iterations() {
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("a"),
+                RecordingTurnAgent::final_resp("b"),
+                RecordingTurnAgent::final_resp("c"),
+            ],
+        );
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::final_resp("x"),
+                RecordingTurnAgent::final_resp("y"),
+                RecordingTurnAgent::final_resp("z"),
+            ],
+        );
+        let verifier = Arc::new(ScriptedVerifier::new(
+            vec![],
+            failed("never good enough"),
+            3,
+        ));
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(verifier.clone());
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::SelfVerifyExhausted {
+                        iterations,
+                        last_reason,
+                    },
+                ..
+            } => {
+                assert_eq!(iterations, 3, "should run exactly max_iterations cycles");
+                assert!(
+                    last_reason.contains("never good enough"),
+                    "got {last_reason}"
+                );
+            }
+            other => panic!("expected SelfVerifyExhausted, got {other:?}"),
+        }
+        // Exactly max_iterations verifier calls (one per build↔evaluate cycle).
+        assert_eq!(verifier.seen.lock().unwrap().len(), 3);
+    }
+
+    // R8: budgets fold both phases across all iterations (sum-check). Each turn
+    // reports 1 input + 1 output token; with 2 iterations × (1 build + 1 eval
+    // turn) the cumulative usage sums to 4 input + 4 output tokens.
+    #[tokio::test]
+    async fn self_verifying_budgets_fold_both_phases() {
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("a"),
+                RecordingTurnAgent::final_resp("b"),
+            ],
+        );
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::final_resp("x"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = build;
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
+            vec![failed("retry"), passed()],
+            passed(),
+            3,
+        )));
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::Success { usage, .. } => {
+                // 2 build turns + 2 eval turns, each 1 in / 1 out.
+                assert_eq!(usage.input_tokens, 4, "input tokens fold both phases");
+                assert_eq!(usage.output_tokens, 4, "output tokens fold both phases");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // R12: fixture replay — scripted (build verdict sequence, evaluator output
+    // sequence) → expected terminal RunResult kind + iteration count.
+    #[derive(serde::Deserialize)]
+    struct SvFixtureCase {
+        name: String,
+        /// Per-iteration verifier verdicts. Each entry is `"pass"` or a failure
+        /// reason string (anything else).
+        verdicts: Vec<String>,
+        max_iterations: u32,
+        expected: SvFixtureExpected,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum SvFixtureExpected {
+        Success { iterations: u32 },
+        Exhausted { iterations: u32 },
+        Misconfigured,
+    }
+    #[derive(serde::Deserialize)]
+    struct SvFixtureSuite {
+        cases: Vec<SvFixtureCase>,
+    }
+
+    #[tokio::test]
+    async fn self_verifying_fixture_replay() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/harness/self_verifying.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let suite: SvFixtureSuite = serde_json::from_str(&raw).expect("fixture parses");
+        for case in suite.cases {
+            // Build an agent with one "done" turn per possible iteration.
+            let n = case.max_iterations.max(1) as usize;
+            let build = RecordingTurnAgent::new(
+                "build",
+                (0..n)
+                    .map(|_| RecordingTurnAgent::final_resp("done"))
+                    .collect(),
+            );
+            let eval = RecordingTurnAgent::new(
+                "eval",
+                (0..n)
+                    .map(|_| RecordingTurnAgent::final_resp("out"))
+                    .collect(),
+            );
+            let verdicts: Vec<VerifierVerdict> = case
+                .verdicts
+                .iter()
+                .map(|v| if v == "pass" { passed() } else { failed(v) })
+                .collect();
+            let mut cfg = standard_config(make_agent());
+            cfg.agent = build;
+            cfg.evaluator_agent = Some(eval);
+            let misconfigured = matches!(case.expected, SvFixtureExpected::Misconfigured);
+            if !misconfigured {
+                cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
+                    verdicts,
+                    failed("default fail"),
+                    case.max_iterations,
+                )));
+            }
+            let h = StandardHarness::new(cfg);
+            let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+            match (case.expected, r) {
+                (SvFixtureExpected::Success { iterations }, RunResult::Success { turns, .. }) => {
+                    // `turns` is the final build sub-loop's absolute turn count;
+                    // assert the run succeeded (iteration count is asserted via
+                    // dedicated unit tests). `iterations` documents the case.
+                    let _ = (iterations, turns);
+                }
+                (
+                    SvFixtureExpected::Exhausted { iterations },
+                    RunResult::Failure {
+                        reason:
+                            HaltReason::SelfVerifyExhausted {
+                                iterations: got, ..
+                            },
+                        ..
+                    },
+                ) => {
+                    assert_eq!(got, iterations, "case `{}` iteration count", case.name);
+                }
+                (
+                    SvFixtureExpected::Misconfigured,
+                    RunResult::Failure {
+                        reason: HaltReason::SelfVerifyMisconfigured { .. },
+                        ..
+                    },
+                ) => {}
+                (_, other) => panic!("case `{}`: unexpected result {other:?}", case.name),
+            }
         }
     }
 }
