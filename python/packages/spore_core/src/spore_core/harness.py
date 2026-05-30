@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from .agent import (
     Agent,
@@ -1280,6 +1280,22 @@ class HaltReasonSelfVerifyMisconfigured(_Model):
     reason: str
 
 
+class HaltReasonRalphCompletionUnmet(_Model):
+    """Returned by :class:`StandardHarness` for the ``Ralph`` strategy (issue
+    #58) when the multi-context-window continuation loop reached its
+    ``max_resets`` cap with tasks still incomplete (the Ralph analogue of
+    :class:`HaltReasonSelfVerifyExhausted`). A RUNTIME limit — the work was
+    attempted across ``iterations`` context windows but the filesystem-backed
+    completion check (the registered ``Stop`` hook reading
+    ``.spore/progress.json``) never reported done. Carries the number of
+    context-window resets performed and the last incompletion reason. Mirrors
+    Rust's ``HaltReason::RalphCompletionUnmet { iterations, last_reason }``."""
+
+    kind: Literal["ralph_completion_unmet"] = "ralph_completion_unmet"
+    iterations: int
+    last_reason: str
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -1294,7 +1310,8 @@ HaltReason = Annotated[
     | HaltReasonStepFailed
     | HaltReasonPlanPhaseFailed
     | HaltReasonSelfVerifyExhausted
-    | HaltReasonSelfVerifyMisconfigured,
+    | HaltReasonSelfVerifyMisconfigured
+    | HaltReasonRalphCompletionUnmet,
     Field(discriminator="kind"),
 ]
 
@@ -1535,6 +1552,7 @@ class HarnessConfig:
         pricing: PricingTable | None = None,
         content_capture: ContentCaptureConfig | None = None,
         max_stop_blocks: int = 8,
+        max_resets: int = 3,
         hooks: HookChain | None = None,
         planner_agent: Agent | None = None,
         verifier: Any | None = None,
@@ -1577,6 +1595,12 @@ class HarnessConfig:
         # terminates anyway (issue #69, R14). Per-run counter; resume starts
         # fresh. Default 8, matching Claude Code's behavior.
         self.max_stop_blocks = max_stop_blocks
+        # Ralph outer-loop reset cap (issue #58, B3). The maximum number of
+        # context windows the ``Ralph`` strategy runs before halting with
+        # :class:`HaltReasonRalphCompletionUnmet` when tasks are still
+        # incomplete. Independent of ``budget.max_turns`` (which bounds the
+        # per-window ReAct sub-loop). Default ``3``.
+        self.max_resets = max_resets
         # Post-compaction verifier (issue #29/#46). The harness runs it after
         # each compaction turn and retries up to ``max_compaction_attempts``
         # before accepting a failing summary. Defaults to ``KeyTermVerifier``.
@@ -1643,6 +1667,7 @@ class HarnessBuilder:
         self._pricing: PricingTable = PricingTable.DEFAULT
         self._content_capture: ContentCaptureConfig | None = None
         self._max_stop_blocks: int = 8
+        self._max_resets: int = 3
         self._hooks: HookChain | None = None
         self._planner_agent: Agent | None = None
         self._verifier: Any | None = None
@@ -1754,6 +1779,15 @@ class HarnessBuilder:
         self._max_stop_blocks = max_blocks
         return self
 
+    def max_resets(self, max_resets: int) -> HarnessBuilder:
+        """Set the Ralph outer-loop reset cap (issue #58, B3) — the maximum
+        number of context windows the ``Ralph`` strategy runs before halting
+        with :class:`HaltReasonRalphCompletionUnmet`. Independent of
+        ``budget.max_turns``. Defaults to ``3``. Mirrors Rust's
+        ``HarnessBuilder::max_resets``."""
+        self._max_resets = max_resets
+        return self
+
     def compaction_verifier(self, verifier: CompactionVerifier) -> HarnessBuilder:
         """Inject a post-compaction verifier (issue #46). Defaults to
         ``KeyTermVerifier``."""
@@ -1814,6 +1848,7 @@ class HarnessBuilder:
             pricing=self._pricing,
             content_capture=self._content_capture,
             max_stop_blocks=self._max_stop_blocks,
+            max_resets=self._max_resets,
             hooks=self._hooks,
             planner_agent=self._planner_agent,
             verifier=self._verifier,
@@ -1825,6 +1860,146 @@ class HarnessBuilder:
     def build(self) -> StandardHarness:
         """Assemble a ready-to-run :class:`StandardHarness`."""
         return StandardHarness(self.build_config())
+
+
+# ============================================================================
+# Ralph loop strategy (issue #58) — filesystem-backed completion contract
+# ============================================================================
+
+
+class RalphProgress(_Model):
+    """Deserialized ``.spore/progress.json`` (issue #58, B2/B4). The agent
+    writes this each context window to record what it has finished and what
+    remains. ``complete: true`` with an empty ``remaining`` ⇒ progress
+    satisfied. Mirrors Rust's ``RalphProgress``."""
+
+    complete: bool = False
+    remaining: list[str] = Field(default_factory=list)
+
+
+class RalphFeatureEntry(_Model):
+    """One entry of ``.spore/feature_list.json`` — the
+    :class:`~spore_core.termination.FeatureListCheck` schema (issue #58, B2).
+    Any ``passes: false`` ⇒ incomplete. Mirrors Rust's ``RalphFeatureEntry``."""
+
+    name: str
+    passes: bool = False
+
+
+def _ralph_completion_status(workspace_root: Path) -> str | None:
+    """Ralph external completion check (issue #58, B1). Reads the deterministic
+    ``.spore/`` files under ``workspace_root`` and reports whether the task is
+    complete. Returns ``None`` when complete, the failure reason when tasks
+    remain. This is the SAME logic the registered :class:`RalphStopHook`
+    applies — one source of truth. Mirrors Rust's ``ralph_completion_status``.
+
+    Contract (B4 — no git):
+
+    * ``.spore/progress.json``: ``{"complete": bool, "remaining": [str]}``.
+      ``complete: true`` with an empty ``remaining`` ⇒ progress satisfied.
+      Missing / unreadable / invalid ⇒ incomplete (so the agent learns to
+      write it).
+    * ``.spore/feature_list.json``: a JSON array of ``{"name", "passes"}``. Any
+      ``passes: false`` ⇒ incomplete. A MISSING feature list is tolerated
+      (progress.json is the primary signal); an invalid one is not.
+    """
+    progress_path = workspace_root / ".spore" / "progress.json"
+    try:
+        raw = progress_path.read_text()
+    except OSError:
+        return ".spore/progress.json missing"
+    try:
+        progress = RalphProgress.model_validate_json(raw)
+    except ValueError as e:
+        return f".spore/progress.json invalid JSON: {e}"
+    if not progress.complete:
+        if not progress.remaining:
+            return "task not marked complete"
+        return f"remaining: {', '.join(progress.remaining)}"
+    if progress.remaining:
+        return f"remaining: {', '.join(progress.remaining)}"
+
+    # Progress says done — corroborate against the feature list when present.
+    feature_path = workspace_root / ".spore" / "feature_list.json"
+    try:
+        feature_raw = feature_path.read_text()
+    except OSError:
+        return None
+    try:
+        entries = TypeAdapter(list[RalphFeatureEntry]).validate_json(feature_raw)
+    except ValueError as e:
+        return f".spore/feature_list.json invalid JSON: {e}"
+    incomplete = [e.name for e in entries if not e.passes]
+    if incomplete:
+        return f"incomplete features: {', '.join(incomplete)}"
+    return None
+
+
+def _ralph_reload_context(workspace_root: Path) -> str | None:
+    """Build the filesystem-reload context block injected into each fresh Ralph
+    context window (issue #58, R3/B4). Returns the verbatim
+    ``.spore/progress.json`` and ``.spore/feature_list.json`` contents (when
+    present) so the re-seeded window knows what is done and what remains.
+    Returns ``None`` when neither file exists. Mirrors Rust's
+    ``ralph_reload_context``."""
+    parts: list[str] = []
+    try:
+        raw = (workspace_root / ".spore" / "progress.json").read_text()
+        parts.append(f"Reloaded .spore/progress.json:\n{raw.strip()}")
+    except OSError:
+        pass
+    try:
+        raw = (workspace_root / ".spore" / "feature_list.json").read_text()
+        parts.append(f"Reloaded .spore/feature_list.json:\n{raw.strip()}")
+    except OSError:
+        pass
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+class RalphStopHook:
+    """``Stop`` hook driving Ralph's multi-context-window continuation (issue
+    #58, B1). At each ``FinalResponse`` it reads ``.spore/progress.json`` under
+    ``workspace_root``: incomplete tasks ⇒ :class:`HookBlock` (the loop
+    continues), all complete ⇒ :class:`HookContinue` (the loop terminates).
+
+    Registration is harmless for non-Ralph strategies: when
+    ``.spore/progress.json`` is ABSENT the hook returns ``Continue`` and does
+    not interfere with ReAct / PlanExecute / SelfVerifying runs. It only blocks
+    when a progress file is PRESENT and reports incomplete tasks — the Ralph
+    contract. Mirrors Rust's ``RalphStopHook``."""
+
+    def __init__(self, workspace_root: Path) -> None:
+        self._workspace_root = workspace_root
+
+    async def handle(self, ctx: Any) -> Any:
+        from .hooks import HookBlock, HookContinue, StopContext
+
+        # Only act on ``Stop``; any other event is a no-op ``Continue``.
+        if not isinstance(ctx, StopContext):
+            return HookContinue()
+        # Absent progress file ⇒ do not interfere with non-Ralph runs.
+        progress_path = self._workspace_root / ".spore" / "progress.json"
+        if not progress_path.exists():
+            return HookContinue()
+        reason = _ralph_completion_status(self._workspace_root)
+        if reason is None:
+            return HookContinue()
+        return HookBlock(reason=reason)
+
+    def events(self) -> list[Any]:
+        from .hooks import HookEvent
+
+        return [HookEvent.STOP]
+
+    def name(self) -> str:
+        return "ralph-stop"
+
+    def sync_mode(self) -> Any:
+        from .hooks import HookSync
+
+        return HookSync.SYNC
 
 
 @dataclass
@@ -1849,6 +2024,25 @@ class StandardHarness:
     """
 
     def __init__(self, config: HarnessConfig) -> None:
+        # Ralph completion mechanism (issue #58, B1): register a ``Stop`` hook
+        # that drives multi-context-window continuation off
+        # ``.spore/progress.json``. Registration is harmless for non-Ralph runs
+        # — the hook only BLOCKS when a progress file is PRESENT and reports
+        # incomplete tasks; when the file is absent (the common case for ReAct /
+        # other strategies) it returns ``Continue``, so existing strategies are
+        # unaffected. Mirrors Rust's ``StandardHarness::new``.
+        from .hooks import StandardHookChain
+
+        workspace_root = config.sandbox.workspace_root()
+        chain = config.hooks if config.hooks is not None else StandardHookChain()
+        # Best-effort: a duplicate/invalid registration must never raise out of
+        # the constructor. The hook subscribes only to the can-block ``Stop``
+        # event, so registration cannot be rejected for sync/async mismatch.
+        try:
+            chain.register(RalphStopHook(workspace_root))
+        except Exception:  # noqa: BLE001 — construction must not fail on a hook
+            pass
+        config.hooks = chain
         self._config = config
 
     def storage(self) -> StorageProvider:
@@ -1974,12 +2168,10 @@ class StandardHarness:
         if isinstance(strategy, LoopStrategyPlanExecute):
             return await self._run_plan_execute(task, session_state, budget_used, on_stream)
         if isinstance(strategy, LoopStrategyRalph):
-            return self._fail(
-                HaltReasonStrategyNotYetImplemented(strategy="ralph"),
-                task.session_id,
-                AggregateUsage(),
-                0,
-            )
+            # Each context window is a fresh session re-seeded INSIDE
+            # ``_run_ralph`` (the context-window reset), so we do NOT pre-seed
+            # the instruction here.
+            return await self._run_ralph(task, budget_used, on_stream)
         if isinstance(strategy, LoopStrategySelfVerifying):
             # Seed the task instruction as the build loop's initial user message,
             # mirroring the ReAct arm (the build phase is a ReAct sub-loop).
@@ -2416,6 +2608,7 @@ class StandardHarness:
             pricing=c.pricing,
             content_capture=c.content_capture,
             max_stop_blocks=c.max_stop_blocks,
+            max_resets=c.max_resets,
             hooks=c.hooks,
             planner_agent=c.planner_agent,
             verifier=c.verifier,
@@ -2476,6 +2669,121 @@ class StandardHarness:
         elif isinstance(result, RunResultEscalate):
             await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
         # RunResultWaitingForHuman: not terminal, do not finalize.
+
+    async def _run_ralph(
+        self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive the Ralph strategy (issue #58) — the multi-context-window
+        continuation loop.
+
+        The OUTER loop runs up to ``config.max_resets`` context windows (B3).
+        Each window is a FRESH :class:`SessionState` (no message carryover —
+        R2) re-seeded with the instruction plus the reloaded ``.spore/`` state
+        (R3, B4 — progress + feature_list, no git), then a bounded ReAct
+        sub-loop runs (the registered :class:`RalphStopHook` fires inside it on
+        ``FinalResponse``). After the window, the SAME filesystem completion
+        check the Stop hook reads (B1) decides reset vs. success: ``None`` ⇒
+        done ⇒ Success; a reason ⇒ tasks remain ⇒ reset into the next window
+        unless the cap is reached. Budgets fold across ALL windows (R6); each
+        reset is independently traceable via a fresh session id (R7).
+
+        Terminal: :class:`HaltReasonRalphCompletionUnmet` when ``max_resets``
+        windows are exhausted with tasks still incomplete. Mirrors Rust's
+        ``run_ralph``.
+        """
+        _ = on_stream  # sub-loops run with a suppressed sink (mirrors PlanExecute).
+        workspace_root = self._config.sandbox.workspace_root()
+        max_resets = max(self._config.max_resets, 1)
+        # Ralph's incoming budget snapshot is irrelevant — each window is a fresh
+        # start with its own per-window turn budget (the reset discards it).
+        # Token/turn accounting is accumulated separately for terminal reporting.
+        _ = budget_used
+
+        # Cumulative usage + turns across ALL context windows (R6).
+        total_usage = AggregateUsage()
+        cumulative_turns = 0
+        # The most recent incompletion reason (for RalphCompletionUnmet).
+        last_reason = ".spore/progress.json missing"
+        # Session id of the most recent context window (terminal accounting).
+        last_session_id = task.session_id
+
+        for iteration in range(max_resets):
+            # R7: a fresh, distinct session id per context window so each reset
+            # is independently traceable. Iteration 0 reuses the task's id.
+            window_session_id = task.session_id if iteration == 0 else new_session_id()
+            last_session_id = window_session_id
+
+            # R2: a FRESH SessionState per window — no message carryover; the
+            # window is re-seeded from scratch.
+            session_state = SessionState()
+
+            # Seed the instruction (R2), then R3: reload the deterministic
+            # ``.spore/`` state and inject it so the fresh window knows what is
+            # already done / still outstanding.
+            await self._config.context_manager.append_user_message(session_state, task.instruction)
+            reload = _ralph_reload_context(workspace_root)
+            if reload is not None:
+                await self._config.context_manager.append_user_message(session_state, reload)
+
+            window_task = Task(
+                id=task.id,
+                instruction=task.instruction,
+                session_id=window_session_id,
+                budget=task.budget,
+                loop_strategy=task.loop_strategy,
+            )
+            # FRESH per-window budget: the context-window reset resets the turn
+            # budget too. Token fold is accumulated separately via ``total_usage``.
+            window_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+            carried = BudgetSnapshot()
+            window_result = await self._run_react_inner(
+                window_task,
+                window_cap,
+                session_state,
+                carried,
+                None,
+            )
+            self._fold_usage(total_usage, carried, window_result)
+            cumulative_turns += carried.turns
+
+            # A window that paused / escalated is propagated up unchanged.
+            if isinstance(window_result, RunResultWaitingForHuman):
+                return window_result
+            if isinstance(window_result, RunResultEscalate):
+                await self._finalize_self_verifying(window_result)
+                return window_result
+
+            # External completion check (B1): consult the SAME filesystem state
+            # the Stop hook reads. ``None`` ⇒ done ⇒ Success; a reason ⇒ tasks
+            # remain ⇒ reset into the next window unless the cap is reached.
+            reason = _ralph_completion_status(workspace_root)
+            if reason is None:
+                output = window_result.output if isinstance(window_result, RunResultSuccess) else ""
+                result: RunResult = RunResultSuccess(
+                    output=output,
+                    session_id=window_session_id,
+                    usage=total_usage,
+                    turns=cumulative_turns,
+                )
+                await self._finalize_self_verifying(result)
+                return result
+            last_reason = reason
+
+        # Ran out of context-window resets without completion.
+        result = self._fail(
+            HaltReasonRalphCompletionUnmet(
+                iterations=max_resets,
+                last_reason=last_reason,
+            ),
+            last_session_id,
+            total_usage,
+            cumulative_turns,
+        )
+        await self._finalize_self_verifying(result)
+        return result
 
     async def _persist_task_list(
         self,
@@ -3791,6 +4099,7 @@ __all__ = [
     "HaltReasonStepFailed",
     "HaltReasonSelfVerifyExhausted",
     "HaltReasonSelfVerifyMisconfigured",
+    "HaltReasonRalphCompletionUnmet",
     "HaltReasonStrategyNotYetImplemented",
     "HaltReasonTerminationPolicyHalt",
     "HaltReasonUnrecoverableToolError",
@@ -3835,6 +4144,9 @@ __all__ = [
     "NoopContextManager",
     "OptimizationDirection",
     "PausedState",
+    "RalphFeatureEntry",
+    "RalphProgress",
+    "RalphStopHook",
     "ReadOnlySandbox",
     "RiskLevel",
     "RunResult",

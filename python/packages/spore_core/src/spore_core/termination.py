@@ -327,7 +327,8 @@ AlwaysComplete = NullCompletionCheck
 
 
 class FeatureListCheck:
-    """Reads ``feature_list.json`` under the snapshot's ``workspace_root``.
+    """Reads ``.spore/feature_list.json`` under the snapshot's
+    ``workspace_root``.
 
     Returns a reason string with the list of incomplete feature names if
     any entry has ``passes: false``. Returns ``None`` when all entries pass.
@@ -335,9 +336,13 @@ class FeatureListCheck:
     File schema: a JSON array of ``{"name": str, "passes": bool}``. Missing
     or unreadable file → ``"<path> missing"`` (treated as incomplete so the
     agent learns to create it).
+
+    Default location: ``<workspace_root>/.spore/feature_list.json`` (issue
+    #58, B2 — the canonical ``.spore/``-prefixed path shared with the Ralph
+    completion check).
     """
 
-    def __init__(self, path: Path | str = "feature_list.json") -> None:
+    def __init__(self, path: Path | str = ".spore/feature_list.json") -> None:
         self.path: Path = Path(path)
 
     async def check(self, state: SessionStateSnapshot) -> str | None:

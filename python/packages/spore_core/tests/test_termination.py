@@ -283,7 +283,10 @@ def _snapshot_in(workspace: Path) -> SessionStateSnapshot:
 
 @pytest.mark.asyncio
 async def test_feature_list_all_pass_returns_none(tmp_path: Path) -> None:
-    (tmp_path / "feature_list.json").write_text(
+    # B2 (issue #58): the default FeatureListCheck path is now
+    # ``.spore/feature_list.json``.
+    (tmp_path / ".spore").mkdir()
+    (tmp_path / ".spore" / "feature_list.json").write_text(
         '[{"name":"a","passes":true},{"name":"b","passes":true}]'
     )
     assert await FeatureListCheck().check(_snapshot_in(tmp_path)) is None
@@ -291,7 +294,8 @@ async def test_feature_list_all_pass_returns_none(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_feature_list_some_fail_returns_reason(tmp_path: Path) -> None:
-    (tmp_path / "feature_list.json").write_text(
+    (tmp_path / ".spore").mkdir()
+    (tmp_path / ".spore" / "feature_list.json").write_text(
         '[{"name":"a","passes":true},{"name":"b","passes":false},{"name":"c","passes":false}]'
     )
     r = await FeatureListCheck().check(_snapshot_in(tmp_path))
