@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -31,7 +32,13 @@ type ralphFixtureCase struct {
 	Name      string             `json:"name"`
 	Windows   []ralphFixtureBody `json:"windows"`
 	MaxResets uint32             `json:"max_resets"`
-	Expected  struct {
+	// VcsLog is the optional VcsProvider seam field (issue #58 v2). When present,
+	// a deterministic FixtureVcsProvider seeded with it is wired into the harness
+	// and the first fresh window's reloaded context must contain a delimited
+	// "Recent VCS history:" section quoting it; absent => no VcsProvider => no git
+	// section (the v1 behavior every original case asserts by omission).
+	VcsLog   *string `json:"vcs_log"`
+	Expected struct {
 		Kind       string `json:"kind"`
 		Iterations uint32 `json:"iterations"`
 	} `json:"expected"`
@@ -78,8 +85,25 @@ func TestRalphFixtureReplay(t *testing.T) {
 			a := newRalphAgent(dir, windows...)
 			cfg := ralphCfg(a, dir)
 			cfg.MaxResets = c.MaxResets
+			// issue #58 v2: when the case carries a vcs_log, wire a deterministic
+			// FixtureVcsProvider seeded with it; absent => nil => no git section.
+			if c.VcsLog != nil {
+				cfg.VcsProvider = FixtureVcsProvider{LogOutput: *c.VcsLog}
+			}
 			h := NewStandardHarness(cfg)
 			r := h.Run(context.Background(), NewHarnessRunOptions(ralphTask()))
+
+			// When a vcs_log is present, the first fresh window must include it.
+			if c.VcsLog != nil {
+				texts := a.turnTexts()
+				if len(texts) == 0 {
+					t.Fatal("agent never ran")
+				}
+				if !strings.Contains(texts[0], "Recent VCS history:") ||
+					!strings.Contains(texts[0], strings.TrimSpace(*c.VcsLog)) {
+					t.Fatalf("case %q: vcs_log not injected into reload: %q", c.Name, texts[0])
+				}
+			}
 
 			switch c.Expected.Kind {
 			case "success":

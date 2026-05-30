@@ -246,6 +246,20 @@ func (h *StandardHarness) runRalph(
 		if reload, ok := ralphReloadContext(workspaceRoot); ok {
 			h.config.ContextManager.AppendUserMessage(ctx, &session, reload)
 		}
+		// R3 (issue #58 v2): when a VcsProvider is wired, ALSO reload git history
+		// and inject it as a delimited "Recent VCS history:" section, exactly as
+		// the .spore/ reload content is injected. When the provider is nil (the
+		// default) this section is omitted entirely — Ralph's reloaded context is
+		// then byte-for-byte the v1 behavior (the B4→nil decision).
+		if h.config.VcsProvider != nil {
+			args := VcsLogArgs{MaxEntries: 20}
+			if log, err := h.config.VcsProvider.Log(ctx, args); err == nil {
+				if trimmed := strings.TrimSpace(log); trimmed != "" {
+					block := "Recent VCS history:\n" + trimmed
+					h.config.ContextManager.AppendUserMessage(ctx, &session, block)
+				}
+			}
+		}
 
 		// The per-window bounded ReAct sub-loop. The registered Stop hook (B1)
 		// fires inside it on each FinalResponse; this strategy's OUTER loop then

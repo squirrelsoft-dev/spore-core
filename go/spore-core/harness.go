@@ -1900,6 +1900,16 @@ type HarnessConfig struct {
 	// the default of 3.
 	MaxResets uint32
 
+	// VcsProvider is the optional VCS seam for the Ralph loop strategy (issue #58
+	// v2, B4). When non-nil, Ralph's per-window reload phase ALSO calls
+	// VcsProvider.Log and injects the output into the fresh context window's seed
+	// as a delimited "Recent VCS history:" section — alongside the reloaded
+	// .spore/ state. When nil (the default) the git-log section is omitted and
+	// Ralph behaves exactly like v1 (the B4→nil decision). This is a
+	// consumer-side interface (go/CONVENTIONS.md): GitVcsProvider is the real
+	// impl, FixtureVcsProvider the hermetic test double.
+	VcsProvider VcsProvider // optional
+
 	// PlannerAgent is the optional alternate agent used for the PlanExecute plan
 	// phase (issue #70, Q1). When the loop strategy is PlanExecute and this is
 	// non-nil, the one-shot plan turn runs on it; otherwise it runs on the
