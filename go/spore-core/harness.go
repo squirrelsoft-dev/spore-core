@@ -1514,6 +1514,19 @@ const (
 	// the artifact could not be serialized for storage. Carries the underlying
 	// PlanPhaseError.
 	HaltPlanPhaseFailed HaltReasonKind = "plan_phase_failed"
+	// HaltSelfVerifyExhausted (issue #61, D4) is returned by the SelfVerifying
+	// strategy when the build<->evaluate loop ran out of the verifier's
+	// MaxIterations round-trips without an explicit Passed verdict — the
+	// stagnation guard / Default-FAIL contract. A RUNTIME limit. Carries the
+	// number of round-trips run (Iterations) and the last failure reason the
+	// verifier gave (Reason). PEER to HaltSelfVerifyMisconfigured (NOT a sub-case
+	// of it).
+	HaltSelfVerifyExhausted HaltReasonKind = "self_verify_exhausted"
+	// HaltSelfVerifyMisconfigured (issue #61, D4) is returned by the
+	// SelfVerifying strategy when config.Verifier is nil. Likely a BUILD-TIME bug
+	// in the caller's wiring. Carries a human-readable Reason. PEER to
+	// HaltSelfVerifyExhausted (NOT a sub-case of it).
+	HaltSelfVerifyMisconfigured HaltReasonKind = "self_verify_misconfigured"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -1609,6 +1622,17 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind  HaltReasonKind  `json:"kind"`
 			Error *PlanPhaseError `json:"error"`
 		}{h.Kind, h.PlanError})
+	case HaltSelfVerifyExhausted:
+		return json.Marshal(struct {
+			Kind       HaltReasonKind `json:"kind"`
+			Iterations uint32         `json:"iterations"`
+			LastReason string         `json:"last_reason"`
+		}{h.Kind, h.Iterations, h.Reason})
+	case HaltSelfVerifyMisconfigured:
+		return json.Marshal(struct {
+			Kind   HaltReasonKind `json:"kind"`
+			Reason string         `json:"reason"`
+		}{h.Kind, h.Reason})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -1629,6 +1653,7 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 		Strategy   string            `json:"strategy"`
 		TaskIndex  int               `json:"task_index"`
 		Task       string            `json:"task"`
+		LastReason string            `json:"last_reason"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1672,6 +1697,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 			}
 			h.PlanError = pe
 		}
+	case HaltSelfVerifyExhausted:
+		// "last_reason" carries the verifier's final failure reason (#61).
+		h.Reason = probe.LastReason
 	}
 	return nil
 }
@@ -1853,6 +1881,25 @@ type HarnessConfig struct {
 	// metadata only — there is no ModelConfig→agent factory.
 	PlannerAgent Agent // optional
 
+	// Verifier is the oracle for the SelfVerifying loop strategy (issue #61, D2).
+	// REQUIRED for that strategy: when the loop strategy is SelfVerifying and
+	// this is nil, the run halts with HaltSelfVerifyMisconfigured (D4) — it does
+	// NOT panic. Its MaxIterations() (default 3) caps the build<->evaluate
+	// round-trips (D3); MaxStopBlocks does NOT enter the picture for this
+	// strategy. This is a consumer-side interface (go/CONVENTIONS.md): the
+	// standard verifier.Verifier family (#44) is bridged into it via
+	// verifier.AsHarnessVerifier, avoiding a sporecore -> verifier import cycle.
+	Verifier Verifier // optional (required by SelfVerifying)
+
+	// EvaluatorAgent is the optional alternate agent used for the SelfVerifying
+	// evaluate phase (issue #61, D2). Defaulting contract — IDENTICAL to
+	// PlannerAgent: when the loop strategy is SelfVerifying and this is non-nil,
+	// the evaluate run runs on it; otherwise it runs on the default Agent. The
+	// read-only sandbox and the fresh evaluate session id are derived internally
+	// by the strategy — there are no evaluator sandbox / chunk-provider config
+	// fields.
+	EvaluatorAgent Agent // optional
+
 	// RunStore is the durable per-run structured-state seam (issue #59, Q4).
 	// The PlanExecute plan phase writes the plan artifact under
 	// PlanExecuteExtrasKey and the execute loop writes the parsed task list
@@ -1945,7 +1992,11 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 	case StrategyRalph:
 		return strategyNotImplemented(task, "ralph")
 	case StrategySelfVerifying:
-		return strategyNotImplemented(task, "self_verifying")
+		// Seed the build phase's initial user message (the evaluate phase seeds
+		// its own fresh session internally). Mirrors the ReAct arm; the resume
+		// path is intentionally not re-seeded.
+		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
+		return h.runSelfVerifying(ctx, task, session, budget, options.OnStream)
 	case StrategyHillClimbing:
 		return strategyNotImplemented(task, "hill_climbing")
 	default:
@@ -2062,6 +2113,10 @@ func haltReasonString(r HaltReason) string {
 			return fmt.Sprintf("plan phase failed: %s", r.PlanError.Error())
 		}
 		return "plan phase failed"
+	case HaltSelfVerifyExhausted:
+		return fmt.Sprintf("self-verify exhausted after %d iterations: %s", r.Iterations, r.Reason)
+	case HaltSelfVerifyMisconfigured:
+		return fmt.Sprintf("self-verify misconfigured: %s", r.Reason)
 	default:
 		return string(r.Kind)
 	}

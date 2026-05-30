@@ -137,6 +137,10 @@ func describeHalt(reason sporecore.HaltReason) string {
 		return fmt.Sprintf("StagnationLimitReached{iterations=%d, best_metric=%v}", reason.Iterations, reason.BestMetric)
 	case sporecore.HaltStrategyNotYetImplemented:
 		return fmt.Sprintf("StrategyNotYetImplemented{strategy=%s}", reason.Strategy)
+	case sporecore.HaltSelfVerifyExhausted:
+		return fmt.Sprintf("SelfVerifyExhausted{iterations=%d, last_reason=%q}", reason.Iterations, reason.Reason)
+	case sporecore.HaltSelfVerifyMisconfigured:
+		return fmt.Sprintf("SelfVerifyMisconfigured{reason=%q}", reason.Reason)
 	default:
 		return fmt.Sprintf("%+v", reason)
 	}
@@ -341,11 +345,53 @@ func (c *CompositeVerifier) Verify(ctx context.Context, input *VerifierInput) Ve
 func (c *CompositeVerifier) MaxIterations() uint32 { return c.maxIterations }
 
 // ============================================================================
+// Harness seam adapter (issue #61)
+// ============================================================================
+
+// harnessVerifier adapts a verifier.Verifier into the consumer-side
+// sporecore.Verifier seam the SelfVerifying strategy reads. The sporecore root
+// package cannot import this package (cycle), so it defines a narrow Verifier
+// interface in root-package terms (sporecore.SelfVerifyInput /
+// sporecore.SelfVerifyVerdict); this adapter translates between the two.
+type harnessVerifier struct {
+	inner Verifier
+}
+
+// AsHarnessVerifier wraps a verifier.Verifier so it can be dropped straight into
+// sporecore.HarnessConfig.Verifier. Returns nil when v is nil so a nil verifier
+// stays nil through the seam (the SelfVerifying strategy treats a nil
+// config.Verifier as HaltSelfVerifyMisconfigured, D4).
+func AsHarnessVerifier(v Verifier) sporecore.Verifier {
+	if v == nil {
+		return nil
+	}
+	return harnessVerifier{inner: v}
+}
+
+// Verify implements sporecore.Verifier.
+func (h harnessVerifier) Verify(ctx context.Context, input sporecore.SelfVerifyInput) sporecore.SelfVerifyVerdict {
+	verdict := h.inner.Verify(ctx, &VerifierInput{
+		BuildResult: input.BuildResult,
+		EvalResult:  input.EvalResult,
+		Workspace:   input.Workspace,
+		Iteration:   input.Iteration,
+	})
+	if verdict.Kind == VerdictPassed {
+		return sporecore.SelfVerifyVerdict{Kind: sporecore.SelfVerifyPassed}
+	}
+	return sporecore.SelfVerifyVerdict{Kind: sporecore.SelfVerifyFailed, Reason: verdict.Reason}
+}
+
+// MaxIterations implements sporecore.Verifier.
+func (h harnessVerifier) MaxIterations() uint32 { return h.inner.MaxIterations() }
+
+// ============================================================================
 // Compile-time interface checks.
 // ============================================================================
 
 var (
-	_ Verifier = (*EvaluatorResponseVerifier)(nil)
-	_ Verifier = (*TestSuiteVerifier)(nil)
-	_ Verifier = (*CompositeVerifier)(nil)
+	_ Verifier           = (*EvaluatorResponseVerifier)(nil)
+	_ Verifier           = (*TestSuiteVerifier)(nil)
+	_ Verifier           = (*CompositeVerifier)(nil)
+	_ sporecore.Verifier = harnessVerifier{}
 )
