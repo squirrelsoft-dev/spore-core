@@ -1,0 +1,59 @@
+{
+  "description": "Cross-language consistency fixture for the Ralph loop strategy (issue #58).\n\nRalph is a multi-context-window continuation loop. Each case scripts the per-window state the agent writes to `.spore/progress.json` (`windows`: one entry per context window, `{complete, remaining}`), the outer-loop reset cap (`max_resets`, B3), and the expected terminal RunResult. The completion mechanism is the registered Stop hook reading `.spore/progress.json` (B1); the strategy resets the context window (fresh SessionState, reload `.spore/progress.json` + `.spore/feature_list.json` from the filesystem — B4: no git) until completion passes or `max_resets` windows are exhausted.\n\n  - the first `complete:true` (with empty `remaining`) window at index i => Success at iteration i+1.\n  - all windows incomplete up to `max_resets` => Failure { RalphCompletionUnmet { iterations: max_resets } }.\n\nExpected.kind is one of: success | completion_unmet. `iterations` is the number of context windows run.",
+  "cases": [
+    {
+      "name": "complete_first_window",
+      "windows": [
+        {"complete": true, "remaining": []}
+      ],
+      "max_resets": 3,
+      "expected": {"kind": "success", "iterations": 1}
+    },
+    {
+      "name": "incomplete_then_complete",
+      "windows": [
+        {"complete": false, "remaining": ["task A"]},
+        {"complete": true, "remaining": []}
+      ],
+      "max_resets": 3,
+      "expected": {"kind": "success", "iterations": 2}
+    },
+    {
+      "name": "incomplete_incomplete_then_complete",
+      "windows": [
+        {"complete": false, "remaining": ["task A"]},
+        {"complete": false, "remaining": ["task B"]},
+        {"complete": true, "remaining": []}
+      ],
+      "max_resets": 3,
+      "expected": {"kind": "success", "iterations": 3}
+    },
+    {
+      "name": "always_incomplete_exhausts_default_cap",
+      "windows": [
+        {"complete": false, "remaining": ["task A"]},
+        {"complete": false, "remaining": ["task A"]},
+        {"complete": false, "remaining": ["task A"]}
+      ],
+      "max_resets": 3,
+      "expected": {"kind": "completion_unmet", "iterations": 3}
+    },
+    {
+      "name": "always_incomplete_single_window_cap",
+      "windows": [
+        {"complete": false, "remaining": ["task A"]}
+      ],
+      "max_resets": 1,
+      "expected": {"kind": "completion_unmet", "iterations": 1}
+    },
+    {
+      "name": "complete_but_remaining_nonempty_is_incomplete",
+      "windows": [
+        {"complete": true, "remaining": ["leftover"]},
+        {"complete": true, "remaining": []}
+      ],
+      "max_resets": 3,
+      "expected": {"kind": "success", "iterations": 2}
+    }
+  ]
+}

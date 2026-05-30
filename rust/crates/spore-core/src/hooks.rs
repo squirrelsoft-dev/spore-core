@@ -1752,6 +1752,7 @@ mod tests {
             evaluator_agent: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
+            max_resets: 3,
         }
     }
 }

@@ -1180,6 +1180,18 @@ pub enum HaltReason {
     SelfVerifyMisconfigured {
         reason: String,
     },
+    /// Returned by [`StandardHarness`] for the `Ralph` strategy (issue #58, B3)
+    /// when the multi-context-window continuation loop reached its `max_resets`
+    /// cap with tasks still incomplete (the Ralph analogue of
+    /// [`SelfVerifyExhausted`](Self::SelfVerifyExhausted)). A RUNTIME limit — the
+    /// work was attempted across `iterations` context windows but the
+    /// filesystem-backed completion check (the registered `Stop` hook reading
+    /// `.spore/progress.json`) never reported done. Carries the number of
+    /// context-window resets performed and the last incompletion reason.
+    RalphCompletionUnmet {
+        iterations: u32,
+        last_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1228,6 +1240,78 @@ struct PlanPhaseOutcome {
     artifact: crate::plan::PlanArtifact,
     usage: AggregateUsage,
     turns: u32,
+}
+
+// ============================================================================
+// Ralph loop strategy support types (issue #58)
+// ============================================================================
+
+/// Deserialized `.spore/progress.json` for the Ralph loop strategy (issue #58,
+/// B1/B2). The handoff artifact between context windows: `complete` is the
+/// primary completion signal, `remaining` lists outstanding work so an
+/// incompletion reason can name what is left. Tolerant by default (`#[serde]`
+/// defaults) so a partially-written file deserializes to "incomplete" rather
+/// than erroring.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RalphProgress {
+    #[serde(default)]
+    complete: bool,
+    #[serde(default)]
+    remaining: Vec<String>,
+}
+
+/// One `.spore/feature_list.json` entry, mirroring
+/// [`FeatureListCheck`](crate::termination::FeatureListCheck)'s schema so the
+/// two sources agree (issue #58, B2).
+#[derive(Debug, Clone, Deserialize)]
+struct RalphFeatureEntry {
+    name: String,
+    passes: bool,
+}
+
+/// The `Stop` lifecycle hook (issue #69) the Ralph loop strategy registers at
+/// construction (issue #58, B1). Drives multi-context-window continuation off
+/// `.spore/progress.json`: while tasks remain incomplete it returns
+/// [`HookDecision::Block`](crate::hooks::HookDecision::Block) (the reason
+/// describes what is left) so the harness loops into a new context window; when
+/// complete it returns [`Continue`](crate::hooks::HookDecision::Continue) so the
+/// loop terminates with success.
+///
+/// Registration is harmless for non-Ralph strategies: when `.spore/progress.json`
+/// is ABSENT the hook returns `Continue` and does not interfere with ReAct /
+/// PlanExecute / SelfVerifying runs. It only blocks when a progress file is
+/// PRESENT and reports incomplete tasks — the Ralph contract.
+struct RalphStopHook {
+    workspace_root: std::path::PathBuf,
+}
+
+impl crate::hooks::Hook for RalphStopHook {
+    fn handle<'a>(
+        &'a self,
+        ctx: &'a mut crate::hooks::HookContext<'a>,
+    ) -> BoxFut<'a, Result<crate::hooks::HookDecision, crate::hooks::HookError>> {
+        Box::pin(async move {
+            // Only act on `Stop`; any other event is a no-op `Continue`.
+            if !matches!(ctx, crate::hooks::HookContext::Stop { .. }) {
+                return Ok(crate::hooks::HookDecision::Continue);
+            }
+            // Absent progress file ⇒ do not interfere with non-Ralph runs.
+            let progress_path = self.workspace_root.join(".spore/progress.json");
+            if !progress_path.exists() {
+                return Ok(crate::hooks::HookDecision::Continue);
+            }
+            match StandardHarness::ralph_completion_status(&self.workspace_root) {
+                None => Ok(crate::hooks::HookDecision::Continue),
+                Some(reason) => Ok(crate::hooks::HookDecision::Block { reason }),
+            }
+        })
+    }
+    fn events(&self) -> Vec<crate::hooks::HookEvent> {
+        vec![crate::hooks::HookEvent::Stop]
+    }
+    fn name(&self) -> String {
+        "ralph-stop".into()
+    }
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -1372,6 +1456,14 @@ pub struct HarnessConfig {
     /// The harness loads chunks from it at construction and feeds them through
     /// a [`ContextSourcesBuilder`](crate::prompt_assembly::ContextSourcesBuilder).
     pub chunk_provider: Arc<dyn crate::prompt_assembly::ChunkProvider>,
+    /// Outer-loop cap for the `Ralph` loop strategy (issue #58, B3): the maximum
+    /// number of context-window RESETS the continuation loop performs before
+    /// halting with [`HaltReason::RalphCompletionUnmet`] when tasks are still
+    /// incomplete. Independent from `max_turns` (the per-context-window ReAct
+    /// turn budget) and from `max_stop_blocks` (the per-sub-loop Stop-block cap).
+    /// Defaults to `3` (matching the `SelfVerifying` verifier `max_iterations`
+    /// precedent). Irrelevant for every other loop strategy.
+    pub max_resets: u32,
 }
 
 impl Clone for HarnessConfig {
@@ -1397,6 +1489,7 @@ impl Clone for HarnessConfig {
             evaluator_agent: self.evaluator_agent.clone(),
             storage: self.storage.clone(),
             chunk_provider: self.chunk_provider.clone(),
+            max_resets: self.max_resets,
         }
     }
 }
@@ -1450,6 +1543,9 @@ pub struct HarnessBuilder {
     /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider)
     /// at build time.
     chunk_provider: Option<Arc<dyn crate::prompt_assembly::ChunkProvider>>,
+    /// Outer-loop reset cap for the `Ralph` loop strategy (issue #58, B3).
+    /// Defaults to `3`.
+    max_resets: u32,
     /// Standard catalogue tools accumulated via [`HarnessBuilder::tool`] /
     /// [`HarnessBuilder::tools`] (issue #81). They are drained into a populated
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
@@ -1488,6 +1584,7 @@ impl HarnessBuilder {
             evaluator_agent: None,
             storage: None,
             chunk_provider: None,
+            max_resets: 3,
             standard_tools: Vec::new(),
         }
     }
@@ -1600,6 +1697,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set the outer-loop context-window reset cap for the `Ralph` loop strategy
+    /// (issue #58, B3). Defaults to `3`.
+    pub fn max_resets(mut self, max: u32) -> Self {
+        self.max_resets = max;
+        self
+    }
+
     /// Inject a deterministic tool-call repair provider (e.g.
     /// [`StandardToolCallRepair`](crate::tool_call_repair::StandardToolCallRepair)).
     /// When set, recoverable tool-dispatch errors trigger an argument-coercion
@@ -1693,6 +1797,7 @@ impl HarnessBuilder {
             chunk_provider: self.chunk_provider.unwrap_or_else(|| {
                 Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
             }),
+            max_resets: self.max_resets,
         }
     }
 
@@ -1708,6 +1813,22 @@ pub struct StandardHarness {
 
 impl StandardHarness {
     pub fn new(config: HarnessConfig) -> Self {
+        // Ralph completion mechanism (issue #58, B1): register a `Stop` hook
+        // that drives multi-context-window continuation off `.spore/progress.json`.
+        // Registration is harmless for non-Ralph runs — the hook only BLOCKS when
+        // a progress file is PRESENT and reports incomplete tasks; when the file
+        // is absent (the common case for ReAct / other strategies) it returns
+        // `Continue`, so existing strategies are unaffected byte-for-byte.
+        let workspace_root = config.sandbox.workspace_root().to_path_buf();
+        let chain: Arc<dyn crate::hooks::HookChain> = match config.hooks.clone() {
+            Some(c) => c,
+            None => Arc::new(crate::hooks::StandardHookChain::new()),
+        };
+        // Best-effort: a duplicate/invalid registration must never panic the
+        // constructor. The hook subscribes only to the can-block `Stop` event.
+        let _ = chain.register(Arc::new(RalphStopHook { workspace_root }));
+        let mut config = config;
+        config.hooks = Some(chain);
         Self { config }
     }
 
@@ -3114,6 +3235,282 @@ impl StandardHarness {
         }
     }
 
+    // ========================================================================
+    // Ralph loop strategy (issue #58)
+    // ========================================================================
+    //
+    // Multi-context-window continuation loop. The model's exit attempt is
+    // intercepted — instead of terminating, the harness RESETS the context
+    // window (discards the prior `SessionState`, builds a FRESH
+    // `SessionState::default()`), RELOADS state from the filesystem (the
+    // deterministic `.spore/progress.json` + `.spore/feature_list.json` files —
+    // B4: no git-log read in v1), and resumes — until an external completion
+    // check passes. The filesystem is what makes multi-context-window work
+    // possible: each window starts from nothing but the instruction plus the
+    // reloaded `.spore/` state.
+    //
+    // ## Completion mechanism (B1): driven off the `Stop` hook (issue #69).
+    //   At construction [`StandardHarness::new`] registers a [`RalphStopHook`]
+    //   that reads `.spore/progress.json` (+ `.spore/feature_list.json`): while
+    //   tasks remain incomplete it returns [`HookDecision::Block`] (the reason
+    //   describes what is left) and the harness loops into a new context window;
+    //   when all tasks are complete it returns [`HookDecision::Continue`] and the
+    //   loop terminates with success. There is NO dedicated `completion_check`
+    //   config field and the deprecated `CompletionCheck` trait is NOT reused.
+    //   The harness fires the Stop hook (`fire_stop_hooks` on `FinalResponse`);
+    //   this strategy ALSO evaluates the SAME filesystem check between windows
+    //   ([`ralph_completion_status`]) to drive the OUTER reset loop and to decide
+    //   the terminal outcome.
+    //
+    // ## Config fields this strategy reads:
+    //   - `config.max_resets` (B3, default 3) — the OUTER loop cap: the maximum
+    //     number of context-window RESETS. Independent from `max_turns` (the
+    //     per-window ReAct turn budget) and `max_stop_blocks` (the per-sub-loop
+    //     Stop-block cap).
+    //
+    // ## Canonical filesystem paths (B2, `.spore/`-prefixed):
+    //   - `{workspace_root}/.spore/progress.json`
+    //   - `{workspace_root}/.spore/feature_list.json`
+    //   (matches [`FeatureListCheck::new`](crate::termination::FeatureListCheck)).
+    //
+    // ## Terminal `HaltReason` variant this strategy produces (peer to
+    //    [`SelfVerifyExhausted`](HaltReason::SelfVerifyExhausted)):
+    //   - [`RalphCompletionUnmet`](HaltReason::RalphCompletionUnmet)
+    //     `{ iterations, last_reason }` — reached `max_resets` context windows
+    //     with tasks still incomplete.
+    //
+    // ## Rules enforced (each maps to a test):
+    //   - R1  the model's exit attempt RESETS the context window instead of
+    //         terminating, while tasks remain incomplete.
+    //   - R2  each reset builds a FRESH `SessionState::default()` — no message
+    //         carryover between context windows.
+    //   - R3  the filesystem reload injects the reloaded `.spore/progress.json` +
+    //         `.spore/feature_list.json` content into the fresh seed.
+    //   - R4  completion pattern `incomplete,incomplete,complete` ⇒ `Success` at
+    //         iteration 3.
+    //   - R5  always-incomplete ⇒ exactly `max_resets` iterations ⇒
+    //         `Failure { RalphCompletionUnmet }`.
+    //   - R6  budgets fold across ALL context windows (`fold_usage`).
+    //   - R7  each reset is traceable (a distinct generated session id per
+    //         window, finalized via observability).
+    //
+    // No `// SPEC QUESTION:` markers — B1–B4 are resolved.
+    async fn run_ralph(
+        &self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        _on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+        let max_resets = self.config.max_resets;
+        // Ralph's incoming budget snapshot is irrelevant — each context window is
+        // a fresh start with its own per-window turn budget (the reset discards
+        // the turn budget along with the SessionState). Token/turn accounting is
+        // accumulated separately for terminal reporting (R6).
+        let _ = budget_used;
+
+        // Cumulative usage + turns across ALL context windows (R6).
+        let mut total_usage = AggregateUsage::default();
+        let mut cumulative_turns: u32 = 0;
+        // The most recent incompletion reason (for RalphCompletionUnmet).
+        let mut last_reason = String::from(".spore/progress.json missing");
+        // Session id of the most recent context window (terminal accounting).
+        let mut last_session_id = task.session_id.clone();
+
+        // The OUTER loop: each iteration is ONE context window. `max_resets`
+        // caps the number of windows (B3). Iteration 0 is the first window; a
+        // reset is the transition into the next iteration (R1).
+        for iteration in 0..max_resets.max(1) {
+            // R7: a fresh, distinct session id per context window so each reset
+            // is independently traceable.
+            let window_session_id = if iteration == 0 {
+                task.session_id.clone()
+            } else {
+                SessionId::generate()
+            };
+            last_session_id = window_session_id.clone();
+
+            // R2: a FRESH SessionState per window — discard the prior one. No
+            // message carryover; the window is re-seeded from scratch.
+            let mut session_state = SessionState::default();
+
+            // Seed the instruction (R2) then R3: reload the deterministic
+            // `.spore/` state from the filesystem and inject it as context so the
+            // fresh window knows what is already done / still outstanding.
+            self.config
+                .context_manager
+                .append_user_message(&mut session_state, &task.instruction)
+                .await;
+            if let Some(reload) = Self::ralph_reload_context(&workspace_root) {
+                self.config
+                    .context_manager
+                    .append_user_message(&mut session_state, &reload)
+                    .await;
+            }
+
+            // The per-window bounded ReAct sub-loop. The registered Stop hook
+            // (B1) fires inside it on each `FinalResponse`: while incomplete it
+            // blocks (capped by `max_stop_blocks`), forcing more work within the
+            // window; this strategy's OUTER loop then decides reset vs success.
+            let window_task = Task {
+                id: task.id.clone(),
+                instruction: task.instruction.clone(),
+                session_id: window_session_id.clone(),
+                budget: task.budget.clone(),
+                loop_strategy: task.loop_strategy.clone(),
+            };
+            let window_cap = task.budget.max_turns.unwrap_or(u32::MAX);
+            // FRESH per-window budget: the context-window reset resets the turn
+            // budget too. Token fold is accumulated separately via `total_usage`.
+            let mut carried = BudgetSnapshot::default();
+            let window_result = self
+                .run_react_inner(
+                    window_task,
+                    window_cap,
+                    session_state,
+                    carried.clone(),
+                    None,
+                )
+                .await;
+            Self::fold_usage(&mut total_usage, &mut carried, &window_result);
+            cumulative_turns += carried.turns;
+
+            // A window that paused / escalated is propagated up unchanged.
+            match &window_result {
+                RunResult::WaitingForHuman { state, request } => {
+                    return RunResult::WaitingForHuman {
+                        state: state.clone(),
+                        request: request.clone(),
+                    };
+                }
+                RunResult::Escalate { .. } => {
+                    self.finalize_self_verifying(&window_result).await;
+                    return window_result;
+                }
+                _ => {}
+            }
+
+            // External completion check (B1): consult the SAME filesystem state
+            // the Stop hook reads. `None` ⇒ done ⇒ Success; `Some(reason)` ⇒
+            // tasks remain ⇒ reset into the next window (R1) unless the cap is
+            // reached (R5).
+            match Self::ralph_completion_status(&workspace_root) {
+                None => {
+                    let output = match window_result {
+                        RunResult::Success { output, .. } => output,
+                        _ => String::new(),
+                    };
+                    let result = RunResult::Success {
+                        output,
+                        session_id: window_session_id,
+                        usage: total_usage,
+                        turns: cumulative_turns,
+                    };
+                    self.finalize_self_verifying(&result).await;
+                    return result;
+                }
+                Some(reason) => {
+                    last_reason = reason;
+                    let _ = iteration;
+                }
+            }
+        }
+
+        // R5: ran out of context-window resets without completion.
+        let result = RunResult::Failure {
+            reason: HaltReason::RalphCompletionUnmet {
+                iterations: max_resets.max(1),
+                last_reason,
+            },
+            session_id: last_session_id,
+            usage: total_usage,
+            turns: cumulative_turns,
+        };
+        self.finalize_self_verifying(&result).await;
+        result
+    }
+
+    /// Ralph external completion check (issue #58, B1). Reads the deterministic
+    /// `.spore/` files under `workspace_root` and reports whether the task is
+    /// complete. Returns `None` when complete, `Some(reason)` when tasks remain
+    /// (the reason describes what is left). This is the SAME logic the registered
+    /// [`RalphStopHook`] applies — one source of truth for the completion
+    /// mechanism.
+    ///
+    /// Contract (both files are written by the strategy/initializer and fixture
+    /// cleanly — B4, no git):
+    ///   - `.spore/progress.json`: `{ "complete": bool, "remaining": [string] }`.
+    ///     `complete: true` with an empty `remaining` ⇒ progress satisfied.
+    ///     Missing/unreadable/invalid ⇒ incomplete (so the agent learns to write
+    ///     it).
+    ///   - `.spore/feature_list.json`: a JSON array of `{ "name", "passes" }`
+    ///     (the [`FeatureListCheck`](crate::termination::FeatureListCheck) schema).
+    ///     Any `passes: false` ⇒ incomplete. A MISSING feature list is tolerated
+    ///     here (progress.json is the primary signal); an invalid one is not.
+    fn ralph_completion_status(workspace_root: &std::path::Path) -> Option<String> {
+        let progress_path = workspace_root.join(".spore/progress.json");
+        let raw = match std::fs::read_to_string(&progress_path) {
+            Ok(s) => s,
+            Err(_) => return Some(".spore/progress.json missing".to_string()),
+        };
+        let progress: RalphProgress = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(e) => return Some(format!(".spore/progress.json invalid JSON: {e}")),
+        };
+        if !progress.complete {
+            let detail = if progress.remaining.is_empty() {
+                "task not marked complete".to_string()
+            } else {
+                format!("remaining: {}", progress.remaining.join(", "))
+            };
+            return Some(detail);
+        }
+        if !progress.remaining.is_empty() {
+            return Some(format!("remaining: {}", progress.remaining.join(", ")));
+        }
+
+        // Progress says done — corroborate against the feature list when present.
+        let feature_path = workspace_root.join(".spore/feature_list.json");
+        if let Ok(raw) = std::fs::read_to_string(&feature_path) {
+            let entries: Vec<RalphFeatureEntry> = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => return Some(format!(".spore/feature_list.json invalid JSON: {e}")),
+            };
+            let incomplete: Vec<String> = entries
+                .into_iter()
+                .filter(|e| !e.passes)
+                .map(|e| e.name)
+                .collect();
+            if !incomplete.is_empty() {
+                return Some(format!("incomplete features: {}", incomplete.join(", ")));
+            }
+        }
+        None
+    }
+
+    /// Build the filesystem-reload context block injected into each fresh
+    /// context window (issue #58, R3). Returns the verbatim `.spore/progress.json`
+    /// and `.spore/feature_list.json` contents (when present) so the re-seeded
+    /// window knows what is already done and what remains. Returns `None` when
+    /// neither file exists (nothing to reload).
+    fn ralph_reload_context(workspace_root: &std::path::Path) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Ok(raw) = std::fs::read_to_string(workspace_root.join(".spore/progress.json")) {
+            parts.push(format!("Reloaded .spore/progress.json:\n{}", raw.trim()));
+        }
+        if let Ok(raw) = std::fs::read_to_string(workspace_root.join(".spore/feature_list.json")) {
+            parts.push(format!(
+                "Reloaded .spore/feature_list.json:\n{}",
+                raw.trim()
+            ));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
     // (private outcome type for `run_plan_phase` is defined at module scope.)
 
     /// Drive the PlanExecute strategy (issue #59) — the two-phase loop.
@@ -3951,14 +4348,15 @@ impl StandardHarness {
                 self.run_plan_execute(task, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::Ralph => RunResult::Failure {
-                reason: HaltReason::StrategyNotYetImplemented {
-                    strategy: "ralph".into(),
-                },
-                session_id: task.session_id,
-                usage: AggregateUsage::default(),
-                turns: 0,
-            },
+            LoopStrategy::Ralph => {
+                // Ralph (issue #58) re-seeds a FRESH SessionState per context
+                // window INSIDE `run_ralph` (the context-window reset). The
+                // incoming `session_state` is intentionally discarded — the first
+                // window is built from scratch like every subsequent reset, so
+                // the prompt is NOT seeded here.
+                let _ = session_state;
+                self.run_ralph(task, budget_used, on_stream).await
+            }
             LoopStrategy::SelfVerifying => {
                 // Seed the build task instruction as the initial user message of
                 // this fresh run (mirrors the ReAct entry above): the build
@@ -4466,6 +4864,7 @@ mod tests {
                 crate::storage::InMemoryStorageProvider::new(),
             ))),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
+            max_resets: 3,
         }
     }
 
@@ -5906,18 +6305,15 @@ mod tests {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
         // Q4 (issue #70): PlanExecute no longer uses StrategyNotYetImplemented;
-        // it is exercised separately below. SelfVerifying (issue #61) is now
-        // implemented and exercised in its own test block. Ralph / HillClimbing
-        // still return the generic stub.
-        for s in [
-            LoopStrategy::Ralph,
-            LoopStrategy::HillClimbing {
-                direction: OptimizationDirection::Maximize,
-                max_stagnation: None,
-                revert_on_no_improvement: false,
-                min_improvement_delta: None,
-            },
-        ] {
+        // it is exercised separately below. SelfVerifying (issue #61) and Ralph
+        // (issue #58) are now implemented and exercised in their own test blocks.
+        // Only HillClimbing still returns the generic stub.
+        for s in [LoopStrategy::HillClimbing {
+            direction: OptimizationDirection::Maximize,
+            max_stagnation: None,
+            revert_on_no_improvement: false,
+            min_improvement_delta: None,
+        }] {
             let t = task(s);
             match h.run(HarnessRunOptions::new(t)).await {
                 RunResult::Failure {
@@ -7119,6 +7515,7 @@ mod tests {
                 evaluator_agent: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
+                max_resets: 3,
             })
         }
 
@@ -8378,6 +8775,366 @@ mod tests {
                         ..
                     },
                 ) => {}
+                (_, other) => panic!("case `{}`: unexpected result {other:?}", case.name),
+            }
+        }
+    }
+
+    // ========================================================================
+    // Ralph loop strategy (issue #58)
+    // ========================================================================
+
+    fn ralph_task() -> Task {
+        let mut t = task(LoopStrategy::Ralph);
+        // One ReAct turn per context window keeps the per-window sub-loop
+        // bounded so the OUTER reset loop drives the test deterministically.
+        t.budget.max_turns = Some(1);
+        t
+    }
+
+    /// A `SandboxProvider` whose `workspace_root` is a real tempdir, so the
+    /// Ralph filesystem reload + completion check read real `.spore/` files.
+    struct WorkspaceSandbox {
+        root: std::path::PathBuf,
+    }
+    impl SandboxProvider for WorkspaceSandbox {
+        fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn workspace_root(&self) -> &std::path::Path {
+            &self.root
+        }
+    }
+
+    /// Write `.spore/progress.json` under `root` (creating `.spore/`).
+    fn write_progress(root: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(root.join(".spore")).unwrap();
+        std::fs::write(root.join(".spore/progress.json"), body).unwrap();
+    }
+    fn write_feature_list(root: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(root.join(".spore")).unwrap();
+        std::fs::write(root.join(".spore/feature_list.json"), body).unwrap();
+    }
+    const INCOMPLETE: &str = r#"{"complete":false,"remaining":["task A"]}"#;
+    const COMPLETE: &str = r#"{"complete":true,"remaining":[]}"#;
+
+    /// Agent that, on each turn, pops the next progress-file body from a queue
+    /// and writes it to `.spore/progress.json` BEFORE returning a `FinalResponse`
+    /// — modelling "the agent did work this window and updated progress." Also
+    /// records the messages it saw so tests can assert fresh-state / reload.
+    struct ProgressWritingAgent {
+        id: AgentId,
+        root: std::path::PathBuf,
+        progress_queue: StdMutex<std::collections::VecDeque<String>>,
+        seen: StdMutex<Vec<Context>>,
+    }
+    impl ProgressWritingAgent {
+        fn new(root: &std::path::Path, bodies: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                id: AgentId::new("ralph-build"),
+                root: root.to_path_buf(),
+                progress_queue: StdMutex::new(bodies.into_iter().map(String::from).collect()),
+                seen: StdMutex::new(Vec::new()),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+        fn seen_text(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .map(|m| match &m.content {
+                            Content::Text { text } => text.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect()
+        }
+    }
+    impl Agent for ProgressWritingAgent {
+        fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+            self.seen.lock().unwrap().push(context);
+            if let Some(body) = self.progress_queue.lock().unwrap().pop_front() {
+                write_progress(&self.root, &body);
+            }
+            Box::pin(async move {
+                TurnResult::FinalResponse {
+                    content: "window done".into(),
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                    },
+                }
+            })
+        }
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+    }
+
+    fn ralph_config(root: &std::path::Path, agent: Arc<dyn Agent>) -> HarnessConfig {
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent;
+        cfg.sandbox = Arc::new(WorkspaceSandbox {
+            root: root.to_path_buf(),
+        });
+        // Use a real context manager so reloaded context lands in messages.
+        cfg.context_manager = Arc::new(NoopContextManager);
+        cfg
+    }
+
+    // R0: Ralph is implemented — no longer StrategyNotYetImplemented.
+    #[tokio::test]
+    async fn ralph_no_longer_unimplemented() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), COMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![COMPLETE]);
+        let h = StandardHarness::new(ralph_config(dir.path(), agent));
+        match h.run(HarnessRunOptions::new(ralph_task())).await {
+            RunResult::Failure {
+                reason: HaltReason::StrategyNotYetImplemented { .. },
+                ..
+            } => panic!("Ralph must be implemented"),
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // R4: completion pattern incomplete,incomplete,complete → Success at it. 3.
+    #[tokio::test]
+    async fn ralph_resets_until_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        // Start incomplete so the first window's reload sees prior state.
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, INCOMPLETE, COMPLETE]);
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        cfg.max_resets = 3;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(ralph_task())).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success at the 3rd window, got {other:?}"),
+        }
+        // Exactly three context windows ran (one agent turn each).
+        assert_eq!(agent.call_count(), 3, "should reset twice, run 3 windows");
+    }
+
+    // R5: always-incomplete → exactly max_resets windows → RalphCompletionUnmet.
+    #[tokio::test]
+    async fn ralph_exhausts_max_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(
+            dir.path(),
+            vec![INCOMPLETE, INCOMPLETE, INCOMPLETE, INCOMPLETE],
+        );
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        cfg.max_resets = 3;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(ralph_task())).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::RalphCompletionUnmet {
+                        iterations,
+                        last_reason,
+                    },
+                ..
+            } => {
+                assert_eq!(iterations, 3, "exactly max_resets windows");
+                assert!(last_reason.contains("task A"), "got: {last_reason}");
+            }
+            other => panic!("expected RalphCompletionUnmet, got {other:?}"),
+        }
+        assert_eq!(agent.call_count(), 3, "exactly max_resets windows ran");
+    }
+
+    // R2: each reset builds a FRESH SessionState — no message carryover. The
+    // agent's recorded context for window 2 must NOT contain window 1's content.
+    #[tokio::test]
+    async fn ralph_fresh_session_per_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        cfg.max_resets = 3;
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
+        let texts = agent.seen_text();
+        assert_eq!(texts.len(), 2, "two windows");
+        // The assistant's "window done" output from window 1 is NOT present in
+        // window 2's fresh context (no carryover). Each window's context is
+        // re-seeded from instruction + reloaded `.spore/` state only.
+        assert!(
+            !texts[1].contains("window done"),
+            "window 2 carried over window 1 messages: {}",
+            texts[1]
+        );
+    }
+
+    // R3: the filesystem reload injects `.spore/` state into the fresh seed.
+    #[tokio::test]
+    async fn ralph_reload_injects_filesystem_state() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        write_feature_list(dir.path(), r#"[{"name":"login","passes":false}]"#);
+        // Agent leaves progress incomplete on window 1, complete on window 2.
+        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        cfg.max_resets = 3;
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
+        let texts = agent.seen_text();
+        // Window 1's fresh seed contains the reloaded progress + feature list.
+        assert!(
+            texts[0].contains("Reloaded .spore/progress.json")
+                && texts[0].contains("Reloaded .spore/feature_list.json")
+                && texts[0].contains("login"),
+            "reload not injected: {}",
+            texts[0]
+        );
+    }
+
+    // R6: budgets fold across ALL context windows (each window adds usage).
+    #[tokio::test]
+    async fn ralph_budgets_fold_across_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), INCOMPLETE);
+        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, INCOMPLETE, COMPLETE]);
+        let mut cfg = ralph_config(dir.path(), agent);
+        cfg.max_resets = 3;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(ralph_task())).await {
+            RunResult::Success { usage, .. } => {
+                // Three windows × one turn × (1 in, 1 out) folded.
+                assert_eq!(usage.input_tokens, 3, "input tokens fold across windows");
+                assert_eq!(usage.output_tokens, 3, "output tokens fold across windows");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // R7: missing progress file is treated as incomplete by the OUTER loop, and
+    // the registered Stop hook does NOT interfere with non-Ralph runs.
+    #[tokio::test]
+    async fn ralph_stop_hook_inert_without_progress_file() {
+        // A plain ReAct run on a workspace with no `.spore/progress.json`: the
+        // registered RalphStopHook must return Continue (terminate in one turn).
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.sandbox = Arc::new(WorkspaceSandbox {
+            root: dir.path().to_path_buf(),
+        });
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { turns, .. } => assert_eq!(turns, 1, "stop hook must be inert"),
+            other => panic!("expected Success in one turn, got {other:?}"),
+        }
+    }
+
+    // Completion-status helper: progress complete but a feature fails ⇒ still
+    // incomplete (the feature list corroborates).
+    #[tokio::test]
+    async fn ralph_completion_status_feature_list_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_progress(dir.path(), COMPLETE);
+        write_feature_list(dir.path(), r#"[{"name":"login","passes":false}]"#);
+        let status = StandardHarness::ralph_completion_status(dir.path());
+        assert!(
+            status.as_deref().unwrap_or("").contains("login"),
+            "got: {status:?}"
+        );
+        // Now mark it passing — complete.
+        write_feature_list(dir.path(), r#"[{"name":"login","passes":true}]"#);
+        assert_eq!(StandardHarness::ralph_completion_status(dir.path()), None);
+    }
+
+    // ── Ralph cross-language fixture replay ─────────────────────────────────
+    #[derive(serde::Deserialize)]
+    struct RalphFixtureCase {
+        name: String,
+        /// Per-window progress-file body the agent writes (the window's state).
+        windows: Vec<RalphWindow>,
+        max_resets: u32,
+        expected: RalphFixtureExpected,
+    }
+    #[derive(serde::Deserialize)]
+    struct RalphWindow {
+        complete: bool,
+        #[serde(default)]
+        remaining: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum RalphFixtureExpected {
+        Success { iterations: u32 },
+        CompletionUnmet { iterations: u32 },
+    }
+    #[derive(serde::Deserialize)]
+    struct RalphFixtureSuite {
+        cases: Vec<RalphFixtureCase>,
+    }
+
+    #[tokio::test]
+    async fn ralph_fixture_replay() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/harness/ralph.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture present");
+        let suite: RalphFixtureSuite = serde_json::from_str(&raw).expect("fixture parses");
+        for case in suite.cases {
+            let dir = tempfile::tempdir().unwrap();
+            // Seed an initial incomplete progress file so window 1 reloads state.
+            write_progress(dir.path(), INCOMPLETE);
+            let bodies: Vec<String> = case
+                .windows
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "complete": w.complete,
+                        "remaining": w.remaining,
+                    })
+                    .to_string()
+                })
+                .collect();
+            let agent =
+                ProgressWritingAgent::new(dir.path(), bodies.iter().map(|s| s.as_str()).collect());
+            let mut cfg = ralph_config(dir.path(), agent.clone());
+            cfg.max_resets = case.max_resets;
+            let h = StandardHarness::new(cfg);
+            let r = h.run(HarnessRunOptions::new(ralph_task())).await;
+            match (case.expected, r) {
+                (RalphFixtureExpected::Success { iterations }, RunResult::Success { .. }) => {
+                    assert_eq!(
+                        agent.call_count() as u32,
+                        iterations,
+                        "case `{}` window count",
+                        case.name
+                    );
+                }
+                (
+                    RalphFixtureExpected::CompletionUnmet { iterations },
+                    RunResult::Failure {
+                        reason:
+                            HaltReason::RalphCompletionUnmet {
+                                iterations: got, ..
+                            },
+                        ..
+                    },
+                ) => {
+                    assert_eq!(got, iterations, "case `{}` iteration count", case.name);
+                }
                 (_, other) => panic!("case `{}`: unexpected result {other:?}", case.name),
             }
         }

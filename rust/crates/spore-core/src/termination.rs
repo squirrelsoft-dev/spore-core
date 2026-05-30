@@ -301,22 +301,24 @@ pub type AlwaysComplete = NullCompletionCheck;
 // FeatureListCheck (issue #43)
 // ============================================================================
 
-/// Reads `feature_list.json` under the snapshot's `workspace_root`. Returns
-/// `Some` with a list of incomplete feature names if any entry has
-/// `passes: false`. Returns `None` when all entries pass.
+/// Reads `.spore/feature_list.json` under the snapshot's `workspace_root`
+/// (issue #58, B2). Returns `Some` with a list of incomplete feature names if
+/// any entry has `passes: false`. Returns `None` when all entries pass.
 ///
 /// File schema: a JSON array of `{ "name": string, "passes": bool }`. Missing
-/// or unreadable file → `Some("feature_list.json missing")` (treated as
+/// or unreadable file → `Some(".spore/feature_list.json missing")` (treated as
 /// incomplete so the agent learns to create it).
 pub struct FeatureListCheck {
     pub path: std::path::PathBuf,
 }
 
 impl FeatureListCheck {
-    /// Default location: `<workspace_root>/feature_list.json`.
+    /// Default location: `<workspace_root>/.spore/feature_list.json` (issue
+    /// #58, B2 — the canonical `.spore/`-prefixed path shared with the Ralph
+    /// loop strategy; one source of truth).
     pub fn new() -> Self {
         Self {
-            path: std::path::PathBuf::from("feature_list.json"),
+            path: std::path::PathBuf::from(".spore/feature_list.json"),
         }
     }
 
@@ -1176,8 +1178,9 @@ mod tests {
     #[tokio::test]
     async fn feature_list_all_pass_returns_none() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".spore")).unwrap();
         std::fs::write(
-            dir.path().join("feature_list.json"),
+            dir.path().join(".spore/feature_list.json"),
             r#"[{"name":"a","passes":true},{"name":"b","passes":true}]"#,
         )
         .unwrap();
@@ -1188,8 +1191,9 @@ mod tests {
     #[tokio::test]
     async fn feature_list_some_fail_returns_reason() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".spore")).unwrap();
         std::fs::write(
-            dir.path().join("feature_list.json"),
+            dir.path().join(".spore/feature_list.json"),
             r#"[{"name":"a","passes":true},{"name":"b","passes":false},{"name":"c","passes":false}]"#,
         )
         .unwrap();
