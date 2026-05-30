@@ -286,6 +286,71 @@ TASK_LIST_PARAMS_BY_ACTION: dict[str, type[_Params]] = {
 }
 
 
+# ---------- Memory (#82) ----------
+
+
+class MemoryWriteParams(_Params):
+    """``operation == "write"`` — append one entry to ``scope``.
+
+    ``scope`` is a free ``str`` here (not the :class:`StorageScope` enum) so that
+    a ``"local"`` scope deserializes successfully and reaches the tool body,
+    where it is rejected at runtime with a recoverable error (the advertised
+    schema enum omits ``local``). ``metadata`` is optional and defaults to ``{}``
+    (decision C); the :class:`~spore_core.storage.MemoryEntry` type is unchanged.
+    """
+
+    scope: str
+    role: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryReadParams(_Params):
+    """``operation == "read"`` — read from ``scope`` (or the merged view).
+
+    ``merged`` defaults to ``False``; ``limit`` defaults to ``50`` (decision B).
+    ``scope`` is a free ``str`` for the same runtime-rejection reason as
+    :class:`MemoryWriteParams`."""
+
+    scope: str
+    merged: bool = False
+    limit: int = 50
+
+
+#: Maps the ``operation`` discriminator to its per-operation parameter model.
+#: Mirrors the Rust internally-tagged ``MemoryToolParams`` enum.
+MEMORY_PARAMS_BY_OPERATION: dict[str, type[_Params]] = {
+    "write": MemoryWriteParams,
+    "read": MemoryReadParams,
+}
+
+
+def parse_memory_params(call: ToolCall) -> tuple[str, _Params]:
+    """Parse the ``operation`` discriminator and dispatch to the matching model.
+
+    Returns ``(operation, params)``. Raises :class:`InvalidParameters` if the
+    input is not an object, ``operation`` is missing/unknown, or the
+    per-operation fields fail validation. The ``operation`` field is stripped
+    before per-operation validation so the ``extra="forbid"`` models do not
+    reject it.
+    """
+    input_ = call.input
+    if not isinstance(input_, dict):
+        raise InvalidParameters(reason="input must be a JSON object")
+    operation = input_.get("operation")
+    if not isinstance(operation, str):
+        raise InvalidParameters(reason="missing or non-string `operation`")
+    model = MEMORY_PARAMS_BY_OPERATION.get(operation)
+    if model is None:
+        raise InvalidParameters(reason=f"unknown operation `{operation}`")
+    fields = {k: v for k, v in input_.items() if k != "operation"}
+    try:
+        params = model.model_validate(fields)
+    except ValidationError as e:
+        raise InvalidParameters(reason=str(e)) from e
+    return operation, params
+
+
 def parse_task_list_params(call: ToolCall) -> tuple[str, _Params]:
     """Parse the ``action`` discriminator and dispatch to the matching model.
 
@@ -315,8 +380,12 @@ __all__ = [
     "AddTaskParams",
     "CompleteTaskParams",
     "ListTasksParams",
+    "MEMORY_PARAMS_BY_OPERATION",
+    "MemoryReadParams",
+    "MemoryWriteParams",
     "TASK_LIST_PARAMS_BY_ACTION",
     "UpdateTaskParams",
+    "parse_memory_params",
     "parse_task_list_params",
     "AbortParams",
     "AskUserQuestionParams",

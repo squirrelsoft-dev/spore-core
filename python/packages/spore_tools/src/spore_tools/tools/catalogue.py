@@ -33,6 +33,7 @@ Tier 2 (storage via ``ToolContext``):
 
 * :meth:`todo_write` → ``todo_write`` (NEW, RunStore key ``"todo"``)
 * :meth:`task_list` → ``task_list`` (EXISTING #71)
+* :meth:`memory` → ``memory`` (NEW #82, scope-aware MemoryStore seam #78)
 
 Tier 3 (escalate / clarify):
 
@@ -57,10 +58,12 @@ Because :class:`~spore_core.tool_registry.StandardToolRegistry.register` is now
 a last-wins upsert (issue #81, Q1), registering a preset and then a custom tool
 of the same name lets the architect override a standard tool.
 
-Q3 — MemoryTool is DEFERRED
----------------------------
-``MemoryTool`` is intentionally NOT part of this catalogue; it depends on the
-``StorageScope`` work (#79) and lands in a follow-on issue.
+Q3 — MemoryTool (now LANDED, #82)
+---------------------------------
+``MemoryTool`` (``memory``) was deferred from #81 (it depended on the scoped
+``MemoryStore`` seam from #78). It now ships here as a Tier-2 storage tool,
+included in :meth:`coding_set` / :meth:`full_set` alongside ``task_list`` /
+``todo_write``.
 """
 
 from __future__ import annotations
@@ -78,6 +81,7 @@ from .control import (
 from .edit import EditFileTool
 from .exec import BashCommandTool
 from .fs import ListDirTool, ReadFileTool, WriteFileTool
+from .memory import MemoryTool
 from .message import SendMessageTool
 from .search import FindFilesTool, GrepFilesTool, GrepTool
 from .tasklist import TaskListTool
@@ -173,6 +177,12 @@ class StandardTools:
         """``task_list`` — EXISTING #71 tool (Q5 overlap: reused, not renamed)."""
         return StandardTool(TaskListTool(), TaskListTool.schema())
 
+    @staticmethod
+    def memory() -> StandardTool:
+        """``memory`` — NEW #82; scope-aware read/write over the
+        :class:`~spore_core.storage.MemoryStore` seam (#78)."""
+        return StandardTool(MemoryTool(), MemoryTool.schema())
+
     # ---- Tier 3 ---------------------------------------------------------
 
     @staticmethod
@@ -231,6 +241,7 @@ class StandardTools:
             StandardTools.web_search(),
             StandardTools.todo_write(),
             StandardTools.task_list(),
+            StandardTools.memory(),
         ]
 
     @staticmethod

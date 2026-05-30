@@ -278,6 +278,21 @@ class MemoryStore(Protocol):
         ``scope``."""
         ...
 
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        """Cross-scope merged read (#78 R6, #82 D2): **User ∪ Project,
+        newest-first by ``timestamp``, NO dedup**. ``Local`` is excluded from the
+        merge in v1.
+
+        This is the SINGLE source of the merge algorithm: every concrete
+        :class:`MemoryStore` delegates to the shared :func:`merge_memories`
+        helper, so the :class:`ScopedMemoryRouter`, leaf backends,
+        :class:`NoOpStorageProvider`, and any mock inherit identical semantics —
+        there is exactly one merge implementation.
+        :meth:`StorageProvider.get_memories_merged` and ``MemoryTool``'s merged
+        ``read`` both route here.
+        """
+        ...
+
 
 @runtime_checkable
 class RunStore(Protocol):
@@ -346,6 +361,9 @@ class NoOpStorageProvider:
         self, scope: StorageScope, session_id: SessionId, limit: int
     ) -> list[MemoryEntry]:
         return []
+
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        return await merge_memories(self, session_id, limit)
 
     # RunStore
     async def get(self, session_id: SessionId, key: str) -> JsonValue | None:
@@ -429,11 +447,11 @@ class StorageProvider:
         ``single``/``__init__`` the one backend serves both scopes (keyed by
         scope) and merges identically. The merge always lives in the routing
         layer, never in a leaf backend.
+
+        Delegates to the single :meth:`MemoryStore.get_memories_merged` (#82 D2)
+        so there is exactly ONE merge implementation.
         """
-        scope = _storage_scope()
-        combined = list(await self._memory.get_memories(scope.USER, session_id, limit))
-        combined.extend(await self._memory.get_memories(scope.PROJECT, session_id, limit))
-        return _merge_newest_first(combined, limit)
+        return await self._memory.get_memories_merged(session_id, limit)
 
     def run(self) -> RunStore:
         return self._run
@@ -491,6 +509,9 @@ class InMemoryStorageProvider:
         with self._lock:
             entries = list(self._memory.get((scope, session_id), []))
         return _most_recent_newest_first(entries, limit)
+
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        return await merge_memories(self, session_id, limit)
 
     # RunStore
     async def get(self, session_id: SessionId, key: str) -> JsonValue | None:
@@ -691,6 +712,9 @@ class FileSystemStorageProvider:
             raise StorageSerializationError(str(exc)) from exc
         return _most_recent_newest_first(entries, limit)
 
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        return await merge_memories(self, session_id, limit)
+
     # RunStore
     async def get(self, session_id: SessionId, key: str) -> JsonValue | None:
         path = self._run_path(session_id, key)
@@ -857,6 +881,13 @@ class ScopedMemoryRouter:
     ) -> list[MemoryEntry]:
         return await self._backend(scope).get_memories(scope, session_id, limit)
 
+    async def get_memories_merged(self, session_id: SessionId, limit: int) -> list[MemoryEntry]:
+        # Fans out to the per-scope backends via this router's own
+        # ``get_memories`` (each scope routes to its backend), then merges once
+        # via the shared helper (#82 D2). The merge lives here in the routing
+        # layer, never in a leaf backend.
+        return await merge_memories(self, session_id, limit)
+
 
 # ============================================================================
 # Shared helpers
@@ -881,6 +912,24 @@ def _merge_newest_first(entries: list[MemoryEntry], limit: int) -> list[MemoryEn
     if limit < 0:
         limit = 0
     return ordered[:limit]
+
+
+async def merge_memories(
+    store: MemoryStore, session_id: SessionId, limit: int
+) -> list[MemoryEntry]:
+    """The SINGLE cross-scope merge implementation (#78 R6, #82 D2): **User ∪
+    Project, newest-first by ``timestamp``, NO dedup**; ``Local`` excluded.
+
+    Reads ``User`` then ``Project`` from ``store`` and merges via
+    :func:`_merge_newest_first`. Every :class:`MemoryStore` implementation's
+    :meth:`~MemoryStore.get_memories_merged` delegates here, so there are no
+    divergent copies of the merge. Defined as a free function (not a Protocol
+    default — Python Protocols carry no inherited bodies) so it composes over any
+    structural :class:`MemoryStore`."""
+    scope = _storage_scope()
+    combined = list(await store.get_memories(scope.USER, session_id, limit))
+    combined.extend(await store.get_memories(scope.PROJECT, session_id, limit))
+    return _merge_newest_first(combined, limit)
 
 
 # ============================================================================
@@ -916,6 +965,7 @@ __all__ = [
     "StorageScope",
     "StorageSerializationError",
     "WorkspaceId",
+    "merge_memories",
     "parse_otlp_endpoints",
     "workspace_id_from_canonical_path",
 ]
