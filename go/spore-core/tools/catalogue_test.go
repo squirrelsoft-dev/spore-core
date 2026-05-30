@@ -23,7 +23,7 @@ func TestEveryConstructorPairsMatchingImplAndSchema(t *testing.T) {
 func TestReadonlySetHasNoMutatingOrEscalatingTools(t *testing.T) {
 	n := names((StandardTools{}).ReadonlySet())
 	for _, forbidden := range []string{
-		"write_file", "edit_file", "bash_command", "todo_write",
+		"write_file", "edit_file", "bash_command", "todo_write", "memory",
 		"enter_plan_mode", "exit_plan_mode", "ask_user_question", "abort",
 	} {
 		if n[forbidden] {
@@ -44,6 +44,11 @@ func TestCodingSetReusesExistingNamesOnOverlap(t *testing.T) {
 	}
 	if !n["edit_file"] || !n["grep"] {
 		t.Fatalf("coding_set missing new edit_file/grep")
+	}
+	// #82: the scope-aware memory tool ships in CodingSet alongside task_list /
+	// todo_write.
+	if !n["memory"] {
+		t.Fatalf("coding_set missing memory (#82)")
 	}
 	if n["abort"] {
 		t.Fatalf("coding_set must not contain Tier-3 abort")

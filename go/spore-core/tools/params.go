@@ -10,6 +10,19 @@ import (
 	"encoding/json"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/storage"
+)
+
+// StorageScope is re-exported from the storage package (its canonical home is
+// promptassembly; storage re-exports it). The MemoryTool params name it without
+// forcing every params caller to import storage directly.
+type StorageScope = storage.StorageScope
+
+// Scope constants re-exported for use at the MemoryTool call site.
+const (
+	StorageScopeUser    = storage.StorageScopeUser
+	StorageScopeProject = storage.StorageScopeProject
+	StorageScopeLocal   = storage.StorageScopeLocal
 )
 
 // ----- Filesystem -----
@@ -266,6 +279,69 @@ type HttpPostParams struct {
 
 type SubagentParams struct {
 	Instruction string `json:"instruction"`
+}
+
+// ----- Memory (#82) -----
+
+// MemoryOperation is the operation discriminator for MemoryToolParams. One of
+// "write" | "read".
+type MemoryOperation string
+
+const (
+	// MemoryOperationWrite appends one MemoryEntry to a scope.
+	MemoryOperationWrite MemoryOperation = "write"
+	// MemoryOperationRead returns the most-recent entries for a scope (or the
+	// cross-scope merged view).
+	MemoryOperationRead MemoryOperation = "read"
+)
+
+// MemoryDefaultReadLimit is the recency cap applied to a read when `limit` is
+// omitted (decision B).
+const MemoryDefaultReadLimit = 50
+
+// MemoryToolParams are the parameters for the MemoryTool. It mirrors the Rust
+// internally-tagged MemoryToolParams enum (tagged on `operation`): an
+// `operation` discriminator plus the union of per-operation fields. `scope` is
+// explicit and required on BOTH operations.
+//
+// Per-operation fields (validated in the tool, not by serde):
+//   - write: scope (required), role (required), content (required),
+//     metadata (optional, defaults to {})
+//   - read:  scope (required), merged (optional, defaults false),
+//     limit (optional, defaults to MemoryDefaultReadLimit)
+//
+// Scope is decoded as a raw promptassembly StorageScope string ("user" /
+// "project" / "local"). StorageScopeLocal decodes fine here so a bad-scope call
+// reaches the tool body, where it is rejected at runtime with a recoverable
+// error (the advertised schema enum omits "local").
+//
+// Limit uses a *int so an omitted `limit` (nil) is distinguishable from an
+// explicit 0; the tool applies MemoryDefaultReadLimit when nil. Metadata uses
+// json.RawMessage; UnmarshalJSON fills it with {} when absent or null so the
+// stored entry's metadata default matches Rust's serde default.
+type MemoryToolParams struct {
+	Operation MemoryOperation `json:"operation"`
+	Scope     StorageScope    `json:"scope"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	Merged    bool            `json:"merged,omitempty"`
+	Limit     *int            `json:"limit,omitempty"`
+}
+
+// UnmarshalJSON fills Metadata with the empty object {} when the field is absent
+// or null, mirroring serde's #[serde(default)] on the write metadata param.
+func (p *MemoryToolParams) UnmarshalJSON(data []byte) error {
+	type alias MemoryToolParams
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	if len(a.Metadata) == 0 || string(a.Metadata) == "null" {
+		a.Metadata = json.RawMessage("{}")
+	}
+	*p = MemoryToolParams(a)
+	return nil
 }
 
 // ----- TaskList (#71) -----

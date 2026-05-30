@@ -340,6 +340,33 @@ type MemoryStore interface {
 	AppendMemory(ctx context.Context, scope StorageScope, sessionID SessionID, entry MemoryEntry) error
 	// GetMemories returns the most-recent limit entries, newest-first, for scope.
 	GetMemories(ctx context.Context, scope StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error)
+	// GetMemoriesMerged returns the cross-scope merged read (#78 R6 / #82 D2):
+	// User ∪ Project, newest-first by timestamp, NO dedup, Local excluded.
+	//
+	// Go interfaces cannot carry default methods, so every implementation
+	// delegates to the single shared MergeMemories helper — there is exactly one
+	// merge implementation, no divergent copies. The merge always lives at this
+	// routing level (a store that fans out to per-scope backends), never in a
+	// scope-dumb leaf's own storage.
+	GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error)
+}
+
+// MergeMemories is the SINGLE cross-scope merge implementation (#78 R6 / #82
+// D2): it reads the User and Project scopes from store, concatenates them, and
+// merges newest-first by timestamp with NO dedup. Local is excluded. Every
+// MemoryStore.GetMemoriesMerged delegates here so there is one merge, byte-
+// identical across callers and languages.
+func MergeMemories(ctx context.Context, store MemoryStore, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	user, err := store.GetMemories(ctx, StorageScopeUser, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	project, err := store.GetMemories(ctx, StorageScopeProject, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	combined := append(user, project...)
+	return mergeNewestFirst(combined, limit), nil
 }
 
 // RunStore is per-run structured state keyed by (SessionID, key). Values are
@@ -419,16 +446,7 @@ func (p *StorageProvider) Memory() MemoryStore { return p.memory }
 // backend serves both scopes (keyed by scope) and merges identically. The merge
 // always lives in this routing layer, never in a leaf backend.
 func (p *StorageProvider) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
-	user, err := p.memory.GetMemories(ctx, StorageScopeUser, sessionID, limit)
-	if err != nil {
-		return nil, err
-	}
-	project, err := p.memory.GetMemories(ctx, StorageScopeProject, sessionID, limit)
-	if err != nil {
-		return nil, err
-	}
-	combined := append(user, project...)
-	return mergeNewestFirst(combined, limit), nil
+	return MergeMemories(ctx, p.memory, sessionID, limit)
 }
 
 // Run returns the run-domain store.
@@ -462,6 +480,9 @@ func (NoOpStorageProvider) AppendMemory(context.Context, StorageScope, SessionID
 }
 func (NoOpStorageProvider) GetMemories(context.Context, StorageScope, SessionID, int) ([]MemoryEntry, error) {
 	return nil, nil
+}
+func (p NoOpStorageProvider) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	return MergeMemories(ctx, p, sessionID, limit)
 }
 
 // RunStore.
@@ -576,6 +597,10 @@ func (p *InMemoryStorageProvider) GetMemories(_ context.Context, scope StorageSc
 	defer p.mu.Unlock()
 	all := p.memory[memoryKey{scope: scope, session: sessionID}]
 	return mostRecentNewestFirst(all, limit), nil
+}
+
+func (p *InMemoryStorageProvider) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	return MergeMemories(ctx, p, sessionID, limit)
 }
 
 // RunStore.
@@ -776,6 +801,12 @@ func (r *ScopedMemoryRouter) AppendMemory(ctx context.Context, scope StorageScop
 // GetMemories routes to the scope's backend (empty when unconfigured).
 func (r *ScopedMemoryRouter) GetMemories(ctx context.Context, scope StorageScope, sessionID SessionID, limit int) ([]MemoryEntry, error) {
 	return r.backend(scope).GetMemories(ctx, scope, sessionID, limit)
+}
+
+// GetMemoriesMerged fans the router across User ∪ Project via the shared merge
+// helper — the router is the canonical routing layer where the merge lives.
+func (r *ScopedMemoryRouter) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	return MergeMemories(ctx, r, sessionID, limit)
 }
 
 var _ MemoryStore = (*ScopedMemoryRouter)(nil)

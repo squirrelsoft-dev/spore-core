@@ -26,6 +26,7 @@
 // Tier 2 (storage via *ToolContext):
 //   - TodoWrite    → todo_write     (NEW, RunStore key "todo")
 //   - TaskList     → task_list      (EXISTING #71)
+//   - Memory       → memory         (NEW #82, MemoryStore seam #78)
 //
 // Tier 3 (escalate / clarify):
 //   - EnterPlanMode    → enter_plan_mode    (NEW)
@@ -47,8 +48,9 @@
 // Q1), registering a preset and then a custom tool of the same name lets the
 // architect override a standard tool.
 //
-// Q3 — MemoryTool is DEFERRED. It depends on StorageScope (#79) and lands in a
-// follow-on issue; it is intentionally NOT part of this catalogue.
+// Q3 — MemoryTool was DEFERRED in #81; it landed in #82 on top of the #78
+// scoped MemoryStore seam and is now part of the CodingSet / FullSet presets
+// (memory → Memory()), alongside todo_write / task_list.
 
 package tools
 
@@ -124,6 +126,9 @@ func (StandardTools) TodoWrite() StandardTool { return newStandardTool(NewTodoWr
 // TaskList — EXISTING #71 tool (Q5 overlap: reused, not renamed).
 func (StandardTools) TaskList() StandardTool { return newStandardTool(NewTaskListTool()) }
 
+// Memory — NEW #82; scope-aware episodic read/write over the #78 memory seam.
+func (StandardTools) Memory() StandardTool { return newStandardTool(NewMemoryTool()) }
+
 // ---- Tier 3 ---------------------------------------------------------------
 
 // EnterPlanMode — NEW; escalates HarnessSignal.EnterPlanMode.
@@ -175,6 +180,7 @@ func (s StandardTools) CodingSet() []StandardTool {
 		s.WebSearch(),
 		s.TodoWrite(),
 		s.TaskList(),
+		s.Memory(),
 	}
 }
 

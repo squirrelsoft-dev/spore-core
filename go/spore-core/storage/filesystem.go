@@ -226,6 +226,14 @@ func (p *FileSystemStorageProvider) GetMemories(_ context.Context, _ StorageScop
 	return mostRecentNewestFirst(entries, limit), nil
 }
 
+// GetMemoriesMerged delegates to the shared merge helper (#82 D2). A lone FS
+// backend is scope-dumb, so both scopes resolve to the same file; the canonical
+// multi-scope wiring routes each scope to its own backend via the
+// CompositeStorageProvider's ScopedMemoryRouter.
+func (p *FileSystemStorageProvider) GetMemoriesMerged(ctx context.Context, sessionID SessionID, limit int) ([]MemoryEntry, error) {
+	return MergeMemories(ctx, p, sessionID, limit)
+}
+
 // RunStore.
 
 func (p *FileSystemStorageProvider) Get(_ context.Context, sessionID SessionID, key string) (json.RawMessage, bool, error) {
