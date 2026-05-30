@@ -73,7 +73,7 @@ use thiserror::Error;
 
 use crate::agent::{Agent, AgentError, Context, TurnResult};
 use crate::context::{
-    CompactionPreserveHints, CompactionVerifier, KeyTermVerifier,
+    CompactionPreserveHints, CompactionVerifier, ContextError, KeyTermVerifier,
     SessionState as ContextSessionState,
 };
 use crate::guide_registry::SessionOutcome;
@@ -1258,6 +1258,15 @@ pub enum HaltReason {
     },
     AgentError {
         error: AgentError,
+    },
+    /// A [`ContextError`] surfaced by the [`crate::context::ContextManager`]
+    /// during assembly halts the run (e.g. a cache-hash mismatch — both Block 1
+    /// `Static` and, as of #32, Block 2 `PerSession` halt mid-session). This is
+    /// the routing type; mirrors [`HaltReason::AgentError`]. The live
+    /// [`StandardHarness`] loop does not yet trigger it because its placeholder
+    /// `ContextManager::assemble` is infallible pending the #7 migration.
+    ContextError {
+        error: ContextError,
     },
     SandboxViolation {
         violation: SandboxViolation,

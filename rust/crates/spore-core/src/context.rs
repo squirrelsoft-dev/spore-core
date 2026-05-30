@@ -71,6 +71,7 @@ pub use crate::guide_registry::{Guide, GuideId};
 pub use crate::memory::MemoryItem;
 
 // `ComposedPrompt` is defined by `PromptChunkRegistry` (issue #24).
+use crate::prompt_chunk_registry::CacheBlock;
 pub use crate::prompt_chunk_registry::ComposedPrompt;
 
 /// Per-block cache hit signal recorded into `ContextMeta` after each
@@ -457,11 +458,26 @@ pub enum ContextError {
     CompactionFailed { reason: String },
     #[error("assembly failed: {reason}")]
     AssemblyFailed { reason: String },
-    #[error("cache hash mismatch on block {block}: expected {expected}, got {actual}")]
+    /// A cache block's content hash changed when it was expected to be stable.
+    ///
+    /// Both Block 1 (`CacheBlock::Static`) and Block 2 (`CacheBlock::PerSession`)
+    /// halt the run on a mid-session mismatch — they are treated consistently.
+    /// A Block-2 change mid-session means session-stable content mutated and
+    /// every subsequent turn would silently pay full input-token cost; rather
+    /// than warn, the run stops so the caller can fix the source.
+    ///
+    /// `turn_number` is the turn on which the mismatch was detected (Block 2
+    /// only halts when `turn_number > 1`; the turn-1 assemble records the
+    /// baseline). Estimated cache-cost-delta tracking (`UnexpectedMiss`) is a
+    /// separate observability concern tracked in issue #90.
+    #[error(
+        "cache hash mismatch on block {block:?} at turn {turn_number}: expected {expected}, got {actual}"
+    )]
     CacheHashMismatch {
-        block: String,
+        block: CacheBlock,
         expected: u64,
         actual: u64,
+        turn_number: u32,
     },
 }
 
@@ -640,9 +656,10 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
             if let Some(prev) = memo.static_hash {
                 if prev != static_hash {
                     return Err(ContextError::CacheHashMismatch {
-                        block: "static".into(),
+                        block: CacheBlock::Static,
                         expected: prev,
                         actual: static_hash,
+                        turn_number: state.turn_number,
                     });
                 }
             } else {
@@ -657,12 +674,17 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
             let mut memo = self.memo.lock().unwrap();
             if let Some(prev) = memo.session_hash {
                 if prev != session_hash && state.turn_number > 1 {
-                    // Spec: warn — but do not fail. Update the memo so we
-                    // do not warn every turn for the rest of the session.
-                    eprintln!(
-                        "warn: session block hash changed mid-session ({} → {})",
-                        prev, session_hash
-                    );
+                    // Block 2 (PerSession) is expected to be stable for the
+                    // life of the session. A mid-session change means cost
+                    // would silently spike; halt consistently with Block 1
+                    // (#32). We return BEFORE updating the memo — the run is
+                    // halting, so there is no "rest of the session" to track.
+                    return Err(ContextError::CacheHashMismatch {
+                        block: CacheBlock::PerSession,
+                        expected: prev,
+                        actual: session_hash,
+                        turn_number: state.turn_number,
+                    });
                 }
             }
             memo.session_hash = Some(session_hash);
@@ -1038,9 +1060,77 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ContextError::CacheHashMismatch { block, .. } => assert_eq!(block, "static"),
+            ContextError::CacheHashMismatch { block, .. } => {
+                assert_eq!(block, CacheBlock::Static)
+            }
             e => panic!("wrong error: {e:?}"),
         }
+    }
+
+    // ── Rule: Block 2 (PerSession) hash invariance (#32) ─────────────────
+
+    #[tokio::test]
+    async fn block_2_hash_mismatch_mid_session_halts() {
+        let mgr = mk();
+        // Turn 1 records the Block-2 baseline.
+        let mut st = state();
+        st.turn_number = 1;
+        mgr.assemble(&st, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap();
+        // Turn 2 with mutated session content (changed task instruction)
+        // must halt, mirroring Block 1.
+        let mut st2 = state();
+        st2.turn_number = 2;
+        st2.task_instruction = "a different task instruction".into();
+        let err = mgr
+            .assemble(&st2, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap_err();
+        match err {
+            ContextError::CacheHashMismatch {
+                block, turn_number, ..
+            } => {
+                assert_eq!(block, CacheBlock::PerSession);
+                assert_eq!(turn_number, 2);
+            }
+            e => panic!("wrong error: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_2_stable_across_turns_does_not_halt() {
+        let mgr = mk();
+        let mut st = state();
+        st.turn_number = 1;
+        mgr.assemble(&st, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap();
+        // Turn 2+ with identical session content → Ok.
+        let mut st2 = state();
+        st2.turn_number = 2;
+        mgr.assemble(&st2, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap();
+        let mut st3 = state();
+        st3.turn_number = 3;
+        mgr.assemble(&st3, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_2_change_at_turn_1_does_not_halt() {
+        let mgr = mk();
+        // First assemble records the baseline. Even if turn-1 content differs
+        // from any prior memo state, the `turn_number > 1` guard means turn 1
+        // never halts on a Block-2 mismatch.
+        let mut st = state();
+        st.turn_number = 1;
+        st.task_instruction = "a brand new baseline instruction".into();
+        mgr.assemble(&st, &sources("BLOCK1", 0xAB, vec![]))
+            .await
+            .unwrap();
     }
 
     // ── Rule: Tool schemas sorted by name ────────────────────────────────
