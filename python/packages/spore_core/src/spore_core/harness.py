@@ -6,6 +6,14 @@ It is stateless between :meth:`Harness.run` calls; everything the harness
 needs comes in via :class:`HarnessRunOptions` or :class:`PausedState`, and
 everything it produces goes out via :class:`RunResult`.
 
+``dangerous`` gate (issue #34): ``IsolationModeNone`` (no path enforcement) is
+a named safety footgun. It is not part of the default public surface — it is
+not exported from this module or ``spore_core``, and is reachable only via
+``from spore_core.dangerous import IsolationModeNone``. Consequently the
+default :meth:`SandboxProvider.isolation_mode` body returns
+``IsolationModeWorkspaceScoped`` (safe-by-default), never ``None``. The wire
+tag for the gated mode stays ``"none"``.
+
 What this component does:
 
 * Assemble context (via :class:`ContextManager`) before each turn
@@ -960,7 +968,11 @@ class BaseSandboxProvider:
         return Path(path)
 
     def isolation_mode(self) -> IsolationMode:
-        return IsolationModeNone()
+        # Safe-by-default (issue #34): the default isolation mode is
+        # WorkspaceScoped, never None. No-isolation requires the explicit
+        # dangerous opt-in (``from spore_core.dangerous import
+        # IsolationModeNone``).
+        return IsolationModeWorkspaceScoped()
 
     def workspace_root(self) -> Path:
         return Path("/")
@@ -4773,7 +4785,10 @@ __all__ = [
     "IsolationMode",
     "IsolationModeBubblewrap",
     "IsolationModeDocker",
-    "IsolationModeNone",
+    # IsolationModeNone is intentionally NOT exported (issue #34). It is the
+    # no-path-enforcement footgun, reachable only via the dangerous opt-in:
+    # ``from spore_core.dangerous import IsolationModeNone``. The class stays
+    # defined for the wire discriminated union; only its name is gated.
     "IsolationModeWorkspaceScoped",
     "NetworkPolicy",
     "NetworkPolicyAllowlist",

@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from spore_core.dangerous import IsolationModeNone
 from spore_core.harness import (
     IsolationModeBubblewrap,
     IsolationModeDocker,
-    IsolationModeNone,
     IsolationModeWorkspaceScoped,
     NetworkPolicyNone,
     SandboxDisallowedCommand,

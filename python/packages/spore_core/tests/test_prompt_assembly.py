@@ -62,7 +62,7 @@ def test_r2_when_mode() -> None:
     c = _ctx()
     c.mode = Mode.PLAN
     assert b.evaluate(ChunkCondition.when_mode(Mode.PLAN), c)
-    assert not b.evaluate(ChunkCondition.when_mode(Mode.YOLO), c)
+    assert not b.evaluate(ChunkCondition.when_mode(Mode.SAFE_AUTO), c)
 
 
 # ── R3: WhenToolActive ───────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ def test_r8_all_any_not() -> None:
     )
     assert b.evaluate(any_ok, c)
 
-    not_ok = ChunkCondition.not_(ChunkCondition.when_mode(Mode.YOLO))
+    not_ok = ChunkCondition.not_(ChunkCondition.when_mode(Mode.SAFE_AUTO))
     assert b.evaluate(not_ok, c)
 
 
@@ -367,7 +367,7 @@ def test_custom_condition_never_equal() -> None:
 
     # Non-custom variants still compare by value.
     assert ChunkCondition.always() == ChunkCondition.always()
-    assert ChunkCondition.when_mode(Mode.YOLO) == ChunkCondition.when_mode(Mode.YOLO)
+    assert ChunkCondition.when_mode(Mode.SAFE_AUTO) == ChunkCondition.when_mode(Mode.SAFE_AUTO)
 
 
 # ── Serialization: Custom skipped (A3) ──────────────────────────────────────
@@ -406,11 +406,11 @@ def test_condition_round_trips_serializable_variants() -> None:
 
 def test_custom_pruned_from_combinators_on_serialize() -> None:
     cond = ChunkCondition.all_of(
-        [ChunkCondition.when_mode(Mode.YOLO), ChunkCondition.custom(lambda _c: True)]
+        [ChunkCondition.when_mode(Mode.SAFE_AUTO), ChunkCondition.custom(lambda _c: True)]
     )
     s = json.dumps(cond.to_json())
     back = ChunkCondition.from_json(json.loads(s))
-    assert back == ChunkCondition.all_of([ChunkCondition.when_mode(Mode.YOLO)])
+    assert back == ChunkCondition.all_of([ChunkCondition.when_mode(Mode.SAFE_AUTO)])
 
 
 # ── ChunkProviderError variants ──────────────────────────────────────────────

@@ -145,7 +145,7 @@ class _StubSandbox:
         return Path(path)
 
     def isolation_mode(self):  # type: ignore[no-untyped-def]
-        from spore_core.harness import IsolationModeNone
+        from spore_core.dangerous import IsolationModeNone
 
         return IsolationModeNone()
 

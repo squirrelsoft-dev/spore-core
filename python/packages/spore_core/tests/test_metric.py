@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from spore_core.dangerous import IsolationModeNone
 from spore_core.harness import (
     BaseSandboxProvider,
     CommandOutput,
     IsolationMode,
-    IsolationModeNone,
     SessionId,
     TaskId,
 )

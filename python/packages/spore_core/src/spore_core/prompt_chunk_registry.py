@@ -26,6 +26,17 @@ Rules enforced:
   PerTurn chunk in Block 1, missing Role or Mode, or more than one Mode.
 * Mode is permanent for the life of a harness instance — there is no
   mutation API.
+
+``dangerous`` gate
+------------------
+
+``Yolo`` (full autonomy, no approval gates) is a named safety footgun. It is
+NOT a member of the default :class:`Mode` enum and is not reachable from a
+normal ``import``; ``Mode.YOLO`` and ``Mode("yolo")`` both fail. The gated
+mode lives in :mod:`spore_core.dangerous` as ``YoloMode`` and must be opted
+into explicitly (``from spore_core.dangerous import YoloMode``). The wire tag
+stays ``"yolo"``. See issue #34 and the Rust reference's ``dangerous`` Cargo
+feature.
 """
 
 from __future__ import annotations
@@ -106,60 +117,96 @@ class ApprovalPolicy(str, Enum):
     NONE = "none"
 
 
-class Mode(str, Enum):
-    """Agent behavioral mode — permanent for the life of a harness."""
-
-    ALWAYS_ASK = "always_ask"
-    AUTO_EDIT = "auto_edit"
-    PLAN = "plan"
-    SAFE_AUTO = "safe_auto"
-    YOLO = "yolo"
-
-    def prompt_chunk(self) -> PromptChunk:
-        """Standard prompt chunk for this mode. Always Static, slot=Mode."""
-        chunk_id, content = _MODE_CHUNK_TEXT[self]
-        return PromptChunk.new(chunk_id, content, ChunkSlot.MODE, CacheBlock.STATIC)
-
-    def approval_policy(self) -> ApprovalPolicy:
-        return _MODE_APPROVAL[self]
-
-    def default_tool_phase(self) -> TaskPhase:
-        return TaskPhase.PLANNING if self is Mode.PLAN else TaskPhase.EXECUTION
-
-
-_MODE_CHUNK_TEXT: dict[Mode, tuple[str, str]] = {
-    Mode.ALWAYS_ASK: (
+# Mode behavior tables are keyed by the wire-tag string so the gated ``Yolo``
+# mode in :mod:`spore_core.dangerous` can reuse the same source of truth
+# without re-importing the ``Mode`` enum (which deliberately omits Yolo).
+_MODE_CHUNK_TEXT_BY_TAG: dict[str, tuple[str, str]] = {
+    "always_ask": (
         "mode-always-ask",
         "Mode: AlwaysAsk. Describe your plan and wait for explicit approval "
         "before taking any action.",
     ),
-    Mode.AUTO_EDIT: (
+    "auto_edit": (
         "mode-auto-edit",
         "Mode: AutoEdit. Edit files freely. Explain the changes you make after they are done.",
     ),
-    Mode.PLAN: (
+    "plan": (
         "mode-plan",
         "Mode: Plan. Produce a plan only. Do not edit files or execute mutating tools.",
     ),
-    Mode.SAFE_AUTO: (
+    "safe_auto": (
         "mode-safe-auto",
         "Mode: SafeAuto. Auto-execute Low and Medium risk actions. High and "
         "Critical actions require approval.",
     ),
-    Mode.YOLO: (
+    # Gated — reachable only via spore_core.dangerous.YoloMode (issue #34).
+    "yolo": (
         "mode-yolo",
         "Mode: Yolo. Full autonomy. No approval gates.",
     ),
 }
 
 
-_MODE_APPROVAL: dict[Mode, ApprovalPolicy] = {
-    Mode.ALWAYS_ASK: ApprovalPolicy.ALWAYS_ASK,
-    Mode.AUTO_EDIT: ApprovalPolicy.AUTO_EXPLAIN,
-    Mode.PLAN: ApprovalPolicy.PLAN_ONLY,
-    Mode.SAFE_AUTO: ApprovalPolicy.SAFE_AUTO,
-    Mode.YOLO: ApprovalPolicy.NONE,
+_MODE_APPROVAL_BY_TAG: dict[str, ApprovalPolicy] = {
+    "always_ask": ApprovalPolicy.ALWAYS_ASK,
+    "auto_edit": ApprovalPolicy.AUTO_EXPLAIN,
+    "plan": ApprovalPolicy.PLAN_ONLY,
+    "safe_auto": ApprovalPolicy.SAFE_AUTO,
+    # Gated — reachable only via spore_core.dangerous.YoloMode (issue #34).
+    "yolo": ApprovalPolicy.NONE,
 }
+
+
+def _mode_prompt_chunk(tag: str) -> PromptChunk:
+    """Standard prompt chunk for a mode wire tag. Always Static, slot=Mode."""
+    chunk_id, content = _MODE_CHUNK_TEXT_BY_TAG[tag]
+    return PromptChunk.new(chunk_id, content, ChunkSlot.MODE, CacheBlock.STATIC)
+
+
+def _mode_approval_policy(tag: str) -> ApprovalPolicy:
+    return _MODE_APPROVAL_BY_TAG[tag]
+
+
+def _mode_default_tool_phase(tag: str) -> TaskPhase:
+    return TaskPhase.PLANNING if tag == "plan" else TaskPhase.EXECUTION
+
+
+class Mode(str, Enum):
+    """Agent behavioral mode — permanent for the life of a harness.
+
+    ``Yolo`` is intentionally absent: it is a named safety footgun gated behind
+    the ``dangerous`` opt-in (issue #34). Import it explicitly via
+    ``from spore_core.dangerous import YoloMode``. ``Mode("yolo")`` raises.
+    """
+
+    ALWAYS_ASK = "always_ask"
+    AUTO_EDIT = "auto_edit"
+    PLAN = "plan"
+    SAFE_AUTO = "safe_auto"
+
+    def prompt_chunk(self) -> PromptChunk:
+        """Standard prompt chunk for this mode. Always Static, slot=Mode."""
+        return _mode_prompt_chunk(self.value)
+
+    def approval_policy(self) -> ApprovalPolicy:
+        return _mode_approval_policy(self.value)
+
+    def default_tool_phase(self) -> TaskPhase:
+        return _mode_default_tool_phase(self.value)
+
+
+# Structural type accepted by :meth:`PromptChunkRegistry.compose`. The default
+# :class:`Mode` enum satisfies it; so does the gated ``YoloMode`` from
+# :mod:`spore_core.dangerous`. Compose only calls ``prompt_chunk()``.
+@runtime_checkable
+class ModeLike(Protocol):
+    """Anything that can supply a Mode prompt chunk (issue #34)."""
+
+    def prompt_chunk(self) -> PromptChunk: ...
+
+    def approval_policy(self) -> ApprovalPolicy: ...
+
+    def default_tool_phase(self) -> TaskPhase: ...
 
 
 # ============================================================================
@@ -342,7 +389,7 @@ class PromptChunkRegistry(Protocol):
     def compose(
         self,
         role: ChunkId,
-        mode: Mode,
+        mode: ModeLike,
         capabilities: list[ChunkId],
         skills: list[ChunkId],
     ) -> ComposedPrompt: ...
@@ -431,7 +478,7 @@ class StandardPromptChunkRegistry:
     def compose(
         self,
         role: ChunkId,
-        mode: Mode,
+        mode: ModeLike,
         capabilities: list[ChunkId],
         skills: list[ChunkId],
     ) -> ComposedPrompt:
@@ -553,8 +600,9 @@ def standard_chunks() -> list[PromptChunk]:
         out.append(PromptChunk.new(chunk_id, content, ChunkSlot.ROLE, CacheBlock.STATIC))
 
     # Modes — derived from the enum so prompt_chunk() and standard_chunks()
-    # are guaranteed to agree.
-    for mode in (Mode.ALWAYS_ASK, Mode.AUTO_EDIT, Mode.PLAN, Mode.SAFE_AUTO, Mode.YOLO):
+    # are guaranteed to agree. ``Yolo`` is deliberately excluded from the
+    # default library (issue #34); the dangerous opt-in supplies it.
+    for mode in (Mode.ALWAYS_ASK, Mode.AUTO_EDIT, Mode.PLAN, Mode.SAFE_AUTO):
         out.append(mode.prompt_chunk())
 
     capabilities: list[tuple[str, str]] = [
@@ -614,6 +662,7 @@ __all__ = [
     "InvalidSlot",
     "MissingRequiredSlot",
     "Mode",
+    "ModeLike",
     "PerTurnChunkInStaticBlock",
     "PromptChunk",
     "PromptChunkRegistry",

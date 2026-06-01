@@ -93,7 +93,7 @@ def test_role_slot_rejects_non_static_cache_block() -> None:
 def test_compose_missing_role_returns_error() -> None:
     r = StandardPromptChunkRegistry()
     with pytest.raises(ComposeFailed) as exc:
-        r.compose(ChunkId("missing"), Mode.YOLO, [], [])
+        r.compose(ChunkId("missing"), Mode.SAFE_AUTO, [], [])
     assert any(
         isinstance(e, MissingRequiredSlot) and e.slot is ChunkSlot.ROLE for e in exc.value.errors
     )
@@ -131,19 +131,19 @@ def test_compose_orders_by_slot() -> None:
 
 
 def test_block_hashes_are_stable_for_identical_content() -> None:
-    a = _registry_with_role().compose(ChunkId("role-test"), Mode.YOLO, [], [])
-    b = _registry_with_role().compose(ChunkId("role-test"), Mode.YOLO, [], [])
+    a = _registry_with_role().compose(ChunkId("role-test"), Mode.SAFE_AUTO, [], [])
+    b = _registry_with_role().compose(ChunkId("role-test"), Mode.SAFE_AUTO, [], [])
     assert a.block_1_hash == b.block_1_hash
     assert a.block_2_hash == b.block_2_hash
 
 
 def test_block_1_hash_changes_when_content_changes() -> None:
-    a = _registry_with_role().compose(ChunkId("role-test"), Mode.YOLO, [], [])
+    a = _registry_with_role().compose(ChunkId("role-test"), Mode.SAFE_AUTO, [], [])
     r2 = StandardPromptChunkRegistry()
     r2.register(
         PromptChunk.new("role-test", "DIFFERENT ROLE CONTENT", ChunkSlot.ROLE, CacheBlock.STATIC)
     )
-    b = r2.compose(ChunkId("role-test"), Mode.YOLO, [], [])
+    b = r2.compose(ChunkId("role-test"), Mode.SAFE_AUTO, [], [])
     assert a.block_1_hash != b.block_1_hash
 
 
@@ -155,7 +155,7 @@ def test_validate_flags_perturn_chunk_in_static_block() -> None:
     composed = ComposedPrompt(
         chunks=[
             PromptChunk.new("role-x", "x", ChunkSlot.ROLE, CacheBlock.STATIC),
-            Mode.YOLO.prompt_chunk(),
+            Mode.SAFE_AUTO.prompt_chunk(),
             # Budget chunk with Static cache block — simulates a bug.
             PromptChunk(
                 id=ChunkId("bad-budget"),
@@ -180,7 +180,7 @@ def test_validate_flags_more_than_one_mode_chunk() -> None:
     composed = ComposedPrompt(
         chunks=[
             PromptChunk.new("role-x", "x", ChunkSlot.ROLE, CacheBlock.STATIC),
-            Mode.YOLO.prompt_chunk(),
+            Mode.SAFE_AUTO.prompt_chunk(),
             Mode.ALWAYS_ASK.prompt_chunk(),
         ],
         block_1_hash=0,
@@ -196,7 +196,7 @@ def test_validate_flags_more_than_one_mode_chunk() -> None:
 def test_validate_flags_missing_role_slot() -> None:
     r = StandardPromptChunkRegistry()
     composed = ComposedPrompt(
-        chunks=[Mode.YOLO.prompt_chunk()],
+        chunks=[Mode.SAFE_AUTO.prompt_chunk()],
         block_1_hash=0,
         block_2_hash=0,
     )
@@ -222,12 +222,10 @@ def test_mode_approval_policy_matches_spec() -> None:
     assert Mode.AUTO_EDIT.approval_policy() is ApprovalPolicy.AUTO_EXPLAIN
     assert Mode.PLAN.approval_policy() is ApprovalPolicy.PLAN_ONLY
     assert Mode.SAFE_AUTO.approval_policy() is ApprovalPolicy.SAFE_AUTO
-    assert Mode.YOLO.approval_policy() is ApprovalPolicy.NONE
 
 
 def test_mode_default_tool_phase() -> None:
     assert Mode.PLAN.default_tool_phase() is TaskPhase.PLANNING
-    assert Mode.YOLO.default_tool_phase() is TaskPhase.EXECUTION
     assert Mode.AUTO_EDIT.default_tool_phase() is TaskPhase.EXECUTION
 
 
@@ -236,11 +234,11 @@ def test_mode_default_tool_phase() -> None:
 
 def test_composed_prompt_render_joins_chunks_with_blank_line() -> None:
     r = _registry_with_role()
-    composed = r.compose(ChunkId("role-test"), Mode.YOLO, [], [])
+    composed = r.compose(ChunkId("role-test"), Mode.SAFE_AUTO, [], [])
     assert composed.rendered is None
     rendered = composed.render()
     assert "you are a test agent" in rendered
-    assert "Mode: Yolo" in rendered
+    assert "Mode: SafeAuto" in rendered
     assert composed.rendered is not None
 
 
@@ -255,16 +253,17 @@ def test_standard_chunks_register_cleanly() -> None:
     assert r.get(ChunkId("skill-testing")) is not None
 
 
-def test_standard_chunks_includes_all_mode_ids() -> None:
+def test_standard_chunks_includes_all_safe_mode_ids() -> None:
     ids = {str(c.id) for c in standard_chunks()}
     for expected in (
         "mode-always-ask",
         "mode-auto-edit",
         "mode-plan",
         "mode-safe-auto",
-        "mode-yolo",
     ):
         assert expected in ids
+    # The Yolo footgun is gated out of the default library (issue #34).
+    assert "mode-yolo" not in ids
 
 
 # ── Compose with standard library smoke-test ────────────────────────────────
