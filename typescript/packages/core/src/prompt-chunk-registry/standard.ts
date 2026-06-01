@@ -8,6 +8,7 @@
  */
 
 import {
+  type AnyMode,
   type CacheBlock,
   ChunkId,
   type ChunkError,
@@ -17,9 +18,9 @@ import {
   type Mode,
   type PromptChunk,
   type PromptChunkRegistry,
+  anyModePromptChunk,
   chunkSlotOrder,
   computeBlockHashes,
-  modePromptChunk,
   promptChunk,
 } from "./types.js";
 
@@ -62,6 +63,22 @@ export class StandardPromptChunkRegistry implements PromptChunkRegistry {
     capabilities: ChunkId[],
     skills: ChunkId[],
   ): { ok: true; composed: ComposedPrompt } | { ok: false; errors: ChunkValidationError[] } {
+    return this.composeAny(role, mode, capabilities, skills);
+  }
+
+  /**
+   * Internal compose that also accepts the dangerous `"yolo"` mode. The public
+   * {@link compose} narrows `mode` to {@link Mode}, so a default-build caller
+   * cannot compose a Yolo prompt. The dangerous entry point
+   * (`@spore/core/dangerous`) exposes a wrapper that reaches this method with
+   * `"yolo"` (issue #34).
+   */
+  composeAny(
+    role: ChunkId,
+    mode: AnyMode,
+    capabilities: ChunkId[],
+    skills: ChunkId[],
+  ): { ok: true; composed: ComposedPrompt } | { ok: false; errors: ChunkValidationError[] } {
     const errors: ChunkValidationError[] = [];
     const chosen: PromptChunk[] = [];
 
@@ -74,7 +91,7 @@ export class StandardPromptChunkRegistry implements PromptChunkRegistry {
     }
 
     // Mode — always sourced from the enum, never from the registry.
-    chosen.push(modePromptChunk(mode));
+    chosen.push(anyModePromptChunk(mode));
 
     // Capabilities
     for (const id of capabilities) {
@@ -250,8 +267,10 @@ export function standardChunks(): PromptChunk[] {
   for (const [id, content] of roles) out.push(promptChunk(id, content, "role", "static"));
 
   // Modes — derived from the enum so promptChunk() and standardChunks() agree.
-  const modes: Mode[] = ["always_ask", "auto_edit", "plan", "safe_auto", "yolo"];
-  for (const m of modes) out.push(modePromptChunk(m));
+  // `"yolo"` is intentionally absent here: it is a dangerous-only mode (issue
+  // #34) and is added by `dangerousStandardChunks()` in `@spore/core/dangerous`.
+  const modes: Mode[] = ["always_ask", "auto_edit", "plan", "safe_auto"];
+  for (const m of modes) out.push(anyModePromptChunk(m));
 
   // Capabilities
   const caps: Array<[string, string]> = [

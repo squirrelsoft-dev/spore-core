@@ -220,7 +220,7 @@ describe("Harness escalation — R7: wire round-trip + SwitchMode uses Mode", ()
     const cases: HarnessSignal[] = [
       { kind: "enter_plan_mode", context: "ctx" },
       { kind: "exit_plan_mode", plan: { tasks: ["a", "b"], rationale: "why" } },
-      { kind: "switch_mode", mode: "yolo" },
+      { kind: "switch_mode", mode: "safe_auto" },
       abortSignal,
     ];
     for (const signal of cases) {

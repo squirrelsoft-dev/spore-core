@@ -7,7 +7,7 @@ import { mkdtempSync, realpathSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   BuildError,
@@ -35,13 +35,10 @@ describe("WorkspaceScopedSandbox construction", () => {
     ).toThrowError(BuildError);
   });
 
-  it("None isolation succeeds and warns", () => {
+  it("defaults to workspace_scoped isolation (None is dangerous-only, issue #34)", () => {
     const root = tmp();
-    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const sb = new WorkspaceScopedSandbox(cfg(root), { kind: "none" });
-    expect(sb.isolationMode()).toEqual({ kind: "none" });
-    expect(spy).toHaveBeenCalled();
-    spy.mockRestore();
+    const sb = new WorkspaceScopedSandbox(cfg(root));
+    expect(sb.isolationMode()).toEqual({ kind: "workspace_scoped" });
   });
 
   it("workspaceRoot returns canonical root", () => {

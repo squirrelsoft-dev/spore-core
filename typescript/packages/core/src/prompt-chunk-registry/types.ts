@@ -100,7 +100,35 @@ export type ApprovalPolicy =
   /** Full autonomy — no approval gates. */
   | "none";
 
-export type Mode = "always_ask" | "auto_edit" | "plan" | "safe_auto" | "yolo";
+/**
+ * Approval modes available in the default build.
+ *
+ * `"yolo"` (full autonomy, no approval gates) is a named safety footgun and is
+ * **not** part of this type. It is reachable only through the dangerous opt-in
+ * entry point (`@spore/core/dangerous`), which re-exposes it as
+ * {@link DangerousMode}. This mirrors the Rust `dangerous` Cargo feature that
+ * removes `Mode::Yolo` from the default build (issue #34). The wire tag for the
+ * dangerous mode stays `"yolo"`.
+ */
+export type Mode = "always_ask" | "auto_edit" | "plan" | "safe_auto";
+
+/**
+ * The dangerous-only mode tag. Its wire value is `"yolo"`, but the type is
+ * **branded**: a value of this type can only be minted by the dangerous opt-in
+ * entry point (`@spore/core/dangerous`). A default-build caller cannot forge it
+ * by writing the string `"yolo"`, so the dangerous APIs that consume it are
+ * unreachable without importing the dangerous module. This is the idiomatic TS
+ * analogue of the Rust `dangerous` Cargo feature gating `Mode::Yolo` (issue #34).
+ */
+export type DangerousMode = "yolo" & { readonly __sporeDangerous: unique symbol };
+
+/**
+ * Internal union of every mode tag, including the dangerous {@link DangerousMode}.
+ * Used by the shared switch bodies and by the dangerous entry point. NOT part of
+ * the default public API — default callers use {@link Mode}, which cannot name
+ * the dangerous mode.
+ */
+export type AnyMode = Mode | DangerousMode;
 
 // ============================================================================
 // Mode helpers — analogue of Rust `impl Mode`.
@@ -108,11 +136,27 @@ export type Mode = "always_ask" | "auto_edit" | "plan" | "safe_auto" | "yolo";
 
 /** The standard prompt chunk for a mode. Always in slot `mode`, cache `static`. */
 export function modePromptChunk(mode: Mode): PromptChunk {
+  return anyModePromptChunk(mode);
+}
+
+/**
+ * Internal variant of {@link modePromptChunk} that also accepts the dangerous
+ * `"yolo"` mode. Re-exposed (typed to {@link DangerousMode}) by the dangerous
+ * entry point; the default {@link modePromptChunk} narrows the input so a
+ * default-build caller cannot construct the Yolo chunk.
+ */
+export function anyModePromptChunk(mode: AnyMode): PromptChunk {
   const spec = modeChunkSpec(mode);
   return promptChunk(spec.id, spec.content, "mode", "static");
 }
 
-function modeChunkSpec(mode: Mode): { id: string; content: string } {
+/** Unreachable-mode guard. The branded {@link DangerousMode} defeats TS switch
+ * exhaustiveness, so the mode switches need an explicit fall-through. */
+function assertUnreachableMode(mode: AnyMode): never {
+  throw new Error(`unhandled mode: ${String(mode)}`);
+}
+
+function modeChunkSpec(mode: AnyMode): { id: string; content: string } {
   switch (mode) {
     case "always_ask":
       return {
@@ -139,11 +183,25 @@ function modeChunkSpec(mode: Mode): { id: string; content: string } {
       };
     case "yolo":
       return { id: "mode-yolo", content: "Mode: Yolo. Full autonomy. No approval gates." };
+    default:
+      // `mode` is branded (DangerousMode), so TS does not treat the switch as
+      // exhaustive; this is unreachable at runtime.
+      return assertUnreachableMode(mode);
   }
 }
 
 /** Enforcement policy implied by a mode. */
 export function modeApprovalPolicy(mode: Mode): ApprovalPolicy {
+  return anyModeApprovalPolicy(mode);
+}
+
+/**
+ * Internal variant of {@link modeApprovalPolicy} that also accepts the
+ * dangerous `"yolo"` mode (which maps to the `"none"` approval policy). The
+ * `"none"` approval policy itself is **not** gated — only its entry point
+ * `"yolo"` is (issue #34).
+ */
+export function anyModeApprovalPolicy(mode: AnyMode): ApprovalPolicy {
   switch (mode) {
     case "always_ask":
       return "always_ask";
@@ -155,11 +213,21 @@ export function modeApprovalPolicy(mode: Mode): ApprovalPolicy {
       return "safe_auto";
     case "yolo":
       return "none";
+    default:
+      return assertUnreachableMode(mode);
   }
 }
 
 /** Initial task phase implied by a mode. */
 export function modeDefaultToolPhase(mode: Mode): TaskPhase {
+  return anyModeDefaultToolPhase(mode);
+}
+
+/**
+ * Internal variant of {@link modeDefaultToolPhase} that also accepts the
+ * dangerous `"yolo"` mode.
+ */
+export function anyModeDefaultToolPhase(mode: AnyMode): TaskPhase {
   return mode === "plan" ? "planning" : "execution";
 }
 

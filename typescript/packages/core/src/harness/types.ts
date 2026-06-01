@@ -282,7 +282,11 @@ export const HarnessSignalSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("switch_mode"),
-    mode: z.enum(["always_ask", "auto_edit", "plan", "safe_auto", "yolo"]),
+    // `"yolo"` is intentionally absent — it is a dangerous-only mode (issue
+    // #34) and cannot be named through the default build, mirroring the Rust
+    // `SwitchMode { mode: Mode }` where `Mode::Yolo` does not exist without the
+    // `dangerous` feature.
+    mode: z.enum(["always_ask", "auto_edit", "plan", "safe_auto"]),
   }),
   z.object({ kind: z.literal("abort"), reason: z.string() }),
 ]);
@@ -356,12 +360,41 @@ export type NetworkPolicy =
   | { kind: "allowlist"; hosts: string[] }
   | { kind: "full" };
 
-/** Discriminated isolation mode. */
+/**
+ * Discriminated isolation mode (default build).
+ *
+ * `{ kind: "none" }` (no path enforcement) is a named safety footgun and is
+ * **not** part of this type. It is reachable only through the dangerous opt-in
+ * entry point (`@spore/core/dangerous`), which re-exposes it as
+ * {@link DangerousIsolationMode}. This mirrors the Rust `dangerous` Cargo
+ * feature that removes `IsolationMode::None` from the default build (issue #34).
+ * The wire tag for the dangerous mode stays `"none"`.
+ */
 export type IsolationMode =
-  | { kind: "none" }
   | { kind: "workspace_scoped" }
   | { kind: "bubblewrap"; profile: BwrapProfile }
   | { kind: "docker"; image: string; network: NetworkPolicy };
+
+/**
+ * The dangerous-only isolation mode: no isolation, no path enforcement. Its
+ * wire value is `{ kind: "none" }`, but the type is **branded**: a value can
+ * only be minted by the dangerous opt-in entry point (`@spore/core/dangerous`).
+ * A default-build caller cannot forge it by writing `{ kind: "none" }`, so the
+ * dangerous sandbox constructor that consumes it is unreachable without
+ * importing the dangerous module. Idiomatic TS analogue of the Rust `dangerous`
+ * Cargo feature gating `IsolationMode::None` (issue #34).
+ */
+export type DangerousIsolationMode = { kind: "none" } & {
+  readonly __sporeDangerous: unique symbol;
+};
+
+/**
+ * Internal union of every isolation mode, including the dangerous
+ * {@link DangerousIsolationMode}. Used by the sandbox switch bodies and by the
+ * dangerous entry point. NOT part of the default public API — default callers
+ * use {@link IsolationMode}, which cannot name the dangerous mode.
+ */
+export type AnyIsolationMode = IsolationMode | DangerousIsolationMode;
 
 /** Configuration consumed by `WorkspaceScopedSandbox`. */
 export interface WorkspaceConfig {
@@ -472,8 +505,12 @@ export interface SandboxProvider {
   /** Resolve a path against the workspace root. */
   resolvePath?(path: string, operation: Operation): Promise<string | SandboxViolation>;
 
-  /** Current isolation mode. */
-  isolationMode?(): IsolationMode;
+  /**
+   * Current isolation mode. Returns {@link AnyIsolationMode} so a sandbox
+   * constructed through the dangerous opt-in can report `{ kind: "none" }`;
+   * default-built sandboxes only ever return a safe {@link IsolationMode}.
+   */
+  isolationMode?(): AnyIsolationMode;
 
   /** Canonical workspace root. */
   workspaceRoot?(): string;

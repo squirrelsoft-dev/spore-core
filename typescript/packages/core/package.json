@@ -4,6 +4,16 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./dangerous": {
+      "types": "./src/dangerous/index.ts",
+      "default": "./src/dangerous/index.ts"
+    }
+  },
   "scripts": {
     "test": "vitest run",
     "lint": "eslint src"

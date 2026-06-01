@@ -24,6 +24,7 @@ import {
 
 import type { ToolCall } from "../model/schemas.js";
 import type {
+  AnyIsolationMode,
   CommandOutput,
   FileRef,
   IsolationMode,
@@ -55,6 +56,14 @@ export class BuildError extends Error {
 // ============================================================================
 
 const CHARS_PER_TOKEN = 4;
+
+/** Warning emitted when a sandbox is constructed with no isolation (issue #34). */
+function warnNoneIsolation(): void {
+  console.warn(
+    "spore-core: WorkspaceScopedSandbox constructed with IsolationMode::None — " +
+      "trusted-dev use only; do not enable silently in production",
+  );
+}
 
 function stripExtDot(ext: string): string {
   return ext.startsWith(".") ? ext.slice(1) : ext;
@@ -101,7 +110,32 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
   private readonly deniedExtensions: string[];
   private readonly readOnly: boolean;
   private readonly maxFileSize: number;
-  private readonly mode: IsolationMode;
+  private readonly mode: AnyIsolationMode;
+
+  /**
+   * Construct a sandbox with the given isolation mode.
+   *
+   * The public constructor only accepts a safe {@link IsolationMode}; the
+   * dangerous `{ kind: "none" }` mode cannot be named here. To build a sandbox
+   * with no isolation, use {@link unsafeWithMode} via the dangerous opt-in
+   * entry point (`@spore/core/dangerous`). This mirrors the Rust `dangerous`
+   * feature gate on `IsolationMode::None` (issue #34).
+   */
+  /**
+   * Internal factory that accepts {@link AnyIsolationMode}, including the
+   * dangerous `{ kind: "none" }`. Reached only through the dangerous entry
+   * point (`@spore/core/dangerous`); not part of the default public API.
+   */
+  static unsafeWithMode(config: WorkspaceConfig, mode: AnyIsolationMode): WorkspaceScopedSandbox {
+    // The constructor only accepts a safe IsolationMode; build with a safe
+    // placeholder, then overwrite the private mode field with the dangerous
+    // value. This keeps a single root-validation path while letting the
+    // dangerous opt-in reach `{ kind: "none" }`.
+    const sb = new WorkspaceScopedSandbox(config);
+    (sb as unknown as { mode: AnyIsolationMode }).mode = mode;
+    if (mode.kind === "none") warnNoneIsolation();
+    return sb;
+  }
 
   constructor(config: WorkspaceConfig, mode?: IsolationMode) {
     // Validate root exists, canonicalize.
@@ -133,14 +167,11 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
     this.deniedExtensions = config.denied_extensions ?? [];
     this.readOnly = config.read_only ?? false;
     this.maxFileSize = config.max_file_size ?? 0;
+    // The public constructor only accepts a safe IsolationMode, so a default
+    // build defaults to workspace-scoped isolation (issue #34). The dangerous
+    // `{ kind: "none" }` mode is injected by `unsafeWithMode`, which emits the
+    // warning itself.
     this.mode = mode ?? { kind: "workspace_scoped" };
-
-    if (this.mode.kind === "none") {
-      console.warn(
-        "spore-core: WorkspaceScopedSandbox constructed with IsolationMode::None — " +
-          "trusted-dev use only; do not enable silently in production",
-      );
-    }
   }
 
   // --------------------------------------------------------------------------
@@ -151,7 +182,7 @@ export class WorkspaceScopedSandbox implements SandboxProvider {
     return null;
   }
 
-  isolationMode(): IsolationMode {
+  isolationMode(): AnyIsolationMode {
     return this.mode;
   }
 

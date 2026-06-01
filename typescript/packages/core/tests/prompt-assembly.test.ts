@@ -56,7 +56,7 @@ describe("ChunkCondition evaluation (R1–R9)", () => {
     const b = builder();
     const c = { ...ctx(), mode: "plan" as const };
     expect(b.evaluate(ChunkConditions.whenMode("plan"), c)).toBe(true);
-    expect(b.evaluate(ChunkConditions.whenMode("yolo"), c)).toBe(false);
+    expect(b.evaluate(ChunkConditions.whenMode("always_ask"), c)).toBe(false);
   });
 
   it("R3: when_tool_active", () => {
@@ -147,7 +147,7 @@ describe("ChunkCondition evaluation (R1–R9)", () => {
         c,
       ),
     ).toBe(true);
-    expect(b.evaluate(ChunkConditions.not(ChunkConditions.whenMode("yolo")), c)).toBe(true);
+    expect(b.evaluate(ChunkConditions.not(ChunkConditions.whenMode("always_ask")), c)).toBe(true);
   });
 
   it("R9: custom is evaluated against ctx", () => {
@@ -332,7 +332,10 @@ describe("A3 — Custom serialization and equality (R25)", () => {
     expect(conditionsEqual(a, b)).toBe(false);
     expect(conditionsEqual(ChunkConditions.always(), ChunkConditions.always())).toBe(true);
     expect(
-      conditionsEqual(ChunkConditions.whenMode("yolo"), ChunkConditions.whenMode("yolo")),
+      conditionsEqual(
+        ChunkConditions.whenMode("always_ask"),
+        ChunkConditions.whenMode("always_ask"),
+      ),
     ).toBe(true);
   });
 
@@ -365,13 +368,13 @@ describe("A3 — Custom serialization and equality (R25)", () => {
 
   it("custom is pruned from combinators on serialize", () => {
     const cond = ChunkConditions.all([
-      ChunkConditions.whenMode("yolo"),
+      ChunkConditions.whenMode("always_ask"),
       ChunkConditions.custom(() => true),
     ]);
     const back = deserializeCondition(serializeCondition(cond));
-    expect(conditionsEqual(back, ChunkConditions.all([ChunkConditions.whenMode("yolo")]))).toBe(
-      true,
-    );
+    expect(
+      conditionsEqual(back, ChunkConditions.all([ChunkConditions.whenMode("always_ask")])),
+    ).toBe(true);
   });
 
   it("not over custom collapses to null -> always", () => {

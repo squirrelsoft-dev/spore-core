@@ -81,7 +81,7 @@ describe("register", () => {
 describe("compose", () => {
   it("returns missing-role error when role chunk is not registered", () => {
     const r = new StandardPromptChunkRegistry();
-    const res = r.compose(new ChunkId("missing"), "yolo", [], []);
+    const res = r.compose(new ChunkId("missing"), "safe_auto", [], []);
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.errors.some((e) => e.kind === "missing_required_slot" && e.slot === "role")).toBe(
@@ -123,7 +123,7 @@ describe("compose", () => {
 
   it("returns missing-capability error when capability chunk is absent", () => {
     const r = registryWithRole("role-test");
-    const res = r.compose(new ChunkId("role-test"), "yolo", [new ChunkId("nope")], []);
+    const res = r.compose(new ChunkId("role-test"), "safe_auto", [new ChunkId("nope")], []);
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(
@@ -137,8 +137,8 @@ describe("compose", () => {
 
 describe("block hashes", () => {
   it("are stable for identical content", () => {
-    const a = registryWithRole("role-test").compose(new ChunkId("role-test"), "yolo", [], []);
-    const b = registryWithRole("role-test").compose(new ChunkId("role-test"), "yolo", [], []);
+    const a = registryWithRole("role-test").compose(new ChunkId("role-test"), "safe_auto", [], []);
+    const b = registryWithRole("role-test").compose(new ChunkId("role-test"), "safe_auto", [], []);
     expect(a.ok && b.ok).toBe(true);
     if (a.ok && b.ok) {
       expect(a.composed.block_1_hash).toBe(b.composed.block_1_hash);
@@ -147,10 +147,10 @@ describe("block hashes", () => {
   });
 
   it("block_1_hash changes when Static content changes", () => {
-    const a = registryWithRole("role-test").compose(new ChunkId("role-test"), "yolo", [], []);
+    const a = registryWithRole("role-test").compose(new ChunkId("role-test"), "safe_auto", [], []);
     const r2 = new StandardPromptChunkRegistry();
     r2.register(promptChunk("role-test", "DIFFERENT ROLE CONTENT", "role", "static"));
-    const b = r2.compose(new ChunkId("role-test"), "yolo", [], []);
+    const b = r2.compose(new ChunkId("role-test"), "safe_auto", [], []);
     expect(a.ok && b.ok).toBe(true);
     if (a.ok && b.ok) {
       expect(a.composed.block_1_hash).not.toBe(b.composed.block_1_hash);
@@ -158,7 +158,12 @@ describe("block hashes", () => {
   });
 
   it("recomputeBlockHashes agrees with the cached hashes", () => {
-    const res = registryWithRole("role-test").compose(new ChunkId("role-test"), "yolo", [], []);
+    const res = registryWithRole("role-test").compose(
+      new ChunkId("role-test"),
+      "safe_auto",
+      [],
+      [],
+    );
     expect(res.ok).toBe(true);
     if (res.ok) {
       const [b1, b2] = recomputeBlockHashes(res.composed);
@@ -181,7 +186,7 @@ describe("validate", () => {
     const composed = {
       chunks: [
         promptChunk("role-x", "x", "role", "static"),
-        modePromptChunk("yolo"),
+        modePromptChunk("safe_auto"),
         // A Budget chunk with Static cache_block — simulates a bug.
         {
           id: new ChunkId("bad-budget"),
@@ -206,7 +211,7 @@ describe("validate", () => {
     const composed = {
       chunks: [
         promptChunk("role-x", "x", "role", "static"),
-        modePromptChunk("yolo"),
+        modePromptChunk("safe_auto"),
         modePromptChunk("always_ask"),
       ],
       block_1_hash: 0,
@@ -220,7 +225,7 @@ describe("validate", () => {
   it("flags missing Role slot", () => {
     const r = new StandardPromptChunkRegistry();
     const composed = {
-      chunks: [modePromptChunk("yolo")],
+      chunks: [modePromptChunk("safe_auto")],
       block_1_hash: 0,
       block_2_hash: 0,
       rendered: null,
@@ -260,12 +265,11 @@ describe("Mode helpers", () => {
     expect(modeApprovalPolicy("auto_edit")).toBe("auto_explain");
     expect(modeApprovalPolicy("plan")).toBe("plan_only");
     expect(modeApprovalPolicy("safe_auto")).toBe("safe_auto");
-    expect(modeApprovalPolicy("yolo")).toBe("none");
+    // "yolo" is dangerous-only (issue #34); see dangerous-gated suite.
   });
 
   it("defaultToolPhase returns planning only for Plan mode", () => {
     expect(modeDefaultToolPhase("plan")).toBe("planning");
-    expect(modeDefaultToolPhase("yolo")).toBe("execution");
     expect(modeDefaultToolPhase("safe_auto")).toBe("execution");
   });
 
@@ -274,7 +278,7 @@ describe("Mode helpers", () => {
     expect(modePromptChunk("auto_edit").id.value).toBe("mode-auto-edit");
     expect(modePromptChunk("plan").id.value).toBe("mode-plan");
     expect(modePromptChunk("safe_auto").id.value).toBe("mode-safe-auto");
-    expect(modePromptChunk("yolo").id.value).toBe("mode-yolo");
+    // "mode-yolo" is dangerous-only (issue #34); see dangerous-gated suite.
   });
 });
 
@@ -283,14 +287,14 @@ describe("Mode helpers", () => {
 describe("renderComposed", () => {
   it("joins chunk contents with a blank line and caches the result", () => {
     const r = registryWithRole("role-test");
-    const res = r.compose(new ChunkId("role-test"), "yolo", [], []);
+    const res = r.compose(new ChunkId("role-test"), "safe_auto", [], []);
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.composed.rendered).toBeNull();
       expect(renderedStr(res.composed)).toBe("");
       const rendered = renderComposed(res.composed);
       expect(rendered).toContain("you are a test agent");
-      expect(rendered).toContain("Mode: Yolo");
+      expect(rendered).toContain("Mode: SafeAuto");
       expect(res.composed.rendered).not.toBeNull();
       expect(renderedStr(res.composed)).toBe(rendered);
     }
@@ -326,11 +330,13 @@ describe("standard chunk library", () => {
     }
   });
 
-  it("includes one chunk per Mode variant", () => {
+  it("includes one chunk per default (non-dangerous) Mode variant", () => {
     const chunks = standardChunks();
     const modeIds = chunks.filter((c) => c.slot === "mode").map((c) => c.id.value);
+    // "mode-yolo" is dangerous-only (issue #34) and absent from the default
+    // library; it is added by `dangerousStandardChunks()` in the dangerous suite.
     expect(modeIds.sort()).toEqual(
-      ["mode-always-ask", "mode-auto-edit", "mode-plan", "mode-safe-auto", "mode-yolo"].sort(),
+      ["mode-always-ask", "mode-auto-edit", "mode-plan", "mode-safe-auto"].sort(),
     );
   });
 });

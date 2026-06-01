@@ -15,8 +15,8 @@
 
 import type { ToolCall } from "../model/schemas.js";
 import type {
+  AnyIsolationMode,
   CommandOutput,
-  IsolationMode,
   Operation,
   SandboxProvider,
   SandboxViolation,
@@ -95,8 +95,12 @@ export class ReadOnlySandbox implements SandboxProvider {
     return path;
   }
 
-  isolationMode(): IsolationMode {
-    return this.inner.isolationMode?.() ?? { kind: "none" };
+  isolationMode(): AnyIsolationMode {
+    // Delegate to the wrapped sandbox (mirrors Rust `ReadOnlySandbox`). When the
+    // inner sandbox does not implement `isolationMode`, fall back to the
+    // safe-by-default `workspace_scoped` — never `none`, which is dangerous-only
+    // (issue #34).
+    return this.inner.isolationMode?.() ?? { kind: "workspace_scoped" };
   }
 
   workspaceRoot(): string {
