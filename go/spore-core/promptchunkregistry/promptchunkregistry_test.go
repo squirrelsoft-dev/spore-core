@@ -117,7 +117,7 @@ func TestRegister_ErrorCases(t *testing.T) {
 
 func TestCompose_MissingRoleReturnsError(t *testing.T) {
 	r := NewStandardPromptChunkRegistry()
-	_, err := r.Compose("missing", ModeYolo, nil, nil)
+	_, err := r.Compose("missing", ModeSafeAuto, nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -181,7 +181,7 @@ func TestCompose_PreservesArgOrderWithinSlot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	composed, err := r.Compose("role-test", ModeYolo, []ChunkID{"cap-c", "cap-a", "cap-b"}, nil)
+	composed, err := r.Compose("role-test", ModeSafeAuto, []ChunkID{"cap-c", "cap-a", "cap-b"}, nil)
 	if err != nil {
 		t.Fatalf("compose: %v", err)
 	}
@@ -202,11 +202,11 @@ func TestCompose_PreservesArgOrderWithinSlot(t *testing.T) {
 // ── Block hashes ────────────────────────────────────────────────────────────
 
 func TestBlockHashes_StableForIdenticalContent(t *testing.T) {
-	a, err := registryWithRole(t, "role-test").Compose("role-test", ModeYolo, nil, nil)
+	a, err := registryWithRole(t, "role-test").Compose("role-test", ModeSafeAuto, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := registryWithRole(t, "role-test").Compose("role-test", ModeYolo, nil, nil)
+	b, err := registryWithRole(t, "role-test").Compose("role-test", ModeSafeAuto, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestBlockHashes_StableForIdenticalContent(t *testing.T) {
 }
 
 func TestBlock1Hash_ChangesWhenContentChanges(t *testing.T) {
-	a, err := registryWithRole(t, "role-test").Compose("role-test", ModeYolo, nil, nil)
+	a, err := registryWithRole(t, "role-test").Compose("role-test", ModeSafeAuto, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestBlock1Hash_ChangesWhenContentChanges(t *testing.T) {
 	if err := r2.Register(NewPromptChunk("role-test", "DIFFERENT ROLE CONTENT", ChunkSlotRole, CacheBlockStatic)); err != nil {
 		t.Fatal(err)
 	}
-	b, err := r2.Compose("role-test", ModeYolo, nil, nil)
+	b, err := r2.Compose("role-test", ModeSafeAuto, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestValidate_FlagsPerTurnChunkInStaticBlock(t *testing.T) {
 	composed := &ComposedPrompt{
 		Chunks: []PromptChunk{
 			NewPromptChunk("role-x", "x", ChunkSlotRole, CacheBlockStatic),
-			ModeYolo.PromptChunk(),
+			ModeSafeAuto.PromptChunk(),
 			// Budget chunk with Static cache block — simulates a bug.
 			{ID: "bad-budget", Content: "b", Slot: ChunkSlotBudget, CacheBlock: CacheBlockStatic},
 		},
@@ -266,7 +266,7 @@ func TestValidate_FlagsMoreThanOneModeChunk(t *testing.T) {
 	composed := &ComposedPrompt{
 		Chunks: []PromptChunk{
 			NewPromptChunk("role-x", "x", ChunkSlotRole, CacheBlockStatic),
-			ModeYolo.PromptChunk(),
+			ModeSafeAuto.PromptChunk(),
 			ModeAlwaysAsk.PromptChunk(),
 		},
 	}
@@ -286,7 +286,7 @@ func TestValidate_FlagsMoreThanOneModeChunk(t *testing.T) {
 func TestValidate_FlagsMissingRoleSlot(t *testing.T) {
 	r := NewStandardPromptChunkRegistry()
 	composed := &ComposedPrompt{
-		Chunks: []PromptChunk{ModeYolo.PromptChunk()},
+		Chunks: []PromptChunk{ModeSafeAuto.PromptChunk()},
 	}
 	errs := r.Validate(composed)
 	found := false
@@ -328,7 +328,7 @@ func TestMode_ApprovalPolicyMatchesSpec(t *testing.T) {
 		{ModeAutoEdit, ApprovalPolicyAutoExplain},
 		{ModePlan, ApprovalPolicyPlanOnly},
 		{ModeSafeAuto, ApprovalPolicySafeAuto},
-		{ModeYolo, ApprovalPolicyNone},
+		// ModeYolo is gated behind `dangerous` (issue #34); see dangerous_test.go.
 	}
 	for _, c := range cases {
 		if got := c.m.ApprovalPolicy(); got != c.want {
@@ -341,7 +341,7 @@ func TestMode_DefaultToolPhase(t *testing.T) {
 	if got := ModePlan.DefaultToolPhase(); got != sporecore.PhasePlanning {
 		t.Errorf("Plan: %q", got)
 	}
-	for _, m := range []Mode{ModeAlwaysAsk, ModeAutoEdit, ModeSafeAuto, ModeYolo} {
+	for _, m := range []Mode{ModeAlwaysAsk, ModeAutoEdit, ModeSafeAuto} {
 		if got := m.DefaultToolPhase(); got != sporecore.PhaseExecution {
 			t.Errorf("%s: %q", m, got)
 		}
@@ -358,7 +358,7 @@ func TestMode_PromptChunkIDsAndPrefixes(t *testing.T) {
 		{ModeAutoEdit, "mode-auto-edit", "Mode: AutoEdit."},
 		{ModePlan, "mode-plan", "Mode: Plan."},
 		{ModeSafeAuto, "mode-safe-auto", "Mode: SafeAuto."},
-		{ModeYolo, "mode-yolo", "Mode: Yolo."},
+		// ModeYolo is gated behind `dangerous` (issue #34); see dangerous_test.go.
 	}
 	for _, c := range cases {
 		pc := c.m.PromptChunk()
@@ -378,7 +378,7 @@ func TestMode_PromptChunkIDsAndPrefixes(t *testing.T) {
 
 func TestComposedPrompt_RenderJoinsChunks(t *testing.T) {
 	r := registryWithRole(t, "role-test")
-	composed, err := r.Compose("role-test", ModeYolo, nil, nil)
+	composed, err := r.Compose("role-test", ModeSafeAuto, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestComposedPrompt_RenderJoinsChunks(t *testing.T) {
 	if !strings.Contains(rendered, "you are a test agent") {
 		t.Error("missing role content")
 	}
-	if !strings.Contains(rendered, "Mode: Yolo") {
+	if !strings.Contains(rendered, "Mode: SafeAuto") {
 		t.Error("missing mode content")
 	}
 	if !composed.HasRendered() {

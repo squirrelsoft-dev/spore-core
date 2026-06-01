@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,9 +65,14 @@ func NewWorkspaceScopedSandbox(cfg WorkspaceConfig) (*WorkspaceScopedSandbox, er
 	return NewWorkspaceScopedSandboxWithMode(cfg, IsolationWorkspaceScoped{})
 }
 
+// warnIfDangerousIsolation is wired up by the `dangerous` build to emit a
+// construction-time warning when a sandbox is built with IsolationNone. It is
+// nil in the default build, where IsolationNone does not exist.
+var warnIfDangerousIsolation func(mode IsolationMode)
+
 // NewWorkspaceScopedSandboxWithMode builds a sandbox with an explicit
-// isolation mode. IsolationNone emits a warning via log.Printf — it must
-// never be enabled silently in production.
+// isolation mode. Under the `dangerous` build tag, IsolationNone emits a
+// warning via log.Printf — it must never be enabled silently in production.
 func NewWorkspaceScopedSandboxWithMode(cfg WorkspaceConfig, mode IsolationMode) (*WorkspaceScopedSandbox, error) {
 	if cfg.Root == "" {
 		return nil, &BuildError{Kind: BuildErrRootNotFound, Path: cfg.Root}
@@ -96,9 +100,8 @@ func NewWorkspaceScopedSandboxWithMode(cfg WorkspaceConfig, mode IsolationMode) 
 	}
 	cfg.Root = canonical
 
-	if _, isNone := mode.(IsolationNone); isNone {
-		log.Printf("spore-core: WorkspaceScopedSandbox constructed with IsolationNone — " +
-			"trusted-dev use only; do not enable silently in production")
+	if warnIfDangerousIsolation != nil {
+		warnIfDangerousIsolation(mode)
 	}
 	return &WorkspaceScopedSandbox{config: cfg, isolationMode: mode}, nil
 }
@@ -281,8 +284,6 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 	timeout time.Duration,
 ) (CommandOutput, *SandboxViolation) {
 	switch s.isolationMode.(type) {
-	case IsolationNone, IsolationWorkspaceScoped:
-		// proceed directly
 	case IsolationBubblewrap:
 		return CommandOutput{}, &SandboxViolation{
 			Kind:    SandboxDisallowedCommand,
@@ -293,6 +294,9 @@ func (s *WorkspaceScopedSandbox) ExecuteCommand(
 			Kind:    SandboxDisallowedCommand,
 			Command: fmt.Sprintf("docker isolation not implemented: %s", command),
 		}
+	default:
+		// IsolationWorkspaceScoped (and, under the `dangerous` build tag,
+		// IsolationNone) proceed directly.
 	}
 
 	runCtx := ctx

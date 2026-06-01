@@ -181,7 +181,7 @@ func (s *stubSandbox) ResolvePath(
 	return p, nil
 }
 func (s *stubSandbox) IsolationMode() sporecore.IsolationMode {
-	return sporecore.IsolationNone{}
+	return sporecore.IsolationWorkspaceScoped{}
 }
 func (s *stubSandbox) WorkspaceRoot() string { return s.root }
 

@@ -50,8 +50,10 @@ func (f *fakeSandbox) ResolvePath(_ context.Context, p string, _ sporecore.Opera
 	return filepath.Join(f.root, p), nil
 }
 
-func (f *fakeSandbox) IsolationMode() sporecore.IsolationMode { return sporecore.IsolationNone{} }
-func (f *fakeSandbox) WorkspaceRoot() string                  { return f.root }
+func (f *fakeSandbox) IsolationMode() sporecore.IsolationMode {
+	return sporecore.IsolationWorkspaceScoped{}
+}
+func (f *fakeSandbox) WorkspaceRoot() string { return f.root }
 
 func snapshot() *termination.SessionStateSnapshot {
 	s := termination.NewSessionStateSnapshot(

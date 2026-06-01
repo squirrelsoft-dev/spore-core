@@ -25,14 +25,29 @@ func TestSandboxBuildFailsWhenRootMissing(t *testing.T) {
 	}
 }
 
-func TestSandboxBuildNoneIsolationWarns(t *testing.T) {
+// TestSandboxDefaultIsolationIsWorkspaceScoped pins the safe-by-default
+// behaviour of issue #34: a sandbox built without an explicit mode reports
+// IsolationWorkspaceScoped — never the gated, no-enforcement IsolationNone.
+func TestSandboxDefaultIsolationIsWorkspaceScoped(t *testing.T) {
 	dir := t.TempDir()
-	sb, err := NewWorkspaceScopedSandboxWithMode(cfg(dir), IsolationNone{})
+	sb, err := NewWorkspaceScopedSandbox(cfg(dir))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if _, ok := sb.IsolationMode().(IsolationNone); !ok {
-		t.Fatalf("expected IsolationNone, got %T", sb.IsolationMode())
+	if sb.IsolationMode().Kind() != "workspace_scoped" {
+		t.Fatalf("default isolation kind = %q, want %q", sb.IsolationMode().Kind(), "workspace_scoped")
+	}
+	if _, ok := sb.IsolationMode().(IsolationWorkspaceScoped); !ok {
+		t.Fatalf("default isolation type = %T, want IsolationWorkspaceScoped", sb.IsolationMode())
+	}
+}
+
+// TestDefaultSandboxIsolationIsWorkspaceScoped pins the same safe default for
+// the non-sandboxed DefaultSandbox stub (issue #34).
+func TestDefaultSandboxIsolationIsWorkspaceScoped(t *testing.T) {
+	var ds DefaultSandbox
+	if _, ok := ds.IsolationMode().(IsolationWorkspaceScoped); !ok {
+		t.Fatalf("DefaultSandbox isolation type = %T, want IsolationWorkspaceScoped", ds.IsolationMode())
 	}
 }
 

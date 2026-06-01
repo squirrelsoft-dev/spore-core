@@ -440,7 +440,10 @@ const (
 	ModeAutoEdit  Mode = "auto_edit"
 	ModePlan      Mode = "plan"
 	ModeSafeAuto  Mode = "safe_auto"
-	ModeYolo      Mode = "yolo"
+	// ModeYolo (full autonomy, no approval gates) is a named safety footgun and
+	// is gated behind the `dangerous` build tag (issue #34). It is defined in
+	// dangerous.go and absent from the default build, so SwitchMode cannot
+	// target it by name without the explicit dangerous opt-in. Wire tag "yolo".
 )
 
 // HarnessSignalKind discriminates HarnessSignal variants.
@@ -818,16 +821,21 @@ type WorkspaceConfig struct {
 // IsolationMode — sealed interface
 // ============================================================================
 
-// IsolationMode is a sealed interface with concrete impls IsolationNone,
-// IsolationWorkspaceScoped, IsolationBubblewrap, IsolationDocker. The
-// unexported sealedIsolationMode() method seals the type so external
-// implementations cannot satisfy it.
+// IsolationMode is a sealed interface with concrete impls
+// IsolationWorkspaceScoped, IsolationBubblewrap, IsolationDocker, and — gated
+// behind the `dangerous` build tag (issue #34) — IsolationNone. The unexported
+// sealedIsolationMode() method seals the type so external implementations
+// cannot satisfy it.
+//
+// IsolationNone (no path enforcement) is a named safety footgun: it is defined
+// only in dangerous.go (`//go:build dangerous`) and absent from the default
+// build, so it cannot be selected by accident. The safe-by-default isolation
+// mode is IsolationWorkspaceScoped.
 type IsolationMode interface {
 	sealedIsolationMode()
 	Kind() string
 }
 
-type IsolationNone struct{}
 type IsolationWorkspaceScoped struct{}
 type IsolationBubblewrap struct {
 	Profile BwrapProfile `json:"profile"`
@@ -837,12 +845,10 @@ type IsolationDocker struct {
 	Network NetworkPolicy `json:"network"`
 }
 
-func (IsolationNone) sealedIsolationMode()            {}
 func (IsolationWorkspaceScoped) sealedIsolationMode() {}
 func (IsolationBubblewrap) sealedIsolationMode()      {}
 func (IsolationDocker) sealedIsolationMode()          {}
 
-func (IsolationNone) Kind() string            { return "none" }
 func (IsolationWorkspaceScoped) Kind() string { return "workspace_scoped" }
 func (IsolationBubblewrap) Kind() string      { return "bubblewrap" }
 func (IsolationDocker) Kind() string          { return "docker" }

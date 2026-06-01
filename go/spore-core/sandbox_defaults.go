@@ -9,7 +9,8 @@
 //   - ExecuteCommand spawns processes directly via os/exec with no isolation.
 //   - ResolvePath returns the raw path unchanged.
 //   - HandleLargeOutput truncates head+tail in memory and never offloads.
-//   - IsolationMode is IsolationNone and WorkspaceRoot is empty.
+//   - IsolationMode is IsolationWorkspaceScoped (safe-by-default, issue #34)
+//     and WorkspaceRoot is empty.
 //
 // Issue #6 (SandboxProvider) ships the canonical WorkspaceScopedSandbox in
 // sandbox.go for production use.
@@ -113,8 +114,11 @@ func (DefaultSandbox) ResolvePath(_ context.Context, path string, _ Operation) (
 	return path, nil
 }
 
-// IsolationMode reports IsolationNone for the default (non-sandboxed) stub.
-func (DefaultSandbox) IsolationMode() IsolationMode { return IsolationNone{} }
+// IsolationMode reports IsolationWorkspaceScoped — the safe-by-default
+// isolation mode (issue #34). The default sandbox is a non-sandboxed stub, but
+// it must not advertise the gated no-enforcement IsolationNone; that mode only
+// exists under the `dangerous` build tag and requires an explicit opt-in.
+func (DefaultSandbox) IsolationMode() IsolationMode { return IsolationWorkspaceScoped{} }
 
 // WorkspaceRoot returns the empty string — the default sandbox does not
 // enforce a workspace root.

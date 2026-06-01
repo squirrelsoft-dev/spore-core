@@ -124,8 +124,26 @@ const (
 	ModeAutoEdit  Mode = "auto_edit"
 	ModePlan      Mode = "plan"
 	ModeSafeAuto  Mode = "safe_auto"
-	ModeYolo      Mode = "yolo"
+	// ModeYolo (full autonomy, no approval gates) is a named safety footgun.
+	// It is NOT defined in the default build (issue #34): the constant, its
+	// prompt-chunk/approval-policy handling, and its inclusion in the standard
+	// library all live in dangerous.go behind `//go:build dangerous`. In a
+	// default build there is no ModeYolo identifier, so naming it is a compile
+	// error rather than a runtime warning. The wire tag stays "yolo".
 )
+
+// dangerousModePromptChunk is wired up by the `dangerous` build to resolve the
+// prompt chunk for the gated ModeYolo. It is nil in the default build, so the
+// footgun mode is unreachable. Returns ok=false for any mode it does not own.
+var dangerousModePromptChunk func(m Mode) (id ChunkID, content string, ok bool)
+
+// dangerousModeApprovalPolicy mirrors dangerousModePromptChunk for the
+// enforcement policy. nil in the default build.
+var dangerousModeApprovalPolicy func(m Mode) (ApprovalPolicy, bool)
+
+// dangerousModeChunks contributes the gated mode chunks to the standard
+// library. nil in the default build.
+var dangerousModeChunks func() []PromptChunk
 
 // PromptChunk returns the standard chunk for this mode. Lands in
 // ChunkSlotMode in Block 1; always Static.
@@ -145,9 +163,12 @@ func (m Mode) PromptChunk() PromptChunk {
 	case ModeSafeAuto:
 		id = "mode-safe-auto"
 		content = "Mode: SafeAuto. Auto-execute Low and Medium risk actions. High and Critical actions require approval."
-	case ModeYolo:
-		id = "mode-yolo"
-		content = "Mode: Yolo. Full autonomy. No approval gates."
+	default:
+		if dangerousModePromptChunk != nil {
+			if gid, gcontent, ok := dangerousModePromptChunk(m); ok {
+				id, content = gid, gcontent
+			}
+		}
 	}
 	return NewPromptChunk(id, content, ChunkSlotMode, CacheBlockStatic)
 }
@@ -163,9 +184,12 @@ func (m Mode) ApprovalPolicy() ApprovalPolicy {
 		return ApprovalPolicyPlanOnly
 	case ModeSafeAuto:
 		return ApprovalPolicySafeAuto
-	case ModeYolo:
-		return ApprovalPolicyNone
 	default:
+		if dangerousModeApprovalPolicy != nil {
+			if p, ok := dangerousModeApprovalPolicy(m); ok {
+				return p
+			}
+		}
 		return ApprovalPolicyAlwaysAsk
 	}
 }
@@ -632,8 +656,13 @@ func StandardChunks() []PromptChunk {
 	}
 
 	// Modes — derived from the enum so PromptChunk() and StandardChunks() agree.
-	for _, m := range []Mode{ModeAlwaysAsk, ModeAutoEdit, ModePlan, ModeSafeAuto, ModeYolo} {
+	for _, m := range []Mode{ModeAlwaysAsk, ModeAutoEdit, ModePlan, ModeSafeAuto} {
 		out = append(out, m.PromptChunk())
+	}
+	// ModeYolo is gated behind the `dangerous` build tag (issue #34); the
+	// dangerous build contributes its chunk here, the default build does not.
+	if dangerousModeChunks != nil {
+		out = append(out, dangerousModeChunks()...)
 	}
 
 	capabilities := []struct{ id, content string }{

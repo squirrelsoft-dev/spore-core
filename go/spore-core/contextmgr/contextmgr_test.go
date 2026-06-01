@@ -86,8 +86,10 @@ func (passthroughSandbox) HandleLargeOutput(_ context.Context, content string, _
 func (passthroughSandbox) ResolvePath(_ context.Context, p string, _ sporecore.Operation) (string, *sporecore.SandboxViolation) {
 	return p, nil
 }
-func (passthroughSandbox) IsolationMode() sporecore.IsolationMode { return sporecore.IsolationNone{} }
-func (passthroughSandbox) WorkspaceRoot() string                  { return "/" }
+func (passthroughSandbox) IsolationMode() sporecore.IsolationMode {
+	return sporecore.IsolationWorkspaceScoped{}
+}
+func (passthroughSandbox) WorkspaceRoot() string { return "/" }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

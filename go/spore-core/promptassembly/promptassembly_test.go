@@ -59,7 +59,7 @@ func TestR2WhenMode(t *testing.T) {
 	if !b.Evaluate(WhenMode(promptchunkregistry.ModePlan), &c) {
 		t.Fatal("expected plan match")
 	}
-	if b.Evaluate(WhenMode(promptchunkregistry.ModeYolo), &c) {
+	if b.Evaluate(WhenMode(promptchunkregistry.ModeAutoEdit), &c) {
 		t.Fatal("expected yolo no-match")
 	}
 }
@@ -173,7 +173,7 @@ func TestR8AllAnyNot(t *testing.T) {
 	if !b.Evaluate(any, &c) {
 		t.Fatal("expected Any true")
 	}
-	not := Not(WhenMode(promptchunkregistry.ModeYolo))
+	not := Not(WhenMode(promptchunkregistry.ModeAutoEdit))
 	if !b.Evaluate(not, &c) {
 		t.Fatal("expected Not true")
 	}
@@ -467,7 +467,7 @@ func TestCustomConditionNeverEqual(t *testing.T) {
 	if !Always().Equal(Always()) {
 		t.Fatal("Always should equal Always")
 	}
-	if !WhenMode(promptchunkregistry.ModeYolo).Equal(WhenMode(promptchunkregistry.ModeYolo)) {
+	if !WhenMode(promptchunkregistry.ModeAutoEdit).Equal(WhenMode(promptchunkregistry.ModeAutoEdit)) {
 		t.Fatal("WhenMode should compare by value")
 	}
 }
@@ -528,7 +528,7 @@ func TestConditionRoundTripsSerializableVariants(t *testing.T) {
 // ── Serialization: Custom pruned from combinators ──────────────────────────
 func TestCustomPrunedFromCombinators(t *testing.T) {
 	cond := All(
-		WhenMode(promptchunkregistry.ModeYolo),
+		WhenMode(promptchunkregistry.ModeAutoEdit),
 		Custom(func(*AssemblyContext) bool { return true }),
 	)
 	s, err := json.Marshal(cond)
@@ -539,7 +539,7 @@ func TestCustomPrunedFromCombinators(t *testing.T) {
 	if err := json.Unmarshal(s, &back); err != nil {
 		t.Fatal(err)
 	}
-	want := All(WhenMode(promptchunkregistry.ModeYolo))
+	want := All(WhenMode(promptchunkregistry.ModeAutoEdit))
 	if !back.Equal(want) {
 		t.Fatalf("expected Custom pruned, got %s", s)
 	}
