@@ -8,15 +8,15 @@
       ],
       "compose": {
         "role": "role-test",
-        "mode": "yolo",
+        "mode": "safe_auto",
         "capabilities": [],
         "skills": []
       },
       "expected_chunks": [
         { "slot": "role", "id": "role-test" },
-        { "slot": "mode", "id": "mode-yolo" }
+        { "slot": "mode", "id": "mode-safe-auto" }
       ],
-      "rendered_contains": ["you are a test agent", "Mode: Yolo"]
+      "rendered_contains": ["you are a test agent", "Mode: SafeAuto"]
     },
     {
       "name": "coding_agent_safeauto_with_capabilities_and_skills",

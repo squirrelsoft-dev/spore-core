@@ -910,7 +910,7 @@ mod tests {
         let mut c = ctx();
         c.mode = Mode::Plan;
         assert!(b.evaluate(&ChunkCondition::WhenMode(Mode::Plan), &c));
-        assert!(!b.evaluate(&ChunkCondition::WhenMode(Mode::Yolo), &c));
+        assert!(!b.evaluate(&ChunkCondition::WhenMode(Mode::AutoEdit), &c));
     }
 
     // ── R3: WhenToolActive ───────────────────────────────────────────────────
@@ -1013,7 +1013,7 @@ mod tests {
         ]);
         assert!(b.evaluate(&any, &c));
 
-        let not = ChunkCondition::Not(Box::new(ChunkCondition::WhenMode(Mode::Yolo)));
+        let not = ChunkCondition::Not(Box::new(ChunkCondition::WhenMode(Mode::AutoEdit)));
         assert!(b.evaluate(&not, &c));
     }
 
@@ -1284,8 +1284,8 @@ mod tests {
         // Non-custom variants still compare by value.
         assert_eq!(ChunkCondition::Always, ChunkCondition::Always);
         assert_eq!(
-            ChunkCondition::WhenMode(Mode::Yolo),
-            ChunkCondition::WhenMode(Mode::Yolo)
+            ChunkCondition::WhenMode(Mode::AutoEdit),
+            ChunkCondition::WhenMode(Mode::AutoEdit)
         );
     }
 
@@ -1328,14 +1328,14 @@ mod tests {
     fn custom_pruned_from_combinators_on_serialize() {
         // A Custom child inside All is pruned; the rest survive round-trip.
         let cond = ChunkCondition::All(vec![
-            ChunkCondition::WhenMode(Mode::Yolo),
+            ChunkCondition::WhenMode(Mode::AutoEdit),
             ChunkCondition::Custom(Arc::new(|_| true)),
         ]);
         let s = serde_json::to_string(&cond).unwrap();
         let back: ChunkCondition = serde_json::from_str(&s).unwrap();
         assert_eq!(
             back,
-            ChunkCondition::All(vec![ChunkCondition::WhenMode(Mode::Yolo)])
+            ChunkCondition::All(vec![ChunkCondition::WhenMode(Mode::AutoEdit)])
         );
     }
 

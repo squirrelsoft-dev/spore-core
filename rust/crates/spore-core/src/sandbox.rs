@@ -123,6 +123,7 @@ impl WorkspaceScopedSandbox {
             config.root = canonical;
         }
 
+        #[cfg(feature = "dangerous")]
         if matches!(mode, IsolationMode::None) {
             eprintln!(
                 "spore-core: WorkspaceScopedSandbox constructed with IsolationMode::None — \
@@ -301,7 +302,9 @@ impl SandboxProvider for WorkspaceScopedSandbox {
     ) -> BoxFut<'a, Result<CommandOutput, SandboxViolation>> {
         Box::pin(async move {
             match self.isolation_mode {
-                IsolationMode::None | IsolationMode::WorkspaceScoped => {}
+                #[cfg(feature = "dangerous")]
+                IsolationMode::None => {}
+                IsolationMode::WorkspaceScoped => {}
                 IsolationMode::Bubblewrap { .. } => {
                     // TODO(#6): wire bubblewrap backend.
                     return Err(SandboxViolation::DisallowedCommand {
@@ -474,6 +477,7 @@ mod tests {
         assert!(matches!(err, BuildError::RootNotFound { .. }));
     }
 
+    #[cfg(feature = "dangerous")]
     #[tokio::test]
     async fn build_none_isolation_succeeds_and_warns() {
         let dir = TempDir::new().unwrap();

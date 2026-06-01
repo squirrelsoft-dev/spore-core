@@ -26,6 +26,11 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 [features]
 default = []
 test-utils = []
+# Gates the two named safety footguns `Mode::Yolo` and `IsolationMode::None`.
+# When this feature is OFF (the default), those variants do not exist, so any
+# attempt to use them is a compile error rather than a runtime warning. Intended
+# for benchmarking and local development only — do not enable in production.
+dangerous = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

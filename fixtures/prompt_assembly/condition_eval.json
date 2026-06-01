@@ -21,7 +21,7 @@
     },
     {
       "name": "r2_when_mode_no_match",
-      "condition": { "type": "when_mode", "mode": "yolo" },
+      "condition": { "type": "when_mode", "mode": "auto_edit" },
       "assembly_context": {
         "session_id": "s1", "task_id": "t1", "turn_number": 1,
         "mode": "plan", "phase": "planning"
@@ -226,7 +226,7 @@
       "name": "r8_not_true",
       "condition": {
         "type": "not",
-        "condition": { "type": "when_mode", "mode": "yolo" }
+        "condition": { "type": "when_mode", "mode": "auto_edit" }
       },
       "assembly_context": {
         "session_id": "s1", "task_id": "t1", "turn_number": 1,

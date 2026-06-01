@@ -1,0 +1,22 @@
+{
+  "description": "Dangerous-feature-only fixture for PromptChunkRegistry (issue #34).\n\nThis fixture exercises `Mode::Yolo`, which only exists when the `dangerous` feature flag is enabled. It is replayed ONLY by the dangerous-gated test suite in each language (e.g. Rust `--features dangerous`). The default cross-language suite must NEVER load this file. Same case schema as `basic.json`.",
+  "cases": [
+    {
+      "name": "yolo_mode_renders",
+      "register_inputs": [
+        { "id": "role-test", "content": "you are a test agent", "slot": "role", "cache_block": "static" }
+      ],
+      "compose": {
+        "role": "role-test",
+        "mode": "yolo",
+        "capabilities": [],
+        "skills": []
+      },
+      "expected_chunks": [
+        { "slot": "role", "id": "role-test" },
+        { "slot": "mode", "id": "mode-yolo" }
+      ],
+      "rendered_contains": ["you are a test agent", "Mode: Yolo"]
+    }
+  ]
+}

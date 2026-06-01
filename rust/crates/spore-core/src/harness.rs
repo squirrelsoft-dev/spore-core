@@ -5,6 +5,15 @@
 //! the harness needs comes in via [`HarnessRunOptions`] or [`PausedState`],
 //! and everything it produces goes out via [`RunResult`].
 //!
+//! ## `dangerous` feature gate
+//!
+//! `IsolationMode::None` (no path enforcement) is a named safety footgun and is
+//! only compiled when the `dangerous` Cargo feature is enabled (issue #34). The
+//! default build omits it, so using it is a compile error rather than a runtime
+//! warning. Consequently the [`SandboxProvider::isolation_mode`] default body is
+//! now `IsolationMode::WorkspaceScoped` (safe-by-default) instead of `None`. The
+//! wire tag for the gated variant stays `"none"`.
+//!
 //! ## What this component does
 //!
 //! - Assemble context (via `ContextManager`) before each turn
@@ -642,9 +651,12 @@ pub trait SandboxProvider: Send + Sync {
     }
 
     /// Active isolation mode. Used by observability and middleware. Default
-    /// returns `IsolationMode::None`; production sandboxes should override.
+    /// returns `IsolationMode::WorkspaceScoped` (safe-by-default, issue #34).
+    /// A provider that genuinely wants no isolation must override this and opt
+    /// in to `IsolationMode::None`, which only exists under the `dangerous`
+    /// feature.
     fn isolation_mode(&self) -> IsolationMode {
-        IsolationMode::None
+        IsolationMode::WorkspaceScoped
     }
 
     /// Workspace root used by `ContextManager` for directory-map injection.
@@ -674,7 +686,9 @@ pub enum Operation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IsolationMode {
     /// No isolation. Trusted-dev use only; the sandbox must emit a warning
-    /// at construction time.
+    /// at construction time. Gated behind the `dangerous` feature (issue #34);
+    /// absent from the default build. The wire tag stays `"none"`.
+    #[cfg(feature = "dangerous")]
     None,
     /// Path enforcement only — no process or network isolation. Default for
     /// the canonical `WorkspaceScopedSandbox`.
@@ -6959,7 +6973,8 @@ mod tests {
     // (Full byte fixture lives in `fixtures/harness/escalation_signals.json`.)
     #[test]
     fn harness_signal_wire_format_round_trips() {
-        let cases = vec![
+        #[cfg_attr(not(feature = "dangerous"), allow(unused_mut))]
+        let mut cases = vec![
             ToolOutput::Escalate {
                 signal: HarnessSignal::EnterPlanMode {
                     context: "ctx".into(),
@@ -6975,13 +6990,20 @@ mod tests {
             },
             ToolOutput::Escalate {
                 signal: HarnessSignal::SwitchMode {
-                    mode: crate::prompt_chunk_registry::Mode::Yolo,
+                    mode: crate::prompt_chunk_registry::Mode::SafeAuto,
                 },
             },
             ToolOutput::Escalate {
                 signal: abort_signal(),
             },
         ];
+        // Yolo only exists under the `dangerous` feature (issue #34).
+        #[cfg(feature = "dangerous")]
+        cases.push(ToolOutput::Escalate {
+            signal: HarnessSignal::SwitchMode {
+                mode: crate::prompt_chunk_registry::Mode::Yolo,
+            },
+        });
         for case in cases {
             let json = serde_json::to_string(&case).unwrap();
             let back: ToolOutput = serde_json::from_str(&json).unwrap();

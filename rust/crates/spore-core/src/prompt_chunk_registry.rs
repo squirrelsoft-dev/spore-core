@@ -25,6 +25,13 @@
 //!     missing required slots (Role and Mode), or more than one Mode chunk.
 //!   - Mode is permanent for the life of a harness instance — there is no
 //!     mutation API. Changing mode means building a new harness.
+//!
+//! ## `dangerous` feature gate
+//!
+//! `Mode::Yolo` (full autonomy, no approval gates) is a named safety footgun.
+//! It is only compiled when the `dangerous` Cargo feature is enabled. In the
+//! default build the variant does not exist, so using it is a compile error
+//! rather than a runtime warning. The wire tag stays `"yolo"`. See issue #34.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
@@ -129,6 +136,9 @@ pub enum Mode {
     AutoEdit,
     Plan,
     SafeAuto,
+    /// Full autonomy — no approval gates. Gated behind the `dangerous` feature
+    /// (issue #34); absent from the default build.
+    #[cfg(feature = "dangerous")]
     Yolo,
 }
 
@@ -153,6 +163,7 @@ impl Mode {
                 "mode-safe-auto",
                 "Mode: SafeAuto. Auto-execute Low and Medium risk actions. High and Critical actions require approval.",
             ),
+            #[cfg(feature = "dangerous")]
             Mode::Yolo => (
                 "mode-yolo",
                 "Mode: Yolo. Full autonomy. No approval gates.",
@@ -168,6 +179,7 @@ impl Mode {
             Mode::AutoEdit => ApprovalPolicy::AutoExplain,
             Mode::Plan => ApprovalPolicy::PlanOnly,
             Mode::SafeAuto => ApprovalPolicy::SafeAuto,
+            #[cfg(feature = "dangerous")]
             Mode::Yolo => ApprovalPolicy::None,
         }
     }
@@ -605,15 +617,11 @@ pub fn standard_chunks() -> Vec<PromptChunk> {
 
     // Modes — derived from the enum so prompt_chunk() and standard_chunks()
     // are guaranteed to agree.
-    for mode in [
-        Mode::AlwaysAsk,
-        Mode::AutoEdit,
-        Mode::Plan,
-        Mode::SafeAuto,
-        Mode::Yolo,
-    ] {
+    for mode in [Mode::AlwaysAsk, Mode::AutoEdit, Mode::Plan, Mode::SafeAuto] {
         out.push(mode.prompt_chunk());
     }
+    #[cfg(feature = "dangerous")]
+    out.push(Mode::Yolo.prompt_chunk());
 
     // Capabilities
     for (id, content) in [
@@ -803,7 +811,7 @@ mod tests {
     fn compose_missing_role_returns_error() {
         let r = StandardPromptChunkRegistry::new();
         let err = r
-            .compose(ChunkId::new("missing"), Mode::Yolo, vec![], vec![])
+            .compose(ChunkId::new("missing"), Mode::SafeAuto, vec![], vec![])
             .unwrap_err();
         assert!(err
             .iter()
@@ -872,10 +880,10 @@ mod tests {
         let r1 = registry_with_role("role-test");
         let r2 = registry_with_role("role-test");
         let a = r1
-            .compose(ChunkId::new("role-test"), Mode::Yolo, vec![], vec![])
+            .compose(ChunkId::new("role-test"), Mode::SafeAuto, vec![], vec![])
             .unwrap();
         let b = r2
-            .compose(ChunkId::new("role-test"), Mode::Yolo, vec![], vec![])
+            .compose(ChunkId::new("role-test"), Mode::SafeAuto, vec![], vec![])
             .unwrap();
         assert_eq!(a.block_1_hash, b.block_1_hash);
         assert_eq!(a.block_2_hash, b.block_2_hash);
@@ -885,7 +893,7 @@ mod tests {
     fn block_1_hash_changes_when_content_changes() {
         let a = {
             let r = registry_with_role("role-test");
-            r.compose(ChunkId::new("role-test"), Mode::Yolo, vec![], vec![])
+            r.compose(ChunkId::new("role-test"), Mode::SafeAuto, vec![], vec![])
                 .unwrap()
         };
         let b = {
@@ -897,7 +905,7 @@ mod tests {
                 CacheBlock::Static,
             ))
             .unwrap();
-            r.compose(ChunkId::new("role-test"), Mode::Yolo, vec![], vec![])
+            r.compose(ChunkId::new("role-test"), Mode::SafeAuto, vec![], vec![])
                 .unwrap()
         };
         assert_ne!(a.block_1_hash, b.block_1_hash);
@@ -912,7 +920,7 @@ mod tests {
         let composed = ComposedPrompt {
             chunks: vec![
                 PromptChunk::new("role-x", "x", ChunkSlot::Role, CacheBlock::Static),
-                Mode::Yolo.prompt_chunk(),
+                Mode::SafeAuto.prompt_chunk(),
                 // Budget chunk with Static cache block — simulates a bug.
                 PromptChunk {
                     id: ChunkId::new("bad-budget"),
@@ -940,7 +948,7 @@ mod tests {
         let composed = ComposedPrompt {
             chunks: vec![
                 PromptChunk::new("role-x", "x", ChunkSlot::Role, CacheBlock::Static),
-                Mode::Yolo.prompt_chunk(),
+                Mode::SafeAuto.prompt_chunk(),
                 Mode::AlwaysAsk.prompt_chunk(),
             ],
             block_1_hash: 0,
@@ -959,7 +967,7 @@ mod tests {
     fn validate_flags_missing_role_slot() {
         let r = StandardPromptChunkRegistry::new();
         let composed = ComposedPrompt {
-            chunks: vec![Mode::Yolo.prompt_chunk()],
+            chunks: vec![Mode::SafeAuto.prompt_chunk()],
             block_1_hash: 0,
             block_2_hash: 0,
             rendered: None,
@@ -991,12 +999,14 @@ mod tests {
         );
         assert_eq!(Mode::Plan.approval_policy(), ApprovalPolicy::PlanOnly);
         assert_eq!(Mode::SafeAuto.approval_policy(), ApprovalPolicy::SafeAuto);
+        #[cfg(feature = "dangerous")]
         assert_eq!(Mode::Yolo.approval_policy(), ApprovalPolicy::None);
     }
 
     #[test]
     fn mode_default_tool_phase_plan_is_planning() {
         assert_eq!(Mode::Plan.default_tool_phase(), TaskPhase::Planning);
+        #[cfg(feature = "dangerous")]
         assert_eq!(Mode::Yolo.default_tool_phase(), TaskPhase::Execution);
     }
 
@@ -1006,12 +1016,12 @@ mod tests {
     fn composed_prompt_render_joins_chunks_with_blank_line() {
         let r = registry_with_role("role-test");
         let mut composed = r
-            .compose(ChunkId::new("role-test"), Mode::Yolo, vec![], vec![])
+            .compose(ChunkId::new("role-test"), Mode::SafeAuto, vec![], vec![])
             .unwrap();
         assert!(composed.rendered.is_none());
         let rendered = composed.render().to_string();
         assert!(rendered.contains("you are a test agent"));
-        assert!(rendered.contains("Mode: Yolo"));
+        assert!(rendered.contains("Mode: SafeAuto"));
         assert!(composed.rendered.is_some());
     }
 
@@ -1064,10 +1074,8 @@ mod tests {
         id: String,
     }
 
-    #[test]
-    fn fixture_replay_basic() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../fixtures/prompt_chunk_registry/basic.json");
+    fn run_fixture_file(rel_path: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
         let bytes = std::fs::read(&path).expect("read fixture file");
         let file: FixtureFile = serde_json::from_slice(&bytes).expect("parse fixture json");
         for case in file.cases {
@@ -1115,6 +1123,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fixture_replay_basic() {
+        run_fixture_file("../../../fixtures/prompt_chunk_registry/basic.json");
+    }
+
+    // `dangerous.json` exercises `Mode::Yolo`, which only exists under the
+    // `dangerous` feature (issue #34). Replayed only by the dangerous-gated
+    // suite; the default suite never touches it.
+    #[cfg(feature = "dangerous")]
+    #[test]
+    fn fixture_replay_dangerous() {
+        run_fixture_file("../../../fixtures/prompt_chunk_registry/dangerous.json");
     }
 
     // ── Compose with standard library smoke-test ────────────────────────────
