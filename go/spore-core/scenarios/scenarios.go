@@ -8,13 +8,17 @@
 //
 // ## Architectural gaps closed here vs. already-present in Go
 //
-//   - RealToolRegistry bridge — NOT needed in Go. The harness ToolRegistry seam
-//     IS sporecore.ToolRegistry (Dispatch(ctx, call, sandbox)), so a
-//     StandardToolRegistry plugs directly into HarnessConfig.ToolRegistry, and
-//     the loop's dispatchAndUnwrap already maps a DispatchError onto a
+//   - RealToolRegistry bridge — NOT needed in Go (issue #91). The harness
+//     ToolRegistry seam IS sporecore.ToolRegistry (Dispatch(ctx, call, sandbox)),
+//     so a *StandardToolRegistry plugs directly into HarnessConfig.ToolRegistry
+//     (or HarnessConfig.CatalogueRegistry for the builder's .Tool()/.Tools()
+//     path), and the loop's dispatchAndUnwrap already maps a DispatchError onto a
 //     recoverable ToolOutputError (and never halts on the recoverable
-//     FailingTool). BuildRealToolRegistry returns the StandardToolRegistry
-//     directly.
+//     FailingTool). Where Rust graduated a distinct RealToolRegistry bridge type
+//     into its tool_registry module, Go's canonical *StandardToolRegistry — in
+//     the blessed tool_registry.go — already IS that production bridge (documented
+//     there), with SetToolContext threading the per-run storage seam.
+//     BuildRealToolRegistry returns the StandardToolRegistry directly.
 //   - SchemaInjectingContextManager — needed. The StandardCompactionAdapter's
 //     Assemble returns a Context with no Tools, so without this decorator the
 //     live model never sees any tools and can never emit a tool call. The

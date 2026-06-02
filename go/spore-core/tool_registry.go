@@ -378,6 +378,51 @@ func (noOpToolRunStore) Get(context.Context, SessionID, string) (json.RawMessage
 }
 func (noOpToolRunStore) Put(context.Context, SessionID, string, json.RawMessage) error { return nil }
 
+// inMemoryToolRunStore is a mutex-guarded, process-local ToolRunStore. It is the
+// HarnessBuilder's default when catalogue tools are present and the caller wired
+// no storage, so session-aware tools (todo_write, memory, task_list) actually
+// persist WITHIN a run — the Go analog of Rust's in-memory storage default. It is
+// deliberately defined here (the root package) rather than in the storage package
+// so the HarnessBuilder, which lives in the observability package and cannot
+// import storage (storage imports observability — a cycle), can default to it.
+type inMemoryToolRunStore struct {
+	mu     sync.Mutex
+	values map[runStoreKey]json.RawMessage
+}
+
+type runStoreKey struct {
+	session SessionID
+	key     string
+}
+
+// NewInMemoryToolRunStore constructs an empty, process-local ToolRunStore. Values
+// round-trip within the process for the life of the store; nothing is persisted
+// across processes.
+func NewInMemoryToolRunStore() ToolRunStore {
+	return &inMemoryToolRunStore{values: map[runStoreKey]json.RawMessage{}}
+}
+
+func (s *inMemoryToolRunStore) Get(_ context.Context, sessionID SessionID, key string) (json.RawMessage, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.values[runStoreKey{sessionID, key}]
+	if !ok {
+		return nil, false, nil
+	}
+	cp := make(json.RawMessage, len(v))
+	copy(cp, v)
+	return cp, true, nil
+}
+
+func (s *inMemoryToolRunStore) Put(_ context.Context, sessionID SessionID, key string, value json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make(json.RawMessage, len(value))
+	copy(cp, value)
+	s.values[runStoreKey{sessionID, key}] = cp
+	return nil
+}
+
 // ============================================================================
 // Tool interface
 // ============================================================================
@@ -483,6 +528,17 @@ type registered struct {
 // StandardToolRegistry is the default in-memory registry. Concurrency-safe:
 // register / lookup go through a RWMutex. The lock is held only briefly;
 // the tool itself executes lock-free.
+//
+// THE PRODUCTION BRIDGE (not test scaffolding). In Rust the harness-loop
+// ToolRegistry trait and the canonical (catalogue) ToolRegistry trait are
+// DISTINCT, and a `RealToolRegistry` bridges one onto the other per-run. Go has
+// no such split: this canonical registry directly satisfies the harness-loop
+// `ToolRegistry` interface (Dispatch(ctx, call, sandbox)), so a populated
+// *StandardToolRegistry plugs straight into HarnessConfig and IS the per-run
+// bridge — there is no separate RealToolRegistry type to import. The
+// HarnessBuilder folds catalogue tools added via .Tool() / .Tools() into one of
+// these and the run loop re-injects its ToolContext each run via
+// effectiveToolRegistry (the Go analog of Rust's effective_tool_registry).
 //
 // Storage seam (#75): the registry is the per-run bridge. It is constructed with
 // the run's SessionID + RunStore (construction-injection, see

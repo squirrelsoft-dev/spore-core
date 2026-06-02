@@ -387,11 +387,25 @@ type HarnessBuilder struct {
 	// simply contributes nothing.
 	spanStore SpanStore
 	// catalogueTools accumulates StandardTools (issue #81) added via Tool() /
-	// Tools(). They are drained into the configured ToolRegistry at build time
-	// via Register() — a last-wins upsert (issue #81, Q1) — so a tool added
+	// Tools(). At build time they are folded into a fresh, populated
+	// *StandardToolRegistry — a last-wins upsert (issue #81, Q1), so a tool added
 	// later (e.g. a custom override) wins over an earlier standard tool of the
-	// same name. This mirrors the Rust builder's drain_tools_into_registry seam.
+	// same name — placed on HarnessConfig.CatalogueRegistry. The run loop then
+	// bridges that registry per-run (threading the run's SessionID + storage). This
+	// mirrors the Rust builder's drain_tools_into_registry + catalogue_registry
+	// seam. Nil accumulator preserves the ToolRegistry-only path.
 	catalogueTools []sporecore.StandardTool
+	// runStore / memStore are the optional storage seams threaded into catalogue
+	// tools' ToolContext (issue #75/#78). When catalogue tools are present and
+	// neither was set, the builder defaults runStore to an in-memory store so
+	// session-aware tools persist within a run (the Go analog of Rust's in-memory
+	// storage default).
+	runStore sporecore.ToolRunStore
+	memStore sporecore.ToolMemoryStore
+	// systemPrompt is the optional operating system prompt prepended to each
+	// turn's assembled context when the context manager renders none (issue #91).
+	// Empty (the default) preserves today's behaviour.
+	systemPrompt string
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -510,25 +524,67 @@ func (b *HarnessBuilder) Tools(ts ...sporecore.StandardTool) *HarnessBuilder {
 	return b
 }
 
-// drainToolsIntoRegistry registers every accumulated catalogue tool into the
-// configured ToolRegistry via Register() (a last-wins upsert). Mirrors the Rust
-// builder's drain_tools_into_registry. Best-effort: a registration error (e.g.
-// an invalid custom schema) is silently skipped here — the registry's own
-// validation is the gate, and the harness loop surfaces an unregistered tool at
-// dispatch time. Drains the accumulator so a second build does not double-register.
-func (b *HarnessBuilder) drainToolsIntoRegistry() {
-	if b.toolRegistry == nil {
-		return
+// SystemPrompt sets an operating system prompt prepended to each turn's
+// assembled context (issue #91).
+//
+// A context manager that renders no system prompt (e.g. the standard compaction
+// adapter) leaves the model with only the task as a user message and no guidance
+// on how to behave. When set, the run loop inserts this text as a leading
+// System-role message each turn — but only when the assembled context does not
+// already start with one, so a context manager that renders its own system prompt
+// is preserved. Empty (the default) preserves today's behaviour. Returns the
+// receiver for fluent chaining.
+func (b *HarnessBuilder) SystemPrompt(text string) *HarnessBuilder {
+	b.systemPrompt = text
+	return b
+}
+
+// Storage wires the per-run storage seams threaded into catalogue tools'
+// ToolContext (issue #75/#78): runStore is the structured-state store, memStore
+// the episodic-memory store. Pass a *storage.StorageProvider's Run() and Memory()
+// stores — they satisfy these consumer-side interfaces structurally, so the
+// builder (in this package) never imports the storage package (which would form a
+// cycle: storage imports observability). When catalogue tools are present and no
+// storage was set, the builder defaults runStore to an in-memory store so
+// session-aware tools persist within a run. Returns the receiver for chaining.
+func (b *HarnessBuilder) Storage(runStore sporecore.ToolRunStore, memStore sporecore.ToolMemoryStore) *HarnessBuilder {
+	b.runStore = runStore
+	b.memStore = memStore
+	return b
+}
+
+// foldCatalogueRegistry folds every accumulated catalogue tool into a fresh,
+// populated *StandardToolRegistry via Register() (a last-wins upsert) and returns
+// it, or nil when no catalogue tools were added. Mirrors the Rust builder's
+// drain_tools_into_registry: build() folds the tools, the run loop bridges the
+// registry per-run. Best-effort: a registration error (e.g. an invalid custom
+// schema) is silently skipped here — the registry's own validation is the gate,
+// and the harness loop surfaces an unregistered tool at dispatch time. Drains the
+// accumulator so a second build does not double-register.
+func (b *HarnessBuilder) foldCatalogueRegistry() *sporecore.StandardToolRegistry {
+	if len(b.catalogueTools) == 0 {
+		return nil
 	}
+	reg := sporecore.NewStandardToolRegistry()
 	for _, t := range b.catalogueTools {
-		_ = b.toolRegistry.Register(t.Implementation, t.Schema)
+		_ = reg.Register(t.Implementation, t.Schema)
 	}
 	b.catalogueTools = nil
+	return reg
 }
 
 // BuildConfig assembles the HarnessConfig without wrapping it in a harness.
 func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
-	b.drainToolsIntoRegistry()
+	catalogue := b.foldCatalogueRegistry()
+	// When catalogue tools are present and the caller wired no storage, default
+	// the run store to an in-memory provider (not the no-op default) so that
+	// session-aware tools (task_list, todo_write, memory) actually persist within
+	// the run. Pure tools (read_file/write_file via the sandbox) are unaffected
+	// either way. Mirrors the Rust in-memory storage default.
+	runStore := b.runStore
+	if catalogue != nil && runStore == nil && b.memStore == nil {
+		runStore = sporecore.NewInMemoryToolRunStore()
+	}
 	cfg := sporecore.HarnessConfig{
 		Agent:                 b.agent,
 		ToolRegistry:          b.toolRegistry,
@@ -538,6 +594,10 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		Middleware:            b.middleware,
 		CompactionVerifier:    b.compactionVerifier,
 		MaxCompactionAttempts: b.maxCompactionAttempts,
+		CatalogueRegistry:     catalogue,
+		ToolRunStore:          runStore,
+		ToolMemoryStore:       b.memStore,
+		SystemPrompt:          b.systemPrompt,
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)

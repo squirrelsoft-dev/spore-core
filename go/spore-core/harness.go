@@ -558,11 +558,18 @@ const (
 type ToolOutput struct {
 	Kind ToolOutputKind `json:"kind"`
 	// success
-	Content   string `json:"-"`
-	Truncated bool   `json:"-"`
+	Content string `json:"-"`
+	// Truncated is true ONLY when the tool itself clipped its output to fit an
+	// inline budget (large outputs routed through SandboxProvider.HandleLargeOutput
+	// set this). Plain tool authors should leave it false — use NewToolOutputSuccess.
+	Truncated bool `json:"-"`
 	// error
-	Message     string `json:"-"`
-	Recoverable bool   `json:"-"`
+	Message string `json:"-"`
+	// Recoverable is true if the agent may sensibly retry or adapt: the loop
+	// appends the error as a tool result and continues. False halts the run. Most
+	// tool failures are recoverable — prefer NewToolOutputError; reach for
+	// NewToolOutputFatal only when continuing is pointless.
+	Recoverable bool `json:"-"`
 	// waiting_for_human
 	ChildState *ChildPausedState `json:"-"`
 	Request    *HumanRequest     `json:"-"`
@@ -646,6 +653,29 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	o.Question = probe.Question
 	o.Options = probe.Options
 	return nil
+}
+
+// NewToolOutputSuccess returns a successful, non-truncated result. The common
+// case for a tool that returns its full output — saves spelling out the Kind +
+// Truncated fields. Mirrors Rust's ToolOutput::success.
+func NewToolOutputSuccess(content string) ToolOutput {
+	return ToolOutput{Kind: ToolOutputSuccess, Content: content, Truncated: false}
+}
+
+// NewToolOutputError returns a RECOVERABLE error: the harness loop appends it as
+// a tool result and lets the agent adapt or retry. This is the right default for
+// almost every tool failure (bad arguments, missing file, transient I/O).
+// Mirrors Rust's ToolOutput::error.
+func NewToolOutputError(message string) ToolOutput {
+	return ToolOutput{Kind: ToolOutputError, Message: message, Recoverable: true}
+}
+
+// NewToolOutputFatal returns a FATAL error: continuing is pointless, so the run
+// halts. Reserve for genuinely unrecoverable conditions; prefer NewToolOutputError
+// when the agent could reasonably do something different next turn. Mirrors
+// Rust's ToolOutput::fatal.
+func NewToolOutputFatal(message string) ToolOutput {
+	return ToolOutput{Kind: ToolOutputError, Message: message, Recoverable: false}
 }
 
 // HarnessToolResult is the recorded outcome of one tool call dispatch by the
@@ -2022,6 +2052,35 @@ type HarnessConfig struct {
 	// family (#23) is bridged into it via metric.AsHarnessMetricEvaluator,
 	// avoiding a sporecore -> metric import cycle (metric imports sporecore).
 	MetricEvaluator MetricEvaluator // optional (required by HillClimbing)
+
+	// CatalogueRegistry holds the catalogue tools accumulated via
+	// HarnessBuilder.Tool / Tools (issue #81), folded into a populated
+	// *StandardToolRegistry at build time. When non-nil, the run loop bridges it
+	// per-run via effectiveToolRegistry — threading the run's SessionID + the
+	// ToolRunStore / ToolMemoryStore seams into every tool dispatch through
+	// SetToolContext — and uses it instead of ToolRegistry (which stays the
+	// harness-loop seam for custom slim registries). Nil (the default) preserves
+	// the ToolRegistry-only path byte-for-byte. Unlike Rust, Go has no separate
+	// RealToolRegistry bridge type: *StandardToolRegistry IS the harness
+	// ToolRegistry, so the per-run "bridge" is the same registry with its
+	// ToolContext re-injected each run.
+	CatalogueRegistry *StandardToolRegistry // optional
+
+	// ToolRunStore is the per-run structured-state seam threaded into catalogue
+	// tools' ToolContext (issue #75). Optional; nil means catalogue tools persist
+	// nothing across processes (no-op store). The builder defaults this to an
+	// in-memory store when catalogue tools are present and no storage was wired.
+	ToolRunStore ToolRunStore // optional
+	// ToolMemoryStore is the episodic-memory seam threaded into catalogue tools'
+	// ToolContext (issue #78/#82). Optional; nil is the never-null library default
+	// (a no-op for memory-aware tools).
+	ToolMemoryStore ToolMemoryStore // optional
+
+	// SystemPrompt is the operating system prompt prepended to each turn's
+	// assembled context when the context manager renders none (issue #91). See
+	// HarnessBuilder.SystemPrompt. Empty (the default) preserves today's behaviour
+	// byte-for-byte.
+	SystemPrompt string // optional
 }
 
 // RunStore is the consumer-side view of the per-run structured-state store the
@@ -2195,6 +2254,28 @@ func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID S
 	}
 	h.config.Observability.SetSessionOutcome(sessionID, outcome, failureReason)
 	h.config.Observability.FlushSession(ctx, sessionID)
+}
+
+// effectiveToolRegistry returns the harness-loop tool registry to use for a run
+// keyed by sessionID. Mirrors Rust's effective_tool_registry.
+//
+// When catalogue tools were added via HarnessBuilder.Tool / Tools, the builder
+// folded them into a *StandardToolRegistry held in CatalogueRegistry. This
+// re-injects that registry's ToolContext with the run's SessionID + the
+// configured storage seams (so every tool dispatch threads the run's storage)
+// and returns it. Otherwise it returns the injected ToolRegistry seam unchanged.
+//
+// Unlike Rust — which builds a fresh RealToolRegistry bridge per run — Go's
+// canonical registry IS the harness registry, so the per-run wiring is a
+// SetToolContext call on the shared registry rather than a new bridge object.
+func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID) ToolRegistry {
+	if h.config.CatalogueRegistry == nil {
+		return h.config.ToolRegistry
+	}
+	h.config.CatalogueRegistry.SetToolContext(
+		NewToolContext(sessionID, h.config.ToolRunStore, h.config.ToolMemoryStore),
+	)
+	return h.config.CatalogueRegistry
 }
 
 // runReAct drives the ReAct loop, then finalizes observability for terminal
@@ -2862,6 +2943,10 @@ func (h *StandardHarness) runReActInner(
 	onStream StreamSink,
 ) RunResult {
 	sessionID := task.SessionID
+	// Resolve the effective tool registry once per turn-loop window. Bridges
+	// catalogue tools per-run (re-injects their ToolContext with this run's
+	// SessionID + storage); otherwise returns the injected ToolRegistry seam.
+	toolRegistry := h.effectiveToolRegistry(sessionID)
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 
@@ -2931,6 +3016,19 @@ func (h *StandardHarness) runReActInner(
 
 		// Assemble + invoke agent for one turn.
 		c := h.config.ContextManager.Assemble(ctx, &session, &task)
+		// Prepend the configured operating system prompt (issue #91). A context
+		// manager that renders none (e.g. the compaction adapter) leaves the model
+		// with only the task and no guidance. Guard against duplicates so a manager
+		// that already leads with a System message (or a resumed/seeded session)
+		// isn't given two. Empty SystemPrompt (the default) is a no-op.
+		if h.config.SystemPrompt != "" {
+			if len(c.Messages) == 0 || c.Messages[0].Role != RoleSystem {
+				c.Messages = append([]Message{{
+					Role:    RoleSystem,
+					Content: NewTextContent(h.config.SystemPrompt),
+				}}, c.Messages...)
+			}
+		}
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
@@ -3068,7 +3166,7 @@ func (h *StandardHarness) runReActInner(
 
 			// Always-halt short circuit (Layer 1).
 			for _, c := range calls {
-				if h.config.ToolRegistry.IsAlwaysHalt(c.Name) {
+				if toolRegistry.IsAlwaysHalt(c.Name) {
 					return RunResult{
 						Kind: RunFailure,
 						Reason: HaltReason{
@@ -3162,7 +3260,7 @@ func (h *StandardHarness) runReActInner(
 				})
 				toolStartedAt := nowRFC3339()
 				toolClock := time.Now()
-				output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
+				output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 
 				// Clarification pause (issue #81, Q4b): a tool (e.g.
 				// ask_user_question) needs a human answer before it can produce a
@@ -3529,6 +3627,11 @@ func (h *StandardHarness) Resume(
 	budget := state.BudgetUsed
 	pending := state.PendingToolCalls
 
+	// Resolve the effective tool registry for this resumed session — bridges
+	// catalogue tools the same way the turn loop does, so pending tool calls
+	// dispatched during resume thread the run's storage + sandbox.
+	toolRegistry := h.effectiveToolRegistry(state.SessionID)
+
 	// Subagent depth-1: a child state, if present, would be resumed via the
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness
 	// itself just round-trips the field and continues the parent loop.
@@ -3557,7 +3660,7 @@ func (h *StandardHarness) Resume(
 				}
 				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 				for _, call := range pending[1:] {
-					output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
+					output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
@@ -3598,13 +3701,13 @@ func (h *StandardHarness) Resume(
 		h.config.ContextManager.AppendUserMessage(ctx, &session, response.Feedback)
 	case HumanRespAllow:
 		for _, call := range pending {
-			output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
+			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
 	case HumanRespAllowWithModification:
 		for _, call := range response.Calls {
-			output := dispatchAndUnwrap(ctx, h.config.ToolRegistry, h.config.Sandbox, call)
+			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 		}
