@@ -39,23 +39,33 @@ Classification rules (must match Rust/TS/Go byte-for-byte):
 
 from __future__ import annotations
 
-from typing import Annotated, ClassVar, Literal, NewType, Protocol, runtime_checkable
+import json
+from collections.abc import Callable
+from typing import Annotated, Any, ClassVar, Literal, NewType, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import SporeError
 from .model import (
+    ContentBlockDelta,
     Message,
+    MessageStart,
+    MessageStop,
     ModelError,
     ModelInterface,
     ModelParams,
     ModelRequest,
+    ModelResponse,
+    StopReason,
+    StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ThinkingDelta,
     TokenUsage,
     ToolCall,
     ToolSchema,
     ToolUseBlock,
+    ToolUseDelta,
 )
 
 # ============================================================================
@@ -86,11 +96,18 @@ class Context(_Model):
     params: ModelParams = Field(default_factory=ModelParams)
 
     def into_request(self) -> ModelRequest:
+        return self.into_request_with_stream(stream=False)
+
+    def into_request_with_stream(self, *, stream: bool) -> ModelRequest:
+        """Build a :class:`ModelRequest`, setting the ``stream`` flag. The
+        streaming turn path (issue #103) builds the request with
+        ``stream=True``."""
+
         return ModelRequest(
             messages=list(self.messages),
             tools=list(self.tools),
             params=self.params,
-            stream=False,
+            stream=stream,
         )
 
 
@@ -184,12 +201,19 @@ class ToolCallRequested(_Model):
     kind: Literal["tool_call_requested"] = "tool_call_requested"
     calls: list[ToolCall]
     usage: TokenUsage
+    # Accumulated reasoning (``Thinking``) text produced in this turn, if any
+    # (issue #103, Q4). Defaults to ``None`` and is omitted from serialized
+    # output when absent, so pre-#103 serialized ``TurnResult``s round-trip.
+    reasoning: str | None = Field(default=None)
 
 
 class FinalResponse(_Model):
     kind: Literal["final_response"] = "final_response"
     content: str
     usage: TokenUsage
+    # Accumulated reasoning (``Thinking``) text produced in this turn, if any
+    # (issue #103, Q4). See note on :class:`ToolCallRequested`.
+    reasoning: str | None = Field(default=None)
 
 
 class TurnError(_Model):
@@ -211,6 +235,14 @@ TurnResult = Annotated[
 # ============================================================================
 
 
+# An owned callback that receives **raw** :class:`spore_core.model.StreamEvent`
+# values as the agent drains a streaming model call (issue #103, Q1). The agent
+# boundary deals only in ``model`` stream events; it does NOT depend on the
+# harness ``StreamEvent`` type. The harness wraps its own sink in an adapter
+# that maps ``model.StreamEvent`` -> ``harness.StreamEvent``.
+AgentStreamSink = Callable[[StreamEvent], None]
+
+
 @runtime_checkable
 class Agent(Protocol):
     """Executes a single turn given a fully assembled :class:`Context`."""
@@ -218,6 +250,77 @@ class Agent(Protocol):
     async def turn(self, context: Context) -> TurnResult: ...
 
     def id(self) -> AgentId: ...
+
+
+async def turn_streaming(
+    agent: Agent,
+    context: Context,
+    sink: AgentStreamSink,
+) -> TurnResult:
+    """Execute one turn, forwarding each raw model ``StreamEvent`` to ``sink``.
+
+    This is the streaming counterpart to :meth:`Agent.turn` (issue #103).
+    Because :class:`Agent` is a structural :class:`~typing.Protocol`, the
+    streaming entry point is a free function rather than a defaulted method:
+    if ``agent`` provides its own ``turn_streaming`` coroutine (e.g.
+    :class:`ModelAgent`) it is used; otherwise this **default** ignores the
+    sink and delegates to :meth:`Agent.turn`, so every existing ``Agent`` impl
+    (e.g. :class:`MockAgent`) keeps working with zero changes.
+    """
+
+    own = getattr(agent, "turn_streaming", None)
+    if own is not None:
+        return await own(context, sink)
+    return await agent.turn(context)
+
+
+def classify_response(response: ModelResponse) -> TurnResult:
+    """Classify an accumulated :class:`ModelResponse` into a :class:`TurnResult`.
+
+    Single source of truth shared by :meth:`ModelAgent.turn` and
+    :meth:`ModelAgent.turn_streaming` (issue #103) — both the blocking and
+    streaming paths buffer a complete ``ModelResponse`` and then run this
+    identical logic so classification can never diverge between them.
+
+    ``Thinking`` blocks are accumulated into the ``reasoning`` field (Q4)
+    instead of being discarded.
+    """
+
+    usage = response.usage
+
+    tool_calls: list[ToolCall] = []
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for block in response.content:
+        if isinstance(block, ToolUseBlock):
+            tool_calls.append(ToolCall(id=block.id, name=block.name, input=block.input))
+        elif isinstance(block, TextBlock):
+            text_parts.append(block.text)
+        elif isinstance(block, ThinkingBlock):
+            # Q4: accumulate thinking text instead of discarding it.
+            reasoning_parts.append(block.text)
+
+    reasoning = "".join(reasoning_parts) if reasoning_parts else None
+
+    stop = response.stop_reason.value
+
+    if stop == "tool_use":
+        if not tool_calls:
+            return TurnError(
+                error=AgentErrorMalformed(
+                    tool_name="",
+                    reason="stop_reason=ToolUse but no ToolUse blocks present",
+                ),
+                usage=usage,
+            )
+        return ToolCallRequested(calls=tool_calls, usage=usage, reasoning=reasoning)
+
+    # end_turn | max_tokens | stop_sequence
+    if not text_parts and not tool_calls:
+        return TurnError(error=AgentErrorEmpty(), usage=usage)
+    if tool_calls:
+        return ToolCallRequested(calls=tool_calls, usage=usage, reasoning=reasoning)
+    return FinalResponse(content="".join(text_parts), usage=usage, reasoning=reasoning)
 
 
 # ============================================================================
@@ -243,41 +346,116 @@ class ModelAgent:
             response = await self._model.call(request)
         except ModelError as e:
             return TurnError(error=_wrap_model_error(e), usage=None)
+        return classify_response(response)
 
-        usage = response.usage
+    async def turn_streaming(self, context: Context, sink: AgentStreamSink) -> TurnResult:
+        """Streaming turn (issue #103).
 
-        # Extract any tool-use blocks regardless of stop_reason; the model
-        # may, in principle, request tool use without setting stop_reason.
-        tool_calls: list[ToolCall] = []
-        text_parts: list[str] = []
-        for block in response.content:
-            if isinstance(block, ToolUseBlock):
-                tool_calls.append(ToolCall(id=block.id, name=block.name, input=block.input))
-            elif isinstance(block, TextBlock):
-                text_parts.append(block.text)
-            elif isinstance(block, ThinkingBlock):
-                # observability only — discard
-                pass
+        Builds a streaming request, drains the model stream forwarding each
+        **raw** ``StreamEvent`` to ``sink``, reassembles a complete
+        :class:`ModelResponse`, then runs the EXACT SAME
+        :func:`classify_response` logic as :meth:`turn`.
 
-        stop = response.stop_reason.value
+        Reassembly rules:
 
-        if stop == "tool_use":
-            if not tool_calls:
-                return TurnError(
-                    error=AgentErrorMalformed(
-                        tool_name="",
-                        reason="stop_reason=ToolUse but no ToolUse blocks present",
-                    ),
-                    usage=usage,
-                )
-            return ToolCallRequested(calls=tool_calls, usage=usage)
+        * :class:`ContentBlockDelta` text deltas concatenate per block index
+          into a ``TextBlock``.
+        * :class:`ThinkingDelta` deltas accumulate into a ``ThinkingBlock``
+          (Q4 — surfaced via ``reasoning``, NOT discarded).
+        * :class:`ToolUseDelta` fragments concatenate and parse into a
+          ``ToolUseBlock``'s ``input`` on block stop.
+        * :class:`MessageStop` carries the final ``usage`` + ``stop_reason``.
 
-        # end_turn | max_tokens | stop_sequence
-        if not text_parts and not tool_calls:
-            return TurnError(error=AgentErrorEmpty(), usage=usage)
-        if tool_calls:
-            return ToolCallRequested(calls=tool_calls, usage=usage)
-        return FinalResponse(content="".join(text_parts), usage=usage)
+        Block ordering is preserved by first-seen stream index.
+
+        Known limitation (issue #103): ``model.StreamEvent`` carries
+        tool-argument deltas but NOT the tool name or id — providers drop them
+        in the streamed frames. The accumulator therefore synthesizes a stable
+        per-index id ``call_{index}`` (matching the harness correlation key)
+        and an EMPTY name. The final arguments round-trip faithfully; under
+        streamed turns the reassembled ``ToolCall`` name is empty.
+        """
+
+        request = context.into_request_with_stream(stream=True)
+        acc = _StreamAccumulator()
+        try:
+            async for event in self._model.call_streaming(request):
+                # Forward the RAW model event to the sink first (Q1), then
+                # fold it into the in-progress response.
+                sink(event)
+                acc.fold(event)
+        except ModelError as e:
+            return TurnError(error=_wrap_model_error(e), usage=None)
+        return classify_response(acc.into_response())
+
+
+# ============================================================================
+# Streaming reassembly (issue #103)
+# ============================================================================
+
+
+class _StreamAccumulator:
+    """Reassembles streamed ``StreamEvent``s into a :class:`ModelResponse`.
+
+    Tracks an ordered set of partial blocks keyed by their stream ``index`` so
+    the reconstructed ``content`` preserves emission (first-seen) order
+    regardless of interleaving.
+    """
+
+    def __init__(self) -> None:
+        # index -> [kind, payload]; kind is "text" | "thinking" | "tool_json".
+        self._blocks: list[tuple[int, str, list[str]]] = []
+        self._usage: TokenUsage = TokenUsage()
+        self._stop_reason: StopReason | None = None
+
+    def _buf(self, index: int, kind: str) -> list[str]:
+        for i, k, payload in self._blocks:
+            if i == index:
+                return payload
+        payload = []
+        self._blocks.append((index, kind, payload))
+        return payload
+
+    def fold(self, event: StreamEvent) -> None:
+        if isinstance(event, MessageStart):
+            return
+        if isinstance(event, ContentBlockDelta):
+            self._buf(event.index, "text").append(event.delta)
+        elif isinstance(event, ThinkingDelta):
+            self._buf(event.index, "thinking").append(event.delta)
+        elif isinstance(event, ToolUseDelta):
+            self._buf(event.index, "tool_json").append(event.partial_json)
+        elif isinstance(event, MessageStop):
+            self._usage = event.usage
+            self._stop_reason = event.stop_reason
+        # ContentBlockStop: nothing to accumulate.
+
+    def into_response(self) -> ModelResponse:
+        content: list[Any] = []
+        for index, kind, payload in self._blocks:
+            joined = "".join(payload)
+            if kind == "text":
+                content.append(TextBlock(text=joined))
+            elif kind == "thinking":
+                content.append(ThinkingBlock(text=joined))
+            else:  # tool_json
+                try:
+                    parsed = json.loads(joined) if joined else {}
+                except json.JSONDecodeError:
+                    parsed = {}
+                if not isinstance(parsed, dict):
+                    parsed = {}
+                # The streaming model events do not carry the tool id / name
+                # (only the partial JSON args). Synthesize a stable per-index
+                # id so the harness correlates by the index-derived id; the
+                # name is left empty (documented limitation).
+                content.append(ToolUseBlock(id=f"call_{index}", name="", input=parsed))
+        return ModelResponse(
+            content=content,
+            usage=self._usage,
+            # Default to END_TURN if the stream ended without MessageStop.
+            stop_reason=self._stop_reason or StopReason.END_TURN,
+        )
 
 
 # ============================================================================
@@ -317,6 +495,7 @@ __all__ = [
     "AgentErrorMalformed",
     "AgentErrorModel",
     "AgentId",
+    "AgentStreamSink",
     "Context",
     "EmptyResponseError",
     "FinalResponse",
@@ -327,4 +506,6 @@ __all__ = [
     "ToolCallRequested",
     "TurnError",
     "TurnResult",
+    "classify_response",
+    "turn_streaming",
 ]

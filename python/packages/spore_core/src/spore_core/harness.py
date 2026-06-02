@@ -62,6 +62,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
 
@@ -70,25 +71,36 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from .agent import (
     Agent,
     AgentError,
+    AgentStreamSink,
     Context,
     FinalResponse,
     ToolCallRequested,
     TurnError,
     TurnResult,
+    turn_streaming as _agent_turn_streaming,
 )
 from .errors import SporeError
 from .model import (
+    ContentBlockDelta,
     ImageContent,
     Message,
+    MessageStart,
+    MessageStop,
     ModelParams,
     Role,
     StopReason,
+    StreamEvent as ModelStreamEvent,
     TextContent,
+    ThinkingDelta,
     TokenUsage,
     ToolCall,
     ToolCallContent as MsgToolCallContent,
     ToolResultContent as MsgToolResultContent,
     ToolSchema,
+    ToolUseDelta,
+)
+from .model import (
+    ContentBlockStop as ModelContentBlockStop,
 )
 
 if TYPE_CHECKING:
@@ -254,6 +266,16 @@ class Task(_Model):
 # ============================================================================
 
 
+class BlockKind(str, Enum):
+    """The kind of content block a :class:`StreamBlockStart` opens (issue #103,
+    Q2: a single generic frame marker carrying a ``BlockKind`` rather than
+    typed-per-kind markers)."""
+
+    TEXT = "text"
+    REASONING = "reasoning"
+    TOOL_USE = "tool_use"
+
+
 class StreamTurnStart(_Model):
     kind: Literal["turn_start"] = "turn_start"
     turn: int
@@ -268,12 +290,18 @@ class StreamToolCall(_Model):
     kind: Literal["tool_call"] = "tool_call"
     call_id: str
     name: str
+    # Final, fully-accumulated tool-call arguments (issue #103, Q5). Defaults
+    # to ``{}`` so pre-#103 serialized events round-trip (back-compat).
+    args: dict[str, Any] = Field(default_factory=dict)
 
 
 class StreamToolResult(_Model):
     kind: Literal["tool_result"] = "tool_result"
     call_id: str
     is_error: bool
+    # The tool result content (issue #103, Q5). Defaults to ``""`` so pre-#103
+    # serialized events round-trip (back-compat).
+    content: str = ""
 
 
 class StreamFinalResponse(_Model):
@@ -296,6 +324,85 @@ class StreamUserMessage(_Model):
     content: str
 
 
+# ── Delta-level streaming (issue #103) ──────────────────────────────────────
+#
+# The harness maps each raw :class:`spore_core.model.StreamEvent` produced by
+# the agent through :meth:`StandardHarness._map_model_stream_event` into zero or
+# more of the delta/frame variants below, alongside the coarse lifecycle events.
+# Resolution notes for the spec ambiguities:
+#
+# * Q2: frame markers are the generic :class:`StreamBlockStart` /
+#   :class:`StreamBlockStop` carrying a :class:`BlockKind`.
+# * Q3: ``model`` ``MessageStart`` / ``MessageStop`` are DROPPED at the harness
+#   boundary (mapped to nothing). ``TurnStart`` / ``TurnEnd`` already cover
+#   message lifecycle.
+# * Q5: the coarse :class:`StreamToolCall` also carries the final ``args`` and
+#   :class:`StreamToolResult` the result ``content`` (both defaulted).
+#
+# Tool lifecycle ordering per call:
+# :class:`StreamToolCallStart` -> :class:`StreamToolArgsDelta`* ->
+# (:class:`StreamBlockStop`) -> coarse :class:`StreamToolCall`.
+#
+# KNOWN LIMITATION (issue #103): ``model.StreamEvent`` tool-argument deltas do
+# NOT carry the tool name or id (providers drop them in streamed frames). The
+# harness synthesizes a stable per-index ``call_{index}`` id (matching the
+# agent accumulator) and emits an EMPTY name on ``StreamToolCallStart``. Under
+# streamed turns the coarse ``StreamToolCall`` name is empty too while ``args``
+# round-trip faithfully.
+
+
+class StreamTextDelta(_Model):
+    """Streamed text fragment (``model`` ``ContentBlockDelta``)."""
+
+    kind: Literal["text_delta"] = "text_delta"
+    content: str
+
+
+class StreamReasoningDelta(_Model):
+    """Streamed reasoning/thinking fragment (``model`` ``ThinkingDelta``). Q4."""
+
+    kind: Literal["reasoning_delta"] = "reasoning_delta"
+    content: str
+
+
+class StreamToolArgsDelta(_Model):
+    """Streamed tool-argument JSON fragment (``model`` ``ToolUseDelta``),
+    correlated to a ``call_id`` via the open-block index."""
+
+    kind: Literal["tool_args_delta"] = "tool_args_delta"
+    call_id: str
+    partial_json: str
+
+
+class StreamBlockStart(_Model):
+    """A content block opened (Q2). Emitted the first time a delta for an index
+    is seen."""
+
+    kind: Literal["block_start"] = "block_start"
+    index: int
+    block: BlockKind
+
+
+class StreamBlockStop(_Model):
+    """A content block closed (``model`` ``ContentBlockStop``). Q2."""
+
+    kind: Literal["block_stop"] = "block_stop"
+    index: int
+
+
+class StreamToolCallStart(_Model):
+    """A tool-use block opened (issue #103). Emitted so consumers can correlate
+    the subsequent :class:`StreamToolArgsDelta` fragments and the final coarse
+    :class:`StreamToolCall` by ``call_id``. The ``name`` is empty under streamed
+    turns (documented ``model.StreamEvent`` limitation — recovered on the coarse
+    ``StreamToolCall``)."""
+
+    kind: Literal["tool_call_start"] = "tool_call_start"
+    index: int
+    call_id: str
+    name: str
+
+
 HarnessStreamEvent = Annotated[
     StreamTurnStart
     | StreamTurnEnd
@@ -303,11 +410,35 @@ HarnessStreamEvent = Annotated[
     | StreamToolResult
     | StreamFinalResponse
     | StreamBudgetWarning
-    | StreamUserMessage,
+    | StreamUserMessage
+    | StreamTextDelta
+    | StreamReasoningDelta
+    | StreamToolArgsDelta
+    | StreamBlockStart
+    | StreamBlockStop
+    | StreamToolCallStart,
     Field(discriminator="kind"),
 ]
 
 StreamSink = Callable[[HarnessStreamEvent], None]
+
+
+class TurnStreamState:
+    """Per-turn state threaded through
+    :meth:`StandardHarness._map_model_stream_event` (issue #103). Tracks which
+    block indices are open and their kind so ``ToolUseDelta`` events can be
+    correlated to a ``call_id``, and so each block's ``BlockStart`` is emitted
+    exactly once."""
+
+    def __init__(self) -> None:
+        self.open_blocks: dict[int, BlockKind] = {}
+        self.tool_calls: dict[int, str] = {}
+
+    @staticmethod
+    def call_id_for(index: int) -> str:
+        # Matches the id synthesized by the agent's streaming accumulator so
+        # the coarse ``StreamToolCall`` correlates.
+        return f"call_{index}"
 
 
 # ============================================================================
@@ -2384,6 +2515,94 @@ class StandardHarness:
             stream(event)
 
     @staticmethod
+    def _tool_output_text(output: ToolOutput) -> str:
+        """Extract the human-readable content from a tool output for the
+        enriched coarse :class:`StreamToolResult` (issue #103, Q5)."""
+
+        if isinstance(output, ToolOutputSuccess):
+            return output.content
+        if isinstance(output, ToolOutputError):
+            return output.message
+        return ""
+
+    @classmethod
+    async def _drive_turn(
+        cls,
+        agent: Agent,
+        context: Context,
+        on_stream: StreamSink | None,
+    ) -> TurnResult:
+        """Run one user-facing turn (issue #103). When a stream sink is
+        attached, drive the turn through ``agent.turn_streaming`` with an
+        adapter that maps each raw ``model`` ``StreamEvent`` to harness
+        ``StreamEvent``s via :meth:`_map_model_stream_event`, threading a fresh
+        :class:`TurnStreamState`. With no sink, falls back to plain ``turn``."""
+
+        if on_stream is None:
+            return await agent.turn(context)
+
+        state = TurnStreamState()
+
+        def adapter(event: ModelStreamEvent) -> None:
+            for mapped in cls._map_model_stream_event(event, state):
+                on_stream(mapped)
+
+        sink: AgentStreamSink = adapter
+        return await _agent_turn_streaming(agent, context, sink)
+
+    @staticmethod
+    def _map_model_stream_event(
+        event: ModelStreamEvent, state: TurnStreamState
+    ) -> list[HarnessStreamEvent]:
+        """Map one raw :class:`spore_core.model.StreamEvent` to zero or more
+        harness :class:`HarnessStreamEvent`s (issue #103), threading
+        :class:`TurnStreamState` so blocks and tool calls are correlated.
+
+        Rules:
+
+        * Q2: a block's ``BlockStart`` is emitted exactly once, the first time
+          a delta for that index is observed; ``ContentBlockStop`` maps to
+          ``BlockStop``.
+        * Q3: ``MessageStart`` / ``MessageStop`` map to nothing (dropped).
+        * A tool-use block additionally emits ``ToolCallStart`` on open, then
+          each fragment as ``ToolArgsDelta`` keyed by the derived ``call_id``.
+        """
+
+        if isinstance(event, (MessageStart, MessageStop)):
+            return []  # Q3: dropped at the harness boundary.
+
+        out: list[HarnessStreamEvent] = []
+        if isinstance(event, ContentBlockDelta):
+            if event.index not in state.open_blocks:
+                state.open_blocks[event.index] = BlockKind.TEXT
+                out.append(StreamBlockStart(index=event.index, block=BlockKind.TEXT))
+            out.append(StreamTextDelta(content=event.delta))
+            return out
+        if isinstance(event, ThinkingDelta):
+            if event.index not in state.open_blocks:
+                state.open_blocks[event.index] = BlockKind.REASONING
+                out.append(StreamBlockStart(index=event.index, block=BlockKind.REASONING))
+            out.append(StreamReasoningDelta(content=event.delta))
+            return out
+        if isinstance(event, ToolUseDelta):
+            if event.index not in state.open_blocks:
+                state.open_blocks[event.index] = BlockKind.TOOL_USE
+                call_id = TurnStreamState.call_id_for(event.index)
+                state.tool_calls[event.index] = call_id
+                out.append(StreamBlockStart(index=event.index, block=BlockKind.TOOL_USE))
+                # Name is not carried by model.StreamEvent; recovered on the
+                # coarse ToolCall. Emit ToolCallStart so consumers can begin
+                # correlating args by call_id.
+                out.append(StreamToolCallStart(index=event.index, call_id=call_id, name=""))
+            call_id = state.tool_calls.get(event.index, TurnStreamState.call_id_for(event.index))
+            out.append(StreamToolArgsDelta(call_id=call_id, partial_json=event.partial_json))
+            return out
+        if isinstance(event, ModelContentBlockStop):
+            state.open_blocks.pop(event.index, None)
+            return [StreamBlockStop(index=event.index)]
+        return []
+
+    @staticmethod
     def _budget_exceeded(
         budget: BudgetLimits, used: BudgetSnapshot, started_at: float
     ) -> BudgetLimitTypeT | None:
@@ -3773,7 +3992,7 @@ class StandardHarness:
         self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
         turn_started_at = _now()
         turn_clock = time.monotonic()
-        result: TurnResult = await planner.turn(context)
+        result: TurnResult = await self._drive_turn(planner, context, on_stream)
         budget_used.turns += 1  # R7: the plan turn counts against the budget.
 
         # R8: emit exactly one turn span for the plan turn. Mirrors the metrics
@@ -4044,7 +4263,7 @@ class StandardHarness:
                 input_messages = _capture_input_messages(
                     context.messages, config.content_capture.max_field_len
                 )
-            result: TurnResult = await config.agent.turn(context)
+            result: TurnResult = await self._drive_turn(config.agent, context, on_stream)
             budget_used.turns += 1
 
             # Emit a turn span for every model call (issue #12). Fire-and-forget;
@@ -4295,13 +4514,20 @@ class StandardHarness:
                         )
                         self._emit(
                             on_stream,
-                            StreamToolResult(call_id=call.id, is_error=True),
+                            StreamToolResult(
+                                call_id=call.id,
+                                is_error=True,
+                                content=f"sandbox: {violation.kind}",
+                            ),
                         )
                         await config.context_manager.append_tool_result(session_state, tr)
                         approved_results.append(tr)
                         continue
 
-                    self._emit(on_stream, StreamToolCall(call_id=call.id, name=call.name))
+                    self._emit(
+                        on_stream,
+                        StreamToolCall(call_id=call.id, name=call.name, args=call.input),
+                    )
                     tool_started_at = _now()
                     tool_clock = time.monotonic()
                     output = await tool_registry.dispatch(call)
@@ -4475,7 +4701,11 @@ class StandardHarness:
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     self._emit(
                         on_stream,
-                        StreamToolResult(call_id=call.id, is_error=is_error),
+                        StreamToolResult(
+                            call_id=call.id,
+                            is_error=is_error,
+                            content=self._tool_output_text(output),
+                        ),
                     )
                     await config.context_manager.append_tool_result(session_state, tr)
                     approved_results.append(tr)
@@ -4974,14 +5204,22 @@ __all__ = [
     "SessionId",
     "SessionState",
     "StandardHarness",
+    "BlockKind",
+    "StreamBlockStart",
+    "StreamBlockStop",
     "StreamBudgetWarning",
     "StreamFinalResponse",
+    "StreamReasoningDelta",
     "StreamSink",
+    "StreamTextDelta",
+    "StreamToolArgsDelta",
     "StreamToolCall",
+    "StreamToolCallStart",
     "StreamToolResult",
     "StreamTurnEnd",
     "StreamTurnStart",
     "StreamUserMessage",
+    "TurnStreamState",
     "SEND_MESSAGE_TOOL_NAME",
     "Task",
     "TaskId",

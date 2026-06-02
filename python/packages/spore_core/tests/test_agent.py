@@ -370,3 +370,149 @@ async def test_agent_classifies_recorded_turns_consistently() -> None:
     assert r4.usage is not None
     assert r4.usage.input_tokens == 3
     assert r4.usage.output_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# #103: delta-level streaming through the agent
+# ---------------------------------------------------------------------------
+
+from spore_core import (  # noqa: E402
+    AgentStreamSink,
+    ContentBlockDelta,
+    MessageStart,
+    MessageStop,
+    RecordedExchange,
+    ThinkingDelta,
+    ToolUseDelta,
+    classify_response,
+    turn_streaming,
+)
+
+
+def _replay_provider() -> ProviderInfo:
+    return ProviderInfo(name="anthropic", model_id="replay", context_window=200_000)
+
+
+def _replay_agent(resp: ModelResponse) -> ModelAgent:
+    exchange = RecordedExchange(
+        request=ModelRequest(stream=True), response=resp, provider="anthropic"
+    )
+    replay = ReplayModelInterface([exchange], _replay_provider())
+    return ModelAgent(AgentId("stream-agent"), replay)
+
+
+from spore_core import ModelRequest  # noqa: E402
+
+
+async def test_turn_streaming_forwards_text_and_thinking_deltas() -> None:
+    agent = _replay_agent(
+        ModelResponse(
+            content=[ThinkingBlock(text="reasoning here"), TextBlock(text="final text")],
+            usage=_usage(3, 4),
+            stop_reason=StopReason.END_TURN,
+        )
+    )
+    seen: list = []
+    sink: AgentStreamSink = seen.append
+    result = await agent.turn_streaming(_ctx_user("hi"), sink)
+
+    # Reasoning surfaced in TurnResult (Q4) AND streamed as ThinkingDelta.
+    assert isinstance(result, FinalResponse)
+    assert result.content == "final text"
+    assert result.reasoning == "reasoning here"
+
+    assert isinstance(seen[0], MessageStart)
+    assert any(isinstance(e, ThinkingDelta) and e.delta == "reasoning here" for e in seen)
+    assert any(isinstance(e, ContentBlockDelta) and e.delta == "final text" for e in seen)
+    assert isinstance(seen[-1], MessageStop)
+
+
+async def test_turn_streaming_ordered_text_delta_concatenation() -> None:
+    # Multiple text blocks at distinct indices concatenate in order.
+    agent = _replay_agent(
+        ModelResponse(
+            content=[TextBlock(text="foo"), TextBlock(text="bar")],
+            usage=_usage(1, 1),
+            stop_reason=StopReason.END_TURN,
+        )
+    )
+    result = await agent.turn_streaming(_ctx_user("x"), lambda _e: None)
+    assert isinstance(result, FinalResponse)
+    assert result.content == "foobar"
+
+
+async def test_turn_streaming_reassembles_tool_call_with_accumulated_args() -> None:
+    agent = _replay_agent(
+        ModelResponse(
+            content=[
+                ThinkingBlock(text="let me think"),
+                ToolUseBlock(id="toolu_1", name="lookup", input={"q": "rust"}),
+            ],
+            usage=_usage(7, 11),
+            stop_reason=StopReason.TOOL_USE,
+        )
+    )
+    seen: list = []
+    result = await agent.turn_streaming(_ctx_user("hi"), seen.append)
+    assert isinstance(result, ToolCallRequested)
+    assert len(result.calls) == 1
+    assert result.calls[0].input == {"q": "rust"}
+    assert result.reasoning == "let me think"
+    # Known limitation: streamed tool-use carries no name; accumulator emits
+    # empty name and a synthesized per-index call id.
+    assert result.calls[0].name == ""
+    assert result.calls[0].id == "call_1"
+    assert any(isinstance(e, ToolUseDelta) and "rust" in e.partial_json for e in seen)
+
+
+async def test_default_turn_streaming_ignores_sink() -> None:
+    # MockAgent has no turn_streaming; the free-function default ignores the
+    # sink and delegates to turn, producing the same TurnResult with no events.
+    from spore_core import MockAgent
+
+    a = MockAgent(AgentId("mock"))
+    a.push(FinalResponse(content="done", usage=_usage(1, 1)))
+    count = 0
+
+    def sink(_e: object) -> None:
+        nonlocal count
+        count += 1
+
+    result = await turn_streaming(a, _ctx_user("hi"), sink)
+    assert isinstance(result, FinalResponse)
+    assert result.content == "done"
+    assert count == 0
+
+
+async def test_turn_and_turn_streaming_classify_identically() -> None:
+    resp = ModelResponse(
+        content=[TextBlock(text="same")],
+        usage=_usage(2, 2),
+        stop_reason=StopReason.END_TURN,
+    )
+    r_block = await _replay_agent(resp.model_copy(deep=True)).turn(_ctx_user("x"))
+    r_stream = await _replay_agent(resp.model_copy(deep=True)).turn_streaming(
+        _ctx_user("x"), lambda _e: None
+    )
+    assert r_block == r_stream
+
+
+def test_classify_response_populates_reasoning() -> None:
+    resp = ModelResponse(
+        content=[ThinkingBlock(text="hmm"), TextBlock(text="answer")],
+        usage=_usage(1, 1),
+        stop_reason=StopReason.END_TURN,
+    )
+    result = classify_response(resp)
+    assert isinstance(result, FinalResponse)
+    assert result.reasoning == "hmm"
+
+
+def test_turn_result_deserializes_without_reasoning_field() -> None:
+    # Serde back-compat: a pre-#103 TurnResult JSON (no reasoning) still loads.
+    adapter = TypeAdapter(TurnResult)
+    back = adapter.validate_json(
+        '{"kind":"final_response","content":"hi","usage":{"input_tokens":1,"output_tokens":1}}'
+    )
+    assert isinstance(back, FinalResponse)
+    assert back.reasoning is None
