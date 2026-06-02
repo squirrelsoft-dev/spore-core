@@ -1942,6 +1942,26 @@ class HarnessBuilder:
         self._standard_tools.extend(tools)
         return self
 
+    def sandbox(self, sandbox: SandboxProvider) -> HarnessBuilder:
+        """Override the :class:`SandboxProvider` — the only path tools have to
+        the environment (filesystem, process exec).
+
+        :meth:`conversational` defaults to a null sandbox that denies
+        environment access — fine for pure-compute tools, but catalogue file
+        tools (``read_file`` / ``write_file`` / ``list_dir``) operate *through*
+        the sandbox, so an agent that touches a real directory needs a
+        workspace-scoped sandbox here::
+
+            harness = (
+                HarnessBuilder.conversational(agent)
+                .sandbox(workspace)
+                .tools(StandardTools.coding_set())
+                .build()
+            )
+        """
+        self._sandbox = sandbox
+        return self
+
     def system_prompt(self, system_prompt: str) -> HarnessBuilder:
         """Set an operating system prompt prepended to each turn's assembled
         context (issue #91).

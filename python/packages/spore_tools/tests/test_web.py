@@ -60,3 +60,11 @@ async def test_web_search_bad_params_is_recoverable() -> None:
     r = await tool.execute(_call("web_search", {}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
+
+
+def test_web_search_with_endpoint_is_named_web_search() -> None:
+    from spore_tools.tools.catalogue import StandardTools
+
+    t = StandardTools.web_search_with_endpoint("http://localhost:9/search")
+    assert t.implementation.name() == "web_search"
+    assert t.schema.name == "web_search"

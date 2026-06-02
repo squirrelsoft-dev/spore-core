@@ -165,6 +165,14 @@ class StandardTools:
         :meth:`WebSearchTool.with_endpoint` to wire a real backend."""
         return StandardTool(WebSearchTool(), WebSearchTool.schema())
 
+    @staticmethod
+    def web_search_with_endpoint(endpoint: str) -> StandardTool:
+        """``web_search`` wired to a concrete backend endpoint. The plain
+        :meth:`web_search` preset ships with no backend and errors on every
+        call until one is configured; use this when you have a search endpoint
+        (e.g. a Brave/Tavily-compatible URL) to POST the query to."""
+        return StandardTool(WebSearchTool.with_endpoint(endpoint), WebSearchTool.schema())
+
     # ---- Tier 2 ---------------------------------------------------------
 
     @staticmethod

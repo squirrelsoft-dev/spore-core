@@ -159,6 +159,12 @@ def test_no_catalogue_tools_keeps_tool_registry_seam() -> None:
     assert cfg.catalogue_registry is None
 
 
+def test_sandbox_setter_overrides_the_configured_sandbox() -> None:
+    sb = AllowAllSandbox()
+    cfg = _builder(MockAgent(AgentId("test"))).sandbox(sb).build_config()
+    assert cfg.sandbox is sb
+
+
 # ---------------------------------------------------------------------------
 # Per-run bridge: schemas advertised + recoverable error mapping
 # ---------------------------------------------------------------------------
