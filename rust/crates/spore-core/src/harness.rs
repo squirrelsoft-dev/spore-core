@@ -1885,6 +1885,27 @@ impl HarnessBuilder {
         Self::new(agent, tool_registry, sandbox, context_manager, termination_policy)
     }
 
+    /// Override the harness-loop tool registry (issue #4 seam).
+    ///
+    /// Use this to supply your own [`ToolRegistry`] implementation — e.g. a set
+    /// of custom tools — on top of a preset like [`conversational`](Self::new):
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spore_core::{HarnessBuilder, OllamaModelInterface, EmptyToolRegistry};
+    /// let harness = HarnessBuilder::conversational(OllamaModelInterface::new("llama3.2"))
+    ///     .tool_registry(Arc::new(EmptyToolRegistry))
+    ///     .build();
+    /// ```
+    ///
+    /// The registry's [`schemas`](ToolRegistry::schemas) are delivered to the
+    /// model automatically each turn, and [`dispatch`](ToolRegistry::dispatch)
+    /// is called when the model requests a tool.
+    pub fn tool_registry(mut self, tool_registry: Arc<dyn ToolRegistry>) -> Self {
+        self.tool_registry = tool_registry;
+        self
+    }
+
     /// Add a single [`StandardTool`](crate::tools::StandardTool) to the
     /// catalogue accumulated for this harness (issue #81, Q1/Q2). The bundled
     /// implementation + schema are destructured when the registry is built via
@@ -2502,11 +2523,20 @@ impl StandardHarness {
             }
 
             // Assemble + invoke agent for one turn.
-            let context = self
+            let mut context = self
                 .config
                 .context_manager
                 .assemble(&session_state, &task)
                 .await;
+            // Deliver the registry's tool schemas to the model. Tool schemas are
+            // owned by the `ToolRegistry`; the harness wires them into the
+            // assembled context so the model knows what it can call. Only fill
+            // when the context manager left `tools` empty (the standard
+            // compaction adapter does), so a context manager that deliberately
+            // sets a phase-specific tool subset is preserved.
+            if context.tools.is_empty() {
+                context.tools = self.config.tool_registry.schemas();
+            }
             Self::emit(
                 &on_stream,
                 StreamEvent::TurnStart {
