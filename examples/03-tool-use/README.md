@@ -51,5 +51,7 @@ cargo run -- --prompt "reverse the word 'mycelium' and multiply 6 by 7"
 
 ## What's next
 
-`04-memory-rag` adds a memory provider so the agent can store and recall facts
-across sessions.
+[`04-filesystem-agent`](../04-filesystem-agent/README.md) — swaps these hand-rolled
+tools for the built-in catalogue (`.tools(StandardTools::coding_set())`) so the agent
+reads, writes, and lists real files. The loop is identical; only the registration
+changes.

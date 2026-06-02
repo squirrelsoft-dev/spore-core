@@ -47,5 +47,5 @@ bot> Your name is Scott, and your favorite color is teal.
 
 ## What's next
 
-`03-web-research` adds real tools (web fetch/search) and a workspace sandbox —
-the first example where the agent acts on its environment.
+[`03-tool-use`](../03-tool-use/README.md) — the first example where the agent
+**acts**: it calls tools in a Think → Act → Observe loop until it can answer.

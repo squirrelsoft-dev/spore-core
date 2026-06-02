@@ -4,8 +4,8 @@ The smallest real thing you can build with spore-core.
 
 This example stands up a harness from its five required components, points it at a
 live local model, and runs a single turn whose only job is to say hello — no tools,
-no observability, no multi-turn state. It is the on-ramp: read this before the full
-[`e2e_agent.rs`](../../rust/crates/spore-core/examples/e2e_agent.rs).
+no observability, no multi-turn state. It is the on-ramp to everything else in this
+directory.
 
 ## What it shows
 
@@ -16,8 +16,9 @@ no observability, no multi-turn state. It is the on-ramp: read this before the f
 - `Task::simple(instruction)` — a one-shot task with a fresh session and a default
   loop strategy.
 - Where the later examples plug in: every default above is overridable through the
-  builder. `02-react-tools` adds real tools and a workspace sandbox; later examples
-  swap the loop strategy, memory, and so on.
+  builder. [`02-conversational-repl`](../02-conversational-repl/README.md) threads
+  multi-turn session state; [`03-tool-use`](../03-tool-use/README.md) adds tools;
+  later examples add a workspace sandbox, swap the loop strategy, and so on.
 
 ## Prerequisites
 
@@ -45,7 +46,6 @@ Expected output is a one-line greeting and `Success (1 turn(s))` (occasionally 2
 
 ## What's next
 
-[`rust/crates/spore-core/examples/e2e_agent.rs`](../../rust/crates/spore-core/examples/e2e_agent.rs)
-is the full version: real file/shell tools, multi-turn sessions, live context
-compaction, tool-failure recovery, and OTLP observability — selectable via scenario
-flags.
+[`02-conversational-repl`](../02-conversational-repl/README.md) — an interactive chat
+loop where the agent remembers earlier turns by threading session state across
+`run()` calls.
