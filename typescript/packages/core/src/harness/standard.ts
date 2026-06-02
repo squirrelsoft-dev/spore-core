@@ -3055,7 +3055,7 @@ export class HarnessBuilder {
   constructor(
     private readonly agent: Agent,
     private readonly toolRegistry: ToolRegistry,
-    private readonly sandbox: SandboxProvider,
+    private _sandbox: SandboxProvider,
     private readonly contextManager: ContextManager,
     private readonly terminationPolicy: TerminationPolicy,
   ) {}
@@ -3223,6 +3223,28 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Override the {@link SandboxProvider} supplied at construction — the only
+   * path tools have to the environment (filesystem, process exec).
+   *
+   * Catalogue file tools (`read_file` / `write_file` / `list_dir`) operate
+   * *through* the sandbox, so an agent that touches a real directory needs a
+   * workspace-scoped sandbox here. This lets `.sandbox(workspace).tools(...)`
+   * reach a real workspace without re-threading every other component through
+   * the constructor:
+   *
+   * ```ts
+   * const harness = builder
+   *   .sandbox(workspace)
+   *   .tools(StandardTools.codingSet())
+   *   .build();
+   * ```
+   */
+  sandbox(sandbox: SandboxProvider): this {
+    this._sandbox = sandbox;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -3251,7 +3273,7 @@ export class HarnessBuilder {
     return {
       agent: this.agent,
       toolRegistry: this.toolRegistry,
-      sandbox: this.sandbox,
+      sandbox: this._sandbox,
       contextManager: this.contextManager,
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,

@@ -172,6 +172,19 @@ export const StandardTools = {
     };
   },
 
+  /**
+   * `web_search` wired to a concrete backend endpoint. The plain
+   * {@link StandardTools.webSearch} preset ships with no backend and errors on
+   * every call until one is configured; use this when you have a search
+   * endpoint (e.g. a Brave/Tavily-compatible URL) to POST the query to.
+   */
+  webSearchWithEndpoint(endpoint: string): StandardTool {
+    return {
+      implementation: WebSearchTool.withEndpoint(endpoint),
+      schema: WebSearchTool.schema(),
+    };
+  },
+
   // ---- Tier 2 ---------------------------------------------------------
 
   /** `todo_write` — NEW; persists the todo list via RunStore key `"todo"`. */

@@ -679,6 +679,12 @@ describe("StandardTools presets", () => {
     expect(n).not.toContain("abort");
   });
 
+  it("webSearchWithEndpoint yields a tool named web_search", () => {
+    const t = StandardTools.webSearchWithEndpoint("http://localhost:9/search");
+    expect(t.implementation.name).toBe("web_search");
+    expect(t.schema.name).toBe("web_search");
+  });
+
   it("full_set adds the Tier-3 control tools", () => {
     const n = names(StandardTools.fullSet());
     for (const t of [

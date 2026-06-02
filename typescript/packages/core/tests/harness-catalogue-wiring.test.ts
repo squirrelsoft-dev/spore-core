@@ -280,3 +280,15 @@ describe("systemPrompt seam (#91)", () => {
     expect(agent.seen.every((m) => m.role !== "system")).toBe(true);
   });
 });
+
+// ============================================================================
+// sandbox setter
+// ============================================================================
+
+describe("sandbox setter (#91 follow-up)", () => {
+  it("overrides the configured sandbox", () => {
+    const override = new AllowAllSandbox();
+    const cfg = catalogueBuilder(makeAgent()).sandbox(override).buildConfig();
+    expect(cfg.sandbox).toBe(override);
+  });
+});
