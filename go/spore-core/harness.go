@@ -344,6 +344,22 @@ func (t Task) WithBudget(b BudgetLimits) Task {
 // Streaming
 // ============================================================================
 
+// BlockKind is the kind of content block a BlockStart stream event opens
+// (issue #103, resolved spec decision Q2: a single generic frame marker
+// carrying a BlockKind rather than typed-per-kind markers). Wire values are
+// snake_case to match the cross-language fixtures.
+type BlockKind string
+
+const (
+	// BlockText is a text content block (model content_block_delta).
+	BlockText BlockKind = "text"
+	// BlockReasoning is a reasoning/thinking block (model thinking_delta).
+	BlockReasoning BlockKind = "reasoning"
+	// BlockToolUse is a tool-use block whose arguments arrive as model
+	// tool_use_delta fragments.
+	BlockToolUse BlockKind = "tool_use"
+)
+
 // HarnessStreamEventKind discriminates harness-level stream events.
 type HarnessStreamEventKind string
 
@@ -358,23 +374,76 @@ const (
 	// out-of-band, prominent message to the user. The loop emits this instead
 	// of collapsing the content into a normal tool result.
 	HarnessStreamUserMessage HarnessStreamEventKind = "user_message"
+
+	// ── Delta-level streaming (issue #103) ──────────────────────────────────
+
+	// HarnessStreamTextDelta is a streamed text fragment (model
+	// content_block_delta).
+	HarnessStreamTextDelta HarnessStreamEventKind = "text_delta"
+	// HarnessStreamReasoningDelta is a streamed reasoning/thinking fragment
+	// (model thinking_delta). Q4.
+	HarnessStreamReasoningDelta HarnessStreamEventKind = "reasoning_delta"
+	// HarnessStreamToolArgsDelta is a streamed tool-argument JSON fragment
+	// (model tool_use_delta), correlated to a call_id via the open-block index.
+	HarnessStreamToolArgsDelta HarnessStreamEventKind = "tool_args_delta"
+	// HarnessStreamBlockStart marks a content block opening (Q2). Emitted the
+	// first time a delta for an index is seen.
+	HarnessStreamBlockStart HarnessStreamEventKind = "block_start"
+	// HarnessStreamBlockStop marks a content block closing (model
+	// content_block_stop). Q2.
+	HarnessStreamBlockStop HarnessStreamEventKind = "block_stop"
+	// HarnessStreamToolCallStart marks a tool-use block opening so consumers can
+	// correlate the subsequent ToolArgsDelta fragments and the final coarse
+	// ToolCall by call_id. The name may be empty when the underlying model
+	// stream does not surface it before args (a documented model StreamEvent
+	// limitation — name is recovered on the coarse ToolCall).
+	HarnessStreamToolCallStart HarnessStreamEventKind = "tool_call_start"
 )
 
 // HarnessStreamEvent is one event emitted while the loop runs.
+//
+// ## Delta-level streaming (issue #103)
+//
+// The harness maps each raw model StreamEvent produced by the agent through
+// mapModelStreamEvent into zero or more of the delta/frame variants below,
+// alongside the existing coarse lifecycle events. Resolution notes:
+//
+//   - Q2: frame markers are the generic block_start / block_stop carrying a
+//     BlockKind, NOT typed-per-kind markers.
+//   - Q3: model message_start / message_stop are DROPPED at the harness
+//     boundary (mapped to nothing). turn_start / turn_end already cover message
+//     lifecycle.
+//   - Q5: the coarse tool_call now also carries the final Args, and tool_result
+//     the result Content. Both new fields serialise with defaults so pre-#103
+//     serialized events round-trip.
+//
+// Tool lifecycle ordering per call: tool_call_start → tool_args_delta* →
+// (block_stop) → coarse tool_call.
 type HarnessStreamEvent struct {
 	Kind HarnessStreamEventKind `json:"kind"`
 	// turn_start, turn_end
 	Turn uint32 `json:"-"`
-	// tool_call, tool_result
+	// tool_call, tool_result, tool_args_delta, tool_call_start
 	CallID string `json:"-"`
-	// tool_call
+	// tool_call, tool_call_start
 	Name string `json:"-"`
 	// tool_result
 	IsError bool `json:"-"`
-	// final_response
+	// final_response, user_message, text_delta, reasoning_delta
 	Content string `json:"-"`
 	// budget_warning
 	LimitType BudgetLimitType `json:"-"`
+	// tool_call (Q5): final, fully-accumulated tool-call arguments (parsed JSON
+	// value carried as RawMessage). Defaults to "null" on the wire.
+	Args json.RawMessage `json:"-"`
+	// tool_result (Q5): the tool result content. Defaults to "" on the wire.
+	ResultContent string `json:"-"`
+	// tool_args_delta
+	PartialJSON string `json:"-"`
+	// block_start, block_stop, tool_call_start
+	Index uint32 `json:"-"`
+	// block_start
+	Block BlockKind `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -386,17 +455,25 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			Turn uint32                 `json:"turn"`
 		}{e.Kind, e.Turn})
 	case HarnessStreamToolCall:
+		// Q5: carry the final args. Default to JSON null so pre-#103 consumers
+		// (and fixtures that omit it) round-trip.
+		args := e.Args
+		if len(args) == 0 {
+			args = json.RawMessage("null")
+		}
 		return json.Marshal(struct {
 			Kind   HarnessStreamEventKind `json:"kind"`
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
-		}{e.Kind, e.CallID, e.Name})
+			Args   json.RawMessage        `json:"args"`
+		}{e.Kind, e.CallID, e.Name, args})
 	case HarnessStreamToolResult:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
 			CallID  string                 `json:"call_id"`
 			IsError bool                   `json:"is_error"`
-		}{e.Kind, e.CallID, e.IsError})
+			Content string                 `json:"content"`
+		}{e.Kind, e.CallID, e.IsError, e.ResultContent})
 	case HarnessStreamFinalResponse, HarnessStreamUserMessage:
 		return json.Marshal(struct {
 			Kind    HarnessStreamEventKind `json:"kind"`
@@ -407,6 +484,35 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			Kind      HarnessStreamEventKind `json:"kind"`
 			LimitType BudgetLimitType        `json:"limit_type"`
 		}{e.Kind, e.LimitType})
+	case HarnessStreamTextDelta, HarnessStreamReasoningDelta:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			Content string                 `json:"content"`
+		}{e.Kind, e.Content})
+	case HarnessStreamToolArgsDelta:
+		return json.Marshal(struct {
+			Kind        HarnessStreamEventKind `json:"kind"`
+			CallID      string                 `json:"call_id"`
+			PartialJSON string                 `json:"partial_json"`
+		}{e.Kind, e.CallID, e.PartialJSON})
+	case HarnessStreamBlockStart:
+		return json.Marshal(struct {
+			Kind  HarnessStreamEventKind `json:"kind"`
+			Index uint32                 `json:"index"`
+			Block BlockKind              `json:"block"`
+		}{e.Kind, e.Index, e.Block})
+	case HarnessStreamBlockStop:
+		return json.Marshal(struct {
+			Kind  HarnessStreamEventKind `json:"kind"`
+			Index uint32                 `json:"index"`
+		}{e.Kind, e.Index})
+	case HarnessStreamToolCallStart:
+		return json.Marshal(struct {
+			Kind   HarnessStreamEventKind `json:"kind"`
+			Index  uint32                 `json:"index"`
+			CallID string                 `json:"call_id"`
+			Name   string                 `json:"name"`
+		}{e.Kind, e.Index, e.CallID, e.Name})
 	default:
 		return nil, fmt.Errorf("HarnessStreamEvent: unknown kind %q", e.Kind)
 	}
@@ -414,6 +520,98 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 
 // StreamSink consumes harness stream events. May be nil.
 type StreamSink func(HarnessStreamEvent)
+
+// turnStreamState is the per-turn mutable state threaded through
+// mapModelStreamEvent (issue #103). It correlates a block index to its
+// BlockKind so tool_use_delta / content_block_stop events can be mapped back to
+// a call_id, and so each block's block_start is emitted exactly once.
+//
+// KNOWN LIMITATION (issue #103): model tool-arg deltas do NOT carry a tool name
+// or id; the harness derives a stable call_id "call_{index}" matching the id the
+// agent's streaming accumulator synthesizes, and the coarse ToolCall name is
+// empty under streamed turns (args round-trip faithfully). See agent.go.
+type turnStreamState struct {
+	openBlocks map[uint32]BlockKind
+	toolCalls  map[uint32]string
+}
+
+func newTurnStreamState() *turnStreamState {
+	return &turnStreamState{
+		openBlocks: make(map[uint32]BlockKind),
+		toolCalls:  make(map[uint32]string),
+	}
+}
+
+func streamCallIDFor(index uint32) string {
+	return fmt.Sprintf("call_%d", index)
+}
+
+// mapModelStreamEvent maps one raw model StreamEvent to zero or more harness
+// HarnessStreamEvents (issue #103), threading turnStreamState so blocks and
+// tool calls are correlated across events.
+//
+// Rules enforced here:
+//   - Q2: a block's block_start is emitted exactly once, the first time a delta
+//     for that index is observed; content_block_stop maps to block_stop.
+//   - Q3: message_start / message_stop map to nothing (dropped).
+//   - A tool-use block additionally emits tool_call_start on open, then each
+//     fragment as tool_args_delta keyed by the derived call_id.
+func mapModelStreamEvent(ev StreamEvent, state *turnStreamState) []HarnessStreamEvent {
+	switch ev.Type {
+	case StreamMessageStart, StreamMessageStop:
+		// Q3: dropped at the harness boundary.
+		return nil
+	case StreamContentBlockDelta:
+		var out []HarnessStreamEvent
+		if _, open := state.openBlocks[ev.Index]; !open {
+			state.openBlocks[ev.Index] = BlockText
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamBlockStart, Index: ev.Index, Block: BlockText,
+			})
+		}
+		out = append(out, HarnessStreamEvent{Kind: HarnessStreamTextDelta, Content: ev.Delta})
+		return out
+	case StreamThinkingDelta:
+		var out []HarnessStreamEvent
+		if _, open := state.openBlocks[ev.Index]; !open {
+			state.openBlocks[ev.Index] = BlockReasoning
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamBlockStart, Index: ev.Index, Block: BlockReasoning,
+			})
+		}
+		out = append(out, HarnessStreamEvent{Kind: HarnessStreamReasoningDelta, Content: ev.Delta})
+		return out
+	case StreamToolUseDelta:
+		var out []HarnessStreamEvent
+		if _, open := state.openBlocks[ev.Index]; !open {
+			state.openBlocks[ev.Index] = BlockToolUse
+			callID := streamCallIDFor(ev.Index)
+			state.toolCalls[ev.Index] = callID
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamBlockStart, Index: ev.Index, Block: BlockToolUse,
+			})
+			// Name is not carried by the model StreamEvent; recovered on the
+			// coarse ToolCall. Emit tool_call_start so consumers can begin
+			// correlating args by call_id.
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamToolCallStart, Index: ev.Index, CallID: callID, Name: "",
+			})
+		}
+		callID, ok := state.toolCalls[ev.Index]
+		if !ok {
+			callID = streamCallIDFor(ev.Index)
+		}
+		out = append(out, HarnessStreamEvent{
+			Kind: HarnessStreamToolArgsDelta, CallID: callID, PartialJSON: ev.PartialJSON,
+		})
+		return out
+	case StreamContentBlockStop:
+		delete(state.openBlocks, ev.Index)
+		return []HarnessStreamEvent{{Kind: HarnessStreamBlockStop, Index: ev.Index}}
+	default:
+		return nil
+	}
+}
 
 // sendMessageToolName is the registered name of the catalogue's send_message
 // tool (issue #81). The harness loop recognizes this name to emit a
@@ -2144,6 +2342,32 @@ func emit(sink StreamSink, event HarnessStreamEvent) {
 	}
 }
 
+// runStreamingTurn executes one user-facing turn (issue #103). When a stream
+// sink is attached, it drives the turn through TurnStreamingOrDelegate with an
+// adapter that maps each raw model StreamEvent into harness StreamEvents (via
+// mapModelStreamEvent, threading turnStreamState) and forwards them to onStream
+// in arrival order. When no sink is attached it uses plain Agent.Turn so the
+// baseline RunResult is byte-identical (back-compat). Either way the returned
+// TurnResult is classified by the shared agent logic.
+//
+// Unlike the Rust reference, the Go StreamSink is an ordinary closure (no
+// 'static / Send+Sync constraints), so the adapter forwards mapped events
+// synchronously as they arrive rather than buffering and flushing after the
+// turn. Ordering is preserved: TurnStart (emitted by the caller) → deltas →
+// TurnEnd → coarse events.
+func (h *StandardHarness) runStreamingTurn(ctx context.Context, agent Agent, c Context, onStream StreamSink) TurnResult {
+	if onStream == nil {
+		return agent.Turn(ctx, c)
+	}
+	state := newTurnStreamState()
+	adapter := func(ev StreamEvent) {
+		for _, mapped := range mapModelStreamEvent(ev, state) {
+			emit(onStream, mapped)
+		}
+	}
+	return TurnStreamingOrDelegate(ctx, agent, c, adapter)
+}
+
 // budgetExceeded returns the BudgetLimitType that just tripped, if any.
 func budgetExceeded(b BudgetLimits, used BudgetSnapshot, startedAt time.Time) (BudgetLimitType, bool) {
 	if b.MaxTurns != nil && used.Turns >= *b.MaxTurns {
@@ -2738,7 +2962,7 @@ func (h *StandardHarness) runPlanPhase(
 	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 	turnStartedAt := nowRFC3339()
 	turnClock := time.Now()
-	result := planner.Turn(ctx, c)
+	result := h.runStreamingTurn(ctx, planner, c, onStream)
 	budget.Turns++ // R7: the plan turn counts against the budget.
 
 	// R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
@@ -3032,7 +3256,7 @@ func (h *StandardHarness) runReActInner(
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
-		result := h.config.Agent.Turn(ctx, c)
+		result := h.runStreamingTurn(ctx, h.config.Agent, c, onStream)
 		budget.Turns++
 		// Emit a turn span for every model call (issue #12). Fire-and-forget;
 		// it never affects control flow. The span id is retained as the
@@ -3248,7 +3472,9 @@ func (h *StandardHarness) runReActInner(
 						},
 					}
 					emit(onStream, HarnessStreamEvent{
+						// Q5: carry the result content.
 						Kind: HarnessStreamToolResult, CallID: call.ID, IsError: true,
+						ResultContent: "sandbox: " + v.Error(),
 					})
 					h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 					approved = append(approved, tr)
@@ -3256,7 +3482,8 @@ func (h *StandardHarness) runReActInner(
 				}
 
 				emit(onStream, HarnessStreamEvent{
-					Kind: HarnessStreamToolCall, CallID: call.ID, Name: call.Name,
+					// Q5: carry the final tool-call arguments.
+					Kind: HarnessStreamToolCall, CallID: call.ID, Name: call.Name, Args: call.Input,
 				})
 				toolStartedAt := nowRFC3339()
 				toolClock := time.Now()
@@ -3402,8 +3629,17 @@ func (h *StandardHarness) runReActInner(
 				}
 
 				tr := HarnessToolResult{CallID: call.ID, Output: output}
+				// Q5: carry the result content on the coarse tool_result event.
+				var streamResultContent string
+				switch output.Kind {
+				case ToolOutputSuccess:
+					streamResultContent = output.Content
+				case ToolOutputError:
+					streamResultContent = output.Message
+				}
 				emit(onStream, HarnessStreamEvent{
 					Kind: HarnessStreamToolResult, CallID: call.ID, IsError: isError,
+					ResultContent: streamResultContent,
 				})
 				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 				approved = append(approved, tr)
