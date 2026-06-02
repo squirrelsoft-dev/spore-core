@@ -105,6 +105,7 @@ fn run_result_success() -> RunResult {
         session_id: SessionId::new("s"),
         usage: Default::default(),
         turns: 1,
+        session_state: Default::default(),
     }
 }
 

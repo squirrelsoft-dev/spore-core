@@ -80,6 +80,7 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
         metric_evaluator: None,
         catalogue_registry: None,
         system_prompt: None,
+        auto_persist_sessions: false,
     }
 }
 

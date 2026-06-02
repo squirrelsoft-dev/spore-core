@@ -80,6 +80,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         metric_evaluator: None,
         catalogue_registry: None,
         system_prompt: None,
+        auto_persist_sessions: false,
     };
     let harness = StandardHarness::new(config);
 

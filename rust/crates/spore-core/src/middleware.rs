@@ -1437,6 +1437,7 @@ mod tests {
             session_id: sid.clone(),
             usage: AggregateUsage::default(),
             turns: 1,
+            session_state: SessionState::default(),
         };
         chain.fire_after_session(&result, &sid).await;
 

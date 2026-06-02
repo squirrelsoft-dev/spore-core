@@ -228,6 +228,7 @@ mod tests {
                         session_id: SessionId::new("s"),
                         usage: AggregateUsage::default(),
                         turns: 0,
+                        session_state: SessionState::default(),
                     };
                 }
                 g.remove(0)
@@ -245,6 +246,7 @@ mod tests {
                     session_id: SessionId::new("s"),
                     usage: AggregateUsage::default(),
                     turns: 0,
+                    session_state: SessionState::default(),
                 }
             })
         }
@@ -265,6 +267,7 @@ mod tests {
             session_id: SessionId::new("s"),
             usage: AggregateUsage::default(),
             turns: 1,
+            session_state: SessionState::default(),
         }]));
         let child_reg = StandardToolRegistry::new();
         let sub = SubagentTool::new(
@@ -294,6 +297,7 @@ mod tests {
             session_id: SessionId::new("s"),
             usage: AggregateUsage::default(),
             turns: 1,
+            session_state: SessionState::default(),
         }]));
         let child_reg = StandardToolRegistry::new();
         let sub = SubagentTool::new(

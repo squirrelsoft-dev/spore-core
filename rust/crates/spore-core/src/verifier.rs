@@ -364,6 +364,7 @@ mod tests {
             session_id: SessionId::new("s"),
             usage: AggregateUsage::default(),
             turns: 1,
+            session_state: crate::harness::SessionState::default(),
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
             session_id: SessionId::new("s"),
             usage: AggregateUsage::default(),
             turns: 0,
+            session_state: crate::harness::SessionState::default(),
         }
     }
 

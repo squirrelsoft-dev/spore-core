@@ -56,6 +56,16 @@
 //!     re-acts on it. `HarnessSignal::Abort` surfaces as `RunResult::Escalate`,
 //!     NOT `RunResult::Failure`. (No `// SPEC QUESTION:` markers remain — all
 //!     four pre-implementation ambiguities were resolved.)
+//! 11. Conversation-history threading (issue #102): every terminal
+//!     [`RunResult::Success`] and [`RunResult::Failure`] carries the post-run
+//!     [`SessionState`] (`messages` + `extras`) so an in-process caller resumes
+//!     LOSSLESSLY — tool-call and tool-result turns included — without
+//!     reconstructing history from `output`. Opt-in
+//!     [`auto_persist_sessions`](HarnessConfig::auto_persist_sessions) layers
+//!     [`SessionStore`](crate::storage::SessionStore) auto-load (ReAct /
+//!     SelfVerifying only; explicit `with_session_state` wins) + terminal
+//!     auto-persist on top for cross-process continuity by `session_id`.
+//!     OFF by default: zero session-store I/O and byte-identical message flow.
 //!
 //! ## Component dependencies (forward declarations)
 //!
@@ -1562,12 +1572,25 @@ pub enum RunResult {
         session_id: SessionId,
         usage: AggregateUsage,
         turns: u32,
+        /// The post-run conversation history (issue #102). Carries the full
+        /// `SessionState.messages` the loop produced — assistant tool-call turns
+        /// and tool-result turns included — so an in-process caller can resume
+        /// losslessly via `HarnessRunOptions::with_session_state(..)` without
+        /// reconstructing history from `output`. `#[serde(default)]` keeps old
+        /// serialized blobs (and other languages mid-migration) deserializing.
+        #[serde(default)]
+        session_state: SessionState,
     },
     Failure {
         reason: HaltReason,
         session_id: SessionId,
         usage: AggregateUsage,
         turns: u32,
+        /// The post-run conversation history at the point of failure (issue
+        /// #102). Same contract as on [`Success`](Self::Success): lossless
+        /// resume, `#[serde(default)]` for back-compat.
+        #[serde(default)]
+        session_state: SessionState,
     },
     /// Boxed because `PausedState` is significantly larger than the other
     /// variants; keeps `RunResult` cheap to clone on the happy path.
@@ -1857,6 +1880,27 @@ pub struct HarnessConfig {
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
     /// today's behaviour byte-for-byte.
     pub system_prompt: Option<String>,
+    /// Opt-in automatic conversation-history threading via the
+    /// [`SessionStore`](crate::storage::SessionStore) (issue #102). When `true`,
+    /// the harness:
+    /// - **auto-loads** the prior [`SessionState`] for the run's `session_id`
+    ///   from the store at the start of a fresh `run()` (ReAct / SelfVerifying
+    ///   strategies ONLY — Ralph/HillClimbing discard incoming state by design),
+    ///   so a caller can resume by reusing the same `session_id` instead of
+    ///   threading messages by hand. An explicit
+    ///   [`with_session_state`](HarnessRunOptions::with_session_state) always
+    ///   wins (the load is skipped).
+    /// - **auto-persists** the post-run [`SessionState`] back to the store at the
+    ///   terminal seam (one write per `run()`/`resume()` — Success/Failure
+    ///   synthesize a [`PausedState`] with empty pending fields, while
+    ///   `WaitingForHuman`/`Escalate` persist their carried `PausedState`).
+    ///
+    /// Storage errors are swallowed-and-logged (load failure ⇒ start fresh;
+    /// persist failure ⇒ continue) — never surfaced as a [`HaltReason`].
+    ///
+    /// `false` (the default) preserves today's behaviour byte-for-byte: ZERO
+    /// `get_session`/`put_session` calls and identical message flow.
+    pub auto_persist_sessions: bool,
 }
 
 impl Clone for HarnessConfig {
@@ -1887,6 +1931,7 @@ impl Clone for HarnessConfig {
             metric_evaluator: self.metric_evaluator.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
             system_prompt: self.system_prompt.clone(),
+            auto_persist_sessions: self.auto_persist_sessions,
         }
     }
 }
@@ -1959,6 +2004,10 @@ pub struct HarnessBuilder {
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
     system_prompt: Option<String>,
+    /// Opt-in automatic session-state threading + auto-persist (issue #102).
+    /// `false` (the default) preserves today's behaviour byte-for-byte (ZERO
+    /// session-store I/O). See [`auto_persist_sessions`](HarnessBuilder::auto_persist_sessions).
+    auto_persist_sessions: bool,
 }
 
 impl HarnessBuilder {
@@ -1997,6 +2046,7 @@ impl HarnessBuilder {
             metric_evaluator: None,
             standard_tools: Vec::new(),
             system_prompt: None,
+            auto_persist_sessions: false,
         }
     }
 
@@ -2171,6 +2221,23 @@ impl HarnessBuilder {
     /// compile and behave unchanged.
     pub fn storage(mut self, storage: Arc<crate::storage::StorageProvider>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Enable opt-in automatic conversation-history threading via the
+    /// [`SessionStore`](crate::storage::SessionStore) (issue #102). Defaults to
+    /// `false`, which preserves today's behaviour byte-for-byte (ZERO
+    /// session-store I/O). When enabled, the harness auto-loads the prior
+    /// session for the run's `session_id` (ReAct / SelfVerifying only; an
+    /// explicit [`with_session_state`](HarnessRunOptions::with_session_state)
+    /// always wins) and auto-persists the post-run state at the terminal seam.
+    /// See [`HarnessConfig::auto_persist_sessions`] for the full contract.
+    ///
+    /// Pair with [`storage`](Self::storage) to wire a real (in-memory or
+    /// filesystem) [`SessionStore`]; without one the default all-no-op store
+    /// makes auto-load/persist no-ops.
+    pub fn auto_persist_sessions(mut self, enabled: bool) -> Self {
+        self.auto_persist_sessions = enabled;
         self
     }
 
@@ -2383,6 +2450,7 @@ impl HarnessBuilder {
             metric_evaluator: self.metric_evaluator,
             catalogue_registry,
             system_prompt: self.system_prompt,
+            auto_persist_sessions: self.auto_persist_sessions,
         }
     }
 
@@ -2830,6 +2898,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 };
             }
             if let Some(limit_type) = Self::budget_exceeded(&task.budget, &budget_used, started_at)
@@ -2839,6 +2908,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 };
             }
 
@@ -2856,6 +2926,7 @@ impl StandardHarness {
                             session_id,
                             usage,
                             turns: budget_used.turns,
+                            session_state: session_state.clone(),
                         };
                     }
                     MiddlewareDecision::SurfaceToHuman { request } => {
@@ -3093,6 +3164,7 @@ impl StandardHarness {
                                     session_id,
                                     usage,
                                     turns: budget_used.turns,
+                                    session_state: session_state.clone(),
                                 };
                             }
                             MiddlewareDecision::SurfaceToHuman { request } => {
@@ -3128,6 +3200,7 @@ impl StandardHarness {
                                 session_id,
                                 usage,
                                 turns: budget_used.turns,
+                                session_state: session_state.clone(),
                             };
                         }
                         TerminationDecision::Continue => {
@@ -3178,6 +3251,7 @@ impl StandardHarness {
                                 session_id,
                                 usage,
                                 turns: budget_used.turns,
+                                session_state: session_state.clone(),
                             };
                         }
                     }
@@ -3200,6 +3274,7 @@ impl StandardHarness {
                             session_id,
                             usage,
                             turns: budget_used.turns,
+                            session_state: session_state.clone(),
                         };
                     }
 
@@ -3240,6 +3315,7 @@ impl StandardHarness {
                                     session_id,
                                     usage,
                                     turns: budget_used.turns,
+                                    session_state: session_state.clone(),
                                 };
                             }
                             MiddlewareDecision::SurfaceToHuman { request } => {
@@ -3273,6 +3349,7 @@ impl StandardHarness {
                                     session_id,
                                     usage,
                                     turns: budget_used.turns,
+                                    session_state: session_state.clone(),
                                 };
                             }
                             // Layer-2 default: recoverable — append as tool error.
@@ -3501,6 +3578,7 @@ impl StandardHarness {
                                 session_id,
                                 usage,
                                 turns: budget_used.turns,
+                                session_state: session_state.clone(),
                             };
                         }
 
@@ -3630,6 +3708,7 @@ impl StandardHarness {
                                 session_id,
                                 usage,
                                 turns: budget_used.turns,
+                                session_state: session_state.clone(),
                             };
                         }
                     }
@@ -3663,6 +3742,7 @@ impl StandardHarness {
                         session_id,
                         usage,
                         turns: budget_used.turns,
+                        session_state: session_state.clone(),
                     };
                 }
             }
@@ -3736,6 +3816,7 @@ impl StandardHarness {
                     session_id: build_session_id,
                     usage: AggregateUsage::default(),
                     turns: 0,
+                    session_state: SessionState::default(),
                 };
                 self.finalize_self_verifying(&result).await;
                 return result;
@@ -3809,18 +3890,27 @@ impl StandardHarness {
             };
             match verifier.verify(&input).await {
                 VerifierVerdict::Passed => {
-                    // Reuse the build run's output as the run's output.
-                    let (output, turns) = match input.build_result {
-                        RunResult::Success { output, turns, .. } => (output, turns),
+                    // Reuse the build run's output as the run's output. Carry the
+                    // build run's final conversation history into the terminal
+                    // result (issue #102) so a SelfVerifying caller resumes
+                    // losslessly; fall back to the running build context.
+                    let (output, turns, final_state) = match input.build_result {
+                        RunResult::Success {
+                            output,
+                            turns,
+                            session_state: st,
+                            ..
+                        } => (output, turns, st),
                         // A non-Success build can still be `Passed` only if a
                         // bespoke verifier says so; fall back to a generic handle.
-                        _ => (String::new(), carried.turns),
+                        _ => (String::new(), carried.turns, session_state.clone()),
                     };
                     let result = RunResult::Success {
                         output,
                         session_id: build_session_id,
                         usage: total_usage,
                         turns,
+                        session_state: final_state,
                     };
                     self.finalize_self_verifying(&result).await;
                     return result;
@@ -3847,6 +3937,7 @@ impl StandardHarness {
             session_id: build_session_id,
             usage: total_usage,
             turns: carried.turns,
+            session_state,
         };
         self.finalize_self_verifying(&result).await;
         result
@@ -4181,15 +4272,22 @@ impl StandardHarness {
             // reached (R5).
             match Self::ralph_completion_status(&workspace_root) {
                 None => {
-                    let output = match window_result {
-                        RunResult::Success { output, .. } => output,
-                        _ => String::new(),
+                    // Carry the final context window's history into the terminal
+                    // result (issue #102).
+                    let (output, final_state) = match window_result {
+                        RunResult::Success {
+                            output,
+                            session_state,
+                            ..
+                        } => (output, session_state),
+                        _ => (String::new(), SessionState::default()),
                     };
                     let result = RunResult::Success {
                         output,
                         session_id: window_session_id,
                         usage: total_usage,
                         turns: cumulative_turns,
+                        session_state: final_state,
                     };
                     self.finalize_self_verifying(&result).await;
                     return result;
@@ -4210,6 +4308,7 @@ impl StandardHarness {
             session_id: last_session_id,
             usage: total_usage,
             turns: cumulative_turns,
+            session_state: SessionState::default(),
         };
         self.finalize_self_verifying(&result).await;
         result
@@ -4389,6 +4488,7 @@ impl StandardHarness {
                     session_id,
                     usage: AggregateUsage::default(),
                     turns: 0,
+                    session_state: SessionState::default(),
                 };
                 self.finalize_self_verifying(&result).await;
                 return result;
@@ -4481,6 +4581,7 @@ impl StandardHarness {
                     session_id,
                     usage: total_usage,
                     turns: carried.turns,
+                    session_state: SessionState::default(),
                 };
                 self.finalize_self_verifying(&result).await;
                 return result;
@@ -4511,6 +4612,7 @@ impl StandardHarness {
                     session_id,
                     usage: total_usage,
                     turns: carried.turns,
+                    session_state: SessionState::default(),
                 };
                 self.finalize_self_verifying(&result).await;
                 return result;
@@ -4667,6 +4769,7 @@ impl StandardHarness {
                         session_id,
                         usage: total_usage,
                         turns: carried.turns,
+                        session_state: SessionState::default(),
                     };
                     self.finalize_self_verifying(&result).await;
                     return result;
@@ -4686,6 +4789,7 @@ impl StandardHarness {
             session_id,
             usage: total_usage,
             turns: carried.turns,
+            session_state: SessionState::default(),
         };
         self.finalize_self_verifying(&result).await;
         result
@@ -4903,6 +5007,7 @@ impl StandardHarness {
                 session_id,
                 usage: outcome.usage,
                 turns: outcome.turns,
+                session_state: SessionState::default(),
             };
             self.finalize_plan_execute(&result).await;
             return result;
@@ -5025,6 +5130,9 @@ impl StandardHarness {
         let mut total_usage = plan_usage;
         // Q2: the success handle is the LAST completed step's final text.
         let mut last_output = String::new();
+        // Issue #102: the LAST completed step's conversation history, carried into
+        // the terminal `RunResult` so a PlanExecute caller resumes losslessly.
+        let mut last_state = SessionState::default();
         // Global turn cap (the hard stop). `None` ⇒ no global turn ceiling.
         let global_max_turns = task.budget.max_turns;
 
@@ -5096,11 +5204,13 @@ impl StandardHarness {
                     output,
                     usage,
                     turns,
+                    session_state: step_state,
                     ..
                 } => {
                     // Carry the shared budget forward (Q1): cumulative turns are
                     // the sub-loop's absolute count; fold in its token usage.
                     carried.turns = turns;
+                    last_state = step_state;
                     carried.input_tokens += usage.input_tokens;
                     carried.output_tokens += usage.output_tokens;
                     total_usage.input_tokens += usage.input_tokens;
@@ -5156,6 +5266,7 @@ impl StandardHarness {
                         session_id,
                         usage: total_usage,
                         turns,
+                        session_state: last_state,
                     };
                 }
                 // A step surfacing to a human pauses the whole run; propagate.
@@ -5188,6 +5299,7 @@ impl StandardHarness {
             session_id,
             usage: total_usage,
             turns: carried.turns,
+            session_state: last_state,
         }
     }
 
@@ -5228,6 +5340,7 @@ impl StandardHarness {
                 session_id,
                 usage,
                 turns: budget_used.turns,
+                session_state: session_state.clone(),
             });
         }
         if let Some(limit_type) = Self::budget_exceeded(&task.budget, &budget_used, started_at) {
@@ -5236,6 +5349,7 @@ impl StandardHarness {
                 session_id,
                 usage,
                 turns: budget_used.turns,
+                session_state: session_state.clone(),
             });
         }
 
@@ -5390,6 +5504,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 });
             }
             TurnResult::Error { error, usage: u } => {
@@ -5401,6 +5516,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 });
             }
         };
@@ -5414,6 +5530,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 });
             }
         };
@@ -5455,6 +5572,7 @@ impl StandardHarness {
                     session_id,
                     usage,
                     turns: budget_used.turns,
+                    session_state: session_state.clone(),
                 });
             }
         }
@@ -5636,7 +5754,11 @@ impl StandardHarness {
 
 impl Harness for StandardHarness {
     fn run<'a>(&'a self, options: HarnessRunOptions) -> BoxFut<'a, RunResult> {
-        Box::pin(self.run_inner(options))
+        Box::pin(async move {
+            let result = self.run_inner(options).await;
+            self.auto_persist_terminal(&result).await;
+            result
+        })
     }
 
     fn resume<'a>(
@@ -5645,17 +5767,127 @@ impl Harness for StandardHarness {
         response: HumanResponse,
         on_stream: Option<StreamSink>,
     ) -> BoxFut<'a, RunResult> {
-        Box::pin(self.resume_inner(state, response, on_stream))
+        Box::pin(async move {
+            let result = self.resume_inner(state, response, on_stream).await;
+            self.auto_persist_terminal(&result).await;
+            result
+        })
     }
 }
 
 impl StandardHarness {
+    /// Issue #102 auto-persist seam: write the terminal run state to the
+    /// [`SessionStore`](crate::storage::SessionStore) when
+    /// [`auto_persist_sessions`](HarnessConfig::auto_persist_sessions) is enabled.
+    ///
+    /// One write per `run()`/`resume()`, at the same terminal seam as the
+    /// observability flush. For `Success`/`Failure` a [`PausedState`] is
+    /// synthesized carrying the final `session_state` with empty pending fields
+    /// (D4); for `WaitingForHuman`/`Escalate` the carried `PausedState` is
+    /// persisted (D6 — the cross-process pause case). Storage errors are
+    /// swallowed-and-logged (D8): a put failure must never lose the run nor
+    /// surface as a [`HaltReason`].
+    ///
+    /// When disabled (the default), this returns immediately WITHOUT touching the
+    /// store — the off-by-default zero-I/O contract (#102).
+    async fn auto_persist_terminal(&self, result: &RunResult) {
+        if !self.config.auto_persist_sessions {
+            return;
+        }
+        // Build the `(SessionId, PausedState)` to persist for this terminal.
+        let (session_id, state) = match result {
+            RunResult::Success {
+                session_id,
+                session_state,
+                turns,
+                ..
+            }
+            | RunResult::Failure {
+                session_id,
+                session_state,
+                turns,
+                ..
+            } => {
+                // Synthesize a completed-run PausedState: empty pending fields,
+                // no human request, no child — it carries only the final history
+                // so a later `get_session(..).session_state` resumes losslessly.
+                let state = PausedState {
+                    session_id: session_id.clone(),
+                    task_id: TaskId::new(session_id.as_str()),
+                    turn_number: *turns,
+                    session_state: session_state.clone(),
+                    pending_tool_calls: vec![],
+                    approved_results: vec![],
+                    human_request: None,
+                    task: Task::new(
+                        String::new(),
+                        session_id.clone(),
+                        LoopStrategy::ReAct { max_iterations: 0 },
+                    ),
+                    budget_used: BudgetSnapshot::default(),
+                    child_state: None,
+                };
+                (session_id.clone(), state)
+            }
+            // Persist the carried pause state directly (D6).
+            RunResult::WaitingForHuman { state, .. } => {
+                (state.session_id.clone(), (**state).clone())
+            }
+            RunResult::Escalate {
+                state, session_id, ..
+            } => (session_id.clone(), (**state).clone()),
+        };
+        // Swallow-and-log on Err (D8): a storage hiccup must not lose the run.
+        let _ = self
+            .config
+            .storage
+            .session()
+            .put_session(&session_id, &state)
+            .await;
+    }
+
     async fn run_inner(&self, options: HarnessRunOptions) -> RunResult {
         let HarnessRunOptions {
             task,
             on_stream,
             session_state,
         } = options;
+
+        // Issue #102 auto-load: when enabled AND no explicit session_state was
+        // provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
+        // Ralph/HillClimbing discard it by design, D7), load the prior session for
+        // this `session_id` from the SessionStore so a caller can resume by id.
+        // Explicit `with_session_state` always wins (D5). Errors are
+        // swallowed-and-logged: a load failure starts fresh (D8).
+        let session_state = match session_state {
+            Some(explicit) => Some(explicit),
+            None if self.config.auto_persist_sessions
+                && matches!(
+                    task.loop_strategy,
+                    LoopStrategy::ReAct { .. } | LoopStrategy::SelfVerifying
+                ) =>
+            {
+                match self
+                    .config
+                    .storage
+                    .session()
+                    .get_session(&task.session_id)
+                    .await
+                {
+                    Ok(Some(prior)) => Some(prior.session_state),
+                    Ok(None) => None,
+                    Err(_e) => {
+                        // Swallow-and-log: start fresh on a load failure (D8).
+                        // (No logging facade is wired into spore-core; the error
+                        // is intentionally dropped rather than surfaced as a
+                        // HaltReason.)
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let mut session_state = session_state.unwrap_or_default();
         let budget_used = BudgetSnapshot::default();
 
@@ -5817,6 +6049,7 @@ impl StandardHarness {
                     session_id,
                     usage: AggregateUsage::default(),
                     turns: turn_number,
+                    session_state,
                 };
             }
             HumanResponse::Deny { reason } => {
@@ -6255,6 +6488,7 @@ mod tests {
             metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
+            auto_persist_sessions: false,
         }
     }
 
@@ -8832,6 +9066,7 @@ mod tests {
             session_id: SessionId::new("s"),
             usage: AggregateUsage::default(),
             turns: 3,
+            session_state: SessionState::default(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: RunResult = serde_json::from_str(&s).unwrap();
@@ -9105,6 +9340,7 @@ mod tests {
                 metric_evaluator: None,
                 catalogue_registry: None,
                 system_prompt: None,
+                auto_persist_sessions: false,
             })
         }
 
@@ -11946,6 +12182,450 @@ mod tests {
                 &mut st
             )
             .is_empty());
+        }
+    }
+
+    // ========================================================================
+    // Issue #102: session-state threading + opt-in auto-persist
+    // ========================================================================
+    mod session_threading {
+        use super::*;
+        use crate::storage::{
+            InMemoryStorageProvider, NoOpStorageProvider, SessionStore, StorageError,
+            StorageProvider,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// In-memory `SessionStore` that COUNTS every get/put so a test can assert
+        /// "zero session-store I/O when auto_persist is disabled".
+        #[derive(Default)]
+        struct CountingSessionStore {
+            inner: InMemoryStorageProvider,
+            gets: AtomicUsize,
+            puts: AtomicUsize,
+        }
+        impl SessionStore for CountingSessionStore {
+            fn get_session<'a>(
+                &'a self,
+                id: &'a SessionId,
+            ) -> BoxFut<'a, Result<Option<PausedState>, StorageError>> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                self.inner.get_session(id)
+            }
+            fn put_session<'a>(
+                &'a self,
+                id: &'a SessionId,
+                state: &'a PausedState,
+            ) -> BoxFut<'a, Result<(), StorageError>> {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                self.inner.put_session(id, state)
+            }
+            fn delete_session<'a>(
+                &'a self,
+                id: &'a SessionId,
+            ) -> BoxFut<'a, Result<(), StorageError>> {
+                self.inner.delete_session(id)
+            }
+            fn list_sessions(&self) -> BoxFut<'_, Result<Vec<SessionId>, StorageError>> {
+                self.inner.list_sessions()
+            }
+        }
+
+        /// Build a `StorageProvider` whose session slot is the counting store and
+        /// whose other three slots are no-ops (so only session I/O is observed).
+        fn counting_provider(store: Arc<CountingSessionStore>) -> Arc<StorageProvider> {
+            Arc::new(StorageProvider::new(
+                store,
+                Arc::new(NoOpStorageProvider),
+                Arc::new(NoOpStorageProvider),
+                Arc::new(NoOpStorageProvider),
+            ))
+        }
+
+        /// A `MockAgent` that requests one tool call, then replies with final text.
+        fn tool_then_final_agent() -> Arc<MockAgent> {
+            let a = make_agent();
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: "after-tool".into(),
+                usage: usage(),
+            });
+            a
+        }
+
+        fn tool_registry() -> Arc<ScriptedToolRegistry> {
+            let reg = Arc::new(ScriptedToolRegistry::new());
+            reg.push(ToolOutput::Success {
+                content: "tool-ok".into(),
+                truncated: false,
+            });
+            reg
+        }
+
+        /// (a) Off-by-default: ZERO session-store I/O AND the message flow /
+        /// outcome is identical to today (Success carries the right messages).
+        #[tokio::test]
+        async fn off_by_default_no_session_io() {
+            let store = Arc::new(CountingSessionStore::default());
+            let mut cfg = standard_config(tool_then_final_agent());
+            cfg.tool_registry = tool_registry();
+            cfg.storage = counting_provider(store.clone());
+            // auto_persist_sessions defaults to false in standard_config.
+            assert!(!cfg.auto_persist_sessions);
+            let h = StandardHarness::new(cfg);
+            let r = h.run(HarnessRunOptions::new(react(5))).await;
+            match r {
+                RunResult::Success {
+                    output,
+                    session_state,
+                    ..
+                } => {
+                    assert_eq!(output, "after-tool");
+                    // The new field is populated even when persistence is off.
+                    assert!(session_state
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m.content, Content::ToolCall(_))));
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+            assert_eq!(store.gets.load(Ordering::SeqCst), 0, "no get_session calls");
+            assert_eq!(store.puts.load(Ordering::SeqCst), 0, "no put_session calls");
+        }
+
+        /// (b) Success.session_state is LOSSLESS for a tool-using run: the
+        /// assistant tool-call message, the tool-result message, and the final
+        /// text are all present (none recoverable from `output` alone).
+        #[tokio::test]
+        async fn success_session_state_is_lossless_for_tool_run() {
+            let mut cfg = standard_config(tool_then_final_agent());
+            cfg.tool_registry = tool_registry();
+            let h = StandardHarness::new(cfg);
+            match h.run(HarnessRunOptions::new(react(5))).await {
+                RunResult::Success { session_state, .. } => {
+                    let roles: Vec<_> = session_state
+                        .messages
+                        .iter()
+                        .map(|m| (&m.role, &m.content))
+                        .collect();
+                    // user instruction
+                    assert!(roles
+                        .iter()
+                        .any(|(r, _)| matches!(r, crate::model::Role::User)));
+                    // assistant tool-call turn
+                    assert!(session_state
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m.content, Content::ToolCall(_))));
+                    // tool-result turn
+                    assert!(session_state
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m.role, crate::model::Role::Tool)));
+                    // final assistant text
+                    assert!(session_state.messages.iter().any(|m| matches!(
+                        (&m.role, &m.content),
+                        (crate::model::Role::Assistant, Content::Text { text }) if text == "after-tool"
+                    )));
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// (d) Auto-persist round-trip: get_session returns the final history.
+        #[tokio::test]
+        async fn auto_persist_round_trip() {
+            let backend = Arc::new(InMemoryStorageProvider::new());
+            let provider = Arc::new(StorageProvider::single(backend));
+            let mut cfg = standard_config(tool_then_final_agent());
+            cfg.tool_registry = tool_registry();
+            cfg.storage = provider.clone();
+            cfg.auto_persist_sessions = true;
+            let h = StandardHarness::new(cfg);
+            let sid = SessionId::new("s1");
+            let task = Task::new(
+                "do something",
+                sid.clone(),
+                LoopStrategy::ReAct { max_iterations: 5 },
+            );
+            let _ = h.run(HarnessRunOptions::new(task)).await;
+
+            let stored = provider
+                .session()
+                .get_session(&sid)
+                .await
+                .expect("get ok")
+                .expect("session persisted");
+            assert!(stored
+                .session_state
+                .messages
+                .iter()
+                .any(|m| matches!(m.content, Content::ToolCall(_))));
+            assert!(stored.pending_tool_calls.is_empty());
+            assert!(stored.human_request.is_none());
+        }
+
+        /// (c) Auto-load across two runs sharing a session_id with an in-memory
+        /// store: the second run sees the first run's history.
+        #[tokio::test]
+        async fn auto_load_by_session_id_across_runs() {
+            let provider = Arc::new(StorageProvider::single(Arc::new(
+                InMemoryStorageProvider::new(),
+            )));
+            let sid = SessionId::new("shared");
+
+            // Run 1: one final response, auto-persisted.
+            {
+                let a = make_agent();
+                a.push(TurnResult::FinalResponse {
+                    reasoning: None,
+                    content: "first".into(),
+                    usage: usage(),
+                });
+                let mut cfg = standard_config(a);
+                cfg.storage = provider.clone();
+                cfg.auto_persist_sessions = true;
+                let h = StandardHarness::new(cfg);
+                let task = Task::new(
+                    "turn one",
+                    sid.clone(),
+                    LoopStrategy::ReAct { max_iterations: 5 },
+                );
+                let _ = h.run(HarnessRunOptions::new(task)).await;
+            }
+
+            // Run 2: same session_id, no explicit state. The loaded history must
+            // carry the prior turns forward.
+            let a = make_agent();
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: "second".into(),
+                usage: usage(),
+            });
+            let mut cfg = standard_config(a);
+            cfg.storage = provider.clone();
+            cfg.auto_persist_sessions = true;
+            let h = StandardHarness::new(cfg);
+            let task = Task::new(
+                "turn two",
+                sid.clone(),
+                LoopStrategy::ReAct { max_iterations: 5 },
+            );
+            match h.run(HarnessRunOptions::new(task)).await {
+                RunResult::Success { session_state, .. } => {
+                    let texts: Vec<String> = session_state
+                        .messages
+                        .iter()
+                        .filter_map(|m| match &m.content {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(texts.iter().any(|t| t == "first"), "prior turn carried");
+                    assert!(texts.iter().any(|t| t == "turn one"));
+                    assert!(texts.iter().any(|t| t == "turn two"));
+                    assert!(texts.iter().any(|t| t == "second"));
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// (e) Cross-process continuity via FileSystemStorageProvider under a
+        /// tempdir: a fresh harness instance resumes by session_id.
+        #[tokio::test]
+        async fn cross_process_continuity_filesystem() {
+            let dir = std::env::temp_dir().join(format!("spore-102-{}", random_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let sid = SessionId::new("fs-session");
+
+            // "Process 1": its own harness + provider instance.
+            {
+                let provider = Arc::new(StorageProvider::single(Arc::new(
+                    crate::storage::FileSystemStorageProvider::new(dir.clone()),
+                )));
+                let a = make_agent();
+                a.push(TurnResult::FinalResponse {
+                    reasoning: None,
+                    content: "process-one".into(),
+                    usage: usage(),
+                });
+                let mut cfg = standard_config(a);
+                cfg.storage = provider;
+                cfg.auto_persist_sessions = true;
+                let h = StandardHarness::new(cfg);
+                let task = Task::new(
+                    "first process",
+                    sid.clone(),
+                    LoopStrategy::ReAct { max_iterations: 5 },
+                );
+                let _ = h.run(HarnessRunOptions::new(task)).await;
+            }
+
+            // "Process 2": brand-new provider over the SAME dir, brand-new harness.
+            let provider = Arc::new(StorageProvider::single(Arc::new(
+                crate::storage::FileSystemStorageProvider::new(dir.clone()),
+            )));
+            let a = make_agent();
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: "process-two".into(),
+                usage: usage(),
+            });
+            let mut cfg = standard_config(a);
+            cfg.storage = provider;
+            cfg.auto_persist_sessions = true;
+            let h = StandardHarness::new(cfg);
+            let task = Task::new(
+                "second process",
+                sid.clone(),
+                LoopStrategy::ReAct { max_iterations: 5 },
+            );
+            let result = h.run(HarnessRunOptions::new(task)).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            match result {
+                RunResult::Success { session_state, .. } => {
+                    let texts: Vec<String> = session_state
+                        .messages
+                        .iter()
+                        .filter_map(|m| match &m.content {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(
+                        texts.iter().any(|t| t == "process-one"),
+                        "prior process history loaded"
+                    );
+                    assert!(texts.iter().any(|t| t == "process-two"));
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// (f) Explicit with_session_state WINS over auto-load (no get_session,
+        /// the explicit state seeds the run).
+        #[tokio::test]
+        async fn explicit_session_state_wins_over_auto_load() {
+            let store = Arc::new(CountingSessionStore::default());
+            // Pre-seed the store with a DIFFERENT history under the session id.
+            {
+                let mut prior = SessionState::default();
+                prior.messages.push(Message {
+                    role: crate::model::Role::User,
+                    content: Content::Text {
+                        text: "STORED-history".into(),
+                    },
+                });
+                let ps = PausedState {
+                    session_id: SessionId::new("s1"),
+                    task_id: TaskId::new("s1"),
+                    turn_number: 0,
+                    session_state: prior,
+                    pending_tool_calls: vec![],
+                    approved_results: vec![],
+                    human_request: None,
+                    task: Task::new(
+                        "",
+                        SessionId::new("s1"),
+                        LoopStrategy::ReAct { max_iterations: 0 },
+                    ),
+                    budget_used: BudgetSnapshot::default(),
+                    child_state: None,
+                };
+                store
+                    .inner
+                    .put_session(&SessionId::new("s1"), &ps)
+                    .await
+                    .unwrap();
+                store.puts.store(0, Ordering::SeqCst); // reset the pre-seed write
+            }
+
+            let a = make_agent();
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: "done".into(),
+                usage: usage(),
+            });
+            let mut cfg = standard_config(a);
+            cfg.storage = counting_provider(store.clone());
+            cfg.auto_persist_sessions = true;
+            let h = StandardHarness::new(cfg);
+
+            let mut explicit = SessionState::default();
+            explicit.messages.push(Message {
+                role: crate::model::Role::User,
+                content: Content::Text {
+                    text: "EXPLICIT-history".into(),
+                },
+            });
+            let task = Task::new(
+                "turn",
+                SessionId::new("s1"),
+                LoopStrategy::ReAct { max_iterations: 5 },
+            );
+            let opts = HarnessRunOptions::new(task).with_session_state(explicit);
+            match h.run(opts).await {
+                RunResult::Success { session_state, .. } => {
+                    let texts: Vec<String> = session_state
+                        .messages
+                        .iter()
+                        .filter_map(|m| match &m.content {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(texts.iter().any(|t| t == "EXPLICIT-history"));
+                    assert!(!texts.iter().any(|t| t == "STORED-history"), "load skipped");
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+            assert_eq!(
+                store.gets.load(Ordering::SeqCst),
+                0,
+                "explicit state skips the auto-load get_session"
+            );
+        }
+
+        /// (g) Failure ALSO carries session_state.
+        #[tokio::test]
+        async fn failure_carries_session_state() {
+            // A tool annotated always_halt fails the run after the assistant
+            // tool-call turn was recorded into session_state.
+            let a = make_agent();
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "danger".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+            let mut cfg = standard_config(a);
+            let reg = Arc::new(ScriptedToolRegistry::new());
+            reg.mark_always_halt("danger");
+            cfg.tool_registry = reg;
+            let h = StandardHarness::new(cfg);
+            match h.run(HarnessRunOptions::new(react(5))).await {
+                RunResult::Failure { session_state, .. } => {
+                    // The seeded user instruction is present in the failure state.
+                    assert!(session_state.messages.iter().any(|m| matches!(
+                        (&m.role, &m.content),
+                        (crate::model::Role::User, Content::Text { .. })
+                    )));
+                }
+                other => panic!("expected Failure, got {other:?}"),
+            }
         }
     }
 }

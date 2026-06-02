@@ -144,6 +144,7 @@ impl EvalHarness {
                 session_id: session_id.clone(),
                 usage: Default::default(),
                 turns: 0,
+                session_state: Default::default(),
             },
         };
 

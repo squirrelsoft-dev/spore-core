@@ -8,21 +8,24 @@
 //!
 //! The harness is stateless between `run()` calls: each call takes an optional
 //! starting [`SessionState`] (the message history) and drives one task to a
-//! final response. It does NOT persist history for you, and — worth knowing —
-//! `RunResult::Success` does not hand the post-run state back. The caller owns
-//! the conversation.
+//! final response. As of issue #102, `RunResult::Success` now hands the
+//! post-run [`SessionState`] back, so the caller resumes the conversation
+//! LOSSLESSLY — no reconstruction. After each turn we feed the returned
+//! `session_state` straight into the next run via
+//! [`HarnessRunOptions::with_session_state`]. The harness appends the new user
+//! line on top of that history before calling the model, so the model sees the
+//! whole conversation and can refer back to it.
 //!
-//! For a no-tools conversational agent that's easy: the assistant's turn is
-//! exactly the `output` string. So after each turn we append the user's line
-//! and the agent's reply to a local `Vec<Message>` and thread it back into the
-//! next run via [`HarnessRunOptions::with_session_state`]. The harness appends
-//! the new user line on top of that history before calling the model, so the
-//! model sees the whole conversation and can refer back to it.
+//! This works for tool-using agents too: the returned `session_state` carries
+//! the tool-call and tool-result messages the loop produced, which the old
+//! "reconstruct history from `output`" trick could not recover. (The previous
+//! version of this example documented that as an honest limitation — issue #102
+//! retired it.)
 //!
-//! (A tool-using agent would also produce tool-call/tool-result messages that
-//! aren't recoverable from `output` alone — that's a limitation of this
-//! reconstruction trick, and motivation for `RunResult::Success` to return the
-//! final `SessionState` someday. For plain chat, reconstruction is exact.)
+//! Prefer it hands-free? Wire a `SessionStore` and call
+//! `HarnessBuilder::auto_persist_sessions(true)`: the harness then auto-loads
+//! and auto-persists by `session_id`, so you reuse the id instead of threading
+//! state at all (great for a web service that resumes across restarts).
 //!
 //! ## Run it
 //!
@@ -35,8 +38,8 @@
 use std::io::{self, BufRead, Write};
 
 use spore_core::{
-    Content, Harness, HarnessBuilder, HarnessRunOptions, LoopStrategy, Message,
-    OllamaModelInterface, Role, RunResult, SessionId, SessionState, Task,
+    Harness, HarnessBuilder, HarnessRunOptions, LoopStrategy, OllamaModelInterface, RunResult,
+    SessionId, SessionState, Task,
 };
 
 #[tokio::main]
@@ -52,11 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model).build();
 
-    // One session id for the whole REPL, and the conversation history we thread
-    // back in on each turn. The harness never sees this as "its" state — we own
-    // it.
+    // One session id for the whole REPL, and the conversation state we thread
+    // back in on each turn. Each run hands the post-run `SessionState` back
+    // (issue #102), so we just carry it forward — lossless, no reconstruction.
     let session_id = SessionId::generate();
-    let mut history: Vec<Message> = Vec::new();
+    let mut state = SessionState::default();
+    let mut turns_exchanged = 0usize;
 
     println!("conversational REPL — model {model_id}. Type a message; /exit or Ctrl-D to quit.");
     let stdin = io::stdin();
@@ -77,24 +81,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Thread the running history into this turn. The harness appends `line`
+        // Thread the running state into this turn. The harness appends `line`
         // as the new user message before calling the model.
         let task = Task::new(
             line.clone(),
             session_id.clone(),
             LoopStrategy::ReAct { max_iterations: 4 },
         );
-        let options = HarnessRunOptions::new(task).with_session_state(SessionState {
-            messages: history.clone(),
-            extras: Default::default(),
-        });
+        let options = HarnessRunOptions::new(task).with_session_state(state.clone());
 
         match harness.run(options).await {
-            RunResult::Success { output, .. } => {
+            RunResult::Success {
+                output,
+                session_state,
+                ..
+            } => {
                 println!("bot> {output}");
-                // Record both halves of the exchange so the next turn remembers.
-                history.push(text_message(Role::User, line));
-                history.push(text_message(Role::Assistant, output));
+                // Carry the post-run state forward losslessly (issue #102):
+                // it already contains this turn's user + assistant messages
+                // (and any tool messages a tool-using agent would produce).
+                state = session_state;
+                turns_exchanged += 1;
             }
             other => {
                 eprintln!("bot> [run did not succeed: {other:?}]");
@@ -102,15 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("bye ({} message(s) exchanged)", history.len());
+    println!(
+        "bye ({turns_exchanged} turn(s); {} message(s) in history)",
+        state.messages.len()
+    );
     Ok(())
-}
-
-fn text_message(role: Role, text: String) -> Message {
-    Message {
-        role,
-        content: Content::Text { text },
-    }
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
