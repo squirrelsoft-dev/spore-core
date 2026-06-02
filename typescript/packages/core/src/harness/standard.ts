@@ -102,6 +102,8 @@ import {
   emptyAggregateUsage,
   emptyBudgetSnapshot,
   emptySessionState,
+  newTask,
+  runResultSessionState,
   type AggregateUsage,
   type BudgetLimitType,
   type BudgetLimits,
@@ -262,6 +264,22 @@ export interface HarnessConfig {
    * Absent (the default) preserves today's behaviour.
    */
   systemPrompt?: string;
+  /**
+   * Opt-in conversation-history threading through the {@link StorageProvider}'s
+   * {@link SessionStore} (issue #102). When `true`, the harness:
+   *   - **auto-loads** the prior {@link SessionState} for the run's `session_id`
+   *     at the start of `run()` (ReAct / SelfVerifying only — Ralph/HillClimbing
+   *     discard incoming state by design). An explicit
+   *     {@link HarnessRunOptions.session_state} always wins (no load).
+   *   - **auto-persists** the post-run {@link SessionState} back to the store at
+   *     the terminal seam — one write per `run()`/`resume()`.
+   *
+   * Absent / `false` (the default) is the off-by-default zero-I/O contract: the
+   * harness performs NO session-store reads or writes and behaves byte-for-byte
+   * like today. Storage errors are swallowed-and-logged, never surfaced as a
+   * {@link HaltReason}. See {@link HarnessBuilder.autoPersistSessions}.
+   */
+  autoPersistSessions?: boolean;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -445,16 +463,102 @@ export class StandardHarness implements Harness {
   }
 
   async run(options: HarnessRunOptions): Promise<RunResult> {
-    const sessionState = options.session_state ?? emptySessionState();
+    const result = await this.runInner(options);
+    await this.autoPersistTerminal(result);
+    return result;
+  }
+
+  /**
+   * Issue #102 auto-persist seam: write the terminal run state to the
+   * {@link SessionStore} when {@link HarnessConfig.autoPersistSessions} is
+   * enabled. One write per `run()`/`resume()`, at the same terminal seam as the
+   * observability flush.
+   *
+   * For `success`/`failure` a {@link PausedState} is synthesized carrying the
+   * final {@link SessionState} with empty pending fields (D4); for
+   * `waiting_for_human`/`escalate` the carried {@link PausedState} is persisted
+   * (D6 — the cross-process pause case). Storage errors are swallowed-and-logged
+   * (D8): a put failure must never lose the run nor surface as a {@link HaltReason}.
+   *
+   * When disabled (the default) this returns immediately WITHOUT touching the
+   * store — the off-by-default zero-I/O contract (#102).
+   */
+  private async autoPersistTerminal(result: RunResult): Promise<void> {
+    if (!this.config.autoPersistSessions) return;
+
+    let sessionId: SessionId;
+    let state: PausedState;
+    switch (result.kind) {
+      case "success":
+      case "failure": {
+        sessionId = result.session_id;
+        // Synthesize a completed-run PausedState: empty pending fields, no human
+        // request, no child — it carries only the final history so a later
+        // getSession(..).session_state resumes losslessly.
+        state = {
+          session_id: sessionId,
+          task_id: new TaskId(sessionId.asString()),
+          turn_number: result.turns,
+          session_state: runResultSessionState(result),
+          pending_tool_calls: [],
+          approved_results: [],
+          task: newTask("", sessionId, { kind: "re_act", max_iterations: 0 }),
+          budget_used: emptyBudgetSnapshot(),
+          child_state: null,
+        };
+        break;
+      }
+      // Persist the carried pause state directly (D6).
+      case "waiting_for_human":
+        sessionId = result.state.session_id;
+        state = result.state;
+        break;
+      case "escalate":
+        sessionId = result.session_id;
+        state = result.state;
+        break;
+    }
+
+    // Swallow-and-log on rejection (D8): a storage hiccup must not lose the run.
+    try {
+      await this.storage().session().putSession(sessionId, state);
+    } catch {
+      // Intentionally dropped — never surfaced as a HaltReason. (No logging
+      // facade is wired into @spore/core; the error is dropped, not propagated.)
+    }
+  }
+
+  private async runInner(options: HarnessRunOptions): Promise<RunResult> {
     const budgetUsed = emptyBudgetSnapshot();
     const task = options.task;
+
+    // Issue #102 auto-load: when enabled AND no explicit session_state was
+    // provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
+    // Ralph/HillClimbing discard it by design, D7), load the prior session for
+    // this `session_id` from the SessionStore so a caller can resume by id.
+    // Explicit `session_state` always wins (D5). Errors are swallowed-and-logged:
+    // a load failure starts fresh (D8).
+    let sessionState = options.session_state;
+    if (
+      sessionState == null &&
+      this.config.autoPersistSessions === true &&
+      (task.loop_strategy.kind === "re_act" || task.loop_strategy.kind === "self_verifying")
+    ) {
+      try {
+        const prior = await this.storage().session().getSession(task.session_id);
+        if (prior != null) sessionState = prior.session_state;
+      } catch {
+        // Swallow-and-log: start fresh on a load failure (D8).
+      }
+    }
+    const resolvedState = sessionState ?? emptySessionState();
 
     switch (task.loop_strategy.kind) {
       case "re_act":
         return this.runReact(
           task,
           task.loop_strategy.max_iterations,
-          sessionState,
+          resolvedState,
           budgetUsed,
           options.on_stream,
           options.signal,
@@ -463,7 +567,7 @@ export class StandardHarness implements Harness {
       case "plan_execute":
         return this.runPlanExecute(
           task,
-          sessionState,
+          resolvedState,
           budgetUsed,
           options.on_stream,
           options.signal,
@@ -471,7 +575,7 @@ export class StandardHarness implements Harness {
       case "ralph":
         return this.runRalph(task, budgetUsed, options.on_stream);
       case "self_verifying":
-        return this.runSelfVerifying(task, sessionState, budgetUsed, options.on_stream);
+        return this.runSelfVerifying(task, resolvedState, budgetUsed, options.on_stream);
       case "hill_climbing":
         return this.runHillClimbing(
           task,
@@ -491,6 +595,17 @@ export class StandardHarness implements Harness {
   }
 
   async resume(
+    state: PausedState,
+    response: HumanResponse,
+    onStream?: StreamSink,
+    signal?: AbortSignal,
+  ): Promise<RunResult> {
+    const result = await this.resumeInner(state, response, onStream, signal);
+    await this.autoPersistTerminal(result);
+    return result;
+  }
+
+  private async resumeInner(
     state: PausedState,
     response: HumanResponse,
     onStream?: StreamSink,
@@ -557,6 +672,7 @@ export class StandardHarness implements Harness {
           session_id: state.session_id,
           usage: emptyAggregateUsage(),
           turns: state.turn_number,
+          session_state: sessionState,
         };
 
       case "deny": {
@@ -826,6 +942,11 @@ export class StandardHarness implements Harness {
     const totalUsage: AggregateUsage = { ...planUsage };
     // Q2: the success handle is the LAST completed step's final text.
     let lastOutput = "";
+    // Issue #102: the post-run conversation history threaded into the terminal
+    // result is the LAST step's sub-loop history (each step runs on a clone),
+    // seeded with the plan-phase session so an empty/all-skipped plan still
+    // carries the planning turns forward. Mirrors Rust's `last_state`.
+    let lastState: SessionState = sessionState;
     // Global turn cap (the hard stop). `null` ⇒ no global turn ceiling.
     const globalMaxTurns = task.budget.max_turns ?? null;
 
@@ -916,6 +1037,7 @@ export class StandardHarness implements Harness {
         totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
         totalUsage.cost_usd += subResult.usage.cost_usd;
         lastOutput = subResult.output;
+        lastState = runResultSessionState(subResult);
 
         // Mark completed and re-persist (Q4).
         completeTask(taskList, taskId);
@@ -951,6 +1073,7 @@ export class StandardHarness implements Harness {
           session_id: sessionId,
           usage: totalUsage,
           turns: subResult.turns,
+          session_state: lastState,
         };
       } else {
         // A step surfacing to a human pauses the whole run; propagate.
@@ -965,6 +1088,7 @@ export class StandardHarness implements Harness {
       session_id: sessionId,
       usage: totalUsage,
       turns: carried.turns,
+      session_state: lastState,
     };
   }
 
@@ -1324,15 +1448,22 @@ export class StandardHarness implements Harness {
       };
       const verdict = await verifier.verify(input);
       if (verdict.kind === "passed") {
-        // Reuse the build run's output as the run's output.
+        // Reuse the build run's output as the run's output. Carry the build
+        // run's final conversation history into the terminal result (issue
+        // #102) so a SelfVerifying caller resumes losslessly; fall back to the
+        // running build context for a non-Success build a bespoke verifier
+        // accepted.
         const output = buildResult.kind === "success" ? buildResult.output : "";
         const turns = buildResult.kind === "success" ? buildResult.turns : carried.turns;
+        const finalState =
+          buildResult.kind === "success" ? runResultSessionState(buildResult) : sessionState;
         const result: RunResult = {
           kind: "success",
           output,
           session_id: buildSessionId,
           usage: totalUsage,
           turns,
+          session_state: finalState,
         };
         await this.finalizeSelfVerifying(result);
         return result;
@@ -1344,13 +1475,15 @@ export class StandardHarness implements Harness {
       await this.config.contextManager.appendUserMessage(sessionState, verdict.reason);
     }
 
-    // R7: ran out of round-trips without a pass — clean exhaustion.
+    // R7: ran out of round-trips without a pass — clean exhaustion. Carry the
+    // live build session history (issue #102).
     const result: RunResult = {
       kind: "failure",
       reason: { kind: "self_verify_exhausted", iterations: maxIterations, last_reason: lastReason },
       session_id: buildSessionId,
       usage: totalUsage,
       turns: carried.turns,
+      session_state: sessionState,
     };
     await this.finalizeSelfVerifying(result);
     return result;
@@ -2053,12 +2186,19 @@ export class StandardHarness implements Harness {
       const status = StandardHarness.ralphCompletionStatus(workspaceRoot);
       if (status == null) {
         const output = windowResult.kind === "success" ? windowResult.output : "";
+        // Carry the final context window's history into the terminal result
+        // (issue #102).
+        const finalState =
+          windowResult.kind === "success"
+            ? runResultSessionState(windowResult)
+            : emptySessionState();
         const result: RunResult = {
           kind: "success",
           output,
           session_id: windowSessionId,
           usage: totalUsage,
           turns: carriedAccounting.turns,
+          session_state: finalState,
         };
         await this.finalizeSelfVerifying(result);
         return result;
@@ -2270,6 +2410,7 @@ export class StandardHarness implements Harness {
           sessionId,
           usage,
           budgetUsed.turns,
+          sessionState,
         );
       }
       const overrun = budgetExceeded(task.budget, budgetUsed, startedAt);
@@ -2279,6 +2420,7 @@ export class StandardHarness implements Harness {
           sessionId,
           usage,
           budgetUsed.turns,
+          sessionState,
         );
       }
 
@@ -2295,6 +2437,7 @@ export class StandardHarness implements Harness {
               sessionId,
               usage,
               budgetUsed.turns,
+              sessionState,
             );
           case "surface_to_human": {
             const ps: PausedState = {
@@ -2476,6 +2619,7 @@ export class StandardHarness implements Harness {
                   sessionId,
                   usage,
                   budgetUsed.turns,
+                  sessionState,
                 );
               case "surface_to_human": {
                 const ps: PausedState = {
@@ -2507,6 +2651,7 @@ export class StandardHarness implements Harness {
               sessionId,
               usage,
               budgetUsed.turns,
+              sessionState,
             );
           }
 
@@ -2547,6 +2692,7 @@ export class StandardHarness implements Harness {
             session_id: sessionId,
             usage,
             turns: budgetUsed.turns,
+            session_state: sessionState,
           };
         }
 
@@ -2567,6 +2713,7 @@ export class StandardHarness implements Harness {
               sessionId,
               usage,
               budgetUsed.turns,
+              sessionState,
             );
           }
 
@@ -2602,6 +2749,7 @@ export class StandardHarness implements Harness {
                   sessionId,
                   usage,
                   budgetUsed.turns,
+                  sessionState,
                 );
               case "surface_to_human": {
                 const ps: PausedState = {
@@ -2637,6 +2785,7 @@ export class StandardHarness implements Harness {
                   sessionId,
                   usage,
                   budgetUsed.turns,
+                  sessionState,
                 );
               }
               // Layer-2 default: recoverable — append as tool error.
@@ -2773,6 +2922,7 @@ export class StandardHarness implements Harness {
                 sessionId,
                 usage,
                 budgetUsed.turns,
+                sessionState,
               );
             }
 
@@ -2854,6 +3004,7 @@ export class StandardHarness implements Harness {
                 sessionId,
                 usage,
                 budgetUsed.turns,
+                sessionState,
               );
             }
           }
@@ -2886,6 +3037,7 @@ export class StandardHarness implements Harness {
             sessionId,
             usage,
             budgetUsed.turns,
+            sessionState,
           );
         }
 
@@ -3110,6 +3262,7 @@ export class HarnessBuilder {
   private _vcsProvider?: VcsProvider;
   private readonly _standardTools: StandardTool[] = [];
   private _systemPrompt?: string;
+  private _autoPersistSessions = false;
 
   constructor(
     private readonly agent: Agent,
@@ -3283,6 +3436,23 @@ export class HarnessBuilder {
   }
 
   /**
+   * Opt into automatic conversation-history threading through the
+   * {@link StorageProvider}'s {@link SessionStore} (issue #102). Defaults to
+   * `false` — the off-by-default zero-I/O contract.
+   *
+   * When `true`, `run()` auto-loads the prior session by `session_id` (ReAct /
+   * SelfVerifying; explicit {@link HarnessRunOptions.session_state} still wins)
+   * and auto-persists the post-run state at the terminal seam. For cross-process
+   * continuity, pair this with a durable {@link StorageProvider}; without one the
+   * default no-op store makes this an inert flag. See
+   * {@link HarnessConfig.autoPersistSessions} for the full contract.
+   */
+  autoPersistSessions(enabled: boolean): this {
+    this._autoPersistSessions = enabled;
+    return this;
+  }
+
+  /**
    * Override the {@link SandboxProvider} supplied at construction — the only
    * path tools have to the environment (filesystem, process exec).
    *
@@ -3351,6 +3521,7 @@ export class HarnessBuilder {
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
       systemPrompt: this._systemPrompt,
+      autoPersistSessions: this._autoPersistSessions,
     };
   }
 
@@ -3373,8 +3544,16 @@ function failure(
   sessionId: SessionId,
   usage: AggregateUsage,
   turns: number,
+  sessionState: SessionState = emptySessionState(),
 ): RunResult {
-  return { kind: "failure", reason, session_id: sessionId, usage, turns };
+  return {
+    kind: "failure",
+    reason,
+    session_id: sessionId,
+    usage,
+    turns,
+    session_state: sessionState,
+  };
 }
 
 /** Derive the `SessionOutcome.failure.reason` string from a {@link HaltReason}.

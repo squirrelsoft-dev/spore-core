@@ -983,6 +983,18 @@ export type RunResult =
       session_id: SessionId;
       usage: AggregateUsage;
       turns: number;
+      /**
+       * The post-run conversation history (issue #102). Carries the full
+       * {@link SessionState.messages} the loop produced — assistant tool-call
+       * turns and tool-result turns included — so an in-process caller can
+       * resume losslessly via {@link HarnessRunOptions.session_state} without
+       * reconstructing history from `output`. Optional so old serialized
+       * `RunResult` blobs (and other languages mid-migration) still parse — the
+       * TS analogue of Rust's `#[serde(default)]`; read it via
+       * {@link runResultSessionState}, which defaults absence to an empty
+       * {@link SessionState}.
+       */
+      session_state?: SessionState;
     }
   | {
       kind: "failure";
@@ -990,6 +1002,12 @@ export type RunResult =
       session_id: SessionId;
       usage: AggregateUsage;
       turns: number;
+      /**
+       * The post-run conversation history at the point of failure (issue #102).
+       * Same contract as on the `success` variant: lossless resume, optional for
+       * back-compat. Read via {@link runResultSessionState}.
+       */
+      session_state?: SessionState;
     }
   | { kind: "waiting_for_human"; state: PausedState; request: HumanRequest }
   /**
@@ -1008,6 +1026,25 @@ export type RunResult =
       usage: AggregateUsage;
       turns: number;
     };
+
+/**
+ * The post-run {@link SessionState} carried by a terminal {@link RunResult}
+ * (issue #102). For `success`/`failure` returns the carried history, defaulting
+ * absence to an empty {@link SessionState} (back-compat with pre-#102 blobs). For
+ * `waiting_for_human`/`escalate` returns the {@link PausedState.session_state}
+ * those variants already carry. The one place to read post-run history from any
+ * terminal/paused result.
+ */
+export function runResultSessionState(result: RunResult): SessionState {
+  switch (result.kind) {
+    case "success":
+    case "failure":
+      return result.session_state ?? emptySessionState();
+    case "waiting_for_human":
+    case "escalate":
+      return result.state.session_state;
+  }
+}
 
 // ============================================================================
 // HarnessRunOptions
