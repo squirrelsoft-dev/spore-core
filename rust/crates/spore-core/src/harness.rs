@@ -1971,6 +1971,32 @@ impl HarnessBuilder {
         self
     }
 
+    /// Override the [`SandboxProvider`] — the only path tools have to the
+    /// environment (filesystem, process exec).
+    ///
+    /// [`conversational`](Self::conversational) defaults to [`NullSandbox`],
+    /// which denies environment access — fine for pure-compute tools, but
+    /// catalogue file tools (`read_file` / `write_file` / `list_dir`) operate
+    /// *through* the sandbox, so an agent that touches a real directory needs a
+    /// workspace-scoped sandbox here:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spore_core::{HarnessBuilder, OllamaModelInterface, StandardTools};
+    /// # use spore_core::sandbox::{WorkspaceScopedSandbox, WorkspaceConfig};
+    /// # fn demo(workspace: Arc<WorkspaceScopedSandbox>) {
+    /// let harness = HarnessBuilder::conversational(OllamaModelInterface::new("llama3.2"))
+    ///     .sandbox(workspace)
+    ///     .tools(StandardTools::coding_set())
+    ///     .build();
+    /// # let _ = harness;
+    /// # }
+    /// ```
+    pub fn sandbox(mut self, sandbox: Arc<dyn SandboxProvider>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
     /// Add a single [`StandardTool`](crate::tools::StandardTool) to the
     /// catalogue accumulated for this harness (issue #81, Q1/Q2).
     ///
@@ -6129,6 +6155,15 @@ mod tests {
     fn no_catalogue_tools_keeps_tool_registry_seam() {
         let cfg = catalogue_builder(make_agent()).build_config();
         assert!(cfg.catalogue_registry.is_none());
+    }
+
+    #[test]
+    fn sandbox_setter_overrides_the_configured_sandbox() {
+        let sb: Arc<dyn SandboxProvider> = Arc::new(AllowAllSandbox);
+        let cfg = catalogue_builder(make_agent())
+            .sandbox(sb.clone())
+            .build_config();
+        assert!(Arc::ptr_eq(&cfg.sandbox, &sb));
     }
 
     #[tokio::test]

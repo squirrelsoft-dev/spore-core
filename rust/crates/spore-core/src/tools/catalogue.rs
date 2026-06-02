@@ -163,6 +163,17 @@ impl StandardTools {
         StandardTool::new(Box::new(WebSearchTool::new()), WebSearchTool::schema())
     }
 
+    /// `web_search` wired to a concrete backend endpoint. The plain
+    /// [`web_search`](Self::web_search) preset ships with no backend and errors
+    /// on every call until one is configured; use this when you have a search
+    /// endpoint (e.g. a Brave/Tavily-compatible URL) to POST the query to.
+    pub fn web_search_with_endpoint(endpoint: impl Into<String>) -> StandardTool {
+        StandardTool::new(
+            Box::new(WebSearchTool::with_endpoint(endpoint)),
+            WebSearchTool::schema(),
+        )
+    }
+
     // ---- Tier 2 ---------------------------------------------------------
 
     /// `todo_write` — NEW; persists the todo list via RunStore key `"todo"`.
@@ -351,5 +362,12 @@ mod tests {
         assert_eq!(t.implementation.name(), "edit_file");
         assert_eq!(t.schema.name, "edit_file");
         assert!(t.schema.annotations.destructive);
+    }
+
+    #[test]
+    fn web_search_with_endpoint_is_named_web_search() {
+        let t = StandardTools::web_search_with_endpoint("http://localhost:9/search");
+        assert_eq!(t.implementation.name(), "web_search");
+        assert_eq!(t.schema.name, "web_search");
     }
 }
