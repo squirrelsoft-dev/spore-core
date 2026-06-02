@@ -291,6 +291,17 @@ impl Task {
         self.budget = budget;
         self
     }
+
+    /// A one-shot task from just an instruction: a fresh [`SessionId`] and a
+    /// default `ReAct` loop. Use [`new`](Self::new) when you need to control the
+    /// session id (e.g. multi-turn) or the loop strategy.
+    pub fn simple(instruction: impl Into<String>) -> Self {
+        Self::new(
+            instruction,
+            SessionId::generate(),
+            LoopStrategy::ReAct { max_iterations: 8 },
+        )
+    }
 }
 
 // ============================================================================
@@ -536,6 +547,26 @@ pub trait ToolRegistry: Send + Sync {
     }
 }
 
+/// A [`ToolRegistry`] with no tools.
+///
+/// `schemas()` is empty, so the model is offered no tools and replies in plain
+/// text; `dispatch` is therefore never reached. This is the registry used by
+/// [`HarnessBuilder::conversational`] and the right starting point for any
+/// agent that does not act on its environment.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmptyToolRegistry;
+
+impl ToolRegistry for EmptyToolRegistry {
+    fn dispatch<'a>(&'a self, _call: ToolCall) -> BoxFut<'a, ToolOutput> {
+        Box::pin(async {
+            ToolOutput::Error {
+                message: "no tools are registered".into(),
+                recoverable: false,
+            }
+        })
+    }
+}
+
 /// Issue #6 — SandboxProvider: validates tool calls against sandbox policy.
 ///
 /// Issue #5 adds default implementations for `execute_command`,
@@ -664,6 +695,22 @@ pub trait SandboxProvider: Send + Sync {
     /// must override.
     fn workspace_root(&self) -> &std::path::Path {
         std::path::Path::new("/")
+    }
+}
+
+/// A [`SandboxProvider`] with no filesystem.
+///
+/// `validate` allows everything because nothing is meant to run against it: it
+/// is the sandbox for tool-less agents (e.g. [`HarnessBuilder::conversational`]),
+/// where no tool is ever dispatched and the boundary is never exercised. Agents
+/// that actually touch the filesystem or shell must use a real sandbox such as
+/// [`WorkspaceScopedSandbox`](crate::sandbox::WorkspaceScopedSandbox).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSandbox;
+
+impl SandboxProvider for NullSandbox {
+    fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -1789,6 +1836,53 @@ impl HarnessBuilder {
             metric_evaluator: None,
             standard_tools: Vec::new(),
         }
+    }
+
+    /// Assemble a minimal conversational harness from a model — no tools, no
+    /// filesystem.
+    ///
+    /// This is the few-lines path: it defaults every required component so you
+    /// can go from a model to a running harness in one call. The defaults are a
+    /// [`ModelAgent`](crate::agent::ModelAgent) over `model`, an
+    /// [`EmptyToolRegistry`], a [`NullSandbox`], a
+    /// [`StandardContextManager`](crate::context::StandardContextManager) with a
+    /// null cache provider and default compaction, and
+    /// [`CompleteOnFinalResponse`](crate::scenarios::CompleteOnFinalResponse)
+    /// termination (the model's first final response is the result).
+    ///
+    /// Every default is overridable: add catalogue tools with
+    /// [`tool`](Self::tool) / [`tools`](Self::tools), or supply your own
+    /// component to [`new`](Self::new) directly.
+    ///
+    /// ```no_run
+    /// # use spore_core::{Harness, HarnessBuilder, OllamaModelInterface, HarnessRunOptions, Task};
+    /// # async fn run() {
+    /// let harness = HarnessBuilder::conversational(OllamaModelInterface::new("llama3.2")).build();
+    /// let result = harness
+    ///     .run(HarnessRunOptions::new(Task::simple("Reply with a friendly greeting.")))
+    ///     .await;
+    /// # let _ = result;
+    /// # }
+    /// ```
+    pub fn conversational<M: crate::model::ModelInterface + 'static>(model: M) -> Self {
+        use crate::compaction_adapter::HarnessContextManagerExt;
+        let model = Arc::new(model);
+        let agent: Arc<dyn Agent> = Arc::new(crate::agent::ModelAgent::new(
+            crate::agent::AgentId::new("agent"),
+            model.clone(),
+        ));
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(NullSandbox);
+        let context_manager: Arc<dyn ContextManager> =
+            Arc::new(crate::context::StandardContextManager::new(
+                model,
+                Arc::new(crate::cache_provider::NullCacheProvider),
+                crate::context::CompactionConfig::default(),
+            ))
+            .into_harness_adapter();
+        let termination_policy: Arc<dyn TerminationPolicy> =
+            Arc::new(crate::scenarios::CompleteOnFinalResponse);
+        Self::new(agent, tool_registry, sandbox, context_manager, termination_policy)
     }
 
     /// Add a single [`StandardTool`](crate::tools::StandardTool) to the

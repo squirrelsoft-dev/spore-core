@@ -60,6 +60,23 @@ pub struct WorkspaceConfig {
     pub max_file_size: u64,
 }
 
+impl WorkspaceConfig {
+    /// A read-write config scoped to `root` with no allow/deny lists, no
+    /// extension filters, and no size cap — the common starting point for a
+    /// tool-using agent. Tighten individual fields as needed.
+    pub fn scoped(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 0,
+        }
+    }
+}
+
 // ============================================================================
 // BuildError
 // ============================================================================

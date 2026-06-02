@@ -1,0 +1,10 @@
+[package]
+name = "conversational-repl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "spore-core example 02: a multi-turn conversational REPL that remembers prior turns."
+
+[dependencies]
+spore-core = { path = "../../rust/crates/spore-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

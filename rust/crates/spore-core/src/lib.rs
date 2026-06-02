@@ -71,10 +71,11 @@ pub use guide_registry::{
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
-    CommandOutput, ContextManager as HarnessContextManager, FileRef, GitVcsProvider, HaltReason,
-    Harness, HarnessBuilder, HarnessConfig, HarnessError, HarnessRunOptions, HarnessSignal,
-    HookPoint, HumanRequest, HumanResponse, IsolationMode, LoopStrategy, MiddlewareChain,
-    MiddlewareDecision, ModelConfig, NetworkPolicy, ObservabilityProvider, Operation,
+    CommandOutput, ContextManager as HarnessContextManager, EmptyToolRegistry, FileRef,
+    GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
+    HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
+    LoopStrategy, MiddlewareChain,
+    MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox, ObservabilityProvider, Operation,
     OptimizationDirection, PausedState, ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider,
     SandboxViolation, SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent,
     Task, TaskId, TerminationDecision, TerminationPolicy, ToolOutput,
