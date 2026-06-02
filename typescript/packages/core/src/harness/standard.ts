@@ -45,7 +45,13 @@ import {
 import type { Message, ToolCall } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
-import { StorageProvider } from "../storage/index.js";
+import { InMemoryStorageProvider, StorageProvider } from "../storage/index.js";
+import {
+  RealToolRegistry,
+  RegistrationErrorException,
+  StandardToolRegistry,
+  type StandardTool,
+} from "../tool-registry/index.js";
 import {
   InMemoryChunkProvider,
   type ChunkProvider,
@@ -238,6 +244,23 @@ export interface HarnessConfig {
    * Ignored by every other strategy.
    */
   metricEvaluator?: MetricEvaluator;
+  /**
+   * Catalogue tools accumulated via {@link HarnessBuilder.tool} / `tools` (issue
+   * #81), drained into a populated {@link StandardToolRegistry} at
+   * {@link HarnessBuilder.buildConfig}. When set, the run loop bridges it per-run
+   * via {@link RealToolRegistry} — threading the run's {@link SessionId}, sandbox,
+   * and storage into every tool dispatch — and uses that instead of
+   * {@link toolRegistry} (which stays the harness-loop seam for custom slim
+   * registries). Absent (the default) preserves the `toolRegistry`-only path
+   * unchanged.
+   */
+  catalogueRegistry?: StandardToolRegistry;
+  /**
+   * Operating system prompt prepended to each turn's assembled context when the
+   * context manager renders none (issue #91). See {@link HarnessBuilder.systemPrompt}.
+   * Absent (the default) preserves today's behaviour.
+   */
+  systemPrompt?: string;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -285,6 +308,28 @@ export class StandardHarness implements Harness {
    */
   storage(): StorageProvider {
     return this.config.storage ?? StorageProvider.noOp();
+  }
+
+  /**
+   * The harness-loop {@link ToolRegistry} to use for a run keyed by `sessionId`
+   * (issue #91). When catalogue tools were added via {@link HarnessBuilder.tool} /
+   * `tools`, this bridges the folded {@link StandardToolRegistry} through a
+   * {@link RealToolRegistry} — built fresh per run so the run's {@link SessionId}
+   * + sandbox + storage (run store + memory store) thread into every tool
+   * dispatch. Otherwise it returns the injected {@link HarnessConfig.toolRegistry}
+   * seam unchanged.
+   */
+  private effectiveToolRegistry(sessionId: SessionId): ToolRegistry {
+    const catalogue = this.config.catalogueRegistry;
+    if (catalogue == null) return this.config.toolRegistry;
+    const store = this.storage();
+    return new RealToolRegistry(
+      catalogue,
+      this.config.sandbox,
+      sessionId,
+      store.run(),
+      store.memory(),
+    );
   }
 
   /**
@@ -452,6 +497,10 @@ export class StandardHarness implements Harness {
   ): Promise<RunResult> {
     const sessionState = state.session_state;
     const pendingCalls = state.pending_tool_calls;
+    // Resolve the effective tool registry for this resumed session — bridges
+    // catalogue tools the same way the turn loop does (issue #91), so pending
+    // tool calls dispatched during resume thread the run's storage + sandbox.
+    const toolRegistry = this.effectiveToolRegistry(state.session_id);
 
     // Subagent depth: if there's a child, the caller-installed SubagentTool
     // owns the dispatch back into the child harness; without #4/#5 wired up
@@ -480,7 +529,7 @@ export class StandardHarness implements Harness {
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
       for (const call of remaining) {
-        const output = await this.config.toolRegistry.dispatch(call, signal);
+        const output = await toolRegistry.dispatch(call, signal);
         const tr: ToolResultRecord = { call_id: call.id, output };
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
@@ -535,7 +584,7 @@ export class StandardHarness implements Harness {
 
       case "allow": {
         for (const call of pendingCalls) {
-          const output = await this.config.toolRegistry.dispatch(call, signal);
+          const output = await toolRegistry.dispatch(call, signal);
           const tr: ToolResultRecord = { call_id: call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
@@ -544,7 +593,7 @@ export class StandardHarness implements Harness {
 
       case "allow_with_modification": {
         for (const call of response.calls) {
-          const output = await this.config.toolRegistry.dispatch(call, signal);
+          const output = await toolRegistry.dispatch(call, signal);
           const tr: ToolResultRecord = { call_id: call.id, output };
           await this.config.contextManager.appendToolResult(sessionState, tr);
         }
@@ -2165,6 +2214,9 @@ export class StandardHarness implements Harness {
     seedInstruction: boolean,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
+    // Resolve the effective tool registry once per turn-loop window (issue #91).
+    // Bridges catalogue tools per-run via RealToolRegistry, else the slim seam.
+    const toolRegistry = this.effectiveToolRegistry(sessionId);
     const startedAt = Date.now();
     const usage: AggregateUsage = emptyAggregateUsage();
     const pricing = this.config.pricing ?? PricingTable.DEFAULT;
@@ -2252,6 +2304,26 @@ export class StandardHarness implements Harness {
 
       // Assemble + invoke agent for one turn.
       const context = await this.config.contextManager.assemble(sessionState, task, signal);
+      // Fold the registry's tool schemas in only when the context manager left
+      // the tool list empty (issue #91). A manager that deliberately sets a
+      // phase-specific subset is preserved.
+      if (context.tools.length === 0) {
+        context.tools = toolRegistry.schemas();
+      }
+      // Prepend the configured operating system prompt (issue #91). The standard
+      // compaction adapter renders none, so without this the model gets only the
+      // task and no guidance. Guard against duplicates so a context manager that
+      // already leads with a system message (or a resumed/seeded session) isn't
+      // given two.
+      if (this.config.systemPrompt != null) {
+        const hasSystem = context.messages[0]?.role === "system";
+        if (!hasSystem) {
+          context.messages.unshift({
+            role: "system",
+            content: { type: "text", text: this.config.systemPrompt },
+          });
+        }
+      }
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
       const turnStartedAt = Timestamp.now();
       const turnClock = Date.now();
@@ -2449,9 +2521,7 @@ export class StandardHarness implements Harness {
           budgetUsed.output_tokens += result.usage.output_tokens;
 
           // Always-halt short-circuit (Layer 1).
-          const haltingTool = result.calls.find((c) =>
-            this.config.toolRegistry.isAlwaysHalt(c.name),
-          );
+          const haltingTool = result.calls.find((c) => toolRegistry.isAlwaysHalt(c.name));
           if (haltingTool) {
             return failure(
               {
@@ -2552,7 +2622,7 @@ export class StandardHarness implements Harness {
             emit(onStream, { kind: "tool_call", call_id: call.id, name: call.name });
             const toolStartedAt = Timestamp.now();
             const toolClock = Date.now();
-            const output: ToolOutput = await this.config.toolRegistry.dispatch(call, signal);
+            const output: ToolOutput = await toolRegistry.dispatch(call, signal);
 
             // WaitingForHuman from subagent tool
             if (output.kind === "waiting_for_human") {
@@ -2979,6 +3049,8 @@ export class HarnessBuilder {
   private _verifier?: Verifier;
   private _evaluatorAgent?: Agent;
   private _vcsProvider?: VcsProvider;
+  private readonly _standardTools: StandardTool[] = [];
+  private _systemPrompt?: string;
 
   constructor(
     private readonly agent: Agent,
@@ -3107,8 +3179,75 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Add a single catalogue {@link StandardTool} to this harness (issue #81,
+   * Q1/Q2). At {@link buildConfig} the accumulated tools are folded into a
+   * populated {@link StandardToolRegistry} and the run loop bridges them per-run
+   * through a {@link RealToolRegistry}, so they run with sandbox + storage wired
+   * in — no manual bridging required. Registration applies LAST-WINS upsert: a
+   * later `.tool()` with the same name overrides an earlier one (e.g. a custom
+   * tool registered after a preset).
+   *
+   * To author a *custom* sandboxed tool, build a {@link StandardTool} over your
+   * own {@link "../tool-registry/index.js".Tool} implementation and pass it here;
+   * catalogue tools take precedence over a registry supplied via the constructor.
+   */
+  tool(tool: StandardTool): this {
+    this._standardTools.push(tool);
+    return this;
+  }
+
+  /**
+   * Add many catalogue {@link StandardTool}s at once (e.g. a preset like
+   * `StandardTools.codingSet()`). Order is preserved, so last-wins upsert still
+   * applies across the batch.
+   */
+  tools(tools: Iterable<StandardTool>): this {
+    for (const t of tools) this._standardTools.push(t);
+    return this;
+  }
+
+  /**
+   * Set an operating system prompt prepended to each turn's assembled context
+   * (issue #91).
+   *
+   * The standard compaction context manager renders no system prompt, so without
+   * this the model receives only the task as a user message and no guidance on
+   * how to behave. When set, the run loop inserts this text as a leading
+   * `system` message each turn — but only when the assembled context does not
+   * already start with one, so a context manager that renders its own system
+   * prompt is preserved. Absent (the default) preserves today's behaviour.
+   */
+  systemPrompt(systemPrompt: string): this {
+    this._systemPrompt = systemPrompt;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
+    // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
+    // populated StandardToolRegistry (last-wins upsert). The run loop bridges it
+    // per-run — `build()` can't, because the ToolContext is keyed by the run's
+    // SessionId, unknown until `run()`.
+    let catalogueRegistry: StandardToolRegistry | undefined;
+    if (this._standardTools.length > 0) {
+      const registry = new StandardToolRegistry();
+      const err = registry.tools(this._standardTools);
+      if (err) {
+        throw new RegistrationErrorException(err);
+      }
+      catalogueRegistry = registry;
+    }
+    // When catalogue tools are present and the caller wired no storage, default
+    // to an in-memory provider (not the all-no-op default) so that session-aware
+    // tools (todo_write, memory, task_list) actually persist within the run.
+    // Pure tools (read_file/write_file via the sandbox) are unaffected.
+    const storage =
+      this._storage ??
+      (catalogueRegistry != null
+        ? StorageProvider.single(new InMemoryStorageProvider())
+        : StorageProvider.noOp());
+
     return {
       agent: this.agent,
       toolRegistry: this.toolRegistry,
@@ -3117,7 +3256,7 @@ export class HarnessBuilder {
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,
       observability: this._observability,
-      storage: this._storage ?? StorageProvider.noOp(),
+      storage,
       compactionVerifier: this._compactionVerifier,
       maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,
@@ -3129,6 +3268,8 @@ export class HarnessBuilder {
       verifier: this._verifier,
       evaluatorAgent: this._evaluatorAgent,
       vcsProvider: this._vcsProvider,
+      catalogueRegistry,
+      systemPrompt: this._systemPrompt,
     };
   }
 

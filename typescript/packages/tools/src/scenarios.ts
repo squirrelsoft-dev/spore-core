@@ -44,19 +44,14 @@ import {
   type Task,
   type TerminationDecision,
   type TerminationPolicy,
-  type ToolCall,
   type ToolOutput,
   type ToolResultRecord,
   type ToolSchema as ModelToolSchema,
   type ToolRegistry as HarnessToolRegistry,
   toolRegistry,
-  type storage,
   HarnessBuilder,
   type StandardHarness,
 } from "@spore/core";
-
-type RunStore = storage.RunStore;
-type MemoryStore = storage.MemoryStore;
 
 import { ListDirTool, ReadFileTool, WriteFileTool } from "./fs.js";
 import { BashCommandTool, ExecTool } from "./exec.js";
@@ -66,106 +61,21 @@ type RegistryToolSchema = toolRegistry.ToolSchema;
 type Tool = toolRegistry.Tool;
 
 const { StandardContextManager } = coreContext;
-const { dispatchErrorMessage } = toolRegistry;
 
 // Re-export so callers can build a registry directly.
 export { ReadFileTool, WriteFileTool, ListDirTool, ExecTool, BashCommandTool };
 
 // ============================================================================
-// Registry → model schema conversion
+// Registry → model schema conversion + RealToolRegistry bridge
 // ============================================================================
-
-/** Project a registry {@link RegistryToolSchema} onto the model-facing
- *  {@link ModelToolSchema} (`parameters` → `input_schema`). */
-export function toModelSchema(schema: RegistryToolSchema): ModelToolSchema {
-  return {
-    name: schema.name,
-    description: schema.description,
-    input_schema: schema.parameters,
-  };
-}
-
-// ============================================================================
-// RealToolRegistry — bridge between the two ToolRegistry interfaces
-// ============================================================================
-
-/**
- * Bridges the harness-loop {@link HarnessToolRegistry} onto the canonical
- * {@link toolRegistry.ToolRegistry} ({@link StandardToolRegistry}).
- *
- * A {@link DispatchError} becomes a **recoverable** error {@link ToolOutput} so
- * the loop appends it as a tool result rather than halting — S4 depends on
- * this. No bridged tool is marked always-halt.
- *
- * ## Storage seam (#75)
- *
- * Per the construction-injection decision, the bridge is given the run's
- * {@link SessionId}, a {@link RunStore}, and a scope-aware {@link MemoryStore}
- * (#78) at construction time (it is already built per-run). It builds a
- * {@link toolRegistry.ToolContext} from those injected fields and forwards it
- * into the inner registry on every dispatch. This keeps the harness-loop
- * `dispatch(call)` signature unchanged while threading storage to tools. With
- * the library's default no-op storage a standalone `task_list` call persists
- * nothing across processes (accepted behavior change — see the tool's
- * doc-comment).
- */
-export class RealToolRegistry implements HarnessToolRegistry {
-  private readonly _schemas: ModelToolSchema[];
-  private readonly ctx: toolRegistry.ToolContext;
-
-  constructor(
-    private readonly inner: toolRegistry.StandardToolRegistry,
-    private readonly sandbox: SandboxProvider,
-    sessionId: SessionId,
-    runStore: RunStore,
-    memoryStore: MemoryStore,
-  ) {
-    // Snapshot the model-facing schemas (sorted by name; activeSchemas already
-    // sorts) once at construction; the catalog is fixed for a scenario run.
-    this._schemas = inner.activeSchemas(null).map(toModelSchema);
-    // Build the storage seam once per run from the injected session + stores.
-    this.ctx = new toolRegistry.ToolContext(sessionId, runStore, memoryStore);
-  }
-
-  /** The model-facing tool schemas, sorted by name. */
-  modelSchemas(): ModelToolSchema[] {
-    return this._schemas.slice();
-  }
-
-  /**
-   * The {@link toolRegistry.ToolContext} this bridge threads into every dispatch
-   * — exposes the `sessionId`, `runStore`, and (#78) `memoryStore` seams it was
-   * wired with. Lets callers verify the storage seams are live.
-   */
-  toolContext(): toolRegistry.ToolContext {
-    return this.ctx;
-  }
-
-  async dispatch(call: ToolCall, signal?: AbortSignal): Promise<ToolOutput> {
-    const outcome = await this.inner.dispatch(
-      call,
-      this.sandbox,
-      this.ctx,
-      signal,
-    );
-    if (outcome.ok) return outcome.result.output;
-    return {
-      kind: "error",
-      message: `dispatch failed: ${dispatchErrorMessage(outcome.error)}`,
-      // Recoverable so the loop appends the error and lets the agent adapt.
-      recoverable: true,
-    };
-  }
-
-  isAlwaysHalt(_toolName: string): boolean {
-    // No bridged tool is always-halt — S4 needs recoverable failure.
-    return false;
-  }
-
-  schemas(): ModelToolSchema[] {
-    return this._schemas.slice();
-  }
-}
+//
+// `toModelSchema` and `RealToolRegistry` graduated into `@spore/core`'s
+// `tool-registry` module (the blessed surface) in #91 so callers don't import
+// them from a scenarios-flavoured location. Re-exported here for back-compat
+// with existing scenario / example wiring.
+export const { toModelSchema } = toolRegistry;
+export const RealToolRegistry = toolRegistry.RealToolRegistry;
+export type RealToolRegistry = toolRegistry.RealToolRegistry;
 
 // ============================================================================
 // SchemaInjectingContextManager — fills assemble().tools from the registry

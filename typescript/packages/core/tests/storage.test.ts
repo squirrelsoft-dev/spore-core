@@ -597,6 +597,8 @@ describe("ScopedMemoryRouter", () => {
 });
 
 // ── R9: ToolContext exposes memoryStore threaded by the registry ─────────────
-// The TS `RealToolRegistry` lives in `@spore/tools` (avoiding a core→tools
-// cycle), so the registry-threading test lives there:
+// The `RealToolRegistry` bridge graduated into core's `tool-registry` module
+// (#91); per-run schema/dispatch bridging is covered by
+// `packages/core/tests/harness-catalogue-wiring.test.ts`, and the catalogue
+// tools' end-to-end storage threading by
 // `typescript/packages/tools/tests/tool-context-memory-seam.test.ts`.

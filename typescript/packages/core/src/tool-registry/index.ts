@@ -8,4 +8,5 @@
 
 export * from "./types.js";
 export { StandardToolRegistry } from "./standard.js";
+export { RealToolRegistry, toModelSchema } from "./real.js";
 export * as toolRegistryMock from "./mock.js";

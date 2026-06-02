@@ -296,7 +296,23 @@ export type HarnessSignal =
   | { kind: "switch_mode"; mode: Mode }
   | { kind: "abort"; reason: string };
 
-/** Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing. */
+/**
+ * Tool dispatch output. Full type lives in issue #4/#5; this covers loop routing.
+ *
+ * Prefer the {@link toolOutput} constructors over the object literals — they
+ * spell out the common cases (`success` / recoverable `error` / `fatal`) and
+ * document the field semantics below in one place.
+ *
+ *   - `truncated` (on `success`) — `true` ONLY when the tool itself clipped its
+ *     output to fit an inline budget (large outputs routed through
+ *     {@link SandboxProvider.handleLargeOutput} set this). Plain tool authors
+ *     should leave it `false` (omit it) — use {@link toolOutput.success}.
+ *   - `recoverable` (on `error`) — `true` if the agent may sensibly retry or
+ *     adapt: the loop appends the error as a tool result and continues. `false`
+ *     halts the run. Most tool failures are recoverable — prefer
+ *     {@link toolOutput.error}; reach for {@link toolOutput.fatal} only when
+ *     continuing is pointless.
+ */
 export type ToolOutput =
   | { kind: "success"; content: string; truncated?: boolean }
   | { kind: "error"; message: string; recoverable: boolean }
@@ -317,6 +333,39 @@ export type ToolOutput =
    * answer text is injected as the tool RESULT for that clarifying call.
    */
   | { kind: "awaiting_clarification"; question: string; options?: string[] };
+
+/**
+ * Ergonomic constructors for the common {@link ToolOutput} cases. Mirrors Rust's
+ * `ToolOutput::success` / `error` / `fatal` — see the field semantics on
+ * {@link ToolOutput}.
+ */
+export const toolOutput = {
+  /**
+   * A successful, non-truncated result — the common case for a tool that
+   * returns its full output. Saves spelling out `truncated: false`.
+   */
+  success(content: string): ToolOutput {
+    return { kind: "success", content, truncated: false };
+  },
+
+  /**
+   * A **recoverable** error: the harness loop appends it as a tool result and
+   * lets the agent adapt or retry. The right default for almost every tool
+   * failure (bad arguments, missing file, transient I/O).
+   */
+  error(message: string): ToolOutput {
+    return { kind: "error", message, recoverable: true };
+  },
+
+  /**
+   * A **fatal** error: continuing is pointless, so the run halts. Reserve for
+   * genuinely unrecoverable conditions; prefer {@link toolOutput.error} when the
+   * agent could reasonably do something different next turn.
+   */
+  fatal(message: string): ToolOutput {
+    return { kind: "error", message, recoverable: false };
+  },
+} as const;
 
 export interface ToolResultRecord {
   call_id: string;
