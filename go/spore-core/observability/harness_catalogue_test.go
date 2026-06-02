@@ -42,6 +42,33 @@ func builderForCatalogue(agent sporecore.Agent) *HarnessBuilder {
 	)
 }
 
+// sentinelSandbox is a distinct SandboxProvider used to assert the Sandbox()
+// setter overrides the sandbox the builder was constructed with. It embeds
+// AllowAllSandbox for the SandboxProvider behaviour and carries an id so the
+// configured value can be identity-checked.
+type sentinelSandbox struct {
+	sporecore.AllowAllSandbox
+	id int
+}
+
+// Mirrors the Rust sandbox_setter_overrides_the_configured_sandbox test: the
+// Sandbox() setter overrides the sandbox the builder was constructed with, and
+// that overriding value is what lands in the built HarnessConfig.
+func TestSandboxSetterOverridesTheConfiguredSandbox(t *testing.T) {
+	override := sentinelSandbox{id: 7}
+	cfg := builderForCatalogue(sporecore.NewMockAgent("t")).
+		Sandbox(override).
+		BuildConfig()
+
+	got, ok := cfg.Sandbox.(sentinelSandbox)
+	if !ok {
+		t.Fatalf("expected the override sandbox, got %T", cfg.Sandbox)
+	}
+	if got.id != override.id {
+		t.Fatalf("sandbox not overridden: got id=%d want %d", got.id, override.id)
+	}
+}
+
 // Issue #91: catalogue tools added via Tool() are folded into a populated
 // CatalogueRegistry, and — because catalogue tools are present and no storage was
 // wired — the run store defaults to in-memory (not no-op) so a put/get round-trips.

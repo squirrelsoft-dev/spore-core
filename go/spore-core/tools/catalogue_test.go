@@ -64,6 +64,13 @@ func TestFullSetAddsTier3(t *testing.T) {
 	}
 }
 
+func TestWebSearchWithEndpointIsNamedWebSearch(t *testing.T) {
+	st := (StandardTools{}).WebSearchWithEndpoint("http://localhost:9/search")
+	if st.Implementation.Name() != "web_search" || st.Schema.Name != "web_search" {
+		t.Fatalf("bundle mismatch: impl=%q schema=%q", st.Implementation.Name(), st.Schema.Name)
+	}
+}
+
 func TestStandardToolBundlesImplAndSchema(t *testing.T) {
 	st := (StandardTools{}).EditFile()
 	if st.Implementation.Name() != "edit_file" || st.Schema.Name != "edit_file" {

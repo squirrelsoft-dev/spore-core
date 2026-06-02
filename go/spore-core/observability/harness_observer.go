@@ -524,6 +524,18 @@ func (b *HarnessBuilder) Tools(ts ...sporecore.StandardTool) *HarnessBuilder {
 	return b
 }
 
+// Sandbox overrides the SandboxProvider — the only path catalogue tools have to
+// the environment (filesystem, process exec). The sandbox is a required builder
+// component (set at NewHarnessBuilder time), but catalogue file tools
+// (read_file / write_file / list_dir) operate *through* the sandbox, so this
+// setter lets an agent reach a real workspace-scoped sandbox via fluent
+// chaining — e.g. b.Sandbox(workspace).Tools(StandardTools{}.CodingSet()) —
+// without reconstructing the builder. Returns the receiver for chaining.
+func (b *HarnessBuilder) Sandbox(sandbox sporecore.SandboxProvider) *HarnessBuilder {
+	b.sandbox = sandbox
+	return b
+}
+
 // SystemPrompt sets an operating system prompt prepended to each turn's
 // assembled context (issue #91).
 //

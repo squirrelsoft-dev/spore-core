@@ -118,6 +118,14 @@ func (StandardTools) WebFetch() StandardTool { return newStandardTool(NewWebFetc
 // StandardTool over NewWebSearchToolWithEndpoint to wire a real backend.
 func (StandardTools) WebSearch() StandardTool { return newStandardTool(NewWebSearchTool()) }
 
+// WebSearchWithEndpoint — web_search wired to a concrete backend endpoint. The
+// plain WebSearch preset ships with no backend and errors on every call until
+// one is configured; use this when you have a search endpoint (e.g. a
+// Brave/Tavily-compatible URL) to POST the query to.
+func (StandardTools) WebSearchWithEndpoint(endpoint string) StandardTool {
+	return newStandardTool(NewWebSearchToolWithEndpoint(endpoint))
+}
+
 // ---- Tier 2 ---------------------------------------------------------------
 
 // TodoWrite — NEW; persists the todo list via RunStore key "todo".
