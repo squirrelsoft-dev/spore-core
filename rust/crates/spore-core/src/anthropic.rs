@@ -580,7 +580,7 @@ impl ModelInterface for AnthropicModelInterface {
 ///
 /// We translate the subset of event types the harness consumes:
 /// - `message_start` → no emit (header-only)
-/// - `content_block_start` → no emit (handled implicitly by deltas)
+/// - `content_block_start` (tool_use) → `ToolUseStart` carrying id + name
 /// - `content_block_delta.text_delta` → `ContentBlockDelta`
 /// - `content_block_delta.thinking_delta` → `ThinkingDelta`
 /// - `content_block_delta.input_json_delta` → `ToolUseDelta`
@@ -624,6 +624,22 @@ fn sse_to_events(
                         Err(_) => continue,
                     };
                     match event_name.as_str() {
+                        "content_block_start" => {
+                            // A tool_use block opens here with its id + name; emit
+                            // ToolUseStart so the accumulator captures them before
+                            // the input_json_delta arg fragments arrive.
+                            let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let block = value.get("content_block");
+                            let is_tool = block
+                                .and_then(|b| b.get("type"))
+                                .and_then(|v| v.as_str())
+                                == Some("tool_use");
+                            if is_tool {
+                                let id = block.and_then(|b| b.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = block.and_then(|b| b.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                yield Ok(StreamEvent::ToolUseStart { index, id, name });
+                            }
+                        }
                         "content_block_delta" => {
                             let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             let delta = value.get("delta");
@@ -1152,6 +1168,7 @@ mod tests {
                 StreamEvent::MessageStart => "start",
                 StreamEvent::ContentBlockDelta { .. } => "text",
                 StreamEvent::ThinkingDelta { .. } => "think",
+                StreamEvent::ToolUseStart { .. } => "tool_start",
                 StreamEvent::ToolUseDelta { .. } => "tool",
                 StreamEvent::ContentBlockStop { .. } => "stop_block",
                 StreamEvent::MessageStop { .. } => "stop",

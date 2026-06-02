@@ -25,6 +25,10 @@ export * from "./harness/index.js";
 export * from "./plan/index.js";
 export * as tasklist from "./tasklist/index.js";
 export * as toolRegistry from "./tool-registry/index.js";
+// Surface the no-tools registry at the package root too (mirrors Rust's
+// crate-root `EmptyToolRegistry`), so `conversational()` callers and tool-less
+// agents can reach it without the `toolRegistry.` namespace prefix.
+export { EmptyToolRegistry } from "./tool-registry/empty.js";
 export * from "./sandbox/index.js";
 export * as context from "./context/index.js";
 export * as memory from "./memory/index.js";

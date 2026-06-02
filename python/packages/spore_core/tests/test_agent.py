@@ -458,10 +458,10 @@ async def test_turn_streaming_reassembles_tool_call_with_accumulated_args() -> N
     assert len(result.calls) == 1
     assert result.calls[0].input == {"q": "rust"}
     assert result.reasoning == "let me think"
-    # Known limitation: streamed tool-use carries no name; accumulator emits
-    # empty name and a synthesized per-index call id.
-    assert result.calls[0].name == ""
-    assert result.calls[0].id == "call_1"
+    # Tool name + id are recovered from the ToolUseStart model event every
+    # provider emits at the tool block's start frame.
+    assert result.calls[0].name == "lookup"
+    assert result.calls[0].id == "toolu_1"
     assert any(isinstance(e, ToolUseDelta) and "rust" in e.partial_json for e in seen)
 
 

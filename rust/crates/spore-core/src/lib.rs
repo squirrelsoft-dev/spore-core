@@ -38,7 +38,6 @@ pub mod plan;
 pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
 pub mod sandbox;
-pub mod scenarios;
 pub mod sensor;
 pub mod storage;
 pub mod tasklist;
@@ -71,7 +70,8 @@ pub use guide_registry::{
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
-    CommandOutput, ContextManager as HarnessContextManager, EmptyToolRegistry, FileRef,
+    CommandOutput, CompleteOnFinalResponse, ContextManager as HarnessContextManager,
+    EmptyToolRegistry, FileRef,
     GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
     HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
     LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox,
@@ -135,10 +135,6 @@ pub use prompt_chunk_registry::{
     ChunkValidationError, Mode, PromptChunk, PromptChunkRegistry, StandardPromptChunkRegistry,
 };
 pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
-pub use scenarios::{
-    build_real_tool_registry, build_rich_context_manager, build_scenario, seed_compaction_state,
-    CompleteOnFinalResponse, FailingTool, ScenarioId, SchemaInjectingContextManager,
-};
 pub use sensor::{
     Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
     SensorOutcome, SensorResult, SensorSignalFlag, SensorSignalThresholds, SensorStats,

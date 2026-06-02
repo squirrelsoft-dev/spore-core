@@ -1,0 +1,9 @@
+[project]
+name = "spore-example-03-tool-use"
+version = "0.0.0"
+description = "spore-core example 03 — ReAct with local tools (Python)"
+requires-python = ">=3.12"
+dependencies = ["spore-core"]
+
+[tool.uv.sources]
+spore-core = { path = "../../../python/packages/spore_core", editable = true }

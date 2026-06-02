@@ -844,6 +844,24 @@ func parseSSEStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Stream
 						contentIndexActive = false
 						contentIndex = eventIndex
 					}
+					// The id + function.name arrive on this first chunk for the
+					// index; emit tool_use_start so they aren't lost when only
+					// argument fragments follow.
+					var name string
+					if fn, ok := tc["function"].(map[string]any); ok {
+						if n, ok := fn["name"].(string); ok {
+							name = n
+						}
+					}
+					id, _ := tc["id"].(string)
+					if id == "" {
+						id = fmt.Sprintf("call_%d", eventIndex)
+					}
+					if !sendEvent(ctx, ch, sporecore.StreamEvent{
+						Type: sporecore.StreamToolUseStart, Index: eventIndex, ID: id, Name: name,
+					}) {
+						return
+					}
 				}
 				var argDelta string
 				if fn, ok := tc["function"].(map[string]any); ok {

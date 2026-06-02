@@ -688,6 +688,7 @@ export async function* sseToEvents(body: ReadableStream<Uint8Array>): AsyncItera
             if (tc == null) continue;
             const i = typeof tc.index === "number" ? tc.index : 0;
             const eventIndex = i + 1;
+            const fn = jsonValue(tc.function);
             if (!toolIndicesSeen.has(eventIndex)) {
               toolIndicesSeen.add(eventIndex);
               if (contentIndexEmitted) {
@@ -695,8 +696,13 @@ export async function* sseToEvents(body: ReadableStream<Uint8Array>): AsyncItera
                 contentIndexEmitted = false;
                 contentIndex = eventIndex;
               }
+              // The id + function.name arrive on this first chunk for the index;
+              // emit tool_use_start so they aren't lost when only argument
+              // fragments follow. A missing id is synthesized stably.
+              const name = typeof fn?.name === "string" ? fn.name : "";
+              const id = typeof tc.id === "string" ? tc.id : `call_${eventIndex}`;
+              yield { type: "tool_use_start", index: eventIndex, id, name };
             }
-            const fn = jsonValue(tc.function);
             const argDelta = fn != null && typeof fn.arguments === "string" ? fn.arguments : "";
             if (argDelta !== "") {
               yield {

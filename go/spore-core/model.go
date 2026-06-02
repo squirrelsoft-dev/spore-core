@@ -393,6 +393,7 @@ const (
 	StreamMessageStart      StreamEventType = "message_start"
 	StreamContentBlockDelta StreamEventType = "content_block_delta"
 	StreamThinkingDelta     StreamEventType = "thinking_delta"
+	StreamToolUseStart      StreamEventType = "tool_use_start"
 	StreamToolUseDelta      StreamEventType = "tool_use_delta"
 	StreamContentBlockStop  StreamEventType = "content_block_stop"
 	StreamMessageStop       StreamEventType = "message_stop"
@@ -405,6 +406,13 @@ type StreamEvent struct {
 	Index uint32 `json:"index,omitempty"`
 	// content_block_delta, thinking_delta
 	Delta string `json:"delta,omitempty"`
+	// tool_use_start: the tool call id and name arrive on the provider's
+	// block-start frame (Anthropic content_block_start, Ollama / OpenAI's
+	// first tool_calls chunk) and would otherwise be lost, since tool_use_delta
+	// carries only argument JSON. The streaming accumulator uses these to
+	// reconstruct the tool call faithfully.
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
 	// tool_use_delta
 	PartialJSON string `json:"partial_json,omitempty"`
 	// message_stop
@@ -898,10 +906,19 @@ func (r *ReplayModel) CallStreaming(ctx context.Context, req ModelRequest) (<-ch
 				}
 			case ContentBlockTypeToolUse:
 				var partial string
-				if block.ToolCall != nil && len(block.ToolCall.Input) > 0 {
-					partial = string(block.ToolCall.Input)
-				} else {
+				var id, name string
+				if block.ToolCall != nil {
+					id = block.ToolCall.ID
+					name = block.ToolCall.Name
+					if len(block.ToolCall.Input) > 0 {
+						partial = string(block.ToolCall.Input)
+					}
+				}
+				if partial == "" {
 					partial = "{}"
+				}
+				if !send(StreamEvent{Type: StreamToolUseStart, Index: idx, ID: id, Name: name}) {
+					return
 				}
 				if !send(StreamEvent{Type: StreamToolUseDelta, Index: idx, PartialJSON: partial}) {
 					return

@@ -221,6 +221,17 @@ export function newTask(
   };
 }
 
+/**
+ * A one-shot task from just an instruction: a fresh {@link SessionId} and a
+ * default `re_act` loop (`max_iterations: 8`). Use {@link newTask} when you need
+ * to control the session id (e.g. multi-turn) or the loop strategy.
+ *
+ * Mirrors `Task::simple` in `rust/crates/spore-core/src/harness.rs`.
+ */
+export function simpleTask(instruction: string): Task {
+  return newTask(instruction, SessionId.generate(), { kind: "re_act", max_iterations: 8 });
+}
+
 // ============================================================================
 // Streaming events emitted by the harness
 // ============================================================================
@@ -361,16 +372,32 @@ export function mapModelStreamEvent(
       out.push({ kind: "reasoning_delta", content: event.delta });
       return out;
     }
+    case "tool_use_start": {
+      const out: HarnessStreamEvent[] = [];
+      if (!state.openBlocks.has(event.index)) {
+        state.openBlocks.set(event.index, "tool_use");
+        // Use the real call id from the model; consumers correlate subsequent
+        // tool_args_delta by it.
+        state.toolCalls.set(event.index, event.id);
+        out.push({ kind: "block_start", index: event.index, block: "tool_use" });
+        out.push({
+          kind: "tool_call_start",
+          index: event.index,
+          call_id: event.id,
+          name: event.name,
+        });
+      }
+      return out;
+    }
     case "tool_use_delta": {
       const out: HarnessStreamEvent[] = [];
+      // Fallback: if a stream omitted tool_use_start, open the block here with a
+      // synthesized id and empty name so args still surface.
       if (!state.openBlocks.has(event.index)) {
         state.openBlocks.set(event.index, "tool_use");
         const callId = TurnStreamState.callIdFor(event.index);
         state.toolCalls.set(event.index, callId);
         out.push({ kind: "block_start", index: event.index, block: "tool_use" });
-        // Name is not carried by the model StreamEvent; recovered on the
-        // coarse tool_call. Emit tool_call_start so consumers can begin
-        // correlating args by call_id.
         out.push({ kind: "tool_call_start", index: event.index, call_id: callId, name: "" });
       }
       const callId = state.toolCalls.get(event.index) ?? TurnStreamState.callIdFor(event.index);

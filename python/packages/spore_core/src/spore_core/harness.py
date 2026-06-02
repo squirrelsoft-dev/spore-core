@@ -86,6 +86,7 @@ from .model import (
     Message,
     MessageStart,
     MessageStop,
+    ModelInterface,
     ModelParams,
     Role,
     StopReason,
@@ -98,6 +99,7 @@ from .model import (
     ToolResultContent as MsgToolResultContent,
     ToolSchema,
     ToolUseDelta,
+    ToolUseStart,
 )
 from .model import (
     ContentBlockStop as ModelContentBlockStop,
@@ -260,6 +262,18 @@ class Task(_Model):
             loop_strategy=loop_strategy,
         )
 
+    @classmethod
+    def simple(cls, instruction: str) -> Task:
+        """A one-shot task from just an instruction: a fresh :class:`SessionId`
+        and a default ``ReAct`` loop (``max_iterations=8``). Use :meth:`new`
+        when you need to control the session id (e.g. multi-turn) or the loop
+        strategy. Mirrors Rust's ``Task::simple``."""
+        return cls.new(
+            instruction,
+            new_session_id(),
+            LoopStrategyReAct(max_iterations=8),
+        )
+
 
 # ============================================================================
 # Stream events
@@ -343,12 +357,13 @@ class StreamUserMessage(_Model):
 # :class:`StreamToolCallStart` -> :class:`StreamToolArgsDelta`* ->
 # (:class:`StreamBlockStop`) -> coarse :class:`StreamToolCall`.
 #
-# KNOWN LIMITATION (issue #103): ``model.StreamEvent`` tool-argument deltas do
-# NOT carry the tool name or id (providers drop them in streamed frames). The
-# harness synthesizes a stable per-index ``call_{index}`` id (matching the
-# agent accumulator) and emits an EMPTY name on ``StreamToolCallStart``. Under
-# streamed turns the coarse ``StreamToolCall`` name is empty too while ``args``
-# round-trip faithfully.
+# Tool name + id are recovered from ``model.StreamEvent`` ``ToolUseStart``, which
+# every provider emits at the tool block's start frame (Anthropic
+# ``content_block_start``, Ollama / OpenAI's first ``tool_calls`` chunk) before
+# the ``ToolUseDelta`` argument fragments arrive. The harness records them and
+# emits the real id + name on ``StreamToolCallStart``. The ``ToolUseDelta`` path
+# keeps a fallback (stable per-index ``call_{index}`` id + empty name) only for
+# a stream that somehow omitted the start frame.
 
 
 class StreamTextDelta(_Model):
@@ -393,9 +408,9 @@ class StreamBlockStop(_Model):
 class StreamToolCallStart(_Model):
     """A tool-use block opened (issue #103). Emitted so consumers can correlate
     the subsequent :class:`StreamToolArgsDelta` fragments and the final coarse
-    :class:`StreamToolCall` by ``call_id``. The ``name`` is empty under streamed
-    turns (documented ``model.StreamEvent`` limitation — recovered on the coarse
-    ``StreamToolCall``)."""
+    :class:`StreamToolCall` by ``call_id``. The ``name`` and ``call_id`` are the
+    real values recovered from the ``model.StreamEvent`` ``ToolUseStart`` frame
+    every provider emits at the tool block's start."""
 
     kind: Literal["tool_call_start"] = "tool_call_start"
     index: int
@@ -1355,6 +1370,43 @@ class TerminationPolicy(Protocol):
     ) -> TerminationDecision: ...
 
 
+class CompleteOnFinalResponse:
+    """Termination policy that lets the loop complete as soon as the agent
+    produces a final response.
+
+    Always returns :class:`TerminationContinue`, which the harness interprets
+    as "accept the final response and succeed". This is the default policy
+    wired by :meth:`HarnessBuilder.conversational` — a tool-less chat agent
+    halts naturally on its first final response, with no extra completion
+    criteria to satisfy. Mirrors Rust's ``CompleteOnFinalResponse``.
+    """
+
+    async def evaluate(
+        self, session: SessionState, budget_used: BudgetSnapshot
+    ) -> TerminationDecision:
+        return TerminationContinue()
+
+
+class EmptyToolRegistry:
+    """Harness-loop :class:`ToolRegistry` with no tools.
+
+    :meth:`schemas` advertises nothing, :meth:`is_always_halt` is always
+    ``False``, and :meth:`dispatch` returns a recoverable error for any call
+    (there is nothing to run). This is the registry wired by
+    :meth:`HarnessBuilder.conversational` for a tool-less chat agent. Mirrors
+    Rust's ``EmptyToolRegistry``.
+    """
+
+    async def dispatch(self, call: ToolCall) -> ToolOutput:
+        return ToolOutputError.error(f"unknown tool: {call.name}")
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        return False
+
+    def schemas(self) -> list[ToolSchema]:
+        return []
+
+
 @runtime_checkable
 class HarnessMiddlewareChain(Protocol):
     """Simplified middleware-chain Protocol consumed by
@@ -2064,6 +2116,60 @@ class HarnessBuilder:
         # module imports ``SessionId``/``TaskId`` from here).
         self._chunk_provider: Any | None = None
 
+    @classmethod
+    def conversational(cls, model: ModelInterface) -> HarnessBuilder:
+        """Assemble a minimal conversational harness from a model — no tools, no
+        filesystem.
+
+        This is the few-lines path: it defaults every required component so you
+        can go from a model to a running harness in one call. The defaults are a
+        :class:`~spore_core.agent.ModelAgent` over ``model``, an
+        :class:`EmptyToolRegistry`, a :class:`NullSandbox` (permits tool-call
+        validation and applies no path/process isolation — fine for a tool-less
+        agent), a
+        :class:`~spore_core.context.StandardContextManager` with a null cache
+        provider and default compaction, and :class:`CompleteOnFinalResponse`
+        termination (the model's first final response is the result).
+
+        Every default is overridable: add catalogue tools with :meth:`tool` /
+        :meth:`tools`, swap the sandbox with :meth:`sandbox`, supply your own
+        harness-loop tool registry with :meth:`tool_registry`, or construct the
+        builder via ``__init__`` directly. Mirrors Rust's
+        ``HarnessBuilder::conversational``.
+
+        Example::
+
+            harness = HarnessBuilder.conversational(
+                OllamaModelInterface("llama3.2")
+            ).build()
+            result = await harness.run(
+                HarnessRunOptions(Task.simple("Reply with a friendly greeting."))
+            )
+        """
+        from .agent import AgentId, ModelAgent
+        from .cache_provider import NullCacheProvider
+        from .compaction_adapter import into_harness_adapter
+        from .context import CompactionConfig, StandardContextManager
+
+        agent = ModelAgent(AgentId("agent"), model)
+        tool_registry = EmptyToolRegistry()
+        sandbox = NullSandbox()
+        context_manager = into_harness_adapter(
+            StandardContextManager(
+                model,
+                NullCacheProvider(),
+                CompactionConfig(),
+            )
+        )
+        termination_policy = CompleteOnFinalResponse()
+        return cls(
+            agent=agent,
+            tool_registry=tool_registry,
+            sandbox=sandbox,
+            context_manager=context_manager,
+            termination_policy=termination_policy,
+        )
+
     def chunk_provider(self, provider: Any) -> HarnessBuilder:
         """Set the chunk provider for the #79 prompt assembly engine. Defaults
         to an empty :class:`~spore_core.prompt_assembly.InMemoryChunkProvider`
@@ -2097,6 +2203,25 @@ class HarnessBuilder:
         self._standard_tools.extend(tools)
         return self
 
+    def tool_registry(self, tool_registry: ToolRegistry) -> HarnessBuilder:
+        """Override the harness-loop tool registry (issue #4 seam).
+
+        Use this to supply your own :class:`ToolRegistry` implementation — e.g. a
+        set of custom tools — on top of a preset like :meth:`conversational`::
+
+            harness = (
+                HarnessBuilder.conversational(model)
+                .tool_registry(LocalTools())
+                .build()
+            )
+
+        The registry's :meth:`~ToolRegistry.schemas` are delivered to the model
+        automatically each turn, and :meth:`~ToolRegistry.dispatch` is called
+        when the model requests a tool. Mirrors Rust's
+        ``HarnessBuilder::tool_registry``."""
+        self._tool_registry = tool_registry
+        return self
+
     def sandbox(self, sandbox: SandboxProvider) -> HarnessBuilder:
         """Override the :class:`SandboxProvider` — the only path tools have to
         the environment (filesystem, process exec).
@@ -2108,7 +2233,7 @@ class HarnessBuilder:
         workspace-scoped sandbox here::
 
             harness = (
-                HarnessBuilder.conversational(agent)
+                HarnessBuilder.conversational(model)
                 .sandbox(workspace)
                 .tools(StandardTools.coding_set())
                 .build()
@@ -2629,15 +2754,26 @@ class StandardHarness:
                 out.append(StreamBlockStart(index=event.index, block=BlockKind.REASONING))
             out.append(StreamReasoningDelta(content=event.delta))
             return out
+        if isinstance(event, ToolUseStart):
+            if event.index not in state.open_blocks:
+                state.open_blocks[event.index] = BlockKind.TOOL_USE
+                # Use the real call id from the model; consumers correlate
+                # subsequent ToolArgsDelta by it.
+                state.tool_calls[event.index] = event.id
+                out.append(StreamBlockStart(index=event.index, block=BlockKind.TOOL_USE))
+                out.append(
+                    StreamToolCallStart(index=event.index, call_id=event.id, name=event.name)
+                )
+            return out
         if isinstance(event, ToolUseDelta):
             if event.index not in state.open_blocks:
+                # Fallback: if a stream omitted ToolUseStart, open the block
+                # here with a synthesized id and empty name so args still
+                # surface.
                 state.open_blocks[event.index] = BlockKind.TOOL_USE
                 call_id = TurnStreamState.call_id_for(event.index)
                 state.tool_calls[event.index] = call_id
                 out.append(StreamBlockStart(index=event.index, block=BlockKind.TOOL_USE))
-                # Name is not carried by model.StreamEvent; recovered on the
-                # coarse ToolCall. Emit ToolCallStart so consumers can begin
-                # correlating args by call_id.
                 out.append(StreamToolCallStart(index=event.index, call_id=call_id, name=""))
             call_id = state.tool_calls.get(event.index, TurnStreamState.call_id_for(event.index))
             out.append(StreamToolArgsDelta(call_id=call_id, partial_json=event.partial_json))
@@ -5122,6 +5258,21 @@ class NoopContextManager:
         return False
 
 
+class NullSandbox(BaseSandboxProvider):
+    """A sandbox that permits every tool-call validation and applies no path or
+    process isolation. It is the right starting point for a tool-less or
+    pure-compute agent — one where no tool is ever dispatched and the
+    environment boundary is never exercised.
+
+    This is the sandbox wired by :meth:`HarnessBuilder.conversational`. Agents
+    that actually touch the filesystem or shell must use a real sandbox such as
+    :class:`~spore_core.sandbox.WorkspaceScopedSandbox`. Mirrors Rust's
+    ``NullSandbox``."""
+
+    async def validate(self, call: ToolCall) -> SandboxViolation | None:
+        return None
+
+
 class AllowAllSandbox(BaseSandboxProvider):
     async def validate(self, call: ToolCall) -> SandboxViolation | None:
         return None
@@ -5274,6 +5425,8 @@ __all__ = [
     "AlwaysContinuePolicy",
     "BaseSandboxProvider",
     "CommandOutput",
+    "CompleteOnFinalResponse",
+    "EmptyToolRegistry",
     "FileRef",
     "TruncatedOutput",
     "BudgetLimits",

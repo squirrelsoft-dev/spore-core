@@ -4,8 +4,8 @@
  * Mirrors `rust/crates/spore-core/src/agent.rs#tests` (the #103 section):
  * raw model `StreamEvent`s are forwarded to the sink in order, deltas are
  * reassembled into a `ModelResponse`, and the SAME classification runs as
- * `turn` — including the documented limitation that streamed tool-use blocks
- * carry an EMPTY name and a synthesized `call_{index}` id.
+ * `turn` — including that streamed tool-use blocks recover the real tool name
+ * and call id from the `tool_use_start` event.
  */
 
 import { describe, expect, it } from "vitest";
@@ -102,7 +102,7 @@ describe("Agent streaming — text + reasoning deltas (#103)", () => {
 });
 
 describe("Agent streaming — tool-use reassembly (#103)", () => {
-  it("reassembles tool args; coarse ToolCall has accumulated args + EMPTY name + call_{index} id", async () => {
+  it("reassembles tool args; coarse ToolCall has accumulated args + real name + id from tool_use_start", async () => {
     const agent = replayAgent({
       content: [
         { type: "thinking", text: "let me think" },
@@ -119,12 +119,14 @@ describe("Agent streaming — tool-use reassembly (#103)", () => {
       expect(result.calls).toHaveLength(1);
       expect(result.calls[0]!.input).toEqual({ q: "rust" });
       expect(result.reasoning).toBe("let me think");
-      // Documented limitation: model stream drops the tool name/id; the
-      // accumulator synthesizes call_{index} and an empty name. The tool_use
-      // block is at index 1 (thinking is index 0).
-      expect(result.calls[0]!.name).toBe("");
-      expect(result.calls[0]!.id).toBe("call_1");
+      // The tool name/id arrive on the tool_use_start event (emitted by the
+      // replay adapter at block start) and are recovered faithfully.
+      expect(result.calls[0]!.name).toBe("lookup");
+      expect(result.calls[0]!.id).toBe("toolu_1");
     }
+    expect(
+      seen.some((e) => e.type === "tool_use_start" && e.name === "lookup" && e.id === "toolu_1"),
+    ).toBe(true);
     expect(seen.some((e) => e.type === "tool_use_delta" && e.partial_json.includes("rust"))).toBe(
       true,
     );

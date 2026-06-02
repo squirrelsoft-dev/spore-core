@@ -100,7 +100,7 @@ export class ReplayModelInterface implements ModelInterface {
     yield { type: "message_start" };
     for (let i = 0; i < response.content.length; i++) {
       const block = response.content[i]!;
-      yield streamEventForBlock(block, i);
+      yield* streamEventsForBlock(block, i);
       yield { type: "content_block_stop", index: i };
     }
     yield {
@@ -146,12 +146,14 @@ function autoDetectMode(exchanges: readonly RecordedExchange[]): ReplayMode {
   return allHashed ? "hash_matched" : "positional";
 }
 
-function streamEventForBlock(block: ContentBlock, index: number): StreamEvent {
+function* streamEventsForBlock(block: ContentBlock, index: number): Iterable<StreamEvent> {
   switch (block.type) {
     case "text":
-      return { type: "content_block_delta", index, delta: block.text };
+      yield { type: "content_block_delta", index, delta: block.text };
+      return;
     case "thinking":
-      return { type: "thinking_delta", index, delta: block.text };
+      yield { type: "thinking_delta", index, delta: block.text };
+      return;
     case "tool_use": {
       let partial = "{}";
       try {
@@ -159,7 +161,12 @@ function streamEventForBlock(block: ContentBlock, index: number): StreamEvent {
       } catch {
         partial = "{}";
       }
-      return { type: "tool_use_delta", index, partial_json: partial };
+      // Emit tool_use_start (carrying id + name) before the args delta so the
+      // accumulator can reconstruct the call faithfully, mirroring the
+      // provider block-start frames.
+      yield { type: "tool_use_start", index, id: block.id, name: block.name };
+      yield { type: "tool_use_delta", index, partial_json: partial };
+      return;
     }
     default: {
       const _exhaustive: never = block;

@@ -15,5 +15,13 @@ The five-line path is the same in every language:
 4. Run it and await the result.
 5. Match the result — `Success` carries the output, turn count, usage, and post-run session state.
 
-See the [architecture concept](../concepts/architecture.md) for what those components are, and
-[`examples/`](../../examples) for runnable programs as the TypeScript examples land.
+See the [architecture concept](../concepts/architecture.md) for what those components are.
+
+## Runnable examples
+
+Three runnable TypeScript programs build the path up step by step
+(`HarnessBuilder.conversational(model)` + `simpleTask(...)`):
+
+- [`examples/typescript/01-hello-agent`](../../examples/typescript/01-hello-agent) — the smallest live agent: one turn, one greeting.
+- [`examples/typescript/02-conversational-repl`](../../examples/typescript/02-conversational-repl) — a chat loop that remembers earlier turns by threading session state.
+- [`examples/typescript/03-tool-use`](../../examples/typescript/03-tool-use) — a ReAct agent that calls local tools in a Think → Act → Observe loop.

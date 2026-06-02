@@ -586,6 +586,17 @@ export async function* sseToEvents(body: ReadableStream<Uint8Array>): AsyncItera
           const u = msg?.usage as Record<string, unknown> | undefined;
           if (typeof u?.input_tokens === "number") usage.input_tokens = u.input_tokens;
           yield { type: "message_start" };
+        } else if (event === "content_block_start") {
+          // A tool_use block opens here with its id + name; emit tool_use_start
+          // so the accumulator captures them before the input_json_delta arg
+          // fragments arrive.
+          const index = typeof ev?.index === "number" ? ev.index : 0;
+          const block = jsonValue(ev?.content_block);
+          if (block?.type === "tool_use") {
+            const id = typeof block.id === "string" ? block.id : "";
+            const name = typeof block.name === "string" ? block.name : "";
+            yield { type: "tool_use_start", index, id, name };
+          }
         } else if (event === "content_block_delta") {
           const index = typeof ev?.index === "number" ? ev.index : 0;
           const delta = ev?.delta as Record<string, unknown> | undefined;

@@ -718,6 +718,21 @@ fn sse_to_events(
                                 content_index_emitted = false;
                                 content_index = event_index;
                             }
+                            // The id + function.name arrive on this first chunk for
+                            // the index; emit ToolUseStart so they aren't lost when
+                            // only argument fragments follow.
+                            let name = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let id = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("call_{event_index}"));
+                            yield Ok(StreamEvent::ToolUseStart { index: event_index, id, name });
                         }
                         let arg_delta = tc
                             .get("function")

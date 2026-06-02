@@ -34,6 +34,7 @@ from spore_core.model import (
     ToolSchema,
     ToolUseBlock,
     ToolUseDelta,
+    ToolUseStart,
 )
 from spore_core.ollama import (
     DEFAULT_BASE_URL,
@@ -504,8 +505,8 @@ async def test_streaming_done_carries_usage() -> None:
 
 async def test_streaming_accumulates_tool_calls() -> None:
     """Ollama returns full arguments objects per chunk (not partial
-    strings). Verify we emit one ToolUseDelta with the serialized object
-    and MessageStop.stop_reason=ToolUse."""
+    strings). Verify we emit a ToolUseStart carrying the name + id, then one
+    ToolUseDelta with the serialized object and MessageStop.stop_reason=ToolUse."""
 
     ndjson = (
         '{"message":{"role":"assistant","tool_calls":'
@@ -522,12 +523,18 @@ async def test_streaming_accumulates_tool_calls() -> None:
     client = _mock_client(httpx.MockTransport(handler))
     iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
     tool_jsons: list[str] = []
+    starts: list[ToolUseStart] = []
     final_stop = StopReason.END_TURN
     async for ev in iface.call_streaming(_req([_user("hi")])):
-        if isinstance(ev, ToolUseDelta):
+        if isinstance(ev, ToolUseStart):
+            starts.append(ev)
+        elif isinstance(ev, ToolUseDelta):
             tool_jsons.append(ev.partial_json)
         elif isinstance(ev, MessageStop):
             final_stop = ev.stop_reason
+    assert len(starts) == 1
+    assert starts[0].name == "fetch"
+    assert starts[0].id == "call_1"
     assert len(tool_jsons) == 1
     assert json.loads(tool_jsons[0]) == {"url": "x"}
     assert final_stop is StopReason.TOOL_USE

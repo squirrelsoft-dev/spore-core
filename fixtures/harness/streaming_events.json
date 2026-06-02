@@ -35,12 +35,12 @@
     {
       "kind": "tool_call_start",
       "index": 2,
-      "call_id": "call_2",
-      "name": ""
+      "call_id": "toolu_stream_1",
+      "name": "lookup"
     },
     {
       "kind": "tool_args_delta",
-      "call_id": "call_2",
+      "call_id": "toolu_stream_1",
       "partial_json": "{\"q\":\"rust\"}"
     },
     {

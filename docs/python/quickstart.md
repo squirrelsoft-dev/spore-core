@@ -15,5 +15,13 @@ The five-line path is the same in every language:
 4. Run it and await the result.
 5. Match the result — `Success` carries the output, turn count, usage, and post-run session state.
 
-See the [architecture concept](../concepts/architecture.md) for what those components are, and
-[`examples/`](../../examples) for runnable programs as the Python examples land.
+See the [architecture concept](../concepts/architecture.md) for what those components are.
+
+## Runnable examples
+
+Three runnable Python programs build the path up step by step (`HarnessBuilder.conversational(model)`
++ `Task.simple(...)`):
+
+- [`examples/python/01-hello-agent`](../../examples/python/01-hello-agent) — the smallest live agent: one turn, one greeting.
+- [`examples/python/02-conversational-repl`](../../examples/python/02-conversational-repl) — a chat loop that remembers earlier turns by threading session state.
+- [`examples/python/03-tool-use`](../../examples/python/03-tool-use) — a ReAct agent that calls local tools in a Think → Act → Observe loop.

@@ -39,6 +39,7 @@ from spore_core.model import (
     ToolSchema,
     ToolUseBlock,
     ToolUseDelta,
+    ToolUseStart,
 )
 from spore_core.openai import (
     OpenAIModelInterface,
@@ -519,12 +520,20 @@ async def test_streaming_accumulates_tool_call_deltas() -> None:
     client = _mock_client(httpx.MockTransport(handler))
     iface = OpenAIModelInterface("k", "gpt-4o", base_url="https://x.test", http_client=client)
     tool_fragments: list[str] = []
+    starts: list[ToolUseStart] = []
     final_stop: StopReason = StopReason.END_TURN
     async for ev in iface.call_streaming(_req([_user("hi")])):
-        if isinstance(ev, ToolUseDelta):
+        if isinstance(ev, ToolUseStart):
+            starts.append(ev)
+        elif isinstance(ev, ToolUseDelta):
             tool_fragments.append(ev.partial_json)
         elif isinstance(ev, MessageStop):
             final_stop = ev.stop_reason
+    # The first tool_calls chunk carries id + name; emit ToolUseStart before
+    # the argument fragments.
+    assert len(starts) == 1
+    assert starts[0].name == "fetch"
+    assert starts[0].id == "call-1"
     joined = "".join(tool_fragments)
     parsed = json.loads(joined)
     assert parsed == {"url": "x"}

@@ -81,6 +81,9 @@ from .model import (
 from .model import (
     ToolUseDelta as _ToolUseDelta,
 )
+from .model import (
+    ToolUseStart as _ToolUseStart,
+)
 
 # ============================================================================
 # Constants
@@ -426,13 +429,26 @@ async def _sse_to_events(response: httpx.Response) -> AsyncIterator[StreamEvent]
                         i_raw = tc.get("index")
                         i = int(i_raw) if isinstance(i_raw, int) else 0
                         event_index = i + 1
+                        func = tc.get("function") or {}
                         if event_index not in tool_indices_seen:
                             tool_indices_seen.add(event_index)
                             if content_index_emitted:
                                 yield _ContentBlockStop(index=content_index)
                                 content_index_emitted = False
                                 content_index = event_index
-                        func = tc.get("function") or {}
+                            # The id + function.name arrive on this first chunk
+                            # for the index; emit ToolUseStart so they aren't
+                            # lost when only argument fragments follow.
+                            name = ""
+                            if isinstance(func, dict):
+                                fn = func.get("name")
+                                if isinstance(fn, str):
+                                    name = fn
+                            tc_id = tc.get("id")
+                            call_id = (
+                                tc_id if isinstance(tc_id, str) and tc_id else f"call_{event_index}"
+                            )
+                            yield _ToolUseStart(index=event_index, id=call_id, name=name)
                         arg_delta = func.get("arguments") if isinstance(func, dict) else None
                         if isinstance(arg_delta, str) and arg_delta:
                             yield _ToolUseDelta(index=event_index, partial_json=arg_delta)

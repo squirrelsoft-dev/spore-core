@@ -66,6 +66,7 @@ from .model import (
     ToolSchema,
     ToolUseBlock,
     ToolUseDelta,
+    ToolUseStart,
 )
 
 # ============================================================================
@@ -368,12 +369,13 @@ class ModelAgent:
 
         Block ordering is preserved by first-seen stream index.
 
-        Known limitation (issue #103): ``model.StreamEvent`` carries
-        tool-argument deltas but NOT the tool name or id — providers drop them
-        in the streamed frames. The accumulator therefore synthesizes a stable
-        per-index id ``call_{index}`` (matching the harness correlation key)
-        and an EMPTY name. The final arguments round-trip faithfully; under
-        streamed turns the reassembled ``ToolCall`` name is empty.
+        Tool name + id are recovered from :class:`ToolUseStart`, which every
+        provider emits at the tool block's start frame (Anthropic
+        ``content_block_start``, Ollama / OpenAI's first ``tool_calls`` chunk)
+        before the :class:`ToolUseDelta` argument fragments arrive. The
+        accumulator records them and reconstructs the ``ToolCall`` faithfully;
+        it only falls back to a synthesized per-index id ``call_{index}`` and
+        empty name if a stream somehow omitted the start frame.
         """
 
         request = context.into_request_with_stream(stream=True)
@@ -405,6 +407,8 @@ class _StreamAccumulator:
     def __init__(self) -> None:
         # index -> [kind, payload]; kind is "text" | "thinking" | "tool_json".
         self._blocks: list[tuple[int, str, list[str]]] = []
+        # index -> (id, name) captured from ToolUseStart for tool-use blocks.
+        self._tool_meta: dict[int, tuple[str, str]] = {}
         self._usage: TokenUsage = TokenUsage()
         self._stop_reason: StopReason | None = None
 
@@ -423,6 +427,10 @@ class _StreamAccumulator:
             self._buf(event.index, "text").append(event.delta)
         elif isinstance(event, ThinkingDelta):
             self._buf(event.index, "thinking").append(event.delta)
+        elif isinstance(event, ToolUseStart):
+            # Record id + name; ensure the block exists in first-seen order.
+            self._buf(event.index, "tool_json")
+            self._tool_meta[event.index] = (event.id, event.name)
         elif isinstance(event, ToolUseDelta):
             self._buf(event.index, "tool_json").append(event.partial_json)
         elif isinstance(event, MessageStop):
@@ -445,11 +453,18 @@ class _StreamAccumulator:
                     parsed = {}
                 if not isinstance(parsed, dict):
                     parsed = {}
-                # The streaming model events do not carry the tool id / name
-                # (only the partial JSON args). Synthesize a stable per-index
-                # id so the harness correlates by the index-derived id; the
-                # name is left empty (documented limitation).
-                content.append(ToolUseBlock(id=f"call_{index}", name="", input=parsed))
+                # id + name come from the ToolUseStart event every provider
+                # emits at block start. Fall back to a stable per-index id and
+                # empty name only if a stream somehow omitted the start frame,
+                # so reconstruction is always well-formed.
+                tool_id, tool_name = self._tool_meta.get(index, ("", ""))
+                content.append(
+                    ToolUseBlock(
+                        id=tool_id or f"call_{index}",
+                        name=tool_name,
+                        input=parsed,
+                    )
+                )
         return ModelResponse(
             content=content,
             usage=self._usage,

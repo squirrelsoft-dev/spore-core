@@ -488,16 +488,23 @@ func TestStreamingAccumulatesToolCallDeltas(t *testing.T) {
 	}
 	var fragments []string
 	var finalStop sporecore.StopReason
+	var startID, startName string
 	for ev := range ch {
 		if ev.Err != nil {
 			t.Fatalf("err: %v", ev.Err)
 		}
 		switch ev.Event.Type {
+		case sporecore.StreamToolUseStart:
+			startID = ev.Event.ID
+			startName = ev.Event.Name
 		case sporecore.StreamToolUseDelta:
 			fragments = append(fragments, ev.Event.PartialJSON)
 		case sporecore.StreamMessageStop:
 			finalStop = ev.Event.StopReason
 		}
+	}
+	if startID != "call-1" || startName != "fetch" {
+		t.Fatalf("tool_use_start id=%q name=%q, want call-1/fetch", startID, startName)
 	}
 	joined := strings.Join(fragments, "")
 	var parsed map[string]any

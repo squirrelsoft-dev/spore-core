@@ -1,0 +1,17 @@
+{
+  "name": "spore-example-03-tool-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 03: a ReAct agent that calls local tools in a Think -> Act -> Observe loop.",
+  "scripts": {
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core"
+  },
+  "devDependencies": {
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3"
+  }
+}

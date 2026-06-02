@@ -74,6 +74,9 @@ from .model import (
 from .model import (
     ToolUseDelta as _ToolUseDelta,
 )
+from .model import (
+    ToolUseStart as _ToolUseStart,
+)
 
 # ============================================================================
 # Constants
@@ -370,13 +373,30 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
                             if not isinstance(tc, dict):
                                 continue
                             event_index = i + 1
+                            func = tc.get("function")
                             if event_index not in tool_indices_seen:
                                 tool_indices_seen.add(event_index)
                                 if content_open:
                                     yield _ContentBlockStop(index=content_index)
                                     content_open = False
                                     content_index = event_index
-                            func = tc.get("function")
+                                # Ollama delivers the full call (id + name +
+                                # complete args) on the chunk — emit a
+                                # ToolUseStart carrying the name and id so the
+                                # accumulator can reconstruct the call
+                                # faithfully. A missing id is synthesized stably.
+                                name = ""
+                                if isinstance(func, dict):
+                                    fn = func.get("name")
+                                    if isinstance(fn, str):
+                                        name = fn
+                                tc_id = tc.get("id")
+                                call_id = (
+                                    tc_id
+                                    if isinstance(tc_id, str) and tc_id
+                                    else f"call_{event_index}"
+                                )
+                                yield _ToolUseStart(index=event_index, id=call_id, name=name)
                             if isinstance(func, dict):
                                 args = func.get("arguments")
                                 # Ollama emits the FULL arguments object

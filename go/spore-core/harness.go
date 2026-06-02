@@ -526,10 +526,10 @@ type StreamSink func(HarnessStreamEvent)
 // BlockKind so tool_use_delta / content_block_stop events can be mapped back to
 // a call_id, and so each block's block_start is emitted exactly once.
 //
-// KNOWN LIMITATION (issue #103): model tool-arg deltas do NOT carry a tool name
-// or id; the harness derives a stable call_id "call_{index}" matching the id the
-// agent's streaming accumulator synthesizes, and the coarse ToolCall name is
-// empty under streamed turns (args round-trip faithfully). See agent.go.
+// The model tool_use_start event carries the real call id + tool name at block
+// start, which the harness threads onto tool_call_start. The synthesized
+// "call_{index}" id + empty name remain only as a fallback when a stream omits
+// the start frame and opens the block on a tool_use_delta instead. See agent.go.
 type turnStreamState struct {
 	openBlocks map[uint32]BlockKind
 	toolCalls  map[uint32]string
@@ -581,6 +581,21 @@ func mapModelStreamEvent(ev StreamEvent, state *turnStreamState) []HarnessStream
 		}
 		out = append(out, HarnessStreamEvent{Kind: HarnessStreamReasoningDelta, Content: ev.Delta})
 		return out
+	case StreamToolUseStart:
+		var out []HarnessStreamEvent
+		if _, open := state.openBlocks[ev.Index]; !open {
+			state.openBlocks[ev.Index] = BlockToolUse
+			// Use the real call id from the model; consumers correlate
+			// subsequent tool_args_delta by it.
+			state.toolCalls[ev.Index] = ev.ID
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamBlockStart, Index: ev.Index, Block: BlockToolUse,
+			})
+			out = append(out, HarnessStreamEvent{
+				Kind: HarnessStreamToolCallStart, Index: ev.Index, CallID: ev.ID, Name: ev.Name,
+			})
+		}
+		return out
 	case StreamToolUseDelta:
 		var out []HarnessStreamEvent
 		if _, open := state.openBlocks[ev.Index]; !open {
@@ -590,9 +605,8 @@ func mapModelStreamEvent(ev StreamEvent, state *turnStreamState) []HarnessStream
 			out = append(out, HarnessStreamEvent{
 				Kind: HarnessStreamBlockStart, Index: ev.Index, Block: BlockToolUse,
 			})
-			// Name is not carried by the model StreamEvent; recovered on the
-			// coarse ToolCall. Emit tool_call_start so consumers can begin
-			// correlating args by call_id.
+			// Fallback: if a stream omitted tool_use_start, open the block here
+			// with a synthesized id and empty name so args still surface.
 			out = append(out, HarnessStreamEvent{
 				Kind: HarnessStreamToolCallStart, Index: ev.Index, CallID: callID, Name: "",
 			})

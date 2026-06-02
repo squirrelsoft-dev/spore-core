@@ -373,15 +373,19 @@ describe("sseToEvents", () => {
       "data: [DONE]\n\n";
 
     const fragments: string[] = [];
+    let start: { id: string; name: string } | null = null;
     let finalStop: StreamEvent["type"] | "" = "";
     let lastStopReason = "";
     for await (const ev of openaiSseToEvents(streamFromString(sse))) {
+      if (ev.type === "tool_use_start") start = { id: ev.id, name: ev.name };
       if (ev.type === "tool_use_delta") fragments.push(ev.partial_json);
       if (ev.type === "message_stop") {
         finalStop = ev.type;
         lastStopReason = ev.stop_reason;
       }
     }
+    // tool_use_start carries the id + name from the first chunk for the index.
+    expect(start).toEqual({ id: "call-1", name: "fetch" });
     expect(finalStop).toBe("message_stop");
     expect(lastStopReason).toBe("tool_use");
     const joined = fragments.join("");

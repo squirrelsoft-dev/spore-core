@@ -221,11 +221,11 @@ async def test_tool_lifecycle_ordering_and_enriched_coarse_events() -> None:
     # ToolArgsDelta carries the args JSON.
     assert any(isinstance(e, StreamToolArgsDelta) and "rust" in e.partial_json for e in events)
 
-    # Q5: coarse ToolCall carries the final accumulated args; name is empty
-    # (not recoverable from streamed model events).
+    # Q5: coarse ToolCall carries the final accumulated args; the name is
+    # recovered from the ToolUseStart model event every provider emits.
     coarse = next(e for e in events if isinstance(e, StreamToolCall))
     assert coarse.args == {"q": "rust"}
-    assert coarse.name == ""
+    assert coarse.name == "lookup"
 
     # Q5: coarse ToolResult carries the result content.
     result_ev = next(e for e in events if isinstance(e, StreamToolResult))
@@ -234,7 +234,7 @@ async def test_tool_lifecycle_ordering_and_enriched_coarse_events() -> None:
     # The ToolCallStart and ToolArgsDelta call_ids correlate.
     start_id = next(e.call_id for e in events if isinstance(e, StreamToolCallStart))
     delta_id = next(e.call_id for e in events if isinstance(e, StreamToolArgsDelta))
-    assert start_id == delta_id == "call_0"
+    assert start_id == delta_id == "toolu_1"
 
 
 # ---------------------------------------------------------------------------

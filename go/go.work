@@ -1,7 +1,10 @@
 go 1.22
 
 use (
-	./spore-core
+	../examples/go/01-hello-agent
+	../examples/go/02-conversational-repl
+	../examples/go/03-tool-use
 	./spore-cli
+	./spore-core
 	./spore-eval
 )

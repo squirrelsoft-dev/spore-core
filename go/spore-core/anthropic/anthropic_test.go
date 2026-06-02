@@ -476,6 +476,9 @@ func TestStreamingEmitsToolUseAndThinkingDeltas(t *testing.T) {
 		"event: content_block_delta",
 		`data: {"index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`,
 		"",
+		"event: content_block_start",
+		`data: {"index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"lookup"}}`,
+		"",
 		"event: content_block_delta",
 		`data: {"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\""}}`,
 		"",
@@ -493,7 +496,7 @@ func TestStreamingEmitsToolUseAndThinkingDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var thinking, tooluse, stop bool
+	var thinking, toolstart, tooluse, stop bool
 	for ev := range ch {
 		if ev.Err != nil {
 			t.Fatalf("err: %v", ev.Err)
@@ -504,6 +507,11 @@ func TestStreamingEmitsToolUseAndThinkingDeltas(t *testing.T) {
 			if ev.Event.Delta != "hmm" {
 				t.Fatalf("thinking delta: %q", ev.Event.Delta)
 			}
+		case sporecore.StreamToolUseStart:
+			toolstart = true
+			if ev.Event.ID != "toolu_a" || ev.Event.Name != "lookup" {
+				t.Fatalf("tool_use_start id=%q name=%q", ev.Event.ID, ev.Event.Name)
+			}
 		case sporecore.StreamToolUseDelta:
 			tooluse = true
 			if ev.Event.PartialJSON != `{"a"` {
@@ -513,8 +521,8 @@ func TestStreamingEmitsToolUseAndThinkingDeltas(t *testing.T) {
 			stop = true
 		}
 	}
-	if !thinking || !tooluse || !stop {
-		t.Fatalf("got thinking=%v tooluse=%v stop=%v", thinking, tooluse, stop)
+	if !thinking || !toolstart || !tooluse || !stop {
+		t.Fatalf("got thinking=%v toolstart=%v tooluse=%v stop=%v", thinking, toolstart, tooluse, stop)
 	}
 }
 

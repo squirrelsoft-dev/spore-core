@@ -1,0 +1,9 @@
+[project]
+name = "spore-example-01-hello-agent"
+version = "0.0.0"
+description = "spore-core example 01 — hello agent (Python)"
+requires-python = ">=3.12"
+dependencies = ["spore-core"]
+
+[tool.uv.sources]
+spore-core = { path = "../../../python/packages/spore_core", editable = true }

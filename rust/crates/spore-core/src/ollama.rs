@@ -794,7 +794,8 @@ fn ndjson_to_events(
                 {
                     for (i, tc) in tcs.iter().enumerate() {
                         let event_index = (i as u32) + 1;
-                        if !tool_indices_seen.contains(&event_index) {
+                        let first_seen = !tool_indices_seen.contains(&event_index);
+                        if first_seen {
                             tool_indices_seen.insert(event_index);
                             if content_open {
                                 yield Ok(StreamEvent::ContentBlockStop {
@@ -803,6 +804,26 @@ fn ndjson_to_events(
                                 content_open = false;
                                 content_index = event_index;
                             }
+                            // Ollama delivers the full call (id + name + complete
+                            // args) on the chunk — emit a ToolUseStart carrying the
+                            // name and id so the accumulator can reconstruct the
+                            // call faithfully. A missing id is synthesized stably.
+                            let name = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let id = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("call_{event_index}"));
+                            yield Ok(StreamEvent::ToolUseStart {
+                                index: event_index,
+                                id,
+                                name,
+                            });
                         }
                         if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")) {
                             let partial = serde_json::to_string(args)

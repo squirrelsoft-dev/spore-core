@@ -200,6 +200,21 @@ class ThinkingDelta(_Model):
     delta: str
 
 
+class ToolUseStart(_Model):
+    """Start of a tool-use block. Carries the tool ``name`` and call ``id`` —
+    both arrive on the provider's block-start frame (Anthropic
+    ``content_block_start``, Ollama / OpenAI's first ``tool_calls`` chunk) and
+    would otherwise be lost, since :class:`ToolUseDelta` carries only argument
+    JSON. The streaming accumulator uses this to reconstruct the tool call
+    faithfully.
+    """
+
+    type: Literal["tool_use_start"] = "tool_use_start"
+    index: int
+    id: str
+    name: str
+
+
 class ToolUseDelta(_Model):
     type: Literal["tool_use_delta"] = "tool_use_delta"
     index: int
@@ -221,6 +236,7 @@ StreamEvent = Annotated[
     MessageStart
     | ContentBlockDelta
     | ThinkingDelta
+    | ToolUseStart
     | ToolUseDelta
     | ContentBlockStop
     | MessageStop,
@@ -497,6 +513,7 @@ class ReplayModelInterface:
             elif isinstance(block, ThinkingBlock):
                 yield ThinkingDelta(index=idx, delta=block.text)
             elif isinstance(block, ToolUseBlock):
+                yield ToolUseStart(index=idx, id=block.id, name=block.name)
                 yield ToolUseDelta(
                     index=idx,
                     partial_json=json.dumps(block.input, separators=(",", ":")),
@@ -716,6 +733,7 @@ __all__ = [
     "ToolSchema",
     "ToolUseBlock",
     "ToolUseDelta",
+    "ToolUseStart",
     "enforce_budget",
     "enforce_context_limit",
     "request_hash",

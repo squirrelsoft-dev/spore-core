@@ -759,6 +759,7 @@ export async function* ndjsonToEvents(
               const tc = jsonValue(tcs[i]);
               if (tc == null) continue;
               const eventIndex = i + 1;
+              const fn = jsonValue(tc.function);
               if (!toolIndicesSeen.has(eventIndex)) {
                 toolIndicesSeen.add(eventIndex);
                 if (contentOpen) {
@@ -766,8 +767,14 @@ export async function* ndjsonToEvents(
                   contentOpen = false;
                   contentIndex = eventIndex;
                 }
+                // Ollama delivers the full call (id + name + complete args) on
+                // the chunk — emit a tool_use_start carrying the name and id so
+                // the accumulator can reconstruct the call faithfully. A missing
+                // id is synthesized stably.
+                const name = typeof fn?.name === "string" ? fn.name : "";
+                const id = typeof tc.id === "string" ? tc.id : `call_${eventIndex}`;
+                yield { type: "tool_use_start", index: eventIndex, id, name };
               }
-              const fn = jsonValue(tc.function);
               if (fn != null && "arguments" in fn) {
                 const args = fn.arguments;
                 let partial: string;

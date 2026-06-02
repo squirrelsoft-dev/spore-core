@@ -850,6 +850,28 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 							contentIndexActive = false
 							contentIndex = eventIndex
 						}
+						// Ollama delivers the full call (id + name + complete args)
+						// on the chunk — emit a tool_use_start carrying the name and
+						// id so the accumulator can reconstruct the call faithfully.
+						// A missing id is synthesized stably.
+						var name string
+						if fn, ok := tc["function"].(map[string]any); ok {
+							if n, ok := fn["name"].(string); ok {
+								name = n
+							}
+						}
+						id, _ := tc["id"].(string)
+						if id == "" {
+							id = fmt.Sprintf("call_%d", eventIndex)
+						}
+						if !sendEvent(ctx, ch, sporecore.StreamEvent{
+							Type:  sporecore.StreamToolUseStart,
+							Index: eventIndex,
+							ID:    id,
+							Name:  name,
+						}) {
+							return
+						}
 					}
 					if fn, ok := tc["function"].(map[string]any); ok {
 						if args, ok := fn["arguments"]; ok {

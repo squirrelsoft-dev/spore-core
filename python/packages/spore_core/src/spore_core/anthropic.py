@@ -65,6 +65,9 @@ from .model import (
 from .model import (
     ToolUseDelta as _ToolUseDelta,
 )
+from .model import (
+    ToolUseStart as _ToolUseStart,
+)
 
 # ============================================================================
 # Constants
@@ -353,6 +356,18 @@ async def _sse_to_events(response: httpx.Response) -> AsyncIterator[StreamEvent]
                             if isinstance(it, int):
                                 usage_input = it
                     yield _MessageStart()
+                elif event_name == "content_block_start":
+                    # A tool_use block opens here with its id + name; emit
+                    # ToolUseStart so the accumulator captures them before the
+                    # input_json_delta arg fragments arrive.
+                    index = int(value.get("index") or 0)
+                    block = value.get("content_block")
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        yield _ToolUseStart(
+                            index=index,
+                            id=str(block.get("id") or ""),
+                            name=str(block.get("name") or ""),
+                        )
                 elif event_name == "content_block_delta":
                     index = int(value.get("index") or 0)
                     delta = value.get("delta") or {}

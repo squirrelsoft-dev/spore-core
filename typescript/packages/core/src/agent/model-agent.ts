@@ -26,17 +26,17 @@
  * can never diverge. Thinking is accumulated into `reasoning` (Q4) rather than
  * discarded.
  *
- * ### Known limitation: tool name in streamed turns
+ * ### Tool name + id in streamed turns
  *
- * Model-layer `StreamEvent` tool-argument deltas (`tool_use_delta`) carry the
- * block `index` and `partial_json` but NOT the tool `name` or `id` — every
- * provider parses the name from the block-start frame and then drops it (the
- * issue text: "No provider SSE-parsing work needed"). The streaming
- * accumulator therefore synthesizes a stable per-index id (`call_{index}`,
- * matching the harness correlation key) and an EMPTY name. The final arguments
- * round-trip faithfully; recovering the name would require a new field on the
- * model `StreamEvent`, which is out of scope here. The shared
- * `fixtures/harness/streaming_events.json` golden encodes this behaviour.
+ * The model-layer `StreamEvent` `tool_use_start` event carries the tool `name`
+ * and call `id` — both arrive on the provider's block-start frame (Anthropic
+ * `content_block_start`, Ollama / OpenAI's first `tool_calls` chunk) — followed
+ * by `tool_use_delta` fragments for the argument JSON. The streaming
+ * accumulator records the name/id from `tool_use_start`, so a tool call
+ * reconstructed from a stream is faithful. A stable per-index id (`call_{index}`)
+ * and empty name are synthesized only as a fallback if a stream somehow omitted
+ * the start frame. The shared `fixtures/harness/streaming_events.json` golden
+ * encodes this behaviour.
  */
 
 import { ModelError } from "../model/errors.js";
@@ -192,7 +192,7 @@ export class ModelAgent implements Agent {
 type PartialBlock =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
-  | { kind: "tool_json"; json: string };
+  | { kind: "tool_json"; id: string; name: string; json: string };
 
 /**
  * Reassembles streamed model {@link StreamEvent}s into a {@link ModelResponse}
@@ -226,8 +226,26 @@ class StreamAccumulator {
         if (b.kind === "thinking") b.text += event.delta;
         break;
       }
+      case "tool_use_start": {
+        const b = this.entry(event.index, () => ({
+          kind: "tool_json",
+          id: "",
+          name: "",
+          json: "",
+        }));
+        if (b.kind === "tool_json") {
+          b.id = event.id;
+          b.name = event.name;
+        }
+        break;
+      }
       case "tool_use_delta": {
-        const b = this.entry(event.index, () => ({ kind: "tool_json", json: "" }));
+        const b = this.entry(event.index, () => ({
+          kind: "tool_json",
+          id: "",
+          name: "",
+          json: "",
+        }));
         if (b.kind === "tool_json") b.json += event.partial_json;
         break;
       }
@@ -258,11 +276,16 @@ class StreamAccumulator {
           } catch {
             input = null;
           }
-          // The streaming model events do not carry the tool id/name (only the
-          // partial JSON args). Synthesize a stable per-index id matching the
-          // harness correlation key; the name is left empty (documented
-          // limitation — see the file header).
-          return { type: "tool_use", id: `call_${index}`, name: "", input };
+          // `id` / `name` come from the `tool_use_start` event every provider
+          // emits at block start. Fall back to a stable per-index id (matching
+          // the harness correlation key) and empty name only if a stream
+          // somehow omitted the start frame, so reconstruction is well-formed.
+          return {
+            type: "tool_use",
+            id: block.id === "" ? `call_${index}` : block.id,
+            name: block.name,
+            input,
+          };
         }
         default: {
           const _exhaustive: never = block;

@@ -642,12 +642,14 @@ func (a *ModelAgent) Turn(ctx context.Context, c Context) TurnResult {
 //
 // Block ordering is preserved by first-seen index order.
 //
-// KNOWN LIMITATION (issue #103): model-layer tool-argument deltas do NOT carry
-// the tool name or id (providers drop them; provider SSE work is out of scope).
-// The accumulator therefore synthesizes a stable per-index call id "call_{index}"
-// (matching the harness correlation key) and an EMPTY tool name. Under streamed
-// turns the coarse ToolCall name is empty while the args round-trip faithfully.
-// Recovering the name would require a new field on the model StreamEvent.
+// Tool name / id in streamed turns: the model StreamEvent tool_use_start carries
+// the tool name and call id at block start — every provider emits it from its
+// block-start frame (Anthropic content_block_start, Ollama / OpenAI's first
+// tool_calls chunk) — followed by tool_use_delta for the argument JSON. The
+// accumulator records the name/id from tool_use_start, so a tool call
+// reconstructed from a stream is identical to one from the coarse response. A
+// stable per-index call id "call_{index}" and empty name are synthesized only as
+// a fallback if a stream somehow omitted the start frame.
 func (a *ModelAgent) TurnStreaming(ctx context.Context, c Context, sink AgentStreamSink) TurnResult {
 	request := c.IntoRequestStreaming()
 	ch, err := a.model.CallStreaming(ctx, request)
@@ -684,6 +686,9 @@ type partialBlock struct {
 	index uint32
 	kind  partialBlockKind
 	buf   strings.Builder
+	// toolID / toolName are captured from the tool_use_start event (partialToolJSON).
+	toolID   string
+	toolName string
 }
 
 // streamAccumulator reassembles streamed StreamEvents into a ModelResponse
@@ -725,6 +730,12 @@ func (s *streamAccumulator) fold(ev StreamEvent) {
 		if b.kind == partialThinking {
 			b.buf.WriteString(ev.Delta)
 		}
+	case StreamToolUseStart:
+		b := s.entry(ev.Index, partialToolJSON)
+		if b.kind == partialToolJSON {
+			b.toolID = ev.ID
+			b.toolName = ev.Name
+		}
 	case StreamToolUseDelta:
 		b := s.entry(ev.Index, partialToolJSON)
 		if b.kind == partialToolJSON {
@@ -750,17 +761,22 @@ func (s *streamAccumulator) intoResponse() ModelResponse {
 		case partialThinking:
 			content = append(content, NewThinkingBlock(b.buf.String()))
 		case partialToolJSON:
-			// The streamed model events do not carry the tool id / name (only
-			// the partial JSON args). Synthesize a stable per-index id; the
-			// harness correlates by this index-derived id consistently.
+			// id / name come from the tool_use_start event every provider emits
+			// at block start. Fall back to a stable per-index id only if a stream
+			// somehow omitted the start frame, so reconstruction is always
+			// well-formed.
 			raw := b.buf.String()
 			input := json.RawMessage(raw)
 			if !json.Valid(input) {
 				input = json.RawMessage("null")
 			}
+			id := b.toolID
+			if id == "" {
+				id = fmt.Sprintf("call_%d", b.index)
+			}
 			content = append(content, NewToolUseBlock(ToolCall{
-				ID:    fmt.Sprintf("call_%d", b.index),
-				Name:  "",
+				ID:    id,
+				Name:  b.toolName,
 				Input: input,
 			}))
 		}

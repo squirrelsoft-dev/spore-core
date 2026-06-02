@@ -161,6 +161,16 @@ pub enum StreamEvent {
         index: u32,
         delta: String,
     },
+    /// Start of a tool-use block. Carries the tool `name` and call `id` — both
+    /// arrive on the provider's block-start frame (Anthropic `content_block_start`,
+    /// Ollama / OpenAI's first `tool_calls` chunk) and would otherwise be lost,
+    /// since [`ToolUseDelta`](Self::ToolUseDelta) carries only argument JSON. The
+    /// streaming accumulator uses this to reconstruct the tool call faithfully.
+    ToolUseStart {
+        index: u32,
+        id: String,
+        name: String,
+    },
     ToolUseDelta {
         index: u32,
         partial_json: String,
@@ -482,6 +492,11 @@ impl ModelInterface for ReplayModelInterface {
                     }
                     ContentBlock::ToolUse(call) => {
                         let json = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
+                        yield Ok(StreamEvent::ToolUseStart {
+                            index: idx,
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                        });
                         yield Ok(StreamEvent::ToolUseDelta { index: idx, partial_json: json });
                     }
                 }

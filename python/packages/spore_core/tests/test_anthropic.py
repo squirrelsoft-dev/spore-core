@@ -41,6 +41,8 @@ from spore_core.model import (
     ToolCallContent,
     ToolResultContent,
     ToolUseBlock,
+    ToolUseDelta,
+    ToolUseStart,
 )
 
 
@@ -510,6 +512,64 @@ async def test_streaming_emits_text_delta_then_stop() -> None:
     assert last.stop_reason is StopReason.END_TURN
     # First event is MessageStart
     assert isinstance(events[0], MessageStart)
+
+
+_SSE_TOOL_PAYLOAD = (
+    "event: message_start\n"
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}\n'
+    "\n"
+    "event: content_block_start\n"
+    'data: {"index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup"}}\n'
+    "\n"
+    "event: content_block_delta\n"
+    'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":"}}\n'
+    "\n"
+    "event: content_block_delta\n"
+    'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"\\"rust\\"}"}}\n'
+    "\n"
+    "event: content_block_stop\n"
+    'data: {"index":0}\n'
+    "\n"
+    "event: message_delta\n"
+    'data: {"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}\n'
+    "\n"
+    "event: message_stop\n"
+    'data: {"type":"message_stop"}\n'
+    "\n"
+)
+
+
+async def test_streaming_tool_use_emits_start_then_args() -> None:
+    """content_block_start (tool_use) → ToolUseStart carrying id + name, then
+    input_json_delta fragments → ToolUseDelta."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_SSE_TOOL_PAYLOAD.encode("utf-8"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = AnthropicModelInterface(
+        "k", "claude-sonnet-4-6", base_url="https://x.test", http_client=client
+    )
+    starts: list[ToolUseStart] = []
+    fragments: list[str] = []
+    final_stop = StopReason.END_TURN
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        if isinstance(ev, ToolUseStart):
+            starts.append(ev)
+        elif isinstance(ev, ToolUseDelta):
+            fragments.append(ev.partial_json)
+        elif isinstance(ev, MessageStop):
+            final_stop = ev.stop_reason
+    assert len(starts) == 1
+    assert starts[0].index == 0
+    assert starts[0].id == "toolu_1"
+    assert starts[0].name == "lookup"
+    assert json.loads("".join(fragments)) == {"q": "rust"}
+    assert final_stop is StopReason.TOOL_USE
 
 
 async def test_streaming_maps_status_error_eagerly() -> None:

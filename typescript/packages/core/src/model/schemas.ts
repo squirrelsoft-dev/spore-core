@@ -113,6 +113,17 @@ export const StreamEventSchema = z.discriminatedUnion("type", [
     index: z.number().int().nonnegative(),
     delta: z.string(),
   }),
+  // Start of a tool-use block. Carries the tool `name` and call `id` — both
+  // arrive on the provider's block-start frame (Anthropic `content_block_start`,
+  // Ollama / OpenAI's first `tool_calls` chunk) and would otherwise be lost,
+  // since `tool_use_delta` carries only argument JSON. The streaming
+  // accumulator uses this to reconstruct the tool call faithfully.
+  z.object({
+    type: z.literal("tool_use_start"),
+    index: z.number().int().nonnegative(),
+    id: z.string(),
+    name: z.string(),
+  }),
   z.object({
     type: z.literal("tool_use_delta"),
     index: z.number().int().nonnegative(),

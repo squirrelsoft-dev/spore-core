@@ -72,10 +72,9 @@ func TestTurnStreamingForwardsTextAndThinkingDeltas(t *testing.T) {
 	}
 }
 
-// Rule: tool-use streaming yields ToolUseDelta with the full args JSON, and
-// TurnStreaming reassembles the ToolCall with accumulated args. Known
-// limitation (#103): the reassembled tool name is empty and the id is the
-// synthesized per-index id.
+// Rule: tool-use streaming yields ToolUseStart (carrying id + name) followed by
+// ToolUseDelta with the full args JSON, and TurnStreaming reassembles the
+// ToolCall with the real id + name and accumulated args.
 func TestTurnStreamingReassemblesToolCall(t *testing.T) {
 	agent := replayAgentFor(ModelResponse{
 		Content: []ContentBlock{
@@ -106,21 +105,28 @@ func TestTurnStreamingReassemblesToolCall(t *testing.T) {
 	if got["q"] != "rust" {
 		t.Fatalf("args = %v, want q=rust", got)
 	}
-	// KNOWN LIMITATION: name is empty under streamed turns, id is synthesized.
-	if result.Calls[0].Name != "" {
-		t.Fatalf("streamed coarse tool name must be empty, got %q", result.Calls[0].Name)
+	// The real tool name + id are recovered from the tool_use_start event.
+	if result.Calls[0].Name != "lookup" {
+		t.Fatalf("streamed coarse tool name = %q, want lookup", result.Calls[0].Name)
 	}
-	if result.Calls[0].ID != "call_1" {
-		t.Fatalf("streamed id = %q, want call_1 (per-index synthesized)", result.Calls[0].ID)
+	if result.Calls[0].ID != "toolu_1" {
+		t.Fatalf("streamed id = %q, want toolu_1", result.Calls[0].ID)
 	}
 	if result.Reasoning == nil || *result.Reasoning != "let me think" {
 		t.Fatalf("reasoning = %v", result.Reasoning)
 	}
+	foundStart := false
 	foundArgs := false
 	for _, ev := range seen {
+		if ev.Type == StreamToolUseStart && ev.ID == "toolu_1" && ev.Name == "lookup" {
+			foundStart = true
+		}
 		if ev.Type == StreamToolUseDelta && ev.PartialJSON != "" {
 			foundArgs = true
 		}
+	}
+	if !foundStart {
+		t.Fatal("expected a tool_use_start carrying id + name")
 	}
 	if !foundArgs {
 		t.Fatal("expected a tool_use_delta with partial json")

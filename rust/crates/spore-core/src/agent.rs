@@ -67,15 +67,14 @@
 //! `turn` and `turn_streaming` share [`classify_response`] so there is exactly
 //! one classification code path.
 //!
-//! ### Known limitation: tool name in streamed turns
+//! ### Tool name / id in streamed turns
 //!
-//! `model::StreamEvent` carries tool-argument deltas (`ToolUseDelta`) but NOT
-//! the tool *name* or *id* — every provider's `call_streaming` parses the name
-//! from the block-start frame and then drops it (issue text: "No provider
-//! SSE-parsing work needed"). The streaming accumulator therefore synthesizes a
-//! stable per-index id (`call_{index}`) and an EMPTY name. The final arguments
-//! round-trip faithfully; recovering the name would require a new field on
-//! `model::StreamEvent`, which is out of scope here.
+//! `model::StreamEvent::ToolUseStart { index, id, name }` carries the tool name
+//! and call id at block start — every provider emits it from its block-start
+//! frame (Anthropic `content_block_start`, Ollama / OpenAI's first `tool_calls`
+//! chunk) — followed by `ToolUseDelta` for the argument JSON. The streaming
+//! accumulator records the name/id from `ToolUseStart`, so a tool call
+//! reconstructed from a stream is identical to one from the coarse response.
 //!
 //! ## Cross-language note
 //!
@@ -376,8 +375,9 @@ impl<M: ModelInterface + 'static> Agent for ModelAgent<M> {
     ///   block index into a `Text` block.
     /// - `ThinkingDelta { index, .. }` deltas accumulate into a `Thinking`
     ///   block (Q4 — surfaced via `reasoning`, NOT discarded).
-    /// - `ToolUseDelta { index, partial_json }` fragments concatenate and parse
-    ///   into a `ToolUse` block's `input` on `ContentBlockStop`.
+    /// - `ToolUseStart { index, id, name }` opens a `ToolUse` block, recording
+    ///   the tool id + name; `ToolUseDelta { index, partial_json }` fragments
+    ///   then concatenate and parse into that block's `input`.
     /// - `MessageStop` carries the final `usage` + `stop_reason`.
     ///
     /// Block ordering is preserved by sorting reassembled blocks on their
@@ -444,7 +444,7 @@ struct StreamAccumulator {
 enum PartialBlock {
     Text(String),
     Thinking(String),
-    ToolJson(String),
+    ToolJson { id: String, name: String, json: String },
 }
 
 impl StreamAccumulator {
@@ -474,14 +474,32 @@ impl StreamAccumulator {
                     s.push_str(&delta);
                 }
             }
+            StreamEvent::ToolUseStart { index, id, name } => {
+                if let PartialBlock::ToolJson {
+                    id: bid,
+                    name: bname,
+                    ..
+                } = self.entry(index, || PartialBlock::ToolJson {
+                    id: String::new(),
+                    name: String::new(),
+                    json: String::new(),
+                }) {
+                    *bid = id;
+                    *bname = name;
+                }
+            }
             StreamEvent::ToolUseDelta {
                 index,
                 partial_json,
             } => {
-                if let PartialBlock::ToolJson(s) =
-                    self.entry(index, || PartialBlock::ToolJson(String::new()))
+                if let PartialBlock::ToolJson { json, .. } =
+                    self.entry(index, || PartialBlock::ToolJson {
+                        id: String::new(),
+                        name: String::new(),
+                        json: String::new(),
+                    })
                 {
-                    s.push_str(&partial_json);
+                    json.push_str(&partial_json);
                 }
             }
             StreamEvent::ContentBlockStop { .. } => {}
@@ -499,18 +517,20 @@ impl StreamAccumulator {
             .map(|(index, block)| match block {
                 PartialBlock::Text(text) => ContentBlock::Text { text },
                 PartialBlock::Thinking(text) => ContentBlock::Thinking { text },
-                PartialBlock::ToolJson(json) => {
+                PartialBlock::ToolJson { id, name, json } => {
                     let input: serde_json::Value =
                         serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
                     ContentBlock::ToolUse(ToolCall {
-                        // The streaming model events do not carry the tool id /
-                        // name (only the partial JSON args). Synthesize a stable
-                        // per-index id; ReplayModelInterface's synthesized stream
-                        // is the one provider that drops these — real providers
-                        // surface them via the coarse response too. The harness
-                        // correlates by the index-derived id consistently.
-                        id: format!("call_{index}"),
-                        name: String::new(),
+                        // `id` / `name` come from the `ToolUseStart` event every
+                        // provider emits at block start. Fall back to a stable
+                        // per-index id only if a stream somehow omitted the start
+                        // frame, so reconstruction is always well-formed.
+                        id: if id.is_empty() {
+                            format!("call_{index}")
+                        } else {
+                            id
+                        },
+                        name,
                         input,
                     })
                 }

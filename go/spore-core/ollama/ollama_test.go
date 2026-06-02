@@ -597,13 +597,23 @@ func TestStreamingAccumulatesToolCalls(t *testing.T) {
 	}
 	var toolJSONs []string
 	var finalStop sporecore.StopReason
+	var startName, startID string
 	for ev := range ch {
 		switch ev.Event.Type {
+		case sporecore.StreamToolUseStart:
+			startName = ev.Event.Name
+			startID = ev.Event.ID
 		case sporecore.StreamToolUseDelta:
 			toolJSONs = append(toolJSONs, ev.Event.PartialJSON)
 		case sporecore.StreamMessageStop:
 			finalStop = ev.Event.StopReason
 		}
+	}
+	if startName != "fetch" {
+		t.Fatalf("tool_use_start name = %q, want fetch", startName)
+	}
+	if startID != "call_1" {
+		t.Fatalf("tool_use_start id = %q, want call_1 (synthesized)", startID)
 	}
 	if len(toolJSONs) != 1 {
 		t.Fatalf("tool jsons: %v", toolJSONs)

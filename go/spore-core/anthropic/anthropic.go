@@ -707,6 +707,20 @@ func parseSSEStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Stream
 				}
 			}
 			return sendEvent(ctx, ch, sporecore.StreamEvent{Type: sporecore.StreamMessageStart})
+		case "content_block_start":
+			// A tool_use block opens here with its id + name; emit tool_use_start
+			// so the accumulator captures them before the input_json_delta arg
+			// fragments arrive.
+			idx := readUint32(v["index"])
+			block, _ := v["content_block"].(map[string]any)
+			if kind, _ := block["type"].(string); kind == "tool_use" {
+				id, _ := block["id"].(string)
+				name, _ := block["name"].(string)
+				return sendEvent(ctx, ch, sporecore.StreamEvent{
+					Type: sporecore.StreamToolUseStart, Index: idx, ID: id, Name: name,
+				})
+			}
+			return true
 		case "content_block_delta":
 			idx := readUint32(v["index"])
 			delta, _ := v["delta"].(map[string]any)

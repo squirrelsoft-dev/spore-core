@@ -1337,6 +1337,23 @@ pub trait TerminationPolicy: Send + Sync {
     ) -> BoxFut<'a, TerminationDecision>;
 }
 
+/// Termination policy that lets the loop complete as soon as the agent produces
+/// a final response (always `Continue`, which the harness interprets as "accept
+/// the final response and succeed"). This is the default policy wired by
+/// [`HarnessBuilder::conversational`] — a tool-less chat agent halts naturally
+/// on its first final response, with no extra completion criteria to satisfy.
+pub struct CompleteOnFinalResponse;
+
+impl TerminationPolicy for CompleteOnFinalResponse {
+    fn evaluate<'a>(
+        &'a self,
+        _session: &'a SessionState,
+        _budget_used: &'a BudgetSnapshot,
+    ) -> BoxFut<'a, TerminationDecision> {
+        Box::pin(async { TerminationDecision::Continue })
+    }
+}
+
 /// Issue #11 — Middleware chain. Full shape (BeforeTool modification,
 /// SurfaceToHuman payload) lives in #11; this stub covers what ReAct needs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2059,8 +2076,8 @@ impl HarnessBuilder {
     /// [`EmptyToolRegistry`], a [`NullSandbox`], a
     /// [`StandardContextManager`](crate::context::StandardContextManager) with a
     /// null cache provider and default compaction, and
-    /// [`CompleteOnFinalResponse`](crate::scenarios::CompleteOnFinalResponse)
-    /// termination (the model's first final response is the result).
+    /// [`CompleteOnFinalResponse`] termination (the model's first final response
+    /// is the result).
     ///
     /// Every default is overridable: add catalogue tools with
     /// [`tool`](Self::tool) / [`tools`](Self::tools), or supply your own
@@ -2093,7 +2110,7 @@ impl HarnessBuilder {
             ))
             .into_harness_adapter();
         let termination_policy: Arc<dyn TerminationPolicy> =
-            Arc::new(crate::scenarios::CompleteOnFinalResponse);
+            Arc::new(CompleteOnFinalResponse);
         Self::new(
             agent,
             tool_registry,
@@ -2201,7 +2218,7 @@ impl HarnessBuilder {
     /// registering each with last-wins upsert (issue #81, Q1/Q2). Consumes the
     /// accumulated set. The harness-loop [`tool_registry`](Self) seam is
     /// separate (it is the bridged dispatch trait); callers wire the returned
-    /// registry into a [`RealToolRegistry`](crate::scenarios::RealToolRegistry)
+    /// registry into a [`RealToolRegistry`](crate::tool_registry::RealToolRegistry)
     /// per run. Returns an empty registry if no catalogue tools were added.
     pub fn drain_tools_into_registry(&mut self) -> Arc<crate::tool_registry::StandardToolRegistry> {
         use crate::tool_registry::ToolRegistry as _;
@@ -2576,11 +2593,32 @@ impl StandardHarness {
                 out.push(StreamEvent::ReasoningDelta { content: delta });
                 out
             }
+            M::ToolUseStart { index, id, name } => {
+                let mut out = Vec::new();
+                if let Entry::Vacant(e) = state.open_blocks.entry(index) {
+                    e.insert(BlockKind::ToolUse);
+                    // Use the real call id from the model; consumers correlate
+                    // subsequent ToolArgsDelta by it.
+                    state.tool_calls.insert(index, id.clone());
+                    out.push(StreamEvent::BlockStart {
+                        index,
+                        block: BlockKind::ToolUse,
+                    });
+                    out.push(StreamEvent::ToolCallStart {
+                        index,
+                        call_id: id,
+                        name,
+                    });
+                }
+                out
+            }
             M::ToolUseDelta {
                 index,
                 partial_json,
             } => {
                 let mut out = Vec::new();
+                // Fallback: if a stream omitted ToolUseStart, open the block here
+                // with a synthesized id and empty name so args still surface.
                 if let Entry::Vacant(e) = state.open_blocks.entry(index) {
                     e.insert(BlockKind::ToolUse);
                     let call_id = TurnStreamState::call_id_for(index);
@@ -2589,9 +2627,6 @@ impl StandardHarness {
                         index,
                         block: BlockKind::ToolUse,
                     });
-                    // Name is not carried by model::StreamEvent; recovered on the
-                    // coarse ToolCall. Emit ToolCallStart so consumers can begin
-                    // correlating args by call_id.
                     out.push(StreamEvent::ToolCallStart {
                         index,
                         call_id,
@@ -11957,11 +11992,10 @@ mod tests {
                 StreamEvent::ToolArgsDelta { partial_json, .. } if partial_json.contains("rust")
             )));
 
-            // Q5: coarse ToolCall carries the final accumulated args. The tool
-            // NAME is not carried by `model::StreamEvent` (a documented provider
-            // limitation — every provider's `call_streaming` drops it), so under
-            // synthesized-stream replay the reassembled name is empty. The args
-            // — the load-bearing new streaming value — round-trip correctly.
+            // Q5: coarse ToolCall carries the final accumulated args AND the tool
+            // name — the name arrives on the `ToolUseStart` model event every
+            // provider emits at block start, so the reassembled call matches the
+            // coarse response exactly.
             let coarse_call = evs
                 .iter()
                 .find_map(|e| match e {
@@ -11971,8 +12005,8 @@ mod tests {
                 .expect("coarse ToolCall present");
             assert_eq!(coarse_call.0, serde_json::json!({"q": "rust"}));
             assert_eq!(
-                coarse_call.1, "",
-                "tool name is not recoverable from the streamed model events"
+                coarse_call.1, "lookup",
+                "tool name is recovered from the ToolUseStart model event"
             );
 
             let coarse_result = evs

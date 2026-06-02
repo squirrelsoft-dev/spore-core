@@ -1,0 +1,17 @@
+{
+  "name": "spore-example-01-hello-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 01: the smallest possible live agent harness.",
+  "scripts": {
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core"
+  },
+  "devDependencies": {
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3"
+  }
+}

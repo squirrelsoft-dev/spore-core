@@ -94,7 +94,23 @@ describe("mapModelStreamEvent (#103)", () => {
     ]);
   });
 
-  it("tool lifecycle: tool_call_start → tool_args_delta, correlated by call_{index}", () => {
+  it("tool lifecycle: tool_use_start carries real id + name, correlating tool_args_delta", () => {
+    const out = mapAll([
+      { type: "tool_use_start", index: 2, id: "toolu_stream_1", name: "lookup" },
+      { type: "tool_use_delta", index: 2, partial_json: '{"q":' },
+      { type: "tool_use_delta", index: 2, partial_json: '"rust"}' },
+      { type: "content_block_stop", index: 2 },
+    ]);
+    expect(out).toEqual([
+      { kind: "block_start", index: 2, block: "tool_use" },
+      { kind: "tool_call_start", index: 2, call_id: "toolu_stream_1", name: "lookup" },
+      { kind: "tool_args_delta", call_id: "toolu_stream_1", partial_json: '{"q":' },
+      { kind: "tool_args_delta", call_id: "toolu_stream_1", partial_json: '"rust"}' },
+      { kind: "block_stop", index: 2 },
+    ]);
+  });
+
+  it("fallback: tool_use_delta without a start frame synthesizes call_{index} + empty name", () => {
     const out = mapAll([
       { type: "tool_use_delta", index: 2, partial_json: '{"q":' },
       { type: "tool_use_delta", index: 2, partial_json: '"rust"}' },
@@ -177,9 +193,10 @@ describe("Harness streaming fixture replay (#103)", () => {
     const toolCall = seen.find((e) => e.kind === "tool_call");
     expect(toolCall).toBeDefined();
     if (toolCall && toolCall.kind === "tool_call") {
-      // Coarse ToolCall correlates by the synthesized call_{index} id and
-      // carries the accumulated args (Q5). The streamed name is empty.
-      expect(toolCall.call_id).toBe("call_2");
+      // Coarse ToolCall correlates by the real call id from tool_use_start and
+      // carries the accumulated args (Q5) plus the real tool name.
+      expect(toolCall.call_id).toBe("toolu_stream_1");
+      expect(toolCall.name).toBe("lookup");
       expect(toolCall.args).toEqual({ q: "rust" });
     }
     const toolResult = seen.find((e) => e.kind === "tool_result");

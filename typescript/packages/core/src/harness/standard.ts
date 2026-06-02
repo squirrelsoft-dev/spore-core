@@ -21,6 +21,15 @@ import { join } from "node:path";
 import type { Agent, AgentStreamSink } from "../agent/interface.js";
 import { turnStreaming } from "../agent/interface.js";
 import type { Context } from "../agent/types.js";
+import { AgentId, ModelAgent } from "../agent/index.js";
+import type { ModelInterface } from "../model/interface.js";
+import { StandardContextManager } from "../context/standard.js";
+import { intoHarnessAdapter } from "../context/compaction-adapter.js";
+import { defaultCompactionConfig } from "../context/types.js";
+import { NullCacheProvider } from "../cache-provider/types.js";
+import { NullSandbox } from "../sandbox/null-sandbox.js";
+import { EmptyToolRegistry } from "../tool-registry/empty.js";
+import { CompleteOnFinalResponse } from "./complete-on-final-response.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
 import { Timestamp } from "../memory/types.js";
 import type { StopReason, TokenUsage } from "../model/schemas.js";
@@ -3266,11 +3275,49 @@ export class HarnessBuilder {
 
   constructor(
     private readonly agent: Agent,
-    private readonly toolRegistry: ToolRegistry,
+    private _toolRegistry: ToolRegistry,
     private _sandbox: SandboxProvider,
     private readonly contextManager: ContextManager,
     private readonly terminationPolicy: TerminationPolicy,
   ) {}
+
+  /**
+   * Assemble a minimal conversational harness builder from a model — no tools,
+   * no filesystem.
+   *
+   * This is the few-lines path: it defaults every required component so you can
+   * go from a model to a running harness in one call. The defaults are a
+   * {@link ModelAgent} over `model` (agent id `"agent"`), an
+   * {@link EmptyToolRegistry}, a {@link NullSandbox}, a
+   * {@link StandardContextManager} with a {@link NullCacheProvider} and default
+   * compaction (wrapped through {@link intoHarnessAdapter}), and
+   * {@link CompleteOnFinalResponse} termination (the model's first final
+   * response is the result).
+   *
+   * Every default is overridable through the fluent setters (e.g.
+   * {@link tool} / {@link tools} for catalogue tools, or {@link sandbox} to
+   * swap in a workspace-scoped sandbox).
+   *
+   * Mirrors `HarnessBuilder::conversational` in
+   * `rust/crates/spore-core/src/harness.rs`.
+   *
+   * ```ts
+   * const harness = HarnessBuilder.conversational(
+   *   new OllamaModelInterface("llama3.2"),
+   * ).build();
+   * const result = await harness.run({ task: simpleTask("Say hello.") });
+   * ```
+   */
+  static conversational(model: ModelInterface): HarnessBuilder {
+    const agent = new ModelAgent(AgentId.of("agent"), model);
+    const toolRegistry = new EmptyToolRegistry();
+    const sandbox = new NullSandbox();
+    const contextManager = intoHarnessAdapter(
+      new StandardContextManager(model, new NullCacheProvider(), defaultCompactionConfig()),
+    );
+    const terminationPolicy = new CompleteOnFinalResponse();
+    return new HarnessBuilder(agent, toolRegistry, sandbox, contextManager, terminationPolicy);
+  }
 
   /** Inject a middleware chain. */
   middleware(middleware: MiddlewareChain): this {
@@ -3474,6 +3521,28 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Override the harness-loop {@link ToolRegistry} supplied at construction.
+   *
+   * Use this to supply your own registry — e.g. a custom set of tools — on top of
+   * a preset like {@link conversational}. The registry's {@link ToolRegistry.schemas}
+   * are delivered to the model automatically each turn, and
+   * {@link ToolRegistry.dispatch} is called when the model requests a tool.
+   *
+   * Mirrors `HarnessBuilder::tool_registry` in
+   * `rust/crates/spore-core/src/harness.rs`.
+   *
+   * ```ts
+   * const harness = HarnessBuilder.conversational(model)
+   *   .toolRegistry(new MyTools())
+   *   .build();
+   * ```
+   */
+  toolRegistry(toolRegistry: ToolRegistry): this {
+    this._toolRegistry = toolRegistry;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -3501,7 +3570,7 @@ export class HarnessBuilder {
 
     return {
       agent: this.agent,
-      toolRegistry: this.toolRegistry,
+      toolRegistry: this._toolRegistry,
       sandbox: this._sandbox,
       contextManager: this.contextManager,
       terminationPolicy: this.terminationPolicy,

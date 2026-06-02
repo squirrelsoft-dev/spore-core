@@ -15,5 +15,13 @@ The five-line path is the same in every language:
 4. Run it and get the result.
 5. Match the result — `Success` carries the output, turn count, usage, and post-run session state.
 
-See the [architecture concept](../concepts/architecture.md) for what those components are, and
-[`examples/`](../../examples) for runnable programs as the Go examples land.
+See the [architecture concept](../concepts/architecture.md) for what those components are.
+
+## Runnable examples
+
+Three runnable Go programs build the path up step by step
+(`observability.NewConversationalHarness(model)` + `sporecore.SimpleTask(...)`):
+
+- [`examples/go/01-hello-agent`](../../examples/go/01-hello-agent) — the smallest live agent: one turn, one greeting.
+- [`examples/go/02-conversational-repl`](../../examples/go/02-conversational-repl) — a chat loop that remembers earlier turns by threading session state.
+- [`examples/go/03-tool-use`](../../examples/go/03-tool-use) — a ReAct agent that calls local tools in a Think → Act → Observe loop.

@@ -60,27 +60,45 @@ func TestMapReasoningDelta(t *testing.T) {
 	}
 }
 
-// Tool lifecycle: tool_call_start → tool_args_delta keyed by the synthesized
-// call_id (KNOWN LIMITATION: name empty, id = call_{index}).
+// Tool lifecycle (normal path): tool_use_start carries the real id + name onto
+// tool_call_start; subsequent tool_use_delta fragments correlate by that id.
 func TestMapToolLifecycle(t *testing.T) {
+	state := newTurnStreamState()
+	out := mapModelStreamEvent(StreamEvent{Type: StreamToolUseStart, Index: 2, ID: "toolu_x", Name: "lookup"}, state)
+	if len(out) != 2 {
+		t.Fatalf("tool_use_start must emit block_start + tool_call_start, got %+v", out)
+	}
+	if out[0].Kind != HarnessStreamBlockStart || out[0].Block != BlockToolUse {
+		t.Fatalf("block_start wrong: %+v", out[0])
+	}
+	if out[1].Kind != HarnessStreamToolCallStart || out[1].CallID != "toolu_x" || out[1].Name != "lookup" {
+		t.Fatalf("tool_call_start must carry real id + name: %+v", out[1])
+	}
+	out = mapModelStreamEvent(StreamEvent{Type: StreamToolUseDelta, Index: 2, PartialJSON: `{"q":`}, state)
+	if len(out) != 1 || out[0].Kind != HarnessStreamToolArgsDelta || out[0].CallID != "toolu_x" || out[0].PartialJSON != `{"q":` {
+		t.Fatalf("tool_args_delta wrong: %+v", out)
+	}
+	// Subsequent fragment correlates by the same call_id without re-opening.
+	out = mapModelStreamEvent(StreamEvent{Type: StreamToolUseDelta, Index: 2, PartialJSON: `"rust"}`}, state)
+	if len(out) != 1 || out[0].Kind != HarnessStreamToolArgsDelta || out[0].CallID != "toolu_x" {
+		t.Fatalf("second tool fragment wrong: %+v", out)
+	}
+}
+
+// Tool lifecycle (fallback path): if a stream omits tool_use_start and opens the
+// block on a tool_use_delta, the harness synthesizes call_{index} with an empty
+// name so args still surface.
+func TestMapToolLifecycleFallbackWithoutStart(t *testing.T) {
 	state := newTurnStreamState()
 	out := mapModelStreamEvent(StreamEvent{Type: StreamToolUseDelta, Index: 2, PartialJSON: `{"q":`}, state)
 	if len(out) != 3 {
 		t.Fatalf("first tool delta must emit block_start + tool_call_start + tool_args_delta, got %+v", out)
 	}
-	if out[0].Kind != HarnessStreamBlockStart || out[0].Block != BlockToolUse {
-		t.Fatalf("block_start wrong: %+v", out[0])
-	}
 	if out[1].Kind != HarnessStreamToolCallStart || out[1].CallID != "call_2" || out[1].Name != "" {
-		t.Fatalf("tool_call_start wrong (name must be empty, id call_2): %+v", out[1])
+		t.Fatalf("fallback tool_call_start wrong (name empty, id call_2): %+v", out[1])
 	}
 	if out[2].Kind != HarnessStreamToolArgsDelta || out[2].CallID != "call_2" || out[2].PartialJSON != `{"q":` {
 		t.Fatalf("tool_args_delta wrong: %+v", out[2])
-	}
-	// Subsequent fragment correlates by the same call_id without re-opening.
-	out = mapModelStreamEvent(StreamEvent{Type: StreamToolUseDelta, Index: 2, PartialJSON: `"rust"}`}, state)
-	if len(out) != 1 || out[0].Kind != HarnessStreamToolArgsDelta || out[0].CallID != "call_2" {
-		t.Fatalf("second tool fragment wrong: %+v", out)
 	}
 }
 

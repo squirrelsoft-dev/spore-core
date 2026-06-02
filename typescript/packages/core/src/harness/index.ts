@@ -11,6 +11,7 @@ export {
   HOOK_POINTS,
   isReact,
 } from "./standard.js";
+export { CompleteOnFinalResponse } from "./complete-on-final-response.js";
 export {
   GitVcsProvider,
   VcsError,
