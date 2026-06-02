@@ -42,7 +42,7 @@ ollama pull llama3.2
 ## Run
 
 ```sh
-cd examples/03-tool-use
+cd examples/rust/03-tool-use
 cargo run
 cargo run -- --prompt "reverse the word 'mycelium' and multiply 6 by 7"
 ```

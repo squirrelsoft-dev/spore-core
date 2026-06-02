@@ -8,5 +8,5 @@ description = "spore-core example 01: the smallest possible live agent harness."
 [dependencies]
 # Path dependency on the spore-core reference crate. Default features only —
 # this example uses nothing from `test-utils` or any optional feature.
-spore-core = { path = "../../rust/crates/spore-core" }
+spore-core = { path = "../../../rust/crates/spore-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

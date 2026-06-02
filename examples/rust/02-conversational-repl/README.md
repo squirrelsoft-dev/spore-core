@@ -30,7 +30,7 @@ ollama pull llama3.2
 ## Run
 
 ```sh
-cd examples/02-conversational-repl
+cd examples/rust/02-conversational-repl
 cargo run                       # or: cargo run -- --model <id>
 ```
 

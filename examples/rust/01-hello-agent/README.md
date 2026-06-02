@@ -32,7 +32,7 @@ ollama pull llama3.2    # the default model this example asks for
 ## Run
 
 ```sh
-cd examples/01-hello-agent
+cd examples/rust/01-hello-agent
 cargo run                 # uses llama3.2 at http://localhost:11434
 cargo run -- --model qwen2.5   # or any other tool-capable model you've pulled
 ```
