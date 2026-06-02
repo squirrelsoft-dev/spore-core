@@ -54,6 +54,7 @@ fn config_with(
             agent.push(TurnResult::FinalResponse {
                 content: "DONE".into(),
                 usage: usage(),
+                reasoning: None,
             });
         } else {
             agent.push(TurnResult::Error {

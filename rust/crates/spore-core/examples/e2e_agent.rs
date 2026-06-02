@@ -367,6 +367,7 @@ async fn run_mock(scenario: ScenarioId, session_id: &SessionId) -> RunResult {
         cache_write_tokens: None,
     };
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![ToolCall {
             id: "c1".into(),
             name: "read_file".into(),
@@ -375,6 +376,7 @@ async fn run_mock(scenario: ScenarioId, session_id: &SessionId) -> RunResult {
         usage,
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE".into(),
         usage,
     });

@@ -36,10 +36,46 @@
 //! 4. Classification uses the model's `stop_reason`:
 //!    - `StopReason::ToolUse` → `ToolCallRequested` (all `ToolUse` blocks).
 //!    - `StopReason::EndTurn | MaxTokens | StopSequence` → `FinalResponse`
-//!      (concatenated `Text` blocks; `Thinking` blocks discarded — they are
-//!      observability, not output).
+//!      (concatenated `Text` blocks).
 //! 5. `ModelError` is surfaced wrapped in `AgentError::ModelError`, with any
 //!    partial usage information preserved.
+//!
+//! ## Delta-level streaming (issue #103)
+//!
+//! New surface added by #103:
+//!
+//! - [`AgentStreamSink`] — an owned callback sink of **raw**
+//!   [`crate::model::StreamEvent`] values. Per the resolved spec decision
+//!   **Q1**, the agent emits raw model stream events and does NOT depend on the
+//!   harness `StreamEvent` type. The harness owns the
+//!   `model::StreamEvent → harness::StreamEvent` mapping.
+//! - [`Agent::turn_streaming`] — a defaulted trait method that takes an
+//!   `AgentStreamSink`. The default ignores the sink and delegates to
+//!   [`Agent::turn`], so every existing `Agent` impl (e.g. `MockAgent`)
+//!   compiles unchanged. [`ModelAgent`] overrides it to call
+//!   [`crate::model::ModelInterface::call_streaming`], forward each
+//!   `model::StreamEvent` to the sink, accumulate the response, and run the
+//!   exact same classification logic as [`Agent::turn`].
+//! - `reasoning: Option<String>` on the `FinalResponse` and `ToolCallRequested`
+//!   variants of [`TurnResult`] (resolved spec decision **Q4**, option (a)).
+//!   Thinking is streamed as raw `ThinkingDelta` events AND accumulated into
+//!   this field. We do NOT add a `Content::Thinking` variant nor preserve
+//!   thinking in `SessionState.messages` — that is deferred to follow-on issue
+//!   **#104**. The non-streaming `turn` path also populates `reasoning` now,
+//!   so it is no longer "observability only".
+//!
+//! `turn` and `turn_streaming` share [`classify_response`] so there is exactly
+//! one classification code path.
+//!
+//! ### Known limitation: tool name in streamed turns
+//!
+//! `model::StreamEvent` carries tool-argument deltas (`ToolUseDelta`) but NOT
+//! the tool *name* or *id* — every provider's `call_streaming` parses the name
+//! from the block-start frame and then drops it (issue text: "No provider
+//! SSE-parsing work needed"). The streaming accumulator therefore synthesizes a
+//! stable per-index id (`call_{index}`) and an EMPTY name. The final arguments
+//! round-trip faithfully; recovering the name would require a new field on
+//! `model::StreamEvent`, which is out of scope here.
 //!
 //! ## Cross-language note
 //!
@@ -54,8 +90,8 @@ use thiserror::Error;
 
 use crate::harness::BoxFut;
 use crate::model::{
-    ContentBlock, Message, ModelError, ModelInterface, ModelParams, ModelRequest, StopReason,
-    TokenUsage, ToolCall, ToolSchema,
+    ContentBlock, Message, ModelError, ModelInterface, ModelParams, ModelRequest, ModelResponse,
+    StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
 };
 
 // ============================================================================
@@ -105,11 +141,17 @@ pub struct Context {
 
 impl Context {
     pub fn into_request(self) -> ModelRequest {
+        self.into_request_with_stream(false)
+    }
+
+    /// Build a [`ModelRequest`], setting the `stream` flag. The streaming turn
+    /// path (issue #103) builds the request with `stream = true`.
+    pub fn into_request_with_stream(self, stream: bool) -> ModelRequest {
         ModelRequest {
             messages: self.messages,
             tools: self.tools,
             params: self.params,
-            stream: false,
+            stream,
         }
     }
 }
@@ -143,9 +185,22 @@ pub enum TurnResult {
     ToolCallRequested {
         calls: Vec<ToolCall>,
         usage: TokenUsage,
+        /// Accumulated reasoning (`Thinking`) text produced in this turn, if
+        /// any (issue #103, Q4). `#[serde(default)]` keeps pre-#103 serialized
+        /// `TurnResult`s back-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     /// The model produced a terminal textual response.
-    FinalResponse { content: String, usage: TokenUsage },
+    FinalResponse {
+        content: String,
+        usage: TokenUsage,
+        /// Accumulated reasoning (`Thinking`) text produced in this turn, if
+        /// any (issue #103, Q4). `#[serde(default)]` keeps pre-#103 serialized
+        /// `TurnResult`s back-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
     /// The turn could not be classified into a tool call or a final response.
     Error {
         error: AgentError,
@@ -157,6 +212,18 @@ pub enum TurnResult {
 // The trait
 // ============================================================================
 
+/// An owned callback that receives **raw** [`crate::model::StreamEvent`]s as
+/// the agent drains a streaming model call (issue #103, Q1).
+///
+/// The agent boundary deals only in `model::StreamEvent`; it does NOT depend on
+/// the harness `StreamEvent` type. The harness wraps `on_stream` in an adapter
+/// that maps `model::StreamEvent → harness::StreamEvent`.
+///
+/// Owned (`Box<dyn Fn ...>`) rather than borrowed: the trait method is
+/// dyn-compatible (returns a `BoxFut`), and an owned sink can be `move`d into
+/// the returned future without lifetime gymnastics.
+pub type AgentStreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
+
 /// Executes a single turn given a fully assembled [`Context`].
 ///
 /// Dyn-compatible via the hand-rolled [`BoxFut`] pattern, so the harness can
@@ -164,7 +231,103 @@ pub enum TurnResult {
 pub trait Agent: Send + Sync {
     fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult>;
 
+    /// Execute one turn while forwarding each raw [`crate::model::StreamEvent`]
+    /// to `sink` as it arrives (issue #103).
+    ///
+    /// The default implementation **ignores** the sink and delegates to
+    /// [`Agent::turn`], so every existing `Agent` impl keeps working with zero
+    /// changes. Model-backed agents override this to call
+    /// [`crate::model::ModelInterface::call_streaming`] and emit deltas.
+    fn turn_streaming<'a>(
+        &'a self,
+        context: Context,
+        sink: AgentStreamSink,
+    ) -> BoxFut<'a, TurnResult> {
+        let _ = sink;
+        self.turn(context)
+    }
+
     fn id(&self) -> AgentId;
+}
+
+/// Classify an accumulated [`ModelResponse`] into a [`TurnResult`].
+///
+/// Single source of truth shared by [`Agent::turn`] and
+/// [`Agent::turn_streaming`] (issue #103) — both the blocking and streaming
+/// paths buffer a complete `ModelResponse` and then run this identical logic so
+/// classification can never diverge between them.
+///
+/// `Thinking` blocks are accumulated into the `reasoning` field (Q4) instead of
+/// being discarded.
+pub fn classify_response(response: ModelResponse) -> TurnResult {
+    let usage = response.usage;
+
+    // Extract any tool-use blocks regardless of stop_reason; the model may, in
+    // principle, request tool use without setting StopReason (different
+    // providers normalise this differently). The stop_reason determines the
+    // *classification*, but missing tool calls when stop_reason == ToolUse is
+    // itself a malformed response.
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
+    for block in &response.content {
+        match block {
+            ContentBlock::ToolUse(tc) => tool_calls.push(tc.clone()),
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            // Q4: accumulate thinking text instead of discarding it.
+            ContentBlock::Thinking { text } => reasoning_parts.push(text.clone()),
+        }
+    }
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join(""))
+    };
+
+    match response.stop_reason {
+        StopReason::ToolUse => {
+            if tool_calls.is_empty() {
+                return TurnResult::Error {
+                    error: AgentError::MalformedToolCall {
+                        tool_name: String::new(),
+                        reason: "stop_reason=ToolUse but no ToolUse blocks present".into(),
+                    },
+                    usage: Some(usage),
+                };
+            }
+            TurnResult::ToolCallRequested {
+                calls: tool_calls,
+                usage,
+                reasoning,
+            }
+        }
+        StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+            // If the provider returned no tool-use blocks AND no text, that is
+            // an empty response — surface it explicitly. (Thinking-only output
+            // is still empty: thinking is not a terminal response.)
+            if text_parts.is_empty() && tool_calls.is_empty() {
+                return TurnResult::Error {
+                    error: AgentError::EmptyResponse,
+                    usage: Some(usage),
+                };
+            }
+            // If we somehow received tool-use blocks but stop_reason did not
+            // indicate tool use, prefer dispatching them — silently dropping a
+            // tool call is worse than a slightly surprising classification.
+            if !tool_calls.is_empty() {
+                return TurnResult::ToolCallRequested {
+                    calls: tool_calls,
+                    usage,
+                    reasoning,
+                };
+            }
+            TurnResult::FinalResponse {
+                content: text_parts.join(""),
+                usage,
+                reasoning,
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -193,8 +356,43 @@ impl<M: ModelInterface + 'static> Agent for ModelAgent<M> {
     fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
         Box::pin(async move {
             let request = context.into_request();
-            let response = match self.model.call(request).await {
-                Ok(r) => r,
+            match self.model.call(request).await {
+                Ok(r) => classify_response(r),
+                Err(e) => TurnResult::Error {
+                    error: AgentError::ModelError(e),
+                    usage: None,
+                },
+            }
+        })
+    }
+
+    /// Streaming turn (issue #103). Builds a streaming request, drains the
+    /// model stream forwarding each raw [`StreamEvent`] to `sink`, reassembles
+    /// a complete [`ModelResponse`], then runs the EXACT SAME
+    /// [`classify_response`] logic as [`Agent::turn`].
+    ///
+    /// Reassembly rules:
+    /// - `ContentBlockDelta { index, .. }` text deltas are concatenated per
+    ///   block index into a `Text` block.
+    /// - `ThinkingDelta { index, .. }` deltas accumulate into a `Thinking`
+    ///   block (Q4 — surfaced via `reasoning`, NOT discarded).
+    /// - `ToolUseDelta { index, partial_json }` fragments concatenate and parse
+    ///   into a `ToolUse` block's `input` on `ContentBlockStop`.
+    /// - `MessageStop` carries the final `usage` + `stop_reason`.
+    ///
+    /// Block ordering is preserved by sorting reassembled blocks on their
+    /// stream index.
+    fn turn_streaming<'a>(
+        &'a self,
+        context: Context,
+        sink: AgentStreamSink,
+    ) -> BoxFut<'a, TurnResult> {
+        Box::pin(async move {
+            use futures_util::StreamExt;
+
+            let request = context.into_request_with_stream(true);
+            let mut stream = match self.model.call_streaming(request).await {
+                Ok(s) => s,
                 Err(e) => {
                     return TurnResult::Error {
                         error: AgentError::ModelError(e),
@@ -203,69 +401,127 @@ impl<M: ModelInterface + 'static> Agent for ModelAgent<M> {
                 }
             };
 
-            let usage = response.usage;
+            // Per-block accumulators keyed by stream index.
+            let mut acc = StreamAccumulator::default();
 
-            // Extract any tool-use blocks regardless of stop_reason; the model
-            // may, in principle, request tool use without setting StopReason
-            // (different providers normalise this differently). The stop_reason
-            // determines the *classification*, but missing tool calls when
-            // stop_reason == ToolUse is itself a malformed response.
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut text_parts: Vec<String> = Vec::new();
-            for block in &response.content {
-                match block {
-                    ContentBlock::ToolUse(tc) => tool_calls.push(tc.clone()),
-                    ContentBlock::Text { text } => text_parts.push(text.clone()),
-                    ContentBlock::Thinking { .. } => { /* observability only */ }
-                }
+            while let Some(item) = stream.next().await {
+                let event = match item {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        return TurnResult::Error {
+                            error: AgentError::ModelError(e),
+                            usage: None,
+                        };
+                    }
+                };
+                // Forward the RAW model event to the sink first (Q1), then fold
+                // it into the in-progress response.
+                sink(event.clone());
+                acc.fold(event);
             }
 
-            match response.stop_reason {
-                StopReason::ToolUse => {
-                    if tool_calls.is_empty() {
-                        return TurnResult::Error {
-                            error: AgentError::MalformedToolCall {
-                                tool_name: String::new(),
-                                reason: "stop_reason=ToolUse but no ToolUse blocks present".into(),
-                            },
-                            usage: Some(usage),
-                        };
-                    }
-                    TurnResult::ToolCallRequested {
-                        calls: tool_calls,
-                        usage,
-                    }
-                }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    // If the provider returned no tool-use blocks AND no text,
-                    // that is an empty response — surface it explicitly.
-                    if text_parts.is_empty() && tool_calls.is_empty() {
-                        return TurnResult::Error {
-                            error: AgentError::EmptyResponse,
-                            usage: Some(usage),
-                        };
-                    }
-                    // If we somehow received tool-use blocks but stop_reason did
-                    // not indicate tool use, prefer dispatching them — silently
-                    // dropping a tool call is worse than a slightly surprising
-                    // classification.
-                    if !tool_calls.is_empty() {
-                        return TurnResult::ToolCallRequested {
-                            calls: tool_calls,
-                            usage,
-                        };
-                    }
-                    TurnResult::FinalResponse {
-                        content: text_parts.join(""),
-                        usage,
-                    }
-                }
-            }
+            classify_response(acc.into_response())
         })
     }
 
     fn id(&self) -> AgentId {
         self.id.clone()
+    }
+}
+
+/// Reassembles streamed [`StreamEvent`]s into a [`ModelResponse`] (issue #103).
+///
+/// Tracks an ordered set of partial blocks keyed by their stream `index` so the
+/// reconstructed `content` preserves emission order regardless of interleaving.
+#[derive(Default)]
+struct StreamAccumulator {
+    /// (index, partial-block) in first-seen order.
+    blocks: Vec<(u32, PartialBlock)>,
+    usage: TokenUsage,
+    stop_reason: Option<StopReason>,
+}
+
+enum PartialBlock {
+    Text(String),
+    Thinking(String),
+    ToolJson(String),
+}
+
+impl StreamAccumulator {
+    fn entry(&mut self, index: u32, make: impl FnOnce() -> PartialBlock) -> &mut PartialBlock {
+        if let Some(pos) = self.blocks.iter().position(|(i, _)| *i == index) {
+            &mut self.blocks[pos].1
+        } else {
+            self.blocks.push((index, make()));
+            &mut self.blocks.last_mut().expect("just pushed").1
+        }
+    }
+
+    fn fold(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::MessageStart => {}
+            StreamEvent::ContentBlockDelta { index, delta } => {
+                if let PartialBlock::Text(s) =
+                    self.entry(index, || PartialBlock::Text(String::new()))
+                {
+                    s.push_str(&delta);
+                }
+            }
+            StreamEvent::ThinkingDelta { index, delta } => {
+                if let PartialBlock::Thinking(s) =
+                    self.entry(index, || PartialBlock::Thinking(String::new()))
+                {
+                    s.push_str(&delta);
+                }
+            }
+            StreamEvent::ToolUseDelta {
+                index,
+                partial_json,
+            } => {
+                if let PartialBlock::ToolJson(s) =
+                    self.entry(index, || PartialBlock::ToolJson(String::new()))
+                {
+                    s.push_str(&partial_json);
+                }
+            }
+            StreamEvent::ContentBlockStop { .. } => {}
+            StreamEvent::MessageStop { usage, stop_reason } => {
+                self.usage = usage;
+                self.stop_reason = Some(stop_reason);
+            }
+        }
+    }
+
+    fn into_response(self) -> ModelResponse {
+        let content: Vec<ContentBlock> = self
+            .blocks
+            .into_iter()
+            .map(|(index, block)| match block {
+                PartialBlock::Text(text) => ContentBlock::Text { text },
+                PartialBlock::Thinking(text) => ContentBlock::Thinking { text },
+                PartialBlock::ToolJson(json) => {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                    ContentBlock::ToolUse(ToolCall {
+                        // The streaming model events do not carry the tool id /
+                        // name (only the partial JSON args). Synthesize a stable
+                        // per-index id; ReplayModelInterface's synthesized stream
+                        // is the one provider that drops these — real providers
+                        // surface them via the coarse response too. The harness
+                        // correlates by the index-derived id consistently.
+                        id: format!("call_{index}"),
+                        name: String::new(),
+                        input,
+                    })
+                }
+            })
+            .collect();
+        ModelResponse {
+            content,
+            usage: self.usage,
+            // Default to EndTurn if the stream ended without MessageStop.
+            stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
+        }
     }
 }
 
@@ -402,7 +658,7 @@ mod tests {
         m.push_response(Ok(text_resp("hello world")));
         let agent = make_agent(m);
         match agent.turn(ctx_user("hi")).await {
-            TurnResult::FinalResponse { content, usage } => {
+            TurnResult::FinalResponse { content, usage, .. } => {
                 assert_eq!(content, "hello world");
                 assert_eq!(usage.input_tokens, 3);
                 assert_eq!(usage.output_tokens, 4);
@@ -422,7 +678,7 @@ mod tests {
         }])));
         let agent = make_agent(m);
         match agent.turn(ctx_user("read /x")).await {
-            TurnResult::ToolCallRequested { calls, usage } => {
+            TurnResult::ToolCallRequested { calls, usage, .. } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_1");
                 assert_eq!(calls[0].name, "read_file");
@@ -623,6 +879,7 @@ mod tests {
     #[test]
     fn turn_result_roundtrips_json() {
         let r = TurnResult::ToolCallRequested {
+            reasoning: None,
             calls: vec![ToolCall {
                 id: "1".into(),
                 name: "x".into(),
@@ -635,6 +892,7 @@ mod tests {
         assert_eq!(r, back);
 
         let r2 = TurnResult::FinalResponse {
+            reasoning: None,
             content: "hi".into(),
             usage: usage(1, 1),
         };
@@ -699,5 +957,189 @@ mod tests {
             TurnResult::FinalResponse { content, .. } => assert_eq!(content, "all done"),
             other => panic!("turn 2 expected FinalResponse, got {other:?}"),
         }
+    }
+
+    // ── #103: delta-level streaming through the agent ───────────────────────
+
+    use crate::model::{ProviderInfo as PInfo, ReplayModelInterface, StreamEvent as MEvent};
+    use std::sync::Mutex as StdMutex;
+
+    fn replay_provider() -> PInfo {
+        PInfo {
+            name: "anthropic".into(),
+            model_id: "replay".into(),
+            context_window: 200_000,
+        }
+    }
+
+    /// A response carrying a Thinking + Text + ToolUse block in one turn, so
+    /// `ReplayModelInterface::call_streaming` synthesizes all three delta kinds.
+    fn mixed_response() -> ModelResponse {
+        ModelResponse {
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "let me think".into(),
+                },
+                ContentBlock::Text {
+                    text: "the answer is".into(),
+                },
+                ContentBlock::ToolUse(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "lookup".into(),
+                    input: serde_json::json!({"q": "rust"}),
+                }),
+            ],
+            usage: usage(7, 11),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    fn replay_agent(resp: ModelResponse) -> ModelAgent<ReplayModelInterface> {
+        let exchanges = vec![crate::model::RecordedExchange {
+            request_hash: None,
+            request: ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                params: ModelParams::default(),
+                stream: true,
+            },
+            response: resp,
+            provider: "anthropic".into(),
+            model_id: None,
+            recorded_at: None,
+            duration_ms: None,
+        }];
+        let replay = Arc::new(ReplayModelInterface::new(exchanges, replay_provider()));
+        ModelAgent::new(AgentId::new("stream-agent"), replay)
+    }
+
+    // Rule: turn_streaming forwards raw model::StreamEvents to the sink in
+    // order, and TextDelta-equivalent fragments concatenate into the final
+    // FinalResponse/ToolCallRequested content.
+    #[tokio::test]
+    async fn turn_streaming_forwards_text_and_thinking_deltas() {
+        let agent = replay_agent(ModelResponse {
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "reasoning here".into(),
+                },
+                ContentBlock::Text {
+                    text: "final text".into(),
+                },
+            ],
+            usage: usage(3, 4),
+            stop_reason: StopReason::EndTurn,
+        });
+        let seen: Arc<StdMutex<Vec<MEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: AgentStreamSink = Box::new(move |ev| s.lock().unwrap().push(ev));
+        let result = agent.turn_streaming(ctx_user("hi"), sink).await;
+
+        // Reasoning surfaced in TurnResult (Q4) AND streamed as ThinkingDelta.
+        match result {
+            TurnResult::FinalResponse {
+                content, reasoning, ..
+            } => {
+                assert_eq!(content, "final text");
+                assert_eq!(reasoning.as_deref(), Some("reasoning here"));
+            }
+            other => panic!("expected FinalResponse, got {other:?}"),
+        }
+        let events = seen.lock().unwrap();
+        assert!(matches!(events.first(), Some(MEvent::MessageStart)));
+        assert!(events.iter().any(
+            |e| matches!(e, MEvent::ThinkingDelta { delta, .. } if delta == "reasoning here")
+        ));
+        assert!(events.iter().any(
+            |e| matches!(e, MEvent::ContentBlockDelta { delta, .. } if delta == "final text")
+        ));
+        assert!(matches!(events.last(), Some(MEvent::MessageStop { .. })));
+    }
+
+    // Rule: tool-use streaming yields ToolUseDelta with the full args JSON, and
+    // turn_streaming reassembles the ToolCall.
+    #[tokio::test]
+    async fn turn_streaming_reassembles_tool_call() {
+        let agent = replay_agent(mixed_response());
+        let seen: Arc<StdMutex<Vec<MEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: AgentStreamSink = Box::new(move |ev| s.lock().unwrap().push(ev));
+        let result = agent.turn_streaming(ctx_user("hi"), sink).await;
+        match result {
+            TurnResult::ToolCallRequested {
+                calls, reasoning, ..
+            } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].input, serde_json::json!({"q": "rust"}));
+                assert_eq!(reasoning.as_deref(), Some("let me think"));
+            }
+            other => panic!("expected ToolCallRequested, got {other:?}"),
+        }
+        let events = seen.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MEvent::ToolUseDelta { partial_json, .. } if partial_json.contains("rust"))));
+    }
+
+    // Back-compat: the default turn_streaming (e.g. MockAgent) ignores the sink
+    // and delegates to `turn`, producing the same TurnResult with no events.
+    #[tokio::test]
+    async fn default_turn_streaming_ignores_sink() {
+        use crate::agent::mock::MockAgent;
+        let a = MockAgent::new(AgentId::new("mock"));
+        a.push(TurnResult::FinalResponse {
+            content: "done".into(),
+            usage: usage(1, 1),
+            reasoning: None,
+        });
+        let count: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let c = count.clone();
+        let sink: AgentStreamSink = Box::new(move |_ev| *c.lock().unwrap() += 1);
+        let result = a.turn_streaming(ctx_user("hi"), sink).await;
+        assert!(matches!(result, TurnResult::FinalResponse { content, .. } if content == "done"));
+        assert_eq!(
+            *count.lock().unwrap(),
+            0,
+            "default impl must not emit events"
+        );
+    }
+
+    // turn and turn_streaming classify identically for the same response.
+    #[tokio::test]
+    async fn turn_and_turn_streaming_classify_identically() {
+        let blocking = replay_agent(ModelResponse {
+            content: vec![ContentBlock::Text {
+                text: "same".into(),
+            }],
+            usage: usage(2, 2),
+            stop_reason: StopReason::EndTurn,
+        });
+        let r_block = blocking.turn(ctx_user("x")).await;
+
+        let streaming = replay_agent(ModelResponse {
+            content: vec![ContentBlock::Text {
+                text: "same".into(),
+            }],
+            usage: usage(2, 2),
+            stop_reason: StopReason::EndTurn,
+        });
+        let noop: AgentStreamSink = Box::new(|_| {});
+        let r_stream = streaming.turn_streaming(ctx_user("x"), noop).await;
+        assert_eq!(r_block, r_stream);
+    }
+
+    // Serde back-compat: a pre-#103 TurnResult JSON (no `reasoning`) still
+    // deserializes, with reasoning defaulting to None.
+    #[test]
+    fn turn_result_deserializes_without_reasoning_field() {
+        let json = r#"{"kind":"final_response","content":"hi","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let back: TurnResult = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            back,
+            TurnResult::FinalResponse {
+                reasoning: None,
+                ..
+            }
+        ));
     }
 }

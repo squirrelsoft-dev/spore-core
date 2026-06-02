@@ -73,6 +73,7 @@ async fn s1_multi_step_multi_tool() {
     let agent = Arc::new(MockAgent::new(AgentId::new("mock")));
     // read -> write -> bash read-back -> final.
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c1",
             "read_file",
@@ -81,6 +82,7 @@ async fn s1_multi_step_multi_tool() {
         usage: usage(),
     });
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c2",
             "write_file",
@@ -89,6 +91,7 @@ async fn s1_multi_step_multi_tool() {
         usage: usage(),
     });
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c3",
             "read_file",
@@ -97,6 +100,7 @@ async fn s1_multi_step_multi_tool() {
         usage: usage(),
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE".into(),
         usage: usage(),
     });
@@ -157,6 +161,7 @@ async fn s2_multi_turn_carries_state() {
     let agent = Arc::new(MockAgent::new(AgentId::new("mock")));
     // Turn 1: write notes.md, then final.
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c1",
             "write_file",
@@ -165,11 +170,13 @@ async fn s2_multi_turn_carries_state() {
         usage: usage(),
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE".into(),
         usage: usage(),
     });
     // Turn 2: append referencing turn 1, then final.
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c2",
             "write_file",
@@ -178,6 +185,7 @@ async fn s2_multi_turn_carries_state() {
         usage: usage(),
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE referencing set up the project".into(),
         usage: usage(),
     });
@@ -241,6 +249,7 @@ async fn s3_live_compaction_reclaims_tokens() {
     // final summary containing the key term so verification passes.
     let agent = Arc::new(MockAgent::new(AgentId::new("mock")));
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c1",
             "read_file",
@@ -251,11 +260,13 @@ async fn s3_live_compaction_reclaims_tokens() {
     // Compaction turn (consumed inside run_compaction) — provide a summary that
     // preserves the "payment"/"service"/"deploy" key terms.
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "summary: continuing the deploy of the payment service".into(),
         usage: usage(),
     });
     // Next loop turn after compaction: final response.
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE deploy payment service".into(),
         usage: usage(),
     });
@@ -363,6 +374,7 @@ async fn s4_tool_failure_then_recovery() {
     let agent = Arc::new(MockAgent::new(AgentId::new("mock")));
     // Call flaky_op (fails recoverably) -> adapt by writing recovered.txt -> final.
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c1",
             "flaky_op",
@@ -371,6 +383,7 @@ async fn s4_tool_failure_then_recovery() {
         usage: usage(),
     });
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c2",
             "write_file",
@@ -382,6 +395,7 @@ async fn s4_tool_failure_then_recovery() {
         usage: usage(),
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE recovered".into(),
         usage: usage(),
     });
@@ -482,6 +496,7 @@ async fn s5_shell_pipeline_uppercases_via_bash_command() {
         output.display()
     );
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c1",
             "bash_command",
@@ -490,6 +505,7 @@ async fn s5_shell_pipeline_uppercases_via_bash_command() {
         usage: usage(),
     });
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![tool_call(
             "c2",
             "read_file",
@@ -498,6 +514,7 @@ async fn s5_shell_pipeline_uppercases_via_bash_command() {
         usage: usage(),
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "DONE".into(),
         usage: usage(),
     });
@@ -569,6 +586,7 @@ impl Agent for CapturingAgent {
         self.contexts.lock().unwrap().push(context);
         Box::pin(async move {
             TurnResult::FinalResponse {
+                reasoning: None,
                 content: "DONE".into(),
                 usage: usage(),
             }

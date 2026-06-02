@@ -37,7 +37,7 @@ async fn agent_classifies_recorded_turns_consistently() {
 
     // 1. Plain text response → FinalResponse("hello")
     match agent.turn(Context::default()).await {
-        TurnResult::FinalResponse { content, usage } => {
+        TurnResult::FinalResponse { content, usage, .. } => {
             assert_eq!(content, "hello");
             assert_eq!(usage.input_tokens, 5);
             assert_eq!(usage.output_tokens, 1);
@@ -47,7 +47,7 @@ async fn agent_classifies_recorded_turns_consistently() {
 
     // 2. Single tool call → ToolCallRequested with one call.
     match agent.turn(Context::default()).await {
-        TurnResult::ToolCallRequested { calls, usage } => {
+        TurnResult::ToolCallRequested { calls, usage, .. } => {
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "read_file");
             assert_eq!(calls[0].id, "toolu_a");

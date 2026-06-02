@@ -586,6 +586,7 @@ mod tests {
             let content = self.summary.clone();
             Box::pin(async move {
                 crate::agent::TurnResult::FinalResponse {
+                    reasoning: None,
                     content,
                     usage: TokenUsage {
                         input_tokens: 1,
@@ -760,6 +761,7 @@ mod tests {
             self.seen.lock().unwrap().push(ctx);
             Box::pin(async {
                 crate::agent::TurnResult::FinalResponse {
+                    reasoning: None,
                     content: "summary".into(),
                     usage: TokenUsage {
                         input_tokens: 1,

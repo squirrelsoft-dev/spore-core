@@ -1,0 +1,51 @@
+{
+  "description": "Expected ordered harness StreamEvent sequence for the deltas of streaming_turn.jsonl (issue #103). MessageStart/MessageStop are dropped (Q3). The coarse ToolCall/ToolResult are emitted later by the harness loop (after dispatch) and are not listed here.",
+  "events": [
+    {
+      "kind": "block_start",
+      "index": 0,
+      "block": "reasoning"
+    },
+    {
+      "kind": "reasoning_delta",
+      "content": "I should look this up before answering."
+    },
+    {
+      "kind": "block_stop",
+      "index": 0
+    },
+    {
+      "kind": "block_start",
+      "index": 1,
+      "block": "text"
+    },
+    {
+      "kind": "text_delta",
+      "content": "Let me search for that."
+    },
+    {
+      "kind": "block_stop",
+      "index": 1
+    },
+    {
+      "kind": "block_start",
+      "index": 2,
+      "block": "tool_use"
+    },
+    {
+      "kind": "tool_call_start",
+      "index": 2,
+      "call_id": "call_2",
+      "name": ""
+    },
+    {
+      "kind": "tool_args_delta",
+      "call_id": "call_2",
+      "partial_json": "{\"q\":\"rust\"}"
+    },
+    {
+      "kind": "block_stop",
+      "index": 2
+    }
+  ]
+}

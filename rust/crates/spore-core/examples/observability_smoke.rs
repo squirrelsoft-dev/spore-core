@@ -52,6 +52,7 @@ async fn main() {
     };
     let agent = Arc::new(MockAgent::new(AgentId::new("smoke")));
     agent.push(TurnResult::ToolCallRequested {
+        reasoning: None,
         calls: vec![ToolCall {
             id: "call-1".into(),
             name: "read_file".into(),
@@ -60,6 +61,7 @@ async fn main() {
         usage,
     });
     agent.push(TurnResult::FinalResponse {
+        reasoning: None,
         content: "fixed the failing test".into(),
         usage,
     });
