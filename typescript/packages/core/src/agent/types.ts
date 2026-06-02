@@ -68,16 +68,36 @@ export function emptyContext(): Context {
   };
 }
 
-export function contextToRequest(context: Context): ModelRequest {
+export function contextToRequest(context: Context, stream = false): ModelRequest {
   return {
     messages: context.messages,
     tools: context.tools,
     params: context.params,
-    stream: false,
+    stream,
   };
 }
 
+/**
+ * Result of one agent turn.
+ *
+ * The `reasoning` field on the `tool_call_requested` / `final_response`
+ * variants carries accumulated thinking text produced during the turn
+ * (issue #103, Q4). It is optional so pre-#103 serialized `TurnResult`s still
+ * deserialize, and is omitted from the wire when absent (matching Rust's
+ * `skip_serializing_if = "Option::is_none"`). Thinking is NOT preserved in
+ * `SessionState` nor added as a `Content` variant — deferred to issue #104.
+ */
 export type TurnResult =
-  | { kind: "tool_call_requested"; calls: ToolCall[]; usage: TokenUsage }
-  | { kind: "final_response"; content: string; usage: TokenUsage }
+  | {
+      kind: "tool_call_requested";
+      calls: ToolCall[];
+      usage: TokenUsage;
+      reasoning?: string;
+    }
+  | {
+      kind: "final_response";
+      content: string;
+      usage: TokenUsage;
+      reasoning?: string;
+    }
   | { kind: "error"; error: AgentError; usage: TokenUsage | null };

@@ -18,7 +18,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { Agent } from "../agent/interface.js";
+import type { Agent, AgentStreamSink } from "../agent/interface.js";
+import { turnStreaming } from "../agent/interface.js";
 import type { Context } from "../agent/types.js";
 import type { SessionOutcome } from "../guide-registry/types.js";
 import { Timestamp } from "../memory/types.js";
@@ -95,7 +96,7 @@ import {
 
 import type { Harness } from "./interface.js";
 import type { VcsLogArgs, VcsProvider } from "./vcs.js";
-import { SessionId, TaskId } from "./types.js";
+import { SessionId, TaskId, TurnStreamState, mapModelStreamEvent } from "./types.js";
 import {
   addTurnUsage,
   emptyAggregateUsage,
@@ -1042,7 +1043,22 @@ export class StandardHarness implements Harness {
     emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
     const turnStartedAt = Timestamp.now();
     const turnClock = Date.now();
-    const result = await planner.turn(context, signal);
+    // Issue #103: stream the plan turn's deltas when a sink is attached.
+    const result = onStream
+      ? await turnStreaming(
+          planner,
+          context,
+          ((): AgentStreamSink => {
+            const streamState = new TurnStreamState();
+            return (ev) => {
+              for (const mapped of mapModelStreamEvent(ev, streamState)) {
+                emit(onStream, mapped);
+              }
+            };
+          })(),
+          signal,
+        )
+      : await planner.turn(context, signal);
     budgetUsed.turns += 1; // R7: the plan turn counts against the budget.
 
     // R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
@@ -2334,7 +2350,26 @@ export class StandardHarness implements Harness {
       const inputMessages: GenAiMessage[] | null = ccTurn.enabled
         ? StandardHarness.captureInputMessages(context.messages, ccTurn.maxFieldLen)
         : null;
-      const result = await this.config.agent.turn(context, signal);
+      // Issue #103: when a stream sink is attached, drive the turn through
+      // `turnStreaming` and forward each raw model `StreamEvent` mapped to
+      // harness `StreamEvent`s, preserving order: turn_start → deltas →
+      // turn_end → coarse events. When no sink is attached we keep the plain
+      // `turn` path so the baseline RunResult is byte-identical (back-compat).
+      const result = onStream
+        ? await turnStreaming(
+            this.config.agent,
+            context,
+            ((): AgentStreamSink => {
+              const streamState = new TurnStreamState();
+              return (ev) => {
+                for (const mapped of mapModelStreamEvent(ev, streamState)) {
+                  emit(onStream, mapped);
+                }
+              };
+            })(),
+            signal,
+          )
+        : await this.config.agent.turn(context, signal);
       budgetUsed.turns += 1;
 
       // Emit a turn span for every model call (issue #12). Fire-and-forget; it
@@ -2613,13 +2648,25 @@ export class StandardHarness implements Harness {
                   recoverable: true,
                 },
               };
-              emit(onStream, { kind: "tool_result", call_id: call.id, is_error: true });
+              emit(onStream, {
+                kind: "tool_result",
+                call_id: call.id,
+                is_error: true,
+                // Q5: carry the result content.
+                content: `sandbox: ${violation.kind}`,
+              });
               await this.config.contextManager.appendToolResult(sessionState, tr);
               approvedResults.push(tr);
               continue;
             }
 
-            emit(onStream, { kind: "tool_call", call_id: call.id, name: call.name });
+            emit(onStream, {
+              kind: "tool_call",
+              call_id: call.id,
+              name: call.name,
+              // Q5: carry the final tool-call arguments.
+              args: call.input,
+            });
             const toolStartedAt = Timestamp.now();
             const toolClock = Date.now();
             const output: ToolOutput = await toolRegistry.dispatch(call, signal);
@@ -2781,7 +2828,19 @@ export class StandardHarness implements Harness {
             }
 
             const tr: ToolResultRecord = { call_id: call.id, output };
-            emit(onStream, { kind: "tool_result", call_id: call.id, is_error: isError });
+            // Q5: surface the result content on the coarse event.
+            const resultContentForStream =
+              output.kind === "success"
+                ? output.content
+                : output.kind === "error"
+                  ? output.message
+                  : "";
+            emit(onStream, {
+              kind: "tool_result",
+              call_id: call.id,
+              is_error: isError,
+              content: resultContentForStream,
+            });
             await this.config.contextManager.appendToolResult(sessionState, tr);
             approvedResults.push(tr);
           }

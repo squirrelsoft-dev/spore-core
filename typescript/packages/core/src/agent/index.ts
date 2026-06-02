@@ -5,5 +5,5 @@
 export * from "./errors.js";
 export * from "./interface.js";
 export * from "./types.js";
-export { ModelAgent } from "./model-agent.js";
+export { ModelAgent, classifyResponse } from "./model-agent.js";
 export { MockAgent } from "./mock.js";

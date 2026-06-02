@@ -27,6 +27,7 @@ import {
   MessageSchema,
   ToolCallSchema,
   type Message,
+  type StreamEvent as ModelStreamEvent,
   type TokenUsage,
   type ToolCall,
   type ToolSchema,
@@ -224,11 +225,50 @@ export function newTask(
 // Streaming events emitted by the harness
 // ============================================================================
 
+/**
+ * The kind of content block a {@link HarnessStreamEvent} `block_start` opens
+ * (issue #103, resolved spec decision **Q2**: a single generic frame marker
+ * carrying a `BlockKind` rather than typed-per-kind markers).
+ */
+export type BlockKind = "text" | "reasoning" | "tool_use";
+
+/**
+ * Events the harness surfaces on {@link StreamSink}.
+ *
+ * ## Delta-level streaming (issue #103)
+ *
+ * The harness maps each raw model `StreamEvent` produced by the agent through
+ * `mapModelStreamEvent` into zero or more of the delta/frame variants below,
+ * alongside the existing coarse lifecycle events. Resolution notes:
+ *
+ *   - **Q2**: frame markers are the generic `block_start` / `block_stop`
+ *     carrying a {@link BlockKind}, NOT typed-per-kind markers.
+ *   - **Q3**: model `message_start` / `message_stop` are DROPPED at the
+ *     harness boundary. `turn_start` / `turn_end` already cover this.
+ *   - **Q5**: the coarse `tool_call` now also carries the final `args`, and
+ *     `tool_result` the result `content`. Both new fields are optional so
+ *     pre-#103 serialized events round-trip.
+ *
+ * Tool lifecycle ordering per call:
+ *   `tool_call_start` → `tool_args_delta`* → (`block_stop`) → coarse `tool_call`.
+ */
 export type HarnessStreamEvent =
   | { kind: "turn_start"; turn: number }
   | { kind: "turn_end"; turn: number }
-  | { kind: "tool_call"; call_id: string; name: string }
-  | { kind: "tool_result"; call_id: string; is_error: boolean }
+  | {
+      kind: "tool_call";
+      call_id: string;
+      name: string;
+      /** Final, fully-accumulated tool-call arguments (issue #103, Q5). */
+      args?: unknown;
+    }
+  | {
+      kind: "tool_result";
+      call_id: string;
+      is_error: boolean;
+      /** The tool result content (issue #103, Q5). */
+      content?: string;
+    }
   | { kind: "final_response"; content: string }
   | { kind: "budget_warning"; limit_type: BudgetLimitType }
   /**
@@ -238,9 +278,114 @@ export type HarnessStreamEvent =
    * rendering it prominently is the architect's UI concern. A minimal success
    * tool result is still recorded in history so the loop continues.
    */
-  | { kind: "user_message"; content: string };
+  | { kind: "user_message"; content: string }
+  // ── Delta-level streaming (issue #103) ──────────────────────────────────
+  /** Streamed text fragment (model `content_block_delta`). */
+  | { kind: "text_delta"; content: string }
+  /** Streamed reasoning/thinking fragment (model `thinking_delta`). Q4. */
+  | { kind: "reasoning_delta"; content: string }
+  /**
+   * Streamed tool-argument JSON fragment (model `tool_use_delta`), correlated
+   * to a `call_id` via the open-block index.
+   */
+  | { kind: "tool_args_delta"; call_id: string; partial_json: string }
+  /** A content block opened (Q2). Emitted on the first delta for an index. */
+  | { kind: "block_start"; index: number; block: BlockKind }
+  /** A content block closed (model `content_block_stop`). Q2. */
+  | { kind: "block_stop"; index: number }
+  /**
+   * A tool-use block opened (issue #103). Emitted so consumers can correlate
+   * the subsequent `tool_args_delta` fragments and the final coarse
+   * `tool_call` by `call_id`. The `name` may be empty when the underlying
+   * model stream does not surface it before args (a documented limitation —
+   * the name is recovered on the coarse `tool_call`).
+   */
+  | { kind: "tool_call_start"; index: number; call_id: string; name: string };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
+
+/**
+ * Per-turn state threaded through `mapModelStreamEvent` (issue #103). Tracks
+ * which block indices are open and their kind so `tool_use_delta` /
+ * `content_block_stop` events correlate back to a `call_id`, and so each
+ * block's `block_start` is emitted exactly once.
+ */
+export class TurnStreamState {
+  /** Open block index → its {@link BlockKind}. */
+  readonly openBlocks = new Map<number, BlockKind>();
+  /** Tool-use block index → its derived `call_id` (`call_{index}`). */
+  readonly toolCalls = new Map<number, string>();
+
+  static callIdFor(index: number): string {
+    return `call_${index}`;
+  }
+}
+
+/**
+ * Map one raw model `StreamEvent` to zero or more harness
+ * {@link HarnessStreamEvent}s (issue #103), threading {@link TurnStreamState}
+ * so blocks and tool calls are correlated across events.
+ *
+ * Rules:
+ *   - Q2: a block's `block_start` is emitted exactly once, the first time a
+ *     delta for that index is observed; `content_block_stop` maps to
+ *     `block_stop`.
+ *   - Q3: model `message_start` / `message_stop` map to nothing (dropped).
+ *   - A tool-use block additionally emits `tool_call_start` on open, then each
+ *     fragment as `tool_args_delta` keyed by the derived `call_id`.
+ */
+export function mapModelStreamEvent(
+  event: ModelStreamEvent,
+  state: TurnStreamState,
+): HarnessStreamEvent[] {
+  switch (event.type) {
+    // Q3: dropped at the harness boundary.
+    case "message_start":
+    case "message_stop":
+      return [];
+    case "content_block_delta": {
+      const out: HarnessStreamEvent[] = [];
+      if (!state.openBlocks.has(event.index)) {
+        state.openBlocks.set(event.index, "text");
+        out.push({ kind: "block_start", index: event.index, block: "text" });
+      }
+      out.push({ kind: "text_delta", content: event.delta });
+      return out;
+    }
+    case "thinking_delta": {
+      const out: HarnessStreamEvent[] = [];
+      if (!state.openBlocks.has(event.index)) {
+        state.openBlocks.set(event.index, "reasoning");
+        out.push({ kind: "block_start", index: event.index, block: "reasoning" });
+      }
+      out.push({ kind: "reasoning_delta", content: event.delta });
+      return out;
+    }
+    case "tool_use_delta": {
+      const out: HarnessStreamEvent[] = [];
+      if (!state.openBlocks.has(event.index)) {
+        state.openBlocks.set(event.index, "tool_use");
+        const callId = TurnStreamState.callIdFor(event.index);
+        state.toolCalls.set(event.index, callId);
+        out.push({ kind: "block_start", index: event.index, block: "tool_use" });
+        // Name is not carried by the model StreamEvent; recovered on the
+        // coarse tool_call. Emit tool_call_start so consumers can begin
+        // correlating args by call_id.
+        out.push({ kind: "tool_call_start", index: event.index, call_id: callId, name: "" });
+      }
+      const callId = state.toolCalls.get(event.index) ?? TurnStreamState.callIdFor(event.index);
+      out.push({ kind: "tool_args_delta", call_id: callId, partial_json: event.partial_json });
+      return out;
+    }
+    case "content_block_stop":
+      state.openBlocks.delete(event.index);
+      return [{ kind: "block_stop", index: event.index }];
+    default: {
+      const _exhaustive: never = event;
+      return _exhaustive;
+    }
+  }
+}
 
 // ============================================================================
 // Forward-declared sibling component types
