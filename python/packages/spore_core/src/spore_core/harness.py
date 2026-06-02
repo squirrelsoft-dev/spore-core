@@ -1630,6 +1630,12 @@ class RunResultSuccess(_Model):
     session_id: SessionId
     usage: AggregateUsage
     turns: int
+    # Post-run conversation history (issue #102). Lets a caller resume
+    # losslessly via ``HarnessRunOptions(session_state=..)`` without
+    # reconstructing tool-call / tool-result turns from ``output``. Defaulted so
+    # old serialized blobs (pre-#102, no field) still deserialize — the Python
+    # analogue of Rust's ``#[serde(default)]``.
+    session_state: SessionState = Field(default_factory=SessionState)
 
 
 class RunResultFailure(_Model):
@@ -1638,6 +1644,10 @@ class RunResultFailure(_Model):
     session_id: SessionId
     usage: AggregateUsage
     turns: int
+    # Post-run conversation history (issue #102). Carried on failure too so a
+    # caller can inspect what the loop produced before halting. Defaulted for
+    # back-compat with pre-#102 serialized blobs (Rust ``#[serde(default)]``).
+    session_state: SessionState = Field(default_factory=SessionState)
 
 
 class RunResultWaitingForHuman(_Model):
@@ -1872,6 +1882,7 @@ class HarnessConfig:
         metric_evaluator: Any | None = None,
         catalogue_registry: StandardToolRegistry | None = None,
         system_prompt: str | None = None,
+        auto_persist_sessions: bool = False,
     ) -> None:
         self.agent = agent
         # The HillClimbing scoring strategy (issue #60). REQUIRED for the
@@ -1981,6 +1992,16 @@ class HarnessConfig:
         # :meth:`HarnessBuilder.system_prompt`. ``None`` (the default) preserves
         # today's behaviour.
         self.system_prompt: str | None = system_prompt
+        # Opt-in conversation-history threading via the SessionStore (issue
+        # #102). OFF by default: when ``False`` the run/resume loop performs
+        # ZERO session-store I/O and behaves byte-for-byte like today. When
+        # ``True`` the harness auto-loads the prior :class:`SessionState` for the
+        # run's ``session_id`` at the start of a fresh ``run()`` (ReAct /
+        # SelfVerifying only — Ralph/HillClimbing discard incoming state by
+        # design; explicit ``session_state`` always wins) and auto-persists the
+        # post-run state back to the store at the terminal seam. Mirrors Rust's
+        # ``HarnessConfig::auto_persist_sessions``.
+        self.auto_persist_sessions: bool = auto_persist_sessions
 
 
 class HarnessBuilder:
@@ -2021,6 +2042,9 @@ class HarnessBuilder:
         self._evaluator_agent: Agent | None = None
         self._metric_evaluator: Any | None = None
         self._storage: StorageProvider | None = None
+        # Opt-in session-state threading + auto-persist (issue #102). OFF by
+        # default — see :meth:`auto_persist_sessions`.
+        self._auto_persist_sessions: bool = False
         # Standard catalogue tools accumulated via :meth:`tool` / :meth:`tools`
         # (issue #81). Each is a ``StandardTool``-shaped object exposing
         # ``implementation`` (a :class:`Tool`) and ``schema`` (a
@@ -2127,6 +2151,26 @@ class HarnessBuilder:
         not read/write sessions internally; callers reach the four domain stores
         via :meth:`StandardHarness.storage` / :meth:`StandardHarness.session_store`."""
         self._storage = storage
+        return self
+
+    def auto_persist_sessions(self, enabled: bool) -> HarnessBuilder:
+        """Opt into conversation-history threading via the :class:`SessionStore`
+        (issue #102). OFF by default.
+
+        When enabled the harness, for ReAct / SelfVerifying runs, **auto-loads**
+        the prior :class:`SessionState` for the run's ``session_id`` from the
+        store at the start of a fresh :meth:`StandardHarness.run` (so a caller
+        can resume by id without threading messages by hand), and **auto-persists**
+        the post-run state back to the store at the terminal seam (one write per
+        ``run()`` / ``resume()``). An explicit
+        ``HarnessRunOptions(session_state=..)`` always wins over the auto-load.
+        Ralph / HillClimbing discard incoming session state by design, so they
+        are NOT auto-loaded. Storage errors are swallowed-and-logged: a load
+        failure starts fresh, a persist failure is ignored — never surfaced as a
+        halt. Pair with a real (in-memory / filesystem) :meth:`storage` provider;
+        without one the default all-no-op store makes this a no-op. Mirrors
+        Rust's ``HarnessBuilder::auto_persist_sessions``."""
+        self._auto_persist_sessions = enabled
         return self
 
     def planner_agent(self, planner_agent: Agent) -> HarnessBuilder:
@@ -2284,6 +2328,7 @@ class HarnessBuilder:
             metric_evaluator=self._metric_evaluator,
             catalogue_registry=catalogue_registry,
             system_prompt=self._system_prompt,
+            auto_persist_sessions=self._auto_persist_sessions,
         )
 
     def build(self) -> StandardHarness:
@@ -2627,12 +2672,19 @@ class StandardHarness:
         session_id: SessionId,
         usage: AggregateUsage,
         turns: int,
+        session_state: SessionState | None = None,
     ) -> RunResultFailure:
+        # ``session_state`` carries the post-run history on failure (issue #102).
+        # ReAct / SelfVerifying / PlanExecute pass the live state; strategies
+        # that re-seed a fresh window (Ralph / HillClimbing) leave it unset and
+        # the failure carries an empty state, mirroring the Rust reference's
+        # ``SessionState::default()``.
         return RunResultFailure(
             reason=reason,
             session_id=session_id,
             usage=usage,
             turns=turns,
+            session_state=session_state if session_state is not None else SessionState(),
         )
 
     async def _fire_stop_hooks(
@@ -2686,12 +2738,80 @@ class StandardHarness:
     # ---- public API -------------------------------------------------
 
     async def run(self, options: HarnessRunOptions) -> RunResult:
+        """Drive one run, then persist its terminal state (issue #102).
+
+        Thin wrapper around :meth:`_run_inner`: it runs the loop and then calls
+        :meth:`_auto_persist_terminal`, which is a no-op unless
+        ``auto_persist_sessions`` is enabled. Mirrors Rust's ``run`` wrapper."""
+        result = await self._run_inner(options)
+        await self._auto_persist_terminal(result)
+        return result
+
+    async def _auto_persist_terminal(self, result: RunResult) -> None:
+        """Issue #102 auto-persist seam: write the terminal run state to the
+        :class:`SessionStore` when ``auto_persist_sessions`` is enabled.
+
+        One write per ``run()`` / ``resume()``, at the same terminal seam as the
+        observability flush. For Success / Failure a :class:`PausedState` is
+        synthesized carrying the final ``session_state`` with empty pending
+        fields (D4); for WaitingForHuman / Escalate the carried
+        :class:`PausedState` is persisted (D6 — the cross-process pause case).
+        Storage errors are swallowed-and-logged (D8): a put failure must never
+        lose the run nor surface as a :class:`HaltReason`. When disabled (the
+        default) this returns immediately WITHOUT touching the store — the
+        off-by-default zero-I/O contract. Mirrors Rust's
+        ``auto_persist_terminal``."""
+        if not self._config.auto_persist_sessions:
+            return
+        if isinstance(result, RunResultSuccess | RunResultFailure):
+            # Synthesize a completed-run PausedState: empty pending fields, no
+            # human request, no child — it carries only the final history so a
+            # later get_session(..).session_state resumes losslessly (D4).
+            session_id = result.session_id
+            state = PausedState(
+                session_id=session_id,
+                task_id=TaskId(str(session_id)),
+                turn_number=result.turns,
+                session_state=result.session_state,
+                pending_tool_calls=[],
+                approved_results=[],
+                human_request=None,
+                task=Task.new("", session_id, LoopStrategyReAct(max_iterations=0)),
+                budget_used=BudgetSnapshot(),
+                child_state=None,
+            )
+        elif isinstance(result, RunResultWaitingForHuman | RunResultEscalate):
+            # Persist the carried pause state directly (D6).
+            state = result.state
+            session_id = state.session_id
+        else:  # pragma: no cover — RunResult is a closed union.
+            return
+        try:
+            await self._config.storage.session().put_session(session_id, state)
+        except Exception:  # noqa: BLE001 — swallow-and-log (D8): never lose the run
+            pass
+
+    async def _run_inner(self, options: HarnessRunOptions) -> RunResult:
         task = options.task
         on_stream = options.on_stream
-        session_state = options.session_state or SessionState()
         budget_used = BudgetSnapshot()
 
         strategy = task.loop_strategy
+
+        # Issue #102 auto-load: when enabled AND no explicit session_state was
+        # provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
+        # Ralph/HillClimbing discard it by design, D7), load the prior session
+        # for this ``session_id`` from the SessionStore so a caller can resume by
+        # id. Explicit ``session_state`` always wins (D5). A load failure starts
+        # fresh (D8, swallow-and-log).
+        if options.session_state is not None:
+            session_state = options.session_state
+        elif self._config.auto_persist_sessions and isinstance(
+            strategy, LoopStrategyReAct | LoopStrategySelfVerifying
+        ):
+            session_state = await self._auto_load_session(task.session_id)
+        else:
+            session_state = SessionState()
         if isinstance(strategy, LoopStrategyReAct):
             # Seed the task instruction as the initial user message of this run.
             # The compaction adapter intentionally mirrors ``session.messages``
@@ -2732,7 +2852,34 @@ class StandardHarness:
             )
         raise AssertionError(f"unknown loop strategy: {strategy!r}")
 
+    async def _auto_load_session(self, session_id: SessionId) -> SessionState:
+        """Load the prior :class:`SessionState` for ``session_id`` from the
+        :class:`SessionStore` (issue #102 auto-load). Returns the stored history
+        when present, a fresh :class:`SessionState` when absent OR on any storage
+        error (swallow-and-log, D8 — never surface a load failure as a halt)."""
+        try:
+            prior = await self._config.storage.session().get_session(session_id)
+        except Exception:  # noqa: BLE001 — swallow-and-log (D8): start fresh
+            return SessionState()
+        return prior.session_state if prior is not None else SessionState()
+
     async def resume(
+        self,
+        state: PausedState,
+        response: HumanResponse,
+        on_stream: StreamSink | None = None,
+    ) -> RunResult:
+        """Resume a paused run, then persist its terminal state (issue #102).
+
+        Thin wrapper around :meth:`_resume_inner` mirroring :meth:`run`: it
+        resumes and then calls :meth:`_auto_persist_terminal` (a no-op unless
+        ``auto_persist_sessions`` is enabled). Mirrors Rust's ``resume``
+        wrapper."""
+        result = await self._resume_inner(state, response, on_stream)
+        await self._auto_persist_terminal(result)
+        return result
+
+    async def _resume_inner(
         self,
         state: PausedState,
         response: HumanResponse,
@@ -2792,6 +2939,7 @@ class StandardHarness:
                 session_id,
                 AggregateUsage(),
                 state.turn_number,
+                session_state,
             )
 
         if isinstance(response, HumanResponseDeny):
@@ -3039,16 +3187,19 @@ class StandardHarness:
                 )
             )
             if isinstance(verdict, VerifierVerdictPassed):
-                # Reuse the build run's output/turns as the run's handle.
+                # Reuse the build run's output/turns/state as the run's handle.
                 if isinstance(build_result, RunResultSuccess):
                     output, turns = build_result.output, build_result.turns
+                    final_state = build_result.session_state
                 else:
                     output, turns = "", carried.turns
+                    final_state = SessionState()
                 result = RunResultSuccess(
                     output=output,
                     session_id=build_session_id,
                     usage=total_usage,
                     turns=turns,
+                    session_state=final_state,
                 )
                 await self._finalize_self_verifying(result)
                 return result
@@ -3059,7 +3210,8 @@ class StandardHarness:
             last_reason = verdict.reason
             await self._config.context_manager.append_user_message(session_state, verdict.reason)
 
-        # R7: ran out of round-trips without a pass — clean exhaustion.
+        # R7: ran out of round-trips without a pass — clean exhaustion. Carry
+        # the accumulated build conversation (issue #102).
         result = self._fail(
             HaltReasonSelfVerifyExhausted(
                 iterations=max_iterations,
@@ -3068,6 +3220,7 @@ class StandardHarness:
             build_session_id,
             total_usage,
             carried.turns,
+            session_state,
         )
         await self._finalize_self_verifying(result)
         return result
@@ -3717,12 +3870,20 @@ class StandardHarness:
             # remain ⇒ reset into the next window unless the cap is reached.
             reason = _ralph_completion_status(workspace_root)
             if reason is None:
-                output = window_result.output if isinstance(window_result, RunResultSuccess) else ""
+                # Carry the final context window's history into the terminal
+                # result (issue #102).
+                if isinstance(window_result, RunResultSuccess):
+                    output = window_result.output
+                    final_state = window_result.session_state
+                else:
+                    output = ""
+                    final_state = SessionState()
                 result: RunResult = RunResultSuccess(
                     output=output,
                     session_id=window_session_id,
                     usage=total_usage,
                     turns=cumulative_turns,
+                    session_state=final_state,
                 )
                 await self._finalize_self_verifying(result)
                 return result
@@ -3911,6 +4072,7 @@ class StandardHarness:
                     session_id,
                     total_usage,
                     sub_result.turns,
+                    session_state,
                 )
 
             else:
@@ -3919,12 +4081,14 @@ class StandardHarness:
                 # propagate the sub-result up unchanged.
                 return sub_result
 
-        # Q2: success output is the LAST completed step's final text.
+        # Q2: success output is the LAST completed step's final text. Carry the
+        # accumulated cross-step conversation (issue #102).
         return RunResultSuccess(
             output=last_output,
             session_id=session_id,
             usage=total_usage,
             turns=carried.turns,
+            session_state=session_state,
         )
 
     async def _run_plan_phase(
@@ -4194,6 +4358,7 @@ class StandardHarness:
                     session_id,
                     usage,
                     budget_used.turns,
+                    session_state,
                 )
             limit_type = self._budget_exceeded(task.budget, budget_used, started_at)
             if limit_type is not None:
@@ -4202,6 +4367,7 @@ class StandardHarness:
                     session_id,
                     usage,
                     budget_used.turns,
+                    session_state,
                 )
 
             # Middleware: BeforeTurn.
@@ -4213,6 +4379,7 @@ class StandardHarness:
                         session_id,
                         usage,
                         budget_used.turns,
+                        session_state,
                     )
                 if isinstance(decision, MiddlewareSurfaceToHuman):
                     paused = PausedState(
@@ -4362,6 +4529,7 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                            session_state,
                         )
                     if isinstance(decision, MiddlewareSurfaceToHuman):
                         paused = PausedState(
@@ -4385,6 +4553,7 @@ class StandardHarness:
                         session_id,
                         usage,
                         budget_used.turns,
+                        session_state,
                     )
 
                 # Record the assistant's final text in history so a continued
@@ -4419,6 +4588,7 @@ class StandardHarness:
                     session_id=session_id,
                     usage=usage,
                     turns=budget_used.turns,
+                    session_state=session_state,
                 )
 
             # ---- ToolCallRequested ----------------------------------
@@ -4438,6 +4608,7 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                            session_state,
                         )
 
                 # Record the assistant's turn (the tool calls the model
@@ -4476,6 +4647,7 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                            session_state,
                         )
                     elif isinstance(decision, MiddlewareSurfaceToHuman):
                         paused = PausedState(
@@ -4503,6 +4675,7 @@ class StandardHarness:
                                 session_id,
                                 usage,
                                 budget_used.turns,
+                                session_state,
                             )
                         # Layer-2 default: recoverable — append as tool error.
                         tr = HarnessToolResult(
@@ -4631,6 +4804,7 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                            session_state,
                         )
 
                     # Tool-call span (issue #12), child of the current turn.
@@ -4719,6 +4893,7 @@ class StandardHarness:
                             session_id,
                             usage,
                             budget_used.turns,
+                            session_state,
                         )
 
                 # Compaction (issue #46): after tool results are appended, before
@@ -4747,6 +4922,7 @@ class StandardHarness:
                     session_id,
                     usage,
                     budget_used.turns,
+                    session_state,
                 )
 
             raise AssertionError(f"unhandled TurnResult variant: {result!r}")
