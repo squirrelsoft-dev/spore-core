@@ -222,6 +222,9 @@ func (h *StandardHarness) runRalph(
 	lastReason := ".spore/progress.json missing"
 	// Session id of the most recent context window (terminal accounting).
 	lastSessionID := task.SessionID
+	// Conversation history of the most recent window (issue #102): carried onto
+	// the RalphCompletionUnmet failure so it resumes losslessly.
+	var lastSessionState SessionState
 
 	// The OUTER loop: each iteration is ONE context window. maxResets caps the
 	// number of windows (B3). Iteration 0 is the first window; a reset is the
@@ -307,11 +310,14 @@ func (h *StandardHarness) runRalph(
 				SessionID: windowSessionID,
 				Usage:     totalUsage,
 				Turns:     cumulativeTurns,
+				// Issue #102: carry the completing window's conversation history.
+				SessionState: windowResult.SessionState,
 			}
 			h.finalizeObservability(ctx, windowSessionID, TerminalSuccess, "")
 			return result
 		}
 		lastReason = reason
+		lastSessionState = windowResult.SessionState
 	}
 
 	// R5: ran out of context-window resets without completion.
@@ -322,9 +328,10 @@ func (h *StandardHarness) runRalph(
 			Iterations: maxResets,
 			Reason:     lastReason,
 		},
-		SessionID: lastSessionID,
-		Usage:     totalUsage,
-		Turns:     cumulativeTurns,
+		SessionID:    lastSessionID,
+		Usage:        totalUsage,
+		Turns:        cumulativeTurns,
+		SessionState: lastSessionState,
 	}
 	h.finalizeObservability(ctx, lastSessionID, TerminalFailure, haltReasonString(result.Reason))
 	return result

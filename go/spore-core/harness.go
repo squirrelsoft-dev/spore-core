@@ -2040,6 +2040,14 @@ type RunResult struct {
 	SessionID SessionID      `json:"-"`
 	Usage     AggregateUsage `json:"-"`
 	Turns     uint32         `json:"-"`
+	// SessionState is the post-run conversation history carried on success and
+	// failure (issue #102). It holds the full SessionState.Messages the loop
+	// produced — assistant tool-call turns and tool-result turns included — so an
+	// in-process caller can resume losslessly via HarnessRunOptions.SessionState
+	// without reconstructing history from Output. On the wire it is the Go analog
+	// of Rust's #[serde(default)]: always emitted on success/failure, and
+	// tolerant of absence on decode so old serialized RunResult blobs still parse.
+	SessionState SessionState `json:"-"`
 	// waiting_for_human, escalate (both carry State)
 	State   *PausedState  `json:"-"`
 	Request *HumanRequest `json:"-"`
@@ -2052,20 +2060,22 @@ func (r RunResult) MarshalJSON() ([]byte, error) {
 	switch r.Kind {
 	case RunSuccess:
 		return json.Marshal(struct {
-			Kind      RunResultKind  `json:"kind"`
-			Output    string         `json:"output"`
-			SessionID SessionID      `json:"session_id"`
-			Usage     AggregateUsage `json:"usage"`
-			Turns     uint32         `json:"turns"`
-		}{r.Kind, r.Output, r.SessionID, r.Usage, r.Turns})
+			Kind         RunResultKind  `json:"kind"`
+			Output       string         `json:"output"`
+			SessionID    SessionID      `json:"session_id"`
+			Usage        AggregateUsage `json:"usage"`
+			Turns        uint32         `json:"turns"`
+			SessionState SessionState   `json:"session_state"`
+		}{r.Kind, r.Output, r.SessionID, r.Usage, r.Turns, r.SessionState})
 	case RunFailure:
 		return json.Marshal(struct {
-			Kind      RunResultKind  `json:"kind"`
-			Reason    HaltReason     `json:"reason"`
-			SessionID SessionID      `json:"session_id"`
-			Usage     AggregateUsage `json:"usage"`
-			Turns     uint32         `json:"turns"`
-		}{r.Kind, r.Reason, r.SessionID, r.Usage, r.Turns})
+			Kind         RunResultKind  `json:"kind"`
+			Reason       HaltReason     `json:"reason"`
+			SessionID    SessionID      `json:"session_id"`
+			Usage        AggregateUsage `json:"usage"`
+			Turns        uint32         `json:"turns"`
+			SessionState SessionState   `json:"session_state"`
+		}{r.Kind, r.Reason, r.SessionID, r.Usage, r.Turns, r.SessionState})
 	case RunWaitingForHuman:
 		return json.Marshal(struct {
 			Kind    RunResultKind `json:"kind"`
@@ -2096,9 +2106,13 @@ func (r *RunResult) UnmarshalJSON(data []byte) error {
 		SessionID SessionID      `json:"session_id"`
 		Usage     AggregateUsage `json:"usage"`
 		Turns     uint32         `json:"turns"`
-		State     *PausedState   `json:"state"`
-		Request   *HumanRequest  `json:"request"`
-		Signal    *HarnessSignal `json:"signal"`
+		// SessionState is tolerant of absence (issue #102): old serialized
+		// RunResult blobs that predate this field decode to the zero value, the
+		// Go analog of Rust's #[serde(default)].
+		SessionState SessionState   `json:"session_state"`
+		State        *PausedState   `json:"state"`
+		Request      *HumanRequest  `json:"request"`
+		Signal       *HarnessSignal `json:"signal"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -2109,6 +2123,7 @@ func (r *RunResult) UnmarshalJSON(data []byte) error {
 	r.SessionID = probe.SessionID
 	r.Usage = probe.Usage
 	r.Turns = probe.Turns
+	r.SessionState = probe.SessionState
 	r.State = probe.State
 	r.Request = probe.Request
 	r.Signal = probe.Signal
@@ -2279,7 +2294,61 @@ type HarnessConfig struct {
 	// HarnessBuilder.SystemPrompt. Empty (the default) preserves today's behaviour
 	// byte-for-byte.
 	SystemPrompt string // optional
+
+	// SessionStore is the opt-in conversation-history persistence seam (issue
+	// #102). When AutoPersistSessions is true the run loop:
+	//   - auto-LOADS the prior SessionState for the run's SessionID from this
+	//     store at the start of Run() (ReAct / SelfVerifying only — Ralph /
+	//     HillClimbing discard incoming state by design), so a caller resumes by
+	//     reusing the same SessionID instead of threading SessionState; an
+	//     explicit HarnessRunOptions.SessionState always wins (the load is
+	//     skipped), and
+	//   - auto-PERSISTS the post-run SessionState back to the store at the
+	//     terminal seam (one write per Run()/Resume()).
+	// Optional; nil is the never-null library default (a no-op store, so the loop
+	// never null-checks). This is a consumer-side interface (go/CONVENTIONS.md):
+	// a *storage.StorageProvider's Session() store satisfies it structurally
+	// without sporecore importing the storage package (which would be a cycle).
+	SessionStore SessionStore // optional
+
+	// AutoPersistSessions opts this harness into the issue #102 session-store
+	// auto-load + auto-persist contract above. Per-harness builder config (NOT a
+	// per-run flag). Defaults to false: when false there is ZERO session-store
+	// I/O and the message flow + replay outcomes are byte-for-byte identical to
+	// today's.
+	AutoPersistSessions bool
 }
+
+// SessionStore is the consumer-side view of the pause/resume lifecycle store
+// the harness reads/writes for opt-in conversation-history threading (issue
+// #102). It mirrors the read/write methods of storage.SessionStore so a
+// *storage.StorageProvider's Session() store can be dropped straight into
+// HarnessConfig.SessionStore without an import cycle (storage imports
+// sporecore). State is the opaque *PausedState keyed by SessionID; found=false
+// means the lookup hit nothing.
+type SessionStore interface {
+	GetSession(ctx context.Context, id SessionID) (state *PausedState, found bool, err error)
+	PutSession(ctx context.Context, id SessionID, state *PausedState) error
+}
+
+// effectiveSessionStore returns the configured SessionStore or a no-op so the
+// loop never null-checks (the never-null library default — D8).
+func (c HarnessConfig) effectiveSessionStore() SessionStore {
+	if c.SessionStore == nil {
+		return noopSessionStore{}
+	}
+	return c.SessionStore
+}
+
+// noopSessionStore is the never-null default: reads find nothing, writes
+// discard. Used when no SessionStore was wired so the loop can call the store
+// unconditionally.
+type noopSessionStore struct{}
+
+func (noopSessionStore) GetSession(context.Context, SessionID) (*PausedState, bool, error) {
+	return nil, false, nil
+}
+func (noopSessionStore) PutSession(context.Context, SessionID, *PausedState) error { return nil }
 
 // RunStore is the consumer-side view of the per-run structured-state store the
 // PlanExecute execute loop writes through (issue #59, Q4). It mirrors the Put
@@ -2389,11 +2458,40 @@ func budgetExceeded(b BudgetLimits, used BudgetSnapshot, startedAt time.Time) (B
 }
 
 // Run executes a task to completion (or pause).
+//
+// Issue #102: Run is the thin auto-persist seam. It delegates the loop to
+// runInner, then — when AutoPersistSessions is enabled — writes the terminal
+// run state to the SessionStore (one write per Run, at the same terminal point
+// as the observability flush). When disabled (the default) it is byte-for-byte
+// the prior behaviour: runInner does no session-store I/O and the persist step
+// returns immediately.
 func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) RunResult {
+	result := h.runInner(ctx, options)
+	h.autoPersistTerminal(ctx, &result)
+	return result
+}
+
+// runInner is the strategy dispatch (the body of the former Run). It performs
+// the issue #102 auto-LOAD before dispatching: when AutoPersistSessions is on,
+// no explicit SessionState was provided, and the strategy seeds incoming state
+// (ReAct / SelfVerifying — Ralph / HillClimbing discard it by design, D7), it
+// loads the prior session for this SessionID from the SessionStore so a caller
+// can resume by id. An explicit HarnessRunOptions.SessionState always wins (the
+// load is skipped, D5). A load failure is swallowed-and-logged: the run starts
+// fresh (D8).
+func (h *StandardHarness) runInner(ctx context.Context, options HarnessRunOptions) RunResult {
 	task := options.Task
 	var session SessionState
-	if options.SessionState != nil {
+	switch {
+	case options.SessionState != nil:
 		session = *options.SessionState
+	case h.config.AutoPersistSessions && seedsIncomingSessionState(task.LoopStrategy.Kind):
+		// Auto-load by session id. errors.Is-style swallow: any read error (or a
+		// miss) starts fresh — never surfaced as a HaltReason (D8). No logging
+		// facade is wired into spore-core, mirroring the Rust reference.
+		if prior, found, err := h.config.effectiveSessionStore().GetSession(ctx, task.SessionID); err == nil && found && prior != nil {
+			session = prior.SessionState
+		}
 	}
 	budget := BudgetSnapshot{}
 
@@ -2444,6 +2542,68 @@ func strategyNotImplemented(task Task, strategy string) RunResult {
 		},
 		SessionID: task.SessionID,
 	}
+}
+
+// seedsIncomingSessionState reports whether a loop strategy seeds an incoming
+// SessionState (issue #102, D7). Only ReAct and SelfVerifying do; Ralph and
+// HillClimbing re-seed a fresh SessionState per context window / iteration and
+// discard incoming state by design, so auto-load is skipped for them.
+func seedsIncomingSessionState(kind LoopStrategyKind) bool {
+	return kind == StrategyReAct || kind == StrategySelfVerifying
+}
+
+// autoPersistTerminal writes the terminal run state to the SessionStore when
+// AutoPersistSessions is enabled (issue #102). One write per Run()/Resume(), at
+// the same terminal seam as the observability flush.
+//
+// For Success/Failure it synthesizes a completed-run PausedState (D4): empty
+// pending tool calls, empty approved results, no human request, no child state
+// — carrying only the final SessionState so a later GetSession resumes
+// losslessly. For WaitingForHuman/Escalate it persists the carried PausedState
+// directly (D6 — the cross-process pause case). Storage errors are
+// swallowed-and-logged (D8): a put failure must never lose the run nor surface
+// as a HaltReason.
+//
+// When disabled (the default) it returns immediately WITHOUT touching the store
+// — the off-by-default zero-I/O contract.
+func (h *StandardHarness) autoPersistTerminal(ctx context.Context, result *RunResult) {
+	if !h.config.AutoPersistSessions {
+		return
+	}
+	var (
+		sessionID SessionID
+		state     *PausedState
+	)
+	switch result.Kind {
+	case RunSuccess, RunFailure:
+		sessionID = result.SessionID
+		// Synthesize a completed-run PausedState: empty pending fields, no human
+		// request, no child — it carries only the final history so a later
+		// GetSession(..).SessionState resumes losslessly.
+		state = &PausedState{
+			SessionID:        sessionID,
+			TaskID:           TaskID(string(sessionID)),
+			TurnNumber:       result.Turns,
+			SessionState:     result.SessionState,
+			PendingToolCalls: nil,
+			ApprovedResults:  nil,
+			HumanRequest:     nil,
+			Task:             NewTask("", sessionID, LoopStrategy{Kind: StrategyReAct, MaxIterations: 0}),
+			BudgetUsed:       BudgetSnapshot{},
+			ChildState:       nil,
+		}
+	case RunWaitingForHuman, RunEscalate:
+		// Persist the carried pause state directly (D6).
+		if result.State == nil {
+			return
+		}
+		sessionID = result.State.SessionID
+		state = result.State
+	default:
+		return
+	}
+	// Swallow-and-log on error (D8): a storage hiccup must not lose the run.
+	_ = h.config.effectiveSessionStore().PutSession(ctx, sessionID, state)
 }
 
 // nowRFC3339 returns the current UTC time as an RFC3339 string — the
@@ -2753,6 +2913,11 @@ func (h *StandardHarness) runExecutePhase(
 	totalUsage := planUsage
 	// Q2: the success handle is the LAST completed step's final text.
 	var lastOutput string
+	// Issue #102: the LAST completed step's full conversation history, carried
+	// onto the terminal Success so PlanExecute resumes losslessly. Each step runs
+	// its own isolated ReAct sub-loop over a copy of the shared session, so the
+	// most recent sub-run's SessionState is the richest post-run history.
+	var lastSessionState SessionState
 
 	for index := 0; index < totalTasks; index++ {
 		taskID := taskList.Tasks[index].ID
@@ -2830,6 +2995,7 @@ func (h *StandardHarness) runExecutePhase(
 			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
 			totalUsage.CostUSD += subResult.Usage.CostUSD
 			lastOutput = subResult.Output
+			lastSessionState = subResult.SessionState
 
 			// Mark Completed and re-persist (Q4).
 			_ = taskList.Complete(taskID)
@@ -2870,6 +3036,8 @@ func (h *StandardHarness) runExecutePhase(
 				SessionID: sessionID,
 				Usage:     totalUsage,
 				Turns:     subResult.Turns,
+				// Issue #102: carry the failing step's conversation history.
+				SessionState: subResult.SessionState,
 			}
 
 		case RunWaitingForHuman:
@@ -2885,11 +3053,12 @@ func (h *StandardHarness) runExecutePhase(
 
 	// Q2: success output is the LAST completed step's final response text.
 	return RunResult{
-		Kind:      RunSuccess,
-		Output:    lastOutput,
-		SessionID: sessionID,
-		Usage:     totalUsage,
-		Turns:     carried.Turns,
+		Kind:         RunSuccess,
+		Output:       lastOutput,
+		SessionID:    sessionID,
+		Usage:        totalUsage,
+		Turns:        carried.Turns,
+		SessionState: lastSessionState,
 	}
 }
 
@@ -2913,7 +3082,18 @@ func (h *StandardHarness) runPlanPhase(
 	session *SessionState,
 	budget BudgetSnapshot,
 	onStream StreamSink,
-) (*planPhaseOutcome, *RunResult) {
+) (outcome *planPhaseOutcome, failure *RunResult) {
+	// Issue #102: stamp the plan-phase conversation history onto any failure
+	// result this function returns. The plan turn mutates *session (the planning
+	// directive + the planner's response), so reading it in a defer captures the
+	// final state at whichever failure return fired — every PlanPhaseFailed /
+	// AgentError / BudgetExceeded exit carries lossless history without threading
+	// SessionState through each construction site.
+	defer func() {
+		if failure != nil && failure.Kind == RunFailure {
+			failure.SessionState = *session
+		}
+	}()
 	sessionID := task.SessionID
 	startedAt := time.Now()
 	usage := AggregateUsage{}
@@ -3165,7 +3345,19 @@ func (h *StandardHarness) runReActInner(
 	session SessionState,
 	budget BudgetSnapshot,
 	onStream StreamSink,
-) RunResult {
+) (out RunResult) {
+	// Issue #102 part 1: stamp the post-run conversation history onto the
+	// terminal Success/Failure result. The loop mutates `session` in place
+	// (appending assistant / tool-result turns); reading it in a defer captures
+	// the final state at whichever return fired, so every Success/Failure exit
+	// carries lossless history without threading SessionState through ~30
+	// construction sites. WaitingForHuman/Escalate already carry session state
+	// via their PausedState, so they are intentionally left untouched.
+	defer func() {
+		if out.Kind == RunSuccess || out.Kind == RunFailure {
+			out.SessionState = session
+		}
+	}()
 	sessionID := task.SessionID
 	// Resolve the effective tool registry once per turn-loop window. Bridges
 	// catalogue tools per-run (re-injects their ToolContext with this run's
@@ -3852,7 +4044,23 @@ func (h *StandardHarness) emitCompactionSpan(
 }
 
 // Resume continues a paused run after a human response.
+//
+// Issue #102: like Run, Resume is the thin auto-persist seam — it delegates the
+// loop to resumeInner, then persists the terminal run state to the SessionStore
+// when AutoPersistSessions is enabled (one write per Resume). When disabled it
+// is byte-for-byte the prior behaviour.
 func (h *StandardHarness) Resume(
+	ctx context.Context,
+	state PausedState,
+	response HumanResponse,
+	onStream StreamSink,
+) RunResult {
+	result := h.resumeInner(ctx, state, response, onStream)
+	h.autoPersistTerminal(ctx, &result)
+	return result
+}
+
+func (h *StandardHarness) resumeInner(
 	ctx context.Context,
 	state PausedState,
 	response HumanResponse,
@@ -3912,10 +4120,11 @@ func (h *StandardHarness) Resume(
 	switch response.Kind {
 	case HumanRespHalt:
 		return RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltHumanHalted},
-			SessionID: state.SessionID,
-			Turns:     state.TurnNumber,
+			Kind:         RunFailure,
+			Reason:       HaltReason{Kind: HaltHumanHalted},
+			SessionID:    state.SessionID,
+			Turns:        state.TurnNumber,
+			SessionState: session,
 		}
 	case HumanRespDeny:
 		for _, call := range pending {

@@ -406,6 +406,16 @@ type HarnessBuilder struct {
 	// turn's assembled context when the context manager renders none (issue #91).
 	// Empty (the default) preserves today's behaviour.
 	systemPrompt string
+	// sessionStore / autoPersistSessions are the issue #102 opt-in
+	// conversation-history threading seam. sessionStore is the SessionStore the
+	// loop auto-loads from / auto-persists to; autoPersistSessions gates the whole
+	// feature (default false → zero session-store I/O, byte-for-byte today's
+	// behaviour). sessionStore is accepted via the consumer-side
+	// sporecore.SessionStore interface, which a *storage.StorageProvider's
+	// Session() store satisfies structurally — so the builder never imports the
+	// storage package (which would form a cycle: storage imports observability).
+	sessionStore        sporecore.SessionStore
+	autoPersistSessions bool
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -565,6 +575,32 @@ func (b *HarnessBuilder) Storage(runStore sporecore.ToolRunStore, memStore spore
 	return b
 }
 
+// SessionStore wires the conversation-history persistence store for opt-in
+// session-state threading (issue #102). Pass a *storage.StorageProvider's
+// Session() store — it satisfies the consumer-side sporecore.SessionStore
+// interface structurally, so the builder (in this package) never imports the
+// storage package (which would form a cycle: storage imports observability).
+// Has no effect unless AutoPersistSessions(true) is also called. Returns the
+// receiver for fluent chaining.
+func (b *HarnessBuilder) SessionStore(store sporecore.SessionStore) *HarnessBuilder {
+	b.sessionStore = store
+	return b
+}
+
+// AutoPersistSessions opts this harness into the issue #102 session-store
+// auto-load + auto-persist contract: the run loop loads the prior SessionState
+// for the run's SessionID at the start of Run() (ReAct / SelfVerifying only; an
+// explicit HarnessRunOptions.SessionState wins) and persists the post-run
+// SessionState back at the terminal seam. Defaults to false — when false there
+// is ZERO session-store I/O and the message flow + replay outcomes are
+// byte-for-byte identical to today's. Pair with SessionStore to point at a
+// concrete store; without one the never-null no-op store makes the flag inert.
+// Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) AutoPersistSessions(enabled bool) *HarnessBuilder {
+	b.autoPersistSessions = enabled
+	return b
+}
+
 // foldCatalogueRegistry folds every accumulated catalogue tool into a fresh,
 // populated *StandardToolRegistry via Register() (a last-wins upsert) and returns
 // it, or nil when no catalogue tools were added. Mirrors the Rust builder's
@@ -610,6 +646,8 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		ToolRunStore:          runStore,
 		ToolMemoryStore:       b.memStore,
 		SystemPrompt:          b.systemPrompt,
+		SessionStore:          b.sessionStore,
+		AutoPersistSessions:   b.autoPersistSessions,
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)

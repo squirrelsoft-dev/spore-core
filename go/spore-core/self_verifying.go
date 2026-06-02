@@ -279,6 +279,9 @@ func (h *StandardHarness) runSelfVerifying(
 				SessionID: buildSessionID,
 				Usage:     totalUsage,
 				Turns:     turns,
+				// Issue #102: carry the passing build run's full conversation
+				// history so the SelfVerifying success resumes losslessly.
+				SessionState: buildResult.SessionState,
 			}
 			h.finalizeObservability(ctx, buildSessionID, TerminalSuccess, "")
 			return result
@@ -303,6 +306,9 @@ func (h *StandardHarness) runSelfVerifying(
 		SessionID: buildSessionID,
 		Usage:     totalUsage,
 		Turns:     carried.Turns,
+		// Issue #102: carry the build conversation (with each verdict reason
+		// appended) so the exhausted-failure result is lossless.
+		SessionState: session,
 	}
 	h.finalizeObservability(ctx, buildSessionID, TerminalFailure, haltReasonString(result.Reason))
 	return result
