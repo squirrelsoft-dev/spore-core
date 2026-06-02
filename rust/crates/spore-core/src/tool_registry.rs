@@ -35,10 +35,10 @@
 //!
 //! `StandardToolRegistry::dispatch`/`dispatch_all` thread the `ToolContext`
 //! through to every tool. The canonical registry takes the `ToolContext` as a
-//! dispatch argument; the harness-side `RealToolRegistry` bridge (scenarios.rs)
-//! is constructed per-run with the `SessionId` + `Arc<dyn RunStore>` and builds
-//! the `ToolContext` itself before forwarding. The harness-loop
-//! `ToolRegistry::dispatch(call)` signature is UNCHANGED. `ToolContext` is a
+//! dispatch argument; the harness-side [`RealToolRegistry`] bridge (defined
+//! below) is constructed per-run with the `SessionId` + `Arc<dyn RunStore>` +
+//! `Arc<dyn MemoryStore>` and builds the `ToolContext` itself before forwarding.
+//! The harness-loop `ToolRegistry::dispatch(call)` signature is UNCHANGED. `ToolContext` is a
 //! struct so future fields are non-breaking; `SandboxProvider` is NOT folded in
 //! (storage is additive).
 //!
@@ -94,9 +94,10 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use crate::harness::{
-    BoxFut, SandboxProvider, SandboxViolation, SessionId, ToolOutput, ToolResult,
+    BoxFut, SandboxProvider, SandboxViolation, SessionId, ToolOutput,
+    ToolRegistry as HarnessToolRegistry, ToolResult,
 };
-use crate::model::ToolCall;
+use crate::model::{ToolCall, ToolSchema as ModelToolSchema};
 use crate::storage::{MemoryStore, RunStore};
 
 // ============================================================================
@@ -757,6 +758,101 @@ pub mod mock {
                 })
             })
         }
+    }
+}
+
+// ============================================================================
+// RealToolRegistry — the bridge between the two ToolRegistry traits
+// ============================================================================
+
+/// Bridges the harness-loop [`HarnessToolRegistry`](crate::harness::ToolRegistry)
+/// onto this canonical [`ToolRegistry`] (a populated [`StandardToolRegistry`]).
+///
+/// This is **the production wiring** for running catalogue / [`Tool`] -based
+/// tools inside the harness — not test scaffolding. The harness loop calls
+/// `dispatch(ToolCall) -> ToolOutput` with no sandbox or storage; this bridge
+/// forwards to the inner registry's `dispatch(call, sandbox, ctx)`, threading
+/// the [`SandboxProvider`] and a per-run [`ToolContext`] (storage seam, #75) it
+/// was constructed with. A [`DispatchError`] becomes a **recoverable**
+/// [`ToolOutput::Error`] so the loop appends it as a tool result and lets the
+/// agent adapt rather than halting.
+///
+/// It is built **once per run**: `session_id`, `run_store`, and `memory_store`
+/// are injected at construction (the run's `SessionId` is only known at
+/// `run()`-time) and used to build the [`ToolContext`] forwarded on every
+/// dispatch. `HarnessBuilder` wires this automatically when catalogue tools are
+/// added via `.tool()` / `.tools()`; construct it directly only when supplying
+/// your own [`StandardToolRegistry`].
+pub struct RealToolRegistry {
+    inner: Arc<StandardToolRegistry>,
+    sandbox: Arc<dyn SandboxProvider>,
+    ctx: ToolContext,
+    schemas: Vec<ModelToolSchema>,
+}
+
+impl RealToolRegistry {
+    /// Build a bridge over an already-populated [`StandardToolRegistry`].
+    ///
+    /// `session_id` + `run_store` + `memory_store` are injected here (the bridge
+    /// is built once per run) and used to construct the [`ToolContext`]
+    /// forwarded on every dispatch — see the storage-seam note on the type.
+    pub fn new(
+        inner: Arc<StandardToolRegistry>,
+        sandbox: Arc<dyn SandboxProvider>,
+        session_id: SessionId,
+        run_store: Arc<dyn RunStore>,
+        memory_store: Arc<dyn MemoryStore>,
+    ) -> Self {
+        // Snapshot the model-facing schemas (sorted by name) once at
+        // construction; the catalogue is fixed for a run.
+        let schemas = inner
+            .active_schemas(None)
+            .iter()
+            .map(ToolSchema::to_model_schema)
+            .collect();
+        Self {
+            inner,
+            sandbox,
+            ctx: ToolContext::new(session_id, run_store, memory_store),
+            schemas,
+        }
+    }
+
+    /// The model-facing tool schemas, sorted by name.
+    pub fn model_schemas(&self) -> Vec<ModelToolSchema> {
+        self.schemas.clone()
+    }
+
+    /// The [`ToolContext`] this bridge threads into every dispatch — exposes the
+    /// `session_id`, `run_store`, and (#78) `memory_store` seams it was wired
+    /// with. Lets callers verify the storage seams are live.
+    pub fn tool_context(&self) -> &ToolContext {
+        &self.ctx
+    }
+}
+
+impl HarnessToolRegistry for RealToolRegistry {
+    fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+        Box::pin(async move {
+            match self.inner.dispatch(call, &*self.sandbox, &self.ctx).await {
+                Ok(result) => result.output,
+                Err(err) => ToolOutput::Error {
+                    message: format!("dispatch failed: {err}"),
+                    // Recoverable so the loop appends the error and lets the
+                    // agent adapt — S4 depends on this.
+                    recoverable: true,
+                },
+            }
+        })
+    }
+
+    fn is_always_halt(&self, _tool_name: &str) -> bool {
+        // No bridged tool is always-halt — S4 needs recoverable failure.
+        false
+    }
+
+    fn schemas(&self) -> Vec<ModelToolSchema> {
+        self.schemas.clone()
     }
 }
 

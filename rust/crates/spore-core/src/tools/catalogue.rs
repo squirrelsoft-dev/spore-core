@@ -80,7 +80,16 @@ pub struct StandardTool {
 }
 
 impl StandardTool {
-    /// Bundle an implementation with a schema.
+    /// Bundle a tool implementation with its schema so it can be registered.
+    ///
+    /// This is the on-ramp for a **custom sandboxed tool**: implement
+    /// [`Tool`](crate::tool_registry::Tool) — whose `execute` receives the
+    /// [`SandboxProvider`](crate::harness::SandboxProvider) and
+    /// [`ToolContext`](crate::tool_registry::ToolContext) seams — wrap it here,
+    /// then add it to a harness with
+    /// [`HarnessBuilder::tool`](crate::HarnessBuilder::tool). The builder folds
+    /// it into the run loop with sandbox + storage wired in; you do not bridge
+    /// the registries yourself.
     pub fn new(implementation: Box<dyn Tool>, schema: ToolSchema) -> Self {
         Self {
             implementation,

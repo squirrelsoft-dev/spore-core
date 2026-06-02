@@ -410,11 +410,19 @@ pub enum HarnessSignal {
 pub enum ToolOutput {
     Success {
         content: String,
+        /// `true` only when the tool itself clipped its output to fit an inline
+        /// budget (large outputs routed through
+        /// [`SandboxProvider::handle_large_output`] set this). Plain tool
+        /// authors should leave it `false` — use [`ToolOutput::success`].
         #[serde(default)]
         truncated: bool,
     },
     Error {
         message: String,
+        /// `true` if the agent may sensibly retry or adapt: the loop appends the
+        /// error as a tool result and continues. `false` halts the run. Most
+        /// tool failures are recoverable — prefer [`ToolOutput::error`]; reach
+        /// for [`ToolOutput::fatal`] only when continuing is pointless.
         recoverable: bool,
     },
     /// Boxed because `ChildPausedState` is significantly larger than the other
@@ -427,9 +435,7 @@ pub enum ToolOutput {
     /// (issue #80). The harness terminates cleanly and passes the signal to
     /// the caller via [`RunResult::Escalate`]. The escalation is NOT appended
     /// to message history.
-    Escalate {
-        signal: HarnessSignal,
-    },
+    Escalate { signal: HarnessSignal },
     /// Tool requests a clarifying answer from the human before it can produce a
     /// result (issue #81, Q4b — `AskUserQuestionTool`). UNLIKE
     /// [`ToolOutput::WaitingForHuman`], there is NO [`ChildPausedState`]: the
@@ -444,6 +450,37 @@ pub enum ToolOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         options: Option<Vec<String>>,
     },
+}
+
+impl ToolOutput {
+    /// A successful, non-truncated result. The common case for a tool that
+    /// returns its full output — saves spelling out `truncated: false`.
+    pub fn success(content: impl Into<String>) -> Self {
+        ToolOutput::Success {
+            content: content.into(),
+            truncated: false,
+        }
+    }
+
+    /// A **recoverable** error: the harness loop appends it as a tool result and
+    /// lets the agent adapt or retry. This is the right default for almost every
+    /// tool failure (bad arguments, missing file, transient I/O).
+    pub fn error(message: impl Into<String>) -> Self {
+        ToolOutput::Error {
+            message: message.into(),
+            recoverable: true,
+        }
+    }
+
+    /// A **fatal** error: continuing is pointless, so the run halts. Reserve for
+    /// genuinely unrecoverable conditions; prefer [`ToolOutput::error`] when the
+    /// agent could reasonably do something different next turn.
+    pub fn fatal(message: impl Into<String>) -> Self {
+        ToolOutput::Error {
+            message: message.into(),
+            recoverable: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1702,6 +1739,21 @@ pub struct HarnessConfig {
     /// `Failure { HillClimbingMisconfigured }` — it does NOT panic. Irrelevant
     /// for every other loop strategy. Defaults to `None`.
     pub metric_evaluator: Option<Arc<dyn crate::metric::MetricEvaluator>>,
+    /// Catalogue tools accumulated via [`HarnessBuilder::tool`] / `tools`
+    /// (issue #81), drained into a populated
+    /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) at
+    /// [`build`](HarnessBuilder::build). When `Some`, the run loop bridges it
+    /// per-run via [`RealToolRegistry`](crate::tool_registry::RealToolRegistry)
+    /// — threading the run's `SessionId`, sandbox, and storage into every tool
+    /// dispatch — and uses that instead of [`tool_registry`](Self::tool_registry)
+    /// (which stays the harness-loop seam for custom slim registries). `None`
+    /// (the default) preserves the `tool_registry`-only path byte-for-byte.
+    pub catalogue_registry: Option<Arc<crate::tool_registry::StandardToolRegistry>>,
+    /// Operating system prompt prepended to each turn's assembled context when
+    /// the context manager renders none (issue #91). See
+    /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
+    /// today's behaviour byte-for-byte.
+    pub system_prompt: Option<String>,
 }
 
 impl Clone for HarnessConfig {
@@ -1730,6 +1782,8 @@ impl Clone for HarnessConfig {
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
             metric_evaluator: self.metric_evaluator.clone(),
+            catalogue_registry: self.catalogue_registry.clone(),
+            system_prompt: self.system_prompt.clone(),
         }
     }
 }
@@ -1798,6 +1852,10 @@ pub struct HarnessBuilder {
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
     /// [`HarnessBuilder::build_tool_registry`], applying last-wins upsert.
     standard_tools: Vec<crate::tools::StandardTool>,
+    /// Optional operating system prompt prepended to each turn's assembled
+    /// context (issue #91) when the context manager renders none. `None` (the
+    /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
+    system_prompt: Option<String>,
 }
 
 impl HarnessBuilder {
@@ -1835,6 +1893,7 @@ impl HarnessBuilder {
             vcs_provider: None,
             metric_evaluator: None,
             standard_tools: Vec::new(),
+            system_prompt: None,
         }
     }
 
@@ -1882,7 +1941,13 @@ impl HarnessBuilder {
             .into_harness_adapter();
         let termination_policy: Arc<dyn TerminationPolicy> =
             Arc::new(crate::scenarios::CompleteOnFinalResponse);
-        Self::new(agent, tool_registry, sandbox, context_manager, termination_policy)
+        Self::new(
+            agent,
+            tool_registry,
+            sandbox,
+            context_manager,
+            termination_policy,
+        )
     }
 
     /// Override the harness-loop tool registry (issue #4 seam).
@@ -1907,13 +1972,40 @@ impl HarnessBuilder {
     }
 
     /// Add a single [`StandardTool`](crate::tools::StandardTool) to the
-    /// catalogue accumulated for this harness (issue #81, Q1/Q2). The bundled
-    /// implementation + schema are destructured when the registry is built via
-    /// [`build_tool_registry`](Self::build_tool_registry). Registration applies
-    /// LAST-WINS upsert: a later `.tool()` with the same name overrides an
-    /// earlier one (e.g. a custom tool registered after a preset).
+    /// catalogue accumulated for this harness (issue #81, Q1/Q2).
+    ///
+    /// At [`build`](Self::build) the accumulated tools are folded into a
+    /// populated [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// (via [`drain_tools_into_registry`](Self::drain_tools_into_registry)) and
+    /// the run loop bridges them per-run through
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry), so they run
+    /// with sandbox + storage wired in — no manual bridging required.
+    /// Registration applies LAST-WINS upsert: a later `.tool()` with the same
+    /// name overrides an earlier one (e.g. a custom tool registered after a
+    /// preset).
+    ///
+    /// To author a *custom* sandboxed tool, implement
+    /// [`Tool`](crate::tool_registry::Tool) and wrap it with
+    /// [`StandardTool::new`](crate::tools::StandardTool::new), then pass it here.
+    /// Catalogue tools added this way take precedence over a registry supplied
+    /// via [`tool_registry`](Self::tool_registry).
     pub fn tool(mut self, tool: crate::tools::StandardTool) -> Self {
         self.standard_tools.push(tool);
+        self
+    }
+
+    /// Set an operating system prompt prepended to each turn's assembled context
+    /// (issue #91).
+    ///
+    /// The standard compaction context manager renders no system prompt, so
+    /// without this the model receives only the task as a user message and no
+    /// guidance on how to behave. When set, the run loop inserts this text as a
+    /// leading [`Role::System`](crate::model::Role) message each turn — but only
+    /// when the assembled context does not already start with one, so a context
+    /// manager that renders its own system prompt is preserved. `None` (the
+    /// default) preserves today's behaviour.
+    pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
         self
     }
 
@@ -2110,7 +2202,30 @@ impl HarnessBuilder {
     }
 
     /// Assemble the [`HarnessConfig`] without wrapping it in a harness.
-    pub fn build_config(self) -> HarnessConfig {
+    pub fn build_config(mut self) -> HarnessConfig {
+        // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
+        // populated `StandardToolRegistry` (last-wins upsert). The run loop
+        // bridges it per-run — `build()` can't, because the `ToolContext` is
+        // keyed by the run's `SessionId`, unknown until `run()`.
+        let catalogue_registry = if self.standard_tools.is_empty() {
+            None
+        } else {
+            Some(self.drain_tools_into_registry())
+        };
+        // When catalogue tools are present and the caller wired no storage,
+        // default to an in-memory provider (not the all-no-op default) so that
+        // session-aware tools (todo_write, memory, task_list) actually persist
+        // within the run. Pure tools (read_file/write_file via the sandbox) are
+        // unaffected either way.
+        let storage = self.storage.unwrap_or_else(|| {
+            if catalogue_registry.is_some() {
+                Arc::new(crate::storage::StorageProvider::single(Arc::new(
+                    crate::storage::InMemoryStorageProvider::new(),
+                )))
+            } else {
+                Arc::new(crate::storage::StorageProvider::no_op())
+            }
+        });
         HarnessConfig {
             agent: self.agent,
             tool_registry: self.tool_registry,
@@ -2130,15 +2245,15 @@ impl HarnessBuilder {
             planner_agent: self.planner_agent,
             verifier: self.verifier,
             evaluator_agent: self.evaluator_agent,
-            storage: self
-                .storage
-                .unwrap_or_else(|| Arc::new(crate::storage::StorageProvider::no_op())),
+            storage,
             chunk_provider: self.chunk_provider.unwrap_or_else(|| {
                 Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
             }),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider,
             metric_evaluator: self.metric_evaluator,
+            catalogue_registry,
+            system_prompt: self.system_prompt,
         }
     }
 
@@ -2436,6 +2551,27 @@ impl StandardHarness {
         result
     }
 
+    /// The harness-loop tool registry to use for a run keyed by `session_id`.
+    ///
+    /// When catalogue tools were added via [`HarnessBuilder::tool`] / `tools`,
+    /// this bridges the folded [`StandardToolRegistry`] through
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry) — built
+    /// fresh per run so the run's `SessionId` + storage thread into every tool
+    /// dispatch. Otherwise it returns the injected
+    /// [`tool_registry`](HarnessConfig::tool_registry) seam unchanged.
+    fn effective_tool_registry(&self, session_id: &SessionId) -> Arc<dyn ToolRegistry> {
+        match &self.config.catalogue_registry {
+            Some(catalogue) => Arc::new(crate::tool_registry::RealToolRegistry::new(
+                catalogue.clone(),
+                self.config.sandbox.clone(),
+                session_id.clone(),
+                self.config.storage.run().clone(),
+                self.config.storage.memory().clone(),
+            )),
+            None => self.config.tool_registry.clone(),
+        }
+    }
+
     async fn run_react_inner(
         &self,
         task: Task,
@@ -2445,6 +2581,9 @@ impl StandardHarness {
         on_stream: Option<StreamSink>,
     ) -> RunResult {
         let session_id = task.session_id.clone();
+        // Resolve the effective tool registry once per turn-loop window (all
+        // strategies funnel through here). Bridges catalogue tools per-run.
+        let tool_registry = self.effective_tool_registry(&session_id);
         let started_at = Instant::now();
         let mut usage = AggregateUsage::default();
         // Per-run Stop-hook block counter (issue #69, Decision 4). Resets on
@@ -2535,7 +2674,29 @@ impl StandardHarness {
             // compaction adapter does), so a context manager that deliberately
             // sets a phase-specific tool subset is preserved.
             if context.tools.is_empty() {
-                context.tools = self.config.tool_registry.schemas();
+                context.tools = tool_registry.schemas();
+            }
+            // Prepend the configured operating system prompt (issue #91). The
+            // standard compaction adapter renders none, so without this the
+            // model gets only the task and no guidance. Guard against duplicates
+            // so a context manager that already leads with a System message (or
+            // a resumed/seeded session) isn't given two.
+            if let Some(system_prompt) = self.config.system_prompt.as_ref() {
+                let has_system = context
+                    .messages
+                    .first()
+                    .is_some_and(|m| matches!(m.role, Role::System));
+                if !has_system {
+                    context.messages.insert(
+                        0,
+                        Message {
+                            role: Role::System,
+                            content: Content::Text {
+                                text: system_prompt.clone(),
+                            },
+                        },
+                    );
+                }
             }
             Self::emit(
                 &on_stream,
@@ -2775,10 +2936,7 @@ impl StandardHarness {
                     budget_used.output_tokens += u.output_tokens as u64;
 
                     // Always-halt short circuit (Layer 1).
-                    if let Some(c) = calls
-                        .iter()
-                        .find(|c| self.config.tool_registry.is_always_halt(&c.name))
-                    {
+                    if let Some(c) = calls.iter().find(|c| tool_registry.is_always_halt(&c.name)) {
                         return RunResult::Failure {
                             reason: HaltReason::UnrecoverableToolError {
                                 tool: c.name.clone(),
@@ -2898,11 +3056,7 @@ impl StandardHarness {
                         // starts as the agent's call and may be replaced by a
                         // repaired variant below. Spans/results are stamped from it.
                         let mut effective_call = call.clone();
-                        let mut output = self
-                            .config
-                            .tool_registry
-                            .dispatch(effective_call.clone())
-                            .await;
+                        let mut output = tool_registry.dispatch(effective_call.clone()).await;
 
                         // Tool-call repair (additive): if the dispatch returned a
                         // recoverable error and a repair provider is configured,
@@ -2920,9 +3074,7 @@ impl StandardHarness {
                                 else {
                                     break;
                                 };
-                                let schema = self
-                                    .config
-                                    .tool_registry
+                                let schema = tool_registry
                                     .schemas()
                                     .into_iter()
                                     .find(|s| s.name == effective_call.name);
@@ -2936,11 +3088,7 @@ impl StandardHarness {
                                 };
                                 attempts_left -= 1;
                                 effective_call = repaired_call;
-                                output = self
-                                    .config
-                                    .tool_registry
-                                    .dispatch(effective_call.clone())
-                                    .await;
+                                output = tool_registry.dispatch(effective_call.clone()).await;
                                 if !matches!(
                                     output,
                                     ToolOutput::Error {
@@ -2958,9 +3106,7 @@ impl StandardHarness {
                                         recoverable: true,
                                     } = output
                                     {
-                                        let schema = self
-                                            .config
-                                            .tool_registry
+                                        let schema = tool_registry
                                             .schemas()
                                             .into_iter()
                                             .find(|s| s.name == effective_call.name);
@@ -5310,6 +5456,11 @@ impl StandardHarness {
             child_state,
         } = state;
 
+        // Resolve the effective tool registry for this resumed session — bridges
+        // catalogue tools the same way the turn loop does, so pending tool calls
+        // dispatched during resume thread the run's storage + sandbox.
+        let tool_registry = self.effective_tool_registry(&session_id);
+
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as
         // the tool RESULT for the clarifying call (the head of
@@ -5336,7 +5487,7 @@ impl StandardHarness {
                 }
                 // Dispatch any remaining pending calls from the same batch.
                 for call in pending {
-                    let output = self.config.tool_registry.dispatch(call.clone()).await;
+                    let output = tool_registry.dispatch(call.clone()).await;
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -5407,7 +5558,7 @@ impl StandardHarness {
             HumanResponse::Allow => {
                 // Dispatch remaining pending calls before resuming the loop.
                 for call in pending_tool_calls {
-                    let output = self.config.tool_registry.dispatch(call.clone()).await;
+                    let output = tool_registry.dispatch(call.clone()).await;
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -5420,7 +5571,7 @@ impl StandardHarness {
             }
             HumanResponse::AllowWithModification { calls } => {
                 for call in calls {
-                    let output = self.config.tool_registry.dispatch(call.clone()).await;
+                    let output = tool_registry.dispatch(call.clone()).await;
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -5809,6 +5960,8 @@ mod tests {
             max_resets: 3,
             vcs_provider: None,
             metric_evaluator: None,
+            catalogue_registry: None,
+            system_prompt: None,
         }
     }
 
@@ -5882,6 +6035,137 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    // ---- issue #91: catalogue tool path + system_prompt seam -------------
+
+    fn catalogue_builder(agent: Arc<MockAgent>) -> HarnessBuilder {
+        HarnessBuilder::new(
+            agent,
+            Arc::new(ScriptedToolRegistry::new()),
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+    }
+
+    /// An agent that records the messages of the context it was handed, then
+    /// replies with a final response — lets a test assert what the model saw.
+    struct CapturingAgent {
+        id: AgentId,
+        seen: std::sync::Mutex<Vec<Message>>,
+    }
+    impl Agent for CapturingAgent {
+        fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
+            *self.seen.lock().unwrap() = context.messages.clone();
+            Box::pin(async move {
+                TurnResult::FinalResponse {
+                    content: "done".into(),
+                    usage: usage(),
+                }
+            })
+        }
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn catalogue_tools_fold_into_registry_with_inmemory_storage() {
+        use crate::tool_registry::ToolRegistry as _;
+        let cfg = catalogue_builder(make_agent())
+            .tool(crate::tools::StandardTools::read_file())
+            .tool(crate::tools::StandardTools::write_file())
+            .build_config();
+
+        // Accumulated catalogue tools were folded into a registry.
+        let catalogue = cfg.catalogue_registry.clone().expect("catalogue registry");
+        let names: Vec<String> = catalogue
+            .active_schemas(None)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+
+        // Storage defaulted to in-memory (not all-no-op) because catalogue tools
+        // are present: a put/get round-trips on the run store.
+        let sid = SessionId::new("s1");
+        let run = cfg.storage.run().clone();
+        run.put(&sid, "k", serde_json::json!({ "v": 1 }))
+            .await
+            .unwrap();
+        assert!(run.get(&sid, "k").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn effective_registry_bridges_catalogue_tools() {
+        let cfg = catalogue_builder(make_agent())
+            .tool(crate::tools::StandardTools::read_file())
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let reg = h.effective_tool_registry(&SessionId::new("s1"));
+        // The bridge advertises the catalogue schemas to the model.
+        assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
+        // And maps an inner dispatch failure (unknown tool) to a *recoverable*
+        // error so the loop appends it and the agent can adapt.
+        let out = reg
+            .dispatch(ToolCall {
+                id: "c".into(),
+                name: "does_not_exist".into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        assert!(matches!(
+            out,
+            ToolOutput::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn no_catalogue_tools_keeps_tool_registry_seam() {
+        let cfg = catalogue_builder(make_agent()).build_config();
+        assert!(cfg.catalogue_registry.is_none());
+    }
+
+    #[tokio::test]
+    async fn system_prompt_is_prepended_to_context() {
+        let agent = Arc::new(CapturingAgent {
+            id: AgentId::new("cap"),
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent.clone();
+        cfg.system_prompt = Some("OPERATING RULES".into());
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(react(2))).await;
+
+        let seen = agent.seen.lock().unwrap();
+        let first = seen.first().expect("context had messages");
+        assert!(matches!(first.role, Role::System));
+        assert!(matches!(
+            &first.content,
+            Content::Text { text } if text == "OPERATING RULES"
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_system_prompt_leaves_context_without_a_system_message() {
+        let agent = Arc::new(CapturingAgent {
+            id: AgentId::new("cap"),
+            seen: std::sync::Mutex::new(vec![]),
+        });
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent.clone();
+        // system_prompt stays None.
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(HarnessRunOptions::new(react(2))).await;
+
+        let seen = agent.seen.lock().unwrap();
+        assert!(seen.iter().all(|m| !matches!(m.role, Role::System)));
     }
 
     // Issue #12 — the harness emits real spans through an injected
@@ -8475,6 +8759,8 @@ mod tests {
                 max_resets: 3,
                 vcs_provider: None,
                 metric_evaluator: None,
+                catalogue_registry: None,
+                system_prompt: None,
             })
         }
 

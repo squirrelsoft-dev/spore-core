@@ -74,13 +74,12 @@ pub use harness::{
     CommandOutput, ContextManager as HarnessContextManager, EmptyToolRegistry, FileRef,
     GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
     HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
-    LoopStrategy, MiddlewareChain,
-    MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox, ObservabilityProvider, Operation,
-    OptimizationDirection, PausedState, ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider,
-    SandboxViolation, SessionId, SessionState, StandardHarness, StreamEvent as HarnessStreamEvent,
-    Task, TaskId, TerminationDecision, TerminationPolicy, ToolOutput,
-    ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult, TruncatedOutput,
-    VcsError, VcsLogArgs, VcsProvider,
+    LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox,
+    ObservabilityProvider, Operation, OptimizationDirection, PausedState, ReadOnlySandbox,
+    RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState,
+    StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
+    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    ToolResult as HarnessToolResult, TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{
     CommandHook, FireOutcome, FunctionHook, Hook, HookChain, HookContext, HookDecision, HookError,
@@ -138,8 +137,7 @@ pub use prompt_chunk_registry::{
 pub use sandbox::{BuildError as SandboxBuildError, WorkspaceConfig, WorkspaceScopedSandbox};
 pub use scenarios::{
     build_real_tool_registry, build_rich_context_manager, build_scenario, seed_compaction_state,
-    CompleteOnFinalResponse, FailingTool, RealToolRegistry, ScenarioId,
-    SchemaInjectingContextManager,
+    CompleteOnFinalResponse, FailingTool, ScenarioId, SchemaInjectingContextManager,
 };
 pub use sensor::{
     Sensor, SensorChain, SensorConfig, SensorError, SensorId, SensorInput, SensorKind,
@@ -172,8 +170,8 @@ pub use termination::{
 };
 pub use tool_call_repair::{coerce_tool_args, StandardToolCallRepair, ToolCallRepair};
 pub use tool_registry::{
-    DispatchError, RegistrationError, StandardToolRegistry, TaskPhase, Tool, ToolAnnotations,
-    ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
+    DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
+    ToolAnnotations, ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,
 };
 pub use verifier::{
     CompositeVerifier, EvaluatorResponseVerifier, TestSuiteVerifier, Verifier, VerifierInput,

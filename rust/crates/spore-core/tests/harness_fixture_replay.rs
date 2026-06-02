@@ -72,6 +72,8 @@ async fn react_loop_dispatches_tool_then_completes() {
         max_resets: 3,
         vcs_provider: None,
         metric_evaluator: None,
+        catalogue_registry: None,
+        system_prompt: None,
     };
     let harness = StandardHarness::new(config);
 
