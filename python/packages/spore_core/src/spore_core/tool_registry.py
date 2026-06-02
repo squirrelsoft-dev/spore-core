@@ -24,10 +24,11 @@ Tools receive a :class:`ToolContext` on every dispatch, *in addition to* the
 :meth:`Tool.execute` signature is ``execute(call, sandbox, ctx)`` — ``ctx`` is
 added *after* the sandbox (storage is additive; the sandbox is NOT folded in).
 :meth:`StandardToolRegistry.dispatch` / :meth:`dispatch_all` thread the
-:class:`ToolContext` through to every tool. The harness-side ``RealToolRegistry``
-bridge (``spore_eval.scenarios``) is constructed per-run with the
-:class:`SessionId` + :class:`RunStore` and builds the :class:`ToolContext` itself
-before forwarding; the harness-loop ``dispatch(call)`` signature is UNCHANGED.
+:class:`ToolContext` through to every tool. The harness-side :class:`RealToolRegistry`
+bridge (defined below) is constructed per-run with the :class:`SessionId` +
+:class:`RunStore` + :class:`MemoryStore` and builds the :class:`ToolContext`
+itself before forwarding; the harness-loop ``dispatch(call)`` signature is
+UNCHANGED.
 :class:`ToolContext` is a dataclass so future fields are non-breaking.
 
 What this component does NOT do:
@@ -84,6 +85,7 @@ from .harness import (
     SandboxViolation,
     SessionId,
     ToolOutput,
+    ToolOutputError,
     ToolOutputSuccess,
 )
 from .model import ToolCall
@@ -482,6 +484,85 @@ class StandardToolRegistry:
 
 
 # ============================================================================
+# RealToolRegistry — the bridge between the two ToolRegistry surfaces
+# ============================================================================
+
+
+class RealToolRegistry:
+    """Bridges the harness-loop :class:`spore_core.harness.ToolRegistry` onto
+    this canonical :class:`ToolRegistry` (a populated
+    :class:`StandardToolRegistry`).
+
+    This is **the production wiring** for running catalogue / :class:`Tool`-based
+    tools inside the harness — not test scaffolding. The harness loop calls
+    ``dispatch(ToolCall) -> ToolOutput`` with no sandbox or storage; this bridge
+    forwards to the inner registry's ``dispatch(call, sandbox, ctx)``, threading
+    the :class:`SandboxProvider` and a per-run :class:`ToolContext` (storage
+    seam, #75) it was constructed with. A :class:`DispatchError` becomes a
+    **recoverable** :class:`ToolOutputError` so the loop appends it as a tool
+    result and lets the agent adapt rather than halting.
+
+    It is built **once per run**: ``session_id``, ``run_store``, and
+    ``memory_store`` are injected at construction (the run's :class:`SessionId`
+    is only known at ``run()``-time) and used to build the :class:`ToolContext`
+    forwarded on every dispatch. :class:`~spore_core.harness.HarnessBuilder`
+    wires this automatically when catalogue tools are added via ``.tool()`` /
+    ``.tools()``; construct it directly only when supplying your own
+    :class:`StandardToolRegistry`.
+    """
+
+    def __init__(
+        self,
+        inner: StandardToolRegistry,
+        sandbox: SandboxProvider,
+        session_id: SessionId,
+        run_store: RunStore,
+        memory_store: MemoryStore,
+    ) -> None:
+        self._inner = inner
+        self._sandbox = sandbox
+        self._ctx = ToolContext(
+            session_id=session_id,
+            run_store=run_store,
+            memory_store=memory_store,
+        )
+        # Snapshot the model-facing schemas (sorted by name) once at
+        # construction; the catalogue is fixed for a run.
+        self._schemas: list[ModelToolSchema] = sorted(
+            (s.to_model_schema() for s in inner.active_schemas(None)),
+            key=lambda s: s.name,
+        )
+
+    def model_schemas(self) -> list[ModelToolSchema]:
+        """The model-facing tool schemas, sorted by name."""
+        return list(self._schemas)
+
+    def tool_context(self) -> ToolContext:
+        """The :class:`ToolContext` this bridge threads into every dispatch —
+        exposing the ``session_id``, ``run_store`` and (#78) ``memory_store``
+        seams it was wired with. Lets callers verify the storage seams are
+        live."""
+        return self._ctx
+
+    async def dispatch(self, call: ToolCall) -> ToolOutput:
+        try:
+            result = await self._inner.dispatch(call, self._sandbox, self._ctx)
+        except DispatchError as err:
+            # Recoverable so the loop appends the error and lets the agent
+            # adapt — S4 depends on this.
+            return ToolOutputError(message=f"dispatch failed: {err}", recoverable=True)
+        return result.output
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        # No bridged tool is always-halt — S4 needs recoverable failure.
+        _ = tool_name
+        return False
+
+    def schemas(self) -> list[ModelToolSchema]:
+        return list(self._schemas)
+
+
+# ============================================================================
 # Mock tools (test utility)
 # ============================================================================
 
@@ -601,6 +682,7 @@ __all__ = [
     "DispatchError",
     "EchoTool",
     "FailingTool",
+    "RealToolRegistry",
     "RegistrationError",
     "StandardToolRegistry",
     "SubagentMock",

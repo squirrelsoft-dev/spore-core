@@ -500,15 +500,51 @@ HumanResponse = Annotated[
 
 
 class ToolOutputSuccess(_Model):
+    """A successful tool result.
+
+    ``truncated`` is ``True`` only when the tool itself clipped its output to
+    fit an inline budget (large outputs routed through
+    :meth:`SandboxProvider.handle_large_output` set this). Plain tool authors
+    should leave it ``False`` — use :meth:`success`.
+    """
+
     kind: Literal["success"] = "success"
     content: str
     truncated: bool = False
 
+    @classmethod
+    def success(cls, content: str) -> ToolOutputSuccess:
+        """A successful, non-truncated result. The common case for a tool that
+        returns its full output — saves spelling out ``truncated=False``."""
+        return cls(content=content, truncated=False)
+
 
 class ToolOutputError(_Model):
+    """A failed tool result.
+
+    ``recoverable`` is ``True`` if the agent may sensibly retry or adapt: the
+    loop appends the error as a tool result and continues. ``False`` halts the
+    run. Most tool failures are recoverable — prefer :meth:`error`; reach for
+    :meth:`fatal` only when continuing is pointless.
+    """
+
     kind: Literal["error"] = "error"
     message: str
     recoverable: bool = True
+
+    @classmethod
+    def error(cls, message: str) -> ToolOutputError:
+        """A **recoverable** error: the harness loop appends it as a tool result
+        and lets the agent adapt or retry. This is the right default for almost
+        every tool failure (bad arguments, missing file, transient I/O)."""
+        return cls(message=message, recoverable=True)
+
+    @classmethod
+    def fatal(cls, message: str) -> ToolOutputError:
+        """A **fatal** error: continuing is pointless, so the run halts. Reserve
+        for genuinely unrecoverable conditions; prefer :meth:`error` when the
+        agent could reasonably do something different next turn."""
+        return cls(message=message, recoverable=False)
 
 
 class ToolOutputWaitingForHuman(_Model):
@@ -1703,6 +1739,8 @@ class HarnessConfig:
         storage: StorageProvider | None = None,
         chunk_provider: Any | None = None,
         metric_evaluator: Any | None = None,
+        catalogue_registry: StandardToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.agent = agent
         # The HillClimbing scoring strategy (issue #60). REQUIRED for the
@@ -1797,6 +1835,21 @@ class HarnessConfig:
 
             chunk_provider = InMemoryChunkProvider.empty()
         self.chunk_provider: Any = chunk_provider
+        # Catalogue tools accumulated via :meth:`HarnessBuilder.tool` /
+        # ``tools`` (issue #81), drained into a populated
+        # :class:`StandardToolRegistry` at :meth:`HarnessBuilder.build_config`.
+        # When not ``None`` the run loop bridges it per-run via
+        # :class:`~spore_core.tool_registry.RealToolRegistry` — threading the
+        # run's :class:`SessionId`, sandbox, and storage into every tool
+        # dispatch — and uses that instead of :attr:`tool_registry` (which stays
+        # the harness-loop seam for custom slim registries). ``None`` (the
+        # default) preserves the ``tool_registry``-only path unchanged.
+        self.catalogue_registry: StandardToolRegistry | None = catalogue_registry
+        # Operating system prompt prepended to each turn's assembled context
+        # when the context manager renders none (issue #91). See
+        # :meth:`HarnessBuilder.system_prompt`. ``None`` (the default) preserves
+        # today's behaviour.
+        self.system_prompt: str | None = system_prompt
 
 
 class HarnessBuilder:
@@ -1846,6 +1899,10 @@ class HarnessBuilder:
         # ``StandardTool`` lives in ``spore_tools`` and must not be imported
         # here — that would invert the package dependency).
         self._standard_tools: list[Any] = []
+        # Optional operating system prompt prepended to each turn's assembled
+        # context (issue #91) when the context manager renders none. ``None``
+        # (the default) preserves today's behaviour. See :meth:`system_prompt`.
+        self._system_prompt: str | None = None
         # Pluggable chunk source for the #79 prompt assembly engine. Defaults to
         # an empty in-memory provider so existing callers are unaffected. Typed
         # ``Any`` to avoid importing ``prompt_assembly`` at module load (that
@@ -1883,6 +1940,20 @@ class HarnessBuilder:
         ``StandardTools.coding_set()``). Order is preserved, so last-wins upsert
         still applies across the batch."""
         self._standard_tools.extend(tools)
+        return self
+
+    def system_prompt(self, system_prompt: str) -> HarnessBuilder:
+        """Set an operating system prompt prepended to each turn's assembled
+        context (issue #91).
+
+        The standard compaction context manager renders no system prompt, so
+        without this the model receives only the task as a user message and no
+        guidance on how to behave. When set, the run loop inserts this text as a
+        leading :class:`~spore_core.model.Role.SYSTEM` message each turn — but
+        only when the assembled context does not already start with one, so a
+        context manager that renders its own system prompt is preserved.
+        ``None`` (the default) preserves today's behaviour."""
+        self._system_prompt = system_prompt
         return self
 
     def drain_tools_into_registry(self) -> StandardToolRegistry:
@@ -2020,6 +2091,24 @@ class HarnessBuilder:
     def build_config(self) -> HarnessConfig:
         """Assemble the :class:`HarnessConfig` without wrapping it in a
         harness."""
+        # Fold catalogue tools accumulated via ``.tool()`` / ``.tools()`` into a
+        # populated :class:`StandardToolRegistry` (last-wins upsert). The run
+        # loop bridges it per-run — ``build()`` can't, because the
+        # :class:`ToolContext` is keyed by the run's :class:`SessionId`, unknown
+        # until ``run()``.
+        catalogue_registry: StandardToolRegistry | None = (
+            self.drain_tools_into_registry() if self._standard_tools else None
+        )
+        # When catalogue tools are present and the caller wired no storage,
+        # default to an in-memory provider (not the all-no-op default) so that
+        # session-aware tools (todo_write, memory, task_list) actually persist
+        # within the run. Pure tools (read_file/write_file via the sandbox) are
+        # unaffected either way.
+        storage = self._storage
+        if storage is None and catalogue_registry is not None:
+            from .storage import InMemoryStorageProvider
+
+            storage = StorageProvider.single(InMemoryStorageProvider())
         return HarnessConfig(
             agent=self._agent,
             tool_registry=self._tool_registry,
@@ -2039,9 +2128,11 @@ class HarnessBuilder:
             planner_agent=self._planner_agent,
             verifier=self._verifier,
             evaluator_agent=self._evaluator_agent,
-            storage=self._storage,
+            storage=storage,
             chunk_provider=self._chunk_provider,
             metric_evaluator=self._metric_evaluator,
+            catalogue_registry=catalogue_registry,
+            system_prompt=self._system_prompt,
         )
 
     def build(self) -> StandardHarness:
@@ -2242,6 +2333,29 @@ class StandardHarness:
         (issue #73, expose-only)."""
         return self._config.storage.session()
 
+    def _effective_tool_registry(self, session_id: SessionId) -> ToolRegistry:
+        """The harness-loop tool registry to use for a run keyed by
+        ``session_id`` (issue #91).
+
+        When catalogue tools were added via :meth:`HarnessBuilder.tool` /
+        ``tools``, this bridges the folded :class:`StandardToolRegistry` through
+        :class:`~spore_core.tool_registry.RealToolRegistry` — built fresh per run
+        so the run's :class:`SessionId` + storage thread into every tool
+        dispatch. Otherwise it returns the injected
+        :attr:`HarnessConfig.tool_registry` seam unchanged."""
+        catalogue = self._config.catalogue_registry
+        if catalogue is None:
+            return self._config.tool_registry
+        from .tool_registry import RealToolRegistry
+
+        return RealToolRegistry(
+            catalogue,
+            self._config.sandbox,
+            session_id,
+            self._config.storage.run(),
+            self._config.storage.memory(),
+        )
+
     # ---- helpers ----------------------------------------------------
 
     @staticmethod
@@ -2390,6 +2504,10 @@ class StandardHarness:
         task = state.task
         budget_used = state.budget_used
         session_id = state.session_id
+        # Resolve the effective tool registry for this resumed session — bridges
+        # catalogue tools the same way the turn loop does, so pending tool calls
+        # dispatched during resume thread the run's storage + sandbox (issue #91).
+        tool_registry = self._effective_tool_registry(session_id)
 
         # Clarification resume (issue #81, Q4b): if this pause came from
         # :class:`ToolOutputAwaitingClarification`, the human's answer is
@@ -2411,7 +2529,7 @@ class StandardHarness:
                 )
                 await self._config.context_manager.append_tool_result(session_state, tr)
                 for call in rest:
-                    output = await self._config.tool_registry.dispatch(call)
+                    output = await tool_registry.dispatch(call)
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
             max_iterations = (
@@ -2456,13 +2574,13 @@ class StandardHarness:
 
         elif isinstance(response, HumanResponseAllow):
             for call in pending:
-                output = await self._config.tool_registry.dispatch(call)
+                output = await tool_registry.dispatch(call)
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         elif isinstance(response, HumanResponseAllowWithModification):
             for call in response.calls:
-                output = await self._config.tool_registry.dispatch(call)
+                output = await tool_registry.dispatch(call)
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
@@ -3809,6 +3927,9 @@ class StandardHarness:
         on_stream: StreamSink | None,
     ) -> RunResult:
         session_id = task.session_id
+        # Resolve the effective tool registry once per turn-loop window (all
+        # strategies funnel through here). Bridges catalogue tools per-run.
+        tool_registry = self._effective_tool_registry(session_id)
         started_at = time.monotonic()
         usage = AggregateUsage()
         # Monotonic per-run span counter for tool-call span ids, and the most
@@ -3871,6 +3992,27 @@ class StandardHarness:
 
             # Assemble + invoke agent for one turn.
             context = await config.context_manager.assemble(session_state, task)
+            # Fill the model-facing tool list from the effective registry only
+            # when the context manager rendered none (the compaction adapter
+            # does), so a context manager that deliberately sets a phase-specific
+            # tool subset is preserved.
+            if not context.tools:
+                context.tools = tool_registry.schemas()
+            # Prepend the configured operating system prompt (issue #91). The
+            # standard compaction adapter renders none, so without this the model
+            # gets only the task and no guidance. Guard against duplicates so a
+            # context manager that already leads with a System message (or a
+            # resumed/seeded session) isn't given two.
+            if config.system_prompt is not None and not (
+                context.messages and context.messages[0].role == Role.SYSTEM
+            ):
+                context.messages.insert(
+                    0,
+                    Message(
+                        role=Role.SYSTEM,
+                        content=TextContent(text=config.system_prompt),
+                    ),
+                )
             self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
             turn_started_at = _now()
             turn_clock = time.monotonic()
@@ -4048,7 +4190,7 @@ class StandardHarness:
 
                 # Always-halt short-circuit.
                 for c in result.calls:
-                    if config.tool_registry.is_always_halt(c.name):
+                    if tool_registry.is_always_halt(c.name):
                         return self._fail(
                             HaltReasonUnrecoverableToolError(
                                 tool=c.name,
@@ -4142,7 +4284,7 @@ class StandardHarness:
                     self._emit(on_stream, StreamToolCall(call_id=call.id, name=call.name))
                     tool_started_at = _now()
                     tool_clock = time.monotonic()
-                    output = await config.tool_registry.dispatch(call)
+                    output = await tool_registry.dispatch(call)
 
                     # Subagent pause propagation.
                     if isinstance(output, ToolOutputWaitingForHuman):
