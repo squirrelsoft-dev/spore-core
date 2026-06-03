@@ -1,0 +1,23 @@
+{
+  "name": "spore-example-04-filesystem-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 04: a ReAct agent using the built-in catalogue file tools to summarize a directory and write SUMMARY.md.",
+  "scripts": {
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}

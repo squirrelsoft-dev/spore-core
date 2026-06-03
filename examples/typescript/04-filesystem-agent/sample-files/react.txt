@@ -1,0 +1,1 @@
+The ReAct loop interleaves reasoning and acting. The agent thinks, calls a tool, observes the result, and repeats until it can answer.
