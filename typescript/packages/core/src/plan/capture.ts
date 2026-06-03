@@ -114,7 +114,7 @@ function trimAsciiWs(s: string): string {
  * Returns the inner body, re-trimmed. If the input does not open with a fence
  * it is returned unchanged. Mirrors the Rust `strip_code_fence`.
  */
-function stripCodeFence(trimmed: string): string {
+export function stripCodeFence(trimmed: string): string {
   if (!trimmed.startsWith("```")) {
     return trimmed;
   }

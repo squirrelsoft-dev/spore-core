@@ -29,6 +29,7 @@
  * {@link "../cache-provider/types.js".OllamaCacheProvider} is a no-op.
  */
 
+import { stripCodeFence } from "../plan/index.js";
 import { ProviderError, Timeout, type ModelError } from "./errors.js";
 import type { ModelInterface } from "./interface.js";
 import type {
@@ -721,7 +722,11 @@ export function parseStructuredContent(raw: string, index: number): [ContentBloc
   const fallback: [ContentBlock[], StopReason] = [[{ type: "text", text: raw }], "end_turn"];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw.trim());
+    // Capable/cloud models often ignore the constrained-decoding grammar and
+    // wrap the JSON tool call in a markdown code fence. Reuse the plan parser's
+    // fence stripping so a fenced `{"tool":...}` still dispatches instead of
+    // being mis-read as a final text answer. Mirrors Rust's `parse_structured_content`.
+    parsed = JSON.parse(stripCodeFence(raw.trim()));
   } catch {
     return fallback;
   }

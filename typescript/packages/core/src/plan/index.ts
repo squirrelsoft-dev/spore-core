@@ -12,4 +12,4 @@ export {
   type PlanArtifact,
   type PlanPhaseErrorKind,
 } from "./types.js";
-export { capturePlanArtifact, type CaptureResult } from "./capture.js";
+export { capturePlanArtifact, stripCodeFence, type CaptureResult } from "./capture.js";

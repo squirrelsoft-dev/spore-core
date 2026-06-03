@@ -383,6 +383,53 @@ describe("parseResponse structured tool calls", () => {
     expect(stop).toBe("end_turn");
     expect(content).toEqual([{ type: "text", text: '{"foo":"bar"}' }]);
   });
+
+  // Regression for the exact gemma-cloud output: the constrained JSON tool call
+  // arrives inside a ```json fence. Must dispatch, not fall back to text.
+  it("parseStructuredContent json-fenced tool call dispatches", () => {
+    const raw = '```json\n{"tool":"web_search","arguments":{"query":"x"}}\n```';
+    const [content, stop] = ollamaParseStructuredContent(raw, 0);
+    expect(stop).toBe("tool_use");
+    const tc = content[0] as Extract<ContentBlock, { type: "tool_use" }>;
+    expect(tc.type).toBe("tool_use");
+    expect(tc.name).toBe("web_search");
+    expect(tc.input).toEqual({ query: "x" });
+  });
+
+  // A bare ``` fence (no language tag) also strips and dispatches.
+  it("parseStructuredContent bare-fenced tool call dispatches", () => {
+    const raw = '```\n{"tool":"web_search","arguments":{"query":"y"}}\n```';
+    const [content, stop] = ollamaParseStructuredContent(raw, 0);
+    expect(stop).toBe("tool_use");
+    const tc = content[0] as Extract<ContentBlock, { type: "tool_use" }>;
+    expect(tc.type).toBe("tool_use");
+    expect(tc.name).toBe("web_search");
+  });
+
+  // A fenced `final` envelope still resolves to a text/end_turn answer.
+  it("parseStructuredContent fenced final is text", () => {
+    const raw = '```json\n{"tool":"final","content":"done"}\n```';
+    const [content, stop] = ollamaParseStructuredContent(raw, 0);
+    expect(stop).toBe("end_turn");
+    expect(content).toEqual([{ type: "text", text: "done" }]);
+  });
+
+  // Un-fenced tool calls (grammar-honoring models) still dispatch — no regression.
+  it("parseStructuredContent raw tool call still dispatches", () => {
+    const raw = '{"tool":"web_search","arguments":{"query":"z"}}';
+    const [content, stop] = ollamaParseStructuredContent(raw, 0);
+    expect(stop).toBe("tool_use");
+    const tc = content[0] as Extract<ContentBlock, { type: "tool_use" }>;
+    expect(tc.type).toBe("tool_use");
+    expect(tc.name).toBe("web_search");
+  });
+
+  // Genuine garbage still falls back to a text block with end_turn.
+  it("parseStructuredContent garbage falls back to text", () => {
+    const [content, stop] = ollamaParseStructuredContent("not json at all", 0);
+    expect(stop).toBe("end_turn");
+    expect(content).toEqual([{ type: "text", text: "not json at all" }]);
+  });
 });
 
 // ---------------------------------------------------------------------------
