@@ -38,6 +38,10 @@ All facts use ``StorageScope.PROJECT`` (the ``memory`` tool rejects ``Local``).
 The prompts instruct the agent to use ``scope: "project"`` consistently so the
 recall read hits the same scope the store writes wrote.
 
+This example also enables ``ModelParams(structured_tool_calls=True)`` via
+``HarnessBuilder.model_params(..)`` — schema-constrained decoding that helps
+small Ollama models emit one clean ``memory`` tool call per turn.
+
 Run it::
 
     ollama serve &
@@ -60,6 +64,7 @@ from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
     LoopStrategyReAct,
+    ModelParams,
     OllamaModelInterface,
     RunResultSuccess,
     SessionId,
@@ -128,6 +133,10 @@ async def _run_phase(
         .storage(storage)
         .tool(StandardTools.memory())
         .system_prompt(system_prompt)
+        # Structured mode helps small Ollama models emit clean tool calls (one
+        # per turn, no interleaved reasoning — so the "think" line is just a
+        # turn marker, not model chatter).
+        .model_params(ModelParams(structured_tool_calls=True))
         .build()
     )
 

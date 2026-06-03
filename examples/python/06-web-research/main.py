@@ -31,6 +31,11 @@ The ONLY substantive difference from 04 is the tool set: 04 registers
 ``coding_set()``, 06 registers a ``web_search`` tool + ``write_file`` +
 ``read_file``. Same harness, different tools.
 
+This example also enables ``ModelParams(structured_tool_calls=True)`` via
+``HarnessBuilder.model_params(..)`` — schema-constrained decoding that helps
+small Ollama models emit one clean tool call per turn instead of malformed or
+interleaved output.
+
 Run it::
 
     ollama serve &
@@ -52,6 +57,7 @@ from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
     LoopStrategyReAct,
+    ModelParams,
     OllamaModelInterface,
     RunResultSuccess,
     StreamToolCall,
@@ -146,6 +152,10 @@ async def main() -> int:
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
+        # Structured mode helps small Ollama models emit clean tool calls (one
+        # per turn, no interleaved reasoning — so the "think" line is just a
+        # turn marker, not model chatter).
+        .model_params(ModelParams(structured_tool_calls=True))
         .build()
     )
 

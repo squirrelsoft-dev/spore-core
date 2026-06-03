@@ -40,6 +40,11 @@ Tools wired (all from the built-in catalogue, identical to 06):
 - ``write_file`` — the agent writes ``async-comparison.md`` into ``workspace/``.
 - ``read_file`` — lets the agent re-read what it wrote.
 
+This example also enables ``ModelParams(structured_tool_calls=True)`` via
+``HarnessBuilder.model_params(..)`` — schema-constrained decoding that helps
+small Ollama models emit one clean tool call per turn across both the plan and
+execute phases.
+
 Run it::
 
     ollama serve &
@@ -68,6 +73,7 @@ from spore_core import (
     HookEvent,
     HookSync,
     LoopStrategyPlanExecute,
+    ModelParams,
     OllamaModelInterface,
     OnPlanCreatedContext,
     OnTaskAdvanceContext,
@@ -205,6 +211,10 @@ async def main() -> int:
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
+        # Structured mode helps small Ollama models emit clean tool calls (one
+        # per turn, no interleaved reasoning — so the "think" line is just a
+        # turn marker, not model chatter).
+        .model_params(ModelParams(structured_tool_calls=True))
         .hooks(chain)
         .build()
     )

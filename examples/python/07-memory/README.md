@@ -147,3 +147,8 @@ This uses Ollama (`llama3.2`) like examples 01–06, so it runs with no hosted
 account. Recall quality scales with the model: a **larger hosted model follows
 the store/recall tool protocol more reliably**. The harness is model-agnostic —
 swap the model interface and change nothing else.
+
+This example also enables `structured_tool_calls` via
+`HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`. That
+turns on schema-constrained decoding so small Ollama models emit one clean
+`memory` tool call per turn instead of malformed JSON.
