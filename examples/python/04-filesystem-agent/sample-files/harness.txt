@@ -1,0 +1,1 @@
+A harness is everything around a model that makes it reliable: tools, sandbox, memory, and the loop that drives them. The model reasons; the harness does the rest.

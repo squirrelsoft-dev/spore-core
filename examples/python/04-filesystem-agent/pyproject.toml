@@ -1,0 +1,10 @@
+[project]
+name = "spore-example-04-filesystem-agent"
+version = "0.0.0"
+description = "spore-core example 04 — filesystem agent with catalogue tools (Python)"
+requires-python = ">=3.12"
+dependencies = ["spore-core", "spore-tools"]
+
+[tool.uv.sources]
+spore-core = { path = "../../../python/packages/spore_core", editable = true }
+spore-tools = { path = "../../../python/packages/spore_tools", editable = true }
