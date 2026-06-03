@@ -157,13 +157,36 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 	if v != nil {
 		return SandboxViolationError(v).ToToolOutput()
 	}
+	// Emit paths relative to the workspace root so each entry can be fed
+	// straight back into read_file/write_file. The sandbox treats every input
+	// path as root-relative, so absolute paths would not round-trip (see #93).
+	// `resolved` is the absolute path of the listed directory (= root-relative
+	// `params.Path`); each entry is under it. Relativize against `resolved`,
+	// then re-anchor onto the caller-supplied (root-relative) `params.Path`.
+	toRootRelative := func(entryAbsPath string) (string, bool) {
+		relToListed, err := filepath.Rel(resolved, entryAbsPath)
+		if err != nil {
+			return "", false
+		}
+		// Skip the listed directory itself (WalkDir yields it first as ".").
+		if relToListed == "." || relToListed == "" {
+			return "", false
+		}
+		// Re-anchor onto the caller-supplied path, then drop a leading "./" so
+		// "."/empty inputs yield bare names. filepath.Clean normalizes away the
+		// "." component when params.Path is "." or empty.
+		anchored := filepath.Clean(filepath.Join(params.Path, relToListed))
+		return filepath.ToSlash(anchored), true
+	}
 	var entries []string
 	if params.Recursive {
 		err := filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil // best effort — skip errors
 			}
-			entries = append(entries, path)
+			if rel, ok := toRootRelative(path); ok {
+				entries = append(entries, rel)
+			}
 			return nil
 		})
 		if err != nil {
@@ -175,7 +198,9 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 			return ExecutionFailed(fmt.Sprintf("read_dir failed: %s", err), true).ToToolOutput()
 		}
 		for _, e := range ents {
-			entries = append(entries, filepath.Join(resolved, e.Name()))
+			if rel, ok := toRootRelative(filepath.Join(resolved, e.Name())); ok {
+				entries = append(entries, rel)
+			}
 		}
 	}
 	sort.Strings(entries)

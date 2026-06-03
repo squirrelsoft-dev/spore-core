@@ -67,6 +67,70 @@ func TestListDirSorted(t *testing.T) {
 	}
 }
 
+// Regression for #93: every entry list_dir returns must round-trip straight
+// back into read_file under the *real* WorkspaceScopedSandbox, which treats
+// all input paths as root-relative. Absolute paths (the old behavior) would
+// be rejected as a non-recoverable path-escape violation.
+func TestListDirEntriesRoundtripThroughWorkspaceSandbox(t *testing.T) {
+	dir := t.TempDir()
+	root, _ := filepath.EvalSymlinks(dir)
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("beta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "c.txt"), []byte("gamma"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Recursive so we exercise both top-level files and a nested file.
+	r := NewListDirTool().Execute(ctx,
+		call("list_dir", "c1", map[string]any{"path": ".", "recursive": true}), sb, nil)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("list_dir failed: %+v", r)
+	}
+	entries := splitLines(r.Content)
+
+	var sawTop, sawNested bool
+	for _, e := range entries {
+		if e == "a.txt" {
+			sawTop = true
+		}
+		if e == "sub/c.txt" {
+			sawNested = true
+		}
+		if e == "" || e == "." {
+			t.Fatalf("must not emit the listed dir itself, got %v", entries)
+		}
+	}
+	if !sawTop {
+		t.Fatalf("expected bare root-relative name a.txt, got %v", entries)
+	}
+	if !sawNested {
+		t.Fatalf("expected nested entry sub/c.txt, got %v", entries)
+	}
+
+	// The actual bug check: feed each entry straight into read_file.
+	for _, entry := range entries {
+		rr := NewReadFileTool().Execute(ctx,
+			call("read_file", "c2", map[string]any{"path": entry}), sb, nil)
+		// A directory entry (e.g. `sub`) reads as a recoverable error but must
+		// NOT be a non-recoverable sandbox violation — that's the regression.
+		if rr.Kind == sporecore.ToolOutputError && !rr.Recoverable {
+			t.Fatalf("entry %q did not round-trip: %+v", entry, rr)
+		}
+	}
+}
+
 func TestDeleteMissingIsRecoverable(t *testing.T) {
 	sb := sporecore.AllowAllSandbox{}
 	r := NewDeleteFileTool().Execute(context.Background(),
