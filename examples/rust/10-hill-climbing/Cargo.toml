@@ -1,0 +1,11 @@
+[package]
+name = "hill-climbing"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "spore-core example 10: the HillClimbing loop strategy — score a draft each iteration, keep on improvement, revert otherwise, halt on stagnation or budget. There is no PASS — only best-so-far."
+
+[dependencies]
+spore-core = { path = "../../../rust/crates/spore-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
