@@ -26,6 +26,7 @@ pub mod context;
 pub mod guide_registry;
 pub mod harness;
 pub mod hooks;
+pub mod macros;
 pub mod memory;
 pub mod metric;
 pub mod middleware;
@@ -37,6 +38,7 @@ pub mod openai;
 pub mod plan;
 pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
+pub mod prompt_tool_call;
 pub mod sandbox;
 pub mod sensor;
 pub mod storage;
@@ -155,6 +157,10 @@ pub use tools::{
 };
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.
+pub use prompt_tool_call::{
+    inject_tool_prompt, parse_prose_response, AdaptiveToolCallModelInterface,
+    PromptBasedToolCallModelInterface,
+};
 #[allow(deprecated)]
 pub use termination::{
     check_budget_default, AlwaysComplete, BudgetValue, CompletionCheck, FeatureListCheck,
@@ -163,7 +169,10 @@ pub use termination::{
     TerminationFailureReason, TerminationInput, TerminationPolicy as FullTerminationPolicy,
     TestSuiteCheck,
 };
-pub use tool_call_repair::{coerce_tool_args, StandardToolCallRepair, ToolCallRepair};
+pub use tool_call_repair::{
+    coerce_tool_args, detect_prose_response, StandardToolCallRepair, ToolCallFailure,
+    ToolCallRepair,
+};
 pub use tool_registry::{
     DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
     ToolAnnotations, ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,

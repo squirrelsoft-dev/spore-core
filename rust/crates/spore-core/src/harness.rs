@@ -1927,6 +1927,14 @@ pub struct HarnessConfig {
     /// `false` (the default) preserves today's behaviour byte-for-byte: ZERO
     /// `get_session`/`put_session` calls and identical message flow.
     pub auto_persist_sessions: bool,
+    /// Session-scoped prompt-based-tool-calling escalation flag, shared with the
+    /// [`AdaptiveToolCallModelInterface`](crate::prompt_tool_call::AdaptiveToolCallModelInterface)
+    /// installed by [`HarnessBuilder::conversational`]. `Some` only on that path.
+    /// The run loop resets it at the start of each turn-loop window and flips it
+    /// to `true` on detecting a prose response where a tool call was expected;
+    /// the wrapped model reads it to switch into prompt-based mode. `None`
+    /// disables adaptive escalation (every non-`conversational` construction).
+    pub prompt_tool_call_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1959,6 +1967,7 @@ impl Clone for HarnessConfig {
             system_prompt: self.system_prompt.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
+            prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
         }
     }
 }
@@ -2039,6 +2048,13 @@ pub struct HarnessBuilder {
     /// `false` (the default) preserves today's behaviour byte-for-byte (ZERO
     /// session-store I/O). See [`auto_persist_sessions`](HarnessBuilder::auto_persist_sessions).
     auto_persist_sessions: bool,
+    /// Session-scoped escalation flag shared with an
+    /// [`AdaptiveToolCallModelInterface`](crate::prompt_tool_call::AdaptiveToolCallModelInterface)
+    /// installed by [`conversational`](HarnessBuilder::conversational). `Some`
+    /// only on that path; the run loop flips it on detecting a prose response so
+    /// the wrapped model switches to prompt-based tool calling for the rest of
+    /// the run. `None` for every other construction (no adaptive wrapping).
+    prompt_tool_call_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl HarnessBuilder {
@@ -2079,6 +2095,7 @@ impl HarnessBuilder {
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
+            prompt_tool_call_flag: None,
         }
     }
 
@@ -2111,9 +2128,22 @@ impl HarnessBuilder {
     pub fn conversational<M: crate::model::ModelInterface + 'static>(model: M) -> Self {
         use crate::compaction_adapter::HarnessContextManagerExt;
         let model = Arc::new(model);
+        // Install the adaptive prompt-based tool-calling wrapper around the
+        // agent's model. While its flag is unset it delegates natively
+        // (byte-for-byte); the run loop flips the flag on detecting a prose
+        // response so the model switches to prompt-based tool calling for the
+        // rest of the run. The context manager keeps the *raw* model (its only
+        // model use is compaction summarization, which advertises no tools).
+        let prompt_tool_call_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adaptive_model = Arc::new(
+            crate::prompt_tool_call::AdaptiveToolCallModelInterface::new(
+                model.clone(),
+                prompt_tool_call_flag.clone(),
+            ),
+        );
         let agent: Arc<dyn Agent> = Arc::new(crate::agent::ModelAgent::new(
             crate::agent::AgentId::new("agent"),
-            model.clone(),
+            adaptive_model,
         ));
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(NullSandbox);
@@ -2125,13 +2155,15 @@ impl HarnessBuilder {
             ))
             .into_harness_adapter();
         let termination_policy: Arc<dyn TerminationPolicy> = Arc::new(CompleteOnFinalResponse);
-        Self::new(
+        let mut builder = Self::new(
             agent,
             tool_registry,
             sandbox,
             context_manager,
             termination_policy,
-        )
+        );
+        builder.prompt_tool_call_flag = Some(prompt_tool_call_flag);
+        builder
     }
 
     /// Override the harness-loop tool registry (issue #4 seam).
@@ -2504,6 +2536,7 @@ impl HarnessBuilder {
             system_prompt: self.system_prompt,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
+            prompt_tool_call_flag: self.prompt_tool_call_flag,
         }
     }
 
@@ -2941,6 +2974,14 @@ impl StandardHarness {
         // Resolve the effective tool registry once per turn-loop window (all
         // strategies funnel through here). Bridges catalogue tools per-run.
         let tool_registry = self.effective_tool_registry(&session_id);
+        // Reset the adaptive prompt-based-tool-calling escalation flag at the
+        // start of this turn-loop window so detection is scoped to the window
+        // and does not leak across `run()` calls (the flag is shared with the
+        // model wrapper for the harness's lifetime). No-op unless a
+        // `conversational` harness installed the adaptive wrapper.
+        if let Some(flag) = self.config.prompt_tool_call_flag.as_ref() {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
         let started_at = Instant::now();
         let mut usage = AggregateUsage::default();
         // Per-run Stop-hook block counter (issue #69, Decision 4). Resets on
@@ -3064,6 +3105,11 @@ impl StandardHarness {
             // structured tool calls) to every tool-requesting ReAct/execute/
             // streaming turn.
             context.params = self.config.model_params.clone();
+            // Whether tools were advertised to the model this turn — a
+            // precondition for classifying a prose final response as a missed
+            // tool call (adaptive prompt-based escalation). Captured before
+            // `context` is moved into the turn.
+            let tools_advertised = !context.tools.is_empty();
             Self::emit(
                 &on_stream,
                 StreamEvent::TurnStart {
@@ -3227,6 +3273,48 @@ impl StandardHarness {
                     usage.add_turn(&u);
                     budget_used.input_tokens += u.input_tokens as u64;
                     budget_used.output_tokens += u.output_tokens as u64;
+
+                    // Adaptive prompt-based tool-calling escalation. When tools
+                    // were advertised but the model answered in prose with
+                    // action-intent language (it *meant* to act), classify the
+                    // turn as a `ProseResponse` failure and escalate: set the
+                    // session flag so the wrapped model switches to prompt-based
+                    // tool calling, nudge the model, and force another turn
+                    // instead of completing. Guarded on the flag being unset so
+                    // it fires at most once per window (bounded — one extra
+                    // turn) and only on the `conversational` adaptive path.
+                    if let Some(flag) = self.config.prompt_tool_call_flag.as_ref() {
+                        let already_escalated = flag.load(std::sync::atomic::Ordering::Acquire);
+                        if !already_escalated
+                            && crate::tool_call_repair::detect_prose_response(
+                                &content,
+                                tools_advertised,
+                            )
+                            .is_some()
+                        {
+                            flag.store(true, std::sync::atomic::Ordering::Release);
+                            // Record the model's prose, then a corrective nudge,
+                            // so the next turn has coherent context.
+                            let assistant = Message {
+                                role: Role::Assistant,
+                                content: Content::Text {
+                                    text: content.clone(),
+                                },
+                            };
+                            self.config
+                                .context_manager
+                                .append_assistant_message(&mut session_state, &assistant)
+                                .await;
+                            let nudge = "You described an action but did not call a \
+tool. Use the provided tool-call format to actually invoke the tool."
+                                .to_string();
+                            self.config
+                                .context_manager
+                                .append_user_message(&mut session_state, &nudge)
+                                .await;
+                            continue;
+                        }
+                    }
 
                     if let Some(mw) = self.config.middleware.as_ref() {
                         match mw.fire(HookPoint::BeforeCompletion, &session_state).await {
@@ -6597,6 +6685,7 @@ mod tests {
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
+            prompt_tool_call_flag: None,
         }
     }
 
@@ -9713,6 +9802,7 @@ mod tests {
                 system_prompt: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
+                prompt_tool_call_flag: None,
             })
         }
 

@@ -69,6 +69,7 @@ fn config() -> HarnessConfig {
         system_prompt: None,
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
+        prompt_tool_call_flag: None,
     }
 }
 
