@@ -734,4 +734,55 @@ describe("Harness — modelParams threading (#93)", () => {
     expect(agent.seen.length).toBeGreaterThan(0);
     expect(agent.seen[0].params.structured_tool_calls).toBe(true);
   });
+
+  // Concatenate the text of a captured context's user/tool messages so we can
+  // assert which seeded directives/instructions reached a given turn.
+  function ctxText(ctx: Context): string {
+    return ctx.messages
+      .map((m) => (m.content.type === "text" ? m.content.text : ""))
+      .join("\n");
+  }
+
+  // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
+  // Respond with a single JSON object…") must NOT leak into the SHARED
+  // sessionState, otherwise every execute step re-sees it and an
+  // instruction-following model re-emits a plan instead of calling tools.
+  // Drive a full 2-step PlanExecute run with the context-capturing agent and
+  // assert no execute-step context carries the directive, while the step
+  // instructions DO reach those contexts (and a step can issue a tool call).
+  it("plan directive does not leak into execute context", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      // Plan turn: produce a 2-step plan.
+      .push(fr('{"tasks":["step one","step two"],"rationale":"r"}'))
+      // Execute step 1: issue a tool call, then finalize.
+      .push(tcr(toolCall("c1", "noop")))
+      .push(fr("did step one"))
+      // Execute step 2: finalize directly.
+      .push(fr("did step two"));
+    const h = new StandardHarness(recordingConfig(agent, { stop_sequences: [] }));
+    await h.run({ task: planTask93() });
+
+    // 1 plan turn + (tool call + final) for step one + 1 for step two.
+    expect(agent.seen.length).toBe(4);
+
+    // The PLAN turn (index 0) DOES carry the directive — that's correct.
+    expect(ctxText(agent.seen[0]!)).toContain("Produce a step-by-step plan");
+    expect(ctxText(agent.seen[0]!)).toContain("Respond with a single JSON object");
+
+    // No EXECUTE-step context (indices 1..) may carry the directive.
+    for (let i = 1; i < agent.seen.length; i++) {
+      const text = ctxText(agent.seen[i]!);
+      expect(text).not.toContain("Produce a step-by-step plan");
+      expect(text).not.toContain("Respond with a single JSON object");
+    }
+
+    // The execute steps still receive their step instructions and can proceed
+    // to a tool call. Step one's second turn (index 2) follows the dispatched
+    // tool call: it still carries the step-one instruction plus the tool result
+    // accumulated within the step's sub-loop.
+    expect(ctxText(agent.seen[1]!)).toContain("step one");
+    expect(ctxText(agent.seen[2]!)).toContain("step one");
+    expect(ctxText(agent.seen[2]!)).toContain("ok");
+    expect(ctxText(agent.seen[3]!)).toContain("step two");
+  });
 });

@@ -1175,15 +1175,23 @@ export class StandardHarness implements Harness {
     const planner = this.config.plannerAgent ?? this.config.agent;
 
     // Seed the planning directive as a user message (reuse ContextManager).
+    // CRITICAL (#93): the directive must NOT mutate the SHARED `sessionState`.
+    // That same state is threaded into the execute phase, where each subtask
+    // sub-loop assembles its context from it. If the directive leaked in,
+    // every execute step would still see "respond with {tasks, rationale}"
+    // and an instruction-following model would re-emit a plan instead of
+    // calling tools. Append to a throwaway CLONE so the plan turn sees the
+    // directive while the shared state stays `[user: task.instruction]`.
     const directive =
       "Produce a step-by-step plan for the following task. Respond with a " +
       'single JSON object: {"tasks": [<ordered step strings>], ' +
       '"rationale": <string>}.\n\nTask:\n' +
       task.instruction;
-    await this.config.contextManager.appendUserMessage(sessionState, directive);
+    const planState = structuredClone(sessionState);
+    await this.config.contextManager.appendUserMessage(planState, directive);
 
     // Assemble + invoke the planner for exactly ONE turn (R1).
-    const context = await this.config.contextManager.assemble(sessionState, task, signal);
+    const context = await this.config.contextManager.assemble(planState, task, signal);
     // Per-run model params win unconditionally (issue #93) — same seam as
     // runReactInner, before the plan turn is dispatched.
     context.params = this.config.modelParams;
