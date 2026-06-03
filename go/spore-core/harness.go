@@ -2797,8 +2797,10 @@ type planPhaseOutcome struct {
 //  1. Plan phase (runs once): runPlanPhase seeds a planning directive, runs one
 //     constrained planner turn, captures a PlanArtifact, fires OnPlanCreated,
 //     and counts the turn against the shared budget.
-//  2. Execute phase (loops): runExecutePhase drains the parsed task list, giving
-//     each task its own bounded, isolated, SEQUENTIAL ReAct sub-loop.
+//  2. Execute phase (loops): runExecutePhase drains the parsed task list,
+//     running each task in a bounded ReAct sub-loop that BUILDS ON the
+//     accumulated execute-phase context (prior steps' tool results and
+//     assistant outputs carry forward).
 //
 // Between the phases the artifact is parsed into a TaskList via
 // PlanArtifactToTaskList and persisted through the RunStore seam (Q4) plus the
@@ -2813,9 +2815,13 @@ type planPhaseOutcome struct {
 //     HaltBudgetExceeded unchanged.
 //
 // Resolved spec decisions (issue #59 — all five FINAL):
-//   - Q1 (execute step model): each task gets its OWN bounded ReAct sub-loop,
-//     fully isolated and SEQUENTIAL (task N completes before N+1). The per-task
-//     turn cap is derived at the START of each step:
+//   - Q1 (execute step model): each task runs a bounded ReAct sub-loop that
+//     BUILDS ON the accumulated execute-phase context — after each successful
+//     step its conversation (instruction + tool calls + tool results +
+//     assistant output) is folded back into the shared execute context, so the
+//     next step sees all prior steps' results. Steps stay SEQUENTIAL (task N
+//     completes before N+1). The shared budget still gates: the per-task turn
+//     cap is derived at the START of each step:
 //     per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
 //     division; remaining_tasks = not-yet-started tasks including the current
 //     one). The shared/parent budget — turns, tokens, observability spans,
@@ -2921,13 +2927,17 @@ func (h *StandardHarness) persistTaskList(ctx context.Context, sessionID Session
 // runExecutePhase drives the PlanExecute execute phase (issue #59), draining
 // taskList.
 //
-// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-// sub-loop. The per-task turn cap is derived at the START of each step from the
-// shared budget: per_task_turns = remaining_turns / remaining_tasks, floored at
-// 1 (integer division; remaining_tasks counts the not-yet-started tasks
-// including the current one). The shared budget snapshot (carried) is threaded
-// through every step so early tasks cannot starve later ones and the global
-// budget stays the hard stop.
+// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
+// accumulated execute-phase context: after each successful step its resulting
+// conversation (instruction + tool calls + tool results + assistant output) is
+// folded back into the shared session, so the next step's sub-loop (which copies
+// the shared session) sees every prior step's results. The per-task turn cap is
+// derived at the START of each step from the shared budget:
+// per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
+// division; remaining_tasks counts the not-yet-started tasks including the
+// current one). The shared budget snapshot (carried) is threaded through every
+// step so early tasks cannot starve later ones and the global budget stays the
+// hard stop.
 //
 // Before each step the task is marked InProgress (and Completed after), the list
 // is re-persisted (Q4), and OnTaskAdvance fires with the correct task_index /
@@ -2956,8 +2966,9 @@ func (h *StandardHarness) runExecutePhase(
 	var lastOutput string
 	// Issue #102: the LAST completed step's full conversation history, carried
 	// onto the terminal Success so PlanExecute resumes losslessly. Each step runs
-	// its own isolated ReAct sub-loop over a copy of the shared session, so the
-	// most recent sub-run's SessionState is the richest post-run history.
+	// its ReAct sub-loop over a copy of the shared session and folds its result
+	// back into that shared session on success (#93), so the most recent step's
+	// returned SessionState is the richest, fully accumulated post-run history.
 	var lastSessionState SessionState
 
 	for index := 0; index < totalTasks; index++ {
@@ -3036,7 +3047,16 @@ func (h *StandardHarness) runExecutePhase(
 			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
 			totalUsage.CostUSD += subResult.Usage.CostUSD
 			lastOutput = subResult.Output
-			lastSessionState = subResult.SessionState
+			// Fold this step's resulting conversation back into the SHARED
+			// execute context so the NEXT step's sub-loop (which copies
+			// *session) builds on this step's tool results and assistant
+			// output, not just its instruction. The returned SessionState
+			// already contains this step's instruction + tool calls + tool
+			// results + final output.
+			*session = subResult.SessionState
+			// Issue #102: the terminal Success carries the LAST completed
+			// step's full state — now the accumulated execute context.
+			lastSessionState = *session
 
 			// Mark Completed and re-persist (Q4).
 			_ = taskList.Complete(taskID)

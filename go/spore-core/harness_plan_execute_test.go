@@ -527,12 +527,85 @@ func (a *planRecordingAgent) ID() AgentID { return a.id }
 func contextText(msgs []Message) string {
 	var b strings.Builder
 	for _, m := range msgs {
-		if m.Content.Type == ContentTypeText {
+		switch m.Content.Type {
+		case ContentTypeText:
 			b.WriteString(m.Content.Text)
 			b.WriteByte('\n')
+		case ContentTypeToolCall:
+			if m.Content.ToolCall != nil {
+				b.WriteString(m.Content.ToolCall.Name)
+				b.WriteByte('\n')
+			}
+		case ContentTypeToolResult:
+			// Tool results carry prior steps' outputs forward — surface their
+			// content so accumulation is visible.
+			if m.Content.ToolResult != nil {
+				b.WriteString(m.Content.ToolResult.Content)
+				b.WriteByte('\n')
+			}
 		}
 	}
 	return b.String()
+}
+
+// #93 regression: the execute phase maintains ONE accumulating context across
+// steps. After a successful step its conversation (instruction + tool calls +
+// TOOL RESULTS + assistant output) is folded back into the shared session, so
+// the NEXT step's sub-loop sees prior steps' RESULTS — not just their
+// instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
+// distinctive string and assert STEP 2's context carries it.
+func TestExecuteStepsAccumulatePriorResults(t *testing.T) {
+	agent := newPlanRecordingAgent("rec")
+	// Plan turn: a 2-step plan (research -> use the result).
+	agent.push(planFinal(`{"tasks":["research tokio","summarize findings"],"rationale":"r"}`))
+	// Step 1: call a tool, then finalize using its result.
+	agent.push(NewToolCallRequested([]ToolCall{{ID: "1", Name: "lookup", Input: json.RawMessage(`{}`)}}, turnUsage()))
+	agent.push(planFinal("researched"))
+	// Step 2: finalize directly (it must SEE step 1's tool result).
+	agent.push(planFinal("summarized"))
+
+	cfg := standardCfg(agent)
+	// Use a context manager that records assistant turns + tool results into the
+	// session (NoopContextManager drops both), so the accumulated execute context
+	// actually carries step 1's tool result and assistant output forward.
+	cfg.ContextManager = &recordingContextManager{}
+	reg := NewScriptedToolRegistry()
+	// Step 1's tool call returns a distinctive result string.
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "TOKIO_FACTS_123"})
+	cfg.ToolRegistry = reg
+	h := NewStandardHarness(cfg)
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(planTask("build a CLI")))
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+	if r.Output != "summarized" {
+		t.Fatalf("expected last step's output %q, got %q", "summarized", r.Output)
+	}
+
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	// 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+	if len(agent.seen) != 4 {
+		t.Fatalf("captured %d turns, want 4 (plan turn + 3 execute turns)", len(agent.seen))
+	}
+
+	// Step 1's SECOND turn (index 2) sees the tool result — sanity check that
+	// the result string is on the wire at all.
+	if c := contextText(agent.seen[2]); !strings.Contains(c, "TOKIO_FACTS_123") {
+		t.Fatalf("step-1 final turn should follow its own tool result:\n%s", c)
+	}
+
+	// The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
+	// tool result, proving the execute loop carried it forward.
+	step2 := contextText(agent.seen[3])
+	if !strings.Contains(step2, "TOKIO_FACTS_123") {
+		t.Fatalf("step 2 must see step 1's tool result (accumulating context):\n%s", step2)
+	}
+	// Step 2 also sees step 1's prior instruction + assistant output.
+	if !strings.Contains(step2, "research tokio") || !strings.Contains(step2, "researched") {
+		t.Fatalf("step 2 must see step 1's instruction and output:\n%s", step2)
+	}
 }
 
 // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
