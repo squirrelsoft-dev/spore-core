@@ -1934,6 +1934,7 @@ class HarnessConfig:
         metric_evaluator: Any | None = None,
         catalogue_registry: StandardToolRegistry | None = None,
         system_prompt: str | None = None,
+        model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
     ) -> None:
         self.agent = agent
@@ -2044,6 +2045,12 @@ class HarnessConfig:
         # :meth:`HarnessBuilder.system_prompt`. ``None`` (the default) preserves
         # today's behaviour.
         self.system_prompt: str | None = system_prompt
+        # Authoritative per-run model sampling/decoding parameters (issue #93).
+        # The harness replaces each turn's ``Context.params`` with this value
+        # UNCONDITIONALLY (builder params win) right before the request is built,
+        # so the configured params reach every agent turn that requests tools.
+        # See :meth:`HarnessBuilder.model_params`. Defaults to ``ModelParams()``.
+        self.model_params: ModelParams = model_params if model_params is not None else ModelParams()
         # Opt-in conversation-history threading via the SessionStore (issue
         # #102). OFF by default: when ``False`` the run/resume loop performs
         # ZERO session-store I/O and behaves byte-for-byte like today. When
@@ -2110,6 +2117,9 @@ class HarnessBuilder:
         # context (issue #91) when the context manager renders none. ``None``
         # (the default) preserves today's behaviour. See :meth:`system_prompt`.
         self._system_prompt: str | None = None
+        # Authoritative per-run model sampling/decoding parameters (issue #93).
+        # Defaults to ``ModelParams()``. See :meth:`model_params`.
+        self._model_params: ModelParams = ModelParams()
         # Pluggable chunk source for the #79 prompt assembly engine. Defaults to
         # an empty in-memory provider so existing callers are unaffected. Typed
         # ``Any`` to avoid importing ``prompt_assembly`` at module load (that
@@ -2254,6 +2264,26 @@ class HarnessBuilder:
         context manager that renders its own system prompt is preserved.
         ``None`` (the default) preserves today's behaviour."""
         self._system_prompt = system_prompt
+        return self
+
+    def model_params(self, params: ModelParams) -> HarnessBuilder:
+        """Set the authoritative model sampling/decoding parameters for the
+        whole run (issue #93).
+
+        These params are authoritative: the harness replaces each turn's
+        ``Context.params`` with this value UNCONDITIONALLY (builder params win)
+        right before the request is built, so the configured params reach every
+        agent turn that requests tools — the ReAct loop, the PlanExecute plan
+        phase, the execute sub-loop, and the streaming path alike. (The internal
+        compaction/summarization turn is intentionally left on defaults; it
+        requests no tools, so decoding params are a no-op there.)
+
+        Enabling :attr:`~spore_core.model.ModelParams.structured_tool_calls`
+        trades interleaved reasoning for one schema-constrained tool call per
+        turn — useful for small local models that otherwise emit malformed tool
+        calls. See :attr:`~spore_core.model.ModelParams.structured_tool_calls`
+        for the full behaviour contract. Defaults to ``ModelParams()``."""
+        self._model_params = params
         return self
 
     def drain_tools_into_registry(self) -> StandardToolRegistry:
@@ -2453,6 +2483,7 @@ class HarnessBuilder:
             metric_evaluator=self._metric_evaluator,
             catalogue_registry=catalogue_registry,
             system_prompt=self._system_prompt,
+            model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
         )
 
@@ -4289,6 +4320,9 @@ class StandardHarness:
 
         # Assemble + invoke the planner for exactly ONE turn (R1).
         context = await config.context_manager.assemble(session_state, task)
+        # Per-run model params win unconditionally (issue #93) — same seam as
+        # _run_react_inner, before the plan turn is dispatched.
+        context.params = config.model_params
         self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
         turn_started_at = _now()
         turn_clock = time.monotonic()
@@ -4555,6 +4589,12 @@ class StandardHarness:
                         content=TextContent(text=config.system_prompt),
                     ),
                 )
+            # Per-run model params win unconditionally (issue #93). The agent
+            # copies ``Context.params`` verbatim into the ``ModelRequest``, so
+            # this is the single seam that delivers configured params (e.g.
+            # structured tool calls) to every tool-requesting ReAct/execute/
+            # streaming turn.
+            context.params = config.model_params
             self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
             turn_started_at = _now()
             turn_clock = time.monotonic()
