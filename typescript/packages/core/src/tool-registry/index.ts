@@ -7,6 +7,11 @@
  */
 
 export * from "./types.js";
+export {
+  defineTool,
+  type DefineToolExecute,
+  type DefineToolOptions,
+} from "./define-tool.js";
 export { StandardToolRegistry } from "./standard.js";
 export { EmptyToolRegistry } from "./empty.js";
 export { RealToolRegistry, toModelSchema } from "./real.js";

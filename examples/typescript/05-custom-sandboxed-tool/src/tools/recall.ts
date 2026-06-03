@@ -1,83 +1,64 @@
 /**
  * `recall(key)` — read a previously-remembered fact back out of the run store.
  *
- * This is the **read** half of the pair. Unlike {@link "./remember.js".RememberTool}
- * it is annotated `read_only` + `idempotent`: it only reads shared state, so the
- * registry may dispatch it concurrently with other read-only tools.
+ * This is the **read** half of the pair, also defined with the
+ * {@link toolRegistry.defineTool | defineTool} helper. Unlike
+ * {@link "./remember.js".rememberTool} it passes `annotations` to mark itself
+ * `read_only` + `idempotent`: it only reads shared state, so the registry may
+ * dispatch it concurrently with other read-only tools.
  *
  * Looking up a key that was never stored is a *recoverable* error — the agent
  * can adapt (try a different key, or remember the fact first) rather than
  * halting the run.
  */
 
-import type {
-  SandboxProvider,
-  ToolCall,
-  ToolOutput,
-  toolRegistry,
-  storage,
-} from "@spore/core";
-import { toolOutput } from "@spore/core";
+import { toolOutput, toolRegistry, type storage } from "@spore/core";
+import { z } from "zod";
 
 import { FACT_PREFIX } from "./remember.js";
 
-type Tool = toolRegistry.Tool;
-type ToolContext = toolRegistry.ToolContext;
-type ToolSchema = toolRegistry.ToolSchema;
+type StandardTool = toolRegistry.StandardTool;
 type JsonValue = storage.JsonValue;
 
-export class RecallTool implements Tool {
-  static readonly NAME = "recall";
-  readonly name = RecallTool.NAME;
+/** Tool name. */
+export const RECALL_NAME = "recall";
 
-  /** The registry-side schema. `name` MUST equal {@link Tool.name}. */
-  static schema(): ToolSchema {
-    return {
-      name: RecallTool.NAME,
-      description:
-        "Recall a fact previously stored with `remember`, by its key.",
-      parameters: {
-        type: "object",
-        properties: {
-          key: { type: "string" },
-        },
-        required: ["key"],
-      },
-      // Pure read of shared state: safe to mark read_only + idempotent.
-      annotations: {
-        read_only: true,
-        destructive: false,
-        idempotent: true,
-        open_world: false,
-      },
-    };
-  }
+/**
+ * Validated input for `recall`. The advertised JSON schema is derived from this
+ * one Zod schema, which also validates the model's arguments.
+ */
+export const RecallInput = z.object({
+  key: z
+    .string()
+    .describe("The key a fact was previously stored under with `remember`."),
+});
 
-  async execute(
-    call: ToolCall,
-    _sandbox: SandboxProvider,
-    ctx: ToolContext,
-  ): Promise<ToolOutput> {
-    const input = (call.input ?? {}) as Record<string, unknown>;
-    const key = input.key;
-    if (typeof key !== "string") {
-      return toolOutput.error("recall: missing or non-string 'key'");
-    }
-
-    const storeKey = `${FACT_PREFIX}${key}`;
-    let value: JsonValue | undefined;
-    try {
-      value = await ctx.runStore.get(ctx.sessionId, storeKey);
-    } catch (e) {
-      return toolOutput.error(
-        `recall: could not read '${key}': ${errMessage(e)}`,
-      );
-    }
-    if (value === undefined) {
-      return toolOutput.error(`no fact stored under '${key}'`);
-    }
-    return toolOutput.success(valueToString(value));
-  }
+/**
+ * Build the `recall` tool. `annotations` marks it `read_only` + `idempotent`
+ * (a pure read of shared state), in contrast to `remember`.
+ */
+export function recallTool(): StandardTool {
+  return toolRegistry.defineTool({
+    name: RECALL_NAME,
+    description: "Recall a fact previously stored with `remember`, by its key.",
+    input: RecallInput,
+    annotations: { read_only: true, idempotent: true },
+    execute: async (input, _sandbox, ctx) => {
+      const storeKey = `${FACT_PREFIX}${input.key}`;
+      let value: JsonValue | undefined;
+      try {
+        value = await ctx.runStore.get(ctx.sessionId, storeKey);
+      } catch (e) {
+        return toolOutput.error(
+          `recall: could not read '${input.key}': ${errMessage(e)}`,
+        );
+      }
+      if (value === undefined) {
+        return toolOutput.error(`no fact stored under '${input.key}'`);
+      }
+      return toolOutput.success(valueToString(value));
+    },
+  });
 }
 
 /**
