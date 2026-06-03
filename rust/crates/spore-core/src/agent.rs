@@ -444,7 +444,11 @@ struct StreamAccumulator {
 enum PartialBlock {
     Text(String),
     Thinking(String),
-    ToolJson { id: String, name: String, json: String },
+    ToolJson {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 impl StreamAccumulator {

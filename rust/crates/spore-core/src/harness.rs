@@ -2109,8 +2109,7 @@ impl HarnessBuilder {
                 crate::context::CompactionConfig::default(),
             ))
             .into_harness_adapter();
-        let termination_policy: Arc<dyn TerminationPolicy> =
-            Arc::new(CompleteOnFinalResponse);
+        let termination_policy: Arc<dyn TerminationPolicy> = Arc::new(CompleteOnFinalResponse);
         Self::new(
             agent,
             tool_registry,

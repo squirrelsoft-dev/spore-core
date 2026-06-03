@@ -778,8 +778,8 @@ async fn local_scope_defaults_to_noop() {
 
 #[tokio::test]
 async fn tool_context_exposes_threaded_memory_store() {
-    use crate::tool_registry::RealToolRegistry;
     use crate::tool_registry::mock::AllowAllSandbox;
+    use crate::tool_registry::RealToolRegistry;
     use crate::tool_registry::StandardToolRegistry;
 
     // Wire a real memory backend through the registry and prove the seam is
