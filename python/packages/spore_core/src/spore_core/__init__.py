@@ -641,6 +641,16 @@ from .model import (
     enforce_context_limit,
     request_hash,
 )
+from .prompt_tool_call import (
+    ACTION_PHRASES,
+    AdaptiveToolCallModelInterface,
+    PromptBasedToolCallModelInterface,
+    PromptToolCallFlag,
+    build_tool_prompt,
+    detect_prose_response,
+    inject_tool_prompt,
+    parse_prose_response,
+)
 
 __all__ = [
     "ALL_EVENTS",
@@ -1235,4 +1245,12 @@ __all__ = [
     "VerifierVerdict",
     "VerifierVerdictFailed",
     "VerifierVerdictPassed",
+    "ACTION_PHRASES",
+    "AdaptiveToolCallModelInterface",
+    "PromptBasedToolCallModelInterface",
+    "PromptToolCallFlag",
+    "build_tool_prompt",
+    "detect_prose_response",
+    "inject_tool_prompt",
+    "parse_prose_response",
 ]

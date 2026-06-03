@@ -104,6 +104,11 @@ from .model import (
 from .model import (
     ContentBlockStop as ModelContentBlockStop,
 )
+from .prompt_tool_call import (
+    AdaptiveToolCallModelInterface,
+    PromptToolCallFlag,
+    detect_prose_response,
+)
 
 if TYPE_CHECKING:
     from .context import (
@@ -1936,6 +1941,7 @@ class HarnessConfig:
         system_prompt: str | None = None,
         model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
+        prompt_tool_call_flag: PromptToolCallFlag | None = None,
     ) -> None:
         self.agent = agent
         # The HillClimbing scoring strategy (issue #60). REQUIRED for the
@@ -2061,6 +2067,15 @@ class HarnessConfig:
         # post-run state back to the store at the terminal seam. Mirrors Rust's
         # ``HarnessConfig::auto_persist_sessions``.
         self.auto_persist_sessions: bool = auto_persist_sessions
+        # Shared escalation flag for adaptive prompt-based tool calling (#111).
+        # ``Some`` only on the :meth:`HarnessBuilder.conversational` path, where
+        # the agent's model is wrapped in an
+        # :class:`~spore_core.prompt_tool_call.AdaptiveToolCallModelInterface`
+        # holding the same holder. ``None`` (every other construction) disables
+        # adaptive escalation. The run loop resets it at each window start and
+        # flips it when a prose response is detected where a tool call was
+        # expected. Mirrors Rust's ``HarnessConfig::prompt_tool_call_flag``.
+        self.prompt_tool_call_flag: PromptToolCallFlag | None = prompt_tool_call_flag
 
 
 class HarnessBuilder:
@@ -2125,6 +2140,11 @@ class HarnessBuilder:
         # ``Any`` to avoid importing ``prompt_assembly`` at module load (that
         # module imports ``SessionId``/``TaskId`` from here).
         self._chunk_provider: Any | None = None
+        # Shared adaptive prompt-based tool-calling escalation flag (#111). Set
+        # only by :meth:`conversational`, which wraps the agent's model in an
+        # :class:`AdaptiveToolCallModelInterface` holding the same holder. ``None``
+        # on the plain constructor leaves adaptive escalation off.
+        self._prompt_tool_call_flag: PromptToolCallFlag | None = None
 
     @classmethod
     def conversational(cls, model: ModelInterface) -> HarnessBuilder:
@@ -2161,7 +2181,15 @@ class HarnessBuilder:
         from .compaction_adapter import into_harness_adapter
         from .context import CompactionConfig, StandardContextManager
 
-        agent = ModelAgent(AgentId("agent"), model)
+        # Adaptive prompt-based tool-calling fallback (#111). Wrap the agent's
+        # model in an AdaptiveToolCallModelInterface gated on a shared flag the
+        # run loop flips when it detects a prose response where a tool call was
+        # expected. The context manager keeps the RAW model — injection/parsing
+        # only happen on the agent's tool-requesting turns.
+        prompt_tool_call_flag = PromptToolCallFlag(value=False)
+        wrapped_model = AdaptiveToolCallModelInterface(model, prompt_tool_call_flag)
+
+        agent = ModelAgent(AgentId("agent"), wrapped_model)
         tool_registry = EmptyToolRegistry()
         sandbox = NullSandbox()
         context_manager = into_harness_adapter(
@@ -2172,13 +2200,15 @@ class HarnessBuilder:
             )
         )
         termination_policy = CompleteOnFinalResponse()
-        return cls(
+        builder = cls(
             agent=agent,
             tool_registry=tool_registry,
             sandbox=sandbox,
             context_manager=context_manager,
             termination_policy=termination_policy,
         )
+        builder._prompt_tool_call_flag = prompt_tool_call_flag
+        return builder
 
     def chunk_provider(self, provider: Any) -> HarnessBuilder:
         """Set the chunk provider for the #79 prompt assembly engine. Defaults
@@ -2485,6 +2515,7 @@ class HarnessBuilder:
             system_prompt=self._system_prompt,
             model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
+            prompt_tool_call_flag=self._prompt_tool_call_flag,
         )
 
     def build(self) -> StandardHarness:
@@ -4531,6 +4562,13 @@ class StandardHarness:
         # Resolve the effective tool registry once per turn-loop window (all
         # strategies funnel through here). Bridges catalogue tools per-run.
         tool_registry = self._effective_tool_registry(session_id)
+        # Reset the adaptive prompt-based-tool-calling escalation flag at the
+        # start of this turn-loop window so detection is scoped to the window and
+        # does not leak across run() calls (the flag is shared with the model
+        # wrapper for the harness's lifetime). No-op unless a conversational
+        # harness installed the adaptive wrapper (#111).
+        if self._config.prompt_tool_call_flag is not None:
+            self._config.prompt_tool_call_flag.value = False
         started_at = time.monotonic()
         usage = AggregateUsage()
         # Monotonic per-run span counter for tool-call span ids, and the most
@@ -4602,6 +4640,10 @@ class StandardHarness:
             # tool subset is preserved.
             if not context.tools:
                 context.tools = tool_registry.schemas()
+            # Whether tools were advertised to the model this turn — a
+            # precondition for classifying a prose final response as a missed
+            # tool call (adaptive prompt-based escalation, #111).
+            tools_advertised = bool(context.tools)
             # Prepend the configured operating system prompt (issue #91). The
             # standard compaction adapter renders none, so without this the model
             # gets only the task and no guidance. Guard against duplicates so a
@@ -4722,6 +4764,39 @@ class StandardHarness:
                 usage.add_turn(result.usage)
                 budget_used.input_tokens += result.usage.input_tokens
                 budget_used.output_tokens += result.usage.output_tokens
+
+                # Adaptive prompt-based tool-calling escalation (#111). When
+                # tools were advertised but the model answered in prose with
+                # action-intent language (it *meant* to act), set the session
+                # flag so the wrapped model switches to prompt-based tool calling,
+                # nudge the model, and force another turn instead of completing.
+                # Guarded on the flag being unset so it fires at most once per
+                # window (bounded — one extra turn) and only on the conversational
+                # adaptive path.
+                flag = config.prompt_tool_call_flag
+                if (
+                    flag is not None
+                    and flag.value is False
+                    and detect_prose_response(result.content, tools_advertised) is not None
+                ):
+                    flag.value = True
+                    # Record the model's prose, then a corrective nudge, so the
+                    # next turn has coherent context.
+                    appender = getattr(config.context_manager, "append_assistant_message", None)
+                    if appender is not None:
+                        await appender(
+                            session_state,
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=TextContent(text=result.content),
+                            ),
+                        )
+                    nudge = (
+                        "You described an action but did not call a tool. Use the "
+                        "provided tool-call format to actually invoke the tool."
+                    )
+                    await config.context_manager.append_user_message(session_state, nudge)
+                    continue
 
                 if config.middleware is not None:
                     decision = await config.middleware.fire("before_completion", session_state)
