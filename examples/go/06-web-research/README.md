@@ -112,10 +112,21 @@ it runs with no hosted-model account. Synthesis quality scales with the model: a
 **larger hosted model will produce noticeably better, better-cited answers**. The
 harness is model-agnostic — swap the model interface and change nothing else.
 
-This example also enables `structured_tool_calls` via
-`.WithModelParams(sporecore.ModelParams{StructuredToolCalls: true})`. That turns
-on schema-constrained decoding so small Ollama models emit one clean tool call
-per turn (no interleaved reasoning) instead of malformed JSON.
+By default this example uses **native Ollama tool calling** — the real typed tool
+schema — which works well for tool-capable / cloud models (e.g.
+`gemma4:31b-cloud`). Pass `--structured` to opt into schema-constrained
+(structured) decoding instead, which helps small local models (e.g. `llama3.2`)
+emit one clean tool call per turn (no interleaved reasoning) instead of malformed
+JSON:
+
+```sh
+go run . --structured
+```
+
+Note: structured mode exposes an always-available `final` envelope whose content
+is optional, so a weak model can bail early with an empty answer (and never call
+`write_file`). If you see an empty answer and no `answer.md` on disk, drop
+`--structured` and let native tool calling drive.
 
 ## Prerequisites
 

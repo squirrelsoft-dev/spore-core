@@ -143,7 +143,18 @@ account. Recall quality scales with the model: a **larger hosted model follows
 the store/recall tool protocol more reliably**. The harness is model-agnostic —
 swap the model interface and change nothing else.
 
-This example also enables `structured_tool_calls` via
-`.WithModelParams(sporecore.ModelParams{StructuredToolCalls: true})`. That turns
-on schema-constrained decoding so small Ollama models emit one clean `memory`
-tool call per turn (no interleaved reasoning) instead of malformed JSON.
+By default this example uses **native Ollama tool calling** — the real typed tool
+schema — which works well for tool-capable / cloud models (e.g.
+`gemma4:31b-cloud`). Pass `--structured` to opt into schema-constrained
+(structured) decoding instead, which helps small local models (e.g. `llama3.2`)
+emit one clean `memory` tool call per turn (no interleaved reasoning) instead of
+malformed JSON:
+
+```sh
+go run . --phase store --structured
+```
+
+Note: structured mode exposes an always-available `final` envelope whose content
+is optional, so a weak model can bail early with an empty answer (and never call
+the `memory` tool). If you see an empty answer and nothing written to
+`memory.md`, drop `--structured` and let native tool calling drive.

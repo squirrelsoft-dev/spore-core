@@ -157,6 +157,10 @@ func run() error {
 		baseURL = ollama.DefaultBaseURL
 	}
 
+	// Native Ollama tool calling is the default. Pass --structured to opt into
+	// constrained-decoding (structured tool calls) for small local models.
+	structured := hasFlag("--structured")
+
 	// The search backend endpoint. web_search issues GET <endpoint>?q=<query> and
 	// returns the JSON body to the agent. There is no live backend in spore-core,
 	// so you must supply one — a self-hosted SearXNG JSON API works out of the box
@@ -222,9 +226,11 @@ func run() error {
 		Tool(tools.StandardTools{}.WriteFile()).                                         // ← writes async-comparison.md
 		Tool(tools.StandardTools{}.ReadFile()).
 		SystemPrompt(systemPrompt).
-		// Structured mode helps small Ollama models emit clean tool calls (one per
-		// turn, no interleaved reasoning, so the "think" line is just a turn marker).
-		WithModelParams(sporecore.ModelParams{StructuredToolCalls: true}).
+		// Native Ollama tool calling by default — it exposes the real typed tool
+		// schema and works for tool-capable / cloud models (e.g. gemma4:31b-cloud).
+		// Pass --structured to enable constrained-decoding (structured tool calls)
+		// for small local models (e.g. llama3.2) that need it to emit clean calls.
+		WithModelParams(sporecore.ModelParams{StructuredToolCalls: structured}).
 		BuildConfig()
 
 	chain := sporecore.NewStandardHookChain()
@@ -308,6 +314,16 @@ func flagValue(flag string) string {
 		}
 	}
 	return ""
+}
+
+// hasFlag reports whether the given boolean flag appears in os.Args.
+func hasFlag(name string) bool {
+	for _, a := range os.Args[1:] {
+		if a == name {
+			return true
+		}
+	}
+	return false
 }
 
 // truncate keeps observe lines readable — search results can be long.

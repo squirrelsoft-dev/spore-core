@@ -105,6 +105,10 @@ func run() error {
 		baseURL = ollama.DefaultBaseURL
 	}
 
+	// Native Ollama tool calling is the default. Pass --structured to opt into
+	// constrained-decoding (structured tool calls) for small local models.
+	structured := hasFlag("--structured")
+
 	// memory.md lives next to this example's sources so `go run .` works from
 	// anywhere and the artifact is easy to find and inspect between phases.
 	memoryPath, err := memoryFilePath()
@@ -135,7 +139,7 @@ func run() error {
 			return err
 		}
 		taskPrompt := "Here is the Project Ironwood briefing. Store each fact to memory.\n\n" + briefing
-		output, err := runPhase(mi, memoryPath, storeSystemPrompt, taskPrompt)
+		output, err := runPhase(mi, memoryPath, storeSystemPrompt, taskPrompt, structured)
 		if err != nil {
 			return err
 		}
@@ -154,7 +158,7 @@ func run() error {
 			return fmt.Errorf("memory.md does not exist yet at %s.\n"+
 				"Run `go run . --phase store` first.", memoryPath)
 		}
-		output, err := runPhase(mi, memoryPath, recallSystemPrompt, recallQuestions)
+		output, err := runPhase(mi, memoryPath, recallSystemPrompt, recallQuestions, structured)
 		if err != nil {
 			return err
 		}
@@ -168,7 +172,7 @@ func run() error {
 
 // runPhase builds a harness over the markdown memory provider + the built-in
 // memory tool, pins the shared session id, runs one task, and streams the loop.
-func runPhase(mi sporecore.ModelInterface, memoryPath, systemPrompt, taskPrompt string) (string, error) {
+func runPhase(mi sporecore.ModelInterface, memoryPath, systemPrompt, taskPrompt string, structured bool) (string, error) {
 	// Compose the real markdown MemoryStore with NoOp for the other three storage
 	// domains. This is the entire integration: the harness threads the memory
 	// store into the memory tool's context per run. Storage(runStore, memStore)
@@ -180,9 +184,11 @@ func runPhase(mi sporecore.ModelInterface, memoryPath, systemPrompt, taskPrompt 
 		Storage(nil, storage.Memory()).       // ← the seam: the memory-domain store
 		Tool(tools.StandardTools{}.Memory()). // ← the built-in memory read/write tool
 		SystemPrompt(systemPrompt).
-		// Structured mode helps small Ollama models emit clean tool calls (one per
-		// turn, no interleaved reasoning, so the "think" line is just a turn marker).
-		WithModelParams(sporecore.ModelParams{StructuredToolCalls: true}).
+		// Native Ollama tool calling by default — it exposes the real typed tool
+		// schema and works for tool-capable / cloud models (e.g. gemma4:31b-cloud).
+		// Pass --structured to enable constrained-decoding (structured tool calls)
+		// for small local models (e.g. llama3.2) that need it to emit clean calls.
+		WithModelParams(sporecore.ModelParams{StructuredToolCalls: structured}).
 		Build()
 
 	// PIN the session id — both phases pass the same one so recall reads what
@@ -253,6 +259,16 @@ func flagValue(flag string) string {
 		}
 	}
 	return ""
+}
+
+// hasFlag reports whether the given boolean flag appears in os.Args.
+func hasFlag(name string) bool {
+	for _, a := range os.Args[1:] {
+		if a == name {
+			return true
+		}
+	}
+	return false
 }
 
 // truncate keeps stream lines readable — memory reads return a JSON array of

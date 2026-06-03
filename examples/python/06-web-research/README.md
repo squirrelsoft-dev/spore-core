@@ -120,10 +120,25 @@ it runs with no hosted-model account. Synthesis quality scales with the model: a
 **larger hosted model will produce noticeably better, better-cited answers**. The
 harness is model-agnostic — swap the model interface and change nothing else.
 
-This example also enables `structured_tool_calls` via
-`HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`. That
-turns on schema-constrained decoding so small Ollama models emit one clean tool
-call per turn (no interleaved reasoning) instead of malformed JSON.
+### Tool-calling mode: native by default, `--structured` to opt in
+
+By default this example uses **native Ollama tool calling** — the real typed
+tool schema — which works well for tool-capable / cloud models like
+`gemma4:31b-cloud`. Pass `--structured` to opt into schema-constrained decoding
+via `HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`, which
+helps **small local models** (e.g. `llama3.2`) emit one clean tool call per turn
+(no interleaved reasoning) instead of malformed JSON:
+
+```sh
+uv run main.py                # native tool calling (default)
+uv run main.py --structured   # constrained decoding for small local models
+```
+
+One caveat for structured mode: it exposes an always-available `final` envelope
+whose content is optional, so a **capable** model can emit `{"tool":"final"}`
+prematurely and hand back an EMPTY answer without ever calling `write_file`. If
+you run with `--structured` and see an empty answer and no `answer.md` on disk,
+drop the flag and use the native default.
 
 ## Prerequisites
 
@@ -141,7 +156,8 @@ variables.
 
 ```sh
 cd examples/python/06-web-research
-uv run main.py
+uv run main.py                # native tool calling (default)
+uv run main.py --structured   # constrained decoding for small local models
 uv run main.py --prompt "What are the current options for running WebAssembly outside the browser? Cite sources and write answer.md."
 ```
 

@@ -64,6 +64,13 @@ async function main(): Promise<void> {
     argValue(args, "--model") ?? process.env.SPORE_OLLAMA_MODEL ?? "llama3.2";
   const baseUrl = process.env.SPORE_OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
 
+  // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+  // `*-cloud` like `gemma4:31b-cloud`) use native Ollama tool calling, which
+  // gives `write_file` a real typed schema and no always-on `final` escape.
+  // Small local models (e.g. `llama3.2`) that leak `<|python_tag|>` or malformed
+  // JSON can pass `--structured` to force the JSON-object channel.
+  const structured = args.includes("--structured");
+
   // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
   // and returns the JSON body to the agent. There is no live backend in
   // spore-core, so you must supply one — a self-hosted SearXNG JSON API. The
@@ -120,10 +127,11 @@ async function main(): Promise<void> {
     .tool(StandardTools.writeFile()) // ← writes answer.md
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
-    // Structured mode helps small Ollama models emit clean tool calls (one per
-    // turn, no interleaved reasoning — so the "think · turn N" line is just a
-    // turn marker, not model chatter).
-    .modelParams({ structured_tool_calls: true, stop_sequences: [] })
+    // Native tool calling by default; `--structured` flips on constrained
+    // decoding for small models (see the `structured` flag above). With
+    // structured mode the "think · turn N" line is just a turn marker, not model
+    // chatter, since each turn emits one clean JSON tool call.
+    .modelParams({ structured_tool_calls: structured, stop_sequences: [] })
     .build();
 
   const task = newTask(prompt, SessionId.generate(), {

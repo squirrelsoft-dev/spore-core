@@ -160,11 +160,17 @@ edges you should know about before running:
   later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else. This
-  example enables `structured_tool_calls` via
-  `.WithModelParams(sporecore.ModelParams{StructuredToolCalls: true})` to push
-  small models toward one clean, schema-constrained tool call per turn (no
-  interleaved reasoning) across both the plan and execute phases.
+  model-agnostic — swap the model interface and change nothing else. By default
+  this example uses **native Ollama tool calling** (the real typed tool schema),
+  which works well for tool-capable / cloud models (e.g. `gemma4:31b-cloud`).
+  Pass `--structured` (i.e. `go run . --structured`) to opt into
+  schema-constrained decoding, pushing small local models toward one clean tool
+  call per turn (no interleaved reasoning) across both the plan and execute
+  phases. Caveat: structured mode exposes an always-available `final` envelope
+  whose content is optional, so a weak model can bail early with an empty answer
+  and never call `write_file`. If you see an empty answer and no
+  `async-comparison.md` on disk, drop `--structured` and let native tool calling
+  drive.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Go
   harness (like Rust and Python) suppresses the sub-loop stream, so the
   `OnPlanCreated` / `OnTaskAdvance` hooks are the portable, cross-language view

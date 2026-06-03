@@ -40,17 +40,23 @@ Tools wired (all from the built-in catalogue, identical to 06):
 - ``write_file`` — the agent writes ``async-comparison.md`` into ``workspace/``.
 - ``read_file`` — lets the agent re-read what it wrote.
 
-This example also enables ``ModelParams(structured_tool_calls=True)`` via
-``HarnessBuilder.model_params(..)`` — schema-constrained decoding that helps
-small Ollama models emit one clean tool call per turn across both the plan and
-execute phases.
+Tool-calling mode: this example uses **native Ollama tool calling by default**
+(the real typed tool schema), which works for tool-capable / cloud models like
+``gemma4:31b-cloud``. Pass ``--structured`` to opt into
+``ModelParams(structured_tool_calls=True)`` — schema-constrained decoding that
+helps small local models (e.g. ``llama3.2``) emit one clean tool call per turn
+across both the plan and execute phases. Structured mode exposes an
+always-available ``final`` envelope, so a capable model may emit
+``{"tool":"final"}`` prematurely and return an EMPTY answer; if you see that
+(and no ``async-comparison.md``), drop ``--structured``.
 
 Run it::
 
     ollama serve &
     ollama pull llama3.2
     export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"  # SearXNG JSON
-    uv run main.py
+    uv run main.py                # native tool calling (default)
+    uv run main.py --structured   # constrained decoding for small local models
 """
 
 from __future__ import annotations
@@ -147,6 +153,15 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="spore-core plan-execute agent")
     parser.add_argument("--model")
     parser.add_argument("--prompt")
+    parser.add_argument(
+        "--structured",
+        action="store_true",
+        help=(
+            "Opt into schema-constrained (structured) tool calls for small local "
+            "models. Default is native Ollama tool calling, which works for "
+            "tool-capable / cloud models like gemma4:31b-cloud."
+        ),
+    )
     args = parser.parse_args()
 
     model_id = args.model or os.environ.get("SPORE_OLLAMA_MODEL") or "llama3.2"
@@ -211,10 +226,12 @@ async def main() -> int:
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
-        # Structured mode helps small Ollama models emit clean tool calls (one
-        # per turn, no interleaved reasoning — so the "think" line is just a
-        # turn marker, not model chatter).
-        .model_params(ModelParams(structured_tool_calls=True))
+        # Native tool calling by default; ``--structured`` opts into constrained
+        # decoding for small local models. With structured mode the "think" line
+        # is just a turn marker (one clean tool call per turn, no interleaved
+        # reasoning), but a capable model can bail early via the always-available
+        # ``final`` envelope — see the docstring.
+        .model_params(ModelParams(structured_tool_calls=args.structured))
         .hooks(chain)
         .build()
     )

@@ -149,11 +149,17 @@ edges you should know about before running:
   later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else. This
-  example enables `structured_tool_calls` via
-  `HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))` to push
-  small models toward one clean, schema-constrained tool call per turn across
-  both the plan and execute phases.
+  model-agnostic — swap the model interface and change nothing else. By default
+  this example uses **native Ollama tool calling** (the real typed tool schema),
+  which works for tool-capable / cloud models like `gemma4:31b-cloud`. Pass
+  `--structured` to opt into `structured_tool_calls` via
+  `HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`, which
+  pushes small local models toward one clean, schema-constrained tool call per
+  turn across both the plan and execute phases. Note that structured mode exposes
+  an always-available `final` envelope, so a capable model can emit
+  `{"tool":"final"}` prematurely and hand back an EMPTY answer without writing
+  `async-comparison.md` — if you see that with `--structured`, drop the flag and
+  use the native default.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Python
   harness (like Rust and Go) suppresses the sub-loop stream, so the
   `OnPlanCreated` / `OnTaskAdvance` hooks are the portable, cross-language view of
@@ -175,7 +181,8 @@ variables.
 
 ```sh
 cd examples/python/08-plan-execute
-uv run main.py
+uv run main.py                # native tool calling (default)
+uv run main.py --structured   # constrained decoding for small local models
 uv run main.py --prompt "Compare three Rust web frameworks (axum, actix-web, rocket) on performance, ergonomics, and ecosystem; cite sources and save to async-comparison.md."
 ```
 
