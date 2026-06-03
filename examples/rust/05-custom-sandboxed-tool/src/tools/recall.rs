@@ -88,3 +88,138 @@ fn value_to_string(value: &serde_json::Value) -> String {
         None => value.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use spore_core::storage::InMemoryStorageProvider;
+    use spore_core::{SandboxProvider, SandboxViolation, SessionId};
+
+    use crate::tools::remember::RememberTool;
+
+    const SESSION: &str = "fact-session";
+
+    /// These tools never touch the filesystem — a permissive sandbox is plenty.
+    struct AllowAllSandbox;
+    impl SandboxProvider for AllowAllSandbox {
+        fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    fn in_memory_ctx() -> ToolContext {
+        let backend = Arc::new(InMemoryStorageProvider::new());
+        ToolContext::new(SessionId::new(SESSION), backend.clone(), backend)
+    }
+
+    fn recall_call(input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: RecallTool::NAME.into(),
+            input,
+        }
+    }
+
+    async fn remember(ctx: &ToolContext, key: &str, value: &str) {
+        let tool = RememberTool::new();
+        tool.execute(
+            &ToolCall {
+                id: "setup".into(),
+                name: RememberTool::NAME.into(),
+                input: json!({"key": key, "value": value}),
+            },
+            &AllowAllSandbox,
+            ctx,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn returns_stored_value() {
+        let ctx = in_memory_ctx();
+        remember(&ctx, "diet", "crabs and shrimp").await;
+        let out = RecallTool::new()
+            .execute(&recall_call(json!({"key": "diet"})), &AllowAllSandbox, &ctx)
+            .await;
+        match out {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "crabs and shrimp"),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn miss_is_recoverable_error_with_exact_message() {
+        let ctx = in_memory_ctx();
+        let out = RecallTool::new()
+            .execute(
+                &recall_call(json!({"key": "unknown"})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        match out {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert_eq!(message, "no fact stored under 'unknown'");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_key_is_recoverable_error() {
+        let ctx = in_memory_ctx();
+        let out = RecallTool::new()
+            .execute(&recall_call(json!({})), &AllowAllSandbox, &ctx)
+            .await;
+        match out {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("key"), "message: {message}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_string_key_is_recoverable_error() {
+        let ctx = in_memory_ctx();
+        let out = RecallTool::new()
+            .execute(&recall_call(json!({"key": 123})), &AllowAllSandbox, &ctx)
+            .await;
+        match out {
+            ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_does_not_write() {
+        let ctx = in_memory_ctx();
+        RecallTool::new()
+            .execute(&recall_call(json!({"key": "k"})), &AllowAllSandbox, &ctx)
+            .await;
+        let keys = ctx.run_store().list_keys(ctx.session_id()).await.unwrap();
+        assert!(
+            keys.is_empty(),
+            "recall must not persist anything, got {keys:?}"
+        );
+    }
+
+    #[test]
+    fn schema_is_read_only_and_idempotent() {
+        let s = RecallTool::schema();
+        assert_eq!(s.name, RecallTool::NAME);
+        assert!(s.annotations.read_only);
+        assert!(s.annotations.idempotent);
+        assert!(!s.annotations.destructive);
+    }
+}

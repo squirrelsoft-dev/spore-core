@@ -87,3 +87,214 @@ impl Tool for RememberTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use serde_json::Value as JsonValue;
+    use spore_core::storage::{InMemoryStorageProvider, RunStore, StorageError};
+    use spore_core::{SandboxProvider, SandboxViolation, SessionId};
+
+    use crate::tools::recall::RecallTool;
+
+    const SESSION: &str = "fact-session";
+
+    /// These tools never touch the filesystem — a permissive sandbox is plenty.
+    struct AllowAllSandbox;
+    impl SandboxProvider for AllowAllSandbox {
+        fn validate<'a>(&'a self, _call: &'a ToolCall) -> BoxFut<'a, Result<(), SandboxViolation>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// A RunStore whose every operation fails — proves storage errors map to a
+    /// recoverable tool error (mirrors the TS/Go `FailingRunStore`).
+    struct FailingRunStore;
+    impl RunStore for FailingRunStore {
+        fn get<'a>(
+            &'a self,
+            _session_id: &'a SessionId,
+            _key: &'a str,
+        ) -> BoxFut<'a, Result<Option<JsonValue>, StorageError>> {
+            Box::pin(async move {
+                Err(StorageError::Backend {
+                    message: "boom".into(),
+                })
+            })
+        }
+        fn put<'a>(
+            &'a self,
+            _session_id: &'a SessionId,
+            _key: &'a str,
+            _value: JsonValue,
+        ) -> BoxFut<'a, Result<(), StorageError>> {
+            Box::pin(async move {
+                Err(StorageError::Backend {
+                    message: "boom".into(),
+                })
+            })
+        }
+        fn delete<'a>(
+            &'a self,
+            _session_id: &'a SessionId,
+            _key: &'a str,
+        ) -> BoxFut<'a, Result<(), StorageError>> {
+            Box::pin(async move { Ok(()) })
+        }
+        fn list_keys<'a>(
+            &'a self,
+            _session_id: &'a SessionId,
+        ) -> BoxFut<'a, Result<Vec<String>, StorageError>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
+
+    fn ctx_with(run_store: Arc<dyn RunStore>) -> ToolContext {
+        // remember/recall exercise the run-store seam only; an in-memory backend
+        // covers the (unused) memory seam.
+        ToolContext::new(
+            SessionId::new(SESSION),
+            run_store,
+            Arc::new(InMemoryStorageProvider::new()),
+        )
+    }
+
+    fn in_memory_ctx() -> ToolContext {
+        ctx_with(Arc::new(InMemoryStorageProvider::new()))
+    }
+
+    fn call(input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: RememberTool::NAME.into(),
+            input,
+        }
+    }
+
+    async fn execute(tool: &RememberTool, call: ToolCall, ctx: &ToolContext) -> ToolOutput {
+        tool.execute(&call, &AllowAllSandbox, ctx).await
+    }
+
+    #[tokio::test]
+    async fn stores_under_fact_prefix() {
+        let ctx = in_memory_ctx();
+        let out = execute(
+            &RememberTool::new(),
+            call(json!({"key": "habitat", "value": "coastal ocean waters"})),
+            &ctx,
+        )
+        .await;
+        match out {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "remembered habitat"),
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        // Persisted under the namespaced key, JSON-encoded as a string …
+        let stored = ctx
+            .run_store()
+            .get(ctx.session_id(), &format!("{FACT_PREFIX}habitat"))
+            .await
+            .unwrap();
+        assert_eq!(stored, Some(json!("coastal ocean waters")));
+        // … and NOT under the bare key.
+        let bare = ctx
+            .run_store()
+            .get(ctx.session_id(), "habitat")
+            .await
+            .unwrap();
+        assert_eq!(bare, None);
+    }
+
+    #[tokio::test]
+    async fn recall_reads_back_remembered_value() {
+        let ctx = in_memory_ctx();
+        execute(
+            &RememberTool::new(),
+            call(json!({"key": "diet", "value": "crabs and shrimp"})),
+            &ctx,
+        )
+        .await;
+        let recall = RecallTool::new();
+        let out = recall
+            .execute(
+                &ToolCall {
+                    id: "c2".into(),
+                    name: RecallTool::NAME.into(),
+                    input: json!({"key": "diet"}),
+                },
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        match out {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "crabs and shrimp"),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_value_is_recoverable_error() {
+        let out = execute(
+            &RememberTool::new(),
+            call(json!({"key": "habitat"})),
+            &in_memory_ctx(),
+        )
+        .await;
+        match out {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("value"), "message: {message}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_string_key_is_recoverable_error() {
+        let out = execute(
+            &RememberTool::new(),
+            call(json!({"key": 7, "value": "x"})),
+            &in_memory_ctx(),
+        )
+        .await;
+        match out {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("key"), "message: {message}");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_failure_is_recoverable_error() {
+        let ctx = ctx_with(Arc::new(FailingRunStore));
+        let out = execute(
+            &RememberTool::new(),
+            call(json!({"key": "k", "value": "v"})),
+            &ctx,
+        )
+        .await;
+        match out {
+            ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_is_not_read_only() {
+        let s = RememberTool::schema();
+        assert_eq!(s.name, RememberTool::NAME);
+        assert!(!s.annotations.read_only);
+        assert!(!s.annotations.destructive);
+        assert!(!s.annotations.idempotent);
+    }
+}
