@@ -66,6 +66,21 @@ export const ModelParamsSchema = z.object({
   reasoning_budget: z.number().int().nonnegative().nullable().optional(),
   top_p: z.number().nullable().optional(),
   stop_sequences: z.array(z.string()).default([]),
+  /**
+   * Opt-in hint for providers that support constrained decoding (Ollama via
+   * the `format` JSON-schema parameter). When `true` AND the request has
+   * tools, the provider forces tool calls to be emitted as schema-constrained
+   * JSON, parsed back into tool-use blocks. Providers without
+   * constrained-decoding support (e.g. Anthropic) ignore it. Helps small local
+   * models (llama3.2) that otherwise leak `<|python_tag|>` tool calls into
+   * content. Tradeoff: one tool call per turn, no interleaved reasoning text.
+   * Default `false`.
+   *
+   * Mirrors Rust's `#[serde(skip_serializing_if = "Not::not")]`: this field is
+   * OMITTED from the canonical request hash when false/absent, keeping the
+   * cross-language request-hash byte-identical when off.
+   */
+  structured_tool_calls: z.boolean().optional(),
 });
 
 export const ModelRequestSchema = z.object({

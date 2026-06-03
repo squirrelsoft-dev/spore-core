@@ -94,14 +94,21 @@ function toolSchemaValue(t: ModelRequest["tools"][number]): CanonValue {
 }
 
 function paramsValue(p: ModelRequest["params"]): CanonValue {
-  // Mirror Rust serde: every field is always emitted; `Option::None` → null.
-  return {
+  // Mirror Rust serde: every `Option` field is always emitted (`None` → null).
+  const out: { [k: string]: CanonValue } = {
     temperature: p.temperature ?? null,
     max_tokens: p.max_tokens ?? null,
     reasoning_budget: p.reasoning_budget ?? null,
     top_p: p.top_p ?? null,
     stop_sequences: p.stop_sequences,
   };
+  // `structured_tool_calls` mirrors Rust's `skip_serializing_if = "Not::not"`:
+  // emitted ONLY when true, so the request hash stays byte-identical to the
+  // other languages when the flag is off/absent.
+  if (p.structured_tool_calls === true) {
+    out.structured_tool_calls = true;
+  }
+  return out;
 }
 
 /**

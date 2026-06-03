@@ -19,6 +19,7 @@ import {
   ollamaNameMatches,
   ollamaNdjsonToEvents,
   ollamaParseResponse,
+  ollamaParseStructuredContent,
   ollamaParseStopReason,
   type ContentBlock,
   type Message,
@@ -234,6 +235,157 @@ describe("buildRequest", () => {
 });
 
 // ---------------------------------------------------------------------------
+// structured tool calls (opt-in constrained decoding)
+//
+// This path describes the tools in a system message and constrains decoding
+// via Ollama's `format` schema instead of sending native `tools`. Because the
+// tool call rides the constrained-JSON channel — never the native tool_calls /
+// `<|python_tag|>` path — small local models can no longer leak a tool call
+// into `message.content` as unparsed text.
+// ---------------------------------------------------------------------------
+
+function structuredToolReq(): ModelRequest {
+  const r = req([user("write a summary file")]);
+  r.params.structured_tool_calls = true;
+  r.tools.push({
+    name: "write_file",
+    description: "write a file",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+    },
+  });
+  r.tools.push({
+    name: "read_file",
+    description: "read a file",
+    input_schema: { type: "object", properties: { path: { type: "string" } } },
+  });
+  return r;
+}
+
+describe("buildRequest structured tool calls", () => {
+  it("sets format, drops tools, adds a system message", () => {
+    const body = ollamaBuildRequest("llama3.2", null, structuredToolReq(), false);
+    // Native tools dropped in structured mode.
+    expect(body.tools).toBeUndefined();
+    // format schema present with tool enum = tool names + "final".
+    const format = body.format as {
+      properties: { tool: { enum: string[] } };
+    };
+    expect(format).toBeDefined();
+    const names = format.properties.tool.enum;
+    expect(names).toContain("write_file");
+    expect(names).toContain("read_file");
+    expect(names).toContain("final");
+    // A system message describing the tools is prepended.
+    expect(body.messages[0]!.role).toBe("system");
+    expect(body.messages[0]!.content).toContain("write_file");
+    expect(body.messages[0]!.content).toContain("read_file");
+    expect(body.messages[0]!.content).toContain("SINGLE JSON object");
+  });
+
+  it("merges the preamble into an existing leading system message", () => {
+    const r = structuredToolReq();
+    r.messages.unshift({ role: "system", content: { type: "text", text: "You are terse." } });
+    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const systemCount = body.messages.filter((m) => m.role === "system").length;
+    expect(systemCount).toBe(1);
+    expect(body.messages[0]!.content).toContain("You are terse.");
+    expect(body.messages[0]!.content).toContain("write_file");
+  });
+
+  it("off when flag set but no tools", () => {
+    const r = req([user("hi")]);
+    r.params.structured_tool_calls = true;
+    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    expect(body.format).toBeUndefined();
+  });
+
+  it("off by default with tools present (native tools, no format)", () => {
+    const r = req([user("hi")]);
+    r.tools.push({
+      name: "search",
+      description: "search the web",
+      input_schema: { type: "object" },
+    });
+    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    expect(body.format).toBeUndefined();
+    expect(body.tools).toHaveLength(1);
+  });
+});
+
+describe("parseResponse structured tool calls", () => {
+  it("parses a structured tool call", () => {
+    const r = ollamaParseResponse(
+      {
+        message: {
+          role: "assistant",
+          content: '{"tool":"write_file","arguments":{"path":"SUMMARY.md","content":"hi"}}',
+        },
+        done: true,
+        done_reason: "stop",
+        prompt_eval_count: 1,
+        eval_count: 1,
+      },
+      true,
+    );
+    expect(r.stop_reason).toBe("tool_use");
+    expect(r.content).toHaveLength(1);
+    const tc = r.content[0] as Extract<ContentBlock, { type: "tool_use" }>;
+    expect(tc.type).toBe("tool_use");
+    expect(tc.name).toBe("write_file");
+    expect(tc.input).toEqual({ path: "SUMMARY.md", content: "hi" });
+  });
+
+  it("parses a structured final reply as text", () => {
+    const r = ollamaParseResponse(
+      {
+        message: { role: "assistant", content: '{"tool":"final","content":"all done"}' },
+        done: true,
+        done_reason: "stop",
+      },
+      true,
+    );
+    expect(r.stop_reason).toBe("end_turn");
+    expect(r.content).toEqual([{ type: "text", text: "all done" }]);
+  });
+
+  it("falls back to text on malformed structured output", () => {
+    const r = ollamaParseResponse(
+      {
+        message: { role: "assistant", content: "oops not json" },
+        done: true,
+        done_reason: "stop",
+      },
+      true,
+    );
+    expect(r.stop_reason).toBe("end_turn");
+    expect(r.content).toEqual([{ type: "text", text: "oops not json" }]);
+  });
+
+  it("unchanged when structured flag is off", () => {
+    const r = ollamaParseResponse({
+      message: {
+        role: "assistant",
+        content: '{"tool":"write_file","arguments":{"path":"x"}}',
+      },
+      done: true,
+      done_reason: "stop",
+    });
+    // Off → raw JSON stays as a text block, no tool_use parsed.
+    expect(r.content).toEqual([
+      { type: "text", text: '{"tool":"write_file","arguments":{"path":"x"}}' },
+    ]);
+  });
+
+  it("parseStructuredContent missing tool field falls back to text", () => {
+    const [content, stop] = ollamaParseStructuredContent('{"foo":"bar"}', 0);
+    expect(stop).toBe("end_turn");
+    expect(content).toEqual([{ type: "text", text: '{"foo":"bar"}' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseStopReason
 // ---------------------------------------------------------------------------
 
@@ -443,6 +595,52 @@ describe("ndjsonToEvents", () => {
       "get_current_time",
       "reverse_string",
     ]);
+  });
+
+  it("structured: buffers JSON across chunks then reconstructs a tool call", async () => {
+    // The constrained JSON object arrives split across content deltas. The
+    // streamer must NOT surface the raw JSON as answer text; instead it buffers
+    // the whole thing and, at done, reconstructs a write_file tool call with
+    // valid argument JSON.
+    const ndjson =
+      '{"message":{"role":"assistant","content":"{\\"tool\\":\\"write_"},"done":false}\n' +
+      '{"message":{"role":"assistant","content":"file\\",\\"arguments\\":{\\"path\\":"},"done":false}\n' +
+      '{"message":{"role":"assistant","content":"\\"OUT.md\\",\\"content\\":\\"hi\\"}}"},"done":false}\n' +
+      '{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":9}\n';
+    const events: StreamEvent[] = [];
+    for await (const ev of ollamaNdjsonToEvents(streamFromString(ndjson), true)) events.push(ev);
+    // No raw-JSON content deltas leaked to the user.
+    expect(events.some((e) => e.type === "content_block_delta")).toBe(false);
+    const start = events.find(
+      (e): e is Extract<StreamEvent, { type: "tool_use_start" }> => e.type === "tool_use_start",
+    );
+    expect(start?.name).toBe("write_file");
+    const delta = events.find(
+      (e): e is Extract<StreamEvent, { type: "tool_use_delta" }> => e.type === "tool_use_delta",
+    );
+    expect(delta).toBeDefined();
+    expect(JSON.parse(delta!.partial_json)).toEqual({ path: "OUT.md", content: "hi" });
+    const last = events[events.length - 1];
+    expect(last?.type).toBe("message_stop");
+    if (last?.type === "message_stop") {
+      expect(last.usage.input_tokens).toBe(3);
+      expect(last.usage.output_tokens).toBe(9);
+    }
+  });
+
+  it("structured: final reply surfaces as a single content delta", async () => {
+    const ndjson =
+      '{"message":{"role":"assistant","content":"{\\"tool\\":\\"final\\","},"done":false}\n' +
+      '{"message":{"role":"assistant","content":"\\"content\\":\\"all done\\"}"},"done":false}\n' +
+      '{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}\n';
+    const deltas: string[] = [];
+    let sawToolUse = false;
+    for await (const ev of ollamaNdjsonToEvents(streamFromString(ndjson), true)) {
+      if (ev.type === "content_block_delta") deltas.push(ev.delta);
+      if (ev.type === "tool_use_start") sawToolUse = true;
+    }
+    expect(sawToolUse).toBe(false);
+    expect(deltas).toEqual(["all done"]);
   });
 });
 

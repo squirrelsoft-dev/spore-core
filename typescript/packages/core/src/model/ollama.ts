@@ -169,7 +169,8 @@ export class OllamaModelInterface implements ModelInterface {
     } catch (e) {
       throw new ProviderError(0, `response decode failed: ${formatError(e)}`);
     }
-    return parseResponse(parsed);
+    const structured = request.params.structured_tool_calls === true && request.tools.length > 0;
+    return parseResponse(parsed, structured);
   }
 
   async *callStreaming(request: ModelRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
@@ -189,7 +190,8 @@ export class OllamaModelInterface implements ModelInterface {
     if (resp.body == null) {
       throw new ProviderError(0, "streaming response had no body");
     }
-    yield* ndjsonToEvents(resp.body);
+    const structured = request.params.structured_tool_calls === true && request.tools.length > 0;
+    yield* ndjsonToEvents(resp.body, structured);
   }
 
   async countTokens(request: ModelRequest, signal?: AbortSignal): Promise<number> {
@@ -427,6 +429,15 @@ export interface OllamaRequest {
   keep_alive?: string;
   options?: OllamaOptions;
   tools?: OllamaTool[];
+  /**
+   * Constrained-decoding JSON schema (Ollama's `format` parameter). Set only
+   * in structured-tool-calls mode (`ModelParams.structured_tool_calls`); when
+   * present, native `tools` are dropped and the model is forced to emit a
+   * single schema-constrained JSON object instead of routing tool calls
+   * through Llama's `<|python_tag|>` channel (which Ollama does not parse,
+   * causing the call to leak into `message.content`). Omitted when undefined.
+   */
+  format?: unknown;
 }
 
 export interface OllamaOptions {
@@ -502,16 +513,47 @@ export function buildRequest(
   req: ModelRequest,
   stream: boolean,
 ): OllamaRequest {
+  // Structured-tool-calls mode (opt-in): constrained decoding via `format`.
+  // We send NO native tools — describing them in a system message instead —
+  // and force the model to emit a single schema-constrained JSON object. The
+  // `tool` enum is the critical constraint: it eliminates the `<|python_tag|>`
+  // leak that small local models (llama3.2) otherwise produce.
+  const structured = req.params.structured_tool_calls === true && req.tools.length > 0;
+
   const messages: OllamaMessage[] = req.messages.map(messageToOllama);
 
-  const tools: OllamaTool[] = req.tools.map((t: ToolSchema) => ({
-    type: "function",
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: t.input_schema,
-    },
-  }));
+  let tools: OllamaTool[] = [];
+  let format: unknown;
+  if (structured) {
+    // Inject a system message describing the tools. Merge into an existing
+    // leading system message when present; otherwise prepend a new one.
+    const preamble = structuredToolsPreamble(req.tools);
+    const first = messages[0];
+    if (first != null && first.role === "system") {
+      first.content = `${first.content}\n\n${preamble}`;
+    } else {
+      messages.unshift({ role: "system", content: preamble });
+    }
+    const toolNames = [...req.tools.map((t) => t.name), "final"];
+    format = {
+      type: "object",
+      properties: {
+        tool: { type: "string", enum: toolNames },
+        arguments: { type: "object" },
+        content: { type: "string" },
+      },
+      required: ["tool"],
+    };
+  } else {
+    tools = req.tools.map((t: ToolSchema) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.input_schema,
+      },
+    }));
+  }
 
   const options: OllamaOptions = {};
   if (req.params.max_tokens != null) options.num_predict = req.params.max_tokens;
@@ -534,6 +576,41 @@ export function buildRequest(
     out.options = options;
   }
   if (tools.length > 0) out.tools = tools;
+  if (format !== undefined) out.format = format;
+  return out;
+}
+
+/**
+ * Build the system-message preamble for structured-tool-calls mode. Describes
+ * each tool's name, description, and parameter property names/types (read from
+ * `t.input_schema`), then gives the model explicit single-JSON-object output
+ * instructions. This — together with the `format` schema's `tool` enum — keeps
+ * tool calls on the constrained-JSON channel and away from `<|python_tag|>`.
+ *
+ * Mirrors Rust's `structured_tools_preamble`.
+ */
+function structuredToolsPreamble(tools: ToolSchema[]): string {
+  let out = "You have access to the following tools:\n";
+  for (const t of tools) {
+    out += `\n- ${t.name}: ${t.description}`;
+    const schema = jsonValue(t.input_schema);
+    const props = schema != null ? jsonValue(schema.properties) : undefined;
+    if (props != null) {
+      const entries = Object.entries(props);
+      if (entries.length > 0) {
+        const params = entries.map(([name, propSchema]) => {
+          const ps = jsonValue(propSchema);
+          const ty = ps != null && typeof ps.type === "string" ? ps.type : "any";
+          return `${name} (${ty})`;
+        });
+        out += `\n  parameters: ${params.join(", ")}`;
+      }
+    }
+  }
+  out +=
+    "\n\nRespond with a SINGLE JSON object and nothing else. To call a tool, " +
+    'set "tool" to the tool name and "arguments" to its inputs. When the task ' +
+    'is fully done, set "tool" to "final" and put your reply in "content".';
   return out;
 }
 
@@ -584,8 +661,27 @@ function messageToOllama(m: Message): OllamaMessage {
   }
 }
 
-export function parseResponse(body: OllamaResponse): ModelResponse {
+export function parseResponse(body: OllamaResponse, structured = false): ModelResponse {
   const msg: OllamaResponseMessage = body.message ?? {};
+
+  const usage: TokenUsage = {
+    input_tokens: body.prompt_eval_count ?? 0,
+    output_tokens: body.eval_count ?? 0,
+    cache_read_tokens: null,
+    cache_write_tokens: null,
+  };
+
+  if (structured) {
+    // In structured mode the assistant content is a single constrained JSON
+    // object — never a native tool_calls array. Parsing it back into a
+    // tool-use block (rather than treating the raw JSON as answer text) is
+    // precisely what avoids the `<|python_tag|>` leak: the tool call never
+    // touches the native channel.
+    const raw = msg.content ?? "";
+    const [content, stopReason] = parseStructuredContent(raw, 0);
+    return { content, usage, stop_reason: stopReason };
+  }
+
   const content: ContentBlock[] = [];
   const text = msg.content;
   if (text != null && text !== "") {
@@ -604,18 +700,42 @@ export function parseResponse(body: OllamaResponse): ModelResponse {
     });
   }
 
-  const usage: TokenUsage = {
-    input_tokens: body.prompt_eval_count ?? 0,
-    output_tokens: body.eval_count ?? 0,
-    cache_read_tokens: null,
-    cache_write_tokens: null,
-  };
-
   return {
     content,
     usage,
     stop_reason: parseStopReason(body.done_reason ?? null),
   };
+}
+
+/**
+ * Parse the constrained-decoding JSON object produced in structured-tool-calls
+ * mode into `[content blocks, stop reason]`. `index` is used to synthesize the
+ * tool-call id, reusing this file's `call-{i}` convention.
+ *
+ * Defensive: if `raw` is missing/empty/not valid JSON/lacks a `tool` field,
+ * fall back to a single text block with the raw content and `end_turn` — weak
+ * models occasionally violate even constrained decoding, and we never throw on
+ * their output. Mirrors Rust's `parse_structured_content`.
+ */
+export function parseStructuredContent(raw: string, index: number): [ContentBlock[], StopReason] {
+  const fallback: [ContentBlock[], StopReason] = [[{ type: "text", text: raw }], "end_turn"];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch {
+    return fallback;
+  }
+  const obj = jsonValue(parsed);
+  if (obj == null) return fallback;
+  const tool = obj.tool;
+  if (typeof tool !== "string") return fallback;
+  if (tool === "final") {
+    const text = typeof obj.content === "string" ? obj.content : "";
+    return [[{ type: "text", text }], "end_turn"];
+  }
+  const argsObj = jsonValue(obj.arguments);
+  const input: unknown = argsObj ?? {};
+  return [[{ type: "tool_use", id: `call-${index}`, name: tool, input }], "tool_use"];
 }
 
 export function parseStopReason(s: string | null | undefined): StopReason {
@@ -711,6 +831,7 @@ function concatRequestText(request: ModelRequest): string {
  */
 export async function* ndjsonToEvents(
   body: ReadableStream<Uint8Array>,
+  structured = false,
 ): AsyncIterable<StreamEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
@@ -719,6 +840,13 @@ export async function* ndjsonToEvents(
   const toolIndicesSeen = new Set<number>();
   let contentIndex = 0;
   let contentOpen = false;
+  // Structured mode: the constrained JSON object arrives as `message.content`
+  // text deltas spread across chunks. We must NOT surface that raw JSON to the
+  // user — instead buffer it for the whole response and parse it at the `done`
+  // chunk exactly like `parseResponse`, emitting reconstructable tool / text
+  // events. This keeps the tool call off the native channel and is what
+  // prevents the `<|python_tag|>` leak in streaming mode too.
+  let structuredContent = "";
 
   try {
     while (true) {
@@ -742,6 +870,41 @@ export async function* ndjsonToEvents(
         if (!started) {
           started = true;
           yield { type: "message_start" };
+        }
+        if (structured) {
+          // Buffer content deltas; defer all emission to the `done` chunk.
+          const msg = jsonValue(obj.message);
+          if (msg != null && typeof msg.content === "string") {
+            structuredContent += msg.content;
+          }
+          if (obj.done === true) {
+            const [content, stopReason] = parseStructuredContent(structuredContent, 0);
+            for (const block of content) {
+              if (block.type === "tool_use") {
+                let partial: string;
+                try {
+                  partial = JSON.stringify(block.input ?? {});
+                } catch {
+                  partial = "{}";
+                }
+                yield { type: "tool_use_start", index: 1, id: block.id, name: block.name };
+                yield { type: "tool_use_delta", index: 1, partial_json: partial };
+              } else if (block.type === "text") {
+                yield { type: "content_block_delta", index: 0, delta: block.text };
+              } else if (block.type === "thinking") {
+                yield { type: "thinking_delta", index: 0, delta: block.text };
+              }
+            }
+            const usage: TokenUsage = {
+              input_tokens: typeof obj.prompt_eval_count === "number" ? obj.prompt_eval_count : 0,
+              output_tokens: typeof obj.eval_count === "number" ? obj.eval_count : 0,
+              cache_read_tokens: null,
+              cache_write_tokens: null,
+            };
+            yield { type: "message_stop", usage, stop_reason: stopReason };
+            return;
+          }
+          continue;
         }
         const message = jsonValue(obj.message);
         if (message != null) {

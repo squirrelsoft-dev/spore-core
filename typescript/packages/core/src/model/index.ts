@@ -30,6 +30,7 @@ export {
   DEFAULT_KEEP_ALIVE as OLLAMA_DEFAULT_KEEP_ALIVE,
   buildRequest as ollamaBuildRequest,
   parseResponse as ollamaParseResponse,
+  parseStructuredContent as ollamaParseStructuredContent,
   parseStopReason as ollamaParseStopReason,
   ndjsonToEvents as ollamaNdjsonToEvents,
   nameMatches as ollamaNameMatches,
