@@ -115,10 +115,27 @@ it runs with no hosted-model account. Synthesis quality scales with the model: a
 **larger hosted model will produce noticeably better, better-cited answers**. The
 harness is model-agnostic — swap the model interface and change nothing else.
 
-This example also enables `structured_tool_calls` via
-`HarnessBuilder::model_params(ModelParams { structured_tool_calls: true, .. })`.
-That turns on schema-constrained decoding so small Ollama models emit one clean
-tool call per turn (no interleaved reasoning) instead of malformed JSON.
+### Native vs. structured tool calls (`--structured`)
+
+By default the example uses **native** Ollama tool calling: `write_file` gets a
+real typed schema and the model is steered straight to search → write → answer.
+This is what tool-capable models (including hosted `*-cloud` models such as
+`gemma4:31b-cloud`) want.
+
+Small local models (e.g. `llama3.2`) sometimes leak `<|python_tag|>` or emit
+malformed JSON on the native channel. Pass `--structured` to switch on
+schema-constrained decoding (`ModelParams { structured_tool_calls: true, .. }`),
+which forces one clean JSON tool call per turn:
+
+```sh
+cargo run -- --structured                       # llama3.2 with constrained decoding
+cargo run -- --model gemma4:31b-cloud           # capable model, native tool calls
+```
+
+> Note: structured mode exposes an always-available `final` envelope. Weaker
+> instruction-followers can take that exit prematurely (emitting an empty answer
+> without ever calling `write_file`). If you see an empty `answer (N turn(s)):`
+> and no `answer.md`, drop `--structured` and use native tool calling.
 
 ## Prerequisites
 

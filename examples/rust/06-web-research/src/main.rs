@@ -67,6 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "llama3.2".to_string());
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
+    // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+    // `*-cloud`) use native Ollama tool calling, which gives `write_file` a real
+    // typed schema and no always-on `final` escape. Small local models that leak
+    // `<|python_tag|>` can pass `--structured` to force the JSON-object channel.
+    let structured = args.iter().any(|a| a == "--structured");
 
     // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
     // and returns the JSON body to the agent. There is no live backend in
@@ -129,11 +134,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
-        // Structured mode helps small Ollama models emit clean tool calls (one
-        // per turn, no interleaved reasoning — so the "think · turn N" line is
-        // just a turn marker, not model chatter).
+        // Native tool calling by default; `--structured` flips on constrained
+        // decoding for small models (see the `structured` flag above). With
+        // structured mode the "think · turn N" line is just a turn marker, not
+        // model chatter, since each turn emits one clean JSON tool call.
         .model_params(spore_core::ModelParams {
-            structured_tool_calls: true,
+            structured_tool_calls: structured,
             ..Default::default()
         })
         .build();

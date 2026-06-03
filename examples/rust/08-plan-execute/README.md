@@ -146,11 +146,17 @@ edges you should know about before running:
   later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else. This
-  example enables `structured_tool_calls` via
-  `HarnessBuilder::model_params(ModelParams { structured_tool_calls: true, .. })`
-  to push small models toward one clean, schema-constrained tool call per turn
-  across both the plan and execute phases.
+  model-agnostic — swap the model interface and change nothing else.
+- **Native vs. structured tool calls (`--structured`).** By default the example
+  uses native Ollama tool calling: `write_file` gets a real typed schema and
+  there is no always-on `final` envelope, so tool-capable models (including
+  hosted `*-cloud` models such as `gemma4:31b-cloud`) reliably search → write →
+  answer. Pass `--structured` to enable
+  `ModelParams { structured_tool_calls: true, .. }` (schema-constrained decoding)
+  for small local models that otherwise leak `<|python_tag|>` or malformed JSON.
+  > Structured mode exposes an always-available `final` envelope that weaker
+  > models can take prematurely (empty answer, no file written). If you see an
+  > empty `answer (N turn(s)):` and no output file, drop `--structured`.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Rust
   harness suppresses the sub-loop stream, so the `OnPlanCreated` / `OnTaskAdvance`
   hooks are the portable, cross-language view of execution.
