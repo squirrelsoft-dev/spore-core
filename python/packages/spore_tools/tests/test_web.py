@@ -242,6 +242,26 @@ async def test_post_default_query_shape_unchanged_via_config(httpx_mock: HTTPXMo
     assert r.content == "res"
 
 
+async def test_get_preserves_existing_endpoint_query_string(httpx_mock: HTTPXMock) -> None:
+    # SearXNG shape: the endpoint already carries ``?format=json`` and the query
+    # is appended under ``q``. The outbound request must carry BOTH params —
+    # httpx's ``params=`` would otherwise replace the pre-existing query string.
+    httpx_mock.add_response(method="GET", text="searxng-results")
+    cfg = WebSearchConfig(
+        endpoint="http://testserver/search?format=json",
+        method=SearchMethod.GET,
+        query_param="q",
+    )
+    tool = WebSearchTool.with_config(cfg)
+    r = await tool.execute(_call("web_search", {"query": "rust"}), AllowAllSandbox(), _CTX)
+    assert isinstance(r, ToolOutputSuccess)
+    assert r.content == "searxng-results"
+    req = httpx_mock.get_request()
+    assert req is not None
+    assert req.url.params.get("format") == "json"
+    assert req.url.params.get("q") == "rust"
+
+
 async def test_get_returns_body_verbatim(httpx_mock: HTTPXMock) -> None:
     raw = '{"web":{"results":[{"title":"t"}]}}'
     httpx_mock.add_response(

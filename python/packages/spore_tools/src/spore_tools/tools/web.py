@@ -280,13 +280,16 @@ class WebSearchTool:
             async with httpx.AsyncClient() as client:
                 if backend.method is SearchMethod.GET:
                     # Query + body-auth params are URL-encoded into the query
-                    # string; httpx encodes spaces, ``&``, etc.
+                    # string; httpx encodes spaces, ``&``, etc. Any query string
+                    # already present on the endpoint URL (e.g. SearXNG's
+                    # ``?format=json``) is PRESERVED — httpx's ``params=`` would
+                    # otherwise REPLACE the existing query string, so we merge
+                    # onto the endpoint URL explicitly.
                     query_params: dict[str, str] = {backend.query_param: params.query}
                     for field_name, value in backend.body_auth_params:
                         query_params[field_name] = value
-                    resp = await client.get(
-                        backend.endpoint, params=query_params, headers=headers or None
-                    )
+                    url = httpx.URL(backend.endpoint).copy_merge_params(query_params)
+                    resp = await client.get(url, headers=headers or None)
                 else:
                     # Query + body-auth params go into the JSON body (Tavily
                     # shape: {"api_key": ..., "query": ...}).
