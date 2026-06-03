@@ -319,8 +319,16 @@ def parse_structured_content(raw: str, index: int) -> tuple[list[ContentBlock], 
         [TextBlock(text=raw)],
         StopReason.END_TURN,
     )
+    # Capable/cloud models often ignore the constrained-decoding grammar and
+    # wrap the JSON tool call in a markdown code fence. Reuse the plan parser's
+    # fence stripping so a fenced ``{"tool":...}`` still dispatches instead of
+    # being mis-read as a final text answer. Imported lazily: ``plan`` pulls in
+    # the hooks/harness graph, and a module-level import here would form an
+    # import cycle through ``__init__``.
+    from .plan import _strip_code_fence
+
     try:
-        value: Any = json.loads(raw.strip())
+        value: Any = json.loads(_strip_code_fence(raw.strip()))
     except ValueError:
         return fallback
     if not isinstance(value, dict):
