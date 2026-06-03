@@ -3174,16 +3174,21 @@ class StandardHarness:
         planning directive, runs one constrained planner turn, captures a
         :class:`PlanArtifact`, fires ``OnPlanCreated``, and counts the turn
         against the shared budget. Phase 2 (execute, loops):
-        :meth:`_run_execute_phase` drains the parsed task list, giving each task
-        its own bounded ReAct sub-loop.
+        :meth:`_run_execute_phase` drains the parsed task list, running each task
+        in a bounded ReAct sub-loop that BUILDS ON the accumulated execute-phase
+        context (prior steps' tool results and assistant outputs carry forward).
 
         Resolved spec decisions (issue #59, all FINAL):
 
-        * **Q1** — each task gets its own bounded, isolated, SEQUENTIAL ReAct
-          sub-loop; the per-task turn cap is derived at the START of each step as
-          ``remaining_turns // remaining_tasks`` (floored at 1). The shared
-          budget — turns, tokens, observability, compaction — is carried across
-          every step and the global budget is the hard stop.
+        * **Q1** — each task runs a bounded, SEQUENTIAL ReAct sub-loop that
+          BUILDS ON the accumulated execute-phase context: after each successful
+          step its conversation (instruction + tool calls + tool results +
+          assistant output) is folded back into the shared ``session_state``, so
+          the next step sees all prior steps' results. The per-task turn cap is
+          derived at the START of each step as ``remaining_turns //
+          remaining_tasks`` (floored at 1). The shared budget — turns, tokens,
+          observability, compaction — is carried across every step and the
+          global budget is the hard stop.
         * **Q2** — success ``output`` is the LAST completed step's final text.
         * **Q3** — an empty plan (``tasks: []``) ⇒ :class:`HaltReasonEmptyPlan`.
         * **Q4** — the task list/plan persist through the
@@ -4104,13 +4109,17 @@ class StandardHarness:
     ) -> RunResult:
         """Drive the PlanExecute execute phase (issue #59), draining ``task_list``.
 
-        Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-        sub-loop. The per-task turn cap is derived at the START of each step from
-        the shared budget: ``per_task_turns = remaining_turns // remaining_tasks``
-        floored at 1 (``remaining_tasks`` counts the not-yet-started tasks
-        including the current one). The shared budget (``carried``) is threaded
-        through every step so early tasks cannot starve later ones and the global
-        budget stays the hard stop.
+        Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
+        the accumulated execute-phase context: after each successful step its
+        resulting conversation (instruction + tool calls + tool results +
+        assistant output) is folded back into the shared ``session_state``, so
+        the next step's sub-loop sees every prior step's results. The per-task
+        turn cap is derived at the START of each step from the shared budget:
+        ``per_task_turns = remaining_turns // remaining_tasks`` floored at 1
+        (``remaining_tasks`` counts the not-yet-started tasks including the
+        current one). The shared budget (``carried``) is threaded through every
+        step so early tasks cannot starve later ones and the global budget stays
+        the hard stop.
 
         Before each step the task is marked ``in_progress`` (and ``completed``
         after), the list is re-persisted (Q4), and ``OnTaskAdvance`` fires with
@@ -4205,6 +4214,17 @@ class StandardHarness:
                 total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
                 total_usage.cost_usd += sub_result.usage.cost_usd
                 last_output = sub_result.output
+
+                # Fold this step's resulting conversation back into the SHARED
+                # execute context so the NEXT step's sub-loop (which reads
+                # ``session_state``) builds on this step's tool results and
+                # assistant output, not just its instruction. The returned
+                # ``sub_result.session_state`` already contains this step's
+                # instruction + tool calls + tool results + final output;
+                # rebinding the loop-local keeps the next iteration on the
+                # accumulated context. The terminal ``RunResult`` then carries
+                # the LAST completed step's full accumulated state (Q2/#102).
+                session_state = sub_result.session_state
 
                 # Mark Completed and re-persist (Q4).
                 task_list.complete(task_id)

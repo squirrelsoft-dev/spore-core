@@ -274,8 +274,28 @@ class _ScriptedTurnAgent:
 
 
 def _context_texts(context: Context) -> str:
-    """Concatenate the text of every message in a captured context."""
-    return "\n".join(getattr(m.content, "text", "") or "" for m in context.messages)
+    """Concatenate the text of every message in a captured context.
+
+    Surfaces ``text`` (assistant/user), tool-call ``name``, and tool-result
+    ``content`` so accumulation across execute steps is visible — prior steps'
+    tool results carry their outputs forward as ``ToolResultContent`` messages.
+    Mirrors the Rust recording agent's ``seen_text`` flattening.
+    """
+    parts: list[str] = []
+    for m in context.messages:
+        c = m.content
+        text = getattr(c, "text", None)
+        if text:
+            parts.append(text)
+            continue
+        result = getattr(c, "content", None)  # ToolResultContent.content
+        if result:
+            parts.append(result)
+            continue
+        name = getattr(c, "name", None)  # ToolCallContent.name
+        if name:
+            parts.append(name)
+    return "\n".join(parts)
 
 
 async def test_plan_directive_does_not_leak_into_execute_context() -> None:
@@ -344,6 +364,83 @@ async def test_plan_directive_does_not_leak_into_execute_context() -> None:
     )
     assert "step two" in _context_texts(agent.seen[3]), (
         "step-two context should carry its instruction"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #93: the execute phase maintains ONE accumulating context across steps.
+#
+# After a successful step its conversation (instruction + tool calls + TOOL
+# RESULTS + assistant output) is folded back into the shared session_state, so
+# the NEXT step's sub-loop sees prior steps' RESULTS — not just their
+# instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
+# distinctive string and assert STEP 2's assembled context carries it. Mirrors
+# Rust's ``execute_steps_accumulate_prior_results``.
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_steps_accumulate_prior_results() -> None:
+    """A 2-step PlanExecute run: step 1 calls a tool returning a distinctive
+    string; step 2's context must CONTAIN that string (accumulating context)."""
+    from spore_core import ToolOutputSuccess
+
+    agent = _ScriptedTurnAgent(
+        [
+            # Plan turn: a 2-step plan (research -> summarize the result).
+            FinalResponse(
+                content='{"tasks":["research tokio","summarize findings"],"rationale":"r"}',
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            # Step 1: call a tool, then finalize using its result.
+            ToolCallRequested(
+                calls=[ToolCall(id="c1", name="lookup")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            FinalResponse(content="researched", usage=TokenUsage(input_tokens=1, output_tokens=1)),
+            # Step 2: finalize directly (it must SEE step 1's tool result).
+            FinalResponse(content="summarized", usage=TokenUsage(input_tokens=1, output_tokens=1)),
+        ]
+    )
+    # Step 1's tool call returns a distinctive result string.
+    registry = ScriptedToolRegistry()
+    registry.push(ToolOutputSuccess(content="TOKIO_FACTS_123"))
+    harness = StandardHarness(
+        HarnessConfig(
+            agent=agent,
+            tool_registry=registry,
+            sandbox=AllowAllSandbox(),
+            context_manager=_rich_adapter(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=StorageProvider.single(InMemoryStorageProvider()),
+        )
+    )
+    task = Task.new(
+        "build something",
+        SessionId("accum"),
+        LoopStrategyPlanExecute(plan_model=None),
+    )
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
+    assert result.output == "summarized"
+
+    # 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+    assert len(agent.seen) == 4, "plan turn + 3 execute turns"
+
+    # Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
+    # result string is on the wire at all.
+    assert "TOKIO_FACTS_123" in _context_texts(agent.seen[2]), (
+        f"step-1 final turn should follow its own tool result: {_context_texts(agent.seen[2])!r}"
+    )
+    # The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
+    # tool result, proving the execute loop carried it forward.
+    assert "TOKIO_FACTS_123" in _context_texts(agent.seen[3]), (
+        f"step 2 must see step 1's tool result (accumulating context): "
+        f"{_context_texts(agent.seen[3])!r}"
+    )
+    # Step 2 also sees step 1's prior instruction + assistant output.
+    step2_text = _context_texts(agent.seen[3])
+    assert "research tokio" in step2_text and "researched" in step2_text, (
+        f"step 2 must see step 1's instruction and output: {step2_text!r}"
     )
 
 
