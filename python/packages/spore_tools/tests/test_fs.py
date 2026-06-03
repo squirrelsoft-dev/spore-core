@@ -71,6 +71,44 @@ async def test_list_dir_sorted(tmp_path: Path) -> None:
     assert lines == sorted(lines)
 
 
+async def test_list_dir_entries_roundtrip_through_workspace_sandbox(
+    tmp_path: Path,
+) -> None:
+    # Regression for #93: every entry list_dir returns must round-trip straight
+    # back into read_file under the *real* WorkspaceScopedSandbox, which treats
+    # all input paths as root-relative. Absolute paths (the old behavior) would
+    # be rejected as PathEscape.
+    root = tmp_path.resolve()
+    (root / "a.txt").write_text("alpha")
+    (root / "b.txt").write_text("beta")
+    (root / "sub").mkdir()
+    (root / "sub" / "c.txt").write_text("gamma")
+    sb = _workspace_sandbox(root)
+
+    # Recursive so we exercise both top-level files and a nested file.
+    r = await ListDirTool().execute(_call("list_dir", {"path": ".", "recursive": True}), sb, _CTX)
+    assert isinstance(r, ToolOutputSuccess)
+    entries = r.content.splitlines()
+    assert "a.txt" in entries, f"expected bare root-relative names, got {entries}"
+    assert "sub/c.txt" in entries, f"expected nested entry as sub/c.txt, got {entries}"
+    assert not any(e == "" or e == "." for e in entries), (
+        f"must not emit the listed dir itself, got {entries}"
+    )
+
+    # The actual bug check: feed each entry straight into read_file.
+    for entry in entries:
+        rr = await ReadFileTool().execute(_call("read_file", {"path": entry}), sb, _CTX)
+        if isinstance(rr, ToolOutputError):
+            # A directory entry (e.g. ``sub``) reads as an error but must NOT be
+            # a sandbox violation — that's the regression.
+            lowered = rr.message.lower()
+            assert "sandbox" not in lowered and "escape" not in lowered, (
+                f"entry {entry!r} did not round-trip: {rr.message}"
+            )
+        else:
+            assert isinstance(rr, ToolOutputSuccess)
+
+
 async def test_delete_missing_is_recoverable() -> None:
     sb = AllowAllSandbox()
     r = await DeleteFileTool().execute(

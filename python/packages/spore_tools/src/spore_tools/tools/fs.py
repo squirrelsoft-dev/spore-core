@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import anyio
 
@@ -182,15 +182,46 @@ class ListDirTool:
 
         def _gather() -> list[str]:
             root = Path(resolved)
+            # Emit paths relative to the workspace root so each entry can be fed
+            # straight back into read_file/write_file. The sandbox treats every
+            # input path as root-relative, so absolute paths would not round-trip
+            # (see #93). ``resolved`` is the absolute path of the listed directory
+            # (= root-relative ``params.path``); each entry is under it.
+            # Relativize against ``resolved``, then re-anchor onto the
+            # root-relative ``params.path``, dropping any leading ``./``.
+            listed = PurePosixPath(*Path(params.path).parts)
+
+            def to_root_relative(entry: Path) -> str | None:
+                try:
+                    rel_to_listed = entry.relative_to(root)
+                except ValueError:
+                    return None
+                # Skip the listed directory itself (an empty relative path).
+                if rel_to_listed == Path():
+                    return None
+                anchored = listed / PurePosixPath(*rel_to_listed.parts)
+                # Drop ``CurDir`` (``.``) components so ``.``/empty inputs yield
+                # bare names.
+                normalized = PurePosixPath(*(part for part in anchored.parts if part != "."))
+                return normalized.as_posix()
+
             out: list[str] = []
             if params.recursive:
                 for p in root.rglob("*"):
-                    out.append(str(p))
-                # include root itself to mirror Rust's WalkDir behavior
-                out.append(str(root))
+                    rel = to_root_relative(p)
+                    if rel is not None:
+                        out.append(rel)
+                # mirror Rust's WalkDir behavior, which yields the root itself;
+                # to_root_relative skips it (empty relative path), so this is a
+                # no-op for the listed dir but keeps the branches symmetric.
+                rel = to_root_relative(root)
+                if rel is not None:
+                    out.append(rel)
             else:
                 for p in root.iterdir():
-                    out.append(str(p))
+                    rel = to_root_relative(p)
+                    if rel is not None:
+                        out.append(rel)
             out.sort()
             return out
 
