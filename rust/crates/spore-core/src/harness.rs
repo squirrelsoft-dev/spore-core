@@ -5438,22 +5438,30 @@ impl StandardHarness {
             .unwrap_or(&self.config.agent);
 
         // Seed the planning directive as a user message (reuse ContextManager).
+        // CRITICAL (#93): the directive must NOT mutate the SHARED `session_state`.
+        // That same state is threaded into the execute phase, where each subtask
+        // sub-loop assembles its context from it. If the directive leaked in,
+        // every execute step would still see "respond with {tasks, rationale}"
+        // and an instruction-following model would re-emit a plan instead of
+        // calling tools. Append to a throwaway CLONE so the plan turn sees the
+        // directive while the shared state stays `[user: task.instruction]`.
         let directive = format!(
             "Produce a step-by-step plan for the following task. Respond with a \
              single JSON object: {{\"tasks\": [<ordered step strings>], \
              \"rationale\": <string>}}.\n\nTask:\n{}",
             task.instruction
         );
+        let mut plan_state = session_state.clone();
         self.config
             .context_manager
-            .append_user_message(session_state, &directive)
+            .append_user_message(&mut plan_state, &directive)
             .await;
 
         // Assemble + invoke the planner for exactly ONE turn (R1).
         let mut context = self
             .config
             .context_manager
-            .assemble(session_state, task)
+            .assemble(&plan_state, task)
             .await;
         // Per-run model params win unconditionally (issue #93) — same seam as
         // run_react_inner, before the plan turn is dispatched.
@@ -8453,6 +8461,77 @@ mod tests {
         assert!(
             seen.iter().all(|c| c.params.structured_tool_calls),
             "plan + execute-step contexts all carry the flag"
+        );
+    }
+
+    // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
+    // Respond with a single JSON object…") must NOT leak into the SHARED
+    // session_state, otherwise every execute step re-sees it and an
+    // instruction-following model re-emits a plan instead of calling tools.
+    // Drive a full 2-step PlanExecute run with a context-capturing agent and
+    // assert no execute-step context carries the directive, while the step
+    // instructions DO reach those contexts (and a step can issue a tool call).
+    #[tokio::test]
+    async fn plan_directive_does_not_leak_into_execute_context() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                // Plan turn: produce a 2-step plan.
+                RecordingTurnAgent::final_resp(
+                    r#"{"tasks":["step one","step two"],"rationale":"r"}"#,
+                ),
+                // Execute step 1: issue a tool call, then finalize.
+                RecordingTurnAgent::tool_call("noop"),
+                RecordingTurnAgent::final_resp("did step one"),
+                // Execute step 2: finalize directly.
+                RecordingTurnAgent::final_resp("did step two"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        cfg.tool_registry = Arc::new(ScriptedToolRegistry::new());
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(plan_task())).await;
+
+        let contexts = agent.seen_text();
+        // 1 plan turn + (tool call + final) for step one + 1 for step two.
+        assert_eq!(contexts.len(), 4, "plan turn + 3 execute turns");
+
+        // The PLAN turn (index 0) DOES carry the directive — that's correct.
+        assert!(
+            contexts[0].contains("Respond with a single JSON object")
+                && contexts[0].contains("Produce a step-by-step plan"),
+            "plan turn should see the directive: {}",
+            contexts[0]
+        );
+
+        // No EXECUTE-step context (indices 1..) may carry the directive.
+        for (i, c) in contexts.iter().enumerate().skip(1) {
+            assert!(
+                !c.contains("Respond with a single JSON object"),
+                "execute-step context {i} leaked the directive: {c}"
+            );
+            assert!(
+                !c.contains("Produce a step-by-step plan"),
+                "execute-step context {i} leaked the directive: {c}"
+            );
+        }
+
+        // The execute steps still receive their step instructions and can
+        // proceed to a tool call.
+        assert!(
+            contexts[1].contains("step one"),
+            "step-one context should carry its instruction: {}",
+            contexts[1]
+        );
+        assert!(
+            contexts[2].contains("noop"),
+            "step-one second turn should follow the tool call: {}",
+            contexts[2]
+        );
+        assert!(
+            contexts[3].contains("step two"),
+            "step-two context should carry its instruction: {}",
+            contexts[3]
         );
     }
 
