@@ -37,6 +37,10 @@
 //!
 //! There are no `// SPEC QUESTION:` markers in this file.
 //!
+//! This example also enables `ModelParams::structured_tool_calls` via
+//! `HarnessBuilder::model_params(..)` — schema-constrained decoding that helps
+//! small Ollama models emit one clean `memory` tool call per turn.
+//!
 //! ## Run it
 //!
 //! ```sh
@@ -174,6 +178,13 @@ async fn run_phase(
         .storage(Arc::new(storage))
         .tool(StandardTools::memory())
         .system_prompt(system_prompt)
+        // Structured mode helps small Ollama models emit clean tool calls (one
+        // per turn, no interleaved reasoning — so the "think · turn N" line is
+        // just a turn marker, not model chatter).
+        .model_params(spore_core::ModelParams {
+            structured_tool_calls: true,
+            ..Default::default()
+        })
         .build();
 
     // PIN the session id — both phases pass the same one so recall reads what

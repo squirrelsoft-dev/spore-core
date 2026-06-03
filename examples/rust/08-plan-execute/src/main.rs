@@ -43,6 +43,11 @@
 //! There are no `// SPEC QUESTION:` markers: the strategy swap, the hook events,
 //! and the budget API were all resolved against the source before writing this.
 //!
+//! This example also enables `ModelParams::structured_tool_calls` via
+//! `HarnessBuilder::model_params(..)` — schema-constrained decoding that helps
+//! small Ollama models emit one clean tool call per turn across both the plan
+//! and execute phases.
+//!
 //! ## Run it
 //!
 //! ```sh
@@ -190,6 +195,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
+        // Structured mode helps small Ollama models emit clean tool calls (one
+        // per turn, no interleaved reasoning — so the "think · turn N" line is
+        // just a turn marker, not model chatter).
+        .model_params(spore_core::ModelParams {
+            structured_tool_calls: true,
+            ..Default::default()
+        })
         .hooks(Arc::new(chain))
         .build();
 

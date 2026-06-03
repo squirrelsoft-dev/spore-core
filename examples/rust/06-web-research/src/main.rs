@@ -32,6 +32,11 @@
 //! There are no `// SPEC QUESTION:` markers: the backend-adapter, file-write
 //! path, and model choices were all resolved before this example was written.
 //!
+//! This example also enables `ModelParams::structured_tool_calls` via
+//! `HarnessBuilder::model_params(..)` — schema-constrained decoding that helps
+//! small Ollama models emit one clean tool call per turn instead of malformed
+//! or interleaved output.
+//!
 //! ## Run it
 //!
 //! ```sh
@@ -124,6 +129,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
+        // Structured mode helps small Ollama models emit clean tool calls (one
+        // per turn, no interleaved reasoning — so the "think · turn N" line is
+        // just a turn marker, not model chatter).
+        .model_params(spore_core::ModelParams {
+            structured_tool_calls: true,
+            ..Default::default()
+        })
         .build();
 
     let task = Task::new(
