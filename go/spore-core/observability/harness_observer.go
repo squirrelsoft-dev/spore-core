@@ -406,6 +406,12 @@ type HarnessBuilder struct {
 	// turn's assembled context when the context manager renders none (issue #91).
 	// Empty (the default) preserves today's behaviour.
 	systemPrompt string
+	// modelParams are the authoritative per-run model sampling/decoding
+	// parameters (issue #93). Builder params win: the harness replaces each
+	// tool-requesting turn's Context.Params with this value unconditionally
+	// right before the request is built. Zero value (the default) preserves
+	// today's behaviour. See WithModelParams.
+	modelParams sporecore.ModelParams
 	// sessionStore / autoPersistSessions are the issue #102 opt-in
 	// conversation-history threading seam. sessionStore is the SessionStore the
 	// loop auto-loads from / auto-persists to; autoPersistSessions gates the whole
@@ -561,6 +567,27 @@ func (b *HarnessBuilder) SystemPrompt(text string) *HarnessBuilder {
 	return b
 }
 
+// WithModelParams sets the authoritative model sampling/decoding parameters for
+// the whole run (issue #93).
+//
+// These params are authoritative: the harness replaces each turn's
+// Context.Params with this value UNCONDITIONALLY (builder params win) right
+// before the request is built, so the configured params reach every agent turn
+// that requests tools — the ReAct loop, the PlanExecute plan phase, the execute
+// sub-loop, and the streaming path alike. (The internal compaction/summarization
+// turn is intentionally left on defaults; it requests no tools, so decoding
+// params are a no-op there.)
+//
+// Enabling ModelParams.StructuredToolCalls trades interleaved reasoning for one
+// schema-constrained tool call per turn — useful for small local models that
+// otherwise emit malformed tool calls. See ModelParams.StructuredToolCalls for
+// the full behaviour contract. The zero value (the default) preserves today's
+// behaviour. Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) WithModelParams(p sporecore.ModelParams) *HarnessBuilder {
+	b.modelParams = p
+	return b
+}
+
 // Storage wires the per-run storage seams threaded into catalogue tools'
 // ToolContext (issue #75/#78): runStore is the structured-state store, memStore
 // the episodic-memory store. Pass a *storage.StorageProvider's Run() and Memory()
@@ -646,6 +673,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		ToolRunStore:          runStore,
 		ToolMemoryStore:       b.memStore,
 		SystemPrompt:          b.systemPrompt,
+		ModelParams:           b.modelParams,
 		SessionStore:          b.sessionStore,
 		AutoPersistSessions:   b.autoPersistSessions,
 	}

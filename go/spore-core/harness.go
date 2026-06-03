@@ -2309,6 +2309,17 @@ type HarnessConfig struct {
 	// byte-for-byte.
 	SystemPrompt string // optional
 
+	// ModelParams are the authoritative per-run model sampling/decoding
+	// parameters (issue #93). The harness replaces each tool-requesting turn's
+	// Context.Params with this value UNCONDITIONALLY (builder params win) right
+	// before the request is built, so the configured params reach every agent
+	// turn that requests tools — the ReAct loop, the PlanExecute plan phase, the
+	// execute sub-loop, and the streaming path alike. The internal
+	// compaction/summarization turn is intentionally left on defaults. See
+	// HarnessBuilder.WithModelParams. The zero value (the default) preserves
+	// today's behaviour byte-for-byte.
+	ModelParams ModelParams // optional
+
 	// SessionStore is the opt-in conversation-history persistence seam (issue
 	// #102). When AutoPersistSessions is true the run loop:
 	//   - auto-LOADS the prior SessionState for the run's SessionID from this
@@ -3153,6 +3164,9 @@ func (h *StandardHarness) runPlanPhase(
 
 	// Assemble + invoke the planner for exactly ONE turn (R1).
 	c := h.config.ContextManager.Assemble(ctx, session, task)
+	// Per-run model params win unconditionally (issue #93) — same seam as
+	// runReActInner, before the plan turn is dispatched.
+	c.Params = h.config.ModelParams
 	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 	turnStartedAt := nowRFC3339()
 	turnClock := time.Now()
@@ -3459,6 +3473,12 @@ func (h *StandardHarness) runReActInner(
 				}}, c.Messages...)
 			}
 		}
+		// Per-run model params win unconditionally (issue #93). The agent copies
+		// Context.Params verbatim into the ModelRequest (IntoRequest /
+		// IntoRequestStreaming), so this is the single seam that delivers the
+		// configured params (e.g. structured tool calls) to every tool-requesting
+		// ReAct / execute / streaming turn.
+		c.Params = h.config.ModelParams
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
