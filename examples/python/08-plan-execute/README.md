@@ -146,7 +146,7 @@ edges you should know about before running:
 - A **subtask error aborts the whole run** with `HaltStepFailed` — there is no
   per-step retry.
 - The turn **budget is divided across subtasks**, so a stingy `max_turns` starves
-  later steps. Set it generously (this example uses `24`).
+  later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
   model-agnostic — swap the model interface and change nothing else. This
