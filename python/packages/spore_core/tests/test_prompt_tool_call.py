@@ -95,8 +95,8 @@ def test_build_tool_prompt_exact_bytes() -> None:
         "<tool>\n"
         "  <name>calculator</name>\n"
         "  <description>evaluate math</description>\n"
-        '  <input_schema>{"type":"object","properties":'
-        '{"expression":{"type":"string"}},"required":["expression"]}</input_schema>\n'
+        '  <input_schema>{"properties":{"expression":{"type":"string"}},'
+        '"required":["expression"],"type":"object"}</input_schema>\n'
         "</tool>\n"
         "</available_tools>\n\n"
         "When you want to use a tool, respond with ONLY the following format and "
@@ -107,6 +107,40 @@ def test_build_tool_prompt_exact_bytes() -> None:
         "normally in prose."
     )
     assert out == expected
+
+
+def test_build_tool_prompt_sorts_schema_keys_recursively() -> None:
+    """A 2+ property schema with keys deliberately out of alphabetical order must
+    render with object keys SORTED at every nesting level, matching Rust
+    (BTreeMap-backed serde_json) and Go (json.Marshal of a map). Single-property
+    schemas coincide regardless; this is the divergence that single-prop tests
+    miss (#111)."""
+    schema = ToolSchema(
+        name="t",
+        description="d",
+        # Insertion order is intentionally NOT alphabetical, at both levels:
+        # top-level "type" before "properties" before "required"; and inside
+        # properties "zeta" before "alpha".
+        input_schema={
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "number"},
+                "alpha": {"type": "string"},
+            },
+            "required": ["zeta", "alpha"],
+        },
+    )
+    out = build_tool_prompt([schema])
+    start = out.index("<input_schema>") + len("<input_schema>")
+    end = out.index("</input_schema>")
+    rendered = out[start:end]
+    # Top-level object keys sorted: properties < required < type. Inside
+    # properties: alpha < zeta. The "required" ARRAY order is preserved
+    # (["zeta","alpha"], not sorted) — only object keys sort.
+    assert rendered == (
+        '{"properties":{"alpha":{"type":"string"},"zeta":{"type":"number"}},'
+        '"required":["zeta","alpha"],"type":"object"}'
+    )
 
 
 # --- injection ---------------------------------------------------------------

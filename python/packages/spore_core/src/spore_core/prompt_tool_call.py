@@ -110,8 +110,9 @@ def build_tool_prompt(tools: list) -> str:
     """Render the tool-definition + response-format block appended to the system
     prompt when prompt-based tool calling is active.
 
-    Schemas are rendered as compact JSON (no insignificant whitespace) so the
-    output is byte-identical to the Rust ``build_tool_prompt``.
+    Schemas are rendered as compact JSON (no insignificant whitespace, object
+    keys sorted recursively) so the output is byte-identical to the Rust and Go
+    ``build_tool_prompt``.
     """
     parts: list[str] = []
     parts.append(
@@ -120,7 +121,11 @@ def build_tool_prompt(tools: list) -> str:
     )
     parts.append("<available_tools>\n")
     for tool in tools:
-        schema_json = json.dumps(tool.input_schema, separators=(",", ":"))
+        # Sort keys recursively at every nesting level so the rendered JSON
+        # matches Rust (BTreeMap-backed serde_json::Value, no preserve_order) and
+        # Go (json.Marshal of a map). Array element order is preserved — only
+        # object keys sort. Byte-identical across all four languages (#111).
+        schema_json = json.dumps(tool.input_schema, sort_keys=True, separators=(",", ":"))
         parts.append("<tool>\n")
         parts.append(f"  <name>{tool.name}</name>\n")
         parts.append(f"  <description>{tool.description}</description>\n")
