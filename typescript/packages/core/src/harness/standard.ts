@@ -23,6 +23,13 @@ import { turnStreaming } from "../agent/interface.js";
 import type { Context } from "../agent/types.js";
 import { AgentId, ModelAgent } from "../agent/index.js";
 import type { ModelInterface } from "../model/interface.js";
+import {
+  AdaptiveToolCallModelInterface,
+  detectProseResponse,
+  newSharedFlag,
+  PROMPT_TOOL_CALL_NUDGE,
+  type SharedFlag,
+} from "../model/prompt-tool-call.js";
 import { StandardContextManager } from "../context/standard.js";
 import { intoHarnessAdapter } from "../context/compaction-adapter.js";
 import { defaultCompactionConfig } from "../context/types.js";
@@ -300,6 +307,18 @@ export interface HarnessConfig {
    * {@link HaltReason}. See {@link HarnessBuilder.autoPersistSessions}.
    */
   autoPersistSessions?: boolean;
+  /**
+   * Shared escalation flag for adaptive prompt-based tool calling (#111). Set
+   * ONLY by {@link HarnessBuilder.conversational}, which wraps the agent's model
+   * in an {@link AdaptiveToolCallModelInterface} sharing this SAME holder. While
+   * `flag.value` is `false` the wrapper delegates natively (byte-for-byte); the
+   * run loop flips it to `true` on detecting a prose response where a tool call
+   * was expected, switching the model to prompt-based tool calling for the rest
+   * of the run. Reset to `false` at the start of each turn-loop window so
+   * detection is scoped to the window. Absent (the default) ⇒ no adaptive
+   * wrapper is installed and the escalation path is inert.
+   */
+  prompt_tool_call_flag?: SharedFlag;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -2429,6 +2448,14 @@ export class StandardHarness implements Harness {
     // Resolve the effective tool registry once per turn-loop window (issue #91).
     // Bridges catalogue tools per-run via RealToolRegistry, else the slim seam.
     const toolRegistry = this.effectiveToolRegistry(sessionId);
+    // Reset the adaptive prompt-based-tool-calling escalation flag at the start
+    // of this turn-loop window so detection is scoped to the window and does not
+    // leak across run() calls (the flag is shared with the model wrapper for the
+    // harness's lifetime). No-op unless a `conversational` harness installed the
+    // adaptive wrapper (#111).
+    if (this.config.prompt_tool_call_flag != null) {
+      this.config.prompt_tool_call_flag.value = false;
+    }
     const startedAt = Date.now();
     const usage: AggregateUsage = emptyAggregateUsage();
     const pricing = this.config.pricing ?? PricingTable.DEFAULT;
@@ -2544,6 +2571,11 @@ export class StandardHarness implements Harness {
       // seam that delivers configured params (e.g. structured tool calls) to
       // every tool-requesting ReAct/execute/streaming turn.
       context.params = this.config.modelParams;
+      // Whether tools were advertised to the model this turn — a precondition for
+      // classifying a prose final response as a missed tool call (adaptive
+      // prompt-based escalation, #111). Captured before `context` is consumed by
+      // the turn.
+      const toolsAdvertised = context.tools.length > 0;
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
       const turnStartedAt = Timestamp.now();
       const turnClock = Date.now();
@@ -2666,6 +2698,37 @@ export class StandardHarness implements Harness {
           addTurnUsage(usage, result.usage);
           budgetUsed.input_tokens += result.usage.input_tokens;
           budgetUsed.output_tokens += result.usage.output_tokens;
+
+          // Adaptive prompt-based tool-calling escalation (#111). When tools were
+          // advertised but the model answered in prose with action-intent
+          // language (it *meant* to act), classify the turn as a prose response
+          // and escalate: set the session flag so the wrapped model switches to
+          // prompt-based tool calling, record the prose + a corrective nudge, and
+          // force another turn instead of completing. Guarded on the flag being
+          // unset so it fires at most once per window (bounded — one extra turn)
+          // and only on the `conversational` adaptive path.
+          {
+            const flag = this.config.prompt_tool_call_flag;
+            if (
+              flag != null &&
+              flag.value === false &&
+              detectProseResponse(result.content, toolsAdvertised) != null
+            ) {
+              flag.value = true;
+              // Record the model's prose, then a corrective nudge, so the next
+              // turn has coherent context.
+              const assistant: Message = {
+                role: "assistant",
+                content: { type: "text", text: result.content },
+              };
+              await this.config.contextManager.appendAssistantMessage?.(sessionState, assistant);
+              await this.config.contextManager.appendUserMessage(
+                sessionState,
+                PROMPT_TOOL_CALL_NUDGE,
+              );
+              continue;
+            }
+          }
 
           // Middleware: BeforeCompletion
           if (this.config.middleware) {
@@ -3325,6 +3388,7 @@ export class HarnessBuilder {
   private _systemPrompt?: string;
   private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
+  private _promptToolCallFlag?: SharedFlag;
 
   constructor(
     private readonly agent: Agent,
@@ -3362,14 +3426,30 @@ export class HarnessBuilder {
    * ```
    */
   static conversational(model: ModelInterface): HarnessBuilder {
-    const agent = new ModelAgent(AgentId.of("agent"), model);
+    // Install the adaptive prompt-based tool-calling wrapper around the agent's
+    // model (#111). While its shared flag is unset it delegates natively
+    // (byte-for-byte); the run loop flips the flag on detecting a prose response
+    // so the model switches to prompt-based tool calling for the rest of the
+    // run. The context manager keeps the *raw* model (its only model use is
+    // compaction summarization, which advertises no tools).
+    const promptToolCallFlag = newSharedFlag();
+    const adaptiveModel = new AdaptiveToolCallModelInterface(model, promptToolCallFlag);
+    const agent = new ModelAgent(AgentId.of("agent"), adaptiveModel);
     const toolRegistry = new EmptyToolRegistry();
     const sandbox = new NullSandbox();
     const contextManager = intoHarnessAdapter(
       new StandardContextManager(model, new NullCacheProvider(), defaultCompactionConfig()),
     );
     const terminationPolicy = new CompleteOnFinalResponse();
-    return new HarnessBuilder(agent, toolRegistry, sandbox, contextManager, terminationPolicy);
+    const builder = new HarnessBuilder(
+      agent,
+      toolRegistry,
+      sandbox,
+      contextManager,
+      terminationPolicy,
+    );
+    builder._promptToolCallFlag = promptToolCallFlag;
+    return builder;
   }
 
   /** Inject a middleware chain. */
@@ -3667,6 +3747,7 @@ export class HarnessBuilder {
       systemPrompt: this._systemPrompt,
       modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
+      prompt_tool_call_flag: this._promptToolCallFlag,
     };
   }
 

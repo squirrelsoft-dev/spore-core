@@ -10,6 +10,17 @@ export { ReplayModelInterface, type ReplayMode } from "./replay.js";
 export { RecordingModelInterface, type RecordingMode } from "./recording.js";
 export { MockModelInterface } from "./mock.js";
 export {
+  PromptBasedToolCallModelInterface,
+  AdaptiveToolCallModelInterface,
+  buildToolPrompt,
+  injectToolPrompt,
+  parseProseResponse,
+  detectProseResponse,
+  newSharedFlag,
+  PROMPT_TOOL_CALL_NUDGE,
+  type SharedFlag,
+} from "./prompt-tool-call.js";
+export {
   AnthropicModelInterface,
   ANTHROPIC_VERSION,
   DEFAULT_BASE_URL as ANTHROPIC_DEFAULT_BASE_URL,
