@@ -180,6 +180,9 @@ func runPhase(mi sporecore.ModelInterface, memoryPath, systemPrompt, taskPrompt 
 		Storage(nil, storage.Memory()).       // ← the seam: the memory-domain store
 		Tool(tools.StandardTools{}.Memory()). // ← the built-in memory read/write tool
 		SystemPrompt(systemPrompt).
+		// Structured mode helps small Ollama models emit clean tool calls (one per
+		// turn, no interleaved reasoning, so the "think" line is just a turn marker).
+		WithModelParams(sporecore.ModelParams{StructuredToolCalls: true}).
 		Build()
 
 	// PIN the session id — both phases pass the same one so recall reads what

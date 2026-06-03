@@ -112,6 +112,11 @@ it runs with no hosted-model account. Synthesis quality scales with the model: a
 **larger hosted model will produce noticeably better, better-cited answers**. The
 harness is model-agnostic — swap the model interface and change nothing else.
 
+This example also enables `structured_tool_calls` via
+`.WithModelParams(sporecore.ModelParams{StructuredToolCalls: true})`. That turns
+on schema-constrained decoding so small Ollama models emit one clean tool call
+per turn (no interleaved reasoning) instead of malformed JSON.
+
 ## Prerequisites
 
 ```sh

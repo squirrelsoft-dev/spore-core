@@ -160,7 +160,11 @@ edges you should know about before running:
   later steps. Set it generously (this example uses `24`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else.
+  model-agnostic — swap the model interface and change nothing else. This
+  example enables `structured_tool_calls` via
+  `.WithModelParams(sporecore.ModelParams{StructuredToolCalls: true})` to push
+  small models toward one clean, schema-constrained tool call per turn (no
+  interleaved reasoning) across both the plan and execute phases.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Go
   harness (like Rust and Python) suppresses the sub-loop stream, so the
   `OnPlanCreated` / `OnTaskAdvance` hooks are the portable, cross-language view

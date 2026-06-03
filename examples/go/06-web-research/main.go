@@ -143,6 +143,9 @@ func run() error {
 		Tool(tools.StandardTools{}.WriteFile()).                                         // ← writes answer.md
 		Tool(tools.StandardTools{}.ReadFile()).
 		SystemPrompt(systemPrompt).
+		// Structured mode helps small Ollama models emit clean tool calls (one per
+		// turn, no interleaved reasoning, so the "think" line is just a turn marker).
+		WithModelParams(sporecore.ModelParams{StructuredToolCalls: true}).
 		Build()
 
 	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
