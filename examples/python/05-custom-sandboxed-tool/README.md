@@ -1,35 +1,41 @@
-# 05 — Custom sandboxed tool (`impl Tool`)
+# 05 — Custom sandboxed tool (`define_tool`)
 
 The first example that ships a tool **you** wrote. Examples 03 and 04 used the
-two built-in tool paths; this one uses spore-core's public extension point — the
-[`Tool`](../../../python/packages/spore_core/src/spore_core/tool_registry.py)
-protocol — to add two custom tools, `remember(key, value)` and `recall(key)`, and
+two built-in tool paths; this one uses spore-core's ergonomic
+[`define_tool`](../../../python/packages/spore_tools/src/spore_tools/tools/define.py)
+helper to add two custom tools, `remember(key, value)` and `recall(key)`, and
 lets an agent research a topic across turns and summarize from the facts it
 recalled.
 
 The thesis is the same as 04, taken one step further: **the harness doesn't
 change — only what you register does.** Same `conversational(model)` builder,
 same `ReAct` loop, same stream-printed `think` / `act` / `obs`. The only new
-thing is the three-step registration pattern below.
+thing is the registration pattern below.
 
-## The pattern: `Tool` impl → `StandardTool` → `.tool()`
+## The headline property: the input model is the single source of truth
 
-### 1. Implement the `Tool` protocol
+`define_tool` takes a typed [pydantic](https://docs.pydantic.dev) input model and
+**derives the advertised JSON schema from it** (via `model_json_schema()`) — the
+schema the model sees is never hand-written, so it can never drift from the model
+the tool actually validates. This mirrors Rust's `tool!` macro (which derives the
+schema from the input struct via `schemars`).
 
-A tool is any object that satisfies the structural `Tool` protocol. The
-substance is `name()` and `execute()` (plus two `False`-returning flag methods):
+## The pattern: `define_tool(...)` → `.tool()`
+
+### 1. Define a typed input model + an async `execute` body
 
 ```python
-async def execute(
-    self,
-    call: ToolCall,
-    sandbox: SandboxProvider,   # the environment seam (unused here)
-    ctx: ToolContext,           # the storage seam
-) -> ToolOutput:
+from pydantic import BaseModel
+
+class RememberInput(BaseModel):
+    key: str
+    value: str
+
+async def _remember(input: RememberInput, sandbox, ctx) -> ToolOutput:
     ...
 ```
 
-`execute` receives two seams:
+`execute` receives the **validated** input model plus two seams:
 
 - **`sandbox`** — the only path to the environment (filesystem, network). These
   two tools never touch it, so they ignore it.
@@ -39,38 +45,40 @@ async def execute(
   collide with reserved catalogue keys (`todo`, `task`, `memory`).
 
 `remember` mutates shared state, so it is **not** `read_only`. `recall` only
-reads, so it is `read_only` + `idempotent`.
+reads, so it is `read_only` + `idempotent` (passed via `annotations`).
 
-#### Two different "tool" interfaces — don't confuse them
+### 2. `define_tool(...)` → `StandardTool`
 
-|                                   | Where it lives | Used by                                       |
-| --------------------------------- | -------------- | --------------------------------------------- |
-| harness-loop `ToolRegistry` (03)  | `spore_core`   | hand-rolled `schemas()` + `dispatch()`        |
-| `Tool` protocol (this example)    | `spore_core`   | one tool, with the sandbox + `ToolContext` seams |
-
-03 implemented the slim harness-loop `ToolRegistry` itself and dispatched every
-call by hand. Here you implement the richer per-tool `Tool` protocol once per
-tool and let the builder do the dispatch.
-
-### 2. `StandardTool(implementation, schema)`
-
-Bundle the implementation with its registry-side schema so the two can never
-drift apart. `tool.name()` MUST equal `schema.name`:
+`define_tool` returns a `StandardTool` bundling a `Tool` implementation with its
+*derived* schema, so the schema and the validation can never drift:
 
 ```python
-StandardTool(RememberTool(), RememberTool.schema())
+from spore_tools import define_tool
+
+def remember_tool() -> StandardTool:
+    return define_tool(
+        name="remember",
+        description="Store a fact under a short key …",
+        input_model=RememberInput,
+        execute=_remember,
+        # annotations omitted → all-False (remember mutates state)
+    )
 ```
+
+If the model sends bad arguments (missing field, wrong type), the tool returns a
+**recoverable** `invalid parameters for tool ...` error so a tool-call-repair pass
+can coerce the arguments and retry — rather than halting the run.
 
 ### 3. `.tool(...)`
 
-Register each bundle on the builder — once per custom tool. The builder wires the
+Register each tool on the builder — once per custom tool. The builder wires the
 sandbox and a per-run `ToolContext` in automatically:
 
 ```python
 harness = (
     HarnessBuilder.conversational(model)
-    .tool(StandardTool(RememberTool(), RememberTool.schema()))
-    .tool(StandardTool(RecallTool(), RecallTool.schema()))
+    .tool(remember_tool())
+    .tool(recall_tool())
     .system_prompt(SYSTEM_PROMPT)
     .build()
 )
@@ -143,5 +151,7 @@ uv run pytest
 
 `test_tools.py` covers every rule: `remember` stores under the `fact:` prefix,
 `recall` returns the stored value, a `recall` miss is a recoverable error,
-missing/wrong arguments are recoverable errors, and the annotations
-(`recall` read-only + idempotent, `remember` neither) are correct.
+missing/wrong arguments are recoverable `invalid parameters` errors (so tool-call
+repair can retry), a store failure is recoverable (via a `FailingRunStore`), and
+the annotations (`recall` read-only + idempotent, `remember` neither) and the
+derived schema are correct.

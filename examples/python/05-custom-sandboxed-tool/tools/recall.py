@@ -1,8 +1,10 @@
 """``recall(key)`` — read a previously-remembered fact back out of the run store.
 
-This is the **read** half of the pair. Unlike :mod:`remember` it is annotated
-``read_only`` + ``idempotent``: it only reads shared state, so the harness may
-dispatch it concurrently with other read-only tools.
+This is the **read** half of the pair, also defined with the
+:func:`~spore_tools.define_tool` helper. Unlike :mod:`remember` it passes
+``annotations`` to mark itself ``read_only`` + ``idempotent``: it only reads
+shared state, so the harness may dispatch it concurrently with other read-only
+tools.
 
 Looking up a key that was never stored is a *recoverable* error — the agent can
 adapt (try a different key, or remember the fact first) rather than halting the
@@ -11,65 +13,51 @@ run.
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from spore_core.harness import (
     SandboxProvider,
     ToolOutput,
     ToolOutputError,
     ToolOutputSuccess,
 )
-from spore_core.model import ToolCall
 from spore_core.storage import JsonValue, StorageError
-from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
+from spore_core.tool_registry import ToolAnnotations, ToolContext
+from spore_tools import StandardTool, define_tool
 
 from .remember import FACT_PREFIX
 
+#: Tool name.
+NAME = "recall"
 
-class RecallTool:
-    """Return the string stored under ``fact:{key}`` by :class:`RememberTool`."""
 
-    NAME = "recall"
+class RecallInput(BaseModel):
+    """Validated input for ``recall``."""
 
-    def name(self) -> str:
-        return self.NAME
+    key: str
 
-    def is_subagent_tool(self) -> bool:
-        return False
 
-    def may_produce_large_output(self) -> bool:
-        return False
+async def _recall(input: RecallInput, sandbox: SandboxProvider, ctx: ToolContext) -> ToolOutput:
+    store_key = f"{FACT_PREFIX}{input.key}"
+    try:
+        value = await ctx.run_store.get(ctx.session_id, store_key)
+    except StorageError as e:
+        return ToolOutputError.error(f"recall: could not read '{input.key}': {e}")
+    if value is None:
+        return ToolOutputError.error(f"no fact stored under '{input.key}'")
+    return ToolOutputSuccess.success(_value_to_string(value))
 
-    @classmethod
-    def schema(cls) -> ToolSchema:
-        """The registry-side schema. ``name`` MUST equal :meth:`name`."""
-        return ToolSchema(
-            name=cls.NAME,
-            description="Recall a fact previously stored with `remember`, by its key.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                },
-                "required": ["key"],
-            },
-            # Pure read of shared state: safe to mark read_only + idempotent.
-            annotations=ToolAnnotations(read_only=True, idempotent=True),
-        )
 
-    async def execute(
-        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
-    ) -> ToolOutput:
-        key = call.input.get("key")
-        if not isinstance(key, str):
-            return ToolOutputError.error("recall: missing or non-string 'key'")
-
-        store_key = f"{FACT_PREFIX}{key}"
-        try:
-            value = await ctx.run_store.get(ctx.session_id, store_key)
-        except StorageError as e:
-            return ToolOutputError.error(f"recall: could not read '{key}': {e}")
-        if value is None:
-            return ToolOutputError.error(f"no fact stored under '{key}'")
-        return ToolOutputSuccess.success(_value_to_string(value))
+def recall_tool() -> StandardTool:
+    """Build the ``recall`` tool. ``annotations`` marks it ``read_only`` +
+    ``idempotent`` (a pure read of shared state), in contrast to ``remember``."""
+    return define_tool(
+        name=NAME,
+        description="Recall a fact previously stored with `remember`, by its key.",
+        input_model=RecallInput,
+        execute=_recall,
+        annotations=ToolAnnotations(read_only=True, idempotent=True),
+    )
 
 
 def _value_to_string(value: JsonValue) -> str:
@@ -80,4 +68,4 @@ def _value_to_string(value: JsonValue) -> str:
     return str(value)
 
 
-__all__ = ["RecallTool"]
+__all__ = ["NAME", "RecallInput", "recall_tool"]
