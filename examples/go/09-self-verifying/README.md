@@ -169,12 +169,14 @@ practice; these remain risks chiefly on weaker/smaller local models:
   Models that wrap the verdict in prose or markdown can dodge the patterns. The
   patterns here are lenient (`(?im)` multiline, anchored `PASS`, `FAIL:`
   anywhere) but not bulletproof.
-- **The builder may not call the tool.** If the build agent answers with code in
-  prose instead of calling `write_file`, the evaluator reads a stale/empty file
-  and FAILs. Note: the Go core does **not** yet have the adaptive prompt-based
-  tool-call repair that the Rust core gained in #111 (porting it is a known
-  follow-up), so there is no automatic recovery here. In practice a capable model
-  like `gemma4:31b-cloud` rarely triggers this; small local models slip.
+- **The builder describing the write in prose — mostly handled.** If the build
+  agent describes the action in prose instead of calling `write_file`, the
+  `conversational` preset's **adaptive prompt-based tool-calling repair** (now in
+  all four cores) detects the action-intent prose, nudges the model once, and
+  escalates to prompt-based `<tool_call>` markers that are parsed back into native
+  tool calls — so the write lands automatically. The only honest caveat: it's a
+  **one-shot** escalation — a model that *keeps* answering in prose even after the
+  nudge still won't write the file. Rarely bites with a capable model.
 - **Exhaustion is a normal outcome here.** A `SelfVerifyExhausted` failure after
   N iterations is the strategy working as designed — it bounds the loop. The
   example prints the last draft and last failure reason so you can see how close
