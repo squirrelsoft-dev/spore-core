@@ -1,0 +1,14 @@
+[project]
+name = "spore-example-06-web-research"
+version = "0.0.0"
+description = "spore-core example 06 — web research with an external API tool (Python)"
+requires-python = ">=3.12"
+dependencies = ["spore-core", "spore-tools"]
+
+[tool.uv.sources]
+spore-core = { path = "../../../python/packages/spore_core", editable = true }
+spore-tools = { path = "../../../python/packages/spore_tools", editable = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
