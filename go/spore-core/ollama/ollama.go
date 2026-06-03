@@ -563,7 +563,11 @@ func parseStructuredContent(raw string, index int) ([]sporecore.ContentBlock, sp
 	fallback := func() ([]sporecore.ContentBlock, sporecore.StopReason) {
 		return []sporecore.ContentBlock{sporecore.NewTextBlock(raw)}, sporecore.StopEndTurn
 	}
-	trimmed := strings.TrimSpace(raw)
+	// Capable/cloud models often ignore the constrained-decoding grammar and
+	// wrap the JSON tool call in a markdown code fence. Reuse the plan parser's
+	// fence stripping so a fenced `{"tool":...}` still dispatches instead of
+	// being mis-read as a final text answer.
+	trimmed := sporecore.StripCodeFence(strings.TrimSpace(raw))
 	var value map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
 		return fallback()
