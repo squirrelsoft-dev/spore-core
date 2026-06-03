@@ -3,7 +3,7 @@
  */
 
 import { promises as fs } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 import type { SandboxProvider, ToolCall, ToolOutput } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
@@ -192,13 +192,41 @@ export class ListDirTool implements Tool {
         kind: "sandbox_violation",
         violation: resolved,
       });
+    // Emit paths relative to the workspace root so each entry can be fed
+    // straight back into read_file/write_file. The sandbox treats every input
+    // path as root-relative, so absolute paths would not round-trip (see #93).
+    // `resolved` is the absolute path of the listed directory (= root-relative
+    // `path`); each entry is under it. Relativize against `resolved`, then
+    // re-anchor onto the caller-supplied (root-relative) `path`.
+    const listed = p.value.path;
+    const toRootRelative = (entryAbsolutePath: string): string | null => {
+      // Path of the entry relative to the listed directory.
+      const relToListed = relative(resolved, entryAbsolutePath);
+      // Skip the listed directory itself (walk yields it first).
+      if (relToListed === "") return null;
+      // Re-anchor onto the caller-supplied path, drop any leading `./`, and
+      // normalize to POSIX-style forward slashes so output is stable
+      // cross-platform and round-trips through the sandbox. Preserve a leading
+      // separator for absolute inputs (mirrors Rust keeping the RootDir
+      // component while filtering CurDir).
+      const joined = join(listed, relToListed);
+      const isAbs = joined.startsWith("/") || joined.startsWith("\\");
+      const body = joined
+        .split(/[\\/]/)
+        .filter((seg) => seg !== "" && seg !== ".")
+        .join("/");
+      return isAbs ? `/${body}` : body;
+    };
     const entries: string[] = [];
     try {
       if (p.value.recursive) {
-        await walk(resolved, entries);
+        await walk(resolved, toRootRelative, entries);
       } else {
         const items = await fs.readdir(resolved);
-        for (const it of items) entries.push(join(resolved, it));
+        for (const it of items) {
+          const rel = toRootRelative(join(resolved, it));
+          if (rel !== null) entries.push(rel);
+        }
       }
     } catch (e) {
       return {
@@ -216,8 +244,13 @@ export class ListDirTool implements Tool {
   }
 }
 
-async function walk(dir: string, out: string[]): Promise<void> {
-  out.push(dir);
+async function walk(
+  dir: string,
+  toRootRelative: (entryAbsolutePath: string) => string | null,
+  out: string[],
+): Promise<void> {
+  // Do not emit the listed directory itself; `toRootRelative` returns null for
+  // it anyway, but skipping here avoids pushing intermediate directories.
   let items: import("node:fs").Dirent[];
   try {
     items = await fs.readdir(dir, { withFileTypes: true });
@@ -227,9 +260,12 @@ async function walk(dir: string, out: string[]): Promise<void> {
   for (const it of items) {
     const full = join(dir, it.name);
     if (it.isDirectory()) {
-      await walk(full, out);
+      const rel = toRootRelative(full);
+      if (rel !== null) out.push(rel);
+      await walk(full, toRootRelative, out);
     } else {
-      out.push(full);
+      const rel = toRootRelative(full);
+      if (rel !== null) out.push(rel);
     }
   }
 }

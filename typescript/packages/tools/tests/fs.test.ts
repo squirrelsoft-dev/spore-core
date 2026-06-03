@@ -2,7 +2,7 @@
  * Filesystem tool tests — mirror `rust/crates/spore-core/src/tools/fs.rs#tests`.
  */
 
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -90,6 +90,53 @@ describe("filesystem tools", () => {
     expect(lines.length).toBe(3);
     const sorted = [...lines].sort();
     expect(lines).toEqual(sorted);
+  });
+
+  it("list_dir entries round-trip through the workspace sandbox", async () => {
+    // Regression for #93: every entry list_dir returns must round-trip
+    // straight back into read_file under the *real* WorkspaceScopedSandbox,
+    // which treats all input paths as root-relative. Absolute paths (the old
+    // behavior) would be rejected as a sandbox path_escape.
+    const root = realpathSync(await tmp());
+    await writeFile(join(root, "a.txt"), "alpha");
+    await writeFile(join(root, "b.txt"), "beta");
+    await mkdir(join(root, "sub"));
+    await writeFile(join(root, "sub", "c.txt"), "gamma");
+    const sb = new WorkspaceScopedSandbox({ root });
+
+    // Recursive so we exercise both top-level files and a nested file.
+    const r = await new ListDirTool().execute(
+      call("list_dir", { path: ".", recursive: true }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+    const entries = r.content.split("\n").filter((e) => e !== "");
+
+    // Bare root-relative names for top-level files; nested file re-anchored.
+    expect(entries).toContain("a.txt");
+    expect(entries).toContain("sub/c.txt");
+    // Must not emit the listed dir itself as an empty/`.` entry.
+    expect(entries.every((e) => e !== "" && e !== ".")).toBe(true);
+
+    // The actual bug check: feed each entry straight into read_file. None must
+    // fail with a sandbox/path_escape violation.
+    for (const entry of entries) {
+      const rr = await new ReadFileTool().execute(
+        call("read_file", { path: entry }),
+        sb,
+        ctx,
+      );
+      if (rr.kind === "error") {
+        // A directory entry (e.g. `sub`) reads as an error but must NOT be a
+        // sandbox violation — that's the regression.
+        const msg = rr.message.toLowerCase();
+        expect(msg.includes("escape") || msg.includes("sandbox")).toBe(false);
+      } else {
+        expect(rr.kind).toBe("success");
+      }
+    }
   });
 
   it("delete missing is recoverable error", async () => {
