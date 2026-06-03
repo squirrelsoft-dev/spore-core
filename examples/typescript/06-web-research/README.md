@@ -12,14 +12,14 @@ tool. It drops into the exact same `conversational(model)` builder, the same
 
 ## The contrast with 04
 
-|          | 04 — filesystem-agent                          | 06 — web-research                                            |
-| -------- | ---------------------------------------------- | ----------------------------------------------------------- |
-| Builder  | `conversational(model)`                        | `conversational(model)` _(same)_                            |
-| Loop     | ReAct                                          | ReAct _(same)_                                              |
-| Sandbox  | `WorkspaceScopedSandbox` over `sample-files/`  | `WorkspaceScopedSandbox` over `workspace/` _(same pattern)_ |
-| Output   | stream-printed `think` / `act` / `obs`         | stream-printed `think` / `act` / `obs` _(same)_             |
-| Tools    | `.tools(StandardTools.codingSet())`            | `webSearchWithEndpoint(..)` + `writeFile` + `readFile`      |
-| Side eff | writes `SUMMARY.md`                            | writes `answer.md`                                          |
+|          | 04 — filesystem-agent                         | 06 — web-research                                           |
+| -------- | --------------------------------------------- | ----------------------------------------------------------- |
+| Builder  | `conversational(model)`                       | `conversational(model)` _(same)_                            |
+| Loop     | ReAct                                         | ReAct _(same)_                                              |
+| Sandbox  | `WorkspaceScopedSandbox` over `sample-files/` | `WorkspaceScopedSandbox` over `workspace/` _(same pattern)_ |
+| Output   | stream-printed `think` / `act` / `obs`        | stream-printed `think` / `act` / `obs` _(same)_             |
+| Tools    | `.tools(StandardTools.codingSet())`           | `WebSearchTool.withConfig(..)` + `writeFile` + `readFile`   |
+| Side eff | writes `SUMMARY.md`                           | writes `answer.md`                                          |
 
 The only substantive change is the tool registration. 04 used the local
 filesystem `codingSet()`; 06 swaps in an **external** search tool and keeps two
@@ -28,7 +28,17 @@ file tools so the agent can persist its answer:
 ```ts
 const harness = HarnessBuilder.conversational(model)
   .sandbox(sandbox) // same as 04
-  .tool(StandardTools.webSearchWithEndpoint(endpoint)) // ← external API
+  .tool({
+    // GET <endpoint>?q=<query>; the endpoint's `?format=json` is preserved.
+    implementation: WebSearchTool.withConfig({
+      endpoint,
+      method: "GET",
+      queryParam: "q",
+      authHeaders: [],
+      bodyAuthParams: [],
+    }),
+    schema: WebSearchTool.schema(),
+  }) // ← external API
   .tool(StandardTools.writeFile()) // ← writes answer.md
   .tool(StandardTools.readFile())
   .systemPrompt(SYSTEM_PROMPT)
@@ -63,25 +73,42 @@ answer (2 turn(s)): I searched for current install guidance and wrote answer.md 
 answer.md now exists on disk: …/workspace/answer.md
 ```
 
-## The search backend (and an honesty note about #108)
+## The search backend (SearXNG, GET + JSON)
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits if it is unset. `web_search` POSTs the query as JSON `{ "query": ... }` and
-hands the response body back to the agent verbatim.
+exits if it is unset. `web_search` issues `GET <endpoint>?q=<query>` and hands the
+response body back to the agent verbatim.
 
-Any endpoint that accepts that shape works:
+This example targets a self-hosted **SearXNG** JSON API. The endpoint already
+carries `format=json`; the GET path **preserves** that query string and appends
+the `q` param, so the backend receives `GET /search?format=json&q=<query>`.
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+`web_search` is configured via `WebSearchTool.withConfig` (core
+[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108), now
+implemented) with `method: "GET"` and `queryParam: "q"`. Auth-bearing backends
+(Brave's `X-Subscription-Token`, Tavily's in-body `api_key`) are also supported
+through the `authHeaders` / `bodyAuthParams` config fields; this example uses no
+auth.
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is a core deficiency tracked as
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
-Until #108 lands, point `SPORE_WEB_SEARCH_ENDPOINT` at SearXNG or a
-`{ "query" }`-compatible mock.
+### SearXNG setup
+
+1. Enable the JSON output format in your SearXNG `settings.yml`:
+
+   ```yaml
+   search:
+     formats:
+       - html
+       - json
+   ```
+
+2. Restart SearXNG so the new format takes effect.
+
+3. Point the example at it:
+
+   ```sh
+   export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+   ```
 
 ## A note on the model
 
@@ -95,8 +122,8 @@ harness is model-agnostic — swap the model interface and change nothing else.
 ```sh
 ollama serve &
 ollama pull llama3.2
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON API (see "SearXNG setup" above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 See `.env.example` for all the variables.
