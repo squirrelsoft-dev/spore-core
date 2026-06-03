@@ -9,18 +9,19 @@
  *
  * Tools wired (all from the built-in catalogue, no custom `Tool` impl):
  *
- * - `web_search` — {@link StandardTools.webSearchWithEndpoint}. The query is
- *   POSTed to `endpoint` as JSON `{ "query": ... }` and the response body is
- *   returned to the agent verbatim. The endpoint comes from
- *   `SPORE_WEB_SEARCH_ENDPOINT` (see the README + `.env.example`).
+ * - `web_search` — {@link WebSearchTool.withConfig}. The query is issued as a
+ *   `GET <endpoint>?q=<query>` request (the endpoint already carries
+ *   `format=json`) and the response body is returned to the agent verbatim.
+ *   The endpoint comes from `SPORE_WEB_SEARCH_ENDPOINT` and points at a
+ *   self-hosted SearXNG JSON API (see the README + `.env.example`).
  * - `write_file` — {@link StandardTools.writeFile}. The agent writes its
  *   synthesized, cited answer to `answer.md`.
  * - `read_file` — {@link StandardTools.readFile}. Lets the agent re-read what it
  *   wrote (e.g. to verify or revise the answer).
  *
  * The ONLY substantive difference from 04 is the tool set: 04 registers
- * `codingSet()`, 06 registers `webSearchWithEndpoint(..)` + `writeFile` +
- * `readFile`. Same `conversational` harness, same `WorkspaceScopedSandbox`
+ * `codingSet()`, 06 registers `web_search` (via `WebSearchTool.withConfig`) +
+ * `writeFile` + `readFile`. Same `conversational` harness, same `WorkspaceScopedSandbox`
  * (here scoped to this example's `workspace/` dir so `write_file` cannot escape
  * it). 04 wrote `SUMMARY.md`; 06 writes `answer.md` — and, like 04, the agent
  * writes it INSIDE the ReAct loop, never `main`.
@@ -31,7 +32,7 @@
  * ollama serve &
  * ollama pull llama3.2
  * pnpm install
- * export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search  # a {"query"}->JSON endpoint
+ * export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"  # SearXNG JSON API
  * pnpm start
  * ```
  */
@@ -49,7 +50,7 @@ import {
   newTask,
   type HarnessStreamEvent,
 } from "@spore/core";
-import { StandardTools } from "@spore/tools";
+import { StandardTools, WebSearchTool } from "@spore/tools";
 
 const SYSTEM_PROMPT =
   "You are a web-research agent. Use web_search to find current information, " +
@@ -63,18 +64,27 @@ async function main(): Promise<void> {
     argValue(args, "--model") ?? process.env.SPORE_OLLAMA_MODEL ?? "llama3.2";
   const baseUrl = process.env.SPORE_OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
 
-  // The search backend endpoint. `web_search` POSTs `{ "query": ... }` here and
-  // returns the JSON body to the agent. There is no live backend in spore-core,
-  // so you must supply one — a self-hosted SearXNG JSON endpoint, or a mock that
-  // accepts the `{ "query" }` shape. Raw Brave/Tavily are NOT yet drop-in: they
-  // need a custom auth header, which is tracked as core issue #108. See README.
+  // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+  // `*-cloud` like `gemma4:31b-cloud`) use native Ollama tool calling, which
+  // gives `write_file` a real typed schema and no always-on `final` escape.
+  // Small local models (e.g. `llama3.2`) that leak `<|python_tag|>` or malformed
+  // JSON can pass `--structured` to force the JSON-object channel.
+  const structured = args.includes("--structured");
+
+  // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
+  // and returns the JSON body to the agent. There is no live backend in
+  // spore-core, so you must supply one — a self-hosted SearXNG JSON API. The
+  // endpoint already carries `format=json`; the GET path preserves it and
+  // appends the `q` param (core #108, now implemented). Brave/Tavily-style auth
+  // headers are also supported via `WebSearchTool.withConfig` (`authHeaders` /
+  // `bodyAuthParams`). See README.
   const endpoint = process.env.SPORE_WEB_SEARCH_ENDPOINT?.trim();
   if (!endpoint) {
     console.error(
       "SPORE_WEB_SEARCH_ENDPOINT is not set.\n" +
-        'Set it to a search endpoint that accepts a JSON `{"query": ...}` POST ' +
-        "and returns JSON results.\n" +
-        "See .env.example and the README. (Raw Brave/Tavily need core #108 first.)",
+        "Set it to a SearXNG JSON endpoint, e.g.\n" +
+        '  export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"\n' +
+        "See .env.example and the README.",
     );
     process.exit(2);
   }
@@ -103,10 +113,25 @@ async function main(): Promise<void> {
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
   const harness = HarnessBuilder.conversational(model)
     .sandbox(sandbox) // same as 04
-    .tool(StandardTools.webSearchWithEndpoint(endpoint)) // ← external API
+    .tool({
+      // GET <endpoint>?q=<query>; the endpoint's `?format=json` is preserved.
+      implementation: WebSearchTool.withConfig({
+        endpoint,
+        method: "GET",
+        queryParam: "q",
+        authHeaders: [],
+        bodyAuthParams: [],
+      }),
+      schema: WebSearchTool.schema(),
+    }) // ← external API
     .tool(StandardTools.writeFile()) // ← writes answer.md
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
+    // Native tool calling by default; `--structured` flips on constrained
+    // decoding for small models (see the `structured` flag above). With
+    // structured mode the "think · turn N" line is just a turn marker, not model
+    // chatter, since each turn emits one clean JSON tool call.
+    .modelParams({ structured_tool_calls: structured, stop_sequences: [] })
     .build();
 
   const task = newTask(prompt, SessionId.generate(), {

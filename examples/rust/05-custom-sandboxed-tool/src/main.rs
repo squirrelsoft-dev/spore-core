@@ -4,32 +4,35 @@
 //! showed the two *built-in* tool paths: hand-rolling the harness-loop
 //! `ToolRegistry` (03) and registering the shipped catalogue with
 //! `.tools(StandardTools::coding_set())` (04). This example shows the third and
-//! most important path — **bringing your own tool** — and the public extension
-//! point that makes it possible: the [`Tool`] trait.
+//! most important path — **bringing your own tool** — using the ergonomic
+//! [`tool!`](spore_core::tool) macro.
 //!
 //! ## The two custom tools
 //!
-//! Both are defined in [`mod tools`](tools) as plain `impl Tool`:
+//! Both are defined in [`mod tools`](tools) with the `tool!` macro:
 //!
 //! - **`remember(key, value)`** — persists a fact into the run store
 //!   ([`tools::remember`]). It MUTATES shared state, so it is not `read_only`.
 //! - **`recall(key)`** — reads a fact back out ([`tools::recall`]). It only
-//!   reads, so it is `read_only` + `idempotent`.
+//!   reads, so it is `read_only` + `idempotent` (passed via `annotations`).
 //!
-//! ## The trait used, and the seam it exposes
+//! ## The macro, and the seam it exposes
 //!
-//! Each tool implements [`spore_core::Tool`]. The `execute` method receives two
-//! seams: a `SandboxProvider` (the environment — unused here, these tools never
-//! touch the filesystem) and a [`ToolContext`](spore_core::ToolContext) (the
-//! storage seam: `run_store()` + `session_id()`). Facts are keyed under
+//! Each tool is a `tool! { name, description, input, execute, .. }` block. The
+//! `input` is a typed struct deriving `serde::Deserialize` +
+//! `schemars::JsonSchema` — the macro derives the advertised JSON schema from it
+//! (so schema and deserialization can never drift) and deserializes the model's
+//! arguments into it before calling `execute`. The `execute` closure receives
+//! two seams: a `SandboxProvider` (the environment — unused here, these tools
+//! never touch the filesystem) and a [`ToolContext`](spore_core::ToolContext)
+//! (the storage seam: `run_store()` + `session_id()`). Facts are keyed under
 //! `fact:{key}` so they cannot collide with reserved catalogue keys.
 //!
-//! ## The pattern: `impl Tool` → `StandardTool::new` → `.tool()`
+//! ## The pattern: `tool! { .. }` → `.tool()`
 //!
-//! 1. Implement [`Tool`](spore_core::Tool).
-//! 2. Bundle the impl with its schema via
-//!    [`StandardTool::new`](spore_core::StandardTool) so the two can never drift.
-//! 3. Register each with `.tool(...)`. The harness wires the sandbox and a
+//! 1. Write a `tool! { .. }` block — it expands to a `Tool` impl bundled with
+//!    its derived schema into a [`StandardTool`](spore_core::StandardTool).
+//! 2. Register each with `.tool(...)`. The harness wires the sandbox and a
 //!    per-run `ToolContext` automatically — **the harness doesn't change, only
 //!    what you register does.**
 //!
@@ -52,11 +55,11 @@ mod tools;
 
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SessionId, StandardTool, Task,
+    OllamaModelInterface, RunResult, SessionId, Task,
 };
 
-use tools::recall::RecallTool;
-use tools::remember::RememberTool;
+use tools::recall::recall_tool;
+use tools::remember::remember_tool;
 
 const SYSTEM_PROMPT: &str = "You are a research agent with a memory. Research the topic the user \
      gives you across several turns. As you discover each fact, call `remember` to store it under \
@@ -85,14 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (build() defaults to in-memory storage when `.tool()` tools are present).
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model)
-        .tool(StandardTool::new(
-            Box::new(RememberTool::new()),
-            RememberTool::schema(),
-        ))
-        .tool(StandardTool::new(
-            Box::new(RecallTool::new()),
-            RecallTool::schema(),
-        ))
+        .tool(remember_tool())
+        .tool(recall_tool())
         .system_prompt(SYSTEM_PROMPT)
         .build();
 

@@ -104,6 +104,7 @@ describe("SelfVerifying loop fixture replay — self_verifying.json", () => {
         sandbox: new AllowAllSandbox(),
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
+        modelParams: { stop_sequences: [] },
         verifier,
       };
       const h = new StandardHarness(config);

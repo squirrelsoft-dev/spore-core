@@ -160,7 +160,7 @@ pub fn capture_plan_artifact(final_text: &str) -> Result<PlanArtifact, PlanPhase
 /// ASCII-whitespace predicate. Matches `' '`, `'\t'`, `'\n'`, `'\r'`, and the
 /// form-feed / vertical-tab the JSON-adjacent grammar treats as whitespace —
 /// kept to the ASCII set so trimming is byte-identical cross-language.
-fn is_ascii_ws(c: char) -> bool {
+pub(crate) fn is_ascii_ws(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000B}' | '\u{000C}')
 }
 
@@ -168,7 +168,7 @@ fn is_ascii_ws(c: char) -> bool {
 /// single trailing ```` ``` ```` fence, if the (already-trimmed) input opens
 /// with a triple-backtick fence. Returns the inner body, re-trimmed. If the
 /// input does not open with a fence it is returned unchanged.
-fn strip_code_fence(trimmed: &str) -> &str {
+pub(crate) fn strip_code_fence(trimmed: &str) -> &str {
     let Some(after_open) = trimmed.strip_prefix("```") else {
         return trimmed;
     };

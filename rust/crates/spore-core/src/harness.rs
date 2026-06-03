@@ -97,7 +97,9 @@ use crate::context::{
 };
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
-use crate::model::{Content, Message, Role, StopReason, TokenUsage, ToolCall, ToolSchema};
+use crate::model::{
+    Content, Message, ModelParams, Role, StopReason, TokenUsage, ToolCall, ToolSchema,
+};
 use crate::observability::{
     truncate_field, ContentCaptureConfig, GenAiMessage, GenAiRole, PricingTable, SpanBase, SpanId,
     SpanKind, SpanStatus, ToolCallContent, ToolCallSpan, ToolResultContent, TurnSpan, WarnEvent,
@@ -1897,6 +1899,13 @@ pub struct HarnessConfig {
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
     /// today's behaviour byte-for-byte.
     pub system_prompt: Option<String>,
+    /// Authoritative per-run model sampling/decoding parameters (issue #93).
+    /// The harness replaces each turn's `Context.params` with this value
+    /// UNCONDITIONALLY (builder params win) right before the request is built,
+    /// so the configured params reach every agent turn that requests tools.
+    /// See [`HarnessBuilder::model_params`]. Defaults to
+    /// [`ModelParams::default`].
+    pub model_params: ModelParams,
     /// Opt-in automatic conversation-history threading via the
     /// [`SessionStore`](crate::storage::SessionStore) (issue #102). When `true`,
     /// the harness:
@@ -1918,6 +1927,14 @@ pub struct HarnessConfig {
     /// `false` (the default) preserves today's behaviour byte-for-byte: ZERO
     /// `get_session`/`put_session` calls and identical message flow.
     pub auto_persist_sessions: bool,
+    /// Session-scoped prompt-based-tool-calling escalation flag, shared with the
+    /// [`AdaptiveToolCallModelInterface`](crate::prompt_tool_call::AdaptiveToolCallModelInterface)
+    /// installed by [`HarnessBuilder::conversational`]. `Some` only on that path.
+    /// The run loop resets it at the start of each turn-loop window and flips it
+    /// to `true` on detecting a prose response where a tool call was expected;
+    /// the wrapped model reads it to switch into prompt-based mode. `None`
+    /// disables adaptive escalation (every non-`conversational` construction).
+    pub prompt_tool_call_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Clone for HarnessConfig {
@@ -1948,7 +1965,9 @@ impl Clone for HarnessConfig {
             metric_evaluator: self.metric_evaluator.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
             system_prompt: self.system_prompt.clone(),
+            model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
+            prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
         }
     }
 }
@@ -2021,10 +2040,21 @@ pub struct HarnessBuilder {
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
     system_prompt: Option<String>,
+    /// Authoritative per-run model sampling/decoding parameters (issue #93).
+    /// Defaults to [`ModelParams::default`]. See
+    /// [`model_params`](HarnessBuilder::model_params).
+    model_params: ModelParams,
     /// Opt-in automatic session-state threading + auto-persist (issue #102).
     /// `false` (the default) preserves today's behaviour byte-for-byte (ZERO
     /// session-store I/O). See [`auto_persist_sessions`](HarnessBuilder::auto_persist_sessions).
     auto_persist_sessions: bool,
+    /// Session-scoped escalation flag shared with an
+    /// [`AdaptiveToolCallModelInterface`](crate::prompt_tool_call::AdaptiveToolCallModelInterface)
+    /// installed by [`conversational`](HarnessBuilder::conversational). `Some`
+    /// only on that path; the run loop flips it on detecting a prose response so
+    /// the wrapped model switches to prompt-based tool calling for the rest of
+    /// the run. `None` for every other construction (no adaptive wrapping).
+    prompt_tool_call_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl HarnessBuilder {
@@ -2063,7 +2093,9 @@ impl HarnessBuilder {
             metric_evaluator: None,
             standard_tools: Vec::new(),
             system_prompt: None,
+            model_params: ModelParams::default(),
             auto_persist_sessions: false,
+            prompt_tool_call_flag: None,
         }
     }
 
@@ -2096,9 +2128,22 @@ impl HarnessBuilder {
     pub fn conversational<M: crate::model::ModelInterface + 'static>(model: M) -> Self {
         use crate::compaction_adapter::HarnessContextManagerExt;
         let model = Arc::new(model);
+        // Install the adaptive prompt-based tool-calling wrapper around the
+        // agent's model. While its flag is unset it delegates natively
+        // (byte-for-byte); the run loop flips the flag on detecting a prose
+        // response so the model switches to prompt-based tool calling for the
+        // rest of the run. The context manager keeps the *raw* model (its only
+        // model use is compaction summarization, which advertises no tools).
+        let prompt_tool_call_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adaptive_model = Arc::new(
+            crate::prompt_tool_call::AdaptiveToolCallModelInterface::new(
+                model.clone(),
+                prompt_tool_call_flag.clone(),
+            ),
+        );
         let agent: Arc<dyn Agent> = Arc::new(crate::agent::ModelAgent::new(
             crate::agent::AgentId::new("agent"),
-            model.clone(),
+            adaptive_model,
         ));
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(NullSandbox);
@@ -2109,15 +2154,16 @@ impl HarnessBuilder {
                 crate::context::CompactionConfig::default(),
             ))
             .into_harness_adapter();
-        let termination_policy: Arc<dyn TerminationPolicy> =
-            Arc::new(CompleteOnFinalResponse);
-        Self::new(
+        let termination_policy: Arc<dyn TerminationPolicy> = Arc::new(CompleteOnFinalResponse);
+        let mut builder = Self::new(
             agent,
             tool_registry,
             sandbox,
             context_manager,
             termination_policy,
-        )
+        );
+        builder.prompt_tool_call_flag = Some(prompt_tool_call_flag);
+        builder
     }
 
     /// Override the harness-loop tool registry (issue #4 seam).
@@ -2202,6 +2248,27 @@ impl HarnessBuilder {
     /// default) preserves today's behaviour.
     pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    /// Set the authoritative model sampling/decoding parameters for the whole
+    /// run (issue #93).
+    ///
+    /// These params are authoritative: the harness replaces each turn's
+    /// `Context.params` with this value UNCONDITIONALLY (builder params win)
+    /// right before the request is built, so the configured params reach every
+    /// agent turn that requests tools — the ReAct loop, the PlanExecute plan
+    /// phase, the execute sub-loop, and the streaming path alike. (The internal
+    /// compaction/summarization turn is intentionally left on defaults; it
+    /// requests no tools, so decoding params are a no-op there.)
+    ///
+    /// Enabling [`structured_tool_calls`](crate::model::ModelParams::structured_tool_calls)
+    /// trades interleaved reasoning for one schema-constrained tool call per
+    /// turn — useful for small local models that otherwise emit malformed tool
+    /// calls. See [`ModelParams::structured_tool_calls`](crate::model::ModelParams::structured_tool_calls)
+    /// for the full behaviour contract.
+    pub fn model_params(mut self, params: ModelParams) -> Self {
+        self.model_params = params;
         self
     }
 
@@ -2467,7 +2534,9 @@ impl HarnessBuilder {
             metric_evaluator: self.metric_evaluator,
             catalogue_registry,
             system_prompt: self.system_prompt,
+            model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
+            prompt_tool_call_flag: self.prompt_tool_call_flag,
         }
     }
 
@@ -2905,6 +2974,14 @@ impl StandardHarness {
         // Resolve the effective tool registry once per turn-loop window (all
         // strategies funnel through here). Bridges catalogue tools per-run.
         let tool_registry = self.effective_tool_registry(&session_id);
+        // Reset the adaptive prompt-based-tool-calling escalation flag at the
+        // start of this turn-loop window so detection is scoped to the window
+        // and does not leak across `run()` calls (the flag is shared with the
+        // model wrapper for the harness's lifetime). No-op unless a
+        // `conversational` harness installed the adaptive wrapper.
+        if let Some(flag) = self.config.prompt_tool_call_flag.as_ref() {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
         let started_at = Instant::now();
         let mut usage = AggregateUsage::default();
         // Per-run Stop-hook block counter (issue #69, Decision 4). Resets on
@@ -3022,6 +3099,17 @@ impl StandardHarness {
                     );
                 }
             }
+            // Per-run model params win unconditionally (issue #93). The agent
+            // copies `Context.params` verbatim into the `ModelRequest`, so this
+            // is the single seam that delivers configured params (e.g.
+            // structured tool calls) to every tool-requesting ReAct/execute/
+            // streaming turn.
+            context.params = self.config.model_params.clone();
+            // Whether tools were advertised to the model this turn — a
+            // precondition for classifying a prose final response as a missed
+            // tool call (adaptive prompt-based escalation). Captured before
+            // `context` is moved into the turn.
+            let tools_advertised = !context.tools.is_empty();
             Self::emit(
                 &on_stream,
                 StreamEvent::TurnStart {
@@ -3185,6 +3273,48 @@ impl StandardHarness {
                     usage.add_turn(&u);
                     budget_used.input_tokens += u.input_tokens as u64;
                     budget_used.output_tokens += u.output_tokens as u64;
+
+                    // Adaptive prompt-based tool-calling escalation. When tools
+                    // were advertised but the model answered in prose with
+                    // action-intent language (it *meant* to act), classify the
+                    // turn as a `ProseResponse` failure and escalate: set the
+                    // session flag so the wrapped model switches to prompt-based
+                    // tool calling, nudge the model, and force another turn
+                    // instead of completing. Guarded on the flag being unset so
+                    // it fires at most once per window (bounded — one extra
+                    // turn) and only on the `conversational` adaptive path.
+                    if let Some(flag) = self.config.prompt_tool_call_flag.as_ref() {
+                        let already_escalated = flag.load(std::sync::atomic::Ordering::Acquire);
+                        if !already_escalated
+                            && crate::tool_call_repair::detect_prose_response(
+                                &content,
+                                tools_advertised,
+                            )
+                            .is_some()
+                        {
+                            flag.store(true, std::sync::atomic::Ordering::Release);
+                            // Record the model's prose, then a corrective nudge,
+                            // so the next turn has coherent context.
+                            let assistant = Message {
+                                role: Role::Assistant,
+                                content: Content::Text {
+                                    text: content.clone(),
+                                },
+                            };
+                            self.config
+                                .context_manager
+                                .append_assistant_message(&mut session_state, &assistant)
+                                .await;
+                            let nudge = "You described an action but did not call a \
+tool. Use the provided tool-call format to actually invoke the tool."
+                                .to_string();
+                            self.config
+                                .context_manager
+                                .append_user_message(&mut session_state, &nudge)
+                                .await;
+                            continue;
+                        }
+                    }
 
                     if let Some(mw) = self.config.middleware.as_ref() {
                         match mw.fire(HookPoint::BeforeCompletion, &session_state).await {
@@ -4969,7 +5099,9 @@ impl StandardHarness {
     ///    and counts the turn against the shared budget.
     /// 2. **Execute phase** (issue #59, loops):
     ///    [`run_execute_phase`](Self::run_execute_phase) drains the task list,
-    ///    giving each task its own bounded ReAct sub-loop.
+    ///    running each task in a bounded ReAct sub-loop that BUILDS ON the
+    ///    accumulated execute-phase context (prior steps' tool results and
+    ///    assistant outputs carry forward).
     ///
     /// Between the phases the artifact is parsed into a
     /// [`TaskList`](crate::tasklist::TaskList) via
@@ -4987,9 +5119,13 @@ impl StandardHarness {
     ///   [`HaltReason::BudgetExceeded`] unchanged.
     ///
     /// # Resolved spec decisions (issue #59 — all five FINAL)
-    /// - **Q1 (execute step model):** each task gets its OWN bounded ReAct
-    ///   sub-loop, fully isolated and SEQUENTIAL (task N completes before N+1).
-    ///   The per-task turn cap is derived at the START of each step:
+    /// - **Q1 (execute step model):** each task runs a bounded ReAct sub-loop
+    ///   that BUILDS ON the accumulated execute-phase context — after each
+    ///   successful step its conversation (instruction + tool calls + tool
+    ///   results + assistant output) is folded back into the shared execute
+    ///   context, so the next step sees all prior steps' results. Steps stay
+    ///   SEQUENTIAL (task N completes before N+1). The shared budget still
+    ///   gates: the per-task turn cap is derived at the START of each step:
     ///   `per_task_turns = remaining_turns / remaining_tasks`, floored at 1
     ///   (integer division; `remaining_tasks` = not-yet-started tasks including
     ///   the current one). The shared/parent budget — turns, tokens,
@@ -5130,13 +5266,17 @@ impl StandardHarness {
 
     /// Drive the PlanExecute execute phase (issue #59), draining `task_list`.
     ///
-    /// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-    /// sub-loop. The per-task turn cap is derived at the START of each step from
-    /// the shared budget: `per_task_turns = remaining_turns / remaining_tasks`,
-    /// floored at 1 (integer division; `remaining_tasks` counts the not-yet-
-    /// started tasks including the current one). The shared budget snapshot
-    /// (`carried`) is threaded through every step so early tasks cannot starve
-    /// later ones and the global budget stays the hard stop.
+    /// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
+    /// the accumulated execute-phase context: after each successful step its
+    /// resulting conversation (instruction + tool calls + tool results +
+    /// assistant output) is folded back into the shared `session_state`, so the
+    /// next step's sub-loop (which clones `session_state`) sees every prior
+    /// step's results. The per-task turn cap is derived at the START of each
+    /// step from the shared budget: `per_task_turns = remaining_turns /
+    /// remaining_tasks`, floored at 1 (integer division; `remaining_tasks`
+    /// counts the not-yet-started tasks including the current one). The shared
+    /// budget snapshot (`carried`) is threaded through every step so early tasks
+    /// cannot starve later ones and the global budget stays the hard stop.
     ///
     /// Before each step the task is marked `InProgress` (and `Completed` after),
     /// the list is re-persisted (Q4), and `OnTaskAdvance` fires with the correct
@@ -5245,7 +5385,16 @@ impl StandardHarness {
                     // Carry the shared budget forward (Q1): cumulative turns are
                     // the sub-loop's absolute count; fold in its token usage.
                     carried.turns = turns;
-                    last_state = step_state;
+                    // Fold this step's resulting conversation back into the
+                    // SHARED execute context so the NEXT step's sub-loop (which
+                    // clones `session_state`) builds on this step's tool results
+                    // and assistant output, not just its instruction. The
+                    // returned `step_state` already contains this step's
+                    // instruction + tool calls + tool results + final output.
+                    *session_state = step_state;
+                    // The terminal `RunResult` carries the LAST completed step's
+                    // full state (now the accumulated context, Q2/#102).
+                    last_state = session_state.clone();
                     carried.input_tokens += usage.input_tokens;
                     carried.output_tokens += usage.output_tokens;
                     total_usage.input_tokens += usage.input_tokens;
@@ -5396,23 +5545,34 @@ impl StandardHarness {
             .unwrap_or(&self.config.agent);
 
         // Seed the planning directive as a user message (reuse ContextManager).
+        // CRITICAL (#93): the directive must NOT mutate the SHARED `session_state`.
+        // That same state is threaded into the execute phase, where each subtask
+        // sub-loop assembles its context from it. If the directive leaked in,
+        // every execute step would still see "respond with {tasks, rationale}"
+        // and an instruction-following model would re-emit a plan instead of
+        // calling tools. Append to a throwaway CLONE so the plan turn sees the
+        // directive while the shared state stays `[user: task.instruction]`.
         let directive = format!(
             "Produce a step-by-step plan for the following task. Respond with a \
              single JSON object: {{\"tasks\": [<ordered step strings>], \
              \"rationale\": <string>}}.\n\nTask:\n{}",
             task.instruction
         );
+        let mut plan_state = session_state.clone();
         self.config
             .context_manager
-            .append_user_message(session_state, &directive)
+            .append_user_message(&mut plan_state, &directive)
             .await;
 
         // Assemble + invoke the planner for exactly ONE turn (R1).
-        let context = self
+        let mut context = self
             .config
             .context_manager
-            .assemble(session_state, task)
+            .assemble(&plan_state, task)
             .await;
+        // Per-run model params win unconditionally (issue #93) — same seam as
+        // run_react_inner, before the plan turn is dispatched.
+        context.params = self.config.model_params.clone();
         Self::emit(
             on_stream,
             StreamEvent::TurnStart {
@@ -6523,7 +6683,9 @@ mod tests {
             metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
+            model_params: ModelParams::default(),
             auto_persist_sessions: false,
+            prompt_tool_call_flag: None,
         }
     }
 
@@ -8300,6 +8462,269 @@ mod tests {
             .is_none());
     }
 
+    // ── #93: model_params reach every tool-requesting turn ─────────────────
+    //
+    // `RecordingTurnAgent::turn` captures every `Context` it sees in `seen`, and
+    // the agent copies `Context.params` verbatim into the `ModelRequest`
+    // (`into_request`). So asserting on a captured context's
+    // `params.structured_tool_calls` proves the configured params reached the
+    // request the model would have seen.
+
+    /// Build a config whose agent is a context-capturing `RecordingTurnAgent`
+    /// returning the given turn script, optionally with non-default model params.
+    fn recording_config(
+        agent: Arc<RecordingTurnAgent>,
+        model_params: ModelParams,
+    ) -> HarnessConfig {
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent;
+        cfg.model_params = model_params;
+        cfg
+    }
+
+    // No `.model_params(...)` ⇒ each turn's context carries the default
+    // (structured_tool_calls == false).
+    #[tokio::test]
+    async fn default_model_params_are_default() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(agent.clone(), ModelParams::default());
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(react(5))).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty(), "agent should have seen at least one turn");
+        assert!(!seen[0].params.structured_tool_calls);
+    }
+
+    // `.model_params(structured_tool_calls = true)` ⇒ the ReAct turn context
+    // carries it.
+    #[tokio::test]
+    async fn model_params_reach_react_turn() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(react(5))).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
+    // The PlanExecute plan phase (`run_plan_phase`) replaces params on its own
+    // seam — the plan-turn context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_plan_phase() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![RecordingTurnAgent::final_resp(
+                r#"{"tasks":["one"],"rationale":"r"}"#,
+            )],
+        );
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        let t = plan_task();
+        let mut state = SessionState::default();
+        h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        let seen = agent.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one plan turn");
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
+    // A full PlanExecute run threads params through the shared react seam used by
+    // the execute sub-loop — every execute-step context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_execute_subloop() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                RecordingTurnAgent::final_resp(r#"{"tasks":["one","two"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("did one"),
+                RecordingTurnAgent::final_resp("did two"),
+            ],
+        );
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(plan_task())).await;
+        let seen = agent.seen.lock().unwrap();
+        // 1 plan turn + 2 execute turns; every captured context carries it.
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|c| c.params.structured_tool_calls),
+            "plan + execute-step contexts all carry the flag"
+        );
+    }
+
+    // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
+    // Respond with a single JSON object…") must NOT leak into the SHARED
+    // session_state, otherwise every execute step re-sees it and an
+    // instruction-following model re-emits a plan instead of calling tools.
+    // Drive a full 2-step PlanExecute run with a context-capturing agent and
+    // assert no execute-step context carries the directive, while the step
+    // instructions DO reach those contexts (and a step can issue a tool call).
+    #[tokio::test]
+    async fn plan_directive_does_not_leak_into_execute_context() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                // Plan turn: produce a 2-step plan.
+                RecordingTurnAgent::final_resp(
+                    r#"{"tasks":["step one","step two"],"rationale":"r"}"#,
+                ),
+                // Execute step 1: issue a tool call, then finalize.
+                RecordingTurnAgent::tool_call("noop"),
+                RecordingTurnAgent::final_resp("did step one"),
+                // Execute step 2: finalize directly.
+                RecordingTurnAgent::final_resp("did step two"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        cfg.tool_registry = Arc::new(ScriptedToolRegistry::new());
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(plan_task())).await;
+
+        let contexts = agent.seen_text();
+        // 1 plan turn + (tool call + final) for step one + 1 for step two.
+        assert_eq!(contexts.len(), 4, "plan turn + 3 execute turns");
+
+        // The PLAN turn (index 0) DOES carry the directive — that's correct.
+        assert!(
+            contexts[0].contains("Respond with a single JSON object")
+                && contexts[0].contains("Produce a step-by-step plan"),
+            "plan turn should see the directive: {}",
+            contexts[0]
+        );
+
+        // No EXECUTE-step context (indices 1..) may carry the directive.
+        for (i, c) in contexts.iter().enumerate().skip(1) {
+            assert!(
+                !c.contains("Respond with a single JSON object"),
+                "execute-step context {i} leaked the directive: {c}"
+            );
+            assert!(
+                !c.contains("Produce a step-by-step plan"),
+                "execute-step context {i} leaked the directive: {c}"
+            );
+        }
+
+        // The execute steps still receive their step instructions and can
+        // proceed to a tool call.
+        assert!(
+            contexts[1].contains("step one"),
+            "step-one context should carry its instruction: {}",
+            contexts[1]
+        );
+        assert!(
+            contexts[2].contains("noop"),
+            "step-one second turn should follow the tool call: {}",
+            contexts[2]
+        );
+        assert!(
+            contexts[3].contains("step two"),
+            "step-two context should carry its instruction: {}",
+            contexts[3]
+        );
+    }
+
+    // #93 regression: the execute phase maintains ONE accumulating context
+    // across steps. After a successful step its conversation (instruction + tool
+    // calls + TOOL RESULTS + assistant output) is folded back into the shared
+    // session_state, so the NEXT step's sub-loop sees prior steps' RESULTS — not
+    // just their instructions. Drive a 2-step run where STEP 1 issues a tool
+    // call returning a distinctive string and assert STEP 2's context carries it.
+    #[tokio::test]
+    async fn execute_steps_accumulate_prior_results() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                // Plan turn: a 2-step plan (research -> use the result).
+                RecordingTurnAgent::final_resp(
+                    r#"{"tasks":["research tokio","summarize findings"],"rationale":"r"}"#,
+                ),
+                // Step 1: call a tool, then finalize using its result.
+                RecordingTurnAgent::tool_call("lookup"),
+                RecordingTurnAgent::final_resp("researched"),
+                // Step 2: finalize directly (it must SEE step 1's tool result).
+                RecordingTurnAgent::final_resp("summarized"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        // Step 1's tool call returns a distinctive result string.
+        reg.push(ToolOutput::Success {
+            content: "TOKIO_FACTS_123".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "summarized"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let contexts = agent.seen_text();
+        // 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+        assert_eq!(contexts.len(), 4, "plan turn + 3 execute turns");
+
+        // Step 1's SECOND turn (index 2) sees the tool result — sanity check that
+        // the result string is on the wire at all.
+        assert!(
+            contexts[2].contains("TOKIO_FACTS_123"),
+            "step-1 final turn should follow its own tool result: {}",
+            contexts[2]
+        );
+        // The accumulation guarantee: STEP 2's context (index 3) CONTAINS step
+        // 1's tool result, proving the execute loop carried it forward.
+        assert!(
+            contexts[3].contains("TOKIO_FACTS_123"),
+            "step 2 must see step 1's tool result (accumulating context): {}",
+            contexts[3]
+        );
+        // Step 2 also sees step 1's prior instruction + assistant output.
+        assert!(
+            contexts[3].contains("research tokio") && contexts[3].contains("researched"),
+            "step 2 must see step 1's instruction and output: {}",
+            contexts[3]
+        );
+    }
+
+    // The streaming path flows through `run_react_inner`'s same seam — the
+    // streamed turn's captured context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_streaming_turn() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(|_ev: StreamEvent| {}));
+        h.run(opts).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
     // R5: when planner_agent is set, the PLANNER runs the plan turn and the
     // default agent does not.
     #[tokio::test]
@@ -9375,7 +9800,9 @@ mod tests {
                 metric_evaluator: None,
                 catalogue_registry: None,
                 system_prompt: None,
+                model_params: ModelParams::default(),
                 auto_persist_sessions: false,
+                prompt_tool_call_flag: None,
             })
         }
 
@@ -10209,6 +10636,9 @@ mod tests {
                         .map(|m| match &m.content {
                             Content::Text { text } => text.clone(),
                             Content::ToolCall(tc) => tc.name.clone(),
+                            // Tool results carry prior steps' outputs forward —
+                            // surface their content so accumulation is visible.
+                            Content::ToolResult(tr) => tr.content.clone(),
                             _ => String::new(),
                         })
                         .collect::<Vec<_>>()

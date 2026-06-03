@@ -147,3 +147,23 @@ This uses Ollama (`llama3.2`) like examples 01–06, so it runs with no hosted
 account. Recall quality scales with the model: a **larger hosted model follows
 the store/recall tool protocol more reliably**. The harness is model-agnostic —
 swap the model interface and change nothing else.
+
+### Tool-calling mode: native by default, `--structured` to opt in
+
+By default this example uses **native Ollama tool calling** — the real typed
+tool schema — which works well for tool-capable / cloud models like
+`gemma4:31b-cloud`. Pass `--structured` to opt into schema-constrained decoding
+via `HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`, which
+helps **small local models** (e.g. `llama3.2`) emit one clean `memory` tool call
+per turn instead of malformed JSON:
+
+```sh
+uv run main.py --phase store                # native tool calling (default)
+uv run main.py --phase store --structured   # constrained decoding for small models
+```
+
+One caveat for structured mode: it exposes an always-available `final` envelope
+whose content is optional, so a **capable** model can emit `{"tool":"final"}`
+prematurely and hand back an EMPTY answer without ever calling the `memory` tool.
+If you run with `--structured` and see an empty answer and no `memory.md` on disk,
+drop the flag and use the native default.

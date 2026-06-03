@@ -167,6 +167,83 @@ fn property_types(schema: &ToolSchema) -> BTreeMap<String, String> {
     map
 }
 
+// ============================================================================
+// Failure classification (issue: prompt-based tool-call fallback)
+// ============================================================================
+
+/// How a model's tool-calling attempt failed.
+///
+/// Classification type shared by the repair seam (malformed JSON, unknown tool)
+/// and the prompt-based fallback (prose responses). The harness loop owns
+/// *prose* detection — a prose response emits no tool call, so it never reaches
+/// the dispatch-error [`ToolCallRepair`] seam — but the variant lives here so
+/// all tool-call failure modes have one vocabulary for observability and
+/// consistency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallFailure {
+    /// A tool call was emitted but its arguments were not valid JSON of the
+    /// expected shape. Carries the offending error/text. Recoverable via
+    /// [`coerce_tool_args`].
+    MalformedJson(String),
+    /// Tools were advertised, but the model answered in prose instead of
+    /// emitting a tool call. Carries the prose text. Recoverable by escalating
+    /// to prompt-based tool calling on the next turn.
+    ProseResponse(String),
+    /// A tool call named a tool not present in the registry. Carries the name.
+    UnknownTool(String),
+}
+
+/// Conservative heuristic: did the model respond in prose when a tool call was
+/// the expected next step?
+///
+/// Returns `Some(ToolCallFailure::ProseResponse(..))` only when **both**:
+/// 1. tools were advertised this turn (`tools_advertised`), and
+/// 2. the response text contains an explicit action-intent phrase suggesting the
+///    model *meant* to act (e.g. "I'll use the … tool", "let me call …").
+///
+/// The bias is deliberately toward false negatives: a missed prose response
+/// costs one extra turn, but a false positive activates prompt-based mode for a
+/// model that was simply giving a final answer. A bare final answer with no
+/// action-intent language is therefore **not** classified as a prose response.
+pub fn detect_prose_response(text: &str, tools_advertised: bool) -> Option<ToolCallFailure> {
+    if !tools_advertised {
+        return None;
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Curated action-intent phrases. Lower-cased substring match — conservative
+    // and cheap. Each phrase strongly implies "I am about to use a tool".
+    const ACTION_PHRASES: &[&str] = &[
+        "i'll use",
+        "i will use",
+        "i'll call",
+        "i will call",
+        "i'll run",
+        "i will run",
+        "let me use",
+        "let me call",
+        "let me run",
+        "i need to use",
+        "i need to call",
+        "i should use",
+        "i should call",
+        "i'll invoke",
+        "i will invoke",
+        "using the",
+        "i can use the",
+        "i'm going to use",
+        "i am going to use",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    if ACTION_PHRASES.iter().any(|p| lower.contains(p)) {
+        Some(ToolCallFailure::ProseResponse(trimmed.to_string()))
+    } else {
+        None
+    }
+}
+
 /// Strategy for repairing a tool call that failed dispatch with a *recoverable*
 /// error. Implementations are pure and side-effect-free: they inspect the call
 /// (and optionally its schema + the error text) and return a repaired
@@ -329,5 +406,37 @@ mod tests {
         };
         let s = schema(json!({ "append": { "type": "boolean" } }));
         assert!(repair.repair(&call, "boom", Some(&s)).is_none());
+    }
+
+    // --- prose detection -----------------------------------------------------
+
+    #[test]
+    fn prose_detected_on_action_intent_with_tools() {
+        let got = detect_prose_response("Sure, I'll use the calculator tool to add these.", true);
+        assert!(matches!(got, Some(ToolCallFailure::ProseResponse(_))));
+    }
+
+    #[test]
+    fn prose_detected_case_insensitive() {
+        let got = detect_prose_response("LET ME CALL the search tool now.", true);
+        assert!(matches!(got, Some(ToolCallFailure::ProseResponse(_))));
+    }
+
+    #[test]
+    fn prose_not_detected_without_tools_advertised() {
+        // Even with action-intent language, no tools advertised → no escalation.
+        assert!(detect_prose_response("I'll use the calculator.", false).is_none());
+    }
+
+    #[test]
+    fn prose_not_detected_for_plain_final_answer() {
+        // Conservative: a final answer with no action-intent language must NOT
+        // trip the heuristic (prefer false negatives).
+        assert!(detect_prose_response("The answer is 42.", true).is_none());
+    }
+
+    #[test]
+    fn prose_not_detected_for_empty_text() {
+        assert!(detect_prose_response("   ", true).is_none());
     }
 }

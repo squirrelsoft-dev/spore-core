@@ -3,14 +3,15 @@
  *
  * This is the first example to swap the **loop strategy**. Everything else —
  * the `conversational(model)` builder, the {@link WorkspaceScopedSandbox}, and
- * the tool set (`web_search` + `write_file` + `read_file`, identical to 06) — is
+ * the tool set (`web_search` via {@link WebSearchTool.withConfig} + `write_file`
+ * + `read_file`, identical to 06) — is
  * held constant. The ONLY substantive change is one line on the `Task`:
  *
  * ```ts
  * // 06 — react step-by-step:
  * newTask(prompt, SessionId.generate(), { kind: "re_act", max_iterations: 10 });
  * // 08 — decompose the goal first, then execute each subtask:
- * newTask(prompt, SessionId.generate(), { kind: "plan_execute" }, { max_turns: 24 });
+ * newTask(prompt, SessionId.generate(), { kind: "plan_execute" }, { max_turns: 64 });
  * ```
  *
  * With `plan_execute`, the harness runs one constrained planner turn FIRST: the
@@ -33,8 +34,8 @@
  *
  * Tools wired (all from the built-in catalogue, identical to 06):
  *
- * - `web_search` — {@link StandardTools.webSearchWithEndpoint}; query POSTed to
- *   `SPORE_WEB_SEARCH_ENDPOINT` as JSON `{ "query": ... }`.
+ * - `web_search` — {@link WebSearchTool.withConfig}; query issued as
+ *   `GET <SPORE_WEB_SEARCH_ENDPOINT>?q=<query>` against a SearXNG JSON API.
  * - `write_file` — the agent writes `async-comparison.md` into `workspace/`.
  * - `read_file` — lets the agent re-read what it wrote.
  *
@@ -44,7 +45,7 @@
  * ollama serve &
  * ollama pull llama3.2
  * pnpm install
- * export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search  # a {"query"}->JSON endpoint
+ * export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"  # SearXNG JSON API
  * pnpm start
  * ```
  */
@@ -63,13 +64,18 @@ import {
   newTask,
   type HarnessStreamEvent,
 } from "@spore/core";
-import { StandardTools } from "@spore/tools";
+import { StandardTools, WebSearchTool } from "@spore/tools";
 
 const SYSTEM_PROMPT =
-  "You are a planning research agent. Decompose the goal into clear subtasks. " +
-  "For each subtask, use web_search to find current information, then " +
-  "synthesize a clear, cited comparison and save the final document with " +
-  "write_file. Act using tools — do not answer from memory alone.";
+  "You are a research-and-writing agent. Your ONLY capabilities are: web_search " +
+  "(find current information online), read_file, and write_file (save your work " +
+  "to the workspace). You have NO shell or terminal — you cannot install software, " +
+  "set up projects or environments, run/compile/build code, or execute commands. " +
+  "Decompose the goal into subtasks that are each achievable with web_search and " +
+  "writing alone; never plan setup, installation, or build steps. For each subtask, " +
+  "use web_search to gather current information, then synthesize a clear, cited " +
+  "comparison and save the final document with write_file. Act using tools — do " +
+  "not answer from memory alone.";
 
 /**
  * Lifecycle hook that prints the PlanExecute plan and each subtask as it runs.
@@ -122,18 +128,27 @@ async function main(): Promise<void> {
     argValue(args, "--model") ?? process.env.SPORE_OLLAMA_MODEL ?? "llama3.2";
   const baseUrl = process.env.SPORE_OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
 
-  // The search backend endpoint. `web_search` POSTs `{ "query": ... }` here and
-  // returns the JSON body to the agent. There is no live backend in spore-core,
-  // so you must supply one — a self-hosted SearXNG JSON endpoint, or a mock that
-  // accepts the `{ "query" }` shape. Raw Brave/Tavily are NOT yet drop-in: they
-  // need a custom auth header, which is tracked as core issue #108. See README.
+  // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+  // `*-cloud` like `gemma4:31b-cloud`) use native Ollama tool calling, which
+  // gives `write_file` a real typed schema and no always-on `final` escape.
+  // Small local models (e.g. `llama3.2`) that leak `<|python_tag|>` or malformed
+  // JSON can pass `--structured` to force the JSON-object channel.
+  const structured = args.includes("--structured");
+
+  // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
+  // and returns the JSON body to the agent. There is no live backend in
+  // spore-core, so you must supply one — a self-hosted SearXNG JSON API. The
+  // endpoint already carries `format=json`; the GET path preserves it and
+  // appends the `q` param (core #108, now implemented). Brave/Tavily-style auth
+  // headers are also supported via `WebSearchTool.withConfig` (`authHeaders` /
+  // `bodyAuthParams`). See README.
   const endpoint = process.env.SPORE_WEB_SEARCH_ENDPOINT?.trim();
   if (!endpoint) {
     console.error(
       "SPORE_WEB_SEARCH_ENDPOINT is not set.\n" +
-        'Set it to a search endpoint that accepts a JSON `{"query": ...}` POST ' +
-        "and returns JSON results.\n" +
-        "See .env.example and the README. (Raw Brave/Tavily need core #108 first.)",
+        "Set it to a SearXNG JSON endpoint, e.g.\n" +
+        '  export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"\n' +
+        "See .env.example and the README.",
     );
     process.exit(2);
   }
@@ -166,10 +181,26 @@ async function main(): Promise<void> {
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
   const harness = HarnessBuilder.conversational(model)
     .sandbox(sandbox) // same as 06
-    .tool(StandardTools.webSearchWithEndpoint(endpoint))
+    .tool({
+      // GET <endpoint>?q=<query>; the endpoint's `?format=json` is preserved.
+      implementation: WebSearchTool.withConfig({
+        endpoint,
+        method: "GET",
+        queryParam: "q",
+        authHeaders: [],
+        bodyAuthParams: [],
+      }),
+      schema: WebSearchTool.schema(),
+    })
     .tool(StandardTools.writeFile())
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
+    // Native tool calling by default; `--structured` flips on constrained
+    // decoding for small models (see the `structured` flag above). With
+    // structured mode the "think · turn N" line is just a turn marker, not model
+    // chatter, since each turn emits one clean JSON tool call across both the
+    // plan and execute phases.
+    .modelParams({ structured_tool_calls: structured, stop_sequences: [] })
     .hooks(chain) // ← the plan becomes visible through the hook chain
     .build();
 
@@ -180,7 +211,7 @@ async function main(): Promise<void> {
     prompt,
     SessionId.generate(),
     { kind: "plan_execute" },
-    { max_turns: 24 },
+    { max_turns: 64 },
   );
 
   console.log(`model    : ${modelId}`);

@@ -110,7 +110,7 @@ func newUnparseablePlan(message string) *PlanPhaseError {
 // Any deviation → *PlanPhaseError{Kind: PlanErrorUnparseablePlan}. Never panics.
 func CapturePlanArtifact(finalText string) (PlanArtifact, error) {
 	trimmed := trimASCIIWS(finalText)
-	body := stripCodeFence(trimmed)
+	body := StripCodeFence(trimmed)
 
 	// Decode into a generic value so we can enforce the object/array/string
 	// shape exactly (and reject non-string task elements verbatim).
@@ -191,11 +191,15 @@ func trimEndASCIIWS(s string) string {
 	return s[:end]
 }
 
-// stripCodeFence strips a single leading ```/```json fence line and a single
+// StripCodeFence strips a single leading ```/```json fence line and a single
 // trailing ``` fence, if the (already-trimmed) input opens with a triple-
 // backtick fence. Returns the inner body, re-trimmed. If the input does not
 // open with a fence it is returned unchanged.
-func stripCodeFence(trimmed string) string {
+//
+// Exported so the ollama package can reuse the same fence-stripping semantics
+// when parsing structured tool calls: capable/cloud models often wrap the
+// constrained-decoding JSON in a markdown fence (see ollama.parseStructuredContent).
+func StripCodeFence(trimmed string) string {
 	const fence = "```"
 	if len(trimmed) < len(fence) || trimmed[:len(fence)] != fence {
 		return trimmed

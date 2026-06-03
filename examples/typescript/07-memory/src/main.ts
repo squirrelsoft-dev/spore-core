@@ -99,6 +99,13 @@ async function main(): Promise<void> {
     argValue(args, "--model") ?? process.env.SPORE_OLLAMA_MODEL ?? "llama3.2";
   const baseUrl = process.env.SPORE_OLLAMA_BASE_URL ?? OLLAMA_DEFAULT_BASE_URL;
 
+  // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+  // `*-cloud` like `gemma4:31b-cloud`) use native Ollama tool calling, which
+  // gives the `memory` tool a real typed schema and no always-on `final` escape.
+  // Small local models (e.g. `llama3.2`) that leak `<|python_tag|>` or malformed
+  // JSON can pass `--structured` to force the JSON-object channel.
+  const structured = args.includes("--structured");
+
   // `memory.md` lives next to this example's sources so `pnpm start` works from
   // anywhere and the artifact is easy to find and inspect between phases.
   const here = dirname(fileURLToPath(import.meta.url));
@@ -136,6 +143,7 @@ async function main(): Promise<void> {
       STORE_SYSTEM_PROMPT,
       prompt,
       baseUrl,
+      structured,
     );
     console.log(`\nstored. agent said: ${output}`);
     if (existsSync(memoryPath)) {
@@ -164,6 +172,7 @@ async function main(): Promise<void> {
       RECALL_SYSTEM_PROMPT,
       RECALL_QUESTIONS,
       baseUrl,
+      structured,
     );
     console.log(`\nanswers from memory:\n${output}`);
     return;
@@ -185,6 +194,7 @@ async function runPhase(
   systemPrompt: string,
   taskPrompt: string,
   baseUrl: string,
+  structured: boolean,
 ): Promise<string> {
   // Compose the real markdown MemoryStore with NoOp for the other three storage
   // domains. This is the entire integration: the harness threads
@@ -195,6 +205,11 @@ async function runPhase(
     .storage(storage) // ← the seam
     .tool(StandardTools.memory()) // ← the built-in memory read/write tool
     .systemPrompt(systemPrompt)
+    // Native tool calling by default; `--structured` flips on constrained
+    // decoding for small models (see the `structured` flag in `main`). With
+    // structured mode the "think · turn N" line is just a turn marker, not model
+    // chatter, since each turn emits one clean JSON tool call.
+    .modelParams({ structured_tool_calls: structured, stop_sequences: [] })
     .build();
 
   // PIN the session id — both phases pass the same one so recall reads what

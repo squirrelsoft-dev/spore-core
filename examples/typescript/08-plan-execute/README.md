@@ -1,8 +1,8 @@
 # 08 — Plan-and-execute (multi-step goal decomposition)
 
 The first example to swap the **loop strategy**. The agent is given a multi-step
-goal — *research three Rust async runtimes and write a cited comparison to a
-file* — and instead of reacting one tool call at a time, it **decomposes the goal
+goal — _research three Rust async runtimes and write a cited comparison to a
+file_ — and instead of reacting one tool call at a time, it **decomposes the goal
 into a plan first**, prints that plan, then executes each subtask in turn.
 
 The thesis: **swapping the loop strategy is a one-line harness change.** Same
@@ -13,15 +13,15 @@ before touching any tool.
 
 ## The contrast with 06
 
-|          | 06 — web-research                                  | 08 — plan-execute                                              |
-| -------- | -------------------------------------------------- | -------------------------------------------------------------- |
-| Builder  | `conversational(model)`                            | `conversational(model)` _(same)_                               |
-| Sandbox  | `WorkspaceScopedSandbox` over `workspace/`         | `WorkspaceScopedSandbox` over `workspace/` _(same)_            |
-| Tools    | `web_search` + `write_file` + `read_file`          | `web_search` + `write_file` + `read_file` _(same)_             |
-| Strategy | `{ kind: "re_act", max_iterations: 10 }`           | **`{ kind: "plan_execute" }`** _(the swap)_                    |
-| Behavior | reacts step-by-step, no upfront plan               | **prints a full plan first, then runs each subtask**           |
-| Output   | stream-printed `think` / `act` / `obs`             | a `── plan ──` banner + `[i/N]` subtask lines (via hooks)      |
-| Side eff | writes `answer.md`                                 | writes `async-comparison.md`                                   |
+|          | 06 — web-research                                    | 08 — plan-execute                                             |
+| -------- | ---------------------------------------------------- | ------------------------------------------------------------- |
+| Builder  | `conversational(model)`                              | `conversational(model)` _(same)_                              |
+| Sandbox  | `WorkspaceScopedSandbox` over `workspace/`           | `WorkspaceScopedSandbox` over `workspace/` _(same)_           |
+| Tools    | `web_search` (GET/JSON) + `write_file` + `read_file` | `web_search` (GET/JSON) + `write_file` + `read_file` _(same)_ |
+| Strategy | `{ kind: "re_act", max_iterations: 10 }`             | **`{ kind: "plan_execute" }`** _(the swap)_                   |
+| Behavior | reacts step-by-step, no upfront plan                 | **prints a full plan first, then runs each subtask**          |
+| Output   | stream-printed `think` / `act` / `obs`               | a `── plan ──` banner + `[i/N]` subtask lines (via hooks)     |
+| Side eff | writes `answer.md`                                   | writes `async-comparison.md`                                  |
 
 Everything above the strategy row is held constant on purpose. The single
 substantive change is the loop strategy:
@@ -38,7 +38,7 @@ const task = newTask(
   prompt,
   SessionId.generate(),
   { kind: "plan_execute" },
-  { max_turns: 24 },
+  { max_turns: 64 },
 );
 ```
 
@@ -106,23 +106,43 @@ Just like 04 and 06, the file write happens **inside the loop** via the catalogu
 `async-comparison.md` itself — the agent does, and the sandbox keeps it inside
 `workspace/`.
 
-## The search backend (and an honesty note about #108)
+## The search backend (SearXNG, GET + JSON)
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits if it is unset. `web_search` POSTs the query as JSON `{ "query": ... }` and
-hands the response body back to the agent verbatim.
+exits if it is unset. `web_search` issues `GET <endpoint>?q=<query>` and hands the
+response body back to the agent verbatim — identical wiring to
+[`06`](../06-web-research).
 
-Any endpoint that accepts that shape works:
+This example targets a self-hosted **SearXNG** JSON API. The endpoint already
+carries `format=json`; the GET path **preserves** that query string and appends
+the `q` param, so the backend receives `GET /search?format=json&q=<query>`.
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+`web_search` is configured via `WebSearchTool.withConfig` (core
+[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108), now
+implemented) with `method: "GET"` and `queryParam: "q"`. Auth-bearing backends
+(Brave's `X-Subscription-Token`, Tavily's in-body `api_key`) are also supported
+through the `authHeaders` / `bodyAuthParams` config fields; this example uses no
+auth.
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is tracked as core
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
+### SearXNG setup
+
+1. Enable the JSON output format in your SearXNG `settings.yml`:
+
+   ```yaml
+   search:
+     formats:
+       - html
+       - json
+   ```
+
+2. Restart SearXNG so the new format takes effect.
+
+3. Point the example at it:
+
+   ```sh
+   export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+   ```
 
 ## An honesty note about PlanExecute
 
@@ -136,10 +156,21 @@ edges you should know about before running:
 - A **subtask error aborts the whole run** with `HaltStepFailed` — there is no
   per-step retry.
 - The turn **budget is divided across subtasks**, so a stingy `max_turns` starves
-  later steps. Set it generously (this example uses `24`).
+  later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
   model-agnostic — swap the model interface and change nothing else.
+- **Native vs. structured tool calls (`--structured`).** By default the example
+  uses native Ollama tool calling: `write_file` gets a real typed schema and
+  there is no always-on `final` envelope, so tool-capable models (including
+  hosted `*-cloud` models such as `gemma4:31b-cloud`) reliably search → write →
+  answer. Pass `--structured` to enable
+  `modelParams({ structured_tool_calls: true, stop_sequences: [] })`
+  (schema-constrained decoding) for small local models that otherwise leak
+  `<|python_tag|>` or malformed JSON across the plan and execute phases.
+  > Structured mode exposes an always-available `final` envelope that weaker
+  > models can take prematurely (empty answer, no file written). If you see an
+  > empty `answer (N turn(s)):` and no output file, drop `--structured`.
 - Subtask **inner tool calls stream in the TypeScript port** — unlike the
   Rust / Python / Go harnesses, which suppress the sub-loop stream. So in TS the
   `think` / `act` / `obs` lines also show each subtask's tool activity; the
@@ -152,8 +183,8 @@ edges you should know about before running:
 ollama serve &
 ollama pull llama3.2
 pnpm install
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON API (see "SearXNG setup" above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 See `.env.example` for all the variables.

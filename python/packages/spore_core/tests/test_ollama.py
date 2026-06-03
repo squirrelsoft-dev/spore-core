@@ -1041,6 +1041,56 @@ def test_parse_structured_content_missing_tool_falls_back() -> None:
     assert isinstance(blocks[0], TextBlock)
 
 
+# ── structured fence stripping (capable/cloud models wrap JSON) ─────────────
+
+
+def test_parse_structured_json_fenced_tool_call_dispatches() -> None:
+    # Regression for the exact gemma-cloud output: the constrained JSON tool
+    # call arrives inside a ```json fence. Must dispatch, not fall back to Text.
+    raw = '```json\n{"tool":"web_search","arguments":{"query":"x"}}\n```'
+    blocks, stop = parse_structured_content(raw, 0)
+    assert stop is StopReason.TOOL_USE
+    assert isinstance(blocks[0], ToolUseBlock)
+    assert blocks[0].name == "web_search"
+    assert blocks[0].input == {"query": "x"}
+
+
+def test_parse_structured_bare_fenced_tool_call_dispatches() -> None:
+    # A bare ``` fence (no language tag) also strips and dispatches.
+    raw = '```\n{"tool":"web_search","arguments":{"query":"y"}}\n```'
+    blocks, stop = parse_structured_content(raw, 0)
+    assert stop is StopReason.TOOL_USE
+    assert isinstance(blocks[0], ToolUseBlock)
+    assert blocks[0].name == "web_search"
+
+
+def test_parse_structured_fenced_final_is_text() -> None:
+    # A fenced ``final`` envelope still resolves to a Text/END_TURN answer.
+    raw = '```json\n{"tool":"final","content":"done"}\n```'
+    blocks, stop = parse_structured_content(raw, 0)
+    assert stop is StopReason.END_TURN
+    assert isinstance(blocks[0], TextBlock)
+    assert blocks[0].text == "done"
+
+
+def test_parse_structured_raw_tool_call_still_dispatches() -> None:
+    # Un-fenced tool calls (grammar-honoring models) still dispatch — no regression.
+    raw = '{"tool":"web_search","arguments":{"query":"z"}}'
+    blocks, stop = parse_structured_content(raw, 0)
+    assert stop is StopReason.TOOL_USE
+    assert isinstance(blocks[0], ToolUseBlock)
+    assert blocks[0].name == "web_search"
+
+
+def test_parse_structured_garbage_falls_back_to_text() -> None:
+    # Genuine garbage still falls back to a Text block with END_TURN.
+    raw = "not json at all"
+    blocks, stop = parse_structured_content(raw, 0)
+    assert stop is StopReason.END_TURN
+    assert isinstance(blocks[0], TextBlock)
+    assert blocks[0].text == "not json at all"
+
+
 async def test_streaming_structured_buffers_json_then_reconstructs_tool_call() -> None:
     """In structured mode the constrained JSON object arrives as content
     deltas spread across chunks. We buffer it (never surfacing raw JSON as

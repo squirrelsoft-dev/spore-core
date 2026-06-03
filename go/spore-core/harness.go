@@ -1173,6 +1173,22 @@ func (s SessionState) MarshalJSON() ([]byte, error) {
 	return json.Marshal(a)
 }
 
+// cloneSessionState returns a shallow copy of s whose Messages slice is a fresh
+// backing array (not aliased to s.Messages). Used by the PlanExecute plan phase
+// (#93) to seed the planning directive onto a throwaway state without mutating
+// the shared session that the execute phase threads through. Appending to the
+// clone's Messages must not touch the caller's slice, so the slice is copied;
+// Extras is shared by reference (the plan turn never mutates it).
+func cloneSessionState(s *SessionState) *SessionState {
+	if s == nil {
+		return &SessionState{}
+	}
+	return &SessionState{
+		Messages: append([]Message(nil), s.Messages...),
+		Extras:   s.Extras,
+	}
+}
+
 // ============================================================================
 // Forward-declared sibling interfaces
 // ============================================================================
@@ -2309,6 +2325,17 @@ type HarnessConfig struct {
 	// byte-for-byte.
 	SystemPrompt string // optional
 
+	// ModelParams are the authoritative per-run model sampling/decoding
+	// parameters (issue #93). The harness replaces each tool-requesting turn's
+	// Context.Params with this value UNCONDITIONALLY (builder params win) right
+	// before the request is built, so the configured params reach every agent
+	// turn that requests tools — the ReAct loop, the PlanExecute plan phase, the
+	// execute sub-loop, and the streaming path alike. The internal
+	// compaction/summarization turn is intentionally left on defaults. See
+	// HarnessBuilder.WithModelParams. The zero value (the default) preserves
+	// today's behaviour byte-for-byte.
+	ModelParams ModelParams // optional
+
 	// SessionStore is the opt-in conversation-history persistence seam (issue
 	// #102). When AutoPersistSessions is true the run loop:
 	//   - auto-LOADS the prior SessionState for the run's SessionID from this
@@ -2770,8 +2797,10 @@ type planPhaseOutcome struct {
 //  1. Plan phase (runs once): runPlanPhase seeds a planning directive, runs one
 //     constrained planner turn, captures a PlanArtifact, fires OnPlanCreated,
 //     and counts the turn against the shared budget.
-//  2. Execute phase (loops): runExecutePhase drains the parsed task list, giving
-//     each task its own bounded, isolated, SEQUENTIAL ReAct sub-loop.
+//  2. Execute phase (loops): runExecutePhase drains the parsed task list,
+//     running each task in a bounded ReAct sub-loop that BUILDS ON the
+//     accumulated execute-phase context (prior steps' tool results and
+//     assistant outputs carry forward).
 //
 // Between the phases the artifact is parsed into a TaskList via
 // PlanArtifactToTaskList and persisted through the RunStore seam (Q4) plus the
@@ -2786,9 +2815,13 @@ type planPhaseOutcome struct {
 //     HaltBudgetExceeded unchanged.
 //
 // Resolved spec decisions (issue #59 — all five FINAL):
-//   - Q1 (execute step model): each task gets its OWN bounded ReAct sub-loop,
-//     fully isolated and SEQUENTIAL (task N completes before N+1). The per-task
-//     turn cap is derived at the START of each step:
+//   - Q1 (execute step model): each task runs a bounded ReAct sub-loop that
+//     BUILDS ON the accumulated execute-phase context — after each successful
+//     step its conversation (instruction + tool calls + tool results +
+//     assistant output) is folded back into the shared execute context, so the
+//     next step sees all prior steps' results. Steps stay SEQUENTIAL (task N
+//     completes before N+1). The shared budget still gates: the per-task turn
+//     cap is derived at the START of each step:
 //     per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
 //     division; remaining_tasks = not-yet-started tasks including the current
 //     one). The shared/parent budget — turns, tokens, observability spans,
@@ -2894,13 +2927,17 @@ func (h *StandardHarness) persistTaskList(ctx context.Context, sessionID Session
 // runExecutePhase drives the PlanExecute execute phase (issue #59), draining
 // taskList.
 //
-// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-// sub-loop. The per-task turn cap is derived at the START of each step from the
-// shared budget: per_task_turns = remaining_turns / remaining_tasks, floored at
-// 1 (integer division; remaining_tasks counts the not-yet-started tasks
-// including the current one). The shared budget snapshot (carried) is threaded
-// through every step so early tasks cannot starve later ones and the global
-// budget stays the hard stop.
+// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
+// accumulated execute-phase context: after each successful step its resulting
+// conversation (instruction + tool calls + tool results + assistant output) is
+// folded back into the shared session, so the next step's sub-loop (which copies
+// the shared session) sees every prior step's results. The per-task turn cap is
+// derived at the START of each step from the shared budget:
+// per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
+// division; remaining_tasks counts the not-yet-started tasks including the
+// current one). The shared budget snapshot (carried) is threaded through every
+// step so early tasks cannot starve later ones and the global budget stays the
+// hard stop.
 //
 // Before each step the task is marked InProgress (and Completed after), the list
 // is re-persisted (Q4), and OnTaskAdvance fires with the correct task_index /
@@ -2929,8 +2966,9 @@ func (h *StandardHarness) runExecutePhase(
 	var lastOutput string
 	// Issue #102: the LAST completed step's full conversation history, carried
 	// onto the terminal Success so PlanExecute resumes losslessly. Each step runs
-	// its own isolated ReAct sub-loop over a copy of the shared session, so the
-	// most recent sub-run's SessionState is the richest post-run history.
+	// its ReAct sub-loop over a copy of the shared session and folds its result
+	// back into that shared session on success (#93), so the most recent step's
+	// returned SessionState is the richest, fully accumulated post-run history.
 	var lastSessionState SessionState
 
 	for index := 0; index < totalTasks; index++ {
@@ -3009,7 +3047,16 @@ func (h *StandardHarness) runExecutePhase(
 			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
 			totalUsage.CostUSD += subResult.Usage.CostUSD
 			lastOutput = subResult.Output
-			lastSessionState = subResult.SessionState
+			// Fold this step's resulting conversation back into the SHARED
+			// execute context so the NEXT step's sub-loop (which copies
+			// *session) builds on this step's tool results and assistant
+			// output, not just its instruction. The returned SessionState
+			// already contains this step's instruction + tool calls + tool
+			// results + final output.
+			*session = subResult.SessionState
+			// Issue #102: the terminal Success carries the LAST completed
+			// step's full state — now the accumulated execute context.
+			lastSessionState = *session
 
 			// Mark Completed and re-persist (Q4).
 			_ = taskList.Complete(taskID)
@@ -3098,11 +3145,13 @@ func (h *StandardHarness) runPlanPhase(
 	onStream StreamSink,
 ) (outcome *planPhaseOutcome, failure *RunResult) {
 	// Issue #102: stamp the plan-phase conversation history onto any failure
-	// result this function returns. The plan turn mutates *session (the planning
-	// directive + the planner's response), so reading it in a defer captures the
-	// final state at whichever failure return fired — every PlanPhaseFailed /
-	// AgentError / BudgetExceeded exit carries lossless history without threading
-	// SessionState through each construction site.
+	// result this function returns. Per #93 the planning directive lands on a
+	// throwaway CLONE (planState), so *session stays the seeded
+	// `[user: task.instruction]` — reading it in a defer captures that clean
+	// state at whichever failure return fired, so every PlanPhaseFailed /
+	// AgentError / BudgetExceeded exit carries the shared history (without the
+	// directive leaking in) without threading SessionState through each
+	// construction site.
 	defer func() {
 		if failure != nil && failure.Kind == RunFailure {
 			failure.SessionState = *session
@@ -3143,16 +3192,27 @@ func (h *StandardHarness) runPlanPhase(
 	}
 
 	// Seed the planning directive as a user message (reuse ContextManager).
+	// CRITICAL (#93): the directive must NOT mutate the SHARED `session`.
+	// That same state is threaded into the execute phase, where each subtask
+	// sub-loop assembles its context from it. If the directive leaked in,
+	// every execute step would still see "respond with {tasks, rationale}"
+	// and an instruction-following model would re-emit a plan instead of
+	// calling tools. Append to a throwaway CLONE so the plan turn sees the
+	// directive while the shared state stays `[user: task.instruction]`.
 	directive := fmt.Sprintf(
 		"Produce a step-by-step plan for the following task. Respond with a "+
 			"single JSON object: {\"tasks\": [<ordered step strings>], "+
 			"\"rationale\": <string>}.\n\nTask:\n%s",
 		task.Instruction,
 	)
-	h.config.ContextManager.AppendUserMessage(ctx, session, directive)
+	planState := cloneSessionState(session)
+	h.config.ContextManager.AppendUserMessage(ctx, planState, directive)
 
 	// Assemble + invoke the planner for exactly ONE turn (R1).
-	c := h.config.ContextManager.Assemble(ctx, session, task)
+	c := h.config.ContextManager.Assemble(ctx, planState, task)
+	// Per-run model params win unconditionally (issue #93) — same seam as
+	// runReActInner, before the plan turn is dispatched.
+	c.Params = h.config.ModelParams
 	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 	turnStartedAt := nowRFC3339()
 	turnClock := time.Now()
@@ -3459,6 +3519,12 @@ func (h *StandardHarness) runReActInner(
 				}}, c.Messages...)
 			}
 		}
+		// Per-run model params win unconditionally (issue #93). The agent copies
+		// Context.Params verbatim into the ModelRequest (IntoRequest /
+		// IntoRequestStreaming), so this is the single seam that delivers the
+		// configured params (e.g. structured tool calls) to every tool-requesting
+		// ReAct / execute / streaming turn.
+		c.Params = h.config.ModelParams
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()

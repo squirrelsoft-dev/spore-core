@@ -119,6 +119,7 @@ function ralphConfig(root: string, agent: Agent, maxResets = 3): HarnessConfig {
     sandbox: new WorkspaceSandbox(root),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
     maxResets,
   };
 }
@@ -261,6 +262,7 @@ describe("Ralph loop strategy (issue #58)", () => {
       sandbox: new WorkspaceSandbox(dir),
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
     });
     const task = newTask("do it", SessionId.of("react-1"), { kind: "re_act", max_iterations: 5 });
     const r = await h.run({ task });

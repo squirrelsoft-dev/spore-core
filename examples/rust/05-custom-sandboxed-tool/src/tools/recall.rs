@@ -1,82 +1,53 @@
 //! `recall(key)` — read a previously-remembered fact back out of the run store.
 //!
-//! This is the **read** half of the pair. Unlike [`remember`](super::remember)
-//! it is annotated `read_only` + `idempotent`: it only reads shared state, so
-//! the harness may dispatch it concurrently with other read-only tools.
+//! This is the **read** half of the pair, also defined with the
+//! [`tool!`](spore_core::tool) macro. Unlike [`remember`](super::remember) it
+//! passes `annotations` to mark itself `read_only` + `idempotent`: it only reads
+//! shared state, so the harness may dispatch it concurrently with other
+//! read-only tools.
 //!
 //! Looking up a key that was never stored is a *recoverable* error — the agent
 //! can adapt (try a different key, or remember the fact first) rather than
 //! halting the run.
 
-use serde_json::json;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
-use spore_core::harness::BoxFut;
-use spore_core::{
-    RegisteredToolSchema, SandboxProvider, Tool, ToolAnnotations, ToolCall, ToolContext, ToolOutput,
-};
+use spore_core::harness::ToolOutput;
+use spore_core::{tool, StandardTool, ToolAnnotations};
 
 use super::remember::FACT_PREFIX;
 
-pub struct RecallTool;
+/// Tool name.
+pub const NAME: &str = "recall";
 
-impl RecallTool {
-    pub const NAME: &'static str = "recall";
-
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// The registry-side schema. `name` MUST equal [`Tool::name`].
-    pub fn schema() -> RegisteredToolSchema {
-        RegisteredToolSchema {
-            name: Self::NAME.into(),
-            description: "Recall a fact previously stored with `remember`, by its key.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                },
-                "required": ["key"],
-            }),
-            // Pure read of shared state: safe to mark read_only + idempotent.
-            annotations: ToolAnnotations {
-                read_only: true,
-                idempotent: true,
-                ..Default::default()
-            },
-        }
-    }
+/// Validated input for `recall`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecallInput {
+    /// The key a fact was previously stored under with `remember`.
+    pub key: String,
 }
 
-impl Default for RecallTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Tool for RecallTool {
-    fn name(&self) -> &str {
-        Self::NAME
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: &'a ToolCall,
-        _sandbox: &'a (dyn SandboxProvider + 'a),
-        ctx: &'a ToolContext,
-    ) -> BoxFut<'a, ToolOutput> {
-        Box::pin(async move {
-            let Some(key) = call.input.get("key").and_then(|v| v.as_str()) else {
-                return ToolOutput::error("recall: missing or non-string 'key'");
-            };
-
-            let store_key = format!("{FACT_PREFIX}{key}");
+/// Build the `recall` tool. `annotations` marks it `read_only` + `idempotent`
+/// (a pure read of shared state), in contrast to `remember`.
+pub fn recall_tool() -> StandardTool {
+    tool! {
+        name: NAME,
+        description: "Recall a fact previously stored with `remember`, by its key.",
+        input: RecallInput,
+        execute: |input, _sandbox, ctx| async move {
+            let store_key = format!("{FACT_PREFIX}{}", input.key);
             match ctx.run_store().get(ctx.session_id(), &store_key).await {
                 Ok(Some(value)) => ToolOutput::success(value_to_string(&value)),
-                Ok(None) => ToolOutput::error(format!("no fact stored under '{key}'")),
-                Err(e) => ToolOutput::error(format!("recall: could not read '{key}': {e}")),
+                Ok(None) => ToolOutput::error(format!("no fact stored under '{}'", input.key)),
+                Err(e) => ToolOutput::error(format!("recall: could not read '{}': {e}", input.key)),
             }
-        })
+        },
+        annotations: ToolAnnotations {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        },
     }
 }
 
@@ -94,10 +65,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use serde_json::json;
+    use spore_core::harness::BoxFut;
     use spore_core::storage::InMemoryStorageProvider;
-    use spore_core::{SandboxProvider, SandboxViolation, SessionId};
+    use spore_core::{
+        SandboxProvider, SandboxViolation, SessionId, ToolCall, ToolContext, ToolOutput,
+    };
 
-    use crate::tools::remember::RememberTool;
+    use crate::tools::remember::remember_tool;
 
     const SESSION: &str = "fact-session";
 
@@ -117,32 +92,38 @@ mod tests {
     fn recall_call(input: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "c1".into(),
-            name: RecallTool::NAME.into(),
+            name: NAME.into(),
             input,
         }
     }
 
+    async fn recall(call: ToolCall, ctx: &ToolContext) -> ToolOutput {
+        recall_tool()
+            .implementation
+            .execute(&call, &AllowAllSandbox, ctx)
+            .await
+    }
+
     async fn remember(ctx: &ToolContext, key: &str, value: &str) {
-        let tool = RememberTool::new();
-        tool.execute(
-            &ToolCall {
-                id: "setup".into(),
-                name: RememberTool::NAME.into(),
-                input: json!({"key": key, "value": value}),
-            },
-            &AllowAllSandbox,
-            ctx,
-        )
-        .await;
+        remember_tool()
+            .implementation
+            .execute(
+                &ToolCall {
+                    id: "setup".into(),
+                    name: "remember".into(),
+                    input: json!({"key": key, "value": value}),
+                },
+                &AllowAllSandbox,
+                ctx,
+            )
+            .await;
     }
 
     #[tokio::test]
     async fn returns_stored_value() {
         let ctx = in_memory_ctx();
         remember(&ctx, "diet", "crabs and shrimp").await;
-        let out = RecallTool::new()
-            .execute(&recall_call(json!({"key": "diet"})), &AllowAllSandbox, &ctx)
-            .await;
+        let out = recall(recall_call(json!({"key": "diet"})), &ctx).await;
         match out {
             ToolOutput::Success { content, .. } => assert_eq!(content, "crabs and shrimp"),
             other => panic!("expected success, got {other:?}"),
@@ -152,13 +133,7 @@ mod tests {
     #[tokio::test]
     async fn miss_is_recoverable_error_with_exact_message() {
         let ctx = in_memory_ctx();
-        let out = RecallTool::new()
-            .execute(
-                &recall_call(json!({"key": "unknown"})),
-                &AllowAllSandbox,
-                &ctx,
-            )
-            .await;
+        let out = recall(recall_call(json!({"key": "unknown"})), &ctx).await;
         match out {
             ToolOutput::Error {
                 recoverable,
@@ -174,16 +149,14 @@ mod tests {
     #[tokio::test]
     async fn missing_key_is_recoverable_error() {
         let ctx = in_memory_ctx();
-        let out = RecallTool::new()
-            .execute(&recall_call(json!({})), &AllowAllSandbox, &ctx)
-            .await;
+        let out = recall(recall_call(json!({})), &ctx).await;
         match out {
             ToolOutput::Error {
                 recoverable,
                 message,
             } => {
                 assert!(recoverable);
-                assert!(message.contains("key"), "message: {message}");
+                assert!(message.contains("invalid parameters"), "message: {message}");
             }
             other => panic!("expected error, got {other:?}"),
         }
@@ -192,9 +165,7 @@ mod tests {
     #[tokio::test]
     async fn non_string_key_is_recoverable_error() {
         let ctx = in_memory_ctx();
-        let out = RecallTool::new()
-            .execute(&recall_call(json!({"key": 123})), &AllowAllSandbox, &ctx)
-            .await;
+        let out = recall(recall_call(json!({"key": 123})), &ctx).await;
         match out {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("expected error, got {other:?}"),
@@ -204,9 +175,7 @@ mod tests {
     #[tokio::test]
     async fn read_does_not_write() {
         let ctx = in_memory_ctx();
-        RecallTool::new()
-            .execute(&recall_call(json!({"key": "k"})), &AllowAllSandbox, &ctx)
-            .await;
+        recall(recall_call(json!({"key": "k"})), &ctx).await;
         let keys = ctx.run_store().list_keys(ctx.session_id()).await.unwrap();
         assert!(
             keys.is_empty(),
@@ -216,8 +185,8 @@ mod tests {
 
     #[test]
     fn schema_is_read_only_and_idempotent() {
-        let s = RecallTool::schema();
-        assert_eq!(s.name, RecallTool::NAME);
+        let s = recall_tool().schema;
+        assert_eq!(s.name, NAME);
         assert!(s.annotations.read_only);
         assert!(s.annotations.idempotent);
         assert!(!s.annotations.destructive);

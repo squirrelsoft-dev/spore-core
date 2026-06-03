@@ -26,6 +26,7 @@ pub mod context;
 pub mod guide_registry;
 pub mod harness;
 pub mod hooks;
+pub mod macros;
 pub mod memory;
 pub mod metric;
 pub mod middleware;
@@ -37,6 +38,7 @@ pub mod openai;
 pub mod plan;
 pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
+pub mod prompt_tool_call;
 pub mod sandbox;
 pub mod sensor;
 pub mod storage;
@@ -71,14 +73,13 @@ pub use guide_registry::{
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
     CommandOutput, CompleteOnFinalResponse, ContextManager as HarnessContextManager,
-    EmptyToolRegistry, FileRef,
-    GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
-    HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
-    LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox,
-    ObservabilityProvider, Operation, OptimizationDirection, PausedState, ReadOnlySandbox,
-    RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState,
-    StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
-    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    EmptyToolRegistry, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
+    HarnessError, HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse,
+    IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy,
+    NullSandbox, ObservabilityProvider, Operation, OptimizationDirection, PausedState,
+    ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId,
+    SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
+    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{
@@ -151,11 +152,15 @@ pub use tasklist::{
 };
 pub use tools::{
     AbortTool, AskUserQuestionTool, EditFileTool, EnterPlanModeTool, ExitPlanModeTool, GrepTool,
-    SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, TODO_STORE_KEY,
+    SearchMethod, SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool,
+    WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool, TODO_STORE_KEY,
 };
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.
+pub use prompt_tool_call::{
+    inject_tool_prompt, parse_prose_response, AdaptiveToolCallModelInterface,
+    PromptBasedToolCallModelInterface,
+};
 #[allow(deprecated)]
 pub use termination::{
     check_budget_default, AlwaysComplete, BudgetValue, CompletionCheck, FeatureListCheck,
@@ -164,7 +169,10 @@ pub use termination::{
     TerminationFailureReason, TerminationInput, TerminationPolicy as FullTerminationPolicy,
     TestSuiteCheck,
 };
-pub use tool_call_repair::{coerce_tool_args, StandardToolCallRepair, ToolCallRepair};
+pub use tool_call_repair::{
+    coerce_tool_args, detect_prose_response, StandardToolCallRepair, ToolCallFailure,
+    ToolCallRepair,
+};
 pub use tool_registry::{
     DispatchError, RealToolRegistry, RegistrationError, StandardToolRegistry, TaskPhase, Tool,
     ToolAnnotations, ToolContext, ToolRegistry, ToolSchema as RegisteredToolSchema, ToolSet,

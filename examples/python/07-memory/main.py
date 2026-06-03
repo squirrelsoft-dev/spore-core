@@ -38,13 +38,24 @@ All facts use ``StorageScope.PROJECT`` (the ``memory`` tool rejects ``Local``).
 The prompts instruct the agent to use ``scope: "project"`` consistently so the
 recall read hits the same scope the store writes wrote.
 
+Tool-calling mode: this example uses **native Ollama tool calling by default**
+(the real typed tool schema), which works for tool-capable / cloud models like
+``gemma4:31b-cloud``. Pass ``--structured`` to opt into
+``ModelParams(structured_tool_calls=True)`` — schema-constrained decoding that
+helps small local models (e.g. ``llama3.2``) emit one clean ``memory`` tool call
+per turn. Structured mode exposes an always-available ``final`` envelope, so a
+capable model may emit ``{"tool":"final"}`` prematurely and return an EMPTY
+answer without ever calling ``memory``; if you see that (and no ``memory.md``),
+drop ``--structured``.
+
 Run it::
 
     ollama serve &
     ollama pull llama3.2
-    uv run main.py --phase store     # writes memory.md
+    uv run main.py --phase store     # writes memory.md (native tool calling)
     cat memory.md                    # inspect the human-readable artifact
     uv run main.py --phase recall    # answers from memory.md alone
+    uv run main.py --phase store --structured   # constrained decoding for small models
 """
 
 from __future__ import annotations
@@ -60,6 +71,7 @@ from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
     LoopStrategyReAct,
+    ModelParams,
     OllamaModelInterface,
     RunResultSuccess,
     SessionId,
@@ -114,6 +126,7 @@ async def _run_phase(
     memory_path: Path,
     system_prompt: str,
     task_prompt: str,
+    structured: bool,
 ) -> str | None:
     """Build a harness over the markdown memory provider + the built-in ``memory``
     tool, pin the shared session id, run one task, and stream the loop. Returns
@@ -128,6 +141,12 @@ async def _run_phase(
         .storage(storage)
         .tool(StandardTools.memory())
         .system_prompt(system_prompt)
+        # Native tool calling by default; ``--structured`` opts into constrained
+        # decoding for small local models. With structured mode the "think" line
+        # is just a turn marker (one clean tool call per turn, no interleaved
+        # reasoning), but a capable model can bail early via the always-available
+        # ``final`` envelope — see the docstring.
+        .model_params(ModelParams(structured_tool_calls=structured))
         .build()
     )
 
@@ -156,6 +175,15 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="spore-core memory / storage-seam example")
     parser.add_argument("--model")
     parser.add_argument("--phase", choices=["store", "recall"])
+    parser.add_argument(
+        "--structured",
+        action="store_true",
+        help=(
+            "Opt into schema-constrained (structured) tool calls for small local "
+            "models. Default is native Ollama tool calling, which works for "
+            "tool-capable / cloud models like gemma4:31b-cloud."
+        ),
+    )
     args = parser.parse_args()
 
     model_id = args.model or os.environ.get("SPORE_OLLAMA_MODEL") or "llama3.2"
@@ -185,7 +213,9 @@ async def main() -> int:
             "Here is the Project Ironwood briefing. Store each fact to memory.\n\n" + briefing
         )
         try:
-            output = await _run_phase(model, memory_path, STORE_SYSTEM_PROMPT, task_prompt)
+            output = await _run_phase(
+                model, memory_path, STORE_SYSTEM_PROMPT, task_prompt, args.structured
+            )
         except OSError as e:
             print(
                 f"\ncould not reach the model — is `ollama serve` running? ({e})", file=sys.stderr
@@ -212,7 +242,9 @@ async def main() -> int:
         )
         return 2
     try:
-        output = await _run_phase(model, memory_path, RECALL_SYSTEM_PROMPT, RECALL_QUESTIONS)
+        output = await _run_phase(
+            model, memory_path, RECALL_SYSTEM_PROMPT, RECALL_QUESTIONS, args.structured
+        )
     except OSError as e:
         print(f"\ncould not reach the model — is `ollama serve` running? ({e})", file=sys.stderr)
         return 1

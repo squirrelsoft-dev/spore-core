@@ -96,6 +96,7 @@ function configWith(agent: Agent, overrides: Partial<HarnessConfig> = {}): Harne
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
     ...overrides,
   };
 }

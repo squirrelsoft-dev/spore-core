@@ -17,20 +17,27 @@ from spore_core import (
     AgentId,
     AllowAllSandbox,
     AlwaysContinuePolicy,
+    BudgetSnapshot,
     CompactionConfig,
+    HarnessBuilder,
     HarnessConfig,
     HarnessRunOptions,
+    InMemoryStorageProvider,
+    LoopStrategyPlanExecute,
     LoopStrategyReAct,
+    NoopContextManager,
     RunResultSuccess,
     ScriptedToolRegistry,
     SessionId,
+    SessionState,
     StandardCompactionAdapter,
     StandardContextManager,
     StandardHarness,
+    StorageProvider,
     Task,
 )
-from spore_core.agent import Context, FinalResponse, TurnResult
-from spore_core.model import ProviderInfo, Role, TokenUsage
+from spore_core.agent import Context, FinalResponse, ToolCallRequested, TurnResult
+from spore_core.model import ModelParams, ProviderInfo, Role, TokenUsage, ToolCall
 
 
 class _StubModel:
@@ -109,3 +116,351 @@ async def test_task_instruction_delivered_as_first_user_message() -> None:
         "first-turn context must contain a User message equal to the task "
         f"instruction; got messages: {first.messages!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #93: builder model_params reach every tool-requesting turn.
+#
+# ``_CapturingAgent`` records every ``Context`` it sees in ``seen``, and the
+# agent copies ``Context.params`` verbatim into the ``ModelRequest``
+# (``into_request``). So asserting on a captured context's
+# ``params.structured_tool_calls`` proves the configured params reached the
+# request the model would have seen.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedCapturingAgent:
+    """Records every ``Context`` it is handed and yields scripted final
+    responses on successive turns (so it can drive a PlanExecute run)."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.seen: list[Context] = []
+        self._responses = list(responses)
+
+    async def turn(self, context: Context) -> TurnResult:
+        self.seen.append(context)
+        text = self._responses.pop(0) if self._responses else "done"
+        return FinalResponse(
+            content=text,
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+        )
+
+    def id(self) -> AgentId:
+        return AgentId("scripted-capture")
+
+
+def _structured_params() -> ModelParams:
+    return ModelParams(structured_tool_calls=True)
+
+
+def _plan_execute_config(agent: object) -> HarnessConfig:
+    return HarnessConfig(
+        agent=agent,  # type: ignore[arg-type]
+        tool_registry=ScriptedToolRegistry(),
+        sandbox=AllowAllSandbox(),
+        context_manager=NoopContextManager(),
+        termination_policy=AlwaysContinuePolicy(),
+        storage=StorageProvider.single(InMemoryStorageProvider()),
+        model_params=_structured_params(),
+    )
+
+
+async def test_default_model_params_are_default() -> None:
+    """No ``.model_params(...)`` ⇒ each turn's context carries the default
+    (``structured_tool_calls`` is False)."""
+    agent = _CapturingAgent()
+    harness = StandardHarness(
+        HarnessConfig(
+            agent=agent,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=_rich_adapter(),
+            termination_policy=AlwaysContinuePolicy(),
+        )
+    )
+    task = Task.new("do a thing", SessionId("dflt"), LoopStrategyReAct(max_iterations=4))
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess)
+    assert agent.seen, "agent should have seen at least one turn"
+    assert not agent.seen[0].params.structured_tool_calls
+
+
+async def test_model_params_reach_react_turn() -> None:
+    """``.model_params(structured_tool_calls=True)`` ⇒ the ReAct turn context
+    carries it."""
+    agent = _CapturingAgent()
+    harness = (
+        HarnessBuilder(
+            agent,
+            ScriptedToolRegistry(),
+            AllowAllSandbox(),
+            _rich_adapter(),
+            AlwaysContinuePolicy(),
+        )
+        .model_params(_structured_params())
+        .build()
+    )
+    task = Task.new("do a thing", SessionId("react"), LoopStrategyReAct(max_iterations=4))
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess)
+    assert agent.seen
+    assert agent.seen[0].params.structured_tool_calls
+
+
+async def test_model_params_reach_plan_phase() -> None:
+    """The PlanExecute plan phase replaces params on its own seam — the
+    plan-turn context carries the flag."""
+    agent = _ScriptedCapturingAgent(['{"tasks":["one"],"rationale":"r"}'])
+    harness = StandardHarness(_plan_execute_config(agent))
+    task = Task.new("build something", SessionId("plan"), LoopStrategyPlanExecute(plan_model=None))
+    state = SessionState()
+    await harness._run_plan_phase(task, state, BudgetSnapshot(), None)
+    assert len(agent.seen) == 1, "exactly one plan turn"
+    assert agent.seen[0].params.structured_tool_calls
+
+
+async def test_model_params_reach_execute_subloop() -> None:
+    """A full PlanExecute run threads params through the shared react seam used
+    by the execute sub-loop — every captured context carries the flag."""
+    agent = _ScriptedCapturingAgent(
+        [
+            '{"tasks":["one","two"],"rationale":"r"}',
+            "did one",
+            "did two",
+        ]
+    )
+    harness = StandardHarness(_plan_execute_config(agent))
+    task = Task.new("build something", SessionId("exec"), LoopStrategyPlanExecute(plan_model=None))
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess)
+    # 1 plan turn + 2 execute turns; every captured context carries it.
+    assert len(agent.seen) == 3
+    assert all(c.params.structured_tool_calls for c in agent.seen)
+
+
+# ---------------------------------------------------------------------------
+# #93: the plan-phase directive must NOT leak into the execute-step contexts.
+#
+# The plan phase ("Produce a step-by-step plan… Respond with a single JSON
+# object…") used to be appended to the SHARED session_state, which the execute
+# phase threads into every subtask sub-loop. An instruction-following model then
+# re-emits a plan each step instead of calling tools. The fix scratch-clones the
+# planning turn so the directive reaches only the plan turn. Mirrors Rust's
+# ``plan_directive_does_not_leak_into_execute_context``.
+# ---------------------------------------------------------------------------
+
+
+_PLAN_DIRECTIVE_HEAD = "Produce a step-by-step plan"
+_PLAN_DIRECTIVE_JSON = "Respond with a single JSON object"
+
+
+class _ScriptedTurnAgent:
+    """Records every ``Context`` it is handed and yields a scripted sequence of
+    turn results (tool calls and/or finals) so it can drive a full PlanExecute
+    run through both phases."""
+
+    def __init__(self, results: list[TurnResult]) -> None:
+        self.seen: list[Context] = []
+        self._results = list(results)
+
+    async def turn(self, context: Context) -> TurnResult:
+        self.seen.append(context)
+        if self._results:
+            return self._results.pop(0)
+        return FinalResponse(content="done", usage=TokenUsage(input_tokens=1, output_tokens=1))
+
+    def id(self) -> AgentId:
+        return AgentId("scripted-turn")
+
+
+def _context_texts(context: Context) -> str:
+    """Concatenate the text of every message in a captured context.
+
+    Surfaces ``text`` (assistant/user), tool-call ``name``, and tool-result
+    ``content`` so accumulation across execute steps is visible — prior steps'
+    tool results carry their outputs forward as ``ToolResultContent`` messages.
+    Mirrors the Rust recording agent's ``seen_text`` flattening.
+    """
+    parts: list[str] = []
+    for m in context.messages:
+        c = m.content
+        text = getattr(c, "text", None)
+        if text:
+            parts.append(text)
+            continue
+        result = getattr(c, "content", None)  # ToolResultContent.content
+        if result:
+            parts.append(result)
+            continue
+        name = getattr(c, "name", None)  # ToolCallContent.name
+        if name:
+            parts.append(name)
+    return "\n".join(parts)
+
+
+async def test_plan_directive_does_not_leak_into_execute_context() -> None:
+    """A full 2-step PlanExecute run: the plan turn sees the directive, but no
+    execute-step context carries it, and the steps receive their instructions."""
+    agent = _ScriptedTurnAgent(
+        [
+            # Plan turn: produce a 2-step plan.
+            FinalResponse(
+                content='{"tasks":["step one","step two"],"rationale":"r"}',
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            # Execute step 1: issue a tool call, then finalize.
+            ToolCallRequested(
+                calls=[ToolCall(id="c1", name="noop")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            FinalResponse(
+                content="did step one", usage=TokenUsage(input_tokens=1, output_tokens=1)
+            ),
+            # Execute step 2: finalize directly.
+            FinalResponse(
+                content="did step two", usage=TokenUsage(input_tokens=1, output_tokens=1)
+            ),
+        ]
+    )
+    harness = StandardHarness(
+        HarnessConfig(
+            agent=agent,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=_rich_adapter(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=StorageProvider.single(InMemoryStorageProvider()),
+        )
+    )
+    task = Task.new(
+        "build something",
+        SessionId("leak"),
+        LoopStrategyPlanExecute(plan_model=None),
+    )
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
+
+    # 1 plan turn + (tool call + final) for step one + 1 for step two.
+    assert len(agent.seen) == 4, "plan turn + 3 execute turns"
+
+    # The PLAN turn (index 0) DOES carry the directive — that's correct.
+    plan_text = _context_texts(agent.seen[0])
+    assert _PLAN_DIRECTIVE_HEAD in plan_text, f"plan turn should see the directive: {plan_text!r}"
+    assert _PLAN_DIRECTIVE_JSON in plan_text, f"plan turn should see the directive: {plan_text!r}"
+
+    # No EXECUTE-step context (indices 1..) may carry the directive.
+    for i, c in enumerate(agent.seen[1:], start=1):
+        text = _context_texts(c)
+        assert _PLAN_DIRECTIVE_HEAD not in text, (
+            f"execute-step context {i} leaked the directive: {text!r}"
+        )
+        assert _PLAN_DIRECTIVE_JSON not in text, (
+            f"execute-step context {i} leaked the directive: {text!r}"
+        )
+
+    # The execute steps still receive their step instructions.
+    assert "step one" in _context_texts(agent.seen[1]), (
+        "step-one context should carry its instruction"
+    )
+    assert "step two" in _context_texts(agent.seen[3]), (
+        "step-two context should carry its instruction"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #93: the execute phase maintains ONE accumulating context across steps.
+#
+# After a successful step its conversation (instruction + tool calls + TOOL
+# RESULTS + assistant output) is folded back into the shared session_state, so
+# the NEXT step's sub-loop sees prior steps' RESULTS — not just their
+# instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
+# distinctive string and assert STEP 2's assembled context carries it. Mirrors
+# Rust's ``execute_steps_accumulate_prior_results``.
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_steps_accumulate_prior_results() -> None:
+    """A 2-step PlanExecute run: step 1 calls a tool returning a distinctive
+    string; step 2's context must CONTAIN that string (accumulating context)."""
+    from spore_core import ToolOutputSuccess
+
+    agent = _ScriptedTurnAgent(
+        [
+            # Plan turn: a 2-step plan (research -> summarize the result).
+            FinalResponse(
+                content='{"tasks":["research tokio","summarize findings"],"rationale":"r"}',
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            # Step 1: call a tool, then finalize using its result.
+            ToolCallRequested(
+                calls=[ToolCall(id="c1", name="lookup")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            FinalResponse(content="researched", usage=TokenUsage(input_tokens=1, output_tokens=1)),
+            # Step 2: finalize directly (it must SEE step 1's tool result).
+            FinalResponse(content="summarized", usage=TokenUsage(input_tokens=1, output_tokens=1)),
+        ]
+    )
+    # Step 1's tool call returns a distinctive result string.
+    registry = ScriptedToolRegistry()
+    registry.push(ToolOutputSuccess(content="TOKIO_FACTS_123"))
+    harness = StandardHarness(
+        HarnessConfig(
+            agent=agent,
+            tool_registry=registry,
+            sandbox=AllowAllSandbox(),
+            context_manager=_rich_adapter(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=StorageProvider.single(InMemoryStorageProvider()),
+        )
+    )
+    task = Task.new(
+        "build something",
+        SessionId("accum"),
+        LoopStrategyPlanExecute(plan_model=None),
+    )
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
+    assert result.output == "summarized"
+
+    # 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+    assert len(agent.seen) == 4, "plan turn + 3 execute turns"
+
+    # Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
+    # result string is on the wire at all.
+    assert "TOKIO_FACTS_123" in _context_texts(agent.seen[2]), (
+        f"step-1 final turn should follow its own tool result: {_context_texts(agent.seen[2])!r}"
+    )
+    # The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
+    # tool result, proving the execute loop carried it forward.
+    assert "TOKIO_FACTS_123" in _context_texts(agent.seen[3]), (
+        f"step 2 must see step 1's tool result (accumulating context): "
+        f"{_context_texts(agent.seen[3])!r}"
+    )
+    # Step 2 also sees step 1's prior instruction + assistant output.
+    step2_text = _context_texts(agent.seen[3])
+    assert "research tokio" in step2_text and "researched" in step2_text, (
+        f"step 2 must see step 1's instruction and output: {step2_text!r}"
+    )
+
+
+async def test_model_params_reach_streaming_turn() -> None:
+    """The streaming path flows through ``_run_react_inner``'s same seam — the
+    streamed turn's captured context carries the flag."""
+    agent = _CapturingAgent()
+    harness = (
+        HarnessBuilder(
+            agent,
+            ScriptedToolRegistry(),
+            AllowAllSandbox(),
+            _rich_adapter(),
+            AlwaysContinuePolicy(),
+        )
+        .model_params(_structured_params())
+        .build()
+    )
+    task = Task.new("do a thing", SessionId("stream"), LoopStrategyReAct(max_iterations=4))
+    result = await harness.run(HarnessRunOptions(task, on_stream=lambda _ev: None))
+    assert isinstance(result, RunResultSuccess)
+    assert agent.seen
+    assert agent.seen[0].params.structured_tool_calls

@@ -20,6 +20,7 @@ import {
   emptyBudgetSnapshot,
   emptySessionState,
   newTask,
+  type Agent,
   type Context,
   type ContextManager,
   type HarnessConfig,
@@ -56,6 +57,7 @@ function standardConfig(agent: MockAgent): HarnessConfig {
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
   };
 }
 
@@ -615,5 +617,219 @@ describe("Harness — ReAct loop", () => {
     );
     expect(toolIdx, "tool result must be recorded").toBeGreaterThanOrEqual(0);
     expect(assistantIdx).toBeLessThan(toolIdx);
+  });
+});
+
+// ── #93: modelParams reach every tool-requesting turn ──────────────────────
+//
+// `RecordingTurnAgent.turn` captures every `Context` it sees in `seen`, and the
+// agent copies `Context.params` verbatim into the `ModelRequest` (see
+// `ModelAgent.turn` / `intoRequest`). So asserting on a captured context's
+// `params.structured_tool_calls` proves the configured params reached the
+// request the model would have seen.
+//
+// Mirrors `rust/crates/spore-core/src/harness.rs#tests` (#93).
+
+/** A context-capturing agent: records every `Context` it sees and pops the next
+ *  scripted result, so we can assert which params reached each turn. */
+class RecordingTurnAgent implements Agent {
+  readonly seen: Context[] = [];
+  private readonly results: TurnResult[] = [];
+  constructor(private readonly agentId: AgentId) {}
+  push(r: TurnResult): this {
+    this.results.push(r);
+    return this;
+  }
+  id(): AgentId {
+    return this.agentId;
+  }
+  async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+    this.seen.push(ctx);
+    const next = this.results.shift();
+    if (next == null) return { kind: "error", error: new EmptyResponse(), usage: null };
+    return next;
+  }
+}
+
+/** Build a config whose agent is a context-capturing `RecordingTurnAgent`, with
+ *  the given (optionally non-default) model params. */
+function recordingConfig(agent: RecordingTurnAgent, modelParams: HarnessConfig["modelParams"]) {
+  return {
+    agent,
+    toolRegistry: new ScriptedToolRegistry(),
+    sandbox: new AllowAllSandbox(),
+    contextManager: new NoopContextManager(),
+    terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams,
+  } satisfies HarnessConfig;
+}
+
+const PLAN_EXECUTE_STRATEGY: LoopStrategy = { kind: "plan_execute", plan_model: null };
+
+function planTask93(): Task {
+  return newTask("build a CLI", SessionId.of("p93"), PLAN_EXECUTE_STRATEGY);
+}
+
+describe("Harness — modelParams threading (#93)", () => {
+  // No `.modelParams(...)` ⇒ each turn's context carries the default
+  // (structured_tool_calls absent ⇒ false).
+  it("default model params reach the request as default (structured false)", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(recordingConfig(agent, { stop_sequences: [] }));
+    await h.run({ task: react(5) });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).not.toBe(true);
+  });
+
+  // (a) ReAct: the ReAct turn context carries the flag.
+  it("model params reach the ReAct turn", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: react(5) });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+  });
+
+  // (b) Plan phase: the plan-turn context carries the flag.
+  it("model params reach the plan phase", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(
+      fr('{"tasks":["one"],"rationale":"r"}'),
+    );
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: planTask93() });
+    // First captured context is the plan turn.
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+  });
+
+  // (c) Execute sub-loops: a full PlanExecute run threads params through the
+  // shared react seam used by the execute sub-loop — every captured context
+  // (plan + execute steps) carries the flag.
+  it("model params reach the execute sub-loops", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      .push(fr('{"tasks":["one","two"],"rationale":"r"}'))
+      .push(fr("did one"))
+      .push(fr("did two"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: planTask93() });
+    // 1 plan turn + 2 execute turns; every captured context carries it.
+    expect(agent.seen.length).toBe(3);
+    expect(agent.seen.every((c) => c.params.structured_tool_calls === true)).toBe(true);
+  });
+
+  // (d) Streaming path: it flows through `runReactInner`'s same seam — the
+  // streamed turn's captured context carries the flag.
+  it("model params reach the streaming path", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: react(5), on_stream: () => {} });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+  });
+
+  // Concatenate the text of a captured context's user/tool messages so we can
+  // assert which seeded directives/instructions reached a given turn.
+  function ctxText(ctx: Context): string {
+    return ctx.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("\n");
+  }
+
+  // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
+  // Respond with a single JSON object…") must NOT leak into the SHARED
+  // sessionState, otherwise every execute step re-sees it and an
+  // instruction-following model re-emits a plan instead of calling tools.
+  // Drive a full 2-step PlanExecute run with the context-capturing agent and
+  // assert no execute-step context carries the directive, while the step
+  // instructions DO reach those contexts (and a step can issue a tool call).
+  it("plan directive does not leak into execute context", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      // Plan turn: produce a 2-step plan.
+      .push(fr('{"tasks":["step one","step two"],"rationale":"r"}'))
+      // Execute step 1: issue a tool call, then finalize.
+      .push(tcr(toolCall("c1", "noop")))
+      .push(fr("did step one"))
+      // Execute step 2: finalize directly.
+      .push(fr("did step two"));
+    const h = new StandardHarness(recordingConfig(agent, { stop_sequences: [] }));
+    await h.run({ task: planTask93() });
+
+    // 1 plan turn + (tool call + final) for step one + 1 for step two.
+    expect(agent.seen.length).toBe(4);
+
+    // The PLAN turn (index 0) DOES carry the directive — that's correct.
+    expect(ctxText(agent.seen[0]!)).toContain("Produce a step-by-step plan");
+    expect(ctxText(agent.seen[0]!)).toContain("Respond with a single JSON object");
+
+    // No EXECUTE-step context (indices 1..) may carry the directive.
+    for (let i = 1; i < agent.seen.length; i++) {
+      const text = ctxText(agent.seen[i]!);
+      expect(text).not.toContain("Produce a step-by-step plan");
+      expect(text).not.toContain("Respond with a single JSON object");
+    }
+
+    // The execute steps still receive their step instructions and can proceed
+    // to a tool call. Step one's second turn (index 2) follows the dispatched
+    // tool call: it still carries the step-one instruction plus the tool result
+    // accumulated within the step's sub-loop.
+    expect(ctxText(agent.seen[1]!)).toContain("step one");
+    expect(ctxText(agent.seen[2]!)).toContain("step one");
+    expect(ctxText(agent.seen[2]!)).toContain("ok");
+    expect(ctxText(agent.seen[3]!)).toContain("step two");
+  });
+
+  // #93 regression: the execute phase maintains ONE accumulating context across
+  // steps. After a successful step its conversation (instruction + tool calls +
+  // TOOL RESULTS + assistant output) is folded back into the shared sessionState,
+  // so the NEXT step's sub-loop sees prior steps' RESULTS — not just their
+  // instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
+  // distinctive string and assert STEP 2's assembled context carries it.
+  //
+  // Mirrors `rust/crates/spore-core/src/harness.rs#execute_steps_accumulate_prior_results`.
+  it("execute steps accumulate prior results", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      // Plan turn: a 2-step plan (research -> summarize).
+      .push(fr('{"tasks":["research tokio","summarize findings"],"rationale":"r"}'))
+      // Step 1: call a tool, then finalize using its result.
+      .push(tcr(toolCall("c1", "lookup")))
+      .push(fr("researched"))
+      // Step 2: finalize directly (it must SEE step 1's tool result).
+      .push(fr("summarized"));
+    const cfg = recordingConfig(agent, { stop_sequences: [] });
+    // Step 1's tool call returns a distinctive result string.
+    cfg.toolRegistry = new ScriptedToolRegistry().push({
+      kind: "success",
+      content: "TOKIO_FACTS_123",
+    });
+    const h = new StandardHarness(cfg);
+    const result = await h.run({ task: planTask93() });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.output).toBe("summarized");
+    }
+
+    // 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+    expect(agent.seen.length).toBe(4);
+
+    // Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
+    // result string is on the wire at all.
+    expect(ctxText(agent.seen[2]!)).toContain("TOKIO_FACTS_123");
+
+    // The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
+    // tool result, proving the execute loop carried it forward.
+    expect(ctxText(agent.seen[3]!)).toContain("TOKIO_FACTS_123");
+
+    // Step 2 also sees step 1's prior instruction. (This harness's
+    // ContextManager seam folds instructions + tool results into the shared
+    // session but does not append the per-step final assistant text — that is
+    // surfaced only as the step's `output` — so the accumulation guarantee is
+    // proven by the carried instruction + tool result above.)
+    expect(ctxText(agent.seen[3]!)).toContain("research tokio");
   });
 });

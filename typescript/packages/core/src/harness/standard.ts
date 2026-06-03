@@ -52,7 +52,8 @@ import {
   type TurnSpan,
   type WarnEvent,
 } from "../observability/types.js";
-import type { Message, ToolCall } from "../model/schemas.js";
+import type { Message, ModelParams, ToolCall } from "../model/schemas.js";
+import { ModelParamsSchema } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { InMemoryStorageProvider, StorageProvider } from "../storage/index.js";
@@ -273,6 +274,16 @@ export interface HarnessConfig {
    * Absent (the default) preserves today's behaviour.
    */
   systemPrompt?: string;
+  /**
+   * Authoritative per-run model sampling/decoding parameters (issue #93). The
+   * harness replaces each turn's {@link Context.params} with this value
+   * UNCONDITIONALLY (builder params win) right before the request is built, so
+   * the configured params reach every agent turn that requests tools. See
+   * {@link HarnessBuilder.modelParams}. Defaults to the schema's default
+   * {@link ModelParams} (`{ stop_sequences: [] }`, `structured_tool_calls`
+   * absent ⇒ `false`).
+   */
+  modelParams: ModelParams;
   /**
    * Opt-in conversation-history threading through the {@link StorageProvider}'s
    * {@link SessionStore} (issue #102). When `true`, the harness:
@@ -773,20 +784,26 @@ export class StandardHarness implements Harness {
    *    {@link PlanArtifact}, fires `on_plan_created`, and counts the turn against
    *    the shared budget.
    * 2. **Execute phase** (issue #59, loops): {@link runExecutePhase} drains the
-   *    task list, giving each task its own bounded ReAct sub-loop.
+   *    task list, running each task in a bounded ReAct sub-loop that BUILDS ON
+   *    the accumulated execute-phase context (prior steps' tool results and
+   *    assistant outputs carry forward).
    *
    * Between the phases the artifact is parsed into a {@link TaskList} via
    * `planArtifactToTaskList` and persisted through the storage seam (Q4) plus
    * the `extras` mirror.
    *
    * ## Resolved spec decisions (issue #59 — all FINAL)
-   * - **Q1:** each task gets its OWN bounded, isolated, SEQUENTIAL ReAct sub-loop
-   *   (task N completes before N+1). The per-task turn cap is derived at the
-   *   START of each step: `per_task_turns = floor(remaining_turns /
-   *   remaining_tasks)`, floored at 1 (`remaining_tasks` counts the not-yet-
-   *   started tasks including the current one). The shared budget — turns,
-   *   tokens, observability spans, compaction — is carried across EVERY step and
-   *   the global budget is the hard stop.
+   * - **Q1:** each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
+   *   the accumulated execute-phase context — after each successful step its
+   *   conversation (instruction + tool calls + tool results + assistant output)
+   *   is folded back into the shared session, so the next step sees all prior
+   *   steps' results. Steps stay SEQUENTIAL (task N completes before N+1). The
+   *   shared budget still gates: the per-task turn cap is derived at the START of
+   *   each step: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
+   *   floored at 1 (`remaining_tasks` counts the not-yet-started tasks including
+   *   the current one). The shared budget — turns, tokens, observability spans,
+   *   compaction — is carried across EVERY step and the global budget is the hard
+   *   stop.
    * - **Q2:** on success `output` is the LAST completed step's `final_response`
    *   text — not a concatenation, not the plan rationale.
    * - **Q3:** an empty task list ⇒ {@link HaltReason} `empty_plan`.
@@ -917,13 +934,17 @@ export class StandardHarness implements Harness {
   /**
    * Drive the PlanExecute execute phase (issue #59), draining `taskList`.
    *
-   * Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-   * sub-loop. The per-task turn cap is derived at the START of each step from the
-   * shared budget: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
-   * floored at 1 (`remaining_tasks` counts not-yet-started tasks including the
-   * current one). The shared budget snapshot (`carried`) is threaded through
-   * every step so early tasks cannot starve later ones and the global budget
-   * stays the hard stop.
+   * Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
+   * accumulated execute-phase context: after each successful step its resulting
+   * conversation (instruction + tool calls + tool results + assistant output) is
+   * folded back into the shared `sessionState`, so the next step's sub-loop
+   * (which clones `sessionState`) sees every prior step's results. The per-task
+   * turn cap is derived at the START of each step from the shared budget:
+   * `per_task_turns = floor(remaining_turns / remaining_tasks)`, floored at 1
+   * (`remaining_tasks` counts not-yet-started tasks including the current one).
+   * The shared budget snapshot (`carried`) is threaded through every step so
+   * early tasks cannot starve later ones and the global budget stays the hard
+   * stop.
    *
    * Before each step the task is marked `in_progress` (and `completed` after),
    * the list is re-persisted (Q4), and `on_task_advance` fires with the correct
@@ -1015,8 +1036,9 @@ export class StandardHarness implements Harness {
 
       // Seed the (possibly mutated) step instruction as a user message, then run
       // the bounded ReAct sub-loop carrying the shared budget (Q1). The sub-loop
-      // works on a CLONE of the session so each step is isolated; the parent
-      // session keeps the seeded message.
+      // works on a CLONE of the accumulated session; on success the clone's
+      // resulting state is folded back into `sessionState` so the NEXT step
+      // builds on this step's tool results and assistant output.
       await this.config.contextManager.appendUserMessage(sessionState, stepTask.instruction);
       const subState: SessionState = {
         messages: [...sessionState.messages],
@@ -1046,7 +1068,21 @@ export class StandardHarness implements Harness {
         totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
         totalUsage.cost_usd += subResult.usage.cost_usd;
         lastOutput = subResult.output;
-        lastState = runResultSessionState(subResult);
+        // Fold this step's resulting conversation back into the SHARED execute
+        // context so the NEXT step's sub-loop (which clones `sessionState`)
+        // builds on this step's tool results and assistant output, not just its
+        // instruction. The returned step state already contains this step's
+        // instruction + tool calls + tool results + final output.
+        const stepState = runResultSessionState(subResult);
+        sessionState.messages = stepState.messages;
+        sessionState.extras = stepState.extras;
+        // The terminal RunResult carries the LAST completed step's full state
+        // (now the accumulated context, Q2/#102). Snapshot it so a later step's
+        // seeded user message cannot retroactively mutate this result.
+        lastState = {
+          messages: [...sessionState.messages],
+          extras: { ...sessionState.extras },
+        };
 
         // Mark completed and re-persist (Q4).
         completeTask(taskList, taskId);
@@ -1164,15 +1200,26 @@ export class StandardHarness implements Harness {
     const planner = this.config.plannerAgent ?? this.config.agent;
 
     // Seed the planning directive as a user message (reuse ContextManager).
+    // CRITICAL (#93): the directive must NOT mutate the SHARED `sessionState`.
+    // That same state is threaded into the execute phase, where each subtask
+    // sub-loop assembles its context from it. If the directive leaked in,
+    // every execute step would still see "respond with {tasks, rationale}"
+    // and an instruction-following model would re-emit a plan instead of
+    // calling tools. Append to a throwaway CLONE so the plan turn sees the
+    // directive while the shared state stays `[user: task.instruction]`.
     const directive =
       "Produce a step-by-step plan for the following task. Respond with a " +
       'single JSON object: {"tasks": [<ordered step strings>], ' +
       '"rationale": <string>}.\n\nTask:\n' +
       task.instruction;
-    await this.config.contextManager.appendUserMessage(sessionState, directive);
+    const planState = structuredClone(sessionState);
+    await this.config.contextManager.appendUserMessage(planState, directive);
 
     // Assemble + invoke the planner for exactly ONE turn (R1).
-    const context = await this.config.contextManager.assemble(sessionState, task, signal);
+    const context = await this.config.contextManager.assemble(planState, task, signal);
+    // Per-run model params win unconditionally (issue #93) — same seam as
+    // runReactInner, before the plan turn is dispatched.
+    context.params = this.config.modelParams;
     emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
     const turnStartedAt = Timestamp.now();
     const turnClock = Date.now();
@@ -2492,6 +2539,11 @@ export class StandardHarness implements Harness {
           });
         }
       }
+      // Per-run model params win unconditionally (issue #93). The agent copies
+      // `Context.params` verbatim into the `ModelRequest`, so this is the single
+      // seam that delivers configured params (e.g. structured tool calls) to
+      // every tool-requesting ReAct/execute/streaming turn.
+      context.params = this.config.modelParams;
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
       const turnStartedAt = Timestamp.now();
       const turnClock = Date.now();
@@ -3271,6 +3323,7 @@ export class HarnessBuilder {
   private _vcsProvider?: VcsProvider;
   private readonly _standardTools: StandardTool[] = [];
   private _systemPrompt?: string;
+  private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
 
   constructor(
@@ -3483,6 +3536,28 @@ export class HarnessBuilder {
   }
 
   /**
+   * Set the authoritative model sampling/decoding parameters for the whole run
+   * (issue #93).
+   *
+   * These params are authoritative: the harness replaces each turn's
+   * {@link Context.params} with this value UNCONDITIONALLY (builder params win)
+   * right before the request is built, so the configured params reach every
+   * agent turn that requests tools — the ReAct loop, the PlanExecute plan
+   * phase, the execute sub-loop, and the streaming path alike. (The internal
+   * compaction/summarization turn is intentionally left on defaults; it
+   * requests no tools, so decoding params are a no-op there.)
+   *
+   * Enabling {@link ModelParams.structured_tool_calls} trades interleaved
+   * reasoning for one schema-constrained tool call per turn — useful for small
+   * local models that otherwise emit malformed tool calls. Defaults to the
+   * schema's default {@link ModelParams}.
+   */
+  modelParams(p: ModelParams): this {
+    this._modelParams = p;
+    return this;
+  }
+
+  /**
    * Opt into automatic conversation-history threading through the
    * {@link StorageProvider}'s {@link SessionStore} (issue #102). Defaults to
    * `false` — the off-by-default zero-I/O contract.
@@ -3590,6 +3665,7 @@ export class HarnessBuilder {
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
       systemPrompt: this._systemPrompt,
+      modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
     };
   }

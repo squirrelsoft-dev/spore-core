@@ -1,9 +1,11 @@
 //! The two custom tools this example registers.
 //!
-//! Each is a plain `impl Tool` (see [`spore_core::Tool`]) paired with a
-//! `schema()` constructor. `main` wraps each pair in `StandardTool::new` and
-//! hands it to the builder via `.tool(...)`. The harness wires the sandbox and a
-//! per-run `ToolContext` (the storage seam) in automatically.
+//! Each is defined with the [`tool!`](spore_core::tool) macro: a typed input
+//! struct deriving `Deserialize` + `JsonSchema`, plus an async `execute`
+//! closure. The macro derives the advertised schema from the input struct and
+//! returns a ready-to-register [`StandardTool`](spore_core::StandardTool). `main`
+//! hands each to the builder via `.tool(...)`; the harness wires the sandbox and
+//! a per-run `ToolContext` (the storage seam) in automatically.
 
 pub mod recall;
 pub mod remember;

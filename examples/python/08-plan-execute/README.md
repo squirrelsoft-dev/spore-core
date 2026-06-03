@@ -35,7 +35,7 @@ task = Task.new(
     prompt,
     new_session_id(),
     LoopStrategyPlanExecute(),
-    budget=BudgetLimits(max_turns=24),
+    budget=BudgetLimits(max_turns=64),
 )
 ```
 
@@ -102,23 +102,38 @@ Just like 04 and 06, the file write happens **inside the loop** via the catalogu
 `async-comparison.md` itself — the agent does, and the sandbox keeps it inside
 `workspace/`.
 
-## The search backend (and an honesty note about #108)
+## The search backend
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits if it is unset. `web_search` POSTs the query as JSON `{ "query": ... }` and
-hands the response body back to the agent verbatim.
+exits if it is unset. `web_search` issues `GET <endpoint>?q=<query>` and hands the
+response body back to the agent verbatim — wired identically to
+[`06`](../06-web-research) via `WebSearchTool.with_config`.
 
-Any endpoint that accepts that shape works:
+This example targets a self-hosted **SearXNG** instance, whose JSON API is
+`GET /search?q=<query>&format=json`. You put the `?format=json` on the endpoint
+URL itself; the GET path **preserves** that existing query string and appends
+`q=<query>`. The configurable GET method + query param this relies on were added
+in [#108](https://github.com/squirrelsoft-dev/spore-core/issues/108) (now
+resolved).
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+### SearXNG setup
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is tracked as core
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
+1. Enable the JSON output format in your SearXNG `settings.yml`:
+
+   ```yaml
+   search:
+     formats:
+       - html
+       - json
+   ```
+
+2. Restart SearXNG so the change takes effect.
+3. Point the example at it (note the `?format=json`):
+
+   ```sh
+   export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+   ```
 
 ## An honesty note about PlanExecute
 
@@ -131,10 +146,20 @@ edges you should know about before running:
 - A **subtask error aborts the whole run** with `HaltStepFailed` — there is no
   per-step retry.
 - The turn **budget is divided across subtasks**, so a stingy `max_turns` starves
-  later steps. Set it generously (this example uses `24`).
+  later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else.
+  model-agnostic — swap the model interface and change nothing else. By default
+  this example uses **native Ollama tool calling** (the real typed tool schema),
+  which works for tool-capable / cloud models like `gemma4:31b-cloud`. Pass
+  `--structured` to opt into `structured_tool_calls` via
+  `HarnessBuilder.model_params(ModelParams(structured_tool_calls=True))`, which
+  pushes small local models toward one clean, schema-constrained tool call per
+  turn across both the plan and execute phases. Note that structured mode exposes
+  an always-available `final` envelope, so a capable model can emit
+  `{"tool":"final"}` prematurely and hand back an EMPTY answer without writing
+  `async-comparison.md` — if you see that with `--structured`, drop the flag and
+  use the native default.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Python
   harness (like Rust and Go) suppresses the sub-loop stream, so the
   `OnPlanCreated` / `OnTaskAdvance` hooks are the portable, cross-language view of
@@ -145,8 +170,8 @@ edges you should know about before running:
 ```sh
 ollama serve &
 ollama pull llama3.2
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON endpoint (see "SearXNG setup" above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 Plus [`uv`](https://docs.astral.sh/uv/). See `.env.example` for all the
@@ -156,7 +181,8 @@ variables.
 
 ```sh
 cd examples/python/08-plan-execute
-uv run main.py
+uv run main.py                # native tool calling (default)
+uv run main.py --structured   # constrained decoding for small local models
 uv run main.py --prompt "Compare three Rust web frameworks (axum, actix-web, rocket) on performance, ergonomics, and ecosystem; cite sources and save to async-comparison.md."
 ```
 

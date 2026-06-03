@@ -34,7 +34,7 @@ let task = Task::new(prompt, SessionId::generate(),
 // 08 — decompose the goal first, then execute each subtask:
 let task = Task::new(prompt, SessionId::generate(),
     LoopStrategy::PlanExecute { plan_model: None })
-    .with_budget(BudgetLimits { max_turns: Some(24), ..Default::default() });
+    .with_budget(BudgetLimits { max_turns: Some(64), ..Default::default() });
 ```
 
 With `PlanExecute`, the harness runs one constrained **planner turn** first. The
@@ -97,23 +97,39 @@ Just like 04 and 06, the file write happens **inside the loop** via the catalogu
 `async-comparison.md` itself — the agent does, and the sandbox keeps it inside
 `workspace/`.
 
-## The search backend (and an honesty note about #108)
+## The search backend (SearXNG)
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits if it is unset. `web_search` POSTs the query as JSON `{ "query": ... }` and
-hands the response body back to the agent verbatim.
+exits if it is unset. The tool issues `GET <endpoint>?q=<query>` and hands the
+response body back to the agent verbatim — the `format=json` selector rides on
+the endpoint URL (`.../search?format=json`) and the query is appended as
+`&q=<query>`. reqwest's `.query()` **preserves** the existing query string, so
+both `format=json` and `q=...` reach SearXNG.
 
-Any endpoint that accepts that shape works:
+### SearXNG setup
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+By default SearXNG only serves HTML. Enable the JSON format in `settings.yml`:
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is tracked as core
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Restart SearXNG, then point the example at it:
+
+```sh
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+```
+
+**Raw Brave / Tavily** would use a custom auth header (`X-Subscription-Token` /
+`Authorization`). That **is** now supported — the `auth_headers` field on
+`WebSearchConfig`, added in
+[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108), attaches
+a secret resolved from an env var on every request. This example simply targets
+keyless SearXNG and configures no auth.
 
 ## An honesty note about PlanExecute
 
@@ -127,10 +143,20 @@ edges you should know about before running:
 - A **subtask error aborts the whole run** with `HaltStepFailed` — there is no
   per-step retry.
 - The turn **budget is divided across subtasks**, so a stingy `max_turns` starves
-  later steps. Set it generously (this example uses `24`).
+  later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
   model-agnostic — swap the model interface and change nothing else.
+- **Native vs. structured tool calls (`--structured`).** By default the example
+  uses native Ollama tool calling: `write_file` gets a real typed schema and
+  there is no always-on `final` envelope, so tool-capable models (including
+  hosted `*-cloud` models such as `gemma4:31b-cloud`) reliably search → write →
+  answer. Pass `--structured` to enable
+  `ModelParams { structured_tool_calls: true, .. }` (schema-constrained decoding)
+  for small local models that otherwise leak `<|python_tag|>` or malformed JSON.
+  > Structured mode exposes an always-available `final` envelope that weaker
+  > models can take prematurely (empty answer, no file written). If you see an
+  > empty `answer (N turn(s)):` and no output file, drop `--structured`.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Rust
   harness suppresses the sub-loop stream, so the `OnPlanCreated` / `OnTaskAdvance`
   hooks are the portable, cross-language view of execution.
@@ -140,8 +166,8 @@ edges you should know about before running:
 ```sh
 ollama serve &
 ollama pull llama3.2
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON endpoint (enable the `json` format first — see above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 See `.env.example` for all the variables.

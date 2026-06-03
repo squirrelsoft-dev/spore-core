@@ -119,6 +119,7 @@ describe("Escalation loop fixture — escalation_loop.jsonl", () => {
       sandbox: new AllowAllSandbox(),
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
     };
     const harness = new StandardHarness(config);
 

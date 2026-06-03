@@ -6,9 +6,10 @@
 //!
 //! Tools wired (all from the built-in catalogue, no custom `impl Tool`):
 //!
-//! - `web_search` — [`StandardTools::web_search_with_endpoint(endpoint)`]. The
-//!   query is POSTed to `endpoint` as JSON `{ "query": ... }` and the response
-//!   body is returned to the agent verbatim. The endpoint comes from
+//! - `web_search` — a [`WebSearchTool::with_config`] backend configured for
+//!   SearXNG: the query is issued as `GET <endpoint>?q=<query>` (the
+//!   `format=json` selector rides on the endpoint) and the JSON response body
+//!   is returned to the agent verbatim. The endpoint comes from
 //!   `SPORE_WEB_SEARCH_ENDPOINT` (see the README + `.env.example`).
 //! - `write_file` — [`StandardTools::write_file`]. The agent writes its
 //!   synthesized, cited answer to `answer.md`.
@@ -25,18 +26,23 @@
 //!   cannot escape it. 04 wrote `SUMMARY.md`; 06 writes `answer.md`.
 //!
 //! The ONLY substantive difference from 04 is the tool set: 04 registers
-//! `coding_set()`, 06 registers `web_search_with_endpoint(..)` + `write_file` +
-//! `read_file`. Same harness, different tools.
+//! `coding_set()`, 06 registers a SearXNG-configured `web_search` (GET +
+//! `?q=`) + `write_file` + `read_file`. Same harness, different tools.
 //!
 //! There are no `// SPEC QUESTION:` markers: the backend-adapter, file-write
 //! path, and model choices were all resolved before this example was written.
+//!
+//! This example also enables `ModelParams::structured_tool_calls` via
+//! `HarnessBuilder::model_params(..)` — schema-constrained decoding that helps
+//! small Ollama models emit one clean tool call per turn instead of malformed
+//! or interleaved output.
 //!
 //! ## Run it
 //!
 //! ```sh
 //! ollama serve &
 //! ollama pull llama3.2
-//! export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search   # a {"query"}->JSON endpoint
+//! export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"   # SearXNG JSON API
 //! cargo run
 //! ```
 
@@ -44,8 +50,8 @@ use std::sync::Arc;
 
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SessionId, StandardTools, Task, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    OllamaModelInterface, RunResult, SearchMethod, SessionId, StandardTool, StandardTools, Task,
+    WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 const SYSTEM_PROMPT: &str = "You are a web-research agent. Use web_search to find current \
@@ -61,24 +67,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "llama3.2".to_string());
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
+    // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+    // `*-cloud`) use native Ollama tool calling, which gives `write_file` a real
+    // typed schema and no always-on `final` escape. Small local models that leak
+    // `<|python_tag|>` can pass `--structured` to force the JSON-object channel.
+    let structured = args.iter().any(|a| a == "--structured");
 
-    // The search backend endpoint. `web_search` POSTs `{ "query": ... }` here and
-    // returns the JSON body to the agent. There is no live backend in spore-core,
-    // so you must supply one — a self-hosted SearXNG JSON endpoint, or a mock that
-    // accepts the `{ "query" }` shape. Raw Brave/Tavily are NOT yet drop-in: they
-    // need a custom auth header, which is tracked as core issue #108. See README.
+    // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
+    // and returns the JSON body to the agent. There is no live backend in
+    // spore-core, so you must supply one — this example targets a self-hosted
+    // SearXNG JSON endpoint (`.../search?format=json`). Raw Brave/Tavily would use
+    // auth headers (now supported via `WebSearchConfig::auth_headers`, core #108);
+    // this example targets SearXNG, which needs no key. See README.
     let endpoint = match std::env::var("SPORE_WEB_SEARCH_ENDPOINT") {
         Ok(e) if !e.trim().is_empty() => e,
         _ => {
             eprintln!(
                 "SPORE_WEB_SEARCH_ENDPOINT is not set.\n\
-                 Set it to a search endpoint that accepts a JSON `{{\"query\": ...}}` POST and \
-                 returns JSON results.\n\
-                 See .env.example and the README. (Raw Brave/Tavily need core #108 first.)"
+                 Set it to a SearXNG JSON endpoint, e.g. \
+                 http://localhost:8888/search?format=json — the query is appended as \
+                 `&q=<query>`.\n\
+                 See .env.example and the README."
             );
             std::process::exit(2);
         }
     };
+
+    // SearXNG GET config: `?q=<query>` appended to the endpoint, `format=json`
+    // already on the endpoint URL. No auth env vars, so `with_config` cannot fail
+    // here — but it returns a `Result`, so surface any error with a clear message.
+    let web_search_tool = WebSearchTool::with_config(WebSearchConfig {
+        endpoint: endpoint.clone(),
+        method: SearchMethod::Get,
+        query_param: "q".into(),
+        auth_headers: Vec::new(),
+        body_auth_params: Vec::new(),
+    })
+    .expect("web_search backend config is valid (SearXNG needs no auth env vars)");
+    let web_search = StandardTool::new(Box::new(web_search_tool), WebSearchTool::schema());
 
     // The agent operates inside this example's `workspace/` directory. Resolve it
     // relative to this source file so `cargo run` works from anywhere, and
@@ -104,10 +130,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
-        .tool(StandardTools::web_search_with_endpoint(endpoint.clone()))
+        .tool(web_search)
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
+        // Native tool calling by default; `--structured` flips on constrained
+        // decoding for small models (see the `structured` flag above). With
+        // structured mode the "think · turn N" line is just a turn marker, not
+        // model chatter, since each turn emits one clean JSON tool call.
+        .model_params(spore_core::ModelParams {
+            structured_tool_calls: structured,
+            ..Default::default()
+        })
         .build();
 
     let task = Task::new(

@@ -17,7 +17,7 @@ about its own task structure before touching any tool.
 | -------- | -------------------------------------------------- | -------------------------------------------------------------- |
 | Builder  | `ConversationalBuilder(model)`                     | `ConversationalBuilder(model)` *(same)*                        |
 | Sandbox  | `WorkspaceScopedSandbox` over `workspace/`         | `WorkspaceScopedSandbox` over `workspace/` *(same)*            |
-| Tools    | `WebSearchWithEndpoint` + `WriteFile` + `ReadFile` | `WebSearchWithEndpoint` + `WriteFile` + `ReadFile` *(same)*    |
+| Tools    | `NewWebSearchToolFromConfig` + `WriteFile` + `ReadFile` | `NewWebSearchToolFromConfig` + `WriteFile` + `ReadFile` *(same)* |
 | Strategy | `StrategyReAct` (`MaxIterations: 10`)              | **`StrategyPlanExecute`** *(the swap)*                         |
 | Behavior | reacts step-by-step, no upfront plan               | **prints a full plan first, then runs each subtask**           |
 | Output   | stream-printed `think` / `act` / `obs`             | a `── plan ──` banner + `[i/N]` subtask lines (via hooks)      |
@@ -34,7 +34,7 @@ task := sporecore.NewTask(prompt, sporecore.NewSessionID(),
 // 08 — decompose the goal first, then execute each subtask:
 task := sporecore.NewTask(prompt, sporecore.NewSessionID(),
     sporecore.LoopStrategy{Kind: sporecore.StrategyPlanExecute}).
-    WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}) // generous: 24
+    WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}) // generous: 64
 ```
 
 With `StrategyPlanExecute`, the harness runs one constrained **planner turn**
@@ -67,7 +67,7 @@ then `NewStandardHarness(cfg)`:
 ```go
 cfg := observability.ConversationalBuilder(mi).
     Sandbox(sandbox).                                          // same sandbox as 06
-    Tool(tools.StandardTools{}.WebSearchWithEndpoint(endpoint)). // same tools as 06
+    Tool(tools.StandardTool{Implementation: webSearch, Schema: webSearch.Schema()}). // same tool as 06 (SearXNG GET/JSON)
     Tool(tools.StandardTools{}.WriteFile()).
     Tool(tools.StandardTools{}.ReadFile()).
     SystemPrompt(systemPrompt).
@@ -111,26 +111,40 @@ Just like 04 and 06, the file write happens **inside the loop** via the catalogu
 `async-comparison.md` itself — the agent does, and the sandbox keeps it inside
 `workspace/`.
 
-## The search backend (and an honesty note about #108)
+## The search backend
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits with a clear error (exit code 2) if it is unset. `web_search` POSTs the
-query as JSON `{ "query": ... }` and hands the response body back to the agent
-verbatim.
+exits with a clear error (exit code 2) if it is unset. `web_search` issues
+`GET <endpoint>?q=<query>` and hands the response body back to the agent verbatim.
+The GET path **preserves any query string already on the endpoint**, so a SearXNG
+`/search?format=json` URL becomes `GET /search?format=json&q=<query>`.
 
-Any endpoint that accepts that shape works:
+A self-hosted **SearXNG** JSON API is the recommended backend (a local mock that
+answers the same `GET ...?q=<query>` shape also works).
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+> Custom auth (Brave's `X-Subscription-Token`, Tavily's in-body `api_key`) is now
+> supported by `web_search` via `WebSearchConfig.AuthHeaders` /
+> `BodyAuthParams` (core [issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108),
+> resolved). This example targets SearXNG, which needs no auth.
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is a core deficiency tracked as
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
-Until #108 lands, point `SPORE_WEB_SEARCH_ENDPOINT` at SearXNG or a
-`{ "query" }`-compatible mock.
+### SearXNG setup
+
+1. Enable the JSON output format in your SearXNG `settings.yml`:
+
+   ```yaml
+   search:
+     formats:
+       - html
+       - json
+   ```
+
+2. Restart SearXNG so the new format takes effect.
+3. Point the example at the JSON API:
+
+   ```sh
+   export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+   ```
 
 ## An honesty note about PlanExecute
 
@@ -143,10 +157,20 @@ edges you should know about before running:
 - A **subtask error aborts the whole run** with `HaltStepFailed` — there is no
   per-step retry.
 - The turn **budget is divided across subtasks**, so a stingy `MaxTurns` starves
-  later steps. Set it generously (this example uses `24`).
+  later steps. Set it generously (this example uses `64`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else.
+  model-agnostic — swap the model interface and change nothing else. By default
+  this example uses **native Ollama tool calling** (the real typed tool schema),
+  which works well for tool-capable / cloud models (e.g. `gemma4:31b-cloud`).
+  Pass `--structured` (i.e. `go run . --structured`) to opt into
+  schema-constrained decoding, pushing small local models toward one clean tool
+  call per turn (no interleaved reasoning) across both the plan and execute
+  phases. Caveat: structured mode exposes an always-available `final` envelope
+  whose content is optional, so a weak model can bail early with an empty answer
+  and never call `write_file`. If you see an empty answer and no
+  `async-comparison.md` on disk, drop `--structured` and let native tool calling
+  drive.
 - Subtask **inner tool calls stream in the TypeScript port only**; the Go
   harness (like Rust and Python) suppresses the sub-loop stream, so the
   `OnPlanCreated` / `OnTaskAdvance` hooks are the portable, cross-language view
@@ -157,8 +181,8 @@ edges you should know about before running:
 ```sh
 ollama serve &
 ollama pull llama3.2
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON API endpoint (see "SearXNG setup" above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 See `.env.example` for all the variables.

@@ -37,6 +37,12 @@
 //!
 //! There are no `// SPEC QUESTION:` markers in this file.
 //!
+//! Tool calling is native by default (real typed `memory` tool schema, no
+//! always-on `final` escape) — what tool-capable models, including hosted
+//! `*-cloud` models, want. Pass `--structured` to enable
+//! `ModelParams::structured_tool_calls` (schema-constrained decoding) for small
+//! local models that otherwise leak `<|python_tag|>` or malformed JSON.
+//!
 //! ## Run it
 //!
 //! ```sh
@@ -91,6 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "llama3.2".to_string());
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
+    // Opt-in constrained decoding. OFF by default: tool-capable models (incl.
+    // `*-cloud`) use native Ollama tool calling, which gives the `memory` tool a
+    // real typed schema and no always-on `final` escape. Small local models that
+    // leak `<|python_tag|>` can pass `--structured` to force the JSON-object channel.
+    let structured = args.iter().any(|a| a == "--structured");
 
     // `memory.md` lives next to this example's sources so `cargo run` works from
     // anywhere and the artifact is easy to find and inspect between phases.
@@ -124,7 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let task_prompt = format!(
                 "Here is the Project Ironwood briefing. Store each fact to memory.\n\n{briefing}"
             );
-            let output = run_phase(model, &memory_path, STORE_SYSTEM_PROMPT, &task_prompt).await?;
+            let output =
+                run_phase(model, &memory_path, STORE_SYSTEM_PROMPT, &task_prompt, structured)
+                    .await?;
             println!("\nstored. agent said: {output}");
             if memory_path.exists() {
                 println!("\nmemory.md now exists on disk: {}", memory_path.display());
@@ -145,8 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(2);
             }
-            let output =
-                run_phase(model, &memory_path, RECALL_SYSTEM_PROMPT, RECALL_QUESTIONS).await?;
+            let output = run_phase(
+                model,
+                &memory_path,
+                RECALL_SYSTEM_PROMPT,
+                RECALL_QUESTIONS,
+                structured,
+            )
+            .await?;
             println!("\nanswers from memory:\n{output}");
             Ok(())
         }
@@ -164,6 +183,7 @@ async fn run_phase(
     memory_path: &std::path::Path,
     system_prompt: &str,
     task_prompt: &str,
+    structured: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Compose the real markdown MemoryStore with NoOp for the other three
     // storage domains. This is the entire integration: the harness threads
@@ -174,6 +194,14 @@ async fn run_phase(
         .storage(Arc::new(storage))
         .tool(StandardTools::memory())
         .system_prompt(system_prompt)
+        // Native tool calling by default; `--structured` (threaded in from main)
+        // flips on constrained decoding for small models. With structured mode the
+        // "think · turn N" line is just a turn marker, not model chatter, since
+        // each turn emits one clean JSON tool call.
+        .model_params(spore_core::ModelParams {
+            structured_tool_calls: structured,
+            ..Default::default()
+        })
         .build();
 
     // PIN the session id — both phases pass the same one so recall reads what

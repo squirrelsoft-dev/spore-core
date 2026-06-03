@@ -399,6 +399,80 @@ func TestParseResponseStructuredMalformedFallsBackToText(t *testing.T) {
 	}
 }
 
+// --- structured fence stripping (capable/cloud models wrap JSON) -----------
+
+// Regression for the exact gemma-cloud output: the constrained JSON tool call
+// arrives inside a ```json fence. Must dispatch, not fall back to Text/final.
+func TestParseStructuredJSONFencedToolCallDispatches(t *testing.T) {
+	raw := "```json\n{\"tool\":\"web_search\",\"arguments\":{\"query\":\"x\"}}\n```"
+	content, stop := parseStructuredContent(raw, 0)
+	if stop != sporecore.StopToolUse {
+		t.Fatalf("stop: %s", stop)
+	}
+	if len(content) != 1 || content[0].Type != sporecore.ContentBlockTypeToolUse {
+		t.Fatalf("content: %+v", content)
+	}
+	tc := content[0].ToolCall
+	if tc == nil || tc.Name != "web_search" {
+		t.Fatalf("tool call: %+v", tc)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(tc.Input, &parsed); err != nil {
+		t.Fatalf("input not JSON: %s", tc.Input)
+	}
+	if parsed["query"] != "x" {
+		t.Fatalf("input: %v", parsed)
+	}
+}
+
+// A bare ``` fence (no language tag) also strips and dispatches.
+func TestParseStructuredBareFencedToolCallDispatches(t *testing.T) {
+	raw := "```\n{\"tool\":\"web_search\",\"arguments\":{\"query\":\"y\"}}\n```"
+	content, stop := parseStructuredContent(raw, 0)
+	if stop != sporecore.StopToolUse {
+		t.Fatalf("stop: %s", stop)
+	}
+	if len(content) != 1 || content[0].ToolCall == nil || content[0].ToolCall.Name != "web_search" {
+		t.Fatalf("content: %+v", content)
+	}
+}
+
+// A fenced `final` envelope still resolves to a Text/EndTurn answer.
+func TestParseStructuredFencedFinalIsText(t *testing.T) {
+	raw := "```json\n{\"tool\":\"final\",\"content\":\"done\"}\n```"
+	content, stop := parseStructuredContent(raw, 0)
+	if stop != sporecore.StopEndTurn {
+		t.Fatalf("stop: %s", stop)
+	}
+	if len(content) != 1 || content[0].Type != sporecore.ContentBlockTypeText || content[0].Text != "done" {
+		t.Fatalf("content: %+v", content)
+	}
+}
+
+// Un-fenced tool calls (grammar-honoring models) still dispatch — no regression.
+func TestParseStructuredRawToolCallStillDispatches(t *testing.T) {
+	raw := "{\"tool\":\"web_search\",\"arguments\":{\"query\":\"z\"}}"
+	content, stop := parseStructuredContent(raw, 0)
+	if stop != sporecore.StopToolUse {
+		t.Fatalf("stop: %s", stop)
+	}
+	if len(content) != 1 || content[0].ToolCall == nil || content[0].ToolCall.Name != "web_search" {
+		t.Fatalf("content: %+v", content)
+	}
+}
+
+// Genuine garbage still falls back to a Text block with EndTurn.
+func TestParseStructuredGarbageFallsBackToText(t *testing.T) {
+	raw := "not json at all"
+	content, stop := parseStructuredContent(raw, 0)
+	if stop != sporecore.StopEndTurn {
+		t.Fatalf("stop: %s", stop)
+	}
+	if len(content) != 1 || content[0].Type != sporecore.ContentBlockTypeText || content[0].Text != "not json at all" {
+		t.Fatalf("content: %+v", content)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // parseStopReason
 // ---------------------------------------------------------------------------

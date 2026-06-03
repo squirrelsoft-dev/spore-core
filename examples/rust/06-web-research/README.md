@@ -18,7 +18,7 @@ tool. It drops into the exact same `conversational(model)` builder, the same
 | Loop     | `ReAct`                                       | `ReAct` *(same)*                                            |
 | Sandbox  | `WorkspaceScopedSandbox` over `sample-files/` | `WorkspaceScopedSandbox` over `workspace/` *(same pattern)* |
 | Output   | stream-printed `think` / `act` / `obs`        | stream-printed `think` / `act` / `obs` *(same)*             |
-| Tools    | `.tools(StandardTools::coding_set())`         | `web_search_with_endpoint(..)` + `write_file` + `read_file` |
+| Tools    | `.tools(StandardTools::coding_set())`         | SearXNG-configured `web_search` (GET) + `write_file` + `read_file` |
 | Side eff | writes `SUMMARY.md`                            | writes `answer.md`                                          |
 
 The only substantive change is the tool registration. 04 used the local
@@ -26,9 +26,20 @@ filesystem `coding_set()`; 06 swaps in an **external** search tool and keeps two
 file tools so the agent can persist its answer:
 
 ```rust
+// SearXNG GET config: `?q=<query>` appended; `format=json` rides on the endpoint.
+let web_search_tool = WebSearchTool::with_config(WebSearchConfig {
+    endpoint,
+    method: SearchMethod::Get,
+    query_param: "q".into(),
+    auth_headers: Vec::new(),
+    body_auth_params: Vec::new(),
+})
+.expect("SearXNG config is valid (no auth env vars)");
+let web_search = StandardTool::new(Box::new(web_search_tool), WebSearchTool::schema());
+
 let harness = HarnessBuilder::conversational(model)
     .sandbox(Arc::new(sandbox))                                   // same as 04
-    .tool(StandardTools::web_search_with_endpoint(endpoint))      // ← external API
+    .tool(web_search)                                             // ← external API (GET)
     .tool(StandardTools::write_file())                            // ← writes answer.md
     .tool(StandardTools::read_file())
     .system_prompt(SYSTEM_PROMPT)
@@ -63,25 +74,39 @@ answer (2 turn(s)): I searched for current install guidance and wrote answer.md 
 answer.md now exists on disk: …/workspace/answer.md
 ```
 
-## The search backend (and an honesty note about #108)
+## The search backend (SearXNG)
 
 There is **no live web-search backend in spore-core**. The endpoint is injected,
 so you must supply one. The example reads it from `SPORE_WEB_SEARCH_ENDPOINT` and
-exits if it is unset. `web_search` POSTs the query as JSON `{ "query": ... }` and
-hands the response body back to the agent verbatim.
+exits if it is unset. The tool issues `GET <endpoint>?q=<query>` and hands the
+response body back to the agent verbatim — the `format=json` selector rides on
+the endpoint URL (`.../search?format=json`) and the query is appended as
+`&q=<query>`. reqwest's `.query()` **preserves** the existing query string, so
+both `format=json` and `q=...` reach SearXNG.
 
-Any endpoint that accepts that shape works:
+### SearXNG setup
 
-- a self-hosted **SearXNG** JSON endpoint, or
-- a small **mock** you run locally for the demo.
+By default SearXNG only serves HTML. Enable the JSON format in `settings.yml`:
 
-**Raw Brave / Tavily are not yet drop-in.** They require a custom auth header
-(`X-Subscription-Token` / `Authorization`) that the current `web_search` tool
-does not send. That gap is a core deficiency tracked as
-[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108); this
-example deliberately does **not** ship a local proxy/adapter to paper over it.
-Until #108 lands, point `SPORE_WEB_SEARCH_ENDPOINT` at SearXNG or a
-`{ "query" }`-compatible mock.
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Restart SearXNG, then point the example at it:
+
+```sh
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+```
+
+**Raw Brave / Tavily** would use a custom auth header (`X-Subscription-Token` /
+`Authorization`). That **is** now supported — the `auth_headers` field on
+`WebSearchConfig`, added in
+[issue #108](https://github.com/squirrelsoft-dev/spore-core/issues/108), attaches
+a secret resolved from an env var on every request. This example simply targets
+keyless SearXNG and configures no auth.
 
 ## A note on the model
 
@@ -90,13 +115,35 @@ it runs with no hosted-model account. Synthesis quality scales with the model: a
 **larger hosted model will produce noticeably better, better-cited answers**. The
 harness is model-agnostic — swap the model interface and change nothing else.
 
+### Native vs. structured tool calls (`--structured`)
+
+By default the example uses **native** Ollama tool calling: `write_file` gets a
+real typed schema and the model is steered straight to search → write → answer.
+This is what tool-capable models (including hosted `*-cloud` models such as
+`gemma4:31b-cloud`) want.
+
+Small local models (e.g. `llama3.2`) sometimes leak `<|python_tag|>` or emit
+malformed JSON on the native channel. Pass `--structured` to switch on
+schema-constrained decoding (`ModelParams { structured_tool_calls: true, .. }`),
+which forces one clean JSON tool call per turn:
+
+```sh
+cargo run -- --structured                       # llama3.2 with constrained decoding
+cargo run -- --model gemma4:31b-cloud           # capable model, native tool calls
+```
+
+> Note: structured mode exposes an always-available `final` envelope. Weaker
+> instruction-followers can take that exit prematurely (emitting an empty answer
+> without ever calling `write_file`). If you see an empty `answer (N turn(s)):`
+> and no `answer.md`, drop `--structured` and use native tool calling.
+
 ## Prerequisites
 
 ```sh
 ollama serve &
 ollama pull llama3.2
-# A {"query"}->JSON search endpoint (SearXNG or a local mock):
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search
+# A SearXNG JSON endpoint (enable the `json` format first — see above):
+export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 ```
 
 See `.env.example` for all the variables.

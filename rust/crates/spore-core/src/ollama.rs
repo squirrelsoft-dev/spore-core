@@ -643,7 +643,12 @@ fn parse_structured_content(raw: &str, index: usize) -> (Vec<ContentBlock>, Stop
             StopReason::EndTurn,
         )
     };
-    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+    // Capable/cloud models often ignore the constrained-decoding grammar and
+    // wrap the JSON tool call in a markdown code fence. Reuse the plan parser's
+    // fence stripping so a fenced `{"tool":...}` still dispatches instead of
+    // being mis-read as a final text answer.
+    let parse_input = crate::plan::strip_code_fence(raw.trim());
+    let value: serde_json::Value = match serde_json::from_str(parse_input) {
         Ok(v) => v,
         Err(_) => return fallback(),
     };
@@ -1390,6 +1395,76 @@ mod tests {
             r.content,
             vec![ContentBlock::Text {
                 text: "oops not json".into()
+            }]
+        );
+    }
+
+    // ── structured fence stripping (capable/cloud models wrap JSON) ─────────
+
+    // Regression for the exact gemma-cloud output: the constrained JSON tool
+    // call arrives inside a ```json fence. Must dispatch, not fall back to Text.
+    #[test]
+    fn parse_structured_json_fenced_tool_call_dispatches() {
+        let raw = "```json\n{\"tool\":\"web_search\",\"arguments\":{\"query\":\"x\"}}\n```";
+        let (content, stop) = parse_structured_content(raw, 0);
+        assert_eq!(stop, StopReason::ToolUse);
+        match &content[0] {
+            ContentBlock::ToolUse(tc) => {
+                assert_eq!(tc.name, "web_search");
+                assert_eq!(tc.input, serde_json::json!({"query":"x"}));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    // A bare ``` fence (no language tag) also strips and dispatches.
+    #[test]
+    fn parse_structured_bare_fenced_tool_call_dispatches() {
+        let raw = "```\n{\"tool\":\"web_search\",\"arguments\":{\"query\":\"y\"}}\n```";
+        let (content, stop) = parse_structured_content(raw, 0);
+        assert_eq!(stop, StopReason::ToolUse);
+        match &content[0] {
+            ContentBlock::ToolUse(tc) => assert_eq!(tc.name, "web_search"),
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    // A fenced `final` envelope still resolves to a Text/EndTurn answer.
+    #[test]
+    fn parse_structured_fenced_final_is_text() {
+        let raw = "```json\n{\"tool\":\"final\",\"content\":\"done\"}\n```";
+        let (content, stop) = parse_structured_content(raw, 0);
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            content,
+            vec![ContentBlock::Text {
+                text: "done".into()
+            }]
+        );
+    }
+
+    // Un-fenced tool calls (grammar-honoring models) still dispatch — no regression.
+    #[test]
+    fn parse_structured_raw_tool_call_still_dispatches() {
+        let raw = "{\"tool\":\"web_search\",\"arguments\":{\"query\":\"z\"}}";
+        let (content, stop) = parse_structured_content(raw, 0);
+        assert_eq!(stop, StopReason::ToolUse);
+        match &content[0] {
+            ContentBlock::ToolUse(tc) => assert_eq!(tc.name, "web_search"),
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    // Genuine garbage still falls back to a Text block with EndTurn.
+    #[test]
+    fn parse_structured_garbage_falls_back_to_text() {
+        let raw = "not json at all";
+        let (content, stop) = parse_structured_content(raw, 0);
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            content,
+            vec![ContentBlock::Text {
+                text: "not json at all".into()
             }]
         );
     }

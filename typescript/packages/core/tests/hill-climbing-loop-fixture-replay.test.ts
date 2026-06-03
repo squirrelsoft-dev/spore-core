@@ -172,6 +172,7 @@ describe("HillClimbing fixture replay (issue #60)", () => {
         sandbox,
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
+        modelParams: { stop_sequences: [] },
         metricEvaluator: evaluator,
       };
 
