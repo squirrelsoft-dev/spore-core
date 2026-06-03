@@ -97,7 +97,9 @@ use crate::context::{
 };
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
-use crate::model::{Content, Message, Role, StopReason, TokenUsage, ToolCall, ToolSchema};
+use crate::model::{
+    Content, Message, ModelParams, Role, StopReason, TokenUsage, ToolCall, ToolSchema,
+};
 use crate::observability::{
     truncate_field, ContentCaptureConfig, GenAiMessage, GenAiRole, PricingTable, SpanBase, SpanId,
     SpanKind, SpanStatus, ToolCallContent, ToolCallSpan, ToolResultContent, TurnSpan, WarnEvent,
@@ -1897,6 +1899,13 @@ pub struct HarnessConfig {
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
     /// today's behaviour byte-for-byte.
     pub system_prompt: Option<String>,
+    /// Authoritative per-run model sampling/decoding parameters (issue #93).
+    /// The harness replaces each turn's `Context.params` with this value
+    /// UNCONDITIONALLY (builder params win) right before the request is built,
+    /// so the configured params reach every agent turn that requests tools.
+    /// See [`HarnessBuilder::model_params`]. Defaults to
+    /// [`ModelParams::default`].
+    pub model_params: ModelParams,
     /// Opt-in automatic conversation-history threading via the
     /// [`SessionStore`](crate::storage::SessionStore) (issue #102). When `true`,
     /// the harness:
@@ -1948,6 +1957,7 @@ impl Clone for HarnessConfig {
             metric_evaluator: self.metric_evaluator.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
             system_prompt: self.system_prompt.clone(),
+            model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
         }
     }
@@ -2021,6 +2031,10 @@ pub struct HarnessBuilder {
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
     system_prompt: Option<String>,
+    /// Authoritative per-run model sampling/decoding parameters (issue #93).
+    /// Defaults to [`ModelParams::default`]. See
+    /// [`model_params`](HarnessBuilder::model_params).
+    model_params: ModelParams,
     /// Opt-in automatic session-state threading + auto-persist (issue #102).
     /// `false` (the default) preserves today's behaviour byte-for-byte (ZERO
     /// session-store I/O). See [`auto_persist_sessions`](HarnessBuilder::auto_persist_sessions).
@@ -2063,6 +2077,7 @@ impl HarnessBuilder {
             metric_evaluator: None,
             standard_tools: Vec::new(),
             system_prompt: None,
+            model_params: ModelParams::default(),
             auto_persist_sessions: false,
         }
     }
@@ -2201,6 +2216,27 @@ impl HarnessBuilder {
     /// default) preserves today's behaviour.
     pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    /// Set the authoritative model sampling/decoding parameters for the whole
+    /// run (issue #93).
+    ///
+    /// These params are authoritative: the harness replaces each turn's
+    /// `Context.params` with this value UNCONDITIONALLY (builder params win)
+    /// right before the request is built, so the configured params reach every
+    /// agent turn that requests tools — the ReAct loop, the PlanExecute plan
+    /// phase, the execute sub-loop, and the streaming path alike. (The internal
+    /// compaction/summarization turn is intentionally left on defaults; it
+    /// requests no tools, so decoding params are a no-op there.)
+    ///
+    /// Enabling [`structured_tool_calls`](crate::model::ModelParams::structured_tool_calls)
+    /// trades interleaved reasoning for one schema-constrained tool call per
+    /// turn — useful for small local models that otherwise emit malformed tool
+    /// calls. See [`ModelParams::structured_tool_calls`](crate::model::ModelParams::structured_tool_calls)
+    /// for the full behaviour contract.
+    pub fn model_params(mut self, params: ModelParams) -> Self {
+        self.model_params = params;
         self
     }
 
@@ -2466,6 +2502,7 @@ impl HarnessBuilder {
             metric_evaluator: self.metric_evaluator,
             catalogue_registry,
             system_prompt: self.system_prompt,
+            model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
         }
     }
@@ -3021,6 +3058,12 @@ impl StandardHarness {
                     );
                 }
             }
+            // Per-run model params win unconditionally (issue #93). The agent
+            // copies `Context.params` verbatim into the `ModelRequest`, so this
+            // is the single seam that delivers configured params (e.g.
+            // structured tool calls) to every tool-requesting ReAct/execute/
+            // streaming turn.
+            context.params = self.config.model_params.clone();
             Self::emit(
                 &on_stream,
                 StreamEvent::TurnStart {
@@ -5407,11 +5450,14 @@ impl StandardHarness {
             .await;
 
         // Assemble + invoke the planner for exactly ONE turn (R1).
-        let context = self
+        let mut context = self
             .config
             .context_manager
             .assemble(session_state, task)
             .await;
+        // Per-run model params win unconditionally (issue #93) — same seam as
+        // run_react_inner, before the plan turn is dispatched.
+        context.params = self.config.model_params.clone();
         Self::emit(
             on_stream,
             StreamEvent::TurnStart {
@@ -6522,6 +6568,7 @@ mod tests {
             metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
+            model_params: ModelParams::default(),
             auto_persist_sessions: false,
         }
     }
@@ -8299,6 +8346,136 @@ mod tests {
             .is_none());
     }
 
+    // ── #93: model_params reach every tool-requesting turn ─────────────────
+    //
+    // `RecordingTurnAgent::turn` captures every `Context` it sees in `seen`, and
+    // the agent copies `Context.params` verbatim into the `ModelRequest`
+    // (`into_request`). So asserting on a captured context's
+    // `params.structured_tool_calls` proves the configured params reached the
+    // request the model would have seen.
+
+    /// Build a config whose agent is a context-capturing `RecordingTurnAgent`
+    /// returning the given turn script, optionally with non-default model params.
+    fn recording_config(
+        agent: Arc<RecordingTurnAgent>,
+        model_params: ModelParams,
+    ) -> HarnessConfig {
+        let mut cfg = standard_config(make_agent());
+        cfg.agent = agent;
+        cfg.model_params = model_params;
+        cfg
+    }
+
+    // No `.model_params(...)` ⇒ each turn's context carries the default
+    // (structured_tool_calls == false).
+    #[tokio::test]
+    async fn default_model_params_are_default() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(agent.clone(), ModelParams::default());
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(react(5))).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty(), "agent should have seen at least one turn");
+        assert!(!seen[0].params.structured_tool_calls);
+    }
+
+    // `.model_params(structured_tool_calls = true)` ⇒ the ReAct turn context
+    // carries it.
+    #[tokio::test]
+    async fn model_params_reach_react_turn() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(react(5))).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
+    // The PlanExecute plan phase (`run_plan_phase`) replaces params on its own
+    // seam — the plan-turn context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_plan_phase() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![RecordingTurnAgent::final_resp(
+                r#"{"tasks":["one"],"rationale":"r"}"#,
+            )],
+        );
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        let t = plan_task();
+        let mut state = SessionState::default();
+        h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("plan phase succeeds");
+        let seen = agent.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one plan turn");
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
+    // A full PlanExecute run threads params through the shared react seam used by
+    // the execute sub-loop — every execute-step context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_execute_subloop() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                RecordingTurnAgent::final_resp(r#"{"tasks":["one","two"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("did one"),
+                RecordingTurnAgent::final_resp("did two"),
+            ],
+        );
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        h.run(HarnessRunOptions::new(plan_task())).await;
+        let seen = agent.seen.lock().unwrap();
+        // 1 plan turn + 2 execute turns; every captured context carries it.
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|c| c.params.structured_tool_calls),
+            "plan + execute-step contexts all carry the flag"
+        );
+    }
+
+    // The streaming path flows through `run_react_inner`'s same seam — the
+    // streamed turn's captured context carries the flag.
+    #[tokio::test]
+    async fn model_params_reach_streaming_turn() {
+        let agent = RecordingTurnAgent::new("rec", vec![RecordingTurnAgent::final_resp("done")]);
+        let cfg = recording_config(
+            agent.clone(),
+            ModelParams {
+                structured_tool_calls: true,
+                ..Default::default()
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(|_ev: StreamEvent| {}));
+        h.run(opts).await;
+        let seen = agent.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen[0].params.structured_tool_calls);
+    }
+
     // R5: when planner_agent is set, the PLANNER runs the plan turn and the
     // default agent does not.
     #[tokio::test]
@@ -9374,6 +9551,7 @@ mod tests {
                 metric_evaluator: None,
                 catalogue_registry: None,
                 system_prompt: None,
+                model_params: ModelParams::default(),
                 auto_persist_sessions: false,
             })
         }

@@ -80,6 +80,7 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
         metric_evaluator: None,
         catalogue_registry: None,
         system_prompt: None,
+        model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
     }
 }

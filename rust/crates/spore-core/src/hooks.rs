@@ -1757,6 +1757,7 @@ mod tests {
             metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
+            model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,
         }
     }
