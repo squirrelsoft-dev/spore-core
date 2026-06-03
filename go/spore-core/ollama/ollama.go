@@ -837,7 +837,21 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 					if tc == nil {
 						continue
 					}
-					eventIndex := uint32(i) + 1
+					// Ollama identifies a distinct tool call by `function.index`,
+					// which is stable across chunks. A response with multiple
+					// calls streams them in SEPARATE chunks, each a one-element
+					// `tool_calls` array — so the array position `i` is 0 for
+					// every call and must NOT be used as the index, or every call
+					// collapses onto the same block and their argument JSON
+					// fragments concatenate into garbage. Fall back to `i` only
+					// when `function.index` is absent.
+					modelIndex := uint32(i)
+					if fn, ok := tc["function"].(map[string]any); ok {
+						if idx, ok := fn["index"].(float64); ok {
+							modelIndex = uint32(idx)
+						}
+					}
+					eventIndex := modelIndex + 1
 					if !toolIndicesSeen[eventIndex] {
 						toolIndicesSeen[eventIndex] = true
 						if contentIndexActive {

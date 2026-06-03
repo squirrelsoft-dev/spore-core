@@ -793,7 +793,21 @@ fn ndjson_to_events(
                     .and_then(|v| v.as_array())
                 {
                     for (i, tc) in tcs.iter().enumerate() {
-                        let event_index = (i as u32) + 1;
+                        // Ollama identifies a distinct tool call by `function.index`,
+                        // which is stable across chunks. A single response with
+                        // multiple calls streams them in SEPARATE chunks, each a
+                        // one-element `tool_calls` array — so the array position `i`
+                        // is 0 for every call and must NOT be used as the index, or
+                        // every call collapses onto the same block and their argument
+                        // JSON fragments concatenate into garbage. Fall back to `i`
+                        // only when `function.index` is absent.
+                        let model_index = tc
+                            .get("function")
+                            .and_then(|f| f.get("index"))
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32)
+                            .unwrap_or(i as u32);
+                        let event_index = model_index + 1;
                         let first_seen = !tool_indices_seen.contains(&event_index);
                         if first_seen {
                             tool_indices_seen.insert(event_index);
@@ -1397,6 +1411,59 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&tool_jsons[0]).unwrap();
         assert_eq!(parsed, serde_json::json!({"url": "x"}));
         assert_eq!(final_stop, StopReason::ToolUse);
+    }
+
+    #[tokio::test]
+    async fn streaming_keeps_multiple_tool_calls_distinct() {
+        // A single response with three tool calls streams them in SEPARATE
+        // chunks, each a one-element `tool_calls` array distinguished only by
+        // `function.index`. Each call must land on its own stream index so its
+        // argument JSON stays well-formed — keying off the array position would
+        // collapse all three onto index 1 and concatenate their args into
+        // invalid JSON (regression: example 03 saw `calculator(null)`).
+        let ndjson = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_a\",\"function\":{\"index\":0,\"name\":\"calculator\",\"arguments\":{\"a\":\"144\",\"b\":\"12\",\"op\":\"/\"}}}]},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_b\",\"function\":{\"index\":1,\"name\":\"get_current_time\",\"arguments\":{}}}]},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"call_c\",\"function\":{\"index\":2,\"name\":\"reverse_string\",\"arguments\":{\"text\":\"harness\"}}}]},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"tool_calls\",\"prompt_eval_count\":1,\"eval_count\":1}\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(ndjson))
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let mut stream = client.call_streaming(req(vec![user("hi")])).await.unwrap();
+        // Collect (index -> name) from starts and concatenated json per index.
+        let mut names: std::collections::BTreeMap<u32, String> = Default::default();
+        let mut jsons: std::collections::BTreeMap<u32, String> = Default::default();
+        while let Some(ev) = stream.next().await {
+            match ev.unwrap() {
+                StreamEvent::ToolUseStart { index, name, .. } => {
+                    names.insert(index, name);
+                }
+                StreamEvent::ToolUseDelta {
+                    index,
+                    partial_json,
+                } => jsons.entry(index).or_default().push_str(&partial_json),
+                _ => {}
+            }
+        }
+        // Three distinct calls, each with a start frame and valid argument JSON.
+        assert_eq!(names.len(), 3);
+        assert_eq!(jsons.len(), 3);
+        for (idx, json) in &jsons {
+            let parsed: serde_json::Value = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("index {idx} json {json:?} did not parse: {e}"));
+            assert!(parsed.is_object(), "index {idx} args not an object: {parsed}");
+        }
+        let collected: Vec<&str> = names.values().map(String::as_str).collect();
+        assert_eq!(
+            collected,
+            vec!["calculator", "get_current_time", "reverse_string"]
+        );
     }
 
     // ── count_tokens ───────────────────────────────────────────────────────

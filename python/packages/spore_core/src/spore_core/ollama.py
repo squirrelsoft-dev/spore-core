@@ -372,8 +372,23 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
                         for i, tc in enumerate(tcs):
                             if not isinstance(tc, dict):
                                 continue
-                            event_index = i + 1
                             func = tc.get("function")
+                            # Ollama identifies a distinct tool call by
+                            # ``function.index``, stable across chunks. A
+                            # response with multiple calls streams them in
+                            # SEPARATE chunks, each a one-element ``tool_calls``
+                            # array — so the array position ``i`` is 0 for every
+                            # call and must NOT be used as the index, or every
+                            # call collapses onto the same block and their
+                            # argument JSON fragments concatenate into garbage.
+                            # Fall back to ``i`` only when ``function.index`` is
+                            # absent.
+                            model_index = i
+                            if isinstance(func, dict) and isinstance(
+                                func.get("index"), int
+                            ):
+                                model_index = func["index"]
+                            event_index = model_index + 1
                             if event_index not in tool_indices_seen:
                                 tool_indices_seen.add(event_index)
                                 if content_open:

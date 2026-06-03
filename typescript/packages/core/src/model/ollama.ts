@@ -758,8 +758,17 @@ export async function* ndjsonToEvents(
             for (let i = 0; i < tcs.length; i += 1) {
               const tc = jsonValue(tcs[i]);
               if (tc == null) continue;
-              const eventIndex = i + 1;
               const fn = jsonValue(tc.function);
+              // Ollama identifies a distinct tool call by `function.index`,
+              // which is stable across chunks. A response with multiple calls
+              // streams them in SEPARATE chunks, each a one-element
+              // `tool_calls` array — so the array position `i` is 0 for every
+              // call and must NOT be used as the index, or every call collapses
+              // onto the same block and their argument JSON fragments
+              // concatenate into garbage. Fall back to `i` only when
+              // `function.index` is absent.
+              const modelIndex = typeof fn?.index === "number" ? fn.index : i;
+              const eventIndex = modelIndex + 1;
               if (!toolIndicesSeen.has(eventIndex)) {
                 toolIndicesSeen.add(eventIndex);
                 if (contentOpen) {

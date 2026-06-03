@@ -630,6 +630,51 @@ func TestStreamingAccumulatesToolCalls(t *testing.T) {
 	}
 }
 
+// A response with three tool calls streams them in SEPARATE chunks, each a
+// one-element tool_calls array distinguished only by function.index. Each call
+// must land on its own stream index so its argument JSON stays well-formed —
+// keying off the array position would collapse all three onto index 1 and
+// concatenate their args into invalid JSON.
+func TestStreamingKeepsMultipleToolCallsDistinct(t *testing.T) {
+	ndjson := strings.Join([]string{
+		`{"message":{"role":"assistant","tool_calls":[{"id":"call_a","function":{"index":0,"name":"calculator","arguments":{"a":"144","b":"12","op":"/"}}}]},"done":false}`,
+		`{"message":{"role":"assistant","tool_calls":[{"id":"call_b","function":{"index":1,"name":"get_current_time","arguments":{}}}]},"done":false}`,
+		`{"message":{"role":"assistant","tool_calls":[{"id":"call_c","function":{"index":2,"name":"reverse_string","arguments":{"text":"harness"}}}]},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"tool_calls","prompt_eval_count":1,"eval_count":1}`,
+		``,
+	}, "\n")
+	srv, _ := newSplitServer(t, "llama3.2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, ndjson)
+	})
+	c := WithBaseURL("llama3.2", srv.URL)
+	ch, err := c.CallStreaming(context.Background(), req(userMsg("hi")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[uint32]string{}
+	jsons := map[uint32]string{}
+	for ev := range ch {
+		switch ev.Event.Type {
+		case sporecore.StreamToolUseStart:
+			names[ev.Event.Index] = ev.Event.Name
+		case sporecore.StreamToolUseDelta:
+			jsons[ev.Event.Index] += ev.Event.PartialJSON
+		}
+	}
+	if len(names) != 3 || len(jsons) != 3 {
+		t.Fatalf("names=%v jsons=%v, want 3 distinct each", names, jsons)
+	}
+	for idx, blob := range jsons {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(blob), &parsed); err != nil {
+			t.Fatalf("index %d args not valid JSON object: %q", idx, blob)
+		}
+	}
+	if names[1] != "calculator" || names[2] != "get_current_time" || names[3] != "reverse_string" {
+		t.Fatalf("names by index: %v", names)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // count_tokens
 // ---------------------------------------------------------------------------

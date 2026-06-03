@@ -414,6 +414,36 @@ describe("ndjsonToEvents", () => {
     expect(JSON.parse(toolJsons[0]!)).toEqual({ url: "x" });
     expect(finalStop).toBe("tool_use");
   });
+
+  it("keeps multiple tool calls distinct (function.index across chunks)", async () => {
+    // A response with three tool calls streams them in SEPARATE chunks, each a
+    // one-element tool_calls array distinguished only by function.index. Each
+    // call must land on its own stream index so its argument JSON stays
+    // well-formed — keying off the array position would collapse all three onto
+    // index 1 and concatenate their args into invalid JSON.
+    const ndjson =
+      '{"message":{"role":"assistant","tool_calls":[{"id":"call_a","function":{"index":0,"name":"calculator","arguments":{"a":"144","b":"12","op":"/"}}}]},"done":false}\n' +
+      '{"message":{"role":"assistant","tool_calls":[{"id":"call_b","function":{"index":1,"name":"get_current_time","arguments":{}}}]},"done":false}\n' +
+      '{"message":{"role":"assistant","tool_calls":[{"id":"call_c","function":{"index":2,"name":"reverse_string","arguments":{"text":"harness"}}}]},"done":false}\n' +
+      '{"message":{"role":"assistant","content":""},"done":true,"done_reason":"tool_calls","prompt_eval_count":1,"eval_count":1}\n';
+    const names = new Map<number, string>();
+    const jsons = new Map<number, string>();
+    for await (const ev of ollamaNdjsonToEvents(streamFromString(ndjson))) {
+      if (ev.type === "tool_use_start") names.set(ev.index, ev.name);
+      if (ev.type === "tool_use_delta")
+        jsons.set(ev.index, (jsons.get(ev.index) ?? "") + ev.partial_json);
+    }
+    expect(names.size).toBe(3);
+    expect(jsons.size).toBe(3);
+    for (const json of jsons.values()) {
+      expect(typeof JSON.parse(json)).toBe("object");
+    }
+    expect([...names.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1])).toEqual([
+      "calculator",
+      "get_current_time",
+      "reverse_string",
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

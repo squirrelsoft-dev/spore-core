@@ -540,6 +540,52 @@ async def test_streaming_accumulates_tool_calls() -> None:
     assert final_stop is StopReason.TOOL_USE
 
 
+async def test_streaming_keeps_multiple_tool_calls_distinct() -> None:
+    """A response with three tool calls streams them in SEPARATE chunks, each a
+    one-element tool_calls array distinguished only by ``function.index``. Each
+    call must land on its own stream index so its argument JSON stays
+    well-formed — keying off the array position would collapse all three onto
+    index 1 and concatenate their args into invalid JSON."""
+
+    ndjson = (
+        '{"message":{"role":"assistant","tool_calls":[{"id":"call_a",'
+        '"function":{"index":0,"name":"calculator",'
+        '"arguments":{"a":"144","b":"12","op":"/"}}}]},"done":false}\n'
+        '{"message":{"role":"assistant","tool_calls":[{"id":"call_b",'
+        '"function":{"index":1,"name":"get_current_time","arguments":{}}}]},'
+        '"done":false}\n'
+        '{"message":{"role":"assistant","tool_calls":[{"id":"call_c",'
+        '"function":{"index":2,"name":"reverse_string",'
+        '"arguments":{"text":"harness"}}}]},"done":false}\n'
+        '{"message":{"role":"assistant","content":""},"done":true,'
+        '"done_reason":"tool_calls","prompt_eval_count":1,"eval_count":1}\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        return httpx.Response(200, content=ndjson.encode("utf-8"))
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    names: dict[int, str] = {}
+    jsons: dict[int, str] = {}
+    async for ev in iface.call_streaming(_req([_user("hi")])):
+        if isinstance(ev, ToolUseStart):
+            names[ev.index] = ev.name
+        elif isinstance(ev, ToolUseDelta):
+            jsons[ev.index] = jsons.get(ev.index, "") + ev.partial_json
+    assert len(names) == 3
+    assert len(jsons) == 3
+    for blob in jsons.values():
+        assert isinstance(json.loads(blob), dict)
+    assert [names[i] for i in sorted(names)] == [
+        "calculator",
+        "get_current_time",
+        "reverse_string",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # count_tokens
 # ---------------------------------------------------------------------------
