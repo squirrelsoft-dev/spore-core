@@ -45,6 +45,7 @@ from spore_core.ollama import (
     context_window,
     parse_response_body,
     parse_stop_reason,
+    parse_structured_content,
 )
 
 
@@ -883,3 +884,208 @@ async def test_ollama_live_tool_call() -> None:
         assert r.stop_reason in (StopReason.TOOL_USE, StopReason.END_TURN)
     finally:
         await iface.aclose()
+
+
+# ---------------------------------------------------------------------------
+# structured tool calls (opt-in constrained decoding) — mirrors Rust
+# ---------------------------------------------------------------------------
+
+
+def _structured_tool_req() -> ModelRequest:
+    return ModelRequest(
+        messages=[_user("write a summary file")],
+        params=ModelParams(structured_tool_calls=True),
+        tools=[
+            ToolSchema(
+                name="write_file",
+                description="write a file",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            ),
+            ToolSchema(
+                name="read_file",
+                description="read a file",
+                input_schema={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            ),
+        ],
+    )
+
+
+def test_build_request_structured_sets_format_drops_tools_adds_system() -> None:
+    body = build_request_body("llama3.2", None, _structured_tool_req(), stream=False)
+    # Native tools dropped in structured mode.
+    assert "tools" not in body
+    # format schema present with tool enum = tool names + "final".
+    fmt = body["format"]
+    enum_vals = fmt["properties"]["tool"]["enum"]
+    assert "write_file" in enum_vals
+    assert "read_file" in enum_vals
+    assert "final" in enum_vals
+    assert fmt["required"] == ["tool"]
+    # A system message describing the tools is prepended.
+    assert body["messages"][0]["role"] == "system"
+    assert "write_file" in body["messages"][0]["content"]
+    assert "read_file" in body["messages"][0]["content"]
+    assert "SINGLE JSON object" in body["messages"][0]["content"]
+
+
+def test_build_request_structured_merges_into_existing_system_message() -> None:
+    req = _structured_tool_req()
+    req.messages.insert(0, Message(role=Role.SYSTEM, content=TextContent(text="You are terse.")))
+    body = build_request_body("llama3.2", None, req, stream=False)
+    system_count = sum(1 for m in body["messages"] if m["role"] == "system")
+    assert system_count == 1
+    assert "You are terse." in body["messages"][0]["content"]
+    assert "write_file" in body["messages"][0]["content"]
+
+
+def test_build_request_structured_off_when_no_tools() -> None:
+    # Flag on but no tools → unchanged behavior, no format.
+    req = ModelRequest(
+        messages=[_user("hi")],
+        params=ModelParams(structured_tool_calls=True),
+    )
+    body = build_request_body("llama3.2", None, req, stream=False)
+    assert "format" not in body
+
+
+def test_build_request_structured_off_by_default() -> None:
+    # Flag default off with tools present → native tools, no format.
+    req = ModelRequest(
+        messages=[_user("hi")],
+        tools=[ToolSchema(name="search", description="search the web", input_schema={})],
+    )
+    body = build_request_body("llama3.2", None, req, stream=False)
+    assert "format" not in body
+    assert len(body["tools"]) == 1
+
+
+def test_structured_flag_omitted_from_serialization_when_false() -> None:
+    # Hash parity: a False flag must NOT appear in the serialized request.
+    off = ModelParams()
+    assert "structured_tool_calls" not in off.model_dump(mode="json")
+    assert "structured_tool_calls" not in json.loads(off.model_dump_json())
+    on = ModelParams(structured_tool_calls=True)
+    assert on.model_dump(mode="json")["structured_tool_calls"] is True
+
+
+def test_parse_response_structured_tool_call() -> None:
+    r = parse_response_body(
+        {
+            "message": {
+                "role": "assistant",
+                "content": (
+                    '{"tool":"write_file","arguments":{"path":"SUMMARY.md","content":"hi"}}'
+                ),
+            },
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+        },
+        structured=True,
+    )
+    assert r.stop_reason is StopReason.TOOL_USE
+    assert len(r.content) == 1
+    block = r.content[0]
+    assert isinstance(block, ToolUseBlock)
+    assert block.name == "write_file"
+    assert block.input == {"path": "SUMMARY.md", "content": "hi"}
+
+
+def test_parse_response_structured_final() -> None:
+    r = parse_response_body(
+        {
+            "message": {"role": "assistant", "content": '{"tool":"final","content":"all done"}'},
+            "done": True,
+            "done_reason": "stop",
+        },
+        structured=True,
+    )
+    assert r.stop_reason is StopReason.END_TURN
+    assert len(r.content) == 1
+    block = r.content[0]
+    assert isinstance(block, TextBlock)
+    assert block.text == "all done"
+
+
+def test_parse_response_structured_malformed_falls_back_to_text() -> None:
+    # Weak model violates constrained decoding: not valid JSON. We must not
+    # raise — fall back to a Text block with the raw content and END_TURN.
+    r = parse_response_body(
+        {
+            "message": {"role": "assistant", "content": "oops not json"},
+            "done": True,
+            "done_reason": "stop",
+        },
+        structured=True,
+    )
+    assert r.stop_reason is StopReason.END_TURN
+    assert len(r.content) == 1
+    block = r.content[0]
+    assert isinstance(block, TextBlock)
+    assert block.text == "oops not json"
+
+
+def test_parse_structured_content_missing_tool_falls_back() -> None:
+    blocks, stop = parse_structured_content('{"arguments":{}}', 0)
+    assert stop is StopReason.END_TURN
+    assert isinstance(blocks[0], TextBlock)
+
+
+async def test_streaming_structured_buffers_json_then_reconstructs_tool_call() -> None:
+    """In structured mode the constrained JSON object arrives as content
+    deltas spread across chunks. We buffer it (never surfacing raw JSON as
+    answer text) and at ``done`` reconstruct a write_file tool call with
+    valid argument JSON."""
+
+    ndjson = (
+        '{"message":{"role":"assistant","content":"{\\"tool\\":\\"write"},"done":false}\n'
+        '{"message":{"role":"assistant","content":"_file\\",\\"arguments\\":{\\"path\\""},'
+        '"done":false}\n'
+        '{"message":{"role":"assistant","content":":\\"a.txt\\",\\"content\\":\\"hi\\"}}"},'
+        '"done":false}\n'
+        '{"message":{"role":"assistant","content":""},"done":true,'
+        '"done_reason":"stop","prompt_eval_count":2,"eval_count":3}\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"capabilities": ["tools"]})
+        return httpx.Response(200, content=ndjson.encode("utf-8"))
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    starts: list[ToolUseStart] = []
+    tool_jsons: list[str] = []
+    raw_deltas: list[str] = []
+    final_stop = StopReason.END_TURN
+    try:
+        async for ev in iface.call_streaming(_structured_tool_req()):
+            if isinstance(ev, ToolUseStart):
+                starts.append(ev)
+            elif isinstance(ev, ToolUseDelta):
+                tool_jsons.append(ev.partial_json)
+            elif hasattr(ev, "delta") and isinstance(ev.delta, str):
+                raw_deltas.append(ev.delta)
+            elif isinstance(ev, MessageStop):
+                final_stop = ev.stop_reason
+    finally:
+        await iface.aclose()
+    # Raw JSON fragments must NOT be surfaced as content deltas.
+    assert raw_deltas == []
+    assert len(starts) == 1
+    assert starts[0].name == "write_file"
+    assert len(tool_jsons) == 1
+    assert json.loads(tool_jsons[0]) == {"path": "a.txt", "content": "hi"}
+    assert final_stop is StopReason.TOOL_USE

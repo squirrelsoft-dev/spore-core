@@ -30,7 +30,14 @@ from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import anyio
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    model_serializer,
+)
 
 from .errors import AlwaysHaltError, SporeError
 
@@ -125,6 +132,28 @@ class ModelParams(_Model):
     reasoning_budget: int | None = None
     top_p: float | None = None
     stop_sequences: list[str] = Field(default_factory=list)
+    #: Opt-in hint for providers that support constrained decoding (Ollama via
+    #: the ``format`` JSON-schema parameter). When ``True`` AND the request has
+    #: tools, the provider forces tool calls to be emitted as schema-constrained
+    #: JSON, parsed back into tool-use blocks. Providers without
+    #: constrained-decoding support (e.g. Anthropic) ignore it. Helps small
+    #: local models (llama3.2) that otherwise leak ``<|python_tag|>`` tool calls
+    #: into content. Tradeoff: one tool call per turn, no interleaved reasoning
+    #: text. Default ``False``.
+    #:
+    #: Mirrors Rust's ``#[serde(skip_serializing_if = "Not::not")]``: a ``False``
+    #: value is OMITTED from the serialized form (see :meth:`_serialize`) so the
+    #: cross-language ``request_hash`` stays byte-identical when the flag is off.
+    structured_tool_calls: bool = False
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        # Omit when False to preserve cross-language request-hash parity
+        # (Rust drops the field via ``skip_serializing_if``).
+        if not self.structured_tool_calls:
+            data.pop("structured_tool_calls", None)
+        return data
 
 
 class ModelRequest(_Model):

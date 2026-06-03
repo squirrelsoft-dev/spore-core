@@ -151,6 +151,40 @@ def _role_to_ollama(role: Role) -> str:
     raise ValueError(f"unexpected role: {role}")
 
 
+def _structured_tools_preamble(tools: list[Any]) -> str:
+    """Build the system-message preamble for structured-tool-calls mode.
+
+    Describes each tool's name, description, and parameter property
+    names/types (read from ``t.input_schema``), then gives the model
+    explicit single-JSON-object output instructions. This — together with
+    the ``format`` schema's ``tool`` enum — keeps tool calls on the
+    constrained-JSON channel and away from ``<|python_tag|>``. Mirrors the
+    Rust ``structured_tools_preamble``.
+    """
+
+    out = ["You have access to the following tools:\n"]
+    for t in tools:
+        out.append(f"\n- {t.name}: {t.description}")
+        schema = t.input_schema if isinstance(t.input_schema, dict) else {}
+        props = schema.get("properties")
+        if isinstance(props, dict) and props:
+            params = []
+            for name, prop in props.items():
+                ty = "any"
+                if isinstance(prop, dict):
+                    raw_ty = prop.get("type")
+                    if isinstance(raw_ty, str):
+                        ty = raw_ty
+                params.append(f"{name} ({ty})")
+            out.append(f"\n  parameters: {', '.join(params)}")
+    out.append(
+        "\n\nRespond with a SINGLE JSON object and nothing else. To call a tool, "
+        'set "tool" to the tool name and "arguments" to its inputs. When the task '
+        'is fully done, set "tool" to "final" and put your reply in "content".'
+    )
+    return "".join(out)
+
+
 def _message_to_ollama(m: Message) -> dict[str, Any]:
     role = _role_to_ollama(m.role)
     c = m.content
@@ -191,9 +225,28 @@ def build_request_body(
     """Translate a Spore :class:`ModelRequest` to the Ollama Chat API
     request body."""
 
+    # Structured-tool-calls mode (opt-in): constrained decoding via ``format``.
+    # We send NO native tools — describing them in a system message instead —
+    # and force the model to emit a single schema-constrained JSON object. The
+    # ``tool`` enum is the critical constraint: it eliminates the
+    # ``<|python_tag|>`` leak that small local models (llama3.2) otherwise
+    # produce. Mirrors the Rust ``build_request``.
+    structured = bool(request.params.structured_tool_calls and request.tools)
+
+    messages = [_message_to_ollama(m) for m in request.messages]
+
+    if structured:
+        # Inject a system message describing the tools. Merge into an existing
+        # leading system message when present; otherwise prepend a new one.
+        preamble = _structured_tools_preamble(list(request.tools))
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = f"{messages[0].get('content', '')}\n\n{preamble}"
+        else:
+            messages.insert(0, {"role": "system", "content": preamble})
+
     body: dict[str, Any] = {
         "model": model_id,
-        "messages": [_message_to_ollama(m) for m in request.messages],
+        "messages": messages,
         "stream": stream,
     }
     if keep_alive is not None:
@@ -211,7 +264,21 @@ def build_request_body(
     if options:
         body["options"] = options
 
-    if request.tools:
+    if structured:
+        # Constrained-decoding JSON schema (Ollama's ``format`` parameter). Set
+        # only in structured mode; native ``tools`` are dropped.
+        tool_names = [t.name for t in request.tools]
+        tool_names.append("final")
+        body["format"] = {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": tool_names},
+                "arguments": {"type": "object"},
+                "content": {"type": "string"},
+            },
+            "required": ["tool"],
+        }
+    elif request.tools:
         body["tools"] = [
             {
                 "type": "function",
@@ -236,11 +303,68 @@ def parse_stop_reason(raw: str | None) -> StopReason:
     return StopReason.END_TURN
 
 
-def parse_response_body(body: dict[str, Any]) -> ModelResponse:
+def parse_structured_content(raw: str, index: int) -> tuple[list[ContentBlock], StopReason]:
+    """Parse the constrained-decoding JSON object produced in
+    structured-tool-calls mode into ``(content blocks, stop reason)``.
+
+    ``index`` synthesizes the tool-call id, reusing this file's ``call-{i}``
+    convention. Defensive: if ``raw`` is missing/empty/not valid JSON/lacks
+    a ``tool`` field, fall back to a single :class:`TextBlock` with the raw
+    content and ``END_TURN`` — weak models occasionally violate even
+    constrained decoding, and we never raise on their output. Mirrors the
+    Rust ``parse_structured_content``.
+    """
+
+    fallback: tuple[list[ContentBlock], StopReason] = (
+        [TextBlock(text=raw)],
+        StopReason.END_TURN,
+    )
+    try:
+        value: Any = json.loads(raw.strip())
+    except ValueError:
+        return fallback
+    if not isinstance(value, dict):
+        return fallback
+    tool = value.get("tool")
+    if not isinstance(tool, str):
+        return fallback
+    if tool == "final":
+        text = value.get("content")
+        return ([TextBlock(text=text if isinstance(text, str) else "")], StopReason.END_TURN)
+    args = value.get("arguments")
+    if not isinstance(args, dict):
+        args = {}
+    return (
+        [ToolUseBlock(id=f"call-{index}", name=tool, input=args)],
+        StopReason.TOOL_USE,
+    )
+
+
+def parse_response_body(body: dict[str, Any], structured: bool = False) -> ModelResponse:
     """Translate an Ollama Chat API response body into a Spore
-    :class:`ModelResponse`."""
+    :class:`ModelResponse`.
+
+    When ``structured`` is true (structured-tool-calls mode), the assistant
+    content is a single constrained JSON object — never a native
+    ``tool_calls`` array — so it is parsed back into a tool-use / text block
+    via :func:`parse_structured_content`. This is precisely what avoids the
+    ``<|python_tag|>`` leak: the tool call never touches the native channel.
+    """
 
     message = body.get("message") or {}
+    usage = TokenUsage(
+        input_tokens=int(body.get("prompt_eval_count") or 0),
+        output_tokens=int(body.get("eval_count") or 0),
+        # Ollama has no prefix-cache concept; cache fields always None.
+        cache_read_tokens=None,
+        cache_write_tokens=None,
+    )
+
+    if structured:
+        raw = message.get("content")
+        content, stop_reason = parse_structured_content(raw if isinstance(raw, str) else "", 0)
+        return ModelResponse(content=content, usage=usage, stop_reason=stop_reason)
+
     content: list[ContentBlock] = []
     text = message.get("content")
     if isinstance(text, str) and text:
@@ -263,13 +387,6 @@ def parse_response_body(body: dict[str, Any]) -> ModelResponse:
             )
         )
 
-    usage = TokenUsage(
-        input_tokens=int(body.get("prompt_eval_count") or 0),
-        output_tokens=int(body.get("eval_count") or 0),
-        # Ollama has no prefix-cache concept; cache fields always None.
-        cache_read_tokens=None,
-        cache_write_tokens=None,
-    )
     return ModelResponse(
         content=content,
         usage=usage,
@@ -325,7 +442,9 @@ def _concat_request_text(request: ModelRequest) -> str:
 # ============================================================================
 
 
-async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEvent]:
+async def _ndjson_to_events(
+    response: httpx.Response, structured: bool = False
+) -> AsyncIterator[StreamEvent]:
     """Convert an Ollama NDJSON stream into a stream of :class:`StreamEvent`.
 
     Ollama streams chat results as newline-delimited JSON (one full JSON
@@ -333,6 +452,15 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
     ``message.content`` delta; ``tool_calls`` arrive as full argument
     objects per chunk (not partial-fragment strings); the terminator line
     carries ``done: true`` plus ``prompt_eval_count`` and ``eval_count``.
+
+    In ``structured`` mode (structured-tool-calls), the constrained JSON
+    object arrives as ``message.content`` text deltas spread across chunks.
+    We must NOT surface that raw JSON to the user — instead we buffer it for
+    the whole response and parse it at the ``done`` chunk exactly like
+    :func:`parse_response_body`, emitting reconstructable tool / text events.
+    This keeps the tool call off the native channel and prevents the
+    ``<|python_tag|>`` leak in streaming mode too. Mirrors the Rust
+    structured branch in ``ndjson_to_events``.
     """
 
     buf = ""
@@ -340,6 +468,8 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
     tool_indices_seen: set[int] = set()
     content_index = 0
     content_open = False
+    # Structured mode buffers content deltas; emission is deferred to ``done``.
+    structured_content = ""
     try:
         async for chunk in response.aiter_text():
             buf += chunk
@@ -361,6 +491,32 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
                 if not started:
                     started = True
                     yield _MessageStart()
+                if structured:
+                    msg = value.get("message")
+                    if isinstance(msg, dict):
+                        text = msg.get("content")
+                        if isinstance(text, str):
+                            structured_content += text
+                    if value.get("done") is True:
+                        blocks, stop_reason = parse_structured_content(structured_content, 0)
+                        for block in blocks:
+                            if isinstance(block, ToolUseBlock):
+                                partial = json.dumps(block.input, separators=(",", ":"))
+                                yield _ToolUseStart(index=1, id=block.id, name=block.name)
+                                yield _ToolUseDelta(index=1, partial_json=partial)
+                            elif isinstance(block, TextBlock):
+                                yield _ContentBlockDelta(index=0, delta=block.text)
+                        yield _MessageStop(
+                            usage=TokenUsage(
+                                input_tokens=int(value.get("prompt_eval_count") or 0),
+                                output_tokens=int(value.get("eval_count") or 0),
+                                cache_read_tokens=None,
+                                cache_write_tokens=None,
+                            ),
+                            stop_reason=stop_reason,
+                        )
+                        return
+                    continue
                 message = value.get("message") or {}
                 if isinstance(message, dict):
                     text = message.get("content")
@@ -384,9 +540,7 @@ async def _ndjson_to_events(response: httpx.Response) -> AsyncIterator[StreamEve
                             # Fall back to ``i`` only when ``function.index`` is
                             # absent.
                             model_index = i
-                            if isinstance(func, dict) and isinstance(
-                                func.get("index"), int
-                            ):
+                            if isinstance(func, dict) and isinstance(func.get("index"), int):
                                 model_index = func["index"]
                             event_index = model_index + 1
                             if event_index not in tool_indices_seen:
@@ -679,7 +833,8 @@ class OllamaModelInterface:
                 raise ProviderError(code=0, message=f"response decode failed: {e}") from e
         finally:
             await resp.aclose()
-        return parse_response_body(data)
+        structured = bool(request.params.structured_tool_calls and request.tools)
+        return parse_response_body(data, structured)
 
     async def call_streaming(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
         await self._ensure_model_available()
@@ -707,7 +862,8 @@ class OllamaModelInterface:
                 body_text.decode("utf-8", "replace"),
                 self._model_id,
             )
-        async for event in _ndjson_to_events(resp):
+        structured = bool(request.params.structured_tool_calls and request.tools)
+        async for event in _ndjson_to_events(resp, structured):
             yield event
 
     async def count_tokens(self, request: ModelRequest) -> int:
@@ -778,4 +934,5 @@ __all__ = [
     "context_window",
     "parse_response_body",
     "parse_stop_reason",
+    "parse_structured_content",
 ]
