@@ -1,0 +1,29 @@
+{
+  "name": "spore-example-08-plan-execute",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 08: swap the loop strategy from ReAct to PlanExecute — a one-line change on the Task. The agent decomposes a multi-step goal into a plan first (surfaced via lifecycle hooks), then executes each subtask. Same conversational harness, sandbox, and tools as 06; only the strategy changes.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "lint": "eslint src",
+    "format": "prettier src --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}
