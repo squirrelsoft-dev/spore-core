@@ -69,6 +69,10 @@ pub mod __support {
 ///   returning a [`ToolOutput`](crate::harness::ToolOutput). `input` is the
 ///   deserialized `input` type; `sandbox` is `&dyn SandboxProvider`; `ctx` is
 ///   `&ToolContext`.
+/// - `annotations` *(optional)* — a
+///   [`ToolAnnotations`](crate::tool_registry::ToolAnnotations) value (e.g.
+///   `ToolAnnotations { read_only: true, idempotent: true, ..Default::default() }`).
+///   Defaults to [`ToolAnnotations::default`] (all `false`) when omitted.
 ///
 /// If the model's arguments fail to deserialize into `input`, the generated
 /// tool returns a **recoverable** [`ToolOutput::error`](crate::harness::ToolOutput::error)
@@ -78,11 +82,20 @@ pub mod __support {
 /// See the [module docs](crate::macros) for a full example.
 #[macro_export]
 macro_rules! tool {
+    // Internal: resolve the optional `annotations` field to a value.
+    (@annotations) => {
+        ::core::default::Default::default()
+    };
+    (@annotations $annotations:expr) => {
+        $annotations
+    };
     (
         name: $name:expr,
         description: $description:expr,
         input: $input:ty,
-        execute: $execute:expr $(,)?
+        execute: $execute:expr
+        $(, annotations: $annotations:expr)?
+        $(,)?
     ) => {{
         // Anonymous, zero-sized tool implementation. Scoped to this block, so
         // multiple `tool!` invocations never collide on the type name.
@@ -142,7 +155,7 @@ macro_rules! tool {
             name: ::std::string::String::from($name),
             description: ::std::string::String::from($description),
             parameters: $crate::macros::__support::schema_for_input::<$input>(),
-            annotations: ::core::default::Default::default(),
+            annotations: $crate::tool!(@annotations $($annotations)?),
         };
 
         $crate::tools::StandardTool::new(::std::boxed::Box::new(__SporeMacroTool), __spore_schema)
@@ -192,6 +205,8 @@ mod tests {
         // Schema carries the macro metadata and a derived object schema.
         assert_eq!(t.schema.name, "echo");
         assert_eq!(t.schema.description, "Echoes the input message");
+        // Annotations default to all-false when omitted.
+        assert_eq!(t.schema.annotations, Default::default());
         let props = t
             .schema
             .parameters
@@ -214,6 +229,23 @@ mod tests {
             .execute(&call, &sandbox as &dyn SandboxProvider, &ctx())
             .await;
         assert_eq!(out, ToolOutput::success("HI"));
+    }
+
+    #[tokio::test]
+    async fn macro_accepts_optional_annotations() {
+        use crate::tool_registry::ToolAnnotations;
+        let t = tool! {
+            name: "lookup",
+            description: "Reads shared state",
+            input: EchoInput,
+            execute: |input, _sandbox, _ctx| async move {
+                ToolOutput::success(input.message)
+            },
+            annotations: ToolAnnotations { read_only: true, idempotent: true, ..Default::default() },
+        };
+        assert!(t.schema.annotations.read_only);
+        assert!(t.schema.annotations.idempotent);
+        assert!(!t.schema.annotations.destructive);
     }
 
     #[tokio::test]

@@ -1,35 +1,53 @@
-# 05 — Custom sandboxed tool (`impl Tool`)
+# 05 — Custom tool with the `tool!` macro
 
 The first example that ships a tool **you** wrote. Examples 03 and 04 used the
-two built-in tool paths; this one uses spore-core's public extension point — the
-[`Tool`] trait — to add two custom tools, `remember(key, value)` and
-`recall(key)`, and lets an agent research a topic across turns and summarize from
-the facts it recalled.
+two built-in tool paths; this one uses spore-core's ergonomic
+[`tool!`](https://docs.rs/spore-core) macro to add two custom tools,
+`remember(key, value)` and `recall(key)`, and lets an agent research a topic
+across turns and summarize from the facts it recalled.
 
 The thesis is the same as 04, taken one step further: **the harness doesn't
 change — only what you register does.** Same `conversational(model)` builder,
 same `ReAct` loop, same stream-printed `think` / `act` / `obs`. The only new
-thing is the three-step registration pattern below.
+thing is the two-step pattern below.
 
-## The pattern: `impl Tool` → `StandardTool::new` → `.tool()`
+## The pattern: `tool! { .. }` → `.tool()`
 
-### 1. `impl Tool`
+### 1. `tool! { .. }`
 
-A tool is anything that implements [`Tool`]. You only write `name()` and
-`execute()`:
+A `tool!` block defines a tool from four fields — `name`, `description`, a typed
+`input`, and an async `execute` closure — plus an optional `annotations`. It
+expands to a `Tool` impl bundled with its schema into a `StandardTool`:
 
 ```rust
-fn execute<'a>(
-    &'a self,
-    call: &'a ToolCall,
-    _sandbox: &'a (dyn SandboxProvider + 'a),  // the environment seam (unused here)
-    ctx: &'a ToolContext,                       // the storage seam
-) -> BoxFut<'a, ToolOutput> {
-    Box::pin(async move { /* ... */ })
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RememberInput {
+    pub key: String,
+    pub value: String,
+}
+
+pub fn remember_tool() -> StandardTool {
+    tool! {
+        name: "remember",
+        description: "Store a fact under a short key so it can be recalled later.",
+        input: RememberInput,
+        execute: |input, _sandbox, ctx| async move {
+            let store_key = format!("fact:{}", input.key);
+            match ctx.run_store().put(ctx.session_id(), &store_key, json!(input.value)).await {
+                Ok(()) => ToolOutput::success(format!("remembered {}", input.key)),
+                Err(e) => ToolOutput::error(format!("could not persist: {e}")),
+            }
+        },
+    }
 }
 ```
 
-`execute` receives two seams:
+The macro **derives the advertised JSON schema from the `input` type** (via
+`schemars`), so the schema the model sees and the struct the tool deserializes
+can never drift. Bad arguments become a *recoverable* error automatically, so a
+configured `ToolCallRepair` can coerce and retry.
+
+The `execute` closure receives two seams:
 
 - **`sandbox`** — the only path to the environment (filesystem, network). These
   two tools never touch it, so they name it `_sandbox`.
@@ -38,38 +56,31 @@ fn execute<'a>(
   `ctx.run_store().get(…)`. Keys are namespaced under `fact:` so they cannot
   collide with reserved catalogue keys (`todo`, `task`, `memory`).
 
-`remember` mutates shared state, so it is **not** `read_only`. `recall` only
-reads, so it is `read_only` + `idempotent`.
+`remember` mutates shared state, so it omits `annotations` (default: not
+`read_only`). `recall` passes
+`annotations: ToolAnnotations { read_only: true, idempotent: true, .. }` because
+it only reads.
 
 #### Two different "tool" traits — don't confuse them
 
 | Trait                                | Where it lives        | Used by                                  |
 | ------------------------------------ | --------------------- | ---------------------------------------- |
 | harness-loop `ToolRegistry` (03)     | `spore_core` (loop)   | hand-rolled `schemas()` + `dispatch()`   |
-| `Tool` (this example)                | `spore_core`          | one tool, with the sandbox + `ToolContext` seams |
+| `Tool` (this example, via `tool!`)   | `spore_core`          | one tool, with the sandbox + `ToolContext` seams |
 
 03 implemented the slim harness-loop `ToolRegistry` itself and dispatched every
-call by hand. Here you implement the richer per-tool `Tool` trait once per tool
-and let the builder do the dispatch.
+call by hand. Here the `tool!` macro generates the richer per-tool `Tool` impl
+for you and the builder does the dispatch.
 
-### 2. `StandardTool::new(Box::new(tool), schema)`
+### 2. `.tool(...)`
 
-Bundle the implementation with its registry-side schema so the two can never
-drift apart. `tool.name()` MUST equal `schema.name`:
-
-```rust
-StandardTool::new(Box::new(RememberTool::new()), RememberTool::schema())
-```
-
-### 3. `.tool(...)`
-
-Register each bundle on the builder — once per custom tool. The builder wires the
+Register each tool on the builder — once per custom tool. The builder wires the
 sandbox and a per-run `ToolContext` in automatically:
 
 ```rust
 let harness = HarnessBuilder::conversational(model)
-    .tool(StandardTool::new(Box::new(RememberTool::new()), RememberTool::schema()))
-    .tool(StandardTool::new(Box::new(RecallTool::new()),   RecallTool::schema()))
+    .tool(remember_tool())
+    .tool(recall_tool())
     .system_prompt(SYSTEM_PROMPT)
     .build();
 ```
