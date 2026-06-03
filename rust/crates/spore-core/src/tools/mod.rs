@@ -47,7 +47,7 @@ pub use search::{FindFilesTool, GrepFilesTool, GrepTool};
 pub use subagent::{BuildError, ContextSharing, SubagentTool};
 pub use tasklist::TaskListTool;
 pub use todo::{TodoWriteTool, TODO_STORE_KEY};
-pub use web::{WebFetchTool, WebSearchTool};
+pub use web::{SearchMethod, WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool};
 
 /// Threshold (in bytes/chars) above which tool output is routed through
 /// `SandboxProvider::handle_large_output` instead of returned inline.

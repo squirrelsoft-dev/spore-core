@@ -71,14 +71,13 @@ pub use guide_registry::{
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
     CommandOutput, CompleteOnFinalResponse, ContextManager as HarnessContextManager,
-    EmptyToolRegistry, FileRef,
-    GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
-    HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
-    LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox,
-    ObservabilityProvider, Operation, OptimizationDirection, PausedState, ReadOnlySandbox,
-    RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState,
-    StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
-    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    EmptyToolRegistry, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
+    HarnessError, HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse,
+    IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy,
+    NullSandbox, ObservabilityProvider, Operation, OptimizationDirection, PausedState,
+    ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId,
+    SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
+    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{
@@ -151,8 +150,8 @@ pub use tasklist::{
 };
 pub use tools::{
     AbortTool, AskUserQuestionTool, EditFileTool, EnterPlanModeTool, ExitPlanModeTool, GrepTool,
-    SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, TODO_STORE_KEY,
+    SearchMethod, SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool,
+    WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool, TODO_STORE_KEY,
 };
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.
