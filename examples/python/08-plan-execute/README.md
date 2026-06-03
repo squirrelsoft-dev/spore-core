@@ -35,7 +35,7 @@ task = Task.new(
     prompt,
     new_session_id(),
     LoopStrategyPlanExecute(),
-    budget=BudgetLimits(max_turns=24),
+    budget=BudgetLimits(max_turns=64),
 )
 ```
 

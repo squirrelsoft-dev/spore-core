@@ -34,7 +34,7 @@ let task = Task::new(prompt, SessionId::generate(),
 // 08 — decompose the goal first, then execute each subtask:
 let task = Task::new(prompt, SessionId::generate(),
     LoopStrategy::PlanExecute { plan_model: None })
-    .with_budget(BudgetLimits { max_turns: Some(24), ..Default::default() });
+    .with_budget(BudgetLimits { max_turns: Some(64), ..Default::default() });
 ```
 
 With `PlanExecute`, the harness runs one constrained **planner turn** first. The

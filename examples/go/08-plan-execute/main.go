@@ -84,8 +84,8 @@ const systemPrompt = "You are a planning research agent. Decompose the goal into
 
 // planMaxTurns is a generous turn budget. PlanExecute divides the budget across
 // subtasks (per-task cap = remaining_turns / remaining_tasks), so a stingy cap
-// starves later steps.
-const planMaxTurns uint32 = 24
+// starves later steps — e.g. an 8-step plan at 64 turns gives each subtask ~8.
+const planMaxTurns uint32 = 64
 
 // planExecuteReporter is a lifecycle hook that prints the PlanExecute plan and
 // each subtask as it runs.

@@ -34,7 +34,7 @@ task := sporecore.NewTask(prompt, sporecore.NewSessionID(),
 // 08 — decompose the goal first, then execute each subtask:
 task := sporecore.NewTask(prompt, sporecore.NewSessionID(),
     sporecore.LoopStrategy{Kind: sporecore.StrategyPlanExecute}).
-    WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}) // generous: 24
+    WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}) // generous: 64
 ```
 
 With `StrategyPlanExecute`, the harness runs one constrained **planner turn**

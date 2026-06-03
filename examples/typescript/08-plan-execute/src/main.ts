@@ -11,7 +11,7 @@
  * // 06 — react step-by-step:
  * newTask(prompt, SessionId.generate(), { kind: "re_act", max_iterations: 10 });
  * // 08 — decompose the goal first, then execute each subtask:
- * newTask(prompt, SessionId.generate(), { kind: "plan_execute" }, { max_turns: 24 });
+ * newTask(prompt, SessionId.generate(), { kind: "plan_execute" }, { max_turns: 64 });
  * ```
  *
  * With `plan_execute`, the harness runs one constrained planner turn FIRST: the
@@ -193,7 +193,7 @@ async function main(): Promise<void> {
     prompt,
     SessionId.generate(),
     { kind: "plan_execute" },
-    { max_turns: 24 },
+    { max_turns: 64 },
   );
 
   console.log(`model    : ${modelId}`);

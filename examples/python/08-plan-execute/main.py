@@ -205,13 +205,14 @@ async def main() -> int:
     )
 
     # THE ONE-LINE SWAP. 06 used ``LoopStrategyReAct(max_iterations=10)``; here we
-    # decompose first via PlanExecute. The turn budget is divided across subtasks,
-    # so we give it generous headroom.
+    # decompose first via PlanExecute. The turn budget is divided across subtasks
+    # (per-task cap = remaining_turns / remaining_tasks), so we give it generous
+    # headroom — an 8-step plan at 64 turns gives each subtask ~8 instead of starving.
     task = Task.new(
         prompt,
         new_session_id(),
         LoopStrategyPlanExecute(),
-        budget=BudgetLimits(max_turns=24),
+        budget=BudgetLimits(max_turns=64),
     )
 
     # Print each turn (Think) and each tool call + result (Act / Observe). This is

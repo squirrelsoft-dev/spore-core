@@ -16,7 +16,8 @@
 //! model must return strict JSON `{ "tasks": [...], "rationale": ... }`. That
 //! plan is captured into a `PlanArtifact`, surfaced, then each subtask is run in
 //! a bounded sub-loop. The turn budget is divided across subtasks (per-task cap
-//! = remaining_turns / remaining_tasks), so we set a generous `max_turns`.
+//! = remaining_turns / remaining_tasks), so we set a generous `max_turns` — e.g.
+//! an 8-step plan at 64 turns gives each subtask ~8 turns instead of starving.
 //!
 //! ## Surfacing the plan — via lifecycle HOOKS, not stream events
 //!
@@ -197,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LoopStrategy::PlanExecute { plan_model: None },
     )
     .with_budget(BudgetLimits {
-        max_turns: Some(24),
+        max_turns: Some(64),
         ..BudgetLimits::default()
     });
 

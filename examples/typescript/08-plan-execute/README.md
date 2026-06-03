@@ -38,7 +38,7 @@ const task = newTask(
   prompt,
   SessionId.generate(),
   { kind: "plan_execute" },
-  { max_turns: 24 },
+  { max_turns: 64 },
 );
 ```
 
