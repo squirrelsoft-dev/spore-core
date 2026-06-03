@@ -12,6 +12,8 @@
 package observability
 
 import (
+	"sync/atomic"
+
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
 )
@@ -33,7 +35,17 @@ import (
 //
 // Every default is overridable through the returned builder's setters.
 func ConversationalBuilder(model sporecore.ModelInterface) *HarnessBuilder {
-	agent := sporecore.NewModelAgent(sporecore.AgentID("agent"), model)
+	// Adaptive prompt-based tool-calling fallback (#111). Create ONE shared flag
+	// (false) and wrap the agent's model in an AdaptiveToolCallModelInterface over
+	// it; the run loop flips the SAME flag on detecting a prose response. While
+	// the flag is unset the wrapper delegates natively, so this is byte-for-byte
+	// the prior behaviour until escalation fires. The context manager keeps the
+	// RAW model (its summarization calls must never be wrapped). This fallback is
+	// enabled in the conversational preset ONLY.
+	flag := &atomic.Bool{}
+	agentModel := sporecore.NewAdaptiveToolCallModelInterface(model, flag)
+
+	agent := sporecore.NewModelAgent(sporecore.AgentID("agent"), agentModel)
 	toolRegistry := sporecore.NewStandardToolRegistry() // empty: ActiveSchemas -> none
 	sandbox := sporecore.NullSandbox{}
 	contextManager := contextmgr.NewStandardCompactionAdapter(
@@ -44,7 +56,9 @@ func ConversationalBuilder(model sporecore.ModelInterface) *HarnessBuilder {
 		),
 	)
 	termination := sporecore.CompleteOnFinalResponse{}
-	return NewHarnessBuilder(agent, toolRegistry, sandbox, contextManager, termination)
+	b := NewHarnessBuilder(agent, toolRegistry, sandbox, contextManager, termination)
+	b.promptToolCallFlag = flag
+	return b
 }
 
 // NewConversationalHarness assembles a minimal conversational harness from a

@@ -17,6 +17,7 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
@@ -422,6 +423,13 @@ type HarnessBuilder struct {
 	// storage package (which would form a cycle: storage imports observability).
 	sessionStore        sporecore.SessionStore
 	autoPersistSessions bool
+	// promptToolCallFlag is the shared session-scoped flag for the adaptive
+	// prompt-based tool-calling fallback (#111). Set ONLY by the conversational
+	// preset (ConversationalBuilder), which also wraps the agent's model in an
+	// AdaptiveToolCallModelInterface over this same pointer. Nil for every other
+	// construction path, leaving HarnessConfig.PromptToolCallFlag nil so the
+	// escalation seam is disabled and behaviour is byte-for-byte today's.
+	promptToolCallFlag *atomic.Bool
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -676,6 +684,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		ModelParams:           b.modelParams,
 		SessionStore:          b.sessionStore,
 		AutoPersistSessions:   b.autoPersistSessions,
+		PromptToolCallFlag:    b.promptToolCallFlag,
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)

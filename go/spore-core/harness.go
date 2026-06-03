@@ -2358,6 +2358,16 @@ type HarnessConfig struct {
 	// I/O and the message flow + replay outcomes are byte-for-byte identical to
 	// today's.
 	AutoPersistSessions bool
+
+	// PromptToolCallFlag is the shared session-scoped flag for the adaptive
+	// prompt-based tool-calling fallback (#111). The conversational preset wraps
+	// the agent's model in an AdaptiveToolCallModelInterface over THIS SAME
+	// pointer and sets it here; the run loop resets it to false at each window
+	// start and flips it to true when it detects a prose response where a tool
+	// call was expected (DetectProseResponse). Nil (the default for
+	// non-conversational construction) disables the escalation seam entirely —
+	// the loop never reads or writes it.
+	PromptToolCallFlag *atomic.Bool // optional (set by the conversational preset)
 }
 
 // SessionStore is the consumer-side view of the pause/resume lifecycle store
@@ -2701,6 +2711,23 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID) ToolRegistr
 		NewToolContext(sessionID, h.config.ToolRunStore, h.config.ToolMemoryStore),
 	)
 	return h.config.CatalogueRegistry
+}
+
+// registrySchemas flattens a tool registry's active schemas (full catalogue —
+// nil phase) into the slim model-facing []ToolSchema the agent advertises.
+// Mirrors Rust's ToolRegistry::schemas. Returns nil when the registry exposes
+// no tools, so an empty registry advertises nothing (and the request hash stays
+// byte-identical to the no-tools baseline).
+func registrySchemas(reg ToolRegistry) []ToolSchema {
+	active := reg.ActiveSchemas(nil)
+	if len(active) == 0 {
+		return nil
+	}
+	out := make([]ToolSchema, len(active))
+	for i, s := range active {
+		out[i] = s.ToModelSchema()
+	}
+	return out
 }
 
 // runReAct drives the ReAct loop, then finalizes observability for terminal
@@ -3440,6 +3467,15 @@ func (h *StandardHarness) runReActInner(
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 
+	// Adaptive prompt-based tool-calling fallback (#111). Reset the shared flag
+	// at the start of this window so each Run begins on the native path. The
+	// conversational preset wires this pointer (and the matching
+	// AdaptiveToolCallModelInterface over the agent's model); it is nil for
+	// non-conversational construction, which disables the escalation seam.
+	if h.config.PromptToolCallFlag != nil {
+		h.config.PromptToolCallFlag.Store(false)
+	}
+
 	// Monotonic per-run span counter for tool-call span ids, and the parent
 	// span id of the most recent turn (parents this turn's tool-call spans).
 	var spanSeq uint64
@@ -3506,6 +3542,18 @@ func (h *StandardHarness) runReActInner(
 
 		// Assemble + invoke agent for one turn.
 		c := h.config.ContextManager.Assemble(ctx, &session, &task)
+		// Deliver the registry's tool schemas to the model. Tool schemas are
+		// owned by the ToolRegistry; the harness wires them into the assembled
+		// context so the model knows what it can call. Only fill when the context
+		// manager left Tools empty (the standard compaction adapter does), so a
+		// context manager that deliberately sets a phase-specific tool subset is
+		// preserved. Mirrors the Rust reference (harness.rs).
+		if len(c.Tools) == 0 {
+			c.Tools = registrySchemas(toolRegistry)
+		}
+		// Whether tools were advertised this turn — the precondition for the
+		// adaptive prompt-based tool-calling prose-detection heuristic (#111).
+		toolsAdvertised := len(c.Tools) > 0
 		// Prepend the configured operating system prompt (issue #91). A context
 		// manager that renders none (e.g. the compaction adapter) leaves the model
 		// with only the task and no guidance. Guard against duplicates so a manager
@@ -3588,6 +3636,25 @@ func (h *StandardHarness) runReActInner(
 			usage.AddTurn(u)
 			budget.InputTokens += uint64(u.InputTokens)
 			budget.OutputTokens += uint64(u.OutputTokens)
+
+			// Adaptive prompt-based tool-calling escalation (#111). The model
+			// answered in prose. If tools were advertised and the text shows
+			// action intent (DetectProseResponse), flip the shared flag — which
+			// activates the AdaptiveToolCallModelInterface for the rest of the
+			// run — record the prose as the assistant's turn, nudge the model
+			// with the tool-call format, and force another turn. One-shot: the
+			// flag is only flipped while still unset, bounding this to exactly one
+			// extra turn per window.
+			if h.config.PromptToolCallFlag != nil && !h.config.PromptToolCallFlag.Load() {
+				if prose, ok := DetectProseResponse(result.Content, toolsAdvertised); ok {
+					h.config.PromptToolCallFlag.Store(true)
+					if a, ok := h.config.ContextManager.(AssistantMessageAppender); ok {
+						a.AppendAssistantMessage(ctx, &session, Message{Role: RoleAssistant, Content: NewTextContent(prose)})
+					}
+					h.config.ContextManager.AppendUserMessage(ctx, &session, PromptToolCallNudge)
+					continue
+				}
+			}
 
 			if h.config.Middleware != nil {
 				d := h.config.Middleware.Fire(ctx, HookBeforeCompletion, &session)
