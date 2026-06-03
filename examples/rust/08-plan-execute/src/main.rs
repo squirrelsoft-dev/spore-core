@@ -33,8 +33,9 @@
 //!
 //! Tools wired (all from the built-in catalogue, identical to 06):
 //!
-//! - `web_search` — [`StandardTools::web_search_with_endpoint`]; query POSTed to
-//!   `SPORE_WEB_SEARCH_ENDPOINT` as JSON `{ "query": ... }`.
+//! - `web_search` — a [`WebSearchTool::with_config`] backend configured for
+//!   SearXNG: the query is issued as `GET <endpoint>?q=<query>` against
+//!   `SPORE_WEB_SEARCH_ENDPOINT` (with `format=json` on the endpoint).
 //! - `write_file` — the agent writes `async-comparison.md` into `workspace/`.
 //! - `read_file` — lets the agent re-read what it wrote.
 //!
@@ -46,7 +47,7 @@
 //! ```sh
 //! ollama serve &
 //! ollama pull llama3.2
-//! export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search   # a {"query"}->JSON endpoint
+//! export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"   # SearXNG JSON API
 //! cargo run
 //! ```
 
@@ -56,8 +57,8 @@ use spore_core::harness::BoxFut;
 use spore_core::{
     BudgetLimits, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, Hook, HookChain,
     HookContext, HookDecision, HookError, HookEvent, LoopStrategy, OllamaModelInterface, RunResult,
-    SessionId, StandardHookChain, StandardTools, Task, WorkspaceConfig, WorkspaceScopedSandbox,
-    PLAN_EXECUTE_EXTRAS_KEY,
+    SearchMethod, SessionId, StandardHookChain, StandardTool, StandardTools, Task, WebSearchConfig,
+    WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox, PLAN_EXECUTE_EXTRAS_KEY,
 };
 
 const SYSTEM_PROMPT: &str = "You are a planning research agent. Decompose the goal into clear \
@@ -120,23 +121,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
 
-    // The search backend endpoint. `web_search` POSTs `{ "query": ... }` here and
-    // returns the JSON body to the agent. There is no live backend in spore-core,
-    // so you must supply one — a self-hosted SearXNG JSON endpoint, or a mock that
-    // accepts the `{ "query" }` shape. Raw Brave/Tavily are NOT yet drop-in: they
-    // need a custom auth header, which is tracked as core issue #108. See README.
+    // The search backend endpoint. `web_search` issues `GET <endpoint>?q=<query>`
+    // and returns the JSON body to the agent. There is no live backend in
+    // spore-core, so you must supply one — this example targets a self-hosted
+    // SearXNG JSON endpoint (`.../search?format=json`). Raw Brave/Tavily would use
+    // auth headers (now supported via `WebSearchConfig::auth_headers`, core #108);
+    // this example targets SearXNG, which needs no key. See README.
     let endpoint = match std::env::var("SPORE_WEB_SEARCH_ENDPOINT") {
         Ok(e) if !e.trim().is_empty() => e,
         _ => {
             eprintln!(
                 "SPORE_WEB_SEARCH_ENDPOINT is not set.\n\
-                 Set it to a search endpoint that accepts a JSON `{{\"query\": ...}}` POST and \
-                 returns JSON results.\n\
-                 See .env.example and the README. (Raw Brave/Tavily need core #108 first.)"
+                 Set it to a SearXNG JSON endpoint, e.g. \
+                 http://localhost:8888/search?format=json — the query is appended as \
+                 `&q=<query>`.\n\
+                 See .env.example and the README."
             );
             std::process::exit(2);
         }
     };
+
+    // SearXNG GET config: `?q=<query>` appended to the endpoint, `format=json`
+    // already on the endpoint URL. No auth env vars, so `with_config` cannot fail
+    // here — but it returns a `Result`, so surface any error with a clear message.
+    let web_search_tool = WebSearchTool::with_config(WebSearchConfig {
+        endpoint: endpoint.clone(),
+        method: SearchMethod::Get,
+        query_param: "q".into(),
+        auth_headers: Vec::new(),
+        body_auth_params: Vec::new(),
+    })
+    .expect("web_search backend config is valid (SearXNG needs no auth env vars)");
+    let web_search = StandardTool::new(Box::new(web_search_tool), WebSearchTool::schema());
 
     // The agent operates inside this example's `workspace/` directory. Resolve it
     // relative to this source file so `cargo run` works from anywhere, and
@@ -165,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
-        .tool(StandardTools::web_search_with_endpoint(endpoint.clone()))
+        .tool(web_search)
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
