@@ -1,0 +1,14 @@
+[project]
+name = "spore-example-08-plan-execute"
+version = "0.0.0"
+description = "spore-core example 08 — multi-step goal decomposition with PlanExecute (Python)"
+requires-python = ">=3.12"
+dependencies = ["spore-core", "spore-tools"]
+
+[tool.uv.sources]
+spore-core = { path = "../../../python/packages/spore_core", editable = true }
+spore-tools = { path = "../../../python/packages/spore_tools", editable = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
