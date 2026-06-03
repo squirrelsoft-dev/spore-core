@@ -311,6 +311,39 @@ func TestWebSearchGetReturnsBodyVerbatim(t *testing.T) {
 	}
 }
 
+func TestWebSearchGetPreservesExistingQueryString(t *testing.T) {
+	// SearXNG-style: the endpoint already carries a query string
+	// (?format=json). The GET path must PRESERVE it and append the query under
+	// the configured param — the received request must have BOTH format=json
+	// AND q=<query>.
+	var gotFormat string
+	var gotQ string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFormat = r.URL.Query().Get("format")
+		gotQ = r.URL.Query().Get("q")
+		_, _ = w.Write([]byte("searxng-results"))
+	}))
+	defer srv.Close()
+	tool, err := NewWebSearchToolFromConfig(WebSearchConfig{
+		Endpoint:   srv.URL + "/search?format=json",
+		Method:     SearchMethodGet,
+		QueryParam: "q",
+	})
+	if err != nil {
+		t.Fatalf("unexpected construction error: %v", err)
+	}
+	r := runSearch(t, tool, "rust wasm")
+	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "searxng-results" {
+		t.Fatalf("expected searxng-results, got %+v", r)
+	}
+	if gotFormat != "json" {
+		t.Fatalf("expected preserved format=json, got %q", gotFormat)
+	}
+	if gotQ != "rust wasm" {
+		t.Fatalf("expected appended q=%q, got %q", "rust wasm", gotQ)
+	}
+}
+
 func TestSearchMethodDefaultIsPost(t *testing.T) {
 	// An unset Method in config resolves to POST.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
