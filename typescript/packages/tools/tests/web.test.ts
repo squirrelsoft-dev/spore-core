@@ -153,6 +153,33 @@ describe("web_search #108 — GET param encoding", () => {
       await close();
     }
   });
+
+  it("preserves a pre-existing query string on the endpoint (SearXNG ?format=json)", async () => {
+    const { url, captured, close } = await startCapturingServer("ok");
+    try {
+      const tool = WebSearchTool.withConfig({
+        // Endpoint already carries `?format=json` (SearXNG JSON API).
+        endpoint: `${url}/search?format=json`,
+        method: "GET",
+        queryParam: "q",
+      });
+      const r = await tool.execute(
+        call({ query: "rust lang" }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      const req = await captured;
+      expect(req.method).toBe("GET");
+      const parsed = new URL(req.url ?? "", "http://x");
+      expect(parsed.pathname).toBe("/search");
+      // BOTH the pre-existing param and the added query param are present.
+      expect(parsed.searchParams.get("format")).toBe("json");
+      expect(parsed.searchParams.get("q")).toBe("rust lang");
+      expect(r.kind).toBe("success");
+    } finally {
+      await close();
+    }
+  });
 });
 
 describe("web_search #108 — auth headers", () => {

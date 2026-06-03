@@ -311,13 +311,15 @@ export class WebSearchTool implements Tool {
       let init: RequestInit & { signal?: AbortSignal };
       if (backend.method === "GET") {
         // Query + body-auth params are URL-encoded into the query string;
-        // `URLSearchParams` encodes spaces, `&`, etc.
-        const params = new URLSearchParams();
-        params.set(backend.queryParam, p.value.query);
+        // `URLSearchParams` encodes spaces, `&`, etc. Any query string already
+        // present on the endpoint (e.g. `?format=json`) is PRESERVED — the new
+        // params are appended, not clobbered (matches Rust/Python/Go).
+        const parsed = new URL(backend.endpoint);
+        parsed.searchParams.set(backend.queryParam, p.value.query);
         for (const [field, value] of backend.bodyAuthParams) {
-          params.set(field, value);
+          parsed.searchParams.set(field, value);
         }
-        url = `${backend.endpoint}?${params.toString()}`;
+        url = parsed.toString();
         init = { method: "GET", headers, signal };
       } else {
         // Query + body-auth params go into the JSON body (Tavily shape:
