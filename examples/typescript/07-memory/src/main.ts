@@ -195,6 +195,10 @@ async function runPhase(
     .storage(storage) // ← the seam
     .tool(StandardTools.memory()) // ← the built-in memory read/write tool
     .systemPrompt(systemPrompt)
+    // Structured mode helps small Ollama models emit clean tool calls (one per
+    // turn, no interleaved reasoning — so the "think · turn N" line is just a
+    // turn marker, not model chatter).
+    .modelParams({ structured_tool_calls: true, stop_sequences: [] })
     .build();
 
   // PIN the session id — both phases pass the same one so recall reads what

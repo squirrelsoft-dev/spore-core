@@ -159,7 +159,11 @@ edges you should know about before running:
   later steps. Set it generously (this example uses `24`).
 - **Small local models (e.g. `llama3.2`) often garble the plan JSON.** A larger
   hosted model produces a cleaner, more reliable demo. The harness is
-  model-agnostic — swap the model interface and change nothing else.
+  model-agnostic — swap the model interface and change nothing else. This example
+  enables `structured_tool_calls` via
+  `HarnessBuilder.modelParams({ structured_tool_calls: true, stop_sequences: [] })`
+  to push small models toward one clean, schema-constrained tool call per turn
+  across both the plan and execute phases.
 - Subtask **inner tool calls stream in the TypeScript port** — unlike the
   Rust / Python / Go harnesses, which suppress the sub-loop stream. So in TS the
   `think` / `act` / `obs` lines also show each subtask's tool activity; the

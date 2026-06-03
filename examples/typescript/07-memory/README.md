@@ -138,6 +138,11 @@ account. Recall quality scales with the model: a **larger hosted model follows
 the store/recall tool protocol more reliably**. The harness is model-agnostic —
 swap the model interface and change nothing else.
 
+This example also enables `structured_tool_calls` via
+`HarnessBuilder.modelParams({ structured_tool_calls: true, stop_sequences: [] })`.
+That turns on schema-constrained decoding so small Ollama models emit one clean
+`memory` tool call per turn instead of malformed JSON.
+
 ## Tests
 
 ```sh

@@ -188,6 +188,10 @@ async function main(): Promise<void> {
     .tool(StandardTools.writeFile())
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
+    // Structured mode helps small Ollama models emit clean tool calls (one per
+    // turn, no interleaved reasoning — so the "think · turn N" line is just a
+    // turn marker, not model chatter) across both the plan and execute phases.
+    .modelParams({ structured_tool_calls: true, stop_sequences: [] })
     .hooks(chain) // ← the plan becomes visible through the hook chain
     .build();
 

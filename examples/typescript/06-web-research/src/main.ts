@@ -120,6 +120,10 @@ async function main(): Promise<void> {
     .tool(StandardTools.writeFile()) // ← writes answer.md
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
+    // Structured mode helps small Ollama models emit clean tool calls (one per
+    // turn, no interleaved reasoning — so the "think · turn N" line is just a
+    // turn marker, not model chatter).
+    .modelParams({ structured_tool_calls: true, stop_sequences: [] })
     .build();
 
   const task = newTask(prompt, SessionId.generate(), {
