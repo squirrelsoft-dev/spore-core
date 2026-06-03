@@ -77,10 +77,14 @@ import (
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/tools"
 )
 
-const systemPrompt = "You are a planning research agent. Decompose the goal into clear " +
-	"subtasks. For each subtask, use web_search to find current information, then synthesize a " +
-	"clear, cited comparison and save the final document with write_file. Act using tools — do " +
-	"not answer from memory alone."
+const systemPrompt = "You are a research-and-writing agent. Your ONLY capabilities are: " +
+	"web_search (find current information online), read_file, and write_file (save your work to " +
+	"the workspace). You have NO shell or terminal — you cannot install software, set up projects " +
+	"or environments, run/compile/build code, or execute commands. Decompose the goal into " +
+	"subtasks that are each achievable with web_search and writing alone; never plan setup, " +
+	"installation, or build steps. For each subtask, use web_search to gather current information, " +
+	"then synthesize a clear, cited comparison and save the final document with write_file. Act " +
+	"using tools — do not answer from memory alone."
 
 // planMaxTurns is a generous turn budget. PlanExecute divides the budget across
 // subtasks (per-task cap = remaining_turns / remaining_tasks), so a stingy cap
