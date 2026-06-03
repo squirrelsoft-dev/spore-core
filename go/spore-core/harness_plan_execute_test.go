@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -487,5 +488,113 @@ func TestPlanExecuteLoopFixtureReplay(t *testing.T) {
 	// Q1: one plan turn + one turn per task (2) under the shared budget.
 	if r.Turns != 3 {
 		t.Fatalf("turns = %d, want 3 (plan + one per task)", r.Turns)
+	}
+}
+
+// planRecordingAgent captures the assembled context of EVERY turn (in order) and
+// yields queued TurnResults, so a test can assert what the model saw on the
+// plan turn versus each execute-step turn.
+type planRecordingAgent struct {
+	id      AgentID
+	mu      sync.Mutex
+	results []TurnResult
+	seen    [][]Message // one entry per Turn() call, in invocation order
+}
+
+func newPlanRecordingAgent(id AgentID) *planRecordingAgent { return &planRecordingAgent{id: id} }
+
+func (a *planRecordingAgent) push(r TurnResult) *planRecordingAgent {
+	a.results = append(a.results, r)
+	return a
+}
+
+func (a *planRecordingAgent) Turn(_ context.Context, c Context) TurnResult {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seen = append(a.seen, append([]Message(nil), c.Messages...))
+	if len(a.results) == 0 {
+		return NewTurnError(NewEmptyResponseError(), nil)
+	}
+	r := a.results[0]
+	a.results = a.results[1:]
+	return r
+}
+
+func (a *planRecordingAgent) ID() AgentID { return a.id }
+
+// contextText flattens a captured context's text content into one string for
+// substring assertions.
+func contextText(msgs []Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		if m.Content.Type == ContentTypeText {
+			b.WriteString(m.Content.Text)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// #93 regression: the plan-phase directive ("Produce a step-by-step plan…
+// Respond with a single JSON object…") must NOT leak into the SHARED session
+// state, otherwise every execute step re-sees it and an instruction-following
+// model re-emits a plan instead of calling tools. Drive a full 2-step
+// PlanExecute run with a context-capturing agent and assert no execute-step
+// context carries the directive, while the step instructions DO reach those
+// contexts (and a step can issue a tool call).
+func TestPlanDirectiveDoesNotLeakIntoExecuteContext(t *testing.T) {
+	const (
+		producePlan = "Produce a step-by-step plan"
+		respondJSON = "Respond with a single JSON object"
+	)
+
+	agent := newPlanRecordingAgent("rec")
+	// Plan turn: produce a 2-step plan.
+	agent.push(planFinal(`{"tasks":["step one","step two"],"rationale":"r"}`))
+	// Execute step 1: issue a tool call, then finalize.
+	agent.push(NewToolCallRequested([]ToolCall{{ID: "1", Name: "noop", Input: json.RawMessage(`{}`)}}, turnUsage()))
+	agent.push(planFinal("did step one"))
+	// Execute step 2: finalize directly.
+	agent.push(planFinal("did step two"))
+
+	cfg := standardCfg(agent)
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
+	cfg.ToolRegistry = reg
+	h := NewStandardHarness(cfg)
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(planTask("build a CLI")))
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	// 1 plan turn + (tool call + final) for step one + 1 for step two.
+	if len(agent.seen) != 4 {
+		t.Fatalf("captured %d turns, want 4 (plan turn + 3 execute turns)", len(agent.seen))
+	}
+
+	// The PLAN turn (index 0) DOES carry the directive — that's correct.
+	plan := contextText(agent.seen[0])
+	if !strings.Contains(plan, producePlan) || !strings.Contains(plan, respondJSON) {
+		t.Fatalf("plan turn should see the directive, context was:\n%s", plan)
+	}
+
+	// No EXECUTE-step context (indices 1..) may carry the directive.
+	for i := 1; i < len(agent.seen); i++ {
+		c := contextText(agent.seen[i])
+		if strings.Contains(c, producePlan) || strings.Contains(c, respondJSON) {
+			t.Fatalf("execute-step context %d leaked the directive:\n%s", i, c)
+		}
+	}
+
+	// The execute steps still receive their step instructions and can proceed
+	// to a tool call.
+	if c := contextText(agent.seen[1]); !strings.Contains(c, "step one") {
+		t.Fatalf("step-one context should carry its instruction:\n%s", c)
+	}
+	if c := contextText(agent.seen[3]); !strings.Contains(c, "step two") {
+		t.Fatalf("step-two context should carry its instruction:\n%s", c)
 	}
 }

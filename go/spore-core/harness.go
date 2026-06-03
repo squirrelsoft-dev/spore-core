@@ -1173,6 +1173,22 @@ func (s SessionState) MarshalJSON() ([]byte, error) {
 	return json.Marshal(a)
 }
 
+// cloneSessionState returns a shallow copy of s whose Messages slice is a fresh
+// backing array (not aliased to s.Messages). Used by the PlanExecute plan phase
+// (#93) to seed the planning directive onto a throwaway state without mutating
+// the shared session that the execute phase threads through. Appending to the
+// clone's Messages must not touch the caller's slice, so the slice is copied;
+// Extras is shared by reference (the plan turn never mutates it).
+func cloneSessionState(s *SessionState) *SessionState {
+	if s == nil {
+		return &SessionState{}
+	}
+	return &SessionState{
+		Messages: append([]Message(nil), s.Messages...),
+		Extras:   s.Extras,
+	}
+}
+
 // ============================================================================
 // Forward-declared sibling interfaces
 // ============================================================================
@@ -3109,11 +3125,13 @@ func (h *StandardHarness) runPlanPhase(
 	onStream StreamSink,
 ) (outcome *planPhaseOutcome, failure *RunResult) {
 	// Issue #102: stamp the plan-phase conversation history onto any failure
-	// result this function returns. The plan turn mutates *session (the planning
-	// directive + the planner's response), so reading it in a defer captures the
-	// final state at whichever failure return fired — every PlanPhaseFailed /
-	// AgentError / BudgetExceeded exit carries lossless history without threading
-	// SessionState through each construction site.
+	// result this function returns. Per #93 the planning directive lands on a
+	// throwaway CLONE (planState), so *session stays the seeded
+	// `[user: task.instruction]` — reading it in a defer captures that clean
+	// state at whichever failure return fired, so every PlanPhaseFailed /
+	// AgentError / BudgetExceeded exit carries the shared history (without the
+	// directive leaking in) without threading SessionState through each
+	// construction site.
 	defer func() {
 		if failure != nil && failure.Kind == RunFailure {
 			failure.SessionState = *session
@@ -3154,16 +3172,24 @@ func (h *StandardHarness) runPlanPhase(
 	}
 
 	// Seed the planning directive as a user message (reuse ContextManager).
+	// CRITICAL (#93): the directive must NOT mutate the SHARED `session`.
+	// That same state is threaded into the execute phase, where each subtask
+	// sub-loop assembles its context from it. If the directive leaked in,
+	// every execute step would still see "respond with {tasks, rationale}"
+	// and an instruction-following model would re-emit a plan instead of
+	// calling tools. Append to a throwaway CLONE so the plan turn sees the
+	// directive while the shared state stays `[user: task.instruction]`.
 	directive := fmt.Sprintf(
 		"Produce a step-by-step plan for the following task. Respond with a "+
 			"single JSON object: {\"tasks\": [<ordered step strings>], "+
 			"\"rationale\": <string>}.\n\nTask:\n%s",
 		task.Instruction,
 	)
-	h.config.ContextManager.AppendUserMessage(ctx, session, directive)
+	planState := cloneSessionState(session)
+	h.config.ContextManager.AppendUserMessage(ctx, planState, directive)
 
 	// Assemble + invoke the planner for exactly ONE turn (R1).
-	c := h.config.ContextManager.Assemble(ctx, session, task)
+	c := h.config.ContextManager.Assemble(ctx, planState, task)
 	// Per-run model params win unconditionally (issue #93) — same seam as
 	// runReActInner, before the plan turn is dispatched.
 	c.Params = h.config.ModelParams
