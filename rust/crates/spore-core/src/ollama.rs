@@ -267,6 +267,14 @@ struct OllamaRequest {
     options: Option<OllamaOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OllamaTool>,
+    /// Constrained-decoding JSON schema (Ollama's `format` parameter). Set only
+    /// in structured-tool-calls mode (`ModelParams.structured_tool_calls`); when
+    /// present, native `tools` are dropped and the model is forced to emit a
+    /// single schema-constrained JSON object instead of routing tool calls
+    /// through Llama's `<|python_tag|>` channel (which Ollama does not parse,
+    /// causing the call to leak into `message.content`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -415,20 +423,60 @@ fn build_request(
     req: &ModelRequest,
     stream: bool,
 ) -> OllamaRequest {
-    let messages: Vec<OllamaMessage> = req.messages.iter().map(message_to_ollama).collect();
+    // Structured-tool-calls mode (opt-in): constrained decoding via `format`.
+    // We send NO native tools — describing them in a system message instead —
+    // and force the model to emit a single schema-constrained JSON object. The
+    // `tool` enum is the critical constraint: it eliminates the `<|python_tag|>`
+    // leak that small local models (llama3.2) otherwise produce.
+    let structured = req.params.structured_tool_calls && !req.tools.is_empty();
 
-    let tools: Vec<OllamaTool> = req
-        .tools
-        .iter()
-        .map(|t: &ToolSchema| OllamaTool {
-            kind: "function",
-            function: OllamaToolFunction {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
+    let mut messages: Vec<OllamaMessage> = req.messages.iter().map(message_to_ollama).collect();
+
+    let (tools, format) = if structured {
+        // Inject a system message describing the tools. Merge into an existing
+        // leading system message when present; otherwise prepend a new one.
+        let preamble = structured_tools_preamble(&req.tools);
+        if let Some(first) = messages.first_mut() {
+            if first.role == "system" {
+                first.content = format!("{}\n\n{}", first.content, preamble);
+            } else {
+                messages.insert(0, system_message(preamble));
+            }
+        } else {
+            messages.insert(0, system_message(preamble));
+        }
+
+        let mut tool_names: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|t| serde_json::Value::String(t.name.clone()))
+            .collect();
+        tool_names.push(serde_json::Value::String("final".into()));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": tool_names},
+                "arguments": {"type": "object"},
+                "content": {"type": "string"}
             },
-        })
-        .collect();
+            "required": ["tool"]
+        });
+        (Vec::new(), Some(schema))
+    } else {
+        let tools: Vec<OllamaTool> = req
+            .tools
+            .iter()
+            .map(|t: &ToolSchema| OllamaTool {
+                kind: "function",
+                function: OllamaToolFunction {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input_schema.clone(),
+                },
+            })
+            .collect();
+        (tools, None)
+    };
 
     let options = OllamaOptions {
         num_predict: req.params.max_tokens,
@@ -448,7 +496,47 @@ fn build_request(
             Some(options)
         },
         tools,
+        format,
     }
+}
+
+fn system_message(content: String) -> OllamaMessage {
+    OllamaMessage {
+        role: "system".into(),
+        content,
+        tool_calls: vec![],
+        tool_call_id: None,
+    }
+}
+
+/// Build the system-message preamble for structured-tool-calls mode. Describes
+/// each tool's name, description, and parameter property names/types (read from
+/// `t.input_schema`), then gives the model explicit single-JSON-object output
+/// instructions. This — together with the `format` schema's `tool` enum — keeps
+/// tool calls on the constrained-JSON channel and away from `<|python_tag|>`.
+fn structured_tools_preamble(tools: &[ToolSchema]) -> String {
+    let mut out = String::from("You have access to the following tools:\n");
+    for t in tools {
+        out.push_str(&format!("\n- {}: {}", t.name, t.description));
+        if let Some(props) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
+            if !props.is_empty() {
+                let params: Vec<String> = props
+                    .iter()
+                    .map(|(name, schema)| {
+                        let ty = schema.get("type").and_then(|v| v.as_str()).unwrap_or("any");
+                        format!("{name} ({ty})")
+                    })
+                    .collect();
+                out.push_str(&format!("\n  parameters: {}", params.join(", ")));
+            }
+        }
+    }
+    out.push_str(
+        "\n\nRespond with a SINGLE JSON object and nothing else. To call a tool, \
+set \"tool\" to the tool name and \"arguments\" to its inputs. When the task is \
+fully done, set \"tool\" to \"final\" and put your reply in \"content\".",
+    );
+    out
 }
 
 fn message_to_ollama(m: &crate::model::Message) -> OllamaMessage {
@@ -491,7 +579,29 @@ fn message_to_ollama(m: &crate::model::Message) -> OllamaMessage {
     }
 }
 
-fn parse_response(body: OllamaResponse) -> ModelResponse {
+fn parse_response(body: OllamaResponse, structured: bool) -> ModelResponse {
+    let usage = TokenUsage {
+        input_tokens: body.prompt_eval_count.unwrap_or(0),
+        output_tokens: body.eval_count.unwrap_or(0),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+    };
+
+    if structured {
+        // In structured mode the assistant content is a single constrained JSON
+        // object — never a native tool_calls array. Parsing it back into a
+        // tool-use block (rather than treating the raw JSON as answer text) is
+        // precisely what avoids the `<|python_tag|>` leak: the tool call never
+        // touches the native channel.
+        let raw = body.message.content.unwrap_or_default();
+        let (content, stop_reason) = parse_structured_content(&raw, 0);
+        return ModelResponse {
+            content,
+            usage,
+            stop_reason,
+        };
+    }
+
     let mut content: Vec<ContentBlock> = Vec::new();
     if let Some(text) = body.message.content {
         if !text.is_empty() {
@@ -513,14 +623,54 @@ fn parse_response(body: OllamaResponse) -> ModelResponse {
 
     ModelResponse {
         content,
-        usage: TokenUsage {
-            input_tokens: body.prompt_eval_count.unwrap_or(0),
-            output_tokens: body.eval_count.unwrap_or(0),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-        },
+        usage,
         stop_reason: parse_stop_reason(body.done_reason.as_deref()),
     }
+}
+
+/// Parse the constrained-decoding JSON object produced in structured-tool-calls
+/// mode into `(content blocks, stop reason)`. `index` is used to synthesize the
+/// tool-call id, reusing this file's `call-{i}` convention.
+///
+/// Defensive: if `raw` is missing/empty/not valid JSON/lacks a `tool` field,
+/// fall back to a single `Text` block with the raw content and `EndTurn` —
+/// weak models occasionally violate even constrained decoding, and we never
+/// panic on their output.
+fn parse_structured_content(raw: &str, index: usize) -> (Vec<ContentBlock>, StopReason) {
+    let fallback = || {
+        (
+            vec![ContentBlock::Text { text: raw.into() }],
+            StopReason::EndTurn,
+        )
+    };
+    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(v) => v,
+        Err(_) => return fallback(),
+    };
+    let tool = match value.get("tool").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return fallback(),
+    };
+    if tool == "final" {
+        let text = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return (vec![ContentBlock::Text { text }], StopReason::EndTurn);
+    }
+    let input = match value.get("arguments") {
+        Some(a) if a.is_object() => a.clone(),
+        _ => serde_json::json!({}),
+    };
+    (
+        vec![ContentBlock::ToolUse(ToolCall {
+            id: format!("call-{index}"),
+            name: tool.to_string(),
+            input,
+        })],
+        StopReason::ToolUse,
+    )
 }
 
 fn parse_stop_reason(s: Option<&str>) -> StopReason {
@@ -606,7 +756,8 @@ impl ModelInterface for OllamaModelInterface {
             code: 0,
             message: format!("response decode failed: {e}"),
         })?;
-        Ok(parse_response(parsed))
+        let structured = request.params.structured_tool_calls && !request.tools.is_empty();
+        Ok(parse_response(parsed, structured))
     }
 
     async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
@@ -632,7 +783,8 @@ impl ModelInterface for OllamaModelInterface {
         if !resp.status().is_success() {
             return Err(map_status_error(resp, &model_id).await);
         }
-        Ok(Box::pin(ndjson_to_events(resp)))
+        let structured = request.params.structured_tool_calls && !request.tools.is_empty();
+        Ok(Box::pin(ndjson_to_events(resp, structured)))
     }
 
     async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
@@ -737,6 +889,7 @@ fn concat_request_text(request: &ModelRequest) -> String {
 /// `done: true` plus `prompt_eval_count` and `eval_count`.
 fn ndjson_to_events(
     resp: reqwest::Response,
+    structured: bool,
 ) -> impl futures_core::Stream<Item = Result<StreamEvent, ModelError>> + Send + 'static {
     async_stream::stream! {
         let stream = resp.bytes_stream();
@@ -747,6 +900,13 @@ fn ndjson_to_events(
             std::collections::HashSet::new();
         let mut content_index: u32 = 0;
         let mut content_open = false;
+        // Structured mode: the constrained JSON object arrives as `message.content`
+        // text deltas spread across chunks. We must NOT surface that raw JSON to
+        // the user — instead buffer it for the whole response and parse it at the
+        // `done` chunk exactly like `parse_response`, emitting reconstructable
+        // tool / text events. This keeps the tool call off the native channel and
+        // is what prevents the `<|python_tag|>` leak in streaming mode too.
+        let mut structured_content = String::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -774,6 +934,64 @@ fn ndjson_to_events(
                 if !started {
                     started = true;
                     yield Ok(StreamEvent::MessageStart);
+                }
+                if structured {
+                    // Buffer content deltas; defer all emission to the `done` chunk.
+                    if let Some(text) = value
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|v| v.as_str())
+                    {
+                        structured_content.push_str(text);
+                    }
+                    if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        let (content, stop_reason) =
+                            parse_structured_content(&structured_content, 0);
+                        for block in content {
+                            match block {
+                                ContentBlock::ToolUse(call) => {
+                                    let partial = serde_json::to_string(&call.input)
+                                        .unwrap_or_else(|_| "{}".into());
+                                    yield Ok(StreamEvent::ToolUseStart {
+                                        index: 1,
+                                        id: call.id,
+                                        name: call.name,
+                                    });
+                                    yield Ok(StreamEvent::ToolUseDelta {
+                                        index: 1,
+                                        partial_json: partial,
+                                    });
+                                }
+                                ContentBlock::Text { text } => {
+                                    yield Ok(StreamEvent::ContentBlockDelta {
+                                        index: 0,
+                                        delta: text,
+                                    });
+                                }
+                                ContentBlock::Thinking { text } => {
+                                    yield Ok(StreamEvent::ThinkingDelta {
+                                        index: 0,
+                                        delta: text,
+                                    });
+                                }
+                            }
+                        }
+                        let usage = TokenUsage {
+                            input_tokens: value
+                                .get("prompt_eval_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32,
+                            output_tokens: value
+                                .get("eval_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                        };
+                        yield Ok(StreamEvent::MessageStop { usage, stop_reason });
+                        return;
+                    }
+                    continue;
                 }
                 let message = value.get("message");
                 if let Some(text) = message
@@ -1014,6 +1232,168 @@ mod tests {
         assert!(!s.contains("thinking"), "wire: {s}");
     }
 
+    // ── structured tool calls (opt-in constrained decoding) ────────────────
+    //
+    // This path describes the tools in a system message and constrains decoding
+    // via Ollama's `format` schema instead of sending native `tools`. Because
+    // the tool call rides the constrained-JSON channel — never the native
+    // tool_calls / `<|python_tag|>` path — small local models can no longer leak
+    // a tool call into `message.content` as unparsed text.
+
+    fn structured_tool_req() -> ModelRequest {
+        let mut r = req(vec![user("write a summary file")]);
+        r.params.structured_tool_calls = true;
+        r.tools.push(ToolSchema {
+            name: "write_file".into(),
+            description: "write a file".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"},"content":{"type":"string"}}
+            }),
+        });
+        r.tools.push(ToolSchema {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}}
+            }),
+        });
+        r
+    }
+
+    #[test]
+    fn build_request_structured_sets_format_drops_tools_adds_system() {
+        let r = structured_tool_req();
+        let body = build_request("llama3.2", &None, &r, false);
+        // Native tools dropped in structured mode.
+        assert!(body.tools.is_empty(), "native tools must be empty");
+        // format schema present with tool enum = tool names + "final".
+        let format = body.format.expect("format schema must be present");
+        let enum_vals = format
+            .pointer("/properties/tool/enum")
+            .and_then(|v| v.as_array())
+            .expect("tool enum present");
+        let names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"final"));
+        // A system message describing the tools is prepended.
+        assert_eq!(body.messages[0].role, "system");
+        assert!(body.messages[0].content.contains("write_file"));
+        assert!(body.messages[0].content.contains("read_file"));
+        assert!(body.messages[0].content.contains("SINGLE JSON object"));
+    }
+
+    #[test]
+    fn build_request_structured_merges_into_existing_system_message() {
+        let mut r = structured_tool_req();
+        r.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                content: Content::Text {
+                    text: "You are terse.".into(),
+                },
+            },
+        );
+        let body = build_request("llama3.2", &None, &r, false);
+        // Only one system message; original content preserved + preamble merged.
+        let system_count = body.messages.iter().filter(|m| m.role == "system").count();
+        assert_eq!(system_count, 1);
+        assert!(body.messages[0].content.contains("You are terse."));
+        assert!(body.messages[0].content.contains("write_file"));
+    }
+
+    #[test]
+    fn build_request_structured_off_when_no_tools() {
+        // Flag on but no tools → unchanged behavior, no format.
+        let mut r = req(vec![user("hi")]);
+        r.params.structured_tool_calls = true;
+        let body = build_request("llama3.2", &None, &r, false);
+        assert!(body.format.is_none());
+    }
+
+    #[test]
+    fn build_request_structured_off_by_default() {
+        // Flag default off with tools present → native tools, no format.
+        let mut r = req(vec![user("hi")]);
+        r.tools.push(ToolSchema {
+            name: "search".into(),
+            description: "search the web".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        let body = build_request("llama3.2", &None, &r, false);
+        assert!(body.format.is_none());
+        assert_eq!(body.tools.len(), 1);
+    }
+
+    #[test]
+    fn parse_response_structured_tool_call() {
+        let body: OllamaResponse = serde_json::from_value(serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "{\"tool\":\"write_file\",\"arguments\":{\"path\":\"SUMMARY.md\",\"content\":\"hi\"}}"
+            },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 1,
+            "eval_count": 1
+        }))
+        .unwrap();
+        let r = parse_response(body, true);
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.content.len(), 1);
+        match &r.content[0] {
+            ContentBlock::ToolUse(tc) => {
+                assert_eq!(tc.name, "write_file");
+                assert_eq!(
+                    tc.input,
+                    serde_json::json!({"path":"SUMMARY.md","content":"hi"})
+                );
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_structured_final() {
+        let body: OllamaResponse = serde_json::from_value(serde_json::json!({
+            "message": {"role":"assistant","content":"{\"tool\":\"final\",\"content\":\"all done\"}"},
+            "done": true,
+            "done_reason": "stop"
+        }))
+        .unwrap();
+        let r = parse_response(body, true);
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::Text {
+                text: "all done".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_response_structured_malformed_falls_back_to_text() {
+        // Weak model violates constrained decoding: not valid JSON. We must not
+        // panic — fall back to a Text block with the raw content and EndTurn.
+        let body: OllamaResponse = serde_json::from_value(serde_json::json!({
+            "message": {"role":"assistant","content":"oops not json"},
+            "done": true,
+            "done_reason": "stop"
+        }))
+        .unwrap();
+        let r = parse_response(body, true);
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            r.content,
+            vec![ContentBlock::Text {
+                text: "oops not json".into()
+            }]
+        );
+    }
+
     // ── stop reason ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1041,7 +1421,7 @@ mod tests {
             "eval_count": 2
         }))
         .unwrap();
-        let r = parse_response(body);
+        let r = parse_response(body, false);
         assert_eq!(r.usage.input_tokens, 7);
         assert_eq!(r.usage.output_tokens, 2);
         assert_eq!(r.stop_reason, StopReason::EndTurn);
@@ -1057,7 +1437,7 @@ mod tests {
             "eval_count": 1
         }))
         .unwrap();
-        let r = parse_response(body);
+        let r = parse_response(body, false);
         assert_eq!(r.usage.cache_read_tokens, None);
         assert_eq!(r.usage.cache_write_tokens, None);
     }
@@ -1078,7 +1458,7 @@ mod tests {
             "eval_count": 1
         }))
         .unwrap();
-        let r = parse_response(body);
+        let r = parse_response(body, false);
         assert_eq!(r.stop_reason, StopReason::ToolUse);
         match &r.content[0] {
             ContentBlock::ToolUse(tc) => {
@@ -1457,13 +1837,74 @@ mod tests {
         for (idx, json) in &jsons {
             let parsed: serde_json::Value = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("index {idx} json {json:?} did not parse: {e}"));
-            assert!(parsed.is_object(), "index {idx} args not an object: {parsed}");
+            assert!(
+                parsed.is_object(),
+                "index {idx} args not an object: {parsed}"
+            );
         }
         let collected: Vec<&str> = names.values().map(String::as_str).collect();
         assert_eq!(
             collected,
             vec!["calculator", "get_current_time", "reverse_string"]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_structured_buffers_json_then_reconstructs_tool_call() {
+        // In structured mode the constrained JSON object arrives split across
+        // multiple content chunks. The raw JSON must never be surfaced as answer
+        // text; at `done` it is parsed into a reconstructable ToolUse. This is
+        // the streaming analogue of the `<|python_tag|>`-leak fix: the tool call
+        // is reconstructed from the constrained-JSON channel, never the native
+        // tool_calls path.
+        let ndjson = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"tool\\\":\\\"write_file\\\",\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\\\"arguments\\\":{\\\"path\\\":\\\"S.md\\\",\\\"content\\\":\\\"hi\\\"}}\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1,\"eval_count\":1}\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 128_000},
+                "capabilities": ["tools"]
+            }),
+            None,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(ndjson))
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let mut stream = client.call_streaming(structured_tool_req()).await.unwrap();
+
+        let mut name: Option<String> = None;
+        let mut json = String::new();
+        let mut text_deltas: Vec<String> = vec![];
+        let mut final_stop = StopReason::EndTurn;
+        while let Some(ev) = stream.next().await {
+            match ev.unwrap() {
+                StreamEvent::ToolUseStart { name: n, .. } => name = Some(n),
+                StreamEvent::ToolUseDelta { partial_json, .. } => json.push_str(&partial_json),
+                StreamEvent::ContentBlockDelta { delta, .. } => text_deltas.push(delta),
+                StreamEvent::MessageStop { stop_reason, .. } => final_stop = stop_reason,
+                _ => {}
+            }
+        }
+        // Raw JSON was NOT surfaced as answer text.
+        assert!(
+            text_deltas.is_empty(),
+            "raw JSON leaked as text: {text_deltas:?}"
+        );
+        // The tool call was reconstructed with the right name + valid arg JSON.
+        assert_eq!(name.as_deref(), Some("write_file"));
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("tool args {json:?} did not parse: {e}"));
+        assert_eq!(parsed, serde_json::json!({"path":"S.md","content":"hi"}));
+        assert_eq!(final_stop, StopReason::ToolUse);
     }
 
     // ── count_tokens ───────────────────────────────────────────────────────

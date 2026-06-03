@@ -98,6 +98,16 @@ pub struct ModelParams {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// Opt-in hint for providers that support constrained decoding (Ollama via
+    /// the `format` JSON-schema parameter). When `true` AND the request has
+    /// tools, the provider forces tool calls to be emitted as schema-constrained
+    /// JSON, parsed back into tool-use blocks. Providers without
+    /// constrained-decoding support (e.g. Anthropic) ignore it. Helps small
+    /// local models (llama3.2) that otherwise leak `<|python_tag|>` tool calls
+    /// into content. Tradeoff: one tool call per turn, no interleaved reasoning
+    /// text. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_tool_calls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
