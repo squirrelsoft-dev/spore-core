@@ -1,0 +1,3 @@
+/target
+# The artifact the agent writes between runs. Inspect it by hand; never commit.
+memory.md
