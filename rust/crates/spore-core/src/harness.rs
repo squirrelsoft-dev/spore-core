@@ -5011,7 +5011,9 @@ impl StandardHarness {
     ///    and counts the turn against the shared budget.
     /// 2. **Execute phase** (issue #59, loops):
     ///    [`run_execute_phase`](Self::run_execute_phase) drains the task list,
-    ///    giving each task its own bounded ReAct sub-loop.
+    ///    running each task in a bounded ReAct sub-loop that BUILDS ON the
+    ///    accumulated execute-phase context (prior steps' tool results and
+    ///    assistant outputs carry forward).
     ///
     /// Between the phases the artifact is parsed into a
     /// [`TaskList`](crate::tasklist::TaskList) via
@@ -5029,9 +5031,13 @@ impl StandardHarness {
     ///   [`HaltReason::BudgetExceeded`] unchanged.
     ///
     /// # Resolved spec decisions (issue #59 — all five FINAL)
-    /// - **Q1 (execute step model):** each task gets its OWN bounded ReAct
-    ///   sub-loop, fully isolated and SEQUENTIAL (task N completes before N+1).
-    ///   The per-task turn cap is derived at the START of each step:
+    /// - **Q1 (execute step model):** each task runs a bounded ReAct sub-loop
+    ///   that BUILDS ON the accumulated execute-phase context — after each
+    ///   successful step its conversation (instruction + tool calls + tool
+    ///   results + assistant output) is folded back into the shared execute
+    ///   context, so the next step sees all prior steps' results. Steps stay
+    ///   SEQUENTIAL (task N completes before N+1). The shared budget still
+    ///   gates: the per-task turn cap is derived at the START of each step:
     ///   `per_task_turns = remaining_turns / remaining_tasks`, floored at 1
     ///   (integer division; `remaining_tasks` = not-yet-started tasks including
     ///   the current one). The shared/parent budget — turns, tokens,
@@ -5172,13 +5178,17 @@ impl StandardHarness {
 
     /// Drive the PlanExecute execute phase (issue #59), draining `task_list`.
     ///
-    /// Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-    /// sub-loop. The per-task turn cap is derived at the START of each step from
-    /// the shared budget: `per_task_turns = remaining_turns / remaining_tasks`,
-    /// floored at 1 (integer division; `remaining_tasks` counts the not-yet-
-    /// started tasks including the current one). The shared budget snapshot
-    /// (`carried`) is threaded through every step so early tasks cannot starve
-    /// later ones and the global budget stays the hard stop.
+    /// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
+    /// the accumulated execute-phase context: after each successful step its
+    /// resulting conversation (instruction + tool calls + tool results +
+    /// assistant output) is folded back into the shared `session_state`, so the
+    /// next step's sub-loop (which clones `session_state`) sees every prior
+    /// step's results. The per-task turn cap is derived at the START of each
+    /// step from the shared budget: `per_task_turns = remaining_turns /
+    /// remaining_tasks`, floored at 1 (integer division; `remaining_tasks`
+    /// counts the not-yet-started tasks including the current one). The shared
+    /// budget snapshot (`carried`) is threaded through every step so early tasks
+    /// cannot starve later ones and the global budget stays the hard stop.
     ///
     /// Before each step the task is marked `InProgress` (and `Completed` after),
     /// the list is re-persisted (Q4), and `OnTaskAdvance` fires with the correct
@@ -5287,7 +5297,16 @@ impl StandardHarness {
                     // Carry the shared budget forward (Q1): cumulative turns are
                     // the sub-loop's absolute count; fold in its token usage.
                     carried.turns = turns;
-                    last_state = step_state;
+                    // Fold this step's resulting conversation back into the
+                    // SHARED execute context so the NEXT step's sub-loop (which
+                    // clones `session_state`) builds on this step's tool results
+                    // and assistant output, not just its instruction. The
+                    // returned `step_state` already contains this step's
+                    // instruction + tool calls + tool results + final output.
+                    *session_state = step_state;
+                    // The terminal `RunResult` carries the LAST completed step's
+                    // full state (now the accumulated context, Q2/#102).
+                    last_state = session_state.clone();
                     carried.input_tokens += usage.input_tokens;
                     carried.output_tokens += usage.output_tokens;
                     total_usage.input_tokens += usage.input_tokens;
@@ -8535,6 +8554,68 @@ mod tests {
         );
     }
 
+    // #93 regression: the execute phase maintains ONE accumulating context
+    // across steps. After a successful step its conversation (instruction + tool
+    // calls + TOOL RESULTS + assistant output) is folded back into the shared
+    // session_state, so the NEXT step's sub-loop sees prior steps' RESULTS — not
+    // just their instructions. Drive a 2-step run where STEP 1 issues a tool
+    // call returning a distinctive string and assert STEP 2's context carries it.
+    #[tokio::test]
+    async fn execute_steps_accumulate_prior_results() {
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                // Plan turn: a 2-step plan (research -> use the result).
+                RecordingTurnAgent::final_resp(
+                    r#"{"tasks":["research tokio","summarize findings"],"rationale":"r"}"#,
+                ),
+                // Step 1: call a tool, then finalize using its result.
+                RecordingTurnAgent::tool_call("lookup"),
+                RecordingTurnAgent::final_resp("researched"),
+                // Step 2: finalize directly (it must SEE step 1's tool result).
+                RecordingTurnAgent::final_resp("summarized"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        // Step 1's tool call returns a distinctive result string.
+        reg.push(ToolOutput::Success {
+            content: "TOKIO_FACTS_123".into(),
+            truncated: false,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(plan_task())).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "summarized"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let contexts = agent.seen_text();
+        // 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+        assert_eq!(contexts.len(), 4, "plan turn + 3 execute turns");
+
+        // Step 1's SECOND turn (index 2) sees the tool result — sanity check that
+        // the result string is on the wire at all.
+        assert!(
+            contexts[2].contains("TOKIO_FACTS_123"),
+            "step-1 final turn should follow its own tool result: {}",
+            contexts[2]
+        );
+        // The accumulation guarantee: STEP 2's context (index 3) CONTAINS step
+        // 1's tool result, proving the execute loop carried it forward.
+        assert!(
+            contexts[3].contains("TOKIO_FACTS_123"),
+            "step 2 must see step 1's tool result (accumulating context): {}",
+            contexts[3]
+        );
+        // Step 2 also sees step 1's prior instruction + assistant output.
+        assert!(
+            contexts[3].contains("research tokio") && contexts[3].contains("researched"),
+            "step 2 must see step 1's instruction and output: {}",
+            contexts[3]
+        );
+    }
+
     // The streaming path flows through `run_react_inner`'s same seam — the
     // streamed turn's captured context carries the flag.
     #[tokio::test]
@@ -10465,6 +10546,9 @@ mod tests {
                         .map(|m| match &m.content {
                             Content::Text { text } => text.clone(),
                             Content::ToolCall(tc) => tc.name.clone(),
+                            // Tool results carry prior steps' outputs forward —
+                            // surface their content so accumulation is visible.
+                            Content::ToolResult(tr) => tr.content.clone(),
                             _ => String::new(),
                         })
                         .collect::<Vec<_>>()
