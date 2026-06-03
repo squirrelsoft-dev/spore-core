@@ -146,7 +146,9 @@ itself defines.
 
 ## Rough edges (honest, because this is also a stress test)
 
-SelfVerifying is demanding and, against a small local model, genuinely flaky:
+SelfVerifying is demanding and, against a small local model, can be flaky. With
+the maintainer-verified `gemma4:31b-cloud` (see below) the loop runs well in
+practice; these remain risks chiefly on weaker/smaller local models:
 
 - **The evaluator mis-judges.** Small models emit false `PASS` (rubber-stamping
   broken code) or false `FAIL` (rejecting correct code), and sometimes neither a
@@ -156,16 +158,22 @@ SelfVerifying is demanding and, against a small local model, genuinely flaky:
   Models that wrap the verdict in prose or markdown can dodge the patterns. The
   patterns here are lenient (`(?im)` multiline, anchored `PASS`, `FAIL:` anywhere)
   but not bulletproof.
-- **The builder may not call the tool.** If the build agent answers with code in
-  prose instead of calling `write_file`, the evaluator reads a stale/empty file
-  and FAILs. The `conversational` preset's adaptive tool-calling helps, but small
-  models still slip.
+- **The builder describing the write in prose — mostly handled.** If the build
+  agent describes the action in prose instead of calling `write_file`, the
+  `conversational` preset's **adaptive prompt-based tool-calling repair** (on by
+  default) detects the prose, nudges the model, and escalates to prompt-based
+  tool calling so the write lands automatically. The only honest caveat: it's a
+  **one-shot** escalation — a model that *keeps* answering in prose even after
+  escalation still won't write the file. Rarely bites with a capable model.
 - **Exhaustion is a normal outcome here.** A `SelfVerifyExhausted` failure after
   N iterations is the strategy working as designed — it bounds the loop. The
   example prints the last draft and last failure reason so you can see how close
   it got.
 
-A **larger hosted model** gives a much cleaner demo. spore-core ships an
+The maintainer-verified known-good model is **`gemma4:31b-cloud`** (an Ollama
+*cloud* model): it gives a clean demo and, because it's served through Ollama,
+needs **no code edit** — just set `SPORE_OLLAMA_MODEL=gemma4:31b-cloud` (the
+existing `OllamaModelInterface` path). As an alternative, spore-core also ships an
 `AnthropicModelInterface` (`AnthropicModelInterface::new(api_key, model_id)`); to
 target it, swap the two `OllamaModelInterface::with_base_url(...)` constructions
 in `main.rs` for `AnthropicModelInterface::new(...)`. This example wires Ollama by
