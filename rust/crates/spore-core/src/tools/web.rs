@@ -771,6 +771,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn get_preserves_preexisting_query_string_and_appends_query_param() {
+        use wiremock::matchers::query_param;
+        // SearXNG shape: the endpoint already carries `?format=json`; the GET
+        // path must PRESERVE it and APPEND the query param (`q`) alongside.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("format", "json"))
+            .and(query_param("q", "rust"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("searxng-results"))
+            .mount(&server)
+            .await;
+        let sb = AllowAllSandbox;
+        let cfg = WebSearchConfig {
+            endpoint: format!("{}/search?format=json", server.uri()),
+            method: SearchMethod::Get,
+            auth_headers: vec![],
+            query_param: "q".into(),
+            body_auth_params: vec![],
+        };
+        let tool = WebSearchTool::with_config(cfg).unwrap();
+        let r = tool
+            .execute(
+                &call("web_search", json!({"query": "rust"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "searxng-results"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn search_method_default_is_post() {
         assert_eq!(SearchMethod::default(), SearchMethod::Post);
