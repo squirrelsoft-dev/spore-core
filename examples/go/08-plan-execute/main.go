@@ -38,9 +38,11 @@
 //
 // # Tools (all from the built-in catalogue — no custom impl Tool)
 //
-//   - web_search — StandardTools{}.WebSearchWithEndpoint(endpoint). The query is
-//     POSTed to endpoint as JSON {"query": ...}; the response body is returned to
-//     the agent verbatim. The endpoint comes from SPORE_WEB_SEARCH_ENDPOINT.
+//   - web_search — built via tools.NewWebSearchToolFromConfig with a GET config
+//     (Method=GET, QueryParam="q"). The tool issues GET <endpoint>?q=<query>,
+//     preserving any query string already on the endpoint (e.g. ?format=json), and
+//     returns the response body to the agent verbatim. The endpoint comes from
+//     SPORE_WEB_SEARCH_ENDPOINT — point it at a SearXNG JSON API.
 //   - write_file — StandardTools{}.WriteFile(). The agent writes the synthesized,
 //     cited comparison to async-comparison.md.
 //   - read_file — StandardTools{}.ReadFile(). Lets the agent re-read what it wrote.
@@ -56,7 +58,7 @@
 //
 //	ollama serve &
 //	ollama pull llama3.2
-//	export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search   # a {"query"}->JSON endpoint
+//	export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"   # SearXNG JSON API
 //	go run .
 //	go run . --prompt "Compare three Rust web frameworks (axum, actix-web, rocket) on performance, ergonomics, and ecosystem; cite sources and save to async-comparison.md."
 package main
@@ -151,18 +153,34 @@ func run() error {
 		baseURL = ollama.DefaultBaseURL
 	}
 
-	// The search backend endpoint. web_search POSTs {"query": ...} here and returns
-	// the JSON body to the agent. There is no live backend in spore-core, so you
-	// must supply one — a self-hosted SearXNG JSON endpoint, or a mock that accepts
-	// the {"query"} shape. Raw Brave/Tavily are NOT yet drop-in: they need a custom
-	// auth header, which is tracked as core issue #108. See README.
+	// The search backend endpoint. web_search issues GET <endpoint>?q=<query> and
+	// returns the JSON body to the agent. There is no live backend in spore-core,
+	// so you must supply one — a self-hosted SearXNG JSON API works out of the box
+	// (?format=json). The GET path preserves any query string already on the
+	// endpoint, so SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
+	// becomes GET /search?format=json&q=<query>. See README.
 	endpoint := strings.TrimSpace(os.Getenv("SPORE_WEB_SEARCH_ENDPOINT"))
 	if endpoint == "" {
 		fmt.Fprintln(os.Stderr, "SPORE_WEB_SEARCH_ENDPOINT is not set.\n"+
-			"Set it to a search endpoint that accepts a JSON `{\"query\": ...}` POST and "+
-			"returns JSON results.\n"+
-			"See .env.example and the README. (Raw Brave/Tavily need core #108 first.)")
+			"Set it to a SearXNG JSON API endpoint, e.g. "+
+			"\"http://localhost:8888/search?format=json\".\n"+
+			"See .env.example and the README.")
 		os.Exit(2)
+	}
+
+	// Build the web_search tool with a GET config pointed at the SearXNG JSON API:
+	// the query is sent as ?q=<query>, preserving any existing query string on the
+	// endpoint. No auth is needed for a local SearXNG instance.
+	webSearch, err := tools.NewWebSearchToolFromConfig(tools.WebSearchConfig{
+		Endpoint:       endpoint,
+		Method:         tools.SearchMethodGet,
+		QueryParam:     "q",
+		AuthHeaders:    []tools.AuthHeader{},
+		BodyAuthParams: []tools.BodyAuthParam{},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to construct web_search tool: %s\n", err)
+		os.Exit(1)
 	}
 
 	// The agent operates inside this example's workspace/ directory. Resolve it
@@ -196,8 +214,8 @@ func run() error {
 	// plan/subtask stream events.
 	cfg := observability.ConversationalBuilder(mi).
 		Sandbox(sandbox).
-		Tool(tools.StandardTools{}.WebSearchWithEndpoint(endpoint)). // ← external API
-		Tool(tools.StandardTools{}.WriteFile()).                     // ← writes async-comparison.md
+		Tool(tools.StandardTool{Implementation: webSearch, Schema: webSearch.Schema()}). // ← external API (SearXNG GET/JSON)
+		Tool(tools.StandardTools{}.WriteFile()).                                         // ← writes async-comparison.md
 		Tool(tools.StandardTools{}.ReadFile()).
 		SystemPrompt(systemPrompt).
 		BuildConfig()
