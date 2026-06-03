@@ -222,19 +222,49 @@ impl Tool for ListDirTool {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
+            // Emit paths relative to the workspace root so each entry can be
+            // fed straight back into read_file/write_file. The sandbox treats
+            // every input path as root-relative, so absolute paths would not
+            // round-trip (see #93). `resolved` is the absolute path of the
+            // listed directory (= root-relative `params.path`); each entry is
+            // under it. Relativize against `resolved`, then re-anchor onto the
+            // root-relative `params.path`.
+            let listed = std::path::Path::new(&params.path);
+            let to_root_relative = |entry_path: &std::path::Path| -> Option<String> {
+                // Path of the entry relative to the listed directory.
+                let rel_to_listed = entry_path.strip_prefix(&resolved).ok()?;
+                // Skip the listed directory itself (WalkDir yields it first).
+                if rel_to_listed.as_os_str().is_empty() {
+                    return None;
+                }
+                // Re-anchor onto the caller-supplied (root-relative) path.
+                let anchored = listed.join(rel_to_listed);
+                // Drop a leading `./` so `.`/empty inputs yield bare names.
+                let normalized: std::path::PathBuf = anchored
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .collect();
+                Some(normalized.display().to_string())
+            };
             let mut entries: Vec<String> = Vec::new();
             if params.recursive {
                 for entry in walkdir::WalkDir::new(&resolved)
                     .into_iter()
                     .filter_map(Result::ok)
                 {
-                    entries.push(entry.path().display().to_string());
+                    if let Some(rel) = to_root_relative(entry.path()) {
+                        entries.push(rel);
+                    }
                 }
             } else {
                 match tokio::fs::read_dir(&resolved).await {
                     Ok(mut rd) => loop {
                         match rd.next_entry().await {
-                            Ok(Some(e)) => entries.push(e.path().display().to_string()),
+                            Ok(Some(e)) => {
+                                if let Some(rel) = to_root_relative(&e.path()) {
+                                    entries.push(rel);
+                                }
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 return ToolOutput::Error {
@@ -507,6 +537,77 @@ mod tests {
                 assert_eq!(lines, sorted);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Regression for #93: every entry list_dir returns must round-trip
+    /// straight back into read_file under the *real* WorkspaceScopedSandbox,
+    /// which treats all input paths as root-relative. Absolute paths (the old
+    /// behavior) would be rejected as PathEscape.
+    #[tokio::test]
+    async fn list_dir_entries_roundtrip_through_workspace_sandbox() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        tokio::fs::write(root.join("a.txt"), "alpha").await.unwrap();
+        tokio::fs::write(root.join("b.txt"), "beta").await.unwrap();
+        tokio::fs::create_dir(root.join("sub")).await.unwrap();
+        tokio::fs::write(root.join("sub").join("c.txt"), "gamma")
+            .await
+            .unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            root: root.clone(),
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 0,
+        })
+        .unwrap();
+
+        // Recursive so we exercise both top-level files and a nested file.
+        let r = ListDirTool::new()
+            .execute(
+                &call("list_dir", json!({"path": ".", "recursive": true})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        let entries: Vec<String> = match r {
+            ToolOutput::Success { content, .. } => content.lines().map(str::to_string).collect(),
+            other => panic!("list_dir failed: {other:?}"),
+        };
+        assert!(
+            entries.iter().any(|e| e == "a.txt"),
+            "expected bare root-relative names, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e == "sub/c.txt"),
+            "expected nested entry as sub/c.txt, got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.is_empty() || e == "."),
+            "must not emit the listed dir itself, got {entries:?}"
+        );
+
+        // The actual bug check: feed each entry straight into read_file.
+        for entry in &entries {
+            let rr = ReadFileTool::new()
+                .execute(&call("read_file", json!({"path": entry})), &sb, &test_ctx())
+                .await;
+            match rr {
+                ToolOutput::Success { .. } => {}
+                ToolOutput::Error { message, .. } => {
+                    // A directory entry (e.g. `sub`) reads as an error but must
+                    // NOT be a sandbox violation — that's the regression.
+                    assert!(
+                        !message.contains("Sandbox") && !message.contains("PathEscape"),
+                        "entry {entry:?} did not round-trip: {message}"
+                    );
+                }
+                other => panic!("unexpected read_file output for {entry:?}: {other:?}"),
+            }
         }
     }
 
