@@ -1,0 +1,30 @@
+{
+  "name": "spore-example-10-hill-climbing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 10: wire the HillClimbing loop strategy. The agent refines one README in place; a custom MetricEvaluator scores each draft with a separate judge model, and the harness keeps improvements / reverts regressions until it stops improving (stagnation) or runs out of budget. There is no PASS — only best-so-far.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "lint": "eslint src",
+    "format": "prettier src --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "@types/node": "~20.16.15",
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+node_modules
+dist
+.env
+# The agent refines this in place; the git-init'd workspace is local state.
+workspace/README.md
+workspace/.git
