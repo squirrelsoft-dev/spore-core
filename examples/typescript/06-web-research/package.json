@@ -1,0 +1,29 @@
+{
+  "name": "spore-example-06-web-research",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 06: a ReAct agent that uses the external `web_search` catalogue tool to research a question, synthesizes a cited answer, and writes it to answer.md via write_file — same harness + sandbox as 04, only the tool set changed.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "lint": "eslint src",
+    "format": "prettier src --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}
