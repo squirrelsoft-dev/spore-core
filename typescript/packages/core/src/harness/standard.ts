@@ -52,7 +52,8 @@ import {
   type TurnSpan,
   type WarnEvent,
 } from "../observability/types.js";
-import type { Message, ToolCall } from "../model/schemas.js";
+import type { Message, ModelParams, ToolCall } from "../model/schemas.js";
+import { ModelParamsSchema } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import { InMemoryStorageProvider, StorageProvider } from "../storage/index.js";
@@ -273,6 +274,16 @@ export interface HarnessConfig {
    * Absent (the default) preserves today's behaviour.
    */
   systemPrompt?: string;
+  /**
+   * Authoritative per-run model sampling/decoding parameters (issue #93). The
+   * harness replaces each turn's {@link Context.params} with this value
+   * UNCONDITIONALLY (builder params win) right before the request is built, so
+   * the configured params reach every agent turn that requests tools. See
+   * {@link HarnessBuilder.modelParams}. Defaults to the schema's default
+   * {@link ModelParams} (`{ stop_sequences: [] }`, `structured_tool_calls`
+   * absent ⇒ `false`).
+   */
+  modelParams: ModelParams;
   /**
    * Opt-in conversation-history threading through the {@link StorageProvider}'s
    * {@link SessionStore} (issue #102). When `true`, the harness:
@@ -1173,6 +1184,9 @@ export class StandardHarness implements Harness {
 
     // Assemble + invoke the planner for exactly ONE turn (R1).
     const context = await this.config.contextManager.assemble(sessionState, task, signal);
+    // Per-run model params win unconditionally (issue #93) — same seam as
+    // runReactInner, before the plan turn is dispatched.
+    context.params = this.config.modelParams;
     emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
     const turnStartedAt = Timestamp.now();
     const turnClock = Date.now();
@@ -2492,6 +2506,11 @@ export class StandardHarness implements Harness {
           });
         }
       }
+      // Per-run model params win unconditionally (issue #93). The agent copies
+      // `Context.params` verbatim into the `ModelRequest`, so this is the single
+      // seam that delivers configured params (e.g. structured tool calls) to
+      // every tool-requesting ReAct/execute/streaming turn.
+      context.params = this.config.modelParams;
       emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
       const turnStartedAt = Timestamp.now();
       const turnClock = Date.now();
@@ -3271,6 +3290,7 @@ export class HarnessBuilder {
   private _vcsProvider?: VcsProvider;
   private readonly _standardTools: StandardTool[] = [];
   private _systemPrompt?: string;
+  private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
 
   constructor(
@@ -3483,6 +3503,28 @@ export class HarnessBuilder {
   }
 
   /**
+   * Set the authoritative model sampling/decoding parameters for the whole run
+   * (issue #93).
+   *
+   * These params are authoritative: the harness replaces each turn's
+   * {@link Context.params} with this value UNCONDITIONALLY (builder params win)
+   * right before the request is built, so the configured params reach every
+   * agent turn that requests tools — the ReAct loop, the PlanExecute plan
+   * phase, the execute sub-loop, and the streaming path alike. (The internal
+   * compaction/summarization turn is intentionally left on defaults; it
+   * requests no tools, so decoding params are a no-op there.)
+   *
+   * Enabling {@link ModelParams.structured_tool_calls} trades interleaved
+   * reasoning for one schema-constrained tool call per turn — useful for small
+   * local models that otherwise emit malformed tool calls. Defaults to the
+   * schema's default {@link ModelParams}.
+   */
+  modelParams(p: ModelParams): this {
+    this._modelParams = p;
+    return this;
+  }
+
+  /**
    * Opt into automatic conversation-history threading through the
    * {@link StorageProvider}'s {@link SessionStore} (issue #102). Defaults to
    * `false` — the off-by-default zero-I/O contract.
@@ -3590,6 +3632,7 @@ export class HarnessBuilder {
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
       systemPrompt: this._systemPrompt,
+      modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
     };
   }

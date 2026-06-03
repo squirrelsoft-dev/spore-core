@@ -44,6 +44,7 @@ function baseConfig(agent: MockAgent): HarnessConfig {
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
   };
 }
 

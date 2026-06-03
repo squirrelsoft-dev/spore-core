@@ -179,6 +179,7 @@ function config(agent: Agent, overrides: Partial<HarnessConfig> = {}): HarnessCo
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
     ...overrides,
   };
 }

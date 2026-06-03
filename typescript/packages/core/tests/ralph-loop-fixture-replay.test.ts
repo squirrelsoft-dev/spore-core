@@ -140,6 +140,7 @@ describe("Ralph loop fixture replay — ralph.json", () => {
         sandbox: new WorkspaceSandbox(dir),
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
+        modelParams: { stop_sequences: [] },
         maxResets: c.max_resets,
         // issue #58 v2: when the case carries a `vcs_log`, wire a
         // FixtureVcsProvider seeded with it; absent ⇒ no provider ⇒ no git

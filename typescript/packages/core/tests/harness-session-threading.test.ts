@@ -141,6 +141,7 @@ function baseConfig(agent: MockAgent): HarnessConfig {
     sandbox: new AllowAllSandbox(),
     contextManager: new RecordingContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
   };
 }
 

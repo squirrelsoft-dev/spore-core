@@ -146,6 +146,7 @@ describe("Harness streaming fixture replay (#103)", () => {
       sandbox: new AllowAllSandbox(),
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
     };
     void onStream;
     return { harness: new StandardHarness(config), toolRegistry };

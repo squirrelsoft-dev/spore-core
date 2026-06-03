@@ -133,6 +133,7 @@ function ralphConfig(root: string, agent: Agent): HarnessConfig {
     sandbox: new WorkspaceSandbox(root),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
     maxResets: 3,
   };
 }

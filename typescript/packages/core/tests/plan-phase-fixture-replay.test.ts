@@ -82,6 +82,7 @@ function configFor(exchange: RecordedExchange, storage: StorageProvider): Harnes
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
     // #76: the plan artifact is persisted to the RunStore seam (not extras), so
     // the replay needs a real in-memory run store for the readback below.
     storage,

@@ -20,6 +20,7 @@ import {
   emptyBudgetSnapshot,
   emptySessionState,
   newTask,
+  type Agent,
   type Context,
   type ContextManager,
   type HarnessConfig,
@@ -56,6 +57,7 @@ function standardConfig(agent: MockAgent): HarnessConfig {
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
   };
 }
 
@@ -615,5 +617,121 @@ describe("Harness — ReAct loop", () => {
     );
     expect(toolIdx, "tool result must be recorded").toBeGreaterThanOrEqual(0);
     expect(assistantIdx).toBeLessThan(toolIdx);
+  });
+});
+
+// ── #93: modelParams reach every tool-requesting turn ──────────────────────
+//
+// `RecordingTurnAgent.turn` captures every `Context` it sees in `seen`, and the
+// agent copies `Context.params` verbatim into the `ModelRequest` (see
+// `ModelAgent.turn` / `intoRequest`). So asserting on a captured context's
+// `params.structured_tool_calls` proves the configured params reached the
+// request the model would have seen.
+//
+// Mirrors `rust/crates/spore-core/src/harness.rs#tests` (#93).
+
+/** A context-capturing agent: records every `Context` it sees and pops the next
+ *  scripted result, so we can assert which params reached each turn. */
+class RecordingTurnAgent implements Agent {
+  readonly seen: Context[] = [];
+  private readonly results: TurnResult[] = [];
+  constructor(private readonly agentId: AgentId) {}
+  push(r: TurnResult): this {
+    this.results.push(r);
+    return this;
+  }
+  id(): AgentId {
+    return this.agentId;
+  }
+  async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+    this.seen.push(ctx);
+    const next = this.results.shift();
+    if (next == null) return { kind: "error", error: new EmptyResponse(), usage: null };
+    return next;
+  }
+}
+
+/** Build a config whose agent is a context-capturing `RecordingTurnAgent`, with
+ *  the given (optionally non-default) model params. */
+function recordingConfig(agent: RecordingTurnAgent, modelParams: HarnessConfig["modelParams"]) {
+  return {
+    agent,
+    toolRegistry: new ScriptedToolRegistry(),
+    sandbox: new AllowAllSandbox(),
+    contextManager: new NoopContextManager(),
+    terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams,
+  } satisfies HarnessConfig;
+}
+
+const PLAN_EXECUTE_STRATEGY: LoopStrategy = { kind: "plan_execute", plan_model: null };
+
+function planTask93(): Task {
+  return newTask("build a CLI", SessionId.of("p93"), PLAN_EXECUTE_STRATEGY);
+}
+
+describe("Harness — modelParams threading (#93)", () => {
+  // No `.modelParams(...)` ⇒ each turn's context carries the default
+  // (structured_tool_calls absent ⇒ false).
+  it("default model params reach the request as default (structured false)", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(recordingConfig(agent, { stop_sequences: [] }));
+    await h.run({ task: react(5) });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).not.toBe(true);
+  });
+
+  // (a) ReAct: the ReAct turn context carries the flag.
+  it("model params reach the ReAct turn", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: react(5) });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+  });
+
+  // (b) Plan phase: the plan-turn context carries the flag.
+  it("model params reach the plan phase", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(
+      fr('{"tasks":["one"],"rationale":"r"}'),
+    );
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: planTask93() });
+    // First captured context is the plan turn.
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
+  });
+
+  // (c) Execute sub-loops: a full PlanExecute run threads params through the
+  // shared react seam used by the execute sub-loop — every captured context
+  // (plan + execute steps) carries the flag.
+  it("model params reach the execute sub-loops", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      .push(fr('{"tasks":["one","two"],"rationale":"r"}'))
+      .push(fr("did one"))
+      .push(fr("did two"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: planTask93() });
+    // 1 plan turn + 2 execute turns; every captured context carries it.
+    expect(agent.seen.length).toBe(3);
+    expect(agent.seen.every((c) => c.params.structured_tool_calls === true)).toBe(true);
+  });
+
+  // (d) Streaming path: it flows through `runReactInner`'s same seam — the
+  // streamed turn's captured context carries the flag.
+  it("model params reach the streaming path", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec")).push(fr("done"));
+    const h = new StandardHarness(
+      recordingConfig(agent, { stop_sequences: [], structured_tool_calls: true }),
+    );
+    await h.run({ task: react(5), on_stream: () => {} });
+    expect(agent.seen.length).toBeGreaterThan(0);
+    expect(agent.seen[0].params.structured_tool_calls).toBe(true);
   });
 });
