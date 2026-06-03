@@ -68,19 +68,59 @@ function systemText(req: ModelRequest): string {
 
 describe("buildToolPrompt", () => {
   it("matches the Rust build_tool_prompt output byte-for-byte", () => {
+    // Object KEYS render sorted at every level (Rust serde_json BTreeMap / Go
+    // json.Marshal of a map), so the single-property `toolSchema()` renders its
+    // top-level keys as properties < required < type.
     const expected =
       "You have access to the following tools. Use them when they would help complete the task.\n\n" +
       "<available_tools>\n" +
       "<tool>\n" +
       "  <name>calculator</name>\n" +
       "  <description>evaluate math</description>\n" +
-      '  <input_schema>{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}</input_schema>\n' +
+      '  <input_schema>{"properties":{"expression":{"type":"string"}},"required":["expression"],"type":"object"}</input_schema>\n' +
       "</tool>\n" +
       "</available_tools>\n\n" +
       "When you want to use a tool, respond with ONLY the following format and nothing else:\n" +
       '<tool_call>\n  <name>tool_name_here</name>\n  <input>{"key": "value"}</input>\n</tool_call>\n\n' +
       "When you have a final answer that does not require a tool, respond normally in prose.";
     expect(buildToolPrompt([toolSchema()])).toBe(expected);
+  });
+
+  it("sorts schema object keys alphabetically at every level (cross-language parity)", () => {
+    // A multi-property schema with keys deliberately OUT of alphabetical order:
+    // top-level `type` before `properties` before `required`, and `zeta` before
+    // `alpha` inside `properties`. Rust (serde_json BTreeMap) and Go
+    // (json.Marshal of a map) both emit object keys sorted; this must match.
+    const schema: ToolSchema = {
+      name: "multi",
+      description: "multi-prop tool",
+      input_schema: {
+        type: "object",
+        properties: {
+          zeta: { type: "number" },
+          alpha: { type: "string" },
+        },
+        required: ["zeta", "alpha"],
+      },
+    };
+    const out = buildToolPrompt([schema]);
+    // Object KEYS sorted: properties < required < type at top level; alpha < zeta
+    // inside properties. The `required` ARRAY preserves element order (not sorted).
+    const expectedSchemaJson =
+      '{"properties":{"alpha":{"type":"string"},"zeta":{"type":"number"}},"required":["zeta","alpha"],"type":"object"}';
+    expect(out).toContain(`  <input_schema>${expectedSchemaJson}</input_schema>\n`);
+    // Sanity: ordering assertions the way the divergence would manifest.
+    const json = out.slice(
+      out.indexOf("<input_schema>") + "<input_schema>".length,
+      out.indexOf("</input_schema>"),
+    );
+    // Use the top-level `"type":"object"` token (the bare `"type"` also appears
+    // nested inside each property) to assert top-level key ordering.
+    expect(json.indexOf('"properties"')).toBeLessThan(json.indexOf('"required"'));
+    expect(json.indexOf('"required"')).toBeLessThan(json.indexOf('"type":"object"'));
+    expect(json.indexOf('"alpha"')).toBeLessThan(json.indexOf('"zeta"'));
+    // Array element order preserved (zeta listed before alpha in `required`).
+    expect(json).toContain('"required":["zeta","alpha"]');
   });
 });
 

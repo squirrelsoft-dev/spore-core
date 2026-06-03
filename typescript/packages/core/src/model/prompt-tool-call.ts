@@ -69,9 +69,31 @@ const TOOLS_BLOCK_OPEN = "<available_tools>";
 // ============================================================================
 
 /**
+ * Recursively sort object keys alphabetically at every nesting level, leaving
+ * array element order untouched. Mirrors how Rust's `serde_json::Value`
+ * (BTreeMap-backed, no `preserve_order`) and Go's `json.Marshal` of a map
+ * serialize: object KEYS are emitted in sorted order, array ELEMENTS in
+ * insertion order. Canonicalizing here keeps the `<input_schema>` JSON
+ * byte-identical across languages even for multi-property schemas.
+ */
+function sortKeysDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeysDeep);
+  if (v !== null && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(obj)
+        .sort()
+        .map((k) => [k, sortKeysDeep(obj[k])]),
+    );
+  }
+  return v;
+}
+
+/**
  * Render the tool-definition + response-format block appended to the system
  * prompt when prompt-based tool calling is active. Byte-for-byte identical to
- * Rust's `build_tool_prompt`.
+ * Rust's `build_tool_prompt` (and Go's): the `<input_schema>` JSON renders with
+ * object keys sorted alphabetically at every level (see {@link sortKeysDeep}).
  */
 export function buildToolPrompt(tools: ToolSchema[]): string {
   let s = "";
@@ -85,7 +107,7 @@ export function buildToolPrompt(tools: ToolSchema[]): string {
     s += `  <description>${tool.description}</description>\n`;
     let schemaJson: string;
     try {
-      schemaJson = JSON.stringify(tool.input_schema);
+      schemaJson = JSON.stringify(sortKeysDeep(tool.input_schema));
       if (schemaJson === undefined) schemaJson = "{}";
     } catch {
       schemaJson = "{}";
