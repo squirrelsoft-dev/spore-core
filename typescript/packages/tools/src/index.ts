@@ -40,7 +40,13 @@ export { BashCommandTool, ExecTool, RunTestsTool } from "./exec.js";
 export { EditFileTool } from "./edit.js";
 export { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
 export { SendMessageTool } from "./message.js";
-export { WebFetchTool, WebSearchTool } from "./web.js";
+export {
+  WebFetchTool,
+  WebSearchTool,
+  WebSearchConfigError,
+  type WebSearchConfig,
+  type SearchMethod,
+} from "./web.js";
 export { TODO_STORE_KEY, TodoWriteTool } from "./todo.js";
 export { MEMORY_LOCAL_REJECTED_MESSAGE, MemoryTool } from "./memory.js";
 export {
