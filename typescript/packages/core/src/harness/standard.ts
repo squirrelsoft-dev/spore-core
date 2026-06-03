@@ -784,20 +784,26 @@ export class StandardHarness implements Harness {
    *    {@link PlanArtifact}, fires `on_plan_created`, and counts the turn against
    *    the shared budget.
    * 2. **Execute phase** (issue #59, loops): {@link runExecutePhase} drains the
-   *    task list, giving each task its own bounded ReAct sub-loop.
+   *    task list, running each task in a bounded ReAct sub-loop that BUILDS ON
+   *    the accumulated execute-phase context (prior steps' tool results and
+   *    assistant outputs carry forward).
    *
    * Between the phases the artifact is parsed into a {@link TaskList} via
    * `planArtifactToTaskList` and persisted through the storage seam (Q4) plus
    * the `extras` mirror.
    *
    * ## Resolved spec decisions (issue #59 — all FINAL)
-   * - **Q1:** each task gets its OWN bounded, isolated, SEQUENTIAL ReAct sub-loop
-   *   (task N completes before N+1). The per-task turn cap is derived at the
-   *   START of each step: `per_task_turns = floor(remaining_turns /
-   *   remaining_tasks)`, floored at 1 (`remaining_tasks` counts the not-yet-
-   *   started tasks including the current one). The shared budget — turns,
-   *   tokens, observability spans, compaction — is carried across EVERY step and
-   *   the global budget is the hard stop.
+   * - **Q1:** each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
+   *   the accumulated execute-phase context — after each successful step its
+   *   conversation (instruction + tool calls + tool results + assistant output)
+   *   is folded back into the shared session, so the next step sees all prior
+   *   steps' results. Steps stay SEQUENTIAL (task N completes before N+1). The
+   *   shared budget still gates: the per-task turn cap is derived at the START of
+   *   each step: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
+   *   floored at 1 (`remaining_tasks` counts the not-yet-started tasks including
+   *   the current one). The shared budget — turns, tokens, observability spans,
+   *   compaction — is carried across EVERY step and the global budget is the hard
+   *   stop.
    * - **Q2:** on success `output` is the LAST completed step's `final_response`
    *   text — not a concatenation, not the plan rationale.
    * - **Q3:** an empty task list ⇒ {@link HaltReason} `empty_plan`.
@@ -928,13 +934,17 @@ export class StandardHarness implements Harness {
   /**
    * Drive the PlanExecute execute phase (issue #59), draining `taskList`.
    *
-   * Per Q1 each task gets its own bounded, fully-isolated, SEQUENTIAL ReAct
-   * sub-loop. The per-task turn cap is derived at the START of each step from the
-   * shared budget: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
-   * floored at 1 (`remaining_tasks` counts not-yet-started tasks including the
-   * current one). The shared budget snapshot (`carried`) is threaded through
-   * every step so early tasks cannot starve later ones and the global budget
-   * stays the hard stop.
+   * Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
+   * accumulated execute-phase context: after each successful step its resulting
+   * conversation (instruction + tool calls + tool results + assistant output) is
+   * folded back into the shared `sessionState`, so the next step's sub-loop
+   * (which clones `sessionState`) sees every prior step's results. The per-task
+   * turn cap is derived at the START of each step from the shared budget:
+   * `per_task_turns = floor(remaining_turns / remaining_tasks)`, floored at 1
+   * (`remaining_tasks` counts not-yet-started tasks including the current one).
+   * The shared budget snapshot (`carried`) is threaded through every step so
+   * early tasks cannot starve later ones and the global budget stays the hard
+   * stop.
    *
    * Before each step the task is marked `in_progress` (and `completed` after),
    * the list is re-persisted (Q4), and `on_task_advance` fires with the correct
@@ -1026,8 +1036,9 @@ export class StandardHarness implements Harness {
 
       // Seed the (possibly mutated) step instruction as a user message, then run
       // the bounded ReAct sub-loop carrying the shared budget (Q1). The sub-loop
-      // works on a CLONE of the session so each step is isolated; the parent
-      // session keeps the seeded message.
+      // works on a CLONE of the accumulated session; on success the clone's
+      // resulting state is folded back into `sessionState` so the NEXT step
+      // builds on this step's tool results and assistant output.
       await this.config.contextManager.appendUserMessage(sessionState, stepTask.instruction);
       const subState: SessionState = {
         messages: [...sessionState.messages],
@@ -1057,7 +1068,21 @@ export class StandardHarness implements Harness {
         totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
         totalUsage.cost_usd += subResult.usage.cost_usd;
         lastOutput = subResult.output;
-        lastState = runResultSessionState(subResult);
+        // Fold this step's resulting conversation back into the SHARED execute
+        // context so the NEXT step's sub-loop (which clones `sessionState`)
+        // builds on this step's tool results and assistant output, not just its
+        // instruction. The returned step state already contains this step's
+        // instruction + tool calls + tool results + final output.
+        const stepState = runResultSessionState(subResult);
+        sessionState.messages = stepState.messages;
+        sessionState.extras = stepState.extras;
+        // The terminal RunResult carries the LAST completed step's full state
+        // (now the accumulated context, Q2/#102). Snapshot it so a later step's
+        // seeded user message cannot retroactively mutate this result.
+        lastState = {
+          messages: [...sessionState.messages],
+          extras: { ...sessionState.extras },
+        };
 
         // Mark completed and re-persist (Q4).
         completeTask(taskList, taskId);

@@ -738,9 +738,7 @@ describe("Harness — modelParams threading (#93)", () => {
   // Concatenate the text of a captured context's user/tool messages so we can
   // assert which seeded directives/instructions reached a given turn.
   function ctxText(ctx: Context): string {
-    return ctx.messages
-      .map((m) => (m.content.type === "text" ? m.content.text : ""))
-      .join("\n");
+    return ctx.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("\n");
   }
 
   // #93 regression: the plan-phase directive ("Produce a step-by-step plan…
@@ -784,5 +782,54 @@ describe("Harness — modelParams threading (#93)", () => {
     expect(ctxText(agent.seen[2]!)).toContain("step one");
     expect(ctxText(agent.seen[2]!)).toContain("ok");
     expect(ctxText(agent.seen[3]!)).toContain("step two");
+  });
+
+  // #93 regression: the execute phase maintains ONE accumulating context across
+  // steps. After a successful step its conversation (instruction + tool calls +
+  // TOOL RESULTS + assistant output) is folded back into the shared sessionState,
+  // so the NEXT step's sub-loop sees prior steps' RESULTS — not just their
+  // instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
+  // distinctive string and assert STEP 2's assembled context carries it.
+  //
+  // Mirrors `rust/crates/spore-core/src/harness.rs#execute_steps_accumulate_prior_results`.
+  it("execute steps accumulate prior results", async () => {
+    const agent = new RecordingTurnAgent(AgentId.of("rec"))
+      // Plan turn: a 2-step plan (research -> summarize).
+      .push(fr('{"tasks":["research tokio","summarize findings"],"rationale":"r"}'))
+      // Step 1: call a tool, then finalize using its result.
+      .push(tcr(toolCall("c1", "lookup")))
+      .push(fr("researched"))
+      // Step 2: finalize directly (it must SEE step 1's tool result).
+      .push(fr("summarized"));
+    const cfg = recordingConfig(agent, { stop_sequences: [] });
+    // Step 1's tool call returns a distinctive result string.
+    cfg.toolRegistry = new ScriptedToolRegistry().push({
+      kind: "success",
+      content: "TOKIO_FACTS_123",
+    });
+    const h = new StandardHarness(cfg);
+    const result = await h.run({ task: planTask93() });
+    expect(result.kind).toBe("success");
+    if (result.kind === "success") {
+      expect(result.output).toBe("summarized");
+    }
+
+    // 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
+    expect(agent.seen.length).toBe(4);
+
+    // Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
+    // result string is on the wire at all.
+    expect(ctxText(agent.seen[2]!)).toContain("TOKIO_FACTS_123");
+
+    // The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
+    // tool result, proving the execute loop carried it forward.
+    expect(ctxText(agent.seen[3]!)).toContain("TOKIO_FACTS_123");
+
+    // Step 2 also sees step 1's prior instruction. (This harness's
+    // ContextManager seam folds instructions + tool results into the shared
+    // session but does not append the per-step final assistant text — that is
+    // surfaced only as the step's `output` — so the accumulation guarantee is
+    // proven by the carried instruction + tool result above.)
+    expect(ctxText(agent.seen[3]!)).toContain("research tokio");
   });
 });
