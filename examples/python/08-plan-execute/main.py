@@ -34,8 +34,9 @@ we read it back on success to confirm it round-tripped.
 
 Tools wired (all from the built-in catalogue, identical to 06):
 
-- ``web_search`` — :meth:`StandardTools.web_search_with_endpoint`; query POSTed
-  to ``SPORE_WEB_SEARCH_ENDPOINT`` as JSON ``{"query": ...}``.
+- ``web_search`` — a :class:`WebSearchTool` built via
+  :meth:`WebSearchTool.with_config` (#108); issues
+  ``GET <SPORE_WEB_SEARCH_ENDPOINT>?q=<query>`` against a SearXNG JSON endpoint.
 - ``write_file`` — the agent writes ``async-comparison.md`` into ``workspace/``.
 - ``read_file`` — lets the agent re-read what it wrote.
 
@@ -43,7 +44,7 @@ Run it::
 
     ollama serve &
     ollama pull llama3.2
-    export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search  # a {"query"}->JSON endpoint
+    export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"  # SearXNG JSON
     uv run main.py
 """
 
@@ -80,7 +81,8 @@ from spore_core import (
     WorkspaceScopedSandbox,
     new_session_id,
 )
-from spore_tools import StandardTools
+from spore_tools import StandardTool, StandardTools, WebSearchTool
+from spore_tools.tools.web import SearchMethod, WebSearchConfig
 
 SYSTEM_PROMPT = (
     "You are a planning research agent. Decompose the goal into clear subtasks. "
@@ -139,18 +141,19 @@ async def main() -> int:
     model_id = args.model or os.environ.get("SPORE_OLLAMA_MODEL") or "llama3.2"
     base_url = os.environ.get("SPORE_OLLAMA_BASE_URL", OllamaModelInterface.DEFAULT_BASE_URL)
 
-    # The search backend endpoint. ``web_search`` POSTs ``{"query": ...}`` here
-    # and returns the JSON body to the agent. There is no live backend in
-    # spore-core, so you must supply one — a self-hosted SearXNG JSON endpoint,
-    # or a mock that accepts the ``{"query"}`` shape. Raw Brave/Tavily are NOT
-    # yet drop-in: they need a custom auth header, tracked as core issue #108.
+    # The search backend endpoint. ``web_search`` issues
+    # ``GET <endpoint>?q=<query>`` and returns the JSON body to the agent. There
+    # is no live backend in spore-core, so you must supply one — a self-hosted
+    # SearXNG JSON endpoint (``.../search?format=json``). #108 added
+    # ``WebSearchConfig`` so the GET method + query param are configurable; the
+    # GET path preserves the ``?format=json`` already on the endpoint.
     endpoint = (os.environ.get("SPORE_WEB_SEARCH_ENDPOINT") or "").strip()
     if not endpoint:
         print(
             "SPORE_WEB_SEARCH_ENDPOINT is not set.\n"
-            'Set it to a search endpoint that accepts a JSON `{"query": ...}` POST '
-            "and returns JSON results.\n"
-            "See .env.example and the README. (Raw Brave/Tavily need core #108 first.)",
+            "Set it to a SearXNG JSON search endpoint, e.g. "
+            "http://localhost:8888/search?format=json\n"
+            "See .env.example and the README.",
             file=sys.stderr,
         )
         return 2
@@ -180,10 +183,20 @@ async def main() -> int:
     # below.
     model = OllamaModelInterface.with_base_url(model_id, base_url)
     sandbox = WorkspaceScopedSandbox(WorkspaceConfig(root=workspace_root))
+    # SearXNG's JSON API is ``GET /search?q=<query>&format=json``. Configure the
+    # tool for GET with the query keyed under ``q``; no auth is needed.
+    web_search_config = WebSearchConfig(
+        endpoint=endpoint,
+        method=SearchMethod.GET,
+        query_param="q",
+        auth_headers=[],
+        body_auth_params=[],
+    )
+    web_search = StandardTool(WebSearchTool.with_config(web_search_config), WebSearchTool.schema())
     harness = (
         HarnessBuilder.conversational(model)
         .sandbox(sandbox)
-        .tool(StandardTools.web_search_with_endpoint(endpoint))
+        .tool(web_search)
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
