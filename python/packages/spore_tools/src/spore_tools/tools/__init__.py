@@ -16,6 +16,7 @@ Families:
 
 from ._common import DEFAULT_HEAD_TOKENS, DEFAULT_TAIL_TOKENS, LARGE_OUTPUT_THRESHOLD
 from .catalogue import StandardTool, StandardTools
+from .define import ExecuteFn, define_tool
 from .control import (
     AbortTool,
     AskUserQuestionTool,
@@ -97,8 +98,10 @@ __all__ = [
     "RunTestsTool",
     "SandboxViolationError",
     "SendMessageTool",
+    "ExecuteFn",
     "StandardTool",
     "StandardTools",
+    "define_tool",
     "SubagentTool",
     "TODO_STORE_KEY",
     "TaskListTool",

@@ -1,10 +1,15 @@
 """``remember(key, value)`` — persist a fact into the run store.
 
-This is the **write** half of the custom-tool pair. It demonstrates the storage
-seam: :attr:`ToolContext.run_store` + :attr:`ToolContext.session_id` are the
-only path to durable, per-run state. The ``sandbox`` parameter is part of the
-:meth:`Tool.execute` signature but unused here — these tools never touch the
-filesystem, so they ignore it.
+This is the **write** half of the custom-tool pair, defined with the
+:func:`~spore_tools.define_tool` helper: a typed pydantic input model plus an
+async ``execute`` body, and the helper derives the advertised JSON schema from
+the model (via ``model_json_schema()``) so the schema and the validation can
+never drift.
+
+It demonstrates the storage seam: :attr:`ToolContext.run_store` +
+:attr:`ToolContext.session_id` are the only path to durable, per-run state. The
+``sandbox`` parameter is part of the ``execute`` signature but unused here —
+these tools never touch the filesystem, so they ignore it.
 
 Keys are namespaced under ``fact:{key}`` so the example cannot collide with
 reserved store keys the catalogue uses (``todo``, ``task``, ``memory``).
@@ -12,72 +17,60 @@ reserved store keys the catalogue uses (``todo``, ``task``, ``memory``).
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from spore_core.harness import (
     SandboxProvider,
     ToolOutput,
     ToolOutputError,
     ToolOutputSuccess,
 )
-from spore_core.model import ToolCall
 from spore_core.storage import StorageError
-from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
+from spore_core.tool_registry import ToolContext
+from spore_tools import StandardTool, define_tool
 
 #: Prefix applied to every key so this example's facts live in their own
 #: namespace inside the run store.
 FACT_PREFIX = "fact:"
 
-
-class RememberTool:
-    """Store a string ``value`` under ``fact:{key}`` in the run store."""
-
-    NAME = "remember"
-
-    def name(self) -> str:
-        return self.NAME
-
-    def is_subagent_tool(self) -> bool:
-        return False
-
-    def may_produce_large_output(self) -> bool:
-        return False
-
-    @classmethod
-    def schema(cls) -> ToolSchema:
-        """The registry-side schema. ``name`` MUST equal :meth:`name`."""
-        return ToolSchema(
-            name=cls.NAME,
-            description=(
-                "Store a fact under a short key so it can be recalled later. "
-                "Use a stable, memorable key (e.g. 'habitat', 'lifespan')."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                    "value": {"type": "string"},
-                },
-                "required": ["key", "value"],
-            },
-            # Intentionally NOT read_only: this mutates shared persisted state.
-            annotations=ToolAnnotations(),
-        )
-
-    async def execute(
-        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
-    ) -> ToolOutput:
-        key = call.input.get("key")
-        if not isinstance(key, str):
-            return ToolOutputError.error("remember: missing or non-string 'key'")
-        value = call.input.get("value")
-        if not isinstance(value, str):
-            return ToolOutputError.error("remember: missing or non-string 'value'")
-
-        store_key = f"{FACT_PREFIX}{key}"
-        try:
-            await ctx.run_store.put(ctx.session_id, store_key, value)
-        except StorageError as e:
-            return ToolOutputError.error(f"remember: could not persist '{key}': {e}")
-        return ToolOutputSuccess.success(f"remembered {key}")
+#: Tool name — also used by tests and ``recall`` cross-checks.
+NAME = "remember"
 
 
-__all__ = ["FACT_PREFIX", "RememberTool"]
+class RememberInput(BaseModel):
+    """Validated input for ``remember``. ``define_tool`` derives the advertised
+    JSON schema from exactly this model."""
+
+    key: str
+    value: str
+
+
+async def _remember(input: RememberInput, sandbox: SandboxProvider, ctx: ToolContext) -> ToolOutput:
+    store_key = f"{FACT_PREFIX}{input.key}"
+    try:
+        await ctx.run_store.put(ctx.session_id, store_key, input.value)
+    except StorageError as e:
+        return ToolOutputError.error(f"remember: could not persist '{input.key}': {e}")
+    return ToolOutputSuccess.success(f"remembered {input.key}")
+
+
+def remember_tool() -> StandardTool:
+    """Build the ``remember`` tool. :func:`~spore_tools.define_tool` generates the
+    ``Tool`` impl, derives the schema from :class:`RememberInput`, and bundles
+    them into a :class:`~spore_tools.StandardTool` ready for ``.tool(...)``.
+
+    Annotations are omitted, so they default to all-``False`` — ``remember``
+    MUTATES shared persisted state, so (unlike ``recall``) it is intentionally
+    not ``read_only``."""
+    return define_tool(
+        name=NAME,
+        description=(
+            "Store a fact under a short key so it can be recalled later. "
+            "Use a stable, memorable key (e.g. 'habitat', 'lifespan')."
+        ),
+        input_model=RememberInput,
+        execute=_remember,
+    )
+
+
+__all__ = ["FACT_PREFIX", "NAME", "RememberInput", "remember_tool"]

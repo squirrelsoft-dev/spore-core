@@ -5,12 +5,14 @@
  * showed the two *built-in* tool paths: hand-rolling the harness-loop
  * `ToolRegistry` (03) and registering the shipped catalogue with
  * `.tools(StandardTools.codingSet())` (04). This example shows the third and
- * most important path — **bringing your own tool** — and the public extension
- * point that makes it possible: the `Tool` interface.
+ * most important path — **bringing your own tool** — via the ergonomic
+ * `defineTool` helper (the TypeScript analogue of Rust's `tool!` macro), where a
+ * single Zod input schema both DERIVES the advertised schema and validates the
+ * model's arguments, so the two can never drift.
  *
  * ## The two custom tools
  *
- * Both are plain classes implementing `Tool` (see `src/tools/`):
+ * Both are defined with the `defineTool` helper (see `src/tools/`):
  *
  * - **`remember(key, value)`** — persists a fact into the run store. It MUTATES
  *   shared state, so it is not `read_only`.
@@ -25,11 +27,14 @@
  * `ctx.sessionId`). Facts are keyed under `fact:{key}` so they cannot collide
  * with reserved catalogue keys.
  *
- * ## The pattern: implement `Tool` → wrap in a `StandardTool` → `.tool()`
+ * ## The pattern: `defineTool({ input, execute })` → `.tool()`
  *
- * 1. Implement `Tool` (a class with `name` + `execute`).
- * 2. Bundle the impl with its schema as a `StandardTool` (`{ implementation,
- *    schema }`) so the two can never drift.
+ * 1. Write a `defineTool({ name, description, input, execute, annotations? })`
+ *    call. `input` is a Zod schema — the SINGLE source of truth.
+ * 2. `defineTool` DERIVES the advertised JSON schema from that Zod schema and
+ *    validates the model's arguments against it before `execute` runs, so the
+ *    schema and the validation can never drift apart. It returns a ready
+ *    `StandardTool` (`{ implementation, schema }`).
  * 3. Register each with `.tool(...)`. The harness wires the sandbox and a
  *    per-run `ToolContext` automatically — **the harness doesn't change, only
  *    what you register does.**
@@ -56,13 +61,10 @@ import {
   SessionId,
   newTask,
   type HarnessStreamEvent,
-  type toolRegistry,
 } from "@spore/core";
 
-import { RecallTool } from "./tools/recall.js";
-import { RememberTool } from "./tools/remember.js";
-
-type StandardTool = toolRegistry.StandardTool;
+import { recallTool } from "./tools/recall.js";
+import { rememberTool } from "./tools/remember.js";
 
 const SYSTEM_PROMPT =
   "You are a research agent with a memory. Research the topic the user gives " +
@@ -88,17 +90,9 @@ async function main(): Promise<void> {
   // `.sandbox(...)` (these tools ignore it) and no `.storage(...)` (build()
   // defaults to in-memory storage when `.tool()` tools are present).
   const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
-  const remember: StandardTool = {
-    implementation: new RememberTool(),
-    schema: RememberTool.schema(),
-  };
-  const recall: StandardTool = {
-    implementation: new RecallTool(),
-    schema: RecallTool.schema(),
-  };
   const harness = HarnessBuilder.conversational(model)
-    .tool(remember)
-    .tool(recall)
+    .tool(rememberTool())
+    .tool(recallTool())
     .systemPrompt(SYSTEM_PROMPT)
     .build();
 

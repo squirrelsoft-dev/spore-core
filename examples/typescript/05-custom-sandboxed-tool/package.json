@@ -11,7 +11,8 @@
     "format": "prettier src tests --check"
   },
   "dependencies": {
-    "@spore/core": "file:../../../typescript/packages/core"
+    "@spore/core": "file:../../../typescript/packages/core",
+    "zod": "~3.23.8"
   },
   "devDependencies": {
     "eslint": "~9.13.0",

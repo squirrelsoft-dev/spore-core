@@ -5,29 +5,35 @@ Examples :doc:`03-tool-use <../03-tool-use/main>` and
 tool paths: hand-rolling the harness-loop ``ToolRegistry`` (03) and registering
 the shipped catalogue with ``.tools(StandardTools.coding_set())`` (04). This
 example shows the third and most important path — **bringing your own tool** —
-and the public extension point that makes it possible: the
-:class:`~spore_core.tool_registry.Tool` protocol.
+using the ergonomic :func:`~spore_tools.define_tool` helper.
 
 The two custom tools
 --------------------
 
-Both live in :mod:`tools` as plain objects that satisfy the ``Tool`` protocol:
+Both live in :mod:`tools`, each defined with :func:`~spore_tools.define_tool`: a
+typed pydantic input model plus an async ``execute`` body. The helper derives
+the advertised JSON schema from the input model (so schema and validation can
+never drift) and validates the model's arguments into it before calling
+``execute``:
 
 - **``remember(key, value)``** — persists a fact into the run store
   (:mod:`tools.remember`). It MUTATES shared state, so it is not ``read_only``.
 - **``recall(key)``** — reads a fact back out (:mod:`tools.recall`). It only
-  reads, so it is ``read_only`` + ``idempotent``.
+  reads, so it is ``read_only`` + ``idempotent`` (passed via ``annotations``).
 
-The pattern: ``Tool`` impl → ``StandardTool`` → ``.tool()``
------------------------------------------------------------
+The pattern: ``define_tool(...)`` → ``.tool()``
+-----------------------------------------------
 
-1. Implement the :class:`~spore_core.tool_registry.Tool` protocol (``name`` +
-   ``execute`` + the two flag methods).
-2. Bundle the impl with its schema via :class:`spore_tools.StandardTool` so the
-   two can never drift.
-3. Register each with ``.tool(...)``. The harness wires the sandbox and a per-run
+1. Call ``define_tool(name, description, input_model, execute, ...)`` — it
+   returns a :class:`~spore_tools.StandardTool` bundling a ``Tool`` impl with
+   its derived schema. The ``input_model`` is the single source of truth: the
+   advertised schema is generated from it, never hand-written.
+2. Register each with ``.tool(...)``. The harness wires the sandbox and a per-run
    :class:`~spore_core.tool_registry.ToolContext` automatically — **the harness
    doesn't change, only what you register does.**
+
+   If the model sends bad arguments, ``define_tool`` returns a *recoverable*
+   ``invalid parameters`` error so tool-call repair can retry.
 
 Two builder differences from 04: there is no ``.tools(...)`` catalogue, and no
 explicit ``.sandbox(...)`` / ``.storage(...)``. ``build()`` defaults storage to
@@ -62,9 +68,7 @@ from spore_core import (
     Task,
     new_session_id,
 )
-from spore_tools import StandardTool
-
-from tools import RecallTool, RememberTool
+from tools import recall_tool, remember_tool
 
 SYSTEM_PROMPT = (
     "You are a research agent with a memory. Research the topic the user gives "
@@ -105,8 +109,8 @@ async def main() -> int:
     model = OllamaModelInterface.with_base_url(model_id, base_url)
     harness = (
         HarnessBuilder.conversational(model)
-        .tool(StandardTool(RememberTool(), RememberTool.schema()))
-        .tool(StandardTool(RecallTool(), RecallTool.schema()))
+        .tool(remember_tool())
+        .tool(recall_tool())
         .system_prompt(SYSTEM_PROMPT)
         .build()
     )

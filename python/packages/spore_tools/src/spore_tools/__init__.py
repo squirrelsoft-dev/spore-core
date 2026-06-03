@@ -19,6 +19,7 @@ from .tools import (
     EnterPlanModeTool,
     ExecTool,
     ExecutionFailed,
+    ExecuteFn,
     ExitPlanModeTool,
     FindFilesTool,
     GitCommitTool,
@@ -48,6 +49,7 @@ from .tools import (
     WebFetchTool,
     WebSearchTool,
     WriteFileTool,
+    define_tool,
 )
 from .tools import TODO_STORE_KEY
 
@@ -64,6 +66,7 @@ __all__ = [
     "EditFileTool",
     "EnterPlanModeTool",
     "ExecTool",
+    "ExecuteFn",
     "ExecutionFailed",
     "ExitPlanModeTool",
     "FindFilesTool",
@@ -95,4 +98,5 @@ __all__ = [
     "WebFetchTool",
     "WebSearchTool",
     "WriteFileTool",
+    "define_tool",
 ]

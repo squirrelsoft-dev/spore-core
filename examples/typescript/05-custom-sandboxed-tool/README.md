@@ -1,29 +1,63 @@
-# 05 — Custom sandboxed tool (`impl Tool`)
+# 05 — Custom sandboxed tool (`defineTool`)
 
 The first example that ships a tool **you** wrote. Examples 03 and 04 used the
-two built-in tool paths; this one uses spore-core's public extension point — the
-`Tool` interface — to add two custom tools, `remember(key, value)` and
-`recall(key)`, and lets an agent research a topic across turns and summarize from
-the facts it recalled.
+two built-in tool paths; this one uses spore-core's ergonomic extension helper —
+`defineTool` — to add two custom tools, `remember(key, value)` and `recall(key)`,
+and lets an agent research a topic across turns and summarize from the facts it
+recalled.
 
 The thesis is the same as 04, taken one step further: **the harness doesn't
 change — only what you register does.** Same `conversational(model)` builder,
 same ReAct loop, same stream-printed `think` / `act` / `obs`. The only new thing
-is the three-step registration pattern below.
+is the registration pattern below.
 
-## The pattern: implement `Tool` → wrap in a `StandardTool` → `.tool()`
+## The pattern: `defineTool({ input, execute })` → `.tool()`
 
-### 1. Implement `Tool`
+`defineTool` is the TypeScript analogue of Rust's `tool!` macro. You give it a
+single **Zod schema** for the input and it does two things with that one schema:
 
-A tool is a class implementing `Tool` — you write `name` and `execute()`:
+- **Advertises** the tool by deriving its JSON-Schema `parameters` from the Zod
+  schema (via `zod-to-json-schema`).
+- **Validates** the model's raw arguments against the *same* schema before your
+  `execute` body runs.
+
+Because one schema serves both jobs, the classic drift between a hand-written
+`parameters` blob and a separate validation schema is **eliminated by
+construction** — there is no second source of truth to fall out of sync.
+
+### 1. Describe the input with Zod
+
+The Zod schema is the single source of truth. `.describe(...)` strings flow
+straight into the advertised JSON schema the model sees:
 
 ```ts
-async execute(
-  call: ToolCall,
-  _sandbox: SandboxProvider, // the environment seam (unused here)
-  ctx: ToolContext, // the storage seam
-): Promise<ToolOutput> {
-  /* ... */
+import { z } from "zod";
+
+export const RememberInput = z.object({
+  key: z.string().describe("Short, stable key to file the fact under."),
+  value: z.string().describe("The fact to remember."),
+});
+```
+
+### 2. `defineTool({ name, description, input, execute, annotations? })`
+
+`execute` receives the **already-validated, fully-typed** input, plus the two
+seams every tool gets:
+
+```ts
+import { toolRegistry, toolOutput } from "@spore/core";
+
+export function rememberTool() {
+  return toolRegistry.defineTool({
+    name: "remember",
+    description: "Store a fact under a short key so it can be recalled later.",
+    input: RememberInput,
+    // annotations omitted → all-false; remember MUTATES, so it is NOT read_only.
+    execute: async (input, _sandbox, ctx) => {
+      await ctx.runStore.put(ctx.sessionId, `fact:${input.key}`, input.value);
+      return toolOutput.success(`remembered ${input.key}`);
+    },
+  });
 }
 ```
 
@@ -31,37 +65,22 @@ async execute(
 
 - **`sandbox`** — the only path to the environment (filesystem, network). These
   two tools never touch it, so they name it `_sandbox`.
-- **`ctx: ToolContext`** — the only path to durable, per-run state. `remember`
-  calls `ctx.runStore.put(ctx.sessionId, "fact:{key}", …)`; `recall` calls
-  `ctx.runStore.get(…)`. Keys are namespaced under `fact:` so they cannot
-  collide with reserved catalogue keys (`todo`, `task`, `memory`).
+- **`ctx: ToolContext`** — the only path to durable, per-run state. Keys are
+  namespaced under `fact:` so they cannot collide with reserved catalogue keys
+  (`todo`, `task`, `memory`).
 
-`remember` mutates shared state, so it is **not** `read_only`. `recall` only
-reads, so it is `read_only` + `idempotent`.
+`remember` mutates shared state, so it omits annotations (all default to
+`false`). `recall` only reads, so it passes
+`annotations: { read_only: true, idempotent: true }`.
 
-#### Two different "tool" surfaces — don't confuse them
+If the model sends arguments that don't match the schema, `defineTool` returns a
+**recoverable** error whose message contains `invalid parameters` — so a
+configured tool-call-repair pass can coerce the arguments and re-dispatch rather
+than halting the run. You never write that validation by hand.
 
-| Surface                          | Where it lives | Used by                                            |
-| -------------------------------- | -------------- | -------------------------------------------------- |
-| harness-loop `ToolRegistry` (03) | `@spore/core`  | hand-rolled `schemas()` + `dispatch()`             |
-| `Tool` interface (this example)  | `@spore/core`  | one tool, with the sandbox + `ToolContext` seams   |
-
-03 implemented the slim harness-loop `ToolRegistry` itself and dispatched every
-call by hand. Here you implement the richer per-tool `Tool` interface once per
-tool and let the builder do the dispatch.
-
-### 2. Wrap in a `StandardTool`
-
-Bundle the implementation with its registry-side schema so the two can never
-drift apart. The bundle is a plain `{ implementation, schema }` object;
-`tool.name` MUST equal `schema.name`:
-
-```ts
-const remember: StandardTool = {
-  implementation: new RememberTool(),
-  schema: RememberTool.schema(),
-};
-```
+`defineTool` returns a `StandardTool` (`{ implementation, schema }`), the same
+bundle the catalogue uses, with `implementation.name` and `schema.name` always
+in agreement.
 
 ### 3. `.tool(...)`
 
@@ -70,8 +89,8 @@ sandbox and a per-run `ToolContext` in automatically:
 
 ```ts
 const harness = HarnessBuilder.conversational(model)
-  .tool(remember)
-  .tool(recall)
+  .tool(rememberTool())
+  .tool(recallTool())
   .systemPrompt(SYSTEM_PROMPT)
   .build();
 ```
@@ -82,7 +101,7 @@ const harness = HarnessBuilder.conversational(model)
 | ------- | --------------------------------------------- | ----------------------------------------------- |
 | Builder | `conversational(model)`                       | `conversational(model)` _(same)_               |
 | Loop    | ReAct                                         | ReAct _(same)_                                  |
-| Tools   | `.tools(StandardTools.codingSet())`           | `.tool(remember).tool(recall)` _(your own)_    |
+| Tools   | `.tools(StandardTools.codingSet())`           | `.tool(rememberTool()).tool(recallTool())` _(your own)_ |
 | Sandbox | `WorkspaceScopedSandbox` over `sample-files/` | none — tools ignore the sandbox                 |
 | Storage | n/a                                           | auto in-memory (free once `.tool()` is present) |
 

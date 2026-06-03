@@ -6,9 +6,11 @@
  *   - `remember` stores under the `fact:` prefix, keyed by SessionId.
  *   - `recall` returns the stored value string.
  *   - a `recall` miss is a recoverable error with the exact message.
- *   - missing / wrong-typed args are recoverable errors.
+ *   - missing / wrong-typed args are recoverable `invalid parameters` errors
+ *     (validated by the SAME Zod schema that derives the advertised schema).
  *   - a run-store failure is a recoverable error.
  *   - the read-only / idempotent annotations are correct.
+ *   - the advertised schema is DERIVED from the input (exposes `key`/`value`).
  */
 
 import {
@@ -22,8 +24,12 @@ import {
 } from "@spore/core";
 import { describe, expect, it } from "vitest";
 
-import { FACT_PREFIX, RememberTool } from "../src/tools/remember.js";
-import { RecallTool } from "../src/tools/recall.js";
+import {
+  FACT_PREFIX,
+  REMEMBER_NAME,
+  rememberTool,
+} from "../src/tools/remember.js";
+import { RECALL_NAME, recallTool } from "../src/tools/recall.js";
 
 type RunStore = storage.RunStore;
 type JsonValue = storage.JsonValue;
@@ -75,11 +81,11 @@ function inMemoryCtx(): toolRegistry.ToolContext {
 }
 
 function rememberCall(input: unknown): ToolCall {
-  return { id: "c1", name: RememberTool.NAME, input };
+  return { id: "c1", name: REMEMBER_NAME, input };
 }
 
 function recallCall(input: unknown): ToolCall {
-  return { id: "c2", name: RecallTool.NAME, input };
+  return { id: "c2", name: RECALL_NAME, input };
 }
 
 function expectSuccess(out: ToolOutput): string {
@@ -91,10 +97,14 @@ function expectSuccess(out: ToolOutput): string {
 
 const sb = new AllowAllSandbox();
 
-describe("RememberTool", () => {
+// Build fresh tools per use — they are stateless StandardTool bundles.
+const remember = () => rememberTool().implementation;
+const recall = () => recallTool().implementation;
+
+describe("remember", () => {
   it("stores the value under the fact: prefix, keyed by SessionId", async () => {
     const ctx = ctxWith(new InMemoryStorageProvider(), "sess-a");
-    const out = await new RememberTool().execute(
+    const out = await remember().execute(
       rememberCall({ key: "habitat", value: "coastal ocean waters" }),
       sb,
       ctx,
@@ -113,28 +123,35 @@ describe("RememberTool", () => {
     );
   });
 
-  it("missing 'key' is a recoverable error", async () => {
-    const out = await new RememberTool().execute(
-      rememberCall({ value: "x" }),
+  it("missing 'value' is a recoverable 'invalid parameters' error", async () => {
+    const out = await remember().execute(
+      rememberCall({ key: "habitat" }),
       sb,
       inMemoryCtx(),
     );
     expect(out.kind).toBe("error");
-    if (out.kind === "error") expect(out.recoverable).toBe(true);
+    if (out.kind === "error") {
+      expect(out.recoverable).toBe(true);
+      expect(out.message).toContain("invalid parameters");
+      expect(out.message).toContain("value");
+    }
   });
 
-  it("non-string 'value' is a recoverable error", async () => {
-    const out = await new RememberTool().execute(
-      rememberCall({ key: "k", value: 42 }),
+  it("non-string 'key' is a recoverable 'invalid parameters' error", async () => {
+    const out = await remember().execute(
+      rememberCall({ key: 7, value: "x" }),
       sb,
       inMemoryCtx(),
     );
     expect(out.kind).toBe("error");
-    if (out.kind === "error") expect(out.recoverable).toBe(true);
+    if (out.kind === "error") {
+      expect(out.recoverable).toBe(true);
+      expect(out.message).toContain("invalid parameters");
+    }
   });
 
   it("a run-store failure is a recoverable error", async () => {
-    const out = await new RememberTool().execute(
+    const out = await remember().execute(
       rememberCall({ key: "k", value: "v" }),
       sb,
       ctxWith(new FailingRunStore()),
@@ -144,31 +161,36 @@ describe("RememberTool", () => {
   });
 
   it("is not read_only / destructive / idempotent", () => {
-    const a = RememberTool.schema().annotations;
+    const a = rememberTool().schema.annotations;
     expect(a.read_only).toBe(false);
     expect(a.destructive).toBe(false);
     expect(a.idempotent).toBe(false);
   });
+
+  it("advertises a schema derived from the input (exposes key + value)", () => {
+    const s = rememberTool().schema;
+    expect(s.name).toBe(REMEMBER_NAME);
+    const params = s.parameters as { properties?: Record<string, unknown> };
+    expect(Object.keys(params.properties ?? {})).toEqual(
+      expect.arrayContaining(["key", "value"]),
+    );
+  });
 });
 
-describe("RecallTool", () => {
+describe("recall", () => {
   it("returns the value a prior remember stored", async () => {
     const ctx = inMemoryCtx();
-    await new RememberTool().execute(
+    await remember().execute(
       rememberCall({ key: "diet", value: "crabs and small fish" }),
       sb,
       ctx,
     );
-    const out = await new RecallTool().execute(
-      recallCall({ key: "diet" }),
-      sb,
-      ctx,
-    );
+    const out = await recall().execute(recallCall({ key: "diet" }), sb, ctx);
     expect(expectSuccess(out)).toBe("crabs and small fish");
   });
 
   it("a miss is a recoverable error with the exact message", async () => {
-    const out = await new RecallTool().execute(
+    const out = await recall().execute(
       recallCall({ key: "nope" }),
       sb,
       inMemoryCtx(),
@@ -180,9 +202,18 @@ describe("RecallTool", () => {
     }
   });
 
-  it("missing 'key' is a recoverable error", async () => {
-    const out = await new RecallTool().execute(
-      recallCall({}),
+  it("missing 'key' is a recoverable 'invalid parameters' error", async () => {
+    const out = await recall().execute(recallCall({}), sb, inMemoryCtx());
+    expect(out.kind).toBe("error");
+    if (out.kind === "error") {
+      expect(out.recoverable).toBe(true);
+      expect(out.message).toContain("invalid parameters");
+    }
+  });
+
+  it("non-string 'key' is a recoverable error", async () => {
+    const out = await recall().execute(
+      recallCall({ key: 123 }),
       sb,
       inMemoryCtx(),
     );
@@ -191,7 +222,7 @@ describe("RecallTool", () => {
   });
 
   it("a run-store failure is a recoverable error", async () => {
-    const out = await new RecallTool().execute(
+    const out = await recall().execute(
       recallCall({ key: "k" }),
       sb,
       ctxWith(new FailingRunStore()),
@@ -202,12 +233,12 @@ describe("RecallTool", () => {
 
   it("read does not write: a recall never persists anything", async () => {
     const ctx = inMemoryCtx();
-    await new RecallTool().execute(recallCall({ key: "k" }), sb, ctx);
+    await recall().execute(recallCall({ key: "k" }), sb, ctx);
     expect(await ctx.runStore.listKeys(ctx.sessionId)).toEqual([]);
   });
 
   it("is read_only + idempotent (and not destructive)", () => {
-    const a = RecallTool.schema().annotations;
+    const a = recallTool().schema.annotations;
     expect(a.read_only).toBe(true);
     expect(a.idempotent).toBe(true);
     expect(a.destructive).toBe(false);

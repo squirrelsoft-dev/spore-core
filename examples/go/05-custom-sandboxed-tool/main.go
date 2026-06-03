@@ -3,27 +3,34 @@
 // Examples 03 and 04 showed the two *built-in* tool paths: hand-rolling the
 // harness-loop ToolRegistry (03) and registering the shipped catalogue with
 // .Tools(tools.StandardTools{}.CodingSet()...) (04). This example shows the
-// third and most important path — bringing your own tool — and the public
-// extension point that makes it possible: the sporecore.Tool interface.
+// third and most important path — bringing your own tool — using the ergonomic
+// DefineTool helper (the Go analog of Rust's `tool!` macro).
 //
 // # The two custom tools
 //
-// Both live in the local tools package as plain sporecore.Tool impls:
+// Both live in the local tools package, built with tools.DefineTool: a typed
+// input struct, an explicit parameter schema, annotations, and a typed exec
+// function.
 //
 //   - remember(key, value) — persists a fact into the run store. It MUTATES
 //     shared state, so it is not ReadOnly.
 //   - recall(key) — reads a fact back out. It only reads, so it is ReadOnly +
 //     Idempotent.
 //
-// # The pattern: impl Tool → StandardTool{...} → .Tool()
+// # The pattern: DefineTool(...) → .Tool()
 //
-//  1. Implement sporecore.Tool (Name / IsSubagentTool / MayProduceLargeOutput /
-//     Execute).
-//  2. Bundle the impl with its schema in a sporecore.StandardTool so the two
-//     can never drift.
-//  3. Register each with .Tool(...). The builder wires the sandbox and a per-run
+//  1. Call tools.DefineTool[T](name, description, annotations, schema, execFn).
+//     It synthesizes the sporecore.Tool methods, unmarshals the model's
+//     arguments into T (a bad decode becomes a recoverable "invalid parameters"
+//     error so ToolCallRepair can retry), and bundles the impl with its schema
+//     into a sporecore.StandardTool so the two can never drift.
+//  2. Register each with .Tool(...). The builder wires the sandbox and a per-run
 //     *ToolContext (the storage seam) automatically — the harness doesn't
 //     change, only what you register does.
+//
+// Unlike Rust, the schema is passed EXPLICITLY (by design): the core module
+// stays dependency-free rather than pulling in a reflection-based JSON-schema
+// library. Deriving the schema from T is a possible later opt-in.
 //
 // Two builder differences from 04: there is no .Tools(...) catalogue, and no
 // explicit .Sandbox(...) / .Storage(...). Build() defaults the run store to an
@@ -90,8 +97,8 @@ func run() error {
 	// to an in-memory run store when .Tool() tools are present).
 	mi := ollama.WithBaseURL(model, baseURL)
 	harness := observability.ConversationalBuilder(mi).
-		Tool(sporecore.StandardTool{Implementation: tools.RememberTool{}, Schema: tools.RememberTool{}.Schema()}).
-		Tool(sporecore.StandardTool{Implementation: tools.RecallTool{}, Schema: tools.RecallTool{}.Schema()}).
+		Tool(tools.RememberTool()).
+		Tool(tools.RecallTool()).
 		SystemPrompt(systemPrompt).
 		Build()
 

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
@@ -21,10 +22,15 @@ func call(name string, input string) sporecore.ToolCall {
 	return sporecore.ToolCall{ID: "c1", Name: name, Input: json.RawMessage(input)}
 }
 
+// execute dispatches through a DefineTool-built StandardTool's Tool impl.
+func execute(tool sporecore.StandardTool, c sporecore.ToolCall, ctx *sporecore.ToolContext) sporecore.ToolOutput {
+	return tool.Implementation.Execute(context.Background(), c, nil, ctx)
+}
+
 // remember stores the value under the fact: prefix.
 func TestRememberStoresUnderFactPrefix(t *testing.T) {
 	ctx, store := newCtx()
-	out := RememberTool{}.Execute(context.Background(), call("remember", `{"key":"habitat","value":"coastal waters"}`), nil, ctx)
+	out := execute(RememberTool(), call("remember", `{"key":"habitat","value":"coastal waters"}`), ctx)
 
 	if out.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("Kind = %v, want success (message=%q)", out.Kind, out.Message)
@@ -54,11 +60,11 @@ func TestRememberStoresUnderFactPrefix(t *testing.T) {
 // recall returns the value a prior remember stored.
 func TestRecallReturnsStoredValue(t *testing.T) {
 	ctx, _ := newCtx()
-	if out := (RememberTool{}).Execute(context.Background(), call("remember", `{"key":"diet","value":"crabs and shrimp"}`), nil, ctx); out.Kind != sporecore.ToolOutputSuccess {
+	if out := execute(RememberTool(), call("remember", `{"key":"diet","value":"crabs and shrimp"}`), ctx); out.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("setup remember failed: %q", out.Message)
 	}
 
-	out := RecallTool{}.Execute(context.Background(), call("recall", `{"key":"diet"}`), nil, ctx)
+	out := execute(RecallTool(), call("recall", `{"key":"diet"}`), ctx)
 	if out.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("Kind = %v, want success (message=%q)", out.Kind, out.Message)
 	}
@@ -67,10 +73,19 @@ func TestRecallReturnsStoredValue(t *testing.T) {
 	}
 }
 
+// recall must not persist anything (it is read-only).
+func TestRecallDoesNotWrite(t *testing.T) {
+	ctx, store := newCtx()
+	execute(RecallTool(), call("recall", `{"key":"k"}`), ctx)
+	if _, found, _ := store.Get(context.Background(), testSession, FactPrefix+"k"); found {
+		t.Error("recall must not persist anything")
+	}
+}
+
 // recall on an unknown key is a recoverable error with the spec'd message.
 func TestRecallMissingKeyIsRecoverableError(t *testing.T) {
 	ctx, _ := newCtx()
-	out := RecallTool{}.Execute(context.Background(), call("recall", `{"key":"nope"}`), nil, ctx)
+	out := execute(RecallTool(), call("recall", `{"key":"nope"}`), ctx)
 
 	if out.Kind != sporecore.ToolOutputError {
 		t.Fatalf("Kind = %v, want error", out.Kind)
@@ -83,31 +98,35 @@ func TestRecallMissingKeyIsRecoverableError(t *testing.T) {
 	}
 }
 
-// Bad arguments are recoverable errors, not panics or fatal errors.
+// Bad arguments are recoverable "invalid parameters" errors, not panics or
+// fatal errors — so a configured ToolCallRepair can coerce and retry.
 func TestArgErrors(t *testing.T) {
 	ctx, _ := newCtx()
 	cases := []struct {
 		name string
-		tool sporecore.Tool
+		tool sporecore.StandardTool
 		args string
 	}{
-		{"remember missing key", RememberTool{}, `{"value":"v"}`},
-		{"remember missing value", RememberTool{}, `{"key":"k"}`},
-		{"remember non-string key", RememberTool{}, `{"key":123,"value":"v"}`},
-		{"remember non-string value", RememberTool{}, `{"key":"k","value":123}`},
-		{"remember empty input", RememberTool{}, ``},
-		{"recall missing key", RecallTool{}, `{}`},
-		{"recall non-string key", RecallTool{}, `{"key":123}`},
-		{"recall empty input", RecallTool{}, ``},
+		{"remember missing key", RememberTool(), `{"value":"v"}`},
+		{"remember missing value", RememberTool(), `{"key":"k"}`},
+		{"remember non-string key", RememberTool(), `{"key":123,"value":"v"}`},
+		{"remember non-string value", RememberTool(), `{"key":"k","value":123}`},
+		{"remember empty input", RememberTool(), ``},
+		{"recall missing key", RecallTool(), `{}`},
+		{"recall non-string key", RecallTool(), `{"key":123}`},
+		{"recall empty input", RecallTool(), ``},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := tc.tool.Execute(context.Background(), call(tc.tool.Name(), tc.args), nil, ctx)
+			out := execute(tc.tool, call(tc.tool.Implementation.Name(), tc.args), ctx)
 			if out.Kind != sporecore.ToolOutputError {
 				t.Fatalf("Kind = %v, want error", out.Kind)
 			}
 			if !out.Recoverable {
 				t.Error("argument error must be recoverable")
+			}
+			if !strings.Contains(out.Message, "invalid parameters") {
+				t.Errorf("Message = %q, want it to contain %q", out.Message, "invalid parameters")
 			}
 		})
 	}
@@ -116,30 +135,39 @@ func TestArgErrors(t *testing.T) {
 // Schema names must match Name(), and the read-only/idempotent annotations must
 // reflect each tool's contract: remember mutates (not read-only), recall reads.
 func TestSchemaAnnotations(t *testing.T) {
-	rem := RememberTool{}
-	if rem.Schema().Name != rem.Name() {
-		t.Errorf("remember schema name %q != Name() %q", rem.Schema().Name, rem.Name())
+	rem := RememberTool()
+	if rem.Schema.Name != rem.Implementation.Name() {
+		t.Errorf("remember schema name %q != Name() %q", rem.Schema.Name, rem.Implementation.Name())
 	}
-	if rem.Schema().Annotations.ReadOnly {
+	if rem.Schema.Annotations.ReadOnly {
 		t.Error("remember must NOT be read-only — it mutates shared state")
 	}
-
-	rec := RecallTool{}
-	if rec.Schema().Name != rec.Name() {
-		t.Errorf("recall schema name %q != Name() %q", rec.Schema().Name, rec.Name())
+	if rem.Schema.Annotations.Destructive {
+		t.Error("remember must not be destructive")
 	}
-	if !rec.Schema().Annotations.ReadOnly {
+
+	rec := RecallTool()
+	if rec.Schema.Name != rec.Implementation.Name() {
+		t.Errorf("recall schema name %q != Name() %q", rec.Schema.Name, rec.Implementation.Name())
+	}
+	if !rec.Schema.Annotations.ReadOnly {
 		t.Error("recall must be read-only")
 	}
-	if !rec.Schema().Annotations.Idempotent {
+	if !rec.Schema.Annotations.Idempotent {
 		t.Error("recall must be idempotent")
 	}
 
-	// Schemas must be valid JSON objects with the required fields.
-	for _, s := range []sporecore.RegistryToolSchema{rem.Schema(), rec.Schema()} {
-		var probe map[string]any
+	// Schemas must be valid JSON objects exposing the expected properties.
+	for _, s := range []sporecore.RegistryToolSchema{rem.Schema, rec.Schema} {
+		var probe struct {
+			Type       string                     `json:"type"`
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
 		if err := json.Unmarshal(s.Parameters, &probe); err != nil {
 			t.Errorf("%s parameters are not valid JSON: %v", s.Name, err)
+		}
+		if probe.Type != "object" {
+			t.Errorf("%s parameters type = %q, want object", s.Name, probe.Type)
 		}
 	}
 }
@@ -148,12 +176,14 @@ func TestSchemaAnnotations(t *testing.T) {
 // run store whose Put always fails.
 func TestRememberStoreFailureIsRecoverable(t *testing.T) {
 	ctx := sporecore.NewToolContext(testSession, failingStore{}, nil)
-	out := RememberTool{}.Execute(context.Background(), call("remember", `{"key":"k","value":"v"}`), nil, ctx)
+	out := execute(RememberTool(), call("remember", `{"key":"k","value":"v"}`), ctx)
 	if out.Kind != sporecore.ToolOutputError || !out.Recoverable {
 		t.Fatalf("got Kind=%v Recoverable=%v, want recoverable error", out.Kind, out.Recoverable)
 	}
 }
 
+// failingStore is a ToolRunStore whose every op fails — the Go analog of Rust's
+// FailingRunStore, proving storage errors map to a recoverable tool error.
 type failingStore struct{}
 
 func (failingStore) Get(context.Context, sporecore.SessionID, string) (json.RawMessage, bool, error) {
