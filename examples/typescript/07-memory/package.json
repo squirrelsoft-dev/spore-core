@@ -1,0 +1,31 @@
+{
+  "name": "spore-example-07-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 07: a MarkdownMemoryProvider — a MemoryStore that persists agent memory to a human-readable memory.md file. Demonstrates the storage seam: the harness is stateless, memory is just a StorageProvider you implement.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "test": "vitest run",
+    "lint": "eslint src tests",
+    "format": "prettier src tests --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2",
+    "vitest": "~2.1.9"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}
