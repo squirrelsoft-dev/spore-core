@@ -140,7 +140,18 @@ account. Recall quality scales with the model: a **larger hosted model follows
 the store/recall tool protocol more reliably**. The harness is model-agnostic —
 swap the model interface and change nothing else.
 
-This example also enables `structured_tool_calls` via
-`HarnessBuilder::model_params(ModelParams { structured_tool_calls: true, .. })`.
-That turns on schema-constrained decoding so small Ollama models emit one clean
-`memory` tool call per turn instead of malformed JSON.
+### Native vs. structured tool calls (`--structured`)
+
+By default the example uses **native** Ollama tool calling: the `memory` tool
+gets a real typed schema and there is no always-on `final` envelope, so
+tool-capable models (including hosted `*-cloud` models such as
+`gemma4:31b-cloud`) follow the store/recall protocol reliably.
+
+Small local models (e.g. `llama3.2`) sometimes leak `<|python_tag|>` or emit
+malformed JSON on the native channel. Pass `--structured` to switch on
+schema-constrained decoding (`ModelParams { structured_tool_calls: true, .. }`),
+which forces one clean JSON tool call per turn.
+
+> Note: structured mode exposes an always-available `final` envelope that weaker
+> models can take prematurely (ending the turn without storing anything). If a
+> phase produces no memory write, drop `--structured`.
