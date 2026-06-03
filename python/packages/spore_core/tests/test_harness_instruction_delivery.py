@@ -36,8 +36,8 @@ from spore_core import (
     StorageProvider,
     Task,
 )
-from spore_core.agent import Context, FinalResponse, TurnResult
-from spore_core.model import ModelParams, ProviderInfo, Role, TokenUsage
+from spore_core.agent import Context, FinalResponse, ToolCallRequested, TurnResult
+from spore_core.model import ModelParams, ProviderInfo, Role, TokenUsage, ToolCall
 
 
 class _StubModel:
@@ -236,6 +236,115 @@ async def test_model_params_reach_execute_subloop() -> None:
     # 1 plan turn + 2 execute turns; every captured context carries it.
     assert len(agent.seen) == 3
     assert all(c.params.structured_tool_calls for c in agent.seen)
+
+
+# ---------------------------------------------------------------------------
+# #93: the plan-phase directive must NOT leak into the execute-step contexts.
+#
+# The plan phase ("Produce a step-by-step plan… Respond with a single JSON
+# object…") used to be appended to the SHARED session_state, which the execute
+# phase threads into every subtask sub-loop. An instruction-following model then
+# re-emits a plan each step instead of calling tools. The fix scratch-clones the
+# planning turn so the directive reaches only the plan turn. Mirrors Rust's
+# ``plan_directive_does_not_leak_into_execute_context``.
+# ---------------------------------------------------------------------------
+
+
+_PLAN_DIRECTIVE_HEAD = "Produce a step-by-step plan"
+_PLAN_DIRECTIVE_JSON = "Respond with a single JSON object"
+
+
+class _ScriptedTurnAgent:
+    """Records every ``Context`` it is handed and yields a scripted sequence of
+    turn results (tool calls and/or finals) so it can drive a full PlanExecute
+    run through both phases."""
+
+    def __init__(self, results: list[TurnResult]) -> None:
+        self.seen: list[Context] = []
+        self._results = list(results)
+
+    async def turn(self, context: Context) -> TurnResult:
+        self.seen.append(context)
+        if self._results:
+            return self._results.pop(0)
+        return FinalResponse(content="done", usage=TokenUsage(input_tokens=1, output_tokens=1))
+
+    def id(self) -> AgentId:
+        return AgentId("scripted-turn")
+
+
+def _context_texts(context: Context) -> str:
+    """Concatenate the text of every message in a captured context."""
+    return "\n".join(getattr(m.content, "text", "") or "" for m in context.messages)
+
+
+async def test_plan_directive_does_not_leak_into_execute_context() -> None:
+    """A full 2-step PlanExecute run: the plan turn sees the directive, but no
+    execute-step context carries it, and the steps receive their instructions."""
+    agent = _ScriptedTurnAgent(
+        [
+            # Plan turn: produce a 2-step plan.
+            FinalResponse(
+                content='{"tasks":["step one","step two"],"rationale":"r"}',
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            # Execute step 1: issue a tool call, then finalize.
+            ToolCallRequested(
+                calls=[ToolCall(id="c1", name="noop")],
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            ),
+            FinalResponse(
+                content="did step one", usage=TokenUsage(input_tokens=1, output_tokens=1)
+            ),
+            # Execute step 2: finalize directly.
+            FinalResponse(
+                content="did step two", usage=TokenUsage(input_tokens=1, output_tokens=1)
+            ),
+        ]
+    )
+    harness = StandardHarness(
+        HarnessConfig(
+            agent=agent,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=_rich_adapter(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=StorageProvider.single(InMemoryStorageProvider()),
+        )
+    )
+    task = Task.new(
+        "build something",
+        SessionId("leak"),
+        LoopStrategyPlanExecute(plan_model=None),
+    )
+    result = await harness.run(HarnessRunOptions(task))
+    assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
+
+    # 1 plan turn + (tool call + final) for step one + 1 for step two.
+    assert len(agent.seen) == 4, "plan turn + 3 execute turns"
+
+    # The PLAN turn (index 0) DOES carry the directive — that's correct.
+    plan_text = _context_texts(agent.seen[0])
+    assert _PLAN_DIRECTIVE_HEAD in plan_text, f"plan turn should see the directive: {plan_text!r}"
+    assert _PLAN_DIRECTIVE_JSON in plan_text, f"plan turn should see the directive: {plan_text!r}"
+
+    # No EXECUTE-step context (indices 1..) may carry the directive.
+    for i, c in enumerate(agent.seen[1:], start=1):
+        text = _context_texts(c)
+        assert _PLAN_DIRECTIVE_HEAD not in text, (
+            f"execute-step context {i} leaked the directive: {text!r}"
+        )
+        assert _PLAN_DIRECTIVE_JSON not in text, (
+            f"execute-step context {i} leaked the directive: {text!r}"
+        )
+
+    # The execute steps still receive their step instructions.
+    assert "step one" in _context_texts(agent.seen[1]), (
+        "step-one context should carry its instruction"
+    )
+    assert "step two" in _context_texts(agent.seen[3]), (
+        "step-two context should carry its instruction"
+    )
 
 
 async def test_model_params_reach_streaming_turn() -> None:

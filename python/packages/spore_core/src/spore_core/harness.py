@@ -4311,15 +4311,23 @@ class StandardHarness:
         planner = config.planner_agent if config.planner_agent is not None else config.agent
 
         # Seed the planning directive as a user message (reuse ContextManager).
+        # CRITICAL (#93): the directive must NOT mutate the SHARED ``session_state``.
+        # That same state is threaded into the execute phase, where each subtask
+        # sub-loop assembles its context from it. If the directive leaked in,
+        # every execute step would still see "respond with {tasks, rationale}"
+        # and an instruction-following model would re-emit a plan instead of
+        # calling tools. Append to a throwaway CLONE so the plan turn sees the
+        # directive while the shared state stays ``[user: task.instruction]``.
         directive = (
             "Produce a step-by-step plan for the following task. Respond with a "
             'single JSON object: {"tasks": [<ordered step strings>], '
             '"rationale": <string>}.\n\nTask:\n' + task.instruction
         )
-        await config.context_manager.append_user_message(session_state, directive)
+        plan_state = session_state.model_copy(deep=True)
+        await config.context_manager.append_user_message(plan_state, directive)
 
         # Assemble + invoke the planner for exactly ONE turn (R1).
-        context = await config.context_manager.assemble(session_state, task)
+        context = await config.context_manager.assemble(plan_state, task)
         # Per-run model params win unconditionally (issue #93) — same seam as
         # _run_react_inner, before the plan turn is dispatched.
         context.params = config.model_params
