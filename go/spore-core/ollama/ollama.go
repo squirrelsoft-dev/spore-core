@@ -41,6 +41,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -201,6 +202,14 @@ type wireRequest struct {
 	KeepAlive string        `json:"keep_alive,omitempty"`
 	Options   *wireOptions  `json:"options,omitempty"`
 	Tools     []wireTool    `json:"tools,omitempty"`
+	// Format is the constrained-decoding JSON schema (Ollama's `format`
+	// parameter). Set only in structured-tool-calls mode
+	// (ModelParams.StructuredToolCalls); when present, native `tools` are
+	// dropped and the model is forced to emit a single schema-constrained JSON
+	// object instead of routing tool calls through Llama's `<|python_tag|>`
+	// channel (which Ollama does not parse, causing the call to leak into
+	// message.content).
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 type wireOptions struct {
@@ -298,25 +307,46 @@ type wireEmbedResponse struct {
 // ---------------------------------------------------------------------------
 
 func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream bool) wireRequest {
+	// Structured-tool-calls mode (opt-in): constrained decoding via `format`.
+	// We send NO native tools — describing them in a system message instead —
+	// and force the model to emit a single schema-constrained JSON object. The
+	// `tool` enum is the critical constraint: it eliminates the `<|python_tag|>`
+	// leak that small local models (llama3.2) otherwise produce.
+	structured := req.Params.StructuredToolCalls && len(req.Tools) > 0
+
 	messages := make([]wireMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		messages = append(messages, messageToWire(m))
 	}
 
-	tools := make([]wireTool, 0, len(req.Tools))
-	for _, t := range req.Tools {
-		params := t.InputSchema
-		if len(params) == 0 {
-			params = json.RawMessage("{}")
+	var tools []wireTool
+	var format json.RawMessage
+	if structured {
+		// Inject a system message describing the tools. Merge into an existing
+		// leading system message when present; otherwise prepend a new one.
+		preamble := structuredToolsPreamble(req.Tools)
+		if len(messages) > 0 && messages[0].Role == "system" {
+			messages[0].Content = messages[0].Content + "\n\n" + preamble
+		} else {
+			messages = append([]wireMessage{{Role: "system", Content: preamble}}, messages...)
 		}
-		tools = append(tools, wireTool{
-			Type: "function",
-			Function: wireToolFunction{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  params,
-			},
-		})
+		format = structuredFormatSchema(req.Tools)
+	} else {
+		tools = make([]wireTool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			params := t.InputSchema
+			if len(params) == 0 {
+				params = json.RawMessage("{}")
+			}
+			tools = append(tools, wireTool{
+				Type: "function",
+				Function: wireToolFunction{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  params,
+				},
+			})
+		}
 	}
 
 	opts := &wireOptions{
@@ -337,7 +367,93 @@ func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream 
 		KeepAlive: keepAlive,
 		Options:   optsOut,
 		Tools:     tools,
+		Format:    format,
 	}
+}
+
+// structuredFormatSchema builds the constrained-decoding JSON schema for
+// structured-tool-calls mode. The `tool` enum lists every tool name plus
+// "final"; this enum is the critical constraint that keeps tool calls on the
+// constrained-JSON channel and away from Llama's `<|python_tag|>`.
+func structuredFormatSchema(tools []sporecore.ToolSchema) json.RawMessage {
+	names := make([]string, 0, len(tools)+1)
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	names = append(names, "final")
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"tool":      map[string]any{"type": "string", "enum": names},
+			"arguments": map[string]any{"type": "object"},
+			"content":   map[string]any{"type": "string"},
+		},
+		"required": []string{"tool"},
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+// structuredToolsPreamble builds the system-message preamble for
+// structured-tool-calls mode. It describes each tool's name, description, and
+// parameter property names/types (read from t.InputSchema), then gives the
+// model explicit single-JSON-object output instructions. This — together with
+// the `format` schema's `tool` enum — keeps tool calls on the constrained-JSON
+// channel and away from `<|python_tag|>`.
+func structuredToolsPreamble(tools []sporecore.ToolSchema) string {
+	var b strings.Builder
+	b.WriteString("You have access to the following tools:\n")
+	for _, t := range tools {
+		b.WriteString(fmt.Sprintf("\n- %s: %s", t.Name, t.Description))
+		params := schemaParamSummary(t.InputSchema)
+		if params != "" {
+			b.WriteString("\n  parameters: ")
+			b.WriteString(params)
+		}
+	}
+	b.WriteString("\n\nRespond with a SINGLE JSON object and nothing else. " +
+		"To call a tool, set \"tool\" to the tool name and \"arguments\" to its " +
+		"inputs. When the task is fully done, set \"tool\" to \"final\" and put " +
+		"your reply in \"content\".")
+	return b.String()
+}
+
+// schemaParamSummary extracts a "name (type), ..." summary from a tool input
+// schema's `properties` object. Returns "" when there are no properties.
+func schemaParamSummary(inputSchema json.RawMessage) string {
+	if len(inputSchema) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(inputSchema, &parsed); err != nil {
+		return ""
+	}
+	if len(parsed.Properties) == 0 {
+		return ""
+	}
+	// Sort property names for deterministic output (Go map order is random).
+	names := make([]string, 0, len(parsed.Properties))
+	for name := range parsed.Properties {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		ty := "any"
+		var ps struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(parsed.Properties[name], &ps); err == nil && ps.Type != "" {
+			ty = ps.Type
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", name, ty))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func messageToWire(m sporecore.Message) wireMessage {
@@ -388,7 +504,29 @@ func messageToWire(m sporecore.Message) wireMessage {
 	return wireMessage{Role: role, Content: m.Content.Text}
 }
 
-func parseResponse(body wireResponse) sporecore.ModelResponse {
+func parseResponse(body wireResponse, structured bool) sporecore.ModelResponse {
+	usage := sporecore.TokenUsage{}
+	if body.PromptEvalCount != nil {
+		usage.InputTokens = *body.PromptEvalCount
+	}
+	if body.EvalCount != nil {
+		usage.OutputTokens = *body.EvalCount
+	}
+
+	if structured {
+		// In structured mode the assistant content is a single constrained JSON
+		// object — never a native tool_calls array. Parsing it back into a
+		// tool-use block (rather than treating the raw JSON as answer text) is
+		// precisely what avoids the `<|python_tag|>` leak: the tool call never
+		// touches the native channel.
+		blocks, stopReason := parseStructuredContent(body.Message.Content, 0)
+		return sporecore.ModelResponse{
+			Content:    blocks,
+			Usage:      usage,
+			StopReason: stopReason,
+		}
+	}
+
 	blocks := make([]sporecore.ContentBlock, 0, 1+len(body.Message.ToolCalls))
 	if body.Message.Content != "" {
 		blocks = append(blocks, sporecore.NewTextBlock(body.Message.Content))
@@ -405,19 +543,58 @@ func parseResponse(body wireResponse) sporecore.ModelResponse {
 		}))
 	}
 
-	usage := sporecore.TokenUsage{}
-	if body.PromptEvalCount != nil {
-		usage.InputTokens = *body.PromptEvalCount
-	}
-	if body.EvalCount != nil {
-		usage.OutputTokens = *body.EvalCount
-	}
-
 	return sporecore.ModelResponse{
 		Content:    blocks,
 		Usage:      usage,
 		StopReason: parseStopReason(body.DoneReason),
 	}
+}
+
+// parseStructuredContent parses the constrained-decoding JSON object produced
+// in structured-tool-calls mode into (content blocks, stop reason). index is
+// used to synthesize the tool-call id, reusing this file's "call-{i}"
+// convention.
+//
+// Defensive: if raw is missing/empty/not valid JSON/lacks a `tool` field, fall
+// back to a single text block with the raw content and StopEndTurn — weak
+// models occasionally violate even constrained decoding, and we never panic on
+// their output.
+func parseStructuredContent(raw string, index int) ([]sporecore.ContentBlock, sporecore.StopReason) {
+	fallback := func() ([]sporecore.ContentBlock, sporecore.StopReason) {
+		return []sporecore.ContentBlock{sporecore.NewTextBlock(raw)}, sporecore.StopEndTurn
+	}
+	trimmed := strings.TrimSpace(raw)
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return fallback()
+	}
+	var tool string
+	rawTool, ok := value["tool"]
+	if !ok {
+		return fallback()
+	}
+	if err := json.Unmarshal(rawTool, &tool); err != nil || tool == "" {
+		return fallback()
+	}
+	if tool == "final" {
+		text := ""
+		if rawContent, ok := value["content"]; ok {
+			_ = json.Unmarshal(rawContent, &text)
+		}
+		return []sporecore.ContentBlock{sporecore.NewTextBlock(text)}, sporecore.StopEndTurn
+	}
+	input := json.RawMessage("{}")
+	if rawArgs, ok := value["arguments"]; ok {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(rawArgs, &obj); err == nil && obj != nil {
+			input = rawArgs
+		}
+	}
+	return []sporecore.ContentBlock{sporecore.NewToolUseBlock(sporecore.ToolCall{
+		ID:    fmt.Sprintf("call-%d", index),
+		Name:  tool,
+		Input: input,
+	})}, sporecore.StopToolUse
 }
 
 func parseStopReason(s string) sporecore.StopReason {
@@ -674,7 +851,8 @@ func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (
 	if err := json.NewDecoder(resp.Body).Decode(&wr); err != nil {
 		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("response decode failed: %v", err))
 	}
-	return parseResponse(wr), nil
+	structured := req.Params.StructuredToolCalls && len(req.Tools) > 0
+	return parseResponse(wr, structured), nil
 }
 
 // CountTokens estimates token usage. Ollama has no dedicated count endpoint
@@ -772,12 +950,13 @@ func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelR
 		cancel()
 		return nil, mapped
 	}
+	structured := req.Params.StructuredToolCalls && len(req.Tools) > 0
 	ch := make(chan sporecore.StreamEventOrErr, 16)
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
 		defer cancel()
-		parseNDJSONStream(ctx, resp.Body, ch)
+		parseNDJSONStream(ctx, resp.Body, ch, structured)
 	}()
 	return ch, nil
 }
@@ -790,7 +969,7 @@ func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelR
 // incremental message.content delta; tool_calls arrive as full argument
 // objects per chunk; the terminator line carries done=true plus
 // prompt_eval_count and eval_count.
-func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.StreamEventOrErr) {
+func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.StreamEventOrErr, structured bool) {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 0, 1<<16)
 	scanner.Buffer(buf, 1<<20)
@@ -802,6 +981,13 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 		toolIndicesSeen    = map[uint32]bool{}
 		contentIndex       uint32
 		contentIndexActive bool
+		// Structured mode: the constrained JSON object arrives as message.content
+		// text deltas spread across chunks. We must NOT surface that raw JSON to
+		// the user — instead buffer it for the whole response and parse it at the
+		// `done` chunk exactly like parseResponse, emitting reconstructable tool /
+		// text events. This keeps the tool call off the native channel and is what
+		// prevents the `<|python_tag|>` leak in streaming mode too.
+		structuredContent strings.Builder
 	)
 
 	for scanner.Scan() {
@@ -818,6 +1004,66 @@ func parseNDJSONStream(ctx context.Context, r io.Reader, ch chan<- sporecore.Str
 			if !sendEvent(ctx, ch, sporecore.StreamEvent{Type: sporecore.StreamMessageStart}) {
 				return
 			}
+		}
+		if structured {
+			// Buffer content deltas; defer all emission to the `done` chunk.
+			if message, ok := value["message"].(map[string]any); ok {
+				if text, ok := message["content"].(string); ok {
+					structuredContent.WriteString(text)
+				}
+			}
+			if done, _ := value["done"].(bool); done {
+				blocks, sr := parseStructuredContent(structuredContent.String(), 0)
+				for _, block := range blocks {
+					switch block.Type {
+					case sporecore.ContentBlockTypeToolUse:
+						if block.ToolCall == nil {
+							continue
+						}
+						partial := "{}"
+						if len(block.ToolCall.Input) > 0 {
+							partial = string(block.ToolCall.Input)
+						}
+						if !sendEvent(ctx, ch, sporecore.StreamEvent{
+							Type:  sporecore.StreamToolUseStart,
+							Index: 1,
+							ID:    block.ToolCall.ID,
+							Name:  block.ToolCall.Name,
+						}) {
+							return
+						}
+						if !sendEvent(ctx, ch, sporecore.StreamEvent{
+							Type:        sporecore.StreamToolUseDelta,
+							Index:       1,
+							PartialJSON: partial,
+						}) {
+							return
+						}
+					case sporecore.ContentBlockTypeText:
+						if !sendEvent(ctx, ch, sporecore.StreamEvent{
+							Type:  sporecore.StreamContentBlockDelta,
+							Index: 0,
+							Delta: block.Text,
+						}) {
+							return
+						}
+					}
+				}
+				if pec, ok := value["prompt_eval_count"].(float64); ok {
+					usage.InputTokens = uint32(pec)
+				}
+				if ec, ok := value["eval_count"].(float64); ok {
+					usage.OutputTokens = uint32(ec)
+				}
+				u := usage
+				sendEvent(ctx, ch, sporecore.StreamEvent{
+					Type:       sporecore.StreamMessageStop,
+					Usage:      &u,
+					StopReason: sr,
+				})
+				return
+			}
+			continue
 		}
 		message, _ := value["message"].(map[string]any)
 		if message != nil {

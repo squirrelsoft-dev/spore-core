@@ -209,6 +209,197 @@ func TestThinkingBlockOmittedInRequest(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// structured tool calls (opt-in constrained decoding)
+//
+// This path describes the tools in a system message and constrains decoding via
+// Ollama's `format` schema instead of sending native `tools`. Because the tool
+// call rides the constrained-JSON channel — never the native tool_calls /
+// `<|python_tag|>` path — small local models can no longer leak a tool call into
+// message.content as unparsed text.
+// ---------------------------------------------------------------------------
+
+func structuredToolReq() sporecore.ModelRequest {
+	r := req(userMsg("write a summary file"))
+	r.Params.StructuredToolCalls = true
+	r.Tools = []sporecore.ToolSchema{
+		{
+			Name:        "write_file",
+			Description: "write a file",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}`),
+		},
+		{
+			Name:        "read_file",
+			Description: "read a file",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+		},
+	}
+	return r
+}
+
+func TestBuildRequestStructuredSetsFormatDropsToolsAddsSystem(t *testing.T) {
+	body := buildRequest("llama3.2", "", structuredToolReq(), false)
+	// Native tools dropped in structured mode.
+	if len(body.Tools) != 0 {
+		t.Fatalf("native tools must be empty, got %d", len(body.Tools))
+	}
+	// format schema present with tool enum = tool names + "final".
+	if len(body.Format) == 0 {
+		t.Fatalf("format schema must be present")
+	}
+	var schema struct {
+		Properties struct {
+			Tool struct {
+				Enum []string `json:"enum"`
+			} `json:"tool"`
+		} `json:"properties"`
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(body.Format, &schema); err != nil {
+		t.Fatalf("format not JSON: %s", body.Format)
+	}
+	enum := strings.Join(schema.Properties.Tool.Enum, ",")
+	for _, want := range []string{"write_file", "read_file", "final"} {
+		if !strings.Contains(enum, want) {
+			t.Fatalf("tool enum missing %q: %v", want, schema.Properties.Tool.Enum)
+		}
+	}
+	if len(schema.Required) != 1 || schema.Required[0] != "tool" {
+		t.Fatalf("required: %v", schema.Required)
+	}
+	// A system message describing the tools is prepended.
+	if body.Messages[0].Role != "system" {
+		t.Fatalf("first message role = %q, want system", body.Messages[0].Role)
+	}
+	for _, want := range []string{"write_file", "read_file", "SINGLE JSON object"} {
+		if !strings.Contains(body.Messages[0].Content, want) {
+			t.Fatalf("system message missing %q: %s", want, body.Messages[0].Content)
+		}
+	}
+}
+
+func TestBuildRequestStructuredMergesIntoExistingSystemMessage(t *testing.T) {
+	r := structuredToolReq()
+	r.Messages = append([]sporecore.Message{{
+		Role:    sporecore.RoleSystem,
+		Content: sporecore.NewTextContent("You are terse."),
+	}}, r.Messages...)
+	body := buildRequest("llama3.2", "", r, false)
+	systemCount := 0
+	for _, m := range body.Messages {
+		if m.Role == "system" {
+			systemCount++
+		}
+	}
+	if systemCount != 1 {
+		t.Fatalf("expected exactly one system message, got %d", systemCount)
+	}
+	if !strings.Contains(body.Messages[0].Content, "You are terse.") {
+		t.Fatalf("original system content lost: %s", body.Messages[0].Content)
+	}
+	if !strings.Contains(body.Messages[0].Content, "write_file") {
+		t.Fatalf("preamble not merged: %s", body.Messages[0].Content)
+	}
+}
+
+func TestBuildRequestStructuredOffWhenNoTools(t *testing.T) {
+	// Flag on but no tools → unchanged behavior, no format.
+	r := req(userMsg("hi"))
+	r.Params.StructuredToolCalls = true
+	body := buildRequest("llama3.2", "", r, false)
+	if len(body.Format) != 0 {
+		t.Fatalf("format must be absent when no tools: %s", body.Format)
+	}
+}
+
+func TestBuildRequestStructuredOffByDefault(t *testing.T) {
+	// Flag default off with tools present → native tools, no format.
+	r := req(userMsg("hi"))
+	r.Tools = []sporecore.ToolSchema{{
+		Name:        "search",
+		Description: "search the web",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}}
+	body := buildRequest("llama3.2", "", r, false)
+	if len(body.Format) != 0 {
+		t.Fatalf("format must be absent by default: %s", body.Format)
+	}
+	if len(body.Tools) != 1 {
+		t.Fatalf("native tools expected, got %d", len(body.Tools))
+	}
+}
+
+func TestBuildRequestStructuredFlagOmittedFromParamsWhenOff(t *testing.T) {
+	// Hash parity: a false StructuredToolCalls must NOT appear in the serialized
+	// ModelParams (mirrors Rust's skip_serializing_if). A serialized `false`
+	// would break the cross-language request hash.
+	out, err := json.Marshal(sporecore.ModelParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "structured_tool_calls") {
+		t.Fatalf("false StructuredToolCalls must be omitted: %s", out)
+	}
+}
+
+func TestParseResponseStructuredToolCall(t *testing.T) {
+	raw := `{"message":{"role":"assistant","content":"{\"tool\":\"write_file\",\"arguments\":{\"path\":\"SUMMARY.md\",\"content\":\"hi\"}}"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`
+	var body wireResponse
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatal(err)
+	}
+	r := parseResponse(body, true)
+	if r.StopReason != sporecore.StopToolUse {
+		t.Fatalf("stop: %s", r.StopReason)
+	}
+	if len(r.Content) != 1 {
+		t.Fatalf("content len = %d", len(r.Content))
+	}
+	tc := r.Content[0].ToolCall
+	if tc == nil || tc.Name != "write_file" {
+		t.Fatalf("tool call: %+v", tc)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(tc.Input, &parsed); err != nil {
+		t.Fatalf("input not JSON: %s", tc.Input)
+	}
+	if parsed["path"] != "SUMMARY.md" || parsed["content"] != "hi" {
+		t.Fatalf("input: %v", parsed)
+	}
+}
+
+func TestParseResponseStructuredFinal(t *testing.T) {
+	raw := `{"message":{"role":"assistant","content":"{\"tool\":\"final\",\"content\":\"all done\"}"},"done":true,"done_reason":"stop"}`
+	var body wireResponse
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatal(err)
+	}
+	r := parseResponse(body, true)
+	if r.StopReason != sporecore.StopEndTurn {
+		t.Fatalf("stop: %s", r.StopReason)
+	}
+	if len(r.Content) != 1 || r.Content[0].Type != sporecore.ContentBlockTypeText || r.Content[0].Text != "all done" {
+		t.Fatalf("content: %+v", r.Content)
+	}
+}
+
+func TestParseResponseStructuredMalformedFallsBackToText(t *testing.T) {
+	// Weak model violates constrained decoding: not valid JSON. We must not
+	// panic — fall back to a Text block with the raw content and EndTurn.
+	raw := `{"message":{"role":"assistant","content":"oops not json"},"done":true,"done_reason":"stop"}`
+	var body wireResponse
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatal(err)
+	}
+	r := parseResponse(body, true)
+	if r.StopReason != sporecore.StopEndTurn {
+		t.Fatalf("stop: %s", r.StopReason)
+	}
+	if len(r.Content) != 1 || r.Content[0].Type != sporecore.ContentBlockTypeText || r.Content[0].Text != "oops not json" {
+		t.Fatalf("content: %+v", r.Content)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // parseStopReason
 // ---------------------------------------------------------------------------
 
@@ -237,7 +428,7 @@ func TestParseResponseExtractsUsageAndText(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatal(err)
 	}
-	r := parseResponse(body)
+	r := parseResponse(body, false)
 	if r.Usage.InputTokens != 7 || r.Usage.OutputTokens != 2 {
 		t.Fatalf("usage: %+v", r.Usage)
 	}
@@ -253,7 +444,7 @@ func TestParseResponseCacheFieldsAlwaysNil(t *testing.T) {
 	raw := `{"message":{"role":"assistant","content":"x"},"done":true,"prompt_eval_count":1,"eval_count":1}`
 	var body wireResponse
 	_ = json.Unmarshal([]byte(raw), &body)
-	r := parseResponse(body)
+	r := parseResponse(body, false)
 	if r.Usage.CacheReadTokens != nil || r.Usage.CacheWriteTokens != nil {
 		t.Fatalf("cache fields not nil: %+v", r.Usage)
 	}
@@ -265,7 +456,7 @@ func TestParseResponseToolCallSynthesizesID(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatal(err)
 	}
-	r := parseResponse(body)
+	r := parseResponse(body, false)
 	if r.StopReason != sporecore.StopToolUse {
 		t.Fatalf("stop: %s", r.StopReason)
 	}
@@ -623,6 +814,72 @@ func TestStreamingAccumulatesToolCalls(t *testing.T) {
 		t.Fatalf("not JSON: %q", toolJSONs[0])
 	}
 	if parsed["url"] != "x" {
+		t.Fatalf("args: %v", parsed)
+	}
+	if finalStop != sporecore.StopToolUse {
+		t.Fatalf("stop: %s", finalStop)
+	}
+}
+
+// In structured mode the constrained JSON object arrives as message.content
+// text deltas spread across chunks. The raw JSON must NOT be surfaced as answer
+// text; instead the buffer is reconstructed at the done chunk into a clean
+// tool_use_start + tool_use_delta carrying valid argument JSON.
+func TestStreamingStructuredBuffersJSONThenReconstructsToolCall(t *testing.T) {
+	// The model emits the constrained JSON object split across several content
+	// deltas. Concatenated they form a valid write_file tool call.
+	ndjson := strings.Join([]string{
+		`{"message":{"role":"assistant","content":"{\"tool\":\"write"},"done":false}`,
+		`{"message":{"role":"assistant","content":"_file\",\"arguments\":{\"path\":"},"done":false}`,
+		`{"message":{"role":"assistant","content":"\"OUT.md\",\"content\":\"hi\"}}"},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":4}`,
+		``,
+	}, "\n")
+	srv, _ := newSplitServerWithShow(t, "llama3.2", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, ndjson)
+	}, showJSON(`{"model_info":{"llama.context_length":16384},"capabilities":["tools"]}`))
+	c := WithBaseURL("llama3.2", srv.URL)
+
+	r := structuredToolReq()
+	ch, err := c.CallStreaming(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startName, startID string
+	var toolJSONs []string
+	var contentDeltas []string
+	var finalStop sporecore.StopReason
+	for ev := range ch {
+		switch ev.Event.Type {
+		case sporecore.StreamToolUseStart:
+			startName = ev.Event.Name
+			startID = ev.Event.ID
+		case sporecore.StreamToolUseDelta:
+			toolJSONs = append(toolJSONs, ev.Event.PartialJSON)
+		case sporecore.StreamContentBlockDelta:
+			contentDeltas = append(contentDeltas, ev.Event.Delta)
+		case sporecore.StreamMessageStop:
+			finalStop = ev.Event.StopReason
+		}
+	}
+	// Raw JSON must never leak as content deltas in structured mode.
+	if len(contentDeltas) != 0 {
+		t.Fatalf("raw JSON leaked as content: %v", contentDeltas)
+	}
+	if startName != "write_file" {
+		t.Fatalf("tool_use_start name = %q, want write_file", startName)
+	}
+	if startID != "call-0" {
+		t.Fatalf("tool_use_start id = %q, want call-0", startID)
+	}
+	if len(toolJSONs) != 1 {
+		t.Fatalf("tool jsons: %v", toolJSONs)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(toolJSONs[0]), &parsed); err != nil {
+		t.Fatalf("args not valid JSON: %q", toolJSONs[0])
+	}
+	if parsed["path"] != "OUT.md" || parsed["content"] != "hi" {
 		t.Fatalf("args: %v", parsed)
 	}
 	if finalStop != sporecore.StopToolUse {

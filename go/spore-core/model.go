@@ -227,6 +227,17 @@ type ModelParams struct {
 	ReasoningBudget *uint32  `json:"reasoning_budget"`
 	TopP            *float32 `json:"top_p"`
 	StopSequences   []string `json:"stop_sequences"`
+	// StructuredToolCalls is an opt-in hint for providers that support
+	// constrained decoding (Ollama via the `format` JSON-schema parameter).
+	// When true AND the request has tools, the provider forces tool calls to be
+	// emitted as schema-constrained JSON, parsed back into tool-use blocks.
+	// Providers without constrained-decoding support (e.g. Anthropic) ignore it.
+	// Helps small local models (llama3.2) that otherwise leak `<|python_tag|>`
+	// tool calls into content. Tradeoff: one tool call per turn, no interleaved
+	// reasoning text. Default false. The `omitempty` tag keeps a false value out
+	// of the serialized request so the cross-language request hash stays
+	// byte-identical when the flag is off (mirrors Rust's skip_serializing_if).
+	StructuredToolCalls bool `json:"structured_tool_calls,omitempty"`
 }
 
 // MarshalJSON ensures StopSequences serialises as [] rather than null.
