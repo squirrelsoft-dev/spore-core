@@ -80,6 +80,13 @@
 //!    returned: <truncated findings>
 //! ```
 //!
+//! The orchestrator's **plan itself** is surfaced separately, through the hook
+//! chain (there are no plan/subtask stream events). A `PlanExecuteReporter`
+//! (`impl Hook`, copied from example 08) prints a `── orchestrator plan ──`
+//! banner on `OnPlanCreated` and an `[i/N]` line per subtask on `OnTaskAdvance`,
+//! interleaved with the boundary banners above — so "the orchestrator PLANS,
+//! then delegates" is legible end to end.
+//!
 //! There are no `// SPEC QUESTION:` markers: the single-file layout, the
 //! three-agent shape, the isolated context sharing, the PlanExecute/ReAct split,
 //! and the final-write owner were all resolved before this example was written.
@@ -97,11 +104,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use spore_core::harness::BoxFut;
 use spore_core::tool_registry::StandardToolRegistry;
 use spore_core::tools::{ContextSharing, SubagentTool};
 use spore_core::{
-    BudgetLimits, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RegisteredToolSchema, RunResult, SearchMethod, SessionId, StandardTool,
+    BudgetLimits, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, Hook, HookChain,
+    HookContext, HookDecision, HookError, HookEvent, LoopStrategy, OllamaModelInterface,
+    RegisteredToolSchema, RunResult, SearchMethod, SessionId, StandardHookChain, StandardTool,
     StandardTools, Task, ToolAnnotations, WebSearchConfig, WebSearchTool, WorkspaceConfig,
     WorkspaceScopedSandbox,
 };
@@ -129,6 +138,58 @@ const ORCHESTRATOR_PROMPT: &str = "You are an orchestrator. You coordinate two w
      research worker, asking it to format a polished markdown report; (3) call `write_file` to \
      save the writing worker's markdown verbatim to `report.md`. Do the research and writing by \
      delegating to the workers — never do it yourself — and always finish by writing report.md.";
+
+/// Lifecycle hook that surfaces the ORCHESTRATOR's PlanExecute plan and each
+/// subtask as it advances. This is the "the orchestrator PLANS, then delegates"
+/// half of the example made visible — the worker hand-offs print via the stream
+/// (the boxed `┌─ … └─` banners); the plan prints here.
+///
+/// The plan is NOT a stream event — it travels through the hook chain, exactly as
+/// in example 08:
+/// - `OnPlanCreated` fires once, post-capture / pre-execute — we print a
+///   `── orchestrator plan ──` banner: the rationale, then the numbered steps.
+/// - `OnTaskAdvance` fires before each subtask — we print `[i/N] <instruction>`.
+///
+/// This hook only observes; it always returns [`HookDecision::Continue`].
+struct PlanExecuteReporter;
+
+impl Hook for PlanExecuteReporter {
+    fn handle<'a>(
+        &'a self,
+        ctx: &'a mut HookContext<'a>,
+    ) -> BoxFut<'a, Result<HookDecision, HookError>> {
+        match ctx {
+            HookContext::OnPlanCreated { plan, .. } => {
+                println!("\n── orchestrator plan ──");
+                if !plan.rationale.trim().is_empty() {
+                    println!("rationale: {}", plan.rationale);
+                }
+                for (i, task) in plan.tasks.iter().enumerate() {
+                    println!("  {}. {task}", i + 1);
+                }
+                println!("───────────────────────\n");
+            }
+            HookContext::OnTaskAdvance {
+                task,
+                task_index,
+                total_tasks,
+                ..
+            } => {
+                println!("[{}/{}] {}", *task_index + 1, total_tasks, task.instruction);
+            }
+            _ => {}
+        }
+        Box::pin(async { Ok(HookDecision::Continue) })
+    }
+
+    fn events(&self) -> Vec<HookEvent> {
+        vec![HookEvent::OnPlanCreated, HookEvent::OnTaskAdvance]
+    }
+
+    fn name(&self) -> String {
+        "plan-execute-reporter".to_string()
+    }
+}
 
 /// The single-parameter input schema every worker tool advertises: the
 /// orchestrator passes one `instruction` string, which `SubagentTool` forwards to
@@ -278,6 +339,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writing_child,
     );
 
+    // Register the plan reporter on a hook chain. The chain is how the
+    // orchestrator's plan becomes visible: there are no plan/subtask stream
+    // events (identical mechanism to example 08).
+    let chain = StandardHookChain::new();
+    chain.register(Arc::new(PlanExecuteReporter))?;
+
     // ---- Build the orchestrator: workers-as-tools + write_file --------------
     let orchestrator_model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
@@ -287,6 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(writing_tool)
         .tool(StandardTools::write_file())
         .system_prompt(ORCHESTRATOR_PROMPT)
+        .hooks(Arc::new(chain))
         .build();
 
     // The orchestrator plans the three steps up front via PlanExecute, then
