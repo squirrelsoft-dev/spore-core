@@ -31,7 +31,11 @@
 //! 2. `TurnResult::ToolCallRequested` may carry **multiple** tool calls when
 //!    the model requests parallel tool use; the harness dispatches all of
 //!    them.
-//! 3. A response that yields neither text nor tool calls is reported as
+//! 3. A response that yields neither text nor tool calls is interpreted by its
+//!    `stop_reason`: a clean `StopReason::EndTurn` with no content is the
+//!    model's completion signal and becomes a (possibly empty) terminal
+//!    `FinalResponse`; a `StopReason::MaxTokens` or `StopReason::StopSequence`
+//!    empty is an abnormal/truncated stop and is reported as
 //!    [`AgentError::EmptyResponse`] — never silently swallowed.
 //! 4. Classification uses the model's `stop_reason`:
 //!    - `StopReason::ToolUse` → `ToolCallRequested` (all `ToolUse` blocks).
@@ -301,13 +305,27 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
             }
         }
         StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-            // If the provider returned no tool-use blocks AND no text, that is
-            // an empty response — surface it explicitly. (Thinking-only output
+            // If the provider returned no tool-use blocks AND no text, the
+            // meaning depends on *why* the model stopped. (Thinking-only output
             // is still empty: thinking is not a terminal response.)
+            //
+            // - A clean `EndTurn` is the model's completion signal: it chose to
+            //   stop and did not request a tool. An empty `EndTurn` is therefore
+            //   a (possibly empty) terminal response, not an error — fabricating
+            //   an `EmptyResponse` error from it would be wrong.
+            // - `MaxTokens` / `StopSequence` empties are abnormal/truncated
+            //   stops and remain genuinely suspect, so they stay `EmptyResponse`.
             if text_parts.is_empty() && tool_calls.is_empty() {
-                return TurnResult::Error {
-                    error: AgentError::EmptyResponse,
-                    usage: Some(usage),
+                return match response.stop_reason {
+                    StopReason::EndTurn => TurnResult::FinalResponse {
+                        content: String::new(),
+                        usage,
+                        reasoning,
+                    },
+                    _ => TurnResult::Error {
+                        error: AgentError::EmptyResponse,
+                        usage: Some(usage),
+                    },
                 };
             }
             // If we somehow received tool-use blocks but stop_reason did not
@@ -739,14 +757,41 @@ mod tests {
         }
     }
 
-    // Rule: EmptyResponse when model returns neither text nor tool calls.
+    // Rule: a clean EndTurn with no text and no tool calls is the model's
+    // voluntary completion signal → a (possibly empty) terminal FinalResponse,
+    // NOT an EmptyResponse error.
     #[tokio::test]
-    async fn empty_response_when_no_content_blocks() {
+    async fn clean_end_turn_with_no_content_is_empty_final_response() {
         let m = Arc::new(MockModelInterface::new(provider()));
         m.push_response(Ok(ModelResponse {
             content: vec![],
             usage: usage(1, 0),
             stop_reason: StopReason::EndTurn,
+        }));
+        let agent = make_agent(m);
+        match agent.turn(ctx_user("?")).await {
+            TurnResult::FinalResponse {
+                content,
+                usage: u,
+                reasoning,
+            } => {
+                assert_eq!(content, "");
+                assert_eq!(u.input_tokens, 1);
+                assert!(reasoning.is_none());
+            }
+            other => panic!("expected empty FinalResponse, got {other:?}"),
+        }
+    }
+
+    // Rule: a truncated/abnormal empty (MaxTokens with no content) remains a
+    // genuine EmptyResponse error — only clean EndTurn is reclassified.
+    #[tokio::test]
+    async fn max_tokens_with_no_content_is_empty_response() {
+        let m = Arc::new(MockModelInterface::new(provider()));
+        m.push_response(Ok(ModelResponse {
+            content: vec![],
+            usage: usage(1, 0),
+            stop_reason: StopReason::MaxTokens,
         }));
         let agent = make_agent(m);
         match agent.turn(ctx_user("?")).await {
@@ -760,7 +805,9 @@ mod tests {
         }
     }
 
-    // Rule: Thinking blocks are discarded — text-only thinking is still empty.
+    // Rule: Thinking blocks are discarded — thinking-only output is still empty.
+    // Under MaxTokens (a truncated stop) this remains an EmptyResponse error;
+    // thinking is not a terminal response.
     #[tokio::test]
     async fn thinking_blocks_do_not_satisfy_final_response() {
         let m = Arc::new(MockModelInterface::new(provider()));
@@ -769,7 +816,7 @@ mod tests {
                 text: "musing".into(),
             }],
             usage: usage(1, 2),
-            stop_reason: StopReason::EndTurn,
+            stop_reason: StopReason::MaxTokens,
         }));
         let agent = make_agent(m);
         assert!(matches!(

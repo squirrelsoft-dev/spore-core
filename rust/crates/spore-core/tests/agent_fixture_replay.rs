@@ -66,7 +66,9 @@ async fn agent_classifies_recorded_turns_consistently() {
         other => panic!("turn 3 expected parallel ToolCallRequested, got {other:?}"),
     }
 
-    // 4. Empty content blocks with EndTurn → AgentError::EmptyResponse.
+    // 4. Empty content blocks with a truncated stop (MaxTokens) →
+    //    AgentError::EmptyResponse. (A clean EndTurn empty is instead a
+    //    completion; only abnormal/truncated empties remain errors.)
     match agent.turn(Context::default()).await {
         TurnResult::Error {
             error: AgentError::EmptyResponse,
