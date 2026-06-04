@@ -153,6 +153,7 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
             ToolOutput::WaitingForHuman { .. } => String::new(),
             ToolOutput::Escalate { .. } => String::new(),
             ToolOutput::AwaitingClarification { .. } => String::new(),
+            ToolOutput::Consult { .. } => String::new(),
         };
         Box::pin(async move {
             session.messages.push(Message {

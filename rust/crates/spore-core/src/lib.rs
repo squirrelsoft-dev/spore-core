@@ -72,14 +72,15 @@ pub use guide_registry::{
 };
 pub use harness::{
     AggregateUsage, BudgetLimitType, BudgetLimits, BudgetSnapshot, BwrapProfile, ChildPausedState,
-    CommandOutput, CompleteOnFinalResponse, ContextManager as HarnessContextManager,
-    EmptyToolRegistry, FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig,
-    HarnessError, HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse,
-    IsolationMode, LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy,
-    NullSandbox, ObservabilityProvider, Operation, OptimizationDirection, PausedState,
-    ReadOnlySandbox, RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId,
-    SessionState, StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId,
-    TerminationDecision, TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
+    CommandOutput, CompleteOnFinalResponse, ConsultHandlerEntry, ConsultOverflowPolicy,
+    ConsultRequest, ConsultResponse, ContextManager as HarnessContextManager, EmptyToolRegistry,
+    FileRef, GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
+    HarnessRunOptions, HarnessSignal, HookPoint, HumanRequest, HumanResponse, IsolationMode,
+    LoopStrategy, MiddlewareChain, MiddlewareDecision, ModelConfig, NetworkPolicy, NullSandbox,
+    ObservabilityProvider, Operation, OptimizationDirection, PausedState, ReadOnlySandbox,
+    RiskLevel, RunResult, SandboxProvider, SandboxViolation, SessionId, SessionState,
+    StandardHarness, StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision,
+    TerminationPolicy, ToolOutput, ToolRegistry as HarnessToolRegistry,
     ToolResult as HarnessToolResult, TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{

@@ -3,7 +3,35 @@
 //! Per spec (issue #5), subagents cannot spawn their own subagents. The
 //! restriction is enforced at construction time by inspecting the child's
 //! `ToolRegistry` via `has_subagent_tools()`.
+//!
+//! ## Mid-loop consult mediation — seam A1 (issue #114)
+//!
+//! This is the ORCHESTRATOR side of the consult primitive (the worker side and
+//! the type/resume seams live in [`crate::harness`]; see its consult doc-hub).
+//! `SubagentTool::execute` drives the FULL consult cycle internally:
+//!
+//! 1. It runs the child worker.
+//! 2. On a child [`RunResult::Consult`] it does the mediation ITSELF — it never
+//!    bubbles the consult to the parent orchestrator's model. It routes by
+//!    `request.kind` to the matching [`ConsultHandlerEntry`] in its
+//!    `consult_handlers` map, checks the per-kind budget, runs the handler
+//!    harness on the request, builds a [`ConsultResponse::Answer`] from the
+//!    handler's output, and calls `child.resume_consult(..)` to continue the
+//!    worker.
+//! 3. It repeats until the child reaches a terminal result, then returns the
+//!    appropriate terminal [`ToolOutput`] to the parent.
+//!
+//! Rules enforced here: R2 (mediate, do not bubble), R3 (route by kind, no
+//! parent model, parent sees `Success`), R4 (per-kind budget), R5a (`SoftFail`
+//! overflow → `BudgetExhausted` resume), R5b (`EscalateToHuman` overflow →
+//! `ToolOutput::WaitingForHuman`), R6 (no matching kind → `Escalate`), R7
+//! (depth-1: the handler is the orchestrator's direct child, run via
+//! `handler.run(..)`, never nested under the worker).
+//!
+//! The handlers reach this tool through [`SubagentTool::with_consult_handlers`]
+//! (the orchestrator builds them from its `HarnessConfig::consult_handlers`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +40,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::harness::{
-    BoxFut, ChildPausedState, Harness, HarnessRunOptions, RunResult, SandboxProvider, SessionId,
-    SessionState, Task, ToolOutput,
+    BoxFut, ChildPausedState, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
+    ConsultResponse, Harness, HarnessRunOptions, HarnessSignal, HumanRequest, PausedState,
+    RunResult, SandboxProvider, SessionId, SessionState, Task, ToolOutput,
 };
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolRegistry};
@@ -41,6 +70,11 @@ pub struct SubagentTool {
     timeout: Duration,
     context_sharing: ContextSharing,
     harness: Arc<dyn Harness>,
+    /// Per-kind consult handlers (issue #114, seam A1). Empty (the default)
+    /// means consults are NOT mediated here — a child `RunResult::Consult`
+    /// degrades gracefully per R6 (no matching kind → `Escalate`). Populated
+    /// via [`with_consult_handlers`](Self::with_consult_handlers).
+    consult_handlers: HashMap<String, ConsultHandlerEntry>,
 }
 
 impl SubagentTool {
@@ -68,7 +102,22 @@ impl SubagentTool {
             timeout,
             context_sharing,
             harness,
+            consult_handlers: HashMap::new(),
         })
+    }
+
+    /// Install the per-kind consult handlers (issue #114, seam A1). Typically
+    /// the orchestrator passes a clone of its
+    /// [`HarnessConfig::consult_handlers`](crate::harness::HarnessConfig::consult_handlers).
+    /// With handlers installed, this tool MEDIATES a child consult internally
+    /// (R2/R3) instead of letting it surface; without them, a child consult
+    /// degrades to `Escalate` (R6).
+    pub fn with_consult_handlers(
+        mut self,
+        consult_handlers: HashMap<String, ConsultHandlerEntry>,
+    ) -> Self {
+        self.consult_handlers = consult_handlers;
+        self
     }
 
     pub fn description(&self) -> &str {
@@ -136,7 +185,7 @@ impl Tool for SubagentTool {
             options.session_state = seeded_session;
 
             let fut = self.harness.run(options);
-            let result = match tokio::time::timeout(self.timeout, fut).await {
+            let mut result = match tokio::time::timeout(self.timeout, fut).await {
                 Ok(r) => r,
                 Err(_) => {
                     return ToolOutput::Error {
@@ -146,29 +195,170 @@ impl Tool for SubagentTool {
                 }
             };
 
-            match result {
-                RunResult::Success { output, .. } => ToolOutput::Success {
-                    content: output,
-                    truncated: false,
-                },
-                RunResult::Failure { reason, .. } => ToolOutput::Error {
-                    message: format!("subagent failed: {reason:?}"),
-                    recoverable: true,
-                },
-                RunResult::WaitingForHuman { state, request } => {
-                    let child = child_state_from_paused(*state, call.id.clone());
-                    ToolOutput::WaitingForHuman {
-                        child_state: Box::new(child),
-                        request,
+            // Per-kind consult counters (issue #114, R4). Each consult of a
+            // given kind decrements its remaining budget; the (budget+1)th
+            // triggers the overflow policy.
+            let mut consult_counts: HashMap<String, u32> = HashMap::new();
+
+            // A1 mediation loop: drive the full consult cycle internally. On a
+            // child `RunResult::Consult`, mediate (route → run handler → resume)
+            // and continue until the child reaches a terminal result.
+            loop {
+                match result {
+                    RunResult::Success { output, .. } => {
+                        return ToolOutput::Success {
+                            content: output,
+                            truncated: false,
+                        };
+                    }
+                    RunResult::Failure { reason, .. } => {
+                        return ToolOutput::Error {
+                            message: format!("subagent failed: {reason:?}"),
+                            recoverable: true,
+                        };
+                    }
+                    RunResult::WaitingForHuman { state, request } => {
+                        let child = child_state_from_paused(*state, call.id.clone());
+                        return ToolOutput::WaitingForHuman {
+                            child_state: Box::new(child),
+                            request,
+                        };
+                    }
+                    // A subagent escalation (issue #80) propagates as a tool-side
+                    // escalation: the parent harness terminates cleanly and hands
+                    // the signal up to its own caller.
+                    RunResult::Escalate { signal, .. } => {
+                        return ToolOutput::Escalate { signal };
+                    }
+                    // Mid-loop consult (issue #114, R2): mediate it here — never
+                    // bubble it to the parent orchestrator's model.
+                    RunResult::Consult { request, state, .. } => {
+                        match self
+                            .mediate_consult(*state, request, &mut consult_counts, &call.id)
+                            .await
+                        {
+                            // The handler answered (or soft-failed): resume the
+                            // worker and loop again on the new result (R3/R5a).
+                            MediateOutcome::Resume(next) => {
+                                result = next;
+                                continue;
+                            }
+                            // Terminal mapping surfaced to the parent (R5b/R6).
+                            MediateOutcome::Terminal(output) => return output,
+                        }
                     }
                 }
-                // A subagent escalation (issue #80) propagates as a tool-side
-                // escalation: the parent harness terminates cleanly and hands
-                // the signal up to its own caller.
-                RunResult::Escalate { signal, .. } => ToolOutput::Escalate { signal },
             }
         })
     }
+}
+
+/// Outcome of one mediation step (issue #114).
+enum MediateOutcome {
+    /// The worker was resumed; carry the new `RunResult` for the next loop turn.
+    Resume(RunResult),
+    /// A terminal `ToolOutput` to surface to the parent (overflow-escalate or
+    /// misconfiguration).
+    Terminal(ToolOutput),
+}
+
+impl SubagentTool {
+    /// Mediate one child consult (issue #114, seam A1). Routes by `kind`,
+    /// enforces the per-kind budget, runs the handler as the ORCHESTRATOR's
+    /// direct child (R7), and resumes the worker — OR applies the overflow
+    /// policy / graceful degradation.
+    async fn mediate_consult(
+        &self,
+        state: PausedState,
+        request: ConsultRequest,
+        counts: &mut HashMap<String, u32>,
+        parent_call_id: &str,
+    ) -> MediateOutcome {
+        // R6: no matching handler (empty map or unknown kind) → Escalate. Loud,
+        // not silent. The parent harness terminates cleanly.
+        let entry = match self.consult_handlers.get(&request.kind) {
+            Some(e) => e,
+            None => {
+                return MediateOutcome::Terminal(ToolOutput::Escalate {
+                    signal: HarnessSignal::Abort {
+                        reason: format!(
+                            "no consult handler registered for kind {:?}",
+                            request.kind
+                        ),
+                    },
+                });
+            }
+        };
+
+        // R4: per-kind budget. `used` is the number of consults of this kind
+        // ALREADY mediated. The handler runs while `used < budget`; the
+        // (budget+1)th consult overflows.
+        let used = counts.entry(request.kind.clone()).or_insert(0);
+        if *used >= entry.budget {
+            // R5: overflow policy.
+            return match entry.overflow {
+                // R5a: resume the worker with a BudgetExhausted response so it
+                // finishes with what it has.
+                ConsultOverflowPolicy::SoftFail => {
+                    let response = ConsultResponse::BudgetExhausted {
+                        message: format!(
+                            "consult budget for kind {:?} exhausted; proceed without further help",
+                            request.kind
+                        ),
+                    };
+                    let next = self.harness.resume_consult(state, response, None).await;
+                    MediateOutcome::Resume(next)
+                }
+                // R5b: convert the over-budget consult into a human pause so the
+                // host decides. The parent sees ToolOutput::WaitingForHuman.
+                ConsultOverflowPolicy::EscalateToHuman => {
+                    let child = child_state_from_paused(state, parent_call_id.to_string());
+                    MediateOutcome::Terminal(ToolOutput::WaitingForHuman {
+                        child_state: Box::new(child),
+                        request: HumanRequest::Review {
+                            content: format!(
+                                "consult budget for kind {:?} exhausted. situation: {} | question: {}",
+                                request.kind, request.situation, request.question
+                            ),
+                        },
+                    })
+                }
+            };
+        }
+
+        // R3/R7: run the handler harness as the orchestrator's direct child
+        // (depth-1), WITHOUT the orchestrator model. The handler's instruction
+        // is the consult request rendered to text.
+        *used += 1;
+        let instruction = render_consult_instruction(&request);
+        let task = Task::new(
+            instruction,
+            SessionId::generate(),
+            crate::harness::LoopStrategy::ReAct { max_iterations: 16 },
+        );
+        let handler_result = entry.handler.run(HarnessRunOptions::new(task)).await;
+        let answer = match handler_result {
+            RunResult::Success { output, .. } => output,
+            // A handler that does not cleanly complete still must not stall the
+            // worker — feed its failure text back as the consult answer so the
+            // worker can adapt. (The orchestrator model is never involved.)
+            other => format!("consult handler did not complete cleanly: {other:?}"),
+        };
+        let response = ConsultResponse::Answer { text: answer };
+        let next = self.harness.resume_consult(state, response, None).await;
+        MediateOutcome::Resume(next)
+    }
+}
+
+/// Render a [`ConsultRequest`] to a handler instruction string (issue #114).
+fn render_consult_instruction(request: &ConsultRequest) -> String {
+    format!(
+        "A worker agent is requesting help (kind: {kind}).\n\nSituation: {situation}\n\nAttempts so far: {attempts}\n\nQuestion: {question}",
+        kind = request.kind,
+        situation = request.situation,
+        attempts = request.attempts,
+        question = request.question,
+    )
 }
 
 fn child_state_from_paused(
@@ -197,7 +387,8 @@ fn child_state_from_paused(
 mod tests {
     use super::*;
     use crate::harness::{
-        AggregateUsage, HaltReason, HarnessRunOptions, HumanRequest, HumanResponse, PausedState,
+        AggregateUsage, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
+        ConsultResponse, HaltReason, HarnessRunOptions, HumanRequest, HumanResponse, PausedState,
         RunResult,
     };
     use crate::tool_registry::mock::{test_ctx, AllowAllSandbox};
@@ -205,14 +396,17 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    /// Scripted harness — returns a queue of `RunResult`s.
+    /// Scripted harness — returns a queue of `RunResult`s. `resume_consult`
+    /// logs the `ConsultResponse` it was resumed with and pops the next result.
     struct ScriptedHarness {
         results: Mutex<Vec<RunResult>>,
+        resume_log: Arc<Mutex<Vec<ConsultResponse>>>,
     }
     impl ScriptedHarness {
         fn new(rs: Vec<RunResult>) -> Self {
             Self {
                 results: Mutex::new(rs),
+                resume_log: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -250,6 +444,134 @@ mod tests {
                 }
             })
         }
+        fn resume_consult<'a>(
+            &'a self,
+            _state: PausedState,
+            response: ConsultResponse,
+            _on_stream: Option<crate::harness::StreamSink>,
+        ) -> BoxFut<'a, RunResult> {
+            // Record the response text and pop the next scripted RunResult — this
+            // lets a test assert exactly what the worker was resumed with.
+            self.resume_log.lock().unwrap().push(response);
+            Box::pin(async move {
+                let mut g = self.results.lock().unwrap();
+                if g.is_empty() {
+                    return RunResult::Success {
+                        output: "child done after consult".into(),
+                        session_id: SessionId::new("s"),
+                        usage: AggregateUsage::default(),
+                        turns: 1,
+                        session_state: SessionState::default(),
+                    };
+                }
+                g.remove(0)
+            })
+        }
+    }
+
+    /// A handler harness that records each instruction it is run with and
+    /// returns a fixed answer. Used to assert depth-1 routing (R3/R7).
+    struct RecordingHandler {
+        answer: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    impl Harness for RecordingHandler {
+        fn run<'a>(&'a self, opts: HarnessRunOptions) -> BoxFut<'a, RunResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(opts.task.instruction.clone());
+            let answer = self.answer.clone();
+            Box::pin(async move {
+                RunResult::Success {
+                    output: answer,
+                    session_id: SessionId::new("handler"),
+                    usage: AggregateUsage::default(),
+                    turns: 1,
+                    session_state: SessionState::default(),
+                }
+            })
+        }
+        fn resume<'a>(
+            &'a self,
+            _s: PausedState,
+            _r: HumanResponse,
+            _o: Option<crate::harness::StreamSink>,
+        ) -> BoxFut<'a, RunResult> {
+            Box::pin(async move {
+                RunResult::Failure {
+                    reason: HaltReason::HumanHalted,
+                    session_id: SessionId::new("handler"),
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                    session_state: SessionState::default(),
+                }
+            })
+        }
+    }
+
+    fn consult_paused() -> PausedState {
+        PausedState {
+            session_id: SessionId::new("worker"),
+            task_id: crate::harness::TaskId::new("t"),
+            turn_number: 1,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![ToolCall {
+                id: "consult-call".into(),
+                name: "ask_advice".into(),
+                input: serde_json::json!({"kind": "advice"}),
+            }],
+            approved_results: vec![],
+            human_request: None,
+            task: Task::new(
+                "audit",
+                SessionId::new("worker"),
+                crate::harness::LoopStrategy::ReAct { max_iterations: 4 },
+            ),
+            budget_used: crate::harness::BudgetSnapshot::default(),
+            child_state: None,
+        }
+    }
+
+    fn consult_request(kind: &str) -> ConsultRequest {
+        ConsultRequest {
+            kind: kind.into(),
+            situation: "drowning".into(),
+            attempts: 2,
+            question: "what now?".into(),
+        }
+    }
+
+    fn consult_result(kind: &str) -> RunResult {
+        RunResult::Consult {
+            request: consult_request(kind),
+            state: Box::new(consult_paused()),
+            session_id: SessionId::new("worker"),
+            usage: AggregateUsage::default(),
+            turns: 1,
+        }
+    }
+
+    fn handlers(
+        kind: &str,
+        answer: &str,
+        budget: u32,
+        overflow: ConsultOverflowPolicy,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> std::collections::HashMap<String, ConsultHandlerEntry> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            kind.to_string(),
+            ConsultHandlerEntry {
+                handler: Arc::new(RecordingHandler {
+                    answer: answer.into(),
+                    seen,
+                }),
+                budget,
+                overflow,
+            },
+        );
+        m
     }
 
     fn call(input: Value) -> ToolCall {
@@ -398,6 +720,209 @@ mod tests {
             &child_reg,
         );
         assert!(matches!(r, Err(BuildError::InvalidConfiguration { .. })));
+    }
+
+    // R2/R3: child Consult is MEDIATED here (not bubbled). With a registered
+    // handler, the handler runs (no parent model), the worker is resumed, and
+    // the parent ultimately sees Success.
+    #[tokio::test]
+    async fn consult_is_mediated_and_resumed_to_success() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // First run() => Consult; resume_consult (default scripted) => Success.
+        let h = Arc::new(ScriptedHarness::new(vec![consult_result("advice")]));
+        let resume_log = h.resume_log.clone();
+        let child_reg = StandardToolRegistry::new();
+        let sub = SubagentTool::new(
+            "subagent",
+            "child",
+            json!({"type": "object"}),
+            Duration::from_secs(5),
+            ContextSharing::Isolated,
+            h,
+            &child_reg,
+        )
+        .unwrap()
+        .with_consult_handlers(handlers(
+            "advice",
+            "try plan B",
+            3,
+            ConsultOverflowPolicy::SoftFail,
+            seen.clone(),
+        ));
+        let sb = AllowAllSandbox;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
+        // R3: parent sees Success (the consult never reached its model).
+        match r {
+            ToolOutput::Success { content, .. } => {
+                assert_eq!(content, "child done after consult")
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // R3/R7: the handler ran exactly once, on the rendered consult request.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("advice"));
+        assert!(seen[0].contains("what now?"));
+        // R3: worker resumed with the handler's answer.
+        let log = resume_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0],
+            ConsultResponse::Answer {
+                text: "try plan B".into()
+            }
+        );
+    }
+
+    // R4 + R5a: handler runs up to `budget` times; the (budget+1)th consult
+    // overflows. With SoftFail, the worker is resumed with BudgetExhausted and
+    // finishes.
+    #[tokio::test]
+    async fn budget_overflow_soft_fail_resumes_with_budget_exhausted() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // budget = 1: run() => Consult; resume_consult => Consult again
+        // (over-budget); resume_consult => Success.
+        let h = Arc::new(ScriptedHarness::new(vec![
+            consult_result("advice"),
+            consult_result("advice"),
+        ]));
+        let resume_log = h.resume_log.clone();
+        let child_reg = StandardToolRegistry::new();
+        let sub = SubagentTool::new(
+            "subagent",
+            "child",
+            json!({"type": "object"}),
+            Duration::from_secs(5),
+            ContextSharing::Isolated,
+            h,
+            &child_reg,
+        )
+        .unwrap()
+        .with_consult_handlers(handlers(
+            "advice",
+            "advice answer",
+            1,
+            ConsultOverflowPolicy::SoftFail,
+            seen.clone(),
+        ));
+        let sb = AllowAllSandbox;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
+        match r {
+            ToolOutput::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // R4: handler ran exactly once (budget = 1).
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // R5a: first resume = Answer, second resume = BudgetExhausted.
+        let log = resume_log.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(matches!(log[0], ConsultResponse::Answer { .. }));
+        assert!(matches!(log[1], ConsultResponse::BudgetExhausted { .. }));
+    }
+
+    // R5b: budget overflow with EscalateToHuman → ToolOutput::WaitingForHuman.
+    #[tokio::test]
+    async fn budget_overflow_escalate_to_human() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // budget = 0: the FIRST consult is already over budget → escalate.
+        let h = Arc::new(ScriptedHarness::new(vec![consult_result("advice")]));
+        let child_reg = StandardToolRegistry::new();
+        let sub = SubagentTool::new(
+            "subagent",
+            "child",
+            json!({"type": "object"}),
+            Duration::from_secs(5),
+            ContextSharing::Isolated,
+            h,
+            &child_reg,
+        )
+        .unwrap()
+        .with_consult_handlers(handlers(
+            "advice",
+            "x",
+            0,
+            ConsultOverflowPolicy::EscalateToHuman,
+            seen.clone(),
+        ));
+        let sb = AllowAllSandbox;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
+        match r {
+            ToolOutput::WaitingForHuman {
+                child_state,
+                request,
+            } => {
+                assert_eq!(child_state.parent_tool_call_id, "parent-call-1");
+                assert!(matches!(request, HumanRequest::Review { .. }));
+            }
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+        // Handler never ran (over budget from the start).
+        assert_eq!(seen.lock().unwrap().len(), 0);
+    }
+
+    // R6: a consult with NO matching handler (map present, wrong kind) →
+    // ToolOutput::Escalate (loud, not silent).
+    #[tokio::test]
+    async fn consult_no_matching_kind_escalates() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let h = Arc::new(ScriptedHarness::new(vec![consult_result("research")]));
+        let child_reg = StandardToolRegistry::new();
+        let sub = SubagentTool::new(
+            "subagent",
+            "child",
+            json!({"type": "object"}),
+            Duration::from_secs(5),
+            ContextSharing::Isolated,
+            h,
+            &child_reg,
+        )
+        .unwrap()
+        .with_consult_handlers(handlers(
+            "advice",
+            "x",
+            3,
+            ConsultOverflowPolicy::SoftFail,
+            seen,
+        ));
+        let sb = AllowAllSandbox;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
+        match r {
+            ToolOutput::Escalate {
+                signal: HarnessSignal::Abort { reason },
+            } => assert!(reason.contains("research")),
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    // R6 (degradation): with NO handlers installed at all, a child consult is
+    // treated as the no-matching-kind case → Escalate.
+    #[tokio::test]
+    async fn consult_with_no_handlers_escalates() {
+        let h = Arc::new(ScriptedHarness::new(vec![consult_result("advice")]));
+        let child_reg = StandardToolRegistry::new();
+        let sub = SubagentTool::new(
+            "subagent",
+            "child",
+            json!({"type": "object"}),
+            Duration::from_secs(5),
+            ContextSharing::Isolated,
+            h,
+            &child_reg,
+        )
+        .unwrap();
+        let sb = AllowAllSandbox;
+        let r = sub
+            .execute(&call(json!({"instruction": "x"})), &sb, &test_ctx())
+            .await;
+        assert!(matches!(r, ToolOutput::Escalate { .. }));
     }
 
     #[tokio::test]

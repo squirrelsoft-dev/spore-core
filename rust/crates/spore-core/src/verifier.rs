@@ -112,6 +112,13 @@ fn view<'a>(label: &str, r: &'a RunResult) -> ResultView<'a> {
             "{label} run escalated ({signal:?}) — verifier received an escalated \
              harness; the caller must handle the signal before verification"
         )),
+        // A consult (issue #114) is a non-terminal pause; like WaitingForHuman,
+        // a verifier should never receive one — surface it as a misconfiguration.
+        RunResult::Consult { request, .. } => ResultView::Failed(format!(
+            "{label} run is Consult ({kind}) — verifier received a paused harness; \
+             the consult must be mediated before verification",
+            kind = request.kind
+        )),
     }
 }
 

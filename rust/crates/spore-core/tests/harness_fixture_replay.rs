@@ -77,6 +77,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
+        consult_handlers: std::collections::HashMap::new(),
     };
     let harness = StandardHarness::new(config);
 

@@ -70,6 +70,7 @@ fn config() -> HarnessConfig {
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
+        consult_handlers: std::collections::HashMap::new(),
     }
 }
 

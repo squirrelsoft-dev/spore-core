@@ -385,7 +385,9 @@ impl TaskVerifier for MetricEvaluatorVerifier {
                 RunResult::Success { session_id, .. }
                 | RunResult::Failure { session_id, .. }
                 | RunResult::Escalate { session_id, .. } => session_id.clone(),
-                RunResult::WaitingForHuman { state, .. } => state.session_id.clone(),
+                RunResult::WaitingForHuman { state, .. } | RunResult::Consult { state, .. } => {
+                    state.session_id.clone()
+                }
             };
             let snapshot = SessionStateSnapshot::new(
                 session_id,

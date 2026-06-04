@@ -83,6 +83,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
+        consult_handlers: std::collections::HashMap::new(),
     };
     let harness = StandardHarness::new(config);
 

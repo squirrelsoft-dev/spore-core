@@ -1760,6 +1760,7 @@ mod tests {
             model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
+            consult_handlers: std::collections::HashMap::new(),
         }
     }
 }

@@ -432,6 +432,20 @@ pub enum ContextOperation {
     SkillInjected {
         guide_id: GuideId,
     },
+    /// A worker paused mid-loop to consult a parent-spawned helper (issue
+    /// #114). Emitted by the worker harness loop when it returns
+    /// `RunResult::Consult`. Lightweight — no Phoenix/span wiring beyond this
+    /// `ContextSpan`.
+    ConsultSpawned {
+        consult_kind: String,
+    },
+    /// A paused worker was resumed after a consult (issue #114). Emitted by the
+    /// `resume_consult` seam. Carries the consult kind and whether the resume
+    /// carried a handler answer (`false` => budget-exhausted soft-fail).
+    ConsultResumed {
+        consult_kind: String,
+        answered: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1,0 +1,164 @@
+{
+  "consult_overflow_policy_cases": [
+    {
+      "kind": "soft_fail"
+    },
+    {
+      "kind": "escalate_to_human"
+    }
+  ],
+  "consult_request_cases": [
+    {
+      "attempts": 3,
+      "kind": "advice",
+      "question": "what should I prioritize?",
+      "situation": "drowning in the audit; not sure where to focus"
+    },
+    {
+      "attempts": 0,
+      "kind": "research",
+      "question": "what is the idiomatic pattern?",
+      "situation": "need a best-practice"
+    }
+  ],
+  "consult_response_cases": [
+    {
+      "kind": "answer",
+      "text": "focus on the token refresh path"
+    },
+    {
+      "kind": "budget_exhausted",
+      "message": "budget exhausted, proceed without further help"
+    }
+  ],
+  "run_result_cases": [
+    {
+      "kind": "consult",
+      "request": {
+        "attempts": 3,
+        "kind": "advice",
+        "question": "what should I prioritize?",
+        "situation": "drowning in the audit; not sure where to focus"
+      },
+      "session_id": "consult-session",
+      "state": {
+        "approved_results": [],
+        "budget_used": {
+          "cost_usd": 0.0,
+          "input_tokens": 24,
+          "output_tokens": 28,
+          "turns": 2,
+          "wall_time": null
+        },
+        "child_state": null,
+        "human_request": null,
+        "pending_tool_calls": [
+          {
+            "id": "consult-call-1",
+            "input": {
+              "kind": "advice"
+            },
+            "name": "ask_advice"
+          }
+        ],
+        "session_id": "consult-session",
+        "session_state": {
+          "extras": {},
+          "messages": []
+        },
+        "task": {
+          "budget": {
+            "max_cost_usd": null,
+            "max_input_tokens": null,
+            "max_output_tokens": null,
+            "max_turns": null,
+            "max_wall_time": null
+          },
+          "id": "task-0000000000000002",
+          "instruction": "audit the auth module",
+          "loop_strategy": {
+            "kind": "re_act",
+            "max_iterations": 5
+          },
+          "session_id": "consult-session"
+        },
+        "task_id": "consult-task",
+        "turn_number": 2
+      },
+      "turns": 2,
+      "usage": {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 24,
+        "output_tokens": 28
+      }
+    }
+  ],
+  "subagent_tool_output_cases": [
+    {
+      "child_state": {
+        "approved_results": [],
+        "budget_used": {
+          "cost_usd": 0.0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "turns": 0,
+          "wall_time": null
+        },
+        "human_request": null,
+        "parent_tool_call_id": "parent-call-1",
+        "pending_tool_calls": [
+          {
+            "id": "consult-call-1",
+            "input": {
+              "kind": "advice"
+            },
+            "name": "ask_advice"
+          }
+        ],
+        "session_id": "worker-session",
+        "session_state": {
+          "extras": {},
+          "messages": []
+        },
+        "task": {
+          "budget": {
+            "max_cost_usd": null,
+            "max_input_tokens": null,
+            "max_output_tokens": null,
+            "max_turns": null,
+            "max_wall_time": null
+          },
+          "id": "task-0000000000000001",
+          "instruction": "audit the auth module",
+          "loop_strategy": {
+            "kind": "re_act",
+            "max_iterations": 5
+          },
+          "session_id": "worker-session"
+        },
+        "task_id": "worker-task",
+        "turn_number": 1
+      },
+      "kind": "consult",
+      "request": {
+        "attempts": 3,
+        "kind": "advice",
+        "question": "what should I prioritize?",
+        "situation": "drowning in the audit; not sure where to focus"
+      }
+    }
+  ],
+  "worker_tool_output_cases": [
+    {
+      "kind": "consult",
+      "request": {
+        "attempts": 3,
+        "kind": "advice",
+        "question": "what should I prioritize?",
+        "situation": "drowning in the audit; not sure where to focus"
+      }
+    }
+  ]
+}
