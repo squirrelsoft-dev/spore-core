@@ -20,8 +20,11 @@
 //
 //  1. One call to Agent.Turn performs exactly one model call.
 //  2. ToolCallRequested may carry multiple tool calls (parallel tool use).
-//  3. A response with neither text nor tool calls is reported as
-//     AgentError EmptyResponse — never silently swallowed.
+//  3. A response with neither text nor tool calls is interpreted by its
+//     stop_reason: a clean StopEndTurn with no content is the model's
+//     completion signal and becomes a (possibly empty) terminal FinalResponse;
+//     a StopMaxTokens or StopStopSequence empty is an abnormal/truncated stop
+//     and is reported as AgentError EmptyResponse — never silently swallowed.
 //  4. Classification uses the model's stop_reason:
 //     - StopToolUse with tool_use blocks → ToolCallRequested
 //     - StopToolUse without tool_use blocks → MalformedToolCall
@@ -30,8 +33,11 @@
 //     - StopEndTurn|MaxTokens|StopSequence with text → FinalResponse
 //     (concatenated text blocks; Thinking is accumulated into Reasoning, not
 //     discarded — issue #103, Q4)
-//     - StopEndTurn|MaxTokens|StopSequence with neither → EmptyResponse
-//     (thinking-only output is still empty: thinking is not a terminal response)
+//     - StopEndTurn with neither → empty terminal FinalResponse (the model's
+//     voluntary completion signal, not an error)
+//     - StopMaxTokens|StopSequence with neither → EmptyResponse (a
+//     truncated/abnormal stop; thinking-only output is still empty: thinking
+//     is not a terminal response)
 //  5. ModelError is surfaced wrapped in AgentError ModelError, with no
 //     partial usage information (usage is nil).
 //
@@ -571,6 +577,19 @@ func classifyResponse(resp ModelResponse) TurnResult {
 			return NewToolCallRequestedWithReasoning(toolCalls, usage, reasoning)
 		}
 		if len(textParts) == 0 {
+			// The meaning of an empty response depends on *why* the model
+			// stopped (thinking-only output counts as empty: thinking is not a
+			// terminal response):
+			//
+			//   - A clean StopEndTurn is the model's completion signal — it
+			//     chose to stop and did not request a tool. An empty EndTurn is
+			//     therefore a (possibly empty) terminal FinalResponse, not an
+			//     error; fabricating an EmptyResponse from it would be wrong.
+			//   - StopMaxTokens / StopStopSequence empties are abnormal/truncated
+			//     stops and remain genuinely suspect, so they stay EmptyResponse.
+			if resp.StopReason == StopEndTurn {
+				return NewFinalResponseWithReasoning("", usage, reasoning)
+			}
 			u := usage
 			return NewTurnError(NewEmptyResponseError(), &u)
 		}

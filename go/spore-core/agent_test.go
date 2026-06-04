@@ -111,13 +111,40 @@ func TestToolCallRequestedCarriesMultipleCalls(t *testing.T) {
 	}
 }
 
-// Rule: EmptyResponse when model returns neither text nor tool calls.
-func TestEmptyResponseWhenNoContentBlocks(t *testing.T) {
+// Rule: a clean EndTurn with no text and no tool calls is the model's
+// voluntary completion signal → a (possibly empty) terminal FinalResponse,
+// NOT an EmptyResponse error.
+func TestCleanEndTurnWithNoContentIsEmptyFinalResponse(t *testing.T) {
 	m := NewMockModel(agentProvider())
 	m.PushResponse(ModelResponse{
 		Content:    []ContentBlock{},
 		Usage:      usage(1, 0),
 		StopReason: StopEndTurn,
+	})
+	agent := makeAgent(m)
+	r := agent.Turn(context.Background(), userCtx("?"))
+	if r.Kind != TurnFinalResponse {
+		t.Fatalf("expected empty FinalResponse, got %+v / err=%+v", r, r.Err)
+	}
+	if r.Content != "" {
+		t.Fatalf("content = %q, want empty", r.Content)
+	}
+	if r.Reasoning != nil {
+		t.Fatalf("reasoning = %+v, want nil", r.Reasoning)
+	}
+	if r.Usage.InputTokens != 1 {
+		t.Fatalf("usage = %+v", r.Usage)
+	}
+}
+
+// Rule: a truncated/abnormal empty (MaxTokens with no content) remains a
+// genuine EmptyResponse error — only clean EndTurn is reclassified.
+func TestMaxTokensWithNoContentIsEmptyResponse(t *testing.T) {
+	m := NewMockModel(agentProvider())
+	m.PushResponse(ModelResponse{
+		Content:    []ContentBlock{},
+		Usage:      usage(1, 0),
+		StopReason: StopMaxTokens,
 	})
 	agent := makeAgent(m)
 	r := agent.Turn(context.Background(), userCtx("?"))
@@ -129,13 +156,15 @@ func TestEmptyResponseWhenNoContentBlocks(t *testing.T) {
 	}
 }
 
-// Rule: Thinking-only content is treated as empty.
+// Rule: Thinking-only content is treated as empty. Under MaxTokens (a
+// truncated stop) this remains an EmptyResponse error; thinking is not a
+// terminal response.
 func TestThinkingBlocksDoNotSatisfyFinalResponse(t *testing.T) {
 	m := NewMockModel(agentProvider())
 	m.PushResponse(ModelResponse{
 		Content:    []ContentBlock{NewThinkingBlock("musing")},
 		Usage:      usage(1, 2),
-		StopReason: StopEndTurn,
+		StopReason: StopMaxTokens,
 	})
 	agent := makeAgent(m)
 	r := agent.Turn(context.Background(), userCtx("?"))

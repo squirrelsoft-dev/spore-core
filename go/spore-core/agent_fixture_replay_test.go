@@ -69,7 +69,9 @@ func TestAgentClassifiesRecordedTurnsConsistently(t *testing.T) {
 		t.Fatalf("turn 3 calls = %+v", r3.Calls)
 	}
 
-	// 4. Empty content blocks with EndTurn → AgentError EmptyResponse.
+	// 4. Empty content blocks with a truncated stop (MaxTokens) →
+	//    AgentError EmptyResponse. (A clean EndTurn empty is instead a
+	//    completion; only abnormal/truncated empties remain errors.)
 	r4 := agent.Turn(ctx, Context{})
 	if r4.Kind != TurnError || r4.Err == nil || r4.Err.Kind != AgentErrEmptyResponse {
 		t.Fatalf("turn 4 = %+v / err=%+v", r4, r4.Err)
