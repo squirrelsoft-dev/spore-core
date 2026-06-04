@@ -1,0 +1,30 @@
+{
+  "name": "spore-example-11-multi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 11: multi-agent composition. An orchestrator (PlanExecute) delegates to two isolated worker agents (ReAct) wrapped as SubagentTools — a research worker (web_search) and a writing worker (no tools) — then writes the assembled markdown to workspace/report.md. Agents are composable: the harness treats a function-tool and an agent-tool identically.",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "lint": "eslint src",
+    "format": "prettier src --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools"
+  },
+  "devDependencies": {
+    "@types/node": "~20.16.15",
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}

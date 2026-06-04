@@ -1,0 +1,5 @@
+node_modules
+dist
+.env
+# The orchestrator writes the assembled report here at runtime; it is local state.
+workspace/report.md
