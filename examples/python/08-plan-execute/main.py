@@ -50,6 +50,20 @@ always-available ``final`` envelope, so a capable model may emit
 ``{"tool":"final"}`` prematurely and return an EMPTY answer; if you see that
 (and no ``async-comparison.md``), drop ``--structured``.
 
+Staying within small (~128K) context windows
+---------------------------------------------
+
+Under ``PlanExecute``, verbose tool output is retained across every plan step,
+so a few searches can overflow a model with a ~128K window (e.g. ``gemma4:e4b``,
+131072 tokens). Two measures keep this example running cleanly on such models:
+
+- It **distills ``web_search`` results**: a :class:`ConciseWebSearch` wrapper
+  trims the verbatim SearXNG JSON (25-40K tokens/call) down to the top 6 results
+  with only ``title`` / ``url`` / ``content``, so context stays small.
+- It **lowers the compaction threshold** to ``0.45`` (compaction at ~90K tokens
+  instead of the default ~160K), installed via ``.context_manager(...)``, so
+  compaction fires before a 128K-window model overflows.
+
 Run it::
 
     ollama serve &
@@ -71,6 +85,7 @@ from pathlib import Path
 from spore_core import (
     PLAN_EXECUTE_EXTRAS_KEY,
     BudgetLimits,
+    CompactionConfig,
     HarnessBuilder,
     HarnessRunOptions,
     HookContext,
@@ -80,17 +95,25 @@ from spore_core import (
     HookSync,
     LoopStrategyPlanExecute,
     ModelParams,
+    NullCacheProvider,
     OllamaModelInterface,
     OnPlanCreatedContext,
     OnTaskAdvanceContext,
     RunResultSuccess,
+    SandboxProvider,
+    StandardContextManager,
     StandardHookChain,
     StreamToolCall,
     StreamToolResult,
     StreamTurnStart,
     Task,
+    ToolCall,
+    ToolContext,
+    ToolOutput,
+    ToolOutputSuccess,
     WorkspaceConfig,
     WorkspaceScopedSandbox,
+    into_harness_adapter,
     new_session_id,
 )
 from spore_tools import StandardTool, StandardTools, WebSearchTool
@@ -147,6 +170,80 @@ def _truncate(text: str, limit: int = 200) -> str:
     if len(flat) <= limit:
         return flat
     return flat[:limit] + "…"
+
+
+def _distill_search_results(content: str) -> str:
+    """Keep only the top 6 results, and for each only ``title`` / ``url`` /
+    ``content`` (content clipped to ~500 chars). Drop all other fields and
+    top-level keys (``answers``, ``infoboxes``, ``suggestions``,
+    ``unresponsive_engines``, …), and re-serialize as compact
+    ``{"results": [...]}``.
+
+    Defensive: if the body is not JSON or has no ``results`` array, the original
+    string is returned unchanged — we never error just because the shape was
+    unexpected.
+    """
+    try:
+        value = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return content
+    if not isinstance(value, dict):
+        return content
+    results = value.get("results")
+    if not isinstance(results, list):
+        return content
+
+    distilled = []
+    for r in results[:6]:
+        if not isinstance(r, dict):
+            continue
+        title = r.get("title") if isinstance(r.get("title"), str) else ""
+        url = r.get("url") if isinstance(r.get("url"), str) else ""
+        body = r.get("content") if isinstance(r.get("content"), str) else ""
+        distilled.append({"title": title, "url": url, "content": body[:500]})
+
+    return json.dumps({"results": distilled}, separators=(",", ":"))
+
+
+class ConciseWebSearch:
+    """A thin wrapper around the built-in :class:`WebSearchTool` that distills
+    its output.
+
+    WHY: the core ``web_search`` tool returns the SearXNG JSON body VERBATIM (by
+    frozen spec — normalization is out of scope for the core tool). Each search
+    yields ~25-30 results, each carrying the full ``content`` plus a dozen noise
+    fields (``thumbnail``, ``engine``, ``score``, ``parsed_url``, …) — roughly
+    25-40K tokens per call. Under ``PlanExecute`` those dumps are retained across
+    every plan step, so three searches alone can overflow a ~128K-window model.
+    This wrapper keeps only the top results and the fields the agent actually
+    reads, so the conversation context stays small. The model still sees an
+    identical ``web_search`` tool (same name + schema); only the *result* is
+    trimmed. Structural :class:`~spore_core.tool_registry.Tool` impl.
+    """
+
+    def __init__(self, inner: WebSearchTool) -> None:
+        self._inner = inner
+
+    def name(self) -> str:
+        return "web_search"
+
+    def is_subagent_tool(self) -> bool:
+        return False
+
+    def may_produce_large_output(self) -> bool:
+        return True
+
+    async def execute(
+        self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
+    ) -> ToolOutput:
+        out = await self._inner.execute(call, sandbox, ctx)
+        # Errors and every non-Success variant pass through untouched.
+        if isinstance(out, ToolOutputSuccess):
+            return ToolOutputSuccess(
+                content=_distill_search_results(out.content),
+                truncated=out.truncated,
+            )
+        return out
 
 
 async def main() -> int:
@@ -218,10 +315,32 @@ async def main() -> int:
         auth_headers=[],
         body_auth_params=[],
     )
-    web_search = StandardTool(WebSearchTool.with_config(web_search_config), WebSearchTool.schema())
+    # Wrap the raw ``WebSearchTool`` in ``ConciseWebSearch`` so verbose SearXNG
+    # JSON is distilled before it enters the conversation (see the class doc
+    # above). Same name + schema, so the model sees an identical ``web_search``
+    # tool.
+    web_search = StandardTool(
+        ConciseWebSearch(WebSearchTool.with_config(web_search_config)),
+        WebSearchTool.schema(),
+    )
+
+    # Lower the compaction threshold so it fires at ~0.45 * 200K ≈ 90K tokens,
+    # BEFORE a ~128K-window model (e.g. gemma4:e4b) overflows. ``conversational``
+    # installs a ``StandardContextManager`` with ``CompactionConfig()`` defaults
+    # (compaction at 80% of a 200K window ≈ 160K), which is too late here. The
+    # context manager gets its OWN model instance for summarization turns.
+    context_manager = into_harness_adapter(
+        StandardContextManager(
+            OllamaModelInterface.with_base_url(model_id, base_url),
+            NullCacheProvider(),
+            CompactionConfig(threshold=0.45),
+        )
+    )
+
     harness = (
         HarnessBuilder.conversational(model)
         .sandbox(sandbox)
+        .context_manager(context_manager)
         .tool(web_search)
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
