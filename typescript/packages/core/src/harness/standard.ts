@@ -127,6 +127,10 @@ import {
   type BudgetSnapshot,
   type ChildPausedState,
   type CompactionTurn,
+  type ConsultHandlerEntry,
+  type ConsultHandlerMap,
+  type ConsultOverflowPolicy,
+  type ConsultResponse,
   type ContextManager,
   type HaltReason,
   type HarnessRunOptions,
@@ -319,6 +323,17 @@ export interface HarnessConfig {
    * wrapper is installed and the escalation path is inert.
    */
   prompt_tool_call_flag?: SharedFlag;
+  /**
+   * Per-kind consult handlers (issue #114), keyed by {@link ConsultRequest.kind}.
+   * Absent / empty (the default) means consults are NOT mediated: a worker that
+   * pauses with {@link RunResult} `consult` surfaces it unchanged to its caller
+   * (R6 graceful degradation), and existing callers are unaffected (R9). When
+   * populated, the orchestrator typically passes a clone of this map to its
+   * {@link "@spore/tools".SubagentTool}, which runs the matching handler
+   * deterministically (the A1 mediation seam) — the orchestrator model is never
+   * involved.
+   */
+  consultHandlers?: ConsultHandlerMap;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -556,6 +571,13 @@ export class StandardHarness implements Harness {
         sessionId = result.session_id;
         state = result.state;
         break;
+      // Consult (issue #114) is non-terminal — persist the carried pause state
+      // directly (same as waiting_for_human) so a cross-process host can later
+      // resumeConsult it.
+      case "consult":
+        sessionId = result.session_id;
+        state = result.state;
+        break;
     }
 
     // Swallow-and-log on rejection (D8): a storage hiccup must not lose the run.
@@ -769,6 +791,85 @@ export class StandardHarness implements Harness {
     return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
   }
 
+  /**
+   * Resume a worker paused by {@link RunResult} `consult` (issue #114). The
+   * resume seam parallel to {@link resume}: it injects the {@link ConsultResponse}
+   * text as the tool RESULT for the head pending (consult) call — NOT appended as
+   * a free-standing user message (R10) — then dispatches any remaining pending
+   * calls and resumes the ReAct loop.
+   */
+  async resumeConsult(
+    state: PausedState,
+    response: ConsultResponse,
+    onStream?: StreamSink,
+    signal?: AbortSignal,
+  ): Promise<RunResult> {
+    const result = await this.resumeConsultInner(state, response, onStream, signal);
+    await this.autoPersistTerminal(result);
+    return result;
+  }
+
+  private async resumeConsultInner(
+    state: PausedState,
+    response: ConsultResponse,
+    onStream?: StreamSink,
+    signal?: AbortSignal,
+  ): Promise<RunResult> {
+    const sessionState = state.session_state;
+    const [text, answered] =
+      response.kind === "answer"
+        ? ([response.text, true] as const)
+        : ([response.message, false] as const);
+
+    // Observability: lightweight consult-resume event.
+    if (this.config.observability) {
+      // Recover the consult `kind` from the head pending call's args, if present.
+      const head = state.pending_tool_calls[0];
+      const input = head?.input as Record<string, unknown> | undefined;
+      const kind = typeof input?.kind === "string" ? input.kind : "";
+      const base = newRootSpanBase(
+        SpanId.of(`${state.session_id.asString()}-consult-resume`),
+        state.session_id,
+        state.task.id,
+        "context_assembly",
+        Timestamp.now(),
+      );
+      const span: ContextSpan = {
+        base,
+        operation: { kind: "consult_resumed", consult_kind: kind, answered },
+        tokens_before: 0,
+        tokens_after: 0,
+        utilization_before: 0,
+        utilization_after: 0,
+      };
+      this.config.observability.emitContext(span);
+    }
+
+    const toolRegistry = this.effectiveToolRegistry(state.session_id);
+
+    // Inject the consult answer as the RESULT of the head pending (consult) call,
+    // then dispatch the remaining pending calls in the same batch.
+    const [consultCall, ...remaining] = state.pending_tool_calls;
+    if (consultCall) {
+      const tr: ToolResultRecord = {
+        call_id: consultCall.id,
+        output: { kind: "success", content: text, truncated: false },
+      };
+      await this.config.contextManager.appendToolResult(sessionState, tr);
+    }
+    for (const call of remaining) {
+      const output = await toolRegistry.dispatch(call, signal);
+      const tr: ToolResultRecord = { call_id: call.id, output };
+      await this.config.contextManager.appendToolResult(sessionState, tr);
+    }
+
+    const max =
+      state.task.loop_strategy.kind === "re_act"
+        ? state.task.loop_strategy.max_iterations
+        : Number.MAX_SAFE_INTEGER;
+    return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
+  }
+
   // --------------------------------------------------------------------------
   // ReAct loop
   // --------------------------------------------------------------------------
@@ -913,6 +1014,9 @@ export class StandardHarness implements Harness {
         });
         break;
       case "waiting_for_human":
+        break;
+      // Consult (issue #114) is non-terminal; do not finalize.
+      case "consult":
         break;
       case "escalate":
         // Escalation propagated from an execute step (#80) is a clean terminal
@@ -1503,6 +1607,11 @@ export class StandardHarness implements Harness {
       if (buildResult.kind === "waiting_for_human") {
         return buildResult;
       }
+      // A build run pausing to consult (issue #114) pauses the whole run;
+      // propagate so the caller (or SubagentTool) mediates.
+      if (buildResult.kind === "consult") {
+        return buildResult;
+      }
       if (buildResult.kind === "escalate") {
         await this.finalizeSelfVerifying(buildResult);
         return buildResult;
@@ -1669,6 +1778,9 @@ export class StandardHarness implements Harness {
         });
         break;
       case "waiting_for_human":
+        break;
+      // Consult (issue #114) is non-terminal; do not finalize.
+      case "consult":
         break;
       case "escalate":
         await this.finalizeObservability(result.session_id, { kind: "escalated" });
@@ -1866,6 +1978,10 @@ export class StandardHarness implements Harness {
 
       // A turn that paused / escalated is propagated up unchanged.
       if (turnResult.kind === "waiting_for_human") {
+        return turnResult;
+      }
+      // A turn pausing to consult (issue #114) pauses the whole run; propagate.
+      if (turnResult.kind === "consult") {
         return turnResult;
       }
       if (turnResult.kind === "escalate") {
@@ -2123,6 +2239,9 @@ export class StandardHarness implements Harness {
         break;
       case "waiting_for_human":
         break;
+      // Consult (issue #114) is non-terminal; do not finalize.
+      case "consult":
+        break;
       case "escalate":
         await this.finalizeObservability(result.session_id, { kind: "escalated" });
         break;
@@ -2248,6 +2367,10 @@ export class StandardHarness implements Harness {
 
       // A window that paused / escalated is propagated up unchanged.
       if (windowResult.kind === "waiting_for_human") {
+        return windowResult;
+      }
+      // A window pausing to consult (issue #114) pauses the whole run; propagate.
+      if (windowResult.kind === "consult") {
         return windowResult;
       }
       if (windowResult.kind === "escalate") {
@@ -2425,6 +2548,10 @@ export class StandardHarness implements Harness {
         break;
       case "waiting_for_human":
         // Not terminal — do not finalize.
+        break;
+      case "consult":
+        // Consult (issue #114) is NOT terminal — like waiting_for_human, the
+        // worker is paused awaiting a resume. Do not finalize observability.
         break;
       case "escalate":
         // Escalation is a clean terminal outcome (#80). Finalize observability
@@ -3025,6 +3152,60 @@ export class StandardHarness implements Harness {
               return { kind: "waiting_for_human", state: ps, request };
             }
 
+            // Consult pause (issue #114, R1/R10): a worker-side tool returns
+            // `consult` (with `child_state` absent) to ask for mid-loop help.
+            // Like the `awaiting_clarification` arm there is NO ChildPausedState:
+            // build a PausedState directly with `human_request` absent, and
+            // preserve the CONSULTING call as the head of `pending_tool_calls`
+            // (followed by the remaining batch) so that on `resumeConsult` the
+            // helper's answer is injected as the tool RESULT for that pending
+            // call. The consult is a control signal, NOT a conversation turn — it
+            // is never appended to message history here (R10).
+            if (output.kind === "consult") {
+              // Observability: lightweight consult-spawn event alongside
+              // `skill_injected`. Emitted before returning the pause.
+              if (this.config.observability) {
+                const base = newRootSpanBase(
+                  SpanId.of(`${sessionId.asString()}-consult-spawn-${spanSeq}`),
+                  sessionId,
+                  task.id,
+                  "context_assembly",
+                  Timestamp.now(),
+                );
+                const span: ContextSpan = {
+                  base,
+                  operation: { kind: "consult_spawned", consult_kind: output.request.kind },
+                  tokens_before: 0,
+                  tokens_after: 0,
+                  utilization_before: 0,
+                  utilization_after: 0,
+                };
+                this.config.observability.emitContext(span);
+                // No spanSeq increment: the pause returns immediately below.
+              }
+              const pending = [call, ...calls.slice(i + 1)];
+              const ps: PausedState = {
+                session_id: sessionId,
+                task_id: task.id,
+                turn_number: budgetUsed.turns,
+                session_state: sessionState,
+                pending_tool_calls: pending,
+                approved_results: approvedResults,
+                // No human_request on a consult pause (#114, optional field).
+                task,
+                budget_used: budgetUsed,
+                child_state: null,
+              };
+              return {
+                kind: "consult",
+                request: output.request,
+                state: ps,
+                session_id: sessionId,
+                usage,
+                turns: budgetUsed.turns,
+              };
+            }
+
             // SendMessage (issue #81): the `send_message` tool surfaces an
             // out-of-band message to the user. Emit a `user_message` stream
             // event rather than collapsing the content into a normal tool
@@ -3389,6 +3570,7 @@ export class HarnessBuilder {
   private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
   private _promptToolCallFlag?: SharedFlag;
+  private readonly _consultHandlers: ConsultHandlerMap = new Map();
 
   constructor(
     private readonly agent: Agent,
@@ -3527,6 +3709,26 @@ export class HarnessBuilder {
    *  turn runs on this agent; otherwise it runs on the default agent. */
   plannerAgent(agent: Agent): this {
     this._plannerAgent = agent;
+    return this;
+  }
+
+  /**
+   * Register a per-kind consult handler (issue #114). Analogous to
+   * {@link plannerAgent}. When a worker (run via {@link "@spore/tools".SubagentTool})
+   * pauses with a {@link ConsultRequest} whose `kind` matches `kind`, the
+   * orchestrator runs `handler` on the request deterministically (no orchestrator
+   * model turn), up to `budget` consults of this kind before applying `overflow`.
+   * Without any registered handler, consults degrade gracefully (R6): a standalone
+   * worker surfaces {@link RunResult} `consult` unchanged. Empty by default.
+   */
+  consultHandler(
+    kind: string,
+    handler: Harness,
+    budget: number,
+    overflow: ConsultOverflowPolicy,
+  ): this {
+    const entry: ConsultHandlerEntry = { handler, budget, overflow };
+    this._consultHandlers.set(kind, entry);
     return this;
   }
 
@@ -3777,6 +3979,9 @@ export class HarnessBuilder {
       modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
       prompt_tool_call_flag: this._promptToolCallFlag,
+      // Only attach when populated so the default config stays byte-for-byte
+      // unchanged for callers that never register a consult handler (R9).
+      consultHandlers: this._consultHandlers.size > 0 ? this._consultHandlers : undefined,
     };
   }
 
@@ -3827,6 +4032,9 @@ function haltReasonToString(reason: HaltReason): string {
  */
 function foldUsage(totalUsage: AggregateUsage, carried: BudgetSnapshot, r: RunResult): void {
   if (r.kind === "waiting_for_human") return;
+  // A consult pause carries usage/turns but is non-terminal; like
+  // waiting_for_human, do not fold it into a sub-run total (issue #114).
+  if (r.kind === "consult") return;
   const usage = r.usage;
   const turns = r.turns;
   totalUsage.input_tokens += usage.input_tokens;

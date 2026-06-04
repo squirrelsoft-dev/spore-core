@@ -350,7 +350,19 @@ export type ContextOperation =
     }
   | { kind: "tool_result_appended"; tool_name: string; truncated: boolean }
   | { kind: "compaction"; messages_removed: number; tokens_reclaimed: number }
-  | { kind: "skill_injected"; guide_id: GuideId };
+  | { kind: "skill_injected"; guide_id: GuideId }
+  /**
+   * A worker paused mid-loop to consult a parent-spawned helper (issue #114).
+   * Emitted by the worker harness loop when it returns {@link RunResult}
+   * `consult`. Lightweight — no Phoenix/span wiring beyond this context span.
+   */
+  | { kind: "consult_spawned"; consult_kind: string }
+  /**
+   * A paused worker was resumed after a consult (issue #114). Emitted by the
+   * `resumeConsult` seam. `answered` is `false` when the resume carried a
+   * budget-exhausted soft-fail rather than a handler answer.
+   */
+  | { kind: "consult_resumed"; consult_kind: string; answered: boolean };
 
 export interface ContextSpan {
   base: SpanBase;

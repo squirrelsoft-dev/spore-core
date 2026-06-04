@@ -13,6 +13,7 @@
 
 import { z } from "zod";
 
+import type { Harness } from "./interface.js";
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
 import type { PlanPhaseErrorKind } from "../plan/types.js";
@@ -504,7 +505,19 @@ export type ToolOutput =
    * returns a `waiting_for_human` {@link RunResult}. On resume the human's
    * answer text is injected as the tool RESULT for that clarifying call.
    */
-  | { kind: "awaiting_clarification"; question: string; options?: string[] };
+  | { kind: "awaiting_clarification"; question: string; options?: string[] }
+  /**
+   * Mid-loop consult signal (issue #114). A worker-side tool returns it with
+   * `child_state` ABSENT; the worker harness pauses and returns
+   * {@link RunResult} `consult` with the consult call preserved as the head of
+   * `pending_tool_calls` and `human_request` absent. At the subagent boundary,
+   * {@link "@spore/tools".SubagentTool} populates `child_state` — but in the A1
+   * mediation seam it consumes the signal itself rather than bubbling it, so a
+   * parent orchestrator never observes this variant on the happy path. Mirrors
+   * `waiting_for_human`: the optional {@link ChildPausedState} keeps the common
+   * (worker-emitted) case cheap. NOT appended to message history.
+   */
+  | { kind: "consult"; child_state?: ChildPausedState; request: ConsultRequest };
 
 /**
  * Ergonomic constructors for the common {@link ToolOutput} cases. Mirrors Rust's
@@ -536,6 +549,16 @@ export const toolOutput = {
    */
   fatal(message: string): ToolOutput {
     return { kind: "error", message, recoverable: false };
+  },
+
+  /**
+   * A **worker-side consult** signal (issue #114): the tool asks for mid-loop
+   * help. `child_state` is omitted — the harness loop builds the
+   * {@link RunResult} `consult` pause; only {@link "@spore/tools".SubagentTool}
+   * populates `child_state` at the boundary.
+   */
+  consult(request: ConsultRequest): ToolOutput {
+    return { kind: "consult", request };
   },
 } as const;
 
@@ -874,6 +897,93 @@ export type HumanResponse =
   | { kind: "reject"; reason: string };
 
 // ============================================================================
+// Mid-loop consult primitive (issue #114)
+// ============================================================================
+//
+// A third pause/resume path that stops at the ORCHESTRATOR instead of bubbling
+// to the human. A worker-side tool returns {@link ToolOutput} `consult`; the
+// worker harness pauses and returns {@link RunResult} `consult`. At the
+// subagent boundary, {@link "@spore/tools".SubagentTool} mediates it
+// deterministically (seam A1): it routes by `kind` to a registered
+// {@link ConsultHandlerEntry}, enforces the per-kind budget, runs the handler
+// (the orchestrator's DIRECT child — depth-1), and resumes the worker via
+// {@link "./interface.js".Harness.resumeConsult} with a {@link ConsultResponse}.
+// The orchestrator's model is never involved.
+//
+// All wire shapes are byte-identical to `fixtures/harness/consult.json`:
+// `kind`-tagged unions in snake_case; `ConsultRequest` has NO defaults (a
+// partial request fails to parse rather than silently defaulting).
+
+/**
+ * The worker's free-form ask when it pauses mid-loop to consult a
+ * parent-spawned helper (issue #114). `kind` selects the handler; `situation`,
+ * `attempts`, and `question` carry the context the handler needs. All fields
+ * are REQUIRED — there are deliberately no schema defaults.
+ */
+export const ConsultRequestSchema = z.object({
+  /** Routing key — selects the {@link ConsultHandlerEntry}. */
+  kind: z.string(),
+  /** Free-form description of where the worker is stuck. */
+  situation: z.string(),
+  /** How many times the worker has already tried (advisory; the per-kind budget
+   *  is enforced independently by the mediator). */
+  attempts: z.number().int().nonnegative(),
+  /** The concrete question the worker wants answered. */
+  question: z.string(),
+});
+export type ConsultRequest = z.infer<typeof ConsultRequestSchema>;
+
+/**
+ * The resume input handed back to a paused worker after a consult (issue #114).
+ * Parallel to {@link HumanResponse}; tagged on `kind`, snake_case.
+ *
+ *   - `answer` — the handler produced an answer; `text` is injected as the tool
+ *     RESULT for the pending consult call.
+ *   - `budget_exhausted` — the per-kind budget is exhausted under a `soft_fail`
+ *     overflow policy: the worker is resumed with this message and finishes
+ *     with what it has.
+ */
+export const ConsultResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("answer"), text: z.string() }),
+  z.object({ kind: z.literal("budget_exhausted"), message: z.string() }),
+]);
+export type ConsultResponse = z.infer<typeof ConsultResponseSchema>;
+
+/**
+ * Per-kind budget-overflow behaviour (issue #114). Tagged on `kind`, snake_case.
+ *
+ *   - `soft_fail` — resume the worker with {@link ConsultResponse} `budget_exhausted`
+ *     so it finishes without further help.
+ *   - `escalate_to_human` — convert the over-budget consult into a
+ *     {@link RunResult} `waiting_for_human` so the host decides.
+ */
+export const ConsultOverflowPolicySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("soft_fail") }),
+  z.object({ kind: z.literal("escalate_to_human") }),
+]);
+export type ConsultOverflowPolicy = z.infer<typeof ConsultOverflowPolicySchema>;
+
+/**
+ * A registered consult handler (issue #114): the helper {@link Harness} to run,
+ * the per-kind budget (max consults of this kind before overflow), and the
+ * overflow policy. Held by `kind` in {@link HarnessConfig.consultHandlers}.
+ *
+ * The `handler` is run by {@link "@spore/tools".SubagentTool} as the
+ * ORCHESTRATOR's direct child (depth-1), never nested under the worker.
+ */
+export interface ConsultHandlerEntry {
+  /** The helper harness run on the {@link ConsultRequest}. */
+  handler: Harness;
+  /** Max number of consults of this kind before the overflow policy applies. */
+  budget: number;
+  /** What to do once the budget is exhausted. */
+  overflow: ConsultOverflowPolicy;
+}
+
+/** Per-kind consult handlers (issue #114), keyed by {@link ConsultRequest.kind}. */
+export type ConsultHandlerMap = Map<string, ConsultHandlerEntry>;
+
+// ============================================================================
 // PausedState / ChildPausedState
 // ============================================================================
 
@@ -1052,6 +1162,23 @@ export type RunResult =
       session_id: SessionId;
       usage: AggregateUsage;
       turns: number;
+    }
+  /**
+   * Worker paused mid-loop to consult a parent-spawned helper (issue #114).
+   * Sibling of `waiting_for_human`, but it stops at the ORCHESTRATOR (via the
+   * SubagentTool A1 mediation), not the human. `state` preserves the full
+   * {@link PausedState} with `human_request` absent and the consult call as the
+   * head of `pending_tool_calls`, so `harness.resumeConsult(state, response)`
+   * continues the worker. With no consult handlers registered, a standalone
+   * worker simply returns this unchanged to its caller (R6 graceful degradation).
+   */
+  | {
+      kind: "consult";
+      request: ConsultRequest;
+      state: PausedState;
+      session_id: SessionId;
+      usage: AggregateUsage;
+      turns: number;
     };
 
 /**
@@ -1069,6 +1196,7 @@ export function runResultSessionState(result: RunResult): SessionState {
       return result.session_state ?? emptySessionState();
     case "waiting_for_human":
     case "escalate":
+    case "consult":
       return result.state.session_state;
   }
 }
