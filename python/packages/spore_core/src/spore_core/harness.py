@@ -66,7 +66,14 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    model_serializer,
+)
 
 from .agent import (
     Agent,
@@ -783,12 +790,145 @@ class ToolOutputAwaitingClarification(_Model):
     options: list[str] | None = None
 
 
+# ----- Mid-loop consult primitive (issue #114) ----------------------------
+# This is the doc-hub for the consult feature on the Python side. See the Rust
+# reference (`rust/crates/spore-core/src/harness.rs`) for the authoritative
+# narrative; the type / interface / rule contract is identical here.
+#
+# Worker side:
+#   - A worker-side tool returns :class:`ToolOutputConsult` (built via
+#     :meth:`ToolOutputConsult.consult`, ``child_state=None``) to ask for
+#     mid-loop help. The loop pauses, preserving the consult call as the HEAD of
+#     ``pending_tool_calls`` (``human_request=None``), and returns
+#     :class:`RunResultConsult` (R1, R10) — a sibling of
+#     :class:`RunResultWaitingForHuman`. The consult is NEVER appended to message
+#     history until the resume injects the answer as its tool result (R10).
+#
+# Resume side:
+#   - :meth:`StandardHarness.resume_consult` injects the
+#     :class:`ConsultResponse` text as the tool RESULT of the head pending
+#     (consult) call, dispatches the remaining batch, and resumes the ReAct loop.
+#
+# Orchestrator mediation (seam A1) lives in ``spore_tools.tools.subagent``:
+#   - ``SubagentTool`` drives the full run -> Consult -> route-by-kind ->
+#     budget-check -> run-handler -> resume loop INTERNALLY, returning a final
+#     success to the parent (R2/R3). The parent model never sees the consult.
+#     Depth-1 is preserved: the handler is the orchestrator's direct child (R7).
+
+
+class ConsultRequest(_Model):
+    """The worker's free-form ask when it pauses mid-loop to consult a
+    parent-spawned helper (issue #114). ``kind`` selects the handler;
+    ``situation`` / ``attempts`` / ``question`` carry the free-form context the
+    handler needs. All fields are REQUIRED — there are deliberately no defaults,
+    so a malformed / partial request fails to deserialize rather than silently
+    defaulting (matches the Rust ``ConsultRequest``)."""
+
+    kind: str
+    situation: str
+    attempts: int
+    question: str
+
+
+class ConsultResponseAnswer(_Model):
+    """The handler produced an answer; ``text`` is injected as the tool RESULT
+    for the pending consult call on resume."""
+
+    kind: Literal["answer"] = "answer"
+    text: str
+
+
+class ConsultResponseBudgetExhausted(_Model):
+    """The per-kind budget is exhausted under a ``SoftFail`` overflow policy: the
+    worker is resumed with this message and finishes with what it has."""
+
+    kind: Literal["budget_exhausted"] = "budget_exhausted"
+    message: str
+
+
+ConsultResponse = Annotated[
+    ConsultResponseAnswer | ConsultResponseBudgetExhausted,
+    Field(discriminator="kind"),
+]
+
+
+class ConsultOverflowPolicySoftFail(_Model):
+    """Resume the worker with :class:`ConsultResponseBudgetExhausted` so it
+    finishes without further help."""
+
+    kind: Literal["soft_fail"] = "soft_fail"
+
+
+class ConsultOverflowPolicyEscalateToHuman(_Model):
+    """Convert the over-budget consult into a :class:`RunResultWaitingForHuman`
+    (surfaced from ``SubagentTool`` as :class:`ToolOutputWaitingForHuman`) so the
+    host decides."""
+
+    kind: Literal["escalate_to_human"] = "escalate_to_human"
+
+
+ConsultOverflowPolicy = Annotated[
+    ConsultOverflowPolicySoftFail | ConsultOverflowPolicyEscalateToHuman,
+    Field(discriminator="kind"),
+]
+
+
+@dataclass
+class ConsultHandlerEntry:
+    """A registered consult handler: the helper harness to run, the per-kind
+    budget (max consults of this kind before overflow), and the overflow policy
+    (issue #114). Held by ``kind`` in :attr:`HarnessConfig.consult_handlers`.
+
+    The ``handler`` is run by ``SubagentTool`` as the ORCHESTRATOR's direct child
+    (depth-1, R7), never nested under the worker. A plain dataclass — it holds a
+    live :class:`Harness`, so it is never serialized."""
+
+    handler: Harness
+    budget: int
+    overflow: ConsultOverflowPolicy
+
+
+class ToolOutputConsult(_Model):
+    """Mid-loop consult signal (issue #114). A worker-side tool returns it with
+    ``child_state=None`` (use :meth:`consult`); the worker harness pauses and
+    returns :class:`RunResultConsult` with the consult call preserved as the head
+    of ``pending_tool_calls`` (``human_request=None``). At the subagent boundary
+    ``SubagentTool`` may populate ``child_state`` — but under the A1 mediation
+    seam it consumes the signal itself rather than bubbling it, so a parent
+    orchestrator never observes this variant on the happy path. Mirrors
+    :class:`ToolOutputWaitingForHuman` (one variant, optional child state)."""
+
+    kind: Literal["consult"] = "consult"
+    child_state: ChildPausedState | None = None
+    request: ConsultRequest
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # Mirror Rust's ``#[serde(default, skip_serializing_if = "Option::is_none")]``
+        # on ``child_state``: a worker-side consult (``child_state=None``) OMITS
+        # the field entirely so the wire form is byte-identical to the fixture's
+        # ``worker_tool_output_cases``. The subagent boundary populates it.
+        data = handler(self)
+        if self.child_state is None:
+            data.pop("child_state", None)
+        return data
+
+    @classmethod
+    def consult(cls, request: ConsultRequest) -> ToolOutputConsult:
+        """A worker-side consult signal: the tool asks for mid-loop help.
+        ``child_state`` is ``None`` — the harness loop builds the
+        :class:`RunResultConsult` pause; only ``SubagentTool`` populates
+        ``child_state`` at the boundary."""
+        return cls(child_state=None, request=request)
+
+
 ToolOutput = Annotated[
     ToolOutputSuccess
     | ToolOutputError
     | ToolOutputWaitingForHuman
     | ToolOutputEscalate
-    | ToolOutputAwaitingClarification,
+    | ToolOutputAwaitingClarification
+    | ToolOutputConsult,
     Field(discriminator="kind"),
 ]
 
@@ -1730,8 +1870,30 @@ class RunResultEscalate(_Model):
     turns: int
 
 
+class RunResultConsult(_Model):
+    """Worker paused mid-loop to consult a parent-spawned helper (issue #114).
+    Sibling of :class:`RunResultWaitingForHuman`, but it stops at the
+    ORCHESTRATOR (via ``SubagentTool``'s A1 mediation), not the human. The
+    ``state`` preserves the full :class:`PausedState` with ``human_request=None``
+    and the consult call as the head of ``pending_tool_calls``, so
+    ``harness.resume_consult(state, response, ..)`` continues the worker. With no
+    consult handlers registered, a standalone worker simply returns this
+    unchanged to its caller (R6 graceful degradation)."""
+
+    kind: Literal["consult"] = "consult"
+    request: ConsultRequest
+    state: PausedState
+    session_id: SessionId
+    usage: AggregateUsage
+    turns: int
+
+
 RunResult = Annotated[
-    RunResultSuccess | RunResultFailure | RunResultWaitingForHuman | RunResultEscalate,
+    RunResultSuccess
+    | RunResultFailure
+    | RunResultWaitingForHuman
+    | RunResultEscalate
+    | RunResultConsult,
     Field(discriminator="kind"),
 ]
 
@@ -1767,6 +1929,8 @@ from .memory import now as _now  # noqa: E402
 from .observability import (  # noqa: E402
     ContentCaptureConfig,
     ContextOperationCompaction,
+    ContextOperationConsultResumed,
+    ContextOperationConsultSpawned,
     ContextSpan,
     GenAiMessage,
     GenAiRole,
@@ -1900,6 +2064,19 @@ class Harness(Protocol):
         on_stream: StreamSink | None = None,
     ) -> RunResult: ...
 
+    async def resume_consult(
+        self,
+        state: PausedState,
+        response: ConsultResponse,
+        on_stream: StreamSink | None = None,
+    ) -> RunResult:
+        """Resume a worker paused by :class:`RunResultConsult` (issue #114). The
+        :class:`ConsultResponse` is injected as the tool RESULT of the head
+        pending consult call, then the loop continues. Default-implemented to
+        ``NotImplementedError`` so callers that never use consults need not
+        provide it (mirrors the Rust default trait method)."""
+        raise NotImplementedError("resume_consult is not implemented for this harness")
+
 
 # ============================================================================
 # HarnessConfig + StandardHarness
@@ -1942,6 +2119,7 @@ class HarnessConfig:
         model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
         prompt_tool_call_flag: PromptToolCallFlag | None = None,
+        consult_handlers: dict[str, ConsultHandlerEntry] | None = None,
     ) -> None:
         self.agent = agent
         # The HillClimbing scoring strategy (issue #60). REQUIRED for the
@@ -2076,6 +2254,15 @@ class HarnessConfig:
         # flips it when a prose response is detected where a tool call was
         # expected. Mirrors Rust's ``HarnessConfig::prompt_tool_call_flag``.
         self.prompt_tool_call_flag: PromptToolCallFlag | None = prompt_tool_call_flag
+        # Per-kind consult handlers (issue #114), keyed by ``ConsultRequest.kind``.
+        # Empty (the default) means consults are NOT mediated: a worker that
+        # pauses with :class:`RunResultConsult` surfaces it unchanged to its
+        # caller (R6 graceful degradation). Populated via
+        # :meth:`HarnessBuilder.consult_handler`. ``SubagentTool`` consumes this
+        # map (built from the orchestrator's config) to mediate child consults.
+        self.consult_handlers: dict[str, ConsultHandlerEntry] = (
+            dict(consult_handlers) if consult_handlers is not None else {}
+        )
 
 
 class HarnessBuilder:
@@ -2145,6 +2332,9 @@ class HarnessBuilder:
         # :class:`AdaptiveToolCallModelInterface` holding the same holder. ``None``
         # on the plain constructor leaves adaptive escalation off.
         self._prompt_tool_call_flag: PromptToolCallFlag | None = None
+        # Per-kind consult handlers (issue #114). Empty by default — consults
+        # degrade gracefully (R6). Populated via :meth:`consult_handler`.
+        self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
 
     @classmethod
     def conversational(cls, model: ModelInterface) -> HarnessBuilder:
@@ -2385,6 +2575,26 @@ class HarnessBuilder:
         self._planner_agent = planner_agent
         return self
 
+    def consult_handler(
+        self,
+        kind: str,
+        handler: Harness,
+        budget: int,
+        overflow: ConsultOverflowPolicy,
+    ) -> HarnessBuilder:
+        """Register a per-kind consult handler (issue #114). Analogous to
+        :meth:`planner_agent`. When a worker pauses with a
+        :class:`ConsultRequest` whose ``kind`` matches ``kind``, the orchestrator
+        (via ``SubagentTool``) runs ``handler`` on the request and resumes the
+        worker. Up to ``budget`` consults of this kind are mediated before
+        ``overflow`` applies. Without any registered handler, consults degrade
+        gracefully (R6): a standalone worker surfaces :class:`RunResultConsult`
+        unchanged. Empty by default."""
+        self._consult_handlers[kind] = ConsultHandlerEntry(
+            handler=handler, budget=budget, overflow=overflow
+        )
+        return self
+
     def verifier(self, verifier: Any) -> HarnessBuilder:
         """Inject the SelfVerifying oracle (issue #61, D2). REQUIRED for the
         ``SelfVerifying`` strategy: without it the run halts with
@@ -2536,6 +2746,7 @@ class HarnessBuilder:
             model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
             prompt_tool_call_flag=self._prompt_tool_call_flag,
+            consult_handlers=self._consult_handlers,
         )
 
     def build(self) -> StandardHarness:
@@ -2998,8 +3209,10 @@ class StandardHarness:
                 budget_used=BudgetSnapshot(),
                 child_state=None,
             )
-        elif isinstance(result, RunResultWaitingForHuman | RunResultEscalate):
-            # Persist the carried pause state directly (D6).
+        elif isinstance(result, RunResultWaitingForHuman | RunResultEscalate | RunResultConsult):
+            # Persist the carried pause state directly (D6). Consult (issue #114)
+            # is non-terminal but carries a resumable state, like WaitingForHuman,
+            # so a cross-process host can later ``resume_consult`` it.
             state = result.state
             session_id = state.session_id
         else:  # pragma: no cover — RunResult is a closed union.
@@ -3190,6 +3403,90 @@ class StandardHarness:
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         # Resume the ReAct loop from where we paused.
+        max_iterations = (
+            task.loop_strategy.max_iterations
+            if isinstance(task.loop_strategy, LoopStrategyReAct)
+            else 2**31 - 1
+        )
+        return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
+
+    async def resume_consult(
+        self,
+        state: PausedState,
+        response: ConsultResponse,
+        on_stream: StreamSink | None = None,
+    ) -> RunResult:
+        """Resume a worker paused by :class:`RunResultConsult` (issue #114), then
+        persist its terminal state (issue #102). Thin wrapper around
+        :meth:`_resume_consult_inner` mirroring :meth:`resume`."""
+        result = await self._resume_consult_inner(state, response, on_stream)
+        await self._auto_persist_terminal(result)
+        return result
+
+    async def _resume_consult_inner(
+        self,
+        state: PausedState,
+        response: ConsultResponse,
+        on_stream: StreamSink | None = None,
+    ) -> RunResult:
+        """Consult resume seam (issue #114). Mirrors the clarification resume
+        branch: the :class:`ConsultResponse` text is injected as the tool RESULT
+        for the head pending (consult) call — NOT appended as a free-standing
+        user message (R10) — then any remaining pending calls are dispatched and
+        the ReAct loop resumes."""
+        session_state = state.session_state
+        pending = state.pending_tool_calls
+        task = state.task
+        budget_used = state.budget_used
+        session_id = state.session_id
+        tool_registry = self._effective_tool_registry(session_id)
+
+        if isinstance(response, ConsultResponseAnswer):
+            text, answered = response.text, True
+        else:  # ConsultResponseBudgetExhausted
+            text, answered = response.message, False
+
+        # Observability: lightweight consult-resume event.
+        if self._config.observability is not None:
+            # Recover the consult ``kind`` from the head pending call's args, if
+            # present, else fall back to a generic label.
+            kind = ""
+            if pending and isinstance(pending[0].input, dict):
+                k = pending[0].input.get("kind")
+                if isinstance(k, str):
+                    kind = k
+            base = SpanBase.new_root(
+                new_span_id(f"{session_id}-consult-resume"),
+                session_id,
+                task.id,
+                SpanKind.CONTEXT_ASSEMBLY,
+                _now(),
+            )
+            self._config.observability.emit_context(
+                ContextSpan(
+                    base=base,
+                    operation=ContextOperationConsultResumed(consult_kind=kind, answered=answered),
+                    tokens_before=0,
+                    tokens_after=0,
+                    utilization_before=0.0,
+                    utilization_after=0.0,
+                )
+            )
+
+        # Inject the consult answer as the RESULT of the head pending (consult)
+        # call, then dispatch the remaining pending calls in the same batch.
+        if pending:
+            consult_call, *rest = pending
+            tr = HarnessToolResult(
+                call_id=consult_call.id,
+                output=ToolOutputSuccess(content=text, truncated=False),
+            )
+            await self._config.context_manager.append_tool_result(session_state, tr)
+            for call in rest:
+                output = await tool_registry.dispatch(call)
+                tr = HarnessToolResult(call_id=call.id, output=output)
+                await self._config.context_manager.append_tool_result(session_state, tr)
+
         max_iterations = (
             task.loop_strategy.max_iterations
             if isinstance(task.loop_strategy, LoopStrategyReAct)
@@ -5085,6 +5382,63 @@ class StandardHarness:
                         )
                         return RunResultWaitingForHuman(state=paused, request=request)
 
+                    # Consult pause (issue #114, R1/R10): a worker-side tool
+                    # returns :class:`ToolOutputConsult` (``child_state=None``) to
+                    # ask for mid-loop help. Like the clarification arm there is
+                    # NO ``ChildPausedState`` at this level — the loop builds a
+                    # :class:`PausedState` directly with ``human_request=None`` and
+                    # preserves the CONSULTING call as the HEAD of
+                    # ``pending_tool_calls`` (followed by the remaining batch), so
+                    # that on ``resume_consult`` the helper's answer is injected as
+                    # the tool RESULT for that pending call. The consult is a
+                    # control signal, NOT a conversation turn: it is never appended
+                    # to message history here (R10) — we ``return`` before any
+                    # ``append_tool_result``.
+                    if isinstance(output, ToolOutputConsult):
+                        # Observability: lightweight consult-spawn event alongside
+                        # ``SkillInjected``.
+                        if config.observability is not None:
+                            base = SpanBase.new_root(
+                                new_span_id(f"{session_id}-consult-spawn-{span_seq}"),
+                                session_id,
+                                task.id,
+                                SpanKind.CONTEXT_ASSEMBLY,
+                                _now(),
+                            )
+                            config.observability.emit_context(
+                                ContextSpan(
+                                    base=base,
+                                    operation=ContextOperationConsultSpawned(
+                                        consult_kind=output.request.kind
+                                    ),
+                                    tokens_before=0,
+                                    tokens_after=0,
+                                    utilization_before=0.0,
+                                    utilization_after=0.0,
+                                )
+                            )
+                        pending = [call, *calls[i + 1 :]]
+                        turns = budget_used.turns
+                        paused = PausedState(
+                            session_id=session_id,
+                            task_id=task.id,
+                            turn_number=budget_used.turns,
+                            session_state=session_state,
+                            pending_tool_calls=pending,
+                            approved_results=approved_results,
+                            human_request=None,
+                            task=task,
+                            budget_used=budget_used,
+                            child_state=None,
+                        )
+                        return RunResultConsult(
+                            request=output.request,
+                            state=paused,
+                            session_id=session_id,
+                            usage=usage,
+                            turns=turns,
+                        )
+
                     # SendMessage (issue #81): the ``send_message`` tool surfaces
                     # an out-of-band message to the user. The loop emits a
                     # :class:`StreamUserMessage` rather than collapsing the
@@ -5570,7 +5924,9 @@ HarnessSignalExitPlanMode.model_rebuild()
 HarnessSignalSwitchMode.model_rebuild()
 ToolOutputEscalate.model_rebuild()
 ToolOutputWaitingForHuman.model_rebuild()
+ToolOutputConsult.model_rebuild()
 RunResultEscalate.model_rebuild()
+RunResultConsult.model_rebuild()
 ChildPausedState.model_rebuild()
 PausedState.model_rebuild()
 
@@ -5596,6 +5952,14 @@ __all__ = [
     "BudgetLimitTypeT",
     "BudgetSnapshot",
     "ChildPausedState",
+    "ConsultHandlerEntry",
+    "ConsultOverflowPolicy",
+    "ConsultOverflowPolicyEscalateToHuman",
+    "ConsultOverflowPolicySoftFail",
+    "ConsultRequest",
+    "ConsultResponse",
+    "ConsultResponseAnswer",
+    "ConsultResponseBudgetExhausted",
     "ContextManager",
     "HaltReason",
     "HaltReasonAgentError",
@@ -5661,6 +6025,7 @@ __all__ = [
     "ReadOnlySandbox",
     "RiskLevel",
     "RunResult",
+    "RunResultConsult",
     "RunResultEscalate",
     "RunResultFailure",
     "RunResultSuccess",
@@ -5721,6 +6086,7 @@ __all__ = [
     "TerminationPolicy",
     "ToolOutput",
     "ToolOutputAwaitingClarification",
+    "ToolOutputConsult",
     "ToolOutputError",
     "ToolOutputEscalate",
     "ToolOutputSuccess",

@@ -425,11 +425,33 @@ class ContextOperationSkillInjected(_Model):
     guide_id: GuideId
 
 
+class ContextOperationConsultSpawned(_Model):
+    """A worker paused mid-loop to consult a parent-spawned helper (issue #114).
+    Emitted by the worker harness loop when it returns
+    :class:`spore_core.harness.RunResultConsult`. Lightweight — no Phoenix / span
+    wiring beyond this :class:`ContextSpan`."""
+
+    kind: Literal["consult_spawned"] = "consult_spawned"
+    consult_kind: str
+
+
+class ContextOperationConsultResumed(_Model):
+    """A paused worker was resumed after a consult (issue #114). Emitted by the
+    ``resume_consult`` seam. Carries the consult kind and whether the resume
+    carried a handler answer (``False`` => budget-exhausted soft-fail)."""
+
+    kind: Literal["consult_resumed"] = "consult_resumed"
+    consult_kind: str
+    answered: bool
+
+
 ContextOperation = Annotated[
     ContextOperationAssembly
     | ContextOperationToolResultAppended
     | ContextOperationCompaction
-    | ContextOperationSkillInjected,
+    | ContextOperationSkillInjected
+    | ContextOperationConsultSpawned
+    | ContextOperationConsultResumed,
     Field(discriminator="kind"),
 ]
 
@@ -1018,6 +1040,8 @@ __all__ = [
     "ContextOperation",
     "ContextOperationAssembly",
     "ContextOperationCompaction",
+    "ContextOperationConsultResumed",
+    "ContextOperationConsultSpawned",
     "ContextOperationSkillInjected",
     "ContextOperationToolResultAppended",
     "ContextSpan",
