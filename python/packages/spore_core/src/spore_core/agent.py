@@ -30,7 +30,10 @@ Classification rules (must match Rust/TS/Go byte-for-byte):
 3. ``stop_reason in {end_turn, max_tokens, stop_sequence}``:
 
    * Tool-use blocks present → still ``ToolCallRequested`` (do not drop).
-   * No text and no tool calls → ``Error`` with :class:`EmptyResponse`.
+   * No text and no tool calls → interpreted by ``stop_reason``: a clean
+     ``end_turn`` is the model's completion signal → a (possibly empty)
+     terminal ``FinalResponse``; a ``max_tokens`` / ``stop_sequence`` empty
+     is an abnormal/truncated stop → ``Error`` with :class:`EmptyResponse`.
    * Otherwise → ``FinalResponse`` with concatenated text (``Thinking``
      blocks discarded — observability, not output).
 
@@ -318,6 +321,15 @@ def classify_response(response: ModelResponse) -> TurnResult:
 
     # end_turn | max_tokens | stop_sequence
     if not text_parts and not tool_calls:
+        # The meaning of a no-content stop depends on *why* the model stopped.
+        # A clean ``end_turn`` is the model's voluntary completion signal: it
+        # chose to stop and did not request a tool, so an empty ``end_turn`` is
+        # a (possibly empty) terminal FinalResponse, not an error. A
+        # ``max_tokens`` / ``stop_sequence`` empty is an abnormal/truncated stop
+        # and remains genuinely suspect → EmptyResponse. (Thinking-only output
+        # is still empty: thinking is not a terminal response.)
+        if stop == "end_turn":
+            return FinalResponse(content="", usage=usage, reasoning=reasoning)
         return TurnError(error=AgentErrorEmpty(), usage=usage)
     if tool_calls:
         return ToolCallRequested(calls=tool_calls, usage=usage, reasoning=reasoning)

@@ -153,9 +153,27 @@ async def test_tool_call_requested_carries_multiple_calls() -> None:
     assert result.calls[1].id == "b"
 
 
-async def test_empty_response_when_no_content_blocks() -> None:
+async def test_clean_end_turn_with_no_content_is_empty_final_response() -> None:
+    # A clean end_turn with no text and no tool calls is the model's voluntary
+    # completion signal → a (possibly empty) terminal FinalResponse, NOT an
+    # EmptyResponse error.
     m = MockModelInterface(_provider())
     m.push_response(ModelResponse(content=[], usage=_usage(1, 0), stop_reason=StopReason.END_TURN))
+    agent = _make_agent(m)
+    result = await agent.turn(_ctx_user("?"))
+    assert isinstance(result, FinalResponse)
+    assert result.content == ""
+    assert result.usage.input_tokens == 1
+    assert result.reasoning is None
+
+
+async def test_max_tokens_with_no_content_is_empty_response() -> None:
+    # A truncated/abnormal empty (max_tokens with no content) remains a genuine
+    # EmptyResponse error — only clean end_turn is reclassified as completion.
+    m = MockModelInterface(_provider())
+    m.push_response(
+        ModelResponse(content=[], usage=_usage(1, 0), stop_reason=StopReason.MAX_TOKENS)
+    )
     agent = _make_agent(m)
     result = await agent.turn(_ctx_user("?"))
     assert isinstance(result, TurnError)
@@ -165,12 +183,14 @@ async def test_empty_response_when_no_content_blocks() -> None:
 
 
 async def test_thinking_blocks_do_not_satisfy_final_response() -> None:
+    # Thinking-only output is still empty. Under max_tokens (a truncated stop)
+    # this remains an EmptyResponse error; thinking is not a terminal response.
     m = MockModelInterface(_provider())
     m.push_response(
         ModelResponse(
             content=[ThinkingBlock(text="musing")],
             usage=_usage(1, 2),
-            stop_reason=StopReason.END_TURN,
+            stop_reason=StopReason.MAX_TOKENS,
         )
     )
     agent = _make_agent(m)
@@ -363,7 +383,9 @@ async def test_agent_classifies_recorded_turns_consistently() -> None:
     assert r3.calls[0].id == "toolu_b1"
     assert r3.calls[1].id == "toolu_b2"
 
-    # 4. Empty content + end_turn → EmptyResponse
+    # 4. Empty content + a truncated stop (max_tokens) → EmptyResponse.
+    #    (A clean end_turn empty is instead a completion; only abnormal/
+    #    truncated empties remain errors.)
     r4 = await agent.turn(Context())
     assert isinstance(r4, TurnError)
     assert isinstance(r4.error, AgentErrorEmpty)
