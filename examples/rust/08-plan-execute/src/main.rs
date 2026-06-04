@@ -43,6 +43,19 @@
 //! There are no `// SPEC QUESTION:` markers: the strategy swap, the hook events,
 //! and the budget API were all resolved against the source before writing this.
 //!
+//! ## Staying within small (~128K) context windows
+//!
+//! Under `PlanExecute`, verbose tool output is retained across every plan step,
+//! so a few searches can overflow a model with a ~128K window (e.g. `gemma4:e4b`,
+//! 131072 tokens). Two measures keep this example running cleanly on such models:
+//!
+//! - It **distills `web_search` results**: a [`ConciseWebSearch`] wrapper trims
+//!   the verbatim SearXNG JSON (25-40K tokens/call) down to the top 6 results
+//!   with only `title` / `url` / `content`, so context stays small.
+//! - It **lowers the compaction threshold** to `0.45` (compaction at ≈90K tokens
+//!   instead of the default ≈160K), installed via `.context_manager(...)`, so
+//!   compaction fires before a 128K-window model overflows.
+//!
 //! Tool calling is native by default (real typed `write_file` schema, no
 //! always-on `final` escape) — what tool-capable models, including hosted
 //! `*-cloud` models, want. Pass `--structured` to enable
@@ -61,12 +74,14 @@
 
 use std::sync::Arc;
 
-use spore_core::harness::BoxFut;
+use spore_core::harness::{BoxFut, ToolOutput};
 use spore_core::{
-    BudgetLimits, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, Hook, HookChain,
-    HookContext, HookDecision, HookError, HookEvent, LoopStrategy, OllamaModelInterface, RunResult,
-    SearchMethod, SessionId, StandardHookChain, StandardTool, StandardTools, Task, WebSearchConfig,
-    WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox, PLAN_EXECUTE_EXTRAS_KEY,
+    BudgetLimits, CompactionConfig, Harness, HarnessBuilder, HarnessContextManagerExt,
+    HarnessRunOptions, HarnessStreamEvent, Hook, HookChain, HookContext, HookDecision, HookError,
+    HookEvent, LoopStrategy, NullCacheProvider, OllamaModelInterface, RunResult, SandboxProvider,
+    SearchMethod, SessionId, StandardContextManager, StandardHookChain, StandardTool,
+    StandardTools, Task, Tool, ToolCall, ToolContext, WebSearchConfig, WebSearchTool,
+    WorkspaceConfig, WorkspaceScopedSandbox, PLAN_EXECUTE_EXTRAS_KEY,
 };
 
 const SYSTEM_PROMPT: &str = "You are a research-and-writing agent. Your ONLY capabilities are: \
@@ -124,6 +139,82 @@ impl Hook for PlanExecuteReporter {
     }
 }
 
+/// A thin wrapper around the built-in [`WebSearchTool`] that distills its output.
+///
+/// WHY: the core `web_search` tool returns the SearXNG JSON body VERBATIM (by
+/// frozen spec — normalization is out of scope for the core tool). Each search
+/// yields ~25-30 results, each carrying the full `content` plus a dozen noise
+/// fields (`thumbnail`, `engine`, `score`, `parsed_url`, …) — roughly 25-40K
+/// tokens per call. Under `PlanExecute` those dumps are retained across every
+/// plan step, so three searches alone can overflow a ~128K-window model. This
+/// wrapper keeps only the top results and the fields the agent actually reads,
+/// so the conversation context stays small. The model still sees an identical
+/// `web_search` tool (same name + schema); only the *result* is trimmed.
+struct ConciseWebSearch {
+    inner: WebSearchTool,
+}
+
+impl Tool for ConciseWebSearch {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn may_produce_large_output(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        sandbox: &'a (dyn SandboxProvider + 'a),
+        ctx: &'a ToolContext,
+    ) -> BoxFut<'a, ToolOutput> {
+        Box::pin(async move {
+            let out = self.inner.execute(call, sandbox, ctx).await;
+            match out {
+                ToolOutput::Success { content, truncated } => ToolOutput::Success {
+                    content: distill_search_results(&content),
+                    truncated,
+                },
+                // Errors and every non-Success variant pass through untouched.
+                other => other,
+            }
+        })
+    }
+}
+
+/// Keep only the top 6 results, and for each only `title` / `url` / `content`
+/// (content clipped to ~500 chars). Drop all other fields and top-level keys
+/// (`answers`, `infoboxes`, `suggestions`, `unresponsive_engines`, …), and
+/// re-serialize as compact `{"results":[...]}`. Defensive: if the body is not
+/// JSON or has no `results` array, the original string is returned unchanged —
+/// we never error just because the shape was unexpected.
+fn distill_search_results(content: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return content.to_string();
+    };
+    let Some(results) = value.get("results").and_then(|r| r.as_array()) else {
+        return content.to_string();
+    };
+
+    let distilled: Vec<serde_json::Value> = results
+        .iter()
+        .take(6)
+        .map(|r| {
+            let title = r.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let body = r
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let clipped: String = body.chars().take(500).collect();
+            serde_json::json!({ "title": title, "url": url, "content": clipped })
+        })
+        .collect();
+
+    serde_json::json!({ "results": distilled }).to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -169,7 +260,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         body_auth_params: Vec::new(),
     })
     .expect("web_search backend config is valid (SearXNG needs no auth env vars)");
-    let web_search = StandardTool::new(Box::new(web_search_tool), WebSearchTool::schema());
+    // Wrap the raw `WebSearchTool` in `ConciseWebSearch` so verbose SearXNG JSON
+    // is distilled before it enters the conversation (see the struct doc above).
+    // Same name + schema, so the model sees an identical `web_search` tool.
+    let web_search = StandardTool::new(
+        Box::new(ConciseWebSearch {
+            inner: web_search_tool,
+        }),
+        WebSearchTool::schema(),
+    );
 
     // The agent operates inside this example's `workspace/` directory. Resolve it
     // relative to this source file so `cargo run` works from anywhere, and
@@ -194,10 +293,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Same `conversational` harness + `WorkspaceScopedSandbox` + tool set as 06.
     // The ONLY substantive change vs 06 is the `LoopStrategy` on the Task below.
-    let model = OllamaModelInterface::with_base_url(&model_id, base_url);
+    let model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
+
+    // Lower the compaction threshold so it fires at ~0.45 * 200K ≈ 90K tokens,
+    // BEFORE a ~128K-window model (e.g. gemma4:e4b) overflows. `conversational`
+    // installs a `StandardContextManager` with `CompactionConfig::default()`
+    // (compaction at 80% of a 200K window ≈ 160K), which is too late here. The
+    // context manager gets its OWN model instance for summarization turns.
+    let cm = Arc::new(StandardContextManager::new(
+        Arc::new(OllamaModelInterface::with_base_url(&model_id, base_url)),
+        Arc::new(NullCacheProvider),
+        CompactionConfig {
+            threshold: 0.45,
+            ..CompactionConfig::default()
+        },
+    ))
+    .into_harness_adapter();
+
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
+        .context_manager(cm)
         .tool(web_search)
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
