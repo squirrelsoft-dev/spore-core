@@ -3394,7 +3394,7 @@ export class HarnessBuilder {
     private readonly agent: Agent,
     private _toolRegistry: ToolRegistry,
     private _sandbox: SandboxProvider,
-    private readonly contextManager: ContextManager,
+    private _contextManager: ContextManager,
     private readonly terminationPolicy: TerminationPolicy,
   ) {}
 
@@ -3698,6 +3698,35 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Override the {@link ContextManager} that assembles per-turn context and
+   * drives compaction.
+   *
+   * {@link conversational} installs a {@link StandardContextManager} with
+   * default compaction (compaction at 80% of a 200K window) wrapped through
+   * {@link intoHarnessAdapter}; supply your own (e.g. a lower compaction
+   * `threshold`) to make compaction fire earlier for models with a smaller
+   * context window. Wrap a {@link StandardContextManager} with
+   * {@link intoHarnessAdapter} to obtain the harness-seam type.
+   *
+   * Mirrors `HarnessBuilder::context_manager` in
+   * `rust/crates/spore-core/src/harness.rs`.
+   *
+   * ```ts
+   * const cm = intoHarnessAdapter(
+   *   new StandardContextManager(model, new NullCacheProvider(), {
+   *     ...defaultCompactionConfig(),
+   *     threshold: 0.45,
+   *   }),
+   * );
+   * const harness = HarnessBuilder.conversational(model).contextManager(cm).build();
+   * ```
+   */
+  contextManager(contextManager: ContextManager): this {
+    this._contextManager = contextManager;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -3727,7 +3756,7 @@ export class HarnessBuilder {
       agent: this.agent,
       toolRegistry: this._toolRegistry,
       sandbox: this._sandbox,
-      contextManager: this.contextManager,
+      contextManager: this._contextManager,
       terminationPolicy: this.terminationPolicy,
       middleware: this._middleware,
       observability: this._observability,

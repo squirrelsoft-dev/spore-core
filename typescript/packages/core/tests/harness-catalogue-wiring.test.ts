@@ -292,3 +292,11 @@ describe("sandbox setter (#91 follow-up)", () => {
     expect(cfg.sandbox).toBe(override);
   });
 });
+
+describe("contextManager setter (#100)", () => {
+  it("overrides the configured context manager", () => {
+    const override = new NoopContextManager();
+    const cfg = catalogueBuilder(makeAgent()).contextManager(override).buildConfig();
+    expect(cfg.contextManager).toBe(override);
+  });
+});
