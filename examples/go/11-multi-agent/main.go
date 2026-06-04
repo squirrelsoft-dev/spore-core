@@ -120,6 +120,54 @@ const workerTimeout = 180 * time.Second
 // generous headroom.
 const maxOrchestratorTurns uint32 = 32
 
+// planExecuteReporter is a lifecycle hook that prints the orchestrator's
+// PlanExecute plan and each subtask as it advances — the "the orchestrator PLANS,
+// then delegates" half of this example, made visible.
+//
+// There are no plan/subtask STREAM events; the plan is surfaced through the hook
+// chain (same seam example 08 uses). OnPlanCreated fires once, after the planner
+// turn captures the plan and before any subtask executes — the money moment for
+// PlanExecute. OnTaskAdvance fires before each subtask. Both are sync; this hook
+// only observes and always returns Continue. The per-subtask line interleaves
+// cleanly with the agent-boundary banners the stream sink prints below.
+type planExecuteReporter struct{}
+
+func (planExecuteReporter) Handle(_ context.Context, hctx *sporecore.HookContext) (sporecore.HookDecision, error) {
+	switch hctx.Event {
+	case sporecore.HookEventOnPlanCreated:
+		fmt.Println("\n── orchestrator plan ──")
+		if hctx.Plan != nil {
+			if r := strings.TrimSpace(hctx.Plan.Rationale); r != "" {
+				fmt.Printf("rationale: %s\n", r)
+			}
+			for i, t := range hctx.Plan.Tasks {
+				fmt.Printf("  %d. %s\n", i+1, t)
+			}
+		}
+		fmt.Println("───────────────────────")
+	case sporecore.HookEventOnTaskAdvance:
+		instruction := ""
+		if hctx.Task != nil {
+			instruction = hctx.Task.Instruction
+		}
+		fmt.Printf("\n▶ subtask [%d/%d] %s\n", hctx.TaskIndex+1, hctx.TotalTasks, truncate(instruction, 160))
+	}
+	return sporecore.Continue(), nil
+}
+
+func (planExecuteReporter) Events() []sporecore.HookEvent {
+	return []sporecore.HookEvent{
+		sporecore.HookEventOnPlanCreated,
+		sporecore.HookEventOnTaskAdvance,
+	}
+}
+
+func (planExecuteReporter) Name() string { return "plan-execute-reporter" }
+
+func (planExecuteReporter) SyncMode() sporecore.HookSync { return sporecore.HookSyncSync }
+
+var _ sporecore.Hook = planExecuteReporter{}
+
 const researchPrompt = "You are a research worker. Use the web_search tool to gather " +
 	"current, factual information on the topic you are given. Issue focused queries, read the " +
 	"results, and return a concise set of findings as plain text — key facts, figures, and " +
@@ -322,13 +370,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to create sandbox: %w", err)
 	}
-	orchestrator := observability.ConversationalBuilder(orchestratorModel).
+	//
+	// Go hooks-wiring asymmetry (mirrors example 08): the observability builder has
+	// no .Hooks() setter, so we BuildConfig(), register the plan reporter on a hook
+	// chain, set cfg.Hooks, then NewStandardHarness. The chain is how the
+	// orchestrator's plan becomes visible — there are no plan/subtask stream events.
+	cfg := observability.ConversationalBuilder(orchestratorModel).
 		Sandbox(sandbox).
 		Tool(researchTool).                      // ← agent-as-tool (research)
 		Tool(writingTool).                       // ← agent-as-tool (writing)
 		Tool(tools.StandardTools{}.WriteFile()). // ← orchestrator saves report.md itself
 		SystemPrompt(orchestratorPrompt).
-		Build()
+		BuildConfig()
+
+	chain := sporecore.NewStandardHookChain()
+	if err := chain.Register(planExecuteReporter{}); err != nil {
+		return fmt.Errorf("failed to register plan reporter: %w", err)
+	}
+	cfg.Hooks = chain
+	orchestrator := sporecore.NewStandardHarness(cfg)
 
 	// The orchestrator plans the three steps up front via PlanExecute, then
 	// executes them. The turn budget is divided across subtasks, so give it
