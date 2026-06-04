@@ -1,149 +1,98 @@
 # PROJECT STATE
-_Last updated: 2026-05-30 by /close — closed #32 (Block-2 cache-hash mismatch must halt) `status: complete`. **The maintainer chose Track-a — correctness/safety debt + docs cleanup — as the post-breadth track**, and #32 is its first gate landed. The fix makes a Block-2 (PerSession) cache-hash mismatch mid-session **halt** with `ContextError::CacheHashMismatch` instead of an `eprintln!`/`console.warn`/`logger.warning`/`log.Printf` warning, exactly mirroring the Block-1 (Static) halt that already existed one branch above it. The `CacheHashMismatch` variant was reshaped (`block: String` → `block: CacheBlock`, added `turn_number`); a `HaltReason::ContextError` routing variant was added in all four (immediately after `AgentError`, mirroring its shape, byte-identical wire `{"kind":"context_error","error":{"kind":"cache_hash_mismatch","block":"per_session",…,"turn_number":…}}`). The `turn_number > 1` baseline guard is preserved (turn-1 rebaseline never halts). **Tight scope, two maintainer-pinned deferrals:** (1) live-loop routing deferred to the #7 ContextManager migration — the live `StandardHarness` calls a separate *infallible* placeholder `ContextManager`, and Block-1's halt isn't live-wired either, so this makes Block-2 *consistent with Block-1* without pulling #7 in; (2) the `UnexpectedMiss`/`estimated_cost_delta_usd` cost-spike observability (the issue's own "separate concern") split out to **new issue #90**, which pins the real formula `(base_input_rate − cache_read_rate) × missed_block_tokens` and flags that `base_input_rate` isn't stored in the pricing path today. Inline unit tests only (Block-1 has no fixture either); cross-language verification PASS, no scope overreach, Go's import-cycle bridge split (rich `CacheBlock`-typed error in `contextmgr`, thin string-block routing error in root pkg) confirmed wire-identical. Commits rust `f3dd41a`, ts `81cd902`, python `62963e0`, go `c60102b` — all on `main`, pushed (`origin/main` == `62963e0`). Next correctness gate: **#34** (Yolo/None behind a dangerous feature flag).
+_Last updated: 2026-06-04 by /close — closed #100 (example: 11-multi-agent — orchestrator and worker composition) `status: complete`. The **11-multi-agent** example now ships end-to-end across all four targets: an orchestrator agent delegates to a research worker and a writing worker (each a fully independent `Harness` instance, no shared mutable state — the "agent as tool" pattern), plans are printed in the example output, and the run assembles a single `report.md`. Building it on top of `08-plan-execute` (PlanExecute drives the orchestrator) surfaced three harness fixes that landed under the same issue across all four languages: a tunable-compaction `context_manager` / `HarnessBuilder::context_manager` setter; treating a clean `EndTurn` with no content as **completion** rather than `EmptyResponse`; and keeping `08-plan-execute` within small (128K-class) context windows by distilling `web_search` output and compacting earlier. Prereqs #102 (session-state round-trip) and #103 (streaming) were already closed. Commits through `2653de8`, all on `main`, pushed (`origin/main` == `2653de8`)._
 
-_(Prior loop: closed #60 (HillClimbing loop strategy) `status: complete`.) This loop landed the **fifth and final loop strategy** across all four languages: the harness now runs **5 of 5** advertised strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing). #60 was the harness-wiring issue, not the trait-design one — the `MetricEvaluator` trait, `should_keep`, `MetricResult`/`MetricError`, `IterationStatus`, `ResultsEntry`, the four production evaluators, and `HaltReason::StagnationLimitReached` all already shipped under #23. #60 drives them from `StandardHarness::run`: baseline-first measurement (iteration 0, no agent turn) → agent turn → evaluate → keep/revert via payload-direction `should_keep`, plus a harness-written TSV results log at `.spore/results/{task_id}.tsv` and a misconfiguration guard. New public surface (mirrored ×4): `HaltReason::HillClimbingMisconfigured`, the `metric_evaluator` config field (injected like `verifier`/`vcs_provider`), the `hill_climbing_iteration` observability span. Seven spec ambiguities (git-reset seam, TSV float byte-identity at 6 decimals, TSV schema, direction source-of-truth, baseline semantics, misconfig halt, baseline-error) were pinned with the maintainer before fan-out. Cross-language verification PASS, byte-identical TSV confirmed, no divergences. Commits rust `5da525f`, python `e21c745`, ts `7d632bc`, go `d53e221` — all on `main`, pushed (`origin/main` == `d53e221`). **Both feature tracks (Track A tool/prompt + loop-strategy track) are now CLOSED.** Next: a maintainer fork — correctness/safety debt + docs cleanup vs. opening the protocol-integration track (#83–87)._
+_**Direction note for this loop:** the prior `/close` (2026-05-30) named correctness/safety gates (#34 → #31 → #30) as the active track, but **that track was never picked up** — every commit since (#98 docs, #99 10-hill-climbing, #100 11-multi-agent) has been building out the **examples suite**. Active Direction is rewritten below to reflect the real course; the correctness gates are reclassified as a parked track pending an explicit maintainer call._
 
 ## Current State
-spore-core is a language-agnostic agentic harness runtime built component by
-component across four targets: Rust (reference), TypeScript, Python, and Go.
-**Everything is pushed — `origin/main` == local == `d53e221`.**
+spore-core is a language-agnostic agentic harness runtime with a **complete core
+capability surface**, now being demonstrated through a numbered **examples suite**
+built across all four targets: Rust (reference), TypeScript, Python, Go.
+**Everything is pushed — `origin/main` == local == `2653de8`.**
 
-**The harness now runs all 5 of 5 advertised loop strategies end-to-end across
-all four languages** (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing).
-The final one, **HillClimbing (#60)**, is an iterative-optimization loop:
-iteration 0 establishes a baseline metric with no agent turn (`status: kept`),
-then each iteration runs one agent turn → evaluates the metric → keeps or reverts
-based on strict improvement (`should_keep`, payload `direction` authoritative).
-`revert_on_no_improvement` discards the working tree via `git reset --hard HEAD`
-through the sandbox seam (no commit-per-keep; harness never commits).
-`max_stagnation` halts with `StagnationLimitReached` after N consecutive
-non-improvements (counter resets on improvement); crash/timeout count as
-non-improvements. The harness (not the agent) writes a TSV results log to
-`.spore/results/{task_id}.tsv` — header + one row per iteration, 6-decimal float
-formatting pinned for cross-language byte-identity, `metadata` excluded. Built on
-#23's already-shipped `MetricEvaluator`/`should_keep`/`ResultsEntry` surface; #60
-added only the harness wiring, the `metric_evaluator` config field, the
-`HillClimbingMisconfigured` halt, and the `hill_climbing_iteration` span. The
-`StrategyNotYetImplemented` stub is gone — **no loop strategy is stubbed anymore.**
+**Examples suite — 11 of 13 landed, all four languages each.** Present under
+`examples/{rust,typescript,python,go}/`:
+`01-hello-agent`, `02-conversational-repl`, `03-tool-use`, `04-filesystem-agent`,
+`05-custom-sandboxed-tool`, `06-web-research`, `07-memory`, `08-plan-execute`,
+`09-self-verifying`, `10-hill-climbing` (#99), `11-multi-agent` (#100, this loop).
+Each example teaches one harness capability and runs against a local Ollama model;
+the later web-search-dependent ones (06, 11) distill `web_search` output so they
+stay inside small context windows. **Remaining example issues: #92** (observability
+example — wire Phoenix/OTLP tracing, show structured trace output), **#101**
+(`12-cordyceps` — fully autonomous task-completion capstone), **#109**
+(`13-coding-agent` — batteries-not-included coding-agent CLI).
 
-**The Ralph loop strategy (#58) is complete end-to-end across all four
-languages, including its v2 `VcsProvider` seam.** Ralph is a
-multi-context-window continuation loop: each outer iteration is one context
-window — a FRESH `SessionState` (no message carryover) re-seeded with the
-instruction + state reloaded from `.spore/`, then a bounded inner ReAct sub-loop.
-The harness fires Stop hooks on `FinalResponse`; Ralph registers a Stop hook
-that reads `.spore/progress.json` and returns `Block{reason}` while tasks remain
-(intercepting the exit → resetting the window) or `Continue` when all complete
-(terminating with success). Budgets/usage fold across all windows; each reset
-gets a distinct session id. Terminal `HaltReason::RalphCompletionUnmet {
-iterations, last_reason }` (peer of `SelfVerifyExhausted`) when `max_resets`
-(default 3) exhausts with tasks incomplete. This takes the harness to **4 of 5
-loop strategies** (ReAct + PlanExecute + SelfVerifying + Ralph).
+**Harness fixes shipped alongside the examples (all four languages):** a tunable
+`context_manager` setter on `HarnessBuilder` so an example can tighten compaction;
+clean `EndTurn`-with-no-content now means completion, not `EmptyResponse`
+(removes a spurious error path on terminal turns); `08-plan-execute`
+`web_search`-distillation + earlier compaction so the PlanExecute orchestrator
+fits a 128K-class model.
 
-v1 forks (pinned in Rust before fan-out): **B1** drive Ralph off the Stop hook
-(#69), no new completion-check config surface, deprecated `CompletionCheck`
-(landed by #43) left untouched; **B2** canonical `.spore/`-prefixed paths, with
-`FeatureListCheck`'s default path updated to `.spore/feature_list.json` (one
-source of truth); **B3** `max_resets` config field, `LoopStrategy::Ralph` stays
-payload-free; **B4** git-log reload originally deferred — **now resolved by the
-v2 seam this loop.**
+**The harness core is DONE and was complete before the examples push began:**
 
-**v2 `VcsProvider` seam (this loop)** — a thin VCS abstraction Ralph calls
-instead of shelling out directly, mirroring how `SandboxProvider` abstracts
-shell/filesystem access. `VcsProvider` trait (`log(VcsLogArgs)` + `status()`),
-`VcsLogArgs { max_entries, since_ref?, format? }`, a `VcsError`, plus two impls:
-`GitVcsProvider` (shells `git log`/`git status` **through**
-`SandboxProvider::execute_command` — verified in all four, never a raw
-`std::process`/`child_process`/`subprocess`/`os/exec`; argv mapping
-`max_entries → -n N`, `format → --format=…`, `since_ref → <ref>..`) and
-`FixtureVcsProvider` (deterministic test double, returns seeded strings verbatim,
-no process spawning). Wired as `vcs_provider: Option<Arc<dyn VcsProvider>>` on the
-Ralph config surface + builder setter, default `None` → git context omitted
-(preserves v1 behavior byte-for-byte). When set, the reload phase injects a
-delimited `Recent VCS history:` block into the next window's seed. Fixture
-`fixtures/harness/ralph.json` gained an optional `vcs_log` field and a 7th case
-`vcs_log_injected_across_reset`, exercised in all four replay suites; the
-original 6 cases pass unchanged. Cross-language verification PASS; one latent Go
-argv divergence (`-n` emitted conditionally at `max_entries==0`) was caught and
-fixed (`bfeba21`) so all four match the Rust reference. Commits: Rust `55f45e8`,
-TS `22ef61f`, Python `95dd1cc`, Go `6fcebae` + fix `bfeba21`. Test deltas: Rust
-802 lib (+6), TS core 960 (+6), Python 996 (+7), Go all green incl. `-race` (+8
-+contract test).
+- **All 5 of 5 advertised loop strategies run end-to-end across all four
+  languages** — ReAct + PlanExecute + SelfVerifying (#61) + Ralph (#58, incl. its
+  v2 `VcsProvider` seam) + HillClimbing (#60). No loop strategy is stubbed.
+  HillClimbing writes a 6-decimal byte-identical TSV results log to
+  `.spore/results/{task_id}.tsv`; Ralph is a multi-context-window continuation
+  loop driven off a Stop hook reading `.spore/progress.json`, reloading state +
+  optional `Recent VCS history:` through the `VcsProvider` seam.
+- **Track A — tool/prompt architecture — DONE** (#79 prompt assembly engine, #80
+  typed tool→caller escalation channel, #81 three-tier standard tool catalogue,
+  #82 scope-aware `memory` tool).
+- **Clean, fully-pluggable, scope-aware persistence seam** (#73/#75/#76/#78/#82):
+  `StorageProvider` with per-domain + per-scope composite routing;
+  `plan_execute`/`task_list`/`todo_write` persist via `RunStore`; the `memory`
+  tool via the scoped `MemoryStore` (`StorageScope { User, Project, Local }`,
+  merged-read single-sourced on the trait per #82 D2).
+- **Runnable** (#57 — shared e2e CLI on Ollama, hermetic + live), **debuggable**
+  (#64/#65 — GenAI content capture, Arize Phoenix trace viewer), with a working
+  **evaluation/feedback loop** (#26 EvalHarness, #68 typed `Span` accessors).
 
-**#61 — the SelfVerifying loop strategy** runs end-to-end across all four. A
-`run_self_verifying` method orchestrating a build ReAct sub-loop → a fresh
-evaluator run (fresh `SessionId`, read-only sandbox, `role-evaluator` chunk) →
-the existing `Verifier` (#44), reusing the failure-reason → user-message
-injection path. Forks: D1 bespoke strategy; D2 `evaluator_agent` config field
-(#70 defaulting) + `verifier` oracle; D3 `Verifier::max_iterations()` (default 3)
-caps the round-trip; D4 peer halts `SelfVerifyExhausted`/`SelfVerifyMisconfigured`.
-Reusable seam: the **`ReadOnlySandbox` decorator** (all four). Rust `c4f607a`,
-TS `856736b`, Python `cc2bab0`, Go `f5b2f21`.
-
-**#82 — the scope-aware `memory` tool** ships across all four, built on #78's
-scoped `MemoryStore` + `ToolContext` memory seam. Single `operation`-discriminated
-tool, `scope` explicit on both ops, `Local` rejected before any storage access.
-Architectural outcome (D2): `get_memories_merged` promoted onto the `MemoryStore`
-trait itself — one merge impl per language. **Known v1 limit (#78 Q7): memory
-stays `SessionId`-keyed; session-independent cross-session addressing is filed as
-#89.**
-
-**#78 (the storage seam #82 built on)** shipped `StorageScope { User, Project,
-Local }`, fixture-pinned `WorkspaceId` derivation, the scoped `MemoryStore`,
-`(domain, scope) → backend` routing, user-scope workspace partitioning, and the
-`ToolContext` memory-store field.
-
-**Track A — tool/prompt architecture — is DONE** (#79 + #80 + #81 + #82): the
-standard tool catalogue (#81, three tiers), the prompt assembly engine (#79), and
-the typed tool→caller escalation channel (#80), all across four languages.
-`RemoteChunkProvider` + scope-aware `FileSystemChunkProvider` deferred to **#88**.
-
-**The persistence layer is clean** (#73 + #76 + #75 + #78 + #82):
-`StorageProvider` with per-domain and per-scope composite routing;
-`plan_execute`/`task_list`/`todo_write` persist through `RunStore`; the `memory`
-tool through the scoped `MemoryStore` seam (merged-read single-sourced on the
-trait, #82 D2).
-
-Foundation: the harness is **runnable** (#57 — shared e2e CLI driving the ReAct
-loop against Ollama, hermetic suite + live `llama3.2`) and **debuggable**
-(#64/#65 — GenAI content capture, Arize Phoenix trace viewer). Working
-**evaluation/feedback loop** (#26 EvalHarness; #68 typed `Span` accessors).
-Earlier: observability stack (#42/#49/#50/#33), `OllamaModelInterface` +
-capability guard (#41), `StandardCompactionAdapter` + verify→retry→warn loop
-(#55/#46), `StandardContextManager`/verifiers (#29), KeyTermVerifier (#47).
-
-Runnability: the harness runs **all five** advertised loop strategies (ReAct,
-PlanExecute, SelfVerifying, Ralph, HillClimbing) end-to-end. The README and
-`docs/harness-engineering-concepts.md` no longer overstate the *count* of working
-strategies — but #27/#35 still track other spec-vs-code drift surfaced in review.
+**Parked (not the active track): correctness/safety debt + docs cleanup.** #32
+(Block-2 cache-hash-mismatch halt) landed on the prior loop, but the rest of that
+track was never started: **#34** (`Mode::Yolo`/`SandboxProvider::None` behind a
+dangerous feature flag), **#31** (SharedSession subagent context read-only by
+default), **#30** (memory distillation through the PendingReview gate), and docs
+**#27/#35/#36**. All still `scope: deferred`.
 
 ## Active Direction
-The harness is **runnable** (#57), **debuggable** (#64/#65), has a working
-**evaluation/feedback loop** (#26/#68), runs **all five** advertised loop
-strategies (ReAct + PlanExecute + SelfVerifying + Ralph + HillClimbing,
-#61/#58/#60), has a **clean, fully-pluggable, scope-aware persistence seam**
-reaching into tools and exercised by a real `memory` tool (#73 + #76 + #75 + #78 +
-#82), a **typed tool→caller escalation channel** (#80), a **complete standard tool
-catalogue** (#81 + #82), and a **conditional prompt assembly engine** (#79) — all
-across four languages. The bar remains **capability breadth and correctness**.
+**Build out and harden the numbered examples suite across all four languages** —
+each example a self-contained, runnable demonstration of one harness capability,
+with four-language parity and small-context-window friendliness so they run on
+local Ollama models. The suite is the current product surface: it's how the
+finished harness core (5/5 loop strategies, full tool/prompt/persistence
+architecture) gets shown and validated. **11 of 13 examples are in;** the
+remaining work is the last two examples plus an observability example, and
+hardening the `web_search` tool the research-style examples depend on.
 
-**Both feature tracks are CLOSED** — Track A (tool/prompt architecture, #79 +
-#80 + #81 + #82) and the loop-strategy track (#61 → #58 → #60). The harness has
-its full advertised core capability surface. **The maintainer has chosen the
-post-breadth track: correctness/safety debt + docs cleanup** (the "correctness"
-half of the bar — concrete, in-repo, no new architecture). The protocol-integration
-track (#83–87) was the alternative and is NOT being pursued for now.
+A design session on **#101** (`12-cordyceps`) reshaped the capstone and spun out
+a **new blocking harness issue, #114** (mid-loop consult primitive): a subagent
+escalates mid-loop to a parent-spawned helper and resumes, orchestrator-mediated
+and deterministic, reusing the `WaitingForHuman` pause/resume machinery (depth-1
+respected — the helper is the orchestrator's child, not the worker's). #101 was
+rewritten to consume it (ReAct + `task_list` orchestrator decomposing a per-crate/
+per-module Rust audit; analysis worker loads an `audit` skill via the real #9
+`GuideRegistry`→injection seam; two consult tools — `research_best_practices`
+≤5 soft-fail, `consult_advisor` ≤3 → human; gemma4:e4b locally + minimax-m3:cloud
+advisor; REPL approval → `gh` issue filing) and is now **`status: blocked` on #114**.
 
-**Correctness/safety gates — progress.** ✅ **#32 done** (Block-2 hash mismatch now
-halts, consistent with Block-1). Remaining, in priority order: **#34** (`Mode::Yolo`
-/ `SandboxProvider::None` behind a dangerous feature flag), **#31** (SharedSession
-subagent context read-only by default), **#30** (memory distillation through the
-PendingReview gate). Then docs — **#27/#35/#36** (stop overstating / clarify spec;
-the strategy *count* is now accurate but other drift remains). All remaining gates
-are still `scope: deferred`-labelled; relabel `status: queued` as picked up.
+Immediate scope: **#114** (consult primitive) lands first, then **#101**
+(`12-cordyceps` capstone) and **#109**
+(`13-coding-agent`) complete the numbered suite; **#92** adds the observability
+example. The `web_search` tool has two real gaps surfaced by the
+research-dependent examples — **#108** (can't attach auth headers or query params,
+which blocks several backends) and **#110** (response normalization across
+Brave/Tavily/SearXNG shapes) — that should be closed to make those examples
+robust across providers.
 
-Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
-#89 cross-session memory keying — all `scope: deferred`.
+**Parked track (needs a maintainer call):** correctness/safety gates
+#34 → #31 → #30 and docs #27/#35/#36 were named active on 2026-05-30 but never
+started; the examples suite took priority instead. Pick these back up explicitly
+when the suite is done, or confirm they stay parked. Larger new feature issues —
+#113 (spore-lsp), #107 (PromptEngineeringAgent), #106 (MicroVMSandboxProvider) —
+and the protocol-integration track (#83–87) remain unscheduled. Storage follow-ups
+#77/#88/#89 stay `scope: deferred`.
 
 ## Known Deviations
 1. **Go outbox is not zero-dependency** — closing #50 added
@@ -209,6 +158,13 @@ Storage remaining: SQL backends (#77, deferred), #88 deferred chunk providers,
    consumer-side-seam pattern as `MetricEvaluator`/`Verifier`/`VcsProvider`;
    wire-identical.
 
+9. **Active direction shifted off the 2026-05-30 plan without a recorded
+   decision** (process note, not a code deviation) — the correctness/safety track
+   (#34/#31/#30) was named active but never started; the examples suite (#98–#100)
+   was built instead. Reconciled this loop: Active Direction now reflects the
+   examples suite; the correctness track is explicitly parked pending a maintainer
+   call. No code impact.
+
 _(Former Deviation — HillClimbing loop strategy stub, #60 (was Deviation #1: harness ran only 4/5 strategies) — **resolved** this loop; HillClimbing runs end-to-end across all four, harness now at 5/5, stub removed.)_
 _(Former Deviation — push blocked on local SSH auth (13 unpushed commits) — **resolved**; SSH fixed, all pushed.)_
 _(Former Deviation — Ralph git-log reload deferred to v2 (#58 B4) — **resolved** by the `VcsProvider` seam; Ralph now reloads all three spec'd sources.)_
@@ -224,19 +180,35 @@ _(Former Deviation — observability captured no message content — **resolved*
 ## Next Actions
 [3-5 items max, highest priority first. Each references a GH issue # where
 possible. /next surfaces item 1 as "work this next."]
-1. **#34 — `Mode::Yolo` / `SandboxProvider::None` behind a dangerous feature flag**
-   (next correctness/safety gate). With #32 done, this is the highest-priority
-   remaining gate on the chosen track: dangerous no-sandbox execution modes must be
-   gated so they can't be reached by accident. Relabel `status: queued` when grabbed.
-2. **#31 — SharedSession subagent context read-only by default** — subagents
-   sharing a parent session must not mutate it unless explicitly granted write.
-3. **#30 — memory distillation through the PendingReview gate** — distilled memory
-   writes must pass the review gate rather than landing directly.
-4. **Docs cleanup** — #27 (README: strategy count now accurate at 5/5, but sweep
-   remaining spec-vs-code drift), #35 (`harness-engineering-concepts.md` drift),
-   #36 (E2B data-residency/privacy doc). Do after the correctness gates.
-5. **Deferred follow-ups (not on the active track)** — #90 (cache cost-spike
-   `UnexpectedMiss`, split from #32), #7 (ContextManager migration — would live-wire
-   the #32/#Block-1 halts), #77 (SQL backends), #88 (deferred chunk providers),
-   #89 (cross-session memory keying). All `scope: deferred`. The
-   protocol-integration track (#83–87) is parked — not chosen.
+1. **#114 — mid-loop consult primitive (harness change, BLOCKS #101)** — new
+   `RunResult::Consult` / `ToolOutput::Consult` / `ConsultResponse` resume path,
+   orchestrator-mediated deterministic routing via a kind→handler map, per-kind
+   budgets + overflow policy, depth-1 respected. Four-language parity (Rust
+   reference, then TS/Python/Go), on the order of the #100 setter work but more
+   invasive. Land before #101. Relabel `status: queued` → `queued`/grabbed.
+2. **#101 — `12-cordyceps` example (autonomous task-completion capstone)** —
+   **`status: blocked` on #114**; it's the consumer that validates the consult
+   primitive. Design is fully pinned in the rewritten issue (ReAct + `task_list`
+   per-crate/module Rust audit, `audit` skill via #9 seam, two consult tools,
+   gemma4:e4b + minimax-m3:cloud advisor, REPL approval → `gh` filing). Grab once
+   #114 lands; relabel `status: blocked` → grabbed.
+3. **#109 — `13-coding-agent` example** — the final numbered example, a
+   batteries-not-included coding-agent CLI; completes the 1–13 suite across all
+   four languages.
+4. **#108 + #110 — `web_search` hardening** — #108 (attach auth headers / query
+   params; blocks several backends) and #110 (normalize cited sources across
+   Brave/Tavily/SearXNG shapes). Both surfaced by the research-dependent examples
+   (06, 11) and make them robust across providers. NOT a blocker for #101 —
+   #101 defaults to a single local SearXNG backend, which is sufficient.
+5. **#92 — observability example** — wire Phoenix/OTLP tracing and show structured
+   trace output; demonstrates the already-shipped #64/#65 observability stack.
+   (#101 deliberately skips observability; #92 owns the Phoenix wiring.)
+
+_Maintainer decision — parked correctness/safety + docs track._ #34
+(Yolo/None feature flag) → #31 (SharedSession read-only) → #30 (memory
+PendingReview gate), then docs #27/#35/#36. Named active 2026-05-30, never
+started, superseded in practice by the examples suite. Confirm: pick back up
+after the suite, or keep parked. Other unscheduled work: #113 (spore-lsp), #107
+(PromptEngineeringAgent), #106 (MicroVMSandboxProvider), protocol track #83–87,
+deferred storage #77/#88/#89, #7 ContextManager migration (would live-wire the
+#32 halts), #90 cache cost-spike.
