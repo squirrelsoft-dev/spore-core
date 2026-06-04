@@ -9,7 +9,11 @@
  *   2. `stop_reason === "tool_use"` AND no tool-use blocks
  *        → `Error(MalformedToolCall)`
  *   3. `stop_reason ∈ {"end_turn","max_tokens","stop_sequence"}` AND
- *      no text AND no tool calls → `Error(EmptyResponse)`
+ *      no text AND no tool calls → interpreted by `stop_reason`: a clean
+ *      `"end_turn"` empty is the model's completion signal and becomes a
+ *      (possibly empty) terminal `FinalResponse`; a `"max_tokens"` /
+ *      `"stop_sequence"` empty is an abnormal/truncated stop and stays
+ *      `Error(EmptyResponse)`
  *   4. `stop_reason ∈ {"end_turn","max_tokens","stop_sequence"}` AND
  *      tool-use blocks present → still `ToolCallRequested` (we never
  *      silently drop a tool call)
@@ -102,6 +106,18 @@ export function classifyResponse(response: ModelResponse): TurnResult {
     case "max_tokens":
     case "stop_sequence":
       if (textParts.length === 0 && toolCalls.length === 0) {
+        // The meaning of an empty response depends on *why* the model stopped.
+        // (Thinking-only output is still empty: thinking is not terminal.)
+        //
+        // - A clean `end_turn` is the model's completion signal: it chose to
+        //   stop and did not request a tool. An empty `end_turn` is therefore a
+        //   (possibly empty) terminal response, not an error — fabricating an
+        //   `EmptyResponse` error from it would be wrong.
+        // - `max_tokens` / `stop_sequence` empties are abnormal/truncated stops
+        //   and remain genuinely suspect, so they stay `EmptyResponse`.
+        if (response.stop_reason === "end_turn") {
+          return { kind: "final_response", content: "", usage, ...maybeReasoning(reasoning) };
+        }
         return { kind: "error", error: new EmptyResponse(), usage };
       }
       if (toolCalls.length > 0) {

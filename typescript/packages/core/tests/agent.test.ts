@@ -125,12 +125,32 @@ describe("Agent — single-turn classification", () => {
     }
   });
 
-  it("returns EmptyResponse when model returns no content blocks", async () => {
+  it("classifies a clean end_turn with no content as an empty FinalResponse", async () => {
+    // A clean end_turn is the model's voluntary completion signal → a (possibly
+    // empty) terminal FinalResponse, NOT an EmptyResponse error.
     const { agent, model } = makeAgent();
     model.pushResponse({
       content: [],
       usage: usage(1, 0),
       stop_reason: "end_turn",
+    });
+    const result = await agent.turn(ctxUser("?"));
+    expect(result.kind).toBe("final_response");
+    if (result.kind === "final_response") {
+      expect(result.content).toBe("");
+      expect(result.usage.input_tokens).toBe(1);
+      expect(result.reasoning).toBeUndefined();
+    }
+  });
+
+  it("returns EmptyResponse when a truncated (max_tokens) stop has no content", async () => {
+    // A truncated/abnormal empty remains a genuine EmptyResponse error — only
+    // a clean end_turn is reclassified as completion.
+    const { agent, model } = makeAgent();
+    model.pushResponse({
+      content: [],
+      usage: usage(1, 0),
+      stop_reason: "max_tokens",
     });
     const result = await agent.turn(ctxUser("?"));
     expect(result.kind).toBe("error");
@@ -141,12 +161,14 @@ describe("Agent — single-turn classification", () => {
     }
   });
 
-  it("discards thinking blocks — thinking-only stays EmptyResponse", async () => {
+  it("discards thinking blocks — thinking-only under a truncated stop stays EmptyResponse", async () => {
+    // Thinking is not a terminal response; under max_tokens (a truncated stop)
+    // thinking-only output remains an EmptyResponse error.
     const { agent, model } = makeAgent();
     model.pushResponse({
       content: [{ type: "thinking", text: "musing" }],
       usage: usage(1, 2),
-      stop_reason: "end_turn",
+      stop_reason: "max_tokens",
     });
     const result = await agent.turn(ctxUser("?"));
     expect(result.kind).toBe("error");

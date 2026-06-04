@@ -63,7 +63,9 @@ describe("Agent fixture replay — turn_classification.jsonl", () => {
       expect(r3.calls[1]!.id).toBe("toolu_b2");
     }
 
-    // 4. Empty content + end_turn → EmptyResponse(usage_some)
+    // 4. Empty content + a truncated stop (max_tokens) → EmptyResponse(usage_some).
+    //    (A clean end_turn empty is instead a completion; only abnormal/truncated
+    //    empties remain errors.)
     const r4 = await agent.turn(emptyContext());
     expect(r4.kind).toBe("error");
     if (r4.kind === "error") {
