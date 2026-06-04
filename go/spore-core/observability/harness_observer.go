@@ -560,6 +560,17 @@ func (b *HarnessBuilder) Sandbox(sandbox sporecore.SandboxProvider) *HarnessBuil
 	return b
 }
 
+// ContextManager overrides the ContextManager that assembles per-turn context
+// and drives compaction. ConversationalBuilder installs a
+// StandardContextManager with the default compaction config (compaction at 80%
+// of a 200K window); supply your own (e.g. one built with a lower threshold) to
+// make compaction fire earlier for models with a smaller context window.
+// Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) ContextManager(contextManager sporecore.ContextManager) *HarnessBuilder {
+	b.contextManager = contextManager
+	return b
+}
+
 // SystemPrompt sets an operating system prompt prepended to each turn's
 // assembled context (issue #91).
 //

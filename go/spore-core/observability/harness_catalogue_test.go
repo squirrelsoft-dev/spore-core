@@ -69,6 +69,34 @@ func TestSandboxSetterOverridesTheConfiguredSandbox(t *testing.T) {
 	}
 }
 
+// sentinelContextManager is a distinct ContextManager used to assert the
+// ContextManager() setter overrides the manager the builder was constructed
+// with. It embeds NoopContextManager for the behaviour and carries an id so the
+// configured value can be identity-checked.
+type sentinelContextManager struct {
+	sporecore.NoopContextManager
+	id int
+}
+
+// Mirrors the Rust context_manager_setter_overrides_the_configured_manager
+// test: the ContextManager() setter overrides the manager the builder was
+// constructed with, and that overriding value is what lands in the built
+// HarnessConfig.
+func TestContextManagerSetterOverridesTheConfiguredManager(t *testing.T) {
+	override := sentinelContextManager{id: 9}
+	cfg := builderForCatalogue(sporecore.NewMockAgent("t")).
+		ContextManager(override).
+		BuildConfig()
+
+	got, ok := cfg.ContextManager.(sentinelContextManager)
+	if !ok {
+		t.Fatalf("expected the override context manager, got %T", cfg.ContextManager)
+	}
+	if got.id != override.id {
+		t.Fatalf("context manager not overridden: got id=%d want %d", got.id, override.id)
+	}
+}
+
 // Issue #91: catalogue tools added via Tool() are folded into a populated
 // CatalogueRegistry, and — because catalogue tools are present and no storage was
 // wired — the run store defaults to in-memory (not no-op) so a put/get round-trips.
