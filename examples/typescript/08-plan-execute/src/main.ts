@@ -39,6 +39,19 @@
  * - `write_file` — the agent writes `async-comparison.md` into `workspace/`.
  * - `read_file` — lets the agent re-read what it wrote.
  *
+ * ## Staying within small (~128K) context windows
+ *
+ * Under PlanExecute, verbose tool output is retained across every plan step, so
+ * a few searches can overflow a model with a ~128K window (e.g. `gemma4:e4b`,
+ * 131072 tokens). Two measures keep this example running cleanly on such models:
+ *
+ * - It **distills `web_search` results**: a {@link ConciseWebSearch} wrapper
+ *   trims the verbatim SearXNG JSON (25-40K tokens/call) down to the top 6
+ *   results with only `title` / `url` / `content`, so context stays small.
+ * - It **lowers the compaction threshold** to `0.45` (compaction at ≈90K tokens
+ *   instead of the default ≈160K), installed via `.contextManager(...)`, so
+ *   compaction fires before a 128K-window model overflows.
+ *
  * ## Run it
  *
  * ```sh
@@ -60,11 +73,20 @@ import {
   OllamaModelInterface,
   SessionId,
   WorkspaceScopedSandbox,
+  cacheProvider,
+  context,
   hooks,
   newTask,
+  toolRegistry,
   type HarnessStreamEvent,
+  type SandboxProvider,
+  type ToolCall,
+  type ToolOutput,
 } from "@spore/core";
 import { StandardTools, WebSearchTool } from "@spore/tools";
+
+type Tool = toolRegistry.Tool;
+type ToolContext = toolRegistry.ToolContext;
 
 const SYSTEM_PROMPT =
   "You are a research-and-writing agent. Your ONLY capabilities are: web_search " +
@@ -120,6 +142,85 @@ class PlanExecuteReporter implements hooks.Hook {
   name(): string {
     return "plan-execute-reporter";
   }
+}
+
+/**
+ * A thin wrapper around the built-in {@link WebSearchTool} that distills its
+ * output.
+ *
+ * WHY: the core `web_search` tool returns the SearXNG JSON body VERBATIM (by
+ * frozen spec — normalization is out of scope for the core tool). Each search
+ * yields ~25-30 results, each carrying the full `content` plus a dozen noise
+ * fields (`thumbnail`, `engine`, `score`, `parsed_url`, …) — roughly 25-40K
+ * tokens per call. Under PlanExecute those dumps are retained across every plan
+ * step, so three searches alone can overflow a ~128K-window model. This wrapper
+ * keeps only the top results and the fields the agent actually reads, so the
+ * conversation context stays small. The model still sees an identical
+ * `web_search` tool (same name + schema); only the *result* is trimmed.
+ */
+class ConciseWebSearch implements Tool {
+  readonly name = "web_search";
+
+  constructor(private readonly inner: WebSearchTool) {}
+
+  mayProduceLargeOutput(): boolean {
+    return true;
+  }
+
+  async execute(
+    call: ToolCall,
+    sandbox: SandboxProvider,
+    ctx: ToolContext,
+    signal?: AbortSignal,
+  ): Promise<ToolOutput> {
+    const out = await this.inner.execute(call, sandbox, ctx, signal);
+    // Errors and every non-success variant pass through untouched.
+    if (out.kind !== "success") {
+      return out;
+    }
+    return {
+      kind: "success",
+      content: distillSearchResults(out.content),
+      truncated: out.truncated,
+    };
+  }
+}
+
+/**
+ * Keep only the top 6 results, and for each only `title` / `url` / `content`
+ * (content clipped to ~500 chars). Drop all other fields and top-level keys
+ * (`answers`, `infoboxes`, `suggestions`, `unresponsive_engines`, …), and
+ * re-serialize as compact `{"results":[...]}`. Defensive: if the body is not
+ * JSON or has no `results` array, the original string is returned unchanged —
+ * we never error just because the shape was unexpected.
+ */
+function distillSearchResults(content: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  const results =
+    typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>).results
+      : undefined;
+  if (!Array.isArray(results)) {
+    return content;
+  }
+
+  const distilled = results.slice(0, 6).map((r) => {
+    const rec = (typeof r === "object" && r !== null ? r : {}) as Record<
+      string,
+      unknown
+    >;
+    const title = typeof rec.title === "string" ? rec.title : "";
+    const url = typeof rec.url === "string" ? rec.url : "";
+    const body = typeof rec.content === "string" ? rec.content : "";
+    return { title, url, content: [...body].slice(0, 500).join("") };
+  });
+
+  return JSON.stringify({ results: distilled });
 }
 
 async function main(): Promise<void> {
@@ -179,17 +280,37 @@ async function main(): Promise<void> {
   // The ONLY substantive change vs 06 is the loop strategy on the Task below.
   const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
+
+  // Lower the compaction threshold so it fires at ~0.45 * 200K ≈ 90K tokens,
+  // BEFORE a ~128K-window model (e.g. `gemma4:e4b`) overflows. `conversational`
+  // installs a StandardContextManager with default compaction (compaction at 80%
+  // of a 200K window ≈ 160K), which is too late here. The context manager gets
+  // its OWN raw model instance for summarization turns (it advertises no tools).
+  const contextManager = context.intoHarnessAdapter(
+    new context.StandardContextManager(
+      OllamaModelInterface.withBaseUrl(modelId, baseUrl),
+      new cacheProvider.NullCacheProvider(),
+      { ...context.defaultCompactionConfig(), threshold: 0.45 },
+    ),
+  );
+
   const harness = HarnessBuilder.conversational(model)
     .sandbox(sandbox) // same as 06
+    .contextManager(contextManager)
     .tool({
       // GET <endpoint>?q=<query>; the endpoint's `?format=json` is preserved.
-      implementation: WebSearchTool.withConfig({
-        endpoint,
-        method: "GET",
-        queryParam: "q",
-        authHeaders: [],
-        bodyAuthParams: [],
-      }),
+      // Wrapped in ConciseWebSearch so verbose SearXNG JSON is distilled before
+      // it enters the conversation (see the struct doc above). Same name +
+      // schema, so the model sees an identical `web_search` tool.
+      implementation: new ConciseWebSearch(
+        WebSearchTool.withConfig({
+          endpoint,
+          method: "GET",
+          queryParam: "q",
+          authHeaders: [],
+          bodyAuthParams: [],
+        }),
+      ),
       schema: WebSearchTool.schema(),
     })
     .tool(StandardTools.writeFile())
