@@ -36,7 +36,20 @@
 // stop hook onto whatever chain is set, so registering the reporter on our chain
 // first is all that is needed.
 //
-// # Tools (all from the built-in catalogue — no custom impl Tool)
+// # Staying within small (~128K) context windows
+//
+// Under PlanExecute, verbose tool output is retained across every plan step, so
+// a few searches can overflow a model with a ~128K window (e.g. gemma4:e4b,
+// 131072 tokens). Two measures keep this example running cleanly on such models:
+//
+//   - It DISTILLS web_search results: a conciseWebSearch wrapper trims the
+//     verbatim SearXNG JSON (25-40K tokens/call) down to the top 6 results with
+//     only title / url / content, so context stays small.
+//   - It LOWERS the compaction threshold to 0.45 (compaction at ≈90K tokens
+//     instead of the default ≈160K), installed via ContextManager(...), so
+//     compaction fires before a 128K-window model overflows.
+//
+// # Tools (web_search is wrapped to distill its output; the rest are catalogue)
 //
 //   - web_search — built via tools.NewWebSearchToolFromConfig with a GET config
 //     (Method=GET, QueryParam="q"). The tool issues GET <endpoint>?q=<query>,
@@ -65,6 +78,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,6 +86,7 @@ import (
 	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/observability"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/ollama"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/tools"
@@ -135,6 +150,95 @@ func (planExecuteReporter) Name() string { return "plan-execute-reporter" }
 func (planExecuteReporter) SyncMode() sporecore.HookSync { return sporecore.HookSyncSync }
 
 var _ sporecore.Hook = planExecuteReporter{}
+
+// conciseWebSearch is a thin wrapper around the built-in web_search tool that
+// distills its output.
+//
+// WHY: the core web_search tool returns the SearXNG JSON body VERBATIM (by
+// frozen spec — normalization is out of scope for the core tool). Each search
+// yields ~25-30 results, each carrying the full content plus a dozen noise
+// fields (thumbnail, engine, score, parsed_url, …) — roughly 25-40K tokens per
+// call. Under PlanExecute those dumps are retained across every plan step, so
+// three searches alone can overflow a ~128K-window model. This wrapper keeps
+// only the top results and the fields the agent actually reads, so the
+// conversation context stays small. The model still sees an identical
+// web_search tool (same name + schema); only the result is trimmed.
+type conciseWebSearch struct {
+	inner *tools.WebSearchTool
+}
+
+func (w conciseWebSearch) Name() string                { return w.inner.Name() }
+func (w conciseWebSearch) IsSubagentTool() bool        { return w.inner.IsSubagentTool() }
+func (w conciseWebSearch) MayProduceLargeOutput() bool { return true }
+
+func (w conciseWebSearch) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, toolCtx *sporecore.ToolContext) sporecore.ToolOutput {
+	out := w.inner.Execute(ctx, call, sandbox, toolCtx)
+	// Distill only successful output; errors and every non-success variant pass
+	// through untouched.
+	if out.Kind == sporecore.ToolOutputSuccess {
+		out.Content = distillSearchResults(out.Content)
+	}
+	return out
+}
+
+var _ sporecore.Tool = conciseWebSearch{}
+
+// distillSearchResults keeps only the top 6 results, and for each only title /
+// url / content (content clipped to ~500 chars). It drops all other fields and
+// top-level keys (answers, infoboxes, suggestions, unresponsive_engines, …) and
+// re-serializes as compact {"results":[...]}. Defensive: if the body is not
+// JSON or has no results array, the original string is returned unchanged — we
+// never error just because the shape was unexpected.
+func distillSearchResults(content string) string {
+	var body struct {
+		Results []json.RawMessage `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(content), &body); err != nil || body.Results == nil {
+		return content
+	}
+
+	type distilled struct {
+		Title   string `json:"title"`
+		URL     string `json:"url"`
+		Content string `json:"content"`
+	}
+	out := struct {
+		Results []distilled `json:"results"`
+	}{Results: []distilled{}}
+
+	for i, raw := range body.Results {
+		if i >= 6 {
+			break
+		}
+		var r struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Content string `json:"content"`
+		}
+		_ = json.Unmarshal(raw, &r) // best-effort: missing fields stay empty
+		out.Results = append(out.Results, distilled{
+			Title:   r.Title,
+			URL:     r.URL,
+			Content: clip(r.Content, 500),
+		})
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return content
+	}
+	return string(encoded)
+}
+
+// clip truncates s to at most n runes (not bytes), so multibyte content is not
+// split mid-character.
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -216,14 +320,35 @@ func run() error {
 		return fmt.Errorf("failed to create sandbox: %w", err)
 	}
 
+	// Wrap the raw WebSearchTool in conciseWebSearch so verbose SearXNG JSON is
+	// distilled before it enters the conversation (see the struct doc above).
+	// Same name + schema, so the model sees an identical web_search tool.
+	concise := conciseWebSearch{inner: webSearch}
+
+	// Lower the compaction threshold so it fires at ~0.45 * 200K ≈ 90K tokens,
+	// BEFORE a ~128K-window model (e.g. gemma4:e4b) overflows. ConversationalBuilder
+	// installs a StandardContextManager with the default compaction config
+	// (compaction at 80% of a 200K window ≈ 160K), which is too late here. The
+	// context manager gets its OWN raw model instance for summarization turns.
+	compaction := contextmgr.DefaultCompactionConfig()
+	compaction.Threshold = 0.45
+	contextManager := contextmgr.NewStandardCompactionAdapter(
+		contextmgr.NewStandardContextManager(
+			ollama.WithBaseURL(model, baseURL),
+			contextmgr.NullCacheProvider{},
+			compaction,
+		),
+	)
+
 	// Go hooks-wiring asymmetry: the builder has no .Hooks() setter. Build the
 	// config, register the reporter on a chain, then set cfg.Hooks before
 	// NewStandardHarness. The chain is how the plan becomes visible — there are no
 	// plan/subtask stream events.
 	cfg := observability.ConversationalBuilder(mi).
 		Sandbox(sandbox).
-		Tool(tools.StandardTool{Implementation: webSearch, Schema: webSearch.Schema()}). // ← external API (SearXNG GET/JSON)
-		Tool(tools.StandardTools{}.WriteFile()).                                         // ← writes async-comparison.md
+		ContextManager(contextManager).                                                // ← compaction fires ~90K, not ~160K (small windows)
+		Tool(tools.StandardTool{Implementation: concise, Schema: webSearch.Schema()}). // ← external API (SearXNG GET/JSON), distilled
+		Tool(tools.StandardTools{}.WriteFile()).                                       // ← writes async-comparison.md
 		Tool(tools.StandardTools{}.ReadFile()).
 		SystemPrompt(systemPrompt).
 		// Native Ollama tool calling by default — it exposes the real typed tool
