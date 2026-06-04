@@ -329,6 +329,9 @@ func (o *capturingObserver) EmitCompactionVerificationFailed(_ string, _ Session
 }
 func (o *capturingObserver) EmitHillClimbingIteration(string, SessionID, TaskID, string, uint32, float64, bool, float64, bool, string, bool) {
 }
+func (o *capturingObserver) EmitConsultSpawned(string, SessionID, TaskID, string, string) {}
+func (o *capturingObserver) EmitConsultResumed(string, SessionID, TaskID, string, string, bool) {
+}
 
 var _ HarnessObserver = (*capturingObserver)(nil)
 

@@ -95,6 +95,9 @@ func (o *escalationObserver) EmitCompactionVerificationFailed(string, SessionID,
 }
 func (o *escalationObserver) EmitHillClimbingIteration(string, SessionID, TaskID, string, uint32, float64, bool, float64, bool, string, bool) {
 }
+func (o *escalationObserver) EmitConsultSpawned(string, SessionID, TaskID, string, string) {}
+func (o *escalationObserver) EmitConsultResumed(string, SessionID, TaskID, string, string, bool) {
+}
 
 var _ HarnessObserver = (*escalationObserver)(nil)
 

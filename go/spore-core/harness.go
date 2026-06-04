@@ -762,6 +762,16 @@ const (
 	// HumanRequest.Clarification, preserving the clarifying call as the head of
 	// PendingToolCalls, and on resume injects the answer as that call's result.
 	ToolOutputAwaitingClarification ToolOutputKind = "awaiting_clarification"
+	// ToolOutputConsult — mid-loop consult signal (issue #114). A worker-side
+	// tool returns it with ChildState nil; the worker harness pauses and returns
+	// RunResult.Consult with the consult call as the head of PendingToolCalls
+	// (HumanRequest nil). At the subagent boundary SubagentTool populates
+	// ChildState — but in the A1 mediation seam it consumes the signal itself
+	// rather than bubbling it, so a parent orchestrator never observes this
+	// variant on the happy path. Mirrors ToolOutputWaitingForHuman. ONE variant:
+	// the optional ChildState distinguishes worker-side (nil) from the
+	// subagent boundary (populated).
+	ToolOutputConsult ToolOutputKind = "consult"
 )
 
 // ToolOutput is the result of dispatching one tool call. Full shape lives
@@ -791,6 +801,10 @@ type ToolOutput struct {
 	Question string `json:"-"`
 	// Options is nil for a free-form clarification.
 	Options *[]string `json:"-"`
+	// consult (issue #114). ConsultRequest is the worker's ask. ChildState
+	// (above) is reused: nil for the worker-side signal, populated by
+	// SubagentTool at the subagent boundary.
+	ConsultRequest *ConsultRequest `json:"-"`
 }
 
 // MarshalJSON serialises ToolOutput as a flat tagged object.
@@ -832,6 +846,21 @@ func (o ToolOutput) MarshalJSON() ([]byte, error) {
 			Question string         `json:"question"`
 			Options  []string       `json:"options"`
 		}{o.Kind, o.Question, opts})
+	case ToolOutputConsult:
+		// ChildState is OMITTED (skip_serializing_if = "Option::is_none") for
+		// the worker-side signal and POPULATED at the subagent boundary, so the
+		// two fixture shapes round-trip byte-identically.
+		if o.ChildState == nil {
+			return json.Marshal(struct {
+				Kind    ToolOutputKind  `json:"kind"`
+				Request *ConsultRequest `json:"request"`
+			}{o.Kind, o.ConsultRequest})
+		}
+		return json.Marshal(struct {
+			Kind       ToolOutputKind    `json:"kind"`
+			ChildState *ChildPausedState `json:"child_state"`
+			Request    *ConsultRequest   `json:"request"`
+		}{o.Kind, o.ChildState, o.ConsultRequest})
 	default:
 		return nil, fmt.Errorf("ToolOutput: unknown kind %q", o.Kind)
 	}
@@ -864,6 +893,19 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 	o.Signal = probe.Signal
 	o.Question = probe.Question
 	o.Options = probe.Options
+	// consult (issue #114): the "request" key here is a ConsultRequest, not a
+	// HumanRequest. Re-read it into the dedicated field for that variant so the
+	// two "request"-keyed variants do not collide on one probe field.
+	if probe.Kind == ToolOutputConsult {
+		var cr struct {
+			Request *ConsultRequest `json:"request"`
+		}
+		if err := json.Unmarshal(data, &cr); err != nil {
+			return err
+		}
+		o.ConsultRequest = cr.Request
+		o.Request = nil
+	}
 	return nil
 }
 
@@ -872,6 +914,15 @@ func (o *ToolOutput) UnmarshalJSON(data []byte) error {
 // Truncated fields. Mirrors Rust's ToolOutput::success.
 func NewToolOutputSuccess(content string) ToolOutput {
 	return ToolOutput{Kind: ToolOutputSuccess, Content: content, Truncated: false}
+}
+
+// NewToolOutputConsult returns a WORKER-SIDE consult signal (issue #114): the
+// tool asks for mid-loop help. ChildState is nil — the harness loop builds the
+// RunResult.Consult pause; only SubagentTool populates ChildState at the
+// subagent boundary. Mirrors Rust's ToolOutput::consult.
+func NewToolOutputConsult(request ConsultRequest) ToolOutput {
+	r := request
+	return ToolOutput{Kind: ToolOutputConsult, ConsultRequest: &r}
 }
 
 // NewToolOutputError returns a RECOVERABLE error: the harness loop appends it as
@@ -1517,6 +1568,31 @@ type HarnessObserver interface {
 		status string,
 		reverted bool,
 	)
+
+	// EmitConsultSpawned records a worker pausing mid-loop to consult a
+	// parent-spawned helper (issue #114), emitted when the loop returns
+	// RunResult.Consult. Lightweight — alongside the SkillInjected event family.
+	// Fire-and-forget; never affects control flow.
+	EmitConsultSpawned(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		consultKind string,
+	)
+
+	// EmitConsultResumed records a paused worker being resumed after a consult
+	// (issue #114), emitted by the ResumeConsult seam. answered is false when the
+	// resume carried a budget-exhausted soft-fail rather than a handler answer.
+	// Fire-and-forget; never affects control flow.
+	EmitConsultResumed(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		consultKind string,
+		answered bool,
+	)
 }
 
 // ============================================================================
@@ -1693,6 +1769,140 @@ func (h *HumanResponse) UnmarshalJSON(data []byte) error {
 	h.Text = probe.Text
 	h.Feedback = probe.Feedback
 	return nil
+}
+
+// ============================================================================
+// Mid-loop consult primitive (issue #114)
+// ============================================================================
+//
+// A third pause/resume path that STOPS AT THE ORCHESTRATOR instead of bubbling
+// to the human. A worker-side tool returns ToolOutput.Consult; the worker
+// harness pauses and returns RunResult.Consult (sibling of WaitingForHuman,
+// HumanRequest nil). At the subagent boundary the SubagentTool (tools/subagent.go)
+// drives the full run -> consult -> route-by-kind -> budget-check -> run-handler
+// -> resume-worker loop internally (mediation seam A1), so the parent
+// orchestrator's model never sees the consult and depth-1 is preserved.
+//
+// Per go/CONVENTIONS.md the consult-handler config is a HarnessConfig struct
+// FIELD (ConsultHandlers), not a builder setter — matching the established
+// PlannerAgent / Verifier / VcsProvider divergence.
+
+// ConsultRequest is the worker's free-form ask when it pauses mid-loop to
+// consult a parent-spawned helper (issue #114). Kind selects the handler;
+// Situation / Attempts / Question carry the free-form context the handler
+// needs. All fields are REQUIRED on the wire (no omitempty) so a malformed
+// request fails to round-trip rather than silently defaulting.
+type ConsultRequest struct {
+	// Kind is the routing key — selects the ConsultHandlerEntry in
+	// HarnessConfig.ConsultHandlers.
+	Kind string `json:"kind"`
+	// Situation is a free-form description of where the worker is stuck.
+	Situation string `json:"situation"`
+	// Attempts is how many times the worker has already tried (advisory; the
+	// harness enforces the per-kind budget independently).
+	Attempts uint32 `json:"attempts"`
+	// Question is the concrete question the worker wants answered.
+	Question string `json:"question"`
+}
+
+// ConsultResponseKind discriminates ConsultResponse variants.
+type ConsultResponseKind string
+
+const (
+	// ConsultRespAnswer — the handler produced an answer; Text is injected as
+	// the tool RESULT for the pending consult call.
+	ConsultRespAnswer ConsultResponseKind = "answer"
+	// ConsultRespBudgetExhausted — the per-kind budget is exhausted under a
+	// SoftFail overflow policy: the worker is resumed with Message and finishes
+	// with what it has.
+	ConsultRespBudgetExhausted ConsultResponseKind = "budget_exhausted"
+)
+
+// ConsultResponse is the resume input handed back to a paused worker after a
+// consult (issue #114). Parallel to HumanResponse; tagged on Kind, snake_case.
+type ConsultResponse struct {
+	Kind ConsultResponseKind `json:"kind"`
+	// answer
+	Text string `json:"-"`
+	// budget_exhausted
+	Message string `json:"-"`
+}
+
+// MarshalJSON serialises ConsultResponse as a flat tagged object.
+func (c ConsultResponse) MarshalJSON() ([]byte, error) {
+	switch c.Kind {
+	case ConsultRespAnswer:
+		return json.Marshal(struct {
+			Kind ConsultResponseKind `json:"kind"`
+			Text string              `json:"text"`
+		}{c.Kind, c.Text})
+	case ConsultRespBudgetExhausted:
+		return json.Marshal(struct {
+			Kind    ConsultResponseKind `json:"kind"`
+			Message string              `json:"message"`
+		}{c.Kind, c.Message})
+	default:
+		return nil, fmt.Errorf("ConsultResponse: unknown kind %q", c.Kind)
+	}
+}
+
+// UnmarshalJSON decodes the flat tagged form.
+func (c *ConsultResponse) UnmarshalJSON(data []byte) error {
+	var probe struct {
+		Kind    ConsultResponseKind `json:"kind"`
+		Text    string              `json:"text"`
+		Message string              `json:"message"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	c.Kind = probe.Kind
+	c.Text = probe.Text
+	c.Message = probe.Message
+	return nil
+}
+
+// NewConsultAnswer builds an Answer response.
+func NewConsultAnswer(text string) ConsultResponse {
+	return ConsultResponse{Kind: ConsultRespAnswer, Text: text}
+}
+
+// NewConsultBudgetExhausted builds a BudgetExhausted response.
+func NewConsultBudgetExhausted(message string) ConsultResponse {
+	return ConsultResponse{Kind: ConsultRespBudgetExhausted, Message: message}
+}
+
+// ConsultOverflowPolicyKind discriminates per-kind budget-overflow behaviours.
+type ConsultOverflowPolicyKind string
+
+const (
+	// ConsultOverflowSoftFail — resume the worker with ConsultResponse.BudgetExhausted
+	// so it finishes without further help.
+	ConsultOverflowSoftFail ConsultOverflowPolicyKind = "soft_fail"
+	// ConsultOverflowEscalateToHuman — convert the over-budget consult into
+	// RunResult.WaitingForHuman so the host decides.
+	ConsultOverflowEscalateToHuman ConsultOverflowPolicyKind = "escalate_to_human"
+)
+
+// ConsultOverflowPolicy is the per-kind budget-overflow behaviour (issue #114).
+// Tagged on Kind, snake_case.
+type ConsultOverflowPolicy struct {
+	Kind ConsultOverflowPolicyKind `json:"kind"`
+}
+
+// ConsultHandlerEntry is a registered consult handler: the helper harness to
+// run, the per-kind budget (max consults of this kind before overflow), and the
+// overflow policy (issue #114). Held by kind in HarnessConfig.ConsultHandlers.
+// The Handler is run by SubagentTool as the ORCHESTRATOR's direct child
+// (depth-1, R7), never nested under the worker.
+type ConsultHandlerEntry struct {
+	// Handler is the helper harness run on the ConsultRequest.
+	Handler Harness
+	// Budget is the max number of consults of this kind before the overflow
+	// policy applies.
+	Budget uint32
+	// Overflow is what to do once the budget is exhausted.
+	Overflow ConsultOverflowPolicy
 }
 
 // ============================================================================
@@ -2057,6 +2267,14 @@ const (
 	// caller can resume the original harness, instantiate a new one, or present
 	// UI to the user.
 	RunEscalate RunResultKind = "escalate"
+	// RunConsult — worker paused mid-loop to consult a parent-spawned helper
+	// (issue #114). Sibling of RunWaitingForHuman, but it stops at the
+	// ORCHESTRATOR (via SubagentTool's A1 mediation), not the human. State
+	// preserves the full PausedState with HumanRequest nil and the consult call
+	// as the head of PendingToolCalls, so ResumeConsult continues the worker.
+	// With no consult handlers registered, a standalone worker returns this
+	// unchanged to its caller (R6 graceful degradation).
+	RunConsult RunResultKind = "consult"
 )
 
 // RunResult is the outcome of Harness.Run / Harness.Resume.
@@ -2083,6 +2301,9 @@ type RunResult struct {
 	Request *HumanRequest `json:"-"`
 	// escalate (issue #80)
 	Signal *HarnessSignal `json:"-"`
+	// consult (issue #114): the worker's ConsultRequest. State (above) carries
+	// the paused worker; SessionID/Usage/Turns carry the pause snapshot.
+	ConsultRequest *ConsultRequest `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -2122,6 +2343,15 @@ func (r RunResult) MarshalJSON() ([]byte, error) {
 			Usage     AggregateUsage `json:"usage"`
 			Turns     uint32         `json:"turns"`
 		}{r.Kind, r.Signal, r.State, r.SessionID, r.Usage, r.Turns})
+	case RunConsult:
+		return json.Marshal(struct {
+			Kind      RunResultKind   `json:"kind"`
+			Request   *ConsultRequest `json:"request"`
+			State     *PausedState    `json:"state"`
+			SessionID SessionID       `json:"session_id"`
+			Usage     AggregateUsage  `json:"usage"`
+			Turns     uint32          `json:"turns"`
+		}{r.Kind, r.ConsultRequest, r.State, r.SessionID, r.Usage, r.Turns})
 	default:
 		return nil, fmt.Errorf("RunResult: unknown kind %q", r.Kind)
 	}
@@ -2157,6 +2387,18 @@ func (r *RunResult) UnmarshalJSON(data []byte) error {
 	r.State = probe.State
 	r.Request = probe.Request
 	r.Signal = probe.Signal
+	// consult (issue #114): the "request" key here is a ConsultRequest, not a
+	// HumanRequest. Re-read it into the dedicated field for that variant.
+	if probe.Kind == RunConsult {
+		var cr struct {
+			Request *ConsultRequest `json:"request"`
+		}
+		if err := json.Unmarshal(data, &cr); err != nil {
+			return err
+		}
+		r.ConsultRequest = cr.Request
+		r.Request = nil
+	}
 	return nil
 }
 
@@ -2184,6 +2426,12 @@ func NewHarnessRunOptions(t Task) HarnessRunOptions {
 type Harness interface {
 	Run(ctx context.Context, options HarnessRunOptions) RunResult
 	Resume(ctx context.Context, state PausedState, response HumanResponse, onStream StreamSink) RunResult
+	// ResumeConsult resumes a worker paused by RunResult.Consult (issue #114).
+	// The resume seam parallel to Resume: it injects the ConsultResponse as the
+	// tool RESULT of the head pending consult call, dispatches any remaining
+	// pending calls, and resumes the loop. SubagentTool calls this internally
+	// during A1 mediation; the orchestrator model is never involved.
+	ResumeConsult(ctx context.Context, state PausedState, response ConsultResponse, onStream StreamSink) RunResult
 }
 
 // ============================================================================
@@ -2368,6 +2616,18 @@ type HarnessConfig struct {
 	// non-conversational construction) disables the escalation seam entirely —
 	// the loop never reads or writes it.
 	PromptToolCallFlag *atomic.Bool // optional (set by the conversational preset)
+
+	// ConsultHandlers is the per-kind consult-handler map (issue #114), keyed by
+	// ConsultRequest.Kind. Per go/CONVENTIONS.md this is a struct FIELD, not a
+	// builder setter — matching the established PlannerAgent / Verifier /
+	// VcsProvider divergence. Empty (the default) means consults are NOT mediated:
+	// a worker that pauses with RunResult.Consult surfaces it unchanged to its
+	// caller (R6 graceful degradation), and existing callers are unaffected
+	// byte-for-byte (R9). When populated, the orchestrator passes a copy to its
+	// SubagentTool (via SubagentTool.WithConsultHandlers); SubagentTool runs the
+	// matching entry's helper harness deterministically (the A1 mediation seam) —
+	// the orchestrator model is never involved.
+	ConsultHandlers map[string]ConsultHandlerEntry // optional
 }
 
 // SessionStore is the consumer-side view of the pause/resume lifecycle store
@@ -2643,8 +2903,10 @@ func (h *StandardHarness) autoPersistTerminal(ctx context.Context, result *RunRe
 			BudgetUsed:       BudgetSnapshot{},
 			ChildState:       nil,
 		}
-	case RunWaitingForHuman, RunEscalate:
-		// Persist the carried pause state directly (D6).
+	case RunWaitingForHuman, RunEscalate, RunConsult:
+		// Persist the carried pause state directly (D6). RunConsult (issue #114)
+		// is non-terminal but carries a full PausedState — persist it like
+		// WaitingForHuman so a cross-process host can later ResumeConsult it.
 		if result.State == nil {
 			return
 		}
@@ -3130,6 +3392,11 @@ func (h *StandardHarness) runExecutePhase(
 
 		case RunWaitingForHuman:
 			// A step surfacing to a human pauses the whole run; propagate.
+			return subResult
+
+		case RunConsult:
+			// A step pausing to consult (issue #114) pauses the whole run;
+			// propagate the consult so the caller (or SubagentTool) mediates.
 			return subResult
 
 		case RunEscalate:
@@ -3852,6 +4119,45 @@ func (h *StandardHarness) runReActInner(
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
 
+				// Consult pause (issue #114, R1/R10): a worker-side tool returns
+				// ToolOutput.Consult (ChildState nil) to ask for mid-loop help.
+				// Like the AwaitingClarification arm there is NO ChildPausedState
+				// at this level — the loop builds a PausedState directly with
+				// HumanRequest nil and preserves the CONSULTING call as the HEAD of
+				// PendingToolCalls (followed by the remaining batch), so that on
+				// ResumeConsult the helper's answer is injected as the tool RESULT
+				// for that pending call. The consult is a control signal, NOT a
+				// conversation turn: it is never appended to message history here
+				// (R10).
+				if output.Kind == ToolOutputConsult {
+					pending := append([]ToolCall{call}, calls[i+1:]...)
+					req := ConsultRequest{}
+					if output.ConsultRequest != nil {
+						req = *output.ConsultRequest
+					}
+					// Observability: lightweight consult-spawn event (issue #114).
+					if h.config.Observability != nil {
+						h.config.Observability.EmitConsultSpawned(
+							fmt.Sprintf("%s-consult-spawn-%s", sessionID, call.ID),
+							sessionID, task.ID, nowRFC3339(), req.Kind,
+						)
+					}
+					state := &PausedState{
+						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
+						SessionState: session, PendingToolCalls: pending,
+						ApprovedResults: approved, HumanRequest: nil, Task: task,
+						BudgetUsed: budget, ChildState: nil,
+					}
+					return RunResult{
+						Kind:           RunConsult,
+						ConsultRequest: &req,
+						State:          state,
+						SessionID:      sessionID,
+						Usage:          usage,
+						Turns:          budget.Turns,
+					}
+				}
+
 				// SendMessage (issue #81): the send_message tool surfaces an
 				// out-of-band message to the user. The loop emits a UserMessage
 				// stream event rather than collapsing the content into a normal
@@ -4205,6 +4511,90 @@ func (h *StandardHarness) Resume(
 	result := h.resumeInner(ctx, state, response, onStream)
 	h.autoPersistTerminal(ctx, &result)
 	return result
+}
+
+// ResumeConsult resumes a worker paused by RunResult.Consult (issue #114).
+// Mirrors Resume: it dispatches to resumeConsultInner, then auto-persists the
+// terminal run state when enabled.
+func (h *StandardHarness) ResumeConsult(
+	ctx context.Context,
+	state PausedState,
+	response ConsultResponse,
+	onStream StreamSink,
+) RunResult {
+	result := h.resumeConsultInner(ctx, state, response, onStream)
+	h.autoPersistTerminal(ctx, &result)
+	return result
+}
+
+// resumeConsultInner is the consult resume seam (issue #114). Mirrors the
+// resumeInner clarification branch: the ConsultResponse text is injected as the
+// tool RESULT for the head pending (consult) call — NOT appended as a
+// free-standing user message (R10) — then any remaining pending calls are
+// dispatched and the ReAct loop resumes.
+func (h *StandardHarness) resumeConsultInner(
+	ctx context.Context,
+	state PausedState,
+	response ConsultResponse,
+	onStream StreamSink,
+) RunResult {
+	session := state.SessionState
+	task := state.Task
+	budget := state.BudgetUsed
+	pending := state.PendingToolCalls
+
+	var (
+		text     string
+		answered bool
+	)
+	switch response.Kind {
+	case ConsultRespAnswer:
+		text, answered = response.Text, true
+	case ConsultRespBudgetExhausted:
+		text, answered = response.Message, false
+	}
+
+	// Observability: lightweight consult-resume event (issue #114). Recover the
+	// consult kind from the head pending call's args, if present.
+	if h.config.Observability != nil {
+		kind := ""
+		if len(pending) > 0 && len(pending[0].Input) > 0 {
+			var probe struct {
+				Kind string `json:"kind"`
+			}
+			if json.Unmarshal(pending[0].Input, &probe) == nil {
+				kind = probe.Kind
+			}
+		}
+		h.config.Observability.EmitConsultResumed(
+			fmt.Sprintf("%s-consult-resume", state.SessionID),
+			state.SessionID, task.ID, nowRFC3339(), kind, answered,
+		)
+	}
+
+	toolRegistry := h.effectiveToolRegistry(state.SessionID)
+
+	// Inject the consult answer as the RESULT of the head pending (consult)
+	// call, then dispatch the remaining pending calls in the same batch.
+	if len(pending) > 0 {
+		consultCall := pending[0]
+		tr := HarnessToolResult{
+			CallID: consultCall.ID,
+			Output: ToolOutput{Kind: ToolOutputSuccess, Content: text},
+		}
+		h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
+		for _, call := range pending[1:] {
+			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
+			rtr := HarnessToolResult{CallID: call.ID, Output: output}
+			h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
+		}
+	}
+
+	maxIterations := uint32(^uint32(0))
+	if task.LoopStrategy.Kind == StrategyReAct {
+		maxIterations = task.LoopStrategy.MaxIterations
+	}
+	return h.runReAct(ctx, task, maxIterations, session, budget, onStream)
 }
 
 func (h *StandardHarness) resumeInner(

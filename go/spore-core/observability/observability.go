@@ -298,6 +298,12 @@ const (
 	ContextOpKindCompaction ContextOperationKind = "compaction"
 	// ContextOpKindSkillInjected — a guide/skill was injected.
 	ContextOpKindSkillInjected ContextOperationKind = "skill_injected"
+	// ContextOpKindConsultSpawned — a worker paused mid-loop to consult a
+	// parent-spawned helper (issue #114).
+	ContextOpKindConsultSpawned ContextOperationKind = "consult_spawned"
+	// ContextOpKindConsultResumed — a paused worker was resumed after a consult
+	// (issue #114).
+	ContextOpKindConsultResumed ContextOperationKind = "consult_resumed"
 )
 
 // ContextOperation is a tagged union. Only the field(s) matching Kind are set.
@@ -315,6 +321,10 @@ type ContextOperation struct {
 	TokensReclaimed uint32 `json:"tokens_reclaimed,omitempty"`
 	// SkillInjected
 	GuideID GuideID `json:"guide_id,omitempty"`
+	// ConsultSpawned / ConsultResumed (issue #114)
+	ConsultKind string `json:"consult_kind,omitempty"`
+	// ConsultResumed (issue #114): false => budget-exhausted soft-fail.
+	Answered bool `json:"answered,omitempty"`
 }
 
 // NewContextOpAssembly returns an Assembly operation.
@@ -348,6 +358,16 @@ func NewContextOpCompaction(messagesRemoved, tokensReclaimed uint32) ContextOper
 // NewContextOpSkillInjected returns a SkillInjected operation.
 func NewContextOpSkillInjected(guideID GuideID) ContextOperation {
 	return ContextOperation{Kind: ContextOpKindSkillInjected, GuideID: guideID}
+}
+
+// NewContextOpConsultSpawned returns a ConsultSpawned operation (issue #114).
+func NewContextOpConsultSpawned(consultKind string) ContextOperation {
+	return ContextOperation{Kind: ContextOpKindConsultSpawned, ConsultKind: consultKind}
+}
+
+// NewContextOpConsultResumed returns a ConsultResumed operation (issue #114).
+func NewContextOpConsultResumed(consultKind string, answered bool) ContextOperation {
+	return ContextOperation{Kind: ContextOpKindConsultResumed, ConsultKind: consultKind, Answered: answered}
 }
 
 // ContextSpan is one context operation.

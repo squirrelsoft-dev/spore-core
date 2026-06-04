@@ -137,6 +137,11 @@ type SubagentTool struct {
 	timeout        time.Duration
 	contextSharing ContextSharing
 	harness        sporecore.Harness
+	// consultHandlers is the per-kind consult-handler map (issue #114, seam A1).
+	// Empty (the default) means consults are NOT mediated here — a child
+	// RunResult.Consult degrades gracefully per R6 (no matching kind → Escalate).
+	// Populated via WithConsultHandlers.
+	consultHandlers map[string]sporecore.ConsultHandlerEntry
 }
 
 // NewSubagentTool constructs a SubagentTool. Returns *BuildError if the
@@ -163,6 +168,16 @@ func NewSubagentTool(
 		contextSharing: contextSharing,
 		harness:        harness,
 	}, nil
+}
+
+// WithConsultHandlers installs the per-kind consult handlers (issue #114, seam
+// A1) and returns the receiver for chaining. Typically the orchestrator passes
+// a copy of its HarnessConfig.ConsultHandlers. With handlers installed, this
+// tool MEDIATES a child consult internally (R2/R3) instead of letting it
+// surface; without them, a child consult degrades to Escalate (R6).
+func (s *SubagentTool) WithConsultHandlers(handlers map[string]sporecore.ConsultHandlerEntry) *SubagentTool {
+	s.consultHandlers = handlers
+	return s
 }
 
 // Name returns the registered tool name.
@@ -268,29 +283,155 @@ func (s *SubagentTool) Execute(
 		result = <-resultCh
 	}
 
-	switch result.Kind {
-	case sporecore.RunSuccess:
-		return sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess, Content: result.Output}
-	case sporecore.RunFailure:
-		return sporecore.ToolOutput{
-			Kind:        sporecore.ToolOutputError,
-			Message:     fmt.Sprintf("subagent failed: %s", reasonString(result.Reason)),
-			Recoverable: true,
-		}
-	case sporecore.RunWaitingForHuman:
-		child := childStateFromPaused(result.State, call.ID)
-		return sporecore.ToolOutput{
-			Kind:       sporecore.ToolOutputWaitingForHuman,
-			ChildState: child,
-			Request:    result.Request,
-		}
-	default:
-		return sporecore.ToolOutput{
-			Kind:        sporecore.ToolOutputError,
-			Message:     fmt.Sprintf("subagent returned unknown run result kind %q", result.Kind),
-			Recoverable: false,
+	// Per-kind consult counters (issue #114, R4). Each consult of a given kind
+	// decrements its remaining budget; the (budget+1)th triggers the overflow
+	// policy. Lives across the mediation loop below.
+	consultCounts := map[string]uint32{}
+
+	// A1 mediation loop: drive the full consult cycle internally. On a child
+	// RunResult.Consult, mediate (route → run handler → resume) and continue
+	// until the child reaches a terminal result.
+	for {
+		switch result.Kind {
+		case sporecore.RunSuccess:
+			return sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess, Content: result.Output}
+		case sporecore.RunFailure:
+			return sporecore.ToolOutput{
+				Kind:        sporecore.ToolOutputError,
+				Message:     fmt.Sprintf("subagent failed: %s", reasonString(result.Reason)),
+				Recoverable: true,
+			}
+		case sporecore.RunWaitingForHuman:
+			child := childStateFromPaused(result.State, call.ID)
+			return sporecore.ToolOutput{
+				Kind:       sporecore.ToolOutputWaitingForHuman,
+				ChildState: child,
+				Request:    result.Request,
+			}
+		case sporecore.RunEscalate:
+			// A subagent escalation (issue #80) propagates as a tool-side
+			// escalation: the parent harness terminates cleanly and hands the
+			// signal up to its own caller.
+			return sporecore.ToolOutput{Kind: sporecore.ToolOutputEscalate, Signal: result.Signal}
+		case sporecore.RunConsult:
+			// Mid-loop consult (issue #114, R2): mediate it here — never bubble
+			// it to the parent orchestrator's model.
+			next, terminal, isTerminal := s.mediateConsult(runCtx, result, consultCounts, call.ID)
+			if isTerminal {
+				return terminal
+			}
+			result = next
+			continue
+		default:
+			return sporecore.ToolOutput{
+				Kind:        sporecore.ToolOutputError,
+				Message:     fmt.Sprintf("subagent returned unknown run result kind %q", result.Kind),
+				Recoverable: false,
+			}
 		}
 	}
+}
+
+// mediateConsult mediates one child consult (issue #114, seam A1). Routes by
+// kind, enforces the per-kind budget, runs the handler as the ORCHESTRATOR's
+// direct child (R7), and resumes the worker — OR applies the overflow policy /
+// graceful degradation. Returns (nextResult, "", false) to continue the
+// mediation loop, or (zero, terminalOutput, true) to surface a terminal output.
+func (s *SubagentTool) mediateConsult(
+	ctx context.Context,
+	result sporecore.RunResult,
+	counts map[string]uint32,
+	parentCallID string,
+) (sporecore.RunResult, sporecore.ToolOutput, bool) {
+	request := sporecore.ConsultRequest{}
+	if result.ConsultRequest != nil {
+		request = *result.ConsultRequest
+	}
+	state := sporecore.PausedState{}
+	if result.State != nil {
+		state = *result.State
+	}
+
+	// R6: no matching handler (empty map or unknown kind) → Escalate. Loud, not
+	// silent. The parent harness terminates cleanly.
+	entry, ok := s.consultHandlers[request.Kind]
+	if !ok {
+		return sporecore.RunResult{}, sporecore.ToolOutput{
+			Kind: sporecore.ToolOutputEscalate,
+			Signal: &sporecore.HarnessSignal{
+				Kind:   sporecore.SignalAbort,
+				Reason: fmt.Sprintf("no consult handler registered for kind %q", request.Kind),
+			},
+		}, true
+	}
+
+	// R4: per-kind budget. counts[kind] is the number of consults of this kind
+	// ALREADY mediated. The handler runs while used < budget; the (budget+1)th
+	// consult overflows.
+	if counts[request.Kind] >= entry.Budget {
+		// R5: overflow policy.
+		switch entry.Overflow.Kind {
+		case sporecore.ConsultOverflowSoftFail:
+			// R5a: resume the worker with a BudgetExhausted response so it
+			// finishes with what it has.
+			resp := sporecore.NewConsultBudgetExhausted(fmt.Sprintf(
+				"consult budget for kind %q exhausted; proceed without further help", request.Kind))
+			next := s.harness.ResumeConsult(ctx, state, resp, nil)
+			return next, sporecore.ToolOutput{}, false
+		case sporecore.ConsultOverflowEscalateToHuman:
+			// R5b: convert the over-budget consult into a human pause so the host
+			// decides. The parent sees ToolOutput.WaitingForHuman.
+			child := childStateFromPaused(&state, parentCallID)
+			req := sporecore.HumanRequest{
+				Kind: sporecore.HumanReqReview,
+				Content: fmt.Sprintf(
+					"consult budget for kind %q exhausted. situation: %s | question: %s",
+					request.Kind, request.Situation, request.Question),
+			}
+			return sporecore.RunResult{}, sporecore.ToolOutput{
+				Kind:       sporecore.ToolOutputWaitingForHuman,
+				ChildState: child,
+				Request:    &req,
+			}, true
+		default:
+			return sporecore.RunResult{}, sporecore.ToolOutput{
+				Kind:        sporecore.ToolOutputError,
+				Message:     fmt.Sprintf("unknown consult overflow policy %q", entry.Overflow.Kind),
+				Recoverable: false,
+			}, true
+		}
+	}
+
+	// R3/R7: run the handler harness as the orchestrator's direct child
+	// (depth-1), WITHOUT the orchestrator model. The handler's instruction is
+	// the consult request rendered to text.
+	counts[request.Kind]++
+	instruction := renderConsultInstruction(request)
+	task := sporecore.NewTask(instruction, generateSessionID(), sporecore.LoopStrategy{
+		Kind:          sporecore.StrategyReAct,
+		MaxIterations: 16,
+	})
+	handlerResult := entry.Handler.Run(ctx, sporecore.HarnessRunOptions{Task: task})
+	var answer string
+	if handlerResult.Kind == sporecore.RunSuccess {
+		answer = handlerResult.Output
+	} else {
+		// A handler that does not cleanly complete still must not stall the
+		// worker — feed its failure back as the consult answer so the worker can
+		// adapt. (The orchestrator model is never involved.)
+		answer = fmt.Sprintf("consult handler did not complete cleanly: kind=%s", handlerResult.Kind)
+	}
+	next := s.harness.ResumeConsult(ctx, state, sporecore.NewConsultAnswer(answer), nil)
+	return next, sporecore.ToolOutput{}, false
+}
+
+// renderConsultInstruction renders a ConsultRequest to a handler instruction
+// string (issue #114).
+func renderConsultInstruction(request sporecore.ConsultRequest) string {
+	return fmt.Sprintf(
+		"A worker agent is requesting help (kind: %s).\n\nSituation: %s\n\nAttempts so far: %d\n\nQuestion: %s",
+		request.Kind, request.Situation, request.Attempts, request.Question,
+	)
 }
 
 // resolveSessionContext picks the SessionID and optional seeded SessionState

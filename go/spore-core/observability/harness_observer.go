@@ -349,6 +349,44 @@ func (a *HarnessObservabilityAdapter) EmitHillClimbingIteration(
 	emitter.EmitWarn(NewWarnSpan(base, NewWarnHillClimbingIteration(iteration, mv, d, status, reverted)))
 }
 
+// EmitConsultSpawned builds a context span for a worker pausing mid-loop to
+// consult a parent-spawned helper (issue #114) and forwards it. A lightweight
+// root ContextAssembly span carrying the consult kind — alongside the existing
+// SkillInjected context-operation family.
+func (a *HarnessObservabilityAdapter) EmitConsultSpawned(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	consultKind string,
+) {
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindContextAssembly, Timestamp(startedAt))
+	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
+	a.provider.EmitContext(ContextSpan{
+		Base:      base,
+		Operation: NewContextOpConsultSpawned(consultKind),
+	})
+}
+
+// EmitConsultResumed builds a context span for a paused worker resumed after a
+// consult (issue #114) and forwards it. answered is false for a budget-exhausted
+// soft-fail resume.
+func (a *HarnessObservabilityAdapter) EmitConsultResumed(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	consultKind string,
+	answered bool,
+) {
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindContextAssembly, Timestamp(startedAt))
+	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
+	a.provider.EmitContext(ContextSpan{
+		Base:      base,
+		Operation: NewContextOpConsultResumed(consultKind, answered),
+	})
+}
+
 // Compile-time interface check.
 var _ sporecore.HarnessObserver = (*HarnessObservabilityAdapter)(nil)
 

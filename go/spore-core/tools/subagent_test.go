@@ -11,10 +11,12 @@ import (
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
 
-// scriptedHarness yields a queue of pre-scripted RunResults.
+// scriptedHarness yields a queue of pre-scripted RunResults. ResumeConsult logs
+// the ConsultResponse it was resumed with and pops the next result (issue #114).
 type scriptedHarness struct {
-	mu      sync.Mutex
-	results []sporecore.RunResult
+	mu        sync.Mutex
+	results   []sporecore.RunResult
+	resumeLog []sporecore.ConsultResponse
 }
 
 func (s *scriptedHarness) Run(_ context.Context, _ sporecore.HarnessRunOptions) sporecore.RunResult {
@@ -33,6 +35,18 @@ func (s *scriptedHarness) Run(_ context.Context, _ sporecore.HarnessRunOptions) 
 
 func (s *scriptedHarness) Resume(_ context.Context, _ sporecore.PausedState, _ sporecore.HumanResponse, _ sporecore.StreamSink) sporecore.RunResult {
 	return sporecore.RunResult{Kind: sporecore.RunFailure, Reason: sporecore.HaltReason{Kind: sporecore.HaltHumanHalted}}
+}
+
+func (s *scriptedHarness) ResumeConsult(_ context.Context, _ sporecore.PausedState, response sporecore.ConsultResponse, _ sporecore.StreamSink) sporecore.RunResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeLog = append(s.resumeLog, response)
+	if len(s.results) == 0 {
+		return sporecore.RunResult{Kind: sporecore.RunSuccess, Output: "child done after consult"}
+	}
+	r := s.results[0]
+	s.results = s.results[1:]
+	return r
 }
 
 func newSubagent(t *testing.T, h sporecore.Harness, sharing ContextSharing) *SubagentTool {
