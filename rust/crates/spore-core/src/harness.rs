@@ -2187,6 +2187,16 @@ impl HarnessBuilder {
         self
     }
 
+    /// Override the [`ContextManager`] that assembles per-turn context and drives
+    /// compaction. `conversational` installs a `StandardContextManager` with
+    /// `CompactionConfig::default()` (compaction at 80% of a 200K window); supply
+    /// your own (e.g. a lower `threshold`) to make compaction fire earlier for
+    /// models with a smaller context window.
+    pub fn context_manager(mut self, context_manager: Arc<dyn ContextManager>) -> Self {
+        self.context_manager = context_manager;
+        self
+    }
+
     /// Override the [`SandboxProvider`] — the only path tools have to the
     /// environment (filesystem, process exec).
     ///
@@ -6866,6 +6876,15 @@ mod tests {
             .sandbox(sb.clone())
             .build_config();
         assert!(Arc::ptr_eq(&cfg.sandbox, &sb));
+    }
+
+    #[test]
+    fn context_manager_setter_overrides_the_configured_manager() {
+        let cm: Arc<dyn ContextManager> = Arc::new(NoopContextManager);
+        let cfg = catalogue_builder(make_agent())
+            .context_manager(cm.clone())
+            .build_config();
+        assert!(Arc::ptr_eq(&cfg.context_manager, &cm));
     }
 
     #[tokio::test]
