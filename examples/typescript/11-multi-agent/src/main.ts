@@ -106,6 +106,7 @@ import {
   OllamaModelInterface,
   SessionId,
   WorkspaceScopedSandbox,
+  hooks,
   newTask,
   toolRegistry,
   type Harness,
@@ -147,6 +148,46 @@ const ORCHESTRATOR_PROMPT =
   "markdown report; (3) call `write_file` to save the writing worker's markdown " +
   "verbatim to `report.md`. Do the research and writing by delegating to the " +
   "workers — never do it yourself — and always finish by writing report.md.";
+
+/**
+ * Lifecycle hook that prints the orchestrator's PlanExecute plan and each
+ * subtask as it advances. PlanExecute has NO plan/subtask *stream* events, so the
+ * hook chain is how the plan becomes visible — same pattern as example 08, mapped
+ * to this orchestrator.
+ *
+ * `on_plan_created` fires once, after the planner turn captures the plan and
+ * before any subtask executes — the money moment for an orchestrator that PLANS
+ * then delegates. `on_task_advance` fires before each subtask. This hook only
+ * observes; it always returns `{ decision: "continue" }`.
+ */
+class OrchestratorPlanReporter implements hooks.Hook {
+  async handle(ctx: hooks.HookContext): Promise<hooks.HookDecision> {
+    if (ctx.event === "on_plan_created") {
+      const { plan } = ctx;
+      console.log("\n── orchestrator plan ──");
+      if (plan.rationale.trim() !== "") {
+        console.log(`rationale: ${plan.rationale}`);
+      }
+      plan.tasks.forEach((task, i) => {
+        console.log(`  ${i + 1}. ${task}`);
+      });
+      console.log("───────────────────────\n");
+    } else if (ctx.event === "on_task_advance") {
+      console.log(
+        `[${ctx.task_index + 1}/${ctx.total_tasks}] ${ctx.task.instruction}`,
+      );
+    }
+    return { decision: "continue" };
+  }
+
+  events(): hooks.HookEvent[] {
+    return ["on_plan_created", "on_task_advance"];
+  }
+
+  name(): string {
+    return "orchestrator-plan-reporter";
+  }
+}
 
 /** The single-parameter input schema every worker tool advertises: the
  * orchestrator passes one `instruction` string, which `SubagentTool` forwards to
@@ -299,6 +340,12 @@ async function main(): Promise<void> {
     writingChild,
   );
 
+  // The plan surfaces through a hook chain (PlanExecute has no plan/subtask
+  // stream events). Registering the reporter is how "the orchestrator PLANS, then
+  // delegates" becomes visible — same pattern as example 08.
+  const chain = new hooks.StandardHookChain();
+  chain.register(new OrchestratorPlanReporter());
+
   // ---- Build the orchestrator: workers-as-tools + write_file ----------------
   const orchestratorModel = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
@@ -308,6 +355,7 @@ async function main(): Promise<void> {
     .tool(writingTool)
     .tool(StandardTools.writeFile())
     .systemPrompt(ORCHESTRATOR_PROMPT)
+    .hooks(chain) // ← the orchestrator's plan becomes visible through this chain
     .build();
 
   // The orchestrator plans the three steps up front via plan_execute, then
