@@ -14,6 +14,7 @@ from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
     LoopStrategyReAct,
+    NoopContextManager,
     NullSandbox,
     ProviderInfo,
     RunResultSuccess,
@@ -86,6 +87,16 @@ def test_conversational_defaults_components() -> None:
     # Empty registry: advertises nothing and errors on dispatch.
     assert config.tool_registry.schemas() == []
     assert config.tool_registry.is_always_halt("anything") is False
+
+
+def test_context_manager_setter_overrides_the_configured_manager() -> None:
+    """``.context_manager(...)`` replaces the default StandardContextManager so
+    callers can install a compaction config with a lower threshold. Mirrors
+    Rust's ``context_manager_setter_overrides_the_configured_manager``."""
+    model = _GreetingModel("hi")
+    cm = NoopContextManager()
+    config = HarnessBuilder.conversational(model).context_manager(cm).build_config()
+    assert config.context_manager is cm
 
 
 async def test_complete_on_final_response_always_continues() -> None:

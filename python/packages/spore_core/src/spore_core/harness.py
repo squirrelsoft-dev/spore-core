@@ -2262,6 +2262,26 @@ class HarnessBuilder:
         self._tool_registry = tool_registry
         return self
 
+    def context_manager(self, context_manager: ContextManager) -> HarnessBuilder:
+        """Override the :class:`ContextManager` that assembles per-turn context
+        and drives compaction.
+
+        :meth:`conversational` installs a
+        :class:`~spore_core.context.StandardContextManager` with
+        ``CompactionConfig()`` defaults (compaction at 80% of a 200K window);
+        supply your own (e.g. a lower ``threshold``) to make compaction fire
+        earlier for models with a smaller context window::
+
+            harness = (
+                HarnessBuilder.conversational(model)
+                .context_manager(my_low_threshold_manager)
+                .build()
+            )
+
+        Mirrors Rust's ``HarnessBuilder::context_manager``."""
+        self._context_manager = context_manager
+        return self
+
     def sandbox(self, sandbox: SandboxProvider) -> HarnessBuilder:
         """Override the :class:`SandboxProvider` — the only path tools have to
         the environment (filesystem, process exec).
