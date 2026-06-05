@@ -1,13 +1,13 @@
 # PROJECT STATE
-_Last updated: 2026-06-04 by /close — closed #100 (example: 11-multi-agent — orchestrator and worker composition) `status: complete`. The **11-multi-agent** example now ships end-to-end across all four targets: an orchestrator agent delegates to a research worker and a writing worker (each a fully independent `Harness` instance, no shared mutable state — the "agent as tool" pattern), plans are printed in the example output, and the run assembles a single `report.md`. Building it on top of `08-plan-execute` (PlanExecute drives the orchestrator) surfaced three harness fixes that landed under the same issue across all four languages: a tunable-compaction `context_manager` / `HarnessBuilder::context_manager` setter; treating a clean `EndTurn` with no content as **completion** rather than `EmptyResponse`; and keeping `08-plan-execute` within small (128K-class) context windows by distilling `web_search` output and compacting earlier. Prereqs #102 (session-state round-trip) and #103 (streaming) were already closed. Commits through `2653de8`, all on `main`, pushed (`origin/main` == `2653de8`)._
+_Last updated: 2026-06-05 by /close — closed #114 (mid-loop consult primitive — `RunResult::Consult`) `status: complete`. The harness now has a **third pause/resume path** alongside `WaitingForHuman` and `Escalate`: a worker-side tool emits `ToolOutput::Consult`, the worker pauses with `RunResult::Consult`, and `SubagentTool` mediates the consult **internally** (seam A1) — routes by `kind` to a parent-spawned handler, enforces a per-kind budget + overflow policy, runs the handler as the orchestrator's depth-1 child, and resumes the worker with a `ConsultResponse`; the orchestrator model never sees the consult. Landed across all four targets (Rust ref `720bc1d`, Go `091aba8`, TS `52a831b`, Python `865189c`), shared fixture `fixtures/harness/consult.json` byte-identical in all four, cross-language verifier PASS. **This unblocked #101** (`12-cordyceps`), now `status: queued`. ⚠️ **Local `main` is 5 commits ahead of `origin/main` (`2653de8`) — NOT pushed.**_
 
-_**Direction note for this loop:** the prior `/close` (2026-05-30) named correctness/safety gates (#34 → #31 → #30) as the active track, but **that track was never picked up** — every commit since (#98 docs, #99 10-hill-climbing, #100 11-multi-agent) has been building out the **examples suite**. Active Direction is rewritten below to reflect the real course; the correctness gates are reclassified as a parked track pending an explicit maintainer call._
+_**Direction note:** Active Direction (examples suite) holds. #114 was the one blocking harness change spun out of the #101 design session; with it done, the remaining work is the last examples (#101 → #109, #92) plus `web_search` hardening (#108/#110). The correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, now being demonstrated through a numbered **examples suite**
 built across all four targets: Rust (reference), TypeScript, Python, Go.
-**Everything is pushed — `origin/main` == local == `2653de8`.**
+**⚠️ Local `main` (`865189c`) is 5 commits ahead of `origin/main` (`2653de8`) — the #114 consult work is committed locally but NOT pushed.**
 
 **Examples suite — 11 of 13 landed, all four languages each.** Present under
 `examples/{rust,typescript,python,go}/`:
@@ -16,10 +16,23 @@ built across all four targets: Rust (reference), TypeScript, Python, Go.
 `09-self-verifying`, `10-hill-climbing` (#99), `11-multi-agent` (#100, this loop).
 Each example teaches one harness capability and runs against a local Ollama model;
 the later web-search-dependent ones (06, 11) distill `web_search` output so they
-stay inside small context windows. **Remaining example issues: #92** (observability
-example — wire Phoenix/OTLP tracing, show structured trace output), **#101**
-(`12-cordyceps` — fully autonomous task-completion capstone), **#109**
-(`13-coding-agent` — batteries-not-included coding-agent CLI).
+stay inside small context windows. **Remaining example issues: #101**
+(`12-cordyceps` — fully autonomous task-completion capstone, now **unblocked** by
+#114, `status: queued`), **#109** (`13-coding-agent` — batteries-not-included
+coding-agent CLI), **#92** (observability example — wire Phoenix/OTLP tracing,
+show structured trace output).
+
+**Mid-loop consult primitive shipped (#114, this loop, all four languages):** a
+third pause/resume path — worker-side `ToolOutput::Consult` → worker pauses with
+`RunResult::Consult` → `SubagentTool` mediates internally (seam A1): routes by
+`kind` to a parent-spawned handler (kind→handler map + per-kind budget + overflow
+policy `SoftFail`/`EscalateToHuman`), runs it as the orchestrator's depth-1 child,
+resumes the worker with a `ConsultResponse` (`Answer`/`BudgetExhausted`). The
+orchestrator model never sees the consult. Graceful degradation: empty map
+standalone → `RunResult::Consult` surfaces unchanged (existing callers
+byte-for-byte unaffected); map present but no matching kind → `RunResult::Escalate`.
+Lightweight `ConsultSpawned`/`ConsultResumed` observability events (no Phoenix
+wiring). This is the harness half of #101.
 
 **Harness fixes shipped alongside the examples (all four languages):** a tunable
 `context_manager` setter on `HarnessBuilder` so an example can tighten compaction;
@@ -66,21 +79,18 @@ architecture) gets shown and validated. **11 of 13 examples are in;** the
 remaining work is the last two examples plus an observability example, and
 hardening the `web_search` tool the research-style examples depend on.
 
-A design session on **#101** (`12-cordyceps`) reshaped the capstone and spun out
-a **new blocking harness issue, #114** (mid-loop consult primitive): a subagent
-escalates mid-loop to a parent-spawned helper and resumes, orchestrator-mediated
-and deterministic, reusing the `WaitingForHuman` pause/resume machinery (depth-1
-respected — the helper is the orchestrator's child, not the worker's). #101 was
-rewritten to consume it (ReAct + `task_list` orchestrator decomposing a per-crate/
-per-module Rust audit; analysis worker loads an `audit` skill via the real #9
-`GuideRegistry`→injection seam; two consult tools — `research_best_practices`
-≤5 soft-fail, `consult_advisor` ≤3 → human; gemma4:e4b locally + minimax-m3:cloud
-advisor; REPL approval → `gh` issue filing) and is now **`status: blocked` on #114**.
+The blocking harness change for the capstone, **#114** (mid-loop consult
+primitive), **landed this loop** across all four languages and is closed
+`status: complete`. **#101** (`12-cordyceps`) is therefore **unblocked**
+(`status: queued`) and is the next piece of work: ReAct + `task_list` orchestrator
+decomposing a per-crate/per-module Rust audit; analysis worker loads an `audit`
+skill via the real #9 `GuideRegistry`→injection seam; two consult tools —
+`research_best_practices` ≤5 soft-fail, `consult_advisor` ≤3 → human; gemma4:e4b
+locally + minimax-m3:cloud advisor; REPL approval → `gh` issue filing.
 
-Immediate scope: **#114** (consult primitive) lands first, then **#101**
-(`12-cordyceps` capstone) and **#109**
-(`13-coding-agent`) complete the numbered suite; **#92** adds the observability
-example. The `web_search` tool has two real gaps surfaced by the
+Immediate scope: **#101** (`12-cordyceps` capstone) first now that #114 is in,
+then **#109** (`13-coding-agent`) completes the numbered suite; **#92** adds the
+observability example. The `web_search` tool has two real gaps surfaced by the
 research-dependent examples — **#108** (can't attach auth headers or query params,
 which blocks several backends) and **#110** (response normalization across
 Brave/Tavily/SearXNG shapes) — that should be closed to make those examples
@@ -164,6 +174,14 @@ and the protocol-integration track (#83–87) remain unscheduled. Storage follow
    was built instead. Reconciled this loop: Active Direction now reflects the
    examples suite; the correctness track is explicitly parked pending a maintainer
    call. No code impact.
+10. **Local `main` is ahead of `origin/main` (unpushed)** (transient, action
+    required) — the four #114 consult commits (`720bc1d`, `091aba8`, `52a831b`,
+    `865189c`) were merged to local `main` via fast-forward but not pushed;
+    `origin/main` is still at `2653de8` (5 commits behind). Push to clear. Until
+    then the consult primitive is local-only. (Also four untracked example
+    run-artifact `.txt`/`.md` files under
+    `examples/rust/08-plan-execute/workspace/` — scratch output from running the
+    plan-execute example, intentionally left untracked; not part of the source.)
 
 _(Former Deviation — HillClimbing loop strategy stub, #60 (was Deviation #1: harness ran only 4/5 strategies) — **resolved** this loop; HillClimbing runs end-to-end across all four, harness now at 5/5, stub removed.)_
 _(Former Deviation — push blocked on local SSH auth (13 unpushed commits) — **resolved**; SSH fixed, all pushed.)_
@@ -180,18 +198,16 @@ _(Former Deviation — observability captured no message content — **resolved*
 ## Next Actions
 [3-5 items max, highest priority first. Each references a GH issue # where
 possible. /next surfaces item 1 as "work this next."]
-1. **#114 — mid-loop consult primitive (harness change, BLOCKS #101)** — new
-   `RunResult::Consult` / `ToolOutput::Consult` / `ConsultResponse` resume path,
-   orchestrator-mediated deterministic routing via a kind→handler map, per-kind
-   budgets + overflow policy, depth-1 respected. Four-language parity (Rust
-   reference, then TS/Python/Go), on the order of the #100 setter work but more
-   invasive. Land before #101. Relabel `status: queued` → `queued`/grabbed.
+1. **Push `main` to `origin`** — local `main` (`865189c`) is 5 commits ahead with
+   the #114 consult work; `origin/main` is at `2653de8`. `git push origin main`
+   to publish before starting #101. (One-line task, do this first.)
 2. **#101 — `12-cordyceps` example (autonomous task-completion capstone)** —
-   **`status: blocked` on #114**; it's the consumer that validates the consult
-   primitive. Design is fully pinned in the rewritten issue (ReAct + `task_list`
-   per-crate/module Rust audit, `audit` skill via #9 seam, two consult tools,
-   gemma4:e4b + minimax-m3:cloud advisor, REPL approval → `gh` filing). Grab once
-   #114 lands; relabel `status: blocked` → grabbed.
+   **unblocked** (`status: queued`) now that #114 is in; it's the consumer that
+   validates the consult primitive. Design is fully pinned in the issue (ReAct +
+   `task_list` per-crate/module Rust audit, `audit` skill via #9 seam, two consult
+   tools — `research_best_practices` ≤5 soft-fail / `consult_advisor` ≤3 → human,
+   gemma4:e4b + minimax-m3:cloud advisor, REPL approval → `gh` filing). The top
+   feature item; grab next.
 3. **#109 — `13-coding-agent` example** — the final numbered example, a
    batteries-not-included coding-agent CLI; completes the 1–13 suite across all
    four languages.
