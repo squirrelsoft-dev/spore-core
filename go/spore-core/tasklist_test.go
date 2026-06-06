@@ -17,7 +17,9 @@ import (
 func listWith(statuses ...TaskStatus) TaskList {
 	l := DefaultTaskList()
 	for range statuses {
-		l.Add("t")
+		if _, err := l.Add("t", nil); err != nil {
+			panic(err)
+		}
 	}
 	for i, s := range statuses {
 		l.Tasks[i].Status = s
@@ -28,14 +30,14 @@ func listWith(statuses ...TaskStatus) TaskList {
 // R1: ids are assigned 1, 2, 3, … sequentially.
 func TestIDsAreSequentialFromOne(t *testing.T) {
 	l := DefaultTaskList()
-	if got := l.Add("a"); got != 1 {
-		t.Fatalf("first id = %d, want 1", got)
+	if got, err := l.Add("a", nil); err != nil || got != 1 {
+		t.Fatalf("first id = %d, err = %v, want 1", got, err)
 	}
-	if got := l.Add("b"); got != 2 {
-		t.Fatalf("second id = %d, want 2", got)
+	if got, err := l.Add("b", nil); err != nil || got != 2 {
+		t.Fatalf("second id = %d, err = %v, want 2", got, err)
 	}
-	if got := l.Add("c"); got != 3 {
-		t.Fatalf("third id = %d, want 3", got)
+	if got, err := l.Add("c", nil); err != nil || got != 3 {
+		t.Fatalf("third id = %d, err = %v, want 3", got, err)
 	}
 	if l.NextID != 4 {
 		t.Fatalf("next_id = %d, want 4", l.NextID)
@@ -50,9 +52,9 @@ func TestIDsAreSequentialFromOne(t *testing.T) {
 // R2: Add appends to the end, preserving positional order, new tasks pending.
 func TestAddAppendsInOrder(t *testing.T) {
 	l := DefaultTaskList()
-	l.Add("first")
-	l.Add("second")
-	l.Add("third")
+	mustAdd(t, &l, "first")
+	mustAdd(t, &l, "second")
+	mustAdd(t, &l, "third")
 	want := []string{"first", "second", "third"}
 	for i, w := range want {
 		if l.Tasks[i].Description != w {
@@ -251,8 +253,8 @@ func TestIdempotentSelfTransition(t *testing.T) {
 // Reload preserves next_id (ids never reused after a round-trip).
 func TestReloadPreservesNextID(t *testing.T) {
 	l := DefaultTaskList()
-	l.Add("a")
-	l.Add("b")
+	mustAdd(t, &l, "a")
+	mustAdd(t, &l, "b")
 	encoded, _ := json.Marshal(l)
 	var reloaded TaskList
 	if err := json.Unmarshal(encoded, &reloaded); err != nil {
@@ -261,16 +263,16 @@ func TestReloadPreservesNextID(t *testing.T) {
 	if reloaded.NextID != 3 {
 		t.Fatalf("reloaded next_id = %d, want 3", reloaded.NextID)
 	}
-	if got := reloaded.Add("c"); got != 3 {
-		t.Fatalf("continued id = %d, want 3", got)
+	if got, err := reloaded.Add("c", nil); err != nil || got != 3 {
+		t.Fatalf("continued id = %d, err = %v, want 3", got, err)
 	}
 }
 
 // Serde round-trip is byte-identical (re-serializing the parsed form).
 func TestSerdeRoundTripByteIdentical(t *testing.T) {
 	l := DefaultTaskList()
-	l.Add("alpha")
-	l.Add("beta")
+	mustAdd(t, &l, "alpha")
+	mustAdd(t, &l, "beta")
 	s := TaskStatusInProgress
 	if err := l.Update(2, &s, nil); err != nil {
 		t.Fatal(err)
@@ -320,13 +322,13 @@ func TestDefaultSerializesCanonically(t *testing.T) {
 // Canonical populated-list serialization (exact spelling).
 func TestPopulatedSerializesCanonically(t *testing.T) {
 	l := DefaultTaskList()
-	l.Add("write tests")
+	mustAdd(t, &l, "write tests")
 	s := TaskStatusInProgress
 	if err := l.Update(1, &s, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := json.Marshal(l)
-	want := `{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}`
+	want := `{"tasks":[{"id":1,"description":"write tests","status":"in_progress","blockers":[]}],"next_id":2}`
 	if string(got) != want {
 		t.Fatalf("got %s", got)
 	}
@@ -422,7 +424,7 @@ func TestPlanDropsRationale(t *testing.T) {
 func TestPlanResultSerdeRoundTripByteIdentical(t *testing.T) {
 	list := PlanArtifactToTaskList(planArtifact([]string{"alpha", "beta"}, "r"))
 	json1, _ := json.Marshal(list)
-	want := `{"tasks":[{"id":1,"description":"alpha","status":"pending"},{"id":2,"description":"beta","status":"pending"}],"next_id":3}`
+	want := `{"tasks":[{"id":1,"description":"alpha","status":"pending","blockers":[]},{"id":2,"description":"beta","status":"pending","blockers":[]}],"next_id":3}`
 	if string(json1) != want {
 		t.Fatalf("canonical = %s, want %s", json1, want)
 	}
@@ -492,4 +494,218 @@ func asTaskListError(err error, target **TaskListError) bool {
 		*target = te
 	}
 	return ok
+}
+
+// mustAdd adds a task with no blockers and fails the test on error.
+func mustAdd(t *testing.T, l *TaskList, description string) uint32 {
+	t.Helper()
+	id, err := l.Add(description, nil)
+	if err != nil {
+		t.Fatalf("Add(%q): %v", description, err)
+	}
+	return id
+}
+
+// ============================================================================
+// blockers (#118)
+// ============================================================================
+
+// Happy path: blockers referencing earlier real ids are accepted and stored.
+func TestAddWithValidBlockersOK(t *testing.T) {
+	l := DefaultTaskList()
+	if id := mustAdd(t, &l, "a"); id != 1 {
+		t.Fatalf("id = %d, want 1", id)
+	}
+	if id := mustAdd(t, &l, "b"); id != 2 {
+		t.Fatalf("id = %d, want 2", id)
+	}
+	id, err := l.Add("c", []uint32{1, 2})
+	if err != nil || id != 3 {
+		t.Fatalf("Add c: id = %d, err = %v, want 3", id, err)
+	}
+	if got := l.Tasks[2].Blockers; len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("blockers = %v, want [1 2]", got)
+	}
+	if l.NextID != 4 {
+		t.Fatalf("next_id = %d, want 4", l.NextID)
+	}
+}
+
+// Empty blockers never reject and store as an empty slice.
+func TestAddWithEmptyBlockersOK(t *testing.T) {
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a")
+	if len(l.Tasks[0].Blockers) != 0 {
+		t.Fatalf("blockers = %v, want empty", l.Tasks[0].Blockers)
+	}
+}
+
+// Self-block: a blocker equal to the about-to-be-assigned id is rejected.
+func TestSelfBlockRejected(t *testing.T) {
+	l := DefaultTaskList()
+	// NextID is 1, blocker 1 == self.
+	_, err := l.Add("a", []uint32{1})
+	var te *TaskListError
+	if !asTaskListError(err, &te) || te.Kind != TaskListErrInvalidBlockers ||
+		te.ID != 1 || te.Reason == nil || te.Reason.Reason != BlockerRejectionSelfBlock {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Unknown id: a blocker matching no existing task is rejected, carrying the id.
+func TestUnknownBlockerIDRejected(t *testing.T) {
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a") // id 1
+	_, err := l.Add("b", []uint32{99})
+	var te *TaskListError
+	if !asTaskListError(err, &te) || te.Kind != TaskListErrInvalidBlockers ||
+		te.ID != 2 || te.Reason == nil || te.Reason.Reason != BlockerRejectionUnknownID ||
+		te.Reason.Blocker != 99 {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A rejected add leaves the list completely untouched (R9, mirrors Update).
+func TestRejectedBlockersDoNotMutate(t *testing.T) {
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a")
+	before, _ := json.Marshal(l)
+	if _, err := l.Add("b", []uint32{99}); err == nil {
+		t.Fatal("expected rejection")
+	}
+	after, _ := json.Marshal(l)
+	if string(before) != string(after) {
+		t.Fatalf("rejected add mutated state: %s != %s", before, after)
+	}
+	if l.NextID != 2 {
+		t.Fatalf("next_id advanced to %d, want 2", l.NextID)
+	}
+}
+
+// Self-block takes precedence over unknown-id when both are present (self-block
+// is checked first per the documented order).
+func TestSelfBlockCheckedBeforeUnknown(t *testing.T) {
+	l := DefaultTaskList()
+	// NextID 1: slice contains self (1) and an unknown (99); self wins.
+	_, err := l.Add("a", []uint32{1, 99})
+	var te *TaskListError
+	if !asTaskListError(err, &te) || te.Reason == nil ||
+		te.Reason.Reason != BlockerRejectionSelfBlock {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// wouldCreateCycle: tested directly against a hand-built cyclic graph, since an
+// append-only add can never close a cycle on its own.
+func TestWouldCreateCycleDetectsBackEdge(t *testing.T) {
+	// Build edges (task -> blocker): 3 -> 2, 2 -> 1. So from node 3 there is a
+	// directed path 3 -> 2 -> 1 reaching node 1.
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a") // 1
+	mustAdd(t, &l, "b") // 2
+	mustAdd(t, &l, "c") // 3
+	l.Tasks[2].Blockers = []uint32{2}
+	l.Tasks[1].Blockers = []uint32{1}
+	// Re-adding node 1 with a blocker on 3 closes 1 -> 3 -> 2 -> 1.
+	if !l.wouldCreateCycle(1, []uint32{3}) {
+		t.Fatal("expected cycle for node 1 -> 3")
+	}
+	// Node 4 with blocker 3 has no path back to 4, so no cycle.
+	if l.wouldCreateCycle(4, []uint32{3}) {
+		t.Fatal("unexpected cycle for node 4 -> 3")
+	}
+}
+
+// wouldCreateCycle: a direct self-edge is a cycle.
+func TestWouldCreateCycleSelfEdge(t *testing.T) {
+	l := DefaultTaskList()
+	if !l.wouldCreateCycle(5, []uint32{5}) {
+		t.Fatal("self-edge should be a cycle")
+	}
+}
+
+// wouldCreateCycle: empty new edges are never a cycle.
+func TestWouldCreateCycleEmptyIsFalse(t *testing.T) {
+	l := DefaultTaskList()
+	if l.wouldCreateCycle(1, nil) {
+		t.Fatal("empty edges should not be a cycle")
+	}
+}
+
+// The cycle branch of Add rejects when the helper reports a cycle. We craft a
+// state where re-adding an id with a back-edge would cycle: task 1 already
+// blocks on id 3 (the next id about to be assigned), so adding task 3 blocked by
+// 1 closes 3 -> 1 -> 3.
+func TestAddRejectsCycle(t *testing.T) {
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a") // id 1
+	mustAdd(t, &l, "b") // id 2
+	l.Tasks[0].Blockers = []uint32{3}
+	_, err := l.Add("c", []uint32{1})
+	var te *TaskListError
+	if !asTaskListError(err, &te) || te.Kind != TaskListErrInvalidBlockers ||
+		te.ID != 3 || te.Reason == nil || te.Reason.Reason != BlockerRejectionCycle {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Non-empty blockers serialize as the LAST field, byte-exact.
+func TestBlockersSerializeLastAndExact(t *testing.T) {
+	l := DefaultTaskList()
+	mustAdd(t, &l, "a")
+	if _, err := l.Add("b", []uint32{1}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(l)
+	want := `{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]},{"id":2,"description":"b","status":"pending","blockers":[1]}],"next_id":3}`
+	if string(got) != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+// Backward-compat: a pre-#118 blob WITHOUT a blockers key still loads, with
+// blockers defaulting to empty; re-serializing emits the canonical form WITH
+// blockers:[].
+func TestDeserializesPre118BlobWithoutBlockers(t *testing.T) {
+	in := `{"tasks":[{"id":1,"description":"old","status":"pending"}],"next_id":2}`
+	var l TaskList
+	if err := json.Unmarshal([]byte(in), &l); err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Tasks) != 1 || len(l.Tasks[0].Blockers) != 0 {
+		t.Fatalf("blockers should default empty: %+v", l.Tasks)
+	}
+	got, _ := json.Marshal(l)
+	want := `{"tasks":[{"id":1,"description":"old","status":"pending","blockers":[]}],"next_id":2}`
+	if string(got) != want {
+		t.Fatalf("reserialized %s, want %s", got, want)
+	}
+}
+
+// BlockerRejection serde tags are snake_case on `reason`, with `blocker` carried
+// only for unknown_id.
+func TestBlockerRejectionSerdeTags(t *testing.T) {
+	cases := []struct {
+		r    BlockerRejection
+		want string
+	}{
+		{BlockerRejection{Reason: BlockerRejectionSelfBlock}, `{"reason":"self_block"}`},
+		{BlockerRejection{Reason: BlockerRejectionUnknownID, Blocker: 7}, `{"reason":"unknown_id","blocker":7}`},
+		{BlockerRejection{Reason: BlockerRejectionCycle}, `{"reason":"cycle"}`},
+	}
+	for _, c := range cases {
+		got, _ := json.Marshal(c.r)
+		if string(got) != c.want {
+			t.Fatalf("marshal %+v = %s, want %s", c.r, got, c.want)
+		}
+	}
+}
+
+// TaskListError InvalidBlockers wire tag is snake_case `invalid_blockers`.
+func TestInvalidBlockersErrorWireTag(t *testing.T) {
+	e := newInvalidBlockers(3, BlockerRejection{Reason: BlockerRejectionSelfBlock})
+	got, _ := json.Marshal(e)
+	if !contains(string(got), `"kind":"invalid_blockers"`) {
+		t.Fatalf("wire tag missing: %s", got)
+	}
 }

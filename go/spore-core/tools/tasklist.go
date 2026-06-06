@@ -77,6 +77,7 @@ func (*TaskListTool) Schema() sporecore.RegistryToolSchema {
 					"type": "string",
 					"enum": ["add_task", "complete_task", "list_tasks", "update_task"]
 				},
+				"blockers": {"type": "array", "items": {"type": "integer"}},
 				"description": {"type": "string"},
 				"id": {"type": "integer"},
 				"status": {
@@ -120,7 +121,9 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ s
 	mutated := false
 	switch params.Action {
 	case TaskListActionAddTask:
-		list.Add(*params.Description)
+		if _, domErr := list.Add(*params.Description, params.Blockers); domErr != nil {
+			return ExecutionFailed(domErr.Error(), true).ToToolOutput()
+		}
 		mutated = true
 	case TaskListActionUpdateTask:
 		if domErr := list.Update(*params.ID, params.Status, params.Description); domErr != nil {

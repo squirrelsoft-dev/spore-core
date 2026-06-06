@@ -363,13 +363,18 @@ const (
 // update_task can apply status and/or description independently.
 //
 // Field requirements per action (validated in the tool, not by serde):
-//   - add_task:      description (required)
+//   - add_task:      description (required); blockers (optional, defaults empty)
 //   - update_task:   id (required); status and/or description (both optional)
 //   - complete_task: id (required)
 //   - list_tasks:    no fields
+//
+// Blockers (#118) are the ids that must be completed before the added task runs;
+// omitting the field defaults to empty. They are threaded through to
+// TaskList.Add, which validates them.
 type TaskListParams struct {
 	Action      TaskListAction        `json:"action"`
 	Description *string               `json:"description,omitempty"`
 	ID          *uint32               `json:"id,omitempty"`
 	Status      *sporecore.TaskStatus `json:"status,omitempty"`
+	Blockers    []uint32              `json:"blockers,omitempty"`
 }

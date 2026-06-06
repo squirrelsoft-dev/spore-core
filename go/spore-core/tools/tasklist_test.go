@@ -351,6 +351,92 @@ func TestNoOpStoragePersistsNothing(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// blockers (#118) — tool boundary
+// ============================================================================
+
+// add_task passes blockers through to the list and stores them.
+func TestAddTaskPassesBlockersThrough(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b", "blockers": []uint32{1}}), sb, tc)
+	l := parseList(t, r)
+	if len(l.Tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %+v", l)
+	}
+	if got := l.Tasks[1].Blockers; len(got) != 1 || got[0] != 1 {
+		t.Fatalf("blockers = %v, want [1]", got)
+	}
+}
+
+// Omitting blockers defaults to empty (backward-compatible call).
+func TestAddTaskWithoutBlockersDefaultsEmpty(t *testing.T) {
+	tc, _ := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a"}),
+		sporecore.AllowAllSandbox{}, tc)
+	l := parseList(t, r)
+	if len(l.Tasks[0].Blockers) != 0 {
+		t.Fatalf("blockers = %v, want empty", l.Tasks[0].Blockers)
+	}
+}
+
+// A self-blocking add maps to a recoverable tool error mentioning blockers.
+func TestSelfBlockIsRecoverableError(t *testing.T) {
+	tc, _ := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a", "blockers": []uint32{1}}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+	if !strings.Contains(r.Message, "invalid blockers") {
+		t.Fatalf("message %q does not mention invalid blockers", r.Message)
+	}
+}
+
+// An unknown blocker id maps to a recoverable tool error.
+func TestUnknownBlockerIsRecoverableError(t *testing.T) {
+	tc, _ := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a", "blockers": []uint32{99}}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+	if !strings.Contains(r.Message, "invalid blockers") {
+		t.Fatalf("message %q does not mention invalid blockers", r.Message)
+	}
+}
+
+// The advertised schema lists blockers as an integer array, in sorted property
+// order (after action, before description).
+func TestSchemaAdvertisesBlockers(t *testing.T) {
+	s := NewTaskListTool().Schema()
+	var parsed struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(s.Parameters, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	blockers, ok := parsed.Properties["blockers"]
+	if !ok {
+		t.Fatal("schema missing blockers property")
+	}
+	var want, got map[string]any
+	_ = json.Unmarshal([]byte(`{"type":"array","items":{"type":"integer"}}`), &want)
+	_ = json.Unmarshal(blockers, &got)
+	wb, _ := json.Marshal(want)
+	gb, _ := json.Marshal(got)
+	if string(wb) != string(gb) {
+		t.Fatalf("blockers schema = %s, want %s", gb, wb)
+	}
+}
+
 func TestSchemaIsNotReadOnly(t *testing.T) {
 	s := NewTaskListTool().Schema()
 	if s.Annotations.ReadOnly {
@@ -440,6 +526,8 @@ func TestFixtureReplayOperations(t *testing.T) {
 					kind = "task_not_found"
 				case strings.Contains(out.Message, "invalid transition"):
 					kind = "invalid_transition"
+				case strings.Contains(out.Message, "invalid blockers"):
+					kind = "invalid_blockers"
 				default:
 					kind = "other"
 				}
@@ -513,6 +601,52 @@ func TestFixtureReplaySerialization(t *testing.T) {
 		reSerialized, _ := json.Marshal(parsed)
 		if string(reSerialized) != c.JSON {
 			t.Fatalf("parse %s not byte-identical:\n got: %s\nwant: %s", c.Name, reSerialized, c.JSON)
+		}
+	}
+}
+
+type deserCase struct {
+	Name         string             `json:"name"`
+	JSON         string             `json:"json"`
+	Expected     sporecore.TaskList `json:"expected"`
+	Reserialized string             `json:"reserialized"`
+}
+
+// #118 backward-compat: a pre-#118 blob WITHOUT a blockers key deserializes
+// (blockers default to empty), and re-serializing emits the canonical form WITH
+// blockers:[]. Replayed byte-identically across all four languages.
+func TestFixtureReplayDeserializeBackwardCompat(t *testing.T) {
+	data, err := os.ReadFile(taskListFixturePath(t, "deserialize.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []deserCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("expected >=1 case")
+	}
+	for _, c := range cases {
+		var parsed sporecore.TaskList
+		if err := json.Unmarshal([]byte(c.JSON), &parsed); err != nil {
+			t.Fatalf("parse %s: %v", c.Name, err)
+		}
+		// Structural equality with the fixture's expected list.
+		gotJSON, _ := json.Marshal(parsed)
+		wantJSON, _ := json.Marshal(c.Expected)
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("parse %s: got %s, want %s", c.Name, gotJSON, wantJSON)
+		}
+		// All blockers defaulted to empty.
+		for _, task := range parsed.Tasks {
+			if len(task.Blockers) != 0 {
+				t.Fatalf("parse %s: blockers should default empty, got %v", c.Name, task.Blockers)
+			}
+		}
+		// Re-serializing emits the canonical form WITH blockers:[].
+		if string(gotJSON) != c.Reserialized {
+			t.Fatalf("reserialize %s: got %s, want %s", c.Name, gotJSON, c.Reserialized)
 		}
 	}
 }
