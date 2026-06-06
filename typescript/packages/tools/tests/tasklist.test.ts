@@ -356,6 +356,79 @@ describe("TaskListTool", () => {
     expect(s.annotations.destructive).toBe(false);
     expect(s.annotations.open_world).toBe(false);
   });
+
+  // #118: add_task passes blockers through to the list and stores them.
+  it("add_task passes blockers through", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+    await tool.execute(call({ action: "add_task", description: "a" }), sb, ctx);
+    const list = parseList(
+      await tool.execute(
+        call({ action: "add_task", description: "b", blockers: [1] }),
+        sb,
+        ctx,
+      ),
+    );
+    expect(list.tasks[1].blockers).toEqual([1]);
+  });
+
+  // #118: omitting blockers defaults to empty (backward-compatible call).
+  it("add_task without blockers defaults to empty", async () => {
+    const ctx = inMemoryCtx();
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a" }),
+      new AllowAllSandbox(),
+      ctx,
+    );
+    expect(parseList(out).tasks[0].blockers).toEqual([]);
+  });
+
+  // #118: a self-blocking add maps to a recoverable tool error.
+  it("self-block is a recoverable error", async () => {
+    const ctx = inMemoryCtx();
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a", blockers: [1] }),
+      new AllowAllSandbox(),
+      ctx,
+    );
+    expect(out.kind).toBe("error");
+    if (out.kind === "error") {
+      expect(out.recoverable).toBe(true);
+      expect(out.message).toContain("invalid blockers");
+    }
+  });
+
+  // #118: an unknown blocker id maps to a recoverable tool error.
+  it("unknown blocker is a recoverable error", async () => {
+    const ctx = inMemoryCtx();
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a", blockers: [99] }),
+      new AllowAllSandbox(),
+      ctx,
+    );
+    expect(out.kind).toBe("error");
+    if (out.kind === "error") expect(out.recoverable).toBe(true);
+  });
+
+  // #118: schema advertises blockers (kept in sorted property order).
+  it("schema advertises blockers", () => {
+    const s = TaskListTool.schema();
+    const params = s.parameters as { properties: Record<string, unknown> };
+    const props = params.properties;
+    expect(props.blockers).toEqual({
+      type: "array",
+      items: { type: "integer" },
+    });
+    // Properties kept in sorted order: action, blockers, description, id, status.
+    expect(Object.keys(props)).toEqual([
+      "action",
+      "blockers",
+      "description",
+      "id",
+      "status",
+    ]);
+  });
 });
 
 // ============================================================================
@@ -401,7 +474,9 @@ describe("fixture: tasklist operations", () => {
             ? "task_not_found"
             : out.message.includes("invalid transition")
               ? "invalid_transition"
-              : "other";
+              : out.message.includes("invalid blockers")
+                ? "invalid_blockers"
+                : "other";
           expect(kind, `${sc.name} step ${i}: ${out.message}`).toBe(
             step.expected.error,
           );
@@ -455,6 +530,35 @@ describe("fixture: tasklist serialization", () => {
     it(c.name, () => {
       expect(tasklist.serializeTaskList(c.list)).toBe(c.json);
       expect(tasklist.parseTaskList(c.json)).toEqual(c.list);
+    });
+  }
+});
+
+interface DeserCase {
+  name: string;
+  json: string;
+  expected: TaskList;
+  reserialized: string;
+}
+
+// #118 backward-compat: a pre-#118 blob WITHOUT a blockers key deserializes
+// (blockers default to []), and re-serializing emits the canonical form WITH
+// blockers:[]. Replayed byte-identically across all four languages.
+describe("fixture: tasklist deserialize (backward compat)", () => {
+  const cases = JSON.parse(
+    readFileSync(join(fixturesRoot, "deserialize.json"), "utf8"),
+  ) as DeserCase[];
+
+  it("loads at least one case", () => {
+    expect(cases.length).toBeGreaterThan(0);
+  });
+
+  for (const c of cases) {
+    it(c.name, () => {
+      const parsed = tasklist.parseTaskList(c.json);
+      expect(parsed).toEqual(c.expected);
+      expect(parsed.tasks.every((t) => t.blockers.length === 0)).toBe(true);
+      expect(tasklist.serializeTaskList(parsed)).toBe(c.reserialized);
     });
   }
 });

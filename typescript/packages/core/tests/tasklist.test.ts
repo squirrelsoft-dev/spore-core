@@ -15,6 +15,7 @@ const {
   parseTaskList,
   validateTransition,
   addTask,
+  wouldCreateCycle,
   updateTask,
   completeTask,
 } = tasklist;
@@ -22,9 +23,17 @@ const {
 type TaskStatus = tasklist.TaskStatus;
 type TaskList = tasklist.TaskList;
 
+/** Helper: addTask is fallible since #118; for the always-ok cases assert + return id. */
+function add(l: TaskList, description: string, blockers: number[] = []): number {
+  const r = addTask(l, description, blockers);
+  expect(r.ok).toBe(true);
+  if (!r.ok) throw new Error("unreachable");
+  return r.id;
+}
+
 function listWith(statuses: TaskStatus[]): TaskList {
   const l = defaultTaskList();
-  for (const _ of statuses) addTask(l, "t");
+  for (const _ of statuses) add(l, "t");
   statuses.forEach((s, i) => {
     l.tasks[i].status = s;
   });
@@ -35,9 +44,9 @@ describe("tasklist helpers", () => {
   // R1
   it("assigns sequential ids from 1", () => {
     const l = defaultTaskList();
-    expect(addTask(l, "a")).toBe(1);
-    expect(addTask(l, "b")).toBe(2);
-    expect(addTask(l, "c")).toBe(3);
+    expect(add(l, "a")).toBe(1);
+    expect(add(l, "b")).toBe(2);
+    expect(add(l, "c")).toBe(3);
     expect(l.next_id).toBe(4);
     expect(l.tasks.map((t) => t.id)).toEqual([1, 2, 3]);
   });
@@ -45,9 +54,9 @@ describe("tasklist helpers", () => {
   // R2
   it("appends in order, new tasks pending", () => {
     const l = defaultTaskList();
-    addTask(l, "first");
-    addTask(l, "second");
-    addTask(l, "third");
+    add(l, "first");
+    add(l, "second");
+    add(l, "third");
     expect(l.tasks.map((t) => t.description)).toEqual(["first", "second", "third"]);
     expect(l.tasks.every((t) => t.status === "pending")).toBe(true);
   });
@@ -183,17 +192,17 @@ describe("tasklist transition matrix (DECISION 1)", () => {
 describe("tasklist serialization", () => {
   it("reload preserves next_id (ids never reused)", () => {
     const l = defaultTaskList();
-    addTask(l, "a");
-    addTask(l, "b");
+    add(l, "a");
+    add(l, "b");
     const reloaded = parseTaskList(serializeTaskList(l));
     expect(reloaded.next_id).toBe(3);
-    expect(addTask(reloaded, "c")).toBe(3);
+    expect(add(reloaded, "c")).toBe(3);
   });
 
   it("serde round-trip is byte-identical", () => {
     const l = defaultTaskList();
-    addTask(l, "alpha");
-    addTask(l, "beta");
+    add(l, "alpha");
+    add(l, "beta");
     updateTask(l, 2, "in_progress");
     const json1 = serializeTaskList(l);
     const parsed = parseTaskList(json1);
@@ -204,7 +213,7 @@ describe("tasklist serialization", () => {
 
   it("status snake_case spellings are exact", () => {
     const l = defaultTaskList();
-    addTask(l, "x");
+    add(l, "x");
     updateTask(l, 1, "in_progress");
     expect(serializeTaskList(l)).toContain('"status":"in_progress"');
     for (const s of ["pending", "completed", "blocked"] as TaskStatus[]) {
@@ -219,10 +228,156 @@ describe("tasklist serialization", () => {
 
   it("populated serializes canonically", () => {
     const l = defaultTaskList();
-    addTask(l, "write tests");
+    add(l, "write tests");
     updateTask(l, 1, "in_progress");
     expect(serializeTaskList(l)).toBe(
-      '{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}',
+      '{"tasks":[{"id":1,"description":"write tests","status":"in_progress","blockers":[]}],"next_id":2}',
     );
+  });
+
+  it("non-empty blockers serialize as the last field, byte-exact", () => {
+    const l = defaultTaskList();
+    add(l, "a");
+    add(l, "b", [1]);
+    expect(serializeTaskList(l)).toBe(
+      '{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]},' +
+        '{"id":2,"description":"b","status":"pending","blockers":[1]}],"next_id":3}',
+    );
+  });
+
+  // Backward-compat: a pre-#118 blob WITHOUT a blockers key still parses, with
+  // blockers defaulting to []. Re-serializing emits the canonical form with [].
+  it("deserializes a pre-#118 blob without a blockers key", () => {
+    const json = '{"tasks":[{"id":1,"description":"old","status":"pending"}],"next_id":2}';
+    const l = parseTaskList(json);
+    expect(l.tasks).toHaveLength(1);
+    expect(l.tasks[0].blockers).toEqual([]);
+    expect(serializeTaskList(l)).toBe(
+      '{"tasks":[{"id":1,"description":"old","status":"pending","blockers":[]}],"next_id":2}',
+    );
+  });
+});
+
+// ============================================================================
+// blockers (#118)
+// ============================================================================
+
+describe("tasklist blockers (#118)", () => {
+  it("accepts and stores blockers referencing earlier real ids", () => {
+    const l = defaultTaskList();
+    expect(add(l, "a")).toBe(1);
+    expect(add(l, "b")).toBe(2);
+    expect(add(l, "c", [1, 2])).toBe(3);
+    expect(l.tasks[2].blockers).toEqual([1, 2]);
+    expect(l.next_id).toBe(4);
+  });
+
+  it("empty blockers never reject and store as an empty array", () => {
+    const l = defaultTaskList();
+    add(l, "a");
+    expect(l.tasks[0].blockers).toEqual([]);
+  });
+
+  it("rejects a self-block (blocker == about-to-assign id)", () => {
+    const l = defaultTaskList();
+    const r = addTask(l, "a", [1]); // next_id is 1, blocker 1 == self
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("invalid_blockers");
+      expect(r.error.detail).toEqual({
+        kind: "invalid_blockers",
+        id: 1,
+        reason: { reason: "self_block" },
+      });
+    }
+  });
+
+  it("rejects an unknown blocker id", () => {
+    const l = defaultTaskList();
+    add(l, "a"); // id 1
+    const r = addTask(l, "b", [99]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("invalid_blockers");
+      expect(r.error.detail).toEqual({
+        kind: "invalid_blockers",
+        id: 2,
+        reason: { reason: "unknown_id", blocker: 99 },
+      });
+    }
+  });
+
+  // R9: a rejected add leaves the list completely untouched (mirrors update).
+  it("a rejected add does not mutate the list", () => {
+    const l = defaultTaskList();
+    add(l, "a");
+    const before = structuredClone(l);
+    const r = addTask(l, "b", [99]);
+    expect(r.ok).toBe(false);
+    expect(l).toEqual(before);
+    expect(l.next_id).toBe(2); // next_id did NOT advance
+  });
+
+  // self-block is checked before unknown-id per documented order.
+  it("self-block takes precedence over unknown-id", () => {
+    const l = defaultTaskList();
+    const r = addTask(l, "a", [1, 99]); // next_id 1: self (1) and unknown (99)
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.detail).toEqual({
+        kind: "invalid_blockers",
+        id: 1,
+        reason: { reason: "self_block" },
+      });
+    }
+  });
+
+  it("rejects a cycle-introducing add", () => {
+    const l = defaultTaskList();
+    add(l, "a"); // id 1
+    add(l, "b"); // id 2
+    // Make task 1 depend on id 3 (the next id about to be assigned).
+    l.tasks[0].blockers = [3];
+    // Now add task 3 blocked by 1: path 3 -> 1 -> 3 is a cycle.
+    const r = addTask(l, "c", [1]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.detail).toEqual({
+        kind: "invalid_blockers",
+        id: 3,
+        reason: { reason: "cycle" },
+      });
+    }
+  });
+});
+
+// ============================================================================
+// wouldCreateCycle helper (#118) — tested directly against hand-built graphs.
+// ============================================================================
+
+describe("wouldCreateCycle", () => {
+  it("detects a back edge that closes a directed cycle", () => {
+    // Edges (task -> blocker): 3 -> 2, 2 -> 1. From node 3 there is a path
+    // 3 -> 2 -> 1 reaching node 1.
+    const l = defaultTaskList();
+    add(l, "a"); // 1
+    add(l, "b"); // 2
+    add(l, "c"); // 3
+    l.tasks[2].blockers = [2]; // 3 -> 2
+    l.tasks[1].blockers = [1]; // 2 -> 1
+    // Re-adding node 1 with a blocker on 3 closes 1 -> 3 -> 2 -> 1.
+    expect(wouldCreateCycle(l, 1, [3])).toBe(true);
+    // Node 4 with blocker 3 has no path back to 4, so no cycle.
+    expect(wouldCreateCycle(l, 4, [3])).toBe(false);
+  });
+
+  it("treats a direct self-edge as a cycle", () => {
+    const l = defaultTaskList();
+    expect(wouldCreateCycle(l, 5, [5])).toBe(true);
+  });
+
+  it("empty new edges are never a cycle", () => {
+    const l = defaultTaskList();
+    expect(wouldCreateCycle(l, 1, [])).toBe(false);
   });
 });

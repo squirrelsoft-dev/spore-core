@@ -91,6 +91,7 @@ export class TaskListTool implements Tool {
             type: "string",
             enum: ["add_task", "complete_task", "list_tasks", "update_task"],
           },
+          blockers: { type: "array", items: { type: "integer" } },
           description: { type: "string" },
           id: { type: "integer" },
           status: {
@@ -154,10 +155,14 @@ export class TaskListTool implements Tool {
     //    mutate.
     let mutated = false;
     switch (params.action) {
-      case "add_task":
-        addTask(list, params.description);
+      case "add_task": {
+        const r = addTask(list, params.description, params.blockers);
+        if (!r.ok) {
+          return { kind: "error", message: r.error.message, recoverable: true };
+        }
         mutated = true;
         break;
+      }
       case "update_task": {
         const r = updateTask(
           list,

@@ -250,6 +250,12 @@ export const TaskListParamsSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("add_task"),
     description: z.string(),
+    /**
+     * Ids of tasks that must be `completed` before this one runs (#118).
+     * Optional; defaults to empty. Validated by
+     * {@link "@spore/core".tasklist.addTask}.
+     */
+    blockers: z.array(z.number().int().nonnegative()).default([]),
   }),
   z.object({
     action: z.literal("update_task"),

@@ -66,8 +66,8 @@ describe("planArtifactToTaskList (#72)", () => {
   it("serializes the parsed result byte-identical / canonical", () => {
     const list = planArtifactToTaskList(artifact(["alpha", "beta"], "r"));
     expect(serializeTaskList(list)).toBe(
-      '{"tasks":[{"id":1,"description":"alpha","status":"pending"},' +
-        '{"id":2,"description":"beta","status":"pending"}],"next_id":3}',
+      '{"tasks":[{"id":1,"description":"alpha","status":"pending","blockers":[]},' +
+        '{"id":2,"description":"beta","status":"pending","blockers":[]}],"next_id":3}',
     );
   });
 
