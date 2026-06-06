@@ -313,12 +313,14 @@ from .plan import (
 )
 from .tasklist import (
     TASK_LIST_EXTRAS_KEY,
+    BlockerRejection,
     Task as TaskListTask,
     TaskList,
     TaskListError,
     TaskStatus,
     plan_artifact_to_task_list,
     validate_transition,
+    would_create_cycle,
 )
 from .guide_registry import (
     CONFLICT_THRESHOLD,
@@ -703,12 +705,14 @@ __all__ = [
     "capture_plan_artifact",
     # TaskList (#71)
     "TASK_LIST_EXTRAS_KEY",
+    "BlockerRejection",
     "TaskList",
     "TaskListError",
     "TaskListTask",
     "TaskStatus",
     "plan_artifact_to_task_list",
     "validate_transition",
+    "would_create_cycle",
     "PostCompactContext",
     "PostToolBatchContext",
     "PostToolUseContext",

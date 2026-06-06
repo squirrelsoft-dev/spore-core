@@ -38,11 +38,13 @@ from spore_core.storage import (
 )
 from spore_core.tasklist import (
     TASK_LIST_EXTRAS_KEY,
+    BlockerRejection,
     Task,
     TaskList,
     TaskListError,
     TaskStatus,
     validate_transition,
+    would_create_cycle,
 )
 from spore_core.tool_registry import ToolContext
 from spore_tools.tools.tasklist import TaskListTool
@@ -338,8 +340,150 @@ def test_populated_serializes_canonically() -> None:
     tl.add("write tests")
     tl.update(1, TaskStatus.IN_PROGRESS)
     assert tl.to_json() == (
-        '{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}'
+        '{"tasks":[{"id":1,"description":"write tests","status":"in_progress","blockers":[]}],'
+        '"next_id":2}'
     )
+
+
+# ============================================================================
+# blockers (#118)
+# ============================================================================
+
+
+# Happy path: blockers referencing earlier real ids are accepted and stored.
+def test_add_with_valid_blockers_ok() -> None:
+    tl = TaskList()
+    assert tl.add("a") == 1
+    assert tl.add("b") == 2
+    assert tl.add("c", [1, 2]) == 3
+    assert tl.tasks[2].blockers == [1, 2]
+    assert tl.next_id == 4
+
+
+# Empty blockers never reject and store as an empty list.
+def test_add_with_empty_blockers_ok() -> None:
+    tl = TaskList()
+    tl.add("a")
+    assert tl.tasks[0].blockers == []
+    tl.add("b", [])
+    assert tl.tasks[1].blockers == []
+
+
+# Self-block: a blocker equal to the about-to-be-assigned id is rejected.
+def test_self_block_rejected() -> None:
+    tl = TaskList()
+    # next_id is 1, blocker 1 == self.
+    with pytest.raises(TaskListError) as ei:
+        tl.add("a", [1])
+    assert ei.value.kind == "invalid_blockers"
+    assert ei.value.id == 1
+    assert ei.value.reason == BlockerRejection.self_block()
+
+
+# Unknown id: a blocker matching no existing task is rejected.
+def test_unknown_blocker_id_rejected() -> None:
+    tl = TaskList()
+    tl.add("a")  # id 1
+    with pytest.raises(TaskListError) as ei:
+        tl.add("b", [99])
+    assert ei.value.kind == "invalid_blockers"
+    assert ei.value.id == 2
+    assert ei.value.reason == BlockerRejection.unknown_id(99)
+
+
+# A rejected add leaves the list completely untouched (R9, mirrors update).
+def test_rejected_blockers_do_not_mutate() -> None:
+    tl = TaskList()
+    tl.add("a")
+    before = tl.to_json()
+    with pytest.raises(TaskListError):
+        tl.add("b", [99])
+    assert tl.to_json() == before
+    # next_id did NOT advance.
+    assert tl.next_id == 2
+
+
+# Self-block takes precedence over unknown-id when both are present (self-block
+# is checked first per the documented order).
+def test_self_block_checked_before_unknown() -> None:
+    tl = TaskList()
+    # next_id 1: list contains self (1) and an unknown (99); self wins.
+    with pytest.raises(TaskListError) as ei:
+        tl.add("a", [1, 99])
+    assert ei.value.reason == BlockerRejection.self_block()
+
+
+# Cycle: add rejects when the helper reports a cycle. Build a graph where
+# re-adding an existing id with a back-edge would cycle.
+def test_add_rejects_cycle() -> None:
+    tl = TaskList()
+    tl.add("a")  # id 1
+    tl.add("b")  # id 2
+    # Make task 1 depend on id 3 (the next id about to be assigned).
+    tl.tasks[0].blockers = [3]
+    # Now add task 3 blocked by 1: path 3 -> 1 -> 3 is a cycle.
+    with pytest.raises(TaskListError) as ei:
+        tl.add("c", [1])
+    assert ei.value.kind == "invalid_blockers"
+    assert ei.value.id == 3
+    assert ei.value.reason == BlockerRejection.cycle()
+
+
+# would_create_cycle: tested directly against a hand-built cyclic graph, since
+# an append-only add can never close a cycle on its own.
+def test_would_create_cycle_detects_back_edge() -> None:
+    tl = TaskList()
+    tl.add("a")  # 1
+    tl.add("b")  # 2
+    tl.add("c")  # 3
+    tl.tasks[2].blockers = [2]  # 3 -> 2
+    tl.tasks[1].blockers = [1]  # 2 -> 1
+    # Re-adding node 1 with a blocker on 3 closes 1 -> 3 -> 2 -> 1.
+    assert would_create_cycle(tl.tasks, 1, [3])
+    # Node 4 with blocker 3 has no path back to 4, so no cycle.
+    assert not would_create_cycle(tl.tasks, 4, [3])
+
+
+# would_create_cycle: a direct self-edge is a cycle.
+def test_would_create_cycle_self_edge() -> None:
+    assert would_create_cycle([], 5, [5])
+
+
+# would_create_cycle: empty new edges are never a cycle.
+def test_would_create_cycle_empty_is_false() -> None:
+    assert not would_create_cycle([], 1, [])
+
+
+# Non-empty blockers serialize as the LAST field, byte-exact.
+def test_blockers_serialize_last_and_exact() -> None:
+    tl = TaskList()
+    tl.add("a")
+    tl.add("b", [1])
+    assert tl.to_json() == (
+        '{"tasks":['
+        '{"id":1,"description":"a","status":"pending","blockers":[]},'
+        '{"id":2,"description":"b","status":"pending","blockers":[1]}'
+        '],"next_id":3}'
+    )
+
+
+# Backward-compat: a pre-#118 blob WITHOUT a blockers key still loads, with
+# blockers defaulting to an empty list; re-serializing emits blockers:[].
+def test_deserializes_pre_118_blob_without_blockers() -> None:
+    blob = '{"tasks":[{"id":1,"description":"old","status":"pending"}],"next_id":2}'
+    tl = TaskList.from_json(blob)
+    assert len(tl.tasks) == 1
+    assert tl.tasks[0].blockers == []
+    assert tl.to_json() == (
+        '{"tasks":[{"id":1,"description":"old","status":"pending","blockers":[]}],"next_id":2}'
+    )
+
+
+# BlockerRejection canonical dict form is tagged on `reason` (snake_case).
+def test_blocker_rejection_dict_tags() -> None:
+    assert BlockerRejection.self_block().to_dict() == {"reason": "self_block"}
+    assert BlockerRejection.unknown_id(7).to_dict() == {"reason": "unknown_id", "blocker": 7}
+    assert BlockerRejection.cycle().to_dict() == {"reason": "cycle"}
 
 
 # ============================================================================
@@ -511,6 +655,56 @@ async def test_list_tasks_does_not_write() -> None:
     assert await _load_from_store(ctx.run_store) is None
 
 
+# #118: add_task passes blockers through to the list and stores them.
+async def test_tool_add_task_passes_blockers_through() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+    await tool.execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
+    r = await tool.execute(
+        _call({"action": "add_task", "description": "b", "blockers": [1]}), sb, ctx
+    )
+    assert _parse_list(r).tasks[1].blockers == [1]
+
+
+# #118: omitting blockers defaults to empty (backward-compatible call).
+async def test_tool_add_task_without_blockers_defaults_empty() -> None:
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "a"}), _AllowAllSandbox(), _in_memory_ctx()
+    )
+    assert _parse_list(r).tasks[0].blockers == []
+
+
+# #118: a self-blocking add maps to a recoverable tool error.
+async def test_tool_self_block_is_recoverable_error() -> None:
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "a", "blockers": [1]}),
+        _AllowAllSandbox(),
+        _in_memory_ctx(),
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable
+    assert "invalid blockers" in r.message
+
+
+# #118: an unknown blocker id maps to a recoverable tool error.
+async def test_tool_unknown_blocker_is_recoverable_error() -> None:
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "a", "blockers": [99]}),
+        _AllowAllSandbox(),
+        _in_memory_ctx(),
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable
+
+
+# #118: schema advertises blockers as an integer array.
+def test_schema_advertises_blockers() -> None:
+    s = TaskListTool.schema()
+    props = s.parameters["properties"]
+    assert props["blockers"] == {"type": "array", "items": {"type": "integer"}}
+
+
 def test_schema_is_not_read_only() -> None:
     s = TaskListTool.schema()
     assert not s.annotations.read_only
@@ -566,6 +760,8 @@ async def test_fixture_replay_operations() -> None:
                     kind = "task_not_found"
                 elif "invalid transition" in out.message:
                     kind = "invalid_transition"
+                elif "invalid blockers" in out.message:
+                    kind = "invalid_blockers"
                 else:
                     kind = "other"
                 assert kind == expected["error"], f"{sc['name']} step {i}: {out.message}"
@@ -597,7 +793,20 @@ def test_fixture_replay_serialization() -> None:
         assert parsed == tl, f"parse {c['name']}"
 
 
+# #118 backward-compat: a pre-#118 blob WITHOUT a blockers key deserializes
+# (blockers default to []), and re-serializing emits the canonical form WITH
+# blockers:[]. Replayed byte-identically across all four languages.
+def test_fixture_replay_deserialize_backward_compat() -> None:
+    cases = json.loads((FIXTURES / "deserialize.json").read_text())
+    assert cases, "expected >= 1 case"
+    for c in cases:
+        parsed = TaskList.from_json(c["json"])
+        assert parsed == TaskList.from_dict(c["expected"]), f"parse {c['name']}"
+        assert all(t.blockers == [] for t in parsed.tasks), f"blockers default empty: {c['name']}"
+        assert parsed.to_json() == c["reserialized"], f"reserialize {c['name']}"
+
+
 def test_task_to_dict_field_order() -> None:
-    # Field order id, description, status is wire-significant.
+    # Field order id, description, status, blockers is wire-significant.
     t = Task(id=1, description="d", status=TaskStatus.PENDING)
-    assert list(t.to_dict().keys()) == ["id", "description", "status"]
+    assert list(t.to_dict().keys()) == ["id", "description", "status", "blockers"]

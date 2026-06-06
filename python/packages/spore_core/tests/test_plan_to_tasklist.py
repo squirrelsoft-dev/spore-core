@@ -76,8 +76,8 @@ def test_result_serializes_byte_identical_canonical() -> None:
     serialized = task_list.to_json()
     assert serialized == (
         '{"tasks":['
-        '{"id":1,"description":"alpha","status":"pending"},'
-        '{"id":2,"description":"beta","status":"pending"}'
+        '{"id":1,"description":"alpha","status":"pending","blockers":[]},'
+        '{"id":2,"description":"beta","status":"pending","blockers":[]}'
         '],"next_id":3}'
     )
     # Round-trip is byte-identical.

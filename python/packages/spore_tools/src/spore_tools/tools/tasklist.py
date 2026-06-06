@@ -108,6 +108,7 @@ class TaskListTool:
                         "type": "string",
                         "enum": ["add_task", "complete_task", "list_tasks", "update_task"],
                     },
+                    "blockers": {"type": "array", "items": {"type": "integer"}},
                     "description": {"type": "string"},
                     "id": {"type": "integer"},
                     "status": {
@@ -153,7 +154,7 @@ class TaskListTool:
         mutated = False
         try:
             if isinstance(params, AddTaskParams):
-                task_list.add(params.description)
+                task_list.add(params.description, params.blockers)
                 mutated = True
             elif isinstance(params, UpdateTaskParams):
                 task_list.update(params.id, params.status, params.description)

@@ -253,9 +253,15 @@ class SubagentParams(_Params):
 
 
 class AddTaskParams(_Params):
-    """``action == "add_task"`` — append a new pending task."""
+    """``action == "add_task"`` — append a new pending task.
+
+    ``blockers`` (#118) are ids of tasks that must be ``completed`` before this
+    one runs. Optional; defaults to empty. Validated by
+    :meth:`~spore_core.tasklist.TaskList.add`.
+    """
 
     description: str
+    blockers: list[int] = Field(default_factory=list)
 
 
 class UpdateTaskParams(_Params):

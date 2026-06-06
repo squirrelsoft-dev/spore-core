@@ -14,15 +14,21 @@ Types
 * :class:`TaskStatus` — ``pending | in_progress | completed | blocked``.
   Serializes to those exact snake_case strings. Byte-identical across all four
   languages.
-* :class:`Task` — ``{id: int, description: str, status: TaskStatus}``. A flat
-  record: NO hierarchy/subtasks, NO timestamps (byte-identity constraint), NO
-  order field (order is positional in :attr:`TaskList.tasks`).
+* :class:`Task` — ``{id: int, description: str, status: TaskStatus,
+  blockers: list[int]}``. A flat record: NO hierarchy/subtasks, NO timestamps
+  (byte-identity constraint), NO order field (order is positional in
+  :attr:`TaskList.tasks`). ``blockers`` (#118) are ids of other tasks that must
+  be ``completed`` before this task runs; it is the LAST wire field and defaults
+  to empty so pre-#118 blobs still load. Empty blockers ALWAYS serialize as
+  ``[]`` (never dropped), mirroring ``next_id``.
 * :class:`TaskList` — ``{tasks: list[Task], next_id: int}``. The persisted
   collection. The default is empty with ``next_id == 1``.
 * :class:`TaskListError` — domain error
-  (:meth:`TaskListError.task_not_found`, :meth:`TaskListError.invalid_transition`).
-  These map to a recoverable tool error at the tool boundary; the tool NEVER
-  raises uncaught.
+  (:meth:`TaskListError.task_not_found`, :meth:`TaskListError.invalid_transition`,
+  :meth:`TaskListError.invalid_blockers`). These map to a recoverable tool error
+  at the tool boundary; the tool NEVER raises uncaught.
+* :class:`BlockerRejection` — why a blocker set was rejected by
+  :meth:`TaskList.add`: ``self_block`` | ``unknown_id`` | ``cycle``.
 
 ID scheme
 ---------
@@ -45,6 +51,14 @@ Rules enforced
 * R6  ``completed`` is terminal: ANY transition OUT of ``completed`` is rejected
   (the idempotent ``completed → completed`` self-transition is allowed).
 * R7  Self-transitions ``X → X`` are idempotent and always allowed.
+* R9  (#118) :meth:`TaskList.add` blockers are validated BEFORE any mutation; a
+  reject leaves the list untouched (mirrors :meth:`TaskList.update`). Validation:
+  self-block (a blocker == the about-to-be-assigned id) →
+  :meth:`TaskListError.invalid_blockers` (``self_block``); unknown id (a blocker
+  matching no existing task) → (``unknown_id`` with the offending ``blocker``);
+  cycle (the new edges would close a directed cycle in the blockers graph,
+  checked by :func:`would_create_cycle`) → (``cycle``). Empty blockers never
+  reject.
 * R8  Persistence is through the storage seam (#75): the standalone
   :class:`~spore_tools.tools.TaskListTool` persists via the
   :class:`~spore_core.storage.RunStore` on the ``ToolContext``, keyed by
@@ -69,12 +83,14 @@ from .hooks import PlanArtifact
 
 __all__ = [
     "TASK_LIST_EXTRAS_KEY",
+    "BlockerRejection",
     "Task",
     "TaskList",
     "TaskListError",
     "TaskStatus",
     "plan_artifact_to_task_list",
     "validate_transition",
+    "would_create_cycle",
 ]
 
 #: Key under which the :class:`TaskList` is persisted in the
@@ -98,33 +114,53 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+    #: Waiting on a blocker. (#118) This means BOTH "waiting on a blocker that
+    #: has not yet completed" AND "a blocker failed terminally" — the status is
+    #: the same in either case; the distinction (if any) lives in the scheduler,
+    #: not the schema.
     BLOCKED = "blocked"
 
 
 @dataclass
 class Task:
     """A single task: flat, no hierarchy, no timestamps, no order field (order is
-    positional in :attr:`TaskList.tasks`)."""
+    positional in :attr:`TaskList.tasks`).
+
+    ``blockers`` (#118) are the ids of other tasks that must be
+    :attr:`TaskStatus.COMPLETED` before this task runs. The canonical wire field
+    order is ``id, description, status, blockers`` (blockers LAST). ``blockers``
+    defaults to empty so a pre-#118 blob without the key still deserializes (to
+    an empty list); empty blockers ALWAYS serialize as ``[]`` (never dropped),
+    the same treatment as :attr:`TaskList.next_id`.
+    """
 
     id: int
     description: str
     status: TaskStatus
+    blockers: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize to a plain dict with canonical field order ``id``,
-        ``description``, ``status`` (matching the cross-language wire form)."""
+        ``description``, ``status``, ``blockers`` (matching the cross-language
+        wire form). Empty ``blockers`` always serialize as ``[]``."""
         return {
             "id": self.id,
             "description": self.description,
             "status": self.status.value,
+            "blockers": list(self.blockers),
         }
 
     @staticmethod
     def from_dict(value: dict[str, object]) -> Task:
+        # ``blockers`` is optional on the wire (pre-#118 blob) → default empty.
+        blockers_value = value.get("blockers", [])
+        if not isinstance(blockers_value, list):
+            raise ValueError("field `blockers` is not an array")
         return Task(
             id=int(value["id"]),  # type: ignore[arg-type]
             description=str(value["description"]),
             status=TaskStatus(value["status"]),
+            blockers=[int(b) for b in blockers_value],
         )
 
 
@@ -175,11 +211,42 @@ class TaskList:
 
     # ---- mutation helpers (the seam #72 / #59 will call) ------------------
 
-    def add(self, description: str) -> int:
+    def add(self, description: str, blockers: list[int] | None = None) -> int:
         """Append a new ``pending`` task with the next sequential id and return
-        that id. Increments :attr:`next_id`. R1, R2."""
+        that id. Increments :attr:`next_id`. R1, R2.
+
+        Fallible since #118: ``blockers`` are validated BEFORE any mutation, so a
+        rejected blocker set leaves the list completely untouched (mirroring how
+        :meth:`update` validates before writing). R9. Validation order:
+
+        1. self-block — a blocker equal to the id about to be assigned
+           (``next_id``) → :meth:`TaskListError.invalid_blockers` (``self_block``).
+        2. unknown id — a blocker matching no existing task id → (``unknown_id``).
+        3. cycle — the new edges would close a directed cycle, checked by
+           :func:`would_create_cycle` → (``cycle``).
+
+        Empty ``blockers`` always pass (and serialize as ``[]``).
+        """
+        blocker_ids = list(blockers) if blockers is not None else []
         task_id = self.next_id
-        self.tasks.append(Task(id=task_id, description=description, status=TaskStatus.PENDING))
+
+        for blocker in blocker_ids:
+            if blocker == task_id:
+                raise TaskListError.invalid_blockers(task_id, BlockerRejection.self_block())
+            if not any(t.id == blocker for t in self.tasks):
+                raise TaskListError.invalid_blockers(task_id, BlockerRejection.unknown_id(blocker))
+
+        if would_create_cycle(self.tasks, task_id, blocker_ids):
+            raise TaskListError.invalid_blockers(task_id, BlockerRejection.cycle())
+
+        self.tasks.append(
+            Task(
+                id=task_id,
+                description=description,
+                status=TaskStatus.PENDING,
+                blockers=blocker_ids,
+            )
+        )
         self.next_id += 1
         return task_id
 
@@ -229,13 +296,58 @@ class TaskList:
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class BlockerRejection:
+    """Why an ``add_task`` blockers set was rejected (#118).
+
+    A single value type with a ``reason`` discriminant
+    (``"self_block"`` | ``"unknown_id"`` | ``"cycle"``), mirroring the Rust
+    ``BlockerRejection`` enum (internally tagged on ``reason``). ``blocker`` is
+    populated only for ``unknown_id`` (the offending id).
+    """
+
+    #: One of ``"self_block"`` | ``"unknown_id"`` | ``"cycle"``.
+    reason: str
+    #: The offending blocker id (``unknown_id`` only); ``None`` otherwise.
+    blocker: int | None = None
+
+    @staticmethod
+    def self_block() -> BlockerRejection:
+        """A blocker referenced the id about to be assigned to this very task."""
+        return BlockerRejection(reason="self_block")
+
+    @staticmethod
+    def unknown_id(blocker: int) -> BlockerRejection:
+        """A blocker referenced an id that matches no existing task."""
+        return BlockerRejection(reason="unknown_id", blocker=blocker)
+
+    @staticmethod
+    def cycle() -> BlockerRejection:
+        """The new blocker edges would close a directed cycle in the graph."""
+        return BlockerRejection(reason="cycle")
+
+    def to_dict(self) -> dict[str, object]:
+        """Canonical dict form, internally tagged on ``reason``. ``unknown_id``
+        also carries the offending ``blocker``."""
+        if self.reason == "unknown_id":
+            return {"reason": "unknown_id", "blocker": self.blocker}
+        return {"reason": self.reason}
+
+    def __str__(self) -> str:
+        if self.reason == "self_block":
+            return "a task cannot block itself"
+        if self.reason == "unknown_id":
+            return f"unknown blocker id: {self.blocker}"
+        return "blocker edges would create a cycle"
+
+
 class TaskListError(SporeError):
-    """Errors raised by task-list mutations. Both variants are recoverable at the
+    """Errors raised by task-list mutations. Every variant is recoverable at the
     tool boundary.
 
     A single class with a ``kind`` discriminant
-    (``"task_not_found"`` | ``"invalid_transition"``), mirroring the Rust
-    ``TaskListError`` enum.
+    (``"task_not_found"`` | ``"invalid_transition"`` | ``"invalid_blockers"``),
+    mirroring the Rust ``TaskListError`` enum.
     """
 
     def __init__(
@@ -246,6 +358,7 @@ class TaskListError(SporeError):
         id: int,
         from_status: TaskStatus | None = None,
         to_status: TaskStatus | None = None,
+        reason: BlockerRejection | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -253,6 +366,7 @@ class TaskListError(SporeError):
         self.id = id
         self.from_status = from_status
         self.to_status = to_status
+        self.reason = reason
 
     @staticmethod
     def task_not_found(task_id: int) -> TaskListError:
@@ -268,6 +382,15 @@ class TaskListError(SporeError):
             id=task_id,
             from_status=from_status,
             to_status=to_status,
+        )
+
+    @staticmethod
+    def invalid_blockers(task_id: int, reason: BlockerRejection) -> TaskListError:
+        return TaskListError(
+            f"invalid blockers for task {task_id}: {reason}",
+            kind="invalid_blockers",
+            id=task_id,
+            reason=reason,
         )
 
 
@@ -317,6 +440,38 @@ def validate_transition(task_id: int, from_status: TaskStatus, to_status: TaskSt
 
 
 # ============================================================================
+# Cycle detection (#118)
+# ============================================================================
+
+
+def would_create_cycle(tasks: list[Task], new_id: int, new_blockers: list[int]) -> bool:
+    """Would adding a node ``new_id`` whose outgoing blocker edges are
+    ``new_blockers`` close a directed cycle in the blockers graph of ``tasks``?
+
+    The graph is ``task -> blocker`` (a task points at each id it is blocked by).
+    A cycle exists if, starting from any of the new edges' targets, a directed
+    path leads back to ``new_id``. Since a single append-only :meth:`TaskList.add`
+    only references EARLIER real ids, this can never actually fire in normal use;
+    the helper exists as a spec acceptance criterion (#118) and is unit-tested
+    directly against a hand-built cyclic graph.
+    """
+    stack: list[int] = list(new_blockers)
+    visited: set[int] = set()
+    by_id = {t.id: t for t in tasks}
+    while stack:
+        node = stack.pop()
+        if node == new_id:
+            return True
+        if node in visited:
+            continue
+        visited.add(node)
+        task = by_id.get(node)
+        if task is not None:
+            stack.extend(task.blockers)
+    return False
+
+
+# ============================================================================
 # Plan → TaskList parser (issue #72; the bridge between #70 and #59)
 # ============================================================================
 
@@ -361,5 +516,7 @@ def plan_artifact_to_task_list(artifact: PlanArtifact) -> TaskList:
     """
     task_list = TaskList()  # next_id == 1
     for step in artifact.tasks:
-        task_list.add(step)  # verbatim; appends pending; bumps next_id
+        # verbatim; appends pending; bumps next_id. Empty blockers can never
+        # reject, so `add` never raises here and the parser stays total. (#118)
+        task_list.add(step)
     return task_list
