@@ -1,0 +1,23 @@
+[
+  {
+    "name": "pre_118_no_blockers_key",
+    "json": "{\"tasks\":[{\"id\":1,\"description\":\"legacy\",\"status\":\"pending\"}],\"next_id\":2}",
+    "expected": {
+      "tasks": [{"id": 1, "description": "legacy", "status": "pending", "blockers": []}],
+      "next_id": 2
+    },
+    "reserialized": "{\"tasks\":[{\"id\":1,\"description\":\"legacy\",\"status\":\"pending\",\"blockers\":[]}],\"next_id\":2}"
+  },
+  {
+    "name": "pre_118_multiple_no_blockers",
+    "json": "{\"tasks\":[{\"id\":1,\"description\":\"a\",\"status\":\"completed\"},{\"id\":2,\"description\":\"b\",\"status\":\"in_progress\"}],\"next_id\":3}",
+    "expected": {
+      "tasks": [
+        {"id": 1, "description": "a", "status": "completed", "blockers": []},
+        {"id": 2, "description": "b", "status": "in_progress", "blockers": []}
+      ],
+      "next_id": 3
+    },
+    "reserialized": "{\"tasks\":[{\"id\":1,\"description\":\"a\",\"status\":\"completed\",\"blockers\":[]},{\"id\":2,\"description\":\"b\",\"status\":\"in_progress\",\"blockers\":[]}],\"next_id\":3}"
+  }
+]

@@ -287,6 +287,10 @@ pub struct SubagentParams {
 pub enum TaskListParams {
     AddTask {
         description: String,
+        /// Ids of tasks that must be `Completed` before this one runs (#118).
+        /// Optional; defaults to empty. Validated by [`crate::tasklist::TaskList::add`].
+        #[serde(default)]
+        blockers: Vec<u32>,
     },
     UpdateTask {
         id: u32,

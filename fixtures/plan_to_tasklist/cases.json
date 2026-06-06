@@ -8,7 +8,7 @@
     "name": "single_step",
     "input": {"tasks": ["do the thing"], "rationale": ""},
     "expected": {
-      "tasks": [{"id": 1, "description": "do the thing", "status": "pending"}],
+      "tasks": [{"id": 1, "description": "do the thing", "status": "pending", "blockers": []}],
       "next_id": 2
     }
   },
@@ -17,9 +17,9 @@
     "input": {"tasks": ["first", "second", "third"], "rationale": ""},
     "expected": {
       "tasks": [
-        {"id": 1, "description": "first", "status": "pending"},
-        {"id": 2, "description": "second", "status": "pending"},
-        {"id": 3, "description": "third", "status": "pending"}
+        {"id": 1, "description": "first", "status": "pending", "blockers": []},
+        {"id": 2, "description": "second", "status": "pending", "blockers": []},
+        {"id": 3, "description": "third", "status": "pending", "blockers": []}
       ],
       "next_id": 4
     }
@@ -29,8 +29,8 @@
     "input": {"tasks": ["  spaced  ", ""], "rationale": ""},
     "expected": {
       "tasks": [
-        {"id": 1, "description": "  spaced  ", "status": "pending"},
-        {"id": 2, "description": "", "status": "pending"}
+        {"id": 1, "description": "  spaced  ", "status": "pending", "blockers": []},
+        {"id": 2, "description": "", "status": "pending", "blockers": []}
       ],
       "next_id": 3
     }
@@ -40,8 +40,8 @@
     "input": {"tasks": ["alpha", "beta"], "rationale": "we chose this order because alpha must precede beta"},
     "expected": {
       "tasks": [
-        {"id": 1, "description": "alpha", "status": "pending"},
-        {"id": 2, "description": "beta", "status": "pending"}
+        {"id": 1, "description": "alpha", "status": "pending", "blockers": []},
+        {"id": 2, "description": "beta", "status": "pending", "blockers": []}
       ],
       "next_id": 3
     }

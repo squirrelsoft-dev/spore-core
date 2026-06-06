@@ -76,6 +76,7 @@ impl TaskListTool {
                         "type": "string",
                         "enum": ["add_task", "complete_task", "list_tasks", "update_task"],
                     },
+                    "blockers": {"type": "array", "items": {"type": "integer"}},
                     "description": {"type": "string"},
                     "id": {"type": "integer"},
                     "status": {
@@ -143,8 +144,16 @@ impl Tool for TaskListTool {
             // 3. Apply the action. Domain errors → recoverable. `list_tasks`
             //    does not mutate.
             let mutated = match params {
-                TaskListParams::AddTask { description } => {
-                    list.add(description);
+                TaskListParams::AddTask {
+                    description,
+                    blockers,
+                } => {
+                    if let Err(e) = list.add(description, blockers) {
+                        return ToolOutput::Error {
+                            message: e.to_string(),
+                            recoverable: true,
+                        };
+                    }
                     true
                 }
                 TaskListParams::UpdateTask {
@@ -652,6 +661,94 @@ mod tests {
             .is_none());
     }
 
+    // #118: add_task passes blockers through to the list and stores them.
+    #[tokio::test]
+    async fn add_task_passes_blockers_through() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+        tool.execute(
+            &call(json!({"action": "add_task", "description": "a"})),
+            &sb,
+            &ctx,
+        )
+        .await;
+        let r = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "b", "blockers": [1]})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        let list = parse_list(&r);
+        assert_eq!(list.tasks[1].blockers, vec![1]);
+    }
+
+    // #118: omitting blockers defaults to empty (backward-compatible call).
+    #[tokio::test]
+    async fn add_task_without_blockers_defaults_empty() {
+        let ctx = in_memory_ctx();
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a"})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        assert!(parse_list(&r).tasks[0].blockers.is_empty());
+    }
+
+    // #118: a self-blocking add maps to a recoverable tool error.
+    #[tokio::test]
+    async fn self_block_is_recoverable_error() {
+        let ctx = in_memory_ctx();
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a", "blockers": [1]})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        match r {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("invalid blockers"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // #118: an unknown blocker id maps to a recoverable tool error.
+    #[tokio::test]
+    async fn unknown_blocker_is_recoverable_error() {
+        let ctx = in_memory_ctx();
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a", "blockers": [99]})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        match r {
+            ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // #118: schema advertises blockers in sorted property order.
+    #[tokio::test]
+    async fn schema_advertises_blockers() {
+        let s = TaskListTool::schema();
+        let props = s.parameters.get("properties").unwrap();
+        assert_eq!(
+            props.get("blockers").unwrap(),
+            &json!({"type": "array", "items": {"type": "integer"}})
+        );
+    }
+
     #[tokio::test]
     async fn schema_is_not_read_only() {
         let s = TaskListTool::schema();
@@ -730,6 +827,8 @@ mod tests {
                             "task_not_found"
                         } else if message.contains("invalid transition") {
                             "invalid_transition"
+                        } else if message.contains("invalid blockers") {
+                            "invalid_blockers"
                         } else {
                             "other"
                         };
@@ -763,6 +862,35 @@ mod tests {
                 Err(_) => "invalid_transition",
             };
             assert_eq!(got, c.expected, "{:?} -> {:?}", c.from, c.to);
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeserCase {
+        name: String,
+        json: String,
+        expected: TaskList,
+        reserialized: String,
+    }
+
+    // #118 backward-compat: a pre-#118 blob WITHOUT a blockers key deserializes
+    // (blockers default to []), and re-serializing emits the canonical form WITH
+    // blockers:[]. Replayed byte-identically across all four languages.
+    #[tokio::test]
+    async fn fixture_replay_deserialize_backward_compat() {
+        let data = std::fs::read_to_string(fixture_path("deserialize.json")).unwrap();
+        let cases: Vec<DeserCase> = serde_json::from_str(&data).unwrap();
+        assert!(!cases.is_empty(), "expected >=1 case");
+        for c in cases {
+            let parsed: TaskList = serde_json::from_str(&c.json).unwrap();
+            assert_eq!(parsed, c.expected, "parse {}", c.name);
+            assert!(
+                parsed.tasks.iter().all(|t| t.blockers.is_empty()),
+                "blockers default empty: {}",
+                c.name
+            );
+            let reser = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(reser, c.reserialized, "reserialize {}", c.name);
         }
     }
 

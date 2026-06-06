@@ -10,16 +10,32 @@
 //! - [`TaskStatus`] — `Pending | InProgress | Completed | Blocked`. Serializes
 //!   to the snake_case strings `"pending"`, `"in_progress"`, `"completed"`,
 //!   `"blocked"`. Byte-identical across all four languages.
-//! - [`Task`] — `{ id: u32, description: String, status: TaskStatus }`. A flat
-//!   record: NO hierarchy/subtasks, NO timestamps (byte-identity constraint),
-//!   NO order field (order is positional in the [`TaskList::tasks`] `Vec`).
+//! - [`Task`] — `{ id: u32, description: String, status: TaskStatus,
+//!   blockers: Vec<u32> }`. A flat record: NO hierarchy/subtasks, NO timestamps
+//!   (byte-identity constraint), NO order field (order is positional in the
+//!   [`TaskList::tasks`] `Vec`). `blockers` (#118) are ids of other tasks that
+//!   must be `Completed` before this task runs; it is the LAST wire field and is
+//!   `#[serde(default)]` so pre-#118 blobs still load. Empty blockers ALWAYS
+//!   serialize as `[]` (no `skip_serializing_if`), mirroring `next_id`.
 //! - [`TaskList`] — `{ tasks: Vec<Task>, next_id: u32 }`. The persisted
 //!   collection. `TaskList::default()` is empty with `next_id == 1`.
 //! - [`TaskListError`] — `#[non_exhaustive]` domain error
 //!   ([`TaskNotFound`](TaskListError::TaskNotFound),
-//!   [`InvalidTransition`](TaskListError::InvalidTransition)). These map to a
+//!   [`InvalidTransition`](TaskListError::InvalidTransition),
+//!   [`InvalidBlockers`](TaskListError::InvalidBlockers)). These map to a
 //!   recoverable [`ToolOutput::Error`] at the tool boundary; the tool NEVER
 //!   panics.
+//! - [`BlockerRejection`] — why a blocker set was rejected by
+//!   [`TaskList::add`]: [`SelfBlock`](BlockerRejection::SelfBlock),
+//!   [`UnknownId`](BlockerRejection::UnknownId),
+//!   [`Cycle`](BlockerRejection::Cycle).
+//!
+//! # Trait / method surface
+//! - [`TaskList::add`] `(description, blockers) -> Result<u32, TaskListError>` —
+//!   fallible (#118): validates blockers BEFORE mutating; reject leaves the list
+//!   untouched.
+//! - [`TaskList::update`], [`TaskList::complete`] — unchanged.
+//! - [`validate_transition`], [`would_create_cycle`], [`plan_artifact_to_task_list`].
 //!
 //! # The tool — `task_list`
 //! One tool ([`crate::tools::tasklist::TaskListTool`]) with an `action`
@@ -54,6 +70,14 @@
 //! - R6  `Completed` is terminal: ANY transition OUT of `Completed` is rejected
 //!   (the idempotent `Completed → Completed` self-transition is allowed).
 //! - R7  Self-transitions `X → X` are idempotent and always allowed.
+//! - R9  (#118) `add_task` blockers are validated BEFORE any mutation; a reject
+//!   leaves the list untouched (mirrors `update`). Validation:
+//!   self-block (a blocker == the about-to-be-assigned id) →
+//!   [`InvalidBlockers`](TaskListError::InvalidBlockers) `{ SelfBlock }`;
+//!   unknown id (a blocker matching no existing task) → `{ UnknownId }`;
+//!   cycle (the new edges would close a directed cycle in the blockers graph,
+//!   checked by [`would_create_cycle`]) → `{ Cycle }`. Empty blockers never
+//!   reject.
 //! - R8  Persistence is through the storage seam (#75): the standalone
 //!   [`TaskListTool`](crate::tools::TaskListTool) persists via the
 //!   [`RunStore`](crate::storage::RunStore) on the `ToolContext`, keyed by
@@ -92,16 +116,29 @@ pub enum TaskStatus {
     Pending,
     InProgress,
     Completed,
+    /// Waiting on a blocker. (#118) This means BOTH "waiting on a blocker that
+    /// has not yet completed" AND "a blocker failed terminally" — the status is
+    /// the same in either case; the distinction (if any) lives in the
+    /// scheduler, not the schema.
     Blocked,
 }
 
 /// A single task: flat, no hierarchy, no timestamps, no order field (order is
 /// positional in [`TaskList::tasks`]).
+///
+/// `blockers` (#118) are the ids of other tasks that must be
+/// [`Completed`](TaskStatus::Completed) before this task runs. The canonical
+/// wire field order is `id, description, status, blockers` (blockers LAST).
+/// `blockers` is `#[serde(default)]` so a pre-#118 blob without the key still
+/// deserializes (to an empty `Vec`); empty blockers ALWAYS serialize as `[]`
+/// (no `skip_serializing_if`), the same treatment as [`TaskList::next_id`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: u32,
     pub description: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub blockers: Vec<u32>,
 }
 
 /// The persisted collection of tasks plus the monotonic id counter.
@@ -129,8 +166,33 @@ impl Default for TaskList {
 // Errors
 // ============================================================================
 
+/// Why an `add_task` blockers set was rejected (#118). Internally tagged on
+/// `reason` (snake_case), matching the tagging discipline of [`TaskListError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum BlockerRejection {
+    /// A blocker referenced the id about to be assigned to this very task.
+    SelfBlock,
+    /// A blocker referenced an id that matches no existing task.
+    UnknownId { blocker: u32 },
+    /// The new blocker edges would close a directed cycle in the graph.
+    Cycle,
+}
+
+impl std::fmt::Display for BlockerRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockerRejection::SelfBlock => write!(f, "a task cannot block itself"),
+            BlockerRejection::UnknownId { blocker } => {
+                write!(f, "unknown blocker id: {blocker}")
+            }
+            BlockerRejection::Cycle => write!(f, "blocker edges would create a cycle"),
+        }
+    }
+}
+
 /// Errors raised by task-list mutations. `#[non_exhaustive]` per crate
-/// conventions. Both variants are recoverable at the tool boundary.
+/// conventions. Every variant is recoverable at the tool boundary.
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -147,6 +209,12 @@ pub enum TaskListError {
         from: TaskStatus,
         to: TaskStatus,
     },
+
+    /// The blockers supplied to `add_task` for the task about to be assigned
+    /// `id` were rejected (self-block, unknown id, or cycle). The list is left
+    /// untouched. (#118)
+    #[error("invalid blockers for task {id}: {reason}")]
+    InvalidBlockers { id: u32, reason: BlockerRejection },
 }
 
 // ============================================================================
@@ -200,15 +268,80 @@ pub fn validate_transition(id: u32, from: TaskStatus, to: TaskStatus) -> Result<
 impl TaskList {
     /// Append a new `Pending` task with the next sequential id and return that
     /// id. Increments [`TaskList::next_id`]. R1, R2.
-    pub fn add(&mut self, description: String) -> u32 {
+    ///
+    /// Fallible since #118: `blockers` are validated BEFORE any mutation, so a
+    /// rejected blocker set leaves the list completely untouched (mirroring how
+    /// [`TaskList::update`] validates before writing). R9. Validation order:
+    /// 1. self-block — a blocker equal to the id about to be assigned
+    ///    (`next_id`) → [`BlockerRejection::SelfBlock`].
+    /// 2. unknown id — a blocker matching no existing task id →
+    ///    [`BlockerRejection::UnknownId`].
+    /// 3. cycle — the new edges would close a directed cycle, checked by
+    ///    [`would_create_cycle`] → [`BlockerRejection::Cycle`].
+    ///
+    /// Empty `blockers` always pass (and serialize as `[]`).
+    pub fn add(&mut self, description: String, blockers: Vec<u32>) -> Result<u32, TaskListError> {
         let id = self.next_id;
+
+        for &blocker in &blockers {
+            if blocker == id {
+                return Err(TaskListError::InvalidBlockers {
+                    id,
+                    reason: BlockerRejection::SelfBlock,
+                });
+            }
+            if !self.tasks.iter().any(|t| t.id == blocker) {
+                return Err(TaskListError::InvalidBlockers {
+                    id,
+                    reason: BlockerRejection::UnknownId { blocker },
+                });
+            }
+        }
+
+        if self.would_create_cycle(id, &blockers) {
+            return Err(TaskListError::InvalidBlockers {
+                id,
+                reason: BlockerRejection::Cycle,
+            });
+        }
+
         self.tasks.push(Task {
             id,
             description,
             status: TaskStatus::Pending,
+            blockers,
         });
         self.next_id += 1;
-        id
+        Ok(id)
+    }
+
+    /// Would adding a node `new_id` whose outgoing blocker edges are
+    /// `new_blockers` close a directed cycle in the blockers graph?
+    ///
+    /// The graph is `task -> blocker` (a task points at each id it is blocked
+    /// by). A cycle exists if, starting from any of the new edges' targets, a
+    /// directed path leads back to `new_id`. Since a single append-only `add`
+    /// only references EARLIER real ids, this can never actually fire today; the
+    /// helper exists as a spec acceptance criterion (#118) and is unit-tested
+    /// directly against a hand-built cyclic graph.
+    fn would_create_cycle(&self, new_id: u32, new_blockers: &[u32]) -> bool {
+        use std::collections::HashSet;
+
+        let mut stack: Vec<u32> = new_blockers.to_vec();
+        let mut visited: HashSet<u32> = HashSet::new();
+
+        while let Some(node) = stack.pop() {
+            if node == new_id {
+                return true;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(task) = self.tasks.iter().find(|t| t.id == node) {
+                stack.extend(task.blockers.iter().copied());
+            }
+        }
+        false
     }
 
     /// Update a task's status and/or description.
@@ -297,7 +430,11 @@ impl TaskList {
 pub fn plan_artifact_to_task_list(artifact: &PlanArtifact) -> TaskList {
     let mut list = TaskList::default(); // next_id == 1
     for step in &artifact.tasks {
-        list.add(step.clone()); // verbatim; appends Pending; bumps next_id
+        // verbatim; appends Pending; bumps next_id. `blockers: vec![]` can never
+        // reject, so `add` is always `Ok` here and the parser stays total (no
+        // `Result`, never panics in practice). (#118)
+        let added = list.add(step.clone(), Vec::new());
+        debug_assert!(added.is_ok(), "empty blockers must never reject");
     }
     list
 }
@@ -313,7 +450,7 @@ mod tests {
     fn list_with(statuses: &[TaskStatus]) -> TaskList {
         let mut l = TaskList::default();
         for _ in statuses {
-            l.add("t".into());
+            l.add("t".into(), Vec::new()).unwrap();
         }
         for (i, s) in statuses.iter().enumerate() {
             l.tasks[i].status = *s;
@@ -325,9 +462,9 @@ mod tests {
     #[test]
     fn ids_are_sequential_from_one() {
         let mut l = TaskList::default();
-        assert_eq!(l.add("a".into()), 1);
-        assert_eq!(l.add("b".into()), 2);
-        assert_eq!(l.add("c".into()), 3);
+        assert_eq!(l.add("a".into(), Vec::new()).unwrap(), 1);
+        assert_eq!(l.add("b".into(), Vec::new()).unwrap(), 2);
+        assert_eq!(l.add("c".into(), Vec::new()).unwrap(), 3);
         assert_eq!(l.next_id, 4);
         assert_eq!(l.tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [1, 2, 3]);
     }
@@ -336,9 +473,9 @@ mod tests {
     #[test]
     fn add_appends_in_order() {
         let mut l = TaskList::default();
-        l.add("first".into());
-        l.add("second".into());
-        l.add("third".into());
+        l.add("first".into(), Vec::new()).unwrap();
+        l.add("second".into(), Vec::new()).unwrap();
+        l.add("third".into(), Vec::new()).unwrap();
         let descs: Vec<&str> = l.tasks.iter().map(|t| t.description.as_str()).collect();
         assert_eq!(descs, ["first", "second", "third"]);
         // New tasks start Pending.
@@ -504,20 +641,20 @@ mod tests {
     #[test]
     fn reload_preserves_next_id() {
         let mut l = TaskList::default();
-        l.add("a".into());
-        l.add("b".into());
+        l.add("a".into(), Vec::new()).unwrap();
+        l.add("b".into(), Vec::new()).unwrap();
         let json = serde_json::to_string(&l).unwrap();
         let mut reloaded: TaskList = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded.next_id, 3);
-        assert_eq!(reloaded.add("c".into()), 3); // continues from 3, not 1.
+        assert_eq!(reloaded.add("c".into(), Vec::new()).unwrap(), 3); // continues from 3, not 1.
     }
 
     // Serde round-trip is byte-identical (re-serializing the parsed form).
     #[test]
     fn serde_round_trip_byte_identical() {
         let mut l = TaskList::default();
-        l.add("alpha".into());
-        l.add("beta".into());
+        l.add("alpha".into(), Vec::new()).unwrap();
+        l.add("beta".into(), Vec::new()).unwrap();
         l.update(2, Some(TaskStatus::InProgress), None).unwrap();
         let json1 = serde_json::to_string(&l).unwrap();
         let parsed: TaskList = serde_json::from_str(&json1).unwrap();
@@ -564,12 +701,203 @@ mod tests {
     #[test]
     fn populated_serializes_canonically() {
         let mut l = TaskList::default();
-        l.add("write tests".into());
+        l.add("write tests".into(), Vec::new()).unwrap();
         l.update(1, Some(TaskStatus::InProgress), None).unwrap();
         assert_eq!(
             serde_json::to_string(&l).unwrap(),
-            r#"{"tasks":[{"id":1,"description":"write tests","status":"in_progress"}],"next_id":2}"#
+            r#"{"tasks":[{"id":1,"description":"write tests","status":"in_progress","blockers":[]}],"next_id":2}"#
         );
+    }
+
+    // ========================================================================
+    // blockers (#118)
+    // ========================================================================
+
+    // Happy path: blockers referencing earlier real ids are accepted and stored.
+    #[test]
+    fn add_with_valid_blockers_ok() {
+        let mut l = TaskList::default();
+        assert_eq!(l.add("a".into(), Vec::new()).unwrap(), 1);
+        assert_eq!(l.add("b".into(), Vec::new()).unwrap(), 2);
+        let id = l.add("c".into(), vec![1, 2]).unwrap();
+        assert_eq!(id, 3);
+        assert_eq!(l.tasks[2].blockers, vec![1, 2]);
+        assert_eq!(l.next_id, 4);
+    }
+
+    // Empty blockers never reject and store as an empty Vec.
+    #[test]
+    fn add_with_empty_blockers_ok() {
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap();
+        assert!(l.tasks[0].blockers.is_empty());
+    }
+
+    // Self-block: a blocker equal to the about-to-be-assigned id is rejected.
+    #[test]
+    fn self_block_rejected() {
+        let mut l = TaskList::default();
+        // next_id is 1, blocker 1 == self.
+        let err = l.add("a".into(), vec![1]).unwrap_err();
+        assert_eq!(
+            err,
+            TaskListError::InvalidBlockers {
+                id: 1,
+                reason: BlockerRejection::SelfBlock
+            }
+        );
+    }
+
+    // Unknown id: a blocker matching no existing task is rejected.
+    #[test]
+    fn unknown_blocker_id_rejected() {
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap(); // id 1
+        let err = l.add("b".into(), vec![99]).unwrap_err();
+        assert_eq!(
+            err,
+            TaskListError::InvalidBlockers {
+                id: 2,
+                reason: BlockerRejection::UnknownId { blocker: 99 }
+            }
+        );
+    }
+
+    // A rejected add leaves the list completely untouched (R9, mirrors update).
+    #[test]
+    fn rejected_blockers_do_not_mutate() {
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap();
+        let before = l.clone();
+        let _ = l.add("b".into(), vec![99]).unwrap_err();
+        assert_eq!(l, before);
+        // next_id did NOT advance.
+        assert_eq!(l.next_id, 2);
+    }
+
+    // Self-block takes precedence over unknown-id when both are present
+    // (self-block is checked first per the documented order).
+    #[test]
+    fn self_block_checked_before_unknown() {
+        let mut l = TaskList::default();
+        // next_id 1: vec contains self (1) and an unknown (99); self wins.
+        let err = l.add("a".into(), vec![1, 99]).unwrap_err();
+        assert_eq!(
+            err,
+            TaskListError::InvalidBlockers {
+                id: 1,
+                reason: BlockerRejection::SelfBlock
+            }
+        );
+    }
+
+    // would_create_cycle: tested directly against a hand-built cyclic graph,
+    // since an append-only add can never close a cycle on its own.
+    #[test]
+    fn would_create_cycle_detects_back_edge() {
+        // Build edges (task -> blocker): 3 -> 2, 2 -> 1. So from node 3 there is
+        // a directed path 3 -> 2 -> 1 reaching node 1.
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap(); // 1
+        l.add("b".into(), Vec::new()).unwrap(); // 2
+        l.add("c".into(), Vec::new()).unwrap(); // 3
+        l.tasks[2].blockers = vec![2]; // 3 -> 2
+        l.tasks[1].blockers = vec![1]; // 2 -> 1
+                                       // Re-adding node 1 with a blocker on 3 closes 1 -> 3 -> 2 -> 1.
+        assert!(l.would_create_cycle(1, &[3]));
+        // Node 4 with blocker 3 has no path back to 4, so no cycle.
+        assert!(!l.would_create_cycle(4, &[3]));
+    }
+
+    // would_create_cycle: a direct self-edge is a cycle.
+    #[test]
+    fn would_create_cycle_self_edge() {
+        let l = TaskList::default();
+        assert!(l.would_create_cycle(5, &[5]));
+    }
+
+    // would_create_cycle: empty new edges are never a cycle.
+    #[test]
+    fn would_create_cycle_empty_is_false() {
+        let l = TaskList::default();
+        assert!(!l.would_create_cycle(1, &[]));
+    }
+
+    // The cycle path of `add` rejects when the helper reports a cycle. We build
+    // a graph where re-adding an existing id with a back-edge would cycle. Since
+    // a normal add uses a fresh next_id, we exercise the cycle branch via a
+    // crafted state: task 2 already blocks on a future id equal to next_id.
+    #[test]
+    fn add_rejects_cycle() {
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap(); // id 1
+        l.add("b".into(), Vec::new()).unwrap(); // id 2
+                                                // Make task 1 depend on id 3 (the next id about to be assigned).
+        l.tasks[0].blockers = vec![3];
+        // Now add task 3 blocked by 1: path 3 -> 1 -> 3 is a cycle.
+        let err = l.add("c".into(), vec![1]).unwrap_err();
+        assert_eq!(
+            err,
+            TaskListError::InvalidBlockers {
+                id: 3,
+                reason: BlockerRejection::Cycle
+            }
+        );
+    }
+
+    // Non-empty blockers serialize as the LAST field, byte-exact.
+    #[test]
+    fn blockers_serialize_last_and_exact() {
+        let mut l = TaskList::default();
+        l.add("a".into(), Vec::new()).unwrap();
+        l.add("b".into(), vec![1]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&l).unwrap(),
+            r#"{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]},{"id":2,"description":"b","status":"pending","blockers":[1]}],"next_id":3}"#
+        );
+    }
+
+    // Backward-compat: a pre-#118 blob WITHOUT a blockers key still loads, with
+    // blockers defaulting to an empty Vec.
+    #[test]
+    fn deserializes_pre_118_blob_without_blockers() {
+        let json = r#"{"tasks":[{"id":1,"description":"old","status":"pending"}],"next_id":2}"#;
+        let l: TaskList = serde_json::from_str(json).unwrap();
+        assert_eq!(l.tasks.len(), 1);
+        assert!(l.tasks[0].blockers.is_empty());
+        // Re-serializing now emits the canonical form WITH blockers:[].
+        assert_eq!(
+            serde_json::to_string(&l).unwrap(),
+            r#"{"tasks":[{"id":1,"description":"old","status":"pending","blockers":[]}],"next_id":2}"#
+        );
+    }
+
+    // BlockerRejection serde tag is snake_case on `reason`.
+    #[test]
+    fn blocker_rejection_serde_tags() {
+        assert_eq!(
+            serde_json::to_string(&BlockerRejection::SelfBlock).unwrap(),
+            r#"{"reason":"self_block"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&BlockerRejection::UnknownId { blocker: 7 }).unwrap(),
+            r#"{"reason":"unknown_id","blocker":7}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&BlockerRejection::Cycle).unwrap(),
+            r#"{"reason":"cycle"}"#
+        );
+    }
+
+    // TaskListError::InvalidBlockers wire tag is snake_case `invalid_blockers`.
+    #[test]
+    fn invalid_blockers_error_wire_tag() {
+        let e = TaskListError::InvalidBlockers {
+            id: 3,
+            reason: BlockerRejection::SelfBlock,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"invalid_blockers""#), "{json}");
     }
 
     // ========================================================================
@@ -648,7 +976,7 @@ mod tests {
         let json1 = serde_json::to_string(&list).unwrap();
         assert_eq!(
             json1,
-            r#"{"tasks":[{"id":1,"description":"alpha","status":"pending"},{"id":2,"description":"beta","status":"pending"}],"next_id":3}"#
+            r#"{"tasks":[{"id":1,"description":"alpha","status":"pending","blockers":[]},{"id":2,"description":"beta","status":"pending","blockers":[]}],"next_id":3}"#
         );
         let parsed: TaskList = serde_json::from_str(&json1).unwrap();
         let json2 = serde_json::to_string(&parsed).unwrap();

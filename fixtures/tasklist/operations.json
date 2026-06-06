@@ -7,7 +7,7 @@
         "expected": {
           "ok": true,
           "list": {
-            "tasks": [{"id": 1, "description": "first", "status": "pending"}],
+            "tasks": [{"id": 1, "description": "first", "status": "pending", "blockers": []}],
             "next_id": 2
           }
         }
@@ -18,8 +18,8 @@
           "ok": true,
           "list": {
             "tasks": [
-              {"id": 1, "description": "first", "status": "pending"},
-              {"id": 2, "description": "second", "status": "pending"}
+              {"id": 1, "description": "first", "status": "pending", "blockers": []},
+              {"id": 2, "description": "second", "status": "pending", "blockers": []}
             ],
             "next_id": 3
           }
@@ -31,8 +31,8 @@
           "ok": true,
           "list": {
             "tasks": [
-              {"id": 1, "description": "first", "status": "pending"},
-              {"id": 2, "description": "second", "status": "pending"}
+              {"id": 1, "description": "first", "status": "pending", "blockers": []},
+              {"id": 2, "description": "second", "status": "pending", "blockers": []}
             ],
             "next_id": 3
           }
@@ -44,8 +44,8 @@
           "ok": true,
           "list": {
             "tasks": [
-              {"id": 1, "description": "first", "status": "in_progress"},
-              {"id": 2, "description": "second", "status": "pending"}
+              {"id": 1, "description": "first", "status": "in_progress", "blockers": []},
+              {"id": 2, "description": "second", "status": "pending", "blockers": []}
             ],
             "next_id": 3
           }
@@ -57,8 +57,8 @@
           "ok": true,
           "list": {
             "tasks": [
-              {"id": 1, "description": "first", "status": "in_progress"},
-              {"id": 2, "description": "second (edited)", "status": "pending"}
+              {"id": 1, "description": "first", "status": "in_progress", "blockers": []},
+              {"id": 2, "description": "second (edited)", "status": "pending", "blockers": []}
             ],
             "next_id": 3
           }
@@ -70,8 +70,8 @@
           "ok": true,
           "list": {
             "tasks": [
-              {"id": 1, "description": "first", "status": "completed"},
-              {"id": 2, "description": "second (edited)", "status": "pending"}
+              {"id": 1, "description": "first", "status": "completed", "blockers": []},
+              {"id": 2, "description": "second (edited)", "status": "pending", "blockers": []}
             ],
             "next_id": 3
           }
@@ -87,7 +87,7 @@
         "expected": {
           "ok": true,
           "list": {
-            "tasks": [{"id": 1, "description": "task", "status": "pending"}],
+            "tasks": [{"id": 1, "description": "task", "status": "pending", "blockers": []}],
             "next_id": 2
           }
         }
@@ -101,7 +101,7 @@
         "expected": {
           "ok": true,
           "list": {
-            "tasks": [{"id": 1, "description": "task", "status": "completed"}],
+            "tasks": [{"id": 1, "description": "task", "status": "completed", "blockers": []}],
             "next_id": 2
           }
         }
@@ -115,7 +115,94 @@
         "expected": {
           "ok": true,
           "list": {
-            "tasks": [{"id": 1, "description": "task", "status": "completed"}],
+            "tasks": [{"id": 1, "description": "task", "status": "completed", "blockers": []}],
+            "next_id": 2
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "add_with_valid_blockers",
+    "steps": [
+      {
+        "action": {"action": "add_task", "description": "build"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "build", "status": "pending", "blockers": []}],
+            "next_id": 2
+          }
+        }
+      },
+      {
+        "action": {"action": "add_task", "description": "test", "blockers": [1]},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "build", "status": "pending", "blockers": []},
+              {"id": 2, "description": "test", "status": "pending", "blockers": [1]}
+            ],
+            "next_id": 3
+          }
+        }
+      },
+      {
+        "action": {"action": "add_task", "description": "ship", "blockers": [1, 2]},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [
+              {"id": 1, "description": "build", "status": "pending", "blockers": []},
+              {"id": 2, "description": "test", "status": "pending", "blockers": [1]},
+              {"id": 3, "description": "ship", "status": "pending", "blockers": [1, 2]}
+            ],
+            "next_id": 4
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "self_block_rejected_does_not_mutate",
+    "steps": [
+      {
+        "action": {"action": "add_task", "description": "a", "blockers": [1]},
+        "expected": {"ok": false, "error": "invalid_blockers"}
+      },
+      {
+        "action": {"action": "list_tasks"},
+        "expected": {
+          "ok": true,
+          "list": {"tasks": [], "next_id": 1}
+        }
+      }
+    ]
+  },
+  {
+    "name": "unknown_blocker_rejected_does_not_mutate",
+    "steps": [
+      {
+        "action": {"action": "add_task", "description": "a"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "a", "status": "pending", "blockers": []}],
+            "next_id": 2
+          }
+        }
+      },
+      {
+        "action": {"action": "add_task", "description": "b", "blockers": [99]},
+        "expected": {"ok": false, "error": "invalid_blockers"}
+      },
+      {
+        "action": {"action": "list_tasks"},
+        "expected": {
+          "ok": true,
+          "list": {
+            "tasks": [{"id": 1, "description": "a", "status": "pending", "blockers": []}],
             "next_id": 2
           }
         }
