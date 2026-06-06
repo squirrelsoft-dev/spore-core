@@ -158,6 +158,7 @@ func TestBudgetExhaustedBehaviorRejectsUnknownAndMissingKind(t *testing.T) {
 		`{"max_continues":1,"on_exhausted":{"kind":"fail"}}`, // missing kind: must NOT default to continue
 		`{}`,
 		`{"kind":"continue","max_continues":1}`, // continue without on_exhausted is invalid
+		`{"kind":"continue","on_exhausted":{"kind":"fail"}}`, // continue without max_continues: no silent default to 0
 	}
 	for _, b := range bad {
 		t.Run(b, func(t *testing.T) {

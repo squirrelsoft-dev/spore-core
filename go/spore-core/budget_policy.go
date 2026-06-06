@@ -150,7 +150,7 @@ func (b BudgetExhaustedBehavior) MarshalJSON() ([]byte, error) {
 func (b *BudgetExhaustedBehavior) UnmarshalJSON(data []byte) error {
 	var probe struct {
 		Kind         BudgetExhaustedBehaviorKind `json:"kind"`
-		MaxContinues uint32                      `json:"max_continues"`
+		MaxContinues *uint32                     `json:"max_continues"`
 		OnExhausted  *BudgetExhaustedBehavior    `json:"on_exhausted"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
@@ -158,11 +158,16 @@ func (b *BudgetExhaustedBehavior) UnmarshalJSON(data []byte) error {
 	}
 	switch probe.Kind {
 	case BehaviorContinue:
+		// max_continues is required with no silent default (spec contract);
+		// a *uint32 probe distinguishes absent from an explicit 0.
+		if probe.MaxContinues == nil {
+			return fmt.Errorf("BudgetExhaustedBehavior: continue requires max_continues")
+		}
 		if probe.OnExhausted == nil {
 			return fmt.Errorf("BudgetExhaustedBehavior: continue requires on_exhausted")
 		}
 		b.Kind = probe.Kind
-		b.MaxContinues = probe.MaxContinues
+		b.MaxContinues = *probe.MaxContinues
 		b.OnExhausted = probe.OnExhausted
 		return nil
 	case BehaviorEscalate, BehaviorFail:
