@@ -1,2 +1,6 @@
 /target/
-workspace/async-comparison.md
+# Agent run-artifacts: the workspace is scratch output. Keep the seed and the
+# canonical committed report; ignore everything else the plan-execute run emits.
+workspace/*
+!workspace/.gitkeep
+!workspace/Async_Runtime_Comparison_Report.md
