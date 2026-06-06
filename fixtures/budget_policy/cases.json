@@ -1,0 +1,22 @@
+{
+  "policies": [
+    { "kind": "unlimited" },
+    { "kind": "total_steps", "value": 100 },
+    { "kind": "per_loop", "value": 10 },
+    { "kind": "per_attempt", "value": 3 }
+  ],
+  "behaviors": [
+    { "kind": "escalate" },
+    { "kind": "fail" },
+    { "kind": "continue", "max_continues": 2, "on_exhausted": { "kind": "fail" } },
+    {
+      "kind": "continue",
+      "max_continues": 1,
+      "on_exhausted": {
+        "kind": "continue",
+        "max_continues": 2,
+        "on_exhausted": { "kind": "fail" }
+      }
+    }
+  ]
+}
