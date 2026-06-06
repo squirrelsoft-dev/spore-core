@@ -116,6 +116,115 @@ export const BudgetLimitTypeSchema = z.enum([
 ]);
 export type BudgetLimitType = z.infer<typeof BudgetLimitTypeSchema>;
 
+// ============================================================================
+// BudgetPolicy + BudgetExhaustedBehavior (issue #117)
+// ============================================================================
+//
+// Composable-execution budget vocabulary (PRD Part B). These are pure,
+// serializable value types — no executor wiring. Later slices thread them
+// through the strategy tree. They layer *on top of* {@link BudgetLimits} (the
+// global turns/tokens/wall/cost backstop), which is unchanged.
+//
+// Wire format: internally tagged on `kind`, snake_case tag values. `value` and
+// `max_continues` are u32 integers. `on_exhausted` is a recursively nested
+// BudgetExhaustedBehavior. No node silently defaults to `continue`.
+
+/** Non-negative 32-bit integer (`u32`) — a step is one model turn. */
+const u32 = z.number().int().nonnegative().max(0xffffffff);
+
+/**
+ * Per-scope step allowance. A **step is one model turn** (matches
+ * {@link BudgetSnapshot} turns). `per_goal` is intentionally excluded in v1.
+ *
+ *   - `{"kind":"unlimited"}` — no per-scope cap.
+ *   - `{"kind":"total_steps","value":N}` — cap across the whole run.
+ *   - `{"kind":"per_loop","value":N}` — cap per loop iteration.
+ *   - `{"kind":"per_attempt","value":N}` — cap per attempt.
+ */
+export const BudgetPolicySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("unlimited") }),
+  z.object({ kind: z.literal("total_steps"), value: u32 }),
+  z.object({ kind: z.literal("per_loop"), value: u32 }),
+  z.object({ kind: z.literal("per_attempt"), value: u32 }),
+]);
+export type BudgetPolicy = z.infer<typeof BudgetPolicySchema>;
+
+/**
+ * What to do when a policy's allowance is spent. There is deliberately no
+ * default: an unknown or missing `kind` is rejected rather than silently
+ * treated as `continue`.
+ *
+ *   - `{"kind":"continue","max_continues":N,"on_exhausted":{...nested...}}` —
+ *     grant up to `max_continues` extra rounds, then fall through to the nested
+ *     `on_exhausted` behavior. `max_continues === 0` means immediate
+ *     fall-through. `max_continues` is required (no default).
+ *   - `{"kind":"escalate"}` — hand off to a parent/escalation path.
+ *   - `{"kind":"fail"}` — terminate with failure.
+ */
+export type BudgetExhaustedBehavior =
+  | { kind: "continue"; max_continues: number; on_exhausted: BudgetExhaustedBehavior }
+  | { kind: "escalate" }
+  | { kind: "fail" };
+
+export const BudgetExhaustedBehaviorSchema: z.ZodType<BudgetExhaustedBehavior> = z.lazy(() =>
+  z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("continue"),
+      max_continues: u32,
+      on_exhausted: BudgetExhaustedBehaviorSchema,
+    }),
+    z.object({ kind: z.literal("escalate") }),
+    z.object({ kind: z.literal("fail") }),
+  ]),
+);
+
+/** Parse a JSON value into a {@link BudgetPolicy}, rejecting unknown variants. */
+export function budgetPolicyFromJson(value: unknown): BudgetPolicy {
+  return BudgetPolicySchema.parse(value);
+}
+
+/**
+ * Serialize a {@link BudgetPolicy} to a plain object with canonical field
+ * order (`kind` first, then `value`) for byte-identical cross-language output.
+ */
+export function budgetPolicyToJson(policy: BudgetPolicy): Record<string, unknown> {
+  switch (policy.kind) {
+    case "unlimited":
+      return { kind: "unlimited" };
+    case "total_steps":
+    case "per_loop":
+    case "per_attempt":
+      return { kind: policy.kind, value: policy.value };
+  }
+}
+
+/** Parse a JSON value into a {@link BudgetExhaustedBehavior}, rejecting unknown variants. */
+export function budgetExhaustedBehaviorFromJson(value: unknown): BudgetExhaustedBehavior {
+  return BudgetExhaustedBehaviorSchema.parse(value);
+}
+
+/**
+ * Serialize a {@link BudgetExhaustedBehavior} to a plain object with canonical
+ * field order (`kind`, `max_continues`, `on_exhausted`), recursing into the
+ * nested behavior, for byte-identical cross-language output.
+ */
+export function budgetExhaustedBehaviorToJson(
+  behavior: BudgetExhaustedBehavior,
+): Record<string, unknown> {
+  switch (behavior.kind) {
+    case "continue":
+      return {
+        kind: "continue",
+        max_continues: behavior.max_continues,
+        on_exhausted: budgetExhaustedBehaviorToJson(behavior.on_exhausted),
+      };
+    case "escalate":
+      return { kind: "escalate" };
+    case "fail":
+      return { kind: "fail" };
+  }
+}
+
 export const BudgetSnapshotSchema = z.object({
   turns: z.number().int().nonnegative().default(0),
   input_tokens: z.number().int().nonnegative().default(0),
