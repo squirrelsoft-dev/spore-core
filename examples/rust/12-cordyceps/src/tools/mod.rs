@@ -3,3 +3,4 @@
 
 pub mod consult;
 pub mod load_skill;
+pub mod send_message;

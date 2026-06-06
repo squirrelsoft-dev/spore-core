@@ -73,13 +73,14 @@ use crate::tools::consult::{
     consult_advisor_tool, research_best_practices_tool, KIND_ADVICE, KIND_RESEARCH,
 };
 use crate::tools::load_skill::load_skill_tool;
+use crate::tools::send_message::send_user_message_tool;
 
 /// The pre-filled audit prompt the user presses enter to accept (from the
 /// issue). An empty line at the REPL ⇒ this verbatim.
 const DEFAULT_AUDIT_PROMPT: &str =
-    "Audit the current repo for the rust language. Work sequentially by identifying each crate, \
-     and each module in the crate, and adding a task to the tasklist for a subagent to do the \
-     deep dive audit on.";
+    "Audit this repository for Rust defects. Discover the crates and their modules, audit each \
+     module for real, actionable defects, and write a markdown report of the most important \
+     findings to `workspace/findings.md`.";
 
 /// Per-worker wall-clock cap. A worker can burn many internal ReAct turns (and
 /// mediated consults); this bounds how long the orchestrator waits on one
@@ -90,35 +91,58 @@ const WORKER_TIMEOUT: Duration = Duration::from_secs(300);
 /// an empty `.spore/skills/`.
 const BUNDLED_AUDIT_SKILL: &str = include_str!("../skills/audit/SKILL.md");
 
-const ORCHESTRATOR_PROMPT: &str = "You are the cordyceps orchestrator: an autonomous Rust-repo \
-     auditor. You do not stop until the audit is complete. Work sequentially: (1) use `list_dir` \
-     to enumerate the crates under `rust/crates/`, then the modules (`src/*.rs`) in each crate; \
-     (2) for each module, add ONE task to the task list (`task_list`) describing the module to \
-     audit; (3) for each task, call `analysis_worker` with an `instruction` naming the ONE module \
-     to deep-dive audit; (4) accumulate the findings each worker returns into `memory` under a \
-     stable key; (5) when every module is audited, pick the TOP 5 most important findings across \
-     all modules and write them as a markdown report to `workspace/findings.md` using \
-     `write_file`. The audit is READ-ONLY — never modify source files. Delegate the per-module \
-     deep dives to `analysis_worker`; do not audit modules yourself. Finish by writing \
-     findings.md.";
+const ORCHESTRATOR_PROMPT: &str = "\
+You are a cordyceps orchestrator. Your job is to decompose a repo audit into per-module tasks \
+and coordinate subagents to complete them.
 
-const ANALYSIS_WORKER_PROMPT: &str = "You are an analysis worker: you deep-dive audit exactly ONE \
-     Rust module for real, actionable defects. BEFORE auditing, call `load_skill` with \
-     `skill_id` = \"audit\" and follow the returned procedure and findings schema EXACTLY. Stay \
-     inside the one module you were given. Grep first, read only narrow line ranges, and escalate \
-     with `research_best_practices` (idiom questions) or `consult_advisor` (severity / is-this-real \
-     questions) when genuinely unsure. Your FINAL answer must be a JSON array of \
-     {file, line, severity, description} objects — and nothing else.";
+Before each step, call `send_user_message` with one short sentence telling the watching human \
+what you are about to do and why.
 
-const RESEARCH_PROMPT: &str = "You are a research worker. Use the web_search tool to gather \
-     current, factual information on the Rust best-practice or idiom question you are given. Issue \
-     focused queries, read the results, and return a concise, cited answer as plain text. Act \
-     using web_search — do not answer from memory alone.";
+You are already scoped to the repository root. Use `.` for the root and paths relative to it \
+(e.g. `rust/crates`); never prefix a path with the repository's own folder name.
 
-const ADVISOR_PROMPT: &str = "You are a senior Rust advisor. A worker is stuck on whether a \
-     finding is a real defect, or on how to rank its severity. Use `read_file` and `grep` to \
-     investigate the specific code in question, then give a crisp, decisive recommendation: is it \
-     a real defect, what severity (low/medium/high/critical), and why. Be concrete and brief.";
+Your working pattern:
+- Use `list_dir` to discover crates and modules in the repo
+- For each module, add ONE task to `task_list` describing what to audit
+- Dispatch each task to `analysis_worker` with the module path as the instruction
+- Accumulate findings returned by each worker into `memory` under a stable key per module
+- When all tasks are complete, synthesize findings into a markdown report using `write_file`
+
+Delegate all per-module deep dives to `analysis_worker`. Do not audit modules yourself. \
+The audit is read-only — never modify source files.";
+
+const ANALYSIS_WORKER_PROMPT: &str = "\
+You are a cordyceps analysis worker. You perform a deep-dive audit on exactly ONE module at a time.
+
+Before each step, call `send_user_message` with one short sentence telling the watching human \
+what you are about to do and why.
+
+Before auditing, call `load_skill` with `skill_id` = \"audit\" and follow the returned procedure \
+and output schema exactly.
+
+When you are unsure about a Rust idiom, best practice, or language behavior: escalate to \
+`research_best_practices` with a focused question. Do not guess.
+
+When you have a candidate finding but are unsure whether it is a real defect or how to rank its \
+severity: escalate to `consult_advisor` with the finding and relevant code. Do not file uncertain \
+findings without consulting the advisor first.
+
+Your final answer must conform to the schema defined by the audit skill.";
+
+const RESEARCH_PROMPT: &str = "\
+You are a research worker. A peer agent needs factual, current information on a Rust best-practice \
+or language question.
+
+Use `web_search` to find the answer. Issue focused queries, read the results, and return a \
+concise cited answer in plain text. Do not answer from memory alone — always search first.";
+
+const ADVISOR_PROMPT: &str = "\
+You are a senior Rust advisor. A worker has escalated a candidate finding to you because they \
+need a judgment call.
+
+Use `read_file` and `grep` to examine the specific code in question. Then make a decision: \
+is this a real defect, what is the severity (low / medium / high / critical), and why. \
+Be decisive. State your verdict in one sentence, your reasoning in two. Do not hedge.";
 
 /// The single-parameter input schema every subagent tool advertises.
 fn instruction_schema() -> serde_json::Value {
@@ -224,6 +248,7 @@ fn build_analysis_harness(
             .tool(research_best_practices_tool())
             .tool(consult_advisor_tool())
             .tool(load_skill_tool(catalog.registry()))
+            .tool(send_user_message_tool("🤖"))
             .system_prompt(ANALYSIS_WORKER_PROMPT)
             .build(),
     )
@@ -249,7 +274,10 @@ fn build_analysis_tool(
         &empty_child_registry,
     )
     .expect("analysis worker has no subagent tools (depth-1 holds)")
-    .with_consult_handlers(consult_handlers);
+    .with_consult_handlers(consult_handlers)
+    // Make the worker's internal loop visible: its turns/tool-calls print
+    // nested under the `┌─ … └─` delegation boundary.
+    .with_stream(worker_stream_sink());
 
     StandardTool::new(
         Box::new(subagent),
@@ -292,12 +320,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Resolve the repo root (cwd) for the read-only audit sandbox, and this
-    // example's workspace/ for the report write.
+    // Resolve the repo root (cwd) for the read-only audit sandbox. The report
+    // write target is `workspace/` UNDER that root: the orchestrator's
+    // `write_file("workspace/findings.md")` resolves relative to the sandbox
+    // root (= repo_root), so anchoring here keeps the agent's write, the
+    // completion Stop hook, and the success check all pointed at one path —
+    // whether you run from the example dir or the monorepo root.
     let repo_root = std::env::current_dir()?;
     let repo_root = std::fs::canonicalize(&repo_root)?;
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace");
+    let workspace_root = repo_root.join("workspace");
     std::fs::create_dir_all(&workspace_root)?;
+    let findings_path = workspace_root.join("findings.md");
 
     // Seed `.spore/skills/audit/SKILL.md` from the bundled copy if absent, so a
     // user can see the filesystem-registry shape (documented in the README).
@@ -371,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(StandardTools::memory())
         .tool(StandardTools::write_file())
         .tool(StandardTools::bash_command())
+        .tool(send_user_message_tool("🍄"))
         .tool(analysis_tool)
         .system_prompt(ORCHESTRATOR_PROMPT)
         .build();
@@ -391,58 +425,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("strategy     : orchestrator=ReAct, workers=ReAct (isolated)\n");
 
-    // ---- REPL: pre-filled prompt, enter accepts the default -----------------
-    let prompt = read_audit_prompt();
+    // ---- REPL: read a prompt, run, report, re-prompt ------------------------
+    // Each run is one audit. A terminal RunResult — success OR unrecoverable
+    // failure — is reported and we land back on the prompt; the process only
+    // exits on EOF (Ctrl-D). An error never drops the user to their shell.
+    while let Some(prompt) = read_audit_prompt() {
+        // Stream banners: mirror 11-multi-agent's `┌─ … └─` boundary style, but
+        // for the analysis_worker delegation. Fresh per run (the sink consumes
+        // the call-name map).
+        let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let task = Task::new(
+            prompt,
+            SessionId::generate(),
+            LoopStrategy::ReAct { max_iterations: 64 },
+        )
+        .with_budget(BudgetLimits {
+            max_turns: Some(64),
+            ..BudgetLimits::default()
+        });
+        let options = HarnessRunOptions::new(task).with_stream(stream_sink(call_names));
 
-    // Stream banners: mirror 11-multi-agent's `┌─ … └─` boundary style, but for
-    // the analysis_worker delegation.
-    let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let task = Task::new(
-        prompt,
-        SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 64 },
-    )
-    .with_budget(BudgetLimits {
-        max_turns: Some(64),
-        ..BudgetLimits::default()
-    });
-    let options = HarnessRunOptions::new(task).with_stream(stream_sink(call_names));
-
-    // ---- Drive the orchestrator, handling the human-escalation ladder -------
-    let mut result = orchestrator.run(options).await;
-    loop {
-        match result {
-            RunResult::Success { output, turns, .. } => {
-                println!(
-                    "\norchestrator done ({turns} turn(s)): {}",
-                    truncate(&output, 400)
-                );
-                let findings = workspace_root.join("findings.md");
-                if findings.exists() {
-                    println!("\nfindings.md written: {}", findings.display());
-                    run_issue_filing_flow(&orchestrator, &findings).await;
-                } else {
-                    eprintln!("\nwarning: orchestrator finished but workspace/findings.md was not written.");
+        // Drive the orchestrator, handling the human-escalation ladder. The
+        // inner loop only re-iterates to resume a human pause; every terminal
+        // outcome breaks back out to the REPL prompt above.
+        let mut result = orchestrator.run(options).await;
+        loop {
+            match result {
+                RunResult::Success { output, turns, .. } => {
+                    println!(
+                        "\norchestrator done ({turns} turn(s)): {}",
+                        truncate(&output, 400)
+                    );
+                    if findings_path.exists() {
+                        println!("\nfindings.md written: {}", findings_path.display());
+                        run_issue_filing_flow(&orchestrator, &findings_path).await;
+                    } else {
+                        eprintln!(
+                            "\nwarning: orchestrator finished but {} was not written.",
+                            findings_path.display()
+                        );
+                    }
+                    break;
                 }
-                return Ok(());
-            }
-            RunResult::Failure { reason, turns, .. } => {
-                eprintln!("\norchestrator failed after {turns} turn(s): {reason:?}");
-                std::process::exit(1);
-            }
-            RunResult::WaitingForHuman { state, request } => {
-                // The advice consult budget (3) was exhausted under
-                // EscalateToHuman: the analysis_worker SubagentTool converted the
-                // over-budget consult into a human pause, which bubbled up here.
-                result =
-                    handle_human_escalation(&orchestrator, &advisor_handler, *state, request).await;
-            }
-            other => {
-                eprintln!("\nrun ended unexpectedly: {other:?}");
-                std::process::exit(1);
+                RunResult::Failure { reason, turns, .. } => {
+                    // Unrecoverable for THIS run (e.g. a Layer-1 SandboxViolation):
+                    // report it and fall back to the prompt — do not exit.
+                    eprintln!("\norchestrator failed after {turns} turn(s): {reason:?}");
+                    break;
+                }
+                RunResult::WaitingForHuman { state, request } => {
+                    // The advice consult budget (3) was exhausted under
+                    // EscalateToHuman: the analysis_worker SubagentTool converted
+                    // the over-budget consult into a human pause, which bubbled
+                    // up here.
+                    result =
+                        handle_human_escalation(&orchestrator, &advisor_handler, *state, request)
+                            .await;
+                }
+                other => {
+                    eprintln!("\nrun ended unexpectedly: {other:?}");
+                    break;
+                }
             }
         }
     }
+
+    println!("\nbye.");
+    Ok(())
 }
 
 /// Build the orchestrator stream sink: boundary banners for the analysis worker,
@@ -460,7 +509,9 @@ fn stream_sink(
             args,
         } => {
             call_names.lock().unwrap().insert(call_id, name.clone());
-            if name == "analysis_worker" {
+            if name == "send_user_message" {
+                // The tool prints the 🍄 line itself; skip the raw call banner.
+            } else if name == "analysis_worker" {
                 let instruction = args
                     .get("instruction")
                     .and_then(|v| v.as_str())
@@ -484,7 +535,9 @@ fn stream_sink(
                 .unwrap()
                 .remove(&call_id)
                 .unwrap_or_else(|| "<tool>".to_string());
-            if name == "analysis_worker" {
+            if name == "send_user_message" {
+                // Already rendered as the 🍄 line; its ack is noise.
+            } else if name == "analysis_worker" {
                 let tag = if is_error { "FAILED" } else { "findings" };
                 println!("└─ analysis_worker → orchestrator");
                 println!("   {tag}: {}", truncate(&content, 300));
@@ -494,6 +547,50 @@ fn stream_sink(
                     "  {name} → orchestrator [{tag}]: {}",
                     truncate(&content, 140)
                 );
+            }
+        }
+        _ => {}
+    })
+}
+
+/// Build the analysis worker's CHILD stream sink: its internal turns and tool
+/// calls, printed nested with a `│  ` prefix so they sit visually inside the
+/// `┌─ … └─` delegation boundary the orchestrator sink draws. Returned as an
+/// `Arc` because `SubagentTool` hands each dispatch a fresh sink. `send_user_message`
+/// echoes are suppressed — the tool prints its own 🤖 line.
+fn worker_stream_sink() -> Arc<dyn Fn(HarnessStreamEvent) + Send + Sync> {
+    let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    Arc::new(move |event: HarnessStreamEvent| match event {
+        HarnessStreamEvent::TurnStart { turn } => {
+            println!("│  worker · turn {turn}");
+        }
+        HarnessStreamEvent::ToolCall {
+            call_id,
+            name,
+            args,
+        } => {
+            call_names.lock().unwrap().insert(call_id, name.clone());
+            if name == "send_user_message" {
+                // The tool prints its own 🤖 line; skip the raw call banner.
+            } else {
+                println!("│    worker → {name}({})", truncate(&args.to_string(), 120));
+            }
+        }
+        HarnessStreamEvent::ToolResult {
+            call_id,
+            is_error,
+            content,
+        } => {
+            let name = call_names
+                .lock()
+                .unwrap()
+                .remove(&call_id)
+                .unwrap_or_else(|| "<tool>".to_string());
+            if name == "send_user_message" {
+                // Already rendered as the 🤖 line; its ack is noise.
+            } else {
+                let tag = if is_error { "err" } else { "ok" };
+                println!("│    {name} → worker [{tag}]: {}", truncate(&content, 120));
             }
         }
         _ => {}
@@ -614,14 +711,25 @@ fn seed_bundled_audit_skill(repo_root: &std::path::Path) {
 
 /// Read the audit prompt from the REPL: print the default, accept an empty line
 /// as the default verbatim.
-fn read_audit_prompt() -> String {
-    println!("Default audit prompt (press enter to accept, or type your own):");
+/// Read one audit prompt from the REPL. `Some(prompt)` to run (empty line ⇒ the
+/// default verbatim); `None` on EOF (Ctrl-D), which quits the REPL.
+fn read_audit_prompt() -> Option<String> {
+    println!("Default audit prompt (press enter to accept, type your own, or Ctrl-D to quit):");
     println!("  {DEFAULT_AUDIT_PROMPT}");
-    let line = prompt_line("audit> ");
-    if line.trim().is_empty() {
-        DEFAULT_AUDIT_PROMPT.to_string()
-    } else {
-        line
+    print!("audit> ");
+    let _ = std::io::stdout().flush();
+    let mut buf = String::new();
+    match std::io::stdin().read_line(&mut buf) {
+        Ok(0) => None, // EOF
+        Ok(_) => {
+            let line = buf.trim_end_matches(['\n', '\r']).to_string();
+            if line.trim().is_empty() {
+                Some(DEFAULT_AUDIT_PROMPT.to_string())
+            } else {
+                Some(line)
+            }
+        }
+        Err(_) => None,
     }
 }
 
