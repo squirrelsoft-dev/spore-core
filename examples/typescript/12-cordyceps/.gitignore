@@ -1,0 +1,7 @@
+node_modules
+dist
+.env
+# The orchestrator writes the audit report here at runtime; it is local state.
+workspace/findings.md
+# Seeded on first run from the bundled skill so you can see the registry shape.
+.spore/

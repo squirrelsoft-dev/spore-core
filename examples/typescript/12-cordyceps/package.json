@@ -1,0 +1,33 @@
+{
+  "name": "spore-example-12-cordyceps",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "spore-core TypeScript example 12: cordyceps — a fully autonomous task-completion agent (the capstone). A ReAct orchestrator audits this repo's Rust code module-by-module, delegating each deep dive to an isolated analysis worker that loads an `audit` skill at runtime (architect-side GuideRegistry + sticky context-manager injection) and escalates mid-loop via a generalized consult/escalation ladder (#114): research helper (soft-fail) then cloud advisor (escalate-to-human).",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "test": "vitest run",
+    "lint": "eslint src tests",
+    "format": "prettier src tests --check"
+  },
+  "dependencies": {
+    "@spore/core": "file:../../../typescript/packages/core",
+    "@spore/tools": "file:../../../typescript/packages/tools",
+    "zod": "~3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "~20.16.15",
+    "eslint": "~9.13.0",
+    "eslint-config-prettier": "~9.1.2",
+    "prettier": "~3.3.3",
+    "tsx": "~4.19.4",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "~8.12.2",
+    "vitest": "~2.1.9"
+  },
+  "pnpm": {
+    "overrides": {
+      "@spore/core": "file:../../../typescript/packages/core"
+    }
+  }
+}
