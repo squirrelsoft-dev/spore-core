@@ -202,6 +202,79 @@ class AggregateUsage(_Model):
 
 
 # ============================================================================
+# Composable-execution budget vocabulary (issue #117)
+# ============================================================================
+#
+# Pure, serializable value types from the Composable Execution PRD (Part B) —
+# no executor wiring. Later slices thread them through the strategy tree. They
+# layer *on top of* ``BudgetLimits`` (the global turns/tokens/wall/cost
+# backstop), which is unchanged.
+#
+# ``BudgetPolicy`` is a per-scope step allowance, where a step is one model turn
+# (matches ``BudgetSnapshot.turns``). ``PerGoal`` is intentionally excluded in
+# v1.
+#
+# ``BudgetExhaustedBehavior`` says what to do when a policy's allowance is spent.
+# No node silently defaults to ``Continue`` — ``Continue`` carries a required
+# ``max_continues`` and a recursively nested ``on_exhausted`` fall-through.
+#
+# Both are internally tagged on ``kind`` (snake_case), matching the established
+# tagged-union pattern in this module and byte-identical with the Rust / TS / Go
+# definitions (see ``fixtures/budget_policy/cases.json``).
+
+
+class BudgetPolicyUnlimited(_Model):
+    kind: Literal["unlimited"] = "unlimited"
+
+
+class BudgetPolicyTotalSteps(_Model):
+    kind: Literal["total_steps"] = "total_steps"
+    value: int
+
+
+class BudgetPolicyPerLoop(_Model):
+    kind: Literal["per_loop"] = "per_loop"
+    value: int
+
+
+class BudgetPolicyPerAttempt(_Model):
+    kind: Literal["per_attempt"] = "per_attempt"
+    value: int
+
+
+BudgetPolicy = Annotated[
+    BudgetPolicyUnlimited | BudgetPolicyTotalSteps | BudgetPolicyPerLoop | BudgetPolicyPerAttempt,
+    Field(discriminator="kind"),
+]
+
+
+class BudgetExhaustedContinue(_Model):
+    kind: Literal["continue"] = "continue"
+    max_continues: int
+    # Recursively nested fall-through behavior once ``max_continues`` extra
+    # rounds are spent. ``max_continues == 0`` means immediate fall-through.
+    on_exhausted: BudgetExhaustedBehavior
+
+
+class BudgetExhaustedEscalate(_Model):
+    kind: Literal["escalate"] = "escalate"
+
+
+class BudgetExhaustedFail(_Model):
+    kind: Literal["fail"] = "fail"
+
+
+BudgetExhaustedBehavior = Annotated[
+    BudgetExhaustedContinue | BudgetExhaustedEscalate | BudgetExhaustedFail,
+    Field(discriminator="kind"),
+]
+
+# Resolve the forward reference to ``BudgetExhaustedBehavior`` used by
+# ``BudgetExhaustedContinue.on_exhausted`` (recursive tagged union).
+BudgetExhaustedContinue.model_rebuild()
+
+
+# ============================================================================
 # Task + loop strategy (tagged union on ``kind``)
 # ============================================================================
 
