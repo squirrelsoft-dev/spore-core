@@ -42,7 +42,7 @@ use thiserror::Error;
 use crate::harness::{
     BoxFut, ChildPausedState, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
     ConsultResponse, Harness, HarnessRunOptions, HarnessSignal, HumanRequest, PausedState,
-    RunResult, SandboxProvider, SessionId, SessionState, Task, ToolOutput,
+    RunResult, SandboxProvider, SessionId, SessionState, StreamEvent, Task, ToolOutput,
 };
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolRegistry};
@@ -75,6 +75,13 @@ pub struct SubagentTool {
     /// degrades gracefully per R6 (no matching kind → `Escalate`). Populated
     /// via [`with_consult_handlers`](Self::with_consult_handlers).
     consult_handlers: HashMap<String, ConsultHandlerEntry>,
+    /// Optional stream sink for the CHILD run's `StreamEvent`s, so a host can
+    /// observe the subagent's internal turns/tool-calls (otherwise the child
+    /// loop is opaque — only its final answer surfaces). Stored as an `Arc` (not
+    /// the `Box`-based [`StreamSink`](crate::harness::StreamSink)) because
+    /// `execute` runs once per dispatch and must hand each child run a fresh
+    /// sink. Installed via [`with_stream`](Self::with_stream).
+    child_stream: Option<Arc<dyn Fn(StreamEvent) + Send + Sync>>,
 }
 
 impl SubagentTool {
@@ -103,7 +110,16 @@ impl SubagentTool {
             context_sharing,
             harness,
             consult_handlers: HashMap::new(),
+            child_stream: None,
         })
+    }
+
+    /// Install a stream sink for the CHILD run, making the subagent's internal
+    /// turns and tool calls observable to the host. Each dispatch wraps this in
+    /// a fresh [`StreamSink`](crate::harness::StreamSink) for the child run.
+    pub fn with_stream(mut self, sink: Arc<dyn Fn(StreamEvent) + Send + Sync>) -> Self {
+        self.child_stream = Some(sink);
+        self
     }
 
     /// Install the per-kind consult handlers (issue #114, seam A1). Typically
@@ -183,6 +199,12 @@ impl Tool for SubagentTool {
 
             let mut options = HarnessRunOptions::new(task);
             options.session_state = seeded_session;
+            // Make the child loop observable: each dispatch gets a fresh
+            // `Box` sink that forwards to the shared `Arc` installed via
+            // `with_stream`.
+            if let Some(sink) = self.child_stream.clone() {
+                options = options.with_stream(Box::new(move |event| sink(event)));
+            }
 
             let fut = self.harness.run(options);
             let mut result = match tokio::time::timeout(self.timeout, fut).await {
