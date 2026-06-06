@@ -1,0 +1,13 @@
+[package]
+name = "cordyceps"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "spore-core example 12: cordyceps — a fully autonomous Rust-repo auditor that loads a skill at runtime and escalates mid-loop (research → advisor → human) via the #114 consult ladder."
+
+[dependencies]
+spore-core = { path = "../../../rust/crates/spore-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
