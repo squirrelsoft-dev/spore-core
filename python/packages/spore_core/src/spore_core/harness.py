@@ -766,6 +766,19 @@ class ExecutionContext:
         self.scratch.terminal_override = result
         return outcome
 
+    def _take_child_override(self) -> RunResult | None:
+        """Take the FULL terminal :class:`RunResult` a child strategy stashed into
+        ``terminal_override`` when it returned from ``run_strategy(child, cx)``
+        (#124). A combinator that recurses per-phase / per-task calls this
+        immediately after each child dispatch to fold the child's usage / turns /
+        session back into the shared execute context. Clearing the override is
+        REQUIRED: the combinator builds its OWN terminal once the whole loop
+        finishes (via :meth:`_finish`), and a stale child override would otherwise
+        propagate verbatim and mask it."""
+        result = self.scratch.terminal_override
+        self.scratch.terminal_override = None
+        return result
+
     async def _finish(
         self,
         executor: StrategyExecutor,
@@ -787,14 +800,22 @@ class ExecutionContext:
 
 @runtime_checkable
 class StrategyExecutor(Protocol):
-    """The harness-side primitives the per-variant ``run`` bodies delegate to
-    (#124). Implemented by :class:`StandardHarness`. This is the seam that lets
-    the recursive config bodies own their loops while the model-touching
-    machinery (ReAct turn-loop window, evaluate phase, plan phase, metric
-    machinery, ``.spore/`` checks) stays where it is tested.
+    """The harness-side LEAF primitives the per-variant ``run`` bodies delegate to
+    (#124). Implemented by :class:`StandardHarness`. This is the seam that lets the
+    recursive config bodies own their loops while the model-touching machinery
+    (ReAct turn-loop window, SelfVerifying evaluate phase, HillClimbing metric
+    machinery, Ralph ``.spore/`` checks) stays where it is tested.
 
-    Every primitive returns a terminal :class:`RunResult` for its phase; the
-    config bodies translate the terminal into a :class:`StrategyOutcome` (or
+    For PlanExecute (#124) recursion is GENUINE: :func:`_run_plan_execute_config`
+    OWNS the plan→execute orchestration and dispatches its children via
+    ``run_strategy(self.plan, cx)`` / ``run_strategy(self.execute, cx)`` once per
+    task. The harness keeps only the PlanExecute leaf helpers — the plan directive,
+    the plan-subtree dispatch, the artifact capture/persist, the deep-resume
+    reconcile, and the ``OnTaskAdvance`` fire — none of which touch the per-task
+    model loop.
+
+    Each whole-loop primitive returns a terminal :class:`RunResult` for its phase;
+    the config bodies translate the terminal into a :class:`StrategyOutcome` (or
     recurse)."""
 
     async def react_window(
@@ -808,28 +829,66 @@ class StrategyExecutor(Protocol):
         """Run ONE bounded ReAct turn-loop window (the leaf primitive)."""
         ...
 
-    async def plan_phase(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> _PlanPhaseOutcome | RunResult:
-        """Run the PlanExecute plan phase (a real planner turn capturing +
-        persisting a :class:`PlanArtifact`). Returns the outcome or a terminal
-        failure to propagate."""
+    def plan_directive(self, instruction: str) -> str:
+        """The planning directive seeded before the plan sub-strategy runs (R1) —
+        the "respond with a single JSON plan" instruction wrapped around the
+        task. Seeded by the recursive PlanExecute ``run`` body before it dispatches
+        ``self.plan`` (#124)."""
         ...
 
-    async def execute_phase(
+    async def seed_user_message(self, session_state: SessionState, text: str) -> None:
+        """Append ``text`` as a user message onto ``session_state`` through the
+        :class:`ContextManager` seam (#124). Used by the recursive PlanExecute body
+        to seed the plan directive / per-step instruction before dispatching a
+        child sub-strategy."""
+        ...
+
+    async def run_plan_subtree(
         self,
-        task: Task,
-        session_state: SessionState,
-        task_list: object,
-        carried: BudgetSnapshot,
-        plan_usage: AggregateUsage,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Run the PlanExecute execute phase, draining the task list."""
+        plan: LoopStrategy,
+        plan_task: Task,
+        plan_session: SessionState,
+        budget_used: BudgetSnapshot,
+    ) -> RunResult | None:
+        """Dispatch the plan sub-strategy ``plan`` for ``plan_task`` over
+        ``plan_session``, returning its terminal :class:`RunResult` (#124).
+        Genuinely recursive — the child's ``run`` drives its whole loop. Routes the
+        configured ``planner_agent`` (R5/R6) by running the child against an
+        agent-swapped child harness when one is set; otherwise the default agent
+        runs the plan turns. ``None`` ⇒ the child produced no terminal."""
+        ...
+
+    async def capture_plan_artifact(
+        self,
+        session_id: SessionId,
+        plan_output: str,
+        usage: AggregateUsage,
+        turns: int,
+    ) -> _PlanPhaseOutcome | RunResult:
+        """Capture + persist a :class:`PlanArtifact` from the plan sub-strategy's
+        final output text (#124). The leaf model work (the planner turns) runs
+        through ``run_plan_subtree``; this primitive owns only the harness-side
+        artifact machinery: parse the response (R3), fire ``OnPlanCreated`` (R11),
+        and persist to the RunStore under ``PLAN_EXECUTE_EXTRAS_KEY`` (R4). Returns
+        the captured outcome or a terminal failure to propagate."""
+        ...
+
+    async def reconcile_completed_tasks(self, session_id: SessionId, task_list: object) -> None:
+        """Reconcile a freshly-parsed task list against the DURABLE RunStore
+        checkpoint (A.6 deep-resume): any task already ``Completed`` on the
+        checkpoint is marked ``Completed`` in ``task_list`` so it is NOT re-run."""
+        ...
+
+    async def fire_task_advance(
+        self,
+        session_id: SessionId,
+        step_task: Task,
+        task_index: int,
+        total_tasks: int,
+    ) -> Task:
+        """Fire the ``OnTaskAdvance`` hook (pre, mutable) for an execute step. The
+        hook may rewrite ``step_task.instruction``; the (possibly mutated) task is
+        returned and is what the execute sub-strategy then runs."""
         ...
 
     async def persist_task_list(self, session_id: SessionId, task_list: object) -> None:
@@ -939,34 +998,100 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
 async def _run_plan_execute_config(
     self: PlanExecuteConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    """Plan→execute (#124). The plan phase recurses through ``self.plan`` (Q4 — a
-    real loop running the constrained planner via the executor primitive); the
-    execute phase recurses through ``self.execute`` per task. Behavior is at
-    parity with the ported ``_run_plan_execute`` body (AC6). The ready-set walk
-    lands in #126 (execute runs per task sequentially for now)."""
-    from .tasklist import plan_artifact_to_task_list
+    """Plan→execute (#124). GENUINELY recursive: the plan phase dispatches
+    ``self.plan`` (seeding the planning directive + a one-turn budget first) and
+    the execute phase dispatches ``self.execute`` ONCE PER TASK. The child
+    strategy's full loop runs for each phase — a non-ReAct execute child
+    (SelfVerifying / HillClimbing) really executes per task, not a hardcoded flat
+    ReAct (the defeated-the-point bug this fixes).
+
+    This config body OWNS the orchestration: per-task turn/budget allocation
+    (Q1), the ``OnTaskAdvance`` hook (pre, mutable), seeding each step instruction
+    as a user message, A.6 deep-resume against the durable RunStore checkpoint,
+    task-list persistence after each transition (Q4), and cumulative usage /
+    last-output / last-state carry. The harness keeps only LEAF primitives: the
+    constrained-plan capture/persist machinery, the deep-resume reconcile, and the
+    ``OnTaskAdvance`` fire — none of which touch the per-task model loop. The
+    ready-set walk lands in #126 (execute runs per task sequentially for now)."""
+    from .tasklist import TaskStatus, plan_artifact_to_task_list
 
     executor = cx._require_executor()
     if isinstance(executor, StrategyOutcomeFailed):
         return executor
     task = cx._current_task()
     session_id = task.session_id
-    session_state = cx.scratch.run_session
+    # The incoming shared execute session (``[user: task.instruction]``).
+    base_session = cx.scratch.run_session
     cx.scratch.run_session = SessionState()
     budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    # PlanExecute suppresses the run's stream sink for its phases; restore it
+    # before returning so the parent-visible step boundaries are re-emitted.
     on_stream = cx.stream
     cx.stream = None
 
-    # ── Phase 1: plan (recurse through the plan sub-strategy). ───────────────
-    outcome = await executor.plan_phase(
-        task, session_state, budget_used.model_copy(deep=True), on_stream
+    # ── Phase 1: plan (dispatch ``self.plan``). ─────────────────────────────
+    #
+    # Seed the planning directive onto a CLONE of the base session so the shared
+    # execute context stays ``[user: task.instruction]`` (#93 — a leaked directive
+    # would make every execute step re-emit a plan). Cap the plan child at ONE
+    # turn (R1) but never beyond the task's global turn ceiling (so an already-
+    # exhausted budget fails the plan turn before it runs — R10).
+    directive = executor.plan_directive(task.instruction)
+    plan_session = base_session.model_copy(deep=True)
+    await executor.seed_user_message(plan_session, directive)
+    plan_cap = budget_used.turns + 1
+    if task.budget.max_turns is not None:
+        plan_cap = min(task.budget.max_turns, plan_cap)
+    plan_budget = task.budget.model_copy(deep=True)
+    plan_budget.max_turns = plan_cap
+    plan_task = Task(
+        id=task.id,
+        instruction=directive,
+        session_id=session_id,
+        budget=plan_budget,
+        loop_strategy=self.plan,
     )
+    plan_result = await executor.run_plan_subtree(
+        self.plan, plan_task, plan_session, budget_used.model_copy(deep=True)
+    )
+    if isinstance(plan_result, RunResultSuccess):
+        plan_output, plan_usage, plan_turns = (
+            plan_result.output,
+            plan_result.usage,
+            plan_result.turns,
+        )
+    elif plan_result is None:
+        cx.stream = on_stream
+        result: RunResult = RunResultFailure(
+            reason=HaltReasonPlanPhaseFailed(
+                error=PlanPhaseErrorPayload(
+                    kind="planning_turn_failed",
+                    message="plan sub-strategy produced no terminal",
+                ),
+            ),
+            session_id=session_id,
+            usage=AggregateUsage(),
+            turns=budget_used.turns,
+            session_state=SessionState(),
+        )
+        return await cx._finish(executor, task, result)
+    else:
+        # A non-success plan terminal (budget / agent error / pause) propagates
+        # verbatim — the run never reaches execute.
+        cx.stream = on_stream
+        return await cx._finish(executor, task, plan_result)
+
+    # Capture + persist the artifact from the plan child's output (R3/R4/R11) —
+    # the harness-side machinery, no model turn.
+    outcome = await executor.capture_plan_artifact(session_id, plan_output, plan_usage, plan_turns)
     if not isinstance(outcome, _PlanPhaseOutcome):
+        cx.stream = on_stream
         return await cx._finish(executor, task, outcome)
 
     task_list = plan_artifact_to_task_list(outcome.artifact)
     if not task_list.tasks:
-        result: RunResult = RunResultFailure(
+        cx.stream = on_stream
+        result = RunResultFailure(
             reason=HaltReasonEmptyPlan(),
             session_id=session_id,
             usage=outcome.usage,
@@ -976,15 +1101,154 @@ async def _run_plan_execute_config(
         return await cx._finish(executor, task, result)
     await executor.persist_task_list(session_id, task_list)
 
-    # Carry the shared budget past the plan turn.
+    # Carry the shared budget past the plan phase.
     carried = budget_used.model_copy(deep=True)
     carried.turns = outcome.turns
     carried.input_tokens += outcome.usage.input_tokens
     carried.output_tokens += outcome.usage.output_tokens
 
-    # ── Phase 2: execute (recurse through the execute sub-strategy). ─────────
-    result = await executor.execute_phase(
-        task, session_state, task_list, carried, outcome.usage, on_stream
+    # ── Phase 2: execute (dispatch ``self.execute`` PER TASK). ──────────────
+    #
+    # The shared execute context starts from ``base_session`` (NOT the plan
+    # child's polluted session) so the directive never leaks (#93).
+    session_state = base_session
+
+    # A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
+    # Completed tasks are not re-run.
+    await executor.reconcile_completed_tasks(session_id, task_list)
+
+    total_tasks = len(task_list.tasks)
+    total_usage = outcome.usage.model_copy(deep=True)
+    last_output = ""
+    last_state = SessionState()
+    global_max_turns = task.budget.max_turns
+
+    for index in range(total_tasks):
+        task_id = task_list.tasks[index].id
+        instruction = task_list.tasks[index].description
+
+        # A.6 deep-resume: a task already Completed is skipped.
+        if task_list.tasks[index].status == TaskStatus.COMPLETED:
+            last_output = instruction
+            continue
+
+        # Q1: per-task turn allocation, derived at the START of the step. The
+        # sub-loop's effective cap is RELATIVE to the carried turns: a per-task
+        # cap of K means "stop K turns from now" while the GLOBAL budget (carried
+        # forward) remains the hard stop — so the step's turn ceiling is
+        # ``min(global, carried + per_task)``. An already-exhausted global budget
+        # thus budget-fails the step BEFORE the execute child calls the agent.
+        remaining_tasks = total_tasks - index
+        if global_max_turns is not None:
+            remaining_turns = max(0, global_max_turns - carried.turns)
+            per_task_turns = max(1, remaining_turns // remaining_tasks)
+            sub_loop_cap = carried.turns + per_task_turns
+            step_cap = min(global_max_turns, sub_loop_cap)
+        else:
+            step_cap = carried.turns + (2**31 - 1)
+
+        # Mark InProgress and re-persist (Q4).
+        task_list.update(task_id, TaskStatus.IN_PROGRESS)
+        await executor.persist_task_list(session_id, task_list)
+
+        # Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step
+        # instruction; the (possibly mutated) instruction seeds the execute child.
+        step_budget = task.budget.model_copy(deep=True)
+        step_budget.max_turns = step_cap
+        step_task = Task(
+            id=task.id,
+            instruction=instruction,
+            session_id=session_id,
+            budget=step_budget,
+            loop_strategy=self.execute,
+        )
+        step_task = await executor.fire_task_advance(session_id, step_task, index, total_tasks)
+
+        # Seed the step instruction as a user message on the SHARED execute
+        # context, then dispatch the execute sub-strategy through ``cx``.
+        await executor.seed_user_message(session_state, step_task.instruction)
+
+        cx.scratch.task = step_task
+        cx.scratch.run_session = session_state
+        cx.scratch.run_budget = carried.model_copy(deep=True)
+        await run_strategy(self.execute, cx)
+        sub_result = cx._take_child_override()
+
+        if isinstance(sub_result, RunResultSuccess):
+            # Carry the shared budget forward (Q1) and fold this step's
+            # conversation back into the SHARED context so the next step builds on
+            # its results.
+            carried.turns = sub_result.turns
+            session_state = sub_result.session_state
+            last_state = session_state
+            carried.input_tokens += sub_result.usage.input_tokens
+            carried.output_tokens += sub_result.usage.output_tokens
+            total_usage.input_tokens += sub_result.usage.input_tokens
+            total_usage.output_tokens += sub_result.usage.output_tokens
+            total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
+            total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
+            total_usage.cost_usd += sub_result.usage.cost_usd
+            last_output = sub_result.output
+
+            task_list.complete(task_id)
+            await executor.persist_task_list(session_id, task_list)
+            executor._emit(on_stream, StreamFinalResponse(content=last_output))
+
+        elif isinstance(sub_result, RunResultFailure):
+            # Q5: any non-success step aborts the whole run.
+            total_usage.input_tokens += sub_result.usage.input_tokens
+            total_usage.output_tokens += sub_result.usage.output_tokens
+            total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
+            total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
+            total_usage.cost_usd += sub_result.usage.cost_usd
+
+            task_list.update(task_id, TaskStatus.BLOCKED)
+            await executor.persist_task_list(session_id, task_list)
+
+            if isinstance(sub_result.reason, HaltReasonBudgetExceeded):
+                terminal_reason: HaltReason = sub_result.reason
+            else:
+                terminal_reason = HaltReasonStepFailed(
+                    task_index=index,
+                    task=task_list.tasks[index].description,
+                    reason=repr(sub_result.reason),
+                )
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=terminal_reason,
+                session_id=session_id,
+                usage=total_usage,
+                turns=sub_result.turns,
+                session_state=last_state,
+            )
+            return await cx._finish(executor, task, result)
+
+        else:
+            # A pause / consult / escalate (or a missing terminal) propagates the
+            # whole run.
+            cx.stream = on_stream
+            if sub_result is None:
+                result = RunResultFailure(
+                    reason=HaltReasonStepFailed(
+                        task_index=index,
+                        task=task_list.tasks[index].description,
+                        reason="execute sub-strategy produced no terminal",
+                    ),
+                    session_id=session_id,
+                    usage=total_usage,
+                    turns=carried.turns,
+                    session_state=last_state,
+                )
+                return await cx._finish(executor, task, result)
+            return await cx._finish(executor, task, sub_result)
+
+    cx.stream = on_stream
+    result = RunResultSuccess(
+        output=last_output,
+        session_id=session_id,
+        usage=total_usage,
+        turns=carried.turns,
+        session_state=last_state,
     )
     return await cx._finish(executor, task, result)
 
@@ -3208,6 +3472,44 @@ class HarnessConfig:
             escalation_mode = EscalationModeSurfaceToHuman()
         self.escalation_mode: EscalationMode = escalation_mode
 
+    def with_agent(self, agent: Agent) -> HarnessConfig:
+        """A full copy of this config with only ``agent`` swapped (#124). Every
+        other component is shared by reference so the child run's spans land in the
+        same trace stream and the configured ``model_params`` / registry / system
+        prompt reach the child turns. Mirrors Rust's ``self.config.clone()`` +
+        ``plan_config.agent = planner`` in ``run_plan_subtree``."""
+        return HarnessConfig(
+            agent=agent,
+            tool_registry=self.tool_registry,
+            sandbox=self.sandbox,
+            context_manager=self.context_manager,
+            termination_policy=self.termination_policy,
+            middleware=self.middleware,
+            observability=self.observability,
+            compaction_verifier=self.compaction_verifier,
+            max_compaction_attempts=self.max_compaction_attempts,
+            pricing=self.pricing,
+            content_capture=self.content_capture,
+            max_stop_blocks=self.max_stop_blocks,
+            max_resets=self.max_resets,
+            vcs_provider=self.vcs_provider,
+            hooks=self.hooks,
+            planner_agent=self.planner_agent,
+            verifier=self.verifier,
+            evaluator_agent=self.evaluator_agent,
+            storage=self.storage,
+            chunk_provider=self.chunk_provider,
+            metric_evaluator=self.metric_evaluator,
+            catalogue_registry=self.catalogue_registry,
+            system_prompt=self.system_prompt,
+            model_params=self.model_params,
+            auto_persist_sessions=self.auto_persist_sessions,
+            prompt_tool_call_flag=self.prompt_tool_call_flag,
+            consult_handlers=self.consult_handlers,
+            registry=self.registry,
+            escalation_mode=self.escalation_mode,
+        )
+
 
 class HarnessBuilder:
     """Fluent assembler for a :class:`HarnessConfig` / :class:`StandardHarness`.
@@ -4523,31 +4825,93 @@ class StandardHarness:
             task, max_iterations, session_state, budget_used, on_stream
         )
 
-    async def plan_phase(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> _PlanPhaseOutcome | RunResult:
-        """:class:`StrategyExecutor` primitive: the PlanExecute plan phase
-        (delegates to :meth:`_run_plan_phase`)."""
-        return await self._run_plan_phase(task, session_state, budget_used, on_stream)
-
-    async def execute_phase(
-        self,
-        task: Task,
-        session_state: SessionState,
-        task_list: object,
-        carried: BudgetSnapshot,
-        plan_usage: AggregateUsage,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """:class:`StrategyExecutor` primitive: the PlanExecute execute phase
-        (delegates to :meth:`_run_execute_phase`)."""
-        return await self._run_execute_phase(
-            task, session_state, task_list, carried, plan_usage, on_stream
+    def plan_directive(self, instruction: str) -> str:
+        """:class:`StrategyExecutor` primitive: the planning directive seeded
+        before the plan sub-strategy runs (R1)."""
+        return (
+            "Produce a step-by-step plan for the following task. Respond with a "
+            'single JSON object: {"tasks": [<ordered step strings>], '
+            '"rationale": <string>}.\n\nTask:\n' + instruction
         )
+
+    async def seed_user_message(self, session_state: SessionState, text: str) -> None:
+        """:class:`StrategyExecutor` primitive: append ``text`` as a user message
+        onto ``session_state`` through the :class:`ContextManager` seam (#124)."""
+        await self._config.context_manager.append_user_message(session_state, text)
+
+    async def run_plan_subtree(
+        self,
+        plan: LoopStrategy,
+        plan_task: Task,
+        plan_session: SessionState,
+        budget_used: BudgetSnapshot,
+    ) -> RunResult | None:
+        """:class:`StrategyExecutor` primitive: dispatch the plan sub-strategy
+        ``plan`` for ``plan_task`` over ``plan_session`` (#124).
+
+        R5/R6: route the planner agent. When ``planner_agent`` is configured the
+        plan child runs against an agent-swapped child harness (same pattern as the
+        SelfVerifying evaluate phase); otherwise the default agent runs through
+        ``self``. Either way the child's ``run`` drives the WHOLE plan loop (genuine
+        recursion). Returns the child's verbatim terminal, or ``None`` when it
+        produced no terminal."""
+        if self._config.planner_agent is not None:
+            plan_config = self._config.with_agent(self._config.planner_agent)
+            plan_harness = StandardHarness(plan_config)
+            cx = ExecutionContext(registry=plan_harness._config.registry)
+            cx.executor = plan_harness
+        else:
+            cx = ExecutionContext(registry=self._config.registry)
+            cx.executor = self
+        cx.scratch.run_session = plan_session
+        cx.scratch.run_budget = budget_used
+        cx.scratch.task = plan_task
+        await run_strategy(plan, cx)
+        return cx.scratch.terminal_override
+
+    async def capture_plan_artifact(
+        self,
+        session_id: SessionId,
+        plan_output: str,
+        usage: AggregateUsage,
+        turns: int,
+    ) -> _PlanPhaseOutcome | RunResult:
+        """:class:`StrategyExecutor` primitive: capture + persist a
+        :class:`PlanArtifact` from the plan sub-strategy's final output text
+        (delegates to :meth:`_capture_and_persist_plan`)."""
+        return await self._capture_and_persist_plan(session_id, plan_output, usage, turns)
+
+    async def reconcile_completed_tasks(self, session_id: SessionId, task_list: object) -> None:
+        """:class:`StrategyExecutor` primitive: A.6 deep-resume reconcile
+        (delegates to :meth:`_reconcile_deep_resume`)."""
+        await self._reconcile_deep_resume(session_id, task_list)
+
+    async def fire_task_advance(
+        self,
+        session_id: SessionId,
+        step_task: Task,
+        task_index: int,
+        total_tasks: int,
+    ) -> Task:
+        """:class:`StrategyExecutor` primitive: fire the ``OnTaskAdvance`` hook
+        (pre, mutable) for an execute step, returning the (possibly mutated)
+        step task."""
+        from .hooks import OnTaskAdvanceContext
+
+        if self._config.hooks is not None:
+            ctx = OnTaskAdvanceContext(
+                session_id=session_id,
+                task=step_task,
+                task_index=task_index,
+                total_tasks=total_tasks,
+            )
+            try:
+                await self._config.hooks.fire(ctx)
+            except Exception:  # noqa: BLE001 — a broken hook must not abort the run
+                pass
+            # The chain threads mutations through ``ctx.task`` in place.
+            step_task = ctx.task
+        return step_task
 
     async def persist_task_list(self, session_id: SessionId, task_list: object) -> None:
         """:class:`StrategyExecutor` primitive: persist a parsed task list
@@ -4674,104 +5038,6 @@ class StandardHarness:
             turns=cx.scratch.run_budget.turns,
             session_state=SessionState(messages=messages),
         )
-
-    # ---- PlanExecute strategy (issues #59 / #70) --------------------
-
-    async def _run_plan_execute(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive the PlanExecute strategy (issue #59) — the two-phase loop.
-
-        Phase 1 (plan, runs EXACTLY once): :meth:`_run_plan_phase` seeds a
-        planning directive, runs one constrained planner turn, captures a
-        :class:`PlanArtifact`, fires ``OnPlanCreated``, and counts the turn
-        against the shared budget. Phase 2 (execute, loops):
-        :meth:`_run_execute_phase` drains the parsed task list, running each task
-        in a bounded ReAct sub-loop that BUILDS ON the accumulated execute-phase
-        context (prior steps' tool results and assistant outputs carry forward).
-
-        Resolved spec decisions (issue #59, all FINAL):
-
-        * **Q1** — each task runs a bounded, SEQUENTIAL ReAct sub-loop that
-          BUILDS ON the accumulated execute-phase context: after each successful
-          step its conversation (instruction + tool calls + tool results +
-          assistant output) is folded back into the shared ``session_state``, so
-          the next step sees all prior steps' results. The per-task turn cap is
-          derived at the START of each step as ``remaining_turns //
-          remaining_tasks`` (floored at 1). The shared budget — turns, tokens,
-          observability, compaction — is carried across every step and the
-          global budget is the hard stop.
-        * **Q2** — success ``output`` is the LAST completed step's final text.
-        * **Q3** — an empty plan (``tasks: []``) ⇒ :class:`HaltReasonEmptyPlan`.
-        * **Q4** — the task list/plan persist through the
-          :class:`StorageProvider` / :class:`RunStore` seam (plus the ``extras``
-          mirror); the #71 sandbox path is NOT used by the execute loop.
-        * **Q5** — a step erroring/blocked ABORTS the whole run with
-          :class:`HaltReasonStepFailed`; execution does not continue.
-
-        Mirrors Rust's ``run_plan_execute``. Like ``_run_react``, this finalizes
-        observability for the terminal outcome.
-        """
-        from .tasklist import plan_artifact_to_task_list
-
-        session_id = task.session_id
-
-        # Phase 1: plan (runs exactly once).
-        outcome = await self._run_plan_phase(task, session_state, budget_used, on_stream)
-        if not isinstance(outcome, _PlanPhaseOutcome):
-            # Plan-phase failure: propagate unchanged (no task list persisted).
-            await self._finalize_plan_execute(outcome)
-            return outcome
-
-        # Bridge: parse the accepted plan into a TaskList (#72).
-        task_list = plan_artifact_to_task_list(outcome.artifact)
-
-        # Q3: an empty plan is a failure, not a silent success.
-        if not task_list.tasks:
-            result: RunResult = self._fail(
-                HaltReasonEmptyPlan(),
-                session_id,
-                outcome.usage,
-                outcome.turns,
-            )
-            await self._finalize_plan_execute(result)
-            return result
-
-        # Q4: persist through the storage seam (RunStore) — single source of truth.
-        await self._persist_task_list(session_id, task_list)
-
-        # Carry the shared budget forward: the plan turn already consumed
-        # ``outcome.turns`` turns and ``outcome.usage`` tokens (Q1).
-        carried = budget_used.model_copy(deep=True)
-        carried.turns = outcome.turns
-        carried.input_tokens += outcome.usage.input_tokens
-        carried.output_tokens += outcome.usage.output_tokens
-
-        # Phase 2: execute (loops over the task list).
-        result = await self._run_execute_phase(
-            task, session_state, task_list, carried, outcome.usage, on_stream
-        )
-        await self._finalize_plan_execute(result)
-        return result
-
-    async def _finalize_plan_execute(self, result: RunResult) -> None:
-        """Finalize observability for a terminal PlanExecute outcome. Mirrors the
-        tail of ``_run_react``: a ``WaitingForHuman`` pause is not terminal and is
-        never flushed here. Mirrors Rust's ``finalize_plan_execute``."""
-        if isinstance(result, RunResultSuccess):
-            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
-        elif isinstance(result, RunResultFailure):
-            await self._finalize_observability(
-                result.session_id,
-                SessionOutcomeFailure(reason=result.reason.kind),
-            )
-        elif isinstance(result, RunResultEscalate):
-            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
-        # RunResultWaitingForHuman: not terminal, do not finalize.
 
     # ---- SelfVerifying strategy (issue #61) -------------------------
 
@@ -5047,8 +5313,8 @@ class StandardHarness:
 
     async def _finalize_self_verifying(self, result: RunResult) -> None:
         """Finalize observability for a terminal SelfVerifying outcome (issue
-        #61). Mirrors ``_finalize_plan_execute``: a ``WaitingForHuman`` pause is
-        not terminal and is never flushed here. Mirrors Rust's
+        #61). Like ``_run_react``'s tail: a ``WaitingForHuman`` pause is not
+        terminal and is never flushed here. Mirrors Rust's
         ``finalize_self_verifying``."""
         if isinstance(result, RunResultSuccess):
             await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
@@ -5612,6 +5878,161 @@ class StandardHarness:
         except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
             pass
 
+    async def _reconcile_deep_resume(
+        self,
+        session_id: SessionId,
+        task_list: object,
+    ) -> None:
+        """A.6 deep-resume reconcile (#124, Q2): mark every task already
+        ``Completed`` on the DURABLE RunStore checkpoint as ``Completed`` in the
+        freshly-parsed ``task_list`` so it is NOT re-run. Tasks are matched by
+        ``id`` (the task list is regenerated deterministically from the same
+        artifact). Extracted from the legacy execute phase so the recursive
+        PlanExecute body owns the per-task loop while the durable-state reconcile
+        stays here as a leaf primitive. Mirrors Rust's ``reconcile_deep_resume``.
+        """
+        from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
+
+        assert isinstance(task_list, TaskList)
+        try:
+            saved_value = await self._config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
+        except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
+            saved_value = None
+        if saved_value is None:
+            return
+        try:
+            saved = TaskList.from_dict(saved_value)
+        except Exception:  # noqa: BLE001 — an unparseable checkpoint is ignored
+            return
+        completed_ids = {s.id for s in saved.tasks if s.status == TaskStatus.COMPLETED}
+        for t in task_list.tasks:
+            if t.id in completed_ids:
+                t.status = TaskStatus.COMPLETED
+
+    async def _capture_and_persist_plan(
+        self,
+        session_id: SessionId,
+        plan_output: str,
+        usage: AggregateUsage,
+        turns: int,
+    ) -> _PlanPhaseOutcome | RunResultFailure:
+        """Capture + persist a :class:`PlanArtifact` from the plan sub-strategy's
+        output text (#124): R3 (parse), R11 (fire ``OnPlanCreated``, mutable), R4
+        (persist to the RunStore under ``PLAN_EXECUTE_EXTRAS_KEY``). The model
+        turns that produced ``plan_output`` ran elsewhere — the recursive
+        ``self.plan`` child — so this carries no agent call. Returns the captured
+        outcome + accounting or a terminal failure to propagate. Mirrors Rust's
+        ``capture_and_persist_plan``."""
+        from .plan import PLAN_EXECUTE_EXTRAS_KEY, PlanPhaseError, capture_plan_artifact
+
+        # R3: capture the artifact from the response text.
+        try:
+            artifact = capture_plan_artifact(plan_output)
+        except PlanPhaseError as e:
+            return self._fail(
+                HaltReasonPlanPhaseFailed(
+                    error=PlanPhaseErrorPayload(kind=e.kind, message=e.message),
+                ),
+                session_id,
+                usage,
+                turns,
+            )
+
+        # R11: fire OnPlanCreated synchronously; the hook may rewrite the
+        # artifact. The stored artifact reflects any mutation. Errors are
+        # non-fatal: an observability/handler error must not lose a
+        # successfully-captured plan, so the (possibly mutated) artifact is
+        # still stored.
+        if self._config.hooks is not None:
+            from .hooks import OnPlanCreatedContext
+
+            ctx = OnPlanCreatedContext(session_id=session_id, plan=artifact)
+            try:
+                await self._config.hooks.fire(ctx)
+            except Exception:  # noqa: BLE001 — a broken hook must not lose the plan
+                pass
+            # The chain threads mutations through ``ctx.plan`` in place.
+            artifact = ctx.plan
+
+        # R4: persist the produced artifact to the RunStore seam under
+        # PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth; no
+        # longer mirrored into SessionState.extras). Storage failures are
+        # swallowed (matching the task-list persist): a successfully-captured plan
+        # must not be lost to a storage hiccup (the default no-op provider never
+        # fails).
+        try:
+            await self._config.storage.run().put(
+                session_id, PLAN_EXECUTE_EXTRAS_KEY, artifact.model_dump(mode="json")
+            )
+        except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
+            pass
+
+        return _PlanPhaseOutcome(artifact=artifact, usage=usage, turns=turns)
+
+    # ---- PlanExecute phase test helpers (#124) ----------------------
+    #
+    # The genuine plan / execute orchestration lives ONLY in
+    # :func:`_run_plan_execute_config` (where it can dispatch the child
+    # ``self.plan`` / ``self.execute`` strategies via ``run_strategy``). These two
+    # helpers reproduce the minimal driver around a SINGLE phase using the same
+    # leaf primitives + scratch wiring, so the granular plan/execute regression
+    # tests exercise the real recursive dispatch rather than a stale parallel copy.
+
+    async def _run_plan_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> _PlanPhaseOutcome | RunResult:
+        """Test helper (#124): drive the genuine recursive plan phase for ``task``
+        (whose ``loop_strategy`` must be a :class:`PlanExecuteConfig`) — seed the
+        directive, dispatch ``self.plan`` capped at one turn via
+        :meth:`run_plan_subtree`, then capture + persist the artifact via
+        :meth:`_capture_and_persist_plan`. Mirrors the plan half of
+        :func:`_run_plan_execute_config` and Rust's cfg-test ``run_plan_phase``.
+        On success returns a :class:`_PlanPhaseOutcome`; on any failure returns the
+        terminal :class:`RunResult` to propagate."""
+        assert isinstance(task.loop_strategy, PlanExecuteConfig)
+        plan_strategy = task.loop_strategy.plan
+        session_id = task.session_id
+
+        directive = self.plan_directive(task.instruction)
+        plan_session = session_state.model_copy(deep=True)
+        await self.seed_user_message(plan_session, directive)
+        plan_cap = budget_used.turns + 1
+        if task.budget.max_turns is not None:
+            plan_cap = min(task.budget.max_turns, plan_cap)
+        plan_budget = task.budget.model_copy(deep=True)
+        plan_budget.max_turns = plan_cap
+        plan_task = Task(
+            id=task.id,
+            instruction=directive,
+            session_id=session_id,
+            budget=plan_budget,
+            loop_strategy=plan_strategy,
+        )
+        plan_result = await self.run_plan_subtree(
+            plan_strategy, plan_task, plan_session, budget_used.model_copy(deep=True)
+        )
+        if isinstance(plan_result, RunResultSuccess):
+            return await self._capture_and_persist_plan(
+                session_id, plan_result.output, plan_result.usage, plan_result.turns
+            )
+        if plan_result is None:
+            return self._fail(
+                HaltReasonPlanPhaseFailed(
+                    error=PlanPhaseErrorPayload(
+                        kind="planning_turn_failed",
+                        message="plan sub-strategy produced no terminal",
+                    ),
+                ),
+                session_id,
+                AggregateUsage(),
+                budget_used.turns,
+            )
+        return plan_result
+
     async def _run_execute_phase(
         self,
         task: Task,
@@ -5621,134 +6042,71 @@ class StandardHarness:
         plan_usage: AggregateUsage,
         on_stream: StreamSink | None,
     ) -> RunResult:
-        """Drive the PlanExecute execute phase (issue #59), draining ``task_list``.
-
-        Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
-        the accumulated execute-phase context: after each successful step its
-        resulting conversation (instruction + tool calls + tool results +
-        assistant output) is folded back into the shared ``session_state``, so
-        the next step's sub-loop sees every prior step's results. The per-task
-        turn cap is derived at the START of each step from the shared budget:
-        ``per_task_turns = remaining_turns // remaining_tasks`` floored at 1
-        (``remaining_tasks`` counts the not-yet-started tasks including the
-        current one). The shared budget (``carried``) is threaded through every
-        step so early tasks cannot starve later ones and the global budget stays
-        the hard stop.
-
-        Before each step the task is marked ``in_progress`` (and ``completed``
-        after), the list is re-persisted (Q4), and ``OnTaskAdvance`` fires with
-        the correct ``task_index`` / ``total_tasks`` (the hook may rewrite the
-        step instruction). Q2: on success ``output`` is the LAST completed step's
-        final text. Q5: a step that errors/blocks aborts the run with
-        :class:`HaltReasonStepFailed`. Mirrors Rust's ``run_execute_phase``.
+        """Test helper (#124): drive the genuine recursive execute phase for
+        ``task`` (whose ``loop_strategy`` must be a :class:`PlanExecuteConfig`),
+        draining ``task_list`` by dispatching ``self.execute`` per task via
+        ``run_strategy``. Mirrors the execute half of
+        :func:`_run_plan_execute_config` and Rust's cfg-test ``run_execute_phase``.
         """
-        from .hooks import OnTaskAdvanceContext
-        from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
+        from .tasklist import TaskList, TaskStatus
 
         assert isinstance(task_list, TaskList)
-        config = self._config
+        assert isinstance(task.loop_strategy, PlanExecuteConfig)
+        execute_strategy = task.loop_strategy.execute
         session_id = task.session_id
 
-        # A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
-        # already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
-        # after every step (Q4). On a resumed run the freshly-parsed ``task_list``
-        # (from the plan artifact) is reconciled with that checkpoint so already-
-        # Completed tasks are NOT re-run — serialize→reset→resume rather than the
-        # old shallow no-op. Tasks are matched by ``id`` (the task list is
-        # regenerated deterministically from the same artifact).
-        try:
-            saved_value = await config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
-        except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
-            saved_value = None
-        if saved_value is not None:
-            try:
-                saved = TaskList.from_dict(saved_value)
-            except Exception:  # noqa: BLE001 — an unparseable checkpoint is ignored
-                saved = None
-            if saved is not None:
-                completed_ids = {s.id for s in saved.tasks if s.status == TaskStatus.COMPLETED}
-                for t in task_list.tasks:
-                    if t.id in completed_ids:
-                        t.status = TaskStatus.COMPLETED
+        await self._reconcile_deep_resume(session_id, task_list)
 
         total_tasks = len(task_list.tasks)
-        # Cumulative usage across the plan turn + every execute step (Q1).
         total_usage = plan_usage.model_copy(deep=True)
-        # Q2: the success handle is the LAST completed step's final text.
         last_output = ""
-        # Global turn cap (the hard stop). ``None`` ⇒ no global turn ceiling.
+        last_state = SessionState()
         global_max_turns = task.budget.max_turns
 
         for index in range(total_tasks):
             task_id = task_list.tasks[index].id
             instruction = task_list.tasks[index].description
 
-            # A.6 deep-resume: a task already Completed on the durable checkpoint
-            # is NOT re-run — its output stays the last-completed handle.
             if task_list.tasks[index].status == TaskStatus.COMPLETED:
                 last_output = instruction
                 continue
 
-            # Q1: per-task turn allocation, derived at the START of this step.
-            # remaining_tasks = not-yet-started tasks including this one.
             remaining_tasks = total_tasks - index
             if global_max_turns is not None:
                 remaining_turns = max(0, global_max_turns - carried.turns)
                 per_task_turns = max(1, remaining_turns // remaining_tasks)
-                # The sub-loop cap is RELATIVE to the carried turns:
-                # _run_react_inner gates on cumulative ``budget_used.turns``, so a
-                # per-task cap of K means "stop K turns from now" while the global
-                # budget (carried forward) remains the hard stop.
-                sub_loop_cap = carried.turns + per_task_turns
+                step_cap = min(global_max_turns, carried.turns + per_task_turns)
             else:
-                # No global turn cap: each step's sub-loop is bounded only by the
-                # other (token / wall / cost) budget gates.
-                sub_loop_cap = 2**31 - 1
+                step_cap = carried.turns + (2**31 - 1)
 
-            # Mark InProgress (pending -> in_progress) and re-persist (Q4).
             task_list.update(task_id, TaskStatus.IN_PROGRESS)
             await self._persist_task_list(session_id, task_list)
 
-            # Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
-            # instruction via the carried Task; the (possibly mutated) instruction
-            # seeds the sub-loop.
+            step_budget = task.budget.model_copy(deep=True)
+            step_budget.max_turns = step_cap
             step_task = Task(
                 id=task.id,
                 instruction=instruction,
                 session_id=session_id,
-                budget=task.budget,
-                loop_strategy=task.loop_strategy,
+                budget=step_budget,
+                loop_strategy=execute_strategy,
             )
-            if config.hooks is not None:
-                ctx = OnTaskAdvanceContext(
-                    session_id=session_id,
-                    task=step_task,
-                    task_index=index,
-                    total_tasks=total_tasks,
-                )
-                try:
-                    await config.hooks.fire(ctx)
-                except Exception:  # noqa: BLE001 — a broken hook must not abort the run
-                    pass
-                # The chain threads mutations through ``ctx.task`` in place.
-                step_task = ctx.task
+            step_task = await self.fire_task_advance(session_id, step_task, index, total_tasks)
 
-            # Seed the step instruction as a user message, then run the bounded
-            # ReAct sub-loop carrying the shared budget (Q1).
-            await config.context_manager.append_user_message(session_state, step_task.instruction)
+            await self.seed_user_message(session_state, step_task.instruction)
 
-            sub_result = await self._run_react_inner(
-                step_task,
-                sub_loop_cap,
-                session_state,
-                carried.model_copy(deep=True),
-                None,
-            )
+            cx = ExecutionContext(registry=self._config.registry)
+            cx.executor = self
+            cx.scratch.run_session = session_state
+            cx.scratch.run_budget = carried.model_copy(deep=True)
+            cx.scratch.task = step_task
+            await run_strategy(execute_strategy, cx)
+            sub_result = cx.scratch.terminal_override
 
             if isinstance(sub_result, RunResultSuccess):
-                # Carry the shared budget forward (Q1): cumulative turns are the
-                # sub-loop's absolute count; fold in its token usage.
                 carried.turns = sub_result.turns
+                session_state = sub_result.session_state
+                last_state = session_state
                 carried.input_tokens += sub_result.usage.input_tokens
                 carried.output_tokens += sub_result.usage.output_tokens
                 total_usage.input_tokens += sub_result.usage.input_tokens
@@ -5758,28 +6116,11 @@ class StandardHarness:
                 total_usage.cost_usd += sub_result.usage.cost_usd
                 last_output = sub_result.output
 
-                # Fold this step's resulting conversation back into the SHARED
-                # execute context so the NEXT step's sub-loop (which reads
-                # ``session_state``) builds on this step's tool results and
-                # assistant output, not just its instruction. The returned
-                # ``sub_result.session_state`` already contains this step's
-                # instruction + tool calls + tool results + final output;
-                # rebinding the loop-local keeps the next iteration on the
-                # accumulated context. The terminal ``RunResult`` then carries
-                # the LAST completed step's full accumulated state (Q2/#102).
-                session_state = sub_result.session_state
-
-                # Mark Completed and re-persist (Q4).
                 task_list.complete(task_id)
                 await self._persist_task_list(session_id, task_list)
-                # Surface the completed step's final text at the parent-visible
-                # step boundary (the sub-loop runs with a suppressed sink).
                 self._emit(on_stream, StreamFinalResponse(content=last_output))
 
             elif isinstance(sub_result, RunResultFailure):
-                # Q5: any non-success step aborts the whole run. A budget halt
-                # surfaces as BudgetExceeded (mid-execute exhaustion); other
-                # failures surface as StepFailed carrying the step context.
                 total_usage.input_tokens += sub_result.usage.input_tokens
                 total_usage.output_tokens += sub_result.usage.output_tokens
                 total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
@@ -5802,232 +6143,32 @@ class StandardHarness:
                     session_id,
                     total_usage,
                     sub_result.turns,
-                    session_state,
+                    last_state,
                 )
 
+            elif sub_result is None:
+                return self._fail(
+                    HaltReasonStepFailed(
+                        task_index=index,
+                        task=task_list.tasks[index].description,
+                        reason="execute sub-strategy produced no terminal",
+                    ),
+                    session_id,
+                    total_usage,
+                    carried.turns,
+                    last_state,
+                )
             else:
-                # A step surfacing to a human pauses the whole run; a step
-                # escalating (issue #80) terminates it cleanly. Either way,
-                # propagate the sub-result up unchanged.
+                # A pause / consult / escalate propagates the whole run unchanged.
                 return sub_result
 
-        # Q2: success output is the LAST completed step's final text. Carry the
-        # accumulated cross-step conversation (issue #102).
         return RunResultSuccess(
             output=last_output,
             session_id=session_id,
             usage=total_usage,
             turns=carried.turns,
-            session_state=session_state,
+            session_state=last_state,
         )
-
-    async def _run_plan_phase(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> _PlanPhaseOutcome | RunResultFailure:
-        """Run the one-shot PlanExecute plan phase (issue #70).
-
-        Selects the planner agent (Q1: ``config.planner_agent`` if set, else the
-        default agent), seeds a planning directive as a user message, runs
-        EXACTLY ONE constrained turn (R1), expects a ``FinalResponse`` (a tool
-        call is a planning failure — R2 — never a dispatch loop), captures the
-        response via :func:`spore_core.plan.capture_plan_artifact` (R3), fires
-        ``OnPlanCreated`` (which may rewrite the artifact — R11), stores the
-        result in ``extras["plan_execute"]`` (R4), emits the turn span (R8), and
-        counts the turn against the shared budget (R7). A budget exhausted
-        before the turn returns a budget-exceeded :class:`RunResultFailure` with
-        no artifact stored (R10).
-
-        On success returns a :class:`_PlanPhaseOutcome`; on any failure returns
-        the terminal :class:`RunResultFailure` to propagate.
-        """
-        from .plan import PLAN_EXECUTE_EXTRAS_KEY, PlanPhaseError, capture_plan_artifact
-
-        config = self._config
-        session_id = task.session_id
-        started_at = time.monotonic()
-        usage = AggregateUsage()
-
-        # R10: Layer-1 budget gate BEFORE the plan turn. Mirrors _run_react_inner.
-        effective_turn_cap = max(task.budget.max_turns, 1) if task.budget.max_turns else 1
-        # ``max_turns is None`` ⇒ no explicit cap; one plan turn always allowed.
-        if task.budget.max_turns is not None and budget_used.turns >= effective_turn_cap:
-            return self._fail(
-                HaltReasonBudgetExceeded(limit_type="turns"),
-                session_id,
-                usage,
-                budget_used.turns,
-            )
-        limit_type = self._budget_exceeded(task.budget, budget_used, started_at)
-        if limit_type is not None:
-            return self._fail(
-                HaltReasonBudgetExceeded(limit_type=limit_type),
-                session_id,
-                usage,
-                budget_used.turns,
-            )
-
-        # Q1: select the planner agent (alternate if configured, else default).
-        planner = config.planner_agent if config.planner_agent is not None else config.agent
-
-        # Seed the planning directive as a user message (reuse ContextManager).
-        # CRITICAL (#93): the directive must NOT mutate the SHARED ``session_state``.
-        # That same state is threaded into the execute phase, where each subtask
-        # sub-loop assembles its context from it. If the directive leaked in,
-        # every execute step would still see "respond with {tasks, rationale}"
-        # and an instruction-following model would re-emit a plan instead of
-        # calling tools. Append to a throwaway CLONE so the plan turn sees the
-        # directive while the shared state stays ``[user: task.instruction]``.
-        directive = (
-            "Produce a step-by-step plan for the following task. Respond with a "
-            'single JSON object: {"tasks": [<ordered step strings>], '
-            '"rationale": <string>}.\n\nTask:\n' + task.instruction
-        )
-        plan_state = session_state.model_copy(deep=True)
-        await config.context_manager.append_user_message(plan_state, directive)
-
-        # Assemble + invoke the planner for exactly ONE turn (R1).
-        context = await config.context_manager.assemble(plan_state, task)
-        # Per-run model params win unconditionally (issue #93) — same seam as
-        # _run_react_inner, before the plan turn is dispatched.
-        context.params = config.model_params
-        self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
-        turn_started_at = _now()
-        turn_clock = time.monotonic()
-        result: TurnResult = await self._drive_turn(planner, context, on_stream)
-        budget_used.turns += 1  # R7: the plan turn counts against the budget.
-
-        # R8: emit exactly one turn span for the plan turn. Mirrors the metrics
-        # path of _run_react_inner; content capture is intentionally omitted (the
-        # plan turn carries no tool calls and #64 content capture is wired in the
-        # ReAct loop only).
-        zero = TokenUsage()
-        if isinstance(result, ToolCallRequested | FinalResponse):
-            u = result.usage
-        elif isinstance(result, TurnError):
-            u = result.usage or zero
-        else:
-            u = zero
-        if isinstance(result, FinalResponse):
-            stop_reason, tool_calls_requested = StopReason.END_TURN, 0
-        elif isinstance(result, ToolCallRequested):
-            stop_reason, tool_calls_requested = StopReason.TOOL_USE, len(result.calls)
-        else:
-            stop_reason, tool_calls_requested = StopReason.END_TURN, 0
-        turn_base = SpanBase.new_root(
-            new_span_id(f"{session_id}-turn-{budget_used.turns}"),
-            session_id,
-            task.id,
-            SpanKind.TURN,
-            turn_started_at,
-        )
-        turn_status: SpanStatusOk | SpanStatusError
-        if isinstance(result, TurnError):
-            turn_status = SpanStatusError(message=result.error.kind)
-        else:
-            turn_status = SpanStatusOk()
-        turn_base.finish(_now(), turn_status, int((time.monotonic() - turn_clock) * 1000))
-        if config.observability is not None:
-            config.observability.emit_turn(
-                TurnSpan(
-                    base=turn_base,
-                    turn_number=budget_used.turns,
-                    input_tokens=u.input_tokens,
-                    output_tokens=u.output_tokens,
-                    cache_read_tokens=u.cache_read_tokens,
-                    cache_write_tokens=u.cache_write_tokens,
-                    cost_usd=config.pricing.cost_for(
-                        u.input_tokens,
-                        u.output_tokens,
-                        u.cache_read_tokens,
-                        u.cache_write_tokens,
-                    ),
-                    stop_reason=stop_reason,
-                    tool_calls_requested=tool_calls_requested,
-                    output_text=None,
-                    tool_calls=None,
-                    input_messages=None,
-                )
-            )
-        self._emit(on_stream, StreamTurnEnd(turn=budget_used.turns))
-
-        # Classify the one-shot turn. R2: a tool call is a planning failure,
-        # NOT a dispatch loop.
-        if isinstance(result, FinalResponse):
-            usage.add_turn(result.usage)
-            budget_used.input_tokens += result.usage.input_tokens
-            budget_used.output_tokens += result.usage.output_tokens
-            final_text = result.content
-        elif isinstance(result, ToolCallRequested):
-            usage.add_turn(result.usage)
-            return self._fail(
-                HaltReasonPlanPhaseFailed(
-                    error=PlanPhaseErrorPayload(
-                        kind="planning_turn_failed",
-                        message="planner requested a tool call in the one-shot plan turn",
-                    ),
-                ),
-                session_id,
-                usage,
-                budget_used.turns,
-            )
-        else:  # TurnError
-            if result.usage is not None:
-                usage.add_turn(result.usage)
-            return self._fail(
-                HaltReasonAgentError(error=result.error),
-                session_id,
-                usage,
-                budget_used.turns,
-            )
-
-        # R3: capture the artifact from the response text.
-        try:
-            artifact = capture_plan_artifact(final_text)
-        except PlanPhaseError as e:
-            return self._fail(
-                HaltReasonPlanPhaseFailed(
-                    error=PlanPhaseErrorPayload(kind=e.kind, message=e.message),
-                ),
-                session_id,
-                usage,
-                budget_used.turns,
-            )
-
-        # R11: fire OnPlanCreated synchronously; the hook may rewrite the
-        # artifact. The stored artifact reflects any mutation. Errors are
-        # non-fatal: an observability/handler error must not lose a
-        # successfully-captured plan, so the (possibly mutated) artifact is
-        # still stored.
-        if config.hooks is not None:
-            from .hooks import OnPlanCreatedContext
-
-            ctx = OnPlanCreatedContext(session_id=session_id, plan=artifact)
-            try:
-                await config.hooks.fire(ctx)
-            except Exception:  # noqa: BLE001 — a broken hook must not lose the plan
-                pass
-            # The chain threads mutations through ``ctx.plan`` in place.
-            artifact = ctx.plan
-
-        # R4: persist the produced artifact to the RunStore seam under
-        # PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth; no
-        # longer mirrored into SessionState.extras). The JSON-safe object matches
-        # Rust's ``serde_json::to_value(&artifact)``: ``{"tasks": [...],
-        # "rationale": "..."}``. Storage failures are swallowed (matching the
-        # execute-phase persist): a successfully-captured plan must not be lost
-        # to a storage hiccup (the default no-op provider never fails).
-        try:
-            await self._config.storage.run().put(
-                session_id, PLAN_EXECUTE_EXTRAS_KEY, artifact.model_dump(mode="json")
-            )
-        except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
-            pass
-
-        return _PlanPhaseOutcome(artifact=artifact, usage=usage, turns=budget_used.turns)
 
     # ---- ReAct loop -------------------------------------------------
 

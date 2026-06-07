@@ -178,6 +178,80 @@ async def test_plan_execute_e2e_through_recursive_executor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #124 REGRESSION-PROOF: a NON-ReAct execute child genuinely runs per task.
+#
+# ``PlanExecute[plan: ReAct, execute: SelfVerifying[ReAct]]`` over a 2-task plan.
+# The execute child is SelfVerifying — its build↔evaluate loop runs ONCE PER TASK,
+# so the scripted verifier is invoked exactly twice (once per task). The pre-#124
+# implementation hardcoded a flat ReAct sub-loop in the execute phase and silently
+# DROPPED the SelfVerifying child — the verifier would have been invoked ZERO
+# times. This proves ``self.execute`` is dispatched via ``run_strategy`` and a
+# non-ReAct child genuinely executes. Mirrors Rust's
+# ``plan_execute_runs_non_react_execute_child_per_task``.
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_execute_runs_non_react_execute_child_per_task() -> None:
+    from spore_core import (
+        VerifierInput,
+        VerifierVerdict,
+        VerifierVerdictPassed,
+    )
+
+    class _RecordingVerifier:
+        """Records every invocation; PASS each time."""
+
+        def __init__(self) -> None:
+            self.seen: list[VerifierInput] = []
+
+        async def verify(self, input: VerifierInput) -> VerifierVerdict:
+            self.seen.append(input)
+            return VerifierVerdictPassed()
+
+        def max_iterations(self) -> int:
+            return 3
+
+    def _eval_agent() -> MockAgent:
+        a = MockAgent(AgentId("eval"))
+        a.push(FinalResponse(content="PASS", usage=_usage()))
+        a.push(FinalResponse(content="PASS", usage=_usage()))
+        return a
+
+    # cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+    a = _agent()
+    a.push(FinalResponse(content=_PLAN_2, usage=_usage()))
+    a.push(FinalResponse(content="built t0", usage=_usage()))
+    a.push(FinalResponse(content="built t1", usage=_usage()))
+    verifier = _RecordingVerifier()
+    cfg = _config(a)
+    cfg.evaluator_agent = _eval_agent()
+    cfg.verifier = verifier
+    h = StandardHarness(cfg)
+
+    # The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
+    task = Task.new(
+        "build a CLI",
+        SessionId("pe-nonreact"),
+        PlanExecuteConfig(
+            plan=ReactConfig.per_loop(2**31 - 1),
+            execute=SelfVerifyingConfig(inner=ReactConfig.per_loop(2**31 - 1), evaluator=""),
+        ),
+        budget=BudgetLimits(max_turns=None),
+    )
+
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultSuccess), f"expected Success, got {r!r}"
+    # Q2: output is the last step's final output.
+    assert r.output == "built t1"
+
+    # The smoking gun: the SelfVerifying evaluator ran ONCE PER TASK (2x). A
+    # dropped execute child would record ZERO verifier invocations.
+    assert len(verifier.seen) == 2, (
+        "the SelfVerifying execute child must run its verifier once per task"
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC4: A.6 deep-resume — an already-Completed task on the durable checkpoint is
 # NOT re-run (serialize→reset→resume, not the old shallow no-op).
 # ---------------------------------------------------------------------------
@@ -199,7 +273,7 @@ async def test_deep_resume_skips_already_completed_task() -> None:
 
     # The freshly-parsed list (as the plan phase would produce) is all-Pending.
     fresh = plan_artifact_to_task_list(PlanArtifact(tasks=["one", "two"], rationale=""))
-    result = await h.execute_phase(
+    result = await h._run_execute_phase(
         t,
         SessionState(),
         fresh,

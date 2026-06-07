@@ -116,27 +116,35 @@ async def test_plan_phase_runs_exactly_once() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R2: one-shot — a tool call in the plan turn is a PlanningTurnFailed, never a
-# dispatch loop.
+# #124 recursion seam (was R2): the plan phase now dispatches the genuine
+# ``self.plan`` child (a ReAct loop) capped at ONE turn. A plan turn that requests
+# a tool instead of emitting the JSON plan cannot complete in its single turn, so
+# the plan child halts (budget) and the plan phase propagates a terminal Failure
+# WITHOUT capturing/storing an artifact. (The old one-shot primitive special-cased
+# a tool call as ``planning_turn_failed``; under genuine recursion the cap is what
+# stops the loop — the observable contract that a non-plan plan turn fails the run
+# and stores nothing is preserved.) Mirrors Rust's
+# ``plan_phase_tool_call_fails_and_stores_no_artifact``.
 # ---------------------------------------------------------------------------
 
 
-async def test_plan_turn_tool_call_is_planning_failure() -> None:
+async def test_plan_turn_tool_call_fails_and_stores_no_artifact() -> None:
+    from spore_core import SessionState, ToolOutputSuccess
+
     a = _agent()
     a.push(ToolCallRequested(calls=[ToolCall(id="c", name="x", input={})], usage=_usage()))
-    from spore_core import SessionState
-
+    # The plan child is a genuine ReAct loop: its one turn dispatches the tool
+    # before the one-turn cap halts the loop, so the registry serves one output.
     reg = ScriptedToolRegistry()
+    reg.push(ToolOutputSuccess(content="ok", truncated=False))
     h = StandardHarness(_config(a, tool_registry=reg))
     state = SessionState()
     task = _plan_task()
     r = await h.run(HarnessRunOptions(task, session_state=state))
+    # The plan child never emitted a JSON plan, so the run halts terminally.
     assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonPlanPhaseFailed)
-    # Error nested under `error` (3-language parity), not flattened.
-    assert r.reason.error.kind == "planning_turn_failed"
-    assert reg.call_count == 0  # never dispatched
-    assert await _stored_artifact(h, task.session_id) is None  # no artifact stored
+    # Nothing captured/stored: no artifact reached the RunStore.
+    assert await _stored_artifact(h, task.session_id) is None
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras  # never mirrored into extras
 
 
