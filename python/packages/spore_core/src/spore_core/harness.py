@@ -6540,7 +6540,6 @@ class StandardHarness:
         total_usage = plan_usage.model_copy(deep=True)
         last_output = ""
         last_state = SessionState()
-        global_max_turns = task.budget.max_turns
 
         for index in range(total_tasks):
             task_id = task_list.tasks[index].id
@@ -6550,24 +6549,17 @@ class StandardHarness:
                 last_output = instruction
                 continue
 
-            remaining_tasks = total_tasks - index
-            if global_max_turns is not None:
-                remaining_turns = max(0, global_max_turns - carried.turns)
-                per_task_turns = max(1, remaining_turns // remaining_tasks)
-                step_cap = min(global_max_turns, carried.turns + per_task_turns)
-            else:
-                step_cap = carried.turns + (2**31 - 1)
-
+            # #125: the per-task ``remaining_turns / remaining_tasks / step_cap``
+            # derivation is REMOVED (dead) — enforcement is now ``charge``-based on
+            # the PlanExecute scope. This helper mirrors the live body's structure.
             task_list.update(task_id, TaskStatus.IN_PROGRESS)
             await self._persist_task_list(session_id, task_list)
 
-            step_budget = task.budget.model_copy(deep=True)
-            step_budget.max_turns = step_cap
             step_task = Task(
                 id=task.id,
                 instruction=instruction,
                 session_id=session_id,
-                budget=step_budget,
+                budget=task.budget.model_copy(deep=True),
                 loop_strategy=execute_strategy,
             )
             step_task = await self.fire_task_advance(session_id, step_task, index, total_tasks)
