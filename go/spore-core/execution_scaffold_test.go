@@ -1,6 +1,9 @@
 package sporecore
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // Composable Execution runtime scaffold tests (issue #123): BudgetContext.Charge
 // / Remaining / ContinuesRemaining, StrategyOutcome variant discrimination,
@@ -246,7 +249,7 @@ type recursiveStub struct {
 	maxDepth *int
 }
 
-func (s recursiveStub) Run(cx *ExecutionContext) StrategyOutcome {
+func (s recursiveStub) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	cx.Budgets.Push(NewBudgetContext(totalSteps(uint32(s.depth+1)), failBehavior(), "node"))
 	if d := cx.Budgets.Depth(); d > *s.maxDepth {
 		*s.maxDepth = d
@@ -254,8 +257,8 @@ func (s recursiveStub) Run(cx *ExecutionContext) StrategyOutcome {
 	if s.depth > 0 {
 		// Two children per node — siblings share the parent context but each
 		// pushes/pops its own BudgetContext.
-		_ = recursiveStub{depth: s.depth - 1, maxDepth: s.maxDepth}.Run(cx)
-		_ = recursiveStub{depth: s.depth - 1, maxDepth: s.maxDepth}.Run(cx)
+		_ = recursiveStub{depth: s.depth - 1, maxDepth: s.maxDepth}.Run(ctx, cx)
+		_ = recursiveStub{depth: s.depth - 1, maxDepth: s.maxDepth}.Run(ctx, cx)
 	}
 	cx.Budgets.Pop()
 	return StrategyComplete("")
@@ -265,7 +268,7 @@ func TestRecursiveStubThreadsContextAndBudgetStack(t *testing.T) {
 	registry := NewExecutionRegistryBuilder().Build()
 	cx := NewExecutionContext(&registry)
 	maxDepth := 0
-	outcome := recursiveStub{depth: 3, maxDepth: &maxDepth}.Run(cx)
+	outcome := recursiveStub{depth: 3, maxDepth: &maxDepth}.Run(context.Background(), cx)
 
 	if outcome.Kind != StrategyOutcomeComplete {
 		t.Fatalf("recursive stub outcome = %q, want complete", outcome.Kind)

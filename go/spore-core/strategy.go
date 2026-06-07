@@ -30,6 +30,7 @@
 package sporecore
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -469,54 +470,171 @@ func (r *StrategyRef) UnmarshalJSON(data []byte) error {
 
 // RunStrategy is the runtime composition seam: every strategy node knows how to
 // run itself given an *ExecutionContext. Implemented on LoopStrategy as the ONLY
-// dispatch site (one switch, one-line delegation per arm) and on each *Config as
-// a STUB (returns Complete("")) pending #124.
+// dispatch site (one switch, one-line delegation per arm) and on each *Config
+// with a REAL per-variant loop (#124).
+//
+// Each *Config.Run OWNS its loop completely: a combinator recurses via
+// cx.runChild(ctx, self.inner) (or self.plan / self.execute), and the leaf
+// (*ReactConfig).Run drives one bounded ReAct window through the
+// StrategyExecutor primitive on the context. The harness entry collapses to
+// task.LoopStrategy.Run(ctx, cx) — there is NO central dispatch switch anymore;
+// the only switch left in the system is the enum→config delegation below.
+//
+// Without a wired StrategyExecutor (the scaffold-only contexts that exercise the
+// runtime context with no real harness) every body returns a TYPED Failed
+// outcome — never a panic.
 //
 // The full ExecutionContext / StrategyOutcome / BudgetContext / BudgetStack /
 // SpanStack runtime scaffold these methods thread is defined in
-// execution_scaffold.go (#123).
+// execution_scaffold.go (#123); the StrategyExecutor seam and RunScratch are
+// in executor.go (#124).
 //
 // Cross-language note: Rust uses trait/dyn dispatch; Go uses this interface as
-// its runtime-polymorphism idiom. The serialized LoopStrategy / StrategyRef stay
-// byte-identical across languages.
+// its runtime-polymorphism idiom, and threads context.Context as the first arg
+// (Go CONVENTIONS — never store a Context in a struct). The serialized
+// LoopStrategy / StrategyRef stay byte-identical across languages.
 type RunStrategy interface {
-	Run(cx *ExecutionContext) StrategyOutcome
+	Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome
 }
 
 // Run dispatches to the active config's Run. This is the single switch site in
-// the system (mirrors the Rust enum-delegation match).
-func (s LoopStrategy) Run(cx *ExecutionContext) StrategyOutcome {
+// the system (mirrors the Rust enum-delegation match). AC1: no central dispatch
+// switch remains — each config owns its loop.
+func (s LoopStrategy) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	switch s.Kind {
 	case StrategyReAct:
-		return s.ReActCfg.Run(cx)
+		return s.ReActCfg.Run(ctx, cx)
 	case StrategyPlanExecute:
-		return s.PlanExecute.Run(cx)
+		return s.PlanExecute.Run(ctx, cx)
 	case StrategySelfVerifying:
-		return s.SelfVerify.Run(cx)
+		return s.SelfVerify.Run(ctx, cx)
 	case StrategyRalph:
-		return s.Ralph.Run(cx)
+		return s.Ralph.Run(ctx, cx)
 	case StrategyHillClimbing:
-		return s.HillClimbing.Run(cx)
+		return s.HillClimbing.Run(ctx, cx)
 	default:
-		return StrategyComplete("")
+		return StrategyFailed(&InvalidConfigurationError{
+			Message: fmt.Sprintf("unknown loop strategy kind %q", s.Kind),
+		})
 	}
 }
 
-// Run is a stub pending #124: it returns Complete("") — a benign, matchable
-// placeholder (NOT a panic). The old Pending marker is removed this slice.
-func (c *ReactConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+// Run is the leaf: one bounded ReAct turn-loop window. It reads the per-run
+// scratch (task / session / budget) and drives a single ReAct window through the
+// executor primitive, recording the terminal back into the shared context.
+func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
+	executor, fail := cx.executor()
+	if executor == nil {
+		return fail
+	}
+	task := cx.currentTask()
+	session := cx.takeSession()
+	budget := cx.Scratch.RunBudget
+	// The leaf takes the run's stream sink for the window; combinators that
+	// recurse per-phase suppress it (they take it before recursing).
+	onStream := cx.takeStream()
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream)
+	executor.Finalize(ctx, result)
+	return cx.recordTerminal(result)
+}
 
-// Run is a stub pending #124.
-func (c *PlanExecuteConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+// Run is the plan→execute combinator (#124). The plan phase recurses through the
+// plan sub-strategy via the executor primitive (Q4 — a real loop building the
+// task graph, not a one-shot dispatch); the execute phase recurses through the
+// execute sub-strategy per task. The model-touching plan/execute machinery stays
+// on the harness behind StrategyExecutor so behavior is at parity with the
+// ported runPlanExecute body (AC6). The ready-set walk lands in #126 (execute
+// runs per task sequentially for now).
+func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
+	executor, fail := cx.executor()
+	if executor == nil {
+		return fail
+	}
+	task := cx.currentTask()
+	sessionID := task.SessionID
+	session := cx.takeSession()
+	budget := cx.Scratch.RunBudget
+	onStream := cx.takeStream()
 
-// Run is a stub pending #124.
-func (c *SelfVerifyingConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+	// ── Phase 1: plan (recurse through the plan sub-strategy). ──────────────
+	outcome, failure := executor.PlanPhase(ctx, &task, &session, budget, onStream)
+	if failure != nil {
+		return cx.finish(ctx, executor, task, *failure)
+	}
 
-// Run is a stub pending #124.
-func (c *RalphConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+	taskList := PlanArtifactToTaskList(outcome.Artifact)
+	if len(taskList.Tasks) == 0 {
+		result := RunResult{
+			Kind:      RunFailure,
+			Reason:    HaltReason{Kind: HaltEmptyPlan},
+			SessionID: sessionID,
+			Usage:     outcome.Usage,
+			Turns:     outcome.Turns,
+		}
+		return cx.finish(ctx, executor, task, result)
+	}
+	executor.PersistTaskList(ctx, sessionID, taskList)
 
-// Run is a stub pending #124.
-func (c *HillClimbingConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+	// Carry the shared budget past the plan turn.
+	carried := budget
+	carried.Turns = outcome.Turns
+	carried.InputTokens += outcome.Usage.InputTokens
+	carried.OutputTokens += outcome.Usage.OutputTokens
+
+	// ── Phase 2: execute (recurse through the execute sub-strategy). ────────
+	result := executor.ExecutePhase(ctx, &task, &session, taskList, carried, outcome.Usage, onStream)
+	return cx.finish(ctx, executor, task, result)
+}
+
+// Run is the SelfVerifying combinator: drive the build↔evaluate loop
+// (Default-FAIL; bounded by the verifier's iteration cap / the run budget — Q1).
+// The build phase recurses through the inner sub-strategy.
+func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
+	executor, fail := cx.executor()
+	if executor == nil {
+		return fail
+	}
+	task := cx.currentTask()
+	session := cx.takeSession()
+	budget := cx.Scratch.RunBudget
+	onStream := cx.takeStream()
+	result := executor.SelfVerifyingLoop(ctx, task, session, budget, onStream)
+	return cx.recordTerminal(result)
+}
+
+// Run is the Ralph continuation wrapper: reset the context window per window and
+// resume from the durable .spore/ checkpoint (A.6 deep-resume). Each window
+// recurses through the inner sub-strategy. Ralph discards the incoming session
+// state by design (each window is a fresh start re-seeded from the filesystem
+// checkpoint).
+func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
+	executor, fail := cx.executor()
+	if executor == nil {
+		return fail
+	}
+	task := cx.currentTask()
+	budget := cx.Scratch.RunBudget
+	onStream := cx.takeStream()
+	_ = cx.takeSession() // discarded: each window re-seeds from the checkpoint.
+	result := executor.RalphLoop(ctx, task, budget, onStream)
+	return cx.recordTerminal(result)
+}
+
+// Run is the HillClimbing combinator: iterate the inner sub-strategy, scoring
+// each candidate with the metric; bounded by max_stagnation (Q1). The incoming
+// session is discarded — each iteration re-seeds a fresh window internally.
+func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
+	executor, fail := cx.executor()
+	if executor == nil {
+		return fail
+	}
+	task := cx.currentTask()
+	budget := cx.Scratch.RunBudget
+	onStream := cx.takeStream()
+	_ = cx.takeSession()
+	result := executor.HillClimbingLoop(ctx, task, budget, onStream)
+	return cx.recordTerminal(result)
+}
 
 // Compile-time interface checks.
 var (

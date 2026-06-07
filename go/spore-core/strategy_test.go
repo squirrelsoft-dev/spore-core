@@ -2,6 +2,7 @@ package sporecore
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -34,15 +35,22 @@ func compactJSON(t *testing.T, raw []byte) []byte {
 // cordycepsTree builds the canonical Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]
 // tree mirrored by fixtures/strategy/cordyceps_tree.json.
 func cordycepsTree() LoopStrategy {
+	// A.5 (#124): the structured plan / worker slots declare output schemas so
+	// they yield typed results — mirrors fixtures/strategy/cordyceps_tree.json,
+	// which the Rust #124 commit updated with these "output" fields (ground truth).
+	planSchema := SchemaRef("plan-schema")
+	workerSchema := SchemaRef("worker-schema")
 	plan := LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
 		Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: 4},
 		Agent:   AgentRef("planner"),
 		Toolset: ToolsetRef("plan-tools"),
+		Output:  &planSchema,
 	}}
 	execInner := LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
 		Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: 12},
 		Agent:   AgentRef("executor"),
 		Toolset: ToolsetRef("exec-tools"),
+		Output:  &workerSchema,
 	}}
 	execute := SelfVerifyingStrategy(SelfVerifyingConfig{
 		Inner:     &execInner,
@@ -186,7 +194,7 @@ func TestCordycepsTreeRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(tree, back) {
 		t.Fatalf("cordyceps round-trip mismatch:\n want %+v\n got %+v", tree, back)
 	}
-	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools"},"evaluator":"exec-evaluator"}},"agent":"ralph-agent"}`
+	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools","output":"plan-schema"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools","output":"worker-schema"},"evaluator":"exec-evaluator"}},"agent":"ralph-agent"}`
 	if string(data) != want {
 		t.Fatalf("cordyceps bytes mismatch:\n got  %s\n want %s", data, want)
 	}
@@ -226,7 +234,12 @@ func TestStrategyRefRoundTrip(t *testing.T) {
 // Stub Run returns a benign Complete(""), never panics
 // ---------------------------------------------------------------------------
 
-func TestStubRunReturnsComplete(t *testing.T) {
+// TestRunWithoutExecutorIsTypedFailure: every per-variant Run body, driven
+// without a wired StrategyExecutor (the scaffold-only context), returns a TYPED
+// Failed outcome — never a panic (#124). The real end-to-end behavior (with an
+// executor) is exercised by the recursive-executor tests in
+// recursive_executor_test.go and the strategy integration tests.
+func TestRunWithoutExecutorIsTypedFailure(t *testing.T) {
 	strategies := []LoopStrategy{
 		ReActStrategy(1),
 		PlanExecuteStrategy(PlanExecuteSimple(nil)),
@@ -240,14 +253,16 @@ func TestStubRunReturnsComplete(t *testing.T) {
 			Evaluator:           AgentRef("m"),
 		}),
 	}
+	tk := NewTask("x", NewSessionID(), ReActStrategy(1))
 	for i, s := range strategies {
 		var cx ExecutionContext
-		got := s.Run(&cx)
-		if got.Kind != StrategyOutcomeComplete {
-			t.Fatalf("case %d: stub Run returned %v, want complete", i, got.Kind)
+		cx.Scratch.Task = &tk
+		got := s.Run(context.Background(), &cx)
+		if got.Kind != StrategyOutcomeFailed {
+			t.Fatalf("case %d: Run without executor returned %v, want failed", i, got.Kind)
 		}
-		if got.Complete != "" {
-			t.Fatalf("case %d: stub Run output = %q, want empty", i, got.Complete)
+		if got.Failed == nil {
+			t.Fatalf("case %d: failed outcome carries no error", i)
 		}
 	}
 }

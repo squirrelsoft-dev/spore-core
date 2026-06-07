@@ -231,6 +231,12 @@ func UnmarshalHarnessError(data []byte) (HarnessError, error) {
 		return nil, err
 	}
 	switch probe.Kind {
+	case "InvalidConfiguration":
+		e := &InvalidConfigurationError{}
+		if err := json.Unmarshal(data, e); err != nil {
+			return nil, err
+		}
+		return e, nil
 	case "StrategyNotFound":
 		e := &StrategyNotFoundError{}
 		if err := json.Unmarshal(data, e); err != nil {
@@ -403,6 +409,11 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 		if ls.PlanExecute == nil {
 			return nil
 		}
+		// A.5 (#124, Q3): the plan slot is STRUCTURED — it must yield a task
+		// graph. A bare ReAct there needs an output schema.
+		if err := checkStructuredSlot(ls.PlanExecute.Plan, "plan"); err != nil {
+			return err
+		}
 		if err := r.walkStrategy(ls.PlanExecute.Plan); err != nil {
 			return err
 		}
@@ -410,6 +421,11 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 	case StrategySelfVerifying:
 		if ls.SelfVerify == nil {
 			return nil
+		}
+		// A.5: the inner (worker) slot is STRUCTURED — its result must be
+		// evaluable. A bare ReAct worker needs an output schema.
+		if err := checkStructuredSlot(ls.SelfVerify.Inner, "worker"); err != nil {
+			return err
 		}
 		if err := r.walkStrategy(ls.SelfVerify.Inner); err != nil {
 			return err
@@ -428,6 +444,11 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 		if ls.HillClimbing == nil {
 			return nil
 		}
+		// A.5: the inner (propose) slot is STRUCTURED — it must yield a
+		// candidate. A bare ReAct proposer needs an output schema.
+		if err := checkStructuredSlot(ls.HillClimbing.Inner, "propose"); err != nil {
+			return err
+		}
 		if err := r.walkStrategy(ls.HillClimbing.Inner); err != nil {
 			return err
 		}
@@ -436,6 +457,23 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 	default:
 		return nil
 	}
+}
+
+// checkStructuredSlot enforces the A.5 output contract (#124, Q3): a bare ReAct
+// feeding a STRUCTURED slot (plan ⇒ task graph, propose ⇒ candidate, worker ⇒
+// evaluable result) MUST declare output = Some(schema). A combinator child
+// carries its own contract, so this check applies only to the leaf. Returns an
+// InvalidConfigurationError naming the offending slot.
+func checkStructuredSlot(slot *LoopStrategy, slotName string) error {
+	if slot != nil && slot.Kind == StrategyReAct && slot.ReActCfg != nil && slot.ReActCfg.Output == nil {
+		return &InvalidConfigurationError{
+			Message: fmt.Sprintf(
+				"a bare ReAct in the structured `%s` slot requires `output = Some(schema)` so the slot yields a typed result",
+				slotName,
+			),
+		}
+	}
+	return nil
 }
 
 func (r ExecutionRegistry) checkAgent(ref AgentRef) error {

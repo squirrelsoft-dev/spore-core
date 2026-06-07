@@ -30,7 +30,9 @@ func (regStubVerifier) MaxIterations() uint32 { return 3 }
 
 type stubStrategy struct{}
 
-func (stubStrategy) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
+func (stubStrategy) Run(_ context.Context, _ *ExecutionContext) StrategyOutcome {
+	return StrategyComplete("")
+}
 
 func reactLeaf(agent, toolset string) LoopStrategy {
 	return LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
@@ -232,6 +234,9 @@ func TestValidateTreeWalkPassesWhenFullyWired(t *testing.T) {
 		Toolset("plan-tools", NewScriptedToolRegistry()).
 		Toolset("exec-tools", NewScriptedToolRegistry()).
 		Schema("exec-evaluator", json.RawMessage(`{}`)).
+		// A.5 (#124): the structured plan / worker slots now carry output schemas.
+		Schema("plan-schema", json.RawMessage(`{}`)).
+		Schema("worker-schema", json.RawMessage(`{}`)).
 		Build()
 	task := NewTask("nested", NewSessionID(), regCordycepsTree(t))
 	if err := reg.Validate(task); err != nil {

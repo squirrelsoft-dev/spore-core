@@ -40,6 +40,12 @@ func (s *fakeRunStore) get(sessionID SessionID, key string) (json.RawMessage, bo
 	return v, ok
 }
 
+// Get satisfies the RunStore seam (#124 deep-resume read path).
+func (s *fakeRunStore) Get(_ context.Context, sessionID SessionID, key string) (json.RawMessage, bool, error) {
+	v, ok := s.get(sessionID, key)
+	return v, ok, nil
+}
+
 var _ RunStore = (*fakeRunStore)(nil)
 
 // runStoreTaskList decodes the TaskList persisted to the RunStore seam under

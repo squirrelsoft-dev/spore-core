@@ -2714,6 +2714,10 @@ func (noopSessionStore) PutSession(context.Context, SessionID, *PausedState) err
 // are opaque JSON blobs keyed by (SessionID, key); the store never knows the
 // schema — the harness owns serialization.
 type RunStore interface {
+	// Get returns the stored value and found=false when absent (#124 deep-resume
+	// reads the durable task-list checkpoint through this seam). Mirrors the
+	// storage.RunStore Get.
+	Get(ctx context.Context, sessionID SessionID, key string) (value json.RawMessage, found bool, err error)
 	Put(ctx context.Context, sessionID SessionID, key string, value json.RawMessage) error
 }
 
@@ -2873,54 +2877,166 @@ func (h *StandardHarness) runInner(ctx context.Context, options HarnessRunOption
 	}
 	budget := BudgetSnapshot{}
 
-	switch task.LoopStrategy.Kind {
-	case StrategyReAct:
-		// Seed the task instruction as the initial user message of this run.
-		// The compaction adapter intentionally mirrors session.Messages and
-		// ignores task on Assemble, so the harness must own delivering the
-		// prompt. On a fresh run this turns an otherwise-empty conversation
-		// into a real user turn; on multi-turn runs over a carried
-		// SessionState each Run call appends its own follow-up instruction.
-		// The resume path is intentionally excluded — its conversation already
-		// exists, so it must not be re-seeded.
+	// #124: the central dispatch switch is GONE — the only switch left is the
+	// enum→config delegation inside LoopStrategy.Run. The harness entry collapses
+	// to driveStrategy, which builds the shared ExecutionContext and calls
+	// task.LoopStrategy.Run(ctx, cx) via the recursive executor.
+	//
+	// Strategies that BUILD ON incoming state (ReAct / PlanExecute /
+	// SelfVerifying) get the instruction seeded HERE on the FRESH run — the
+	// compaction adapter ignores task on Assemble, so the harness owns prompt
+	// delivery; on a fresh run this turns an otherwise-empty conversation into a
+	// real user turn; on multi-turn runs each Run call appends its follow-up. The
+	// resume path is intentionally excluded — its conversation already exists.
+	// Ralph / HillClimbing re-seed a fresh window internally (D7), so their
+	// incoming state is discarded by the config body and the seed is skipped.
+	if seedsIncomingSessionState(task.LoopStrategy.Kind) {
 		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
-		return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, options.OnStream)
-	case StrategyPlanExecute:
-		return h.runPlanExecute(ctx, task, session, budget, options.OnStream)
-	case StrategyRalph:
-		// Ralph (issue #58) re-seeds a FRESH SessionState per context window
-		// INSIDE runRalph (the context-window reset). The dispatch-level seed the
-		// other strategies do here would be discarded, so it is intentionally
-		// skipped — runRalph owns seeding each window.
-		return h.runRalph(ctx, task, budget, options.OnStream)
-	case StrategySelfVerifying:
-		// Seed the build phase's initial user message (the evaluate phase seeds
-		// its own fresh session internally). Mirrors the ReAct arm; the resume
-		// path is intentionally not re-seeded.
-		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
-		return h.runSelfVerifying(ctx, task, session, budget, options.OnStream)
-	case StrategyHillClimbing:
-		// HillClimbing (issue #60) drives its own per-iteration agent sub-runs
-		// (each a fresh ReAct loop), so it owns seeding each iteration's session.
-		// The dispatch-level seed the other strategies do here is intentionally
-		// skipped — runHillClimbing owns iteration-0 (baseline, no agent turn) and
-		// each subsequent iteration's fresh session.
-		return h.runHillClimbing(ctx, task, budget, options.OnStream)
-	default:
-		return strategyNotImplemented(task, string(task.LoopStrategy.Kind))
+	}
+	return h.driveStrategy(ctx, task, session, budget, options.OnStream)
+}
+
+// driveStrategy is the recursive-executor entry (#124): it builds the shared
+// ExecutionContext, seeds the per-run scratch (task / session / budget), drives
+// task.LoopStrategy.Run(ctx, cx), and translates the outcome back into a terminal
+// RunResult (Q5). A non-terminal pause / escalate stashed in
+// Scratch.TerminalOverride propagates VERBATIM (it never collapses into a
+// StrategyOutcome).
+func (h *StandardHarness) driveStrategy(
+	ctx context.Context,
+	task Task,
+	session SessionState,
+	budget BudgetSnapshot,
+	onStream StreamSink,
+) RunResult {
+	sessionID := task.SessionID
+	cx := NewExecutionContext(&h.config.Registry)
+	cx.Executor = h
+	cx.Stream = onStream
+	cx.Scratch.RunSession = session
+	cx.Scratch.RunBudget = budget
+	taskCopy := task
+	cx.Scratch.Task = &taskCopy
+
+	outcome := task.LoopStrategy.Run(ctx, cx)
+
+	// A pause / escalate propagates verbatim (preserves the HITL / consult /
+	// escalation contract through the recursive executor).
+	if cx.Scratch.TerminalOverride != nil {
+		return *cx.Scratch.TerminalOverride
+	}
+	switch outcome.Kind {
+	case StrategyOutcomeComplete:
+		return RunResult{
+			Kind:         RunSuccess,
+			Output:       outcome.Complete,
+			SessionID:    sessionID,
+			Usage:        cx.Usage,
+			Turns:        cx.Scratch.RunBudget.Turns,
+			SessionState: cx.Scratch.RunSession,
+		}
+	case StrategyOutcomeBudgetExhausted:
+		var messages []Message
+		if outcome.Exhausted != nil && outcome.Exhausted.PartialOutput != nil {
+			messages = []Message{{
+				Role:    RoleAssistant,
+				Content: NewTextContent(*outcome.Exhausted.PartialOutput),
+			}}
+		}
+		return RunResult{
+			Kind:         RunFailure,
+			Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+			SessionID:    sessionID,
+			Usage:        cx.Usage,
+			Turns:        cx.Scratch.RunBudget.Turns,
+			SessionState: SessionState{Messages: messages},
+		}
+	default: // StrategyOutcomeFailed
+		var configErr HarnessError = &InvalidConfigurationError{Message: "strategy failed"}
+		if outcome.Failed != nil {
+			configErr = outcome.Failed
+		}
+		return RunResult{
+			Kind:         RunFailure,
+			Reason:       HaltReason{Kind: HaltConfigurationError, ConfigError: configErr},
+			SessionID:    sessionID,
+			Usage:        cx.Usage,
+			Turns:        cx.Scratch.RunBudget.Turns,
+			SessionState: cx.Scratch.RunSession,
+		}
 	}
 }
 
-func strategyNotImplemented(task Task, strategy string) RunResult {
-	return RunResult{
-		Kind: RunFailure,
-		Reason: HaltReason{
-			Kind:     HaltStrategyNotYetImplemented,
-			Strategy: strategy,
-		},
-		SessionID: task.SessionID,
+// ============================================================================
+// StrategyExecutor impl (#124): the harness-side primitives the recursive
+// per-variant RunStrategy.Run bodies delegate to. Each primitive wraps an
+// existing, tested orchestration method so behavior stays at parity — the only
+// structural change is that the per-variant bodies now own their loops and the
+// central dispatch switch is gone.
+// ============================================================================
+
+// ReactWindow runs one bounded ReAct turn-loop window (the leaf primitive).
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
+}
+
+// PlanPhase runs the PlanExecute plan phase. Adapts the private
+// (*planPhaseOutcome, *RunResult) shape to the public seam shape.
+func (h *StandardHarness) PlanPhase(ctx context.Context, task *Task, session *SessionState, budget BudgetSnapshot, onStream StreamSink) (PlanPhaseOutcome, *RunResult) {
+	outcome, failure := h.runPlanPhase(ctx, task, session, budget, onStream)
+	if failure != nil {
+		return PlanPhaseOutcome{}, failure
+	}
+	return PlanPhaseOutcome{
+		Artifact: outcome.artifact,
+		Usage:    outcome.usage,
+		Turns:    outcome.turns,
+	}, nil
+}
+
+// ExecutePhase runs the PlanExecute execute phase.
+func (h *StandardHarness) ExecutePhase(ctx context.Context, task *Task, session *SessionState, taskList TaskList, carried BudgetSnapshot, planUsage AggregateUsage, onStream StreamSink) RunResult {
+	return h.runExecutePhase(ctx, task, session, taskList, carried, planUsage, onStream)
+}
+
+// PersistTaskList persists a parsed task list through the RunStore seam.
+func (h *StandardHarness) PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList) {
+	h.persistTaskList(ctx, sessionID, taskList)
+}
+
+// SelfVerifyingLoop drives a whole SelfVerifying loop.
+func (h *StandardHarness) SelfVerifyingLoop(ctx context.Context, task Task, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult {
+	return h.runSelfVerifying(ctx, task, session, budget, onStream)
+}
+
+// RalphLoop drives a whole Ralph continuation loop.
+func (h *StandardHarness) RalphLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult {
+	return h.runRalph(ctx, task, budget, onStream)
+}
+
+// HillClimbingLoop drives a whole HillClimbing loop. It reads the config
+// scalars off task.LoopStrategy, mirroring the legacy executor entry.
+func (h *StandardHarness) HillClimbingLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult {
+	return h.runHillClimbing(ctx, task, budget, onStream)
+}
+
+// Finalize finalizes observability for a terminal outcome (mirrors the tail of
+// runReAct / finalizePlanExecute). Non-terminal pauses are never finalized.
+func (h *StandardHarness) Finalize(ctx context.Context, result RunResult) {
+	switch result.Kind {
+	case RunSuccess:
+		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
+	case RunFailure:
+		h.finalizeObservability(ctx, result.SessionID, TerminalFailure, haltReasonString(result.Reason))
+	case RunEscalate:
+		h.finalizeObservability(ctx, result.SessionID, TerminalEscalated, "")
+	case RunWaitingForHuman, RunConsult:
+		// Not terminal — do not flush.
 	}
 }
+
+// Compile-time check: StandardHarness implements StrategyExecutor (#124).
+var _ StrategyExecutor = (*StandardHarness)(nil)
 
 // seedsIncomingSessionState reports whether a loop strategy seeds an incoming
 // SessionState (issue #102, D7). Only ReAct and SelfVerifying do; Ralph and
@@ -3315,6 +3431,30 @@ func (h *StandardHarness) runExecutePhase(
 	onStream StreamSink,
 ) RunResult {
 	sessionID := task.SessionID
+
+	// A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
+	// already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
+	// after every step (Q4). On a resumed run the freshly-parsed taskList (from
+	// the plan artifact) is reconciled with that checkpoint so already-Completed
+	// tasks are NOT re-run — serialize→reset→resume rather than the old shallow
+	// no-op. Tasks are matched by id (the task list is regenerated
+	// deterministically from the same artifact). A read miss / error starts fresh.
+	if h.config.RunStore != nil {
+		if raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey); err == nil && found {
+			var saved TaskList
+			if json.Unmarshal(raw, &saved) == nil {
+				for i := range taskList.Tasks {
+					for j := range saved.Tasks {
+						if saved.Tasks[j].ID == taskList.Tasks[i].ID && saved.Tasks[j].Status == TaskStatusCompleted {
+							taskList.Tasks[i].Status = TaskStatusCompleted
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
 	totalTasks := len(taskList.Tasks)
 	// Cumulative usage across the plan turn + every execute step (Q1).
 	totalUsage := planUsage
@@ -3330,6 +3470,13 @@ func (h *StandardHarness) runExecutePhase(
 	for index := 0; index < totalTasks; index++ {
 		taskID := taskList.Tasks[index].ID
 		instruction := taskList.Tasks[index].Description
+
+		// A.6 deep-resume: a task already Completed on the durable checkpoint is
+		// NOT re-run — its description stays the last-completed output handle.
+		if taskList.Tasks[index].Status == TaskStatusCompleted {
+			lastOutput = instruction
+			continue
+		}
 
 		// Q1: per-task turn allocation, derived at the START of this step.
 		// remaining_tasks = not-yet-started tasks including this one.

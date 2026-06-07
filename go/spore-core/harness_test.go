@@ -301,13 +301,21 @@ func TestResumeWithAllowExecutesPendingAndContinues(t *testing.T) {
 // ralph_test.go), and HillClimbing (issue #60, hill_climbing_test.go). The
 // NotYetImplemented stub is now reached only by an unrecognized strategy kind —
 // the dispatch's default arm.
-func TestUnknownStrategyMarkedNotYetImplemented(t *testing.T) {
+// #124: with the central dispatch switch removed, an unknown LoopStrategy kind
+// (a Go-only edge case — Rust's closed enum cannot express it) is rejected by
+// the enum→config delegation in LoopStrategy.Run as a typed Failed outcome,
+// which driveStrategy maps to a HaltConfigurationError carrying the typed
+// InvalidConfigurationError — never a panic.
+func TestUnknownStrategyIsConfigurationError(t *testing.T) {
 	a := NewMockAgent("t")
 	h := NewStandardHarness(standardCfg(a))
 	task := NewTask("do it", SessionID("s"), LoopStrategy{Kind: LoopStrategyKind("not_a_real_strategy")})
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltStrategyNotYetImplemented {
+	if r.Kind != RunFailure || r.Reason.Kind != HaltConfigurationError {
 		t.Fatalf("got %+v", r)
+	}
+	if _, ok := r.Reason.ConfigError.(*InvalidConfigurationError); !ok {
+		t.Fatalf("expected InvalidConfigurationError, got %T", r.Reason.ConfigError)
 	}
 }
 

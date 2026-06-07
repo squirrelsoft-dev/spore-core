@@ -333,8 +333,17 @@ type ExecutionContext struct {
 	Session SessionState
 	// Spans is the span stack for observability nesting.
 	Spans SpanStack
-	// Stream is an optional streaming sink for emitted events (nil = none).
+	// Stream is an optional streaming sink for emitted events (nil = none). It is
+	// single-use: a leaf / combinator takes it once via takeStream when driving a
+	// sub-loop, suppressing it for the rest of the recursion (#124).
 	Stream StreamSink
+	// Executor is the harness primitives the per-variant Run bodies delegate to
+	// (#124). Nil only for the scaffold/unit fixtures that exercise the runtime
+	// context without a real harness (the recursion stub tests).
+	Executor StrategyExecutor
+	// Scratch is the per-run mutable orchestration state threaded across the
+	// recursive strategy tree (#124). Runtime-only.
+	Scratch RunScratch
 }
 
 // NewExecutionContext returns a fresh context bound to registry, with empty
