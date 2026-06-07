@@ -1,17 +1,17 @@
 # PROJECT STATE
-_Last updated: 2026-06-06 by /close (closed #118) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Two bricks landed: #117 (`BudgetPolicy`/`BudgetExhaustedBehavior` value types) and #118 (`Task.blockers` schema + `add_task` blockers param) are both `status: complete`, all four languages, byte-identical.** The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ **Local `main` is 13 commits ahead of `origin/main` (f63bf07) and unpushed** — the 5 #117 commits, 4 #118 commits, 2 Rust-only `12-cordyceps` polish commits (one of which, `SubagentTool::with_stream`, is a real core-harness addition not yet mirrored to TS/Python/Go), and 2 `/close` bookkeeping commits._
+_Last updated: 2026-06-06 by /close (closed #119) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Three bricks landed: #117 (`BudgetPolicy`/`BudgetExhaustedBehavior` value types), #118 (`Task.blockers` schema + `add_task` blockers param), and #119 (recursive `LoopStrategy` config newtypes + `RunStrategy` trait + `StrategyRef`) are all `status: complete`, all four languages, byte-identical.** The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ **Local `main` is 18 commits ahead of `origin/main` (f63bf07) and unpushed** — the 5 #117 commits, 4 #118 commits, 4 #119 commits, 2 Rust-only `12-cordyceps` polish commits (one of which, `SubagentTool::with_stream`, is a real core-harness addition not yet mirrored to TS/Python/Go), and 3 `/close` bookkeeping commits. (The prior loop's planned push never happened — still pending.)_
 
-_**Direction note:** New active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; #118 is now done, #121/#122 remain parallel-grabbable immediately. Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
+_**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119 are now done**, so the next critical-path brick is **#120** (ExecutionRegistry). #121/#122 remain parallel-grabbable immediately. Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, demonstrated through a numbered **examples suite** built
 across all four targets: Rust (reference), TypeScript, Python, Go. ⚠️ Local `main`
-is **13 commits ahead of `origin/main` (f63bf07) and unpushed** (the #117 + #118
-work, 2 Rust-only cordyceps commits, 2 `/close` bookkeeping commits).
+is **18 commits ahead of `origin/main` (f63bf07) and unpushed** (the #117 + #118 +
+#119 work, 2 Rust-only cordyceps commits, 3 `/close` bookkeeping commits).
 
 **🎯 Active work: the Composable Execution refactor (#117–#131, label
-`loop-strategy-refactor`) — two bricks landed.** The `StandardHarness` hardwires
+`loop-strategy-refactor`) — three bricks landed.** The `StandardHarness` hardwires
 three things the PRD makes composable: (1) loop strategy is a fixed `run()`
 dispatch match — becomes a recursive `LoopStrategy` enum where each variant's
 config struct owns its loop via a `RunStrategy` trait, recursion is
@@ -52,7 +52,40 @@ scheduling** (deferred to #126). New `fixtures/tasklist/deserialize.json` proves
 serde-default backward-compat; existing tasklist fixtures gained `"blockers":[]`
 byte-identically. Spec ambiguities resolved from the spec text (empty→`[]` per the
 `next_id` analogy; single error variant w/ reason; cycle helper tested directly).
-**13 issues remain `status: queued`; none others started.**
+
+**#119 done (3 of 15, `status: complete`).** The strategy-node shapes + the
+composition seam — types and trait only, **no per-variant run bodies yet**.
+`LoopStrategy` is now a closed recursive serde enum of config newtypes —
+`ReAct(ReactConfig)`, `PlanExecute(PlanExecuteConfig)`, `SelfVerifying(SelfVerifyingConfig)`,
+`Ralph(RalphConfig)`, `HillClimbing(HillClimbingConfig)`, `#[serde(tag="kind",
+rename_all="snake_case")]` with the leaf tag overridden to **`react`** (was
+`re_act`). `ReactConfig` is the leaf (`budget: BudgetPolicy` — the renamed
+`max_iterations`, semantically `PerLoop` — plus `agent`/`toolset` required `*Ref`
+handles + optional `output`); the rest are combinators holding `Box<LoopStrategy>`
+children under phase-named keys (`plan`/`execute`, `inner`). The `RunStrategy`
+trait (`async fn run(&mut ExecutionContext) -> StrategyOutcome`) is defined and
+implemented on the enum as **one-line delegation** — the only `match` site — with
+each config's `run` body **stubbed to a `Pending` placeholder that never
+panics/throws/raises** (real bodies land in #124). `StrategyRef::{BuiltIn(LoopStrategy),
+Custom(String)}` is **adjacently tagged** (`{"kind":"built_in","value":…}` /
+`{"kind":"custom","value":"key"}`) to dodge the `kind` collision with the nested
+internally-tagged `LoopStrategy`. New per-node collaborator handles `AgentRef`/
+`ToolsetRef`/`SchemaRef` serialize as bare strings (resolution lands in #120). The
+cordyceps tree `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` round-trips
+**byte-identically** across all four languages against shared fixtures
+`fixtures/strategy/{cordyceps_tree,strategy_ref,paused_state,child_paused_state}.json`;
+`PausedState`/`ChildPausedState` round-trip the new shape. Scope deliberately
+deferred: `StrategyOutcome`/`ExecutionContext` are minimal placeholders (full shape
+→ #123), `max_steps()` omitted (→ #122), the existing executor dispatch was adapted
+to the new newtype shape (reads `max_iterations` from the `PerLoop` budget) but
+**not** migrated into `run` bodies (→ #124). Spec ambiguities (config field sets,
+combinator child names, `StrategyRef` tagging, `react` vs `re_act`) were surfaced
+to the maintainer and pinned in prose before the parallel agents ran. Two benign
+cross-language naming/repr notes, both pre-existing & orthogonal: Go kept the type
+name `OptimizationDirection` (Rust renamed to `HillClimbingDirection`) — wire
+identical (`direction`: `minimize`/`maximize`); Go/Python use semantic-JSON
+equality for the float-bearing `PausedState` wrappers (`cost_usd` `0` vs `0.0`).
+**12 issues remain `status: queued`; none others started.**
 
 **Examples suite — 12 of 13 landed, all four languages each.** Present under
 `examples/{rust,typescript,python,go}/`:
@@ -118,9 +151,10 @@ gate), docs #27/#35/#36. All `scope: deferred`.
 completion** (label `loop-strategy-refactor`, all `status: queued`). Make
 `LoopStrategy`, budget, and the task list compositional and mutually consistent,
 applied byte-identically across all four languages where serialized. Work the
-critical path: **117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131**; #118
-(task-graph schema) is **done**, and #121 (`SubagentTool` strategy param), #122
-(`max_steps()`) remain parallel-grabbable immediately. Use the `/implement` skill per issue (Rust
+critical path: **117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131**; #117,
+#118, and #119 (the keystone strategy seam) are **done**, so **#120
+(ExecutionRegistry) is the next critical-path brick**, and #121 (`SubagentTool`
+strategy param), #122 (`max_steps()`) remain parallel-grabbable immediately. Use the `/implement` skill per issue (Rust
 reference + three parallel language agents + cross-language verifier). Honor the
 maintainer's design choice — `RunStrategy` trait + `StrategyRef::Custom` escape
 hatch — over the PRD's literal recursive-`run_strategy`-with-match sketch (A.4).
@@ -194,12 +228,14 @@ cache halts.
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
 10. **Local `main` is ahead of `origin/main` and unpushed** (`scope: debt`,
-    transient) — `origin/main` is at `f63bf07`; local `main` is **13 commits ahead**:
-    the five #117 commits (`0dd8b7a` rust, `a4eea8c` ts, `a3649d4` python, `771d66d`
-    go + `b9a46bc` go fix), the four #118 commits (`7728a54` rust, `a68a337` python,
-    `4ec76e2` go, `5d6c674` ts), two Rust-only `12-cordyceps` polish commits
-    (`8bb7734`, `d65ae64`), and two `/close` bookkeeping commits (`60a9e83` project
-    state, `cdf0c17` gitignore). **Needs a push.** The plan-execute scratch
+    transient, **growing — the prior loop flagged this as the #1 action but the push
+    never happened**) — `origin/main` is at `f63bf07`; local `main` is **18 commits
+    ahead**: the five #117 commits (`0dd8b7a` rust, `a4eea8c` ts, `a3649d4` python,
+    `771d66d` go + `b9a46bc` go fix), the four #118 commits (`7728a54` rust,
+    `a68a337` python, `4ec76e2` go, `5d6c674` ts), the four #119 commits (`e62f7c9`
+    rust, `faeff6a` python, `4354912` ts, `a031c59` go), two Rust-only
+    `12-cordyceps` polish commits (`8bb7734`, `d65ae64`), and three `/close`
+    bookkeeping commits (`60a9e83`, `cdf0c17`, `7ff75c0`). **Needs a push.** The plan-execute scratch
     run-artifacts that were previously left untracked are now covered by a
     `workspace/*` wildcard in `examples/rust/08-plan-execute/.gitignore` (preserving
     the tracked `.gitkeep` + canonical `Async_Runtime_Comparison_Report.md`).
@@ -221,20 +257,22 @@ stubs — all resolved in prior loops. Former Deviation "#114 consult work unpus
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-1. **Push local `main` to `origin` (13 commits ahead, incl. #117 + #118).** Cheap,
-   removes a growing divergence; two full cross-language features plus the Rust
-   cordyceps polish are committed but unpushed. Do this before grabbing more work
-   (see Deviation #10).
-2. **#119 — recursive `LoopStrategy` + `RunStrategy` trait + `StrategyRef` (the
-   keystone).** With #117 (budget value types) and #118 (task-graph schema) both
-   landed, #119 is the next critical-path brick and unblocks most of the tree. Grab
-   via `/implement`. #121 (`SubagentTool` strategy param) and #122 (`max_steps()`)
-   are early parallel grabs alongside it.
-3. **Critical path through the executor** — after #119: #120 (`ExecutionRegistry` +
-   custom registry) → #123 (`StrategyOutcome` + `ExecutionContext`) → #124
-   (per-variant `RunStrategy::run` impls — the big one). Then #125 (budget
-   enforcement) and #126 (ready-set walk — consumes #118's `Task.blockers` schema)
-   open up.
+1. **Push local `main` to `origin` (18 commits ahead, incl. #117 + #118 + #119).**
+   Cheap, removes a now-growing divergence the last loop already flagged and didn't
+   action; three full cross-language features plus the Rust cordyceps polish are
+   committed but unpushed. Do this before grabbing more work (see Deviation #10).
+2. **#120 — `ExecutionRegistry` replaces single-collaborator `HarnessConfig` fields
+   + custom-strategy registry (the next critical-path brick).** With #119's `*Ref`
+   handles and `StrategyRef::{BuiltIn,Custom}` landed but resolution stubbed, #120
+   is what makes them resolvable at runtime (agents/toolsets/schemas/verifiers/custom
+   strategies by key; unresolved handle = startup error; missing `Custom` key on
+   resume = recoverable `StrategyNotFound`). Grab via `/implement`. #121
+   (`SubagentTool` strategy param) and #122 (`max_steps()`) are parallel grabs.
+3. **Critical path through the executor** — after #120: #123 (`StrategyOutcome` +
+   `ExecutionContext` runtime scaffold — fleshes out #119's placeholders) → #124
+   (per-variant `RunStrategy::run` impls — the big one; migrates the adapted
+   dispatch into the stubbed `run` bodies). Then #125 (budget enforcement) and #126
+   (ready-set walk — consumes #118's `Task.blockers` schema) open up.
 4. **Refactor finishers** — #127 (custom-strategy tracer), #128 (observability),
    #129 (`Continue` checkpoint), #130 (`HumanRequest::BudgetExhausted` HITL resume),
    then **#131** (cordyceps capstone — the success bar).
