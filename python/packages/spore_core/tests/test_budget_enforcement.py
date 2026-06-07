@@ -67,7 +67,7 @@ from spore_core.harness import (
     _self_verifying_partial_json,
 )
 from spore_core import ToolOutputSuccess
-from spore_core.model import ToolCall
+from spore_core.model import Role, TextContent, ToolCall
 from spore_core.tasklist import TaskList, TaskStatus
 
 
@@ -278,7 +278,11 @@ def test_sibling_isolation_fresh_context_per_node() -> None:
 
 def test_child_exhaustion_does_not_charge_parent_scope() -> None:
     budgets = BudgetStack()
-    # Parent scope (capped at 5, behavior Fail).
+    # Parent scope (TotalSteps{5}) that is ALREADY nearly exhausted: it has spent
+    # 4 of its 5 steps, leaving EXACTLY ONE remaining. This is the adversarial
+    # case for rule 4/7 — if a child's exhaustion auto-cascaded even a single step
+    # onto the parent, the parent would be pushed over its own cap and could no
+    # longer Complete.
     budgets.push(
         BudgetContext(
             policy=BudgetPolicyTotalSteps(value=5),
@@ -286,6 +290,11 @@ def test_child_exhaustion_does_not_charge_parent_scope() -> None:
             phase="parent",
         )
     )
+    budgets.current().charge(4)  # type: ignore[union-attr]
+    assert budgets.current().remaining() == 1, (  # type: ignore[union-attr]
+        "parent starts with exactly 1 step left"
+    )
+
     # Child descends with its OWN scope (capped at 1) and exhausts.
     budgets.push(
         BudgetContext(
@@ -303,10 +312,21 @@ def test_child_exhaustion_does_not_charge_parent_scope() -> None:
 
     parent = budgets.current()
     assert parent is not None
-    assert parent.steps_taken == 0
-    # The parent can then proceed and Complete within its own budget.
-    parent.charge(5)
+    assert parent.steps_taken == 4, (
+        "rule 4/7: child exhaustion did NOT auto-charge the parent — its "
+        "steps_taken is unchanged at 4 (not bumped to 5)"
+    )
+    assert parent.remaining() == 1, (
+        "the parent STILL has its 1 remaining step after the child exhausted"
+    )
+    # The parent can spend its last step and Complete — proving the child's
+    # exhaustion did NOT push it over its own cap.
+    parent.charge(1)
     assert parent.steps_taken == 5
+    # And only now is the parent itself exhausted (at its own 5, by its own work —
+    # never by the child's).
+    with pytest.raises(BudgetExhausted):
+        parent.charge(1)
 
 
 # ---------------------------------------------------------------------------
@@ -382,5 +402,30 @@ async def test_react_leaf_cap_binding_propagates_partial() -> None:
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonBudgetExceeded)
     assert r.reason.limit_type == "turns"
-    # The leaf stopped at its own cap N=2 (surfaced turn count = node steps_taken).
+    # The turn count is the EXHAUSTED NODE's own ``steps_taken`` (#125
+    # BudgetExhausted path), which equals the leaf cap N=2 here.
     assert r.turns == 2
+    # The #125 discriminator: the partial flowed through
+    # ``StrategyOutcomeBudgetExhausted.partial_output`` -> ``_drive_strategy``'s
+    # BudgetExhausted arm, which materializes the partial as a SINGLE assistant
+    # Text message. On PRE-#125 code the leaf's recorded terminal surfaced the
+    # window's RAW session (the tool-call / observation messages), NOT this
+    # node-concrete partial JSON — so these assertions FAIL on the old path and
+    # PROVE the new BudgetExhausted machinery is exercised.
+    assert len(r.session_state.messages) == 1, (
+        "BudgetExhausted arm materializes exactly the partial as one assistant "
+        "message (not the window's raw transcript)"
+    )
+    msg = r.session_state.messages[0]
+    assert msg.role == Role.ASSISTANT
+    assert isinstance(msg.content, TextContent)
+    text = msg.content.text
+    # The documented ReAct partial shape (fork #2): the last FinalResponse text as
+    # JSON. This window produced no FinalResponse, so the documented shape carries
+    # an empty ``last_final_response``.
+    assert text == _react_partial_json("")
+    # Sanity: the materialized text is genuinely the partial helper's output, i.e.
+    # valid JSON with the node tag — not free-form prose.
+    parsed = json.loads(text)
+    assert parsed["node"] == "react"
+    assert parsed["last_final_response"] == ""

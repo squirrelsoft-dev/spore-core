@@ -1598,7 +1598,23 @@ async def _run_plan_execute_config(
                 cx.stream = on_stream
                 if resolution == ExhaustedResolution.FAIL:
                     return _promote_budget_exhausted(charge_err, None)
-                return _promote_budget_exhausted(charge_err, partial)
+                # #129: a granted ``Continue`` must reset this scope
+                # (``resolve_current`` already did via ``consume_continue``) and
+                # RE-RUN this execute step — the in-process loop wiring lands in
+                # #129. It is UNREACHABLE today: live bodies push an ``Escalate``
+                # placeholder behavior (the serialized ``BudgetExhaustedBehavior``
+                # field is a wire change deferred to #129), so ``resolve_current``
+                # only ever yields ``Escalate`` / ``Fail`` here. Until that loop
+                # exists, an (impossible) ``Continue`` is handled EXPLICITLY
+                # (alongside ``Escalate``) as a lossless surface-with-partial
+                # rather than a silent fall-through.
+                if resolution in (
+                    ExhaustedResolution.CONTINUE,
+                    ExhaustedResolution.ESCALATE,
+                ):
+                    return _promote_budget_exhausted(charge_err, partial)
+                # Defensive: ``ExhaustedResolution`` is exhausted above.
+                raise AssertionError(f"unhandled resolution {resolution!r}")
 
         elif isinstance(sub_result, RunResultFailure):
             # Q5: any non-success step aborts the whole run.
@@ -1793,7 +1809,19 @@ async def _run_self_verifying_config(
             cx.stream = on_stream
             if resolution == ExhaustedResolution.FAIL:
                 return _promote_budget_exhausted(charge_err, None)
-            return _promote_budget_exhausted(charge_err, partial)
+            # #129: a granted ``Continue`` must reset + RE-RUN this
+            # build↔evaluate iteration (the in-process loop wiring lands in
+            # #129). UNREACHABLE today — live bodies push an ``Escalate``
+            # placeholder, so ``resolve_current`` never yields ``Continue`` here.
+            # Handle it EXPLICITLY (alongside ``Escalate``, surface-with-partial)
+            # rather than via a silent fall-through.
+            if resolution in (
+                ExhaustedResolution.CONTINUE,
+                ExhaustedResolution.ESCALATE,
+            ):
+                return _promote_budget_exhausted(charge_err, partial)
+            # Defensive: ``ExhaustedResolution`` is exhausted above.
+            raise AssertionError(f"unhandled resolution {resolution!r}")
 
         # ── Evaluate phase: a fresh evaluator run on ``eval_agent``.
         eval_result = await executor.evaluate_phase(task, eval_agent, carried, total_usage)
@@ -2038,7 +2066,19 @@ async def _run_hill_climbing_config(
             cx.stream = on_stream
             if resolution == ExhaustedResolution.FAIL:
                 return _promote_budget_exhausted(charge_err, None)
-            return _promote_budget_exhausted(charge_err, partial)
+            # #129: a granted ``Continue`` must reset + keep iterating the climb
+            # (the in-process loop wiring lands in #129). UNREACHABLE today — live
+            # bodies push an ``Escalate`` placeholder, so ``resolve_current``
+            # never yields ``Continue`` here. Handle it EXPLICITLY (alongside
+            # ``Escalate``, surface-with-partial) rather than via a silent
+            # fall-through.
+            if resolution in (
+                ExhaustedResolution.CONTINUE,
+                ExhaustedResolution.ESCALATE,
+            ):
+                return _promote_budget_exhausted(charge_err, partial)
+            # Defensive: ``ExhaustedResolution`` is exhausted above.
+            raise AssertionError(f"unhandled resolution {resolution!r}")
         limit_type = executor.budget_exceeded(task.budget, carried, started_at)
         if limit_type is not None:
             await executor.hill_write_tsv(task_id, rows)

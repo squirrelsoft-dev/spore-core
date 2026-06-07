@@ -36,9 +36,11 @@ from spore_core import (
     Task,
     TokenUsage,
     ToolCall,
+    ToolOutputSuccess,
     VcsError,
     VcsLogArgs,
 )
+from spore_core.agent import ToolCallRequested
 from spore_core.harness import (
     BaseSandboxProvider,
     CommandOutput,
@@ -114,6 +116,39 @@ class ProgressWritingAgent:
             _write_progress(self._root, self._queue.pop(0))
         return FinalResponse(
             content="window done",
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+        )
+
+    def id(self) -> AgentId:
+        return self._id
+
+
+class ToolLoopingAgent:
+    """An agent that NEVER returns a ``FinalResponse`` — every turn requests a
+    tool call, so a bounded ReAct window can only ever exhaust its turn budget (it
+    never terminates cleanly). On its FIRST turn it writes ``COMPLETE`` to
+    ``.spore/progress.json``, so any code path that DID consult Ralph's external
+    completion after the window would (wrongly) see "complete" and Success.
+    Mirrors Rust's ``ToolLoopingAgent`` (#125 F5)."""
+
+    def __init__(self, root: Path) -> None:
+        self._id = AgentId("ralph-tool-loop")
+        self._root = root
+        self._calls = 0
+
+    @property
+    def call_count(self) -> int:
+        return self._calls
+
+    async def turn(self, context: Context) -> ToolCallRequested:
+        if self._calls == 0:
+            # Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
+            # completion after a budget-exhausted window it would Success.
+            _write_progress(self._root, COMPLETE)
+        n = self._calls
+        self._calls += 1
+        return ToolCallRequested(
+            calls=[ToolCall(id=f"c{n}", name="x", input={})],
             usage=TokenUsage(input_tokens=1, output_tokens=1),
         )
 
@@ -226,6 +261,57 @@ async def test_r5_single_window_cap(tmp_path: Path) -> None:
     assert isinstance(r.reason, HaltReasonRalphCompletionUnmet)
     assert r.reason.iterations == 1
     assert agent.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# F5 (#125): a Ralph window whose INNER LEAF exhausts its OWN budget mid-window
+# (the leaf's ``PerLoop`` policy is the binding cap, no smaller global backstop).
+# The window surfaces ``StrategyOutcomeBudgetExhausted``; Ralph must treat it as
+# "window incomplete → RESET and retry" — it must NOT consult external completion
+# (which is COMPLETE on disk here) and must NOT cascade the child's exhaustion
+# into its own terminal. So the run reaches ``max_resets`` windows and ends
+# ``RalphCompletionUnmet``, NOT Success.
+#
+# NOTE: the other Ralph tests use an unbounded leaf + a global ``max_turns`` cap
+# (Deviation #14c) to AVOID this path; this test adds explicit coverage of the
+# BOUNDED-leaf path.
+# ---------------------------------------------------------------------------
+
+
+async def test_ralph_budget_exhausted_window_resets_no_completion_no_cascade(
+    tmp_path: Path,
+) -> None:
+    _write_progress(tmp_path, INCOMPLETE)
+    agent = ToolLoopingAgent(tmp_path)
+    # Provide tool outputs for the looping calls across all windows.
+    reg = ScriptedToolRegistry()
+    for _ in range(32):
+        reg.push(ToolOutputSuccess(content="ok", truncated=False))
+    cfg = _config(tmp_path, agent, max_resets=3)
+    cfg.tool_registry = reg
+    h = StandardHarness(cfg)
+
+    # Inner leaf carries its OWN binding cap (PerLoop{2}); NO global max_turns
+    # backstop, so the leaf policy — not the global cap — exhausts the window and
+    # the new BudgetExhausted path is taken.
+    task = Task.new(
+        "implement the thing",
+        SessionId("ralph-exhaust"),
+        RalphConfig(inner=ReactConfig.per_loop(2), agent=""),
+        budget=BudgetLimits(max_turns=None),
+    )
+
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultFailure), (
+        f"expected RalphCompletionUnmet (reset-on-exhaust, no completion, no cascade), got {r!r}"
+    )
+    assert isinstance(r.reason, HaltReasonRalphCompletionUnmet)
+    # Reached max_resets — completion was NEVER consulted (despite COMPLETE on
+    # disk) and the child's exhaustion did NOT cascade into Ralph's own terminal.
+    assert r.reason.iterations == 3, "exactly max_resets windows ran"
+    # Three windows × two leaf turns each = six agent turns total — proving each
+    # exhausted window fully reset and re-ran, not short-circuited.
+    assert agent.call_count == 6, "3 windows × 2 leaf turns each"
 
 
 # ---------------------------------------------------------------------------
