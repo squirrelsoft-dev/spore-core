@@ -93,7 +93,8 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
 /// Drive the plan phase against `exchange` through a ReplayModelInterface and
 /// assert the run consumes the planner turn, parses a non-empty task list, and
 /// enters the execute phase — where the single-exchange replay exhausts on the
-/// first step and aborts with `StepFailed { task_index: 0 }` (issue #59, Q5).
+/// first step, cascades, and drains to `TasksBlockedByFailure { failed_task: 1 }`
+/// (#126 — replaces the pre-#126 `StepFailed` blanket abort).
 async fn drive_plan_phase(exchange: RecordedExchange) {
     let harness = StandardHarness::new(config_for(exchange));
     // #124 A.5: the plan slot is STRUCTURED — its leaf carries an output schema.
@@ -113,16 +114,20 @@ async fn drive_plan_phase(exchange: RecordedExchange) {
     );
     match harness.run(HarnessRunOptions::new(task)).await {
         RunResult::Failure {
-            reason: HaltReason::StepFailed { task_index, .. },
+            reason: HaltReason::TasksBlockedByFailure { failed_task, .. },
             turns,
             ..
         } => {
-            assert_eq!(task_index, 0, "aborts on the first execute step");
-            // The plan turn (1) plus the step's first model call (2) before the
+            // #126: a failing execute step no longer raises `StepFailed`; it
+            // cascades and the run drains to `TasksBlockedByFailure`. With the
+            // single-exchange replay every execute step exhausts, so the FIRST
+            // ready task (id 1) is the failed task.
+            assert_eq!(failed_task, 1, "the first ready task fails");
+            // The plan turn (1) plus the step's first model call before the
             // replay exhausts: the harness reached the execute phase.
             assert!(turns >= 1, "at least the plan turn was consumed");
         }
-        other => panic!("expected StepFailed, got {other:?}"),
+        other => panic!("expected TasksBlockedByFailure, got {other:?}"),
     }
 }
 

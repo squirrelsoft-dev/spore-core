@@ -130,6 +130,19 @@ pub struct TurnOutput {
 }
 
 /// A composite-strategy plan artifact, handed to `OnPlanCreated`.
+///
+/// # Deprecated as a task-list authoring source (#126, decision C)
+/// This flat artifact (`tasks: Vec<String>`, no blockers) is the plan-capture /
+/// `OnPlanCreated` hook payload, and remains first-class IN THAT ROLE. What is
+/// DEPRECATED is using it to author a runnable [`TaskList`](crate::tasklist::TaskList):
+/// the linear
+/// [`plan_artifact_to_task_list`](crate::tasklist::plan_artifact_to_task_list)
+/// bridge can only ever produce a chain with empty `blockers`, so it cannot
+/// express the blocker DAG the #126 ready-set executor walks. The `task_list`
+/// tool path ([`TaskListTool`](crate::tools::TaskListTool), i.e.
+/// [`TaskList::add`](crate::tasklist::TaskList::add) with real blockers) is the
+/// ONE authoring path the executor reads from. Do not seed a DAG run from this
+/// artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanArtifact {
     pub tasks: Vec<String>,

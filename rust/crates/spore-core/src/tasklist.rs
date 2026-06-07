@@ -163,6 +163,88 @@ impl Default for TaskList {
 }
 
 // ============================================================================
+// Step ledger (#126 — Tier-2 global running ledger)
+// ============================================================================
+
+/// The maximum number of [`StepLedgerEntry`] rows the Tier-2 running ledger
+/// retains (#126, RESOLVED spec decision B). Past this bound the ledger drops
+/// the OLDEST entries (a deterministic, NO-model, byte-identical policy — never
+/// summarize). This constant MUST be identical across all four language
+/// implementations.
+pub const STEP_LEDGER_MAX_ENTRIES: usize = 20;
+
+/// A single compact row in the Tier-2 global running ledger (#126). Appended on
+/// task completion and injected into EVERY subsequent execute step so each step
+/// sees a compact record of what has already happened across the whole DAG.
+///
+/// `files_touched` is **harness-observed from write/edit tool calls** during the
+/// task's execution — NOT a model-self-reported field. A task whose execute step
+/// only *narrated* touching a file (no actual write/edit tool call) records an
+/// EMPTY `files_touched` (#126 AC2).
+///
+/// Wire field order is `task_id, summary, files_touched`. Byte-identical across
+/// all four languages (the same serde shape as [`Task`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepLedgerEntry {
+    pub task_id: u32,
+    pub summary: String,
+    pub files_touched: Vec<String>,
+}
+
+/// The static marker row inserted (once) when the Tier-2 ledger drops its oldest
+/// entries past [`STEP_LEDGER_MAX_ENTRIES`] (#126, decision B). It is a fixed
+/// string — NOT a summary of the elided rows — so the elision note is
+/// byte-identical across languages. Rendered as a leading ledger line by
+/// [`render_step_ledger`].
+pub const STEP_LEDGER_ELISION_MARKER: &str = "[older ledger entries elided]";
+
+/// Append `entry` to a bounded Tier-2 running ledger, keeping at most
+/// [`STEP_LEDGER_MAX_ENTRIES`] rows via **drop-oldest** (#126, decision B).
+///
+/// Pure and deterministic: NO model call, NO summarization. When the push would
+/// exceed the bound the oldest entries are removed from the front so exactly the
+/// `STEP_LEDGER_MAX_ENTRIES` most-recent entries remain (completion order
+/// preserved). Returns `true` iff at least one entry was dropped on this call
+/// (so the caller can render the static [`STEP_LEDGER_ELISION_MARKER`]).
+pub fn push_step_ledger(ledger: &mut Vec<StepLedgerEntry>, entry: StepLedgerEntry) -> bool {
+    ledger.push(entry);
+    let mut dropped = false;
+    while ledger.len() > STEP_LEDGER_MAX_ENTRIES {
+        ledger.remove(0);
+        dropped = true;
+    }
+    dropped
+}
+
+/// Render the Tier-2 ledger as a compact, deterministic text block for seeding
+/// into an execute step (#126). One line per entry: `#<id> <summary> [files:
+/// a, b]` (the `[files: …]` suffix omitted when `files_touched` is empty). When
+/// `elided` is true a single leading [`STEP_LEDGER_ELISION_MARKER`] line is
+/// emitted. Returns `None` for an empty ledger (nothing to inject).
+pub fn render_step_ledger(ledger: &[StepLedgerEntry], elided: bool) -> Option<String> {
+    if ledger.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if elided {
+        lines.push(STEP_LEDGER_ELISION_MARKER.to_string());
+    }
+    for e in ledger {
+        if e.files_touched.is_empty() {
+            lines.push(format!("#{} {}", e.task_id, e.summary));
+        } else {
+            lines.push(format!(
+                "#{} {} [files: {}]",
+                e.task_id,
+                e.summary,
+                e.files_touched.join(", ")
+            ));
+        }
+    }
+    Some(format!("Progress ledger so far:\n{}", lines.join("\n")))
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -389,6 +471,147 @@ impl TaskList {
         task.status = TaskStatus::Completed;
         Ok(())
     }
+
+    // ========================================================================
+    // DAG scheduling helpers (#126) — pure, deterministic, no I/O.
+    // ========================================================================
+
+    /// The next READY task to run under the ready-set scheduler (#126): the
+    /// LOWEST-`id` [`Pending`](TaskStatus::Pending) task ALL of whose `blockers`
+    /// are [`Completed`](TaskStatus::Completed). Returns its `id`, or `None` when
+    /// no Pending task is currently runnable (every Pending task is waiting on an
+    /// un-completed blocker, or none remain).
+    ///
+    /// The id tiebreak is deterministic and language-agnostic: among ready
+    /// tasks, the smallest id always wins, regardless of positional order in
+    /// [`tasks`](TaskList::tasks).
+    pub fn next_ready(&self) -> Option<u32> {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                t.status == TaskStatus::Pending && t.blockers.iter().all(|b| self.is_completed(*b))
+            })
+            .map(|t| t.id)
+            .min()
+    }
+
+    /// Whether the task with `id` exists and is [`Completed`](TaskStatus::Completed).
+    fn is_completed(&self, id: u32) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| t.id == id && t.status == TaskStatus::Completed)
+    }
+
+    /// The TRANSITIVE-blocker closure of `id` (#126, Tier-1 scoped context): the
+    /// set of all tasks `id` (transitively) depends on — its direct `blockers`,
+    /// their blockers, and so on. Excludes `id` itself. Returned SORTED ascending
+    /// for deterministic, byte-identical seeding across languages.
+    ///
+    /// Independent branches (tasks NOT reachable from `id` via the
+    /// `task -> blocker` edges) never appear, which is what keeps a task's
+    /// Tier-1 seed free of unrelated branches (#126 AC1 branch isolation).
+    pub fn transitive_blockers(&self, id: u32) -> Vec<u32> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<u32> = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.blockers.clone())
+            .unwrap_or_default();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if let Some(t) = self.tasks.iter().find(|t| t.id == node) {
+                stack.extend(t.blockers.iter().copied());
+            }
+        }
+        let mut out: Vec<u32> = seen.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The TRANSITIVE-dependent closure of `id` (#126, failure cascade): every
+    /// task that depends on `id` directly or transitively (i.e. has a directed
+    /// `task -> blocker` path reaching `id`). Excludes `id` itself. Returned
+    /// SORTED ascending. When `id` fails terminally, exactly these tasks are
+    /// marked [`Blocked`](TaskStatus::Blocked); tasks NOT in this set are
+    /// unaffected and keep scheduling (#126 AC3).
+    pub fn transitive_dependents(&self, id: u32) -> Vec<u32> {
+        use std::collections::HashSet;
+        // Reverse reachability: repeatedly add any task whose blockers intersect
+        // the growing dependent set (seeded with `id`).
+        let mut dependents: HashSet<u32> = HashSet::new();
+        let mut frontier: Vec<u32> = vec![id];
+        while let Some(node) = frontier.pop() {
+            for t in &self.tasks {
+                if t.id == id {
+                    continue;
+                }
+                if t.blockers.contains(&node) && dependents.insert(t.id) {
+                    frontier.push(t.id);
+                }
+            }
+        }
+        let mut out: Vec<u32> = dependents.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whole-graph cycle detection over the `task -> blocker` edges (#126,
+    /// defense-in-depth at execute entry). Generalizes the single-edge
+    /// [`would_create_cycle`](TaskList::would_create_cycle) check used by
+    /// [`add`](TaskList::add): it inspects the ENTIRE persisted graph (which the
+    /// `task_list` tool authoring path could in principle leave cyclic via
+    /// out-of-band edits) rather than one prospective `add`.
+    ///
+    /// Returns `true` iff any directed cycle exists. Pure; O(V+E) via DFS
+    /// three-coloring. Blockers referencing unknown ids are simply ignored (no
+    /// edge), matching `next_ready`'s "an unknown blocker is never completed"
+    /// — but an unknown blocker also cannot form a cycle.
+    pub fn has_cycle(&self) -> bool {
+        use std::collections::{HashMap, HashSet};
+        // 0 = unvisited, 1 = on-stack (gray), 2 = done (black).
+        let mut color: HashMap<u32, u8> = HashMap::new();
+        // Iterative DFS so a pathological graph never blows the stack.
+        for start in self.tasks.iter().map(|t| t.id) {
+            if color.get(&start).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            // Each stack frame: (node, whether we've already pushed its children).
+            let mut stack: Vec<(u32, bool)> = vec![(start, false)];
+            let mut on_path: HashSet<u32> = HashSet::new();
+            while let Some((node, expanded)) = stack.pop() {
+                if expanded {
+                    color.insert(node, 2);
+                    on_path.remove(&node);
+                    continue;
+                }
+                if color.get(&node).copied().unwrap_or(0) == 2 {
+                    continue;
+                }
+                color.insert(node, 1);
+                on_path.insert(node);
+                stack.push((node, true));
+                if let Some(t) = self.tasks.iter().find(|t| t.id == node) {
+                    for &b in &t.blockers {
+                        // An edge to a non-existent task is no edge at all.
+                        if !self.tasks.iter().any(|x| x.id == b) {
+                            continue;
+                        }
+                        if on_path.contains(&b) {
+                            return true; // back-edge → cycle.
+                        }
+                        if color.get(&b).copied().unwrap_or(0) != 2 {
+                            stack.push((b, false));
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 // ============================================================================
@@ -427,6 +650,20 @@ impl TaskList {
 /// The accepted plan is mirrored into the [`RunStore`](crate::storage::RunStore)
 /// under [`TASK_LIST_EXTRAS_KEY`] by #59's execute loop; the standalone
 /// [`TaskListTool`](crate::tools::TaskListTool) shares that same key (#75).
+///
+/// # Deprecated (#126, decision C)
+/// This flat bridge can only ever produce a LINEAR chain (it always sets
+/// `blockers: vec![]`), so it cannot express the blocker DAG the #126 ready-set
+/// executor walks. The `task_list` tool path
+/// ([`TaskListTool`](crate::tools::TaskListTool), which calls
+/// [`TaskList::add`] with real blockers) is now the ONE authoring path; the
+/// PlanExecute executor reads its [`TaskList`] from the persisted `task_list`
+/// store rather than from this bridge. The function is RETAINED (its replay
+/// tests stay green) but should not be used to seed a DAG run.
+#[deprecated(
+    since = "0.1.0",
+    note = "linear-only bridge; author the task list via the `task_list` tool (TaskList::add with blockers). See #126."
+)]
 pub fn plan_artifact_to_task_list(artifact: &PlanArtifact) -> TaskList {
     let mut list = TaskList::default(); // next_id == 1
     for step in &artifact.tasks {
@@ -444,6 +681,7 @@ pub fn plan_artifact_to_task_list(artifact: &PlanArtifact) -> TaskList {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the retained-for-compat `plan_artifact_to_task_list` bridge (#126 C).
 mod tests {
     use super::*;
 
@@ -1019,5 +1257,179 @@ mod tests {
             let want_json = serde_json::to_string(&case.expected).unwrap();
             assert_eq!(got_json, want_json, "case {}: canonical bytes", case.name);
         }
+    }
+
+    // ========================================================================
+    // #126 DAG helpers + step ledger
+    // ========================================================================
+
+    fn dag() -> TaskList {
+        // 1 (root) ; 2 -> 1 ; 3 -> 1 ; 4 -> 2,3 (diamond) ; 5 (independent).
+        let mut l = TaskList::default();
+        l.add("a".into(), vec![]).unwrap(); // 1
+        l.add("b".into(), vec![1]).unwrap(); // 2
+        l.add("c".into(), vec![1]).unwrap(); // 3
+        l.add("d".into(), vec![2, 3]).unwrap(); // 4
+        l.add("e".into(), vec![]).unwrap(); // 5
+        l
+    }
+
+    // next_ready: lowest-id Pending task with all blockers Completed.
+    #[test]
+    fn next_ready_respects_blockers_and_id_tiebreak() {
+        let mut l = dag();
+        // Initially tasks 1 and 5 are ready (no blockers); lowest id wins → 1.
+        assert_eq!(l.next_ready(), Some(1));
+        l.complete(1).unwrap();
+        // Now 2, 3, 5 are ready (4 still waits on 2 & 3). Lowest is 2.
+        assert_eq!(l.next_ready(), Some(2));
+        l.complete(2).unwrap();
+        // 3 and 5 ready; 4 still needs 3. Lowest is 3.
+        assert_eq!(l.next_ready(), Some(3));
+        l.complete(3).unwrap();
+        // Now 4 and 5 ready; lowest is 4.
+        assert_eq!(l.next_ready(), Some(4));
+        l.complete(4).unwrap();
+        assert_eq!(l.next_ready(), Some(5));
+        l.complete(5).unwrap();
+        assert_eq!(l.next_ready(), None);
+    }
+
+    // A Pending task whose blocker is NOT completed is never ready.
+    #[test]
+    fn next_ready_skips_unsatisfied_blockers() {
+        let l = dag();
+        // Only 1 and 5 are runnable; 2/3/4 wait. next_ready is the min of {1,5}.
+        assert_eq!(l.next_ready(), Some(1));
+    }
+
+    // transitive_blockers: the full upstream closure, sorted, excluding self.
+    #[test]
+    fn transitive_blockers_closure() {
+        let l = dag();
+        assert_eq!(l.transitive_blockers(1), Vec::<u32>::new());
+        assert_eq!(l.transitive_blockers(2), vec![1]);
+        assert_eq!(l.transitive_blockers(4), vec![1, 2, 3]);
+        // Independent task has no blockers.
+        assert_eq!(l.transitive_blockers(5), Vec::<u32>::new());
+    }
+
+    // transitive_dependents: the full downstream closure, sorted, excluding self.
+    #[test]
+    fn transitive_dependents_closure() {
+        let l = dag();
+        // Everything downstream of 1: 2, 3, 4.
+        assert_eq!(l.transitive_dependents(1), vec![2, 3, 4]);
+        assert_eq!(l.transitive_dependents(2), vec![4]);
+        assert_eq!(l.transitive_dependents(3), vec![4]);
+        assert_eq!(l.transitive_dependents(4), Vec::<u32>::new());
+        // Independent task has no dependents.
+        assert_eq!(l.transitive_dependents(5), Vec::<u32>::new());
+    }
+
+    // has_cycle: acyclic graphs return false; a hand-built cycle returns true.
+    #[test]
+    fn has_cycle_detects_cycles() {
+        let l = dag();
+        assert!(!l.has_cycle(), "diamond DAG is acyclic");
+
+        // Build a cycle out of band: 1 -> 2 -> 1.
+        let mut c = TaskList::default();
+        c.add("a".into(), vec![]).unwrap(); // 1
+        c.add("b".into(), vec![1]).unwrap(); // 2 -> 1
+        c.tasks[0].blockers = vec![2]; // 1 -> 2 closes the cycle
+        assert!(c.has_cycle());
+
+        // A self-edge is a cycle.
+        let mut s = TaskList::default();
+        s.add("x".into(), vec![]).unwrap();
+        s.tasks[0].blockers = vec![1];
+        assert!(s.has_cycle());
+    }
+
+    // has_cycle: an edge to a non-existent task is ignored (no false positive).
+    #[test]
+    fn has_cycle_ignores_unknown_blockers() {
+        let mut l = TaskList::default();
+        l.add("a".into(), vec![]).unwrap();
+        l.tasks[0].blockers = vec![99]; // dangling edge, not a cycle
+        assert!(!l.has_cycle());
+    }
+
+    // push_step_ledger: drop-oldest past N, returns whether anything was dropped.
+    #[test]
+    fn step_ledger_drop_oldest_past_n() {
+        let mut ledger: Vec<StepLedgerEntry> = Vec::new();
+        // Push exactly N entries: no drop.
+        for i in 0..STEP_LEDGER_MAX_ENTRIES as u32 {
+            let dropped = push_step_ledger(
+                &mut ledger,
+                StepLedgerEntry {
+                    task_id: i + 1,
+                    summary: format!("s{i}"),
+                    files_touched: vec![],
+                },
+            );
+            assert!(!dropped, "no drop before exceeding N");
+        }
+        assert_eq!(ledger.len(), STEP_LEDGER_MAX_ENTRIES);
+        // One more: drop-oldest fires.
+        let dropped = push_step_ledger(
+            &mut ledger,
+            StepLedgerEntry {
+                task_id: 999,
+                summary: "newest".into(),
+                files_touched: vec![],
+            },
+        );
+        assert!(dropped, "drop fires at N+1");
+        assert_eq!(ledger.len(), STEP_LEDGER_MAX_ENTRIES, "stays bounded at N");
+        // The OLDEST (task_id 1) was dropped; the newest is retained.
+        assert!(ledger.iter().all(|e| e.task_id != 1));
+        assert_eq!(ledger.last().unwrap().task_id, 999);
+    }
+
+    // render_step_ledger: deterministic text; files suffix only when non-empty;
+    // elision marker leads when requested; None for empty.
+    #[test]
+    fn render_step_ledger_shape() {
+        assert_eq!(render_step_ledger(&[], false), None);
+        let entries = vec![
+            StepLedgerEntry {
+                task_id: 1,
+                summary: "scaffolded".into(),
+                files_touched: vec![],
+            },
+            StepLedgerEntry {
+                task_id: 2,
+                summary: "wrote tests".into(),
+                files_touched: vec!["a.rs".into(), "b.rs".into()],
+            },
+        ];
+        let rendered = render_step_ledger(&entries, false).unwrap();
+        assert!(rendered.contains("#1 scaffolded"));
+        assert!(
+            !rendered.contains("#1 scaffolded [files"),
+            "no empty files suffix"
+        );
+        assert!(rendered.contains("#2 wrote tests [files: a.rs, b.rs]"));
+        assert!(!rendered.contains(STEP_LEDGER_ELISION_MARKER));
+        // With elision the static marker leads.
+        let elided = render_step_ledger(&entries, true).unwrap();
+        assert!(elided.contains(STEP_LEDGER_ELISION_MARKER));
+    }
+
+    // StepLedgerEntry serde field order is task_id, summary, files_touched.
+    #[test]
+    fn step_ledger_entry_serde_shape() {
+        let e = StepLedgerEntry {
+            task_id: 7,
+            summary: "did".into(),
+            files_touched: vec!["x".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"task_id":7,"summary":"did","files_touched":["x"]}"#
+        );
     }
 }

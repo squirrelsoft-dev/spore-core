@@ -155,9 +155,18 @@ pub use storage::{
     InMemoryStorageProvider, MemoryEntry, MemoryStore, NoOpStorageProvider, ObservabilityStore,
     RunStore, ScopedMemoryRouter, SessionStore, StorageError, StorageProvider, WorkspaceId,
 };
+// `plan_artifact_to_task_list` is re-exported but #[deprecated] (#126, decision
+// C — the linear bridge is retained for its replay tests but the `task_list`
+// tool is the authoring path). The allow keeps the kept-for-compat re-export
+// warning-free under `-D warnings`.
+#[allow(deprecated)]
 pub use tasklist::{
     plan_artifact_to_task_list, Task as TaskListTask, TaskList, TaskListError, TaskStatus,
     TASK_LIST_EXTRAS_KEY,
+};
+pub use tasklist::{
+    push_step_ledger, render_step_ledger, StepLedgerEntry, STEP_LEDGER_ELISION_MARKER,
+    STEP_LEDGER_MAX_ENTRIES,
 };
 pub use tools::{
     AbortTool, AskUserQuestionTool, EditFileTool, EnterPlanModeTool, ExitPlanModeTool, GrepTool,
