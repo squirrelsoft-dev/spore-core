@@ -1761,6 +1761,8 @@ mod tests {
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
+            registry: crate::ExecutionRegistry::empty(),
+            escalation_mode: crate::EscalationMode::SurfaceToHuman,
         }
     }
 }

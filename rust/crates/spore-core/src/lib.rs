@@ -23,6 +23,7 @@ pub mod anthropic;
 pub mod cache_provider;
 pub mod compaction_adapter;
 pub mod context;
+pub mod execution_registry;
 pub mod guide_registry;
 pub mod harness;
 pub mod hooks;
@@ -64,6 +65,9 @@ pub use context::{
     ComposedPrompt, Context, ContextError, ContextManager, ContextMeta, ContextSources,
     KeyTermVerifier, PromptSegment, RenderedSystemPrompt, SegmentStability,
     SessionState as ContextSessionState, StandardContextManager,
+};
+pub use execution_registry::{
+    EscalationMode, ExecutionRegistry, ExecutionRegistryBuilder, StrategyResolution,
 };
 pub use guide_registry::{
     Guide, GuideConflict, GuideId, GuideQuery, GuideRegistry, GuideRegistryError, GuideSource,

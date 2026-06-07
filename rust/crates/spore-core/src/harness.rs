@@ -95,6 +95,7 @@ use crate::context::{
     CompactionPreserveHints, CompactionVerifier, ContextError, KeyTermVerifier,
     SessionState as ContextSessionState,
 };
+use crate::execution_registry::{EscalationMode, ExecutionRegistry};
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
 use crate::model::{
@@ -505,50 +506,55 @@ pub enum StrategyOutcome {
 /// ONLY `match` site — one-line delegation per arm to the inner config's
 /// `run`. Each `*Config` impl is a STUB (returns [`StrategyOutcome::Pending`])
 /// pending #124.
-#[trait_variant::make(Send)]
+///
+/// Uses the hand-rolled [`BoxFut`] return shape (NOT `trait_variant::make`) so
+/// that `Arc<dyn RunStrategy>` is dyn-compatible — the
+/// [`ExecutionRegistry`](crate::ExecutionRegistry) custom-strategy escape hatch
+/// (#120) stores trait objects keyed by `StrategyRef::Custom` key. This trait is
+/// never serialized, so the dyn-safe shape has no wire impact.
 pub trait RunStrategy: Send + Sync {
-    async fn run(&self, cx: &mut ExecutionContext) -> StrategyOutcome;
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome>;
 }
 
 impl RunStrategy for LoopStrategy {
-    async fn run(&self, cx: &mut ExecutionContext) -> StrategyOutcome {
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
         match self {
-            LoopStrategy::ReAct(c) => c.run(cx).await,
-            LoopStrategy::PlanExecute(c) => c.run(cx).await,
-            LoopStrategy::SelfVerifying(c) => c.run(cx).await,
-            LoopStrategy::Ralph(c) => c.run(cx).await,
-            LoopStrategy::HillClimbing(c) => c.run(cx).await,
+            LoopStrategy::ReAct(c) => c.run(cx),
+            LoopStrategy::PlanExecute(c) => c.run(cx),
+            LoopStrategy::SelfVerifying(c) => c.run(cx),
+            LoopStrategy::Ralph(c) => c.run(cx),
+            LoopStrategy::HillClimbing(c) => c.run(cx),
         }
     }
 }
 
 impl RunStrategy for ReactConfig {
-    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
-        StrategyOutcome::Pending
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Pending })
     }
 }
 
 impl RunStrategy for PlanExecuteConfig {
-    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
-        StrategyOutcome::Pending
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Pending })
     }
 }
 
 impl RunStrategy for SelfVerifyingConfig {
-    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
-        StrategyOutcome::Pending
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Pending })
     }
 }
 
 impl RunStrategy for RalphConfig {
-    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
-        StrategyOutcome::Pending
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Pending })
     }
 }
 
 impl RunStrategy for HillClimbingConfig {
-    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
-        StrategyOutcome::Pending
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Pending })
     }
 }
 
@@ -2029,6 +2035,14 @@ pub enum HaltReason {
     HillClimbingMisconfigured {
         reason: String,
     },
+    /// Returned by [`StandardHarness`] when [`ExecutionRegistry::validate`](crate::ExecutionRegistry::validate)
+    /// fails at run entry: a handle referenced by the task's strategy tree is
+    /// unresolved against the configured registry, or a `StrategyRef::Custom`
+    /// key is missing. A STARTUP error surfaced before the first turn (issue
+    /// #120). Carries the underlying [`HarnessError`].
+    ConfigurationError {
+        error: HarnessError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2185,6 +2199,25 @@ impl crate::hooks::Hook for RalphStopHook {
 pub enum HarnessError {
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
+    /// A `StrategyRef::Custom(key)` referenced a custom strategy that is not
+    /// registered in [`ExecutionRegistry::custom`](crate::ExecutionRegistry).
+    /// RECOVERABLE — returned, never panics (same pattern as a missing
+    /// `AgentRef`). Issue #120.
+    #[error("custom strategy not found: {key}")]
+    StrategyNotFound { key: String },
+    /// A serializable handle (`AgentRef`/`ToolsetRef`/`SchemaRef`) referenced an
+    /// entry absent from the [`ExecutionRegistry`](crate::ExecutionRegistry).
+    /// The STARTUP-validation error: surfaced before the first turn. Issue #120.
+    ///
+    /// The handle category is the Rust field `kind`, but it serializes as
+    /// `handle_kind` to avoid colliding with the enum's `#[serde(tag = "kind")]`
+    /// discriminant.
+    #[error("unresolved {kind} handle: {key}")]
+    UnresolvedHandle {
+        #[serde(rename = "handle_kind")]
+        kind: String,
+        key: String,
+    },
 }
 
 // ============================================================================
@@ -2272,6 +2305,11 @@ pub trait Harness: Send + Sync {
 /// The `Agent` trait (issue #2) is dyn-compatible via the hand-rolled `BoxFut`
 /// pattern, so no type parameter is needed (issue #45).
 pub struct HarnessConfig {
+    /// Deprecated: superseded by [`ExecutionRegistry`]; physical removal +
+    /// executor migration to registry resolution lands in #124. Still the live
+    /// single-collaborator agent this slice (Option B / additive scope, #120) —
+    /// the run bodies continue to read it until the registry-resolution path
+    /// replaces it.
     pub agent: Arc<dyn Agent>,
     pub tool_registry: Arc<dyn ToolRegistry>,
     pub sandbox: Arc<dyn SandboxProvider>,
@@ -2316,6 +2354,10 @@ pub struct HarnessConfig {
     /// one-shot plan turn runs on this agent; otherwise it runs on
     /// [`agent`](Self::agent). `plan_model` on the strategy is descriptive
     /// metadata only — there is no `ModelConfig`→agent factory.
+    ///
+    /// Deprecated: superseded by [`ExecutionRegistry`] (resolved per-node via a
+    /// strategy's `AgentRef`); physical removal + executor migration to registry
+    /// resolution lands in #124.
     pub planner_agent: Option<Arc<dyn Agent>>,
     /// The verification oracle for the `SelfVerifying` loop strategy (issue
     /// #61). When the loop strategy is `SelfVerifying` and this is `Some`, the
@@ -2324,6 +2366,10 @@ pub struct HarnessConfig {
     /// round-trip cap (D3). When `None`, `SelfVerifying` is MISCONFIGURED: the
     /// run returns `Failure { SelfVerifyMisconfigured }` (D4) — it does NOT
     /// panic. Irrelevant for every other loop strategy. Defaults to `None`.
+    ///
+    /// Deprecated: superseded by [`ExecutionRegistry`] (verifiers resolved by
+    /// key from the registry's `verifiers` map); physical removal + executor
+    /// migration to registry resolution lands in #124.
     pub verifier: Option<Arc<dyn crate::verifier::Verifier>>,
     /// Optional alternate agent used for the `SelfVerifying` evaluate phase
     /// (issue #61, D2). Follows the EXACT same defaulting contract as
@@ -2334,6 +2380,10 @@ pub struct HarnessConfig {
     /// a READ-ONLY sandbox derived internally (no `evaluator_sandbox` field) so
     /// the evaluator cannot be biased by the build session nor mutate the
     /// workspace it is reviewing (the Default-FAIL contract). Defaults to `None`.
+    ///
+    /// Deprecated: superseded by [`ExecutionRegistry`] (resolved per-node via a
+    /// strategy's `AgentRef`); physical removal + executor migration to registry
+    /// resolution lands in #124.
     pub evaluator_agent: Option<Arc<dyn Agent>>,
     /// Pluggable per-domain persistence layer (issue #73). Defaults to an
     /// all-no-op [`StorageProvider`] so existing callers/tests compile and
@@ -2430,6 +2480,20 @@ pub struct HarnessConfig {
     /// deterministically by `SubagentTool` (the A1 mediation seam) — the
     /// orchestrator model is never involved.
     pub consult_handlers: std::collections::HashMap<String, ConsultHandlerEntry>,
+    /// Runtime resolver for the serializable strategy handles
+    /// (`AgentRef`/`ToolsetRef`/`SchemaRef`) and `StrategyRef::Custom` keys held
+    /// by a task's `LoopStrategy` tree (issue #120). [`StandardHarness::run`]
+    /// calls [`ExecutionRegistry::validate`] at entry, so an unresolved handle is
+    /// a startup error before the first turn. This slice is ADDITIVE (Option B):
+    /// the registry coexists with the deprecated single-collaborator fields and
+    /// is not yet read by the run bodies (that lands in #123/#124). Defaults to
+    /// an empty registry.
+    pub registry: ExecutionRegistry,
+    /// HITL-vs-AFK escalation knob (issue #120, PRD goal #7): whether budget
+    /// escalation surfaces to a human or proceeds autonomously. STORED only this
+    /// slice — consumed in #130. Builder defaults to
+    /// [`EscalationMode::SurfaceToHuman`].
+    pub escalation_mode: EscalationMode,
 }
 
 impl Clone for HarnessConfig {
@@ -2464,6 +2528,8 @@ impl Clone for HarnessConfig {
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
             consult_handlers: self.consult_handlers.clone(),
+            registry: self.registry.clone(),
+            escalation_mode: self.escalation_mode,
         }
     }
 }
@@ -2555,6 +2621,13 @@ pub struct HarnessBuilder {
     /// today's behaviour byte-for-byte (no mediation). See
     /// [`consult_handler`](HarnessBuilder::consult_handler).
     consult_handlers: std::collections::HashMap<String, ConsultHandlerEntry>,
+    /// Runtime strategy-handle resolver (issue #120). Defaults to an empty
+    /// [`ExecutionRegistry`]. See [`registry`](HarnessBuilder::registry).
+    registry: ExecutionRegistry,
+    /// HITL-vs-AFK escalation knob (issue #120). Defaults to
+    /// [`EscalationMode::SurfaceToHuman`]. See
+    /// [`escalation_mode`](HarnessBuilder::escalation_mode).
+    escalation_mode: EscalationMode,
 }
 
 impl HarnessBuilder {
@@ -2597,6 +2670,8 @@ impl HarnessBuilder {
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
+            registry: ExecutionRegistry::empty(),
+            escalation_mode: EscalationMode::SurfaceToHuman,
         }
     }
 
@@ -2891,6 +2966,78 @@ impl HarnessBuilder {
         self
     }
 
+    /// Replace the whole [`ExecutionRegistry`] (issue #120). The registry
+    /// resolves a task's serializable strategy handles
+    /// (`AgentRef`/`ToolsetRef`/`SchemaRef`) and `StrategyRef::Custom` keys at
+    /// run entry. Defaults to an empty registry.
+    pub fn registry(mut self, registry: ExecutionRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Register a named agent in the [`ExecutionRegistry`] (issue #120,
+    /// per-key convenience over [`registry`](Self::registry)).
+    pub fn registry_agent(mut self, key: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+        self.registry = std::mem::take(&mut self.registry)
+            .into_builder()
+            .agent(key, agent)
+            .build();
+        self
+    }
+
+    /// Register a named toolset in the [`ExecutionRegistry`] (issue #120).
+    pub fn registry_toolset(
+        mut self,
+        key: impl Into<String>,
+        toolset: Arc<dyn ToolRegistry>,
+    ) -> Self {
+        self.registry = std::mem::take(&mut self.registry)
+            .into_builder()
+            .toolset(key, toolset)
+            .build();
+        self
+    }
+
+    /// Register a named JSON schema in the [`ExecutionRegistry`] (issue #120).
+    pub fn registry_schema(mut self, key: impl Into<String>, schema: serde_json::Value) -> Self {
+        self.registry = std::mem::take(&mut self.registry)
+            .into_builder()
+            .schema(key, schema)
+            .build();
+        self
+    }
+
+    /// Register a named verifier in the [`ExecutionRegistry`] (issue #120).
+    pub fn registry_verifier(
+        mut self,
+        key: impl Into<String>,
+        verifier: Arc<dyn crate::verifier::Verifier>,
+    ) -> Self {
+        self.registry = std::mem::take(&mut self.registry)
+            .into_builder()
+            .verifier(key, verifier)
+            .build();
+        self
+    }
+
+    /// Register a custom strategy in the [`ExecutionRegistry`] under `key`
+    /// (issue #120). Resolvable later via a `StrategyRef::Custom(key)`.
+    pub fn register_strategy(
+        mut self,
+        key: impl Into<String>,
+        strategy: Arc<dyn RunStrategy>,
+    ) -> Self {
+        self.registry.register_strategy(key, strategy);
+        self
+    }
+
+    /// Select the HITL-vs-AFK escalation mode (issue #120, PRD goal #7).
+    /// Defaults to [`EscalationMode::SurfaceToHuman`].
+    pub fn escalation_mode(mut self, mode: EscalationMode) -> Self {
+        self.escalation_mode = mode;
+        self
+    }
+
     /// Inject the verification oracle for the `SelfVerifying` loop strategy
     /// (issue #61). Required for that strategy: without it a `SelfVerifying`
     /// run halts with `SelfVerifyMisconfigured` (D4). Its
@@ -3075,6 +3222,8 @@ impl HarnessBuilder {
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag,
             consult_handlers: self.consult_handlers,
+            registry: self.registry,
+            escalation_mode: self.escalation_mode,
         }
     }
 
@@ -6793,6 +6942,24 @@ impl StandardHarness {
             session_state,
         } = options;
 
+        // Issue #120 startup validation: every serializable handle in the task's
+        // strategy tree must resolve against the configured ExecutionRegistry,
+        // BEFORE the first turn. Validation runs only when the registry is
+        // populated, so existing callers that never wire a registry (and instead
+        // use the deprecated single-collaborator fields, Option B) are
+        // unaffected byte-for-byte. An unresolved handle is a startup error.
+        if !self.config.registry.is_empty() {
+            if let Err(error) = self.config.registry.validate(&task) {
+                return RunResult::Failure {
+                    reason: HaltReason::ConfigurationError { error },
+                    session_id: task.session_id.clone(),
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                    session_state: SessionState::default(),
+                };
+            }
+        }
+
         // Issue #102 auto-load: when enabled AND no explicit session_state was
         // provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
         // Ralph/HillClimbing discard it by design, D7), load the prior session for
@@ -7934,6 +8101,8 @@ mod tests {
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
+            registry: ExecutionRegistry::empty(),
+            escalation_mode: EscalationMode::SurfaceToHuman,
         }
     }
 
@@ -8103,6 +8272,101 @@ mod tests {
     fn no_catalogue_tools_keeps_tool_registry_seam() {
         let cfg = catalogue_builder(make_agent()).build_config();
         assert!(cfg.catalogue_registry.is_none());
+    }
+
+    // ---- issue #120: ExecutionRegistry run-entry validation + knob ---------
+
+    /// An agent whose `turn` MUST never be reached: it panics if invoked, so a
+    /// passing test proves no model turn fired before startup validation.
+    struct NeverCalledAgent;
+    impl Agent for NeverCalledAgent {
+        fn turn<'a>(&'a self, _context: Context) -> BoxFut<'a, TurnResult> {
+            panic!("agent turn fired despite an unresolved registry handle");
+        }
+        fn id(&self) -> AgentId {
+            AgentId::new("never")
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_handle_is_startup_failure_before_any_turn() {
+        // A populated registry that does NOT contain the agent referenced by the
+        // task's ReAct leaf. run() must validate at entry and fail BEFORE the
+        // first turn — NeverCalledAgent panics if a turn ever fires.
+        let leaf = LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 4 },
+            agent: AgentRef("missing".into()),
+            toolset: ToolsetRef("t".into()),
+            output: None,
+        });
+        let harness = HarnessBuilder::new(
+            Arc::new(NeverCalledAgent),
+            Arc::new(ScriptedToolRegistry::new()),
+            Arc::new(AllowAllSandbox),
+            Arc::new(NoopContextManager),
+            Arc::new(AlwaysContinuePolicy),
+        )
+        // Populate the registry with SOMETHING (so validation runs) but not the
+        // referenced agent "missing".
+        .registry_toolset("t", Arc::new(EmptyToolRegistry))
+        .build();
+
+        let task = Task::new("go", SessionId::new("s120"), leaf);
+        let result = harness.run(HarnessRunOptions::new(task)).await;
+
+        match result {
+            RunResult::Failure {
+                reason: HaltReason::ConfigurationError { error },
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 0, "validation failed before the first turn");
+                assert_eq!(
+                    error,
+                    HarnessError::UnresolvedHandle {
+                        kind: "agent".into(),
+                        key: "missing".into(),
+                    }
+                );
+            }
+            other => panic!("expected ConfigurationError startup failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escalation_mode_is_selectable_and_readable_on_config() {
+        // Default is SurfaceToHuman.
+        let cfg = catalogue_builder(make_agent()).build_config();
+        assert_eq!(cfg.escalation_mode, EscalationMode::SurfaceToHuman);
+
+        // And the builder setter overrides it.
+        let cfg = catalogue_builder(make_agent())
+            .escalation_mode(EscalationMode::Autonomous)
+            .build_config();
+        assert_eq!(cfg.escalation_mode, EscalationMode::Autonomous);
+    }
+
+    #[test]
+    fn empty_registry_skips_validation_legacy_path_unaffected() {
+        // With no registry wired (Option B legacy path), run-entry validation is
+        // skipped: the config carries an empty registry.
+        let cfg = catalogue_builder(make_agent()).build_config();
+        assert!(cfg.registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_custom_strategy_key_is_recoverable_strategy_not_found() {
+        // A registry referencing a Custom strategy key not registered yields a
+        // recoverable StrategyNotFound (no panic) when resolved.
+        let reg = ExecutionRegistry::empty();
+        let r = StrategyRef::Custom("absent".into());
+        let err = reg.resolve_strategy(&r).unwrap_err();
+        assert_eq!(
+            err,
+            HarnessError::StrategyNotFound {
+                key: "absent".into()
+            }
+        );
     }
 
     #[test]
@@ -11235,6 +11499,8 @@ mod tests {
                 auto_persist_sessions: false,
                 prompt_tool_call_flag: None,
                 consult_handlers: std::collections::HashMap::new(),
+                registry: ExecutionRegistry::empty(),
+                escalation_mode: EscalationMode::SurfaceToHuman,
             })
         }
 

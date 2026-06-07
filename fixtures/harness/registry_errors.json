@@ -1,0 +1,11 @@
+{
+  "strategy_not_found": {
+    "kind": "StrategyNotFound",
+    "key": "my-harness::DoubleVerify"
+  },
+  "unresolved_handle": {
+    "kind": "UnresolvedHandle",
+    "handle_kind": "agent",
+    "key": "planner"
+  }
+}

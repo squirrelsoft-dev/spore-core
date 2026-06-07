@@ -84,6 +84,8 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
         consult_handlers: std::collections::HashMap::new(),
+        registry: spore_core::ExecutionRegistry::empty(),
+        escalation_mode: spore_core::EscalationMode::SurfaceToHuman,
     };
     let harness = StandardHarness::new(config);
 
