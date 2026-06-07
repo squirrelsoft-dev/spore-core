@@ -809,25 +809,26 @@ describe("Harness — modelParams threading (#93)", () => {
     expect(ctxText(agent.seen[3]!)).toContain("step two");
   });
 
-  // #93 regression: the execute phase maintains ONE accumulating context across
-  // steps. After a successful step its conversation (instruction + tool calls +
-  // TOOL RESULTS + assistant output) is folded back into the shared sessionState,
-  // so the NEXT step's sub-loop sees prior steps' RESULTS — not just their
-  // instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
-  // distinctive string and assert STEP 2's assembled context carries it.
+  // #126 two-tier context (REPLACES the pre-#126 linear-folding regression):
+  // linear folding broke on a DAG, so it is GONE. The plan-artifact bridge
+  // produces a LINEAR chain with EMPTY blockers, so steps 1 and 2 are INDEPENDENT
+  // branches in the DAG sense. Therefore:
+  //   - step 2 does NOT see step 1's raw tool result (no transcript fold), and
+  //   - step 2 DOES see step 1's compact Tier-2 ledger summary ("researched") and
+  //     NOT its mid-step tool-result internals.
   //
-  // Mirrors `rust/crates/spore-core/src/harness.rs#execute_steps_accumulate_prior_results`.
-  it("execute steps accumulate prior results", async () => {
+  // Mirrors `rust/crates/spore-core/src/harness.rs#execute_steps_two_tier_context_no_transcript_fold`.
+  it("execute steps use two-tier context (no transcript fold)", async () => {
     const agent = new RecordingTurnAgent(AgentId.of("rec"))
-      // Plan turn: a 2-step plan (research -> summarize).
+      // Plan turn: a 2-step LINEAR plan (no blockers from the bridge).
       .push(fr('{"tasks":["research tokio","summarize findings"],"rationale":"r"}'))
-      // Step 1: call a tool, then finalize using its result.
+      // Step 1: call a tool, then finalize with a distinctive summary.
       .push(tcr(toolCall("c1", "lookup")))
       .push(fr("researched"))
-      // Step 2: finalize directly (it must SEE step 1's tool result).
+      // Step 2: finalize directly.
       .push(fr("summarized"));
     const cfg = recordingConfig(agent, { stop_sequences: [] });
-    // Step 1's tool call returns a distinctive result string.
+    // Step 1's tool call returns a distinctive (internal) result string.
     cfg.toolRegistry = new ScriptedToolRegistry().push({
       kind: "success",
       content: "TOKIO_FACTS_123",
@@ -842,19 +843,17 @@ describe("Harness — modelParams threading (#93)", () => {
     // 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
     expect(agent.seen.length).toBe(4);
 
-    // Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
-    // result string is on the wire at all.
+    // Step 1's SECOND turn (index 2) sees its OWN tool result.
     expect(ctxText(agent.seen[2]!)).toContain("TOKIO_FACTS_123");
 
-    // The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
-    // tool result, proving the execute loop carried it forward.
-    expect(ctxText(agent.seen[3]!)).toContain("TOKIO_FACTS_123");
+    // #126: step 2 (index 3) must NOT carry step 1's raw tool-result transcript —
+    // no linear fold across the DAG.
+    expect(ctxText(agent.seen[3]!)).not.toContain("TOKIO_FACTS_123");
 
-    // Step 2 also sees step 1's prior instruction. (This harness's
-    // ContextManager seam folds instructions + tool results into the shared
-    // session but does not append the per-step final assistant text — that is
-    // surfaced only as the step's `output` — so the accumulation guarantee is
-    // proven by the carried instruction + tool result above.)
-    expect(ctxText(agent.seen[3]!)).toContain("research tokio");
+    // #126 Tier-2: step 2 DOES see step 1's compact ledger summary.
+    expect(ctxText(agent.seen[3]!)).toContain("researched");
+
+    // And it carries its own instruction.
+    expect(ctxText(agent.seen[3]!)).toContain("summarize findings");
   });
 });

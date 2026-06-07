@@ -237,7 +237,8 @@ describe("capturePlanArtifact — Q3 grammar", () => {
 describe("PlanExecute plan phase", () => {
   it("Q4: produces+stores an artifact, then hands off to the execute phase", async () => {
     // Only the plan turn is scripted; the execute phase then drives the agent
-    // again, exhausts the script, and aborts with step_failed (proving the
+    // again, exhausts the script, and (under #126) drains to
+    // tasks_blocked_by_failure when the dry execute steps fail (proving the
     // execute_phase_not_implemented halt is gone and the artifact was stored).
     const a = new RecordingAgent(AgentId.of("default")).push(fr(PLAN_JSON));
     const state: SessionState = emptySessionState();
@@ -246,7 +247,7 @@ describe("PlanExecute plan phase", () => {
     const r = await h.run({ task: planTask(), session_state: state });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("step_failed");
+      expect(r.reason.kind).toBe("tasks_blocked_by_failure");
     }
     // #76: the plan artifact was produced + persisted to the RunStore seam
     // before the execute phase ran (no longer mirrored into extras).

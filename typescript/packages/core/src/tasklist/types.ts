@@ -128,6 +128,90 @@ export function defaultTaskList(): TaskList {
 }
 
 // ============================================================================
+// Step ledger (#126 — Tier-2 global running ledger)
+// ============================================================================
+
+/**
+ * The maximum number of {@link StepLedgerEntry} rows the Tier-2 running ledger
+ * retains (#126, RESOLVED spec decision B). Past this bound the ledger drops the
+ * OLDEST entries (a deterministic, NO-model, byte-identical policy — never
+ * summarize). This constant MUST be identical across all four language
+ * implementations.
+ */
+export const STEP_LEDGER_MAX_ENTRIES = 20;
+
+/**
+ * The static marker row inserted (once) when the Tier-2 ledger drops its oldest
+ * entries past {@link STEP_LEDGER_MAX_ENTRIES} (#126, decision B). It is a fixed
+ * string — NOT a summary of the elided rows — so the elision note is
+ * byte-identical across languages. Rendered as a leading ledger line by
+ * {@link renderStepLedger}.
+ */
+export const STEP_LEDGER_ELISION_MARKER = "[older ledger entries elided]";
+
+/**
+ * A single compact row in the Tier-2 global running ledger (#126). Appended on
+ * task completion and injected into EVERY subsequent execute step so each step
+ * sees a compact record of what has already happened across the whole DAG.
+ *
+ * `files_touched` is **harness-observed from write/edit tool calls** during the
+ * task's execution — NOT a model-self-reported field. A task whose execute step
+ * only *narrated* touching a file (no actual write/edit tool call) records an
+ * EMPTY `files_touched` (#126 AC2).
+ *
+ * Wire field order is `task_id, summary, files_touched`. Byte-identical across
+ * all four languages (the same serialized shape as {@link Task}).
+ */
+export const StepLedgerEntrySchema = z.object({
+  task_id: z.number().int().nonnegative(),
+  summary: z.string(),
+  files_touched: z.array(z.string()),
+});
+export type StepLedgerEntry = z.infer<typeof StepLedgerEntrySchema>;
+
+/**
+ * Append `entry` to a bounded Tier-2 running ledger, keeping at most
+ * {@link STEP_LEDGER_MAX_ENTRIES} rows via **drop-oldest** (#126, decision B).
+ *
+ * Pure and deterministic: NO model call, NO summarization. When the push would
+ * exceed the bound the oldest entries are removed from the front so exactly the
+ * `STEP_LEDGER_MAX_ENTRIES` most-recent entries remain (completion order
+ * preserved). Mutates `ledger` in place. Returns `true` iff at least one entry
+ * was dropped on this call (so the caller can render the static
+ * {@link STEP_LEDGER_ELISION_MARKER}).
+ */
+export function pushStepLedger(ledger: StepLedgerEntry[], entry: StepLedgerEntry): boolean {
+  ledger.push(entry);
+  let dropped = false;
+  while (ledger.length > STEP_LEDGER_MAX_ENTRIES) {
+    ledger.shift();
+    dropped = true;
+  }
+  return dropped;
+}
+
+/**
+ * Render the Tier-2 ledger as a compact, deterministic text block for seeding
+ * into an execute step (#126). One line per entry: `#<id> <summary> [files: a,
+ * b]` (the `[files: …]` suffix omitted when `files_touched` is empty). When
+ * `elided` is true a single leading {@link STEP_LEDGER_ELISION_MARKER} line is
+ * emitted. Returns `undefined` for an empty ledger (nothing to inject).
+ */
+export function renderStepLedger(ledger: StepLedgerEntry[], elided: boolean): string | undefined {
+  if (ledger.length === 0) return undefined;
+  const lines: string[] = [];
+  if (elided) lines.push(STEP_LEDGER_ELISION_MARKER);
+  for (const e of ledger) {
+    if (e.files_touched.length === 0) {
+      lines.push(`#${e.task_id} ${e.summary}`);
+    } else {
+      lines.push(`#${e.task_id} ${e.summary} [files: ${e.files_touched.join(", ")}]`);
+    }
+  }
+  return `Progress ledger so far:\n${lines.join("\n")}`;
+}
+
+// ============================================================================
 // Serialization (byte-identical: field order `tasks` then `next_id`; per-task
 // `id`, `description`, `status`, `blockers`). `JSON.stringify` preserves
 // insertion order, so the objects are rebuilt in canonical key order rather than
@@ -392,6 +476,125 @@ export function completeTask(list: TaskList, id: number): MutationResult {
 }
 
 // ============================================================================
+// DAG scheduling helpers (#126) — pure, deterministic, no I/O.
+// ============================================================================
+
+/** Whether the task with `id` exists in `list` and is `completed`. */
+function isCompleted(list: TaskList, id: number): boolean {
+  return list.tasks.some((t) => t.id === id && t.status === "completed");
+}
+
+/**
+ * The next READY task to run under the ready-set scheduler (#126): the LOWEST-id
+ * `pending` task ALL of whose `blockers` are `completed`. Returns its id, or
+ * `undefined` when no `pending` task is currently runnable (every `pending` task
+ * is waiting on an un-completed blocker, or none remain).
+ *
+ * The id tiebreak is deterministic and language-agnostic: among ready tasks the
+ * smallest id always wins, regardless of positional order in {@link TaskList.tasks}.
+ */
+export function nextReady(list: TaskList): number | undefined {
+  let best: number | undefined;
+  for (const t of list.tasks) {
+    if (t.status !== "pending") continue;
+    if (!t.blockers.every((b) => isCompleted(list, b))) continue;
+    if (best === undefined || t.id < best) best = t.id;
+  }
+  return best;
+}
+
+/**
+ * The TRANSITIVE-blocker closure of `id` (#126, Tier-1 scoped context): the set
+ * of all tasks `id` (transitively) depends on — its direct `blockers`, their
+ * blockers, and so on. Excludes `id` itself. Returned SORTED ascending for
+ * deterministic, byte-identical seeding across languages.
+ *
+ * Independent branches (tasks NOT reachable from `id` via the `task -> blocker`
+ * edges) never appear, which is what keeps a task's Tier-1 seed free of
+ * unrelated branches (#126 AC1 branch isolation).
+ */
+export function transitiveBlockers(list: TaskList, id: number): number[] {
+  const seen = new Set<number>();
+  const start = list.tasks.find((t) => t.id === id);
+  const stack: number[] = start !== undefined ? [...start.blockers] : [];
+  while (stack.length > 0) {
+    const node = stack.pop() as number;
+    if (seen.has(node)) continue;
+    seen.add(node);
+    const t = list.tasks.find((x) => x.id === node);
+    if (t !== undefined) stack.push(...t.blockers);
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+/**
+ * The TRANSITIVE-dependent closure of `id` (#126, failure cascade): every task
+ * that depends on `id` directly or transitively (i.e. has a directed
+ * `task -> blocker` path reaching `id`). Excludes `id` itself. Returned SORTED
+ * ascending. When `id` fails terminally, exactly these tasks are marked
+ * `blocked`; tasks NOT in this set are unaffected and keep scheduling (#126 AC3).
+ */
+export function transitiveDependents(list: TaskList, id: number): number[] {
+  const dependents = new Set<number>();
+  const frontier: number[] = [id];
+  while (frontier.length > 0) {
+    const node = frontier.pop() as number;
+    for (const t of list.tasks) {
+      if (t.id === id) continue;
+      if (t.blockers.includes(node) && !dependents.has(t.id)) {
+        dependents.add(t.id);
+        frontier.push(t.id);
+      }
+    }
+  }
+  return [...dependents].sort((a, b) => a - b);
+}
+
+/**
+ * Whole-graph cycle detection over the `task -> blocker` edges (#126, defense in
+ * depth at execute entry). Generalizes the single-edge {@link wouldCreateCycle}
+ * check used by {@link addTask}: it inspects the ENTIRE persisted graph (which
+ * the `task_list` tool authoring path could in principle leave cyclic via
+ * out-of-band edits) rather than one prospective add.
+ *
+ * Returns `true` iff any directed cycle exists. Pure; O(V+E) via iterative DFS
+ * three-coloring. Blockers referencing unknown ids are simply ignored (no edge)
+ * — an unknown blocker is never completed and also cannot form a cycle.
+ */
+export function hasCycle(list: TaskList): boolean {
+  // 0 = unvisited, 1 = on-stack (gray), 2 = done (black).
+  const color = new Map<number, number>();
+  const exists = (id: number): boolean => list.tasks.some((t) => t.id === id);
+  for (const start of list.tasks.map((t) => t.id)) {
+    if ((color.get(start) ?? 0) !== 0) continue;
+    // Each frame: [node, whether its children have already been pushed].
+    const stack: Array<[number, boolean]> = [[start, false]];
+    const onPath = new Set<number>();
+    while (stack.length > 0) {
+      const [node, expanded] = stack.pop() as [number, boolean];
+      if (expanded) {
+        color.set(node, 2);
+        onPath.delete(node);
+        continue;
+      }
+      if ((color.get(node) ?? 0) === 2) continue;
+      color.set(node, 1);
+      onPath.add(node);
+      stack.push([node, true]);
+      const t = list.tasks.find((x) => x.id === node);
+      if (t !== undefined) {
+        for (const b of t.blockers) {
+          if (!exists(b)) continue; // an edge to a non-existent task is no edge.
+          if (onPath.has(b)) return true; // back-edge → cycle.
+          if ((color.get(b) ?? 0) !== 2) stack.push([b, false]);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// ============================================================================
 // Plan → TaskList parser (issue #72; the bridge between #70 and #59)
 // ============================================================================
 
@@ -429,6 +632,15 @@ export function completeTask(list: TaskList, id: number): MutationResult {
  * existing list (replanning is out of scope — single parse per accepted plan).
  * Wiring this into the plan-acceptance seam is DEFERRED to #59's execute loop;
  * #72 ships only this pure function.
+ *
+ * @deprecated (#126, decision C) The `task_list` tool store is now the ONE
+ * authoring path — it is the only path that can carry real `blockers`, which the
+ * DAG executor (#126) needs. The PlanExecute DAG executor loads its runnable list
+ * from the persisted `task_list` store and only falls back to this linear bridge
+ * when nothing was authored via the tool (back-compat with the #59/#124 plan-only
+ * path and its replay fixtures). This function is kept working but should not be
+ * used by new authoring paths. Mirrors Rust, which `#[deprecated]`-marked only the
+ * bridge fn (not the `PlanArtifact` type, which the live hook payload still uses).
  */
 export function planArtifactToTaskList(artifact: PlanArtifact): TaskList {
   const list = defaultTaskList(); // next_id === 1

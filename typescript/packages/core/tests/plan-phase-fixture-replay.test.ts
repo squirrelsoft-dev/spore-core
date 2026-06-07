@@ -120,12 +120,13 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     const result = await harness.run({ task, session_state: state });
     // The plan turn is consumed + parsed into a non-empty list, so the run
     // enters the execute phase; the single-exchange replay then exhausts on the
-    // first step and aborts with step_failed (issue #59, Q5).
+    // first step. Under #126 a dry step is a terminal failure that cascades; the
+    // run drains to tasks_blocked_by_failure (the first task is id 1).
     expect(result.kind).toBe("failure");
     if (result.kind === "failure") {
-      expect(result.reason.kind).toBe("step_failed");
-      if (result.reason.kind === "step_failed") {
-        expect(result.reason.task_index).toBe(0);
+      expect(result.reason.kind).toBe("tasks_blocked_by_failure");
+      if (result.reason.kind === "tasks_blocked_by_failure") {
+        expect(result.reason.failed_task).toBe(1);
       }
       expect(result.turns).toBeGreaterThanOrEqual(1); // at least the plan turn
     }
@@ -171,9 +172,9 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     const result = await harness.run({ task, session_state: state });
     expect(result.kind).toBe("failure");
     if (result.kind === "failure") {
-      expect(result.reason.kind).toBe("step_failed");
-      if (result.reason.kind === "step_failed") {
-        expect(result.reason.task_index).toBe(0);
+      expect(result.reason.kind).toBe("tasks_blocked_by_failure");
+      if (result.reason.kind === "tasks_blocked_by_failure") {
+        expect(result.reason.failed_task).toBe(1);
       }
       expect(result.turns).toBeGreaterThanOrEqual(1);
     }

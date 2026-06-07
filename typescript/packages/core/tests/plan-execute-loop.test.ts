@@ -46,6 +46,7 @@ import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js
 import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
 import {
   TASK_LIST_EXTRAS_KEY,
+  addTask,
   planArtifactToTaskList,
   type TaskList,
 } from "../src/tasklist/index.js";
@@ -220,15 +221,15 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
   });
 
-  it("no per-task turn cap; step runs dry → step_failed (#125)", async () => {
+  it("no per-task turn cap; step runs dry → tasks_blocked_by_failure (#125/#126)", async () => {
     // #125: the OLD Q1 per-task turn allocation (`remaining_turns /
     // remaining_tasks`, cutting task `a` off at 2 of a 7-turn budget) is REMOVED
     // as dead logic. Enforcement is now charge-based on the PlanExecute scope's
     // global `total_steps`, NOT divided per task. With the same setup — global cap
-    // 7, plan spends 1 — task `a` is NO LONGER capped at 2 turns: it runs its 2
-    // tool turns then runs dry (no 3rd scripted turn), so the run fails as a STEP
-    // failure (not a per-task budget cap). This asserts the per-task derivation
-    // is gone.
+    // 7, plan spends 1 — task `a` (id 1) is NO LONGER capped at 2 turns: it runs
+    // its 2 tool turns then runs dry (no 3rd scripted turn). #126: a task that runs
+    // dry is a terminal failure that cascades; the run drains to the partial
+    // terminal `tasks_blocked_by_failure` (first failure is task id 1).
     const a = new RecordingAgent(AgentId.of("default"))
       .push(fr('{"tasks":["a","b","c"]}'))
       .push(tcr())
@@ -241,9 +242,12 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       // NOT a per-task budget_exceeded(turns) cut at 2 turns — the derivation is
-      // gone. Task `a` runs past 2 turns under the global ceiling and fails as a
-      // STEP failure when the agent runs dry.
-      expect(r.reason.kind).toBe("step_failed");
+      // gone. Task `a` runs past 2 turns under the global ceiling and fails when
+      // the agent runs dry → #126 cascade → tasks_blocked_by_failure(failed=1).
+      expect(r.reason.kind).toBe("tasks_blocked_by_failure");
+      if (r.reason.kind === "tasks_blocked_by_failure") {
+        expect(r.reason.failed_task).toBe(1);
+      }
     }
   });
 
@@ -319,9 +323,25 @@ describe("PlanExecute execute phase (issue #59)", () => {
   });
 
   it("on_task_advance may rewrite the step instruction (Q1 mutable task)", async () => {
-    const a = new RecordingAgent(AgentId.of("default"))
-      .push(fr('{"tasks":["original"]}'))
-      .push(fr("done"));
+    // #126: each step is seeded onto a FRESH copy of the base session (Tier-1
+    // isolation) — NOT the shared parent session. The hook's rewritten
+    // instruction must still reach the execute sub-strategy's turn, so assert it
+    // appears in the Context the execute agent actually received.
+    const seenUserTexts: string[] = [];
+    const captureAgent: Agent = {
+      id: () => AgentId.of("default"),
+      async turn(ctx: Context): Promise<TurnResult> {
+        for (const m of ctx.messages) {
+          if (m.role === "user" && m.content.type === "text") seenUserTexts.push(m.content.text);
+        }
+        // First call is the plan turn; respond with a placeholder plan, then the
+        // execute step.
+        if (seenUserTexts.some((t) => t.includes("original") || t.includes("rewritten"))) {
+          return fr("done");
+        }
+        return fr('{"tasks":["original"]}');
+      },
+    };
     let seenInstruction = "";
     const chain: HookChain = new StandardHookChain();
     chain.register(
@@ -334,14 +354,17 @@ describe("PlanExecute execute phase (issue #59)", () => {
       }),
     );
     const state: SessionState = emptySessionState();
-    const h = new StandardHarness(configWith(a, { hooks: chain }));
-    await h.run({ task: planTask(), session_state: state });
+    const h = new StandardHarness(configWith(captureAgent, { hooks: chain }));
+    const r = await h.run({ task: planTask(), session_state: state });
+    expect(r.kind).toBe("success");
     expect(seenInstruction).toBe("original");
-    // The rewritten instruction is what got seeded into the (parent) session.
-    const seeded = state.messages.some(
+    // The rewritten instruction is what got seeded into the execute step's turn.
+    expect(seenUserTexts).toContain("rewritten step");
+    // ...and it never leaked into the shared parent session (Tier-1 isolation).
+    const leakedToParent = state.messages.some(
       (m) => m.role === "user" && m.content.type === "text" && m.content.text === "rewritten step",
     );
-    expect(seeded).toBe(true);
+    expect(leakedToParent).toBe(false);
   });
 
   it("Q3: an empty plan → empty_plan (not a silent success)", async () => {
@@ -358,23 +381,39 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(a.ran).toBe(1); // no execute steps
   });
 
-  it("Q5: a step that errors aborts with step_failed; later tasks do NOT run", async () => {
+  it("#126 (was Q5): a step that errors cascades; transitive dependents do NOT run", async () => {
+    // #126 AC3 REPLACES the Q5 blanket abort. DAG authored via the persisted
+    // `task_list` store (the #126 authoring path):
+    //   1 "good"  (no blockers)  → completes
+    //   2 "bad"   (no blockers)  → fails terminally
+    //   3 "never" (blocked by 2) → cascade-blocked (never runs)
+    // The run does NOT abort on the first failure; it drains to the partial
+    // terminal `tasks_blocked_by_failure` reporting the full partition.
     const a = new RecordingAgent(AgentId.of("default"))
-      .push(fr('{"tasks":["good","bad","never"]}'))
+      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("did good"))
       .push({ kind: "error", error: new EmptyResponse(), usage: null });
-    // "never" must not run.
-    const h = new StandardHarness(configWith(a));
+    const provider = StorageProvider.single(new InMemoryStorageProvider());
+    const h = new StandardHarness(configWith(a, { storage: provider }));
+
+    // Pre-seed the authored DAG into the persisted task_list store.
+    const tl = planArtifactToTaskList({ tasks: [], rationale: "" });
+    const good = addTask(tl, "good", []);
+    const bad = addTask(tl, "bad", []);
+    if (good.ok && bad.ok) addTask(tl, "never", [bad.id]);
+    await h.persistTaskList(SID, tl);
+
     const r = await h.run({ task: planTask() });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("step_failed");
-      if (r.reason.kind === "step_failed") {
-        expect(r.reason.task_index).toBe(1);
-        expect(r.reason.task).toBe("bad");
+      expect(r.reason.kind).toBe("tasks_blocked_by_failure");
+      if (r.reason.kind === "tasks_blocked_by_failure") {
+        expect(r.reason.failed_task).toBe(2);
+        expect(r.reason.completed).toEqual([1]);
+        expect(r.reason.blocked).toEqual([2, 3]);
       }
     }
-    // plan(1) + good(1) + bad(1) = 3 agent calls; "never" never ran.
+    // plan(1) + good(1) + bad(1) = 3 agent calls; the dependent "never" never ran.
     expect(a.ran).toBe(3);
   });
 

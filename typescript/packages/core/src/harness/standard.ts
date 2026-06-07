@@ -336,6 +336,17 @@ const DEFAULT_MAX_STOP_BLOCKS = 8;
 const DEFAULT_MAX_RESETS = 3;
 
 export class StandardHarness implements Harness, StrategyExecutor {
+  /**
+   * #126 (AC2): the harness-OBSERVED write/edit tool-call paths for the CURRENT
+   * execute step. The dispatch seam records the `path` of every `write_file` /
+   * `edit_file` tool call here as it dispatches ({@link observeWriteCall}); the
+   * PlanExecute DAG executor drains it ({@link takeObservedWrites}) on task
+   * completion to build the task's `StepLedgerEntry.files_touched`, and clears it
+   * ({@link clearObservedWrites}) before each step. The path always comes from
+   * the real tool call — never a model-self-reported field.
+   */
+  private observedWrites: string[] = [];
+
   constructor(private readonly config: HarnessConfig) {
     // Issue #58, B1: drive Ralph off the Stop hook. Register a `stop` hook at
     // construction that reads `.spore/progress.json` under the sandbox's
@@ -1563,6 +1574,51 @@ export class StandardHarness implements Harness, StrategyExecutor {
   }
 
   /**
+   * Load the persisted {@link TaskList} from the RunStore under
+   * `TASK_LIST_EXTRAS_KEY` (#126, decision C): the ONE authoring path that can
+   * carry real `blockers`. A storage miss / deserialize failure yields
+   * `undefined` (the DAG executor then falls back to the linear plan-artifact
+   * bridge). Mirrors Rust's `load_task_list`.
+   */
+  async loadTaskList(sessionId: SessionId): Promise<TaskList | undefined> {
+    try {
+      const saved = await this.storage().run().get(sessionId, TASK_LIST_EXTRAS_KEY);
+      if (saved == null) return undefined;
+      const parsed = TaskListSchema.safeParse(saved);
+      return parsed.success ? parsed.data : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * #126 (AC2): record a `write_file` / `edit_file` tool call's `path` into the
+   * observed-write accumulator for the current step. De-duplicated against what
+   * is already accumulated. Called from the ReAct dispatch seam for the call
+   * ACTUALLY dispatched, so the path comes from the real tool call — never a
+   * model-self-reported field. Mirrors Rust's `observe_write_call`.
+   */
+  observeWriteCall(call: ToolCall): void {
+    if (call.name !== "write_file" && call.name !== "edit_file") return;
+    const input = call.input as Record<string, unknown> | undefined;
+    const path = input?.["path"];
+    if (typeof path !== "string") return;
+    if (!this.observedWrites.includes(path)) this.observedWrites.push(path);
+  }
+
+  /** {@inheritDoc StrategyExecutor.takeObservedWrites} */
+  takeObservedWrites(): string[] {
+    const acc = this.observedWrites;
+    this.observedWrites = [];
+    return acc;
+  }
+
+  /** {@inheritDoc StrategyExecutor.clearObservedWrites} */
+  clearObservedWrites(): void {
+    this.observedWrites = [];
+  }
+
+  /**
    * A.6 deep-resume reconcile (#124, Q2): mark every task already `completed` on
    * the DURABLE RunStore checkpoint as `completed` in the freshly-parsed
    * `taskList` so it is NOT re-run. Tasks are matched by `id` (the list is
@@ -2508,6 +2564,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
             });
             const toolStartedAt = Timestamp.now();
             const toolClock = Date.now();
+            // #126 (AC2): observe write/edit calls as they dispatch so the
+            // PlanExecute DAG executor can attach HARNESS-OBSERVED `files_touched`
+            // to a task's ledger entry — never model-self-reported.
+            this.observeWriteCall(call);
             const output: ToolOutput = await toolRegistry.dispatch(call, signal);
 
             // WaitingForHuman from subagent tool

@@ -19,6 +19,13 @@ import {
   completeTask,
   planArtifactToTaskList,
   updateTask,
+  nextReady,
+  transitiveBlockers,
+  transitiveDependents,
+  hasCycle,
+  pushStepLedger,
+  renderStepLedger,
+  type StepLedgerEntry,
   type TaskList,
 } from "../tasklist/index.js";
 import type { SpanId } from "../observability/types.js";
@@ -991,6 +998,32 @@ export interface StrategyExecutor {
   persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void>;
 
   /**
+   * Load the persisted {@link TaskList} from the RunStore under
+   * `TASK_LIST_EXTRAS_KEY` (#126, decision C): the ONE authoring path that can
+   * carry real `blockers`. A storage miss / deserialize failure yields
+   * `undefined` (the DAG executor then falls back to the linear plan-artifact
+   * bridge).
+   */
+  loadTaskList(sessionId: SessionId): Promise<TaskList | undefined>;
+
+  /**
+   * Drain and return the harness-OBSERVED write/edit tool-call paths recorded
+   * since the last {@link clearObservedWrites} (#126, AC2). The dispatch seam
+   * records the `path` of every `write_file` / `edit_file` tool call as it
+   * happens; the DAG executor calls this on task completion to attach the
+   * OBSERVED `files_touched` to the task's {@link StepLedgerEntry}. Paths are
+   * never model-self-reported. Draining resets the accumulator.
+   */
+  takeObservedWrites(): string[];
+
+  /**
+   * Clear the observed-write accumulator (#126, AC2). The DAG executor calls
+   * this before each execute step so a step's `files_touched` reflects ONLY the
+   * writes that step issues.
+   */
+  clearObservedWrites(): void;
+
+  /**
    * Build the per-window Ralph seed session (#124): a fresh session seeded with
    * `instruction`, the `.spore/` reload context (R3), and the optional VCS
    * history block — exactly the legacy `runRalph` window setup, minus the model
@@ -1769,7 +1802,17 @@ async function runPlanExecuteConfig(
     return finishCombinator(cx, executor, task, outcome.failure);
   }
 
-  const taskList = planArtifactToTaskList(outcome.artifact);
+  // #126 decision C: the runnable task list comes from the persisted `task_list`
+  // tool store (the ONE authoring path — it can carry real blockers). Fall back
+  // to the linear plan-artifact bridge only when nothing was authored via the
+  // tool (back-compat with the #59/#124 plan-only path and its replay fixtures).
+  // The plan artifact is still captured + persisted above so the plan-phase
+  // replay tests stay green.
+  const persisted = await executor.loadTaskList(sessionId);
+  const taskList: TaskList =
+    persisted != null && persisted.tasks.length > 0
+      ? persisted
+      : planArtifactToTaskList(outcome.artifact);
   if (taskList.tasks.length === 0) {
     cx.stream = onStream;
     const result: RunResult = {
@@ -1781,6 +1824,25 @@ async function runPlanExecuteConfig(
     };
     return finishCombinator(cx, executor, task, result);
   }
+
+  // #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+  // depth — `add_task` already rejects cycles, but the persisted store could be
+  // cyclic out of band). No task runs.
+  if (hasCycle(taskList)) {
+    cx.stream = onStream;
+    const result: RunResult = {
+      kind: "failure",
+      reason: {
+        kind: "task_graph_cycle",
+        reason: "persisted task graph contains a directed cycle",
+      },
+      session_id: sessionId,
+      usage: outcome.usage,
+      turns: outcome.turns,
+    };
+    return finishCombinator(cx, executor, task, result);
+  }
+
   await executor.persistTaskList(sessionId, taskList);
 
   // Carry the shared budget past the plan turn.
@@ -1789,27 +1851,39 @@ async function runPlanExecuteConfig(
   carried.input_tokens += outcome.usage.input_tokens;
   carried.output_tokens += outcome.usage.output_tokens;
 
-  // ── Phase 2: execute (dispatch `c.execute` PER TASK). ───────────────────────
+  // ── Phase 2: ready-set DAG walk (#126). ─────────────────────────────────────
   //
-  // The shared execute context starts from `baseSession` (NOT the plan child's
-  // polluted session) so the directive never leaks (#93).
-  let sessionState = baseSession;
+  // Repeatedly pick the lowest-id `pending` task whose blockers are all
+  // `completed`. A task whose blocker FAILED is cascade-`blocked` (so it is no
+  // longer `pending` and never becomes ready). When no `pending` task is ready,
+  // the walk drains.
 
   // A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
   // Completed tasks are not re-run.
   await executor.reconcileCompletedTasks(sessionId, taskList);
 
+  // Total positional count for the on_task_advance hook (stable).
   const totalTasks = taskList.tasks.length;
   const totalUsage: AggregateUsage = { ...outcome.usage };
   let lastOutput = "";
   let lastState: SessionState = emptySessionState();
 
-  // #125: PlanExecute owns a budget scope for its execute phase. Its POLICY is
-  // the task's global turn ceiling (`total_steps`) — the root node's
-  // `total_steps` subsumes the OLD per-task `remaining_turns / remaining_tasks /
-  // step_cap` derivation, which is now DEAD and removed. Behavior is the
-  // `escalate` placeholder (the serialized behavior field is #129). Enforcement
-  // is now `charge`-based per node.
+  // #126 Tier-1/Tier-2 + cascade run-local state.
+  // - `finalOutputs`: each completed task's `success.output` (Tier-1).
+  // - `ledger`: the Tier-2 global running ledger (bounded, drop-oldest).
+  // - `ledgerElided`: sticky flag set the first time entries are dropped.
+  // - `blockedByFailure`: tasks cascade-`blocked` by a terminal failure
+  //   (decision E — run scratch, NOT a TaskStatus variant).
+  const finalOutputs = new Map<number, string>();
+  const ledger: StepLedgerEntry[] = [];
+  let ledgerElided = false;
+  const blockedByFailure = new Set<number>();
+  // The first terminal failure that triggered a cascade (decision A).
+  let firstFailure: { failedTask: number; reason: string } | undefined;
+
+  // #125: PlanExecute owns a budget scope for its execute phase (`escalate`
+  // placeholder behavior; the serialized behavior field is #129). Enforcement is
+  // `charge`-based per node.
   pushBudget(
     cx,
     combinatorBudgetPolicy(task.budget.max_turns),
@@ -1817,15 +1891,11 @@ async function runPlanExecuteConfig(
     "plan_execute",
   );
 
-  for (let index = 0; index < totalTasks; index += 1) {
-    const taskId = taskList.tasks[index]!.id;
+  for (;;) {
+    const taskId = nextReady(taskList);
+    if (taskId === undefined) break;
+    const index = taskList.tasks.findIndex((t) => t.id === taskId);
     const instruction = taskList.tasks[index]!.description;
-
-    // A.6 deep-resume: a task already Completed is skipped.
-    if (taskList.tasks[index]!.status === "completed") {
-      lastOutput = instruction;
-      continue;
-    }
 
     // Mark in_progress and re-persist (Q4).
     updateTask(taskList, taskId, "in_progress");
@@ -1842,26 +1912,54 @@ async function runPlanExecuteConfig(
     };
     await executor.fireTaskAdvance(sessionId, stepTask, index, totalTasks, cx.signal);
 
-    // Seed the step instruction as a user message on the SHARED execute context,
-    // then dispatch the execute sub-strategy.
-    await executor.seedUserMessage(sessionState, stepTask.instruction);
+    // #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
+    // session (NOT a forward-folded shared transcript — that breaks on a DAG)
+    // plus, for THIS task's transitive blockers ONLY, their final outputs + their
+    // ledger rows. Independent branches never appear (AC1 isolation).
+    const stepSession = structuredClone(baseSession);
+    const blockers = transitiveBlockers(taskList, taskId);
+    if (blockers.length > 0) {
+      const blockerSet = new Set(blockers);
+      // Tier-1: transitive blockers' final outputs (ascending id).
+      const tier1Lines: string[] = [];
+      for (const b of blockers) {
+        const out = finalOutputs.get(b);
+        if (out !== undefined) tier1Lines.push(`#${b} result: ${out}`);
+      }
+      if (tier1Lines.length > 0) {
+        await executor.seedUserMessage(
+          stepSession,
+          `Results from upstream tasks:\n${tier1Lines.join("\n")}`,
+        );
+      }
+      // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+      const scoped = ledger.filter((e) => blockerSet.has(e.task_id));
+      const scopedBlock = renderStepLedger(scoped, false);
+      if (scopedBlock !== undefined) await executor.seedUserMessage(stepSession, scopedBlock);
+    }
+
+    // #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+    // the static elision marker once entries were dropped).
+    const tier2Block = renderStepLedger(ledger, ledgerElided);
+    if (tier2Block !== undefined) await executor.seedUserMessage(stepSession, tier2Block);
+
+    // Finally seed this step's own instruction.
+    await executor.seedUserMessage(stepSession, stepTask.instruction);
+
+    // #126 AC2: clear the observed-write accumulator so this task's
+    // files_touched reflect ONLY the writes this step issues.
+    executor.clearObservedWrites();
 
     // #125: absolute turn count BEFORE this step, so the success path charges
     // only the DELTA against the PlanExecute scope.
     const carriedBefore = carried.turns;
     cx.scratch.task = stepTask;
-    cx.scratch.runSession = sessionState;
+    cx.scratch.runSession = stepSession;
     cx.scratch.runBudget = { ...carried };
     const stepOutcome = await runStrategy(c.execute, cx);
-    // #125 rule 4/7: a child's `budget_exhausted` reaches THIS parent as a
-    // `StrategyOutcome`, never auto-cascaded. PlanExecute does NOT charge the
-    // child's exhaustion against its OWN scope; it surfaces its own typed
-    // `budget_exhausted` with the PlanExecute partial (tasklist + statuses +
-    // ledger) and aborts the run.
+
+    // ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ──────────────
     if (stepOutcome.kind === "budget_exhausted") {
-      updateTask(taskList, taskId, "blocked");
-      await executor.persistTaskList(sessionId, taskList);
-      const partial = planExecutePartialJson(taskList);
       const err = currentBudgetExhausted(cx, {
         policy: combinatorBudgetPolicy(task.budget.max_turns),
         behavior: ESCALATE_PLACEHOLDER,
@@ -1869,22 +1967,42 @@ async function runPlanExecuteConfig(
         continuesUsed: 0,
         phase: "plan_execute",
       });
+      const resolution = resolveCurrent(cx);
+      if (resolution === "fail") {
+        // #126 AC4: a budget-`fail` task cascades IDENTICALLY to an error-failed
+        // one — block its transitive dependents and keep scheduling unrelated
+        // tasks.
+        updateTask(taskList, taskId, "blocked");
+        for (const dep of transitiveDependents(taskList, taskId)) {
+          updateTask(taskList, dep, "blocked");
+          blockedByFailure.add(dep);
+        }
+        blockedByFailure.add(taskId);
+        await executor.persistTaskList(sessionId, taskList);
+        if (firstFailure === undefined) {
+          firstFailure = {
+            failedTask: taskId,
+            reason: `budget exhausted (fail): ${JSON.stringify(err.policy)}`,
+          };
+        }
+        continue;
+      }
+      // Escalate / Continue: surface the partial and abort the run (the
+      // in-process Continue loop is #129; today only escalate/fail are reachable).
+      updateTask(taskList, taskId, "blocked");
+      await executor.persistTaskList(sessionId, taskList);
+      const partial = planExecutePartialJson(taskList);
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
       return promoteBudgetExhausted(err, partial);
     }
+
     const subResult = takeChildOverride(cx);
 
     if (subResult != null && subResult.kind === "success") {
-      // Carry the shared budget forward (Q1) and fold this step's conversation
-      // back into the SHARED context so the next step builds on its results.
       carried.turns = subResult.turns;
-      sessionState = runResultSessionState(subResult);
-      lastState = {
-        messages: [...sessionState.messages],
-        extras: { ...sessionState.extras },
-      };
+      lastState = runResultSessionState(subResult);
       carried.input_tokens += subResult.usage.input_tokens;
       carried.output_tokens += subResult.usage.output_tokens;
       totalUsage.input_tokens += subResult.usage.input_tokens;
@@ -1896,14 +2014,23 @@ async function runPlanExecuteConfig(
 
       completeTask(taskList, taskId);
       await executor.persistTaskList(sessionId, taskList);
+
+      // #126: record this task's final output (Tier-1) and append a ledger entry
+      // whose files_touched is HARNESS-OBSERVED (AC2) — never self-reported.
+      finalOutputs.set(taskId, subResult.output);
+      const filesTouched = executor.takeObservedWrites();
+      const entry: StepLedgerEntry = {
+        task_id: taskId,
+        summary: subResult.output,
+        files_touched: filesTouched,
+      };
+      if (pushStepLedger(ledger, entry)) ledgerElided = true;
+
       // Surface the completed step's final text to the caller's sink — the
       // parent-visible step boundary.
       if (onStream != null) onStream({ kind: "final_response", content: lastOutput });
 
-      // #125: charge this step's turns against the PlanExecute scope. If the
-      // global `total_steps` cap is now spent, the PlanExecute node surfaces its
-      // OWN typed `budget_exhausted` (partial = tasklist + ledger), resolving its
-      // behavior.
+      // #125: charge this step's turns against the PlanExecute scope.
       const stepCharge = chargeCurrent(cx, Math.max(0, subResult.turns - carriedBefore));
       if (!stepCharge.ok) {
         const partial = planExecutePartialJson(taskList);
@@ -1914,21 +2041,44 @@ async function runPlanExecuteConfig(
         switch (resolution) {
           case "fail":
             return promoteBudgetExhausted(stepCharge.error, undefined);
-          // #129: a granted `continue` must reset this scope (`resolveCurrent`
-          // already did via `consumeContinue`) and RE-RUN this execute step — the
-          // in-process loop wiring lands in #129. It is UNREACHABLE today: live
-          // bodies push an `escalate` placeholder behavior (the serialized
-          // `BudgetExhaustedBehavior` field is a wire change deferred to #129), so
-          // `resolveCurrent` only ever yields `escalate`/`fail` here. Until that
-          // loop exists, an (impossible) `continue` is handled EXPLICITLY as a
-          // lossless surface-with-partial rather than a silent fall-through.
           case "continue":
           case "escalate":
             return promoteBudgetExhausted(stepCharge.error, partial);
         }
       }
+    } else if (
+      subResult != null &&
+      subResult.kind === "failure" &&
+      subResult.reason.kind === "budget_exceeded"
+    ) {
+      // A GLOBAL turn-budget hard stop (#117 backstop) surfaces as a
+      // `budget_exceeded` failure from the leaf. That is a WHOLE-RUN hard stop,
+      // NOT a single-task terminal failure — it aborts the run verbatim
+      // (preserving the pre-#126 mid-execute budget behavior). Distinct from a
+      // per-NODE `budget_exhausted` resolving to `fail`, which DOES cascade (AC4).
+      totalUsage.input_tokens += subResult.usage.input_tokens;
+      totalUsage.output_tokens += subResult.usage.output_tokens;
+      totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
+      totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
+      totalUsage.cost_usd += subResult.usage.cost_usd;
+      updateTask(taskList, taskId, "blocked");
+      await executor.persistTaskList(sessionId, taskList);
+      popBudget(cx);
+      cx.stream = onStream;
+      const result: RunResult = {
+        kind: "failure",
+        reason: subResult.reason,
+        session_id: sessionId,
+        usage: totalUsage,
+        turns: subResult.turns,
+        session_state: lastState,
+      };
+      return finishCombinator(cx, executor, task, result);
     } else if (subResult != null && subResult.kind === "failure") {
-      // Q5: any non-success step aborts the whole run.
+      // #126 AC3: a terminal task FAILURE cascade-blocks its transitive
+      // dependents and KEEPS scheduling unrelated tasks (replaces the Q5 blanket
+      // abort).
+      carried.turns = subResult.turns;
       totalUsage.input_tokens += subResult.usage.input_tokens;
       totalUsage.output_tokens += subResult.usage.output_tokens;
       totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
@@ -1936,55 +2086,72 @@ async function runPlanExecuteConfig(
       totalUsage.cost_usd += subResult.usage.cost_usd;
 
       updateTask(taskList, taskId, "blocked");
+      for (const dep of transitiveDependents(taskList, taskId)) {
+        updateTask(taskList, dep, "blocked");
+        blockedByFailure.add(dep);
+      }
+      blockedByFailure.add(taskId);
       await executor.persistTaskList(sessionId, taskList);
-
-      const terminalReason: HaltReason =
-        subResult.reason.kind === "budget_exceeded"
-          ? subResult.reason
-          : {
-              kind: "step_failed",
-              task_index: index,
-              task: taskList.tasks[index]!.description,
-              reason: haltReasonToString(subResult.reason),
-            };
-      popBudget(cx);
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: terminalReason,
-        session_id: sessionId,
-        usage: totalUsage,
-        turns: subResult.turns,
-        session_state: lastState,
-      };
-      return finishCombinator(cx, executor, task, result);
+      if (firstFailure === undefined) {
+        firstFailure = { failedTask: taskId, reason: haltReasonToString(subResult.reason) };
+      }
+      continue;
     } else if (subResult != null) {
-      // A pause / consult / escalate propagates the whole run.
+      // A pause / consult / escalate propagates the whole run verbatim.
       popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, subResult);
     } else {
-      popBudget(cx);
-      cx.stream = onStream;
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "step_failed",
-          task_index: index,
-          task: taskList.tasks[index]!.description,
+      // No terminal from the child: treat as a terminal failure of this task and
+      // cascade (same as a Failure).
+      updateTask(taskList, taskId, "blocked");
+      for (const dep of transitiveDependents(taskList, taskId)) {
+        updateTask(taskList, dep, "blocked");
+        blockedByFailure.add(dep);
+      }
+      blockedByFailure.add(taskId);
+      await executor.persistTaskList(sessionId, taskList);
+      if (firstFailure === undefined) {
+        firstFailure = {
+          failedTask: taskId,
           reason: "execute sub-strategy produced no terminal",
-        },
-        session_id: sessionId,
-        usage: totalUsage,
-        turns: carried.turns,
-        session_state: lastState,
-      };
-      return finishCombinator(cx, executor, task, result);
+        };
+      }
+      continue;
     }
   }
 
   popBudget(cx);
   cx.stream = onStream;
+
+  // ── Drain (#126, decision A). ───────────────────────────────────────────────
+  //
+  // A run where a terminal failure cascade-blocked any task returns a PARTIAL
+  // terminal `failure` reporting the full partition. A run where every task
+  // completed returns `success` (output = last step's text).
+  if (firstFailure !== undefined) {
+    const completed = taskList.tasks
+      .filter((t) => t.status === "completed")
+      .map((t) => t.id)
+      .sort((a, b) => a - b);
+    const blocked = [...blockedByFailure].sort((a, b) => a - b);
+    const result: RunResult = {
+      kind: "failure",
+      reason: {
+        kind: "tasks_blocked_by_failure",
+        completed,
+        blocked,
+        failed_task: firstFailure.failedTask,
+        reason: firstFailure.reason,
+      },
+      session_id: sessionId,
+      usage: totalUsage,
+      turns: carried.turns,
+      session_state: lastState,
+    };
+    return finishCombinator(cx, executor, task, result);
+  }
+
   const result: RunResult = {
     kind: "success",
     output: lastOutput,
@@ -3586,6 +3753,30 @@ export type HaltReason =
    * Surfaced as a typed halt, NOT a throw.
    */
   | { kind: "hill_climbing_misconfigured"; reason: string }
+  /**
+   * Returned by the PlanExecute DAG executor (#126, decision A) at drain: a task
+   * failed terminally (unrecoverable error or `BudgetExhausted` resolving to
+   * `fail`) and its transitive dependents were cascade-`blocked`, while unrelated
+   * branches still completed. The run as a whole is a `failure`, but the full
+   * partition is reported: which tasks `completed`, which were `blocked` by the
+   * cascade, the `failed_task` that triggered it, and the human-readable `reason`.
+   * (A run where EVERY task completes is a `success`, as before.)
+   */
+  | {
+      kind: "tasks_blocked_by_failure";
+      completed: number[];
+      blocked: number[];
+      failed_task: number;
+      reason: string;
+    }
+  /**
+   * Returned by the PlanExecute DAG executor (#126, AC5) when the persisted task
+   * graph contains a directed cycle, re-checked at EXECUTE ENTRY as defense in
+   * depth (`add_task` already rejects cycles, but the `task_list` tool path could
+   * in principle persist a cyclic graph out of band). No task is run. Carries a
+   * human-readable description.
+   */
+  | { kind: "task_graph_cycle"; reason: string }
   /**
    * Returned by {@link StandardHarness} when {@link ExecutionRegistry.validate}
    * fails at run entry (issue #120): a handle referenced by the task's strategy
