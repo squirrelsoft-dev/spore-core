@@ -64,8 +64,10 @@ function toolCall(id: string, name: string, input: unknown): ToolCall {
 }
 
 const react = (max: number) => ({
-  kind: "re_act" as const,
-  max_iterations: max,
+  kind: "react" as const,
+  budget: { kind: "per_loop" as const, value: max },
+  agent: "",
+  toolset: "",
 });
 
 // ---------------------------------------------------------------------------

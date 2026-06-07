@@ -64,8 +64,10 @@ describe("Harness fixture replay — react_loop.jsonl", () => {
     const harness = new StandardHarness(config);
 
     const task = newTask("read /etc/hosts then summarize", SessionId.of("fixture-session"), {
-      kind: "re_act",
-      max_iterations: 5,
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
     });
 
     const result = await harness.run({ task });

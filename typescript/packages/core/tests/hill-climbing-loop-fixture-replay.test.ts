@@ -178,10 +178,15 @@ describe("HillClimbing fixture replay (issue #60)", () => {
 
       const strategy: LoopStrategy = {
         kind: "hill_climbing",
+        inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
         direction: sc.payload.direction,
-        max_stagnation: sc.payload.max_stagnation,
+        // `null` ("unbounded" / "no delta") maps to behavior-preserving
+        // concretes now that the fields are required (#119): MAX_SAFE_INTEGER
+        // never trips stagnation, `0` matches the null-as-0.0 keep default.
+        max_stagnation: sc.payload.max_stagnation ?? Number.MAX_SAFE_INTEGER,
         revert_on_no_improvement: sc.payload.revert_on_no_improvement,
-        min_improvement_delta: sc.payload.min_improvement_delta,
+        min_improvement_delta: sc.payload.min_improvement_delta ?? 0,
+        evaluator: "",
       };
       const task = newTask("optimize", SessionId.of("hc-fx"), strategy, {
         max_turns: sc.max_turns ?? 100,

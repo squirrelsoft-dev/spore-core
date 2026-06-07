@@ -56,7 +56,12 @@ describe("PatchToolCallsMiddleware fixture replay", () => {
     const mw = new PatchToolCallsMiddleware(fix.fallback_name, obs);
 
     // Drive identity capture, then the before_tool fire.
-    const task = newTask("test task", sid, { kind: "re_act", max_iterations: 5 });
+    const task = newTask("test task", sid, {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
     await mw.handle({ kind: "before_session", task, session_id: sid });
     const calls: ToolCall[] = fix.input_calls.map((c) => ({
       id: c.id,
@@ -99,7 +104,12 @@ describe("PatchToolCallsMiddleware fixture replay", () => {
     const chain = new StandardMiddlewareChain();
     chain.register(new PatchToolCallsMiddleware(fix.fallback_name, obs));
 
-    const task = newTask("test task", sid, { kind: "re_act", max_iterations: 5 });
+    const task = newTask("test task", sid, {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
     await chain.fireBeforeSession(task, sid);
     const calls: ToolCall[] = fix.input_calls.map((c) => ({
       id: c.id,

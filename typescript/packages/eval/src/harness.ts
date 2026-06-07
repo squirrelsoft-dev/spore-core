@@ -7,6 +7,7 @@ import {
   StandardHarness,
   SessionId,
   TaskId,
+  reactPerLoop,
   type HarnessConfig,
   type ObservabilityProvider,
   type RunResult,
@@ -190,7 +191,7 @@ export class EvalHarness {
         instruction: task.instruction,
         session_id: sessionId,
         budget: { max_turns: maxTurns, max_wall_time: task.timeout },
-        loop_strategy: { kind: "re_act", max_iterations: maxTurns },
+        loop_strategy: reactPerLoop(maxTurns),
       };
 
       // Rule 15 / Rule 4: run the harness, bounded by the per-task timeout. A

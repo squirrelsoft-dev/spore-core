@@ -271,35 +271,377 @@ export function addTurnUsage(agg: AggregateUsage, u: TokenUsage): void {
 export const OptimizationDirectionSchema = z.enum(["minimize", "maximize"]);
 export type OptimizationDirection = z.infer<typeof OptimizationDirectionSchema>;
 
+/**
+ * HillClimbing optimization direction (Rust `HillClimbingDirection`). Wire
+ * format is snake_case `"minimize"` / `"maximize"` — identical to
+ * {@link OptimizationDirection}; this alias keeps the strategy-config naming in
+ * lockstep with the Rust reference (#119).
+ */
+export const HillClimbingDirectionSchema = OptimizationDirectionSchema;
+export type HillClimbingDirection = OptimizationDirection;
+
 export const ModelConfigSchema = z.object({
   provider: z.string(),
   model_id: z.string(),
 });
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
 
+// ============================================================================
+// Composable Execution Part A (issue #119): recursive LoopStrategy config
+// newtypes + per-node collaborator handles + StrategyRef + RunStrategy.
+// ============================================================================
+//
+// `LoopStrategy` is a recursive, closed discriminated union of config shapes:
+// `react` (the leaf) plus the combinators `plan_execute`, `self_verifying`,
+// `ralph`, `hill_climbing` (each holding nested `LoopStrategy` children). The
+// wire form is internally tagged on `kind` (snake_case), byte-identical across
+// Rust / TS / Python / Go. `react` (NOT `re_act`) is the leaf tag, and its
+// `budget` field is the renamed `max_iterations` (semantically PerLoop(n)).
+//
+// Per-node collaborator handles — `AgentRef`, `ToolsetRef`, `SchemaRef` — are
+// transparent strings on the wire (idiomatic TS: bare `string`). Resolution to
+// concrete collaborators lands with the registry slice (#120).
+//
+// `StrategyRef` is the serializable identity of a strategy: a closed built-in
+// `LoopStrategy` tree, or an opaque `Custom` string key resolved at runtime
+// (registry: #120). Adjacently tagged on `kind`/`value` to avoid a tag
+// collision with the nested `LoopStrategy`'s own `kind`.
+//
+// `RunStrategy` is the runtime composition seam: every strategy node knows how
+// to run itself given an {@link ExecutionContext}. The single dispatch is one
+// `switch (strategy.kind)` (see {@link runStrategy}); per-variant bodies are
+// STUBS returning {@link StrategyOutcome} `pending` (they do NOT throw). Real
+// bodies land in #124. {@link ExecutionContext} / {@link StrategyOutcome} are
+// minimal placeholders whose full shapes are owned by #123.
+//
+// JSON field order follows the declaration order below (cross-language
+// byte-identity target). The {@link loopStrategyToJson} / {@link strategyRefToJson}
+// serializers emit keys in that order so output is byte-identical to the
+// `fixtures/strategy/` ground truth.
+
 /**
- * Loop strategy. Data shapes are canonical; only `react` is fully executable
- * in {@link StandardHarness}. Other variants return {@link HaltReason} of
- * `strategy_not_yet_implemented` until the trait dependencies (CompletionCheck,
- * Verifier, MetricEvaluator) ship in later component issues.
+ * Per-node handle to a named agent definition. Serializes as a bare JSON
+ * string. Resolution lands with the registry slice (#120).
  */
-export const LoopStrategySchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("re_act"), max_iterations: z.number().int().nonnegative() }),
-  z.object({
-    kind: z.literal("plan_execute"),
-    plan_model: ModelConfigSchema.nullable().optional(),
-  }),
-  z.object({ kind: z.literal("ralph") }),
-  z.object({ kind: z.literal("self_verifying") }),
-  z.object({
-    kind: z.literal("hill_climbing"),
-    direction: OptimizationDirectionSchema,
-    max_stagnation: z.number().int().nonnegative().nullable().optional(),
-    revert_on_no_improvement: z.boolean(),
-    min_improvement_delta: z.number().nullable().optional(),
-  }),
+export type AgentRef = string;
+/**
+ * Per-node handle to a named toolset. Serializes as a bare JSON string.
+ * Resolution lands with the registry slice (#120).
+ */
+export type ToolsetRef = string;
+/**
+ * Per-node handle to a named output/evaluator schema. Serializes as a bare JSON
+ * string. Resolution lands with the registry slice (#120).
+ */
+export type SchemaRef = string;
+
+const AgentRefSchema = z.string();
+const ToolsetRefSchema = z.string();
+const SchemaRefSchema = z.string();
+
+/**
+ * Leaf ReAct node config. `budget` is the renamed `max_iterations`
+ * (semantically `PerLoop(n)`). `output` is OMITTED from JSON when absent.
+ */
+export interface ReactConfig {
+  kind: "react";
+  budget: BudgetPolicy;
+  agent: AgentRef;
+  toolset: ToolsetRef;
+  output?: SchemaRef;
+}
+
+/**
+ * PlanExecute combinator: a `plan` sub-strategy feeds an `execute`
+ * sub-strategy. `plan_model` stays optional/omittable.
+ */
+export interface PlanExecuteConfig {
+  kind: "plan_execute";
+  plan: LoopStrategy;
+  execute: LoopStrategy;
+  plan_model?: ModelConfig;
+}
+
+/** SelfVerifying combinator: run `inner`, then judge it against `evaluator`. */
+export interface SelfVerifyingConfig {
+  kind: "self_verifying";
+  inner: LoopStrategy;
+  evaluator: SchemaRef;
+}
+
+/**
+ * Ralph combinator: re-run `inner` under a fixed `agent` across context-window
+ * resets.
+ */
+export interface RalphConfig {
+  kind: "ralph";
+  inner: LoopStrategy;
+  agent: AgentRef;
+}
+
+/**
+ * HillClimbing combinator: iterate `inner`, keeping/reverting per the metric
+ * `evaluator` and `direction`. `max_stagnation` and `min_improvement_delta` are
+ * required (#119).
+ */
+export interface HillClimbingConfig {
+  kind: "hill_climbing";
+  inner: LoopStrategy;
+  direction: HillClimbingDirection;
+  max_stagnation: number;
+  revert_on_no_improvement: boolean;
+  min_improvement_delta: number;
+  evaluator: AgentRef;
+}
+
+/**
+ * Loop strategy — a closed, recursive discriminated union of config shapes. The
+ * `react` variant is the leaf; the rest are combinators holding nested
+ * `LoopStrategy` children. Internally tagged on `kind` (snake_case), the
+ * `react` tag overriding the would-be `re_act`. Wire form is byte-identical
+ * across all four language targets (see `fixtures/strategy/`).
+ */
+export type LoopStrategy =
+  | ReactConfig
+  | PlanExecuteConfig
+  | SelfVerifyingConfig
+  | RalphConfig
+  | HillClimbingConfig;
+
+export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
+  z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("react"),
+      budget: BudgetPolicySchema,
+      agent: AgentRefSchema,
+      toolset: ToolsetRefSchema,
+      output: SchemaRefSchema.optional(),
+    }),
+    z.object({
+      kind: z.literal("plan_execute"),
+      plan: LoopStrategySchema,
+      execute: LoopStrategySchema,
+      plan_model: ModelConfigSchema.optional(),
+    }),
+    z.object({
+      kind: z.literal("self_verifying"),
+      inner: LoopStrategySchema,
+      evaluator: SchemaRefSchema,
+    }),
+    z.object({
+      kind: z.literal("ralph"),
+      inner: LoopStrategySchema,
+      agent: AgentRefSchema,
+    }),
+    z.object({
+      kind: z.literal("hill_climbing"),
+      inner: LoopStrategySchema,
+      direction: HillClimbingDirectionSchema,
+      max_stagnation: u32,
+      revert_on_no_improvement: z.boolean(),
+      min_improvement_delta: z.number(),
+      evaluator: AgentRefSchema,
+    }),
+  ]),
+);
+
+/** Parse a JSON value into a {@link LoopStrategy}, rejecting unknown variants. */
+export function loopStrategyFromJson(value: unknown): LoopStrategy {
+  return LoopStrategySchema.parse(value);
+}
+
+/**
+ * Serialize a {@link LoopStrategy} to a plain object with canonical field order
+ * (declaration order, matching the Rust serializer / `fixtures/strategy/`), for
+ * byte-identical cross-language output. `output` / `plan_model` are OMITTED when
+ * absent (never `null`). Recurses into nested strategy children.
+ */
+export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unknown> {
+  switch (strategy.kind) {
+    case "react": {
+      const out: Record<string, unknown> = {
+        kind: "react",
+        budget: budgetPolicyToJson(strategy.budget),
+        agent: strategy.agent,
+        toolset: strategy.toolset,
+      };
+      if (strategy.output !== undefined) out.output = strategy.output;
+      return out;
+    }
+    case "plan_execute": {
+      const out: Record<string, unknown> = {
+        kind: "plan_execute",
+        plan: loopStrategyToJson(strategy.plan),
+        execute: loopStrategyToJson(strategy.execute),
+      };
+      if (strategy.plan_model !== undefined) {
+        out.plan_model = {
+          provider: strategy.plan_model.provider,
+          model_id: strategy.plan_model.model_id,
+        };
+      }
+      return out;
+    }
+    case "self_verifying":
+      return {
+        kind: "self_verifying",
+        inner: loopStrategyToJson(strategy.inner),
+        evaluator: strategy.evaluator,
+      };
+    case "ralph":
+      return {
+        kind: "ralph",
+        inner: loopStrategyToJson(strategy.inner),
+        agent: strategy.agent,
+      };
+    case "hill_climbing":
+      return {
+        kind: "hill_climbing",
+        inner: loopStrategyToJson(strategy.inner),
+        direction: strategy.direction,
+        max_stagnation: strategy.max_stagnation,
+        revert_on_no_improvement: strategy.revert_on_no_improvement,
+        min_improvement_delta: strategy.min_improvement_delta,
+        evaluator: strategy.evaluator,
+      };
+  }
+}
+
+/**
+ * The `max_iterations` value extracted from a `react` node's `per_loop` budget;
+ * any other budget shape yields `Number.MAX_SAFE_INTEGER` (matching the legacy
+ * executor's "unbounded" fall-through). Mirrors `ReactConfig::max_iterations`.
+ */
+export function reactMaxIterations(config: ReactConfig): number {
+  return config.budget.kind === "per_loop" ? config.budget.value : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * A bare `react` leaf with a `per_loop` budget and empty agent/toolset handles
+ * (resolution lands with the registry slice, #120). Migration shim for the old
+ * `{ kind: "re_act", max_iterations }` shape. Mirrors `ReactConfig::per_loop`.
+ */
+export function reactPerLoop(value: number): ReactConfig {
+  return { kind: "react", budget: { kind: "per_loop", value }, agent: "", toolset: "" };
+}
+
+/**
+ * Serializable identity of a strategy: either a closed built-in
+ * {@link LoopStrategy} tree or an opaque `custom` string key resolved at runtime
+ * (registry: #120). Adjacently tagged on `kind`/`value` to avoid a tag
+ * collision with the nested {@link LoopStrategy}'s own `kind`:
+ *   - `{"kind":"built_in","value":{"kind":"react",...}}`
+ *   - `{"kind":"custom","value":"my-harness::DoubleVerify"}`
+ */
+export type StrategyRef =
+  | { kind: "built_in"; value: LoopStrategy }
+  | { kind: "custom"; value: string };
+
+export const StrategyRefSchema: z.ZodType<StrategyRef> = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("built_in"), value: LoopStrategySchema }),
+  z.object({ kind: z.literal("custom"), value: z.string() }),
 ]);
-export type LoopStrategy = z.infer<typeof LoopStrategySchema>;
+
+/** Parse a JSON value into a {@link StrategyRef}, rejecting unknown variants. */
+export function strategyRefFromJson(value: unknown): StrategyRef {
+  return StrategyRefSchema.parse(value);
+}
+
+/**
+ * Serialize a {@link StrategyRef} to a plain object with canonical field order
+ * (`kind`, `value`) for byte-identical cross-language output. Recurses into the
+ * nested {@link LoopStrategy} for the `built_in` arm.
+ */
+export function strategyRefToJson(ref: StrategyRef): Record<string, unknown> {
+  switch (ref.kind) {
+    case "built_in":
+      return { kind: "built_in", value: loopStrategyToJson(ref.value) };
+    case "custom":
+      return { kind: "custom", value: ref.value };
+  }
+}
+
+// ── RunStrategy composition seam (#119) ─────────────────────────────────────
+
+/**
+ * Placeholder for #119; full shape owned by #123 (StrategyOutcome +
+ * ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
+ * pre-build #123's budget-stack / aggregate-usage scaffolding here.
+ */
+export interface ExecutionContext {
+  readonly __executionContext?: never;
+}
+
+/**
+ * Placeholder for #119; full shape owned by #123. The stub strategy run bodies
+ * return `{ kind: "pending" }` so the seam exists without a throw; per-variant
+ * outcomes land with the executor slice (#124).
+ */
+export type StrategyOutcome = { kind: "pending" };
+
+/**
+ * The runtime composition seam: every strategy node knows how to run itself
+ * given an {@link ExecutionContext}. The TS runtime-polymorphism idiom is one
+ * `run(cx)` method whose single dispatch is {@link runStrategy}.
+ */
+export interface RunStrategy {
+  run(cx: ExecutionContext): Promise<StrategyOutcome>;
+}
+
+/**
+ * The single dispatch site for the strategy tree (#119). One `switch` over the
+ * `kind` discriminant delegates to per-config run logic. Each per-config body
+ * is a STUB returning {@link StrategyOutcome} `pending` (it does NOT throw);
+ * real bodies land in #124.
+ */
+export async function runStrategy(
+  strategy: LoopStrategy,
+  cx: ExecutionContext,
+): Promise<StrategyOutcome> {
+  switch (strategy.kind) {
+    case "react":
+      return runReactConfig(strategy, cx);
+    case "plan_execute":
+      return runPlanExecuteConfig(strategy, cx);
+    case "self_verifying":
+      return runSelfVerifyingConfig(strategy, cx);
+    case "ralph":
+      return runRalphConfig(strategy, cx);
+    case "hill_climbing":
+      return runHillClimbingConfig(strategy, cx);
+  }
+}
+
+/** Wrap a {@link LoopStrategy} as a {@link RunStrategy} (delegates to {@link runStrategy}). */
+export function asRunStrategy(strategy: LoopStrategy): RunStrategy {
+  return { run: (cx) => runStrategy(strategy, cx) };
+}
+
+// Per-config run STUBS (#124 lands the real bodies). They never throw.
+async function runReactConfig(_c: ReactConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
+  return { kind: "pending" };
+}
+async function runPlanExecuteConfig(
+  _c: PlanExecuteConfig,
+  _cx: ExecutionContext,
+): Promise<StrategyOutcome> {
+  return { kind: "pending" };
+}
+async function runSelfVerifyingConfig(
+  _c: SelfVerifyingConfig,
+  _cx: ExecutionContext,
+): Promise<StrategyOutcome> {
+  return { kind: "pending" };
+}
+async function runRalphConfig(_c: RalphConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
+  return { kind: "pending" };
+}
+async function runHillClimbingConfig(
+  _c: HillClimbingConfig,
+  _cx: ExecutionContext,
+): Promise<StrategyOutcome> {
+  return { kind: "pending" };
+}
 
 export const TaskSchema = z.object({
   id: z.string().transform((s) => new TaskId(s)),
@@ -333,13 +675,13 @@ export function newTask(
 
 /**
  * A one-shot task from just an instruction: a fresh {@link SessionId} and a
- * default `re_act` loop (`max_iterations: 8`). Use {@link newTask} when you need
- * to control the session id (e.g. multi-turn) or the loop strategy.
+ * default `react` loop with a `per_loop` budget of 8. Use {@link newTask} when
+ * you need to control the session id (e.g. multi-turn) or the loop strategy.
  *
  * Mirrors `Task::simple` in `rust/crates/spore-core/src/harness.rs`.
  */
 export function simpleTask(instruction: string): Task {
-  return newTask(instruction, SessionId.generate(), { kind: "re_act", max_iterations: 8 });
+  return newTask(instruction, SessionId.generate(), reactPerLoop(8));
 }
 
 // ============================================================================

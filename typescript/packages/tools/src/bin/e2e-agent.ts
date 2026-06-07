@@ -66,6 +66,7 @@ import {
   type LoopStrategy,
   ModelAgent,
   newTask,
+  reactPerLoop,
   observability as coreObs,
   OllamaModelInterface,
   OLLAMA_DEFAULT_BASE_URL,
@@ -104,7 +105,7 @@ function argValue(args: string[], flag: string): string | undefined {
 }
 
 function reactStrategy(maxIterations: number): LoopStrategy {
-  return { kind: "re_act", max_iterations: maxIterations };
+  return reactPerLoop(maxIterations);
 }
 
 async function main(): Promise<void> {

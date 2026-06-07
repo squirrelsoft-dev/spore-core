@@ -54,7 +54,11 @@ import {
 // Helpers
 // --------------------------------------------------------------------------
 
-const PLAN_STRATEGY: LoopStrategy = { kind: "plan_execute", plan_model: null };
+const PLAN_STRATEGY: LoopStrategy = {
+  kind: "plan_execute",
+  plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+};
 
 function usage(): TokenUsage {
   return { input_tokens: 1, output_tokens: 1, cache_read_tokens: null, cache_write_tokens: null };

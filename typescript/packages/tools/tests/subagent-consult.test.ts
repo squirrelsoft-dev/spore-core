@@ -123,7 +123,12 @@ function consultPaused(): PausedState {
       { id: "consult-call", name: "ask_advice", input: { kind: "advice" } },
     ],
     approved_results: [],
-    task: newTask("audit", sessionId, { kind: "re_act", max_iterations: 4 }),
+    task: newTask("audit", sessionId, {
+      kind: "react",
+      budget: { kind: "per_loop", value: 4 },
+      agent: "",
+      toolset: "",
+    }),
     budget_used: emptyBudgetSnapshot(),
     child_state: null,
   };

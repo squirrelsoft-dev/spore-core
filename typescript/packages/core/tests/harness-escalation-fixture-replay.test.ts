@@ -124,8 +124,10 @@ describe("Escalation loop fixture — escalation_loop.jsonl", () => {
     const harness = new StandardHarness(config);
 
     const task = newTask("investigate then decide whether to abort", SessionId.of("escalation"), {
-      kind: "re_act",
-      max_iterations: 5,
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
     });
 
     const result = await harness.run({ task });

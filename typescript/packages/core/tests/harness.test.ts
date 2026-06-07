@@ -66,7 +66,7 @@ function task(strategy: LoopStrategy): Task {
 }
 
 function react(max: number): Task {
-  return task({ kind: "re_act", max_iterations: max });
+  return task({ kind: "react", budget: { kind: "per_loop", value: max }, agent: "", toolset: "" });
 }
 
 function usage(): TokenUsage {
@@ -289,8 +289,10 @@ describe("Harness — ReAct loop", () => {
     a.push(tcr(toolCall("c", "subagent")));
     const cfg = standardConfig(a);
     const childTask = newTask("child", SessionId.of("child"), {
-      kind: "re_act",
-      max_iterations: 1,
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
     });
     cfg.toolRegistry = new ScriptedToolRegistry().push({
       kind: "waiting_for_human",
@@ -370,10 +372,12 @@ describe("Harness — ReAct loop", () => {
     const strategies: LoopStrategy[] = [
       {
         kind: "hill_climbing",
+        inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
         direction: "maximize",
-        max_stagnation: null,
+        max_stagnation: 0,
         revert_on_no_improvement: false,
-        min_improvement_delta: null,
+        min_improvement_delta: 0,
+        evaluator: "",
       },
     ];
     for (const s of strategies) {
@@ -664,7 +668,11 @@ function recordingConfig(agent: RecordingTurnAgent, modelParams: HarnessConfig["
   } satisfies HarnessConfig;
 }
 
-const PLAN_EXECUTE_STRATEGY: LoopStrategy = { kind: "plan_execute", plan_model: null };
+const PLAN_EXECUTE_STRATEGY: LoopStrategy = {
+  kind: "plan_execute",
+  plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+};
 
 function planTask93(): Task {
   return newTask("build a CLI", SessionId.of("p93"), PLAN_EXECUTE_STRATEGY);

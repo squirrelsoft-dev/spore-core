@@ -163,10 +163,16 @@ function hcStrategy(opts: {
 }): LoopStrategy {
   return {
     kind: "hill_climbing",
+    inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
     direction: opts.direction,
-    max_stagnation: opts.max_stagnation ?? null,
+    // `max_stagnation`/`min_improvement_delta` are required numbers (#119). The
+    // old `null` ("unbounded" / "no delta") inputs map to behavior-preserving
+    // concretes: MAX_SAFE_INTEGER never trips the stagnation halt, and `0`
+    // matches `shouldKeep`'s null-as-0.0 default.
+    max_stagnation: opts.max_stagnation ?? Number.MAX_SAFE_INTEGER,
     revert_on_no_improvement: opts.revert_on_no_improvement ?? false,
-    min_improvement_delta: opts.min_improvement_delta ?? null,
+    min_improvement_delta: opts.min_improvement_delta ?? 0,
+    evaluator: "",
   };
 }
 

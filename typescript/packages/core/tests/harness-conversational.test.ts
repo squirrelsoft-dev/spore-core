@@ -62,16 +62,14 @@ describe("HarnessBuilder.conversational", () => {
 
     // NullSandbox allows everything (the boundary is never exercised).
     const sandbox = new NullSandbox();
-    await expect(
-      sandbox.validate({ id: "x", name: "noop", input: {} }),
-    ).resolves.toBeNull();
+    await expect(sandbox.validate({ id: "x", name: "noop", input: {} })).resolves.toBeNull();
     expect(sandbox.isolationMode()).toEqual({ kind: "workspace_scoped" });
 
     // CompleteOnFinalResponse always continues (accept the first final response).
     const policy = new CompleteOnFinalResponse();
-    await expect(
-      policy.evaluate(emptySessionState(), emptyBudgetSnapshot()),
-    ).resolves.toEqual({ kind: "continue" });
+    await expect(policy.evaluate(emptySessionState(), emptyBudgetSnapshot())).resolves.toEqual({
+      kind: "continue",
+    });
   });
 });
 
@@ -81,7 +79,12 @@ describe("simpleTask", () => {
     const b = simpleTask("Do a thing.");
 
     expect(a.instruction).toBe("Do a thing.");
-    expect(a.loop_strategy).toEqual({ kind: "re_act", max_iterations: 8 });
+    expect(a.loop_strategy).toEqual({
+      kind: "react",
+      budget: { kind: "per_loop", value: 8 },
+      agent: "",
+      toolset: "",
+    });
     // A fresh session id each call.
     expect(a.session_id.asString()).not.toBe(b.session_id.asString());
     // Default (empty) budget.

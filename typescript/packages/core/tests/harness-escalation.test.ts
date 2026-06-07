@@ -49,7 +49,12 @@ function standardConfig(agent: MockAgent): HarnessConfig {
 }
 
 function react(max: number): Task {
-  const strategy: LoopStrategy = { kind: "re_act", max_iterations: max };
+  const strategy: LoopStrategy = {
+    kind: "react",
+    budget: { kind: "per_loop", value: max },
+    agent: "",
+    toolset: "",
+  };
   return newTask("do something", SessionId.of("s1"), strategy);
 }
 

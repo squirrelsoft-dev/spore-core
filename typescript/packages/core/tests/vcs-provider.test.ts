@@ -43,7 +43,11 @@ import {
   ScriptedToolRegistry,
 } from "../src/harness/testing.js";
 
-const RALPH: LoopStrategy = { kind: "ralph" };
+const RALPH: LoopStrategy = {
+  kind: "ralph",
+  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  agent: "",
+};
 const INCOMPLETE = JSON.stringify({ complete: false, remaining: ["task A"] });
 const COMPLETE = JSON.stringify({ complete: true, remaining: [] });
 

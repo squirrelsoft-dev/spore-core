@@ -48,7 +48,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..", "..", "..", "..");
 const fixturePath = resolve(repoRoot, "fixtures/harness/ralph.json");
 
-const RALPH: LoopStrategy = { kind: "ralph" };
+const RALPH: LoopStrategy = {
+  kind: "ralph",
+  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  agent: "",
+};
 const INCOMPLETE = JSON.stringify({ complete: false, remaining: ["task A"] });
 
 interface Window {

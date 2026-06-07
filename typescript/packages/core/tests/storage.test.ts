@@ -70,7 +70,12 @@ function paused(session: string, turn = 3): PausedState {
     pending_tool_calls: [],
     approved_results: [],
     human_request: { kind: "tool_approval", calls: [], risk_level: "low" },
-    task: newTask("do the thing", sid(session), { kind: "re_act", max_iterations: 1 }),
+    task: newTask("do the thing", sid(session), {
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
+    }),
     budget_used: emptyBudgetSnapshot(),
     child_state: null,
   };

@@ -219,7 +219,12 @@ describe("fixture: subagent_scenarios", () => {
               pending_tool_calls: [],
               approved_results: [],
               human_request: { kind: "clarification", question: "?" },
-              task: newTask("x", sid, { kind: "re_act", max_iterations: 1 }),
+              task: newTask("x", sid, {
+                kind: "react",
+                budget: { kind: "per_loop", value: 1 },
+                agent: "",
+                toolset: "",
+              }),
               budget_used: emptyBudgetSnapshot(),
               child_state: null,
             },

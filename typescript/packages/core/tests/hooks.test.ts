@@ -427,7 +427,12 @@ describe("deferred (defined-but-not-loop-wired) events fire in isolation", () =>
       instruction: "next",
       session_id: SessionId.of("s2"),
       budget: {},
-      loop_strategy: { kind: "re_act", max_iterations: 5 } as const,
+      loop_strategy: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 5 },
+        agent: "",
+        toolset: "",
+      } as const,
     };
     chain.register(fnHook("ta", ["on_task_advance"], { decision: "mutate", data: replacement }));
     const ctx: HookContext = {
@@ -438,7 +443,12 @@ describe("deferred (defined-but-not-loop-wired) events fire in isolation", () =>
         instruction: "first",
         session_id: sid(),
         budget: {},
-        loop_strategy: { kind: "re_act", max_iterations: 5 },
+        loop_strategy: {
+          kind: "react",
+          budget: { kind: "per_loop", value: 5 },
+          agent: "",
+          toolset: "",
+        },
       },
       task_index: 0,
       total_tasks: 2,

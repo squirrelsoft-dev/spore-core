@@ -162,7 +162,12 @@ function toolRegistry(): ScriptedToolRegistry {
 }
 
 function reactTask(instruction: string, sid: SessionId, max = 5): Task {
-  return newTask(instruction, sid, { kind: "re_act", max_iterations: max });
+  return newTask(instruction, sid, {
+    kind: "react",
+    budget: { kind: "per_loop", value: max },
+    agent: "",
+    toolset: "",
+  });
 }
 
 function textsOf(state: SessionState): string[] {
@@ -311,7 +316,12 @@ describe("Harness — session-state threading (#102)", () => {
     const sid = SessionId.of("s1");
     await store.inner.putSession(sid, {
       session_id: sid,
-      task_id: newTask("", sid, { kind: "re_act", max_iterations: 0 }).id,
+      task_id: newTask("", sid, {
+        kind: "react",
+        budget: { kind: "per_loop", value: 0 },
+        agent: "",
+        toolset: "",
+      }).id,
       turn_number: 0,
       session_state: {
         messages: [{ role: "user", content: { type: "text", text: "STORED-history" } }],
@@ -319,7 +329,12 @@ describe("Harness — session-state threading (#102)", () => {
       },
       pending_tool_calls: [],
       approved_results: [],
-      task: newTask("", sid, { kind: "re_act", max_iterations: 0 }),
+      task: newTask("", sid, {
+        kind: "react",
+        budget: { kind: "per_loop", value: 0 },
+        agent: "",
+        toolset: "",
+      }),
       budget_used: { turns: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 },
       child_state: null,
     });

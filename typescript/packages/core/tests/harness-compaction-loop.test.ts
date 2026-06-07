@@ -145,7 +145,12 @@ function harnessWith(
  * sequence (tool_call → final_response) so one compaction pass runs.
  */
 function task(): Task {
-  return newTask("do something", SID, { kind: "re_act", max_iterations: 5 });
+  return newTask("do something", SID, {
+    kind: "react",
+    budget: { kind: "per_loop", value: 5 },
+    agent: "",
+    toolset: "",
+  });
 }
 
 /**

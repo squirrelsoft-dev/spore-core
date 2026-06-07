@@ -140,7 +140,9 @@ import {
   type LoopStrategy,
   type MiddlewareChain,
   type ObservabilityProvider,
-  type OptimizationDirection,
+  type HillClimbingDirection,
+  reactMaxIterations,
+  reactPerLoop,
   type PausedState,
   type RunResult,
   type SandboxProvider,
@@ -556,7 +558,7 @@ export class StandardHarness implements Harness {
           session_state: runResultSessionState(result),
           pending_tool_calls: [],
           approved_results: [],
-          task: newTask("", sessionId, { kind: "re_act", max_iterations: 0 }),
+          task: newTask("", sessionId, reactPerLoop(0)),
           budget_used: emptyBudgetSnapshot(),
           child_state: null,
         };
@@ -603,7 +605,7 @@ export class StandardHarness implements Harness {
     if (
       sessionState == null &&
       this.config.autoPersistSessions === true &&
-      (task.loop_strategy.kind === "re_act" || task.loop_strategy.kind === "self_verifying")
+      (task.loop_strategy.kind === "react" || task.loop_strategy.kind === "self_verifying")
     ) {
       try {
         const prior = await this.storage().session().getSession(task.session_id);
@@ -615,10 +617,10 @@ export class StandardHarness implements Harness {
     const resolvedState = sessionState ?? emptySessionState();
 
     switch (task.loop_strategy.kind) {
-      case "re_act":
+      case "react":
         return this.runReact(
           task,
-          task.loop_strategy.max_iterations,
+          reactMaxIterations(task.loop_strategy),
           resolvedState,
           budgetUsed,
           options.on_stream,
@@ -641,9 +643,9 @@ export class StandardHarness implements Harness {
         return this.runHillClimbing(
           task,
           task.loop_strategy.direction,
-          task.loop_strategy.max_stagnation ?? null,
+          task.loop_strategy.max_stagnation,
           task.loop_strategy.revert_on_no_improvement,
-          task.loop_strategy.min_improvement_delta ?? null,
+          task.loop_strategy.min_improvement_delta,
           budgetUsed,
           options.on_stream,
           options.signal,
@@ -711,8 +713,8 @@ export class StandardHarness implements Harness {
         await this.config.contextManager.appendToolResult(sessionState, tr);
       }
       const maxIter =
-        state.task.loop_strategy.kind === "re_act"
-          ? state.task.loop_strategy.max_iterations
+        state.task.loop_strategy.kind === "react"
+          ? reactMaxIterations(state.task.loop_strategy)
           : Number.MAX_SAFE_INTEGER;
       return this.runReact(
         state.task,
@@ -785,8 +787,8 @@ export class StandardHarness implements Harness {
     }
 
     const max =
-      state.task.loop_strategy.kind === "re_act"
-        ? state.task.loop_strategy.max_iterations
+      state.task.loop_strategy.kind === "react"
+        ? reactMaxIterations(state.task.loop_strategy)
         : Number.MAX_SAFE_INTEGER;
     return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
   }
@@ -864,8 +866,8 @@ export class StandardHarness implements Harness {
     }
 
     const max =
-      state.task.loop_strategy.kind === "re_act"
-        ? state.task.loop_strategy.max_iterations
+      state.task.loop_strategy.kind === "react"
+        ? reactMaxIterations(state.task.loop_strategy)
         : Number.MAX_SAFE_INTEGER;
     return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
   }
@@ -1713,10 +1715,7 @@ export class StandardHarness implements Harness {
       instruction: directive,
       session_id: evalSessionId,
       budget: task.budget,
-      loop_strategy: {
-        kind: "re_act",
-        max_iterations: task.budget.max_turns ?? Number.MAX_SAFE_INTEGER,
-      },
+      loop_strategy: reactPerLoop(task.budget.max_turns ?? Number.MAX_SAFE_INTEGER),
     };
 
     // Child harness: clone the config, swap agent + sandbox. Cloning shares the
@@ -1830,7 +1829,7 @@ export class StandardHarness implements Harness {
    */
   private async runHillClimbing(
     task: Task,
-    direction: OptimizationDirection,
+    direction: HillClimbingDirection,
     maxStagnation: number | null,
     revertOnNoImprovement: boolean,
     minImprovementDelta: number | null,
@@ -4077,5 +4076,5 @@ export const HOOK_POINTS: readonly HookPoint[] = [
 
 /** Type marker used by `LoopStrategy` consumers to detect non-ReAct strategies. */
 export function isReact(strategy: LoopStrategy): boolean {
-  return strategy.kind === "re_act";
+  return strategy.kind === "react";
 }

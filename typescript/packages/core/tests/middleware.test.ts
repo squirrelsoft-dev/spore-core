@@ -257,7 +257,12 @@ describe("PatchToolCallsMiddleware observability", () => {
   const sid = SessionId.of("sess");
 
   function patchTask(): Task {
-    return newTask("test task", sid, { kind: "re_act", max_iterations: 5 });
+    return newTask("test task", sid, {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
   }
 
   // Drive identity capture (before_session) then a before_tool fire directly on
@@ -451,7 +456,12 @@ describe("MiddlewareChain session boundary hooks", () => {
     chain.register(tracing);
 
     const sid = SessionId.of("sess-1");
-    const task = newTask("test task", sid, { kind: "re_act", max_iterations: 5 });
+    const task = newTask("test task", sid, {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
     await chain.fireBeforeSession(task, sid);
     const result: RunResult = {
       kind: "success",

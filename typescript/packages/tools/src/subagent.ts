@@ -47,7 +47,12 @@ import type {
   ToolCall,
   ToolOutput,
 } from "@spore/core";
-import { newTask, SessionId, type toolRegistry } from "@spore/core";
+import {
+  newTask,
+  reactPerLoop,
+  SessionId,
+  type toolRegistry,
+} from "@spore/core";
 
 type Tool = toolRegistry.Tool;
 type ToolContext = toolRegistry.ToolContext;
@@ -158,10 +163,7 @@ export class SubagentTool implements Tool {
     }
 
     const { sessionId, seededSession } = resolveSession(this.contextSharing);
-    const task: Task = newTask(instruction, sessionId, {
-      kind: "re_act",
-      max_iterations: 16,
-    });
+    const task: Task = newTask(instruction, sessionId, reactPerLoop(16));
 
     const runOpts: Parameters<Harness["run"]>[0] = { task };
     if (seededSession) runOpts.session_state = seededSession;
@@ -306,10 +308,11 @@ export class SubagentTool implements Tool {
     // the consult request rendered to text.
     counts.set(request.kind, used + 1);
     const instruction = renderConsultInstruction(request);
-    const task: Task = newTask(instruction, SessionId.generate(), {
-      kind: "re_act",
-      max_iterations: 16,
-    });
+    const task: Task = newTask(
+      instruction,
+      SessionId.generate(),
+      reactPerLoop(16),
+    );
     const runOpts: Parameters<Harness["run"]>[0] = { task };
     if (signal) runOpts.signal = signal;
     const handlerResult = await entry.handler.run(runOpts);

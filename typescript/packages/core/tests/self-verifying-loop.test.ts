@@ -53,7 +53,11 @@ import {
 // Helpers
 // --------------------------------------------------------------------------
 
-const SV_STRATEGY: LoopStrategy = { kind: "self_verifying" };
+const SV_STRATEGY: LoopStrategy = {
+  kind: "self_verifying",
+  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  evaluator: "",
+};
 
 function usage(): TokenUsage {
   return { input_tokens: 1, output_tokens: 1, cache_read_tokens: null, cache_write_tokens: null };

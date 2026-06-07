@@ -101,7 +101,8 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     const harness = new StandardHarness(configFor(exchanges[0]!, storage));
     const task = newTask("build something", FIXTURE_SID, {
       kind: "plan_execute",
-      plan_model: null,
+      plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
     });
 
     const result = await harness.run({ task, session_state: state });
@@ -140,7 +141,8 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
     const harness = new StandardHarness(configFor(exchanges[1]!, storage));
     const task = newTask("build something", FIXTURE_SID, {
       kind: "plan_execute",
-      plan_model: null,
+      plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
     });
 
     const result = await harness.run({ task, session_state: state });

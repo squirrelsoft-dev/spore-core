@@ -53,7 +53,12 @@ function fr(content: string): TurnResult {
   return { kind: "final_response", content, usage: usage() };
 }
 
-const react: LoopStrategy = { kind: "re_act", max_iterations: 5 };
+const react: LoopStrategy = {
+  kind: "react",
+  budget: { kind: "per_loop", value: 5 },
+  agent: "",
+  toolset: "",
+};
 
 describe("Harness — spans through durable outbox (hermetic)", () => {
   it("harness emits turn + tool_call spans and a session summary through the JSONL outbox", async () => {

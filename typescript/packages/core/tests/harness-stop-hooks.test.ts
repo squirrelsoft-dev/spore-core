@@ -34,7 +34,7 @@ function usage(): TokenUsage {
 }
 
 function react(max: number): LoopStrategy {
-  return { kind: "re_act", max_iterations: max };
+  return { kind: "react", budget: { kind: "per_loop", value: max }, agent: "", toolset: "" };
 }
 
 function baseConfig(agent: MockAgent): HarnessConfig {

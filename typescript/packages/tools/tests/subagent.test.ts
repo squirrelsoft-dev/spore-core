@@ -128,7 +128,12 @@ describe("SubagentTool", () => {
       pending_tool_calls: [],
       approved_results: [],
       human_request: { kind: "clarification", question: "yes?" },
-      task: newTask("x", sessionId, { kind: "re_act", max_iterations: 1 }),
+      task: newTask("x", sessionId, {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        agent: "",
+        toolset: "",
+      }),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
     };

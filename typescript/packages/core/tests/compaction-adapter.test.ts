@@ -283,7 +283,12 @@ class SummaryAgent implements Agent {
 }
 
 function task(): Task {
-  return newTask("do something", SID, { kind: "re_act", max_iterations: 5 });
+  return newTask("do something", SID, {
+    kind: "react",
+    budget: { kind: "per_loop", value: 5 },
+    agent: "",
+    toolset: "",
+  });
 }
 
 describe("StandardCompactionAdapter — end-to-end through the seam (issue #55)", () => {

@@ -51,7 +51,11 @@ interface Case {
   expected: { kind: "success" | "exhausted" | "misconfigured"; iterations?: number };
 }
 
-const SV_STRATEGY: LoopStrategy = { kind: "self_verifying" };
+const SV_STRATEGY: LoopStrategy = {
+  kind: "self_verifying",
+  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  evaluator: "",
+};
 
 function usage(): TokenUsage {
   return { input_tokens: 0, output_tokens: 0, cache_read_tokens: null, cache_write_tokens: null };

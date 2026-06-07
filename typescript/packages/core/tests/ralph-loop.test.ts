@@ -45,7 +45,11 @@ import {
 // Helpers
 // --------------------------------------------------------------------------
 
-const RALPH: LoopStrategy = { kind: "ralph" };
+const RALPH: LoopStrategy = {
+  kind: "ralph",
+  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  agent: "",
+};
 const INCOMPLETE = JSON.stringify({ complete: false, remaining: ["task A"] });
 const COMPLETE = JSON.stringify({ complete: true, remaining: [] });
 
@@ -264,7 +268,12 @@ describe("Ralph loop strategy (issue #58)", () => {
       terminationPolicy: new AlwaysContinuePolicy(),
       modelParams: { stop_sequences: [] },
     });
-    const task = newTask("do it", SessionId.of("react-1"), { kind: "re_act", max_iterations: 5 });
+    const task = newTask("do it", SessionId.of("react-1"), {
+      kind: "react",
+      budget: { kind: "per_loop", value: 5 },
+      agent: "",
+      toolset: "",
+    });
     const r = await h.run({ task });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.turns).toBe(1);

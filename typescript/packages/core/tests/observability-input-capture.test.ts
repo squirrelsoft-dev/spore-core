@@ -203,7 +203,12 @@ describe("Input-capture fixture replay", () => {
 
 // ── End-to-end through StandardHarness ───────────────────────────────────────
 
-const react: LoopStrategy = { kind: "re_act", max_iterations: 1 };
+const react: LoopStrategy = {
+  kind: "react",
+  budget: { kind: "per_loop", value: 1 },
+  agent: "",
+  toolset: "",
+};
 
 function usage(): TokenUsage {
   return { input_tokens: 5, output_tokens: 2, cache_read_tokens: null, cache_write_tokens: null };

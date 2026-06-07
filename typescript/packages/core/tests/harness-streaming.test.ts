@@ -156,8 +156,10 @@ describe("Harness streaming fixture replay (#103)", () => {
     const seen: HarnessStreamEvent[] = [];
     const { harness } = harnessWith();
     const task = newTask("look up rust and explain", SessionId.of("stream-session"), {
-      kind: "re_act",
-      max_iterations: 1,
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
     });
     await harness.run({ task, on_stream: (e) => seen.push(e) });
 
@@ -186,8 +188,10 @@ describe("Harness streaming fixture replay (#103)", () => {
     const seen: HarnessStreamEvent[] = [];
     const { harness } = harnessWith();
     const task = newTask("look up rust and explain", SessionId.of("stream-session-2"), {
-      kind: "re_act",
-      max_iterations: 1,
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
     });
     await harness.run({ task, on_stream: (e) => seen.push(e) });
 
@@ -211,15 +215,19 @@ describe("Harness streaming fixture replay (#103)", () => {
   it("no-sink baseline parity: identical RunResult with and without a sink", async () => {
     const withSink = harnessWith();
     const taskA = newTask("look up rust and explain", SessionId.of("parity"), {
-      kind: "re_act",
-      max_iterations: 1,
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
     });
     const resultWith = await withSink.harness.run({ task: taskA, on_stream: () => {} });
 
     const without = harnessWith();
     const taskB = newTask("look up rust and explain", SessionId.of("parity"), {
-      kind: "re_act",
-      max_iterations: 1,
+      kind: "react",
+      budget: { kind: "per_loop", value: 1 },
+      agent: "",
+      toolset: "",
     });
     const resultWithout = await without.harness.run({ task: taskB });
 
