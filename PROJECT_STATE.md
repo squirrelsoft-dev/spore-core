@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close (#125 complete; merged to local `main`, **NOT pushed** — push gated on maintainer per Deviation #10) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Seven bricks landed (#117, #118, #119, #120, #123, #124, #125) all `status: complete`, all four languages.** #125 (per-node budget enforcement) makes `charge()` the real enforcement point and `StrategyOutcome::BudgetExhausted` a live, isolated, parent-inspectable value (produced nowhere before): a capped node stops without killing siblings, a child's exhaustion never auto-cascades to its parent, ReAct-leaf propagates (Open Q A-2), and the dead per-task derivation is gone from every PlanExecute body + cfg-test helper. With #125 done, **#126 (ready-set walk) is the remaining top critical-path item**, and #129/#130 (which consume #125's budget machinery) are unblocked. ⚠️ **#125 has tracked follow-ups from an adversarial review (see Deviation #14):** the in-process Continue chain is unit-proven but not wired through a live run (the `BudgetExhaustedBehavior` wire-field belongs to #129), a stale Rust doc header, and thin integration coverage (the headline leaf-cap test would pass on `main` too — the #124 degenerate-test pattern). The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ `origin/main` is now **6 commits behind** local `main` (the #125 series) — push pending maintainer OK._
+_Last updated: 2026-06-08 by /close (#125 complete; merged to local `main`, **NOT pushed** — push gated on maintainer per Deviation #10) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Seven bricks landed (#117, #118, #119, #120, #123, #124, #125) all `status: complete`, all four languages.** #125 (per-node budget enforcement) makes `charge()` the real enforcement point and `StrategyOutcome::BudgetExhausted` a live, isolated, parent-inspectable value (produced nowhere before): a capped node stops without killing siblings, a child's exhaustion never auto-cascades to its parent, ReAct-leaf propagates (Open Q A-2), and the dead per-task derivation is gone from every PlanExecute body + cfg-test helper. With #125 done, **#126 (ready-set walk) is the remaining top critical-path item**, and #129/#130 (which consume #125's budget machinery) are unblocked. ✅ **The adversarial-review follow-ups (Deviation #14) are now ADDRESSED** by a four-language hardening pass: the empirical question — was #125's headline `partial_output` behavior actually reachable end-to-end, or just degenerate-tested like the bug that reopened #124? — was answered: **reachable in all four, no implementation gap**; the leaf-cap integration test is now discriminating, F5/F6 are covered with bounded leaves, the stale Rust doc is fixed, and the Continue arms are explicit. The only remaining piece (wiring the serialized `BudgetExhaustedBehavior` field + the live `Continue` loop) is genuinely **#129's** scope. The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ `origin/main` is now **11 commits behind** local `main` (the #125 series + the Deviation-#14 hardening) — push pending maintainer OK._
 
 _**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119, #120, #123, #124, #125 are all done.** The next critical-path item is **#126 (ready-set task walk)**, unblocked since #124. #121/#122/#127/#128/#129/#130 remain parallel-grabbable (#129 owns #125's deferred Continue wire-field + `continues_used` persistence; #130 consumes #125's `BudgetExhausted` + #120's `EscalationMode`). Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
 
@@ -218,10 +218,12 @@ wired onto config structs (a serialized wire change forbidden by fork #3 — bel
 Escalate chain is exercised by direct primitive tests. Commits `763b53a` (rust, 15
 tests) / `2644117`+`f3c9362` (py, 14) / `3e4a33e` (go, 14) / `f192fd0`+`5ccdb03` (ts,
 19). Cross-language verifier PASS; two stale-helper divergences found+fixed during verify
-(py `f3c9362`, ts `5ccdb03`). ⚠️ Tracked review follow-ups (Deviation #14): Continue not
-wired through a live run; stale Rust doc header; thin integration coverage (the headline
-leaf-cap test would pass on `main` too — #124's degenerate-test pattern; rule 6 is
-genuinely proven only at the **primitive** level).
+(py `f3c9362`, ts `5ccdb03`). ✅ A post-merge adversarial-review hardening pass (Deviation
+#14, `ca0165b`/`ca89df6`/`c96ceed`/`9a9fb12`, verifier PASS) confirmed the new
+`BudgetExhausted`/`partial_output` path is reachable end-to-end in all four (no impl gap),
+made the leaf-cap integration test discriminating, added bounded-leaf F5/F6 coverage,
+fixed the stale Rust doc, and made the Continue arms explicit; only #129's wire-field
+remains.
 
 **Examples suite — 12 of 13 landed, all four languages each.** Present under
 `examples/{rust,typescript,python,go}/`:
@@ -419,25 +421,27 @@ cache halts.
     TS `{ok}|{ok,error}`, Go `*BudgetExhausted` (nil = ok), Python raises `BudgetExhausted`;
     semantically identical.
 
-14. **#125 review follow-ups** (`scope: debt`, from a post-merge adversarial review;
-    documented on issue #125, NOT blocking) — three items the review surfaced after #125
-    merged: (a) **in-process `Continue` is unit-proven but not wired through a live run** —
-    every live `*Config::run` pushes scopes with an `Escalate` placeholder; the serialized
-    `BudgetExhaustedBehavior` field is deliberately not on config structs (wire change
-    forbidden by fork #3) so a real run never grants a `Continue`. Wiring it (and the latent
-    `_ => Some(partial)` arm that would mishandle a granted Continue) belongs to **#129**.
-    (b) **stale Rust doc header** — `harness.rs` describes a `charge_step`/`run_with_budget`
-    wrapper that was never written (real code inlines charge/resolve per body); doc-only,
-    correct alongside #129. (c) **thin integration coverage** — the end-to-end
-    `react_leaf_cap_binding_propagates_partial` test asserts only `BudgetExceeded(Turns)`/
-    `turns==2` (holds on `main` too) and never asserts `partial_output` reached the result —
-    the **same degenerate-test pattern that got #124 reopened** (see the
-    `parity-shortcut-hid-fake-recursion` lesson). Rule 6 is genuinely proven at the
-    **primitive** level (per-node partial helpers + `promote_fail_drops_partial_escalate_keeps_it`),
-    not end-to-end; Ralph's tests were also edited to dodge the new budget-exhausted-window→
-    reset interaction (uncovered). **Recommended hardening pass before #125 is considered
-    bulletproof** — harden the integration test to assert the new `BudgetExhausted` path,
-    or fold into #126/#129.
+14. **#125 review follow-ups — ADDRESSED** (hardening pass `ca0165b`/`ca89df6`/`c96ceed`/
+    `9a9fb12`, all four languages; cross-language verifier PASS). A post-merge adversarial
+    review surfaced three items; the hardening pass resolved them: (c) **thin integration
+    coverage** — the empirical question (was the headline behavior actually reachable
+    end-to-end, or was the test degenerate like the one that got #124 reopened?) was
+    answered: **the new `BudgetExhausted`/`partial_output` path IS reachable end-to-end in
+    all four languages — no implementation gap.** The `react_leaf_cap_binding_propagates_partial`
+    test is now discriminating (asserts the materialized session is exactly one assistant
+    message == `react_partial_json("")` → `{"node":"react","last_final_response":""}`, byte-
+    identical across all four; FAILS on pre-#125 code). Added the Ralph budget-exhausted-
+    window→reset test (F5, **bounded** leaf — the path the old tests dodged) and strengthened
+    the child-non-cascade test (F6, parent pre-charged to 4/5, survives child exhaustion with
+    1 step intact). (b) **stale Rust doc header** fixed (described nonexistent `charge_step`/
+    `run_with_budget`/`execute_budget` wrappers; corrected to the real per-body inline
+    charge/resolve; TS/Py/Go had no analogous stale comment). (a) **defensive Continue** —
+    the three combinator resolution sites now handle `ExhaustedResolution::Continue`
+    EXPLICITLY (no silent `_`/`else`/`default` fall-through) with `#129` markers.
+    **Remaining (genuinely #129's scope, not a deviation):** the in-process `Continue` *loop*
+    is still not wired through a live run — every live `*Config::run` pushes an `Escalate`
+    placeholder because the serialized `BudgetExhaustedBehavior` field is a wire change
+    forbidden by fork #3; wiring the field + making `Continue` actually loop is **#129**.
 
 _(Former Deviations — HillClimbing/SelfVerifying/Ralph-git-log/MemoryTool/storage-
 scope/sandbox-path/extras-mirror/Rust-dyn/compaction-tokens/observability-content
@@ -445,12 +449,10 @@ stubs — all resolved in prior loops.)_
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-1. **MAINTAINER DECISIONS (blocking, from the #125 loop)** — (a) **push** local `main`
-   (6 commits ahead, the #125 series) to `origin/main` — gated on explicit OK per
-   Deviation #10; (b) the **#125 review follow-ups (Deviation #14)** — fix now vs. fold
-   into #129/#126: harden the degenerate `react_leaf_cap_binding_propagates_partial`
-   integration test (the #124 reopen pattern), correct the stale Rust doc header, and
-   confirm the `Continue` wire-field deferral to #129.
+1. **MAINTAINER DECISION (blocking)** — **push** local `main` (**11 commits ahead**: the
+   #125 series + the Deviation-#14 hardening pass) to `origin/main`. Gated on explicit OK
+   per Deviation #10. _(The #125 review follow-ups / Deviation #14 are now ADDRESSED — see
+   Deviation #14; nothing left there but #129's wire-field.)_
 2. **#126 — ready-set task walk + two-tier context + failure cascade (Part C
    executor).** The top critical-path item now that #125 is done (unblocked since #124).
    Consume #118's `Task.blockers` DAG: a ready-set walk over unblocked tasks, two-tier
