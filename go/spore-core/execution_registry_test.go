@@ -30,7 +30,7 @@ func (regStubVerifier) MaxIterations() uint32 { return 3 }
 
 type stubStrategy struct{}
 
-func (stubStrategy) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+func (stubStrategy) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 func reactLeaf(agent, toolset string) LoopStrategy {
 	return LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{

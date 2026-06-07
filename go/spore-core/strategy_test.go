@@ -223,10 +223,10 @@ func TestStrategyRefRoundTrip(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Stub Run returns a placeholder, never panics
+// Stub Run returns a benign Complete(""), never panics
 // ---------------------------------------------------------------------------
 
-func TestStubRunReturnsPending(t *testing.T) {
+func TestStubRunReturnsComplete(t *testing.T) {
 	strategies := []LoopStrategy{
 		ReActStrategy(1),
 		PlanExecuteStrategy(PlanExecuteSimple(nil)),
@@ -243,8 +243,11 @@ func TestStubRunReturnsPending(t *testing.T) {
 	for i, s := range strategies {
 		var cx ExecutionContext
 		got := s.Run(&cx)
-		if got.Kind != StrategyOutcomePending {
-			t.Fatalf("case %d: stub Run returned %v, want pending", i, got.Kind)
+		if got.Kind != StrategyOutcomeComplete {
+			t.Fatalf("case %d: stub Run returned %v, want complete", i, got.Kind)
+		}
+		if got.Complete != "" {
+			t.Fatalf("case %d: stub Run output = %q, want empty", i, got.Complete)
 		}
 	}
 }

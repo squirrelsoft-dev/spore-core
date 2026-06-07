@@ -467,35 +467,14 @@ func (r *StrategyRef) UnmarshalJSON(data []byte) error {
 // RunStrategy — the runtime composition seam
 // ============================================================================
 
-// ExecutionContext is a placeholder for #119; its full shape is owned by #123
-// (the StrategyOutcome + ExecutionContext runtime scaffold). Intentionally
-// near-empty — do NOT pre-build #123's BudgetStack / AggregateUsage / etc.
-type ExecutionContext struct{}
-
-// StrategyOutcomeKind discriminates StrategyOutcome variants. Placeholder for
-// #119; the full shape is owned by #123.
-type StrategyOutcomeKind string
-
-const (
-	// StrategyOutcomePending marks that per-variant execution is not yet
-	// implemented (#124). Stub marker only.
-	StrategyOutcomePending StrategyOutcomeKind = "pending"
-)
-
-// StrategyOutcome is a placeholder for #119; its full shape is owned by #123.
-// The stub Run bodies return the Pending marker so the seam compiles without a
-// panic.
-type StrategyOutcome struct {
-	Kind StrategyOutcomeKind
-}
-
-// pendingOutcome is the placeholder every stub Run body returns until #124.
-func pendingOutcome() StrategyOutcome { return StrategyOutcome{Kind: StrategyOutcomePending} }
-
 // RunStrategy is the runtime composition seam: every strategy node knows how to
-// run itself given an ExecutionContext. Implemented on LoopStrategy as the ONLY
+// run itself given an *ExecutionContext. Implemented on LoopStrategy as the ONLY
 // dispatch site (one switch, one-line delegation per arm) and on each *Config as
-// a STUB (returns the Pending outcome) pending #124.
+// a STUB (returns Complete("")) pending #124.
+//
+// The full ExecutionContext / StrategyOutcome / BudgetContext / BudgetStack /
+// SpanStack runtime scaffold these methods thread is defined in
+// execution_scaffold.go (#123).
 //
 // Cross-language note: Rust uses trait/dyn dispatch; Go uses this interface as
 // its runtime-polymorphism idiom. The serialized LoopStrategy / StrategyRef stay
@@ -519,24 +498,25 @@ func (s LoopStrategy) Run(cx *ExecutionContext) StrategyOutcome {
 	case StrategyHillClimbing:
 		return s.HillClimbing.Run(cx)
 	default:
-		return pendingOutcome()
+		return StrategyComplete("")
 	}
 }
 
-// Run is a stub pending #124.
-func (c *ReactConfig) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+// Run is a stub pending #124: it returns Complete("") — a benign, matchable
+// placeholder (NOT a panic). The old Pending marker is removed this slice.
+func (c *ReactConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 // Run is a stub pending #124.
-func (c *PlanExecuteConfig) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+func (c *PlanExecuteConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 // Run is a stub pending #124.
-func (c *SelfVerifyingConfig) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+func (c *SelfVerifyingConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 // Run is a stub pending #124.
-func (c *RalphConfig) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+func (c *RalphConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 // Run is a stub pending #124.
-func (c *HillClimbingConfig) Run(_ *ExecutionContext) StrategyOutcome { return pendingOutcome() }
+func (c *HillClimbingConfig) Run(_ *ExecutionContext) StrategyOutcome { return StrategyComplete("") }
 
 // Compile-time interface checks.
 var (
