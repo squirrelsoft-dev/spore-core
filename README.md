@@ -136,13 +136,36 @@ The harness wires together fifteen components. Every component is a trait/interf
 
 The harness supports five loop strategies. The agent is the same in all cases — one turn. The strategy determines the outer structure.
 
-| Strategy | Use Case |
+| Strategy | Kind | Use Case |
+|---|---|---|
+| **ReAct** | leaf | Standard tool-calling loop. Thought/Action/Observation interleaved. Runs the actual agent turns; every tree bottoms out here. |
+| **PlanExecute** | combinator | Plan once (optionally with a different model), then run each planned task through a child strategy. |
+| **Ralph** | combinator | Multi-context-window continuation. Runs a child strategy per window; intercepts exit, resets context, resumes from filesystem state. |
+| **SelfVerifying** | combinator | Build loop (a child strategy) + separate evaluator agent (read-only, fresh context, Default-FAIL contract). |
+| **HillClimbing** | combinator | Iterative optimization. Each iteration runs a child strategy; establish baseline metric, propose changes, keep if improved, revert if not. Generalizes the [autoresearch](https://github.com/karpathy/autoresearch) pattern. |
+
+### Composition
+
+Strategies are a **recursive tree**, not a flat menu. `ReAct` is the only leaf — it drives the real agent turns. The other four are *combinators*: each holds one or more child strategies and genuinely recurses into them (`PlanExecute` runs its `plan` and `execute` children; the other three drive an `inner` child per iteration/window). A child can be any strategy, including another combinator, to arbitrary depth.
+
+```
+Ralph                              ← reset context across windows…
+└─ PlanExecute                     ← …each window plans, then per task…
+   ├─ plan:    ReAct
+   └─ execute: SelfVerifying       ← …builds-and-verifies each task…
+                └─ inner: ReAct    ← …with a plain tool-calling loop.
+```
+
+This single tree — `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` — is a fully autonomous, multi-window agent that decomposes work into tasks and self-verifies each one. A few other useful shapes:
+
+| Composition | What it gives you |
 |---|---|
-| **ReAct** | Standard tool-calling loop. Thought/Action/Observation interleaved. |
-| **PlanExecute** | Plan once (optionally with a different model), execute steps in a loop. |
-| **Ralph** | Multi-context-window continuation. Intercepts exit, resets context, resumes from filesystem state. |
-| **SelfVerifying** | Build loop + separate evaluator agent (read-only, fresh context, Default-FAIL contract). |
-| **HillClimbing** | Iterative optimization. Establish baseline metric, propose changes, keep if improved, revert if not. Generalizes the [autoresearch](https://github.com/karpathy/autoresearch) pattern. |
+| `SelfVerifying[ReAct]` | A standard agent whose output is checked by a fresh read-only evaluator before it's accepted. |
+| `SelfVerifying[PlanExecute[ReAct, ReAct]]` | Plan-and-execute, with the whole plan's result verified as a unit. |
+| `HillClimbing[PlanExecute[ReAct, ReAct]]` | Each optimization iteration is a full plan/execute pass; keep the iteration only if the metric improved. |
+| `Ralph[SelfVerifying[ReAct]]` | Long-horizon work across context windows, self-verified once per window. |
+
+The strategy tree is data — a serializable, recursive config — so any combination round-trips for resume and replay. Each node carries its own budget, so a runaway child is bounded without cascading to its siblings. Collaborators (agents, verifiers, metric evaluators) are resolved per node from an execution registry.
 
 ---
 
@@ -287,7 +310,7 @@ Subprocess    → TypeScript REST API shells out to Rust binary (recommended v1 
 
 ## Project Status
 
-All component interfaces, rules, identity models, and architectural decisions are fully specified, and the harness is implemented at **parity across all four languages**. The fifteen core components and the Mode/cache systems are landed; the remaining work is the non-ReAct loop strategies (#58–#61).
+All component interfaces, rules, identity models, and architectural decisions are fully specified, and the harness is implemented at **parity across all four languages**. The fifteen core components, the Mode/cache systems, and all five loop strategies are landed. Current work is the [composable-execution refactor](#composition) (#117–#131): making the loop strategies a recursive, composable tree with per-node budgets.
 
 | Area | Status |
 |---|---|
@@ -300,7 +323,8 @@ All component interfaces, rules, identity models, and architectural decisions ar
 | TypeScript implementation | ✅ Core complete |
 | Python implementation | ✅ Core complete |
 | Go implementation | ✅ Core complete |
-| Loop strategies (ReAct landed; Ralph, PlanExecute, SelfVerifying, HillClimbing) | 🔜 In progress (#58–#61) |
+| Loop strategies (all five: ReAct, PlanExecute, Ralph, SelfVerifying, HillClimbing) | ✅ Landed, four-language parity (#58–#61) |
+| Composable execution (recursive strategy tree, per-node budgets) | 🔜 In progress (#117–#131) |
 
 ---
 
