@@ -739,11 +739,16 @@ impl SpanStack {
 ///
 /// The per-variant [`RunStrategy::run`] bodies are LOOP OWNERS: a combinator
 /// recurses by calling `self.inner.run(cx).await` (or `self.plan`/`self.execute`
-/// as applicable). The model-touching primitives (the ReAct turn-loop window,
-/// the SelfVerifying evaluate phase, the PlanExecute plan phase, the
-/// HillClimbing metric machinery, the Ralph `.spore/` reload/completion checks)
-/// stay on the harness behind the [`StrategyExecutor`] trait, reachable through
-/// `executor`. The per-run mutable orchestration state (`task`, `on_stream`,
+/// as applicable). For PlanExecute (#124) this recursion is GENUINE: the plan
+/// phase dispatches `self.plan.run(cx)` and the execute phase dispatches
+/// `self.execute.run(cx)` once per task, so a non-ReAct execute child really
+/// executes its loop per task. The leaf model-touching primitives (the ReAct
+/// turn-loop window, the SelfVerifying evaluate phase, the HillClimbing metric
+/// machinery, the Ralph `.spore/` reload/completion checks, and the PlanExecute
+/// artifact-capture / deep-resume / hook helpers) stay on the harness behind the
+/// [`StrategyExecutor`] trait, reachable through `executor` — but the per-task
+/// ORCHESTRATION loop lives in `PlanExecuteConfig::run`, where it can call the
+/// child `.run(cx)`. The per-run mutable orchestration state (`task`, `on_stream`,
 /// `run_session`, `run_budget`) lives in the [`RunScratch`] so it threads across
 /// recursion through this one shared context — `ExecutionContext::run_strategy`
 /// is the single entry the harness calls instead of the old central dispatch
@@ -878,28 +883,56 @@ pub trait StrategyExecutor: Send + Sync {
         text: &'a str,
     ) -> BoxFut<'a, ()>;
 
-    /// Run the PlanExecute plan phase (legacy `run_plan_phase`) — the constrained
-    /// planner turn that captures + persists a [`PlanArtifact`]. Returns the
-    /// artifact + accounting, or a terminal failure to propagate.
-    fn plan_phase<'a>(
+    /// Capture + persist a [`PlanArtifact`] from the plan sub-strategy's final
+    /// output text (#124). The leaf model work (the planner turn) now runs through
+    /// `self.plan.run(cx)`; this primitive owns only the harness-side artifact
+    /// machinery: parse the response (R3), fire `OnPlanCreated` (R11), and persist
+    /// to the RunStore under `PLAN_EXECUTE_EXTRAS_KEY` (R4). Returns the captured
+    /// artifact or a terminal failure to propagate.
+    fn capture_plan_artifact<'a>(
         &'a self,
-        task: &'a Task,
-        session_state: &'a mut SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: &'a Option<StreamSink>,
+        session_id: &'a SessionId,
+        plan_output: &'a str,
+        usage: AggregateUsage,
+        turns: u32,
     ) -> BoxFut<'a, Result<PlanPhaseOutcome, RunResult>>;
 
-    /// Run the PlanExecute execute phase (legacy `run_execute_phase`) — drains the
-    /// task list, recursing the execute sub-strategy per task.
-    fn execute_phase<'a>(
+    /// The planning directive seeded before the plan sub-strategy runs (R1) — the
+    /// "respond with a single JSON plan" instruction wrapped around the task.
+    fn plan_directive(&self, instruction: &str) -> String;
+
+    /// Dispatch the plan sub-strategy `plan` for `plan_task` over `plan_session`,
+    /// returning its terminal [`RunResult`] (#124). Genuinely recursive — the
+    /// child's `.run(cx)` drives its whole loop. Routes the configured
+    /// `planner_agent` (R5/R6) by running the child against an agent-swapped child
+    /// harness when one is set; otherwise the default agent runs the plan turn.
+    fn run_plan_subtree<'a>(
         &'a self,
-        task: &'a Task,
-        session_state: &'a mut SessionState,
-        task_list: crate::tasklist::TaskList,
-        carried: BudgetSnapshot,
-        plan_usage: AggregateUsage,
-        on_stream: &'a Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult>;
+        plan: &'a LoopStrategy,
+        plan_task: Task,
+        plan_session: SessionState,
+        budget_used: BudgetSnapshot,
+    ) -> BoxFut<'a, Option<RunResult>>;
+
+    /// Reconcile a freshly-parsed task list against the DURABLE RunStore
+    /// checkpoint (A.6 deep-resume): any task already `Completed` on the
+    /// checkpoint is marked `Completed` in `task_list` so it is NOT re-run.
+    fn reconcile_completed_tasks<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        task_list: &'a mut crate::tasklist::TaskList,
+    ) -> BoxFut<'a, ()>;
+
+    /// Fire the `OnTaskAdvance` hook (pre, mutable) for an execute step. The hook
+    /// may rewrite `step_task.instruction`; the (possibly mutated) instruction is
+    /// what the execute sub-strategy then runs.
+    fn fire_task_advance<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        step_task: &'a mut Task,
+        task_index: usize,
+        total_tasks: usize,
+    ) -> BoxFut<'a, ()>;
 
     /// Persist a parsed task list through the RunStore seam (legacy
     /// `persist_task_list`).
@@ -1003,36 +1036,119 @@ impl RunStrategy for ReactConfig {
 }
 
 impl RunStrategy for PlanExecuteConfig {
-    /// Plan→execute (#124). The plan phase recurses through `self.plan` (Q4 — a
-    /// real loop that runs the constrained planner via the executor primitive,
-    /// not a one-shot dispatch in the central executor); the execute phase
-    /// recurses through `self.execute` per task. The model-touching plan/execute
-    /// machinery stays on the harness behind [`StrategyExecutor`] so behavior is
-    /// at parity with the ported `run_plan_execute` body (AC6). The ready-set
-    /// walk lands in #126 (execute runs per task sequentially for now).
+    /// Plan→execute (#124). GENUINELY recursive: the plan phase dispatches
+    /// `self.plan.run(cx)` (seeding the planning directive + a one-turn budget on
+    /// the scratch first) and the execute phase dispatches `self.execute.run(cx)`
+    /// ONCE PER TASK. The child strategy's full loop runs for each phase — a
+    /// non-ReAct execute child (SelfVerifying / HillClimbing) really executes per
+    /// task, not a hardcoded flat ReAct (the defeated-the-point bug this fixes).
+    ///
+    /// This config body OWNS the orchestration: per-task turn/budget allocation
+    /// (Q1), the `OnTaskAdvance` hook (pre, mutable), seeding each step
+    /// instruction as a user message, A.6 deep-resume against the durable
+    /// RunStore checkpoint, task-list persistence after each transition (Q4), and
+    /// cumulative usage / last-output / last-state carry. The harness keeps only
+    /// LEAF primitives: the constrained-plan capture/persist machinery, the
+    /// deep-resume reconcile, and the `OnTaskAdvance` fire — none of which touch
+    /// the per-task model loop. The ready-set walk lands in #126 (execute runs per
+    /// task sequentially for now).
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
+            use crate::tasklist::TaskStatus;
+
             let executor = match cx.executor() {
                 Ok(e) => e,
                 Err(o) => return o,
             };
             let task = cx.current_task();
             let session_id = task.session_id.clone();
-            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
+            // The incoming shared execute session ( `[user: task.instruction]` ).
+            let base_session = std::mem::take(&mut cx.scratch.run_session);
             let budget_used = cx.scratch.run_budget.clone();
+            // PlanExecute suppresses the run's stream sink for its phases (parent-
+            // visible step boundaries are re-emitted on `cx.stream`). Take it now
+            // and keep it OUT of `cx.stream` so the recursive children run with a
+            // suppressed sink; restore it before returning.
             let on_stream = cx.stream.take();
 
-            // ── Phase 1: plan (recurse through the plan sub-strategy). ──────
+            // ── Phase 1: plan (dispatch through `self.plan`). ───────────────
+            //
+            // Seed the planning directive onto a CLONE of the base session so the
+            // shared execute context stays `[user: task.instruction]` (#93 — a
+            // leaked directive would make every execute step re-emit a plan).
+            // Cap the plan child at ONE turn (R1): the plan is a single
+            // constrained turn that yields the JSON artifact.
+            let directive = executor.plan_directive(&task.instruction);
+            let mut plan_session = base_session.clone();
+            executor
+                .seed_user_message(&mut plan_session, &directive)
+                .await;
+            // Cap the plan child at ONE turn but never beyond the task's global
+            // turn ceiling (so an already-exhausted budget fails the plan turn
+            // before it runs — R10).
+            let plan_cap = match task.budget.max_turns {
+                Some(global) => global.min(budget_used.turns.saturating_add(1)),
+                None => budget_used.turns.saturating_add(1),
+            };
+            let plan_task = Task {
+                id: task.id.clone(),
+                instruction: directive,
+                session_id: session_id.clone(),
+                budget: BudgetLimits {
+                    max_turns: Some(plan_cap),
+                    ..task.budget.clone()
+                },
+                loop_strategy: (*self.plan).clone(),
+            };
+            let plan_result = executor
+                .run_plan_subtree(&self.plan, plan_task, plan_session, budget_used.clone())
+                .await;
+            let (plan_output, plan_usage, plan_turns) = match plan_result {
+                Some(RunResult::Success {
+                    output,
+                    usage,
+                    turns,
+                    ..
+                }) => (output, usage, turns),
+                Some(other) => {
+                    // A non-success plan terminal (budget / agent error / pause)
+                    // propagates verbatim — the run never reaches execute.
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, other).await;
+                }
+                None => {
+                    cx.stream = on_stream;
+                    let result = RunResult::Failure {
+                        reason: HaltReason::PlanPhaseFailed {
+                            error: crate::plan::PlanPhaseError::PlanningTurnFailed {
+                                message: "plan sub-strategy produced no terminal".into(),
+                            },
+                        },
+                        session_id,
+                        usage: AggregateUsage::default(),
+                        turns: budget_used.turns,
+                        session_state: SessionState::default(),
+                    };
+                    return cx.finish(executor, task, result).await;
+                }
+            };
+
+            // Capture + persist the artifact from the plan child's output (R3/
+            // R4/R11) — the harness-side machinery, no model turn.
             let outcome = match executor
-                .plan_phase(&task, &mut session_state, budget_used.clone(), &on_stream)
+                .capture_plan_artifact(&session_id, &plan_output, plan_usage, plan_turns)
                 .await
             {
                 Ok(outcome) => outcome,
-                Err(failure) => return cx.finish(executor, task, failure).await,
+                Err(failure) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, failure).await;
+                }
             };
 
-            let task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
+            let mut task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
             if task_list.tasks.is_empty() {
+                cx.stream = on_stream;
                 let result = RunResult::Failure {
                     reason: HaltReason::EmptyPlan,
                     session_id,
@@ -1050,17 +1166,185 @@ impl RunStrategy for PlanExecuteConfig {
             carried.input_tokens += outcome.usage.input_tokens;
             carried.output_tokens += outcome.usage.output_tokens;
 
-            // ── Phase 2: execute (recurse through the execute sub-strategy). ─
-            let result = executor
-                .execute_phase(
-                    &task,
-                    &mut session_state,
-                    task_list,
-                    carried,
-                    outcome.usage,
-                    &on_stream,
-                )
+            // ── Phase 2: execute (dispatch `self.execute` PER TASK). ────────
+            //
+            // The shared execute context starts from `base_session` (NOT the
+            // plan child's polluted session) so the directive never leaks (#93).
+            let mut session_state = base_session;
+
+            // A.6 deep-resume (Q2): reconcile against the durable checkpoint so
+            // already-Completed tasks are not re-run.
+            executor
+                .reconcile_completed_tasks(&session_id, &mut task_list)
                 .await;
+
+            let total_tasks = task_list.tasks.len();
+            let mut total_usage = outcome.usage;
+            let mut last_output = String::new();
+            let mut last_state = SessionState::default();
+            let global_max_turns = task.budget.max_turns;
+
+            for index in 0..total_tasks {
+                let task_id = task_list.tasks[index].id;
+                let instruction = task_list.tasks[index].description.clone();
+
+                // A.6 deep-resume: a task already Completed is skipped.
+                if task_list.tasks[index].status == TaskStatus::Completed {
+                    last_output = instruction.clone();
+                    continue;
+                }
+
+                // Q1: per-task turn allocation, derived at the START of the step.
+                let remaining_tasks = (total_tasks - index) as u32;
+                let per_task_turns = match global_max_turns {
+                    Some(max) => {
+                        let remaining_turns = max.saturating_sub(carried.turns);
+                        (remaining_turns / remaining_tasks).max(1)
+                    }
+                    None => u32::MAX,
+                };
+                // The sub-loop's effective cap is RELATIVE to the carried turns:
+                // a per-task cap of K means "stop K turns from now" while the
+                // GLOBAL budget (carried forward) remains the hard stop — so the
+                // step task's turn ceiling is `min(global, carried + per_task)`.
+                // An already-exhausted global budget thus budget-fails the step
+                // BEFORE the execute child calls the agent (Q1).
+                let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
+                let step_cap = match global_max_turns {
+                    Some(global) => global.min(sub_loop_cap),
+                    None => sub_loop_cap,
+                };
+
+                // Mark InProgress and re-persist (Q4).
+                let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
+                executor.persist_task_list(&session_id, &task_list).await;
+
+                // Fire OnTaskAdvance (pre, mutable). The hook may rewrite the
+                // step instruction; the (possibly mutated) instruction seeds the
+                // execute sub-strategy.
+                let mut step_task = Task {
+                    id: task.id.clone(),
+                    instruction,
+                    session_id: session_id.clone(),
+                    budget: BudgetLimits {
+                        max_turns: Some(step_cap),
+                        ..task.budget.clone()
+                    },
+                    loop_strategy: (*self.execute).clone(),
+                };
+                executor
+                    .fire_task_advance(&session_id, &mut step_task, index, total_tasks)
+                    .await;
+
+                // Seed the step instruction as a user message on the SHARED
+                // execute context, then dispatch the execute sub-strategy.
+                executor
+                    .seed_user_message(&mut session_state, &step_task.instruction)
+                    .await;
+
+                cx.scratch.task = Some(step_task);
+                cx.scratch.run_session = session_state.clone();
+                cx.scratch.run_budget = carried.clone();
+                let _step_outcome = self.execute.run(cx).await;
+                let sub_result = cx.take_child_override();
+
+                match sub_result {
+                    Some(RunResult::Success {
+                        output,
+                        usage,
+                        turns,
+                        session_state: step_state,
+                        ..
+                    }) => {
+                        // Carry the shared budget forward (Q1) and fold this
+                        // step's conversation back into the SHARED context so the
+                        // next step builds on its results.
+                        carried.turns = turns;
+                        session_state = step_state;
+                        last_state = session_state.clone();
+                        carried.input_tokens += usage.input_tokens;
+                        carried.output_tokens += usage.output_tokens;
+                        total_usage.input_tokens += usage.input_tokens;
+                        total_usage.output_tokens += usage.output_tokens;
+                        total_usage.cache_read_tokens += usage.cache_read_tokens;
+                        total_usage.cache_write_tokens += usage.cache_write_tokens;
+                        total_usage.cost_usd += usage.cost_usd;
+                        last_output = output;
+
+                        let _ = task_list.complete(task_id);
+                        executor.persist_task_list(&session_id, &task_list).await;
+                        StandardHarness::emit(
+                            &on_stream,
+                            StreamEvent::FinalResponse {
+                                content: last_output.clone(),
+                            },
+                        );
+                    }
+                    // Q5: any non-success step aborts the whole run.
+                    Some(RunResult::Failure {
+                        reason,
+                        usage,
+                        turns,
+                        ..
+                    }) => {
+                        total_usage.input_tokens += usage.input_tokens;
+                        total_usage.output_tokens += usage.output_tokens;
+                        total_usage.cache_read_tokens += usage.cache_read_tokens;
+                        total_usage.cache_write_tokens += usage.cache_write_tokens;
+                        total_usage.cost_usd += usage.cost_usd;
+
+                        let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
+                        executor.persist_task_list(&session_id, &task_list).await;
+
+                        let terminal_reason = match reason {
+                            HaltReason::BudgetExceeded { .. } => reason,
+                            other => HaltReason::StepFailed {
+                                task_index: index,
+                                task: task_list.tasks[index].description.clone(),
+                                reason: format!("{other:?}"),
+                            },
+                        };
+                        cx.stream = on_stream;
+                        let result = RunResult::Failure {
+                            reason: terminal_reason,
+                            session_id,
+                            usage: total_usage,
+                            turns,
+                            session_state: last_state,
+                        };
+                        return cx.finish(executor, task, result).await;
+                    }
+                    // A pause / consult / escalate propagates the whole run.
+                    Some(pause) => {
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, pause).await;
+                    }
+                    None => {
+                        cx.stream = on_stream;
+                        let result = RunResult::Failure {
+                            reason: HaltReason::StepFailed {
+                                task_index: index,
+                                task: task_list.tasks[index].description.clone(),
+                                reason: "execute sub-strategy produced no terminal".into(),
+                            },
+                            session_id,
+                            usage: total_usage,
+                            turns: carried.turns,
+                            session_state: last_state,
+                        };
+                        return cx.finish(executor, task, result).await;
+                    }
+                }
+            }
+
+            cx.stream = on_stream;
+            let result = RunResult::Success {
+                output: last_output,
+                session_id,
+                usage: total_usage,
+                turns: carried.turns,
+                session_state: last_state,
+            };
             cx.finish(executor, task, result).await
         })
     }
@@ -1167,6 +1451,17 @@ impl ExecutionContext<'_> {
         let outcome = outcome_from_run_result_ref(&result);
         self.scratch.terminal_override = Some(result);
         outcome
+    }
+
+    /// Take the FULL terminal [`RunResult`] a child strategy stashed into
+    /// `terminal_override` when it returned from `.run(cx)` (#124). A combinator
+    /// that recurses per-phase / per-task calls this immediately after each child
+    /// `.run(cx)` to fold the child's usage / turns / session back into the shared
+    /// execute context. Clearing the override is REQUIRED: the combinator builds
+    /// its OWN terminal once the whole loop finishes (via [`finish`](Self::finish)),
+    /// and a stale child override would otherwise propagate verbatim and mask it.
+    fn take_child_override(&mut self) -> Option<RunResult> {
+        self.scratch.terminal_override.take()
     }
 
     /// A combinator's terminal seam: finalize observability for `result`, restore
@@ -2770,8 +3065,9 @@ pub enum RunResult {
 
 /// Result of a successful PlanExecute plan phase (issue #70). Carries the
 /// produced artifact plus the run accounting so the caller can build the terminal
-/// `RunResult`. Surfaced on the [`StrategyExecutor::plan_phase`] primitive (#124);
-/// the artifact itself is also observable via `SessionState.extras["plan_execute"]`.
+/// `RunResult`. Surfaced on the [`StrategyExecutor::capture_plan_artifact`]
+/// primitive (#124); the artifact is also persisted under
+/// `PLAN_EXECUTE_EXTRAS_KEY` on the RunStore.
 #[derive(Debug)]
 pub struct PlanPhaseOutcome {
     pub artifact: crate::plan::PlanArtifact,
@@ -6530,520 +6826,41 @@ tool. Use the provided tool-call format to actually invoke the tool."
         }
     }
 
-    /// Drive the PlanExecute execute phase (issue #59), draining `task_list`.
-    ///
-    /// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
-    /// the accumulated execute-phase context: after each successful step its
-    /// resulting conversation (instruction + tool calls + tool results +
-    /// assistant output) is folded back into the shared `session_state`, so the
-    /// next step's sub-loop (which clones `session_state`) sees every prior
-    /// step's results. The per-task turn cap is derived at the START of each
-    /// step from the shared budget: `per_task_turns = remaining_turns /
-    /// remaining_tasks`, floored at 1 (integer division; `remaining_tasks`
-    /// counts the not-yet-started tasks including the current one). The shared
-    /// budget snapshot (`carried`) is threaded through every step so early tasks
-    /// cannot starve later ones and the global budget stays the hard stop.
-    ///
-    /// Before each step the task is marked `InProgress` (and `Completed` after),
-    /// the list is re-persisted (Q4), and `OnTaskAdvance` fires with the correct
-    /// `task_index` / `total_tasks` (the hook may rewrite the step instruction).
-    ///
-    /// Q2: on success `output` is the LAST completed step's `FinalResponse`.
-    /// Q5: a step that errors / blocks aborts the run with
-    /// [`HaltReason::StepFailed`] — no further tasks run.
-    ///
-    /// `plan_usage` seeds the cumulative [`AggregateUsage`] with the plan turn's
-    /// usage so the terminal `RunResult` reflects the WHOLE run.
-    async fn run_execute_phase(
-        &self,
-        task: &Task,
-        session_state: &mut SessionState,
-        mut task_list: crate::tasklist::TaskList,
-        mut carried: BudgetSnapshot,
-        plan_usage: AggregateUsage,
-        on_stream: &Option<StreamSink>,
-    ) -> RunResult {
-        use crate::tasklist::TaskStatus;
-
-        let session_id = task.session_id.clone();
-
-        // A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
-        // already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
-        // after every step (Q4). On a resumed run the freshly-parsed `task_list`
-        // (from the plan artifact) is reconciled with that checkpoint so already-
-        // Completed tasks are NOT re-run — serialize→reset→resume rather than the
-        // old shallow no-op. Tasks are matched positionally by `id` (the task list
-        // is regenerated deterministically from the same artifact).
-        if let Ok(Some(value)) = self
-            .config
-            .storage
-            .run()
-            .get(&session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY)
-            .await
-        {
-            if let Ok(saved) = serde_json::from_value::<crate::tasklist::TaskList>(value) {
-                for t in &mut task_list.tasks {
-                    if saved
-                        .tasks
-                        .iter()
-                        .any(|s| s.id == t.id && s.status == TaskStatus::Completed)
-                    {
-                        t.status = TaskStatus::Completed;
-                    }
-                }
-            }
-        }
-
-        let total_tasks = task_list.tasks.len();
-        // Cumulative usage across the plan turn + every execute step (Q1).
-        let mut total_usage = plan_usage;
-        // Q2: the success handle is the LAST completed step's final text.
-        let mut last_output = String::new();
-        // Issue #102: the LAST completed step's conversation history, carried into
-        // the terminal `RunResult` so a PlanExecute caller resumes losslessly.
-        let mut last_state = SessionState::default();
-        // Global turn cap (the hard stop). `None` ⇒ no global turn ceiling.
-        let global_max_turns = task.budget.max_turns;
-
-        for index in 0..total_tasks {
-            let task_id = task_list.tasks[index].id;
-            let instruction = task_list.tasks[index].description.clone();
-
-            // A.6 deep-resume: a task already Completed on the durable checkpoint
-            // is NOT re-run — its output stays the last-completed handle.
-            if task_list.tasks[index].status == TaskStatus::Completed {
-                last_output = instruction.clone();
-                continue;
-            }
-
-            // Q1: per-task turn allocation, derived at the START of this step.
-            // remaining_tasks = not-yet-started tasks including this one.
-            let remaining_tasks = (total_tasks - index) as u32;
-            let per_task_turns = match global_max_turns {
-                Some(max) => {
-                    let remaining_turns = max.saturating_sub(carried.turns);
-                    (remaining_turns / remaining_tasks).max(1)
-                }
-                // No global turn cap: each step's sub-loop is bounded only by
-                // the other (token / wall / cost) budget gates.
-                None => u32::MAX,
-            };
-            // The sub-loop's effective cap is RELATIVE to the carried turns:
-            // run_react_inner gates on the cumulative `budget_used.turns`, so a
-            // per-task cap of K means "stop K turns from now" while the global
-            // budget (carried forward) remains the hard stop.
-            let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
-
-            // Mark InProgress (Pending -> InProgress) and re-persist (Q4).
-            let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
-            self.persist_task_list(&session_id, &task_list).await;
-
-            // Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
-            // instruction via the carried harness::Task; the (possibly mutated)
-            // instruction seeds the sub-loop.
-            let mut step_task = Task {
-                id: task.id.clone(),
-                instruction,
-                session_id: session_id.clone(),
-                budget: task.budget.clone(),
-                loop_strategy: task.loop_strategy.clone(),
-            };
-            if let Some(chain) = self.config.hooks.as_ref() {
-                let mut ctx = crate::hooks::HookContext::OnTaskAdvance {
-                    session_id: &session_id,
-                    task: &mut step_task,
-                    task_index: index,
-                    total_tasks,
-                };
-                let _ = chain.fire(&mut ctx).await;
-            }
-
-            // Seed the step instruction as a user message, then run the bounded
-            // ReAct sub-loop carrying the shared budget (Q1).
-            self.config
-                .context_manager
-                .append_user_message(session_state, &step_task.instruction)
-                .await;
-
-            let sub_result = self
-                .run_react_inner(
-                    step_task,
-                    sub_loop_cap,
-                    session_state.clone(),
-                    carried.clone(),
-                    None,
-                )
-                .await;
-
-            match sub_result {
-                RunResult::Success {
-                    output,
-                    usage,
-                    turns,
-                    session_state: step_state,
-                    ..
-                } => {
-                    // Carry the shared budget forward (Q1): cumulative turns are
-                    // the sub-loop's absolute count; fold in its token usage.
-                    carried.turns = turns;
-                    // Fold this step's resulting conversation back into the
-                    // SHARED execute context so the NEXT step's sub-loop (which
-                    // clones `session_state`) builds on this step's tool results
-                    // and assistant output, not just its instruction. The
-                    // returned `step_state` already contains this step's
-                    // instruction + tool calls + tool results + final output.
-                    *session_state = step_state;
-                    // The terminal `RunResult` carries the LAST completed step's
-                    // full state (now the accumulated context, Q2/#102).
-                    last_state = session_state.clone();
-                    carried.input_tokens += usage.input_tokens;
-                    carried.output_tokens += usage.output_tokens;
-                    total_usage.input_tokens += usage.input_tokens;
-                    total_usage.output_tokens += usage.output_tokens;
-                    total_usage.cache_read_tokens += usage.cache_read_tokens;
-                    total_usage.cache_write_tokens += usage.cache_write_tokens;
-                    total_usage.cost_usd += usage.cost_usd;
-                    last_output = output;
-
-                    // Mark Completed and re-persist (Q4).
-                    let _ = task_list.complete(task_id);
-                    self.persist_task_list(&session_id, &task_list).await;
-                    // Surface the completed step's final text to the caller's
-                    // sink. The per-step sub-loop runs with its own (suppressed)
-                    // sink, so this is the parent-visible step boundary.
-                    Self::emit(
-                        on_stream,
-                        StreamEvent::FinalResponse {
-                            content: last_output.clone(),
-                        },
-                    );
-                }
-                // Q5: any non-success step aborts the whole run. A budget halt
-                // surfaces as BudgetExceeded (mid-execute exhaustion); other
-                // failures surface as StepFailed carrying the step context.
-                RunResult::Failure {
-                    reason,
-                    usage,
-                    turns,
-                    ..
-                } => {
-                    total_usage.input_tokens += usage.input_tokens;
-                    total_usage.output_tokens += usage.output_tokens;
-                    total_usage.cache_read_tokens += usage.cache_read_tokens;
-                    total_usage.cache_write_tokens += usage.cache_write_tokens;
-                    total_usage.cost_usd += usage.cost_usd;
-
-                    let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
-                    self.persist_task_list(&session_id, &task_list).await;
-
-                    let terminal_reason = match reason {
-                        // Budget exhaustion mid-execute is its own halt — keep
-                        // it distinct from a step's own failure.
-                        HaltReason::BudgetExceeded { .. } => reason,
-                        other => HaltReason::StepFailed {
-                            task_index: index,
-                            task: task_list.tasks[index].description.clone(),
-                            reason: format!("{other:?}"),
-                        },
-                    };
-                    return RunResult::Failure {
-                        reason: terminal_reason,
-                        session_id,
-                        usage: total_usage,
-                        turns,
-                        session_state: last_state,
-                    };
-                }
-                // A step surfacing to a human pauses the whole run; propagate.
-                RunResult::WaitingForHuman { state, request } => {
-                    return RunResult::WaitingForHuman { state, request };
-                }
-                // A step pausing to consult (issue #114) pauses the whole run;
-                // propagate the consult so the caller (or SubagentTool) mediates.
-                RunResult::Consult {
-                    request,
-                    state,
-                    session_id,
-                    usage,
-                    turns,
-                } => {
-                    return RunResult::Consult {
-                        request,
-                        state,
-                        session_id,
-                        usage,
-                        turns,
-                    };
-                }
-                // A step escalating (issue #80) terminates the whole run
-                // cleanly; propagate the signal and preserved state up.
-                RunResult::Escalate {
-                    signal,
-                    state,
-                    session_id,
-                    usage,
-                    turns,
-                } => {
-                    return RunResult::Escalate {
-                        signal,
-                        state,
-                        session_id,
-                        usage,
-                        turns,
-                    };
-                }
-            }
-        }
-
-        // Q2: success output is the LAST completed step's FinalResponse text.
-        RunResult::Success {
-            output: last_output,
-            session_id,
-            usage: total_usage,
-            turns: carried.turns,
-            session_state: last_state,
-        }
-    }
-
-    /// Run the one-shot PlanExecute plan phase (issue #70).
-    ///
-    /// Selects the planner agent (Q1: `config.planner_agent` if set, else the
-    /// default agent), seeds a planning directive as a user message, runs
-    /// EXACTLY ONE constrained turn (R1), expects a `FinalResponse` (a tool call
-    /// is a planning failure — R2 — never a dispatch loop), captures the
-    /// response via [`capture_plan_artifact`](crate::plan::capture_plan_artifact)
-    /// (R3), fires `OnPlanCreated` (which may rewrite the artifact — R11),
-    /// stores the result in `extras["plan_execute"]` (R4), emits the turn span
-    /// (R8), and counts the turn against the shared budget (R7). A budget
-    /// exhausted before the turn returns a budget-exceeded `Failure` with no
-    /// artifact stored (R10).
-    ///
-    /// On success returns the produced [`PlanArtifact`](crate::plan::PlanArtifact)
-    /// plus the run accounting. On any failure returns the terminal
-    /// `RunResult::Failure` to propagate.
-    async fn run_plan_phase(
-        &self,
-        task: &Task,
-        session_state: &mut SessionState,
-        mut budget_used: BudgetSnapshot,
-        on_stream: &Option<StreamSink>,
-    ) -> Result<PlanPhaseOutcome, RunResult> {
-        let session_id = task.session_id.clone();
-        let started_at = Instant::now();
-        let mut usage = AggregateUsage::default();
-
-        // R10: Layer-1 budget gate BEFORE the plan turn. Mirrors run_react_inner.
-        let effective_turn_cap = task.budget.max_turns.unwrap_or(u32::MAX).max(1);
-        if budget_used.turns >= effective_turn_cap {
-            return Err(RunResult::Failure {
-                reason: HaltReason::BudgetExceeded {
-                    limit_type: BudgetLimitType::Turns,
-                },
-                session_id,
-                usage,
-                turns: budget_used.turns,
-                session_state: session_state.clone(),
-            });
-        }
-        if let Some(limit_type) = Self::budget_exceeded(&task.budget, &budget_used, started_at) {
-            return Err(RunResult::Failure {
-                reason: HaltReason::BudgetExceeded { limit_type },
-                session_id,
-                usage,
-                turns: budget_used.turns,
-                session_state: session_state.clone(),
-            });
-        }
-
-        // Q1: select the planner agent (alternate if configured, else default).
-        let planner = self
-            .config
-            .planner_agent
-            .as_ref()
-            .unwrap_or(&self.config.agent);
-
-        // Seed the planning directive as a user message (reuse ContextManager).
-        // CRITICAL (#93): the directive must NOT mutate the SHARED `session_state`.
-        // That same state is threaded into the execute phase, where each subtask
-        // sub-loop assembles its context from it. If the directive leaked in,
-        // every execute step would still see "respond with {tasks, rationale}"
-        // and an instruction-following model would re-emit a plan instead of
-        // calling tools. Append to a throwaway CLONE so the plan turn sees the
-        // directive while the shared state stays `[user: task.instruction]`.
-        let directive = format!(
+    /// The planning directive seeded before the constrained plan turn (R1): the
+    /// "respond with a single JSON plan object" instruction wrapped around the
+    /// task. Seeded by the recursive [`PlanExecuteConfig::run`] plan dispatch
+    /// before `self.plan.run(cx)` (#124).
+    fn plan_directive(instruction: &str) -> String {
+        format!(
             "Produce a step-by-step plan for the following task. Respond with a \
              single JSON object: {{\"tasks\": [<ordered step strings>], \
-             \"rationale\": <string>}}.\n\nTask:\n{}",
-            task.instruction
-        );
-        let mut plan_state = session_state.clone();
-        self.config
-            .context_manager
-            .append_user_message(&mut plan_state, &directive)
-            .await;
+             \"rationale\": <string>}}.\n\nTask:\n{instruction}"
+        )
+    }
 
-        // Assemble + invoke the planner for exactly ONE turn (R1).
-        let mut context = self
-            .config
-            .context_manager
-            .assemble(&plan_state, task)
-            .await;
-        // Per-run model params win unconditionally (issue #93) — same seam as
-        // run_react_inner, before the plan turn is dispatched.
-        context.params = self.config.model_params.clone();
-        Self::emit(
-            on_stream,
-            StreamEvent::TurnStart {
-                turn: budget_used.turns + 1,
-            },
-        );
-        let turn_started_at = Timestamp::now();
-        let turn_clock = Instant::now();
-        // Delta-level streaming (issue #103): same adapter pattern as
-        // run_react_inner. Plain `turn` when no sink is attached (back-compat).
-        let result = if on_stream.is_some() {
-            let shared: std::sync::Arc<std::sync::Mutex<(TurnStreamState, Vec<StreamEvent>)>> =
-                std::sync::Arc::new(std::sync::Mutex::new((
-                    TurnStreamState::default(),
-                    Vec::new(),
-                )));
-            let sink_shared = shared.clone();
-            let adapter: crate::agent::AgentStreamSink = Box::new(move |ev| {
-                let mut guard = sink_shared.lock().expect("stream buffer poisoned");
-                let (state, buffer) = &mut *guard;
-                let mapped = Self::map_model_stream_event(ev, state);
-                buffer.extend(mapped);
-            });
-            let r = planner.turn_streaming(context, adapter).await;
-            let events = std::mem::take(&mut shared.lock().expect("stream buffer poisoned").1);
-            for ev in events {
-                Self::emit(on_stream, ev);
-            }
-            r
-        } else {
-            planner.turn(context).await
-        };
-        budget_used.turns += 1; // R7: the plan turn counts against the budget.
-
-        // R8: emit exactly one TurnSpan for the plan turn. Mirrors the metrics
-        // path of run_react_inner; content capture intentionally omitted (the
-        // plan turn carries no tool calls and #64 content capture is wired in
-        // the ReAct loop only).
-        {
-            let zero = TokenUsage::default();
-            let u = match &result {
-                TurnResult::ToolCallRequested { usage, .. }
-                | TurnResult::FinalResponse { usage, .. } => usage,
-                TurnResult::Error { usage, .. } => usage.as_ref().unwrap_or(&zero),
-            };
-            let (stop_reason, tool_calls_requested) = match &result {
-                TurnResult::FinalResponse { .. } => (StopReason::EndTurn, 0),
-                TurnResult::ToolCallRequested { calls, .. } => {
-                    (StopReason::ToolUse, calls.len() as u32)
-                }
-                TurnResult::Error { .. } => (StopReason::EndTurn, 0),
-            };
-            let mut base = SpanBase::new_root(
-                SpanId::new(format!(
-                    "{}-turn-{}",
-                    session_id.as_str(),
-                    budget_used.turns
-                )),
-                session_id.clone(),
-                task.id.clone(),
-                SpanKind::Turn,
-                turn_started_at,
-            );
-            let status = match &result {
-                TurnResult::Error { error, .. } => SpanStatus::Error {
-                    message: format!("{error:?}"),
-                },
-                _ => SpanStatus::Ok,
-            };
-            base.finish(
-                Timestamp::now(),
-                status,
-                turn_clock.elapsed().as_millis() as u64,
-            );
-            if let Some(obs) = self.config.observability.as_ref() {
-                obs.emit_turn(TurnSpan {
-                    base,
-                    turn_number: budget_used.turns,
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cache_read_tokens: u.cache_read_tokens,
-                    cache_write_tokens: u.cache_write_tokens,
-                    cost_usd: self.config.pricing.cost_for(
-                        u.input_tokens,
-                        u.output_tokens,
-                        u.cache_read_tokens,
-                        u.cache_write_tokens,
-                    ),
-                    stop_reason,
-                    tool_calls_requested,
-                    output_text: None,
-                    tool_calls: None,
-                    input_messages: None,
-                });
-            }
-        }
-        Self::emit(
-            on_stream,
-            StreamEvent::TurnEnd {
-                turn: budget_used.turns,
-            },
-        );
-
-        // Classify the one-shot turn. R2: a tool call is a planning failure,
-        // NOT a dispatch loop.
-        let final_text = match result {
-            TurnResult::FinalResponse {
-                content, usage: u, ..
-            } => {
-                usage.add_turn(&u);
-                budget_used.input_tokens += u.input_tokens as u64;
-                budget_used.output_tokens += u.output_tokens as u64;
-                content
-            }
-            TurnResult::ToolCallRequested { usage: u, .. } => {
-                usage.add_turn(&u);
-                return Err(RunResult::Failure {
-                    reason: HaltReason::PlanPhaseFailed {
-                        error: crate::plan::PlanPhaseError::PlanningTurnFailed {
-                            message: "planner requested a tool call in the one-shot plan turn"
-                                .into(),
-                        },
-                    },
-                    session_id,
-                    usage,
-                    turns: budget_used.turns,
-                    session_state: session_state.clone(),
-                });
-            }
-            TurnResult::Error { error, usage: u } => {
-                if let Some(u) = u.as_ref() {
-                    usage.add_turn(u);
-                }
-                return Err(RunResult::Failure {
-                    reason: HaltReason::AgentError { error },
-                    session_id,
-                    usage,
-                    turns: budget_used.turns,
-                    session_state: session_state.clone(),
-                });
-            }
-        };
-
+    /// Capture + persist a [`PlanArtifact`] from the plan turn's output text
+    /// (#124): R3 (parse), R11 (fire `OnPlanCreated`, mutable), R4 (persist to the
+    /// RunStore under `PLAN_EXECUTE_EXTRAS_KEY`). The model turn that produced
+    /// `plan_output` ran elsewhere — the recursive `self.plan` child via
+    /// `self.plan.run(cx)` — so this carries no agent call. Returns the captured
+    /// artifact + accounting or a terminal failure to propagate.
+    async fn capture_and_persist_plan(
+        &self,
+        session_id: &SessionId,
+        plan_output: &str,
+        usage: AggregateUsage,
+        turns: u32,
+    ) -> Result<PlanPhaseOutcome, RunResult> {
         // R3: capture the artifact from the response text.
-        let mut artifact = match crate::plan::capture_plan_artifact(&final_text) {
+        let mut artifact = match crate::plan::capture_plan_artifact(plan_output) {
             Ok(a) => a,
             Err(e) => {
                 return Err(RunResult::Failure {
                     reason: HaltReason::PlanPhaseFailed { error: e },
-                    session_id,
+                    session_id: session_id.clone(),
                     usage,
-                    turns: budget_used.turns,
-                    session_state: session_state.clone(),
+                    turns,
+                    session_state: SessionState::default(),
                 });
             }
         };
@@ -7052,7 +6869,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
         // in place. The stored artifact reflects any mutation.
         if let Some(chain) = self.config.hooks.as_ref() {
             let mut ctx = crate::hooks::HookContext::OnPlanCreated {
-                session_id: &session_id,
+                session_id,
                 plan: &mut artifact,
             };
             // Errors are non-fatal: an observability/handler error must not lose
@@ -7072,7 +6889,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                     .config
                     .storage
                     .run()
-                    .put(&session_id, crate::plan::PLAN_EXECUTE_EXTRAS_KEY, value)
+                    .put(session_id, crate::plan::PLAN_EXECUTE_EXTRAS_KEY, value)
                     .await;
             }
             Err(e) => {
@@ -7082,10 +6899,10 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             message: format!("failed to serialize plan artifact: {e}"),
                         },
                     },
-                    session_id,
+                    session_id: session_id.clone(),
                     usage,
-                    turns: budget_used.turns,
-                    session_state: session_state.clone(),
+                    turns,
+                    session_state: SessionState::default(),
                 });
             }
         }
@@ -7093,8 +6910,42 @@ tool. Use the provided tool-call format to actually invoke the tool."
         Ok(PlanPhaseOutcome {
             artifact,
             usage,
-            turns: budget_used.turns,
+            turns,
         })
+    }
+
+    /// A.6 deep-resume reconcile (#124, Q2): mark every task already `Completed`
+    /// on the DURABLE RunStore checkpoint as `Completed` in the freshly-parsed
+    /// `task_list` so it is NOT re-run. Tasks are matched positionally by `id`
+    /// (the task list is regenerated deterministically from the same artifact).
+    /// Extracted from the legacy `run_execute_phase` so the recursive
+    /// [`PlanExecuteConfig::run`] owns the per-task loop while the durable-state
+    /// reconcile stays here.
+    async fn reconcile_deep_resume(
+        &self,
+        session_id: &SessionId,
+        task_list: &mut crate::tasklist::TaskList,
+    ) {
+        use crate::tasklist::TaskStatus;
+        if let Ok(Some(value)) = self
+            .config
+            .storage
+            .run()
+            .get(session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY)
+            .await
+        {
+            if let Ok(saved) = serde_json::from_value::<crate::tasklist::TaskList>(value) {
+                for t in &mut task_list.tasks {
+                    if saved
+                        .tasks
+                        .iter()
+                        .any(|s| s.id == t.id && s.status == TaskStatus::Completed)
+                    {
+                        t.status = TaskStatus::Completed;
+                    }
+                }
+            }
+        }
     }
 
     /// Run the post-compaction verify→retry→warn loop (issue #46/#29).
@@ -7334,38 +7185,86 @@ impl StrategyExecutor for StandardHarness {
         })
     }
 
-    fn plan_phase<'a>(
+    fn capture_plan_artifact<'a>(
         &'a self,
-        task: &'a Task,
-        session_state: &'a mut SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: &'a Option<StreamSink>,
+        session_id: &'a SessionId,
+        plan_output: &'a str,
+        usage: AggregateUsage,
+        turns: u32,
     ) -> BoxFut<'a, Result<PlanPhaseOutcome, RunResult>> {
         Box::pin(async move {
-            self.run_plan_phase(task, session_state, budget_used, on_stream)
+            self.capture_and_persist_plan(session_id, plan_output, usage, turns)
                 .await
         })
     }
 
-    fn execute_phase<'a>(
+    fn plan_directive(&self, instruction: &str) -> String {
+        StandardHarness::plan_directive(instruction)
+    }
+
+    fn run_plan_subtree<'a>(
         &'a self,
-        task: &'a Task,
-        session_state: &'a mut SessionState,
-        task_list: crate::tasklist::TaskList,
-        carried: BudgetSnapshot,
-        plan_usage: AggregateUsage,
-        on_stream: &'a Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult> {
+        plan: &'a LoopStrategy,
+        plan_task: Task,
+        plan_session: SessionState,
+        budget_used: BudgetSnapshot,
+    ) -> BoxFut<'a, Option<RunResult>> {
         Box::pin(async move {
-            self.run_execute_phase(
-                task,
-                session_state,
-                task_list,
-                carried,
-                plan_usage,
-                on_stream,
-            )
-            .await
+            // R5/R6: route the planner agent. When `planner_agent` is configured
+            // the plan child runs against an agent-swapped child harness (same
+            // pattern as the SelfVerifying evaluate phase); otherwise the default
+            // agent runs through `self`. Either way the child's `.run(cx)` drives
+            // the WHOLE plan loop (genuine recursion).
+            if let Some(planner) = self.config.planner_agent.as_ref() {
+                let mut plan_config = self.config.clone();
+                plan_config.agent = planner.clone();
+                let plan_harness = StandardHarness::new(plan_config);
+                let mut cx = ExecutionContext::new(&plan_harness.config.registry);
+                cx.executor = Some(&plan_harness);
+                cx.scratch.run_session = plan_session;
+                cx.scratch.run_budget = budget_used;
+                cx.scratch.task = Some(plan_task);
+                let _ = plan.run(&mut cx).await;
+                cx.scratch.terminal_override.take()
+            } else {
+                let mut cx = ExecutionContext::new(&self.config.registry);
+                cx.executor = Some(self);
+                cx.scratch.run_session = plan_session;
+                cx.scratch.run_budget = budget_used;
+                cx.scratch.task = Some(plan_task);
+                let _ = plan.run(&mut cx).await;
+                cx.scratch.terminal_override.take()
+            }
+        })
+    }
+
+    fn reconcile_completed_tasks<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        task_list: &'a mut crate::tasklist::TaskList,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.reconcile_deep_resume(session_id, task_list).await;
+        })
+    }
+
+    fn fire_task_advance<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        step_task: &'a mut Task,
+        task_index: usize,
+        total_tasks: usize,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            if let Some(chain) = self.config.hooks.as_ref() {
+                let mut ctx = crate::hooks::HookContext::OnTaskAdvance {
+                    session_id,
+                    task: step_task,
+                    task_index,
+                    total_tasks,
+                };
+                let _ = chain.fire(&mut ctx).await;
+            }
         })
     }
 
@@ -8766,6 +8665,250 @@ mod strategy_tests {
             "CHILD_PAUSED_STATE={}",
             serde_json::to_string(&cps).unwrap()
         );
+    }
+}
+
+/// Test-only seams (#124) that drive the GENUINE recursive plan / execute
+/// phases of [`PlanExecuteConfig::run`] in isolation, so the granular plan/
+/// execute regression tests exercise the real per-task `self.plan.run(cx)` /
+/// `self.execute.run(cx)` dispatch — not a stale parallel copy. The phase logic
+/// lives ONLY in [`PlanExecuteConfig::run`]; these helpers reproduce the minimal
+/// driver around a single phase using the same scratch wiring + leaf primitives.
+#[cfg(test)]
+impl StandardHarness {
+    /// Drive the recursive plan phase for `task` (whose strategy must be a
+    /// `PlanExecute`): seed the directive, dispatch `plan.run(cx)` capped at one
+    /// turn, then capture + persist the artifact. Mirrors the plan half of
+    /// [`PlanExecuteConfig::run`].
+    async fn run_plan_phase(
+        &self,
+        task: &Task,
+        session_state: &mut SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: &Option<StreamSink>,
+    ) -> Result<PlanPhaseOutcome, RunResult> {
+        let LoopStrategy::PlanExecute(cfg) = &task.loop_strategy else {
+            panic!("run_plan_phase test helper requires a PlanExecute strategy");
+        };
+        let plan_strategy = (*cfg.plan).clone();
+        let session_id = task.session_id.clone();
+
+        let directive = Self::plan_directive(&task.instruction);
+        let mut plan_session = session_state.clone();
+        self.config
+            .context_manager
+            .append_user_message(&mut plan_session, &directive)
+            .await;
+        let _ = on_stream;
+        let plan_cap = match task.budget.max_turns {
+            Some(global) => global.min(budget_used.turns.saturating_add(1)),
+            None => budget_used.turns.saturating_add(1),
+        };
+        let plan_task = Task {
+            id: task.id.clone(),
+            instruction: directive,
+            session_id: session_id.clone(),
+            budget: BudgetLimits {
+                max_turns: Some(plan_cap),
+                ..task.budget.clone()
+            },
+            loop_strategy: plan_strategy.clone(),
+        };
+
+        let plan_result = self
+            .run_plan_subtree(&plan_strategy, plan_task, plan_session, budget_used.clone())
+            .await;
+        let (plan_output, usage, turns) = match plan_result {
+            Some(RunResult::Success {
+                output,
+                usage,
+                turns,
+                ..
+            }) => (output, usage, turns),
+            Some(other) => return Err(other),
+            None => {
+                return Err(RunResult::Failure {
+                    reason: HaltReason::PlanPhaseFailed {
+                        error: crate::plan::PlanPhaseError::PlanningTurnFailed {
+                            message: "plan sub-strategy produced no terminal".into(),
+                        },
+                    },
+                    session_id,
+                    usage: AggregateUsage::default(),
+                    turns: budget_used.turns,
+                    session_state: SessionState::default(),
+                })
+            }
+        };
+        self.capture_and_persist_plan(&session_id, &plan_output, usage, turns)
+            .await
+    }
+
+    /// Drive the recursive execute phase for `task` (whose strategy must be a
+    /// `PlanExecute`), draining `task_list` by dispatching `execute.run(cx)` per
+    /// task. Mirrors the execute half of [`PlanExecuteConfig::run`].
+    async fn run_execute_phase(
+        &self,
+        task: &Task,
+        session_state: &mut SessionState,
+        mut task_list: crate::tasklist::TaskList,
+        mut carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: &Option<StreamSink>,
+    ) -> RunResult {
+        use crate::tasklist::TaskStatus;
+        let LoopStrategy::PlanExecute(cfg) = &task.loop_strategy else {
+            panic!("run_execute_phase test helper requires a PlanExecute strategy");
+        };
+        let execute_strategy = (*cfg.execute).clone();
+        let session_id = task.session_id.clone();
+
+        self.reconcile_deep_resume(&session_id, &mut task_list)
+            .await;
+
+        let total_tasks = task_list.tasks.len();
+        let mut total_usage = plan_usage;
+        let mut last_output = String::new();
+        let mut last_state = SessionState::default();
+        let global_max_turns = task.budget.max_turns;
+
+        for index in 0..total_tasks {
+            let task_id = task_list.tasks[index].id;
+            let instruction = task_list.tasks[index].description.clone();
+
+            if task_list.tasks[index].status == TaskStatus::Completed {
+                last_output = instruction.clone();
+                continue;
+            }
+
+            let remaining_tasks = (total_tasks - index) as u32;
+            let per_task_turns = match global_max_turns {
+                Some(max) => (max.saturating_sub(carried.turns) / remaining_tasks).max(1),
+                None => u32::MAX,
+            };
+            let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
+            let step_cap = match global_max_turns {
+                Some(global) => global.min(sub_loop_cap),
+                None => sub_loop_cap,
+            };
+
+            let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
+            self.persist_task_list(&session_id, &task_list).await;
+
+            let mut step_task = Task {
+                id: task.id.clone(),
+                instruction,
+                session_id: session_id.clone(),
+                budget: BudgetLimits {
+                    max_turns: Some(step_cap),
+                    ..task.budget.clone()
+                },
+                loop_strategy: execute_strategy.clone(),
+            };
+            if let Some(chain) = self.config.hooks.as_ref() {
+                let mut ctx = crate::hooks::HookContext::OnTaskAdvance {
+                    session_id: &session_id,
+                    task: &mut step_task,
+                    task_index: index,
+                    total_tasks,
+                };
+                let _ = chain.fire(&mut ctx).await;
+            }
+
+            self.config
+                .context_manager
+                .append_user_message(session_state, &step_task.instruction)
+                .await;
+
+            let mut cx = ExecutionContext::new(&self.config.registry);
+            cx.executor = Some(self);
+            cx.scratch.run_session = session_state.clone();
+            cx.scratch.run_budget = carried.clone();
+            cx.scratch.task = Some(step_task);
+            let _ = execute_strategy.run(&mut cx).await;
+            let sub_result = cx.take_child_override();
+
+            match sub_result {
+                Some(RunResult::Success {
+                    output,
+                    usage,
+                    turns,
+                    session_state: step_state,
+                    ..
+                }) => {
+                    carried.turns = turns;
+                    *session_state = step_state;
+                    last_state = session_state.clone();
+                    carried.input_tokens += usage.input_tokens;
+                    carried.output_tokens += usage.output_tokens;
+                    total_usage.input_tokens += usage.input_tokens;
+                    total_usage.output_tokens += usage.output_tokens;
+                    total_usage.cache_read_tokens += usage.cache_read_tokens;
+                    total_usage.cache_write_tokens += usage.cache_write_tokens;
+                    total_usage.cost_usd += usage.cost_usd;
+                    last_output = output;
+                    let _ = task_list.complete(task_id);
+                    self.persist_task_list(&session_id, &task_list).await;
+                    Self::emit(
+                        on_stream,
+                        StreamEvent::FinalResponse {
+                            content: last_output.clone(),
+                        },
+                    );
+                }
+                Some(RunResult::Failure {
+                    reason,
+                    usage,
+                    turns,
+                    ..
+                }) => {
+                    total_usage.input_tokens += usage.input_tokens;
+                    total_usage.output_tokens += usage.output_tokens;
+                    total_usage.cache_read_tokens += usage.cache_read_tokens;
+                    total_usage.cache_write_tokens += usage.cache_write_tokens;
+                    total_usage.cost_usd += usage.cost_usd;
+                    let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
+                    self.persist_task_list(&session_id, &task_list).await;
+                    let terminal_reason = match reason {
+                        HaltReason::BudgetExceeded { .. } => reason,
+                        other => HaltReason::StepFailed {
+                            task_index: index,
+                            task: task_list.tasks[index].description.clone(),
+                            reason: format!("{other:?}"),
+                        },
+                    };
+                    return RunResult::Failure {
+                        reason: terminal_reason,
+                        session_id,
+                        usage: total_usage,
+                        turns,
+                        session_state: last_state,
+                    };
+                }
+                Some(pause) => return pause,
+                None => {
+                    return RunResult::Failure {
+                        reason: HaltReason::StepFailed {
+                            task_index: index,
+                            task: task_list.tasks[index].description.clone(),
+                            reason: "execute sub-strategy produced no terminal".into(),
+                        },
+                        session_id,
+                        usage: total_usage,
+                        turns: carried.turns,
+                        session_state: last_state,
+                    }
+                }
+            }
+        }
+
+        RunResult::Success {
+            output: last_output,
+            session_id,
+            usage: total_usage,
+            turns: carried.turns,
+            session_state: last_state,
+        }
     }
 }
 
@@ -10825,10 +10968,16 @@ mod tests {
         assert_eq!(stored, outcome.artifact);
     }
 
-    // R2: a tool call in the one-shot plan turn is a planning failure — no
-    // dispatch loop runs (tool registry is never hit).
+    // #124 recursion seam (was R2): the plan phase now dispatches the genuine
+    // `self.plan` child (a ReAct loop) capped at ONE turn. A plan turn that
+    // requests a tool instead of emitting the JSON plan cannot complete in its
+    // single turn, so the plan child halts (budget) and the plan phase propagates
+    // a terminal Failure WITHOUT capturing/storing an artifact. (The old one-shot
+    // primitive special-cased a tool call as `PlanningTurnFailed`; under genuine
+    // recursion the cap is what stops the loop — the observable contract that a
+    // non-plan plan turn fails the run and stores nothing is preserved.)
     #[tokio::test]
-    async fn plan_phase_tool_call_is_planning_failure() {
+    async fn plan_phase_tool_call_fails_and_stores_no_artifact() {
         let a = make_agent();
         a.push(TurnResult::ToolCallRequested {
             reasoning: None,
@@ -10840,6 +10989,10 @@ mod tests {
             usage: usage(),
         });
         let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::Success {
+            content: "ok".into(),
+            truncated: false,
+        });
         let mut cfg = standard_config(a);
         cfg.tool_registry = reg.clone();
         let h = StandardHarness::new(cfg);
@@ -10848,23 +11001,13 @@ mod tests {
         let err = h
             .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
             .await
-            .expect_err("tool call fails the plan phase");
-        match err {
-            RunResult::Failure {
-                reason:
-                    HaltReason::PlanPhaseFailed {
-                        error: PlanPhaseError::PlanningTurnFailed { .. },
-                    },
-                ..
-            } => {}
-            other => panic!("expected PlanningTurnFailed, got {other:?}"),
-        }
-        // No dispatch loop: registry never called, nothing stored.
-        assert_eq!(
-            reg.call_count.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "tool registry must not be dispatched in the plan turn"
+            .expect_err("a tool-only plan turn fails the plan phase");
+        // The plan child never emitted a JSON plan, so the run halts terminally.
+        assert!(
+            matches!(err, RunResult::Failure { .. }),
+            "expected a terminal Failure, got {err:?}"
         );
+        // Nothing captured/stored: no artifact reached the RunStore.
         assert!(h
             .storage()
             .run()
@@ -11922,6 +12065,63 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "default agent ran exactly the execute step"
+        );
+    }
+
+    // #124 REGRESSION-PROOF: a NON-ReAct execute child genuinely runs per task.
+    //
+    // `PlanExecute[plan: ReAct, execute: SelfVerifying[ReAct]]` over a 2-task
+    // plan. The execute child is SelfVerifying — its build↔evaluate loop runs
+    // ONCE PER TASK, so the `ScriptedVerifier` is invoked exactly twice (once per
+    // task). The pre-#124 implementation hardcoded a flat ReAct sub-loop in
+    // `run_execute_phase` and silently DROPPED the SelfVerifying child — the
+    // verifier would have been invoked ZERO times. This proves `self.execute` is
+    // dispatched via `.run(cx)` and a non-ReAct child genuinely executes.
+    #[tokio::test]
+    async fn plan_execute_runs_non_react_execute_child_per_task() {
+        // cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["t0","t1"],"rationale":"r"}"#));
+        a.push(final_resp("built t0"));
+        a.push(final_resp("built t1"));
+        // The evaluate phase runs on a distinct agent.
+        let eval = RecordingTurnAgent::new(
+            "eval",
+            vec![
+                RecordingTurnAgent::final_resp("PASS"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
+        // The verifier records every invocation; PASS each time.
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed(), passed()], passed(), 3));
+        let mut cfg = standard_config(a);
+        cfg.evaluator_agent = Some(eval);
+        cfg.verifier = Some(verifier.clone());
+        let h = StandardHarness::new(cfg);
+
+        // The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+                evaluator: SchemaRef(String::new()),
+            })),
+            plan_model: None,
+        }));
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "built t1", "Q2: last step's final output");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // The smoking gun: the SelfVerifying evaluator ran ONCE PER TASK (2x).
+        // A dropped execute child would record ZERO verifier invocations.
+        assert_eq!(
+            verifier.seen.lock().unwrap().len(),
+            2,
+            "the SelfVerifying execute child must run its evaluator once per task"
         );
     }
 
