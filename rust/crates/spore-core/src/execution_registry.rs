@@ -373,8 +373,8 @@ mod tests {
     struct StubStrategy;
 
     impl RunStrategy for StubStrategy {
-        fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-            Box::pin(async { StrategyOutcome::Pending })
+        fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+            Box::pin(async { StrategyOutcome::Complete(String::new()) })
         }
     }
 

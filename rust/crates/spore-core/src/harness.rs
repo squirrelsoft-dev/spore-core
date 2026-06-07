@@ -486,26 +486,290 @@ pub enum StrategyRef {
     Custom(String),
 }
 
-/// Placeholder for #119; full shape owned by #123 (StrategyOutcome +
-/// ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
-/// pre-build #123's BudgetStack/AggregateUsage/etc here.
-#[derive(Debug, Default)]
-pub struct ExecutionContext {}
+// ============================================================================
+// Composable Execution runtime scaffold (issue #123): StrategyOutcome +
+// ExecutionContext / BudgetContext / BudgetStack / SpanStack.
+// ============================================================================
+//
+// SCAFFOLD ONLY. This slice establishes the typed strategy outcome and the
+// shared, mutable runtime context that threads through a nested strategy tree.
+// `charge` here is PURE ARITHMETIC against a per-scope step allowance — the
+// behavior-chain walk, continue-consumption, and persistence are the later
+// budget-enforcement slice (#124+).
+//
+// Types defined in this section:
+//   - `StrategyOutcome` — typed result a strategy node returns.
+//   - `BudgetExhausted` — the error type `BudgetContext::charge` returns.
+//   - `BudgetContext` — one budget scope (`charge`/`remaining`/
+//     `continues_remaining`).
+//   - `BudgetStack` — runtime push/pop stack of `BudgetContext`, one node per
+//     recursion frame (siblings do NOT share).
+//   - `SpanStack` — runtime push/pop stack of `observability::SpanId`.
+//   - `ExecutionContext<'a>` — the one shared, mutable context for a whole
+//     nested tree; borrows the [`ExecutionRegistry`].
+//
+// Trait methods (updated this slice):
+//   - `RunStrategy::run<'a>(&'a self, &'a mut ExecutionContext<'_>) ->
+//     BoxFut<'a, StrategyOutcome>` — the `ExecutionContext` now carries the
+//     real runtime scaffold and a borrowed registry lifetime.
+//
+// Rules enforced:
+//   - A child's `StrategyOutcome::BudgetExhausted` is an INSPECTABLE value the
+//     parent reads; it does NOT auto-propagate.
+//   - `charge` is pure arithmetic: it debits `turns` steps; on success
+//     increments `steps_taken` and returns `Ok(())`; on overflow returns
+//     `Err(BudgetExhausted{..})` from current state. It does NOT walk the
+//     behavior chain or consume continues. `BudgetPolicy::Unlimited` never
+//     exhausts.
+//   - Each `BudgetContext` represents ONE scope; the allowance is the policy's
+//     own `value` (Unlimited = no cap → `None`).
+//   - All runtime types here are NEVER serialized (no serde derives). Rust
+//     cannot assert the *absence* of a `Serialize` impl via a negative trait
+//     bound, so this is structural-only, not test-asserted.
+//
+// Resolved spec ambiguities (DECIDED — see issue #123 plan):
+//   1. `ExecutionContext<'a>` borrows the registry (`&'a ExecutionRegistry`);
+//      the `RunStrategy` trait + all impls thread the context lifetime.
+//      `Arc<dyn RunStrategy>` stays dyn-compatible.
+//   2. `charge` is pure arithmetic (above); `BudgetExhausted` is a dedicated
+//      struct used as charge's error; `StrategyOutcome::BudgetExhausted` is a
+//      struct variant that mirrors those fields and adds `partial_output`
+//      (modeled as a struct variant rather than wrapping, so callers can match
+//      and read all fields uniformly). `Output` maps to `String`.
+//   3. `continues_used` is an IN-MEMORY field ONLY in this slice. Its "rides a
+//      Continue/Escalate checkpoint" persistence is DEFERRED to the
+//      enforcement slice — it is intentionally NOT added to
+//      `BudgetSnapshot`/`PausedState` here.
+//   4. `SpanStack` reuses [`observability::SpanId`](crate::observability::SpanId)
+//      as its element type.
+//
+// No `// SPEC QUESTION:` markers — the plan is fully pinned.
 
-/// Placeholder for #119; full shape owned by #123 (StrategyOutcome +
-/// ExecutionContext runtime scaffold). The stub `run` bodies return
-/// [`StrategyOutcome::Pending`] so the trait compiles without a panic.
+/// The typed result a strategy node returns. Runtime-only (NOT serialized): a
+/// strategy outcome is an in-process value, never persisted.
+///
+/// `BudgetExhausted` is distinguishable from `Failed` by callers — a child's
+/// `BudgetExhausted` is a value the parent INSPECTS (e.g. to grant a continue
+/// or escalate); it does NOT auto-propagate as a failure. `Output` maps to
+/// `String` in this codebase (mirrors [`RunResult`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrategyOutcome {
-    /// Per-variant execution is not yet implemented (#124). Stub marker only.
-    Pending,
+    /// The strategy completed and produced its final output.
+    Complete(String),
+    /// The strategy's budget scope ran out of allowance. Mirrors the
+    /// [`BudgetExhausted`] charge-error fields and adds `partial_output` — any
+    /// output produced before exhaustion. Inspectable, NOT auto-propagating.
+    BudgetExhausted {
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        steps_taken: u32,
+        continues_used: u32,
+        phase: String,
+        partial_output: Option<String>,
+    },
+    /// The strategy halted with a harness error.
+    Failed(HarnessError),
+}
+
+/// The error [`BudgetContext::charge`] returns when a debit would exceed the
+/// scope's step allowance. Captures the budget state at the moment of
+/// exhaustion. Runtime-only (NOT serialized).
+///
+/// Promotes to [`StrategyOutcome::BudgetExhausted`] (which adds
+/// `partial_output`) at the strategy boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetExhausted {
+    pub policy: BudgetPolicy,
+    pub behavior: BudgetExhaustedBehavior,
+    pub steps_taken: u32,
+    pub continues_used: u32,
+    pub phase: String,
+}
+
+/// One budget scope in the strategy tree. Each recursion node gets its OWN
+/// `BudgetContext`; siblings do NOT share. Runtime-only (NOT serialized).
+///
+/// The per-scope step allowance is the policy's own `value`:
+/// `TotalSteps`/`PerLoop`/`PerAttempt` all expose `value` as the cap for this
+/// scope; `Unlimited` is uncapped (`remaining()` → `None`).
+///
+/// `continues_used` is an in-memory field ONLY in this slice; its checkpoint
+/// persistence is deferred to the enforcement slice (see section header,
+/// resolution #3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetContext {
+    pub policy: BudgetPolicy,
+    pub behavior: BudgetExhaustedBehavior,
+    pub steps_taken: u32,
+    pub continues_used: u32,
+    pub phase: String,
+}
+
+impl BudgetContext {
+    /// Construct a fresh scope (zeroed counters) for `policy`/`behavior`/`phase`.
+    pub fn new(
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        phase: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy,
+            behavior,
+            steps_taken: 0,
+            continues_used: 0,
+            phase: phase.into(),
+        }
+    }
+
+    /// The per-scope step allowance (`None` for `Unlimited`).
+    fn allowance(&self) -> Option<u32> {
+        match self.policy {
+            BudgetPolicy::Unlimited => None,
+            BudgetPolicy::TotalSteps { value }
+            | BudgetPolicy::PerLoop { value }
+            | BudgetPolicy::PerAttempt { value } => Some(value),
+        }
+    }
+
+    /// Debit `turns` steps against the scope allowance (pure arithmetic — see
+    /// section header, resolution #2). On success increments `steps_taken` and
+    /// returns `Ok(())`. If the debit would exceed the allowance, returns
+    /// `Err(BudgetExhausted{..})` from current state WITHOUT mutating. Does NOT
+    /// walk the behavior chain or consume continues. `Unlimited` never exhausts.
+    pub fn charge(&mut self, turns: u32) -> Result<(), BudgetExhausted> {
+        if let Some(allowance) = self.allowance() {
+            if self.steps_taken.saturating_add(turns) > allowance {
+                return Err(BudgetExhausted {
+                    policy: self.policy.clone(),
+                    behavior: self.behavior.clone(),
+                    steps_taken: self.steps_taken,
+                    continues_used: self.continues_used,
+                    phase: self.phase.clone(),
+                });
+            }
+        }
+        self.steps_taken = self.steps_taken.saturating_add(turns);
+        Ok(())
+    }
+
+    /// Steps left in this scope (`allowance - steps_taken`, saturating).
+    /// `None` for `Unlimited` (no cap).
+    pub fn remaining(&self) -> Option<u32> {
+        self.allowance().map(|a| a.saturating_sub(self.steps_taken))
+    }
+
+    /// Continues left before fall-through. For a `Continue { max_continues }`
+    /// behavior this is `max_continues - continues_used` (saturating); for
+    /// `Escalate`/`Fail` there are no continues, so `0`.
+    pub fn continues_remaining(&self) -> u32 {
+        match self.behavior {
+            BudgetExhaustedBehavior::Continue { max_continues, .. } => {
+                max_continues.saturating_sub(self.continues_used)
+            }
+            BudgetExhaustedBehavior::Escalate | BudgetExhaustedBehavior::Fail => 0,
+        }
+    }
+}
+
+/// Runtime push/pop stack of [`BudgetContext`] scopes — one node per recursion
+/// frame, pushed on descent and popped on ascent. Runtime-only (NOT
+/// serialized). Siblings get DISTINCT contexts and do not share state.
+#[derive(Debug, Default)]
+pub struct BudgetStack {
+    pub stack: Vec<BudgetContext>,
+}
+
+impl BudgetStack {
+    /// Push a new scope onto the stack.
+    pub fn push(&mut self, cx: BudgetContext) {
+        self.stack.push(cx);
+    }
+
+    /// Pop the current scope, returning it (if any).
+    pub fn pop(&mut self) -> Option<BudgetContext> {
+        self.stack.pop()
+    }
+
+    /// The current (innermost) scope, mutably.
+    pub fn current_mut(&mut self) -> Option<&mut BudgetContext> {
+        self.stack.last_mut()
+    }
+
+    /// The current stack depth (recursion frames active).
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+}
+
+/// Runtime push/pop stack of [`observability::SpanId`](crate::observability::SpanId)
+/// (resolution #4). Runtime-only (NOT serialized).
+#[derive(Debug, Default)]
+pub struct SpanStack {
+    pub stack: Vec<SpanId>,
+}
+
+impl SpanStack {
+    /// Push a span id onto the stack.
+    pub fn push(&mut self, id: SpanId) {
+        self.stack.push(id);
+    }
+
+    /// Pop the current span id, returning it (if any).
+    pub fn pop(&mut self) -> Option<SpanId> {
+        self.stack.pop()
+    }
+
+    /// The current stack depth.
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+}
+
+/// The one shared, mutable runtime context threaded through a whole nested
+/// strategy tree. Borrows the [`ExecutionRegistry`] for the duration of the
+/// run (`'a`). Runtime-only — NOT serialized.
+///
+/// `stream` holds an optional boxed `dyn Fn` [`StreamSink`], which is neither
+/// `Debug` nor `Clone`; like [`HarnessRunOptions`] this type therefore does not
+/// derive `Debug`.
+pub struct ExecutionContext<'a> {
+    /// Borrowed handle registry (agents/toolsets/schemas/custom strategies).
+    pub registry: &'a ExecutionRegistry,
+    /// Per-scope budget stack, pushed/popped through recursion.
+    pub budgets: BudgetStack,
+    /// Aggregated token/cost usage across the whole tree.
+    pub usage: AggregateUsage,
+    /// Conversation/session state round-tripped across the tree.
+    pub session: SessionState,
+    /// Span stack for observability nesting.
+    pub spans: SpanStack,
+    /// Optional streaming sink for emitted events.
+    pub stream: Option<StreamSink>,
+}
+
+impl<'a> ExecutionContext<'a> {
+    /// A fresh context bound to `registry`, with empty stacks and default
+    /// usage/session and no stream sink.
+    pub fn new(registry: &'a ExecutionRegistry) -> Self {
+        Self {
+            registry,
+            budgets: BudgetStack::default(),
+            usage: AggregateUsage::default(),
+            session: SessionState::default(),
+            spans: SpanStack::default(),
+            stream: None,
+        }
+    }
 }
 
 /// The runtime composition seam: every strategy node knows how to run itself
 /// given an [`ExecutionContext`]. Implemented once on [`LoopStrategy`] as the
 /// ONLY `match` site — one-line delegation per arm to the inner config's
-/// `run`. Each `*Config` impl is a STUB (returns [`StrategyOutcome::Pending`])
-/// pending #124.
+/// `run`. Each `*Config` impl is a STUB pending the per-variant executor slice
+/// (#124): it returns `StrategyOutcome::Complete(String::new())` — a benign,
+/// matchable placeholder (NOT panic/unimplemented/todo, which CONVENTIONS
+/// forbids outside `cfg(test)`). The old `StrategyOutcome::Pending` marker is
+/// removed this slice.
 ///
 /// Uses the hand-rolled [`BoxFut`] return shape (NOT `trait_variant::make`) so
 /// that `Arc<dyn RunStrategy>` is dyn-compatible — the
@@ -513,11 +777,11 @@ pub enum StrategyOutcome {
 /// (#120) stores trait objects keyed by `StrategyRef::Custom` key. This trait is
 /// never serialized, so the dyn-safe shape has no wire impact.
 pub trait RunStrategy: Send + Sync {
-    fn run<'a>(&'a self, cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome>;
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome>;
 }
 
 impl RunStrategy for LoopStrategy {
-    fn run<'a>(&'a self, cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         match self {
             LoopStrategy::ReAct(c) => c.run(cx),
             LoopStrategy::PlanExecute(c) => c.run(cx),
@@ -529,32 +793,32 @@ impl RunStrategy for LoopStrategy {
 }
 
 impl RunStrategy for ReactConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Pending })
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Complete(String::new()) })
     }
 }
 
 impl RunStrategy for PlanExecuteConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Pending })
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Complete(String::new()) })
     }
 }
 
 impl RunStrategy for SelfVerifyingConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Pending })
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Complete(String::new()) })
     }
 }
 
 impl RunStrategy for RalphConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Pending })
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Complete(String::new()) })
     }
 }
 
 impl RunStrategy for HillClimbingConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Pending })
+    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async { StrategyOutcome::Complete(String::new()) })
     }
 }
 
@@ -7897,7 +8161,7 @@ mod strategy_tests {
     }
 
     #[test]
-    fn stub_run_returns_pending_not_panic() {
+    fn stub_run_returns_complete_not_panic() {
         let strategies = vec![
             LoopStrategy::ReAct(ReactConfig::per_loop(1)),
             LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
@@ -7919,10 +8183,11 @@ mod strategy_tests {
             }),
         ];
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let registry = ExecutionRegistry::empty();
         for s in &strategies {
-            let mut cx = ExecutionContext::default();
+            let mut cx = ExecutionContext::new(&registry);
             let outcome = rt.block_on(s.run(&mut cx));
-            assert_eq!(outcome, StrategyOutcome::Pending);
+            assert_eq!(outcome, StrategyOutcome::Complete(String::new()));
         }
     }
 
@@ -14801,5 +15066,248 @@ mod tests {
                 other => panic!("expected Failure, got {other:?}"),
             }
         }
+    }
+}
+
+// ============================================================================
+// Composable Execution runtime scaffold tests (issue #123)
+// ============================================================================
+//
+// NOTE: "runtime types are never serialized" (no `Serialize`/`Deserialize`
+// impl) cannot be asserted with a Rust negative trait bound — there is no
+// stable way to test for the ABSENCE of a trait impl. It is enforced
+// structurally (the types simply derive no serde traits), not by a test here.
+// No fixtures are added for this slice: every type defined here is runtime-only
+// and never crosses the wire, so there is nothing to byte-compare across
+// languages.
+#[cfg(test)]
+mod execution_scaffold_tests {
+    use super::*;
+    use crate::execution_registry::ExecutionRegistry;
+    use crate::observability::SpanId;
+
+    fn continue_behavior(max_continues: u32) -> BudgetExhaustedBehavior {
+        BudgetExhaustedBehavior::Continue {
+            max_continues,
+            on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+        }
+    }
+
+    // ---- charge: within allowance increments steps_taken -------------------
+
+    #[test]
+    fn charge_within_allowance_increments_steps() {
+        let mut cx = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 5 },
+            BudgetExhaustedBehavior::Fail,
+            "loop",
+        );
+        assert!(cx.charge(2).is_ok());
+        assert_eq!(cx.steps_taken, 2);
+        assert!(cx.charge(3).is_ok()); // exactly to the cap
+        assert_eq!(cx.steps_taken, 5);
+        assert_eq!(cx.remaining(), Some(0));
+    }
+
+    // ---- charge: overflow returns Err with correct fields, no mutation -----
+
+    #[test]
+    fn charge_overflow_returns_err_with_state_and_no_mutation() {
+        let mut cx = BudgetContext::new(
+            BudgetPolicy::TotalSteps { value: 3 },
+            continue_behavior(2),
+            "phase-x",
+        );
+        assert!(cx.charge(3).is_ok());
+        let err = cx.charge(1).expect_err("debit past cap must exhaust");
+        assert_eq!(
+            err,
+            BudgetExhausted {
+                policy: BudgetPolicy::TotalSteps { value: 3 },
+                behavior: continue_behavior(2),
+                steps_taken: 3,
+                continues_used: 0,
+                phase: "phase-x".to_string(),
+            }
+        );
+        // state unchanged on failure
+        assert_eq!(cx.steps_taken, 3);
+    }
+
+    // ---- charge: Unlimited never exhausts ----------------------------------
+
+    #[test]
+    fn charge_unlimited_never_exhausts() {
+        let mut cx = BudgetContext::new(
+            BudgetPolicy::Unlimited,
+            BudgetExhaustedBehavior::Fail,
+            "root",
+        );
+        assert!(cx.charge(u32::MAX).is_ok());
+        assert!(cx.charge(100).is_ok());
+        assert_eq!(cx.remaining(), None);
+    }
+
+    // ---- remaining(): capped + Unlimited -----------------------------------
+
+    #[test]
+    fn remaining_capped_and_unlimited() {
+        let mut capped = BudgetContext::new(
+            BudgetPolicy::PerAttempt { value: 10 },
+            BudgetExhaustedBehavior::Fail,
+            "attempt",
+        );
+        assert_eq!(capped.remaining(), Some(10));
+        capped.charge(4).unwrap();
+        assert_eq!(capped.remaining(), Some(6));
+
+        let unlimited =
+            BudgetContext::new(BudgetPolicy::Unlimited, BudgetExhaustedBehavior::Fail, "u");
+        assert_eq!(unlimited.remaining(), None);
+    }
+
+    // ---- continues_remaining(): Continue / Escalate / Fail -----------------
+
+    #[test]
+    fn continues_remaining_per_behavior() {
+        let mut cont = BudgetContext::new(BudgetPolicy::Unlimited, continue_behavior(3), "c");
+        assert_eq!(cont.continues_remaining(), 3);
+        cont.continues_used = 2;
+        assert_eq!(cont.continues_remaining(), 1);
+        cont.continues_used = 5; // saturates
+        assert_eq!(cont.continues_remaining(), 0);
+
+        let esc = BudgetContext::new(
+            BudgetPolicy::Unlimited,
+            BudgetExhaustedBehavior::Escalate,
+            "e",
+        );
+        assert_eq!(esc.continues_remaining(), 0);
+
+        let fail = BudgetContext::new(BudgetPolicy::Unlimited, BudgetExhaustedBehavior::Fail, "f");
+        assert_eq!(fail.continues_remaining(), 0);
+    }
+
+    // ---- StrategyOutcome variant discrimination ----------------------------
+
+    #[test]
+    fn strategy_outcome_budget_exhausted_distinct_from_failed() {
+        let exhausted = StrategyOutcome::BudgetExhausted {
+            policy: BudgetPolicy::PerLoop { value: 1 },
+            behavior: BudgetExhaustedBehavior::Fail,
+            steps_taken: 1,
+            continues_used: 0,
+            phase: "p".to_string(),
+            partial_output: Some("partial".to_string()),
+        };
+        let failed = StrategyOutcome::Failed(HarnessError::InvalidConfiguration("boom".into()));
+        let complete = StrategyOutcome::Complete("done".to_string());
+
+        // A BudgetExhausted is NOT a Failed — callers can distinguish.
+        assert!(matches!(exhausted, StrategyOutcome::BudgetExhausted { .. }));
+        assert!(!matches!(exhausted, StrategyOutcome::Failed(_)));
+        assert!(matches!(failed, StrategyOutcome::Failed(_)));
+        assert!(matches!(complete, StrategyOutcome::Complete(_)));
+    }
+
+    // ---- SpanStack push/pop depth ------------------------------------------
+
+    #[test]
+    fn span_stack_push_pop_depth() {
+        let mut spans = SpanStack::default();
+        assert_eq!(spans.depth(), 0);
+        spans.push(SpanId::new("a"));
+        spans.push(SpanId::new("b"));
+        assert_eq!(spans.depth(), 2);
+        assert_eq!(spans.pop(), Some(SpanId::new("b")));
+        assert_eq!(spans.depth(), 1);
+    }
+
+    // ---- recursive stub strategy threads ExecutionContext + BudgetStack ----
+
+    /// A recursive stub: pushes its own scope, optionally recurses, then pops —
+    /// modeling how a combinator threads the shared context and gives each node
+    /// (incl. siblings) its OWN BudgetContext.
+    struct RecursiveStub {
+        children: Vec<RecursiveStub>,
+        value: u32,
+    }
+
+    impl RunStrategy for RecursiveStub {
+        fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+            Box::pin(async move {
+                let baseline = cx.budgets.depth();
+                cx.budgets.push(BudgetContext::new(
+                    BudgetPolicy::PerLoop { value: self.value },
+                    BudgetExhaustedBehavior::Fail,
+                    "node",
+                ));
+                // charge against this node's own scope
+                if let Some(scope) = cx.budgets.current_mut() {
+                    let _ = scope.charge(1);
+                }
+                for child in &self.children {
+                    let _ = child.run(cx).await;
+                }
+                // pop our scope; depth returns to baseline
+                cx.budgets.pop();
+                assert_eq!(cx.budgets.depth(), baseline);
+                StrategyOutcome::Complete(String::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_stub_threads_context_stack_returns_to_baseline() {
+        let registry = ExecutionRegistry::empty();
+        let mut cx = ExecutionContext::new(&registry);
+        assert_eq!(cx.budgets.depth(), 0);
+
+        let tree = RecursiveStub {
+            value: 4,
+            children: vec![
+                RecursiveStub {
+                    value: 2,
+                    children: vec![],
+                },
+                RecursiveStub {
+                    value: 3,
+                    children: vec![],
+                },
+            ],
+        };
+
+        let outcome = tree.run(&mut cx).await;
+        assert!(matches!(outcome, StrategyOutcome::Complete(_)));
+        // stack fully unwound after the recursive run
+        assert_eq!(cx.budgets.depth(), 0);
+        // the shared usage/session/spans are reachable through one context
+        assert_eq!(cx.spans.depth(), 0);
+    }
+
+    // ---- siblings get distinct BudgetContexts ------------------------------
+
+    #[test]
+    fn siblings_get_distinct_budget_contexts() {
+        let mut budgets = BudgetStack::default();
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 5 },
+            BudgetExhaustedBehavior::Fail,
+            "sib-a",
+        ));
+        // mutate sibling A
+        budgets.current_mut().unwrap().charge(2).unwrap();
+        let a = budgets.pop().unwrap();
+        assert_eq!(a.steps_taken, 2);
+
+        // sibling B starts fresh — no shared state with A
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 5 },
+            BudgetExhaustedBehavior::Fail,
+            "sib-b",
+        ));
+        let b = budgets.current_mut().unwrap();
+        assert_eq!(b.steps_taken, 0);
+        assert_ne!(a.phase, b.phase);
     }
 }

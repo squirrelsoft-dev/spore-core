@@ -75,9 +75,10 @@ pub use guide_registry::{
     StandardGuideRegistry,
 };
 pub use harness::{
-    AgentRef, AggregateUsage, BudgetExhaustedBehavior, BudgetLimitType, BudgetLimits, BudgetPolicy,
-    BudgetSnapshot, BwrapProfile, ChildPausedState, CommandOutput, CompleteOnFinalResponse,
-    ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest, ConsultResponse,
+    AgentRef, AggregateUsage, BudgetContext, BudgetExhausted, BudgetExhaustedBehavior,
+    BudgetLimitType, BudgetLimits, BudgetPolicy, BudgetSnapshot, BudgetStack, BwrapProfile,
+    ChildPausedState, CommandOutput, CompleteOnFinalResponse, ConsultHandlerEntry,
+    ConsultOverflowPolicy, ConsultRequest, ConsultResponse,
     ContextManager as HarnessContextManager, EmptyToolRegistry, ExecutionContext, FileRef,
     GitVcsProvider, HaltReason, Harness, HarnessBuilder, HarnessConfig, HarnessError,
     HarnessRunOptions, HarnessSignal, HillClimbingConfig, HillClimbingDirection, HookPoint,
@@ -85,9 +86,9 @@ pub use harness::{
     ModelConfig, NetworkPolicy, NullSandbox, ObservabilityProvider, Operation, PausedState,
     PlanExecuteConfig, RalphConfig, ReactConfig, ReadOnlySandbox, RiskLevel, RunResult,
     RunStrategy, SandboxProvider, SandboxViolation, SchemaRef, SelfVerifyingConfig, SessionId,
-    SessionState, StandardHarness, StrategyOutcome, StrategyRef, StreamEvent as HarnessStreamEvent,
-    Task, TaskId, TerminationDecision, TerminationPolicy, ToolOutput,
-    ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult, ToolsetRef,
+    SessionState, SpanStack, StandardHarness, StrategyOutcome, StrategyRef,
+    StreamEvent as HarnessStreamEvent, Task, TaskId, TerminationDecision, TerminationPolicy,
+    ToolOutput, ToolRegistry as HarnessToolRegistry, ToolResult as HarnessToolResult, ToolsetRef,
     TruncatedOutput, VcsError, VcsLogArgs, VcsProvider,
 };
 pub use hooks::{
