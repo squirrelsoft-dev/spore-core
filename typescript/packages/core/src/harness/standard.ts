@@ -926,7 +926,6 @@ export class StandardHarness implements Harness, StrategyExecutor {
     let shared = sessionState;
     let lastOutput = "";
     let lastState: SessionState = emptySessionState();
-    const globalMaxTurns = task.budget.max_turns ?? null;
 
     for (let index = 0; index < totalTasks; index += 1) {
       const taskId = taskList.tasks[index]!.id;
@@ -937,20 +936,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
         continue;
       }
 
-      const remainingTasks = totalTasks - index;
-      let perTaskTurns: number;
-      if (globalMaxTurns != null) {
-        const remainingTurns = Math.max(globalMaxTurns - sharedCarried.turns, 0);
-        perTaskTurns = Math.max(Math.floor(remainingTurns / remainingTasks), 1);
-      } else {
-        perTaskTurns = Number.MAX_SAFE_INTEGER;
-      }
-      const subLoopCap =
-        perTaskTurns === Number.MAX_SAFE_INTEGER
-          ? Number.MAX_SAFE_INTEGER
-          : sharedCarried.turns + perTaskTurns;
-      const stepCap = globalMaxTurns != null ? Math.min(globalMaxTurns, subLoopCap) : subLoopCap;
-
+      // #125: the per-task `remainingTurns / remainingTasks / stepCap` derivation
+      // is REMOVED (dead) — enforcement is now charge-based on the PlanExecute
+      // scope (see `runPlanExecuteConfig`). This helper mirrors the live body's
+      // structure and passes the task budget through verbatim.
       updateTask(taskList, taskId, "in_progress");
       await this.persistTaskList(sessionId, taskList);
 
@@ -958,7 +947,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
         id: task.id,
         instruction,
         session_id: sessionId,
-        budget: { ...task.budget, max_turns: stepCap },
+        budget: { ...task.budget },
         loop_strategy: executeChild,
       };
       await this.fireTaskAdvance(sessionId, stepTask, index, totalTasks, signal);
