@@ -132,8 +132,11 @@ import {
   type ConsultOverflowPolicy,
   type ConsultResponse,
   type ContextManager,
+  type EscalationMode,
   type HaltReason,
+  HarnessError,
   type HarnessRunOptions,
+  surfaceToHuman,
   type HookPoint,
   type HumanRequest,
   type HumanResponse,
@@ -145,6 +148,7 @@ import {
   reactPerLoop,
   type PausedState,
   type RunResult,
+  type RunStrategy,
   type SandboxProvider,
   type SessionState,
   type StreamSink,
@@ -154,9 +158,16 @@ import {
   type ToolRegistry,
   type ToolResultRecord,
 } from "./types.js";
+import { ExecutionRegistry } from "./execution-registry.js";
 
 /** Components injected at construction. Mirrors `HarnessConfig` in the spec. */
 export interface HarnessConfig {
+  /**
+   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): agents are
+   * resolved per-node via a strategy's {@link AgentRef}. Physical removal +
+   * executor migration to registry resolution lands in #124. Still the live
+   * default-agent field this slice (Option B additive scope).
+   */
   agent: Agent;
   toolRegistry: ToolRegistry;
   sandbox: SandboxProvider;
@@ -216,6 +227,10 @@ export interface HarnessConfig {
    * Q1). When the loop strategy is `plan_execute` and this is set, the one-shot
    * plan turn runs on this agent; otherwise it runs on the default {@link agent}.
    * `plan_model` on the strategy stays DESCRIPTIVE metadata only.
+   *
+   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): resolved
+   * per-node via a strategy's {@link AgentRef}. Physical removal + executor
+   * migration to registry resolution lands in #124.
    */
   plannerAgent?: Agent;
   /**
@@ -230,6 +245,10 @@ export interface HarnessConfig {
    * `self_verify_misconfigured` (a typed halt, NOT a throw). Its
    * {@link "../verifier/types.js".Verifier.maxIterations} (default 3) caps the
    * build↔evaluate round-trips (D3). Ignored by every other strategy.
+   *
+   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): verifiers
+   * are resolved by key from the registry's `verifiers` map. Physical removal +
+   * executor migration to registry resolution lands in #124.
    */
   verifier?: Verifier;
   /**
@@ -239,6 +258,10 @@ export interface HarnessConfig {
    * {@link agent}. The read-only sandbox and the fresh, never-shared session id
    * for the evaluate run are derived INTERNALLY by the strategy — callers do NOT
    * supply an evaluator sandbox or chunk provider here.
+   *
+   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): resolved
+   * per-node via a strategy's {@link AgentRef}. Physical removal + executor
+   * migration to registry resolution lands in #124.
    */
   evaluatorAgent?: Agent;
   /**
@@ -336,6 +359,25 @@ export interface HarnessConfig {
    * involved.
    */
   consultHandlers?: ConsultHandlerMap;
+  /**
+   * Runtime resolver for the serializable strategy handles
+   * ({@link AgentRef}/{@link ToolsetRef}/{@link SchemaRef}) and `StrategyRef`
+   * custom keys held by a task's strategy tree (issue #120). {@link run} calls
+   * {@link ExecutionRegistry.validate} at entry, so an unresolved handle is a
+   * STARTUP error before the first turn — but only when the registry is
+   * populated, so legacy callers (Option B) stay byte-identical. This slice the
+   * registry coexists with the deprecated single-collaborator fields and is not
+   * yet read by the run bodies (#123/#124). Optional; defaults to an empty
+   * registry.
+   */
+  registry?: ExecutionRegistry;
+  /**
+   * HITL-vs-AFK escalation knob (issue #120, PRD goal #7). Selects whether
+   * budget escalation surfaces to a human or proceeds autonomously. STORED only
+   * this slice; consumed in #130. Optional; the {@link HarnessBuilder} defaults
+   * it to {@link surfaceToHuman}.
+   */
+  escalationMode?: EscalationMode;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
@@ -594,6 +636,31 @@ export class StandardHarness implements Harness {
   private async runInner(options: HarnessRunOptions): Promise<RunResult> {
     const budgetUsed = emptyBudgetSnapshot();
     const task = options.task;
+
+    // Issue #120 startup validation: every serializable handle in the task's
+    // strategy tree must resolve against the configured ExecutionRegistry,
+    // BEFORE the first turn. Validation runs only when the registry is populated,
+    // so existing callers that never wire a registry (and instead use the
+    // deprecated single-collaborator fields, Option B) are unaffected
+    // byte-for-byte. An unresolved handle is a startup error.
+    const registry = this.config.registry;
+    if (registry != null && !registry.isEmpty()) {
+      try {
+        registry.validate(task);
+      } catch (e) {
+        if (e instanceof HarnessError) {
+          return {
+            kind: "failure",
+            reason: { kind: "configuration_error", error: e },
+            session_id: task.session_id,
+            usage: emptyAggregateUsage(),
+            turns: 0,
+            session_state: emptySessionState(),
+          };
+        }
+        throw e;
+      }
+    }
 
     // Issue #102 auto-load: when enabled AND no explicit session_state was
     // provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
@@ -3570,6 +3637,8 @@ export class HarnessBuilder {
   private _autoPersistSessions = false;
   private _promptToolCallFlag?: SharedFlag;
   private readonly _consultHandlers: ConsultHandlerMap = new Map();
+  private _registry: ExecutionRegistry = ExecutionRegistry.empty();
+  private _escalationMode: EscalationMode = surfaceToHuman;
 
   constructor(
     private readonly agent: Agent,
@@ -3928,6 +3997,60 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Inject a fully-assembled {@link ExecutionRegistry} (issue #120). REPLACES
+   * any registry accumulated via the per-key convenience setters
+   * ({@link agentRef}/{@link toolsetRef}/{@link schemaRef}/{@link verifierRef}/
+   * {@link registerStrategy}). Empty by default (Option B — legacy callers stay
+   * byte-identical and skip startup validation).
+   */
+  registry(registry: ExecutionRegistry): this {
+    this._registry = registry;
+    return this;
+  }
+
+  /** Convenience: register an agent in the {@link ExecutionRegistry} under
+   *  `key` (issue #120). */
+  agentRef(key: string, agent: Agent): this {
+    this._registry = this._registry.toBuilder().agent(key, agent).build();
+    return this;
+  }
+
+  /** Convenience: register a toolset in the {@link ExecutionRegistry} under
+   *  `key` (issue #120). */
+  toolsetRef(key: string, toolset: ToolRegistry): this {
+    this._registry = this._registry.toBuilder().toolset(key, toolset).build();
+    return this;
+  }
+
+  /** Convenience: register a JSON schema in the {@link ExecutionRegistry} under
+   *  `key` (issue #120). */
+  schemaRef(key: string, schema: unknown): this {
+    this._registry = this._registry.toBuilder().schema(key, schema).build();
+    return this;
+  }
+
+  /** Convenience: register a verifier in the {@link ExecutionRegistry} under
+   *  `key` (issue #120). */
+  verifierRef(key: string, verifier: Verifier): this {
+    this._registry = this._registry.toBuilder().verifier(key, verifier).build();
+    return this;
+  }
+
+  /** Convenience: register a custom strategy in the {@link ExecutionRegistry}
+   *  under `key` (issue #120). */
+  registerStrategy(key: string, strategy: RunStrategy): this {
+    this._registry = this._registry.toBuilder().registerStrategy(key, strategy).build();
+    return this;
+  }
+
+  /** Select the HITL-vs-AFK {@link EscalationMode} (issue #120). Defaults to
+   *  {@link surfaceToHuman}. STORED only this slice; consumed in #130. */
+  escalationMode(mode: EscalationMode): this {
+    this._escalationMode = mode;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -3981,6 +4104,8 @@ export class HarnessBuilder {
       // Only attach when populated so the default config stays byte-for-byte
       // unchanged for callers that never register a consult handler (R9).
       consultHandlers: this._consultHandlers.size > 0 ? this._consultHandlers : undefined,
+      registry: this._registry,
+      escalationMode: this._escalationMode,
     };
   }
 

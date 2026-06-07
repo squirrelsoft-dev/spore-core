@@ -643,6 +643,132 @@ async function runHillClimbingConfig(
   return { kind: "pending" };
 }
 
+// ── EscalationMode (HITL-vs-AFK config knob, #120) ──────────────────────────
+
+/**
+ * The HITL-vs-AFK escalation knob (PRD goal #7: local vs. prod differ only by
+ * config). Selects whether budget escalation surfaces to a human or proceeds
+ * autonomously. Stored on {@link HarnessConfig} this slice; consumed in #130.
+ *
+ * Adjacently tagged on `kind` (`snake_case`) for symmetry with the other
+ * harness enums:
+ *   - `{ "kind": "surface_to_human" }` — pauses and surfaces to a human (HITL).
+ *   - `{ "kind": "autonomous" }` — proceeds autonomously (AFK / prod).
+ *
+ * No baked-in default value (mirrors the budget-types discipline); the
+ * {@link HarnessBuilder} picks an explicit default ({@link surfaceToHuman}).
+ * NOT placed on the serialized {@link Task} — there is no fixture for it.
+ */
+export type EscalationMode = { kind: "surface_to_human" } | { kind: "autonomous" };
+
+export const EscalationModeSchema: z.ZodType<EscalationMode> = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("surface_to_human") }),
+  z.object({ kind: z.literal("autonomous") }),
+]);
+
+/** Budget escalation pauses and surfaces to a human (HITL). */
+export const surfaceToHuman: EscalationMode = { kind: "surface_to_human" };
+/** Budget escalation proceeds autonomously (AFK / prod). */
+export const autonomous: EscalationMode = { kind: "autonomous" };
+
+// ── HarnessError (registry resolution errors, #120) ─────────────────────────
+
+/** Discriminant tags for {@link HarnessError}. PascalCase to match the Rust
+ *  `#[serde(tag = "kind")]` wire shape (see `fixtures/harness/registry_errors.json`). */
+export type HarnessErrorKind = "InvalidConfiguration" | "StrategyNotFound" | "UnresolvedHandle";
+
+/**
+ * Typed errors surfaced by the {@link ExecutionRegistry} (issue #120) and the
+ * harness configuration path. Mirrors the Rust `HarnessError` enum byte-for-byte
+ * (`#[serde(tag = "kind")]`, PascalCase variant tags — see
+ * `fixtures/harness/registry_errors.json`).
+ *
+ * Each variant is a class extending `Error` with a discriminant `kind` so
+ * call-sites can exhaustively `switch` on `err.kind`.
+ */
+export abstract class HarnessError extends Error {
+  abstract readonly kind: HarnessErrorKind;
+
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+
+  /** JSON wire shape — matches Rust `#[serde(tag = "kind")]`. */
+  abstract toJSON(): Record<string, unknown>;
+}
+
+/**
+ * Invalid harness configuration (Rust `HarnessError::InvalidConfiguration`).
+ * Not part of #120's registry-resolution additions and not fixture-covered; the
+ * `detail` is carried for the `Error.message` but the registry never emits this
+ * variant.
+ */
+export class InvalidConfiguration extends HarnessError {
+  readonly kind = "InvalidConfiguration" as const;
+  constructor(readonly detail: string) {
+    super(`invalid configuration: ${detail}`);
+  }
+  toJSON() {
+    return { kind: this.kind, detail: this.detail };
+  }
+}
+
+/**
+ * A `StrategyRef` `custom` key referenced a custom strategy that is not
+ * registered in {@link ExecutionRegistry}'s custom map. RECOVERABLE — returned,
+ * never thrown across the resolution boundary (same pattern as a missing agent
+ * handle). Issue #120.
+ */
+export class StrategyNotFound extends HarnessError {
+  readonly kind = "StrategyNotFound" as const;
+  constructor(readonly key: string) {
+    super(`custom strategy not found: ${key}`);
+  }
+  toJSON() {
+    return { kind: this.kind, key: this.key };
+  }
+}
+
+/**
+ * A serializable handle ({@link AgentRef}/{@link ToolsetRef}/{@link SchemaRef})
+ * referenced an entry absent from the {@link ExecutionRegistry}. The
+ * STARTUP-validation error: surfaced before the first turn. Issue #120.
+ *
+ * The handle category is the `handleKind` field, which serializes as
+ * `handle_kind` to avoid colliding with the enum's `kind` discriminant tag.
+ */
+export class UnresolvedHandle extends HarnessError {
+  readonly kind = "UnresolvedHandle" as const;
+  constructor(
+    readonly handleKind: string,
+    readonly key: string,
+  ) {
+    super(`unresolved ${handleKind} handle: ${key}`);
+  }
+  toJSON() {
+    return { kind: this.kind, handle_kind: this.handleKind, key: this.key };
+  }
+}
+
+/** Parse a JSON value into a {@link HarnessError}, rejecting unknown variants. */
+export function harnessErrorFromJson(value: unknown): HarnessError {
+  if (typeof value !== "object" || value === null) {
+    throw new TypeError("HarnessError must be a JSON object");
+  }
+  const obj = value as Record<string, unknown>;
+  switch (obj.kind) {
+    case "InvalidConfiguration":
+      return new InvalidConfiguration(String(obj.detail ?? ""));
+    case "StrategyNotFound":
+      return new StrategyNotFound(String(obj.key));
+    case "UnresolvedHandle":
+      return new UnresolvedHandle(String(obj.handle_kind), String(obj.key));
+    default:
+      throw new TypeError(`unknown HarnessError kind: ${String(obj.kind)}`);
+  }
+}
+
 export const TaskSchema = z.object({
   id: z.string().transform((s) => new TaskId(s)),
   instruction: z.string(),
@@ -1562,7 +1688,17 @@ export type HaltReason =
    * NOT a stagnation increment). Likely a BUILD-TIME bug in the caller's wiring.
    * Surfaced as a typed halt, NOT a throw.
    */
-  | { kind: "hill_climbing_misconfigured"; reason: string };
+  | { kind: "hill_climbing_misconfigured"; reason: string }
+  /**
+   * Returned by {@link StandardHarness} when {@link ExecutionRegistry.validate}
+   * fails at run entry (issue #120): a handle referenced by the task's strategy
+   * tree is unresolved against the configured {@link ExecutionRegistry}, or a
+   * `StrategyRef` `custom` key is missing. A STARTUP error surfaced before the
+   * first turn. Carries the underlying {@link HarnessError}. Validation only
+   * fires when the registry is populated, so legacy callers (Option B, the
+   * deprecated single-collaborator fields) are unaffected.
+   */
+  | { kind: "configuration_error"; error: HarnessError };
 
 export type RunResult =
   | {

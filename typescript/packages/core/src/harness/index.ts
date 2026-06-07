@@ -11,6 +11,11 @@ export {
   HOOK_POINTS,
   isReact,
 } from "./standard.js";
+export {
+  ExecutionRegistry,
+  ExecutionRegistryBuilder,
+  type StrategyResolution,
+} from "./execution-registry.js";
 export { CompleteOnFinalResponse } from "./complete-on-final-response.js";
 export {
   GitVcsProvider,
