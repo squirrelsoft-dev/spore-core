@@ -38,7 +38,7 @@ func TestHarnessEmitsSpansThroughOutboxJSONL(t *testing.T) {
 	).WithObservabilityOutbox(tmp).Build()
 
 	task := sporecore.NewTask("do something", sporecore.SessionID("s1"),
-		sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+		sporecore.ReActStrategy(5))
 
 	res := harness.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
 	if res.Kind != sporecore.RunSuccess {

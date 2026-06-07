@@ -52,7 +52,7 @@ func TestHarnessReActLoopDispatchesToolThenCompletes(t *testing.T) {
 	task := NewTask(
 		"read /etc/hosts then summarize",
 		SessionID("fixture-session"),
-		LoopStrategy{Kind: StrategyReAct, MaxIterations: 5},
+		ReActStrategy(5),
 	)
 
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))

@@ -165,7 +165,7 @@ func ralphCfg(agent Agent, root string) HarnessConfig {
 }
 
 func ralphTask() Task {
-	return NewTask("build the thing", SessionID("s1"), LoopStrategy{Kind: StrategyRalph})
+	return NewTask("build the thing", SessionID("s1"), RalphStrategy(RalphConfig{Inner: PtrStrategy(ReActStrategy(^uint32(0))), Agent: AgentRef("ralph-agent")}))
 }
 
 // ============================================================================

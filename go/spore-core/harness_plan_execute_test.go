@@ -475,7 +475,7 @@ func TestPlanExecuteLoopFixtureReplay(t *testing.T) {
 		TerminationPolicy: AlwaysContinuePolicy{},
 	}
 	h := NewStandardHarness(cfg)
-	task := NewTask("build a CLI", SessionID("plan-execute-fixture"), LoopStrategy{Kind: StrategyPlanExecute})
+	task := NewTask("build a CLI", SessionID("plan-execute-fixture"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
 
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {

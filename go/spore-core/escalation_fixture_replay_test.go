@@ -60,7 +60,7 @@ func TestEscalationLoopReturnsEscalateAndSkipsHistoryAppend(t *testing.T) {
 	task := NewTask(
 		"investigate then decide whether to abort",
 		SessionID("escalation-loop-session"),
-		LoopStrategy{Kind: StrategyReAct, MaxIterations: 5},
+		ReActStrategy(5),
 	)
 
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))

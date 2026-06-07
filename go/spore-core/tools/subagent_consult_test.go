@@ -52,7 +52,7 @@ func consultPaused() *sporecore.PausedState {
 		PendingToolCalls: []sporecore.ToolCall{
 			{ID: "consult-call", Name: "ask_advice", Input: json.RawMessage(`{"kind":"advice"}`)},
 		},
-		Task: sporecore.NewTask("audit", "worker", sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 4}),
+		Task: sporecore.NewTask("audit", "worker", sporecore.ReActStrategy(4)),
 	}
 }
 

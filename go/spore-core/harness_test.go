@@ -20,7 +20,7 @@ func standardCfg(agent Agent) HarnessConfig {
 }
 
 func reactTask(max uint32) Task {
-	return NewTask("do something", SessionID("s1"), LoopStrategy{Kind: StrategyReAct, MaxIterations: max})
+	return NewTask("do something", SessionID("s1"), ReActStrategy(max))
 }
 
 // Rule: Harness owns the loop; a single FinalResponse returns Success.
@@ -386,7 +386,7 @@ func TestPausedStateRoundtripJSON(t *testing.T) {
 	if back.SessionID != "s" || back.TurnNumber != 4 || back.HumanRequest.Question != "what?" {
 		t.Fatalf("roundtrip mismatch: %s -> %+v", data, back)
 	}
-	if back.Task.LoopStrategy.Kind != StrategyReAct || back.Task.LoopStrategy.MaxIterations != 5 {
+	if back.Task.LoopStrategy.Kind != StrategyReAct || back.Task.LoopStrategy.MaxIterations() != 5 {
 		t.Fatalf("task strategy lost: %+v", back.Task.LoopStrategy)
 	}
 }
@@ -410,12 +410,12 @@ func TestChildPausedStateHasNoChildField(t *testing.T) {
 
 // JSON tag values match Rust serde snake_case for the loop strategy.
 func TestLoopStrategyJSONTags(t *testing.T) {
-	s := LoopStrategy{Kind: StrategyReAct, MaxIterations: 5}
+	s := ReActStrategy(5)
 	data, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"kind":"re_act","max_iterations":5}`
+	want := `{"kind":"react","budget":{"kind":"per_loop","value":5},"agent":"","toolset":""}`
 	if string(data) != want {
 		t.Fatalf("got %s, want %s", data, want)
 	}

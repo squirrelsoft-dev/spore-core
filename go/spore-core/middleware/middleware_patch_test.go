@@ -64,7 +64,7 @@ func TestPatchRunsBeforeOtherBeforeToolMiddleware(t *testing.T) {
 func TestPatchEmitsEventWithCapturedIdentity(t *testing.T) {
 	rec := &recordingEmitter{}
 	mw := NewPatchToolCallsMiddleware("noop").WithObservability(rec)
-	task := sporecore.NewTask("task", sporecore.SessionID("sess"), sporecore.LoopStrategy{})
+	task := sporecore.NewTask("task", sporecore.SessionID("sess"), sporecore.ReActStrategy(0))
 	s := sporecore.SessionID("sess")
 	if _, err := mw.Handle(context.Background(), HookContext{
 		Point: HookBeforeSession, Task: &task, SessionID: &s,

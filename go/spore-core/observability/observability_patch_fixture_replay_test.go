@@ -61,7 +61,7 @@ func TestPatchEventsFixtureReplay(t *testing.T) {
 	mw := middleware.NewPatchToolCallsMiddleware(fx.FallbackName).
 		WithObservability(NewPatchEmitterAdapter(obs))
 
-	task := sporecore.NewTask("fixture", sid("sess"), sporecore.LoopStrategy{})
+	task := sporecore.NewTask("fixture", sid("sess"), sporecore.ReActStrategy(0))
 	s := sid("sess")
 	if _, err := mw.Handle(context.Background(), middleware.HookContext{
 		Point: middleware.HookBeforeSession, Task: &task, SessionID: &s,

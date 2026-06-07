@@ -175,7 +175,24 @@ func (h *StandardHarness) runHillClimbing(
 		return result
 	}
 	evaluator := h.config.MetricEvaluator
-	direction := task.LoopStrategy.Direction
+
+	// #119: HillClimbingConfig now carries required scalar fields. The legacy
+	// executor below was written against Option<u32>/Option<f64> semantics
+	// (nil = "no stagnation cap" / "default 0.0 delta"), so map the new required
+	// fields back here until #124 migrates the body: max_stagnation == MaxUint32
+	// is the "unbounded" sentinel (→ nil), and the delta is always present.
+	cfg := task.LoopStrategy.HillClimbing
+	if cfg == nil {
+		cfg = &HillClimbingConfig{}
+	}
+	direction := cfg.Direction
+	revertOnNoImprovement := cfg.RevertOnNoImprovement
+	var maxStagnation *uint32
+	if cfg.MaxStagnation != ^uint32(0) {
+		v := cfg.MaxStagnation
+		maxStagnation = &v
+	}
+	minImprovementDelta := cfg.MinImprovementDelta
 	description := evaluator.Description()
 
 	// Cumulative usage + turns across ALL agent-turn iterations.
@@ -292,7 +309,7 @@ func (h *StandardHarness) runHillClimbing(
 			// Crash/timeout/etc.: counts as a non-improvement. Optionally revert,
 			// increment stagnation, record an empty-metric row.
 			reverted := false
-			if task.LoopStrategy.RevertOnNoImprovement {
+			if revertOnNoImprovement {
 				h.hillClimbingRevert(ctx)
 				reverted = true
 			}
@@ -309,7 +326,7 @@ func (h *StandardHarness) runHillClimbing(
 			h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, iteration, 0, false, 0, false, evalErr.Status, reverted)
 		} else {
 			value := evalRes.Value
-			kept := hillClimbShouldKeep(value, currentBest, direction, task.LoopStrategy.MinImprovementDelta)
+			kept := hillClimbShouldKeep(value, currentBest, direction, &minImprovementDelta)
 			var delta float64
 			switch direction {
 			case OptimizationMinimize:
@@ -334,7 +351,7 @@ func (h *StandardHarness) runHillClimbing(
 			} else {
 				// No improvement (Decision 1: optionally revert).
 				reverted := false
-				if task.LoopStrategy.RevertOnNoImprovement {
+				if revertOnNoImprovement {
 					h.hillClimbingRevert(ctx)
 					reverted = true
 				}
@@ -354,7 +371,7 @@ func (h *StandardHarness) runHillClimbing(
 		}
 
 		// ── Stagnation halt (only when a cap is configured).
-		if task.LoopStrategy.MaxStagnation != nil && stagnation >= *task.LoopStrategy.MaxStagnation {
+		if maxStagnation != nil && stagnation >= *maxStagnation {
 			h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
 			result := RunResult{
 				Kind: RunFailure,

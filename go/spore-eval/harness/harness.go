@@ -126,7 +126,7 @@ func (h *EvalHarness) runOne(ctx context.Context, config sporecore.HarnessConfig
 			MaxTurns:    &maxTurns,
 			MaxWallTime: &timeout,
 		},
-		LoopStrategy: sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: maxTurns},
+		LoopStrategy: sporecore.ReActStrategy(maxTurns),
 	}
 
 	hs := sporecore.NewStandardHarness(config)

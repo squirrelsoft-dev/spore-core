@@ -101,7 +101,7 @@ var _ Verifier = (*svVerifier)(nil)
 
 func selfVerifyTask() Task {
 	return NewTask("build the widget", SessionID("build-sess"),
-		LoopStrategy{Kind: StrategySelfVerifying})
+		SelfVerifyingStrategy(SelfVerifyingConfig{Inner: PtrStrategy(ReActStrategy(^uint32(0))), Evaluator: SchemaRef("evaluator")}))
 }
 
 func selfVerifyCfg(agent Agent, v Verifier) HarnessConfig {

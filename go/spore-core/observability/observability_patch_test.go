@@ -63,7 +63,7 @@ func wiredPatch(obs *InMemoryObservabilityProvider) *middleware.PatchToolCallsMi
 // directly on the middleware so the test owns the calls slice.
 func runPatch(t *testing.T, mw *middleware.PatchToolCallsMiddleware, calls *[]sporecore.ToolCall) middleware.MiddlewareDecision {
 	t.Helper()
-	task := sporecore.NewTask("test task", sid("sess"), sporecore.LoopStrategy{})
+	task := sporecore.NewTask("test task", sid("sess"), sporecore.ReActStrategy(0))
 	s := sid("sess")
 	if _, err := mw.Handle(context.Background(), middleware.HookContext{
 		Point: middleware.HookBeforeSession, Task: &task, SessionID: &s,

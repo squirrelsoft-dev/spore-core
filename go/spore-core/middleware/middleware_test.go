@@ -446,7 +446,7 @@ func TestSessionBoundaryHooksFire(t *testing.T) {
 	task := sporecore.NewTask(
 		"do thing",
 		sid(),
-		sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5},
+		sporecore.ReActStrategy(5),
 	)
 	if _, err := chain.FireBeforeSession(context.Background(), &task, sid()); err != nil {
 		t.Fatal(err)

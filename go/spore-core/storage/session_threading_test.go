@@ -93,7 +93,7 @@ func TestSessionThreading_AutoPersistRoundTrip_InMemory(t *testing.T) {
 	provider := storage.SingleStorageProvider(storage.NewInMemoryStorageProvider())
 	sid := sporecore.SessionID("s1")
 	h := sporecore.NewStandardHarness(cfgWithStore(finalAgent("done"), provider.Session()))
-	task := sporecore.NewTask("do something", sid, sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+	task := sporecore.NewTask("do something", sid, sporecore.ReActStrategy(5))
 	r := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
 	if r.Kind != sporecore.RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
@@ -124,7 +124,7 @@ func TestSessionThreading_CrossProcessContinuity_FileSystem(t *testing.T) {
 	{
 		provider := storage.SingleStorageProvider(storage.NewFileSystemStorageProvider(dir))
 		h := sporecore.NewStandardHarness(cfgWithStore(finalAgent("process-one"), provider.Session()))
-		task := sporecore.NewTask("first process", sid, sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+		task := sporecore.NewTask("first process", sid, sporecore.ReActStrategy(5))
 		if r := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task)); r.Kind != sporecore.RunSuccess {
 			t.Fatalf("process 1 expected Success, got %+v", r)
 		}
@@ -133,7 +133,7 @@ func TestSessionThreading_CrossProcessContinuity_FileSystem(t *testing.T) {
 	// "Process 2": brand-new provider over the SAME dir, brand-new harness.
 	provider := storage.SingleStorageProvider(storage.NewFileSystemStorageProvider(dir))
 	h := sporecore.NewStandardHarness(cfgWithStore(finalAgent("process-two"), provider.Session()))
-	task := sporecore.NewTask("second process", sid, sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+	task := sporecore.NewTask("second process", sid, sporecore.ReActStrategy(5))
 	r := h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
 	if r.Kind != sporecore.RunSuccess {
 		t.Fatalf("process 2 expected Success, got %+v", r)

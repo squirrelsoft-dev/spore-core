@@ -109,13 +109,24 @@ func hcConfig(t *testing.T, eval MetricEvaluator) (HarnessConfig, *hcRootedSandb
 
 // hcTask builds a HillClimbing task with the given strategy payload.
 func hcTask(direction OptimizationDirection, maxStagnation *uint32, revert bool, minDelta *float64, maxTurns *uint32) Task {
-	t := NewTask("optimize", SessionID("s1"), LoopStrategy{
-		Kind:                  StrategyHillClimbing,
+	// Map the legacy Option semantics onto the #119 required scalar config:
+	// nil maxStagnation → the MaxUint32 "unbounded" sentinel; nil minDelta → 0.0.
+	stag := ^uint32(0)
+	if maxStagnation != nil {
+		stag = *maxStagnation
+	}
+	var delta float64
+	if minDelta != nil {
+		delta = *minDelta
+	}
+	t := NewTask("optimize", SessionID("s1"), HillClimbingStrategy(HillClimbingConfig{
+		Inner:                 PtrStrategy(ReActStrategy(^uint32(0))),
 		Direction:             direction,
-		MaxStagnation:         maxStagnation,
+		MaxStagnation:         stag,
 		RevertOnNoImprovement: revert,
-		MinImprovementDelta:   minDelta,
-	})
+		MinImprovementDelta:   delta,
+		Evaluator:             AgentRef(""),
+	}))
 	if maxTurns != nil {
 		t.Budget = BudgetLimits{MaxTurns: maxTurns}
 	}

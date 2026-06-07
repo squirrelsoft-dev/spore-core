@@ -248,10 +248,7 @@ func (s *SubagentTool) Execute(
 	}
 
 	sessionID, seeded := s.resolveSessionContext()
-	task := sporecore.NewTask(probe.Instruction, sessionID, sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 16,
-	})
+	task := sporecore.NewTask(probe.Instruction, sessionID, sporecore.ReActStrategy(16))
 
 	opts := sporecore.HarnessRunOptions{Task: task}
 	if seeded != nil {
@@ -407,10 +404,7 @@ func (s *SubagentTool) mediateConsult(
 	// the consult request rendered to text.
 	counts[request.Kind]++
 	instruction := renderConsultInstruction(request)
-	task := sporecore.NewTask(instruction, generateSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 16,
-	})
+	task := sporecore.NewTask(instruction, generateSessionID(), sporecore.ReActStrategy(16))
 	handlerResult := entry.Handler.Run(ctx, sporecore.HarnessRunOptions{Task: task})
 	var answer string
 	if handlerResult.Kind == sporecore.RunSuccess {

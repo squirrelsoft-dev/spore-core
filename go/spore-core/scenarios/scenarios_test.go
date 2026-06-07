@@ -34,7 +34,7 @@ func toolCall(id, name string, input string) sporecore.ToolCall {
 }
 
 func reactStrategy(maxIter uint32) sporecore.LoopStrategy {
-	return sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: maxIter}
+	return sporecore.ReActStrategy(maxIter)
 }
 
 // ---------------------------------------------------------------------------

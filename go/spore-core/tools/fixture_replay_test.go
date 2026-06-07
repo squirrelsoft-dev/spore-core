@@ -183,7 +183,7 @@ func TestFixtureReplaySubagentScenarios(t *testing.T) {
 		case "waiting_for_human":
 			paused := &sporecore.PausedState{
 				SessionID:    "s",
-				Task:         sporecore.NewTask("x", "s", sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 1}),
+				Task:         sporecore.NewTask("x", "s", sporecore.ReActStrategy(1)),
 				HumanRequest: &sporecore.HumanRequest{Kind: sporecore.HumanReqClarification, Question: "?"},
 			}
 			req := &sporecore.HumanRequest{Kind: sporecore.HumanReqClarification, Question: "?"}

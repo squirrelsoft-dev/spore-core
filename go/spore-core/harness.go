@@ -227,92 +227,14 @@ const (
 	OptimizationMaximize OptimizationDirection = "maximize"
 )
 
-// LoopStrategyKind discriminates LoopStrategy variants.
-type LoopStrategyKind string
-
-const (
-	StrategyReAct         LoopStrategyKind = "re_act"
-	StrategyPlanExecute   LoopStrategyKind = "plan_execute"
-	StrategyRalph         LoopStrategyKind = "ralph"
-	StrategySelfVerifying LoopStrategyKind = "self_verifying"
-	StrategyHillClimbing  LoopStrategyKind = "hill_climbing"
-)
-
 // ModelConfig is a lightweight placeholder for an alternate planner model.
 type ModelConfig struct {
 	Provider string `json:"provider"`
 	ModelID  string `json:"model_id"`
 }
 
-// LoopStrategy is a tagged-union. Only ReAct is fully executable in
-// StandardHarness; the other variants return HaltReason
-// StrategyNotYetImplemented per the Rust reference.
-type LoopStrategy struct {
-	Kind LoopStrategyKind `json:"kind"`
-	// ReAct
-	MaxIterations uint32 `json:"-"`
-	// PlanExecute
-	PlanModel *ModelConfig `json:"-"`
-	// HillClimbing
-	Direction             OptimizationDirection `json:"-"`
-	MaxStagnation         *uint32               `json:"-"`
-	RevertOnNoImprovement bool                  `json:"-"`
-	MinImprovementDelta   *float64              `json:"-"`
-}
-
-// MarshalJSON serialises LoopStrategy as a flat tagged object.
-func (s LoopStrategy) MarshalJSON() ([]byte, error) {
-	switch s.Kind {
-	case StrategyReAct:
-		return json.Marshal(struct {
-			Kind          LoopStrategyKind `json:"kind"`
-			MaxIterations uint32           `json:"max_iterations"`
-		}{s.Kind, s.MaxIterations})
-	case StrategyPlanExecute:
-		return json.Marshal(struct {
-			Kind      LoopStrategyKind `json:"kind"`
-			PlanModel *ModelConfig     `json:"plan_model"`
-		}{s.Kind, s.PlanModel})
-	case StrategyRalph, StrategySelfVerifying:
-		return json.Marshal(struct {
-			Kind LoopStrategyKind `json:"kind"`
-		}{s.Kind})
-	case StrategyHillClimbing:
-		return json.Marshal(struct {
-			Kind                  LoopStrategyKind      `json:"kind"`
-			Direction             OptimizationDirection `json:"direction"`
-			MaxStagnation         *uint32               `json:"max_stagnation"`
-			RevertOnNoImprovement bool                  `json:"revert_on_no_improvement"`
-			MinImprovementDelta   *float64              `json:"min_improvement_delta"`
-		}{s.Kind, s.Direction, s.MaxStagnation, s.RevertOnNoImprovement, s.MinImprovementDelta})
-	default:
-		return nil, fmt.Errorf("LoopStrategy: unknown kind %q", s.Kind)
-	}
-}
-
-// UnmarshalJSON decodes the flat tagged form.
-func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
-	var probe struct {
-		Kind                  LoopStrategyKind      `json:"kind"`
-		MaxIterations         uint32                `json:"max_iterations"`
-		PlanModel             *ModelConfig          `json:"plan_model"`
-		Direction             OptimizationDirection `json:"direction"`
-		MaxStagnation         *uint32               `json:"max_stagnation"`
-		RevertOnNoImprovement bool                  `json:"revert_on_no_improvement"`
-		MinImprovementDelta   *float64              `json:"min_improvement_delta"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return err
-	}
-	s.Kind = probe.Kind
-	s.MaxIterations = probe.MaxIterations
-	s.PlanModel = probe.PlanModel
-	s.Direction = probe.Direction
-	s.MaxStagnation = probe.MaxStagnation
-	s.RevertOnNoImprovement = probe.RevertOnNoImprovement
-	s.MinImprovementDelta = probe.MinImprovementDelta
-	return nil
-}
+// LoopStrategy, LoopStrategyKind, the strategy config newtypes, StrategyRef,
+// and the RunStrategy seam live in strategy.go (issue #119).
 
 // Task is the input to a harness run.
 type Task struct {
@@ -2817,7 +2739,7 @@ func (h *StandardHarness) runInner(ctx context.Context, options HarnessRunOption
 		// The resume path is intentionally excluded — its conversation already
 		// exists, so it must not be re-seeded.
 		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
-		return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations, session, budget, options.OnStream)
+		return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, options.OnStream)
 	case StrategyPlanExecute:
 		return h.runPlanExecute(ctx, task, session, budget, options.OnStream)
 	case StrategyRalph:
@@ -2899,7 +2821,7 @@ func (h *StandardHarness) autoPersistTerminal(ctx context.Context, result *RunRe
 			PendingToolCalls: nil,
 			ApprovedResults:  nil,
 			HumanRequest:     nil,
-			Task:             NewTask("", sessionID, LoopStrategy{Kind: StrategyReAct, MaxIterations: 0}),
+			Task:             NewTask("", sessionID, ReActStrategy(0)),
 			BudgetUsed:       BudgetSnapshot{},
 			ChildState:       nil,
 		}
@@ -4590,11 +4512,7 @@ func (h *StandardHarness) resumeConsultInner(
 		}
 	}
 
-	maxIterations := uint32(^uint32(0))
-	if task.LoopStrategy.Kind == StrategyReAct {
-		maxIterations = task.LoopStrategy.MaxIterations
-	}
-	return h.runReAct(ctx, task, maxIterations, session, budget, onStream)
+	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
 }
 
 func (h *StandardHarness) resumeInner(
@@ -4645,11 +4563,7 @@ func (h *StandardHarness) resumeInner(
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
-				maxIterations := uint32(^uint32(0))
-				if task.LoopStrategy.Kind == StrategyReAct {
-					maxIterations = task.LoopStrategy.MaxIterations
-				}
-				return h.runReAct(ctx, task, maxIterations, session, budget, onStream)
+				return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
 			}
 		}
 	}
@@ -4695,11 +4609,7 @@ func (h *StandardHarness) resumeInner(
 		}
 	}
 
-	maxIterations := uint32(^uint32(0))
-	if task.LoopStrategy.Kind == StrategyReAct {
-		maxIterations = task.LoopStrategy.MaxIterations
-	}
-	return h.runReAct(ctx, task, maxIterations, session, budget, onStream)
+	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
 }
 
 // Compile-time interface check.

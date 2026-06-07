@@ -231,7 +231,7 @@ func TestSessionThreading_AutoPersistRoundTrip(t *testing.T) {
 	cfg.AutoPersistSessions = true
 	h := NewStandardHarness(cfg)
 	sid := SessionID("s1")
-	task := NewTask("do something", sid, LoopStrategy{Kind: StrategyReAct, MaxIterations: 5})
+	task := NewTask("do something", sid, ReActStrategy(5))
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
@@ -269,7 +269,7 @@ func TestSessionThreading_AutoLoadBySessionIDAcrossRuns(t *testing.T) {
 		cfg.SessionStore = store
 		cfg.AutoPersistSessions = true
 		h := NewStandardHarness(cfg)
-		task := NewTask("turn one", sid, LoopStrategy{Kind: StrategyReAct, MaxIterations: 5})
+		task := NewTask("turn one", sid, ReActStrategy(5))
 		_ = h.Run(context.Background(), NewHarnessRunOptions(task))
 	}
 
@@ -282,7 +282,7 @@ func TestSessionThreading_AutoLoadBySessionIDAcrossRuns(t *testing.T) {
 	cfg.SessionStore = store
 	cfg.AutoPersistSessions = true
 	h := NewStandardHarness(cfg)
-	task := NewTask("turn two", sid, LoopStrategy{Kind: StrategyReAct, MaxIterations: 5})
+	task := NewTask("turn two", sid, ReActStrategy(5))
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
@@ -306,7 +306,7 @@ func TestSessionThreading_RalphDoesNotAutoLoad(t *testing.T) {
 	cfg.SessionStore = store
 	cfg.AutoPersistSessions = true
 	h := NewStandardHarness(cfg)
-	task := NewTask("ralph task", SessionID("r1"), LoopStrategy{Kind: StrategyRalph})
+	task := NewTask("ralph task", SessionID("r1"), RalphStrategy(RalphConfig{Inner: PtrStrategy(ReActStrategy(^uint32(0))), Agent: AgentRef("ralph-agent")}))
 	_ = h.Run(context.Background(), NewHarnessRunOptions(task))
 	if g := store.gets.Load(); g != 0 {
 		t.Fatalf("Ralph must NOT auto-load (D7); got %d GetSession calls", g)
@@ -382,7 +382,7 @@ func TestSessionThreading_FixtureReplayLosslessSessionState(t *testing.T) {
 	task := NewTask(
 		"read /etc/hosts then summarize",
 		SessionID("fixture-session"),
-		LoopStrategy{Kind: StrategyReAct, MaxIterations: 5},
+		ReActStrategy(5),
 	)
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {

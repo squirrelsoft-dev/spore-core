@@ -360,7 +360,7 @@ func (h *StandardHarness) runSelfVerifyEvaluatePhase(
 		Instruction:  directive,
 		SessionID:    evalSessionID,
 		Budget:       task.Budget,
-		LoopStrategy: LoopStrategy{Kind: StrategyReAct, MaxIterations: cap},
+		LoopStrategy: ReActStrategy(cap),
 	}
 
 	// Child harness: copy the config, swap agent + sandbox. The copy shares the

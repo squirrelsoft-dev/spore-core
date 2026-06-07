@@ -294,7 +294,7 @@ func TestEndToEndDrivesCompactionThroughSeam(t *testing.T) {
 	session := sessionWith(rich)
 
 	task := sporecore.NewTask("deploy the payment service", "s1",
-		sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+		sporecore.ReActStrategy(5))
 	opts := sporecore.HarnessRunOptions{Task: task, SessionState: &session}
 	result := h.Run(context.Background(), opts)
 

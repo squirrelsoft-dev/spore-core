@@ -57,7 +57,7 @@ func (CompleteOnFinalResponse) Evaluate(context.Context, *SessionState, *BudgetS
 //
 // Mirrors Rust's Task::simple.
 func SimpleTask(instruction string) Task {
-	return NewTask(instruction, NewSessionID(), LoopStrategy{Kind: StrategyReAct, MaxIterations: 8})
+	return NewTask(instruction, NewSessionID(), ReActStrategy(8))
 }
 
 // Compile-time interface checks.

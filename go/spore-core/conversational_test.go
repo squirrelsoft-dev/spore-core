@@ -33,8 +33,8 @@ func TestSimpleTaskDefaults(t *testing.T) {
 	if task.LoopStrategy.Kind != StrategyReAct {
 		t.Fatalf("strategy kind = %q, want %q", task.LoopStrategy.Kind, StrategyReAct)
 	}
-	if task.LoopStrategy.MaxIterations != 8 {
-		t.Fatalf("max iterations = %d, want 8", task.LoopStrategy.MaxIterations)
+	if task.LoopStrategy.MaxIterations() != 8 {
+		t.Fatalf("max iterations = %d, want 8", task.LoopStrategy.MaxIterations())
 	}
 	if task.SessionID == "" {
 		t.Fatalf("session id is empty, want a fresh generated id")

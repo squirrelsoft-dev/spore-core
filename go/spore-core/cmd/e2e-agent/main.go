@@ -185,7 +185,7 @@ func runLive(scenario scenarios.ScenarioID, sessionID sporecore.SessionID, model
 // runScenario drives the scenario, including the S2 multi-turn and S3 seed.
 func runScenario(scenario scenarios.ScenarioID, h sporecore.Harness, sessionID sporecore.SessionID, windowLimit uint32) sporecore.RunResult {
 	ctx := context.Background()
-	strategy := sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 8}
+	strategy := sporecore.ReActStrategy(8)
 
 	switch scenario {
 	case scenarios.S2:
@@ -244,7 +244,7 @@ func runMock(scenario scenarios.ScenarioID, sessionID sporecore.SessionID) spore
 		agent, tools, sporecore.AllowAllSandbox{}, sporecore.NoopContextManager{},
 		sporecore.AlwaysContinuePolicy{}, nil, nil, 2, nil,
 	)
-	task := sporecore.NewTask(scenario.Prompt(), sessionID, sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 5})
+	task := sporecore.NewTask(scenario.Prompt(), sessionID, sporecore.ReActStrategy(5))
 	return h.Run(context.Background(), sporecore.NewHarnessRunOptions(task))
 }
 

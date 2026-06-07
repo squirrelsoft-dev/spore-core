@@ -140,7 +140,7 @@ func TestCaptureIsDeterministic(t *testing.T) {
 // ============================================================================
 
 func planTask(instruction string) Task {
-	return NewTask(instruction, SessionID("plan-sess"), LoopStrategy{Kind: StrategyPlanExecute})
+	return NewTask(instruction, SessionID("plan-sess"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
 }
 
 func planFinal(text string) TurnResult {
