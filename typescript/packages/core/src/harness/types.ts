@@ -15,6 +15,7 @@ import { z } from "zod";
 
 import type { Harness } from "./interface.js";
 import type { ExecutionRegistry } from "./execution-registry.js";
+import { planArtifactToTaskList, type TaskList } from "../tasklist/index.js";
 import type { SpanId } from "../observability/types.js";
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
@@ -762,6 +763,126 @@ export class SpanStack {
 }
 
 /**
+ * The PlanExecute plan-phase result the {@link StrategyExecutor} returns
+ * (#124, Q4). The plan phase is a real loop that drives the constrained planner
+ * and captures a {@link PlanArtifact} + accounting, or a terminal failure
+ * {@link RunResult} the combinator must propagate.
+ */
+export type PlanPhaseOutcome =
+  | { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number }
+  | { ok: false; failure: RunResult };
+
+/**
+ * The harness-side primitives the per-variant {@link RunStrategy.run} bodies
+ * delegate to (#124). Implemented by `StandardHarness`. This is the seam that
+ * lets the recursive config bodies OWN their loops while the model-touching
+ * machinery (the ReAct turn-loop window, the SelfVerifying evaluate phase, the
+ * PlanExecute plan/execute phases, the HillClimbing metric machinery, the
+ * Ralph `.spore/` checks) stays where it is tested.
+ *
+ * Every primitive returns a terminal {@link RunResult} for its phase; the
+ * config bodies translate the terminal into a {@link StrategyOutcome} (or
+ * recurse). Runtime-only — NEVER serialized. Mirrors the Rust `StrategyExecutor`
+ * trait.
+ */
+export interface StrategyExecutor {
+  /**
+   * Run ONE bounded ReAct turn-loop window over `sessionState`, carrying the
+   * shared `budgetUsed`. The leaf primitive (the body of the legacy
+   * `runReactInner`). Does NOT finalize observability — the caller does.
+   */
+  reactWindow(
+    task: Task,
+    maxIterations: number,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult>;
+
+  /** Run the PlanExecute plan phase (legacy `runPlanPhase`). */
+  planPhase(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<PlanPhaseOutcome>;
+
+  /** Run the PlanExecute execute phase (legacy `runExecutePhase`). */
+  executePhase(
+    task: Task,
+    sessionState: SessionState,
+    taskList: TaskList,
+    carried: BudgetSnapshot,
+    planUsage: AggregateUsage,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult>;
+
+  /** Persist a parsed task list through the RunStore seam (legacy `persistTaskList`). */
+  persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void>;
+
+  /** Drive a whole SelfVerifying loop (legacy `runSelfVerifying`). Default-FAIL. */
+  selfVerifyingLoop(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+  ): Promise<RunResult>;
+
+  /** Drive a whole Ralph continuation loop (legacy `runRalph`). Resets the
+   *  context window per continuation; resumes from the durable `.spore/`
+   *  checkpoint (A.6 deep-resume). */
+  ralphLoop(
+    task: Task,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+  ): Promise<RunResult>;
+
+  /** Drive a whole HillClimbing loop (legacy `runHillClimbing`). */
+  hillClimbingLoop(
+    task: Task,
+    direction: HillClimbingDirection,
+    maxStagnation: number | undefined,
+    revertOnNoImprovement: boolean,
+    minImprovementDelta: number | undefined,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult>;
+
+  /** Finalize observability for a terminal outcome. No-op for non-terminal. */
+  finalize(result: RunResult): Promise<void>;
+}
+
+/**
+ * Per-run mutable orchestration state threaded through the recursive strategy
+ * tree (#124). Runtime-only (NOT serialized). The combinator bodies set up the
+ * sub-phase `task` here before recursing, and the leaf ({@link ReactConfig})
+ * reads it to drive the ReAct window. `onStream` lives here (it is taken at the
+ * leaf so combinators that recurse per-phase suppress it).
+ *
+ *   - `task` — the task whose strategy is currently executing.
+ *   - `runSession` — the conversation/session state the current leaf builds on.
+ *   - `runBudget` — the shared budget snapshot threaded across every sub-loop.
+ *   - `terminalOverride` — a non-terminal pause (`waiting_for_human` / `consult`
+ *     / `escalate`) or a fully-formed terminal that must propagate VERBATIM as a
+ *     {@link RunResult} (preserving the strategy's typed {@link HaltReason} and
+ *     accounting) rather than being collapsed into a {@link StrategyOutcome}.
+ */
+export interface RunScratch {
+  task?: Task;
+  runSession: SessionState;
+  runBudget: BudgetSnapshot;
+  terminalOverride?: RunResult;
+}
+
+function newRunScratch(): RunScratch {
+  return { runSession: emptySessionState(), runBudget: emptyBudgetSnapshot() };
+}
+
+/**
  * The one shared, mutable runtime context threaded through a whole nested
  * strategy tree. Holds the {@link ExecutionRegistry} for the duration of the
  * run (resolution #1 — no lifetime concerns in TS). Runtime-only — NEVER
@@ -780,6 +901,21 @@ export interface ExecutionContext {
   spans: SpanStack;
   /** Optional streaming sink for emitted events. */
   stream?: StreamSink;
+  /**
+   * Optional cancellation signal threaded into every model/tool call across the
+   * recursive tree (TS-only — Rust uses a different cancellation model).
+   * Runtime-only; NEVER serialized.
+   */
+  signal?: AbortSignal;
+  /**
+   * The harness primitives the per-variant run bodies delegate to (#124).
+   * Absent only for the scaffold/unit fixtures that exercise the runtime
+   * context without a real harness (the recursion stub tests); without one a
+   * config body returns a TYPED {@link StrategyOutcome} `failed` (never throws).
+   */
+  executor?: StrategyExecutor;
+  /** Per-run orchestration scratch threaded across recursion (#124). */
+  scratch: RunScratch;
 }
 
 /**
@@ -793,6 +929,7 @@ export function newExecutionContext(registry: ExecutionRegistry): ExecutionConte
     usage: emptyAggregateUsage(),
     session: emptySessionState(),
     spans: new SpanStack(),
+    scratch: newRunScratch(),
   };
 }
 
@@ -806,10 +943,10 @@ export interface RunStrategy {
 }
 
 /**
- * The single dispatch site for the strategy tree. One `switch` over the `kind`
- * discriminant delegates to per-config run logic. Each per-config body is a
- * STUB returning a `complete` {@link StrategyOutcome} with an empty output (it
- * does NOT throw); real per-variant bodies land in #124.
+ * The ONLY dispatch site for the strategy tree (AC1): one `switch` over the
+ * `kind` discriminant — the enum→config delegation. There is no central
+ * dispatch `match` anymore; each per-config body OWNS its loop and recurses via
+ * `runStrategy(child, cx)`.
  */
 export async function runStrategy(
   strategy: LoopStrategy,
@@ -834,31 +971,293 @@ export function asRunStrategy(strategy: LoopStrategy): RunStrategy {
   return { run: (cx) => runStrategy(strategy, cx) };
 }
 
-// Per-config run STUBS (#124 lands the real bodies). They never throw; the
-// benign matchable placeholder is `complete` with an empty output.
-async function runReactConfig(_c: ReactConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
-  return { kind: "complete", output: "" };
+// ── Per-config run bodies (#124) ─────────────────────────────────────────────
+//
+// Each body OWNS its loop and recurses into children via `runStrategy`. The
+// model-touching machinery stays on the harness behind {@link StrategyExecutor},
+// reachable through `cx.executor`. Without a wired executor (scaffold-only
+// contexts) every body returns a TYPED {@link StrategyOutcome} `failed` — never
+// a throw (CONVENTIONS).
+
+/** The current per-run task, or `undefined` when scratch is unset (misuse). */
+function currentTask(cx: ExecutionContext): Task | undefined {
+  return cx.scratch.task;
 }
-async function runPlanExecuteConfig(
-  _c: PlanExecuteConfig,
-  _cx: ExecutionContext,
+
+/** The executor primitives, or a typed failure outcome when absent. */
+function requireExecutor(cx: ExecutionContext): StrategyExecutor | StrategyOutcome {
+  if (cx.executor === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("ExecutionContext has no StrategyExecutor wired"),
+    };
+  }
+  return cx.executor;
+}
+
+/** Derive the `SessionOutcome.failure.reason` string from a {@link HaltReason}.
+ *  Mirrors Rust's `format!("{reason:?}")` for the failure outcome. */
+export function haltReasonToString(reason: HaltReason): string {
+  return JSON.stringify(reason);
+}
+
+/**
+ * Translate a terminal {@link RunResult} into a {@link StrategyOutcome} (#124,
+ * Q5): `success → complete(output)`; every non-success terminal → `failed`. A
+ * `budget_exceeded` failure maps to `failed` here (the budget-enforcement
+ * `budget_exhausted` value is produced by {@link BudgetContext.charge} at the
+ * boundary; full HITL-through-recursion is #130). The pause variants are handled
+ * separately (the override path) and degrade to a typed failure only if they
+ * ever reach this mapping.
+ */
+function outcomeFromRunResult(result: RunResult): StrategyOutcome {
+  switch (result.kind) {
+    case "success":
+      return { kind: "complete", output: result.output };
+    case "failure":
+      return {
+        kind: "failed",
+        error: new InvalidConfiguration(haltReasonToString(result.reason)),
+      };
+    case "waiting_for_human":
+    case "consult":
+    case "escalate":
+      return {
+        kind: "failed",
+        error: new InvalidConfiguration("non-terminal outcome reached strategy boundary"),
+      };
+  }
+}
+
+/**
+ * Record a terminal/pause {@link RunResult} from a whole-loop primitive
+ * (ReAct / SelfVerifying / Ralph / HillClimbing): carry the post-run session
+ * into the scratch (so a parent resumes losslessly) and stash the FULL result
+ * in `terminalOverride` so the harness entry returns it VERBATIM — preserving
+ * the strategy's typed {@link HaltReason} and accounting. Returns the matchable
+ * {@link StrategyOutcome} for any combinator that recurses into this node.
+ */
+function recordTerminal(cx: ExecutionContext, result: RunResult): StrategyOutcome {
+  if (result.kind === "success" || result.kind === "failure") {
+    cx.scratch.runSession = result.session_state ?? emptySessionState();
+  }
+  const outcome = outcomeFromRunResult(result);
+  cx.scratch.terminalOverride = result;
+  return outcome;
+}
+
+/**
+ * A combinator's terminal seam: finalize observability for `result`, restore the
+ * parent `task` into scratch, stash `result` as the override so the harness entry
+ * returns it VERBATIM, and return the matching outcome.
+ */
+async function finishCombinator(
+  cx: ExecutionContext,
+  executor: StrategyExecutor,
+  parentTask: Task,
+  result: RunResult,
 ): Promise<StrategyOutcome> {
-  return { kind: "complete", output: "" };
+  await executor.finalize(result);
+  cx.scratch.task = parentTask;
+  if (result.kind === "success" || result.kind === "failure") {
+    cx.scratch.runSession = result.session_state ?? emptySessionState();
+  }
+  const outcome = outcomeFromRunResult(result);
+  cx.scratch.terminalOverride = result;
+  return outcome;
 }
+
+/**
+ * The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
+ * (`task`, `runSession`, `runBudget`) and drives one ReAct window through the
+ * executor primitive. The leaf takes the run's stream sink for the window
+ * (combinators that recurse per-phase suppress it by taking it first).
+ */
+async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<StrategyOutcome> {
+  const executor = requireExecutor(cx);
+  if (!("reactWindow" in executor)) return executor;
+  const task = currentTask(cx);
+  if (task === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("no task in ExecutionContext scratch"),
+    };
+  }
+  const maxIterations = reactMaxIterations(c);
+  const sessionState = cx.scratch.runSession;
+  cx.scratch.runSession = emptySessionState();
+  const budgetUsed = { ...cx.scratch.runBudget };
+  const onStream = cx.stream;
+  cx.stream = undefined;
+  const result = await executor.reactWindow(
+    task,
+    maxIterations,
+    sessionState,
+    budgetUsed,
+    onStream,
+    cx.signal,
+  );
+  await executor.finalize(result);
+  return recordTerminal(cx, result);
+}
+
+/**
+ * Plan→execute (#124). The plan phase runs the constrained planner via the
+ * executor primitive (Q4 — a real loop, not a one-shot dispatch); the execute
+ * phase drains the task list, recursing the execute sub-strategy per task (the
+ * ready-set walk lands in #126). Behavior is at parity with the ported
+ * `runPlanExecute` body (AC6).
+ */
+async function runPlanExecuteConfig(
+  c: PlanExecuteConfig,
+  cx: ExecutionContext,
+): Promise<StrategyOutcome> {
+  const executor = requireExecutor(cx);
+  if (!("planPhase" in executor)) return executor;
+  const task = currentTask(cx);
+  if (task === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("no task in ExecutionContext scratch"),
+    };
+  }
+  const sessionId = task.session_id;
+  const sessionState = cx.scratch.runSession;
+  cx.scratch.runSession = emptySessionState();
+  const budgetUsed = { ...cx.scratch.runBudget };
+  const onStream = cx.stream;
+  cx.stream = undefined;
+
+  // ── Phase 1: plan ────────────────────────────────────────────────────────
+  const outcome = await executor.planPhase(
+    task,
+    sessionState,
+    { ...budgetUsed },
+    onStream,
+    cx.signal,
+  );
+  if (!outcome.ok) {
+    return finishCombinator(cx, executor, task, outcome.failure);
+  }
+
+  const taskList = planArtifactToTaskList(outcome.artifact);
+  if (taskList.tasks.length === 0) {
+    const result: RunResult = {
+      kind: "failure",
+      reason: { kind: "empty_plan" },
+      session_id: sessionId,
+      usage: outcome.usage,
+      turns: outcome.turns,
+    };
+    return finishCombinator(cx, executor, task, result);
+  }
+  await executor.persistTaskList(sessionId, taskList);
+
+  // Carry the shared budget past the plan turn.
+  const carried: BudgetSnapshot = { ...budgetUsed };
+  carried.turns = outcome.turns;
+  carried.input_tokens += outcome.usage.input_tokens;
+  carried.output_tokens += outcome.usage.output_tokens;
+
+  // ── Phase 2: execute ───────────────────────────────────────────────────────
+  const result = await executor.executePhase(
+    task,
+    sessionState,
+    taskList,
+    carried,
+    outcome.usage,
+    onStream,
+    cx.signal,
+  );
+  return finishCombinator(cx, executor, task, result);
+}
+
+/**
+ * SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
+ * verifier's iteration cap / the run budget — Q1). The build phase reuses the
+ * leaf ReAct window through the executor primitive.
+ */
 async function runSelfVerifyingConfig(
   _c: SelfVerifyingConfig,
-  _cx: ExecutionContext,
+  cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
-  return { kind: "complete", output: "" };
+  const executor = requireExecutor(cx);
+  if (!("selfVerifyingLoop" in executor)) return executor;
+  const task = currentTask(cx);
+  if (task === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("no task in ExecutionContext scratch"),
+    };
+  }
+  const sessionState = cx.scratch.runSession;
+  cx.scratch.runSession = emptySessionState();
+  const budgetUsed = { ...cx.scratch.runBudget };
+  const onStream = cx.stream;
+  cx.stream = undefined;
+  const result = await executor.selfVerifyingLoop(task, sessionState, budgetUsed, onStream);
+  return recordTerminal(cx, result);
 }
-async function runRalphConfig(_c: RalphConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
-  return { kind: "complete", output: "" };
+
+/**
+ * Ralph: the continuation wrapper — reset the context window per window and
+ * resume from the durable `.spore/` checkpoint (A.6 deep-resume). Ralph discards
+ * the incoming session state by design (each window is a fresh start re-seeded
+ * from the filesystem checkpoint).
+ */
+async function runRalphConfig(_c: RalphConfig, cx: ExecutionContext): Promise<StrategyOutcome> {
+  const executor = requireExecutor(cx);
+  if (!("ralphLoop" in executor)) return executor;
+  const task = currentTask(cx);
+  if (task === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("no task in ExecutionContext scratch"),
+    };
+  }
+  const budgetUsed = { ...cx.scratch.runBudget };
+  const onStream = cx.stream;
+  cx.stream = undefined;
+  cx.scratch.runSession = emptySessionState();
+  const result = await executor.ralphLoop(task, budgetUsed, onStream);
+  return recordTerminal(cx, result);
 }
+
+/**
+ * HillClimbing: iterate the inner candidate-producing strategy, scoring each
+ * candidate with the metric; bounded by `max_stagnation` (Q1). A
+ * `Number.MAX_SAFE_INTEGER` sentinel ⇒ no stagnation cap (mirrors the legacy
+ * entry).
+ */
 async function runHillClimbingConfig(
-  _c: HillClimbingConfig,
-  _cx: ExecutionContext,
+  c: HillClimbingConfig,
+  cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
-  return { kind: "complete", output: "" };
+  const executor = requireExecutor(cx);
+  if (!("hillClimbingLoop" in executor)) return executor;
+  const task = currentTask(cx);
+  if (task === undefined) {
+    return {
+      kind: "failed",
+      error: new InvalidConfiguration("no task in ExecutionContext scratch"),
+    };
+  }
+  const budgetUsed = { ...cx.scratch.runBudget };
+  const onStream = cx.stream;
+  cx.stream = undefined;
+  cx.scratch.runSession = emptySessionState();
+  const maxStagnation = c.max_stagnation !== Number.MAX_SAFE_INTEGER ? c.max_stagnation : undefined;
+  const result = await executor.hillClimbingLoop(
+    task,
+    c.direction,
+    maxStagnation,
+    c.revert_on_no_improvement,
+    c.min_improvement_delta,
+    budgetUsed,
+    onStream,
+    cx.signal,
+  );
+  return recordTerminal(cx, result);
 }
 
 // ── EscalationMode (HITL-vs-AFK config knob, #120) ──────────────────────────

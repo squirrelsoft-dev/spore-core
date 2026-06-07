@@ -21,10 +21,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   ExecutionRegistry,
+  SessionId,
   asRunStrategy,
   loopStrategyFromJson,
   loopStrategyToJson,
   newExecutionContext,
+  newTask,
   runStrategy,
   strategyRefFromJson,
   strategyRefToJson,
@@ -75,6 +77,7 @@ function cordycepsTree(): LoopStrategy {
         budget: { kind: "per_loop", value: 4 },
         agent: "planner",
         toolset: "plan-tools",
+        output: "plan-schema",
       },
       execute: {
         kind: "self_verifying",
@@ -83,6 +86,7 @@ function cordycepsTree(): LoopStrategy {
           budget: { kind: "per_loop", value: 12 },
           agent: "executor",
           toolset: "exec-tools",
+          output: "worker-schema",
         },
         evaluator: "exec-evaluator",
       },
@@ -195,9 +199,11 @@ describe("LoopStrategy", () => {
   it("serializes the cordyceps tree to the exact compact form", () => {
     expect(JSON.stringify(loopStrategyToJson(cordycepsTree()))).toBe(
       '{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react",' +
-        '"budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools"},' +
+        '"budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools",' +
+        '"output":"plan-schema"},' +
         '"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":' +
-        '{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools"},' +
+        '{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools",' +
+        '"output":"worker-schema"},' +
         '"evaluator":"exec-evaluator"}},"agent":"ralph-agent"}',
     );
   });
@@ -233,7 +239,7 @@ describe("StrategyRef", () => {
   });
 });
 
-describe("RunStrategy stub dispatch", () => {
+describe("RunStrategy dispatch without a wired executor (#124)", () => {
   const strategies: LoopStrategy[] = [
     { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
     {
@@ -262,15 +268,24 @@ describe("RunStrategy stub dispatch", () => {
     },
   ];
 
-  it.each(strategies)("returns complete (no throw) for %j", async (strategy) => {
+  // #124: the per-variant bodies are real now. Without a wired StrategyExecutor
+  // (the scaffold-only context) every body returns a TYPED `failed` outcome —
+  // never a throw (CONVENTIONS), never the old `complete` stub.
+  it.each(strategies)("returns a typed failed (no throw) for %j", async (strategy) => {
     const cx = newExecutionContext(ExecutionRegistry.empty());
-    await expect(runStrategy(strategy, cx)).resolves.toEqual({ kind: "complete", output: "" });
+    // scratch.task must be set before running a strategy (the harness entry does
+    // this; here we set it directly so the body reaches the executor check).
+    cx.scratch.task = newTask("t", SessionId.generate(), strategy);
+    const outcome = await runStrategy(strategy, cx);
+    expect(outcome.kind).toBe("failed");
   });
 
   it("asRunStrategy delegates to the single dispatch", async () => {
     const cx = newExecutionContext(ExecutionRegistry.empty());
+    cx.scratch.task = newTask("t", SessionId.generate(), cordycepsTree());
     const rs = asRunStrategy(cordycepsTree());
-    await expect(rs.run(cx)).resolves.toEqual({ kind: "complete", output: "" });
+    const outcome = await rs.run(cx);
+    expect(outcome.kind).toBe("failed");
   });
 });
 

@@ -28,6 +28,7 @@ import {
   EmptyToolRegistry,
   ExecutionRegistry,
   HarnessBuilder,
+  InvalidConfiguration,
   SessionId,
   StandardHarness,
   StrategyNotFound,
@@ -266,8 +267,115 @@ describe("ExecutionRegistry tree-walk over cordyceps_tree.json", () => {
       .toolset("plan-tools", new EmptyToolRegistry())
       .toolset("exec-tools", new EmptyToolRegistry())
       .schema("exec-evaluator", {})
+      .schema("plan-schema", {})
+      .schema("worker-schema", {})
       .build();
     const task = newTask("nested", SessionId.generate(), cordycepsTree());
+    expect(() => reg.validate(task)).not.toThrow();
+  });
+});
+
+// ── A.5 output-contract enforcement (#124, Q3) ───────────────────────────────
+
+describe("A.5 output-contract enforcement (#124)", () => {
+  it("a bare ReAct in the structured `plan` slot without output is rejected", () => {
+    const reg = ExecutionRegistry.builder()
+      .agent("a1", new StubAgent())
+      .toolset("t1", new EmptyToolRegistry())
+      .build();
+    const tree: LoopStrategy = {
+      kind: "plan_execute",
+      plan: reactLeaf("a1", "t1"), // output: undefined
+      execute: reactLeaf("a1", "t1"),
+    };
+    const task = newTask("contract", SessionId.generate(), tree);
+    try {
+      reg.validate(task);
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidConfiguration);
+      expect((e as InvalidConfiguration).message).toContain("plan");
+    }
+  });
+
+  it("a bare ReAct worker slot (self_verifying.inner) without output is rejected", () => {
+    const reg = ExecutionRegistry.builder()
+      .agent("a1", new StubAgent())
+      .toolset("t1", new EmptyToolRegistry())
+      .schema("eval", {})
+      .build();
+    const tree: LoopStrategy = {
+      kind: "self_verifying",
+      inner: reactLeaf("a1", "t1"),
+      evaluator: "eval",
+    };
+    const task = newTask("contract", SessionId.generate(), tree);
+    try {
+      reg.validate(task);
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidConfiguration);
+      expect((e as InvalidConfiguration).message).toContain("worker");
+    }
+  });
+
+  it("a bare ReAct propose slot (hill_climbing.inner) without output is rejected", () => {
+    const reg = ExecutionRegistry.builder()
+      .agent("a1", new StubAgent())
+      .toolset("t1", new EmptyToolRegistry())
+      .build();
+    const tree: LoopStrategy = {
+      kind: "hill_climbing",
+      inner: reactLeaf("a1", "t1"),
+      direction: "minimize",
+      max_stagnation: 1,
+      revert_on_no_improvement: false,
+      min_improvement_delta: 0,
+      evaluator: "a1",
+    };
+    const task = newTask("contract", SessionId.generate(), tree);
+    try {
+      reg.validate(task);
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidConfiguration);
+      expect((e as InvalidConfiguration).message).toContain("propose");
+    }
+  });
+
+  it("accepts a ReAct in a structured slot WITH an output schema", () => {
+    const reg = ExecutionRegistry.builder()
+      .agent("a1", new StubAgent())
+      .toolset("t1", new EmptyToolRegistry())
+      .schema("plan-schema", {})
+      .build();
+    const tree: LoopStrategy = {
+      kind: "plan_execute",
+      plan: reactLeaf("a1", "t1", "plan-schema"),
+      execute: reactLeaf("a1", "t1"),
+    };
+    const task = newTask("contract", SessionId.generate(), tree);
+    expect(() => reg.validate(task)).not.toThrow();
+  });
+
+  it("accepts a COMBINATOR child in a structured slot (carries its own contract)", () => {
+    const reg = ExecutionRegistry.builder()
+      .agent("a1", new StubAgent())
+      .toolset("t1", new EmptyToolRegistry())
+      .schema("worker-schema", {})
+      .schema("eval-schema", {})
+      .build();
+    const innerSv: LoopStrategy = {
+      kind: "self_verifying",
+      inner: reactLeaf("a1", "t1", "worker-schema"),
+      evaluator: "eval-schema",
+    };
+    const tree: LoopStrategy = {
+      kind: "plan_execute",
+      plan: innerSv,
+      execute: reactLeaf("a1", "t1"),
+    };
+    const task = newTask("contract", SessionId.generate(), tree);
     expect(() => reg.validate(task)).not.toThrow();
   });
 });

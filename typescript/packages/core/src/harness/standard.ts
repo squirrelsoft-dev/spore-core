@@ -104,6 +104,7 @@ import {
 } from "../plan/index.js";
 import {
   TASK_LIST_EXTRAS_KEY,
+  TaskListSchema,
   completeTask,
   planArtifactToTaskList,
   serializeTaskList,
@@ -119,8 +120,13 @@ import {
   emptyAggregateUsage,
   emptyBudgetSnapshot,
   emptySessionState,
+  haltReasonToString,
+  newExecutionContext,
   newTask,
   runResultSessionState,
+  type ExecutionContext,
+  type PlanPhaseOutcome,
+  type StrategyExecutor,
   type AggregateUsage,
   type BudgetLimitType,
   type BudgetLimits,
@@ -146,6 +152,7 @@ import {
   type HillClimbingDirection,
   reactMaxIterations,
   reactPerLoop,
+  runStrategy,
   type PausedState,
   type RunResult,
   type RunStrategy,
@@ -383,7 +390,7 @@ export interface HarnessConfig {
 const DEFAULT_MAX_STOP_BLOCKS = 8;
 const DEFAULT_MAX_RESETS = 3;
 
-export class StandardHarness implements Harness {
+export class StandardHarness implements Harness, StrategyExecutor {
   constructor(private readonly config: HarnessConfig) {
     // Issue #58, B1: drive Ralph off the Stop hook. Register a `stop` hook at
     // construction that reads `.spore/progress.json` under the sandbox's
@@ -683,44 +690,198 @@ export class StandardHarness implements Harness {
     }
     const resolvedState = sessionState ?? emptySessionState();
 
-    switch (task.loop_strategy.kind) {
-      case "react":
-        return this.runReact(
-          task,
-          reactMaxIterations(task.loop_strategy),
-          resolvedState,
-          budgetUsed,
-          options.on_stream,
-          options.signal,
-          true,
-        );
-      case "plan_execute":
-        return this.runPlanExecute(
-          task,
-          resolvedState,
-          budgetUsed,
-          options.on_stream,
-          options.signal,
-        );
-      case "ralph":
-        return this.runRalph(task, budgetUsed, options.on_stream);
-      case "self_verifying":
-        return this.runSelfVerifying(task, resolvedState, budgetUsed, options.on_stream);
-      case "hill_climbing":
-        return this.runHillClimbing(
-          task,
-          task.loop_strategy.direction,
-          task.loop_strategy.max_stagnation,
-          task.loop_strategy.revert_on_no_improvement,
-          task.loop_strategy.min_improvement_delta,
-          budgetUsed,
-          options.on_stream,
-          options.signal,
-        );
-      default: {
-        const _exhaustive: never = task.loop_strategy;
-        return _exhaustive;
-      }
+    // #124: the central dispatch `match` is GONE — the only `switch` left is the
+    // enum→config delegation inside {@link runStrategy}. The harness entry
+    // collapses to `task.loop_strategy.run(cx)` via the recursive executor.
+    // Instruction seeding stays OWNED by the leaf {@link reactWindow} / the
+    // combinators' own build sub-loops (byte-for-byte parity with the ported
+    // bodies, AC6) rather than being lifted to the entry.
+    return this.driveStrategy(task, resolvedState, budgetUsed, options.on_stream, options.signal);
+  }
+
+  /**
+   * The recursive-executor entry (#124): build the shared {@link ExecutionContext},
+   * seed the per-run scratch (task / session / budget), drive
+   * `task.loop_strategy.run(cx)` via {@link runStrategy}, and translate the
+   * outcome back into a terminal {@link RunResult} (Q5). A non-terminal pause /
+   * escalate stashed in `scratch.terminalOverride` propagates VERBATIM (it never
+   * collapses into a {@link StrategyOutcome}).
+   */
+  private async driveStrategy(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    const sessionId = task.session_id;
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    const cx: ExecutionContext = newExecutionContext(registry);
+    cx.executor = this;
+    cx.stream = onStream;
+    cx.signal = signal;
+    cx.scratch.runSession = sessionState;
+    cx.scratch.runBudget = budgetUsed;
+    cx.scratch.task = task;
+
+    const outcome = await runStrategy(task.loop_strategy, cx);
+
+    // A pause / escalate (or any fully-formed terminal) propagates verbatim —
+    // preserves the HITL / consult / escalation contract and the strategy's
+    // typed HaltReason + accounting through the recursive executor.
+    if (cx.scratch.terminalOverride !== undefined) {
+      return cx.scratch.terminalOverride;
+    }
+    switch (outcome.kind) {
+      case "complete":
+        return {
+          kind: "success",
+          output: outcome.output,
+          session_id: sessionId,
+          usage: cx.usage,
+          turns: cx.scratch.runBudget.turns,
+          session_state: cx.scratch.runSession,
+        };
+      case "failed":
+        return {
+          kind: "failure",
+          reason: { kind: "configuration_error", error: outcome.error },
+          session_id: sessionId,
+          usage: cx.usage,
+          turns: cx.scratch.runBudget.turns,
+          session_state: cx.scratch.runSession,
+        };
+      case "budget_exhausted":
+        return {
+          kind: "failure",
+          reason: { kind: "budget_exceeded", limit_type: "turns" },
+          session_id: sessionId,
+          usage: cx.usage,
+          turns: cx.scratch.runBudget.turns,
+          session_state: emptySessionState(),
+        };
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // StrategyExecutor (#124): the harness-side primitives the recursive
+  // per-variant RunStrategy.run bodies delegate to. Each wraps an existing,
+  // tested orchestration method so behavior stays at parity (AC6) — the only
+  // structural change is that the per-variant bodies now own their loops and
+  // the central dispatch switch is gone.
+  // --------------------------------------------------------------------------
+
+  /** {@inheritDoc StrategyExecutor.reactWindow} */
+  reactWindow(
+    task: Task,
+    maxIterations: number,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    // The leaf seeds the task instruction (parity with the old top-level ReAct
+    // entry, which called runReact(.., seedInstruction: true)). The combinators'
+    // own build sub-loops call runReactInner directly with their own seed flag.
+    return this.runReactInner(
+      task,
+      maxIterations,
+      sessionState,
+      budgetUsed,
+      onStream,
+      signal,
+      true,
+    );
+  }
+
+  /** {@inheritDoc StrategyExecutor.planPhase} */
+  planPhase(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<PlanPhaseOutcome> {
+    return this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
+  }
+
+  /** {@inheritDoc StrategyExecutor.executePhase} */
+  executePhase(
+    task: Task,
+    sessionState: SessionState,
+    taskList: TaskList,
+    carried: BudgetSnapshot,
+    planUsage: AggregateUsage,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    return this.runExecutePhase(task, sessionState, taskList, carried, planUsage, onStream, signal);
+  }
+
+  /** {@inheritDoc StrategyExecutor.selfVerifyingLoop} */
+  selfVerifyingLoop(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+  ): Promise<RunResult> {
+    return this.runSelfVerifying(task, sessionState, budgetUsed, onStream);
+  }
+
+  /** {@inheritDoc StrategyExecutor.ralphLoop} */
+  ralphLoop(
+    task: Task,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+  ): Promise<RunResult> {
+    return this.runRalph(task, budgetUsed, onStream);
+  }
+
+  /** {@inheritDoc StrategyExecutor.hillClimbingLoop} */
+  hillClimbingLoop(
+    task: Task,
+    direction: HillClimbingDirection,
+    maxStagnation: number | undefined,
+    revertOnNoImprovement: boolean,
+    minImprovementDelta: number | undefined,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult> {
+    // The legacy entry took the raw (sentinel-encoded) fields; the config body
+    // already decoded the `Number.MAX_SAFE_INTEGER` ⇒ "no cap" sentinel to
+    // `undefined`. Re-encode for the legacy method's signature.
+    return this.runHillClimbing(
+      task,
+      direction,
+      maxStagnation ?? Number.MAX_SAFE_INTEGER,
+      revertOnNoImprovement,
+      minImprovementDelta ?? 0,
+      budgetUsed,
+      onStream,
+      signal,
+    );
+  }
+
+  /** {@inheritDoc StrategyExecutor.finalize} */
+  async finalize(result: RunResult): Promise<void> {
+    switch (result.kind) {
+      case "success":
+        await this.finalizeObservability(result.session_id, { kind: "success" });
+        break;
+      case "failure":
+        await this.finalizeObservability(result.session_id, {
+          kind: "failure",
+          reason: haltReasonToString(result.reason),
+        });
+        break;
+      case "escalate":
+        await this.finalizeObservability(result.session_id, { kind: "escalated" });
+        break;
+      // Non-terminal pauses are never finalized.
+      case "waiting_for_human":
+      case "consult":
+        break;
     }
   }
 
@@ -1104,7 +1265,7 @@ export class StandardHarness implements Harness {
    * successful plan must not be lost to a storage hiccup (the default no-op /
    * in-memory provider never fails).
    */
-  private async persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void> {
+  async persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void> {
     // Serialize via the canonical task-list form, then re-parse to a plain JSON
     // value so the durable blob is byte-identical to the cross-language
     // `{ tasks, next_id }` shape.
@@ -1159,6 +1320,33 @@ export class StandardHarness implements Harness {
     signal: AbortSignal | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
+
+    // A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
+    // already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
+    // after every step (Q4). On a resumed run the freshly-parsed `taskList`
+    // (from the plan artifact) is reconciled with that checkpoint so already-
+    // Completed tasks are NOT re-run — serialize→reset→resume rather than the
+    // old shallow no-op. Tasks are matched by `id` (the list is regenerated
+    // deterministically from the same artifact).
+    try {
+      const saved = await this.storage().run().get(sessionId, TASK_LIST_EXTRAS_KEY);
+      if (saved != null) {
+        const parsed = TaskListSchema.safeParse(saved);
+        if (parsed.success) {
+          const completed = new Set(
+            parsed.data.tasks.filter((s) => s.status === "completed").map((s) => s.id),
+          );
+          for (const t of taskList.tasks) {
+            if (completed.has(t.id)) {
+              t.status = "completed";
+            }
+          }
+        }
+      }
+    } catch {
+      // A checkpoint read hiccup must not block a fresh execute run.
+    }
+
     const totalTasks = taskList.tasks.length;
     // Cumulative usage across the plan turn + every execute step (Q1).
     const totalUsage: AggregateUsage = { ...planUsage };
@@ -1175,6 +1363,13 @@ export class StandardHarness implements Harness {
     for (let index = 0; index < totalTasks; index += 1) {
       const taskId = taskList.tasks[index]!.id;
       const instruction = taskList.tasks[index]!.description;
+
+      // A.6 deep-resume: a task already Completed on the durable checkpoint is
+      // NOT re-run — its instruction stays the last-completed output handle.
+      if (taskList.tasks[index]!.status === "completed") {
+        lastOutput = instruction;
+        continue;
+      }
 
       // Q1: per-task turn allocation, derived at the START of this step.
       // remaining_tasks = not-yet-started tasks including this one.
@@ -4138,12 +4333,6 @@ function failure(
     turns,
     session_state: sessionState,
   };
-}
-
-/** Derive the `SessionOutcome.failure.reason` string from a {@link HaltReason}.
- *  Mirrors Rust's `format!("{reason:?}")` for the failure outcome. */
-function haltReasonToString(reason: HaltReason): string {
-  return JSON.stringify(reason);
 }
 
 /**

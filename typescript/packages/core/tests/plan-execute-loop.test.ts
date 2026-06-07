@@ -41,7 +41,11 @@ import type { Hook, HookChain, HookContext, HookDecision, HookEvent } from "../s
 import { StandardHookChain } from "../src/hooks/standard.js";
 import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js";
 import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
-import { TASK_LIST_EXTRAS_KEY, type TaskList } from "../src/tasklist/index.js";
+import {
+  TASK_LIST_EXTRAS_KEY,
+  planArtifactToTaskList,
+  type TaskList,
+} from "../src/tasklist/index.js";
 import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
@@ -355,5 +359,60 @@ describe("PlanExecute execute phase (issue #59)", () => {
     const h = new StandardHarness(configWith(a));
     const r = await h.run({ task: planTask() });
     expect(r.kind).toBe("success");
+  });
+
+  // ── A.6 deep-resume (#124, Q2) ─────────────────────────────────────────────
+  it("deep-resume: a task already Completed on the durable checkpoint is NOT re-run", async () => {
+    // Mirrors the Rust `deep_resume_skips_already_completed_task`: a PRIOR run's
+    // progress (task 1 Completed) lives on the durable RunStore checkpoint. The
+    // execute phase reconciles the freshly-parsed (all-Pending) task list with
+    // that checkpoint via serialize→reset→resume — task 1 is skipped, only the
+    // not-yet-done task runs.
+    const provider = StorageProvider.single(new InMemoryStorageProvider());
+
+    // Pre-seed the durable checkpoint: task 1 ("one") Completed, task 2 Pending.
+    const checkpoint: TaskList = {
+      tasks: [
+        { id: 1, description: "one", status: "completed", blockers: [] },
+        { id: 2, description: "two", status: "pending", blockers: [] },
+      ],
+      next_id: 3,
+    };
+    await provider.run().put(SID, TASK_LIST_EXTRAS_KEY, JSON.parse(JSON.stringify(checkpoint)));
+
+    // The freshly-parsed list (as the plan phase produces) is all-Pending.
+    const fresh = planArtifactToTaskList({ tasks: ["one", "two"], rationale: "r" });
+
+    // Only ONE scripted response: enough iff task 1 is skipped (else the second
+    // step starves and the run fails).
+    const a = new RecordingAgent(AgentId.of("default")).push(fr("done two"));
+    const h = new StandardHarness(configWith(a, { storage: provider }));
+
+    // Drive the execute phase directly (the StrategyExecutor seam) with a budget
+    // that already reflects the prior plan turn (turns: 1).
+    const r = await h.executePhase(
+      planTask(),
+      emptySessionState(),
+      fresh,
+      { turns: 1, input_tokens: 0, output_tokens: 0, cost_usd: 0 },
+      {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_usd: 0,
+      },
+      undefined,
+      undefined,
+    );
+
+    expect(r.kind).toBe("success");
+    // Exactly ONE agent turn: task 1 was resumed-from-checkpoint, not re-run.
+    expect(a.ran).toBe(1);
+    if (r.kind === "success") expect(r.output).toBe("done two");
+
+    // Both tasks Completed on the final persisted checkpoint.
+    const list = (await provider.run().get(SID, TASK_LIST_EXTRAS_KEY)) as TaskList;
+    expect(list.tasks.every((t) => t.status === "completed")).toBe(true);
   });
 });

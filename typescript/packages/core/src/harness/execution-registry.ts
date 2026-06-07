@@ -41,7 +41,7 @@
 import type { Agent } from "../agent/interface.js";
 import type { Verifier } from "../verifier/types.js";
 
-import { StrategyNotFound, UnresolvedHandle } from "./types.js";
+import { InvalidConfiguration, StrategyNotFound, UnresolvedHandle } from "./types.js";
 import type {
   AgentRef,
   LoopStrategy,
@@ -203,10 +203,16 @@ export class ExecutionRegistry {
         }
         return;
       case "plan_execute":
+        // A.5 (#124, Q3): the `plan` slot is STRUCTURED — it must yield a task
+        // graph. A bare `ReAct` there needs an output schema.
+        ExecutionRegistry.checkStructuredSlot(ls.plan, "plan");
         this.walkStrategy(ls.plan);
         this.walkStrategy(ls.execute);
         return;
       case "self_verifying":
+        // A.5: the `inner` (worker) slot is STRUCTURED — its result must be
+        // evaluable. A bare `ReAct` worker needs an output schema.
+        ExecutionRegistry.checkStructuredSlot(ls.inner, "worker");
         this.walkStrategy(ls.inner);
         // The evaluator is a SchemaRef (the evaluator schema handle).
         this.checkSchema(ls.evaluator);
@@ -216,10 +222,29 @@ export class ExecutionRegistry {
         this.checkAgent(ls.agent);
         return;
       case "hill_climbing":
+        // A.5: the `inner` (propose) slot is STRUCTURED — it must yield a
+        // candidate. A bare `ReAct` proposer needs an output schema.
+        ExecutionRegistry.checkStructuredSlot(ls.inner, "propose");
         this.walkStrategy(ls.inner);
         // The evaluator is an AgentRef (the metric-evaluator agent).
         this.checkAgent(ls.evaluator);
         return;
+    }
+  }
+
+  /**
+   * A.5 output-contract enforcement (#124, Q3): a bare `ReAct` feeding a
+   * STRUCTURED slot (`plan` ⇒ task graph, `propose` ⇒ candidate, `worker` ⇒
+   * evaluable result) MUST declare `ReAct.output`. A combinator child carries
+   * its own contract, so this check applies only to the leaf. Throws
+   * {@link InvalidConfiguration} naming the offending slot.
+   */
+  private static checkStructuredSlot(slot: LoopStrategy, slotName: string): void {
+    if (slot.kind === "react" && slot.output === undefined) {
+      throw new InvalidConfiguration(
+        `a bare ReAct in the structured \`${slotName}\` slot requires ` +
+          "`output = Some(schema)` so the slot yields a typed result",
+      );
     }
   }
 
