@@ -373,10 +373,16 @@ class PlanExecuteConfig(_Model):
     @classmethod
     def simple(cls, plan_model: ModelConfig | None = None) -> PlanExecuteConfig:
         """A PlanExecute whose plan and execute phases are both bare ReAct leaves
-        (migration shim for the old ``PlanExecute { plan_model }`` shape; the
-        live executor does not read the children yet — #124)."""
+        (migration shim for the old ``PlanExecute { plan_model }`` shape). #124:
+        the ``plan`` slot is STRUCTURED (A.5), so its leaf declares the default
+        ``output`` schema handle (empty key) to satisfy the output contract."""
         return cls(
-            plan=ReactConfig.per_loop(2**31 - 1),
+            plan=ReactConfig(
+                budget=BudgetPolicyPerLoop(value=2**31 - 1),
+                agent="",
+                toolset="",
+                output="",
+            ),
             execute=ReactConfig.per_loop(2**31 - 1),
             plan_model=plan_model,
         )
@@ -393,8 +399,18 @@ class SelfVerifyingConfig(_Model):
     @classmethod
     def simple(cls) -> SelfVerifyingConfig:
         """Migration shim for the old empty ``SelfVerifying`` shape: a bare ReAct
-        inner leaf and an empty evaluator handle (resolution lands with #120)."""
-        return cls(inner=ReactConfig.per_loop(2**31 - 1), evaluator="")
+        inner (worker) leaf and an empty evaluator handle. #124: the ``inner``
+        slot is STRUCTURED (A.5), so its leaf declares the default ``output``
+        schema handle (empty key) to satisfy the output contract."""
+        return cls(
+            inner=ReactConfig(
+                budget=BudgetPolicyPerLoop(value=2**31 - 1),
+                agent="",
+                toolset="",
+                output="",
+            ),
+            evaluator="",
+        )
 
 
 class RalphConfig(_Model):
@@ -825,8 +841,103 @@ class StrategyExecutor(Protocol):
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
+        agent: Agent,
     ) -> RunResult:
-        """Run ONE bounded ReAct turn-loop window (the leaf primitive)."""
+        """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
+        resolved worker ``agent`` (#124)."""
+        ...
+
+    def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
+        """Resolve an ``AgentRef`` to its registered agent (#124). The leaf and the
+        combinators resolve their worker agent through this so a missing handle is
+        a typed terminal ``Failure`` (carrying an ``UnresolvedHandle``) rather than
+        a raise."""
+        ...
+
+    async def evaluate_phase(
+        self,
+        task: Task,
+        eval_agent: Agent,
+        carried: BudgetSnapshot,
+        total_usage: AggregateUsage,
+    ) -> RunResult:
+        """Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over
+        a read-only sandbox in a never-shared session, on ``eval_agent``. Folds the
+        run's usage into ``total_usage`` / ``carried``; returns its terminal."""
+        ...
+
+    async def append_user_message(self, session_state: SessionState, text: str) -> None:
+        """Append ``text`` as a user message on ``session_state`` (Default-FAIL)."""
+        ...
+
+    def workspace_root(self) -> Path:
+        """The configured sandbox workspace root (#124, for ``VerifierInput``)."""
+        ...
+
+    async def ralph_seed_session(self, instruction: str) -> SessionState:
+        """Build the per-window Ralph seed session (#124): a fresh
+        :class:`SessionState` seeded with ``instruction``, the ``.spore/`` reload
+        context (R3), and the optional VCS history block."""
+        ...
+
+    def ralph_completion_status(self) -> str | None:
+        """Ralph external completion check (#124): ``None`` ⇒ complete;
+        ``str`` reason ⇒ tasks remain."""
+        ...
+
+    def ralph_max_resets(self) -> int:
+        """The Ralph outer-loop reset cap (``config.max_resets``, #124)."""
+        ...
+
+    def resolve_metric_evaluator(self, key: str, session_id: SessionId) -> Any | RunResultFailure:
+        """Resolve the HillClimbing metric evaluator for ``key`` (#124, Q2), or a
+        typed misconfiguration ``Failure`` when absent."""
+        ...
+
+    async def hill_baseline(
+        self,
+        evaluator: Any,
+        session_id: SessionId,
+        task_id: TaskId,
+        direction: OptimizationDirection,
+        rows: list[Any],
+        span_seq: list[int],
+        total_usage: AggregateUsage,
+        turns: int,
+    ) -> float | RunResultFailure:
+        """HillClimbing iteration-0 baseline (#124): evaluate the metric (no agent
+        turn), record the row + span, and return the baseline value — or a
+        ``Failure`` on a baseline-evaluation failure (already records the failed
+        row + writes the TSV)."""
+        ...
+
+    async def hill_iteration(
+        self,
+        evaluator: Any,
+        session_id: SessionId,
+        task_id: TaskId,
+        iteration: int,
+        direction: OptimizationDirection,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: float | None,
+        current_best: float,
+        rows: list[Any],
+        span_seq: list[int],
+    ) -> tuple[float, bool]:
+        """HillClimbing per-iteration metric eval + keep/revert decision (#124):
+        the agent turn already ran (recursively); this evaluates the metric,
+        applies ``should_keep``, optionally reverts, records the row + span, and
+        returns ``(current_best, non_improvement)``."""
+        ...
+
+    async def hill_write_tsv(self, task_id: TaskId, rows: list[Any]) -> None:
+        """Write the HillClimbing results TSV (#124, leaf primitive)."""
+        ...
+
+    def budget_exceeded(
+        self, budget: BudgetLimits, used: BudgetSnapshot, started_at: float
+    ) -> BudgetLimitTypeT | None:
+        """The wall-time/cost/token budget gate (#124, HillClimbing)."""
         ...
 
     def plan_directive(self, instruction: str) -> str:
@@ -895,40 +1006,6 @@ class StrategyExecutor(Protocol):
         """Persist a parsed task list through the RunStore seam."""
         ...
 
-    async def self_verifying_loop(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive a whole SelfVerifying loop (Default-FAIL, bounded by the
-        verifier's iteration cap — Q1)."""
-        ...
-
-    async def ralph_loop(
-        self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive a whole Ralph continuation loop (resets the context window per
-        continuation, resumes from the durable ``.spore/`` checkpoint — A.6)."""
-        ...
-
-    async def hill_climbing_loop(
-        self,
-        task: Task,
-        direction: HillClimbingDirection,
-        max_stagnation: int | None,
-        revert_on_no_improvement: bool,
-        min_improvement_delta: float | None,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive a whole HillClimbing loop (bounded by ``max_stagnation``)."""
-        ...
-
     async def finalize(self, result: RunResult) -> None:
         """Finalize observability for a terminal outcome (no-op for pauses)."""
         ...
@@ -984,12 +1061,19 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     session_state = cx.scratch.run_session
     cx.scratch.run_session = SessionState()
     budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    # #124: resolve the worker agent from the registry by THIS leaf's handle
+    # (genuine recursion — no ``config.agent``). A missing handle is a typed
+    # terminal failure.
+    agent = executor.resolve_agent_ref(self.agent, task.session_id)
+    if isinstance(agent, RunResultFailure):
+        await executor.finalize(agent)
+        return cx._record_terminal(agent)
     # The leaf takes the run's stream sink for the window. Combinators that
     # recurse per-phase suppress it (they take it before recursing).
     on_stream = cx.stream
     cx.stream = None
     result = await executor.react_window(
-        task, max_iterations, session_state, budget_used, on_stream
+        task, max_iterations, session_state, budget_used, on_stream, agent
     )
     await executor.finalize(result)
     return cx._record_terminal(result)
@@ -1256,67 +1340,439 @@ async def _run_plan_execute_config(
 async def _run_self_verifying_config(
     self: SelfVerifyingConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    """SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
-    verifier's iteration cap / the run budget — Q1). The build phase recurses
-    through ``self.inner``."""
+    """SelfVerifying (#124): GENUINELY recursive build↔evaluate loop. Each
+    iteration dispatches ``run_strategy(self.inner, cx)`` for the build phase (a
+    non-ReAct inner — e.g. PlanExecute — really runs its whole loop per
+    iteration), then runs a fresh evaluate phase on the inner worker's resolved
+    agent (Q1c) and consults the verifier resolved from ``self.evaluator``'s key
+    (Q1a). Passed ⇒ Success; Failed ⇒ append the reason (Default-FAIL) and loop;
+    exhausted ⇒ ``SelfVerifyExhausted``."""
+    from .verifier import VerifierInput, VerifierVerdictPassed
+
     executor = cx._require_executor()
     if isinstance(executor, StrategyOutcomeFailed):
         return executor
     task = cx._current_task()
+    build_session_id = task.session_id
     session_state = cx.scratch.run_session
-    cx.scratch.run_session = SessionState()
-    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    carried = cx.scratch.run_budget.model_copy(deep=True)
+    # Suppress the run's stream sink for the recursive child phases.
     on_stream = cx.stream
     cx.stream = None
-    result = await executor.self_verifying_loop(task, session_state, budget_used, on_stream)
-    return cx._record_terminal(result)
+
+    # Q1a: resolve the verifier from ``evaluator``'s key (NO wire change).
+    verifier = cx.registry.resolve_verifier(self.evaluator)
+    if verifier is None:
+        cx.stream = on_stream
+        result: RunResult = RunResultFailure(
+            reason=HaltReasonSelfVerifyMisconfigured(
+                reason=(
+                    f"SelfVerifying requires a verifier registered under key {self.evaluator!r}"
+                )
+            ),
+            session_id=build_session_id,
+            usage=AggregateUsage(),
+            turns=0,
+            session_state=SessionState(),
+        )
+        return await cx._finish(executor, task, result)
+    # Q1c: the evaluate-phase agent defaults to the inner worker's agent.
+    eval_agent = executor.resolve_agent_ref(_worker_agent_key_of(self.inner), build_session_id)
+    if isinstance(eval_agent, RunResultFailure):
+        cx.stream = on_stream
+        return await cx._finish(executor, task, eval_agent)
+
+    max_iterations = verifier.max_iterations()
+    total_usage = AggregateUsage()
+    last_reason = ""
+
+    for iteration in range(max_iterations):
+        # ── Build phase: recurse ``run_strategy(self.inner, cx)``.
+        build_task = Task(
+            id=task.id,
+            instruction=task.instruction,
+            session_id=build_session_id,
+            budget=task.budget,
+            loop_strategy=self.inner,
+        )
+        cx.scratch.task = build_task
+        cx.scratch.run_session = session_state.model_copy(deep=True)
+        cx.scratch.run_budget = carried.model_copy(deep=True)
+        await run_strategy(self.inner, cx)
+        build_result = cx._take_child_override()
+        if build_result is None:
+            build_result = RunResultFailure(
+                reason=HaltReasonSelfVerifyMisconfigured(
+                    reason="build sub-strategy produced no terminal"
+                ),
+                session_id=build_session_id,
+                usage=AggregateUsage(),
+                turns=carried.turns,
+                session_state=session_state,
+            )
+        _fold_usage(total_usage, carried, build_result)
+
+        # A paused / escalated build propagates verbatim.
+        if isinstance(
+            build_result, RunResultWaitingForHuman | RunResultConsult | RunResultEscalate
+        ):
+            cx.stream = on_stream
+            return await cx._finish(executor, task, build_result)
+        # Carry the build's post-run session forward for the next round.
+        if isinstance(build_result, RunResultSuccess | RunResultFailure):
+            session_state = build_result.session_state
+
+        # ── Evaluate phase: a fresh evaluator run on ``eval_agent``.
+        eval_result = await executor.evaluate_phase(task, eval_agent, carried, total_usage)
+
+        verdict = await verifier.verify(
+            VerifierInput(
+                build_result=build_result,
+                eval_result=eval_result,
+                workspace=executor.workspace_root(),
+                iteration=iteration,
+            )
+        )
+        if isinstance(verdict, VerifierVerdictPassed):
+            if isinstance(build_result, RunResultSuccess):
+                output, turns = build_result.output, build_result.turns
+                final_state = build_result.session_state
+            else:
+                output, turns = "", carried.turns
+                final_state = session_state
+            cx.stream = on_stream
+            result = RunResultSuccess(
+                output=output,
+                session_id=build_session_id,
+                usage=total_usage,
+                turns=turns,
+                session_state=final_state,
+            )
+            return await cx._finish(executor, task, result)
+        last_reason = verdict.reason
+        await executor.append_user_message(session_state, verdict.reason)
+
+    cx.stream = on_stream
+    result = RunResultFailure(
+        reason=HaltReasonSelfVerifyExhausted(
+            iterations=max_iterations,
+            last_reason=last_reason,
+        ),
+        session_id=build_session_id,
+        usage=total_usage,
+        turns=carried.turns,
+        session_state=session_state,
+    )
+    return await cx._finish(executor, task, result)
 
 
 async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> StrategyOutcome:
-    """Ralph: the continuation wrapper — reset the context window per window and
-    resume from the durable ``.spore/`` checkpoint (A.6 deep-resume). Each window
-    recurses through ``self.inner``. Ralph discards the incoming session state by
-    design (each window is a fresh start re-seeded from the filesystem
+    """Ralph (#124): GENUINELY recursive continuation wrapper. Each context window
+    seeds a FRESH session from the ``.spore/`` checkpoint, then recurses
+    ``run_strategy(self.inner, cx)`` (a non-ReAct inner — e.g. SelfVerifying —
+    really runs its whole loop per window). Q3: when ``self.agent`` is set it
+    OVERRIDES the inner leaf's agent per window; when unset the worker resolves
+    via the inner leaf. ``ralph_completion_status`` drives the OUTER reset loop;
+    exhaustion ⇒ ``RalphCompletionUnmet``. Ralph discards the incoming session
+    state by design (each window is a fresh start re-seeded from the filesystem
     checkpoint)."""
     executor = cx._require_executor()
     if isinstance(executor, StrategyOutcomeFailed):
         return executor
     task = cx._current_task()
-    budget_used = cx.scratch.run_budget.model_copy(deep=True)
     on_stream = cx.stream
     cx.stream = None
     cx.scratch.run_session = SessionState()
-    result = await executor.ralph_loop(task, budget_used, on_stream)
-    return cx._record_terminal(result)
+    max_resets = max(executor.ralph_max_resets(), 1)
+
+    # Q3: when ``self.agent`` is set, override the inner leaf's agent for every
+    # window by rewriting the inner tree's worker leaf handle.
+    inner_for_window = (
+        self.inner if not self.agent else _override_worker_agent(self.inner, self.agent)
+    )
+
+    total_usage = AggregateUsage()
+    cumulative_turns = 0
+    last_reason = ".spore/progress.json missing"
+    last_session_id = task.session_id
+
+    for iteration in range(max_resets):
+        window_session_id = task.session_id if iteration == 0 else new_session_id()
+        last_session_id = window_session_id
+
+        # R2/R3: a FRESH session seeded from the ``.spore/`` checkpoint.
+        session_state = await executor.ralph_seed_session(task.instruction)
+
+        window_task = Task(
+            id=task.id,
+            instruction=task.instruction,
+            session_id=window_session_id,
+            budget=task.budget,
+            loop_strategy=inner_for_window,
+        )
+        cx.scratch.task = window_task
+        cx.scratch.run_session = session_state
+        # FRESH per-window budget (the reset discards the turn budget).
+        cx.scratch.run_budget = BudgetSnapshot()
+        await run_strategy(inner_for_window, cx)
+        window_result = cx._take_child_override()
+        if window_result is None:
+            window_result = RunResultFailure(
+                reason=HaltReasonRalphCompletionUnmet(
+                    iterations=iteration + 1,
+                    last_reason="window sub-strategy produced no terminal",
+                ),
+                session_id=window_session_id,
+                usage=AggregateUsage(),
+                turns=0,
+                session_state=SessionState(),
+            )
+        window_budget = BudgetSnapshot()
+        _fold_usage(total_usage, window_budget, window_result)
+        cumulative_turns += window_budget.turns
+
+        # A paused / escalated window propagates verbatim.
+        if isinstance(
+            window_result, RunResultWaitingForHuman | RunResultConsult | RunResultEscalate
+        ):
+            cx.stream = on_stream
+            return await cx._finish(executor, task, window_result)
+
+        reason = executor.ralph_completion_status()
+        if reason is None:
+            if isinstance(window_result, RunResultSuccess):
+                output = window_result.output
+                final_state = window_result.session_state
+            else:
+                output = ""
+                final_state = SessionState()
+            cx.stream = on_stream
+            result: RunResult = RunResultSuccess(
+                output=output,
+                session_id=window_session_id,
+                usage=total_usage,
+                turns=cumulative_turns,
+                session_state=final_state,
+            )
+            return await cx._finish(executor, task, result)
+        last_reason = reason
+
+    cx.stream = on_stream
+    result = RunResultFailure(
+        reason=HaltReasonRalphCompletionUnmet(
+            iterations=max_resets,
+            last_reason=last_reason,
+        ),
+        session_id=last_session_id,
+        usage=total_usage,
+        turns=cumulative_turns,
+        session_state=SessionState(),
+    )
+    return await cx._finish(executor, task, result)
 
 
 async def _run_hill_climbing_config(
     self: HillClimbingConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    """HillClimbing: iterate ``self.inner``, scoring each candidate with the
-    metric; bounded by ``max_stagnation`` (Q1). Each iteration recurses through
-    ``self.inner``. Discards the incoming session state (each iteration seeds its
-    own fresh window)."""
+    """HillClimbing (#124): GENUINELY recursive optimization loop. Iteration 0 is
+    a pure baseline (no agent turn). Iterations 1.. recurse
+    ``run_strategy(self.inner, cx)`` to propose a change (a non-ReAct inner —
+    e.g. PlanExecute — really runs its whole loop per iteration), then evaluate
+    the metric (resolved via ``resolve_metric_evaluator``, Q2) and keep/revert.
+    Bounded by ``max_stagnation`` and the turn budget. Discards the incoming
+    session state (each iteration seeds its own fresh window)."""
     executor = cx._require_executor()
     if isinstance(executor, StrategyOutcomeFailed):
         return executor
     task = cx._current_task()
-    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    session_id = task.session_id
+    task_id = task.id
     on_stream = cx.stream
     cx.stream = None
+    carried = cx.scratch.run_budget.model_copy(deep=True)
     cx.scratch.run_session = SessionState()
-    # ``2**31 - 1`` sentinel ⇒ no stagnation cap (mirrors the legacy entry).
+    direction = self.direction
+    revert = self.revert_on_no_improvement
+    min_delta = self.min_improvement_delta
+    # ``2**31 - 1`` sentinel ⇒ no stagnation cap.
     max_stagnation = self.max_stagnation if self.max_stagnation != 2**31 - 1 else None
-    result = await executor.hill_climbing_loop(
-        task,
-        self.direction,
-        max_stagnation,
-        self.revert_on_no_improvement,
-        self.min_improvement_delta,
-        budget_used,
-        on_stream,
+
+    # Q2: resolve the metric evaluator from ``evaluator``'s key.
+    evaluator = executor.resolve_metric_evaluator(self.evaluator, session_id)
+    if isinstance(evaluator, RunResultFailure):
+        cx.stream = on_stream
+        return await cx._finish(executor, task, evaluator)
+
+    total_usage = AggregateUsage()
+    rows: list[Any] = []
+    span_seq = [0]
+
+    # ── Iteration 0: pure baseline (no agent turn).
+    baseline = await executor.hill_baseline(
+        evaluator,
+        session_id,
+        task_id,
+        direction,
+        rows,
+        span_seq,
+        total_usage,
+        carried.turns,
     )
-    return cx._record_terminal(result)
+    if isinstance(baseline, RunResultFailure):
+        cx.stream = on_stream
+        return await cx._finish(executor, task, baseline)
+    current_best = baseline
+
+    stagnation = 0
+    iteration = 1
+    turn_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
+    started_at = time.monotonic()
+
+    while True:
+        # Budget gate before the iteration's agent turn.
+        if carried.turns >= turn_cap:
+            await executor.hill_write_tsv(task_id, rows)
+            cx.stream = on_stream
+            result: RunResult = RunResultFailure(
+                reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                session_id=session_id,
+                usage=total_usage,
+                turns=carried.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+        limit_type = executor.budget_exceeded(task.budget, carried, started_at)
+        if limit_type is not None:
+            await executor.hill_write_tsv(task_id, rows)
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=HaltReasonBudgetExceeded(limit_type=limit_type),
+                session_id=session_id,
+                usage=total_usage,
+                turns=carried.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+
+        # ── One agent turn proposes a change: recurse ``self.inner``.
+        iter_task = Task(
+            id=task.id,
+            instruction=task.instruction,
+            session_id=session_id,
+            budget=task.budget,
+            loop_strategy=self.inner,
+        )
+        cx.scratch.task = iter_task
+        iter_state = SessionState()
+        await executor.append_user_message(iter_state, task.instruction)
+        cx.scratch.run_session = iter_state
+        cx.scratch.run_budget = carried.model_copy(deep=True)
+        await run_strategy(self.inner, cx)
+        turn_result = cx._take_child_override()
+        if turn_result is None:
+            turn_result = RunResultFailure(
+                reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                session_id=session_id,
+                usage=AggregateUsage(),
+                turns=carried.turns,
+                session_state=SessionState(),
+            )
+        _fold_usage(total_usage, carried, turn_result)
+
+        # A paused / escalated turn propagates verbatim.
+        if isinstance(turn_result, RunResultWaitingForHuman | RunResultConsult | RunResultEscalate):
+            await executor.hill_write_tsv(task_id, rows)
+            cx.stream = on_stream
+            return await cx._finish(executor, task, turn_result)
+
+        # ── Evaluate the metric + keep/revert decision.
+        current_best, non_improvement = await executor.hill_iteration(
+            evaluator,
+            session_id,
+            task_id,
+            iteration,
+            direction,
+            revert,
+            min_delta,
+            current_best,
+            rows,
+            span_seq,
+        )
+        stagnation = stagnation + 1 if non_improvement else 0
+
+        if max_stagnation is not None and stagnation >= max_stagnation:
+            await executor.hill_write_tsv(task_id, rows)
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=HaltReasonStagnationLimitReached(
+                    iterations=stagnation,
+                    best_metric=current_best,
+                ),
+                session_id=session_id,
+                usage=total_usage,
+                turns=carried.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+
+        iteration += 1
+
+
+def _fold_usage(total_usage: AggregateUsage, carried: BudgetSnapshot, r: RunResult) -> None:
+    """Fold a sub-run's token usage / turn count into the cumulative
+    ``total_usage`` and the shared ``carried`` budget snapshot (#124, R8).
+    ``carried.turns`` becomes the running MAX of the sub-runs' absolute turn
+    counts. A non-terminal pause (``WaitingForHuman`` / ``Consult``) carries no
+    fold. Mirrors Rust's standalone ``fold_usage``."""
+    if isinstance(r, RunResultWaitingForHuman | RunResultConsult):
+        return
+    usage = r.usage
+    turns = r.turns
+    total_usage.input_tokens += usage.input_tokens
+    total_usage.output_tokens += usage.output_tokens
+    total_usage.cache_read_tokens += usage.cache_read_tokens
+    total_usage.cache_write_tokens += usage.cache_write_tokens
+    total_usage.cost_usd += usage.cost_usd
+    carried.input_tokens += usage.input_tokens
+    carried.output_tokens += usage.output_tokens
+    carried.turns = max(carried.turns, turns)
+
+
+def _worker_agent_key_of(ls: LoopStrategy) -> str:
+    """Descend a :data:`LoopStrategy` tree to the worker leaf's agent key (#124).
+    The worker is the agent on the LEAF reached by descending the recursion: a
+    ``ReAct`` leaf's ``agent``; a combinator descends into its primary worker
+    child (``inner`` / ``execute``). A ``Ralph`` with a non-empty ``agent``
+    override resolves THAT (Q3). Mirrors Rust's ``worker_agent_key_of``."""
+    if isinstance(ls, ReactConfig):
+        return ls.agent
+    if isinstance(ls, PlanExecuteConfig):
+        return _worker_agent_key_of(ls.execute)
+    if isinstance(ls, SelfVerifyingConfig):
+        return _worker_agent_key_of(ls.inner)
+    if isinstance(ls, RalphConfig):
+        return ls.agent if ls.agent else _worker_agent_key_of(ls.inner)
+    if isinstance(ls, HillClimbingConfig):
+        return _worker_agent_key_of(ls.inner)
+    raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
+
+
+def _override_worker_agent(ls: LoopStrategy, agent: str) -> LoopStrategy:
+    """Return a copy of ``ls`` with the worker leaf's agent handle rewritten to
+    ``agent`` (#124 Q3 — Ralph's per-window agent override). Mutates the leaf
+    reached by descending the worker child chain. Mirrors Rust's
+    ``override_worker_agent``."""
+    if isinstance(ls, ReactConfig):
+        return ls.model_copy(update={"agent": agent})
+    if isinstance(ls, PlanExecuteConfig):
+        return ls.model_copy(update={"execute": _override_worker_agent(ls.execute, agent)})
+    if isinstance(ls, SelfVerifyingConfig):
+        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+    if isinstance(ls, RalphConfig):
+        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+    if isinstance(ls, HillClimbingConfig):
+        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+    raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
 
 
 async def run_strategy(strategy: LoopStrategy, cx: ExecutionContext) -> StrategyOutcome:
@@ -3300,44 +3756,28 @@ class HarnessConfig:
         registry: ExecutionRegistry | None = None,
         escalation_mode: EscalationMode | None = None,
     ) -> None:
-        # Deprecated (superseded by ``registry`` / :class:`ExecutionRegistry`):
-        # the four single-collaborator fields ``agent``, ``verifier``,
-        # ``planner_agent``, ``evaluator_agent`` carry over from the pre-#120
-        # shape. They remain the live collaborators this slice (Option B /
-        # additive scope, #120) — the run bodies continue to read them until the
-        # registry-resolution path replaces them. Physical removal + executor
-        # migration to registry resolution lands in #124.
-        self.agent = agent
-        # The HillClimbing scoring strategy (issue #60). REQUIRED for the
-        # ``HillClimbing`` strategy: when ``None`` the run halts with
-        # :class:`HaltReasonHillClimbingMisconfigured` (Decision 6) — a typed
-        # halt, never a raise. The harness calls ``evaluate`` once per iteration
-        # (iteration 0 is a pure baseline with NO agent turn) and routes the
-        # result through :func:`~spore_core.metric.should_keep`. Typed ``Any`` to
-        # avoid a top-level import of :mod:`spore_core.metric` (that module
-        # imports from this one — a top-level import is circular). Mirrors Rust's
-        # ``HarnessConfig::metric_evaluator``.
-        self.metric_evaluator: Any | None = metric_evaluator
-        # Optional alternate agent used for the PlanExecute plan phase (issue
-        # #70, Q1). When the loop strategy is ``PlanExecute`` and this is set,
-        # the one-shot plan turn runs on it; otherwise the plan turn runs on
-        # ``agent``. ``None`` means "use the default agent".
-        self.planner_agent = planner_agent
-        # The SelfVerifying oracle (issue #61, D2). REQUIRED for the
-        # ``SelfVerifying`` strategy: when ``None`` the run halts with
-        # :class:`HaltReasonSelfVerifyMisconfigured` (D4) — a typed halt, never a
-        # raise. Its ``max_iterations()`` (default 3) caps the build↔evaluate
-        # round-trips (D3); ``max_stop_blocks`` does NOT govern this strategy.
-        # Typed ``Any`` to avoid a top-level import of :mod:`spore_core.verifier`
-        # (that module imports from this one — a top-level import is circular).
-        self.verifier: Any | None = verifier
-        # Optional alternate agent for the SelfVerifying evaluate phase (issue
-        # #61, D2). Defaulting contract is IDENTICAL to ``planner_agent``: when
-        # ``None`` the evaluate phase runs on ``config.agent``
-        # (``evaluator_agent or agent``). The read-only sandbox and the fresh
-        # never-shared session id are derived INTERNALLY by the strategy — there
-        # are deliberately NO evaluator sandbox / chunk-provider config fields.
-        self.evaluator_agent = evaluator_agent
+        # #124: the legacy single-collaborator fields (``agent`` / ``verifier`` /
+        # ``planner_agent`` / ``evaluator_agent`` / ``metric_evaluator``) are GONE
+        # as live fields — all collaborator resolution now goes through
+        # :class:`ExecutionRegistry`. The constructor still ACCEPTS them (public
+        # signature stays stable) and folds them into ``self.registry`` under the
+        # DEFAULT empty-string handle so bare ``ReactConfig.per_loop`` leaves
+        # (empty ``AgentRef`` / ``ToolsetRef``) and the default
+        # ``SelfVerifyingConfig.evaluator`` / ``HillClimbingConfig.evaluator``
+        # (empty key) resolve to them. ``planner_agent`` is DROPPED (Q1: the plan
+        # child's leaf ``ReactConfig.agent`` is authoritative); ``evaluator_agent``
+        # is DROPPED (Q1c: the evaluate-phase agent defaults to the inner worker's
+        # resolved agent). The folding happens after ``self.registry`` is set up
+        # below. ``_agent`` is retained ONLY as the value to fold (never read as a
+        # live collaborator).
+        self._fold_agent = agent
+        self._fold_verifier = verifier
+        self._fold_metric_evaluator = metric_evaluator
+        # ``planner_agent`` / ``evaluator_agent`` are accepted-but-ignored (#124,
+        # Q1): the resolution path no longer routes a separate planner / evaluator
+        # agent. They are kept in the signature only for source compatibility.
+        _ = planner_agent
+        _ = evaluator_agent
         self.tool_registry = tool_registry
         self.sandbox = sandbox
         self.context_manager = context_manager
@@ -3449,19 +3889,30 @@ class HarnessConfig:
         self.consult_handlers: dict[str, ConsultHandlerEntry] = (
             dict(consult_handlers) if consult_handlers is not None else {}
         )
-        # Runtime resolver for the serializable strategy handles (#120). The
+        # Runtime resolver for the serializable strategy handles (#120/#124). The
         # registry resolves per-node ``AgentRef`` / ``ToolsetRef`` / ``SchemaRef``
-        # handles and ``StrategyRef.Custom`` keys; :meth:`StandardHarness.run`
-        # calls ``registry.validate(task)`` at entry (only when the registry is
-        # populated), so an unresolved handle is a startup error before the first
-        # turn. Defaults to an empty registry — legacy callers that never wire one
-        # stay byte-identical (Option B). Supersedes the four deprecated
-        # single-collaborator fields; they are not removed this slice (#124).
-        if registry is None:
-            from .execution_registry import ExecutionRegistry as _ExecutionRegistry
+        # handles, the SelfVerifying verifier key, the HillClimbing metric
+        # evaluator key (the sixth map, Q2), and ``StrategyRef.Custom`` keys;
+        # :meth:`StandardHarness.run` calls ``registry.validate(task)`` at entry —
+        # the single resolution path — so an unresolved handle is a startup error
+        # before the first turn. #124: the builder's single-collaborator inputs
+        # (``agent`` / ``tool_registry`` / ``verifier`` / ``metric_evaluator``)
+        # are FOLDED into this registry under the DEFAULT empty-string key, so the
+        # single resolution path always has a worker to resolve. Explicitly
+        # registered handles win (``setdefault`` semantics).
+        from .execution_registry import ExecutionRegistry as _ExecutionRegistry
 
+        if registry is None:
             registry = _ExecutionRegistry.empty()
-        self.registry: ExecutionRegistry = registry
+        reg_builder = registry.into_builder()
+        reg_builder = reg_builder.fill_default_agent(self._fold_agent)
+        reg_builder = reg_builder.fill_default_toolset(tool_registry)
+        reg_builder = reg_builder.fill_default_schema({})
+        if self._fold_verifier is not None:
+            reg_builder = reg_builder.fill_default_verifier(self._fold_verifier)
+        if self._fold_metric_evaluator is not None:
+            reg_builder = reg_builder.fill_default_metric_evaluator(self._fold_metric_evaluator)
+        self.registry: ExecutionRegistry = reg_builder.build()
         # HITL-vs-AFK escalation knob (#120, PRD goal #7). Selects whether budget
         # escalation surfaces to a human or proceeds autonomously. STORED only
         # this slice (#130 consumes it); NOT part of the serialized ``Task``.
@@ -3472,16 +3923,16 @@ class HarnessConfig:
             escalation_mode = EscalationModeSurfaceToHuman()
         self.escalation_mode: EscalationMode = escalation_mode
 
-    def with_agent(self, agent: Agent) -> HarnessConfig:
-        """A full copy of this config with only ``agent`` swapped (#124). Every
-        other component is shared by reference so the child run's spans land in the
-        same trace stream and the configured ``model_params`` / registry / system
-        prompt reach the child turns. Mirrors Rust's ``self.config.clone()`` +
-        ``plan_config.agent = planner`` in ``run_plan_subtree``."""
+    def with_sandbox(self, sandbox: SandboxProvider) -> HarnessConfig:
+        """A full copy of this config with only ``sandbox`` swapped (#124). Every
+        other component (incl. the ExecutionRegistry) is shared by reference so the
+        child run's spans land in the same trace stream and the configured handles
+        resolve identically. Mirrors Rust's ``self.config.clone()`` +
+        ``eval_config.sandbox = read_only_sandbox`` in ``run_evaluate_phase``."""
         return HarnessConfig(
-            agent=agent,
+            agent=self._fold_agent,
             tool_registry=self.tool_registry,
-            sandbox=self.sandbox,
+            sandbox=sandbox,
             context_manager=self.context_manager,
             termination_policy=self.termination_policy,
             middleware=self.middleware,
@@ -3494,12 +3945,8 @@ class HarnessConfig:
             max_resets=self.max_resets,
             vcs_provider=self.vcs_provider,
             hooks=self.hooks,
-            planner_agent=self.planner_agent,
-            verifier=self.verifier,
-            evaluator_agent=self.evaluator_agent,
             storage=self.storage,
             chunk_provider=self.chunk_provider,
-            metric_evaluator=self.metric_evaluator,
             catalogue_registry=self.catalogue_registry,
             system_prompt=self.system_prompt,
             model_params=self.model_params,
@@ -4039,9 +4486,7 @@ class HarnessBuilder:
             max_resets=self._max_resets,
             vcs_provider=self._vcs_provider,
             hooks=self._hooks,
-            planner_agent=self._planner_agent,
             verifier=self._verifier,
-            evaluator_agent=self._evaluator_agent,
             storage=storage,
             chunk_provider=self._chunk_provider,
             metric_evaluator=self._metric_evaluator,
@@ -4535,23 +4980,21 @@ class StandardHarness:
 
         strategy = task.loop_strategy
 
-        # Issue #120 startup validation: every serializable handle in the task's
+        # #124 startup validation: every serializable handle in the task's
         # strategy tree must resolve against the configured ExecutionRegistry,
-        # BEFORE the first turn. Validation runs only when the registry is
-        # populated, so existing callers that never wire a registry (and instead
-        # use the deprecated single-collaborator fields, Option B) are unaffected
-        # byte-for-byte. An unresolved handle is a startup error.
-        if not self._config.registry.is_empty():
-            try:
-                self._config.registry.validate(task)
-            except HarnessErrorException as exc:
-                return RunResultFailure(
-                    reason=HaltReasonConfigurationError(error=exc.error),
-                    session_id=task.session_id,
-                    usage=AggregateUsage(),
-                    turns=0,
-                    session_state=SessionState(),
-                )
+        # BEFORE the first turn. The legacy single-collaborator fields are gone —
+        # resolution is now the SINGLE path, so validation ALWAYS runs (the
+        # ``is_empty()`` gate is dropped). An unresolved handle is a startup error.
+        try:
+            self._config.registry.validate(task)
+        except HarnessErrorException as exc:
+            return RunResultFailure(
+                reason=HaltReasonConfigurationError(error=exc.error),
+                session_id=task.session_id,
+                usage=AggregateUsage(),
+                turns=0,
+                session_state=SessionState(),
+            )
 
         # Issue #102 auto-load: when enabled AND no explicit session_state was
         # provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
@@ -4650,8 +5093,11 @@ class StandardHarness:
                 if isinstance(task.loop_strategy, ReactConfig)
                 else 2**31 - 1
             )
+            agent = self._resolve_worker_agent(task.loop_strategy)
+            if isinstance(agent, RunResultFailure):
+                return agent.model_copy(update={"session_id": session_id})
             return await self._run_react(
-                task, max_iterations, session_state, budget_used, on_stream
+                task, max_iterations, session_state, budget_used, on_stream, agent
             )
 
         # Subagent depth: a full child.resume() dispatch lives with
@@ -4704,7 +5150,12 @@ class StandardHarness:
             if isinstance(task.loop_strategy, ReactConfig)
             else 2**31 - 1
         )
-        return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
+        agent = self._resolve_worker_agent(task.loop_strategy)
+        if isinstance(agent, RunResultFailure):
+            return agent.model_copy(update={"session_id": session_id})
+        return await self._run_react(
+            task, max_iterations, session_state, budget_used, on_stream, agent
+        )
 
     async def resume_consult(
         self,
@@ -4788,7 +5239,12 @@ class StandardHarness:
             if isinstance(task.loop_strategy, ReactConfig)
             else 2**31 - 1
         )
-        return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
+        agent = self._resolve_worker_agent(task.loop_strategy)
+        if isinstance(agent, RunResultFailure):
+            return agent.model_copy(update={"session_id": session_id})
+        return await self._run_react(
+            task, max_iterations, session_state, budget_used, on_stream, agent
+        )
 
     # ---- observability finalization ---------------------------------
 
@@ -4817,13 +5273,83 @@ class StandardHarness:
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
+        agent: Agent,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
-        (delegates to :meth:`_run_react_inner`). Does NOT finalize observability —
-        the leaf ``run`` body does."""
+        on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
+        Does NOT finalize observability — the leaf ``run`` body does."""
         return await self._run_react_inner(
-            task, max_iterations, session_state, budget_used, on_stream
+            task, max_iterations, session_state, budget_used, on_stream, agent
         )
+
+    def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
+        """:class:`StrategyExecutor` primitive: resolve an ``AgentRef`` to its
+        registered agent (#124), or a typed ``UnresolvedHandle`` ``Failure``."""
+        agent = self._config.registry.resolve_agent(ref)
+        if agent is None:
+            return RunResultFailure(
+                reason=HaltReasonConfigurationError(
+                    error=HarnessErrorUnresolvedHandle(handle_kind="agent", key=ref)
+                ),
+                session_id=session_id,
+                usage=AggregateUsage(),
+                turns=0,
+                session_state=SessionState(),
+            )
+        return agent
+
+    async def evaluate_phase(
+        self,
+        task: Task,
+        eval_agent: Agent,
+        carried: BudgetSnapshot,
+        total_usage: AggregateUsage,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: the SelfVerifying evaluate phase
+        (delegates to :meth:`_run_evaluate_phase`)."""
+        return await self._run_evaluate_phase(task, eval_agent, carried, total_usage)
+
+    async def append_user_message(self, session_state: SessionState, text: str) -> None:
+        """:class:`StrategyExecutor` primitive: append ``text`` as a user message
+        onto ``session_state`` through the :class:`ContextManager` seam (#124)."""
+        await self._config.context_manager.append_user_message(session_state, text)
+
+    def workspace_root(self) -> Path:
+        """:class:`StrategyExecutor` primitive: the configured sandbox workspace
+        root (#124, for ``VerifierInput``)."""
+        return self._config.sandbox.workspace_root()
+
+    async def ralph_seed_session(self, instruction: str) -> SessionState:
+        """:class:`StrategyExecutor` primitive: build the per-window Ralph seed
+        session (delegates to :meth:`_ralph_seed_session`)."""
+        return await self._ralph_seed_session(instruction)
+
+    def ralph_completion_status(self) -> str | None:
+        """:class:`StrategyExecutor` primitive: Ralph external completion check
+        (delegates to the module-level :func:`_ralph_completion_status`)."""
+        return _ralph_completion_status(self._config.sandbox.workspace_root())
+
+    def ralph_max_resets(self) -> int:
+        """:class:`StrategyExecutor` primitive: the Ralph outer-loop reset cap."""
+        return self._config.max_resets
+
+    def resolve_metric_evaluator(self, key: str, session_id: SessionId) -> Any | RunResultFailure:
+        """:class:`StrategyExecutor` primitive: resolve the HillClimbing metric
+        evaluator for ``key`` (#124, Q2), or a typed misconfiguration ``Failure``."""
+        evaluator = self._config.registry.resolve_metric_evaluator(key)
+        if evaluator is None:
+            return RunResultFailure(
+                reason=HaltReasonHillClimbingMisconfigured(
+                    reason=(
+                        f"HillClimbing requires a metric evaluator registered under key {key!r}"
+                    )
+                ),
+                session_id=session_id,
+                usage=AggregateUsage(),
+                turns=0,
+                session_state=SessionState(),
+            )
+        return evaluator
 
     def plan_directive(self, instruction: str) -> str:
         """:class:`StrategyExecutor` primitive: the planning directive seeded
@@ -4849,20 +5375,13 @@ class StandardHarness:
         """:class:`StrategyExecutor` primitive: dispatch the plan sub-strategy
         ``plan`` for ``plan_task`` over ``plan_session`` (#124).
 
-        R5/R6: route the planner agent. When ``planner_agent`` is configured the
-        plan child runs against an agent-swapped child harness (same pattern as the
-        SelfVerifying evaluate phase); otherwise the default agent runs through
-        ``self``. Either way the child's ``run`` drives the WHOLE plan loop (genuine
-        recursion). Returns the child's verbatim terminal, or ``None`` when it
-        produced no terminal."""
-        if self._config.planner_agent is not None:
-            plan_config = self._config.with_agent(self._config.planner_agent)
-            plan_harness = StandardHarness(plan_config)
-            cx = ExecutionContext(registry=plan_harness._config.registry)
-            cx.executor = plan_harness
-        else:
-            cx = ExecutionContext(registry=self._config.registry)
-            cx.executor = self
+        #124 Q1: the planner concept is DROPPED — the plan child's leaf
+        ``ReactConfig.agent`` is authoritative and resolved by the recursing leaf
+        itself. The child's ``run`` drives the WHOLE plan loop (genuine recursion).
+        Returns the child's verbatim terminal, or ``None`` when it produced no
+        terminal."""
+        cx = ExecutionContext(registry=self._config.registry)
+        cx.executor = self
         cx.scratch.run_session = plan_session
         cx.scratch.run_budget = budget_used
         cx.scratch.task = plan_task
@@ -4917,49 +5436,6 @@ class StandardHarness:
         """:class:`StrategyExecutor` primitive: persist a parsed task list
         (delegates to :meth:`_persist_task_list`)."""
         await self._persist_task_list(session_id, task_list)
-
-    async def self_verifying_loop(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """:class:`StrategyExecutor` primitive: a whole SelfVerifying loop
-        (delegates to :meth:`_run_self_verifying`)."""
-        return await self._run_self_verifying(task, session_state, budget_used, on_stream)
-
-    async def ralph_loop(
-        self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """:class:`StrategyExecutor` primitive: a whole Ralph loop (delegates to
-        :meth:`_run_ralph`)."""
-        return await self._run_ralph(task, budget_used, on_stream)
-
-    async def hill_climbing_loop(
-        self,
-        task: Task,
-        direction: HillClimbingDirection,
-        max_stagnation: int | None,
-        revert_on_no_improvement: bool,
-        min_improvement_delta: float | None,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """:class:`StrategyExecutor` primitive: a whole HillClimbing loop
-        (delegates to :meth:`_run_hill_climbing`)."""
-        return await self._run_hill_climbing(
-            task,
-            direction,
-            max_stagnation,
-            revert_on_no_improvement,
-            min_improvement_delta,
-            budget_used,
-            on_stream,
-        )
 
     async def finalize(self, result: RunResult) -> None:
         """:class:`StrategyExecutor` primitive: finalize observability for a
@@ -5039,166 +5515,25 @@ class StandardHarness:
             session_state=SessionState(messages=messages),
         )
 
-    # ---- SelfVerifying strategy (issue #61) -------------------------
-
-    async def _run_self_verifying(
-        self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive the SelfVerifying strategy (issue #61) — the loop-within-a-loop.
-
-        Each round-trip runs a bounded BUILD ReAct sub-loop (the agent works
-        until it claims done — R1), then a fresh EVALUATE run (a separate
-        evaluator agent on a read-only sandbox in a never-shared session — R2,
-        R3, R4), then asks the injected :class:`Verifier` to translate
-        ``(build_result, eval_result)`` into a verdict. ``Passed`` ⇒ Success;
-        ``Failed { reason }`` ⇒ inject ``reason`` into the build context (the
-        same ``append_user_message`` path the Stop-block uses — R5/R6) and loop.
-
-        Config fields read (both default ``None``):
-
-        * ``config.verifier`` — the oracle. REQUIRED: ``None`` ⇒
-          :class:`HaltReasonSelfVerifyMisconfigured` (D4, R11) — a typed halt,
-          NOT a raise. Its ``max_iterations()`` (default 3) caps the round-trips
-          (D3); ``max_stop_blocks`` does NOT enter the picture.
-        * ``config.evaluator_agent`` — the evaluate-phase agent. Defaulting (D2):
-          ``evaluator_agent or agent``, identical to ``planner_agent``. The
-          read-only sandbox and the fresh session id are derived INTERNALLY.
-
-        Terminal halts (peers, D4): :class:`HaltReasonSelfVerifyExhausted`
-        (R7 — ran out of round-trips without a pass) and
-        :class:`HaltReasonSelfVerifyMisconfigured` (R11). Budgets fold BOTH
-        phases across ALL iterations (R8); build vs evaluate are distinguishable
-        by their distinct session ids (R9). Mirrors Rust's ``run_self_verifying``.
-        """
-        build_session_id = task.session_id
-
-        # D4/R11: a missing verifier is a typed halt, not a raise.
-        verifier = self._config.verifier
-        if verifier is None:
-            result: RunResult = self._fail(
-                HaltReasonSelfVerifyMisconfigured(
-                    reason="SelfVerifying requires `config.verifier`, but it is None"
-                ),
-                build_session_id,
-                AggregateUsage(),
-                0,
-            )
-            await self._finalize_self_verifying(result)
-            return result
-
-        max_iterations = verifier.max_iterations()
-        # Shared budget threaded across every build + evaluate sub-run (R8).
-        carried = budget_used.model_copy(deep=True)
-        # Cumulative usage across ALL build + evaluate runs of ALL iterations.
-        total_usage = AggregateUsage()
-        # The most recent verifier failure reason (for SelfVerifyExhausted).
-        last_reason = ""
-
-        from .verifier import VerifierInput, VerifierVerdictPassed
-
-        for iteration in range(max_iterations):
-            # Build phase (R1): bounded ReAct sub-loop carrying the shared budget.
-            # The first iteration's seed instruction is already in
-            # ``session_state``; later iterations have the prior verdict reason
-            # injected as a user message (R6).
-            build_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
-            build_result = await self._run_react_inner(
-                task,
-                build_cap,
-                session_state,
-                carried.model_copy(deep=True),
-                # Sub-loops run with a suppressed sink (mirrors PlanExecute);
-                # terminal observability is finalized by this strategy.
-                None,
-            )
-            self._fold_usage(total_usage, carried, build_result)
-
-            # A build run that paused / escalated is propagated up unchanged —
-            # the caller must handle it before verification can resume.
-            if isinstance(build_result, RunResultWaitingForHuman):
-                return build_result
-            if isinstance(build_result, RunResultEscalate):
-                await self._finalize_self_verifying(build_result)
-                return build_result
-
-            # Evaluate phase (R2/R3/R4): a fresh evaluator RUN with a distinct
-            # generated session id (R2/R9), a read-only sandbox derived internally
-            # (R3), the evaluator agent (D2 defaulting), and the role-evaluator
-            # chunk (R4).
-            eval_result = await self._run_evaluate_phase(task, carried, total_usage)
-
-            # Verdict.
-            verdict = await verifier.verify(
-                VerifierInput(
-                    build_result=build_result,
-                    eval_result=eval_result,
-                    workspace=self._config.sandbox.workspace_root(),
-                    iteration=iteration,
-                )
-            )
-            if isinstance(verdict, VerifierVerdictPassed):
-                # Reuse the build run's output/turns/state as the run's handle.
-                if isinstance(build_result, RunResultSuccess):
-                    output, turns = build_result.output, build_result.turns
-                    final_state = build_result.session_state
-                else:
-                    output, turns = "", carried.turns
-                    final_state = SessionState()
-                result = RunResultSuccess(
-                    output=output,
-                    session_id=build_session_id,
-                    usage=total_usage,
-                    turns=turns,
-                    session_state=final_state,
-                )
-                await self._finalize_self_verifying(result)
-                return result
-
-            # R5/R6: Default-FAIL keeps looping; inject the reason into the build
-            # context via the SAME path the Stop-block uses so the next build
-            # iteration sees it.
-            last_reason = verdict.reason
-            await self._config.context_manager.append_user_message(session_state, verdict.reason)
-
-        # R7: ran out of round-trips without a pass — clean exhaustion. Carry
-        # the accumulated build conversation (issue #102).
-        result = self._fail(
-            HaltReasonSelfVerifyExhausted(
-                iterations=max_iterations,
-                last_reason=last_reason,
-            ),
-            build_session_id,
-            total_usage,
-            carried.turns,
-            session_state,
-        )
-        await self._finalize_self_verifying(result)
-        return result
-
     async def _run_evaluate_phase(
         self,
         task: Task,
+        eval_agent: Agent,
         carried: BudgetSnapshot,
         total_usage: AggregateUsage,
     ) -> RunResult:
-        """Run the SelfVerifying evaluate phase (issue #61): a fresh evaluator RUN
-        over a read-only sandbox in a never-shared session.
+        """Run the SelfVerifying evaluate phase (issue #61, #124): a fresh
+        evaluator RUN over a read-only sandbox in a never-shared session, on the
+        passed ``eval_agent`` (Q1c — the inner worker's resolved agent).
 
         Builds a child :class:`StandardHarness` from a copy of ``self._config``
-        with the ``agent`` swapped to the evaluator agent (D2 defaulting) and the
-        ``sandbox`` wrapped in a :class:`ReadOnlySandbox` (R3). The evaluator runs
-        a fresh ReAct loop seeded with the ``role-evaluator`` chunk (R4,
-        presence-only) plus a review directive, in a freshly generated session
+        with the ``sandbox`` wrapped in a :class:`ReadOnlySandbox` (R3). The
+        evaluator runs a fresh ReAct loop seeded with the ``role-evaluator`` chunk
+        (R4, presence-only) plus a review directive, in a freshly generated session
         (R2/R9). Folds the evaluate run's usage into ``total_usage`` / ``carried``
         (R8) and returns its terminal :class:`RunResult`. Mirrors Rust's
         ``run_evaluate_phase``."""
         config = self._config
-        # D2: evaluator agent defaulting — identical contract to ``planner_agent``.
-        evaluator = config.evaluator_agent if config.evaluator_agent is not None else config.agent
 
         # R3: derive a read-only sandbox internally from the build sandbox.
         read_only_sandbox = ReadOnlySandbox(config.sandbox)
@@ -5226,10 +5561,12 @@ class StandardHarness:
             ),
         )
 
-        # Child harness: copy the config, swap agent + sandbox. The copy shares
-        # the same observability / storage seams so the evaluate run's spans land
-        # in the SAME trace stream (distinguished by its distinct session id).
-        eval_config = self._clone_config_with(agent=evaluator, sandbox=read_only_sandbox)
+        # Child harness: copy the config, swap the sandbox to read-only. The copy
+        # shares the same observability / storage seams (incl. the registry) so the
+        # evaluate run's spans land in the SAME trace stream (distinguished by its
+        # distinct session id). The evaluate agent is passed to ``_run_react``
+        # directly (#124 — no ``config.agent`` swap).
+        eval_config = config.with_sandbox(read_only_sandbox)
         eval_harness = StandardHarness(eval_config)
 
         eval_state = SessionState()
@@ -5237,42 +5574,11 @@ class StandardHarness:
 
         cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
         eval_result = await eval_harness._run_react(
-            eval_task, cap, eval_state, BudgetSnapshot(), None
+            eval_task, cap, eval_state, BudgetSnapshot(), None, eval_agent
         )
 
-        self._fold_usage(total_usage, carried, eval_result)
+        _fold_usage(total_usage, carried, eval_result)
         return eval_result
-
-    def _clone_config_with(self, *, agent: Agent, sandbox: SandboxProvider) -> HarnessConfig:
-        """Copy ``self._config`` swapping only ``agent`` and ``sandbox`` (issue
-        #61). Every other component (context manager, observability, storage,
-        verifier, …) is shared by reference so the evaluate run's spans land in
-        the same trace stream. Mirrors the Rust ``self.config.clone()`` + field
-        swap in ``run_evaluate_phase``."""
-        c = self._config
-        return HarnessConfig(
-            agent=agent,
-            tool_registry=c.tool_registry,
-            sandbox=sandbox,
-            context_manager=c.context_manager,
-            termination_policy=c.termination_policy,
-            middleware=c.middleware,
-            observability=c.observability,
-            compaction_verifier=c.compaction_verifier,
-            max_compaction_attempts=c.max_compaction_attempts,
-            pricing=c.pricing,
-            content_capture=c.content_capture,
-            max_stop_blocks=c.max_stop_blocks,
-            max_resets=c.max_resets,
-            vcs_provider=c.vcs_provider,
-            hooks=c.hooks,
-            planner_agent=c.planner_agent,
-            verifier=c.verifier,
-            evaluator_agent=c.evaluator_agent,
-            storage=c.storage,
-            chunk_provider=c.chunk_provider,
-            metric_evaluator=c.metric_evaluator,
-        )
 
     async def _role_evaluator_chunk(self) -> str | None:
         """Look up the ``role-evaluator`` chunk content from the configured chunk
@@ -5289,324 +5595,6 @@ class StandardHarness:
             if chunk.id == "role-evaluator":
                 return chunk.content
         return None
-
-    @staticmethod
-    def _fold_usage(total_usage: AggregateUsage, carried: BudgetSnapshot, r: RunResult) -> None:
-        """Fold a sub-run's token usage / turn count into the cumulative
-        ``total_usage`` and the shared ``carried`` budget snapshot (R8). Mirrors
-        the PlanExecute budget fold and Rust's ``fold_usage``. ``carried.turns``
-        becomes the max of the sub-run's absolute turn count (the build sub-loop
-        gates on cumulative turns; the fresh-session evaluate run reports its own
-        turns)."""
-        if isinstance(r, RunResultWaitingForHuman):
-            return
-        usage = r.usage
-        turns = r.turns
-        total_usage.input_tokens += usage.input_tokens
-        total_usage.output_tokens += usage.output_tokens
-        total_usage.cache_read_tokens += usage.cache_read_tokens
-        total_usage.cache_write_tokens += usage.cache_write_tokens
-        total_usage.cost_usd += usage.cost_usd
-        carried.input_tokens += usage.input_tokens
-        carried.output_tokens += usage.output_tokens
-        carried.turns = max(carried.turns, turns)
-
-    async def _finalize_self_verifying(self, result: RunResult) -> None:
-        """Finalize observability for a terminal SelfVerifying outcome (issue
-        #61). Like ``_run_react``'s tail: a ``WaitingForHuman`` pause is not
-        terminal and is never flushed here. Mirrors Rust's
-        ``finalize_self_verifying``."""
-        if isinstance(result, RunResultSuccess):
-            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
-        elif isinstance(result, RunResultFailure):
-            await self._finalize_observability(
-                result.session_id,
-                SessionOutcomeFailure(reason=result.reason.kind),
-            )
-        elif isinstance(result, RunResultEscalate):
-            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
-        # RunResultWaitingForHuman: not terminal, do not finalize.
-
-    async def _run_hill_climbing(
-        self,
-        task: Task,
-        direction: OptimizationDirection,
-        max_stagnation: int | None,
-        revert_on_no_improvement: bool,
-        min_improvement_delta: float | None,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive the HillClimbing strategy (issue #60) — the iterative
-        optimization loop.
-
-        Iteration 0 is a PURE baseline: the evaluator is called with NO agent
-        turn (Decision 5); its value becomes ``current_best`` and the row is
-        recorded ``kept``. Iterations 1+ each run a bounded ReAct sub-run (one
-        proposed change), then evaluate the metric and route the result through
-        :func:`~spore_core.metric.should_keep` using the payload ``direction``
-        (Decision 4): an improvement keeps the change (status ``kept``, best
-        updated, stagnation reset); a non-improvement discards it (status
-        ``discarded``), optionally runs ``git reset --hard HEAD`` through the
-        sandbox (Decision 1), and increments the consecutive non-improvement
-        counter. A :data:`~spore_core.metric.MetricError` (crash/timeout) counts
-        as a non-improvement with an EMPTY metric value (Decision 3). When
-        ``max_stagnation`` is set, the run halts with
-        :class:`HaltReasonStagnationLimitReached` after that many consecutive
-        non-improvements; otherwise it runs until the turn/budget cap. The
-        harness writes the results TSV to ``.spore/results/{task_id}.tsv``
-        (Decisions 2/3); it NEVER commits.
-
-        Config fields read:
-
-        * ``config.metric_evaluator`` — the scorer. REQUIRED: ``None`` ⇒
-          :class:`HaltReasonHillClimbingMisconfigured` (Decision 6), a typed
-          halt, never a raise. A baseline (iteration-0) evaluation that itself
-          errors is ALSO :class:`HaltReasonHillClimbingMisconfigured` (Decision
-          7) — there is no current best to climb from.
-
-        Mirrors Rust's ``run_hill_climbing``.
-        """
-        from .metric import MetricResult, ResultsEntry, iteration_status_from_error, should_keep
-        from .termination import SessionStateSnapshot
-
-        session_id = task.session_id
-        workspace_root = self._config.sandbox.workspace_root()
-
-        # Decision 6: a missing evaluator is a typed halt, not a raise.
-        evaluator = self._config.metric_evaluator
-        if evaluator is None:
-            result: RunResult = self._fail(
-                HaltReasonHillClimbingMisconfigured(
-                    reason="HillClimbing requires `config.metric_evaluator`, but it is None"
-                ),
-                session_id,
-                AggregateUsage(),
-                0,
-            )
-            await self._finalize_self_verifying(result)
-            return result
-
-        description = evaluator.description()
-        # Per-iteration observability span counter.
-        span_seq = 0
-        # Cumulative usage + turns across ALL agent-turn iterations.
-        total_usage = AggregateUsage()
-        # Shared budget threaded across every agent sub-run.
-        carried = budget_used.model_copy(deep=True)
-        # The TSV rows, in iteration order.
-        rows: list[ResultsEntry] = []
-
-        # A snapshot for the evaluator. HillClimbing keeps no carried message
-        # state of its own (each iteration is a fresh sub-run), so a default
-        # SessionState is the right snapshot to hand the evaluator.
-        snapshot = SessionStateSnapshot(
-            session_id=session_id,
-            task_id=task.id,
-            state=SessionState(),
-            workspace_root=workspace_root,
-        )
-
-        # ── Iteration 0: pure baseline. No agent turn (Decision 5).
-        baseline = await evaluator.evaluate(self._config.sandbox, snapshot)
-        if isinstance(baseline, MetricResult):
-            current_best = baseline.value
-            rows.append(
-                ResultsEntry(
-                    iteration=0,
-                    commit_hash=self._hill_climbing_commit_hash(),
-                    metric_value=baseline.value,
-                    direction=direction,
-                    status="kept",
-                    duration=baseline.duration,
-                    description=description,
-                )
-            )
-            self._emit_hill_climbing_span(
-                session_id, task.id, span_seq, 0, baseline.value, None, "kept", False
-            )
-            span_seq += 1
-        else:
-            # Decision 7: a baseline that cannot even be measured is a
-            # misconfiguration of the experiment, not a non-improvement to climb
-            # away from — there is no ``current_best`` to compare against. Record
-            # the failed row, write the TSV, and halt.
-            status = iteration_status_from_error(baseline)
-            rows.append(
-                ResultsEntry(
-                    iteration=0,
-                    commit_hash=self._hill_climbing_commit_hash(),
-                    # Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-                    metric_value=float("nan"),
-                    direction=direction,
-                    status=status,
-                    duration=0.0,
-                    description=description,
-                )
-            )
-            self._emit_hill_climbing_span(
-                session_id, task.id, span_seq, 0, None, None, status, False
-            )
-            span_seq += 1
-            await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
-            result = self._fail(
-                HaltReasonHillClimbingMisconfigured(
-                    reason=f"baseline evaluation failed: {baseline.kind}"
-                ),
-                session_id,
-                total_usage,
-                carried.turns,
-            )
-            await self._finalize_self_verifying(result)
-            return result
-
-        # Consecutive non-improvement counter (Decision-driven stagnation halt).
-        stagnation = 0
-        # The 0-based iteration index; agent turns begin at 1.
-        iteration = 1
-        turn_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
-        started_at = time.monotonic()
-
-        while True:
-            # Budget gate before the iteration's agent turn (mirrors run_react).
-            if carried.turns >= turn_cap:
-                break
-            limit_type = self._budget_exceeded(task.budget, carried, started_at)
-            if limit_type is not None:
-                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
-                result = self._fail(
-                    HaltReasonBudgetExceeded(limit_type=limit_type),
-                    session_id,
-                    total_usage,
-                    carried.turns,
-                )
-                await self._finalize_self_verifying(result)
-                return result
-
-            # ── One bounded agent turn proposes a change. The sub-run carries the
-            #    shared budget so per-iteration turns count toward the cap. It
-            #    seeds its OWN fresh session state with the instruction.
-            iter_state = SessionState()
-            await self._config.context_manager.append_user_message(iter_state, task.instruction)
-            turn_result = await self._run_react_inner(
-                task, turn_cap, iter_state, carried.model_copy(deep=True), None
-            )
-            self._fold_usage(total_usage, carried, turn_result)
-
-            # A turn that paused / escalated is propagated up unchanged.
-            if isinstance(turn_result, RunResultWaitingForHuman):
-                return turn_result
-            if isinstance(turn_result, RunResultEscalate):
-                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
-                await self._finalize_self_verifying(turn_result)
-                return turn_result
-
-            # ── Evaluate the metric after the change.
-            eval_result = await evaluator.evaluate(self._config.sandbox, snapshot)
-            if isinstance(eval_result, MetricResult):
-                value = eval_result.value
-                kept = should_keep(value, current_best, direction, min_improvement_delta)
-                delta = (
-                    (current_best - value) if direction == "minimize" else (value - current_best)
-                )
-                if kept:
-                    current_best = value
-                    stagnation = 0
-                    rows.append(
-                        ResultsEntry(
-                            iteration=iteration,
-                            commit_hash=self._hill_climbing_commit_hash(),
-                            metric_value=value,
-                            direction=direction,
-                            status="kept",
-                            duration=eval_result.duration,
-                            description=description,
-                        )
-                    )
-                    self._emit_hill_climbing_span(
-                        session_id, task.id, span_seq, iteration, value, delta, "kept", False
-                    )
-                    span_seq += 1
-                else:
-                    # No improvement (Decision 1: optionally revert).
-                    reverted = revert_on_no_improvement
-                    if reverted:
-                        await self._hill_climbing_revert()
-                    stagnation += 1
-                    rows.append(
-                        ResultsEntry(
-                            iteration=iteration,
-                            commit_hash=self._hill_climbing_commit_hash(),
-                            metric_value=value,
-                            direction=direction,
-                            status="discarded",
-                            duration=eval_result.duration,
-                            description=description,
-                        )
-                    )
-                    self._emit_hill_climbing_span(
-                        session_id,
-                        task.id,
-                        span_seq,
-                        iteration,
-                        value,
-                        delta,
-                        "discarded",
-                        reverted,
-                    )
-                    span_seq += 1
-            else:
-                # Crash/timeout/etc.: counts as a non-improvement. Optionally
-                # revert, increment stagnation, record an empty-metric row.
-                status = iteration_status_from_error(eval_result)
-                reverted = revert_on_no_improvement
-                if reverted:
-                    await self._hill_climbing_revert()
-                stagnation += 1
-                rows.append(
-                    ResultsEntry(
-                        iteration=iteration,
-                        commit_hash=self._hill_climbing_commit_hash(),
-                        # Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-                        metric_value=float("nan"),
-                        direction=direction,
-                        status=status,
-                        duration=0.0,
-                        description=description,
-                    )
-                )
-                self._emit_hill_climbing_span(
-                    session_id, task.id, span_seq, iteration, None, None, status, reverted
-                )
-                span_seq += 1
-
-            # ── Stagnation halt (only when a cap is configured).
-            if max_stagnation is not None and stagnation >= max_stagnation:
-                await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
-                result = self._fail(
-                    HaltReasonStagnationLimitReached(
-                        iterations=stagnation,
-                        best_metric=current_best,
-                    ),
-                    session_id,
-                    total_usage,
-                    carried.turns,
-                )
-                await self._finalize_self_verifying(result)
-                return result
-
-            iteration += 1
-
-        # Budget/turn cap reached without a stagnation halt — clean budget halt.
-        await self._write_hill_climbing_tsv(workspace_root, task.id, rows)
-        result = self._fail(
-            HaltReasonBudgetExceeded(limit_type="turns"),
-            session_id,
-            total_usage,
-            carried.turns,
-        )
-        await self._finalize_self_verifying(result)
-        return result
 
     async def _hill_climbing_revert(self) -> None:
         """Revert the working tree to current HEAD for a no-improvement iteration
@@ -5714,145 +5702,210 @@ class StandardHarness:
             )
         return "\n".join(out) + "\n"
 
-    async def _run_ralph(
-        self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        on_stream: StreamSink | None,
-    ) -> RunResult:
-        """Drive the Ralph strategy (issue #58) — the multi-context-window
-        continuation loop.
+    # ---- #124 leaf primitives (Ralph seed + HillClimbing scoring) ----------
 
-        The OUTER loop runs up to ``config.max_resets`` context windows (B3).
-        Each window is a FRESH :class:`SessionState` (no message carryover —
-        R2) re-seeded with the instruction plus the reloaded ``.spore/`` state
-        (R3, B4 — progress + feature_list, no git), then a bounded ReAct
-        sub-loop runs (the registered :class:`RalphStopHook` fires inside it on
-        ``FinalResponse``). After the window, the SAME filesystem completion
-        check the Stop hook reads (B1) decides reset vs. success: ``None`` ⇒
-        done ⇒ Success; a reason ⇒ tasks remain ⇒ reset into the next window
-        unless the cap is reached. Budgets fold across ALL windows (R6); each
-        reset is independently traceable via a fresh session id (R7).
-
-        Terminal: :class:`HaltReasonRalphCompletionUnmet` when ``max_resets``
-        windows are exhausted with tasks still incomplete. Mirrors Rust's
-        ``run_ralph``.
-        """
-        _ = on_stream  # sub-loops run with a suppressed sink (mirrors PlanExecute).
+    async def _ralph_seed_session(self, instruction: str) -> SessionState:
+        """Build the per-window Ralph seed session (#124): a fresh
+        :class:`SessionState` seeded with ``instruction``, the ``.spore/`` reload
+        context (R3), and the optional VCS history block — exactly the legacy
+        ``_run_ralph`` window setup, minus the model loop (which now recurses).
+        Mirrors Rust's ``ralph_seed_session``."""
         workspace_root = self._config.sandbox.workspace_root()
-        max_resets = max(self._config.max_resets, 1)
-        # Ralph's incoming budget snapshot is irrelevant — each window is a fresh
-        # start with its own per-window turn budget (the reset discards it).
-        # Token/turn accounting is accumulated separately for terminal reporting.
-        _ = budget_used
+        session_state = SessionState()
+        await self._config.context_manager.append_user_message(session_state, instruction)
+        reload = _ralph_reload_context(workspace_root)
+        if reload is not None:
+            await self._config.context_manager.append_user_message(session_state, reload)
+        # R3 (issue #58 v2): inject git history when a ``VcsProvider`` is wired.
+        vcs = self._config.vcs_provider
+        if vcs is not None:
+            args = VcsLogArgs(max_entries=20)
+            try:
+                log = await vcs.log(args)
+            except VcsError:
+                log = ""
+            trimmed = log.strip()
+            if trimmed:
+                block = f"Recent VCS history:\n{trimmed}"
+                await self._config.context_manager.append_user_message(session_state, block)
+        return session_state
 
-        # Cumulative usage + turns across ALL context windows (R6).
-        total_usage = AggregateUsage()
-        cumulative_turns = 0
-        # The most recent incompletion reason (for RalphCompletionUnmet).
-        last_reason = ".spore/progress.json missing"
-        # Session id of the most recent context window (terminal accounting).
-        last_session_id = task.session_id
+    def budget_exceeded(
+        self, budget: BudgetLimits, used: BudgetSnapshot, started_at: float
+    ) -> BudgetLimitTypeT | None:
+        """:class:`StrategyExecutor` primitive: the wall-time / cost / token budget
+        gate (#124, HillClimbing). Delegates to :meth:`_budget_exceeded`."""
+        return self._budget_exceeded(budget, used, started_at)
 
-        for iteration in range(max_resets):
-            # R7: a fresh, distinct session id per context window so each reset
-            # is independently traceable. Iteration 0 reuses the task's id.
-            window_session_id = task.session_id if iteration == 0 else new_session_id()
-            last_session_id = window_session_id
+    async def hill_baseline(
+        self,
+        evaluator: Any,
+        session_id: SessionId,
+        task_id: TaskId,
+        direction: OptimizationDirection,
+        rows: list[Any],
+        span_seq: list[int],
+        total_usage: AggregateUsage,
+        turns: int,
+    ) -> float | RunResultFailure:
+        """HillClimbing iteration-0 baseline (#124): evaluate the metric (no agent
+        turn), record the row + span, and return the baseline value — or a
+        ``Failure`` on a baseline-evaluation failure (already records the failed
+        row + writes the TSV). Mirrors Rust's ``hill_baseline``."""
+        from .metric import MetricResult, ResultsEntry, iteration_status_from_error
+        from .termination import SessionStateSnapshot
 
-            # R2: a FRESH SessionState per window — no message carryover; the
-            # window is re-seeded from scratch.
-            session_state = SessionState()
-
-            # Seed the instruction (R2), then R3: reload the deterministic
-            # ``.spore/`` state and inject it so the fresh window knows what is
-            # already done / still outstanding.
-            await self._config.context_manager.append_user_message(session_state, task.instruction)
-            reload = _ralph_reload_context(workspace_root)
-            if reload is not None:
-                await self._config.context_manager.append_user_message(session_state, reload)
-            # R3 (issue #58 v2): when a ``VcsProvider`` is wired, ALSO reload git
-            # history and inject it as a delimited "Recent VCS history:" section,
-            # exactly as the ``.spore/`` reload content is injected. When the
-            # provider is ``None`` (the default), this section is omitted
-            # entirely — Ralph's reloaded context is then byte-for-byte the v1
-            # behavior (the B4→None decision).
-            vcs = self._config.vcs_provider
-            if vcs is not None:
-                args = VcsLogArgs(max_entries=20)
-                try:
-                    log = await vcs.log(args)
-                except VcsError:
-                    log = ""
-                trimmed = log.strip()
-                if trimmed:
-                    block = f"Recent VCS history:\n{trimmed}"
-                    await self._config.context_manager.append_user_message(session_state, block)
-
-            window_task = Task(
-                id=task.id,
-                instruction=task.instruction,
-                session_id=window_session_id,
-                budget=task.budget,
-                loop_strategy=task.loop_strategy,
-            )
-            # FRESH per-window budget: the context-window reset resets the turn
-            # budget too. Token fold is accumulated separately via ``total_usage``.
-            window_cap = task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
-            carried = BudgetSnapshot()
-            window_result = await self._run_react_inner(
-                window_task,
-                window_cap,
-                session_state,
-                carried,
-                None,
-            )
-            self._fold_usage(total_usage, carried, window_result)
-            cumulative_turns += carried.turns
-
-            # A window that paused / escalated is propagated up unchanged.
-            if isinstance(window_result, RunResultWaitingForHuman):
-                return window_result
-            if isinstance(window_result, RunResultEscalate):
-                await self._finalize_self_verifying(window_result)
-                return window_result
-
-            # External completion check (B1): consult the SAME filesystem state
-            # the Stop hook reads. ``None`` ⇒ done ⇒ Success; a reason ⇒ tasks
-            # remain ⇒ reset into the next window unless the cap is reached.
-            reason = _ralph_completion_status(workspace_root)
-            if reason is None:
-                # Carry the final context window's history into the terminal
-                # result (issue #102).
-                if isinstance(window_result, RunResultSuccess):
-                    output = window_result.output
-                    final_state = window_result.session_state
-                else:
-                    output = ""
-                    final_state = SessionState()
-                result: RunResult = RunResultSuccess(
-                    output=output,
-                    session_id=window_session_id,
-                    usage=total_usage,
-                    turns=cumulative_turns,
-                    session_state=final_state,
-                )
-                await self._finalize_self_verifying(result)
-                return result
-            last_reason = reason
-
-        # Ran out of context-window resets without completion.
-        result = self._fail(
-            HaltReasonRalphCompletionUnmet(
-                iterations=max_resets,
-                last_reason=last_reason,
-            ),
-            last_session_id,
-            total_usage,
-            cumulative_turns,
+        workspace_root = self._config.sandbox.workspace_root()
+        description = evaluator.description()
+        snapshot = SessionStateSnapshot(
+            session_id=session_id,
+            task_id=task_id,
+            state=SessionState(),
+            workspace_root=workspace_root,
         )
-        await self._finalize_self_verifying(result)
-        return result
+        baseline = await evaluator.evaluate(self._config.sandbox, snapshot)
+        if isinstance(baseline, MetricResult):
+            rows.append(
+                ResultsEntry(
+                    iteration=0,
+                    commit_hash=self._hill_climbing_commit_hash(),
+                    metric_value=baseline.value,
+                    direction=direction,
+                    status="kept",
+                    duration=baseline.duration,
+                    description=description,
+                )
+            )
+            self._emit_hill_climbing_span(
+                session_id, task_id, span_seq[0], 0, baseline.value, None, "kept", False
+            )
+            span_seq[0] += 1
+            return baseline.value
+        # A baseline that cannot even be measured is a misconfiguration of the
+        # experiment — record the failed row, write the TSV, and halt.
+        status = iteration_status_from_error(baseline)
+        rows.append(
+            ResultsEntry(
+                iteration=0,
+                commit_hash=self._hill_climbing_commit_hash(),
+                metric_value=float("nan"),
+                direction=direction,
+                status=status,
+                duration=0.0,
+                description=description,
+            )
+        )
+        self._emit_hill_climbing_span(
+            session_id, task_id, span_seq[0], 0, None, None, status, False
+        )
+        span_seq[0] += 1
+        await self._write_hill_climbing_tsv(workspace_root, task_id, rows)
+        return RunResultFailure(
+            reason=HaltReasonHillClimbingMisconfigured(
+                reason=f"baseline evaluation failed: {baseline.kind}"
+            ),
+            session_id=session_id,
+            usage=total_usage,
+            turns=turns,
+            session_state=SessionState(),
+        )
+
+    async def hill_iteration(
+        self,
+        evaluator: Any,
+        session_id: SessionId,
+        task_id: TaskId,
+        iteration: int,
+        direction: OptimizationDirection,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: float | None,
+        current_best: float,
+        rows: list[Any],
+        span_seq: list[int],
+    ) -> tuple[float, bool]:
+        """HillClimbing per-iteration metric eval + keep/revert decision (#124):
+        the agent turn already ran (recursively); this evaluates the metric,
+        applies ``should_keep``, optionally reverts, records the row + span, and
+        returns ``(current_best, non_improvement)``. Mirrors Rust's
+        ``hill_iteration``."""
+        from .metric import MetricResult, ResultsEntry, iteration_status_from_error, should_keep
+        from .termination import SessionStateSnapshot
+
+        workspace_root = self._config.sandbox.workspace_root()
+        description = evaluator.description()
+        snapshot = SessionStateSnapshot(
+            session_id=session_id,
+            task_id=task_id,
+            state=SessionState(),
+            workspace_root=workspace_root,
+        )
+        eval_result = await evaluator.evaluate(self._config.sandbox, snapshot)
+        if isinstance(eval_result, MetricResult):
+            value = eval_result.value
+            kept = should_keep(value, current_best, direction, min_improvement_delta)
+            delta = (current_best - value) if direction == "minimize" else (value - current_best)
+            if kept:
+                rows.append(
+                    ResultsEntry(
+                        iteration=iteration,
+                        commit_hash=self._hill_climbing_commit_hash(),
+                        metric_value=value,
+                        direction=direction,
+                        status="kept",
+                        duration=eval_result.duration,
+                        description=description,
+                    )
+                )
+                self._emit_hill_climbing_span(
+                    session_id, task_id, span_seq[0], iteration, value, delta, "kept", False
+                )
+                span_seq[0] += 1
+                return value, False
+            reverted = revert_on_no_improvement
+            if reverted:
+                await self._hill_climbing_revert()
+            rows.append(
+                ResultsEntry(
+                    iteration=iteration,
+                    commit_hash=self._hill_climbing_commit_hash(),
+                    metric_value=value,
+                    direction=direction,
+                    status="discarded",
+                    duration=eval_result.duration,
+                    description=description,
+                )
+            )
+            self._emit_hill_climbing_span(
+                session_id, task_id, span_seq[0], iteration, value, delta, "discarded", reverted
+            )
+            span_seq[0] += 1
+            return current_best, True
+        # Crash/timeout/etc.: counts as a non-improvement.
+        status = iteration_status_from_error(eval_result)
+        reverted = revert_on_no_improvement
+        if reverted:
+            await self._hill_climbing_revert()
+        rows.append(
+            ResultsEntry(
+                iteration=iteration,
+                commit_hash=self._hill_climbing_commit_hash(),
+                metric_value=float("nan"),
+                direction=direction,
+                status=status,
+                duration=0.0,
+                description=description,
+            )
+        )
+        self._emit_hill_climbing_span(
+            session_id, task_id, span_seq[0], iteration, None, None, status, reverted
+        )
+        span_seq[0] += 1
+        return current_best, True
+
+    async def hill_write_tsv(self, task_id: TaskId, rows: list[Any]) -> None:
+        """:class:`StrategyExecutor` primitive: write the HillClimbing results TSV
+        (#124). Delegates to :meth:`_write_hill_climbing_tsv`."""
+        await self._write_hill_climbing_tsv(self._config.sandbox.workspace_root(), task_id, rows)
 
     async def _persist_task_list(
         self,
@@ -6172,6 +6225,25 @@ class StandardHarness:
 
     # ---- ReAct loop -------------------------------------------------
 
+    def _resolve_worker_agent(self, ls: LoopStrategy) -> Agent | RunResultFailure:
+        """Resolve the worker agent for a :data:`LoopStrategy` tree from the
+        :class:`ExecutionRegistry` (#124). Mirrors Rust's ``resolve_worker_agent``:
+        the worker is the agent on the LEAF reached by descending the recursion.
+        Returns the resolved agent, or a typed ``UnresolvedHandle`` ``Failure``."""
+        key = _worker_agent_key_of(ls)
+        agent = self._config.registry.resolve_agent(key)
+        if agent is None:
+            return RunResultFailure(
+                reason=HaltReasonConfigurationError(
+                    error=HarnessErrorUnresolvedHandle(handle_kind="agent", key=key)
+                ),
+                session_id=SessionId(""),
+                usage=AggregateUsage(),
+                turns=0,
+                session_state=SessionState(),
+            )
+        return agent
+
     async def _run_react(
         self,
         task: Task,
@@ -6179,13 +6251,15 @@ class StandardHarness:
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
+        agent: Agent,
     ) -> RunResult:
         """Drive the ReAct loop, then finalize observability for terminal
         outcomes. A ``WaitingForHuman`` pause is not terminal, so it is never
         flushed here — the eventual ``resume`` reaches a terminal outcome and
-        flushes then. Mirrors Rust's ``run_react`` wrapper."""
+        flushes then. Mirrors Rust's ``run_react`` wrapper. The worker ``agent``
+        is RESOLVED by the caller (#124)."""
         result = await self._run_react_inner(
-            task, max_iterations, session_state, budget_used, on_stream
+            task, max_iterations, session_state, budget_used, on_stream, agent
         )
         if isinstance(result, RunResultSuccess):
             await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
@@ -6210,6 +6284,10 @@ class StandardHarness:
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
+        # #124: the worker agent is RESOLVED by the caller (the recursing
+        # ``_run_react_config`` resolves ``self.agent`` from the registry; Ralph
+        # may override it per window). The leaf no longer reads ``config.agent``.
+        agent: Agent,
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
@@ -6329,7 +6407,7 @@ class StandardHarness:
                 input_messages = _capture_input_messages(
                     context.messages, config.content_capture.max_field_len
                 )
-            result: TurnResult = await self._drive_turn(config.agent, context, on_stream)
+            result: TurnResult = await self._drive_turn(agent, context, on_stream)
             budget_used.turns += 1
 
             # Emit a turn span for every model call (issue #12). Fire-and-forget;
@@ -6896,6 +6974,7 @@ class StandardHarness:
                         task.id,
                         span_seq,
                         usage,
+                        agent,
                     )
 
                 continue
@@ -6925,6 +7004,9 @@ class StandardHarness:
         task_id: TaskId,
         span_seq: int,
         usage: AggregateUsage,
+        # #124: the compaction summary turn runs on the SAME resolved worker
+        # agent driving the ReAct window (no ``config.agent``).
+        agent: Agent,
     ) -> int:
         """Run the post-compaction verify→retry→warn loop (issue #46/#29).
 
@@ -6953,7 +7035,7 @@ class StandardHarness:
         while True:
             attempt += 1
             # Run one compaction turn through the agent to produce a summary.
-            result = await config.agent.turn(turn.context)
+            result = await agent.turn(turn.context)
             if isinstance(result, FinalResponse):
                 usage.add_turn(result.usage)
                 summary = result.content

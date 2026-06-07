@@ -18,7 +18,6 @@ from spore_core import (
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
     HaltReasonPlanPhaseFailed,
-    HarnessBuilder,
     HarnessConfig,
     HarnessRunOptions,
     InMemoryStorageProvider,
@@ -224,28 +223,14 @@ async def test_plan_turn_agent_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R5: when planner_agent is set, the PLANNER runs the plan turn and the default
-# agent does not.
+# #124 Q1: the separate ``planner_agent`` concept is DROPPED — the plan child's
+# leaf ``ReactConfig.agent`` is authoritative (the recursing leaf resolves it).
+# The former ``test_plan_phase_routes_to_planner_agent`` is removed accordingly.
 # ---------------------------------------------------------------------------
 
 
-async def test_plan_phase_routes_to_planner_agent() -> None:
-    from spore_core import BudgetSnapshot, SessionState
-    from spore_core.harness import _PlanPhaseOutcome
-
-    default = _agent()
-    default.push(FinalResponse(content='{"tasks":["default ran"]}', usage=_usage()))
-    planner = _agent()
-    planner.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
-    h = StandardHarness(_config(default, planner_agent=planner))
-    outcome = await h._run_plan_phase(_plan_task(), SessionState(), BudgetSnapshot(), None)
-    assert isinstance(outcome, _PlanPhaseOutcome)
-    assert planner.call_count == 1
-    assert default.call_count == 0
-
-
 # ---------------------------------------------------------------------------
-# R6: with no planner_agent, the plan turn runs on the default agent.
+# R6: the plan turn runs on the resolved (default) worker agent.
 # ---------------------------------------------------------------------------
 
 
@@ -417,32 +402,9 @@ async def test_execute_phase_not_implemented_removed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Builder wires planner_agent: the planner runs the one-shot plan turn.
+# #124 Q1: the ``planner_agent`` concept is DROPPED — the former
+# ``test_builder_planner_agent_setter`` is removed accordingly.
 # ---------------------------------------------------------------------------
-
-
-async def test_builder_planner_agent_setter() -> None:
-    from spore_core import BudgetSnapshot, SessionState
-    from spore_core.harness import _PlanPhaseOutcome
-
-    default = _agent()
-    planner = _agent()
-    planner.push(FinalResponse(content=_PLAN_JSON, usage=_usage()))
-    h = (
-        HarnessBuilder(
-            default,
-            ScriptedToolRegistry(),
-            AllowAllSandbox(),
-            NoopContextManager(),
-            AlwaysContinuePolicy(),
-        )
-        .planner_agent(planner)
-        .build()
-    )
-    outcome = await h._run_plan_phase(_plan_task(), SessionState(), BudgetSnapshot(), None)
-    assert isinstance(outcome, _PlanPhaseOutcome)
-    assert planner.call_count == 1
-    assert default.call_count == 0
 
 
 # ---------------------------------------------------------------------------

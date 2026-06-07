@@ -249,7 +249,8 @@ def test_validate_tree_walk_passes_when_fully_wired() -> None:
         .agent("ralph-agent", _agent())
         .toolset("plan-tools", EmptyToolRegistry())
         .toolset("exec-tools", EmptyToolRegistry())
-        .schema("exec-evaluator", {})
+        # #124 Q1: the SelfVerifying ``evaluator`` resolves as a VERIFIER key.
+        .verifier("exec-evaluator", object())
         # A.5 (#124): the structured plan/worker slots now carry output schemas.
         .schema("plan-schema", {})
         .schema("worker-schema", {})
@@ -336,9 +337,14 @@ def _builder() -> HarnessBuilder:
     )
 
 
-def test_config_registry_defaults_to_empty() -> None:
+def test_config_registry_folds_default_agent() -> None:
+    # #124: the legacy single-collaborator fields are gone — ``HarnessConfig``
+    # folds the builder's agent + toolset + default schema into the registry under
+    # the DEFAULT empty key, so the single resolution path always has a worker to
+    # resolve. Mirrors Rust's ``builder_folds_default_agent_into_registry``.
     cfg = _builder().build_config()
-    assert cfg.registry.is_empty()
+    assert not cfg.registry.is_empty()
+    assert cfg.registry.resolve_agent("") is not None
 
 
 def test_builder_register_convenience_setters() -> None:
@@ -387,18 +393,19 @@ async def test_run_entry_unresolved_handle_is_startup_failure() -> None:
     assert r.turns == 0
 
 
-async def test_run_entry_empty_registry_skips_validation() -> None:
-    # Legacy caller: no registry wired → validation is skipped, the run proceeds
-    # on the deprecated single-collaborator fields (Option B, byte-identical).
+async def test_run_entry_default_folded_leaf_validates_and_runs() -> None:
+    # #124: validation is now the SINGLE resolution path and ALWAYS runs (the old
+    # "empty registry skips validation" gate is dropped). A bare default ReAct
+    # leaf (empty handles) resolves against the defaults the builder folds into the
+    # registry, so the run validates and proceeds.
     a = _agent()
     a.push(FinalResponse(content="done", usage=TokenUsage(input_tokens=1, output_tokens=1)))
     h = HarnessBuilder(
         a, EmptyToolRegistry(), AllowAllSandbox(), NoopContextManager(), AlwaysContinuePolicy()
     ).build()
-    # Handles are unresolved, but the empty registry skips validation entirely.
-    task = Task.new("do it", SessionId("s1"), _react_leaf("missing", "missing"))
+    # The default empty-key leaf resolves via the folded default agent + toolset.
+    task = Task.new("do it", SessionId("s1"), ReactConfig.per_loop(5))
     r = await h.run(HarnessRunOptions(task))
-    # Reaches the loop and succeeds — does NOT fail with ConfigurationError.
     assert isinstance(r, RunResultSuccess)
     assert r.output == "done"
 

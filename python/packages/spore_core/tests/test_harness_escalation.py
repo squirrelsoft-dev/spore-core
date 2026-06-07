@@ -179,6 +179,13 @@ def _escalating_config(
     )
 
 
+def _set_worker_agent(config: HarnessConfig, agent: object) -> None:
+    """#124: the legacy ``config.agent`` field is gone — re-register ``agent``
+    under the DEFAULT empty key in the config's ExecutionRegistry (the worker the
+    bare ``ReactConfig.per_loop`` leaf resolves)."""
+    config.registry = config.registry.into_builder().agent("", agent).build()
+
+
 # ---------------------------------------------------------------------------
 # R1 + R8: a dispatched Escalate { Abort } terminates the run and returns
 # RunResultEscalate, NOT RunResultFailure.
@@ -192,7 +199,7 @@ async def test_escalate_abort_returns_escalate_not_failure() -> None:
     agent.push(ToolCallRequested(calls=[_tc("c1", "abort_tool")], usage=_usage()))
 
     config = _escalating_config(signal=_abort_signal())
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task()))
@@ -215,7 +222,7 @@ async def test_escalation_not_appended_to_history() -> None:
     agent.push(ToolCallRequested(calls=[_tc("c1", "abort_tool")], usage=_usage()))
 
     config = _escalating_config(signal=_abort_signal(), context_manager=cm)
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task()))
@@ -242,7 +249,7 @@ async def test_escalation_finalizes_observability_as_escalated() -> None:
     agent.push(ToolCallRequested(calls=[_tc("c1", "abort_tool")], usage=_usage()))
 
     config = _escalating_config(signal=_abort_signal(), observability=obs)
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("esc-session")))
@@ -277,7 +284,7 @@ async def test_waiting_for_human_not_finalized_contrast() -> None:
         )
     )
     config = _escalating_config(signal=_abort_signal(), tool_registry=reg, observability=obs)
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("hitl-session")))
@@ -298,7 +305,7 @@ async def test_escalate_populates_all_five_fields() -> None:
     agent.push(ToolCallRequested(calls=[_tc("c1", "abort_tool")], usage=_usage(7, 3)))
 
     config = _escalating_config(signal=_abort_signal())
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("five-session")))
@@ -323,7 +330,7 @@ async def test_escalate_state_is_resumable_with_no_human_request() -> None:
     agent.push(ToolCallRequested(calls=[_tc("c1", "abort_tool")], usage=_usage()))
 
     config = _escalating_config(signal=_abort_signal())
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("resume-session")))
@@ -357,7 +364,7 @@ async def test_signal_discarded_on_resume() -> None:
     agent.push(FinalResponse(content="resumed cleanly", usage=_usage()))
 
     config = _escalating_config(signal=_abort_signal())
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("disc-session")))
@@ -394,7 +401,7 @@ async def test_remaining_calls_preserved_in_pending() -> None:
         .push(ToolOutputSuccess(content="should-not-run"))
     )
     config = _escalating_config(signal=_abort_signal(), tool_registry=reg)
-    config.agent = agent
+    _set_worker_agent(config, agent)
     harness = StandardHarness(config)
 
     r = await harness.run(HarnessRunOptions(_react_task("pending-session")))

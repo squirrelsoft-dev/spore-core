@@ -80,7 +80,9 @@ def test_conversational_defaults_components() -> None:
     termination."""
     model = _GreetingModel("hi")
     config = HarnessBuilder.conversational(model).build_config()
-    assert config.agent.id() == "agent"
+    # #124: the legacy ``config.agent`` field is gone — the worker resolves from
+    # the registry under the DEFAULT empty key (the builder folds it there).
+    assert config.registry.resolve_agent("").id() == "agent"
     assert isinstance(config.tool_registry, EmptyToolRegistry)
     assert isinstance(config.termination_policy, CompleteOnFinalResponse)
     assert isinstance(config.sandbox, NullSandbox)

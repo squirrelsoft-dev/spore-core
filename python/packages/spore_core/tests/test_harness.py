@@ -25,7 +25,6 @@ from spore_core import (
     HaltReasonAgentError,
     HaltReasonBudgetExceeded,
     HaltReasonContextError,
-    HaltReasonHillClimbingMisconfigured,
     HaltReasonHumanHalted,
     HaltReasonMiddlewareHalt,
     HaltReasonSandboxViolation,
@@ -438,14 +437,19 @@ async def test_resume_with_allow_executes_pending_and_continues() -> None:
 async def test_non_react_strategies_marked_not_yet_implemented() -> None:
     # PlanExecute no longer uses StrategyNotYetImplemented; it runs the full
     # two-phase plan→execute loop (#59). SelfVerifying (#61), Ralph (#58), and
-    # HillClimbing (#60) are now all implemented. HillClimbing with no
-    # metric_evaluator wired returns the typed HillClimbingMisconfigured halt
-    # (Decision 6), NOT StrategyNotYetImplemented (mirrors the Rust reference
-    # test at harness.rs:7100). No non-ReAct strategy remains stubbed.
+    # HillClimbing (#60) are now all implemented. #124: HillClimbing with no
+    # metric evaluator registered returns a STARTUP ConfigurationError (the
+    # unresolved ``evaluator`` handle on the single resolution path), NOT
+    # StrategyNotYetImplemented (mirrors Rust's
+    # ``hill_climbing_no_longer_not_yet_implemented``).
+    from spore_core import HaltReasonConfigurationError, HarnessErrorUnresolvedHandle
+
     a = _agent()
     h = StandardHarness(_config(a))
     s = HillClimbingConfig(
-        inner=ReactConfig.per_loop(2**31 - 1),
+        inner=ReactConfig(
+            budget=ReactConfig.per_loop(2**31 - 1).budget, agent="", toolset="", output=""
+        ),
         direction="maximize",
         max_stagnation=2**31 - 1,
         revert_on_no_improvement=False,
@@ -456,8 +460,8 @@ async def test_non_react_strategies_marked_not_yet_implemented() -> None:
     r = await h.run(HarnessRunOptions(t))
     assert isinstance(r, RunResultFailure)
     assert not isinstance(r.reason, HaltReasonStrategyNotYetImplemented)
-    assert isinstance(r.reason, HaltReasonHillClimbingMisconfigured)
-    assert "metric_evaluator" in r.reason.reason
+    assert isinstance(r.reason, HaltReasonConfigurationError)
+    assert r.reason.error == HarnessErrorUnresolvedHandle(handle_kind="metric_evaluator", key="")
 
 
 # ---------------------------------------------------------------------------

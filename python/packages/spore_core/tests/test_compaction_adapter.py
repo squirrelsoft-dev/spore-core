@@ -370,7 +370,9 @@ async def test_end_to_end_drives_compaction_through_seam() -> None:
     assert h._config.context_manager.should_compact(session) is True
 
     usage = AggregateUsage()
-    await h._run_compaction(session, SessionId("s1"), TaskId("t1"), 0, usage)
+    await h._run_compaction(
+        session, SessionId("s1"), TaskId("t1"), 0, usage, h._config.registry.resolve_agent("")
+    )
 
     assert len(session.messages) < before
     assert len(session.messages) == 3
@@ -410,7 +412,9 @@ async def test_compaction_loop_fixture_parity_with_real_adapter() -> None:
         # 10 messages, over threshold -> a real CompactionTurn is offered.
         session = _session_with(_rich_state(10, 95, 100))
         usage = AggregateUsage()
-        await h._run_compaction(session, SessionId("s1"), TaskId("t1"), 0, usage)
+        await h._run_compaction(
+            session, SessionId("s1"), TaskId("t1"), 0, usage, h._config.registry.resolve_agent("")
+        )
 
         sid = SessionId("s1")
         expected = case["expected"]

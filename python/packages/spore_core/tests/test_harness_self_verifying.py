@@ -18,7 +18,6 @@ from spore_core import (
     BudgetLimits,
     FinalResponse,
     HaltReasonSelfVerifyExhausted,
-    HaltReasonSelfVerifyMisconfigured,
     HarnessConfig,
     HarnessRunOptions,
     SelfVerifyingConfig,
@@ -183,10 +182,17 @@ async def test_r10_self_verifying_not_strategy_not_yet_implemented() -> None:
 
 
 async def test_r11_no_verifier_is_misconfigured() -> None:
+    # #124: an unresolved verifier (the SelfVerifying ``evaluator`` key resolves
+    # against the verifier map) is a STARTUP ConfigurationError (single resolution
+    # path), NOT the legacy SelfVerifyMisconfigured. Mirrors Rust's
+    # ``self_verifying_missing_verifier_is_typed_halt``.
+    from spore_core import HaltReasonConfigurationError, HarnessErrorUnresolvedHandle
+
     h = StandardHarness(_config(agent=_build_agent(), verifier=None))
     r = await h.run(HarnessRunOptions(_task()))
     assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonSelfVerifyMisconfigured)
+    assert isinstance(r.reason, HaltReasonConfigurationError)
+    assert r.reason.error == HarnessErrorUnresolvedHandle(handle_kind="verifier", key="")
     assert r.session_id == SessionId("build-session")
 
 
@@ -422,10 +428,16 @@ async def test_r12_fixture_replay() -> None:
         expected = case["expected"]
 
         if expected["kind"] == "misconfigured":
+            # #124: an unresolved verifier is now a startup ConfigurationError
+            # (single resolution path). The fixture file is unchanged — only the
+            # expected runtime mapping. Mirrors Rust's fixture-replay arm.
+            from spore_core import HaltReasonConfigurationError, HarnessErrorUnresolvedHandle
+
             h = StandardHarness(_config(agent=_build_agent(), verifier=None))
             r: RunResult = await h.run(HarnessRunOptions(_task()))
             assert isinstance(r, RunResultFailure), name
-            assert isinstance(r.reason, HaltReasonSelfVerifyMisconfigured), name
+            assert isinstance(r.reason, HaltReasonConfigurationError), name
+            assert isinstance(r.reason.error, HarnessErrorUnresolvedHandle), name
             continue
 
         v = ScriptedVerifier(verdicts, max_iterations=max_iter)

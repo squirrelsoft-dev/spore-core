@@ -10,9 +10,9 @@ built registry, with no reconfiguration.
 
 Types
 -----
-- :class:`ExecutionRegistry` — five maps keyed by string: ``agents``,
-  ``toolsets``, ``schemas``, ``verifiers``, ``custom`` (custom strategies). NOT
-  serialized.
+- :class:`ExecutionRegistry` — six maps keyed by string: ``agents``,
+  ``toolsets``, ``schemas``, ``verifiers``, ``metric_evaluators`` (#124, Q2),
+  ``custom`` (custom strategies). NOT serialized.
 - :class:`ExecutionRegistryBuilder` — fluent assembler mirroring
   ``HarnessBuilder``.
 - :class:`StrategyResolution` — the result of resolving a ``StrategyRef``:
@@ -127,7 +127,7 @@ class ExecutionRegistry:
     """Runtime resolver mapping serializable string handles (and
     ``StrategyRef.Custom`` keys) to concrete collaborators.
 
-    Five maps; NOT serialized. Build one with :meth:`builder` or :meth:`empty`.
+    Six maps; NOT serialized. Build one with :meth:`builder` or :meth:`empty`.
     The default constructor yields an empty registry.
     """
 
@@ -135,19 +135,29 @@ class ExecutionRegistry:
     toolsets: dict[str, Any] = field(default_factory=dict)
     schemas: dict[str, Any] = field(default_factory=dict)
     verifiers: dict[str, Verifier] = field(default_factory=dict)
+    # Sixth map (#124, Q2): HillClimbing metric evaluators, keyed by the same
+    # string ``HillClimbingConfig.evaluator`` carries on the wire. Runtime-only
+    # (never serialized) like the other maps; keeping it distinct from ``agents``
+    # preserves the metric-evaluator wire string while resolving it to a
+    # ``MetricEvaluator`` rather than an ``Agent``.
+    metric_evaluators: dict[str, Any] = field(default_factory=dict)
     custom: dict[str, RunStrategy] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> ExecutionRegistry:
-        """An empty registry (no entries in any of the five maps)."""
+        """An empty registry (no entries in any of the six maps)."""
         return cls()
 
     def is_empty(self) -> bool:
-        """True when no entries exist in any of the five maps. Lets the harness
-        skip startup validation for callers that never wire a registry (Option B
-        additive scope — they still use the deprecated single-collaborator
-        fields)."""
-        return not (self.agents or self.toolsets or self.schemas or self.verifiers or self.custom)
+        """True when no entries exist in any of the six maps."""
+        return not (
+            self.agents
+            or self.toolsets
+            or self.schemas
+            or self.verifiers
+            or self.metric_evaluators
+            or self.custom
+        )
 
     @classmethod
     def builder(cls) -> ExecutionRegistryBuilder:
@@ -178,6 +188,13 @@ class ExecutionRegistry:
     def resolve_verifier(self, key: str) -> Verifier | None:
         """Resolve a verifier key to its registered verifier, or ``None``."""
         return self.verifiers.get(key)
+
+    def resolve_metric_evaluator(self, key: str) -> Any | None:
+        """Resolve a metric-evaluator key (the string ``HillClimbingConfig.evaluator``
+        carries, #124 Q2) to its registered ``MetricEvaluator``, or ``None`` if
+        absent. The wire string is identical to the legacy ``AgentRef``; only the
+        resolution target differs (the sixth ``metric_evaluators`` map)."""
+        return self.metric_evaluators.get(key)
 
     def resolve_strategy(self, ref: StrategyRef) -> StrategyResolution:
         """Resolve a ``StrategyRef``: a ``BuiltIn(ls)`` returns the built-in
@@ -226,8 +243,9 @@ class ExecutionRegistry:
             # evaluable. A bare ``ReAct`` worker needs an output schema.
             self._check_structured_slot(ls.inner, "worker")
             self._walk_strategy(ls.inner)
-            # The evaluator is a SchemaRef (the evaluator schema handle).
-            self._check_schema(ls.evaluator)
+            # #124 Q1: the evaluator's wire string (a ``SchemaRef``) is the
+            # VERIFIER registry key — resolved against the ``verifiers`` map.
+            self._check_verifier(ls.evaluator)
         elif isinstance(ls, RalphConfig):
             self._walk_strategy(ls.inner)
             self._check_agent(ls.agent)
@@ -236,8 +254,9 @@ class ExecutionRegistry:
             # candidate. A bare ``ReAct`` proposer needs an output schema.
             self._check_structured_slot(ls.inner, "propose")
             self._walk_strategy(ls.inner)
-            # The evaluator is an AgentRef (the metric-evaluator agent).
-            self._check_agent(ls.evaluator)
+            # #124 Q2: the evaluator's wire string is resolved against the sixth
+            # ``metric_evaluators`` map (not ``agents``).
+            self._check_metric_evaluator(ls.evaluator)
         else:  # pragma: no cover — closed union; exhaustive above
             raise AssertionError(f"unknown loop strategy: {ls!r}")
 
@@ -274,6 +293,22 @@ class ExecutionRegistry:
         if ref not in self.schemas:
             raise HarnessErrorException(HarnessErrorUnresolvedHandle(handle_kind="schema", key=ref))
 
+    def _check_verifier(self, ref: SchemaRef) -> None:
+        """#124 Q1: a SelfVerifying ``evaluator`` (a ``SchemaRef`` on the wire)
+        resolves against the ``verifiers`` map."""
+        if ref not in self.verifiers:
+            raise HarnessErrorException(
+                HarnessErrorUnresolvedHandle(handle_kind="verifier", key=ref)
+            )
+
+    def _check_metric_evaluator(self, ref: AgentRef) -> None:
+        """#124 Q2: a HillClimbing ``evaluator`` (an ``AgentRef`` on the wire)
+        resolves against the sixth ``metric_evaluators`` map."""
+        if ref not in self.metric_evaluators:
+            raise HarnessErrorException(
+                HarnessErrorUnresolvedHandle(handle_kind="metric_evaluator", key=ref)
+            )
+
 
 # ── ExecutionRegistryBuilder ─────────────────────────────────────────────────
 
@@ -305,9 +340,47 @@ class ExecutionRegistryBuilder:
         self.registry.verifiers[key] = verifier
         return self
 
+    def metric_evaluator(self, key: str, evaluator: Any) -> ExecutionRegistryBuilder:
+        """Register a metric evaluator under ``key`` (#124, Q2 — the sixth map)."""
+        self.registry.metric_evaluators[key] = evaluator
+        return self
+
     def register_strategy(self, key: str, strategy: RunStrategy) -> ExecutionRegistryBuilder:
         """Register a custom strategy under ``key``."""
         self.registry.custom[key] = strategy
+        return self
+
+    def fill_default_agent(self, agent: Agent) -> ExecutionRegistryBuilder:
+        """#124 migration seam: register ``agent`` under the DEFAULT empty-string
+        key ONLY if that key is not already wired. ``HarnessConfig`` folds its
+        single agent here so bare ``ReactConfig.per_loop`` leaves (empty
+        ``AgentRef``) resolve to it. An explicitly-registered ``""`` agent wins."""
+        self.registry.agents.setdefault("", agent)
+        return self
+
+    def fill_default_toolset(self, toolset: Any) -> ExecutionRegistryBuilder:
+        """#124: as :meth:`fill_default_agent`, for the default toolset (the
+        config's ``tool_registry``) under the empty key."""
+        self.registry.toolsets.setdefault("", toolset)
+        return self
+
+    def fill_default_schema(self, schema: Any) -> ExecutionRegistryBuilder:
+        """#124: as :meth:`fill_default_agent`, for a default output schema under
+        the empty key — so a bare structured-slot leaf (``output=""``) resolves
+        under the single resolution path without each caller wiring a schema."""
+        self.registry.schemas.setdefault("", schema)
+        return self
+
+    def fill_default_verifier(self, verifier: Verifier) -> ExecutionRegistryBuilder:
+        """#124: as :meth:`fill_default_agent`, for a default SelfVerifying
+        verifier under the empty key."""
+        self.registry.verifiers.setdefault("", verifier)
+        return self
+
+    def fill_default_metric_evaluator(self, evaluator: Any) -> ExecutionRegistryBuilder:
+        """#124: as :meth:`fill_default_agent`, for a default HillClimbing metric
+        evaluator under the empty key."""
+        self.registry.metric_evaluators.setdefault("", evaluator)
         return self
 
     def build(self) -> ExecutionRegistry:

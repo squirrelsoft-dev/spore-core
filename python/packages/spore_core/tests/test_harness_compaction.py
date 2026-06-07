@@ -159,7 +159,10 @@ async def _drive(
     usage = AggregateUsage()
     # Pre-condition: the should_compact gate is honored by the caller.
     if h._config.context_manager.should_compact(state):
-        await h._run_compaction(state, SessionId("s1"), TaskId("t1"), 0, usage)
+        # #124: the compaction turn runs on the resolved worker agent (the
+        # default ``""`` key the constructor folds the single agent under).
+        agent = h._config.registry.resolve_agent("")
+        await h._run_compaction(state, SessionId("s1"), TaskId("t1"), 0, usage, agent)
 
 
 # ---------------------------------------------------------------------------

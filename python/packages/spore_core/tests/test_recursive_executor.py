@@ -45,6 +45,7 @@ from spore_core import (
     MockAgent,
     NoopContextManager,
     PlanExecuteConfig,
+    RalphConfig,
     ReactConfig,
     RunResultFailure,
     RunResultSuccess,
@@ -211,21 +212,19 @@ async def test_plan_execute_runs_non_react_execute_child_per_task() -> None:
         def max_iterations(self) -> int:
             return 3
 
-    def _eval_agent() -> MockAgent:
-        a = MockAgent(AgentId("eval"))
-        a.push(FinalResponse(content="PASS", usage=_usage()))
-        a.push(FinalResponse(content="PASS", usage=_usage()))
-        return a
-
-    # cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+    # #124 Q1c: the single worker agent (default ``""`` key) runs the plan turn
+    # (JSON), then per task the build turn, then the evaluate-phase turn. 2 tasks
+    # ⇒ plan + 2×(build + eval) = 5 turns.
     a = _agent()
     a.push(FinalResponse(content=_PLAN_2, usage=_usage()))
     a.push(FinalResponse(content="built t0", usage=_usage()))
+    a.push(FinalResponse(content="PASS", usage=_usage()))
     a.push(FinalResponse(content="built t1", usage=_usage()))
+    a.push(FinalResponse(content="PASS", usage=_usage()))
     verifier = _RecordingVerifier()
-    cfg = _config(a)
-    cfg.evaluator_agent = _eval_agent()
-    cfg.verifier = verifier
+    # #124: the verifier resolves from the SelfVerifying ``evaluator`` key — here
+    # the default empty key, folded via the ``verifier=`` constructor param.
+    cfg = _config(a, registry=ExecutionRegistry.builder().verifier("", verifier).build())
     h = StandardHarness(cfg)
 
     # The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
@@ -233,8 +232,18 @@ async def test_plan_execute_runs_non_react_execute_child_per_task() -> None:
         "build a CLI",
         SessionId("pe-nonreact"),
         PlanExecuteConfig(
-            plan=ReactConfig.per_loop(2**31 - 1),
-            execute=SelfVerifyingConfig(inner=ReactConfig.per_loop(2**31 - 1), evaluator=""),
+            plan=ReactConfig(
+                budget=ReactConfig.per_loop(2**31 - 1).budget, agent="", toolset="", output=""
+            ),
+            execute=SelfVerifyingConfig(
+                inner=ReactConfig(
+                    budget=ReactConfig.per_loop(2**31 - 1).budget,
+                    agent="",
+                    toolset="",
+                    output="",
+                ),
+                evaluator="",
+            ),
         ),
         budget=BudgetLimits(max_turns=None),
     )
@@ -304,7 +313,10 @@ def _wired_registry() -> ExecutionRegistry:
         .toolset("t1", ScriptedToolRegistry())
         .schema("plan-schema", {})
         .schema("worker-schema", {})
-        .schema("eval-schema", {})
+        # #124 Q1: the SelfVerifying ``evaluator`` resolves as a VERIFIER key.
+        .verifier("eval-schema", object())
+        # #124 Q2: the HillClimbing ``evaluator`` resolves as a metric key.
+        .metric_evaluator("metric-1", object())
         .build()
     )
 
@@ -333,7 +345,7 @@ def _react_leaf(output: str | None = None) -> ReactConfig:
                 max_stagnation=3,
                 revert_on_no_improvement=False,
                 min_improvement_delta=0.1,
-                evaluator="a1",
+                evaluator="metric-1",
             ),
             "propose",
         ),
@@ -436,3 +448,301 @@ async def test_no_executor_is_typed_failure() -> None:
     outcome = await run_strategy(ReactConfig.per_loop(1), cx)
     assert isinstance(outcome, StrategyOutcomeFailed)
     assert isinstance(outcome.error, HarnessErrorInvalidConfiguration)
+
+
+# ---------------------------------------------------------------------------
+# #124 REGRESSION-PROOF: the three combinators GENUINELY recurse into a NON-ReAct
+# inner. Each asserts the inner's distinctive work fires (a hardcoded-ReAct loop
+# would record ZERO). Mirrors the Rust ``*_runs_non_react_inner_*`` tests.
+# ---------------------------------------------------------------------------
+
+
+class _StoringContextManager:
+    """A context manager that actually STORES appended user messages on the
+    session (unlike the no-op default) and assembles them into the Context, so a
+    recording agent can observe the plan directive text the harness seeds."""
+
+    async def assemble(self, session: SessionState, task: object) -> object:
+        from spore_core.agent import Context
+        from spore_core.model import ModelParams
+
+        return Context(messages=list(session.messages), tools=[], params=ModelParams())
+
+    async def append_tool_result(self, session: SessionState, result: object) -> None:
+        return None
+
+    async def append_user_message(self, session: SessionState, text: str) -> None:
+        from spore_core.model import Message, Role, TextContent
+
+        session.messages.append(Message(role=Role.USER, content=TextContent(text=text)))
+
+    async def append_assistant_message(self, session: SessionState, message: object) -> None:
+        session.messages.append(message)  # type: ignore[arg-type]
+
+    def should_compact(self, session: SessionState) -> bool:
+        return False
+
+
+def _react_structured() -> ReactConfig:
+    """A bare ReAct leaf carrying the default output schema handle, for the
+    STRUCTURED slots (PlanExecute plan / SelfVerifying worker / HillClimbing
+    propose) A.5 requires to declare an output schema."""
+    return ReactConfig(
+        budget=ReactConfig.per_loop(2**31 - 1).budget, agent="", toolset="", output=""
+    )
+
+
+class _RecordingAgent:
+    """Records every ``Context`` it is handed and yields a scripted sequence of
+    finals, so a test can assert what the worker saw (e.g. the plan directive)."""
+
+    def __init__(self, contents: list[str]) -> None:
+        self.seen: list[object] = []
+        self._contents = list(contents)
+
+    async def turn(self, context: object) -> FinalResponse:
+        self.seen.append(context)
+        content = self._contents.pop(0) if self._contents else "done"
+        return FinalResponse(content=content, usage=_usage())
+
+    def id(self) -> AgentId:
+        return AgentId("recording")
+
+    def seen_text(self) -> list[str]:
+        out: list[str] = []
+        for ctx in self.seen:
+            parts: list[str] = []
+            for m in ctx.messages:  # type: ignore[attr-defined]
+                text = getattr(m.content, "text", "")
+                if text:
+                    parts.append(text)
+            out.append("\n".join(parts))
+        return out
+
+
+async def test_self_verifying_runs_non_react_inner_worker() -> None:
+    """SelfVerifying[inner: PlanExecute[ReAct, ReAct]] — each build iteration runs
+    the inner PlanExecute's WHOLE loop, which fires a plan turn (parsing JSON)
+    before the execute step. A hardcoded-ReAct build would NEVER fire the plan
+    phase. Mirrors Rust's ``self_verifying_runs_non_react_inner_worker``."""
+    from spore_core import VerifierInput, VerifierVerdict, VerifierVerdictPassed
+
+    class _RecordingVerifier:
+        def __init__(self) -> None:
+            self.seen: list[VerifierInput] = []
+
+        async def verify(self, input: VerifierInput) -> VerifierVerdict:
+            self.seen.append(input)
+            return VerifierVerdictPassed()
+
+        def max_iterations(self) -> int:
+            return 3
+
+    # One SelfVerifying iteration of PlanExecute[ReAct,ReAct] over a 1-task plan:
+    # plan JSON, execute step, then the evaluate-phase turn.
+    worker = _RecordingAgent(['{"tasks":["only"],"rationale":"r"}', "did the step", "PASS"])
+    verifier = _RecordingVerifier()
+    cfg = _config(
+        worker,
+        context_manager=_StoringContextManager(),
+        registry=ExecutionRegistry.builder().verifier("", verifier).build(),
+    )
+    h = StandardHarness(cfg)
+
+    # inner is a genuine PlanExecute combinator (NOT a ReAct).
+    task = Task.new(
+        "build it",
+        SessionId("sv-nonreact"),
+        SelfVerifyingConfig(
+            inner=PlanExecuteConfig(
+                plan=_react_structured(), execute=ReactConfig.per_loop(2**31 - 1)
+            ),
+            evaluator="",
+        ),
+        budget=BudgetLimits(max_turns=None),
+    )
+    r = await h.run(HarnessRunOptions(task))
+    assert isinstance(r, RunResultSuccess), f"expected Success, got {r!r}"
+    # The inner PlanExecute fired its plan turn ⇒ the worker saw the plan
+    # directive. A hardcoded-ReAct build would record ZERO plan turns.
+    plan_turns = sum(1 for c in worker.seen_text() if "step-by-step plan" in c)
+    assert plan_turns >= 1, (
+        f"the inner PlanExecute plan phase must fire >=1 per iteration; saw {worker.seen_text()!r}"
+    )
+    # The verifier fired (the SelfVerifying loop ran its evaluate phase).
+    assert len(verifier.seen) == 1
+
+
+async def test_ralph_runs_non_react_inner_per_window() -> None:
+    """Ralph[inner: SelfVerifying[ReAct]] over always-incomplete progress — each
+    window runs its inner SelfVerifying's full build↔evaluate loop (firing its
+    verifier once), Ralph reads incomplete and resets until ``max_resets`` is
+    exhausted. With max_resets=2 the verifier fires >=1 per window (>=2 total). A
+    hardcoded-ReAct window would record ZERO verifier invocations. Mirrors Rust's
+    ``ralph_runs_non_react_inner_per_window``."""
+    import tempfile
+    from pathlib import Path
+
+    from spore_core import VerifierInput, VerifierVerdict, VerifierVerdictPassed
+    from spore_core.harness import BaseSandboxProvider
+
+    class _RecordingVerifier:
+        def __init__(self) -> None:
+            self.seen: list[VerifierInput] = []
+
+        async def verify(self, input: VerifierInput) -> VerifierVerdict:
+            self.seen.append(input)
+            return VerifierVerdictPassed()
+
+        def max_iterations(self) -> int:
+            return 3
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        incomplete = '{"complete": false, "remaining": ["task A"]}'
+        spore = root / ".spore"
+        spore.mkdir()
+        (spore / "progress.json").write_text(incomplete)
+
+        class _WorkspaceSandbox(BaseSandboxProvider):
+            async def validate(self, call: object) -> None:
+                return None
+
+            def workspace_root(self) -> Path:
+                return root
+
+        # The worker keeps progress incomplete on every turn it writes.
+        class _ProgressAgent(_RecordingAgent):
+            async def turn(self, context: object) -> FinalResponse:
+                (spore / "progress.json").write_text(incomplete)
+                return await super().turn(context)
+
+        worker = _ProgressAgent(["window done"] * 16)
+        verifier = _RecordingVerifier()
+        cfg = HarnessConfig(
+            agent=worker,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=_WorkspaceSandbox(),
+            context_manager=NoopContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            max_resets=2,
+            registry=ExecutionRegistry.builder().verifier("", verifier).build(),
+        )
+        h = StandardHarness(cfg)
+
+        # inner is a genuine SelfVerifying combinator (NOT a ReAct).
+        task = Task.new(
+            "keep going",
+            SessionId("ralph-nonreact"),
+            RalphConfig(
+                inner=SelfVerifyingConfig(inner=_react_structured(), evaluator=""),
+                agent="",
+            ),
+            budget=BudgetLimits(max_turns=8),
+        )
+        r = await h.run(HarnessRunOptions(task))
+        from spore_core import HaltReasonRalphCompletionUnmet
+
+        assert isinstance(r, RunResultFailure), f"expected Failure, got {r!r}"
+        assert isinstance(r.reason, HaltReasonRalphCompletionUnmet)
+        assert r.reason.iterations == 2, "exactly max_resets windows ran"
+        # The inner SelfVerifying verifier fired at least once per window (>=2). A
+        # hardcoded-ReAct window would record ZERO verifier invocations.
+        assert len(verifier.seen) >= 2, (
+            f"inner SelfVerifying verifier must fire >=1 per window; got {len(verifier.seen)}"
+        )
+
+
+async def test_hill_climbing_runs_non_react_inner_per_iteration() -> None:
+    """HillClimbing[inner: PlanExecute[ReAct, ReAct]] improve-then-stagnate — each
+    iteration recurses the inner PlanExecute's WHOLE loop (firing a plan turn +
+    execute step) before the metric eval. baseline 1.0, iter1 2.0 (improve→keep),
+    iter2 0.5 (regress→discard, stagnation hits cap 1 ⇒ halt). The plan turn must
+    fire ONCE PER iteration (2x). A hardcoded-ReAct proposer would record ZERO.
+    Mirrors Rust's ``hill_climbing_runs_non_react_inner_per_iteration``."""
+    import tempfile
+    from pathlib import Path
+    from typing import Any
+
+    from spore_core.harness import BaseSandboxProvider, CommandOutput
+    from spore_core.metric import MetricResult
+    from spore_core.termination import SessionStateSnapshot
+
+    class _ScriptedMetric:
+        def __init__(self, seq: list[float]) -> None:
+            self._seq = list(seq)
+            self._i = 0
+
+        async def evaluate(self, sandbox: Any, snapshot: SessionStateSnapshot) -> MetricResult:
+            v = self._seq[self._i] if self._i < len(self._seq) else self._seq[-1]
+            self._i += 1
+            return MetricResult(value=v, raw_output="", duration=0.0)
+
+        def direction(self) -> str:
+            return "maximize"
+
+        def description(self) -> str:
+            return "scripted metric"
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        class _Sandbox(BaseSandboxProvider):
+            async def validate(self, call: object) -> None:
+                return None
+
+            async def execute_command(
+                self, command: str, args: list[str], working_dir: Any = None, timeout: Any = None
+            ) -> CommandOutput:
+                return CommandOutput(stdout="", stderr="", exit_code=0, timed_out=False)
+
+            def workspace_root(self) -> Path:
+                return root
+
+        # Per iteration the inner PlanExecute fires a plan JSON turn + execute step.
+        worker = _RecordingAgent(
+            [
+                '{"tasks":["only"],"rationale":"r"}',
+                "changed iter1",
+                '{"tasks":["only"],"rationale":"r"}',
+                "changed iter2",
+            ]
+        )
+        evaluator = _ScriptedMetric([1.0, 2.0, 0.5])
+        cfg = HarnessConfig(
+            agent=worker,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=_Sandbox(),
+            context_manager=_StoringContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            metric_evaluator=evaluator,
+        )
+        h = StandardHarness(cfg)
+
+        # inner is a genuine PlanExecute combinator (NOT a ReAct).
+        task = Task.new(
+            "optimize it",
+            SessionId("hc-nonreact"),
+            HillClimbingConfig(
+                inner=PlanExecuteConfig(
+                    plan=_react_structured(), execute=ReactConfig.per_loop(2**31 - 1)
+                ),
+                direction="maximize",
+                max_stagnation=1,
+                revert_on_no_improvement=False,
+                min_improvement_delta=0.0,
+                evaluator="",
+            ),
+            budget=BudgetLimits(max_turns=50),
+        )
+        r = await h.run(HarnessRunOptions(task))
+        from spore_core import HaltReasonStagnationLimitReached
+
+        assert isinstance(r, RunResultFailure), f"expected Failure, got {r!r}"
+        assert isinstance(r.reason, HaltReasonStagnationLimitReached)
+        # The inner PlanExecute fired its plan turn ONCE PER iteration (2x). A
+        # hardcoded-ReAct proposer would record ZERO plan turns.
+        plan_turns = sum(1 for c in worker.seen_text() if "step-by-step plan" in c)
+        assert plan_turns == 2, (
+            f"inner PlanExecute plan phase fires once per iteration; saw {worker.seen_text()!r}"
+        )

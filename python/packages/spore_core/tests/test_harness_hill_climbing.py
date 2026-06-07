@@ -160,7 +160,14 @@ def _task(
         "optimize the thing",
         SessionId("hc-session"),
         HillClimbingConfig(
-            inner=ReactConfig.per_loop(2**31 - 1),
+            # #124 A.5: the ``inner`` (propose) slot is STRUCTURED — its leaf
+            # declares the default output schema handle (empty key).
+            inner=ReactConfig(
+                budget=ReactConfig.per_loop(2**31 - 1).budget,
+                agent="",
+                toolset="",
+                output="",
+            ),
             direction=direction,  # type: ignore[arg-type]
             # ``max_stagnation`` / ``min_improvement_delta`` are required (#119);
             # map the old "unset" sentinels to behavior-preserving values: a
@@ -184,12 +191,18 @@ def _read_tsv(sandbox: RecordingSandbox, task: Task) -> str:
 
 
 async def test_misconfigured_no_evaluator(tmp_path: Path) -> None:
+    # #124: with no metric evaluator registered, the unresolved ``evaluator``
+    # handle is a STARTUP ConfigurationError (single resolution path) — NOT the
+    # legacy HillClimbingMisconfigured. Mirrors Rust's
+    # ``hill_climbing_missing_evaluator_is_typed_halt``.
+    from spore_core import HaltReasonConfigurationError, HarnessErrorUnresolvedHandle
+
     sb = RecordingSandbox(tmp_path)
     h = StandardHarness(_config(sandbox=sb, evaluator=None))
     r = await h.run(HarnessRunOptions(_task()))
     assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonHillClimbingMisconfigured)
-    assert "metric_evaluator" in r.reason.reason
+    assert isinstance(r.reason, HaltReasonConfigurationError)
+    assert r.reason.error == HarnessErrorUnresolvedHandle(handle_kind="metric_evaluator", key="")
 
 
 # ---------------------------------------------------------------------------
