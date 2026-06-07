@@ -8,7 +8,7 @@
  *   - the `react` tag (NOT `re_act`) and flat config layout,
  *   - StrategyRef BuiltIn/Custom round-trip + adjacent tagging,
  *   - handle types (AgentRef/ToolsetRef/SchemaRef) round-trip as bare strings,
- *   - the stub `run` dispatch returns the `pending` placeholder (no throw),
+ *   - the stub `run` dispatch returns a `complete` placeholder (no throw),
  *   - PausedState/ChildPausedState round-trip with a cordyceps task.loop_strategy,
  *   - byte-identity replay against the shared `fixtures/strategy/` ground truth.
  */
@@ -20,13 +20,14 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
+  ExecutionRegistry,
   asRunStrategy,
   loopStrategyFromJson,
   loopStrategyToJson,
+  newExecutionContext,
   runStrategy,
   strategyRefFromJson,
   strategyRefToJson,
-  type ExecutionContext,
   type LoopStrategy,
   type StrategyRef,
 } from "../src/index.js";
@@ -218,7 +219,9 @@ describe("StrategyRef", () => {
   });
 
   it("adjacently tags custom on kind/value", () => {
-    expect(JSON.stringify(strategyRefToJson({ kind: "custom", value: "my-harness::DoubleVerify" })));
+    expect(
+      JSON.stringify(strategyRefToJson({ kind: "custom", value: "my-harness::DoubleVerify" })),
+    );
     expect(
       JSON.stringify(strategyRefToJson({ kind: "custom", value: "my-harness::DoubleVerify" })),
     ).toBe('{"kind":"custom","value":"my-harness::DoubleVerify"}');
@@ -259,15 +262,15 @@ describe("RunStrategy stub dispatch", () => {
     },
   ];
 
-  it.each(strategies)("returns pending (no throw) for %j", async (strategy) => {
-    const cx: ExecutionContext = {};
-    await expect(runStrategy(strategy, cx)).resolves.toEqual({ kind: "pending" });
+  it.each(strategies)("returns complete (no throw) for %j", async (strategy) => {
+    const cx = newExecutionContext(ExecutionRegistry.empty());
+    await expect(runStrategy(strategy, cx)).resolves.toEqual({ kind: "complete", output: "" });
   });
 
   it("asRunStrategy delegates to the single dispatch", async () => {
-    const cx: ExecutionContext = {};
+    const cx = newExecutionContext(ExecutionRegistry.empty());
     const rs = asRunStrategy(cordycepsTree());
-    await expect(rs.run(cx)).resolves.toEqual({ kind: "pending" });
+    await expect(rs.run(cx)).resolves.toEqual({ kind: "complete", output: "" });
   });
 });
 

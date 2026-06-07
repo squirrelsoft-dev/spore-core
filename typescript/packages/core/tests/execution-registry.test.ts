@@ -83,7 +83,7 @@ class StubVerifier implements Verifier {
 
 class StubStrategy implements RunStrategy {
   async run(_cx: ExecutionContext): Promise<StrategyOutcome> {
-    return { kind: "pending" };
+    return { kind: "complete", output: "" };
   }
 }
 

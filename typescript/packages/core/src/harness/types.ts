@@ -14,6 +14,8 @@
 import { z } from "zod";
 
 import type { Harness } from "./interface.js";
+import type { ExecutionRegistry } from "./execution-registry.js";
+import type { SpanId } from "../observability/types.js";
 import type { Context } from "../agent/types.js";
 import type { AgentError } from "../agent/errors.js";
 import type { PlanPhaseErrorKind } from "../plan/types.js";
@@ -561,23 +563,238 @@ export function strategyRefToJson(ref: StrategyRef): Record<string, unknown> {
   }
 }
 
-// ── RunStrategy composition seam (#119) ─────────────────────────────────────
+// ── Composable Execution runtime scaffold (#123) ────────────────────────────
+//
+// StrategyOutcome + ExecutionContext / BudgetContext / BudgetStack / SpanStack.
+// These are the typed result a strategy node returns and the one shared,
+// mutable runtime context threaded through a whole nested strategy tree. This
+// is the SCAFFOLD slice: it establishes the types and the threading. The
+// enforcement semantics (walking the behavior chain, consuming continues,
+// promoting a charge error to a {@link StrategyOutcome}) land in a later slice.
+//
+// Resolved spec decisions (mirrors the Rust reference):
+//   1. {@link ExecutionContext} holds the {@link ExecutionRegistry} object — no
+//      lifetime concerns in TS. {@link RunStrategy.run} threads the context.
+//   2. {@link BudgetContext.charge} is PURE ARITHMETIC: it debits `turns`
+//      against the per-scope allowance; on success increments `stepsTaken`; on
+//      overflow returns the error WITHOUT mutating. It does NOT walk the
+//      behavior chain or consume continues. `unlimited` never exhausts.
+//   3. `continuesUsed` is an in-memory field ONLY this slice; checkpoint
+//      persistence is deferred.
+//   4. {@link SpanStack} is a runtime-only push/pop stack of {@link SpanId}.
+//
+// All of these types are RUNTIME-ONLY and are NEVER serialized (there is
+// deliberately no zod schema and no `*ToJson` for them — that absence is the
+// "not serialized" guarantee).
 
 /**
- * Placeholder for #119; full shape owned by #123 (StrategyOutcome +
- * ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
- * pre-build #123's budget-stack / aggregate-usage scaffolding here.
+ * The error {@link BudgetContext.charge} returns when a debit would exceed the
+ * scope's step allowance. Captures the budget state at the moment of
+ * exhaustion. Runtime-only (NOT serialized).
+ *
+ * Promotes to a {@link StrategyOutcome} `budget_exhausted` (which adds
+ * `partialOutput`) at the strategy boundary in the enforcement slice.
  */
-export interface ExecutionContext {
-  readonly __executionContext?: never;
+export interface BudgetExhausted {
+  policy: BudgetPolicy;
+  behavior: BudgetExhaustedBehavior;
+  stepsTaken: number;
+  continuesUsed: number;
+  phase: string;
 }
 
 /**
- * Placeholder for #119; full shape owned by #123. The stub strategy run bodies
- * return `{ kind: "pending" }` so the seam exists without a throw; per-variant
- * outcomes land with the executor slice (#124).
+ * The result of charging a {@link BudgetContext}. A Result-style discriminated
+ * union: `{ ok: true }` on success, `{ ok: false, error }` carrying the
+ * {@link BudgetExhausted} state on overflow — non-throwing, matching how the
+ * codebase models fallible, recoverable operations.
  */
-export type StrategyOutcome = { kind: "pending" };
+export type ChargeResult = { ok: true } | { ok: false; error: BudgetExhausted };
+
+/**
+ * The typed outcome a strategy node returns. Internally tagged on `kind`
+ * (snake_case for symmetry with the other harness unions). Runtime-only — NEVER
+ * serialized.
+ *
+ *   - `complete` — the strategy finished and produced its final `output`
+ *     (`Output` maps to `string`, mirroring {@link RunResult}).
+ *   - `budget_exhausted` — the strategy's budget scope ran out of allowance.
+ *     Mirrors the {@link BudgetExhausted} charge-error fields and adds
+ *     `partialOutput` (any output produced before exhaustion). A child's
+ *     `budget_exhausted` is an INSPECTABLE value the parent reads (e.g. to grant
+ *     a continue or escalate); it does NOT auto-propagate as a failure.
+ *   - `failed` — the strategy halted with a {@link HarnessError}. Callers can
+ *     distinguish this from `budget_exhausted`.
+ */
+export type StrategyOutcome =
+  | { kind: "complete"; output: string }
+  | {
+      kind: "budget_exhausted";
+      policy: BudgetPolicy;
+      behavior: BudgetExhaustedBehavior;
+      stepsTaken: number;
+      continuesUsed: number;
+      phase: string;
+      partialOutput?: string;
+    }
+  | { kind: "failed"; error: HarnessError };
+
+/**
+ * One budget scope in the strategy tree. Each recursion node gets its OWN
+ * `BudgetContext`; siblings do NOT share. Runtime-only (NOT serialized).
+ *
+ * The per-scope step allowance is the policy's own `value`: `total_steps` /
+ * `per_loop` / `per_attempt` all expose `value` as the cap for this scope;
+ * `unlimited` is uncapped ({@link remaining} → `undefined`).
+ *
+ * `continuesUsed` is an in-memory field ONLY in this slice; its checkpoint
+ * persistence is deferred to the enforcement slice (resolution #3).
+ */
+export class BudgetContext {
+  stepsTaken = 0;
+  continuesUsed = 0;
+
+  constructor(
+    readonly policy: BudgetPolicy,
+    readonly behavior: BudgetExhaustedBehavior,
+    readonly phase: string,
+  ) {}
+
+  /** The per-scope step allowance (`undefined` for `unlimited`). */
+  private allowance(): number | undefined {
+    return this.policy.kind === "unlimited" ? undefined : this.policy.value;
+  }
+
+  /**
+   * Debit `turns` steps against the scope allowance (pure arithmetic —
+   * resolution #2). On success increments `stepsTaken` and returns
+   * `{ ok: true }`. If the debit would exceed the allowance, returns
+   * `{ ok: false, error }` capturing current state WITHOUT mutating. Does NOT
+   * walk the behavior chain or consume continues. `unlimited` never exhausts.
+   */
+  charge(turns: number): ChargeResult {
+    const allowance = this.allowance();
+    if (allowance !== undefined && this.stepsTaken + turns > allowance) {
+      return {
+        ok: false,
+        error: {
+          policy: this.policy,
+          behavior: this.behavior,
+          stepsTaken: this.stepsTaken,
+          continuesUsed: this.continuesUsed,
+          phase: this.phase,
+        },
+      };
+    }
+    this.stepsTaken += turns;
+    return { ok: true };
+  }
+
+  /**
+   * Steps left in this scope (`allowance - stepsTaken`, floored at 0).
+   * `undefined` for `unlimited` (no cap).
+   */
+  remaining(): number | undefined {
+    const allowance = this.allowance();
+    return allowance === undefined ? undefined : Math.max(0, allowance - this.stepsTaken);
+  }
+
+  /**
+   * Continues left before fall-through. For a `continue` behavior this is
+   * `maxContinues - continuesUsed` (floored at 0); for `escalate` / `fail`
+   * there are no continues, so `0`.
+   */
+  continuesRemaining(): number {
+    return this.behavior.kind === "continue"
+      ? Math.max(0, this.behavior.max_continues - this.continuesUsed)
+      : 0;
+  }
+}
+
+/**
+ * Runtime push/pop stack of {@link BudgetContext} scopes — one node per
+ * recursion frame, pushed on descent and popped on ascent. Runtime-only (NOT
+ * serialized). Siblings get DISTINCT contexts and do not share state.
+ */
+export class BudgetStack {
+  readonly stack: BudgetContext[] = [];
+
+  push(cx: BudgetContext): void {
+    this.stack.push(cx);
+  }
+
+  /** Pop the current scope, returning it (or `undefined` when empty). */
+  pop(): BudgetContext | undefined {
+    return this.stack.pop();
+  }
+
+  /** The current (innermost) scope, or `undefined` when empty. */
+  current(): BudgetContext | undefined {
+    return this.stack[this.stack.length - 1];
+  }
+
+  /** The current stack depth (recursion frames active). */
+  depth(): number {
+    return this.stack.length;
+  }
+}
+
+/**
+ * Runtime push/pop stack of {@link SpanId} (resolution #4). Runtime-only (NOT
+ * serialized).
+ */
+export class SpanStack {
+  readonly stack: SpanId[] = [];
+
+  push(id: SpanId): void {
+    this.stack.push(id);
+  }
+
+  /** Pop the current span id, returning it (or `undefined` when empty). */
+  pop(): SpanId | undefined {
+    return this.stack.pop();
+  }
+
+  /** The current stack depth. */
+  depth(): number {
+    return this.stack.length;
+  }
+}
+
+/**
+ * The one shared, mutable runtime context threaded through a whole nested
+ * strategy tree. Holds the {@link ExecutionRegistry} for the duration of the
+ * run (resolution #1 — no lifetime concerns in TS). Runtime-only — NEVER
+ * serialized.
+ */
+export interface ExecutionContext {
+  /** Handle registry (agents/toolsets/schemas/custom strategies). */
+  registry: ExecutionRegistry;
+  /** Per-scope budget stack, pushed/popped through recursion. */
+  budgets: BudgetStack;
+  /** Aggregated token/cost usage across the whole tree. */
+  usage: AggregateUsage;
+  /** Conversation/session state round-tripped across the tree. */
+  session: SessionState;
+  /** Span stack for observability nesting. */
+  spans: SpanStack;
+  /** Optional streaming sink for emitted events. */
+  stream?: StreamSink;
+}
+
+/**
+ * A fresh {@link ExecutionContext} bound to `registry`, with empty stacks and
+ * default usage/session and no stream sink.
+ */
+export function newExecutionContext(registry: ExecutionRegistry): ExecutionContext {
+  return {
+    registry,
+    budgets: new BudgetStack(),
+    usage: emptyAggregateUsage(),
+    session: emptySessionState(),
+    spans: new SpanStack(),
+  };
+}
 
 /**
  * The runtime composition seam: every strategy node knows how to run itself
@@ -589,10 +806,10 @@ export interface RunStrategy {
 }
 
 /**
- * The single dispatch site for the strategy tree (#119). One `switch` over the
- * `kind` discriminant delegates to per-config run logic. Each per-config body
- * is a STUB returning {@link StrategyOutcome} `pending` (it does NOT throw);
- * real bodies land in #124.
+ * The single dispatch site for the strategy tree. One `switch` over the `kind`
+ * discriminant delegates to per-config run logic. Each per-config body is a
+ * STUB returning a `complete` {@link StrategyOutcome} with an empty output (it
+ * does NOT throw); real per-variant bodies land in #124.
  */
 export async function runStrategy(
   strategy: LoopStrategy,
@@ -617,30 +834,31 @@ export function asRunStrategy(strategy: LoopStrategy): RunStrategy {
   return { run: (cx) => runStrategy(strategy, cx) };
 }
 
-// Per-config run STUBS (#124 lands the real bodies). They never throw.
+// Per-config run STUBS (#124 lands the real bodies). They never throw; the
+// benign matchable placeholder is `complete` with an empty output.
 async function runReactConfig(_c: ReactConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
-  return { kind: "pending" };
+  return { kind: "complete", output: "" };
 }
 async function runPlanExecuteConfig(
   _c: PlanExecuteConfig,
   _cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
-  return { kind: "pending" };
+  return { kind: "complete", output: "" };
 }
 async function runSelfVerifyingConfig(
   _c: SelfVerifyingConfig,
   _cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
-  return { kind: "pending" };
+  return { kind: "complete", output: "" };
 }
 async function runRalphConfig(_c: RalphConfig, _cx: ExecutionContext): Promise<StrategyOutcome> {
-  return { kind: "pending" };
+  return { kind: "complete", output: "" };
 }
 async function runHillClimbingConfig(
   _c: HillClimbingConfig,
   _cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
-  return { kind: "pending" };
+  return { kind: "complete", output: "" };
 }
 
 // ── EscalationMode (HITL-vs-AFK config knob, #120) ──────────────────────────
