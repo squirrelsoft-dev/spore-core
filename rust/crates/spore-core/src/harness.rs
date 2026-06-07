@@ -300,36 +300,256 @@ pub enum BudgetExhaustedBehavior {
 // Task + loop strategy
 // ============================================================================
 
+/// HillClimbing optimization direction (formerly `HillClimbingDirection`).
+/// Renamed in #119 (Composable Execution Part A) to live alongside the other
+/// strategy-config types. Wire format is unchanged: snake_case `"minimize"` /
+/// `"maximize"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OptimizationDirection {
+pub enum HillClimbingDirection {
     Minimize,
     Maximize,
 }
 
-/// Loop strategy. The data shape is canonical; concrete strategy traits
-/// (`CompletionCheck`, `Verifier`, `MetricEvaluator`) are owned by their
-/// respective component issues. [`LoopStrategy::ReAct`] (issue #57) and
-/// [`LoopStrategy::PlanExecute`] (issues #70/#59) are fully executable in
-/// [`StandardHarness`]; the remaining variants still halt with
-/// [`HaltReason::StrategyNotYetImplemented`] until their component issues land.
+// ============================================================================
+// Composable Execution Part A (issue #119): recursive LoopStrategy config
+// newtypes + per-node collaborator handles + StrategyRef + RunStrategy trait.
+// ============================================================================
+//
+// Types defined in this section:
+//   - Handle newtypes: AgentRef, ToolsetRef, SchemaRef (transparent strings).
+//   - Config structs: ReactConfig, PlanExecuteConfig, SelfVerifyingConfig,
+//     RalphConfig, HillClimbingConfig.
+//   - LoopStrategy: closed serde enum of config newtypes (recursive via
+//     Box<LoopStrategy> children on the combinator variants).
+//   - StrategyRef: adjacently-tagged BuiltIn(LoopStrategy) | Custom(String).
+//   - RunStrategy trait + delegation impl on LoopStrategy (the single match
+//     site) + stub impls on each *Config.
+//   - Placeholder runtime types: ExecutionContext, StrategyOutcome (#123 owns
+//     their real shapes).
+//
+// Trait method: `RunStrategy::run(&self, &mut ExecutionContext) ->
+// StrategyOutcome` (native async).
+//
+// Rules enforced:
+//   - `LoopStrategy` is `#[serde(tag = "kind", rename_all = "snake_case")]`;
+//     the `ReAct` variant overrides its tag to `"react"` (not `"re_act"`).
+//   - Newtype-variant inner structs flatten next to `"kind"` (flat wire form);
+//     recursive `Box<LoopStrategy>` children nest as tagged objects.
+//   - JSON field order follows struct declaration order (cross-language
+//     byte-identity target).
+//   - Built-ins stay a closed enum (versioning + `max_steps()`, #122);
+//     `StrategyRef::Custom` is the opaque escape hatch (registry: #120).
+//   - Per-variant run bodies are STUBS returning a placeholder outcome — NOT
+//     panic/unimplemented/todo (CONVENTIONS forbids panics outside cfg(test));
+//     real bodies land in #124. The existing executor dispatch in
+//     `StandardHarness` is intentionally left in place (also migrates in #124).
+//
+// No `// SPEC QUESTION:` markers — the plan is fully pinned.
+
+/// Per-node handle to a named agent definition. Serializes as a bare JSON
+/// string. Resolution to a concrete agent lands with the registry slice (#120).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentRef(pub String);
+
+/// Per-node handle to a named toolset. Serializes as a bare JSON string.
+/// Resolution lands with the registry slice (#120).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolsetRef(pub String);
+
+/// Per-node handle to a named output/evaluator schema. Serializes as a bare
+/// JSON string. Resolution lands with the registry slice (#120).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SchemaRef(pub String);
+
+/// Leaf ReAct node config. `budget` is the renamed `max_iterations`
+/// (semantically `PerLoop(n)`). Serializes flat next to `"kind":"react"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReactConfig {
+    pub budget: BudgetPolicy,
+    pub agent: AgentRef,
+    pub toolset: ToolsetRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<SchemaRef>,
+}
+
+impl ReactConfig {
+    /// A bare ReAct leaf with a `PerLoop { value }` budget and empty agent /
+    /// toolset handles (resolution lands with the registry slice, #120). This
+    /// is the migration shim for the old `ReAct { max_iterations }` shape.
+    pub fn per_loop(value: u32) -> Self {
+        Self {
+            budget: BudgetPolicy::PerLoop { value },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }
+    }
+
+    /// The `max_iterations` value extracted from a `PerLoop` budget; any other
+    /// budget shape yields `u32::MAX` (matching the legacy executor's
+    /// "unbounded" fall-through for non-ReAct/non-`PerLoop` strategies).
+    pub fn max_iterations(&self) -> u32 {
+        match self.budget {
+            BudgetPolicy::PerLoop { value } => value,
+            _ => u32::MAX,
+        }
+    }
+}
+
+/// PlanExecute combinator: a `plan` sub-strategy feeds an `execute`
+/// sub-strategy. `plan_model` stays optional/omittable (as today).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanExecuteConfig {
+    pub plan: Box<LoopStrategy>,
+    pub execute: Box<LoopStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_model: Option<ModelConfig>,
+}
+
+impl PlanExecuteConfig {
+    /// A PlanExecute whose plan and execute phases are both bare ReAct leaves
+    /// (migration shim for the old `PlanExecute { plan_model }` shape; the live
+    /// executor does not read the children yet — #124).
+    pub fn simple(plan_model: Option<ModelConfig>) -> Self {
+        Self {
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model,
+        }
+    }
+}
+
+/// SelfVerifying combinator: run `inner`, then judge it against `evaluator`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfVerifyingConfig {
+    pub inner: Box<LoopStrategy>,
+    pub evaluator: SchemaRef,
+}
+
+/// Ralph combinator: re-run `inner` under a fixed `agent` across context-window
+/// resets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RalphConfig {
+    pub inner: Box<LoopStrategy>,
+    pub agent: AgentRef,
+}
+
+/// HillClimbing combinator: iterate `inner`, keeping/reverting per the metric
+/// `evaluator` and `direction`. `max_stagnation` and `min_improvement_delta`
+/// are now required (#119).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HillClimbingConfig {
+    pub inner: Box<LoopStrategy>,
+    pub direction: HillClimbingDirection,
+    pub max_stagnation: u32,
+    pub revert_on_no_improvement: bool,
+    pub min_improvement_delta: f64,
+    pub evaluator: AgentRef,
+}
+
+/// Loop strategy — a closed, recursive serde enum of config newtypes. The
+/// `ReAct` variant is the leaf; the rest are combinators holding
+/// `Box<LoopStrategy>` children. See the section header above for the full
+/// type/wire-format/rule documentation.
+///
+/// Concrete strategy traits (`CompletionCheck`, `Verifier`, `MetricEvaluator`)
+/// are owned by their respective component issues. The live `StandardHarness`
+/// executes ReAct/PlanExecute via its own dispatch (migrating to the
+/// per-`*Config` `run` bodies in #124); the remaining variants still halt with
+/// [`HaltReason::StrategyNotYetImplemented`] until then.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoopStrategy {
-    ReAct {
-        max_iterations: u32,
-    },
-    PlanExecute {
-        plan_model: Option<ModelConfig>,
-    },
-    Ralph,
-    SelfVerifying,
-    HillClimbing {
-        direction: OptimizationDirection,
-        max_stagnation: Option<u32>,
-        revert_on_no_improvement: bool,
-        min_improvement_delta: Option<f64>,
-    },
+    #[serde(rename = "react")]
+    ReAct(ReactConfig),
+    PlanExecute(PlanExecuteConfig),
+    SelfVerifying(SelfVerifyingConfig),
+    Ralph(RalphConfig),
+    HillClimbing(HillClimbingConfig),
+}
+
+/// Serializable identity of a strategy: either a closed built-in
+/// [`LoopStrategy`] tree or an opaque `Custom` string key resolved at runtime
+/// (registry: #120). Adjacently tagged on `kind`/`value` to avoid a tag
+/// collision with the nested `LoopStrategy`'s own `kind`:
+///   - `{"kind":"built_in","value":{"kind":"react",...}}`
+///   - `{"kind":"custom","value":"my-harness::DoubleVerify"}`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum StrategyRef {
+    BuiltIn(LoopStrategy),
+    Custom(String),
+}
+
+/// Placeholder for #119; full shape owned by #123 (StrategyOutcome +
+/// ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
+/// pre-build #123's BudgetStack/AggregateUsage/etc here.
+#[derive(Debug, Default)]
+pub struct ExecutionContext {}
+
+/// Placeholder for #119; full shape owned by #123 (StrategyOutcome +
+/// ExecutionContext runtime scaffold). The stub `run` bodies return
+/// [`StrategyOutcome::Pending`] so the trait compiles without a panic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrategyOutcome {
+    /// Per-variant execution is not yet implemented (#124). Stub marker only.
+    Pending,
+}
+
+/// The runtime composition seam: every strategy node knows how to run itself
+/// given an [`ExecutionContext`]. Implemented once on [`LoopStrategy`] as the
+/// ONLY `match` site — one-line delegation per arm to the inner config's
+/// `run`. Each `*Config` impl is a STUB (returns [`StrategyOutcome::Pending`])
+/// pending #124.
+#[trait_variant::make(Send)]
+pub trait RunStrategy: Send + Sync {
+    async fn run(&self, cx: &mut ExecutionContext) -> StrategyOutcome;
+}
+
+impl RunStrategy for LoopStrategy {
+    async fn run(&self, cx: &mut ExecutionContext) -> StrategyOutcome {
+        match self {
+            LoopStrategy::ReAct(c) => c.run(cx).await,
+            LoopStrategy::PlanExecute(c) => c.run(cx).await,
+            LoopStrategy::SelfVerifying(c) => c.run(cx).await,
+            LoopStrategy::Ralph(c) => c.run(cx).await,
+            LoopStrategy::HillClimbing(c) => c.run(cx).await,
+        }
+    }
+}
+
+impl RunStrategy for ReactConfig {
+    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
+        StrategyOutcome::Pending
+    }
+}
+
+impl RunStrategy for PlanExecuteConfig {
+    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
+        StrategyOutcome::Pending
+    }
+}
+
+impl RunStrategy for SelfVerifyingConfig {
+    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
+        StrategyOutcome::Pending
+    }
+}
+
+impl RunStrategy for RalphConfig {
+    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
+        StrategyOutcome::Pending
+    }
+}
+
+impl RunStrategy for HillClimbingConfig {
+    async fn run(&self, _cx: &mut ExecutionContext) -> StrategyOutcome {
+        StrategyOutcome::Pending
+    }
 }
 
 /// Lightweight placeholder for an alternate planner model selection. Full
@@ -375,7 +595,7 @@ impl Task {
         Self::new(
             instruction,
             SessionId::generate(),
-            LoopStrategy::ReAct { max_iterations: 8 },
+            LoopStrategy::ReAct(ReactConfig::per_loop(8)),
         )
     }
 }
@@ -4549,9 +4769,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
             instruction: directive.clone(),
             session_id: eval_session_id.clone(),
             budget: task.budget.clone(),
-            loop_strategy: LoopStrategy::ReAct {
-                max_iterations: task.budget.max_turns.unwrap_or(u32::MAX),
-            },
+            loop_strategy: LoopStrategy::ReAct(ReactConfig::per_loop(
+                task.budget.max_turns.unwrap_or(u32::MAX),
+            )),
         };
 
         // Child harness: clone the config, swap agent + sandbox. Cloning shares
@@ -5019,7 +5239,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
     async fn run_hill_climbing(
         &self,
         task: Task,
-        direction: OptimizationDirection,
+        direction: HillClimbingDirection,
         max_stagnation: Option<u32>,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
@@ -5220,8 +5440,8 @@ tool. Use the provided tool-call format to actually invoke the tool."
                 }) => {
                     let kept = should_keep(value, current_best, direction, min_improvement_delta);
                     let delta = match direction {
-                        OptimizationDirection::Minimize => current_best - value,
-                        OptimizationDirection::Maximize => value - current_best,
+                        HillClimbingDirection::Minimize => current_best - value,
+                        HillClimbingDirection::Maximize => value - current_best,
                     };
                     if kept {
                         current_best = value;
@@ -5454,8 +5674,8 @@ tool. Use the provided tool-call format to actually invoke the tool."
             };
             let commit_hash = r.commit_hash.clone().unwrap_or_default();
             let direction = match r.direction {
-                OptimizationDirection::Minimize => "minimize",
-                OptimizationDirection::Maximize => "maximize",
+                HillClimbingDirection::Minimize => "minimize",
+                HillClimbingDirection::Maximize => "maximize",
             };
             let status = match r.status {
                 IterationStatus::Kept => "kept",
@@ -6482,8 +6702,8 @@ impl StandardHarness {
                 .await;
         }
 
-        let max_iterations = match task.loop_strategy {
-            LoopStrategy::ReAct { max_iterations } => max_iterations,
+        let max_iterations = match &task.loop_strategy {
+            LoopStrategy::ReAct(c) => c.max_iterations(),
             _ => u32::MAX,
         };
         self.run_react(task, max_iterations, session_state, budget_used, on_stream)
@@ -6536,7 +6756,7 @@ impl StandardHarness {
                     task: Task::new(
                         String::new(),
                         session_id.clone(),
-                        LoopStrategy::ReAct { max_iterations: 0 },
+                        LoopStrategy::ReAct(ReactConfig::per_loop(0)),
                     ),
                     budget_used: BudgetSnapshot::default(),
                     child_state: None,
@@ -6584,7 +6804,7 @@ impl StandardHarness {
             None if self.config.auto_persist_sessions
                 && matches!(
                     task.loop_strategy,
-                    LoopStrategy::ReAct { .. } | LoopStrategy::SelfVerifying
+                    LoopStrategy::ReAct(_) | LoopStrategy::SelfVerifying(_)
                 ) =>
             {
                 match self
@@ -6612,7 +6832,8 @@ impl StandardHarness {
         let budget_used = BudgetSnapshot::default();
 
         match task.loop_strategy.clone() {
-            LoopStrategy::ReAct { max_iterations } => {
+            LoopStrategy::ReAct(ref react_cfg) => {
+                let max_iterations = react_cfg.max_iterations();
                 // Seed the task instruction as the initial user message of this
                 // FRESH run only. The compaction adapter intentionally mirrors
                 // `session.messages` and ignores `task` on `assemble`, so the
@@ -6630,11 +6851,11 @@ impl StandardHarness {
                 self.run_react(task, max_iterations, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::PlanExecute { .. } => {
+            LoopStrategy::PlanExecute(_) => {
                 self.run_plan_execute(task, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::Ralph => {
+            LoopStrategy::Ralph(_) => {
                 // Ralph (issue #58) re-seeds a FRESH SessionState per context
                 // window INSIDE `run_ralph` (the context-window reset). The
                 // incoming `session_state` is intentionally discarded — the first
@@ -6643,7 +6864,7 @@ impl StandardHarness {
                 let _ = session_state;
                 self.run_ralph(task, budget_used, on_stream).await
             }
-            LoopStrategy::SelfVerifying => {
+            LoopStrategy::SelfVerifying(_) => {
                 // Seed the build task instruction as the initial user message of
                 // this fresh run (mirrors the ReAct entry above): the build
                 // sub-loop reuses `run_react_inner`, which does NOT itself seed
@@ -6655,12 +6876,14 @@ impl StandardHarness {
                 self.run_self_verifying(task, session_state, budget_used, on_stream)
                     .await
             }
-            LoopStrategy::HillClimbing {
-                direction,
-                max_stagnation,
-                revert_on_no_improvement,
-                min_improvement_delta,
-            } => {
+            LoopStrategy::HillClimbing(hc) => {
+                let HillClimbingConfig {
+                    direction,
+                    max_stagnation,
+                    revert_on_no_improvement,
+                    min_improvement_delta,
+                    ..
+                } = hc;
                 // HillClimbing (issue #60) re-seeds a FRESH SessionState per
                 // agent-turn iteration INSIDE `run_hill_climbing` — the iteration-0
                 // baseline runs NO agent turn at all, and every subsequent
@@ -6668,12 +6891,18 @@ impl StandardHarness {
                 // `session_state` is intentionally discarded; the prompt is NOT
                 // seeded here.
                 let _ = session_state;
+                // The legacy executor takes `Option<u32>`/`Option<f64>` where
+                // `None` means "no stagnation cap" / "default 0.0 delta". The
+                // new required config fields encode that as the `u32::MAX`
+                // sentinel (unbounded) and a literal delta; map them back here
+                // to preserve runtime behavior until #124 migrates the body.
+                let max_stagnation = (max_stagnation != u32::MAX).then_some(max_stagnation);
                 self.run_hill_climbing(
                     task,
                     direction,
                     max_stagnation,
                     revert_on_no_improvement,
-                    min_improvement_delta,
+                    Some(min_improvement_delta),
                     budget_used,
                     on_stream,
                 )
@@ -6742,8 +6971,8 @@ impl StandardHarness {
                         .append_tool_result(&mut session_state, &tr)
                         .await;
                 }
-                let max_iterations = match task.loop_strategy {
-                    LoopStrategy::ReAct { max_iterations } => max_iterations,
+                let max_iterations = match &task.loop_strategy {
+                    LoopStrategy::ReAct(c) => c.max_iterations(),
                     _ => u32::MAX,
                 };
                 return self
@@ -6831,8 +7060,8 @@ impl StandardHarness {
         }
 
         // Resume the ReAct loop from where we left off.
-        let max_iterations = match task.loop_strategy {
-            LoopStrategy::ReAct { max_iterations } => max_iterations,
+        let max_iterations = match &task.loop_strategy {
+            LoopStrategy::ReAct(c) => c.max_iterations(),
             _ => u32::MAX,
         };
         self.run_react(task, max_iterations, session_state, budget_used, on_stream)
@@ -7326,6 +7555,336 @@ mod budget_policy_tests {
     }
 }
 
+// ============================================================================
+// Composable Execution Part A (issue #119) — LoopStrategy / StrategyRef /
+// *Ref handles / RunStrategy stubs round-trip + fixture replay.
+// ============================================================================
+#[cfg(test)]
+mod strategy_tests {
+    use super::*;
+
+    /// The canonical cordyceps tree `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`.
+    /// Concrete values are the cross-language byte-identity ground truth; they
+    /// MUST match `fixtures/strategy/cordyceps_tree.json`.
+    fn cordyceps_tree() -> LoopStrategy {
+        LoopStrategy::Ralph(RalphConfig {
+            inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                    budget: BudgetPolicy::PerLoop { value: 4 },
+                    agent: AgentRef("planner".to_string()),
+                    toolset: ToolsetRef("plan-tools".to_string()),
+                    output: None,
+                })),
+                execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                    inner: Box::new(LoopStrategy::ReAct(ReactConfig {
+                        budget: BudgetPolicy::PerLoop { value: 12 },
+                        agent: AgentRef("executor".to_string()),
+                        toolset: ToolsetRef("exec-tools".to_string()),
+                        output: None,
+                    })),
+                    evaluator: SchemaRef("exec-evaluator".to_string()),
+                })),
+                plan_model: None,
+            })),
+            agent: AgentRef("ralph-agent".to_string()),
+        })
+    }
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../../fixtures/{name}"))
+    }
+
+    /// Minify a pretty-printed JSON string WITHOUT reordering keys (unlike
+    /// re-serializing through `serde_json::Value`, which sorts map keys). The
+    /// fixtures are pretty-printed in struct-declaration order, so the minified
+    /// form is the cross-language byte-identity target our serializer must
+    /// reproduce. Strips insignificant whitespace while preserving string
+    /// contents verbatim.
+    fn minify_preserving_order(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in s.chars() {
+            if in_string {
+                out.push(ch);
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+                out.push(ch);
+            } else if !ch.is_whitespace() {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Assert a value's serialization is byte-identical to the order-preserving
+    /// minified fixture (the cross-language ground truth).
+    fn assert_fixture_byte_identical<T: Serialize>(value: &T, fixture: &str) {
+        let raw = std::fs::read_to_string(fixture_path(fixture)).expect("fixture present");
+        let canonical = minify_preserving_order(&raw);
+        let ours = serde_json::to_string(value).unwrap();
+        assert_eq!(ours, canonical, "{fixture} not byte-identical");
+    }
+
+    #[test]
+    fn each_variant_round_trips() {
+        let variants = vec![
+            LoopStrategy::ReAct(ReactConfig {
+                budget: BudgetPolicy::PerLoop { value: 8 },
+                agent: AgentRef("a".to_string()),
+                toolset: ToolsetRef("t".to_string()),
+                output: Some(SchemaRef("out".to_string())),
+            }),
+            LoopStrategy::ReAct(ReactConfig::per_loop(3)),
+            LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
+            LoopStrategy::PlanExecute(PlanExecuteConfig::simple(Some(ModelConfig {
+                provider: "anthropic".to_string(),
+                model_id: "claude".to_string(),
+            }))),
+            LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
+                evaluator: SchemaRef("ev".to_string()),
+            }),
+            LoopStrategy::Ralph(RalphConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+                agent: AgentRef("r".to_string()),
+            }),
+            LoopStrategy::HillClimbing(HillClimbingConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(5))),
+                direction: HillClimbingDirection::Maximize,
+                max_stagnation: 3,
+                revert_on_no_improvement: true,
+                min_improvement_delta: 0.25,
+                evaluator: AgentRef("metric".to_string()),
+            }),
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let back: LoopStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, back, "round-trip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn react_tag_is_react_not_re_act() {
+        let json = serde_json::to_string(&LoopStrategy::ReAct(ReactConfig::per_loop(8))).unwrap();
+        assert!(json.contains(r#""kind":"react""#), "got {json}");
+        assert!(!json.contains("re_act"), "got {json}");
+        // ReactConfig fields flatten next to the tag (no nesting).
+        assert_eq!(
+            json,
+            r#"{"kind":"react","budget":{"kind":"per_loop","value":8},"agent":"","toolset":""}"#
+        );
+    }
+
+    #[test]
+    fn handles_are_transparent_strings() {
+        assert_eq!(
+            serde_json::to_string(&AgentRef("x".to_string())).unwrap(),
+            r#""x""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolsetRef("y".to_string())).unwrap(),
+            r#""y""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SchemaRef("z".to_string())).unwrap(),
+            r#""z""#
+        );
+        let a: AgentRef = serde_json::from_str(r#""x""#).unwrap();
+        assert_eq!(a, AgentRef("x".to_string()));
+    }
+
+    #[test]
+    fn cordyceps_tree_round_trips() {
+        let tree = cordyceps_tree();
+        let json = serde_json::to_string(&tree).unwrap();
+        let back: LoopStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(tree, back);
+    }
+
+    #[test]
+    fn strategy_ref_built_in_and_custom_round_trip() {
+        let built_in = StrategyRef::BuiltIn(cordyceps_tree());
+        let custom = StrategyRef::Custom("my-harness::DoubleVerify".to_string());
+        for r in [&built_in, &custom] {
+            let json = serde_json::to_string(r).unwrap();
+            let back: StrategyRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(*r, back, "round-trip failed for {json}");
+        }
+        // Adjacent tagging: kind/value, no collision with nested LoopStrategy kind.
+        let json = serde_json::to_string(&custom).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"custom","value":"my-harness::DoubleVerify"}"#
+        );
+        let bi = serde_json::to_string(&built_in).unwrap();
+        assert!(bi.starts_with(r#"{"kind":"built_in","value":{"kind":"ralph""#));
+    }
+
+    #[test]
+    fn stub_run_returns_pending_not_panic() {
+        let strategies = vec![
+            LoopStrategy::ReAct(ReactConfig::per_loop(1)),
+            LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
+            LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+                evaluator: SchemaRef("e".to_string()),
+            }),
+            LoopStrategy::Ralph(RalphConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+                agent: AgentRef("r".to_string()),
+            }),
+            LoopStrategy::HillClimbing(HillClimbingConfig {
+                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+                direction: HillClimbingDirection::Minimize,
+                max_stagnation: 1,
+                revert_on_no_improvement: false,
+                min_improvement_delta: 0.0,
+                evaluator: AgentRef("m".to_string()),
+            }),
+        ];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for s in &strategies {
+            let mut cx = ExecutionContext::default();
+            let outcome = rt.block_on(s.run(&mut cx));
+            assert_eq!(outcome, StrategyOutcome::Pending);
+        }
+    }
+
+    fn paused_state_with(task: Task) -> PausedState {
+        PausedState {
+            session_id: SessionId::new("sess-1"),
+            task_id: TaskId::new("task-1"),
+            turn_number: 3,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: None,
+            task,
+            budget_used: BudgetSnapshot::default(),
+            child_state: None,
+        }
+    }
+
+    fn cordyceps_task() -> Task {
+        Task {
+            id: TaskId::new("task-1"),
+            instruction: "compose".to_string(),
+            session_id: SessionId::new("sess-1"),
+            budget: BudgetLimits::default(),
+            loop_strategy: cordyceps_tree(),
+        }
+    }
+
+    #[test]
+    fn paused_state_round_trips_with_cordyceps_strategy() {
+        let ps = paused_state_with(cordyceps_task());
+        let json = serde_json::to_string(&ps).unwrap();
+        let back: PausedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(ps, back);
+    }
+
+    #[test]
+    fn child_paused_state_round_trips_with_cordyceps_strategy() {
+        let cps = ChildPausedState {
+            session_id: SessionId::new("sess-1"),
+            task_id: TaskId::new("task-1"),
+            turn_number: 2,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: None,
+            task: cordyceps_task(),
+            budget_used: BudgetSnapshot::default(),
+            parent_tool_call_id: "call-1".to_string(),
+        };
+        let json = serde_json::to_string(&cps).unwrap();
+        let back: ChildPausedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(cps, back);
+    }
+
+    // ── Fixture replay (byte-identity ground truth for all four languages) ───
+
+    #[test]
+    fn fixture_replay_cordyceps_tree() {
+        assert_fixture_byte_identical(&cordyceps_tree(), "strategy/cordyceps_tree.json");
+        // And the fixture deserializes back to the canonical tree.
+        let raw = std::fs::read_to_string(fixture_path("strategy/cordyceps_tree.json")).unwrap();
+        let parsed: LoopStrategy = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, cordyceps_tree());
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct StrategyRefSuite {
+        built_in: StrategyRef,
+        custom: StrategyRef,
+    }
+
+    #[test]
+    fn fixture_replay_strategy_ref() {
+        let raw = std::fs::read_to_string(fixture_path("strategy/strategy_ref.json")).unwrap();
+        let suite: StrategyRefSuite = serde_json::from_str(&raw).unwrap();
+        assert_eq!(suite.built_in, StrategyRef::BuiltIn(cordyceps_tree()));
+        assert_eq!(
+            suite.custom,
+            StrategyRef::Custom("my-harness::DoubleVerify".to_string())
+        );
+        // Whole-suite byte identity (field order: built_in, custom).
+        assert_fixture_byte_identical(&suite, "strategy/strategy_ref.json");
+    }
+
+    #[test]
+    fn fixture_replay_paused_state() {
+        let raw = std::fs::read_to_string(fixture_path("strategy/paused_state.json")).unwrap();
+        let parsed: PausedState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.task.loop_strategy, cordyceps_tree());
+        assert_fixture_byte_identical(&parsed, "strategy/paused_state.json");
+    }
+
+    #[test]
+    fn fixture_replay_child_paused_state() {
+        let raw =
+            std::fs::read_to_string(fixture_path("strategy/child_paused_state.json")).unwrap();
+        let parsed: ChildPausedState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.task.loop_strategy, cordyceps_tree());
+        assert_fixture_byte_identical(&parsed, "strategy/child_paused_state.json");
+    }
+
+    /// Generator: emits the exact PausedState / ChildPausedState JSON so the
+    /// committed fixtures stay byte-identical with the Rust serializer. Run with
+    /// `cargo test -p spore-core gen_paused_fixtures -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gen_paused_fixtures() {
+        let ps = paused_state_with(cordyceps_task());
+        println!("PAUSED_STATE={}", serde_json::to_string(&ps).unwrap());
+        let cps = ChildPausedState {
+            session_id: SessionId::new("sess-1"),
+            task_id: TaskId::new("task-1"),
+            turn_number: 2,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: None,
+            task: cordyceps_task(),
+            budget_used: BudgetSnapshot::default(),
+            parent_tool_call_id: "call-1".to_string(),
+        };
+        println!(
+            "CHILD_PAUSED_STATE={}",
+            serde_json::to_string(&cps).unwrap()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::testing::*;
@@ -7383,9 +7942,7 @@ mod tests {
     }
 
     fn react(max: u32) -> Task {
-        task(LoopStrategy::ReAct {
-            max_iterations: max,
-        })
+        task(LoopStrategy::ReAct(ReactConfig::per_loop(max)))
     }
 
     fn usage() -> TokenUsage {
@@ -8436,7 +8993,7 @@ mod tests {
         });
         let mut cfg = standard_config(a);
         let reg = Arc::new(ScriptedToolRegistry::new());
-        let child_task = task(LoopStrategy::ReAct { max_iterations: 1 });
+        let child_task = task(LoopStrategy::ReAct(ReactConfig::per_loop(1)));
         reg.push(ToolOutput::WaitingForHuman {
             child_state: Box::new(ChildPausedState {
                 session_id: SessionId::new("child"),
@@ -8614,7 +9171,7 @@ mod tests {
                     question: "?".into(),
                     options: None,
                 }),
-                task: task(LoopStrategy::ReAct { max_iterations: 1 }),
+                task: task(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 budget_used: BudgetSnapshot::default(),
                 parent_tool_call_id: "c".into(),
             }),
@@ -9184,12 +9741,14 @@ mod tests {
     async fn hill_climbing_no_longer_not_yet_implemented() {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
-        let t = task(LoopStrategy::HillClimbing {
-            direction: OptimizationDirection::Maximize,
-            max_stagnation: None,
+        let t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            direction: HillClimbingDirection::Maximize,
+            max_stagnation: u32::MAX,
             revert_on_no_improvement: false,
-            min_improvement_delta: None,
-        });
+            min_improvement_delta: 0.0,
+            evaluator: AgentRef(String::new()),
+        }));
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Failure { reason, .. } => {
                 assert!(
@@ -9210,7 +9769,7 @@ mod tests {
     use crate::plan::{PlanArtifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
 
     fn plan_task() -> Task {
-        task(LoopStrategy::PlanExecute { plan_model: None })
+        task(LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)))
     }
 
     fn final_resp(text: &str) -> TurnResult {
@@ -11400,7 +11959,10 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     fn self_verifying_task() -> Task {
-        task(LoopStrategy::SelfVerifying)
+        task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            evaluator: SchemaRef(String::new()),
+        }))
     }
 
     /// A `Verifier` test double that replays a scripted queue of verdicts.
@@ -11965,7 +12527,10 @@ mod tests {
     // ========================================================================
 
     fn ralph_task() -> Task {
-        let mut t = task(LoopStrategy::Ralph);
+        let mut t = task(LoopStrategy::Ralph(RalphConfig {
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            agent: AgentRef(String::new()),
+        }));
         // One ReAct turn per context window keeps the per-window sub-loop
         // bounded so the OUTER reset loop drives the test deterministically.
         t.budget.max_turns = Some(1);
@@ -12521,19 +13086,24 @@ mod tests {
     use crate::termination::SessionStateSnapshot as HcSnapshot;
 
     fn hill_task(
-        direction: OptimizationDirection,
+        direction: HillClimbingDirection,
         max_stagnation: Option<u32>,
         revert: bool,
         min_delta: Option<f64>,
     ) -> Task {
         // Give a generous turn budget so the loop is bounded by stagnation, not
         // turns, unless a test overrides it.
-        let mut t = task(LoopStrategy::HillClimbing {
+        let mut t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             direction,
-            max_stagnation,
+            // `None` (unbounded) encodes as the `u32::MAX` sentinel; the
+            // dispatch maps it back to `None` for the legacy executor.
+            max_stagnation: max_stagnation.unwrap_or(u32::MAX),
             revert_on_no_improvement: revert,
-            min_improvement_delta: min_delta,
-        });
+            // `None` delta is equivalent to `0.0` (see `should_keep`).
+            min_improvement_delta: min_delta.unwrap_or(0.0),
+            evaluator: AgentRef(String::new()),
+        }));
         t.budget.max_turns = Some(50);
         t
     }
@@ -12544,11 +13114,11 @@ mod tests {
     struct ScriptedMetricEvaluator {
         outcomes: StdMutex<std::collections::VecDeque<Result<MetricResult, MetricError>>>,
         calls: std::sync::atomic::AtomicUsize,
-        direction: OptimizationDirection,
+        direction: HillClimbingDirection,
         description: String,
     }
     impl ScriptedMetricEvaluator {
-        fn new(values: Vec<Result<f64, MetricError>>, direction: OptimizationDirection) -> Self {
+        fn new(values: Vec<Result<f64, MetricError>>, direction: HillClimbingDirection) -> Self {
             let outcomes = values
                 .into_iter()
                 .map(|v| v.map(MetricResult::new))
@@ -12578,7 +13148,7 @@ mod tests {
             ));
             Box::pin(async move { next })
         }
-        fn direction(&self) -> OptimizationDirection {
+        fn direction(&self) -> HillClimbingDirection {
             self.direction
         }
         fn description(&self) -> String {
@@ -12661,7 +13231,7 @@ mod tests {
     async fn hill_climbing_missing_evaluator_is_typed_halt() {
         let cfg = standard_config(make_agent());
         let h = StandardHarness::new(cfg);
-        let t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        let t = hill_task(HillClimbingDirection::Maximize, None, false, None);
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Failure {
                 reason: HaltReason::HillClimbingMisconfigured { reason },
@@ -12681,12 +13251,12 @@ mod tests {
         // baseline 1.0, then a worse value (regress) for maximize.
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(1.0), Ok(0.5)],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval.clone(), sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
         let h = StandardHarness::new(cfg);
-        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let t = hill_task(HillClimbingDirection::Maximize, Some(1), false, None);
         let task_id = t.id.as_str().to_string();
         let r = h.run(HarnessRunOptions::new(t)).await;
         assert!(
@@ -12725,12 +13295,12 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(1.0), Ok(2.0), Ok(1.5), Ok(3.0)],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval.clone(), sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
         // Cap turns at 3 so exactly iterations 1,2,3 run (then budget halt).
-        let mut t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        let mut t = hill_task(HillClimbingDirection::Maximize, None, false, None);
         t.budget.max_turns = Some(3);
         let task_id = t.id.as_str().to_string();
         let _ = h_run(&cfg, t).await;
@@ -12752,10 +13322,10 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(2.0), Ok(3.0)], // minimize: baseline 2.0, then 3.0 (worse)
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
-        let t = hill_task(OptimizationDirection::Minimize, Some(1), false, None);
+        let t = hill_task(HillClimbingDirection::Minimize, Some(1), false, None);
         let _ = h_run(&cfg, t).await;
         assert_eq!(sandbox.revert_count(), 0, "revert OFF must not git reset");
     }
@@ -12766,10 +13336,10 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(2.0), Ok(3.0)], // minimize: baseline 2.0, then 3.0 (worse)
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
-        let t = hill_task(OptimizationDirection::Minimize, Some(1), true, None);
+        let t = hill_task(HillClimbingDirection::Minimize, Some(1), true, None);
         let _ = h_run(&cfg, t).await;
         assert_eq!(sandbox.revert_count(), 1, "revert ON must git reset once");
     }
@@ -12781,11 +13351,11 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(2.0), Ok(1.5)],
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
-        let t = hill_task(OptimizationDirection::Minimize, Some(1), false, Some(0.5));
+        let t = hill_task(HillClimbingDirection::Minimize, Some(1), false, Some(0.5));
         let task_id = t.id.as_str().to_string();
         let r = h_run(&cfg, t).await;
         // Exactly-min_delta improvement is discarded ⇒ stagnation hits 1 ⇒ halt.
@@ -12811,10 +13381,10 @@ mod tests {
         // maximize, baseline 5.0, then three regresses.
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(5.0), Ok(4.0), Ok(4.0), Ok(4.0)],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
-        let t = hill_task(OptimizationDirection::Maximize, Some(3), false, None);
+        let t = hill_task(HillClimbingDirection::Maximize, Some(3), false, None);
         match h_run(&cfg, t).await {
             RunResult::Failure {
                 reason:
@@ -12839,12 +13409,12 @@ mod tests {
         // maximize: baseline 1.0; iters: 0.5(regress) 0.5(regress) 2.0(improve!) 1.0(regress)
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(1.0), Ok(0.5), Ok(0.5), Ok(2.0), Ok(1.0)],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
         // Cap turns at 4 so the improve at iter 3 resets the counter and the run
         // ends on the turn budget rather than stagnation.
-        let mut t = hill_task(OptimizationDirection::Maximize, Some(3), false, None);
+        let mut t = hill_task(HillClimbingDirection::Maximize, Some(3), false, None);
         t.budget.max_turns = Some(4);
         match h_run(&cfg, t).await {
             RunResult::Failure {
@@ -12865,11 +13435,11 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(1.0), Err(MetricError::Crashed { log: "boom".into() })],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
-        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let t = hill_task(HillClimbingDirection::Maximize, Some(1), false, None);
         let task_id = t.id.as_str().to_string();
         match h_run(&cfg, t).await {
             RunResult::Failure {
@@ -12898,11 +13468,11 @@ mod tests {
                     after: std::time::Duration::from_secs(1),
                 }),
             ],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval, sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
-        let t = hill_task(OptimizationDirection::Maximize, Some(1), false, None);
+        let t = hill_task(HillClimbingDirection::Maximize, Some(1), false, None);
         let task_id = t.id.as_str().to_string();
         let _ = h_run(&cfg, t).await;
         let tsv = std::fs::read_to_string(workspace.join(format!(".spore/results/{task_id}.tsv")))
@@ -12919,11 +13489,11 @@ mod tests {
         let sandbox = Arc::new(HcSpySandbox::new());
         let eval = Arc::new(ScriptedMetricEvaluator::new(
             vec![Ok(1.0)],
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
         ));
         let cfg = hc_config(eval.clone(), sandbox.clone());
         let workspace = sandbox.root.path().to_path_buf();
-        let mut t = hill_task(OptimizationDirection::Maximize, None, false, None);
+        let mut t = hill_task(HillClimbingDirection::Maximize, None, false, None);
         t.budget.max_turns = Some(0);
         let task_id = t.id.as_str().to_string();
         match h_run(&cfg, t).await {
@@ -12951,7 +13521,7 @@ mod tests {
                 iteration: 0,
                 commit_hash: None,
                 metric_value: 1.0,
-                direction: OptimizationDirection::Maximize,
+                direction: HillClimbingDirection::Maximize,
                 status: IterationStatus::Kept,
                 duration: std::time::Duration::from_millis(1500),
                 description: "scripted metric".into(),
@@ -12961,7 +13531,7 @@ mod tests {
                 iteration: 1,
                 commit_hash: None,
                 metric_value: 2.5,
-                direction: OptimizationDirection::Maximize,
+                direction: HillClimbingDirection::Maximize,
                 status: IterationStatus::Kept,
                 duration: std::time::Duration::from_secs(0),
                 description: "scripted metric".into(),
@@ -12971,7 +13541,7 @@ mod tests {
                 iteration: 2,
                 commit_hash: None,
                 metric_value: f64::NAN, // crashed ⇒ empty in TSV
-                direction: OptimizationDirection::Maximize,
+                direction: HillClimbingDirection::Maximize,
                 status: IterationStatus::Crashed,
                 duration: std::time::Duration::from_secs(0),
                 description: "scripted metric".into(),
@@ -13014,7 +13584,7 @@ mod tests {
     }
     #[derive(serde::Deserialize)]
     struct HcPayload {
-        direction: OptimizationDirection,
+        direction: HillClimbingDirection,
         max_stagnation: Option<u32>,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
@@ -13693,7 +14263,7 @@ mod tests {
             let task = Task::new(
                 "do something",
                 sid.clone(),
-                LoopStrategy::ReAct { max_iterations: 5 },
+                LoopStrategy::ReAct(ReactConfig::per_loop(5)),
             );
             let _ = h.run(HarnessRunOptions::new(task)).await;
 
@@ -13736,7 +14306,7 @@ mod tests {
                 let task = Task::new(
                     "turn one",
                     sid.clone(),
-                    LoopStrategy::ReAct { max_iterations: 5 },
+                    LoopStrategy::ReAct(ReactConfig::per_loop(5)),
                 );
                 let _ = h.run(HarnessRunOptions::new(task)).await;
             }
@@ -13756,7 +14326,7 @@ mod tests {
             let task = Task::new(
                 "turn two",
                 sid.clone(),
-                LoopStrategy::ReAct { max_iterations: 5 },
+                LoopStrategy::ReAct(ReactConfig::per_loop(5)),
             );
             match h.run(HarnessRunOptions::new(task)).await {
                 RunResult::Success { session_state, .. } => {
@@ -13804,7 +14374,7 @@ mod tests {
                 let task = Task::new(
                     "first process",
                     sid.clone(),
-                    LoopStrategy::ReAct { max_iterations: 5 },
+                    LoopStrategy::ReAct(ReactConfig::per_loop(5)),
                 );
                 let _ = h.run(HarnessRunOptions::new(task)).await;
             }
@@ -13826,7 +14396,7 @@ mod tests {
             let task = Task::new(
                 "second process",
                 sid.clone(),
-                LoopStrategy::ReAct { max_iterations: 5 },
+                LoopStrategy::ReAct(ReactConfig::per_loop(5)),
             );
             let result = h.run(HarnessRunOptions::new(task)).await;
             let _ = std::fs::remove_dir_all(&dir);
@@ -13875,7 +14445,7 @@ mod tests {
                     task: Task::new(
                         "",
                         SessionId::new("s1"),
-                        LoopStrategy::ReAct { max_iterations: 0 },
+                        LoopStrategy::ReAct(ReactConfig::per_loop(0)),
                     ),
                     budget_used: BudgetSnapshot::default(),
                     child_state: None,
@@ -13909,7 +14479,7 @@ mod tests {
             let task = Task::new(
                 "turn",
                 SessionId::new("s1"),
-                LoopStrategy::ReAct { max_iterations: 5 },
+                LoopStrategy::ReAct(ReactConfig::per_loop(5)),
             );
             let opts = HarnessRunOptions::new(task).with_session_state(explicit);
             match h.run(opts).await {

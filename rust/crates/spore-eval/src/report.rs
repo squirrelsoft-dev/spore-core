@@ -1,7 +1,7 @@
 //! Comparison + recommendation types and derivation (Rules 19-25).
 
 use serde::{Deserialize, Serialize};
-use spore_core::harness::OptimizationDirection;
+use spore_core::harness::HillClimbingDirection;
 
 use crate::metric_map::EvalMetric;
 use crate::stats::{ConfidenceInterval, MetricStats};
@@ -61,21 +61,21 @@ pub struct ComparisonReport {
 /// direction (Rule 22). A delta within `eps` of zero is `NoChange`.
 pub fn classify_direction(
     delta: f64,
-    direction: OptimizationDirection,
+    direction: HillClimbingDirection,
     eps: f64,
 ) -> ComparisonDirection {
     if delta.abs() <= eps {
         return ComparisonDirection::NoChange;
     }
     match direction {
-        OptimizationDirection::Maximize => {
+        HillClimbingDirection::Maximize => {
             if delta > 0.0 {
                 ComparisonDirection::Better
             } else {
                 ComparisonDirection::Worse
             }
         }
-        OptimizationDirection::Minimize => {
+        HillClimbingDirection::Minimize => {
             if delta < 0.0 {
                 ComparisonDirection::Better
             } else {
@@ -181,16 +181,16 @@ mod tests {
     fn classify_respects_direction() {
         // Maximize: positive delta is better.
         assert_eq!(
-            classify_direction(0.2, OptimizationDirection::Maximize, 1e-9),
+            classify_direction(0.2, HillClimbingDirection::Maximize, 1e-9),
             ComparisonDirection::Better
         );
         // Minimize: positive delta is worse.
         assert_eq!(
-            classify_direction(0.2, OptimizationDirection::Minimize, 1e-9),
+            classify_direction(0.2, HillClimbingDirection::Minimize, 1e-9),
             ComparisonDirection::Worse
         );
         assert_eq!(
-            classify_direction(0.0, OptimizationDirection::Maximize, 1e-9),
+            classify_direction(0.0, HillClimbingDirection::Maximize, 1e-9),
             ComparisonDirection::NoChange
         );
     }

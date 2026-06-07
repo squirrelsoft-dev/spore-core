@@ -397,7 +397,7 @@ fn rule11_composite_spec_resolves_determinism_and() {
 
 #[tokio::test]
 async fn rule12_metric_evaluator_verifier_normalizes() {
-    use spore_core::harness::{BoxFut, OptimizationDirection, SandboxProvider};
+    use spore_core::harness::{BoxFut, HillClimbingDirection, SandboxProvider};
     use spore_core::metric::{MetricError, MetricEvaluator, MetricResult};
     use spore_core::termination::SessionStateSnapshot;
 
@@ -411,8 +411,8 @@ async fn rule12_metric_evaluator_verifier_normalizes() {
             let v = self.0;
             Box::pin(async move { Ok(MetricResult::new(v)) })
         }
-        fn direction(&self) -> OptimizationDirection {
-            OptimizationDirection::Maximize
+        fn direction(&self) -> HillClimbingDirection {
+            HillClimbingDirection::Maximize
         }
         fn description(&self) -> String {
             "fixed".into()
@@ -523,7 +523,7 @@ async fn rule14_15_16_runs_per_config_and_metrics_from_obs() {
 
 #[test]
 fn rule17_metric_names_and_directions() {
-    use spore_core::harness::OptimizationDirection::*;
+    use spore_core::harness::HillClimbingDirection::*;
     assert_eq!(EvalMetric::TaskSuccessRate.direction(), Maximize);
     assert_eq!(EvalMetric::MeanCostUsd.direction(), Minimize);
     assert_eq!(EvalMetric::MeanTurnsToCompletion.direction(), Minimize);
@@ -658,9 +658,9 @@ async fn rule21_nondeterministic_verifier_gets_ci() {
 #[test]
 fn rule22_direction() {
     use crate::report::classify_direction;
-    use spore_core::harness::OptimizationDirection;
+    use spore_core::harness::HillClimbingDirection;
     assert_eq!(
-        classify_direction(0.3, OptimizationDirection::Maximize, 1e-9),
+        classify_direction(0.3, HillClimbingDirection::Maximize, 1e-9),
         ComparisonDirection::Better
     );
 }

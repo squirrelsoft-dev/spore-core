@@ -10,7 +10,7 @@
 //! TypeScript, Python, and Go EvalHarnesses.
 
 use serde::{Deserialize, Serialize};
-use spore_core::harness::OptimizationDirection;
+use spore_core::harness::HillClimbingDirection;
 use spore_core::middleware::MiddlewareDecision;
 use spore_core::observability::{SessionMetrics, Span};
 
@@ -42,16 +42,16 @@ pub enum EvalMetric {
 impl EvalMetric {
     /// The optimization direction: higher-is-better metrics maximize; cost,
     /// turns, wall-time, and intervention rate minimize.
-    pub fn direction(&self) -> OptimizationDirection {
+    pub fn direction(&self) -> HillClimbingDirection {
         match self {
             EvalMetric::TaskSuccessRate
             | EvalMetric::CacheHitRate { .. }
-            | EvalMetric::VerificationScore => OptimizationDirection::Maximize,
+            | EvalMetric::VerificationScore => HillClimbingDirection::Maximize,
             EvalMetric::MeanTurnsToCompletion
             | EvalMetric::MeanCostUsd
             | EvalMetric::MeanWallTime
             | EvalMetric::SensorFireRate { .. }
-            | EvalMetric::MiddlewareInterventionRate { .. } => OptimizationDirection::Minimize,
+            | EvalMetric::MiddlewareInterventionRate { .. } => HillClimbingDirection::Minimize,
         }
     }
 

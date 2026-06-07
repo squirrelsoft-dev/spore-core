@@ -19,7 +19,8 @@ use spore_core::harness::testing::{
 };
 use spore_core::{
     Agent, AgentId, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy, ModelAgent,
-    ProviderInfo, ReplayModelInterface, RunResult, SessionId, StandardHarness, Task,
+    PlanExecuteConfig, ProviderInfo, ReplayModelInterface, RunResult, SessionId, StandardHarness,
+    Task,
 };
 
 fn provider() -> ProviderInfo {
@@ -80,7 +81,7 @@ async fn plan_execute_loop_full_trace_succeeds() {
     let task = Task::new(
         "build a CLI",
         SessionId::new("plan-execute-fixture"),
-        LoopStrategy::PlanExecute { plan_model: None },
+        LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
     );
     match harness.run(HarnessRunOptions::new(task)).await {
         RunResult::Success { output, turns, .. } => {

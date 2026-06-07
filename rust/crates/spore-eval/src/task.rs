@@ -184,7 +184,7 @@ pub struct CompositeChildSpec {
 }
 
 /// Optimization direction for a metric-evaluator verifier. Mirrors
-/// [`spore_core::harness::OptimizationDirection`] but is serializable here as a
+/// [`spore_core::harness::HillClimbingDirection`] but is serializable here as a
 /// self-contained spec field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

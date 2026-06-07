@@ -7,7 +7,7 @@ use spore_core::harness::{
     BoxFut, Harness, HarnessConfig, HarnessRunOptions, RunResult, SessionId, StandardHarness, Task,
     TaskId,
 };
-use spore_core::harness::{BudgetLimits, LoopStrategy};
+use spore_core::harness::{BudgetLimits, LoopStrategy, ReactConfig};
 use spore_core::observability::{ObservabilityProvider, SessionMetrics, Span};
 
 use crate::metric_map::{sample_for, EvalMetric, RunSampleInputs};
@@ -123,9 +123,9 @@ impl EvalHarness {
                 max_wall_time: Some(task.timeout),
                 ..Default::default()
             },
-            loop_strategy: LoopStrategy::ReAct {
-                max_iterations: task.expected_turns.map(|(_, hi)| hi).unwrap_or(20),
-            },
+            loop_strategy: LoopStrategy::ReAct(ReactConfig::per_loop(
+                task.expected_turns.map(|(_, hi)| hi).unwrap_or(20),
+            )),
         };
 
         // Rule 15: run the harness. Rule 4: timeout bounds a single run and

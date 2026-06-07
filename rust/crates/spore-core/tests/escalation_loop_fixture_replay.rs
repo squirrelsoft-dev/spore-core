@@ -19,8 +19,8 @@ use spore_core::harness::testing::{
 };
 use spore_core::{
     Agent, AgentId, Harness, HarnessConfig, HarnessRunOptions, HarnessSignal, LoopStrategy,
-    ModelAgent, ProviderInfo, ReplayModelInterface, Role, RunResult, SessionId, StandardHarness,
-    Task, ToolOutput,
+    ModelAgent, ProviderInfo, ReactConfig, ReplayModelInterface, Role, RunResult, SessionId,
+    StandardHarness, Task, ToolOutput,
 };
 
 fn fixture_path() -> std::path::PathBuf {
@@ -90,7 +90,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
     let task = Task::new(
         "investigate then decide whether to abort",
         SessionId::new("escalation-loop-session"),
-        LoopStrategy::ReAct { max_iterations: 5 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(5)),
     );
 
     match harness.run(HarnessRunOptions::new(task)).await {

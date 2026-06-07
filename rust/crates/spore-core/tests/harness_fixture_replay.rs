@@ -15,7 +15,8 @@ use spore_core::harness::testing::{
 };
 use spore_core::{
     Agent, AgentId, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy, ModelAgent,
-    ProviderInfo, ReplayModelInterface, RunResult, SessionId, StandardHarness, Task, ToolOutput,
+    ProviderInfo, ReactConfig, ReplayModelInterface, RunResult, SessionId, StandardHarness, Task,
+    ToolOutput,
 };
 
 fn fixture_path() -> std::path::PathBuf {
@@ -84,7 +85,7 @@ async fn react_loop_dispatches_tool_then_completes() {
     let task = Task::new(
         "read /etc/hosts then summarize",
         SessionId::new("fixture-session"),
-        LoopStrategy::ReAct { max_iterations: 5 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(5)),
     );
 
     match harness.run(HarnessRunOptions::new(task)).await {

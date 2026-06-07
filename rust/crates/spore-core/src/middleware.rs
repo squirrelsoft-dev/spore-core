@@ -966,8 +966,8 @@ impl Middleware for TokenBudgetMiddleware {
 mod tests {
     use super::*;
     use crate::harness::{
-        AggregateUsage, BudgetLimits, HumanRequest, LoopStrategy, RiskLevel, RunResult, SessionId,
-        Task,
+        AggregateUsage, BudgetLimits, HumanRequest, LoopStrategy, ReactConfig, RiskLevel,
+        RunResult, SessionId, Task,
     };
     use crate::model::ToolCall;
     use serde_json::json;
@@ -977,7 +977,7 @@ mod tests {
         Task::new(
             "test task",
             SessionId::new("sess"),
-            LoopStrategy::ReAct { max_iterations: 5 },
+            LoopStrategy::ReAct(ReactConfig::per_loop(5)),
         )
         .with_budget(BudgetLimits::default())
     }

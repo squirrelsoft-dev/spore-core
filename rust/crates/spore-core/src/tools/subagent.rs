@@ -194,7 +194,7 @@ impl Tool for SubagentTool {
             let task = Task::new(
                 instruction,
                 session_id,
-                crate::harness::LoopStrategy::ReAct { max_iterations: 16 },
+                crate::harness::LoopStrategy::ReAct(crate::harness::ReactConfig::per_loop(16)),
             );
 
             let mut options = HarnessRunOptions::new(task);
@@ -356,7 +356,7 @@ impl SubagentTool {
         let task = Task::new(
             instruction,
             SessionId::generate(),
-            crate::harness::LoopStrategy::ReAct { max_iterations: 16 },
+            crate::harness::LoopStrategy::ReAct(crate::harness::ReactConfig::per_loop(16)),
         );
         let handler_result = entry.handler.run(HarnessRunOptions::new(task)).await;
         let answer = match handler_result {
@@ -548,7 +548,7 @@ mod tests {
             task: Task::new(
                 "audit",
                 SessionId::new("worker"),
-                crate::harness::LoopStrategy::ReAct { max_iterations: 4 },
+                crate::harness::LoopStrategy::ReAct(crate::harness::ReactConfig::per_loop(4)),
             ),
             budget_used: crate::harness::BudgetSnapshot::default(),
             child_state: None,
@@ -680,7 +680,7 @@ mod tests {
             task: Task::new(
                 "x",
                 SessionId::new("s"),
-                crate::harness::LoopStrategy::ReAct { max_iterations: 1 },
+                crate::harness::LoopStrategy::ReAct(crate::harness::ReactConfig::per_loop(1)),
             ),
             budget_used: crate::harness::BudgetSnapshot::default(),
             child_state: None,

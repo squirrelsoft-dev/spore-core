@@ -47,8 +47,10 @@
                     "id": "task-0000000000000001",
                     "instruction": "build a CLI",
                     "loop_strategy": {
-                        "kind": "re_act",
-                        "max_iterations": 5
+                        "kind": "react",
+                        "budget": { "kind": "per_loop", "value": 5 },
+                        "agent": "",
+                        "toolset": ""
                     },
                     "session_id": "escalation-session"
                 },
@@ -105,8 +107,10 @@
                     "id": "task-0000000000000001",
                     "instruction": "build a CLI",
                     "loop_strategy": {
-                        "kind": "re_act",
-                        "max_iterations": 5
+                        "kind": "react",
+                        "budget": { "kind": "per_loop", "value": 5 },
+                        "agent": "",
+                        "toolset": ""
                     },
                     "session_id": "escalation-session"
                 },

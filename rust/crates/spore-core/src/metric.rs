@@ -38,7 +38,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::harness::{BoxFut, OptimizationDirection, SandboxProvider};
+use crate::harness::{BoxFut, HillClimbingDirection, SandboxProvider};
 use crate::model::{
     Content, ContentBlock, Message, ModelInterface, ModelParams, ModelRequest, Role,
 };
@@ -116,7 +116,7 @@ pub trait MetricEvaluator: Send + Sync {
         session_state: &'a SessionStateSnapshot,
     ) -> BoxFut<'a, Result<MetricResult, MetricError>>;
 
-    fn direction(&self) -> OptimizationDirection;
+    fn direction(&self) -> HillClimbingDirection;
 
     fn description(&self) -> String;
 }
@@ -133,12 +133,12 @@ pub trait MetricEvaluator: Send + Sync {
 pub fn should_keep(
     new_value: f64,
     current_best: f64,
-    direction: OptimizationDirection,
+    direction: HillClimbingDirection,
     min_delta: Option<f64>,
 ) -> bool {
     let delta = match direction {
-        OptimizationDirection::Minimize => current_best - new_value,
-        OptimizationDirection::Maximize => new_value - current_best,
+        HillClimbingDirection::Minimize => current_best - new_value,
+        HillClimbingDirection::Maximize => new_value - current_best,
     };
     delta > min_delta.unwrap_or(0.0)
 }
@@ -174,7 +174,7 @@ pub struct ResultsEntry {
     #[serde(default)]
     pub commit_hash: Option<String>,
     pub metric_value: f64,
-    pub direction: OptimizationDirection,
+    pub direction: HillClimbingDirection,
     pub status: IterationStatus,
     #[serde(with = "duration_secs")]
     pub duration: Duration,
@@ -233,7 +233,7 @@ pub struct CommandMetricEvaluator {
     pub timeout: Duration,
     pub log_output_to: PathBuf,
     pub working_dir: Option<PathBuf>,
-    pub direction: OptimizationDirection,
+    pub direction: HillClimbingDirection,
     pub description: String,
 }
 
@@ -284,7 +284,7 @@ impl MetricEvaluator for CommandMetricEvaluator {
         })
     }
 
-    fn direction(&self) -> OptimizationDirection {
+    fn direction(&self) -> HillClimbingDirection {
         self.direction
     }
 
@@ -360,8 +360,8 @@ impl MetricEvaluator for TestPassRateEvaluator {
         })
     }
 
-    fn direction(&self) -> OptimizationDirection {
-        OptimizationDirection::Maximize
+    fn direction(&self) -> HillClimbingDirection {
+        HillClimbingDirection::Maximize
     }
 
     fn description(&self) -> String {
@@ -455,8 +455,8 @@ impl MetricEvaluator for LatencyEvaluator {
         })
     }
 
-    fn direction(&self) -> OptimizationDirection {
-        OptimizationDirection::Minimize
+    fn direction(&self) -> HillClimbingDirection {
+        HillClimbingDirection::Minimize
     }
 
     fn description(&self) -> String {
@@ -559,8 +559,8 @@ impl<M: ModelInterface + 'static> MetricEvaluator for LlmJudgeEvaluator<M> {
         })
     }
 
-    fn direction(&self) -> OptimizationDirection {
-        OptimizationDirection::Maximize
+    fn direction(&self) -> HillClimbingDirection {
+        HillClimbingDirection::Maximize
     }
 
     fn description(&self) -> String {
@@ -597,22 +597,22 @@ mod tests {
 
     #[test]
     fn should_keep_minimize_lower_is_better() {
-        assert!(should_keep(1.0, 2.0, OptimizationDirection::Minimize, None));
+        assert!(should_keep(1.0, 2.0, HillClimbingDirection::Minimize, None));
         assert!(!should_keep(
             2.0,
             1.0,
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
             None
         ));
     }
 
     #[test]
     fn should_keep_maximize_higher_is_better() {
-        assert!(should_keep(2.0, 1.0, OptimizationDirection::Maximize, None));
+        assert!(should_keep(2.0, 1.0, HillClimbingDirection::Maximize, None));
         assert!(!should_keep(
             1.0,
             2.0,
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
             None
         ));
     }
@@ -622,13 +622,13 @@ mod tests {
         assert!(!should_keep(
             1.0,
             1.0,
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
             None
         ));
         assert!(!should_keep(
             1.0,
             1.0,
-            OptimizationDirection::Maximize,
+            HillClimbingDirection::Maximize,
             None
         ));
     }
@@ -639,13 +639,13 @@ mod tests {
         assert!(!should_keep(
             1.5,
             2.0,
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
             Some(0.5)
         ));
         assert!(should_keep(
             1.49,
             2.0,
-            OptimizationDirection::Minimize,
+            HillClimbingDirection::Minimize,
             Some(0.5)
         ));
     }
@@ -763,7 +763,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             log_output_to: PathBuf::from("run.log"),
             working_dir: None,
-            direction: OptimizationDirection::Minimize,
+            direction: HillClimbingDirection::Minimize,
             description: "autoresearch val_bpb".into(),
         };
         let r = eval.evaluate(&sb, &snapshot()).await.unwrap();
@@ -772,7 +772,7 @@ mod tests {
             .await
             .unwrap();
         assert!(log.contains("val_bpb"));
-        assert_eq!(eval.direction(), OptimizationDirection::Minimize);
+        assert_eq!(eval.direction(), HillClimbingDirection::Minimize);
     }
 
     #[tokio::test]
@@ -786,7 +786,7 @@ mod tests {
             timeout: Duration::from_millis(1),
             log_output_to: PathBuf::from("run.log"),
             working_dir: None,
-            direction: OptimizationDirection::Minimize,
+            direction: HillClimbingDirection::Minimize,
             description: "x".into(),
         };
         let err = eval.evaluate(&sb, &snapshot()).await.unwrap_err();
@@ -804,7 +804,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             log_output_to: PathBuf::from("run.log"),
             working_dir: None,
-            direction: OptimizationDirection::Minimize,
+            direction: HillClimbingDirection::Minimize,
             description: "x".into(),
         };
         let err = eval.evaluate(&sb, &snapshot()).await.unwrap_err();
@@ -821,7 +821,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             log_output_to: PathBuf::from("run.log"),
             working_dir: None,
-            direction: OptimizationDirection::Minimize,
+            direction: HillClimbingDirection::Minimize,
             description: "x".into(),
         };
         let err = eval.evaluate(&sb, &snapshot()).await.unwrap_err();
@@ -841,7 +841,7 @@ mod tests {
         };
         let r = eval.evaluate(&sb, &snapshot()).await.unwrap();
         assert!((r.value - 0.85).abs() < 1e-9);
-        assert_eq!(eval.direction(), OptimizationDirection::Maximize);
+        assert_eq!(eval.direction(), HillClimbingDirection::Maximize);
     }
 
     #[tokio::test]
@@ -857,7 +857,7 @@ mod tests {
         };
         let r = eval.evaluate(&sb, &snapshot()).await.unwrap();
         assert!(r.value >= 0.0);
-        assert_eq!(eval.direction(), OptimizationDirection::Minimize);
+        assert_eq!(eval.direction(), HillClimbingDirection::Minimize);
         assert_eq!(r.metadata.get("measured_runs").unwrap(), "2");
     }
 
@@ -931,7 +931,7 @@ mod tests {
         };
         let r = eval.evaluate(&sb, &snapshot()).await.unwrap();
         assert!((r.value - 0.75).abs() < 1e-9);
-        assert_eq!(eval.direction(), OptimizationDirection::Maximize);
+        assert_eq!(eval.direction(), HillClimbingDirection::Maximize);
     }
 
     #[tokio::test]
@@ -985,7 +985,7 @@ mod tests {
         name: String,
         new_value: f64,
         current_best: f64,
-        direction: OptimizationDirection,
+        direction: HillClimbingDirection,
         min_delta: Option<f64>,
         expected: bool,
     }

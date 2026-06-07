@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use spore_core::harness::{BoxFut, OptimizationDirection, RunResult, SandboxProvider};
+use spore_core::harness::{BoxFut, HillClimbingDirection, RunResult, SandboxProvider};
 use spore_core::metric::MetricEvaluator;
 use spore_core::model::ModelInterface;
 use spore_core::termination::SessionStateSnapshot;
@@ -348,11 +348,11 @@ impl MetricEvaluatorVerifier {
         self
     }
 
-    fn normalize(&self, value: f64, direction: OptimizationDirection) -> f64 {
+    fn normalize(&self, value: f64, direction: HillClimbingDirection) -> f64 {
         if let Some(threshold) = self.threshold {
             let beats = match direction {
-                OptimizationDirection::Maximize => value >= threshold,
-                OptimizationDirection::Minimize => value <= threshold,
+                HillClimbingDirection::Maximize => value >= threshold,
+                HillClimbingDirection::Minimize => value <= threshold,
             };
             return if beats { 1.0 } else { 0.0 };
         }
@@ -362,8 +362,8 @@ impl MetricEvaluatorVerifier {
             }
             let unit = ((value - min) / (max - min)).clamp(0.0, 1.0);
             return match direction {
-                OptimizationDirection::Maximize => unit,
-                OptimizationDirection::Minimize => 1.0 - unit,
+                HillClimbingDirection::Maximize => unit,
+                HillClimbingDirection::Minimize => 1.0 - unit,
             };
         }
         value.clamp(0.0, 1.0)

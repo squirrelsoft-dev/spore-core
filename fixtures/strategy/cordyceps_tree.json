@@ -1,0 +1,23 @@
+{
+  "kind": "ralph",
+  "inner": {
+    "kind": "plan_execute",
+    "plan": {
+      "kind": "react",
+      "budget": { "kind": "per_loop", "value": 4 },
+      "agent": "planner",
+      "toolset": "plan-tools"
+    },
+    "execute": {
+      "kind": "self_verifying",
+      "inner": {
+        "kind": "react",
+        "budget": { "kind": "per_loop", "value": 12 },
+        "agent": "executor",
+        "toolset": "exec-tools"
+      },
+      "evaluator": "exec-evaluator"
+    }
+  },
+  "agent": "ralph-agent"
+}

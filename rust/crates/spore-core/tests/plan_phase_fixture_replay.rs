@@ -23,8 +23,8 @@ use spore_core::harness::testing::{
 };
 use spore_core::{
     Agent, AgentId, HaltReason, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy,
-    ModelAgent, ProviderInfo, RecordedExchange, ReplayModelInterface, RunResult, SessionId,
-    StandardHarness, Task,
+    ModelAgent, PlanExecuteConfig, ProviderInfo, RecordedExchange, ReplayModelInterface, RunResult,
+    SessionId, StandardHarness, Task,
 };
 
 fn fixture_exchanges() -> Vec<RecordedExchange> {
@@ -96,7 +96,7 @@ async fn drive_plan_phase(exchange: RecordedExchange) {
     let task = Task::new(
         "build something",
         SessionId::new("plan-fixture"),
-        LoopStrategy::PlanExecute { plan_model: None },
+        LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
     );
     match harness.run(HarnessRunOptions::new(task)).await {
         RunResult::Failure {
