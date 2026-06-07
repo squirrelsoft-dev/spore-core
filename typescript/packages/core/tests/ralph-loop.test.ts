@@ -117,6 +117,36 @@ class ProgressWritingAgent implements Agent {
   }
 }
 
+/**
+ * An agent that NEVER returns a final response — every turn requests a tool
+ * call, so a bounded ReAct window can only ever exhaust its turn budget (it
+ * never terminates cleanly). On its FIRST turn it writes `COMPLETE` to
+ * `.spore/progress.json`, so any code path that DID consult Ralph's external
+ * completion after the window would (wrongly) see "complete" and Success.
+ * Mirrors the Rust `ToolLoopingAgent` (#125 F5).
+ */
+class ToolLoopingAgent implements Agent {
+  calls = 0;
+  constructor(
+    private readonly agentId: AgentId,
+    private readonly root: string,
+  ) {}
+  id(): AgentId {
+    return this.agentId;
+  }
+  async turn(_ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+    if (this.calls === 0) {
+      // Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
+      // completion after a budget-exhausted window it would Success.
+      writeProgress(this.root, COMPLETE);
+    }
+    const n = this.calls;
+    this.calls += 1;
+    const call: ToolCall = { id: `c${n}`, name: "x", input: {} };
+    return { kind: "tool_call_requested", calls: [call], usage: usage() };
+  }
+}
+
 /** Flatten a Context's text content for substring assertions. */
 function contextText(ctx: Context): string {
   return ctx.messages
@@ -350,5 +380,64 @@ describe("Ralph loop strategy (issue #58)", () => {
     }
     // The inner SelfVerifying verifier fired at least once per window (>=2).
     expect(verifier.seen.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // #125 F5: a Ralph window whose INNER LEAF exhausts its OWN budget mid-window
+  // (the leaf's per_loop policy is the binding cap, no smaller global backstop).
+  // The window surfaces StrategyOutcome `budget_exhausted`; Ralph must treat it
+  // as "window incomplete → RESET and retry" — it must NOT consult external
+  // completion (which is COMPLETE on disk here) and must NOT cascade the child's
+  // exhaustion into its own terminal. So the run reaches max_resets windows and
+  // ends `ralph_completion_unmet`, NOT Success.
+  //
+  // NOTE: the RALPH helper above uses an UNBOUNDED leaf to AVOID this path
+  // (Deviation #14c); this case adds explicit coverage of the BOUNDED path.
+  it("F5: a budget-exhausted window resets (no completion consult, no cascade)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "spore-ralph-f5-"));
+    writeProgress(dir, INCOMPLETE);
+    const agent = new ToolLoopingAgent(AgentId.of("ralph-tool-loop"), dir);
+    // Provide tool outputs for the looping calls across all windows.
+    const reg = new ScriptedToolRegistry();
+    for (let i = 0; i < 32; i += 1) reg.push({ kind: "success", content: "ok" });
+    const config: HarnessConfig = {
+      registry: registryWith({ agent }),
+      toolRegistry: reg,
+      sandbox: new WorkspaceSandbox(dir),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      maxResets: 3,
+    };
+    const h = new StandardHarness(config);
+
+    // Inner leaf carries its OWN binding cap (per_loop{2}); NO global max_turns
+    // backstop, so the leaf policy — not the global cap — exhausts the window
+    // and the new budget_exhausted path is taken.
+    const strategy: LoopStrategy = {
+      kind: "ralph",
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 2 },
+        agent: "",
+        toolset: "",
+      },
+      agent: "",
+    };
+    // No global cap (empty BudgetLimits).
+    const task = newTask("implement the feature", SessionId.of("ralph-build"), strategy, {});
+
+    const r = await h.run({ task });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      // Reached max_resets — completion was NEVER consulted (despite COMPLETE on
+      // disk) and the child's exhaustion did NOT cascade into Ralph's terminal.
+      expect(r.reason.kind).toBe("ralph_completion_unmet");
+      if (r.reason.kind === "ralph_completion_unmet") {
+        expect(r.reason.iterations).toBe(3); // exactly max_resets windows ran
+      }
+    }
+    // Three windows × two leaf turns each = six agent turns total — proving each
+    // exhausted window fully reset and re-ran, not short-circuited.
+    expect(agent.calls).toBe(6);
   });
 });

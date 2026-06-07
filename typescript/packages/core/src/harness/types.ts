@@ -1911,9 +1911,21 @@ async function runPlanExecuteConfig(
         popBudget(cx);
         cx.scratch.task = task;
         cx.stream = onStream;
-        return resolution === "fail"
-          ? promoteBudgetExhausted(stepCharge.error, undefined)
-          : promoteBudgetExhausted(stepCharge.error, partial);
+        switch (resolution) {
+          case "fail":
+            return promoteBudgetExhausted(stepCharge.error, undefined);
+          // #129: a granted `continue` must reset this scope (`resolveCurrent`
+          // already did via `consumeContinue`) and RE-RUN this execute step — the
+          // in-process loop wiring lands in #129. It is UNREACHABLE today: live
+          // bodies push an `escalate` placeholder behavior (the serialized
+          // `BudgetExhaustedBehavior` field is a wire change deferred to #129), so
+          // `resolveCurrent` only ever yields `escalate`/`fail` here. Until that
+          // loop exists, an (impossible) `continue` is handled EXPLICITLY as a
+          // lossless surface-with-partial rather than a silent fall-through.
+          case "continue":
+          case "escalate":
+            return promoteBudgetExhausted(stepCharge.error, partial);
+        }
       }
     } else if (subResult != null && subResult.kind === "failure") {
       // Q5: any non-success step aborts the whole run.
@@ -2132,9 +2144,18 @@ async function runSelfVerifyingConfig(
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
-      return resolution === "fail"
-        ? promoteBudgetExhausted(buildCharge.error, undefined)
-        : promoteBudgetExhausted(buildCharge.error, partial);
+      switch (resolution) {
+        case "fail":
+          return promoteBudgetExhausted(buildCharge.error, undefined);
+        // #129: a granted `continue` must reset + RE-RUN this build↔evaluate
+        // iteration (the in-process loop wiring lands in #129). UNREACHABLE today
+        // — live bodies push an `escalate` placeholder, so `resolveCurrent` never
+        // yields `continue` here. Handle it EXPLICITLY (surface-with-partial)
+        // rather than via a silent fall-through.
+        case "continue":
+        case "escalate":
+          return promoteBudgetExhausted(buildCharge.error, partial);
+      }
     }
 
     // ── Evaluate phase: a fresh evaluator run on `evalAgent`.
@@ -2394,9 +2415,18 @@ async function runHillClimbingConfig(
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
-      return resolution === "fail"
-        ? promoteBudgetExhausted(gateCharge.error, undefined)
-        : promoteBudgetExhausted(gateCharge.error, partial);
+      switch (resolution) {
+        case "fail":
+          return promoteBudgetExhausted(gateCharge.error, undefined);
+        // #129: a granted `continue` must reset + keep iterating the climb (the
+        // in-process loop wiring lands in #129). UNREACHABLE today — live bodies
+        // push an `escalate` placeholder, so `resolveCurrent` never yields
+        // `continue` here. Handle it EXPLICITLY (surface-with-partial) rather
+        // than via a silent fall-through.
+        case "continue":
+        case "escalate":
+          return promoteBudgetExhausted(gateCharge.error, partial);
+      }
     }
     const overrun = executor.budgetExceeded(task.budget, carried);
     if (overrun != null) {

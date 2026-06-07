@@ -295,8 +295,14 @@ describe("sibling isolation (rule 1)", () => {
 describe("child exhaustion isolation (rule 4 & 7)", () => {
   it("a child's exhaustion does NOT charge the parent scope; parent can Complete", () => {
     const budgets = new BudgetStack();
-    // Parent scope (capped at 5, behavior Fail).
+    // Parent scope (total_steps{5}) that is ALREADY nearly exhausted: it has
+    // spent 4 of its 5 steps, leaving EXACTLY ONE remaining. This is the
+    // adversarial case for rule 4/7 — if a child's exhaustion auto-cascaded even
+    // a single step onto the parent, the parent would be pushed over its own cap
+    // and could no longer Complete.
     budgets.push(new BudgetContext({ kind: "total_steps", value: 5 }, { kind: "fail" }, "parent"));
+    expect(budgets.current()!.charge(4).ok).toBe(true);
+    expect(budgets.current()!.remaining()).toBe(1); // parent starts with exactly 1 step left
 
     // Child descends with its OWN scope (capped at 1) and exhausts.
     budgets.push(new BudgetContext({ kind: "per_loop", value: 1 }, { kind: "escalate" }, "child"));
@@ -307,9 +313,17 @@ describe("child exhaustion isolation (rule 4 & 7)", () => {
     budgets.pop();
 
     const parent = budgets.current()!;
-    expect(parent.stepsTaken).toBe(0); // rule 4/7: child did NOT auto-charge parent
-    // The parent can then proceed and Complete within its own budget.
-    expect(parent.charge(5).ok).toBe(true); // parent still has its full allowance
+    // rule 4/7: child exhaustion did NOT auto-charge the parent — its stepsTaken
+    // is unchanged at 4 (not bumped to 5).
+    expect(parent.stepsTaken).toBe(4);
+    // The parent STILL has its 1 remaining step after the child exhausted.
+    expect(parent.remaining()).toBe(1);
+    // The parent can spend its last step and Complete — proving the child's
+    // exhaustion did NOT push it over its own cap.
+    expect(parent.charge(1).ok).toBe(true);
+    // And only now is the parent itself exhausted (at its own 5, by its own work
+    // — never by the child's).
+    expect(parent.charge(1).ok).toBe(false);
   });
 });
 
@@ -387,7 +401,33 @@ describe("ReAct leaf cap binding (rule 6)", () => {
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("budget_exceeded");
       if (r.reason.kind === "budget_exceeded") expect(r.reason.limit_type).toBe("turns");
+      // The turn count is the EXHAUSTED LEAF's own stepsTaken (#125
+      // budget_exhausted path), which equals the leaf cap N=2 here.
       expect(r.turns).toBe(2); // leaf stopped at its own cap N=2
+
+      // The #125 discriminator: the partial flowed through
+      // StrategyOutcome `budget_exhausted` { partialOutput } → driveStrategy's
+      // budget_exhausted arm, which materializes the partial as a single
+      // assistant Text message. On PRE-#125 code the leaf surfaced the window's
+      // RAW session (the tool-call / observation messages), NOT this
+      // node-concrete partial JSON — so these assertions FAIL on the old path
+      // and PROVE the new budget_exhausted machinery is exercised end-to-end.
+      expect(r.session_state).toBeDefined();
+      const messages = r.session_state!.messages;
+      expect(messages).toHaveLength(1);
+      const msg = messages[0]!;
+      expect(msg.role).toBe("assistant");
+      expect(msg.content.type).toBe("text");
+      const text = msg.content.type === "text" ? msg.content.text : "";
+      // The documented ReAct partial shape (fork #2): the last FinalResponse
+      // text as JSON. This window produced no FinalResponse, so the documented
+      // shape carries an empty `last_final_response`.
+      expect(text).toBe(reactPartialJson(""));
+      // Sanity: the materialized text is genuinely the partial helper's output,
+      // i.e. valid JSON tagged with the node — not a free-form transcript.
+      const parsed = JSON.parse(text);
+      expect(parsed.node).toBe("react");
+      expect(parsed.last_final_response).toBe("");
     }
   });
 });
