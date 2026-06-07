@@ -258,18 +258,13 @@ cache halts.
    orchestrator but not the worker's in-flight consult. #101's three escalation
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
-10. **Local `main` is ahead of `origin/main` and unpushed** (`scope: debt`,
-    transient, **growing — flagged as the #1 action for three loops running; the push
-    never happened**) — `origin/main` is at `f63bf07`; local `main` is **~24 commits
-    ahead**: the entire #117–#120 refactor series (five #117 commits incl. `b9a46bc`
-    go fix; four #118; four #119: `e62f7c9` rust/`faeff6a` py/`4354912` ts/`a031c59`
-    go; four #120: `71ed9be` rust/`7ef6601` go/`9fe0006` py/`a20cc1e` ts), two
-    Rust-only `12-cordyceps` polish commits (`8bb7734`, `d65ae64`), and the `/close`
-    bookkeeping commits (`60a9e83`, `cdf0c17`, `7ff75c0`, `cf529f5`, + this one).
-    **Needs a push.** The plan-execute scratch run-artifacts that were previously left
-    untracked are now covered by a `workspace/*` wildcard in
-    `examples/rust/08-plan-execute/.gitignore` (preserving the tracked `.gitkeep` +
-    canonical `Async_Runtime_Comparison_Report.md`).
+10. **~~Local `main` ahead of `origin/main` and unpushed~~ RESOLVED this loop** —
+    pushed `f63bf07..f884cf4`; `origin/main` now level with local `main` (the entire
+    #117–#120 refactor series + Rust cordyceps polish + `/close` bookkeeping are
+    upstream). Remaining note: the plan-execute scratch run-artifacts are covered by a
+    `workspace/*` wildcard in `examples/rust/08-plan-execute/.gitignore` (preserving
+    the tracked `.gitkeep` + canonical `Async_Runtime_Comparison_Report.md`). Keep
+    future per-issue work pushed promptly so this doesn't re-accumulate.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`,
     not yet mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the **core
     harness** (`rust/crates/spore-core/src/tools/subagent.rs`): an optional child
@@ -303,27 +298,23 @@ stubs — all resolved in prior loops. Former Deviation "#114 consult work unpus
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-1. **Push local `main` to `origin` (~24 commits ahead, the entire #117–#120 series).**
-   Cheap, removes a divergence flagged as #1 for three loops running and never
-   actioned; four full cross-language features plus the Rust cordyceps polish are
-   committed but unpushed. Do this before grabbing more work (see Deviation #10).
-2. **#123 — `StrategyOutcome` + `ExecutionContext`/`BudgetContext`/`BudgetStack`
+1. **#123 — `StrategyOutcome` + `ExecutionContext`/`BudgetContext`/`BudgetStack`
    runtime scaffold (the next critical-path brick).** Fleshes out #119's placeholder
    `StrategyOutcome`/`ExecutionContext` into the real shapes and threads the shared,
    mutable runtime context (carrying `registry: &ExecutionRegistry` from #120) through
    recursion — scaffold only; `charge`/enforcement is #125. Grab via `/implement`.
    #121 (`SubagentTool` strategy param) and #122 (`max_steps()`) are parallel grabs.
-3. **The executor migration — #124 (largest unit).** After #123: per-variant
+2. **The executor migration — #124 (largest unit).** After #123: per-variant
    `RunStrategy::run` impls replace the central dispatch `match` with recursive trait
    calls, **and #124 physically removes the four legacy collaborator fields #120 kept,
    migrating the ~7 executor consumption sites to registry resolution** (see Deviation
    #12). Then #125 (budget enforcement) and #126 (ready-set walk — consumes #118's
    `Task.blockers` schema) open up.
-4. **Refactor finishers** — #127 (custom-strategy tracer — exercises #120's `custom`
+3. **Refactor finishers** — #127 (custom-strategy tracer — exercises #120's `custom`
    map + `StrategyNotFound` end-to-end), #128 (observability), #129 (`Continue`
    checkpoint), #130 (`HumanRequest::BudgetExhausted` HITL resume — consumes #120's
    `EscalationMode` knob), then **#131** (cordyceps capstone — the success bar).
-5. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — either
+4. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — either
    file an issue to mirror it to TS/Python/Go (and the cordyceps example polish) or
    accept it as a Rust-reference-ahead experiment. **Still parked:** examples #109 /
    #92 + `web_search` #108/#110; harness gaps #115 (skill loading) and #116 (HITL
