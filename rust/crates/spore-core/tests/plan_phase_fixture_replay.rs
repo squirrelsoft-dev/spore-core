@@ -23,8 +23,8 @@ use spore_core::harness::testing::{
 };
 use spore_core::{
     Agent, AgentId, HaltReason, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy,
-    ModelAgent, PlanExecuteConfig, ProviderInfo, RecordedExchange, ReplayModelInterface, RunResult,
-    SessionId, StandardHarness, Task,
+    ModelAgent, PlanExecuteConfig, ProviderInfo, ReactConfig, RecordedExchange,
+    ReplayModelInterface, RunResult, SessionId, StandardHarness, Task,
 };
 
 fn fixture_exchanges() -> Vec<RecordedExchange> {
@@ -55,7 +55,6 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
     let agent: Arc<ModelAgent<ReplayModelInterface>> =
         Arc::new(ModelAgent::new(AgentId::new("planner"), replay));
     HarnessConfig {
-        agent: agent as Arc<dyn Agent>,
         tool_registry: Arc::new(ScriptedToolRegistry::new()),
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),
@@ -70,21 +69,23 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         hooks: None,
-        planner_agent: None,
-        verifier: None,
-        evaluator_agent: None,
         storage: Arc::new(spore_core::StorageProvider::no_op()),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,
-        metric_evaluator: None,
         catalogue_registry: None,
         system_prompt: None,
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
         consult_handlers: std::collections::HashMap::new(),
-        registry: spore_core::ExecutionRegistry::empty(),
+        // #124: worker agent + toolset + default plan-slot schema under the
+        // default empty key.
+        registry: spore_core::ExecutionRegistry::builder()
+            .agent("", agent as Arc<dyn Agent>)
+            .toolset("", Arc::new(spore_core::EmptyToolRegistry))
+            .schema("", serde_json::json!({}))
+            .build(),
         escalation_mode: spore_core::EscalationMode::SurfaceToHuman,
     }
 }
@@ -95,10 +96,20 @@ fn config_for(exchange: RecordedExchange) -> HarnessConfig {
 /// first step and aborts with `StepFailed { task_index: 0 }` (issue #59, Q5).
 async fn drive_plan_phase(exchange: RecordedExchange) {
     let harness = StandardHarness::new(config_for(exchange));
+    // #124 A.5: the plan slot is STRUCTURED — its leaf carries an output schema.
     let task = Task::new(
         "build something",
         SessionId::new("plan-fixture"),
-        LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
+        LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                budget: spore_core::BudgetPolicy::PerLoop { value: u32::MAX },
+                agent: spore_core::AgentRef(String::new()),
+                toolset: spore_core::ToolsetRef(String::new()),
+                output: Some(spore_core::SchemaRef(String::new())),
+            })),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }),
     );
     match harness.run(HarnessRunOptions::new(task)).await {
         RunResult::Failure {

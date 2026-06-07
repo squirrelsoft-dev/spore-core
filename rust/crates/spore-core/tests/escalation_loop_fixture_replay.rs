@@ -55,7 +55,6 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
     });
 
     let config = HarnessConfig {
-        agent: agent as Arc<dyn Agent>,
         tool_registry: tool_registry.clone(),
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),
@@ -70,21 +69,21 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         hooks: None,
-        planner_agent: None,
-        verifier: None,
-        evaluator_agent: None,
         storage: Arc::new(spore_core::StorageProvider::no_op()),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,
-        metric_evaluator: None,
         catalogue_registry: None,
         system_prompt: None,
         model_params: spore_core::ModelParams::default(),
         auto_persist_sessions: false,
         prompt_tool_call_flag: None,
         consult_handlers: std::collections::HashMap::new(),
-        registry: spore_core::ExecutionRegistry::empty(),
+        // #124: worker agent + toolset under the default empty key.
+        registry: spore_core::ExecutionRegistry::builder()
+            .agent("", agent as Arc<dyn Agent>)
+            .toolset("", tool_registry.clone())
+            .build(),
         escalation_mode: spore_core::EscalationMode::SurfaceToHuman,
     };
     let harness = StandardHarness::new(config);

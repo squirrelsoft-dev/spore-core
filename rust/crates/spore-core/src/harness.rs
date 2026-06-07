@@ -874,7 +874,39 @@ pub trait StrategyExecutor: Send + Sync {
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        agent: Arc<dyn Agent>,
     ) -> BoxFut<'a, RunResult>;
+
+    /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
+    /// combinators resolve their worker agent through this so a missing handle is
+    /// a typed terminal `Failure` rather than a panic. Returns `Err(RunResult)`
+    /// carrying the `UnresolvedHandle` failure when the key is absent.
+    fn resolve_agent_ref(
+        &self,
+        r: &AgentRef,
+        session_id: &SessionId,
+    ) -> Result<Arc<dyn Agent>, Box<RunResult>>;
+
+    /// Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
+    /// read-only sandbox in a never-shared session, on `eval_agent`. Folds the
+    /// run's usage into `total_usage`/`carried`; returns its terminal.
+    fn evaluate_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        eval_agent: Arc<dyn Agent>,
+        carried: &'a mut BudgetSnapshot,
+        total_usage: &'a mut AggregateUsage,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Append `reason` as a user message on `session_state` (Default-FAIL).
+    fn append_user_message<'a>(
+        &'a self,
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()>;
+
+    /// The configured sandbox workspace root (#124, for `VerifierInput`).
+    fn workspace_root(&self) -> std::path::PathBuf;
 
     /// Seed a user message onto `session_state` (the `ContextManager` seam).
     fn seed_user_message<'a>(
@@ -942,39 +974,71 @@ pub trait StrategyExecutor: Send + Sync {
         task_list: &'a crate::tasklist::TaskList,
     ) -> BoxFut<'a, ()>;
 
-    /// Drive a whole SelfVerifying loop (legacy `run_self_verifying`). The
-    /// build phase reuses the leaf ReAct window; the loop is Default-FAIL and
-    /// bounded by the verifier's iteration cap (Q1).
-    fn self_verifying_loop<'a>(
-        &'a self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult>;
+    /// Build the per-window Ralph seed session (#124): a fresh
+    /// `SessionState::default()` seeded with `instruction`, the `.spore/` reload
+    /// context (R3), and the optional VCS history block — exactly the legacy
+    /// `run_ralph` window setup, minus the model loop (which now recurses).
+    fn ralph_seed_session<'a>(&'a self, instruction: &'a str) -> BoxFut<'a, SessionState>;
 
-    /// Drive a whole Ralph continuation loop (legacy `run_ralph`). Resets the
-    /// context window per continuation and resumes from the durable `.spore/`
-    /// checkpoint (A.6 deep-resume).
-    fn ralph_loop<'a>(
-        &'a self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult>;
+    /// Ralph external completion check (#124, legacy `ralph_completion_status`):
+    /// `None` ⇒ complete; `Some(reason)` ⇒ tasks remain.
+    fn ralph_completion_status(&self) -> Option<String>;
 
-    /// Drive a whole HillClimbing loop (legacy `run_hill_climbing`).
+    /// The Ralph outer-loop reset cap (`config.max_resets`, #124).
+    fn ralph_max_resets(&self) -> u32;
+
+    /// Resolve the HillClimbing metric evaluator for `key` (#124, Q2), or
+    /// `Err(RunResult)` with the misconfiguration failure when absent.
+    fn resolve_metric_evaluator(
+        &self,
+        key: &str,
+        session_id: &SessionId,
+    ) -> Result<Arc<dyn crate::metric::MetricEvaluator>, Box<RunResult>>;
+
+    /// HillClimbing iteration-0 baseline (#124): evaluate the metric (no agent
+    /// turn), record the row + span, and return the baseline value — or
+    /// `Err(RunResult)` on a baseline-evaluation failure (already records the
+    /// failed row + writes the TSV). Leaf primitive of the legacy
+    /// `run_hill_climbing`.
     #[allow(clippy::too_many_arguments)]
-    fn hill_climbing_loop<'a>(
+    fn hill_baseline<'a>(
         &'a self,
-        task: Task,
+        evaluator: &'a Arc<dyn crate::metric::MetricEvaluator>,
+        session_id: &'a SessionId,
+        task_id: &'a TaskId,
         direction: HillClimbingDirection,
-        max_stagnation: Option<u32>,
+        rows: &'a mut Vec<crate::metric::ResultsEntry>,
+        span_seq: &'a mut u64,
+        total_usage: AggregateUsage,
+        turns: u32,
+    ) -> BoxFut<'a, Result<f64, RunResult>>;
+
+    /// HillClimbing per-iteration metric eval + keep/revert decision (#124): the
+    /// agent turn already ran (recursively); this evaluates the metric, applies
+    /// `should_keep`, optionally reverts, records the row + span, and returns the
+    /// updated `(current_best, stagnation_increment)`. Leaf primitive of the
+    /// legacy `run_hill_climbing`.
+    #[allow(clippy::too_many_arguments)]
+    fn hill_iteration<'a>(
+        &'a self,
+        evaluator: &'a Arc<dyn crate::metric::MetricEvaluator>,
+        session_id: &'a SessionId,
+        task_id: &'a TaskId,
+        iteration: u32,
+        direction: HillClimbingDirection,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult>;
+        current_best: f64,
+        rows: &'a mut Vec<crate::metric::ResultsEntry>,
+        span_seq: &'a mut u64,
+    ) -> BoxFut<'a, (f64, bool)>;
+
+    /// Write the HillClimbing results TSV (#124, leaf primitive).
+    fn hill_write_tsv<'a>(
+        &'a self,
+        task_id: &'a TaskId,
+        rows: &'a [crate::metric::ResultsEntry],
+    ) -> BoxFut<'a, ()>;
 
     /// Finalize observability for a terminal outcome (legacy
     /// `finalize_observability` routing). No-op for non-terminal results.
@@ -1023,11 +1087,29 @@ impl RunStrategy for ReactConfig {
             let max_iterations = self.max_iterations();
             let session_state = std::mem::take(&mut cx.scratch.run_session);
             let budget_used = cx.scratch.run_budget.clone();
+            // #124: resolve the worker agent from the registry by THIS leaf's
+            // handle (genuine recursion — no `config.agent`). A missing handle is
+            // a typed terminal failure.
+            let agent = match executor.resolve_agent_ref(&self.agent, &task.session_id) {
+                Ok(a) => a,
+                Err(result) => {
+                    let result = *result;
+                    executor.finalize(&result).await;
+                    return cx.record_terminal(result);
+                }
+            };
             // The leaf takes the run's stream sink for the window. Combinators
             // that recurse per-phase suppress it (they take it before recursing).
             let on_stream = cx.stream.take();
             let result = executor
-                .react_window(task, max_iterations, session_state, budget_used, on_stream)
+                .react_window(
+                    task,
+                    max_iterations,
+                    session_state,
+                    budget_used,
+                    on_stream,
+                    agent,
+                )
                 .await;
             executor.finalize(&result).await;
             cx.record_terminal(result)
@@ -1351,9 +1433,13 @@ impl RunStrategy for PlanExecuteConfig {
 }
 
 impl RunStrategy for SelfVerifyingConfig {
-    /// SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
-    /// verifier's iteration cap / the run budget — Q1). The build phase recurses
-    /// through `self.inner`.
+    /// SelfVerifying (#124): GENUINELY recursive build↔evaluate loop. Each
+    /// iteration dispatches `self.inner.run(cx)` for the build phase (a non-ReAct
+    /// inner — e.g. PlanExecute — really runs its whole loop per iteration), then
+    /// runs a fresh evaluate phase on the inner worker's resolved agent (Q1c) and
+    /// consults the verifier resolved from `self.evaluator`'s key (Q1a). Passed ⇒
+    /// Success; Failed ⇒ append the reason (Default-FAIL) and loop; exhausted ⇒
+    /// `SelfVerifyExhausted`.
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
             let executor = match cx.executor() {
@@ -1361,21 +1447,193 @@ impl RunStrategy for SelfVerifyingConfig {
                 Err(o) => return o,
             };
             let task = cx.current_task();
-            let session_state = std::mem::take(&mut cx.scratch.run_session);
-            let budget_used = cx.scratch.run_budget.clone();
+            let build_session_id = task.session_id.clone();
+            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
+            let mut carried = cx.scratch.run_budget.clone();
+            // Suppress the run's stream sink for the recursive child phases.
             let on_stream = cx.stream.take();
-            let result = executor
-                .self_verifying_loop(task, session_state, budget_used, on_stream)
-                .await;
-            cx.record_terminal(result)
+
+            // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
+            let verifier = match cx.registry.resolve_verifier(&self.evaluator.0) {
+                Some(v) => v.clone(),
+                None => {
+                    let result = RunResult::Failure {
+                        reason: HaltReason::SelfVerifyMisconfigured {
+                            reason: format!(
+                                "SelfVerifying requires a verifier registered under key {:?}",
+                                self.evaluator.0
+                            ),
+                        },
+                        session_id: build_session_id,
+                        usage: AggregateUsage::default(),
+                        turns: 0,
+                        session_state: SessionState::default(),
+                    };
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+            };
+            // Q1c: the evaluate-phase agent defaults to the inner worker's agent.
+            let eval_agent = match executor
+                .resolve_agent_ref(&AgentRef(executor_worker_key(self)), &build_session_id)
+            {
+                Ok(a) => a,
+                Err(result) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, *result).await;
+                }
+            };
+
+            let max_iterations = verifier.max_iterations();
+            let mut total_usage = AggregateUsage::default();
+            let mut last_reason = String::new();
+
+            for iteration in 0..max_iterations {
+                // ── Build phase: recurse `self.inner.run(cx)`.
+                let build_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: build_session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: (*self.inner).clone(),
+                };
+                cx.scratch.task = Some(build_task);
+                cx.scratch.run_session = session_state.clone();
+                cx.scratch.run_budget = carried.clone();
+                let _ = self.inner.run(cx).await;
+                let build_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::SelfVerifyMisconfigured {
+                            reason: "build sub-strategy produced no terminal".into(),
+                        },
+                        session_id: build_session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: carried.turns,
+                        session_state: session_state.clone(),
+                    },
+                };
+                fold_usage(&mut total_usage, &mut carried, &build_result);
+
+                // A paused / escalated build propagates verbatim.
+                match &build_result {
+                    RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, build_result).await;
+                    }
+                    RunResult::Escalate { .. } => {
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, build_result).await;
+                    }
+                    _ => {}
+                }
+                // Carry the build's post-run session forward for the next round.
+                if let RunResult::Success {
+                    session_state: st, ..
+                }
+                | RunResult::Failure {
+                    session_state: st, ..
+                } = &build_result
+                {
+                    session_state = st.clone();
+                }
+
+                // ── Evaluate phase: a fresh evaluator run on `eval_agent`.
+                let eval_result = executor
+                    .evaluate_phase(&task, eval_agent.clone(), &mut carried, &mut total_usage)
+                    .await;
+
+                let input = VerifierInput {
+                    build_result,
+                    eval_result,
+                    workspace: self.sandbox_root(executor),
+                    iteration,
+                };
+                match verifier.verify(&input).await {
+                    VerifierVerdict::Passed => {
+                        let (output, turns, final_state) = match input.build_result {
+                            RunResult::Success {
+                                output,
+                                turns,
+                                session_state: st,
+                                ..
+                            } => (output, turns, st),
+                            _ => (String::new(), carried.turns, session_state.clone()),
+                        };
+                        let result = RunResult::Success {
+                            output,
+                            session_id: build_session_id,
+                            usage: total_usage,
+                            turns,
+                            session_state: final_state,
+                        };
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                    VerifierVerdict::Failed { reason } => {
+                        last_reason = reason.clone();
+                        executor
+                            .append_user_message(&mut session_state, &reason)
+                            .await;
+                    }
+                }
+            }
+
+            let result = RunResult::Failure {
+                reason: HaltReason::SelfVerifyExhausted {
+                    iterations: max_iterations,
+                    last_reason,
+                },
+                session_id: build_session_id,
+                usage: total_usage,
+                turns: carried.turns,
+                session_state,
+            };
+            cx.stream = on_stream;
+            cx.finish(executor, task, result).await
         })
+    }
+}
+
+impl SelfVerifyingConfig {
+    /// The workspace root for a verifier input. Delegated to the executor so the
+    /// config body stays harness-agnostic.
+    fn sandbox_root(&self, executor: &dyn StrategyExecutor) -> std::path::PathBuf {
+        executor.workspace_root()
+    }
+}
+
+/// The worker-agent key for a SelfVerifying inner (Q1c: the evaluate-phase agent
+/// defaults to the inner worker's resolved agent). Descends to the worker leaf.
+fn executor_worker_key(cfg: &SelfVerifyingConfig) -> String {
+    worker_agent_key_of(&cfg.inner)
+}
+
+/// Descend a [`LoopStrategy`] tree to the worker leaf's agent key (#124).
+fn worker_agent_key_of(ls: &LoopStrategy) -> String {
+    match ls {
+        LoopStrategy::ReAct(c) => c.agent.0.clone(),
+        LoopStrategy::PlanExecute(c) => worker_agent_key_of(&c.execute),
+        LoopStrategy::SelfVerifying(c) => worker_agent_key_of(&c.inner),
+        LoopStrategy::Ralph(c) => {
+            if c.agent.0.is_empty() {
+                worker_agent_key_of(&c.inner)
+            } else {
+                c.agent.0.clone()
+            }
+        }
+        LoopStrategy::HillClimbing(c) => worker_agent_key_of(&c.inner),
     }
 }
 
 impl RunStrategy for RalphConfig {
-    /// Ralph: the continuation wrapper — reset the context window per window and
-    /// resume from the durable `.spore/` checkpoint (A.6 deep-resume). Each
-    /// window recurses through `self.inner`.
+    /// Ralph (#124): GENUINELY recursive continuation wrapper. Each context
+    /// window seeds a FRESH session from the `.spore/` checkpoint, then recurses
+    /// `self.inner.run(cx)` (a non-ReAct inner — e.g. SelfVerifying — really runs
+    /// its whole loop per window). Q3: when `self.agent` is set it OVERRIDES the
+    /// inner leaf's agent per window; when unset the worker resolves via the inner
+    /// leaf. `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
+    /// `RalphCompletionUnmet`.
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
             let executor = match cx.executor() {
@@ -1383,21 +1641,142 @@ impl RunStrategy for RalphConfig {
                 Err(o) => return o,
             };
             let task = cx.current_task();
-            let budget_used = cx.scratch.run_budget.clone();
             let on_stream = cx.stream.take();
             // Ralph discards the incoming session state by design (each window is
             // a fresh start re-seeded from the filesystem checkpoint).
             let _ = std::mem::take(&mut cx.scratch.run_session);
-            let result = executor.ralph_loop(task, budget_used, on_stream).await;
-            cx.record_terminal(result)
+            let max_resets = self.max_resets(executor);
+
+            // Q3: when `self.agent` is set, override the inner leaf's agent for
+            // every window by rewriting the inner tree's worker leaf handle.
+            let inner_for_window: LoopStrategy = if self.agent.0.is_empty() {
+                (*self.inner).clone()
+            } else {
+                let mut cloned = (*self.inner).clone();
+                override_worker_agent(&mut cloned, &self.agent);
+                cloned
+            };
+
+            let mut total_usage = AggregateUsage::default();
+            let mut cumulative_turns: u32 = 0;
+            let mut last_reason = String::from(".spore/progress.json missing");
+            let mut last_session_id = task.session_id.clone();
+
+            for iteration in 0..max_resets.max(1) {
+                let window_session_id = if iteration == 0 {
+                    task.session_id.clone()
+                } else {
+                    SessionId::generate()
+                };
+                last_session_id = window_session_id.clone();
+
+                // R2/R3: a FRESH session seeded from the `.spore/` checkpoint.
+                let session_state = executor.ralph_seed_session(&task.instruction).await;
+
+                let window_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: window_session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: inner_for_window.clone(),
+                };
+                cx.scratch.task = Some(window_task);
+                cx.scratch.run_session = session_state;
+                // FRESH per-window budget (the reset discards the turn budget).
+                cx.scratch.run_budget = BudgetSnapshot::default();
+                let _ = inner_for_window.run(cx).await;
+                let window_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::RalphCompletionUnmet {
+                            iterations: iteration + 1,
+                            last_reason: "window sub-strategy produced no terminal".into(),
+                        },
+                        session_id: window_session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: 0,
+                        session_state: SessionState::default(),
+                    },
+                };
+                let mut window_budget = BudgetSnapshot::default();
+                fold_usage(&mut total_usage, &mut window_budget, &window_result);
+                cumulative_turns += window_budget.turns;
+
+                // A paused / escalated window propagates verbatim.
+                if window_result.is_pause() {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, window_result).await;
+                }
+
+                match executor.ralph_completion_status() {
+                    None => {
+                        let (output, final_state) = match window_result {
+                            RunResult::Success {
+                                output,
+                                session_state,
+                                ..
+                            } => (output, session_state),
+                            _ => (String::new(), SessionState::default()),
+                        };
+                        let result = RunResult::Success {
+                            output,
+                            session_id: window_session_id,
+                            usage: total_usage,
+                            turns: cumulative_turns,
+                            session_state: final_state,
+                        };
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                    Some(reason) => {
+                        last_reason = reason;
+                    }
+                }
+            }
+
+            let result = RunResult::Failure {
+                reason: HaltReason::RalphCompletionUnmet {
+                    iterations: max_resets.max(1),
+                    last_reason,
+                },
+                session_id: last_session_id,
+                usage: total_usage,
+                turns: cumulative_turns,
+                session_state: SessionState::default(),
+            };
+            cx.stream = on_stream;
+            cx.finish(executor, task, result).await
         })
     }
 }
 
+impl RalphConfig {
+    /// The configured `max_resets` (the harness `config.max_resets`).
+    fn max_resets(&self, executor: &dyn StrategyExecutor) -> u32 {
+        executor.ralph_max_resets()
+    }
+}
+
+/// Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
+/// per-window agent override). Mutates the leaf reached by descending the worker
+/// child chain.
+fn override_worker_agent(ls: &mut LoopStrategy, agent: &AgentRef) {
+    match ls {
+        LoopStrategy::ReAct(c) => c.agent = agent.clone(),
+        LoopStrategy::PlanExecute(c) => override_worker_agent(&mut c.execute, agent),
+        LoopStrategy::SelfVerifying(c) => override_worker_agent(&mut c.inner, agent),
+        LoopStrategy::Ralph(c) => override_worker_agent(&mut c.inner, agent),
+        LoopStrategy::HillClimbing(c) => override_worker_agent(&mut c.inner, agent),
+    }
+}
+
 impl RunStrategy for HillClimbingConfig {
-    /// HillClimbing: iterate `self.inner`, scoring each candidate with the
-    /// metric; bounded by `max_stagnation` (Q1). Each iteration recurses through
-    /// `self.inner`.
+    /// HillClimbing (#124): GENUINELY recursive optimization loop. Iteration 0 is
+    /// a pure baseline (no agent turn). Iterations 1.. recurse `self.inner.run(cx)`
+    /// to propose a change (a non-ReAct inner — e.g. PlanExecute — really runs its
+    /// whole loop per iteration), then evaluate the metric (resolved via
+    /// `resolve_metric_evaluator`, Q2) and keep/revert. Bounded by
+    /// `max_stagnation` and the turn budget.
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
             let executor = match cx.executor() {
@@ -1405,23 +1784,166 @@ impl RunStrategy for HillClimbingConfig {
                 Err(o) => return o,
             };
             let task = cx.current_task();
-            let budget_used = cx.scratch.run_budget.clone();
+            let session_id = task.session_id.clone();
+            let task_id = task.id.clone();
             let on_stream = cx.stream.take();
+            let mut carried = cx.scratch.run_budget.clone();
             let _ = std::mem::take(&mut cx.scratch.run_session);
-            // `u32::MAX` sentinel ⇒ no stagnation cap (mirrors the legacy entry).
+            let direction = self.direction;
+            let revert = self.revert_on_no_improvement;
+            let min_delta = Some(self.min_improvement_delta);
+            // `u32::MAX` sentinel ⇒ no stagnation cap.
             let max_stagnation = (self.max_stagnation != u32::MAX).then_some(self.max_stagnation);
-            let result = executor
-                .hill_climbing_loop(
-                    task,
-                    self.direction,
-                    max_stagnation,
-                    self.revert_on_no_improvement,
-                    Some(self.min_improvement_delta),
-                    budget_used,
-                    on_stream,
+
+            // Q2: resolve the metric evaluator from `evaluator`'s key.
+            let evaluator = match executor.resolve_metric_evaluator(&self.evaluator.0, &session_id)
+            {
+                Ok(e) => e,
+                Err(result) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, *result).await;
+                }
+            };
+
+            let mut total_usage = AggregateUsage::default();
+            let mut rows: Vec<crate::metric::ResultsEntry> = Vec::new();
+            let mut span_seq: u64 = 0;
+
+            // ── Iteration 0: pure baseline (no agent turn).
+            let mut current_best = match executor
+                .hill_baseline(
+                    &evaluator,
+                    &session_id,
+                    &task_id,
+                    direction,
+                    &mut rows,
+                    &mut span_seq,
+                    total_usage.clone(),
+                    carried.turns,
                 )
-                .await;
-            cx.record_terminal(result)
+                .await
+            {
+                Ok(v) => v,
+                Err(result) => {
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+            };
+
+            let mut stagnation: u32 = 0;
+            let mut iteration: u32 = 1;
+            let turn_cap = task.budget.max_turns.unwrap_or(u32::MAX);
+
+            loop {
+                // Budget gate before the iteration's agent turn.
+                if carried.turns >= turn_cap {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    let result = RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        session_id,
+                        usage: total_usage,
+                        turns: carried.turns,
+                        session_state: SessionState::default(),
+                    };
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+                if let Some(limit_type) =
+                    StandardHarness::budget_exceeded(&task.budget, &carried, Instant::now())
+                {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    let result = RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded { limit_type },
+                        session_id,
+                        usage: total_usage,
+                        turns: carried.turns,
+                        session_state: SessionState::default(),
+                    };
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, result).await;
+                }
+
+                // ── One agent turn proposes a change: recurse `self.inner`.
+                let iter_task = Task {
+                    id: task.id.clone(),
+                    instruction: task.instruction.clone(),
+                    session_id: session_id.clone(),
+                    budget: task.budget.clone(),
+                    loop_strategy: (*self.inner).clone(),
+                };
+                cx.scratch.task = Some(iter_task);
+                let mut iter_state = SessionState::default();
+                executor
+                    .append_user_message(&mut iter_state, &task.instruction)
+                    .await;
+                cx.scratch.run_session = iter_state;
+                cx.scratch.run_budget = carried.clone();
+                let _ = self.inner.run(cx).await;
+                let turn_result = match cx.take_child_override() {
+                    Some(r) => r,
+                    None => RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        session_id: session_id.clone(),
+                        usage: AggregateUsage::default(),
+                        turns: carried.turns,
+                        session_state: SessionState::default(),
+                    },
+                };
+                fold_usage(&mut total_usage, &mut carried, &turn_result);
+
+                // A paused / escalated turn propagates verbatim.
+                if turn_result.is_pause() {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    cx.stream = on_stream;
+                    return cx.finish(executor, task, turn_result).await;
+                }
+
+                // ── Evaluate the metric + keep/revert decision.
+                let (best, non_improvement) = executor
+                    .hill_iteration(
+                        &evaluator,
+                        &session_id,
+                        &task_id,
+                        iteration,
+                        direction,
+                        revert,
+                        min_delta,
+                        current_best,
+                        &mut rows,
+                        &mut span_seq,
+                    )
+                    .await;
+                current_best = best;
+                if non_improvement {
+                    stagnation += 1;
+                } else {
+                    stagnation = 0;
+                }
+
+                if let Some(limit) = max_stagnation {
+                    if stagnation >= limit {
+                        executor.hill_write_tsv(&task_id, &rows).await;
+                        let result = RunResult::Failure {
+                            reason: HaltReason::StagnationLimitReached {
+                                iterations: stagnation,
+                                best_metric: current_best,
+                            },
+                            session_id,
+                            usage: total_usage,
+                            turns: carried.turns,
+                            session_state: SessionState::default(),
+                        };
+                        cx.stream = on_stream;
+                        return cx.finish(executor, task, result).await;
+                    }
+                }
+
+                iteration = iteration.saturating_add(1);
+            }
         })
     }
 }
@@ -1509,6 +2031,32 @@ fn outcome_from_run_result_ref(result: &RunResult) -> StrategyOutcome {
             ))
         }
     }
+}
+
+/// Fold a sub-run's token usage / turn count into the cumulative `total_usage`
+/// and the shared `carried` budget snapshot (#124, R8). `carried.turns` becomes
+/// the running MAX of the sub-runs' absolute turn counts. A non-terminal pause
+/// (`WaitingForHuman`/`Consult`) carries no fold.
+pub(crate) fn fold_usage(
+    total_usage: &mut AggregateUsage,
+    carried: &mut BudgetSnapshot,
+    r: &RunResult,
+) {
+    let (usage, turns) = match r {
+        RunResult::Success { usage, turns, .. }
+        | RunResult::Failure { usage, turns, .. }
+        | RunResult::Escalate { usage, turns, .. } => (usage, *turns),
+        RunResult::WaitingForHuman { .. } => return,
+        RunResult::Consult { .. } => return,
+    };
+    total_usage.input_tokens += usage.input_tokens;
+    total_usage.output_tokens += usage.output_tokens;
+    total_usage.cache_read_tokens += usage.cache_read_tokens;
+    total_usage.cache_write_tokens += usage.cache_write_tokens;
+    total_usage.cost_usd += usage.cost_usd;
+    carried.input_tokens += usage.input_tokens;
+    carried.output_tokens += usage.output_tokens;
+    carried.turns = carried.turns.max(turns);
 }
 
 /// Lightweight placeholder for an alternate planner model selection. Full
@@ -3259,12 +3807,6 @@ pub trait Harness: Send + Sync {
 /// The `Agent` trait (issue #2) is dyn-compatible via the hand-rolled `BoxFut`
 /// pattern, so no type parameter is needed (issue #45).
 pub struct HarnessConfig {
-    /// Deprecated: superseded by [`ExecutionRegistry`]; physical removal +
-    /// executor migration to registry resolution lands in #124. Still the live
-    /// single-collaborator agent this slice (Option B / additive scope, #120) —
-    /// the run bodies continue to read it until the registry-resolution path
-    /// replaces it.
-    pub agent: Arc<dyn Agent>,
     pub tool_registry: Arc<dyn ToolRegistry>,
     pub sandbox: Arc<dyn SandboxProvider>,
     pub context_manager: Arc<dyn ContextManager>,
@@ -3303,42 +3845,6 @@ pub struct HarnessConfig {
     /// lifecycle events (`PreTurn`, `Stop`, `OnError`, …) through it.
     /// `None` (the default) preserves today's behaviour byte-for-byte.
     pub hooks: Option<Arc<dyn crate::hooks::HookChain>>,
-    /// Optional alternate agent used for the PlanExecute plan phase (issue #70,
-    /// Q1). When the loop strategy is `PlanExecute` and this is `Some`, the
-    /// one-shot plan turn runs on this agent; otherwise it runs on
-    /// [`agent`](Self::agent). `plan_model` on the strategy is descriptive
-    /// metadata only — there is no `ModelConfig`→agent factory.
-    ///
-    /// Deprecated: superseded by [`ExecutionRegistry`] (resolved per-node via a
-    /// strategy's `AgentRef`); physical removal + executor migration to registry
-    /// resolution lands in #124.
-    pub planner_agent: Option<Arc<dyn Agent>>,
-    /// The verification oracle for the `SelfVerifying` loop strategy (issue
-    /// #61). When the loop strategy is `SelfVerifying` and this is `Some`, the
-    /// strategy consults it after each build↔evaluate round-trip and its
-    /// [`max_iterations`](crate::verifier::Verifier::max_iterations) governs the
-    /// round-trip cap (D3). When `None`, `SelfVerifying` is MISCONFIGURED: the
-    /// run returns `Failure { SelfVerifyMisconfigured }` (D4) — it does NOT
-    /// panic. Irrelevant for every other loop strategy. Defaults to `None`.
-    ///
-    /// Deprecated: superseded by [`ExecutionRegistry`] (verifiers resolved by
-    /// key from the registry's `verifiers` map); physical removal + executor
-    /// migration to registry resolution lands in #124.
-    pub verifier: Option<Arc<dyn crate::verifier::Verifier>>,
-    /// Optional alternate agent used for the `SelfVerifying` evaluate phase
-    /// (issue #61, D2). Follows the EXACT same defaulting contract as
-    /// [`planner_agent`](Self::planner_agent): when `None`, the evaluate phase
-    /// runs on [`agent`](Self::agent) (the canonical fallback is
-    /// `config.evaluator_agent.as_ref().unwrap_or(&config.agent)`). The
-    /// evaluate phase always runs on a FRESH [`SessionId::generate`] session and
-    /// a READ-ONLY sandbox derived internally (no `evaluator_sandbox` field) so
-    /// the evaluator cannot be biased by the build session nor mutate the
-    /// workspace it is reviewing (the Default-FAIL contract). Defaults to `None`.
-    ///
-    /// Deprecated: superseded by [`ExecutionRegistry`] (resolved per-node via a
-    /// strategy's `AgentRef`); physical removal + executor migration to registry
-    /// resolution lands in #124.
-    pub evaluator_agent: Option<Arc<dyn Agent>>,
     /// Pluggable per-domain persistence layer (issue #73). Defaults to an
     /// all-no-op [`StorageProvider`] so existing callers/tests compile and
     /// behave unchanged. v1 is expose-only — the run/resume loop is NOT
@@ -3366,15 +3872,6 @@ pub struct HarnessConfig {
     /// byte-for-byte like v1 (the B4→None decision). Irrelevant for every other
     /// loop strategy.
     pub vcs_provider: Option<Arc<dyn VcsProvider>>,
-    /// The scoring oracle for the `HillClimbing` loop strategy (issue #60).
-    /// When the loop strategy is `HillClimbing` and this is `Some`, the harness
-    /// evaluates the workspace metric at iteration 0 (the pure baseline, no
-    /// agent turn) and after every subsequent agent turn, feeding each result
-    /// through [`should_keep`](crate::metric::should_keep). When `None`,
-    /// `HillClimbing` is MISCONFIGURED: the run returns
-    /// `Failure { HillClimbingMisconfigured }` — it does NOT panic. Irrelevant
-    /// for every other loop strategy. Defaults to `None`.
-    pub metric_evaluator: Option<Arc<dyn crate::metric::MetricEvaluator>>,
     /// Catalogue tools accumulated via [`HarnessBuilder::tool`] / `tools`
     /// (issue #81), drained into a populated
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) at
@@ -3453,7 +3950,6 @@ pub struct HarnessConfig {
 impl Clone for HarnessConfig {
     fn clone(&self) -> Self {
         Self {
-            agent: self.agent.clone(),
             tool_registry: self.tool_registry.clone(),
             sandbox: self.sandbox.clone(),
             context_manager: self.context_manager.clone(),
@@ -3468,14 +3964,10 @@ impl Clone for HarnessConfig {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks.clone(),
-            planner_agent: self.planner_agent.clone(),
-            verifier: self.verifier.clone(),
-            evaluator_agent: self.evaluator_agent.clone(),
             storage: self.storage.clone(),
             chunk_provider: self.chunk_provider.clone(),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
-            metric_evaluator: self.metric_evaluator.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
             system_prompt: self.system_prompt.clone(),
             model_params: self.model_params.clone(),
@@ -3529,9 +4021,9 @@ pub struct HarnessBuilder {
     max_repair_attempts: u32,
     max_stop_blocks: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
-    planner_agent: Option<Arc<dyn Agent>>,
+    /// #124: the default SelfVerifying verifier, folded into the registry under
+    /// the empty key at build (no longer a live `HarnessConfig` field).
     verifier: Option<Arc<dyn crate::verifier::Verifier>>,
-    evaluator_agent: Option<Arc<dyn Agent>>,
     storage: Option<Arc<crate::storage::StorageProvider>>,
     /// Conditional prompt-chunk source (issue #79). `None` resolves to an empty
     /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider)
@@ -3610,9 +4102,7 @@ impl HarnessBuilder {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
-            planner_agent: None,
             verifier: None,
-            evaluator_agent: None,
             storage: None,
             chunk_provider: None,
             max_resets: 3,
@@ -3885,17 +4375,7 @@ impl HarnessBuilder {
         self
     }
 
-    /// Inject an alternate agent for the PlanExecute plan phase (issue #70,
-    /// Q1). When set and the loop strategy is `PlanExecute`, the one-shot plan
-    /// turn runs on this agent; otherwise the plan turn runs on the default
-    /// agent. Defaults to `None`.
-    pub fn planner_agent(mut self, planner_agent: Arc<dyn Agent>) -> Self {
-        self.planner_agent = Some(planner_agent);
-        self
-    }
-
-    /// Register a per-kind consult handler (issue #114). Analogous to
-    /// [`planner_agent`](Self::planner_agent). When a worker (run via
+    /// Register a per-kind consult handler (issue #114). When a worker (run via
     /// [`SubagentTool`](crate::tools::SubagentTool)) pauses with a
     /// [`ConsultRequest`] whose `kind` matches `kind`, the orchestrator runs
     /// `handler` on the request deterministically (no orchestrator model turn),
@@ -3992,22 +4472,15 @@ impl HarnessBuilder {
         self
     }
 
-    /// Inject the verification oracle for the `SelfVerifying` loop strategy
-    /// (issue #61). Required for that strategy: without it a `SelfVerifying`
-    /// run halts with `SelfVerifyMisconfigured` (D4). Its
+    /// Inject the default verification oracle for the `SelfVerifying` loop
+    /// strategy (issue #61, #124). Folded into the [`ExecutionRegistry`] under
+    /// the default empty key at build, so a `SelfVerifying` whose `evaluator`
+    /// key is empty resolves to it. Without any resolvable verifier a
+    /// `SelfVerifying` run halts with `SelfVerifyMisconfigured` (D4). Its
     /// [`max_iterations`](crate::verifier::Verifier::max_iterations) caps the
-    /// build↔evaluate round-trips (D3). Defaults to `None`.
+    /// build↔evaluate round-trips (D3).
     pub fn verifier(mut self, verifier: Arc<dyn crate::verifier::Verifier>) -> Self {
         self.verifier = Some(verifier);
-        self
-    }
-
-    /// Inject an alternate agent for the `SelfVerifying` evaluate phase (issue
-    /// #61, D2). Mirrors [`planner_agent`](Self::planner_agent): when set and
-    /// the loop strategy is `SelfVerifying`, the evaluate phase runs on this
-    /// agent; otherwise it runs on the default agent. Defaults to `None`.
-    pub fn evaluator_agent(mut self, evaluator_agent: Arc<dyn Agent>) -> Self {
-        self.evaluator_agent = Some(evaluator_agent);
         self
     }
 
@@ -4144,8 +4617,24 @@ impl HarnessBuilder {
                 Arc::new(crate::storage::StorageProvider::no_op())
             }
         });
+        // #124: the legacy single-collaborator fields are gone — fold the
+        // builder's collaborators into the ExecutionRegistry under the DEFAULT
+        // empty-string handle (`ReactConfig::per_loop` uses an empty `AgentRef`/
+        // `ToolsetRef`; the default `SelfVerifyingConfig.evaluator` /
+        // `HillClimbingConfig.evaluator` likewise use the empty key). Explicitly
+        // registered handles (via `registry`) take precedence: only fill a key
+        // the caller did not already wire.
+        let mut reg_builder = self.registry.into_builder();
+        reg_builder = reg_builder.fill_default_agent(self.agent);
+        reg_builder = reg_builder.fill_default_toolset(self.tool_registry.clone());
+        if let Some(v) = self.verifier {
+            reg_builder = reg_builder.fill_default_verifier(v);
+        }
+        if let Some(m) = self.metric_evaluator {
+            reg_builder = reg_builder.fill_default_metric_evaluator(m);
+        }
+        let registry = reg_builder.build();
         HarnessConfig {
-            agent: self.agent,
             tool_registry: self.tool_registry,
             sandbox: self.sandbox,
             context_manager: self.context_manager,
@@ -4160,23 +4649,19 @@ impl HarnessBuilder {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             hooks: self.hooks,
-            planner_agent: self.planner_agent,
-            verifier: self.verifier,
-            evaluator_agent: self.evaluator_agent,
             storage,
             chunk_provider: self.chunk_provider.unwrap_or_else(|| {
                 Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
             }),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider,
-            metric_evaluator: self.metric_evaluator,
             catalogue_registry,
             system_prompt: self.system_prompt,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
             prompt_tool_call_flag: self.prompt_tool_call_flag,
             consult_handlers: self.consult_handlers,
-            registry: self.registry,
+            registry,
             escalation_mode: self.escalation_mode,
         }
     }
@@ -4243,8 +4728,9 @@ impl StandardHarness {
         task_id: &TaskId,
         span_seq: &mut u64,
         usage: &mut AggregateUsage,
+        agent: Arc<dyn Agent>,
     ) {
-        self.run_compaction(session_state, session_id, task_id, span_seq, usage)
+        self.run_compaction(session_state, session_id, task_id, span_seq, usage, &agent)
             .await;
     }
 
@@ -4542,6 +5028,42 @@ impl StandardHarness {
     /// Drive the ReAct loop, then finalize observability for terminal outcomes.
     /// A `WaitingForHuman` pause is not terminal, so it is never flushed here —
     /// the eventual `resume` path reaches a terminal outcome and flushes then.
+    /// Resolve the worker agent for a [`LoopStrategy`] tree from the
+    /// [`ExecutionRegistry`] (#124). The worker is the agent on the LEAF reached
+    /// by descending the recursion: a `ReAct` leaf's `agent`; a combinator
+    /// descends into its primary worker child (`inner` / `execute`). A `Ralph`
+    /// with a non-empty `agent` override resolves THAT (Q3). Returns the resolved
+    /// agent, or a typed `UnresolvedHandle` failure carried as `Err`.
+    fn resolve_worker_agent(&self, ls: &LoopStrategy) -> Result<Arc<dyn Agent>, HarnessError> {
+        let key = self.worker_agent_key(ls);
+        self.config
+            .registry
+            .resolve_agent(&AgentRef(key.clone()))
+            .cloned()
+            .ok_or(HarnessError::UnresolvedHandle {
+                kind: "agent".to_string(),
+                key,
+            })
+    }
+
+    /// The agent key the worker leaf of `ls` references (see
+    /// [`resolve_worker_agent`](Self::resolve_worker_agent)).
+    fn worker_agent_key(&self, ls: &LoopStrategy) -> String {
+        match ls {
+            LoopStrategy::ReAct(c) => c.agent.0.clone(),
+            LoopStrategy::PlanExecute(c) => self.worker_agent_key(&c.execute),
+            LoopStrategy::SelfVerifying(c) => self.worker_agent_key(&c.inner),
+            LoopStrategy::Ralph(c) => {
+                if c.agent.0.is_empty() {
+                    self.worker_agent_key(&c.inner)
+                } else {
+                    c.agent.0.clone()
+                }
+            }
+            LoopStrategy::HillClimbing(c) => self.worker_agent_key(&c.inner),
+        }
+    }
+
     async fn run_react(
         &self,
         task: Task,
@@ -4549,9 +5071,17 @@ impl StandardHarness {
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        agent: Arc<dyn Agent>,
     ) -> RunResult {
         let result = self
-            .run_react_inner(task, max_iterations, session_state, budget_used, on_stream)
+            .run_react_inner(
+                task,
+                max_iterations,
+                session_state,
+                budget_used,
+                on_stream,
+                agent,
+            )
             .await;
         match &result {
             RunResult::Success { session_id, .. } => {
@@ -4613,6 +5143,10 @@ impl StandardHarness {
         mut session_state: SessionState,
         mut budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        // #124: the worker agent is RESOLVED by the caller (the recursing
+        // `ReactConfig::run` resolves `self.agent` from the registry; Ralph may
+        // override it per window). The leaf no longer reads `config.agent`.
+        agent: Arc<dyn Agent>,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
@@ -4799,14 +5333,14 @@ impl StandardHarness {
                     let mapped = Self::map_model_stream_event(ev, state);
                     buffer.extend(mapped);
                 });
-                let r = self.config.agent.turn_streaming(context, adapter).await;
+                let r = agent.turn_streaming(context, adapter).await;
                 let events = std::mem::take(&mut shared.lock().expect("stream buffer poisoned").1);
                 for ev in events {
                     Self::emit(&on_stream, ev);
                 }
                 r
             } else {
-                self.config.agent.turn(context).await
+                agent.turn(context).await
             };
             budget_used.turns += 1;
             // Emit a turn span for every model call (issue #12). Fire-and-forget;
@@ -5599,6 +6133,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             &task.id,
                             &mut span_seq,
                             &mut usage,
+                            &agent,
                         )
                         .await;
                     }
@@ -5670,154 +6205,6 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //   - R11 `verifier == None` ⇒ `Failure { SelfVerifyMisconfigured }`.
     //
     // No `// SPEC QUESTION:` markers — all four forks (D1–D4) are resolved.
-    async fn run_self_verifying(
-        &self,
-        task: Task,
-        mut session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        _on_stream: Option<StreamSink>,
-    ) -> RunResult {
-        let build_session_id = task.session_id.clone();
-
-        // D4/R11: a missing verifier is a typed halt, not a panic.
-        let verifier = match self.config.verifier.as_ref() {
-            Some(v) => v.clone(),
-            None => {
-                let result = RunResult::Failure {
-                    reason: HaltReason::SelfVerifyMisconfigured {
-                        reason: "SelfVerifying requires `config.verifier`, but it is None"
-                            .to_string(),
-                    },
-                    session_id: build_session_id,
-                    usage: AggregateUsage::default(),
-                    turns: 0,
-                    session_state: SessionState::default(),
-                };
-                self.finalize_self_verifying(&result).await;
-                return result;
-            }
-        };
-
-        let max_iterations = verifier.max_iterations();
-        // Shared budget threaded across every build + evaluate sub-run (R8).
-        let mut carried = budget_used;
-        // Cumulative usage across ALL build + evaluate runs of ALL iterations.
-        let mut total_usage = AggregateUsage::default();
-        // The most recent verifier failure reason (for SelfVerifyExhausted).
-        let mut last_reason = String::new();
-
-        for iteration in 0..max_iterations {
-            // ── Build phase (R1): bounded ReAct sub-loop carrying the shared
-            //    budget. The first iteration's seed instruction is already in
-            //    `session_state` (from `run_inner`); later iterations already
-            //    have the prior verdict reason injected as a user message (R6).
-            let build_task = Task {
-                id: task.id.clone(),
-                instruction: task.instruction.clone(),
-                session_id: build_session_id.clone(),
-                budget: task.budget.clone(),
-                loop_strategy: task.loop_strategy.clone(),
-            };
-            let build_cap = task.budget.max_turns.unwrap_or(u32::MAX);
-            let build_result = self
-                .run_react_inner(
-                    build_task,
-                    build_cap,
-                    session_state.clone(),
-                    carried.clone(),
-                    // Sub-loops run with a suppressed sink (mirrors PlanExecute);
-                    // terminal observability is finalized by this strategy.
-                    None,
-                )
-                .await;
-            Self::fold_usage(&mut total_usage, &mut carried, &build_result);
-
-            // A build run that paused / escalated is propagated up unchanged —
-            // the caller must handle it before verification can resume.
-            match &build_result {
-                RunResult::WaitingForHuman { state, request } => {
-                    return RunResult::WaitingForHuman {
-                        state: state.clone(),
-                        request: request.clone(),
-                    };
-                }
-                RunResult::Escalate { .. } => {
-                    self.finalize_self_verifying(&build_result).await;
-                    return build_result;
-                }
-                _ => {}
-            }
-
-            // ── Evaluate phase (R2/R3/R4): a fresh evaluator RUN. Distinct
-            //    generated session id (never shared with build — R2/R9), a
-            //    read-only sandbox derived internally (R3), the evaluator agent
-            //    (D2 defaulting), and the `role-evaluator` chunk (R4).
-            let eval_result = self
-                .run_evaluate_phase(&task, &mut carried, &mut total_usage)
-                .await;
-
-            // ── Verdict.
-            let input = VerifierInput {
-                build_result,
-                eval_result,
-                workspace: self.config.sandbox.workspace_root().to_path_buf(),
-                iteration,
-            };
-            match verifier.verify(&input).await {
-                VerifierVerdict::Passed => {
-                    // Reuse the build run's output as the run's output. Carry the
-                    // build run's final conversation history into the terminal
-                    // result (issue #102) so a SelfVerifying caller resumes
-                    // losslessly; fall back to the running build context.
-                    let (output, turns, final_state) = match input.build_result {
-                        RunResult::Success {
-                            output,
-                            turns,
-                            session_state: st,
-                            ..
-                        } => (output, turns, st),
-                        // A non-Success build can still be `Passed` only if a
-                        // bespoke verifier says so; fall back to a generic handle.
-                        _ => (String::new(), carried.turns, session_state.clone()),
-                    };
-                    let result = RunResult::Success {
-                        output,
-                        session_id: build_session_id,
-                        usage: total_usage,
-                        turns,
-                        session_state: final_state,
-                    };
-                    self.finalize_self_verifying(&result).await;
-                    return result;
-                }
-                VerifierVerdict::Failed { reason } => {
-                    // R5/R6: Default-FAIL keeps looping; inject the reason into
-                    // the build context via the SAME path the Stop-block uses
-                    // (append a user message) so the next build iteration sees it.
-                    last_reason = reason.clone();
-                    self.config
-                        .context_manager
-                        .append_user_message(&mut session_state, &reason)
-                        .await;
-                }
-            }
-        }
-
-        // R7: ran out of round-trips without a pass — clean exhaustion.
-        let result = RunResult::Failure {
-            reason: HaltReason::SelfVerifyExhausted {
-                iterations: max_iterations,
-                last_reason,
-            },
-            session_id: build_session_id,
-            usage: total_usage,
-            turns: carried.turns,
-            session_state,
-        };
-        self.finalize_self_verifying(&result).await;
-        result
-    }
-
     /// Run the SelfVerifying evaluate phase (issue #61): a fresh evaluator RUN
     /// over a read-only sandbox in a never-shared session.
     ///
@@ -5831,17 +6218,10 @@ tool. Use the provided tool-call format to actually invoke the tool."
     async fn run_evaluate_phase(
         &self,
         task: &Task,
+        evaluator: Arc<dyn Agent>,
         carried: &mut BudgetSnapshot,
         total_usage: &mut AggregateUsage,
     ) -> RunResult {
-        // D2: evaluator agent defaulting — identical contract to `planner_agent`.
-        let evaluator = self
-            .config
-            .evaluator_agent
-            .as_ref()
-            .unwrap_or(&self.config.agent)
-            .clone();
-
         // R3: derive a read-only sandbox internally from the build sandbox.
         let read_only_sandbox: Arc<dyn SandboxProvider> =
             Arc::new(ReadOnlySandbox::new(self.config.sandbox.clone()));
@@ -5877,11 +6257,12 @@ tool. Use the provided tool-call format to actually invoke the tool."
             )),
         };
 
-        // Child harness: clone the config, swap agent + sandbox. Cloning shares
-        // the same observability/storage seams so the evaluate run's spans land
-        // in the SAME trace stream (distinguished by its distinct session id).
+        // Child harness: clone the config, swap the sandbox to read-only. Cloning
+        // shares the same observability/storage seams so the evaluate run's spans
+        // land in the SAME trace stream (distinguished by its distinct session
+        // id). The evaluate agent is passed to `run_react` directly (#124 — no
+        // `config.agent`).
         let mut eval_config = self.config.clone();
-        eval_config.agent = evaluator;
         eval_config.sandbox = read_only_sandbox;
         let eval_harness = StandardHarness::new(eval_config);
 
@@ -5894,10 +6275,17 @@ tool. Use the provided tool-call format to actually invoke the tool."
 
         let cap = task.budget.max_turns.unwrap_or(u32::MAX);
         let eval_result = eval_harness
-            .run_react(eval_task, cap, eval_state, BudgetSnapshot::default(), None)
+            .run_react(
+                eval_task,
+                cap,
+                eval_state,
+                BudgetSnapshot::default(),
+                None,
+                evaluator,
+            )
             .await;
 
-        Self::fold_usage(total_usage, carried, &eval_result);
+        fold_usage(total_usage, carried, &eval_result);
         eval_result
     }
 
@@ -5911,60 +6299,6 @@ tool. Use the provided tool-call format to actually invoke the tool."
             .into_iter()
             .find(|c| c.id == "role-evaluator")
             .map(|c| c.content)
-    }
-
-    /// Fold a sub-run's token usage / turn count into the cumulative
-    /// `total_usage` and the shared `carried` budget snapshot (R8). Mirrors the
-    /// PlanExecute budget fold. `carried.turns` becomes the sub-run's ABSOLUTE
-    /// turn count (the build sub-loop already gates on cumulative turns); the
-    /// evaluate run reports its own fresh-session turns, which are added in.
-    fn fold_usage(total_usage: &mut AggregateUsage, carried: &mut BudgetSnapshot, r: &RunResult) {
-        let (usage, turns) = match r {
-            RunResult::Success { usage, turns, .. }
-            | RunResult::Failure { usage, turns, .. }
-            | RunResult::Escalate { usage, turns, .. } => (usage, *turns),
-            RunResult::WaitingForHuman { .. } => return,
-            // A consult pause carries usage/turns but is non-terminal; like
-            // WaitingForHuman, do not fold it into a sub-run total.
-            RunResult::Consult { .. } => return,
-        };
-        total_usage.input_tokens += usage.input_tokens;
-        total_usage.output_tokens += usage.output_tokens;
-        total_usage.cache_read_tokens += usage.cache_read_tokens;
-        total_usage.cache_write_tokens += usage.cache_write_tokens;
-        total_usage.cost_usd += usage.cost_usd;
-        carried.input_tokens += usage.input_tokens;
-        carried.output_tokens += usage.output_tokens;
-        carried.turns = carried.turns.max(turns);
-    }
-
-    /// Finalize observability for a terminal SelfVerifying outcome. Mirrors the
-    /// tail of [`run_react`](Self::run_react) / [`finalize_plan_execute`].
-    /// `WaitingForHuman` is not terminal and is never flushed here.
-    async fn finalize_self_verifying(&self, result: &RunResult) {
-        match result {
-            RunResult::Success { session_id, .. } => {
-                self.finalize_observability(session_id, SessionOutcome::Success)
-                    .await;
-            }
-            RunResult::Failure {
-                session_id, reason, ..
-            } => {
-                self.finalize_observability(
-                    session_id,
-                    SessionOutcome::Failure {
-                        reason: format!("{reason:?}"),
-                    },
-                )
-                .await;
-            }
-            RunResult::WaitingForHuman { .. } => {}
-            RunResult::Consult { .. } => {}
-            RunResult::Escalate { session_id, .. } => {
-                self.finalize_observability(session_id, SessionOutcome::Escalated)
-                    .await;
-            }
-        }
     }
 
     // ========================================================================
@@ -6027,172 +6361,6 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //         window, finalized via observability).
     //
     // No `// SPEC QUESTION:` markers — B1–B4 are resolved.
-    async fn run_ralph(
-        &self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        _on_stream: Option<StreamSink>,
-    ) -> RunResult {
-        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
-        let max_resets = self.config.max_resets;
-        // Ralph's incoming budget snapshot is irrelevant — each context window is
-        // a fresh start with its own per-window turn budget (the reset discards
-        // the turn budget along with the SessionState). Token/turn accounting is
-        // accumulated separately for terminal reporting (R6).
-        let _ = budget_used;
-
-        // Cumulative usage + turns across ALL context windows (R6).
-        let mut total_usage = AggregateUsage::default();
-        let mut cumulative_turns: u32 = 0;
-        // The most recent incompletion reason (for RalphCompletionUnmet).
-        let mut last_reason = String::from(".spore/progress.json missing");
-        // Session id of the most recent context window (terminal accounting).
-        let mut last_session_id = task.session_id.clone();
-
-        // The OUTER loop: each iteration is ONE context window. `max_resets`
-        // caps the number of windows (B3). Iteration 0 is the first window; a
-        // reset is the transition into the next iteration (R1).
-        for iteration in 0..max_resets.max(1) {
-            // R7: a fresh, distinct session id per context window so each reset
-            // is independently traceable.
-            let window_session_id = if iteration == 0 {
-                task.session_id.clone()
-            } else {
-                SessionId::generate()
-            };
-            last_session_id = window_session_id.clone();
-
-            // R2: a FRESH SessionState per window — discard the prior one. No
-            // message carryover; the window is re-seeded from scratch.
-            let mut session_state = SessionState::default();
-
-            // Seed the instruction (R2) then R3: reload the deterministic
-            // `.spore/` state from the filesystem and inject it as context so the
-            // fresh window knows what is already done / still outstanding.
-            self.config
-                .context_manager
-                .append_user_message(&mut session_state, &task.instruction)
-                .await;
-            if let Some(reload) = Self::ralph_reload_context(&workspace_root) {
-                self.config
-                    .context_manager
-                    .append_user_message(&mut session_state, &reload)
-                    .await;
-            }
-            // R3 (issue #58 v2): when a `VcsProvider` is wired, ALSO reload git
-            // history and inject it as a delimited "Recent VCS history:" section,
-            // exactly as the `.spore/` reload content is injected. When the
-            // provider is `None` (the default), this section is omitted entirely
-            // — Ralph's reloaded context is then byte-for-byte the v1 behavior
-            // (the B4→None decision).
-            if let Some(vcs) = &self.config.vcs_provider {
-                let args = VcsLogArgs {
-                    max_entries: 20,
-                    since_ref: None,
-                    format: None,
-                };
-                if let Ok(log) = vcs.log(&args).await {
-                    let trimmed = log.trim();
-                    if !trimmed.is_empty() {
-                        let block = format!("Recent VCS history:\n{trimmed}");
-                        self.config
-                            .context_manager
-                            .append_user_message(&mut session_state, &block)
-                            .await;
-                    }
-                }
-            }
-
-            // The per-window bounded ReAct sub-loop. The registered Stop hook
-            // (B1) fires inside it on each `FinalResponse`: while incomplete it
-            // blocks (capped by `max_stop_blocks`), forcing more work within the
-            // window; this strategy's OUTER loop then decides reset vs success.
-            let window_task = Task {
-                id: task.id.clone(),
-                instruction: task.instruction.clone(),
-                session_id: window_session_id.clone(),
-                budget: task.budget.clone(),
-                loop_strategy: task.loop_strategy.clone(),
-            };
-            let window_cap = task.budget.max_turns.unwrap_or(u32::MAX);
-            // FRESH per-window budget: the context-window reset resets the turn
-            // budget too. Token fold is accumulated separately via `total_usage`.
-            let mut carried = BudgetSnapshot::default();
-            let window_result = self
-                .run_react_inner(
-                    window_task,
-                    window_cap,
-                    session_state,
-                    carried.clone(),
-                    None,
-                )
-                .await;
-            Self::fold_usage(&mut total_usage, &mut carried, &window_result);
-            cumulative_turns += carried.turns;
-
-            // A window that paused / escalated is propagated up unchanged.
-            match &window_result {
-                RunResult::WaitingForHuman { state, request } => {
-                    return RunResult::WaitingForHuman {
-                        state: state.clone(),
-                        request: request.clone(),
-                    };
-                }
-                RunResult::Escalate { .. } => {
-                    self.finalize_self_verifying(&window_result).await;
-                    return window_result;
-                }
-                _ => {}
-            }
-
-            // External completion check (B1): consult the SAME filesystem state
-            // the Stop hook reads. `None` ⇒ done ⇒ Success; `Some(reason)` ⇒
-            // tasks remain ⇒ reset into the next window (R1) unless the cap is
-            // reached (R5).
-            match Self::ralph_completion_status(&workspace_root) {
-                None => {
-                    // Carry the final context window's history into the terminal
-                    // result (issue #102).
-                    let (output, final_state) = match window_result {
-                        RunResult::Success {
-                            output,
-                            session_state,
-                            ..
-                        } => (output, session_state),
-                        _ => (String::new(), SessionState::default()),
-                    };
-                    let result = RunResult::Success {
-                        output,
-                        session_id: window_session_id,
-                        usage: total_usage,
-                        turns: cumulative_turns,
-                        session_state: final_state,
-                    };
-                    self.finalize_self_verifying(&result).await;
-                    return result;
-                }
-                Some(reason) => {
-                    last_reason = reason;
-                    let _ = iteration;
-                }
-            }
-        }
-
-        // R5: ran out of context-window resets without completion.
-        let result = RunResult::Failure {
-            reason: HaltReason::RalphCompletionUnmet {
-                iterations: max_resets.max(1),
-                last_reason,
-            },
-            session_id: last_session_id,
-            usage: total_usage,
-            turns: cumulative_turns,
-            session_state: SessionState::default(),
-        };
-        self.finalize_self_verifying(&result).await;
-        result
-    }
-
     /// Ralph external completion check (issue #58, B1). Reads the deterministic
     /// `.spore/` files under `workspace_root` and reports whether the task is
     /// complete. Returns `None` when complete, `Some(reason)` when tasks remain
@@ -6338,341 +6506,6 @@ tool. Use the provided tool-call format to actually invoke the tool."
     //      No panic.
     //
     // No `// SPEC QUESTION:` markers — all six decisions are resolved.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_hill_climbing(
-        &self,
-        task: Task,
-        direction: HillClimbingDirection,
-        max_stagnation: Option<u32>,
-        revert_on_no_improvement: bool,
-        min_improvement_delta: Option<f64>,
-        budget_used: BudgetSnapshot,
-        _on_stream: Option<StreamSink>,
-    ) -> RunResult {
-        use crate::metric::{should_keep, IterationStatus, MetricResult, ResultsEntry};
-        use crate::termination::SessionStateSnapshot;
-
-        let session_id = task.session_id.clone();
-        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
-
-        // Decision 6: a missing evaluator is a typed halt, not a panic.
-        let evaluator = match self.config.metric_evaluator.as_ref() {
-            Some(e) => e.clone(),
-            None => {
-                let result = RunResult::Failure {
-                    reason: HaltReason::HillClimbingMisconfigured {
-                        reason: "HillClimbing requires `config.metric_evaluator`, but it is None"
-                            .to_string(),
-                    },
-                    session_id,
-                    usage: AggregateUsage::default(),
-                    turns: 0,
-                    session_state: SessionState::default(),
-                };
-                self.finalize_self_verifying(&result).await;
-                return result;
-            }
-        };
-
-        let description = evaluator.description();
-        // Per-iteration observability span counter.
-        let mut span_seq: u64 = 0;
-        // Cumulative usage + turns across ALL agent-turn iterations.
-        let mut total_usage = AggregateUsage::default();
-        // Shared budget threaded across every agent sub-run.
-        let mut carried = budget_used;
-        // The TSV rows, in iteration order.
-        let mut rows: Vec<ResultsEntry> = Vec::new();
-
-        // A snapshot for the evaluator. HillClimbing keeps no carried message
-        // state of its own (each iteration is a fresh sub-run), so a default
-        // SessionState is the right snapshot to hand the evaluator.
-        let snapshot = SessionStateSnapshot::new(
-            session_id.clone(),
-            task.id.clone(),
-            SessionState::default(),
-            workspace_root.clone(),
-        );
-
-        // ── Iteration 0: pure baseline. No agent turn (Decision 5).
-        let baseline = evaluator
-            .evaluate(self.config.sandbox.as_ref(), &snapshot)
-            .await;
-        let mut current_best = match baseline {
-            Ok(MetricResult {
-                value, duration, ..
-            }) => {
-                rows.push(ResultsEntry {
-                    iteration: 0,
-                    commit_hash: self.hill_climbing_commit_hash().await,
-                    metric_value: value,
-                    direction,
-                    status: IterationStatus::Kept,
-                    duration,
-                    description: description.clone(),
-                    metadata: Default::default(),
-                });
-                self.emit_hill_climbing_span(
-                    &session_id,
-                    &task.id,
-                    &mut span_seq,
-                    0,
-                    Some(value),
-                    None,
-                    IterationStatus::Kept,
-                    false,
-                );
-                value
-            }
-            Err(err) => {
-                // A baseline that cannot even be measured is a misconfiguration of
-                // the experiment, not a non-improvement to climb away from — there
-                // is no `current_best` to compare against. Record the failed row,
-                // write the TSV, and halt.
-                let status = IterationStatus::from_error(&err);
-                rows.push(ResultsEntry {
-                    iteration: 0,
-                    commit_hash: self.hill_climbing_commit_hash().await,
-                    // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-                    metric_value: f64::NAN,
-                    direction,
-                    status,
-                    duration: Duration::ZERO,
-                    description: description.clone(),
-                    metadata: Default::default(),
-                });
-                self.emit_hill_climbing_span(
-                    &session_id,
-                    &task.id,
-                    &mut span_seq,
-                    0,
-                    None,
-                    None,
-                    status,
-                    false,
-                );
-                self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
-                    .await;
-                let result = RunResult::Failure {
-                    reason: HaltReason::HillClimbingMisconfigured {
-                        reason: format!("baseline evaluation failed: {err}"),
-                    },
-                    session_id,
-                    usage: total_usage,
-                    turns: carried.turns,
-                    session_state: SessionState::default(),
-                };
-                self.finalize_self_verifying(&result).await;
-                return result;
-            }
-        };
-
-        // Consecutive non-improvement counter (Decision-driven stagnation halt).
-        let mut stagnation: u32 = 0;
-        // The 0-based iteration index; agent turns begin at 1.
-        let mut iteration: u32 = 1;
-
-        loop {
-            // Budget gate before the iteration's agent turn (mirrors run_react).
-            let turn_cap = task.budget.max_turns.unwrap_or(u32::MAX);
-            if carried.turns >= turn_cap {
-                break;
-            }
-            if let Some(limit_type) = Self::budget_exceeded(&task.budget, &carried, Instant::now())
-            {
-                // A wall-time/cost/token cap reached BEFORE any iteration work is a
-                // clean budget halt — but only surface it as a failure when no
-                // iteration has produced an improvement to report. We mirror
-                // run_react's contract: budget gates terminate with BudgetExceeded.
-                self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
-                    .await;
-                let result = RunResult::Failure {
-                    reason: HaltReason::BudgetExceeded { limit_type },
-                    session_id,
-                    usage: total_usage,
-                    turns: carried.turns,
-                    session_state: SessionState::default(),
-                };
-                self.finalize_self_verifying(&result).await;
-                return result;
-            }
-
-            // ── One bounded agent turn proposes a change. The sub-run carries the
-            //    shared budget so per-iteration turns count toward the cap.
-            let iter_task = Task {
-                id: task.id.clone(),
-                instruction: task.instruction.clone(),
-                session_id: session_id.clone(),
-                budget: task.budget.clone(),
-                loop_strategy: task.loop_strategy.clone(),
-            };
-            let mut iter_state = SessionState::default();
-            self.config
-                .context_manager
-                .append_user_message(&mut iter_state, &task.instruction)
-                .await;
-            let turn_result = self
-                .run_react_inner(iter_task, turn_cap, iter_state, carried.clone(), None)
-                .await;
-            Self::fold_usage(&mut total_usage, &mut carried, &turn_result);
-
-            // A turn that paused / escalated is propagated up unchanged.
-            match &turn_result {
-                RunResult::WaitingForHuman { state, request } => {
-                    return RunResult::WaitingForHuman {
-                        state: state.clone(),
-                        request: request.clone(),
-                    };
-                }
-                RunResult::Escalate { .. } => {
-                    self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
-                        .await;
-                    self.finalize_self_verifying(&turn_result).await;
-                    return turn_result;
-                }
-                _ => {}
-            }
-
-            // ── Evaluate the metric after the change.
-            let eval = evaluator
-                .evaluate(self.config.sandbox.as_ref(), &snapshot)
-                .await;
-            match eval {
-                Ok(MetricResult {
-                    value, duration, ..
-                }) => {
-                    let kept = should_keep(value, current_best, direction, min_improvement_delta);
-                    let delta = match direction {
-                        HillClimbingDirection::Minimize => current_best - value,
-                        HillClimbingDirection::Maximize => value - current_best,
-                    };
-                    if kept {
-                        current_best = value;
-                        stagnation = 0;
-                        rows.push(ResultsEntry {
-                            iteration,
-                            commit_hash: self.hill_climbing_commit_hash().await,
-                            metric_value: value,
-                            direction,
-                            status: IterationStatus::Kept,
-                            duration,
-                            description: description.clone(),
-                            metadata: Default::default(),
-                        });
-                        self.emit_hill_climbing_span(
-                            &session_id,
-                            &task.id,
-                            &mut span_seq,
-                            iteration,
-                            Some(value),
-                            Some(delta),
-                            IterationStatus::Kept,
-                            false,
-                        );
-                    } else {
-                        // No improvement (Decision 1: optionally revert).
-                        let reverted = if revert_on_no_improvement {
-                            self.hill_climbing_revert().await;
-                            true
-                        } else {
-                            false
-                        };
-                        stagnation += 1;
-                        rows.push(ResultsEntry {
-                            iteration,
-                            commit_hash: self.hill_climbing_commit_hash().await,
-                            metric_value: value,
-                            direction,
-                            status: IterationStatus::Discarded,
-                            duration,
-                            description: description.clone(),
-                            metadata: Default::default(),
-                        });
-                        self.emit_hill_climbing_span(
-                            &session_id,
-                            &task.id,
-                            &mut span_seq,
-                            iteration,
-                            Some(value),
-                            Some(delta),
-                            IterationStatus::Discarded,
-                            reverted,
-                        );
-                    }
-                }
-                Err(err) => {
-                    // Crash/timeout/etc.: counts as a non-improvement. Optionally
-                    // revert, increment stagnation, record an empty-metric row.
-                    let status = IterationStatus::from_error(&err);
-                    let reverted = if revert_on_no_improvement {
-                        self.hill_climbing_revert().await;
-                        true
-                    } else {
-                        false
-                    };
-                    stagnation += 1;
-                    rows.push(ResultsEntry {
-                        iteration,
-                        commit_hash: self.hill_climbing_commit_hash().await,
-                        // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-                        metric_value: f64::NAN,
-                        direction,
-                        status,
-                        duration: Duration::ZERO,
-                        description: description.clone(),
-                        metadata: Default::default(),
-                    });
-                    self.emit_hill_climbing_span(
-                        &session_id,
-                        &task.id,
-                        &mut span_seq,
-                        iteration,
-                        None,
-                        None,
-                        status,
-                        reverted,
-                    );
-                }
-            }
-
-            // ── Stagnation halt (only when a cap is configured).
-            if let Some(limit) = max_stagnation {
-                if stagnation >= limit {
-                    self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
-                        .await;
-                    let result = RunResult::Failure {
-                        reason: HaltReason::StagnationLimitReached {
-                            iterations: stagnation,
-                            best_metric: current_best,
-                        },
-                        session_id,
-                        usage: total_usage,
-                        turns: carried.turns,
-                        session_state: SessionState::default(),
-                    };
-                    self.finalize_self_verifying(&result).await;
-                    return result;
-                }
-            }
-
-            iteration = iteration.saturating_add(1);
-        }
-
-        // Budget/turn cap reached without a stagnation halt — clean budget halt.
-        self.write_hill_climbing_tsv(&workspace_root, &task.id, &rows)
-            .await;
-        let result = RunResult::Failure {
-            reason: HaltReason::BudgetExceeded {
-                limit_type: BudgetLimitType::Turns,
-            },
-            session_id,
-            usage: total_usage,
-            turns: carried.turns,
-            session_state: SessionState::default(),
-        };
-        self.finalize_self_verifying(&result).await;
-        result
-    }
 
     /// Revert the working tree to current HEAD for a no-improvement iteration
     /// (issue #60, Decision 1). Runs `git reset --hard HEAD` THROUGH the sandbox;
@@ -6969,6 +6802,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
         task_id: &TaskId,
         span_seq: &mut u64,
         usage: &mut AggregateUsage,
+        // #124: the compaction summary turn runs on the SAME resolved worker
+        // agent driving the ReAct window (no `config.agent`).
+        agent: &Arc<dyn Agent>,
     ) {
         let Some(mut turn) = self
             .config
@@ -6985,7 +6821,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
         loop {
             attempt += 1;
             // Run one compaction turn through the agent to produce a summary.
-            let result = self.config.agent.turn(turn.context.clone()).await;
+            let result = agent.turn(turn.context.clone()).await;
             let summary = match result {
                 TurnResult::FinalResponse {
                     content, usage: u, ..
@@ -7165,11 +7001,74 @@ impl StrategyExecutor for StandardHarness {
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
+        agent: Arc<dyn Agent>,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
-            self.run_react_inner(task, max_iterations, session_state, budget_used, on_stream)
+            self.run_react_inner(
+                task,
+                max_iterations,
+                session_state,
+                budget_used,
+                on_stream,
+                agent,
+            )
+            .await
+        })
+    }
+
+    fn resolve_agent_ref(
+        &self,
+        r: &AgentRef,
+        session_id: &SessionId,
+    ) -> Result<Arc<dyn Agent>, Box<RunResult>> {
+        self.config
+            .registry
+            .resolve_agent(r)
+            .cloned()
+            .ok_or_else(|| {
+                Box::new(RunResult::Failure {
+                    reason: HaltReason::ConfigurationError {
+                        error: HarnessError::UnresolvedHandle {
+                            kind: "agent".to_string(),
+                            key: r.0.clone(),
+                        },
+                    },
+                    session_id: session_id.clone(),
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                    session_state: SessionState::default(),
+                })
+            })
+    }
+
+    fn evaluate_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        eval_agent: Arc<dyn Agent>,
+        carried: &'a mut BudgetSnapshot,
+        total_usage: &'a mut AggregateUsage,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_evaluate_phase(task, eval_agent, carried, total_usage)
                 .await
         })
+    }
+
+    fn append_user_message<'a>(
+        &'a self,
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.config
+                .context_manager
+                .append_user_message(session_state, text)
+                .await;
+        })
+    }
+
+    fn workspace_root(&self) -> std::path::PathBuf {
+        self.config.sandbox.workspace_root().to_path_buf()
     }
 
     fn seed_user_message<'a>(
@@ -7210,31 +7109,16 @@ impl StrategyExecutor for StandardHarness {
         budget_used: BudgetSnapshot,
     ) -> BoxFut<'a, Option<RunResult>> {
         Box::pin(async move {
-            // R5/R6: route the planner agent. When `planner_agent` is configured
-            // the plan child runs against an agent-swapped child harness (same
-            // pattern as the SelfVerifying evaluate phase); otherwise the default
-            // agent runs through `self`. Either way the child's `.run(cx)` drives
-            // the WHOLE plan loop (genuine recursion).
-            if let Some(planner) = self.config.planner_agent.as_ref() {
-                let mut plan_config = self.config.clone();
-                plan_config.agent = planner.clone();
-                let plan_harness = StandardHarness::new(plan_config);
-                let mut cx = ExecutionContext::new(&plan_harness.config.registry);
-                cx.executor = Some(&plan_harness);
-                cx.scratch.run_session = plan_session;
-                cx.scratch.run_budget = budget_used;
-                cx.scratch.task = Some(plan_task);
-                let _ = plan.run(&mut cx).await;
-                cx.scratch.terminal_override.take()
-            } else {
-                let mut cx = ExecutionContext::new(&self.config.registry);
-                cx.executor = Some(self);
-                cx.scratch.run_session = plan_session;
-                cx.scratch.run_budget = budget_used;
-                cx.scratch.task = Some(plan_task);
-                let _ = plan.run(&mut cx).await;
-                cx.scratch.terminal_override.take()
-            }
+            // #124 Q1: the planner concept is DROPPED — the plan child's leaf
+            // `ReactConfig.agent` is authoritative and resolved by the recursing
+            // leaf itself. The child's `.run(cx)` drives the WHOLE plan loop.
+            let mut cx = ExecutionContext::new(&self.config.registry);
+            cx.executor = Some(self);
+            cx.scratch.run_session = plan_session;
+            cx.scratch.run_budget = budget_used;
+            cx.scratch.task = Some(plan_task);
+            let _ = plan.run(&mut cx).await;
+            cx.scratch.terminal_override.take()
         })
     }
 
@@ -7279,49 +7163,281 @@ impl StrategyExecutor for StandardHarness {
         })
     }
 
-    fn self_verifying_loop<'a>(
-        &'a self,
-        task: Task,
-        session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult> {
+    fn ralph_seed_session<'a>(&'a self, instruction: &'a str) -> BoxFut<'a, SessionState> {
         Box::pin(async move {
-            self.run_self_verifying(task, session_state, budget_used, on_stream)
-                .await
+            let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+            let mut session_state = SessionState::default();
+            self.config
+                .context_manager
+                .append_user_message(&mut session_state, instruction)
+                .await;
+            if let Some(reload) = Self::ralph_reload_context(&workspace_root) {
+                self.config
+                    .context_manager
+                    .append_user_message(&mut session_state, &reload)
+                    .await;
+            }
+            // R3 (issue #58 v2): inject git history when a `VcsProvider` is wired.
+            if let Some(vcs) = &self.config.vcs_provider {
+                let args = VcsLogArgs {
+                    max_entries: 20,
+                    since_ref: None,
+                    format: None,
+                };
+                if let Ok(log) = vcs.log(&args).await {
+                    let trimmed = log.trim();
+                    if !trimmed.is_empty() {
+                        let block = format!("Recent VCS history:\n{trimmed}");
+                        self.config
+                            .context_manager
+                            .append_user_message(&mut session_state, &block)
+                            .await;
+                    }
+                }
+            }
+            session_state
         })
     }
 
-    fn ralph_loop<'a>(
-        &'a self,
-        task: Task,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult> {
-        Box::pin(async move { self.run_ralph(task, budget_used, on_stream).await })
+    fn ralph_completion_status(&self) -> Option<String> {
+        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+        Self::ralph_completion_status(&workspace_root)
     }
 
-    fn hill_climbing_loop<'a>(
+    fn ralph_max_resets(&self) -> u32 {
+        self.config.max_resets
+    }
+
+    fn resolve_metric_evaluator(
+        &self,
+        key: &str,
+        session_id: &SessionId,
+    ) -> Result<Arc<dyn crate::metric::MetricEvaluator>, Box<RunResult>> {
+        self.config
+            .registry
+            .resolve_metric_evaluator(key)
+            .cloned()
+            .ok_or_else(|| {
+                Box::new(RunResult::Failure {
+                    reason: HaltReason::HillClimbingMisconfigured {
+                        reason: format!(
+                            "HillClimbing requires a metric evaluator registered under key {key:?}"
+                        ),
+                    },
+                    session_id: session_id.clone(),
+                    usage: AggregateUsage::default(),
+                    turns: 0,
+                    session_state: SessionState::default(),
+                })
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hill_baseline<'a>(
         &'a self,
-        task: Task,
+        evaluator: &'a Arc<dyn crate::metric::MetricEvaluator>,
+        session_id: &'a SessionId,
+        task_id: &'a TaskId,
         direction: HillClimbingDirection,
-        max_stagnation: Option<u32>,
+        rows: &'a mut Vec<crate::metric::ResultsEntry>,
+        span_seq: &'a mut u64,
+        total_usage: AggregateUsage,
+        turns: u32,
+    ) -> BoxFut<'a, Result<f64, RunResult>> {
+        Box::pin(async move {
+            use crate::metric::{IterationStatus, MetricResult, ResultsEntry};
+            use crate::termination::SessionStateSnapshot;
+            let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+            let snapshot = SessionStateSnapshot::new(
+                session_id.clone(),
+                task_id.clone(),
+                SessionState::default(),
+                workspace_root.clone(),
+            );
+            let baseline = evaluator
+                .evaluate(self.config.sandbox.as_ref(), &snapshot)
+                .await;
+            match baseline {
+                Ok(MetricResult {
+                    value, duration, ..
+                }) => {
+                    rows.push(ResultsEntry {
+                        iteration: 0,
+                        commit_hash: self.hill_climbing_commit_hash().await,
+                        metric_value: value,
+                        direction,
+                        status: IterationStatus::Kept,
+                        duration,
+                        description: evaluator.description(),
+                        metadata: Default::default(),
+                    });
+                    self.emit_hill_climbing_span(
+                        session_id,
+                        task_id,
+                        span_seq,
+                        0,
+                        Some(value),
+                        None,
+                        IterationStatus::Kept,
+                        false,
+                    );
+                    Ok(value)
+                }
+                Err(err) => {
+                    let status = IterationStatus::from_error(&err);
+                    rows.push(ResultsEntry {
+                        iteration: 0,
+                        commit_hash: self.hill_climbing_commit_hash().await,
+                        metric_value: f64::NAN,
+                        direction,
+                        status,
+                        duration: Duration::ZERO,
+                        description: evaluator.description(),
+                        metadata: Default::default(),
+                    });
+                    self.emit_hill_climbing_span(
+                        session_id, task_id, span_seq, 0, None, None, status, false,
+                    );
+                    self.write_hill_climbing_tsv(&workspace_root, task_id, rows)
+                        .await;
+                    Err(RunResult::Failure {
+                        reason: HaltReason::HillClimbingMisconfigured {
+                            reason: format!("baseline evaluation failed: {err}"),
+                        },
+                        session_id: session_id.clone(),
+                        usage: total_usage,
+                        turns,
+                        session_state: SessionState::default(),
+                    })
+                }
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hill_iteration<'a>(
+        &'a self,
+        evaluator: &'a Arc<dyn crate::metric::MetricEvaluator>,
+        session_id: &'a SessionId,
+        task_id: &'a TaskId,
+        iteration: u32,
+        direction: HillClimbingDirection,
         revert_on_no_improvement: bool,
         min_improvement_delta: Option<f64>,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> BoxFut<'a, RunResult> {
+        current_best: f64,
+        rows: &'a mut Vec<crate::metric::ResultsEntry>,
+        span_seq: &'a mut u64,
+    ) -> BoxFut<'a, (f64, bool)> {
         Box::pin(async move {
-            self.run_hill_climbing(
-                task,
-                direction,
-                max_stagnation,
-                revert_on_no_improvement,
-                min_improvement_delta,
-                budget_used,
-                on_stream,
-            )
-            .await
+            use crate::metric::{should_keep, IterationStatus, MetricResult, ResultsEntry};
+            use crate::termination::SessionStateSnapshot;
+            let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+            let snapshot = SessionStateSnapshot::new(
+                session_id.clone(),
+                task_id.clone(),
+                SessionState::default(),
+                workspace_root,
+            );
+            let eval = evaluator
+                .evaluate(self.config.sandbox.as_ref(), &snapshot)
+                .await;
+            match eval {
+                Ok(MetricResult {
+                    value, duration, ..
+                }) => {
+                    let kept = should_keep(value, current_best, direction, min_improvement_delta);
+                    let delta = match direction {
+                        HillClimbingDirection::Minimize => current_best - value,
+                        HillClimbingDirection::Maximize => value - current_best,
+                    };
+                    if kept {
+                        rows.push(ResultsEntry {
+                            iteration,
+                            commit_hash: self.hill_climbing_commit_hash().await,
+                            metric_value: value,
+                            direction,
+                            status: IterationStatus::Kept,
+                            duration,
+                            description: evaluator.description(),
+                            metadata: Default::default(),
+                        });
+                        self.emit_hill_climbing_span(
+                            session_id,
+                            task_id,
+                            span_seq,
+                            iteration,
+                            Some(value),
+                            Some(delta),
+                            IterationStatus::Kept,
+                            false,
+                        );
+                        (value, false)
+                    } else {
+                        let reverted = if revert_on_no_improvement {
+                            self.hill_climbing_revert().await;
+                            true
+                        } else {
+                            false
+                        };
+                        rows.push(ResultsEntry {
+                            iteration,
+                            commit_hash: self.hill_climbing_commit_hash().await,
+                            metric_value: value,
+                            direction,
+                            status: IterationStatus::Discarded,
+                            duration,
+                            description: evaluator.description(),
+                            metadata: Default::default(),
+                        });
+                        self.emit_hill_climbing_span(
+                            session_id,
+                            task_id,
+                            span_seq,
+                            iteration,
+                            Some(value),
+                            Some(delta),
+                            IterationStatus::Discarded,
+                            reverted,
+                        );
+                        (current_best, true)
+                    }
+                }
+                Err(err) => {
+                    let status = IterationStatus::from_error(&err);
+                    let reverted = if revert_on_no_improvement {
+                        self.hill_climbing_revert().await;
+                        true
+                    } else {
+                        false
+                    };
+                    rows.push(ResultsEntry {
+                        iteration,
+                        commit_hash: self.hill_climbing_commit_hash().await,
+                        metric_value: f64::NAN,
+                        direction,
+                        status,
+                        duration: Duration::ZERO,
+                        description: evaluator.description(),
+                        metadata: Default::default(),
+                    });
+                    self.emit_hill_climbing_span(
+                        session_id, task_id, span_seq, iteration, None, None, status, reverted,
+                    );
+                    (current_best, true)
+                }
+            }
+        })
+    }
+
+    fn hill_write_tsv<'a>(
+        &'a self,
+        task_id: &'a TaskId,
+        rows: &'a [crate::metric::ResultsEntry],
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
+            self.write_hill_climbing_tsv(&workspace_root, task_id, rows)
+                .await;
         })
     }
 
@@ -7448,8 +7564,27 @@ impl StandardHarness {
             LoopStrategy::ReAct(c) => c.max_iterations(),
             _ => u32::MAX,
         };
-        self.run_react(task, max_iterations, session_state, budget_used, on_stream)
-            .await
+        let agent = match self.resolve_worker_agent(&task.loop_strategy) {
+            Ok(a) => a,
+            Err(error) => {
+                return RunResult::Failure {
+                    reason: HaltReason::ConfigurationError { error },
+                    session_id,
+                    usage: AggregateUsage::default(),
+                    turns: budget_used.turns,
+                    session_state,
+                };
+            }
+        };
+        self.run_react(
+            task,
+            max_iterations,
+            session_state,
+            budget_used,
+            on_stream,
+            agent,
+        )
+        .await
     }
 
     /// Issue #102 auto-persist seam: write the terminal run state to the
@@ -7535,22 +7670,19 @@ impl StandardHarness {
             session_state,
         } = options;
 
-        // Issue #120 startup validation: every serializable handle in the task's
+        // #124 startup validation: every serializable handle in the task's
         // strategy tree must resolve against the configured ExecutionRegistry,
-        // BEFORE the first turn. Validation runs only when the registry is
-        // populated, so existing callers that never wire a registry (and instead
-        // use the deprecated single-collaborator fields, Option B) are
-        // unaffected byte-for-byte. An unresolved handle is a startup error.
-        if !self.config.registry.is_empty() {
-            if let Err(error) = self.config.registry.validate(&task) {
-                return RunResult::Failure {
-                    reason: HaltReason::ConfigurationError { error },
-                    session_id: task.session_id.clone(),
-                    usage: AggregateUsage::default(),
-                    turns: 0,
-                    session_state: SessionState::default(),
-                };
-            }
+        // BEFORE the first turn. The legacy single-collaborator fields are gone —
+        // resolution is now the SINGLE path, so validation ALWAYS runs (the
+        // `!is_empty()` gate is dropped). An unresolved handle is a startup error.
+        if let Err(error) = self.config.registry.validate(&task) {
+            return RunResult::Failure {
+                reason: HaltReason::ConfigurationError { error },
+                session_id: task.session_id.clone(),
+                usage: AggregateUsage::default(),
+                turns: 0,
+                session_state: SessionState::default(),
+            };
         }
 
         // Issue #102 auto-load: when enabled AND no explicit session_state was
@@ -7741,8 +7873,27 @@ impl StandardHarness {
                     LoopStrategy::ReAct(c) => c.max_iterations(),
                     _ => u32::MAX,
                 };
+                let agent = match self.resolve_worker_agent(&task.loop_strategy) {
+                    Ok(a) => a,
+                    Err(error) => {
+                        return RunResult::Failure {
+                            reason: HaltReason::ConfigurationError { error },
+                            session_id,
+                            usage: AggregateUsage::default(),
+                            turns: budget_used.turns,
+                            session_state,
+                        };
+                    }
+                };
                 return self
-                    .run_react(task, max_iterations, session_state, budget_used, on_stream)
+                    .run_react(
+                        task,
+                        max_iterations,
+                        session_state,
+                        budget_used,
+                        on_stream,
+                        agent,
+                    )
                     .await;
             }
         }
@@ -7830,8 +7981,27 @@ impl StandardHarness {
             LoopStrategy::ReAct(c) => c.max_iterations(),
             _ => u32::MAX,
         };
-        self.run_react(task, max_iterations, session_state, budget_used, on_stream)
-            .await
+        let agent = match self.resolve_worker_agent(&task.loop_strategy) {
+            Ok(a) => a,
+            Err(error) => {
+                return RunResult::Failure {
+                    reason: HaltReason::ConfigurationError { error },
+                    session_id,
+                    usage: AggregateUsage::default(),
+                    turns: budget_used.turns,
+                    session_state,
+                };
+            }
+        };
+        self.run_react(
+            task,
+            max_iterations,
+            session_state,
+            budget_used,
+            on_stream,
+            agent,
+        )
+        .await
     }
 }
 
@@ -8925,8 +9095,17 @@ mod tests {
     }
 
     fn standard_config(agent: Arc<MockAgent>) -> HarnessConfig {
+        let a: Arc<dyn Agent> = agent;
+        // #124: the legacy single-collaborator fields are gone — the worker agent
+        // + toolset resolve from the registry under the DEFAULT empty key (bare
+        // `ReactConfig::per_loop` leaves carry empty `AgentRef`/`ToolsetRef`).
+        let registry = ExecutionRegistry::builder()
+            .agent("", a)
+            .toolset("", Arc::new(EmptyToolRegistry))
+            // Default output schema for structured-slot inner leaves (A.5).
+            .schema("", serde_json::json!({}))
+            .build();
         HarnessConfig {
-            agent,
             tool_registry: Arc::new(ScriptedToolRegistry::new()),
             sandbox: Arc::new(AllowAllSandbox),
             context_manager: Arc::new(NoopContextManager),
@@ -8941,9 +9120,6 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
-            planner_agent: None,
-            verifier: None,
-            evaluator_agent: None,
             // #76: plan_execute + task_list persistence now lives on the
             // RunStore seam (not SessionState.extras), so the test harness
             // needs a real (in-memory) run store for the readback helpers and
@@ -8954,14 +9130,13 @@ mod tests {
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,
-            metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
-            registry: ExecutionRegistry::empty(),
+            registry,
             escalation_mode: EscalationMode::SurfaceToHuman,
         }
     }
@@ -8970,8 +9145,41 @@ mod tests {
         Task::new("do something", SessionId::new("s1"), strategy)
     }
 
+    // #124 test helpers: register collaborators into a config's registry under
+    // the DEFAULT empty key (matching the bare `*_task()` strategy handles).
+    fn set_worker_agent(cfg: &mut HarnessConfig, agent: Arc<dyn Agent>) {
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .agent("", agent)
+            .build();
+    }
+    fn set_default_verifier(cfg: &mut HarnessConfig, v: Arc<dyn crate::verifier::Verifier>) {
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .verifier("", v)
+            .build();
+    }
+    fn set_default_metric(cfg: &mut HarnessConfig, m: Arc<dyn crate::metric::MetricEvaluator>) {
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .metric_evaluator("", m)
+            .build();
+    }
+
     fn react(max: u32) -> Task {
         task(LoopStrategy::ReAct(ReactConfig::per_loop(max)))
+    }
+
+    // #124: a bare ReAct leaf carrying the default output schema, for STRUCTURED
+    // slots (SelfVerifying worker / HillClimbing propose) that A.5 requires to
+    // declare an output schema.
+    fn react_structured(max: u32) -> LoopStrategy {
+        LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: max },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: Some(SchemaRef(String::new())),
+        })
     }
 
     fn usage() -> TokenUsage {
@@ -9207,11 +9415,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_skips_validation_legacy_path_unaffected() {
-        // With no registry wired (Option B legacy path), run-entry validation is
-        // skipped: the config carries an empty registry.
+    fn builder_folds_default_agent_into_registry() {
+        // #124: the legacy single-collaborator fields are gone — `HarnessBuilder`
+        // folds its agent + toolset into the ExecutionRegistry under the DEFAULT
+        // empty key, so the single resolution path always has a worker to resolve.
         let cfg = catalogue_builder(make_agent()).build_config();
-        assert!(cfg.registry.is_empty());
+        assert!(!cfg.registry.is_empty());
+        assert!(cfg
+            .registry
+            .resolve_agent(&AgentRef(String::new()))
+            .is_some());
     }
 
     #[tokio::test]
@@ -9254,7 +9467,7 @@ mod tests {
             seen: std::sync::Mutex::new(vec![]),
         });
         let mut cfg = standard_config(make_agent());
-        cfg.agent = agent.clone();
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.system_prompt = Some("OPERATING RULES".into());
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(react(2))).await;
@@ -9275,7 +9488,7 @@ mod tests {
             seen: std::sync::Mutex::new(vec![]),
         });
         let mut cfg = standard_config(make_agent());
-        cfg.agent = agent.clone();
+        set_worker_agent(&mut cfg, agent.clone());
         // system_prompt stays None.
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(react(2))).await;
@@ -10865,8 +11078,11 @@ mod tests {
     async fn hill_climbing_no_longer_not_yet_implemented() {
         let a = make_agent();
         let h = StandardHarness::new(standard_config(a));
+        // #124: with no metric evaluator registered, the unresolved handle is a
+        // STARTUP ConfigurationError (single resolution path) — NOT the generic
+        // StrategyNotYetImplemented stub.
         let t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
-            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            inner: Box::new(react_structured(u32::MAX)),
             direction: HillClimbingDirection::Maximize,
             max_stagnation: u32::MAX,
             revert_on_no_improvement: false,
@@ -10880,8 +11096,13 @@ mod tests {
                     "HillClimbing must not return StrategyNotYetImplemented; got {reason:?}"
                 );
                 assert!(
-                    matches!(reason, HaltReason::HillClimbingMisconfigured { .. }),
-                    "expected HillClimbingMisconfigured with no evaluator wired; got {reason:?}"
+                    matches!(
+                        reason,
+                        HaltReason::ConfigurationError {
+                            error: HarnessError::UnresolvedHandle { ref kind, .. }
+                        } if kind == "metric_evaluator"
+                    ),
+                    "expected an unresolved metric_evaluator startup error; got {reason:?}"
                 );
             }
             other => panic!("expected Failure, got {other:?}"),
@@ -10893,7 +11114,13 @@ mod tests {
     use crate::plan::{PlanArtifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
 
     fn plan_task() -> Task {
-        task(LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)))
+        // #124 A.5: the plan slot is STRUCTURED — its leaf carries an output
+        // schema (registered as "" in standard_config). Execute stays a bare leaf.
+        task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(react_structured(u32::MAX)),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }))
     }
 
     fn final_resp(text: &str) -> TurnResult {
@@ -11032,7 +11259,7 @@ mod tests {
         model_params: ModelParams,
     ) -> HarnessConfig {
         let mut cfg = standard_config(make_agent());
-        cfg.agent = agent;
+        set_worker_agent(&mut cfg, agent);
         cfg.model_params = model_params;
         cfg
     }
@@ -11280,8 +11507,9 @@ mod tests {
         assert!(seen[0].params.structured_tool_calls);
     }
 
-    // R5: when planner_agent is set, the PLANNER runs the plan turn and the
-    // default agent does not.
+    // R5 (#124 Q1): the plan child's leaf `ReactConfig.agent` is authoritative —
+    // register a distinct "planner" agent on the plan leaf; it runs the plan turn
+    // and the default agent does not.
     #[tokio::test]
     async fn plan_phase_routes_to_planner_agent() {
         let default_agent = make_agent();
@@ -11290,9 +11518,24 @@ mod tests {
         planner.push(final_resp(r#"{"tasks":["planner"]}"#));
 
         let mut cfg = standard_config(default_agent.clone());
-        cfg.planner_agent = Some(planner.clone());
+        // Register the planner under a distinct key + a schema for the plan slot.
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .agent("planner", planner.clone())
+            .schema("plan-schema", serde_json::json!({}))
+            .build();
         let h = StandardHarness::new(cfg);
-        let t = plan_task();
+        // A plan tree whose plan leaf routes to "planner".
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                budget: BudgetPolicy::PerLoop { value: u32::MAX },
+                agent: AgentRef("planner".into()),
+                toolset: ToolsetRef(String::new()),
+                output: Some(SchemaRef("plan-schema".into())),
+            })),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }));
         let mut state = SessionState::default();
         h.run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
             .await
@@ -12048,9 +12291,24 @@ mod tests {
         planner.push(final_resp(r#"{"tasks":["step"]}"#));
 
         let mut cfg = standard_config(default_agent.clone());
-        cfg.planner_agent = Some(planner.clone());
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .agent("planner", planner.clone())
+            .schema("plan-schema", serde_json::json!({}))
+            .build();
         let h = StandardHarness::new(cfg);
-        match h.run(HarnessRunOptions::new(plan_task())).await {
+        // A plan tree whose plan leaf routes to "planner"; execute uses default.
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                budget: BudgetPolicy::PerLoop { value: u32::MAX },
+                agent: AgentRef("planner".into()),
+                toolset: ToolsetRef(String::new()),
+                output: Some(SchemaRef("plan-schema".into())),
+            })),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Success { output, .. } => assert_eq!(output, "did the step"),
             other => panic!("expected Success, got {other:?}"),
         }
@@ -12079,31 +12337,26 @@ mod tests {
     // dispatched via `.run(cx)` and a non-ReAct child genuinely executes.
     #[tokio::test]
     async fn plan_execute_runs_non_react_execute_child_per_task() {
-        // cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+        // The single worker agent runs the plan turn (JSON), then per task: the
+        // build turn, then the evaluate-phase turn (Q1c). 2 tasks ⇒ plan + 2×
+        // (build + eval) = 5 turns.
         let a = make_agent();
         a.push(final_resp(r#"{"tasks":["t0","t1"],"rationale":"r"}"#));
         a.push(final_resp("built t0"));
+        a.push(final_resp("PASS"));
         a.push(final_resp("built t1"));
-        // The evaluate phase runs on a distinct agent.
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
-                RecordingTurnAgent::final_resp("PASS"),
-                RecordingTurnAgent::final_resp("PASS"),
-            ],
-        );
+        a.push(final_resp("PASS"));
         // The verifier records every invocation; PASS each time.
         let verifier = Arc::new(ScriptedVerifier::new(vec![passed(), passed()], passed(), 3));
         let mut cfg = standard_config(a);
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(verifier.clone());
+        set_default_verifier(&mut cfg, verifier.clone());
         let h = StandardHarness::new(cfg);
 
         // The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
         let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
-            plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan: Box::new(react_structured(u32::MAX)),
             execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
-                inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+                inner: Box::new(react_structured(u32::MAX)),
                 evaluator: SchemaRef(String::new()),
             })),
             plan_model: None,
@@ -12123,6 +12376,60 @@ mod tests {
             2,
             "the SelfVerifying execute child must run its evaluator once per task"
         );
+    }
+
+    // #124 REGRESSION-PROOF: SelfVerifying genuinely recurses into a NON-ReAct
+    // inner. `SelfVerifying[ inner: PlanExecute[ReAct, ReAct] ]` — each build
+    // iteration runs the inner PlanExecute's WHOLE loop, which fires a plan turn
+    // (parsing a JSON task list) before the execute step. A hardcoded-ReAct build
+    // would NEVER fire the plan phase, so the worker would never see the plan
+    // directive. We assert the worker saw the plan directive (proving the inner
+    // PlanExecute combinator ran, not a flat ReAct).
+    #[tokio::test]
+    async fn self_verifying_runs_non_react_inner_worker() {
+        // Worker turns for ONE SelfVerifying iteration of PlanExecute[ReAct,ReAct]
+        // over a 1-task plan: plan JSON, execute step, then the evaluate-phase turn.
+        let worker = RecordingTurnAgent::new(
+            "worker",
+            vec![
+                RecordingTurnAgent::final_resp(r#"{"tasks":["only"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("did the step"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker.clone());
+        set_default_verifier(&mut cfg, verifier.clone());
+        let h = StandardHarness::new(cfg);
+
+        // inner is a genuine PlanExecute combinator (NOT a ReAct).
+        let t = task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                plan: Box::new(react_structured(u32::MAX)),
+                execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+                plan_model: None,
+            })),
+            evaluator: SchemaRef(String::new()),
+        }));
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // The inner PlanExecute fired its plan turn ⇒ the worker saw the plan
+        // directive. A hardcoded-ReAct build would record ZERO plan turns.
+        let seen = worker.seen_text();
+        let plan_turns = seen
+            .iter()
+            .filter(|c| c.contains("step-by-step plan"))
+            .count();
+        assert!(
+            plan_turns >= 1,
+            "the inner PlanExecute plan phase must fire at least once per iteration; saw: {seen:?}"
+        );
+        // The verifier fired (the SelfVerifying loop ran its evaluate phase).
+        assert_eq!(verifier.seen.lock().unwrap().len(), 1);
     }
 
     // Rule: Aggregate usage accumulates across turns.
@@ -12449,8 +12756,8 @@ mod tests {
             obs: Arc<dyn ObservabilityProvider>,
             max_attempts: u32,
         ) -> StandardHarness {
+            let worker: Arc<dyn Agent> = agent;
             StandardHarness::new(HarnessConfig {
-                agent,
                 tool_registry: Arc::new(ScriptedToolRegistry::new()),
                 sandbox: Arc::new(AllowAllSandbox),
                 context_manager: cm,
@@ -12465,21 +12772,17 @@ mod tests {
                 max_repair_attempts: 1,
                 max_stop_blocks: 8,
                 hooks: None,
-                planner_agent: None,
-                verifier: None,
-                evaluator_agent: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
                 max_resets: 3,
                 vcs_provider: None,
-                metric_evaluator: None,
                 catalogue_registry: None,
                 system_prompt: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
                 prompt_tool_call_flag: None,
                 consult_handlers: std::collections::HashMap::new(),
-                registry: ExecutionRegistry::empty(),
+                registry: ExecutionRegistry::builder().agent("", worker).build(),
                 escalation_mode: EscalationMode::SurfaceToHuman,
             })
         }
@@ -12494,12 +12797,14 @@ mod tests {
             let mut span_seq = 0u64;
             // Pre-condition: should_compact gate is honored by the caller.
             if h.config.context_manager.should_compact(&state) {
+                let worker: Arc<dyn Agent> = agent.clone();
                 h.run_compaction(
                     &mut state,
                     &SessionId::new("s1"),
                     &TaskId::new("t1"),
                     &mut span_seq,
                     &mut usage,
+                    &worker,
                 )
                 .await;
             }
@@ -13206,7 +13511,7 @@ mod tests {
 
     fn self_verifying_task() -> Task {
         task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
-            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            inner: Box::new(react_structured(u32::MAX)),
             evaluator: SchemaRef(String::new()),
         }))
     }
@@ -13358,10 +13663,20 @@ mod tests {
     // R10: SelfVerifying no longer returns StrategyNotYetImplemented.
     #[tokio::test]
     async fn self_verifying_no_longer_unimplemented() {
-        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
+        // Q1c: build + evaluate run on the SAME worker agent (one scripted queue).
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("done"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        set_worker_agent(&mut cfg, build);
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Failure {
@@ -13373,18 +13688,22 @@ mod tests {
         }
     }
 
-    // R11: verifier == None → Failure { SelfVerifyMisconfigured } (not panic).
+    // R11 (#124): an unresolved verifier is a typed STARTUP halt (single
+    // resolution path), not a panic.
     #[tokio::test]
     async fn self_verifying_missing_verifier_is_typed_halt() {
         let cfg = standard_config(make_agent());
-        // verifier defaults to None.
+        // no verifier registered under the default key.
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Failure {
-                reason: HaltReason::SelfVerifyMisconfigured { reason },
+                reason:
+                    HaltReason::ConfigurationError {
+                        error: HarnessError::UnresolvedHandle { kind, .. },
+                    },
                 ..
-            } => assert!(reason.contains("verifier"), "got: {reason}"),
-            other => panic!("expected SelfVerifyMisconfigured, got {other:?}"),
+            } => assert_eq!(kind, "verifier"),
+            other => panic!("expected unresolved verifier, got {other:?}"),
         }
     }
 
@@ -13392,25 +13711,30 @@ mod tests {
     // followed by a final response — the build agent loops at least twice).
     #[tokio::test]
     async fn self_verifying_build_runs_react_until_done() {
+        // Q1c: build + evaluate share one worker queue: build does tool+final,
+        // then the evaluate phase pulls its PASS turn from the same agent.
         let build = RecordingTurnAgent::new(
             "build",
             vec![
                 RecordingTurnAgent::tool_call("read_file"),
                 RecordingTurnAgent::final_resp("done"),
+                RecordingTurnAgent::final_resp("PASS"),
             ],
         );
-        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build.clone();
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        set_worker_agent(&mut cfg, build.clone());
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
         let h = StandardHarness::new(cfg);
         let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
         assert!(matches!(r, RunResult::Success { .. }), "got {r:?}");
-        // The build agent took at least two turns (tool call, then final).
+        // The build agent took at least two turns (tool call, then final) plus the
+        // evaluate turn.
         assert!(
-            build.call_count() >= 2,
-            "build should loop: {} turns",
+            build.call_count() >= 3,
+            "build+eval should loop: {} turns",
             build.call_count()
         );
     }
@@ -13419,13 +13743,17 @@ mod tests {
     // build session — distinguishable in traces.
     #[tokio::test]
     async fn self_verifying_evaluate_uses_fresh_distinct_session() {
-        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
-        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("done"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
         let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(verifier.clone());
+        set_worker_agent(&mut cfg, build);
+        set_default_verifier(&mut cfg, verifier.clone());
         let h = StandardHarness::new(cfg);
         let t = self_verifying_task();
         let build_session = t.session_id.as_str().to_string();
@@ -13443,53 +13771,61 @@ mod tests {
     // sandbox is unaffected (the build phase writes freely).
     #[tokio::test]
     async fn self_verifying_evaluate_sandbox_is_read_only() {
-        // Build agent writes (allowed by AllowAllSandbox), then claims done.
+        // Q1c: one worker agent. Build phase writes (allowed), then claims done;
+        // the evaluate phase (same agent, read-only sandbox) tries to write —
+        // that write MUST be rejected — then claims a verdict.
         let build = RecordingTurnAgent::new(
             "build",
             vec![
+                // build phase: write allowed, then done
                 RecordingTurnAgent::tool_call("write_file"),
                 RecordingTurnAgent::final_resp("done"),
-            ],
-        );
-        // Evaluator tries to write (must be blocked), then claims a verdict.
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
+                // evaluate phase (fresh session, read-only): write rejected, PASS
                 RecordingTurnAgent::tool_call("write_file"),
                 RecordingTurnAgent::final_resp("PASS"),
             ],
         );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build.clone();
-        cfg.evaluator_agent = Some(eval.clone());
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        set_worker_agent(&mut cfg, build.clone());
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
         let h = StandardHarness::new(cfg);
         let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
         assert!(matches!(r, RunResult::Success { .. }), "got {r:?}");
-        // The evaluator's second context (after its blocked write) must carry the
-        // recoverable read-only sandbox error fed back as a tool result.
-        let eval_seen = eval.seen_text();
-        assert!(
-            eval_seen.iter().any(|c| c.contains("ReadOnlyViolation")),
-            "evaluator write must be rejected read-only; saw: {eval_seen:?}"
-        );
-        // The build phase's write was NOT rejected (no read-only error fed back).
-        let build_seen = build.seen_text();
-        assert!(
-            !build_seen.iter().any(|c| c.contains("ReadOnlyViolation")),
-            "build sandbox must be unaffected; saw: {build_seen:?}"
+        // The evaluate phase's write (over the read-only sandbox) must surface a
+        // recoverable read-only sandbox error fed back as a tool result. The build
+        // phase's write (over the writable sandbox) was NOT rejected, so exactly
+        // ONE ReadOnlyViolation appears across the worker's contexts.
+        let seen = build.seen_text();
+        let violations = seen
+            .iter()
+            .filter(|c| c.contains("ReadOnlyViolation"))
+            .count();
+        assert_eq!(
+            violations, 1,
+            "exactly the evaluate-phase write is rejected read-only; saw: {seen:?}"
         );
     }
 
     // R4: the evaluator carries the `role-evaluator` chunk (presence assertion).
     #[tokio::test]
     async fn self_verifying_evaluator_carries_role_chunk() {
-        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("done")]);
-        let eval = RecordingTurnAgent::new("eval", vec![RecordingTurnAgent::final_resp("PASS")]);
+        // Q1c: one worker agent; the evaluate-phase turn (PASS) is its 2nd turn.
+        let build = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("done"),
+                RecordingTurnAgent::final_resp("PASS"),
+            ],
+        );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.evaluator_agent = Some(eval.clone());
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)));
+        set_worker_agent(&mut cfg, build.clone());
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
         // Register the role-evaluator chunk through the provider.
         cfg.chunk_provider = Arc::new(crate::prompt_assembly::InMemoryChunkProvider::new(vec![
             crate::prompt_assembly::PromptChunk::new(
@@ -13499,7 +13835,7 @@ mod tests {
         ]));
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(self_verifying_task())).await;
-        let eval_seen = eval.seen_text();
+        let eval_seen = build.seen_text();
         assert!(
             eval_seen.iter().any(|c| c.contains("fresh evaluator")),
             "evaluator context must carry the role-evaluator chunk; saw: {eval_seen:?}"
@@ -13510,29 +13846,27 @@ mod tests {
     // does not succeed. (The verifier returns Failed for an indeterminate eval.)
     #[tokio::test]
     async fn self_verifying_default_fail_does_not_succeed() {
+        // Q1c: one worker queue, build/eval turns interleaved per iteration.
         let build = RecordingTurnAgent::new(
             "build",
             vec![
                 RecordingTurnAgent::final_resp("attempt 1"),
-                RecordingTurnAgent::final_resp("attempt 2"),
-            ],
-        );
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
                 RecordingTurnAgent::final_resp("indeterminate"),
+                RecordingTurnAgent::final_resp("attempt 2"),
                 RecordingTurnAgent::final_resp("indeterminate"),
             ],
         );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.evaluator_agent = Some(eval);
+        set_worker_agent(&mut cfg, build);
         // Default-FAIL: every verdict is Failed (no explicit pass).
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
-            vec![],
-            failed("indeterminate — default fail"),
-            2,
-        )));
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(
+                vec![],
+                failed("indeterminate — default fail"),
+                2,
+            )),
+        );
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Failure {
@@ -13549,40 +13883,37 @@ mod tests {
     #[tokio::test]
     async fn self_verifying_injects_reason_and_resumes() {
         const FINDING: &str = "MISSING_NULL_CHECK_IN_HANDLER";
+        // Q1c: one worker queue: build v1, eval FAIL-turn, build v2, eval PASS.
         let build = RecordingTurnAgent::new(
             "build",
             vec![
                 RecordingTurnAgent::final_resp("v1"),
-                RecordingTurnAgent::final_resp("v2"),
-            ],
-        );
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
                 RecordingTurnAgent::final_resp("FAIL"),
+                RecordingTurnAgent::final_resp("v2"),
                 RecordingTurnAgent::final_resp("PASS"),
             ],
         );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build.clone();
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
-            vec![failed(FINDING), passed()],
-            passed(),
-            3,
-        )));
+        set_worker_agent(&mut cfg, build.clone());
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(
+                vec![failed(FINDING), passed()],
+                passed(),
+                3,
+            )),
+        );
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Success { .. } => {}
             other => panic!("expected Success on iter 1, got {other:?}"),
         }
-        // The build agent's LAST context (iteration 1) must contain the injected
-        // finding from iteration 0.
+        // The injected finding from iteration 0 must appear in a later build
+        // context (iteration 1 resumes the build session with the reason appended).
         let build_seen = build.seen_text();
-        let last = build_seen.last().expect("build ran");
         assert!(
-            last.contains(FINDING),
-            "iter-1 build context must contain the injected finding; saw: {last}"
+            build_seen.iter().any(|c| c.contains(FINDING)),
+            "iter-1 build context must contain the injected finding; saw: {build_seen:?}"
         );
     }
 
@@ -13590,19 +13921,15 @@ mod tests {
     // max_iterations cycles, then Failure { SelfVerifyExhausted }.
     #[tokio::test]
     async fn self_verifying_stagnation_guard_caps_iterations() {
+        // Q1c: one worker queue, 3 iterations × (build, eval).
         let build = RecordingTurnAgent::new(
             "build",
             vec![
                 RecordingTurnAgent::final_resp("a"),
-                RecordingTurnAgent::final_resp("b"),
-                RecordingTurnAgent::final_resp("c"),
-            ],
-        );
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
                 RecordingTurnAgent::final_resp("x"),
+                RecordingTurnAgent::final_resp("b"),
                 RecordingTurnAgent::final_resp("y"),
+                RecordingTurnAgent::final_resp("c"),
                 RecordingTurnAgent::final_resp("z"),
             ],
         );
@@ -13612,9 +13939,8 @@ mod tests {
             3,
         ));
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(verifier.clone());
+        set_worker_agent(&mut cfg, build);
+        set_default_verifier(&mut cfg, verifier.clone());
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Failure {
@@ -13642,28 +13968,26 @@ mod tests {
     // turn) the cumulative usage sums to 4 input + 4 output tokens.
     #[tokio::test]
     async fn self_verifying_budgets_fold_both_phases() {
+        // Q1c: one worker queue, 2 iterations × (build, eval).
         let build = RecordingTurnAgent::new(
             "build",
             vec![
                 RecordingTurnAgent::final_resp("a"),
-                RecordingTurnAgent::final_resp("b"),
-            ],
-        );
-        let eval = RecordingTurnAgent::new(
-            "eval",
-            vec![
                 RecordingTurnAgent::final_resp("x"),
+                RecordingTurnAgent::final_resp("b"),
                 RecordingTurnAgent::final_resp("PASS"),
             ],
         );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = build;
-        cfg.evaluator_agent = Some(eval);
-        cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
-            vec![failed("retry"), passed()],
-            passed(),
-            3,
-        )));
+        set_worker_agent(&mut cfg, build);
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(
+                vec![failed("retry"), passed()],
+                passed(),
+                3,
+            )),
+        );
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(self_verifying_task())).await {
             RunResult::Success { usage, .. } => {
@@ -13705,35 +14029,32 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("fixture present");
         let suite: SvFixtureSuite = serde_json::from_str(&raw).expect("fixture parses");
         for case in suite.cases {
-            // Build an agent with one "done" turn per possible iteration.
+            // Q1c: one worker queue with a build "done" + an eval "out" turn per
+            // possible iteration, interleaved.
             let n = case.max_iterations.max(1) as usize;
-            let build = RecordingTurnAgent::new(
-                "build",
-                (0..n)
-                    .map(|_| RecordingTurnAgent::final_resp("done"))
-                    .collect(),
-            );
-            let eval = RecordingTurnAgent::new(
-                "eval",
-                (0..n)
-                    .map(|_| RecordingTurnAgent::final_resp("out"))
-                    .collect(),
-            );
+            let mut turns = Vec::with_capacity(2 * n);
+            for _ in 0..n {
+                turns.push(RecordingTurnAgent::final_resp("done"));
+                turns.push(RecordingTurnAgent::final_resp("out"));
+            }
+            let build = RecordingTurnAgent::new("build", turns);
             let verdicts: Vec<VerifierVerdict> = case
                 .verdicts
                 .iter()
                 .map(|v| if v == "pass" { passed() } else { failed(v) })
                 .collect();
             let mut cfg = standard_config(make_agent());
-            cfg.agent = build;
-            cfg.evaluator_agent = Some(eval);
+            set_worker_agent(&mut cfg, build);
             let misconfigured = matches!(case.expected, SvFixtureExpected::Misconfigured);
             if !misconfigured {
-                cfg.verifier = Some(Arc::new(ScriptedVerifier::new(
-                    verdicts,
-                    failed("default fail"),
-                    case.max_iterations,
-                )));
+                set_default_verifier(
+                    &mut cfg,
+                    Arc::new(ScriptedVerifier::new(
+                        verdicts,
+                        failed("default fail"),
+                        case.max_iterations,
+                    )),
+                );
             }
             let h = StandardHarness::new(cfg);
             let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
@@ -13758,8 +14079,12 @@ mod tests {
                 }
                 (
                     SvFixtureExpected::Misconfigured,
+                    // #124: an unresolved verifier is now a startup ConfigurationError.
                     RunResult::Failure {
-                        reason: HaltReason::SelfVerifyMisconfigured { .. },
+                        reason:
+                            HaltReason::ConfigurationError {
+                                error: HarnessError::UnresolvedHandle { .. },
+                            },
                         ..
                     },
                 ) => {}
@@ -13875,7 +14200,7 @@ mod tests {
 
     fn ralph_config(root: &std::path::Path, agent: Arc<dyn Agent>) -> HarnessConfig {
         let mut cfg = standard_config(make_agent());
-        cfg.agent = agent;
+        set_worker_agent(&mut cfg, agent);
         cfg.sandbox = Arc::new(WorkspaceSandbox {
             root: root.to_path_buf(),
         });
@@ -13946,6 +14271,62 @@ mod tests {
             other => panic!("expected RalphCompletionUnmet, got {other:?}"),
         }
         assert_eq!(agent.call_count(), 3, "exactly max_resets windows ran");
+    }
+
+    // #124 REGRESSION-PROOF: Ralph genuinely recurses into a NON-ReAct inner.
+    // `Ralph[ inner: SelfVerifying[ReAct] ]` over a 2-window incomplete,complete
+    // pattern — each window runs the inner SelfVerifying's WHOLE loop, firing its
+    // verifier at least once per window. A hardcoded-ReAct window would NEVER call
+    // the verifier (ZERO invocations).
+    #[tokio::test]
+    async fn ralph_runs_non_react_inner_per_window() {
+        let dir = tempfile::tempdir().unwrap();
+        // Always-incomplete progress: every window's inner SelfVerifying runs its
+        // full build↔evaluate loop (firing its verifier once), Ralph reads
+        // incomplete and resets, until `max_resets` is exhausted. With max_resets
+        // = 2 the verifier fires exactly ONCE PER WINDOW (2x). A hardcoded-ReAct
+        // window would NEVER call the verifier (ZERO invocations).
+        write_progress(dir.path(), INCOMPLETE);
+        // The worker keeps progress incomplete on every turn it writes.
+        let agent = ProgressWritingAgent::new(
+            dir.path(),
+            vec![INCOMPLETE; 16], // plenty for the blocked build turns + eval turns
+        );
+        let verifier = Arc::new(ScriptedVerifier::new(vec![], passed(), 3));
+        let mut cfg = ralph_config(dir.path(), agent.clone());
+        set_default_verifier(&mut cfg, verifier.clone());
+        cfg.max_resets = 2;
+        // One Stop-block then continue, so the per-window build loop ends quickly
+        // and the inner SelfVerifying reaches its evaluate phase + verifier.
+        cfg.max_stop_blocks = 1;
+        let h = StandardHarness::new(cfg);
+
+        // inner is a genuine SelfVerifying combinator (NOT a ReAct).
+        let mut t = task(LoopStrategy::Ralph(RalphConfig {
+            inner: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                inner: Box::new(react_structured(u32::MAX)),
+                evaluator: SchemaRef(String::new()),
+            })),
+            agent: AgentRef(String::new()),
+        }));
+        // Generous per-window turn budget so the build's Stop-block continuation
+        // and the evaluate phase both fit within the window.
+        t.budget.max_turns = Some(8);
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason: HaltReason::RalphCompletionUnmet { iterations, .. },
+                ..
+            } => assert_eq!(iterations, 2, "exactly max_resets windows ran"),
+            other => panic!("expected RalphCompletionUnmet after 2 windows, got {other:?}"),
+        }
+        // The inner SelfVerifying verifier fired at least once per window (>=2). A
+        // hardcoded-ReAct window would record ZERO verifier invocations.
+        assert!(
+            verifier.seen.lock().unwrap().len() >= 2,
+            "the inner SelfVerifying verifier must fire >=1 per window; got {}",
+            verifier.seen.lock().unwrap().len()
+        );
     }
 
     // R2: each reset builds a FRESH SessionState — no message carryover. The
@@ -14340,10 +14721,12 @@ mod tests {
         // Give a generous turn budget so the loop is bounded by stagnation, not
         // turns, unless a test overrides it.
         let mut t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
-            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            // #124 A.5: the propose slot is STRUCTURED — the inner leaf carries an
+            // output schema (registered as "" in standard_config).
+            inner: Box::new(react_structured(u32::MAX)),
             direction,
             // `None` (unbounded) encodes as the `u32::MAX` sentinel; the
-            // dispatch maps it back to `None` for the legacy executor.
+            // dispatch maps it back to `None`.
             max_stagnation: max_stagnation.unwrap_or(u32::MAX),
             revert_on_no_improvement: revert,
             // `None` delta is equivalent to `0.0` (see `should_keep`).
@@ -14466,13 +14849,14 @@ mod tests {
                 .collect(),
         );
         let mut cfg = standard_config(make_agent());
-        cfg.agent = agent;
+        set_worker_agent(&mut cfg, agent);
         cfg.sandbox = sandbox;
-        cfg.metric_evaluator = Some(evaluator);
+        set_default_metric(&mut cfg, evaluator);
         cfg
     }
 
-    // Decision 6: a None evaluator halts with HillClimbingMisconfigured (no panic).
+    // Decision 6 (#124): an unresolved metric evaluator is a typed STARTUP halt
+    // (single resolution path), not a panic.
     #[tokio::test]
     async fn hill_climbing_missing_evaluator_is_typed_halt() {
         let cfg = standard_config(make_agent());
@@ -14480,10 +14864,13 @@ mod tests {
         let t = hill_task(HillClimbingDirection::Maximize, None, false, None);
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Failure {
-                reason: HaltReason::HillClimbingMisconfigured { reason },
+                reason:
+                    HaltReason::ConfigurationError {
+                        error: HarnessError::UnresolvedHandle { kind, .. },
+                    },
                 ..
-            } => assert!(reason.contains("metric_evaluator"), "got: {reason}"),
-            other => panic!("expected HillClimbingMisconfigured, got {other:?}"),
+            } => assert_eq!(kind, "metric_evaluator"),
+            other => panic!("expected unresolved metric_evaluator, got {other:?}"),
         }
     }
 
@@ -14530,6 +14917,73 @@ mod tests {
             lines[1].contains("\tkept\t"),
             "baseline status kept: {}",
             lines[1]
+        );
+    }
+
+    // #124 REGRESSION-PROOF: HillClimbing genuinely recurses into a NON-ReAct
+    // inner. `HillClimbing[ inner: PlanExecute[ReAct, ReAct] ]` with a metric that
+    // improves (iter 1) then stagnates (iter 2, cap 1 ⇒ halt). Each iteration runs
+    // the inner PlanExecute's WHOLE loop, firing a plan turn. A hardcoded-ReAct
+    // proposer would NEVER fire the plan phase (the worker never sees the plan
+    // directive).
+    #[tokio::test]
+    async fn hill_climbing_runs_non_react_inner_per_iteration() {
+        let sandbox = Arc::new(HcSpySandbox::new());
+        // baseline 1.0, iter1 2.0 (improve→keep, stagnation reset), iter2 0.5
+        // (regress→discard, stagnation hits cap 1 ⇒ halt).
+        let eval = Arc::new(ScriptedMetricEvaluator::new(
+            vec![Ok(1.0), Ok(2.0), Ok(0.5)],
+            HillClimbingDirection::Maximize,
+        ));
+        // Per iteration the inner PlanExecute fires a plan JSON turn + execute step.
+        let worker = RecordingTurnAgent::new(
+            "hc-inner",
+            vec![
+                RecordingTurnAgent::final_resp(r#"{"tasks":["only"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("changed iter1"),
+                RecordingTurnAgent::final_resp(r#"{"tasks":["only"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("changed iter2"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker.clone());
+        cfg.sandbox = sandbox;
+        set_default_metric(&mut cfg, eval.clone());
+        let h = StandardHarness::new(cfg);
+
+        // inner is a genuine PlanExecute combinator (NOT a ReAct).
+        let mut t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                plan: Box::new(react_structured(u32::MAX)),
+                execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+                plan_model: None,
+            })),
+            direction: HillClimbingDirection::Maximize,
+            max_stagnation: 1,
+            revert_on_no_improvement: false,
+            min_improvement_delta: 0.0,
+            evaluator: AgentRef(String::new()),
+        }));
+        // Generous turn budget so the loop is bounded by stagnation, not turns.
+        t.budget.max_turns = Some(50);
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason: HaltReason::StagnationLimitReached { .. },
+                ..
+            } => {}
+            other => panic!("expected StagnationLimitReached, got {other:?}"),
+        }
+        // The inner PlanExecute fired its plan turn ONCE PER iteration (2x). A
+        // hardcoded-ReAct proposer would record ZERO plan turns.
+        let seen = worker.seen_text();
+        let plan_turns = seen
+            .iter()
+            .filter(|c| c.contains("step-by-step plan"))
+            .count();
+        assert_eq!(
+            plan_turns, 2,
+            "the inner PlanExecute plan phase fires once per iteration; saw: {seen:?}"
         );
     }
 
@@ -14989,7 +15443,7 @@ mod tests {
             // a model-backed agent that actually streams.
             let mock = make_agent();
             let mut cfg = standard_config(mock);
-            cfg.agent = agent;
+            set_worker_agent(&mut cfg, agent);
             cfg
         }
 

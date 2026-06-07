@@ -1732,7 +1732,6 @@ mod tests {
 
         let agent: Arc<dyn crate::agent::Agent> = Arc::new(MockAgent::new(AgentId::new("a")));
         HarnessConfig {
-            agent,
             tool_registry: Arc::new(ScriptedToolRegistry::new()),
             sandbox: Arc::new(AllowAllSandbox),
             context_manager: Arc::new(NoopContextManager),
@@ -1747,21 +1746,17 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             hooks: None,
-            planner_agent: None,
-            verifier: None,
-            evaluator_agent: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,
-            metric_evaluator: None,
             catalogue_registry: None,
             system_prompt: None,
             model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
-            registry: crate::ExecutionRegistry::empty(),
+            registry: crate::ExecutionRegistry::builder().agent("", agent).build(),
             escalation_mode: crate::EscalationMode::SurfaceToHuman,
         }
     }

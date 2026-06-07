@@ -660,7 +660,7 @@ mod tests {
         let obs = Arc::new(InMemoryObservabilityProvider::new());
         let h = build_harness(
             adapter.clone(),
-            agent,
+            agent.clone(),
             obs.clone(),
             Arc::new(crate::context::KeyTermVerifier),
             2,
@@ -679,6 +679,7 @@ mod tests {
             &TaskId::new("t1"),
             &mut span_seq,
             &mut usage,
+            agent,
         )
         .await;
 
@@ -809,12 +810,14 @@ mod tests {
             let mut session = session_with(&rich_state(10, 95, 100));
             let mut usage = AggregateUsage::default();
             let mut span_seq = 0u64;
+            let worker: Arc<dyn crate::agent::Agent> = agent.clone();
             h.run_compaction_for_test(
                 &mut session,
                 &SessionId::new("s1"),
                 &TaskId::new("t1"),
                 &mut span_seq,
                 &mut usage,
+                worker,
             )
             .await;
 

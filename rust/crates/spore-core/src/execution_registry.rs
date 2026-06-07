@@ -59,6 +59,7 @@ use crate::harness::{
     ReactConfig, RunStrategy, SchemaRef, SelfVerifyingConfig, StrategyRef, Task, ToolRegistry,
     ToolsetRef,
 };
+use crate::metric::MetricEvaluator;
 use crate::verifier::Verifier;
 
 /// HITL-vs-AFK escalation knob (PRD goal #7: local vs. prod differ only by
@@ -113,6 +114,12 @@ pub struct ExecutionRegistry {
     toolsets: HashMap<String, Arc<dyn ToolRegistry>>,
     schemas: HashMap<String, serde_json::Value>,
     verifiers: HashMap<String, Arc<dyn Verifier>>,
+    /// Sixth map (#124, Q2): HillClimbing metric evaluators, keyed by the same
+    /// string `HillClimbingConfig.evaluator` carries on the wire. Runtime-only
+    /// (never serialized) like the other maps; keeping it distinct from `agents`
+    /// preserves the metric-evaluator wire string while resolving it to a
+    /// `MetricEvaluator` rather than an `Agent`.
+    metric_evaluators: HashMap<String, Arc<dyn MetricEvaluator>>,
     custom: HashMap<String, Arc<dyn RunStrategy>>,
 }
 
@@ -124,6 +131,10 @@ impl std::fmt::Debug for ExecutionRegistry {
             .field("toolsets", &self.toolsets.keys().collect::<Vec<_>>())
             .field("schemas", &self.schemas.keys().collect::<Vec<_>>())
             .field("verifiers", &self.verifiers.keys().collect::<Vec<_>>())
+            .field(
+                "metric_evaluators",
+                &self.metric_evaluators.keys().collect::<Vec<_>>(),
+            )
             .field("custom", &self.custom.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -144,6 +155,7 @@ impl ExecutionRegistry {
             && self.toolsets.is_empty()
             && self.schemas.is_empty()
             && self.verifiers.is_empty()
+            && self.metric_evaluators.is_empty()
             && self.custom.is_empty()
     }
 
@@ -178,6 +190,14 @@ impl ExecutionRegistry {
     /// Resolve a verifier key to its registered verifier, or `None` if absent.
     pub fn resolve_verifier(&self, key: &str) -> Option<&Arc<dyn Verifier>> {
         self.verifiers.get(key)
+    }
+
+    /// Resolve a metric-evaluator key (the string `HillClimbingConfig.evaluator`
+    /// carries, #124 Q2) to its registered [`MetricEvaluator`], or `None` if
+    /// absent. The wire string is identical to the legacy `AgentRef`; only the
+    /// resolution target differs (the sixth `metric_evaluators` map).
+    pub fn resolve_metric_evaluator(&self, key: &str) -> Option<&Arc<dyn MetricEvaluator>> {
+        self.metric_evaluators.get(key)
     }
 
     /// Resolve a [`StrategyRef`]: a `BuiltIn(ls)` borrows the built-in tree; a
@@ -241,8 +261,9 @@ impl ExecutionRegistry {
                 // evaluable. A bare `ReAct` worker needs an output schema.
                 Self::check_structured_slot(inner, "worker")?;
                 self.walk_strategy(inner)?;
-                // The evaluator is a SchemaRef (the evaluator schema handle).
-                self.check_schema(evaluator)?;
+                // #124 Q1: the evaluator's wire string (a `SchemaRef`) is the
+                // VERIFIER registry key — resolved against the `verifiers` map.
+                self.check_verifier(evaluator)?;
                 Ok(())
             }
             LoopStrategy::Ralph(RalphConfig { inner, agent }) => {
@@ -257,8 +278,9 @@ impl ExecutionRegistry {
                 // candidate. A bare `ReAct` proposer needs an output schema.
                 Self::check_structured_slot(inner, "propose")?;
                 self.walk_strategy(inner)?;
-                // The evaluator is an AgentRef (the metric-evaluator agent).
-                self.check_agent(evaluator)?;
+                // #124 Q2: the evaluator's wire string is resolved against the
+                // sixth `metric_evaluators` map (not `agents`).
+                self.check_metric_evaluator(evaluator)?;
                 Ok(())
             }
         }
@@ -311,6 +333,32 @@ impl ExecutionRegistry {
             })
         }
     }
+
+    /// #124 Q1: a SelfVerifying `evaluator` (a `SchemaRef` on the wire) resolves
+    /// against the `verifiers` map.
+    fn check_verifier(&self, r: &SchemaRef) -> Result<(), HarnessError> {
+        if self.verifiers.contains_key(&r.0) {
+            Ok(())
+        } else {
+            Err(HarnessError::UnresolvedHandle {
+                kind: "verifier".to_string(),
+                key: r.0.clone(),
+            })
+        }
+    }
+
+    /// #124 Q2: a HillClimbing `evaluator` (an `AgentRef` on the wire) resolves
+    /// against the sixth `metric_evaluators` map.
+    fn check_metric_evaluator(&self, r: &AgentRef) -> Result<(), HarnessError> {
+        if self.metric_evaluators.contains_key(&r.0) {
+            Ok(())
+        } else {
+            Err(HarnessError::UnresolvedHandle {
+                kind: "metric_evaluator".to_string(),
+                key: r.0.clone(),
+            })
+        }
+    }
 }
 
 /// Fluent assembler for an [`ExecutionRegistry`], mirroring `HarnessBuilder`.
@@ -344,6 +392,18 @@ impl ExecutionRegistryBuilder {
         self
     }
 
+    /// Register a metric evaluator under `key` (#124, Q2 — the sixth map).
+    pub fn metric_evaluator(
+        mut self,
+        key: impl Into<String>,
+        evaluator: Arc<dyn MetricEvaluator>,
+    ) -> Self {
+        self.registry
+            .metric_evaluators
+            .insert(key.into(), evaluator);
+        self
+    }
+
     /// Register a custom strategy under `key`.
     pub fn register_strategy(
         mut self,
@@ -351,6 +411,45 @@ impl ExecutionRegistryBuilder {
         strategy: Arc<dyn RunStrategy>,
     ) -> Self {
         self.registry.custom.insert(key.into(), strategy);
+        self
+    }
+
+    /// #124 migration seam: register `agent` under the DEFAULT empty-string key
+    /// ONLY if that key is not already wired. `HarnessBuilder::new(agent)` folds
+    /// its single agent here so bare `ReactConfig::per_loop` leaves (empty
+    /// `AgentRef`) resolve to it. An explicitly-registered `""` agent wins.
+    pub fn fill_default_agent(mut self, agent: Arc<dyn Agent>) -> Self {
+        self.registry.agents.entry(String::new()).or_insert(agent);
+        self
+    }
+
+    /// #124: as [`fill_default_agent`](Self::fill_default_agent), for the
+    /// default toolset (the builder's `tool_registry`) under the empty key.
+    pub fn fill_default_toolset(mut self, toolset: Arc<dyn ToolRegistry>) -> Self {
+        self.registry
+            .toolsets
+            .entry(String::new())
+            .or_insert(toolset);
+        self
+    }
+
+    /// #124: as [`fill_default_agent`](Self::fill_default_agent), for a default
+    /// SelfVerifying verifier (the builder's `.verifier(..)`) under the empty key.
+    pub fn fill_default_verifier(mut self, verifier: Arc<dyn Verifier>) -> Self {
+        self.registry
+            .verifiers
+            .entry(String::new())
+            .or_insert(verifier);
+        self
+    }
+
+    /// #124: as [`fill_default_agent`](Self::fill_default_agent), for a default
+    /// HillClimbing metric evaluator under the empty key.
+    pub fn fill_default_metric_evaluator(mut self, evaluator: Arc<dyn MetricEvaluator>) -> Self {
+        self.registry
+            .metric_evaluators
+            .entry(String::new())
+            .or_insert(evaluator);
         self
     }
 
@@ -613,7 +712,7 @@ mod tests {
             .agent("a1", Arc::new(StubAgent))
             .toolset("t1", Arc::new(EmptyToolRegistry))
             .schema("worker-schema", serde_json::json!({}))
-            .schema("eval-schema", serde_json::json!({}))
+            .verifier("eval-schema", Arc::new(StubVerifier))
             .build();
         let worker = LoopStrategy::ReAct(ReactConfig {
             budget: BudgetPolicy::PerLoop { value: 4 },
@@ -667,7 +766,8 @@ mod tests {
             .agent("ralph-agent", Arc::new(StubAgent))
             .toolset("plan-tools", Arc::new(EmptyToolRegistry))
             .toolset("exec-tools", Arc::new(EmptyToolRegistry))
-            .schema("exec-evaluator", serde_json::json!({}))
+            // #124 Q1: the SelfVerifying `evaluator` resolves as a VERIFIER key.
+            .verifier("exec-evaluator", Arc::new(StubVerifier))
             .schema("plan-schema", serde_json::json!({}))
             .schema("worker-schema", serde_json::json!({}))
             .build();
