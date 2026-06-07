@@ -2449,43 +2449,14 @@ type HarnessConfig struct {
 	// impl, FixtureVcsProvider the hermetic test double.
 	VcsProvider VcsProvider // optional
 
-	// PlannerAgent is the optional alternate agent used for the PlanExecute plan
-	// phase (issue #70, Q1). When the loop strategy is PlanExecute and this is
-	// non-nil, the one-shot plan turn runs on it; otherwise it runs on the
-	// default Agent. The plan_model field on the strategy stays DESCRIPTIVE
-	// metadata only — there is no ModelConfig→agent factory.
-	//
-	// Superseded by ExecutionRegistry (issue #120): the plan-phase agent is the
-	// plan strategy node's AgentRef resolved via Registry. Kept this slice (Option
-	// B); physical removal + executor migration lands in #124.
-	PlannerAgent Agent // optional
-
-	// Verifier is the oracle for the SelfVerifying loop strategy (issue #61, D2).
-	// REQUIRED for that strategy: when the loop strategy is SelfVerifying and
-	// this is nil, the run halts with HaltSelfVerifyMisconfigured (D4) — it does
-	// NOT panic. Its MaxIterations() (default 3) caps the build<->evaluate
-	// round-trips (D3); MaxStopBlocks does NOT enter the picture for this
-	// strategy. This is a consumer-side interface (go/CONVENTIONS.md): the
-	// standard verifier.Verifier family (#44) is bridged into it via
-	// verifier.AsHarnessVerifier, avoiding a sporecore -> verifier import cycle.
-	//
-	// Superseded by ExecutionRegistry (issue #120): the SelfVerifying evaluator is
-	// resolved from Registry's verifiers map by key. Kept this slice (Option B);
-	// physical removal + executor migration lands in #124.
-	Verifier Verifier // optional (required by SelfVerifying)
-
-	// EvaluatorAgent is the optional alternate agent used for the SelfVerifying
-	// evaluate phase (issue #61, D2). Defaulting contract — IDENTICAL to
-	// PlannerAgent: when the loop strategy is SelfVerifying and this is non-nil,
-	// the evaluate run runs on it; otherwise it runs on the default Agent. The
-	// read-only sandbox and the fresh evaluate session id are derived internally
-	// by the strategy — there are no evaluator sandbox / chunk-provider config
-	// fields.
-	//
-	// Superseded by ExecutionRegistry (issue #120): the evaluate-phase agent is a
-	// strategy node's AgentRef resolved via Registry. Kept this slice (Option B);
-	// physical removal + executor migration lands in #124.
-	EvaluatorAgent Agent // optional
+	// #124: the legacy single-collaborator fields PlannerAgent / Verifier /
+	// EvaluatorAgent are GONE. The SelfVerifying verifier resolves from the
+	// Registry verifiers map by the SelfVerifying evaluator key (Q1a); the
+	// PlanExecute plan-phase agent is the plan child's leaf ReactConfig.Agent
+	// (Q1 — the planner_agent concept is dropped); the SelfVerifying evaluate
+	// agent defaults to the inner worker's resolved agent (Q1c). A default
+	// Verifier passed in via the (#124-folded) registry seam resolves under the
+	// empty key — see NewStandardHarness.
 
 	// RunStore is the durable per-run structured-state seam (issue #59, Q4).
 	// The PlanExecute plan phase writes the plan artifact under
@@ -2498,16 +2469,11 @@ type HarnessConfig struct {
 	// sporecore package importing the storage package (which would be a cycle).
 	RunStore RunStore // optional
 
-	// MetricEvaluator is the pluggable scoring strategy for the HillClimbing loop
-	// strategy (issue #60, owned by #23). REQUIRED for that strategy: when the
-	// loop strategy is HillClimbing and this is nil, the run halts with
-	// HaltHillClimbingMisconfigured — it does NOT panic. The harness calls
-	// Evaluate once for the iteration-0 baseline (no agent turn) and once after
-	// each iteration's agent turn, feeding the value into ShouldKeep. This is a
-	// consumer-side interface (go/CONVENTIONS.md): the standard metric.* evaluator
-	// family (#23) is bridged into it via metric.AsHarnessMetricEvaluator,
-	// avoiding a sporecore -> metric import cycle (metric imports sporecore).
-	MetricEvaluator MetricEvaluator // optional (required by HillClimbing)
+	// #124: the legacy MetricEvaluator single-collaborator field is GONE. The
+	// HillClimbing metric evaluator resolves from the Registry's SIXTH
+	// metricEvaluators map by the HillClimbing evaluator key (Q2); a default
+	// MetricEvaluator passed via the (#124-folded) registry seam resolves under
+	// the empty key — see NewStandardHarness.
 
 	// CatalogueRegistry holds the catalogue tools accumulated via
 	// HarnessBuilder.Tool / Tools (issue #81), folded into a populated
@@ -2661,6 +2627,14 @@ func (c HarnessConfig) WithRegistryVerifier(key string, verifier Verifier) Harne
 	return c
 }
 
+// WithRegistryMetricEvaluator registers a named metric evaluator in the
+// ExecutionRegistry's SIXTH map (#124, Q2) and returns the updated config. The
+// key matches the HillClimbingConfig.Evaluator string on the wire.
+func (c HarnessConfig) WithRegistryMetricEvaluator(key string, evaluator MetricEvaluator) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().MetricEvaluator(key, evaluator).Build()
+	return c
+}
+
 // RegisterStrategy registers a custom strategy in the ExecutionRegistry under
 // key (issue #120). Resolvable later via a StrategyRef.Custom(key). Returns the
 // updated config.
@@ -2759,6 +2733,26 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 	if c.Hooks == nil {
 		c.Hooks = NewStandardHookChain()
 	}
+	// #124: the per-strategy single-collaborator fields are gone — collaborator
+	// resolution now goes through the ExecutionRegistry. Fold the default
+	// collaborators (the config's Agent / ToolRegistry) into the registry under
+	// the DEFAULT empty-string handle so a bare ReactConfig leaf (empty
+	// AgentRef/ToolsetRef) and a bare SelfVerifying/HillClimbing whose evaluator
+	// key is empty resolve to them. Explicitly-registered handles win (fill-only).
+	// This keeps NewStandardHarness's signature stable: callers still pass Agent /
+	// ToolRegistry on the config, and the recursive executor resolves them via the
+	// registry. A nil Agent (scaffold-only configs) is left unfolded.
+	if c.Agent != nil {
+		// A real harness: fold the default agent + toolset + a default empty-key
+		// output schema (so a structured slot's leaf carrying output SchemaRef("")
+		// resolves under A.5). A nil Agent (scaffold-only config) is left unfolded
+		// so its registry stays empty and startup validation is skipped.
+		c.Registry = c.Registry.intoBuilder().
+			fillDefaultAgent(c.Agent).
+			fillDefaultToolset(c.ToolRegistry).
+			fillDefaultSchema().
+			Build()
+	}
 	// Best-effort registration: a Stop hook can only fail registration on an
 	// event-class mismatch, which never applies to a sync Stop hook, so the
 	// error is intentionally ignored.
@@ -2843,12 +2837,15 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 func (h *StandardHarness) runInner(ctx context.Context, options HarnessRunOptions) RunResult {
 	task := options.Task
 
-	// Issue #120 startup validation: every serializable handle in the task's
-	// strategy tree must resolve against the configured ExecutionRegistry, BEFORE
-	// the first turn. Validation runs only when the registry is populated, so
-	// existing callers that never wire a registry (and instead use the superseded
-	// single-collaborator fields, Option B) are unaffected byte-for-byte. An
-	// unresolved handle is a startup error.
+	// #124 startup validation (UNGATED): every serializable handle in the task's
+	// strategy tree must resolve against the ExecutionRegistry, BEFORE the first
+	// turn. The IsEmpty gate is gone — collaborator resolution now goes through
+	// the registry for every run (the default Agent / ToolRegistry / Verifier /
+	// MetricEvaluator are folded under the empty key by NewStandardHarness), so
+	// validation is a single resolution path. A scaffold-only config with no
+	// folded agent leaves an empty registry; validation is skipped there so those
+	// tests still reach the no-executor leaf failure rather than a spurious
+	// unresolved-handle halt.
 	if !h.config.Registry.IsEmpty() {
 		if err := h.config.Registry.Validate(task); err != nil {
 			he, ok := err.(HarnessError)
@@ -2975,9 +2972,76 @@ func (h *StandardHarness) driveStrategy(
 // central dispatch switch is gone.
 // ============================================================================
 
-// ReactWindow runs one bounded ReAct turn-loop window (the leaf primitive).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
+// ReactWindow runs one bounded ReAct turn-loop window (the leaf primitive) on
+// the RESOLVED worker agent (#124 — threaded by ReactConfig.Run).
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent)
+}
+
+// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
+// ExecutionRegistry (#124): the agent on the LEAF reached by descending the
+// worker child chain (workerAgentKeyOf). Returns a typed UnresolvedHandle
+// failure RunResult when the key is absent.
+func (h *StandardHarness) ResolveWorkerAgent(ls *LoopStrategy) (Agent, *RunResult) {
+	key := workerAgentKeyOf(ls)
+	agent, ok := h.config.Registry.ResolveAgent(AgentRef(key))
+	if !ok {
+		he := &UnresolvedHandleError{Kind: "agent", Key: key}
+		return nil, &RunResult{
+			Kind:   RunFailure,
+			Reason: HaltReason{Kind: HaltConfigurationError, ConfigError: he},
+		}
+	}
+	return agent, nil
+}
+
+// WorkspaceRoot returns the sandbox workspace root (#124). Empty when no sandbox
+// is wired.
+func (h *StandardHarness) WorkspaceRoot() string {
+	if h.config.Sandbox == nil {
+		return ""
+	}
+	return h.config.Sandbox.WorkspaceRoot()
+}
+
+// AppendUserMessage seeds a user message onto session via the ContextManager
+// seam (#124 — alias of SeedUserMessage for the combinator bodies).
+func (h *StandardHarness) AppendUserMessage(ctx context.Context, session *SessionState, text string) {
+	h.config.ContextManager.AppendUserMessage(ctx, session, text)
+}
+
+// HillEvaluate runs one HillClimbing metric evaluation on the resolved evaluator
+// over a fresh SessionState (#124). On success ok is true; on failure ok is
+// false and (errStatus, errMsg) carry the typed failure.
+func (h *StandardHarness) HillEvaluate(ctx context.Context, evaluator MetricEvaluator, sessionID SessionID, taskID TaskID) (float64, time.Duration, HillClimbIterationStatus, string, bool) {
+	res, err := evaluator.Evaluate(ctx, h.config.Sandbox, sessionID, taskID, SessionState{})
+	if err != nil {
+		return 0, 0, err.Status, err.Message, false
+	}
+	return res.Value, res.Duration, "", "", true
+}
+
+// HillRevert reverts the working tree to HEAD through the sandbox (#124,
+// Decision 1). Best-effort.
+func (h *StandardHarness) HillRevert(ctx context.Context) {
+	h.hillClimbingRevert(ctx)
+}
+
+// HillCommitHash resolves the commit_hash recorded on a TSV row (#124,
+// Decision 1; v1 always empty).
+func (h *StandardHarness) HillCommitHash(ctx context.Context) string {
+	return h.hillClimbingCommitHash(ctx)
+}
+
+// HillEmitIteration emits one fire-and-forget per-iteration HillClimbing
+// observability span (#124).
+func (h *StandardHarness) HillEmitIteration(ctx context.Context, sessionID SessionID, taskID TaskID, spanSeq *uint64, iteration uint32, metricValue float64, hasMetric bool, delta float64, hasDelta bool, status HillClimbIterationStatus, reverted bool) {
+	h.emitHillClimbingIteration(ctx, sessionID, taskID, spanSeq, iteration, metricValue, hasMetric, delta, hasDelta, status, reverted)
+}
+
+// HillWriteTSV serializes the HillClimbing results log (#124, Decisions 2/3).
+func (h *StandardHarness) HillWriteTSV(workspaceRoot string, taskID TaskID, rows []HillClimbRow) {
+	h.writeHillClimbingTSV(workspaceRoot, taskID, rows)
 }
 
 // SeedUserMessage seeds a user message onto session (the ContextManager seam).
@@ -2995,19 +3059,16 @@ func (h *StandardHarness) PlanDirective(instruction string) string {
 
 // RunPlanSubtree dispatches the plan sub-strategy plan for planTask over
 // planSession, returning its terminal RunResult (#124). Genuinely recursive —
-// the child's Run drives its WHOLE loop. Routes the configured PlannerAgent
-// (R5/R6) by running the child against an agent-swapped child harness when one is
-// set; otherwise the default agent runs through h. Either way the child's Run
-// drives the whole plan loop. Returns nil if the child produced no terminal.
+// the child's Run drives its WHOLE loop and resolves its own worker agent from
+// the registry via the plan child's leaf ReactConfig.Agent (Q1 — the separate
+// planner_agent concept is dropped). Returns nil if the child produced no
+// terminal.
 func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult {
-	driver := h
-	if h.config.PlannerAgent != nil {
-		planCfg := h.config
-		planCfg.Agent = h.config.PlannerAgent
-		driver = NewStandardHarness(planCfg)
-	}
-	cx := NewExecutionContext(&driver.config.Registry)
-	cx.Executor = driver
+	// #124 Q1: the separate planner_agent concept is DROPPED — the plan child's
+	// leaf ReactConfig.Agent is authoritative and the plan child resolves its own
+	// worker agent from the registry via plan.Run.
+	cx := NewExecutionContext(&h.config.Registry)
+	cx.Executor = h
 	cx.Scratch.RunSession = planSession
 	cx.Scratch.RunBudget = budget
 	pt := planTask
@@ -3055,22 +3116,6 @@ func (h *StandardHarness) FireTaskAdvance(ctx context.Context, sessionID Session
 // PersistTaskList persists a parsed task list through the RunStore seam.
 func (h *StandardHarness) PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList) {
 	h.persistTaskList(ctx, sessionID, taskList)
-}
-
-// SelfVerifyingLoop drives a whole SelfVerifying loop.
-func (h *StandardHarness) SelfVerifyingLoop(ctx context.Context, task Task, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult {
-	return h.runSelfVerifying(ctx, task, session, budget, onStream)
-}
-
-// RalphLoop drives a whole Ralph continuation loop.
-func (h *StandardHarness) RalphLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult {
-	return h.runRalph(ctx, task, budget, onStream)
-}
-
-// HillClimbingLoop drives a whole HillClimbing loop. It reads the config
-// scalars off task.LoopStrategy, mirroring the legacy executor entry.
-func (h *StandardHarness) HillClimbingLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult {
-	return h.runHillClimbing(ctx, task, budget, onStream)
 }
 
 // Finalize finalizes observability for a terminal outcome (mirrors the tail of
@@ -3239,8 +3284,9 @@ func (h *StandardHarness) runReAct(
 	session SessionState,
 	budget BudgetSnapshot,
 	onStream StreamSink,
+	agent Agent,
 ) RunResult {
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -3487,6 +3533,10 @@ func (h *StandardHarness) runReActInner(
 	session SessionState,
 	budget BudgetSnapshot,
 	onStream StreamSink,
+	// #124: the worker agent is RESOLVED by the caller (the recursing
+	// ReactConfig.Run resolves task.LoopStrategy's leaf agent from the registry;
+	// Ralph may override it per window). The leaf no longer reads config.Agent.
+	agent Agent,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -3617,7 +3667,7 @@ func (h *StandardHarness) runReActInner(
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
-		result := h.runStreamingTurn(ctx, h.config.Agent, c, onStream)
+		result := h.runStreamingTurn(ctx, agent, c, onStream)
 		budget.Turns++
 		// Emit a turn span for every model call (issue #12). Fire-and-forget;
 		// it never affects control flow. The span id is retained as the
@@ -4085,7 +4135,7 @@ func (h *StandardHarness) runReActInner(
 			// the concepts-doc loop diagram's "compact if should_compact()"
 			// placement. Runs the verify→retry→warn loop; never halts the run.
 			if h.config.ContextManager.ShouldCompact(&session) {
-				h.runCompaction(ctx, &session, sessionID, task.ID, &spanSeq, &usage)
+				h.runCompaction(ctx, &session, sessionID, task.ID, &spanSeq, &usage, agent)
 			}
 
 			// loop again
@@ -4140,6 +4190,9 @@ func (h *StandardHarness) runCompaction(
 	taskID TaskID,
 	spanSeq *uint64,
 	usage *AggregateUsage,
+	// #124: the compaction summary turn runs on the RESOLVED worker agent, not a
+	// default config agent.
+	agent Agent,
 ) {
 	cm, ok := h.config.ContextManager.(CompactingContextManager)
 	if !ok {
@@ -4170,7 +4223,7 @@ func (h *StandardHarness) runCompaction(
 
 	for attempt := uint32(1); ; attempt++ {
 		// Run one compaction turn through the agent to produce a summary.
-		result := h.config.Agent.Turn(ctx, turn.Context)
+		result := agent.Turn(ctx, turn.Context)
 		var summary string
 		switch result.Kind {
 		case TurnFinalResponse:
@@ -4364,7 +4417,13 @@ func (h *StandardHarness) resumeConsultInner(
 		}
 	}
 
-	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
+	agent, agentFail := h.ResolveWorkerAgent(&task.LoopStrategy)
+	if agentFail != nil {
+		af := *agentFail
+		af.SessionID = task.SessionID
+		return af
+	}
+	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream, agent)
 }
 
 func (h *StandardHarness) resumeInner(
@@ -4377,6 +4436,14 @@ func (h *StandardHarness) resumeInner(
 	task := state.Task
 	budget := state.BudgetUsed
 	pending := state.PendingToolCalls
+
+	// #124: resolve the resumed task's worker agent from the registry once.
+	agent, agentFail := h.ResolveWorkerAgent(&task.LoopStrategy)
+	if agentFail != nil {
+		af := *agentFail
+		af.SessionID = task.SessionID
+		return af
+	}
 
 	// Resolve the effective tool registry for this resumed session — bridges
 	// catalogue tools the same way the turn loop does, so pending tool calls
@@ -4415,7 +4482,7 @@ func (h *StandardHarness) resumeInner(
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
-				return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
+				return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream, agent)
 			}
 		}
 	}
@@ -4461,7 +4528,7 @@ func (h *StandardHarness) resumeInner(
 		}
 	}
 
-	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream)
+	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream, agent)
 }
 
 // Compile-time interface check.

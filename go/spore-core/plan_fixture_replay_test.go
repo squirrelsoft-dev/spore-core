@@ -86,7 +86,14 @@ func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 	h := NewStandardHarness(cfg)
 	// #124: PlanExecute now genuinely recurses into its plan/execute children, so
 	// the strategy must carry a real config (both phases default ReAct leaves).
-	task := NewTask("build something", SessionID("plan-fixture"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
+	// A.5: the structured plan slot's leaf carries an output schema (empty key).
+	planChild := ReActStrategy(^uint32(0))
+	planChild.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	execChild := ReActStrategy(^uint32(0))
+	task := NewTask("build something", SessionID("plan-fixture"), PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:    &planChild,
+		Execute: &execChild,
+	}))
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunFailure || r.Reason.Kind != HaltStepFailed {
 		t.Fatalf("expected StepFailed, got %+v", r)

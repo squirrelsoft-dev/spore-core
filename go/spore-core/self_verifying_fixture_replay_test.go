@@ -56,12 +56,14 @@ func TestSelfVerifyingFixtureReplay(t *testing.T) {
 	for _, c := range fx.Cases {
 		t.Run(c.Name, func(t *testing.T) {
 			build := newRecordingAgent("build", "built")
-			eval := newRecordingAgent("eval", "evaluated")
-			cfg := standardCfg(build)
-			cfg.EvaluatorAgent = eval
-			// `misconfigured` cases run with NO verifier configured.
+			// Worker schema registered so A.5 validation reaches the verifier check.
+			cfg := selfVerifyRegisterSchema(standardCfg(build))
+			// #124: the verifier resolves from the registry under the SelfVerifying
+			// evaluator key ("evaluator"); the evaluate phase runs on the inner
+			// worker's resolved agent (Q1c). `misconfigured` cases register NO
+			// verifier, so startup validation rejects them as an UnresolvedHandle.
 			if c.Expected.Kind != "misconfigured" {
-				cfg.Verifier = newSVVerifier(c.MaxIterations, c.Verdicts...)
+				cfg = cfg.WithRegistryVerifier("evaluator", newSVVerifier(c.MaxIterations, c.Verdicts...))
 			}
 			h := NewStandardHarness(cfg)
 			r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
@@ -79,8 +81,13 @@ func TestSelfVerifyingFixtureReplay(t *testing.T) {
 					t.Fatalf("expected %d iterations, got %d", c.Expected.Iterations, r.Reason.Iterations)
 				}
 			case "misconfigured":
-				if r.Kind != RunFailure || r.Reason.Kind != HaltSelfVerifyMisconfigured {
-					t.Fatalf("expected SelfVerifyMisconfigured, got %+v", r)
+				// #124: an unresolvable verifier is caught at startup validation as
+				// an UnresolvedHandle ConfigurationError (kind "verifier").
+				if r.Kind != RunFailure || r.Reason.Kind != HaltConfigurationError {
+					t.Fatalf("expected ConfigurationError, got %+v", r)
+				}
+				if uh, ok := r.Reason.ConfigError.(*UnresolvedHandleError); !ok || uh.Kind != "verifier" {
+					t.Fatalf("expected UnresolvedHandle(verifier), got %+v", r.Reason.ConfigError)
 				}
 			default:
 				t.Fatalf("unknown expected kind %q", c.Expected.Kind)

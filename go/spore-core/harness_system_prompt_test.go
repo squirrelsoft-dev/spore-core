@@ -169,7 +169,7 @@ func TestSystemPromptNotDuplicated(t *testing.T) {
 		{Role: RoleSystem, Content: NewTextContent("EXISTING SYSTEM")},
 		{Role: RoleUser, Content: NewTextContent("hi")},
 	}}
-	r := h.runReAct(context.Background(), task, 2, session, BudgetSnapshot{}, nil)
+	r := h.runReAct(context.Background(), task, 2, session, BudgetSnapshot{}, nil, h.config.Agent)
 	if r.Kind != RunSuccess {
 		t.Fatalf("run: %+v", r)
 	}

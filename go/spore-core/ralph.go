@@ -176,163 +176,56 @@ func ralphReloadContext(workspaceRoot string) (string, bool) {
 }
 
 // ============================================================================
-// Ralph strategy driver
+// Ralph strategy executor primitives (#124)
 // ============================================================================
+//
+// The Ralph OUTER reset loop now lives in the recursive RalphConfig.Run
+// (strategy.go), which dispatches c.Inner.Run per window. These leaf primitives
+// supply the harness-side machinery the recursive body delegates to: the
+// per-window FRESH session seed (instruction + .spore/ reload + optional VCS
+// history), the external completion check, and the reset cap.
 
-// runRalph drives the Ralph loop strategy (issue #58).
-//
-// Config fields read:
-//   - config.MaxResets (B3, default 3 via effectiveMaxResets) — the OUTER loop
-//     cap: the maximum number of context windows run before halting with
-//     HaltRalphCompletionUnmet when tasks are still incomplete.
-//   - config.Sandbox.WorkspaceRoot() — where the .spore/ state lives.
-//
-// Terminal HaltReason produced:
-//   - HaltRalphCompletionUnmet{Iterations, Reason} — reached MaxResets context
-//     windows but the filesystem completion check never reported done.
-//
-// Rules enforced (each maps to a test): R1 the outer loop resets the context
-// window on incomplete; R2 a FRESH SessionState per window (no carryover); R3
-// the filesystem reload injects reloaded .spore/ content into the fresh seed; R4
-// incomplete,incomplete,complete => Success at iteration 3; R5 always-incomplete
-// => exactly MaxResets windows => RalphCompletionUnmet; R6 budgets fold across
-// ALL windows; R7 each reset is traceable (a distinct generated session id per
-// window, finalized via observability).
-func (h *StandardHarness) runRalph(
-	ctx context.Context,
-	task Task,
-	budget BudgetSnapshot,
-	_ StreamSink,
-) RunResult {
+// RalphSeedSession builds a FRESH per-window SessionState re-seeded from the
+// .spore/ filesystem checkpoint (issue #58, R2/R3). Seeds the instruction, then
+// injects the reloaded .spore/progress.json + feature_list.json content, then —
+// when a VcsProvider is wired — the recent VCS history block. No message
+// carryover from any prior window.
+func (h *StandardHarness) RalphSeedSession(ctx context.Context, instruction string) SessionState {
 	workspaceRoot := ""
 	if h.config.Sandbox != nil {
 		workspaceRoot = h.config.Sandbox.WorkspaceRoot()
 	}
-	maxResets := h.config.effectiveMaxResets()
-	// Ralph's incoming budget snapshot is irrelevant — each context window is a
-	// fresh start with its own per-window turn budget (the reset discards the
-	// turn budget along with the SessionState). Token/turn accounting is
-	// accumulated separately for terminal reporting (R6).
-	_ = budget
-
-	// Cumulative usage + turns across ALL context windows (R6).
-	var totalUsage AggregateUsage
-	var cumulativeTurns uint32
-	// The most recent incompletion reason (for RalphCompletionUnmet).
-	lastReason := ".spore/progress.json missing"
-	// Session id of the most recent context window (terminal accounting).
-	lastSessionID := task.SessionID
-	// Conversation history of the most recent window (issue #102): carried onto
-	// the RalphCompletionUnmet failure so it resumes losslessly.
-	var lastSessionState SessionState
-
-	// The OUTER loop: each iteration is ONE context window. maxResets caps the
-	// number of windows (B3). Iteration 0 is the first window; a reset is the
-	// transition into the next iteration (R1).
-	for iteration := uint32(0); iteration < maxResets; iteration++ {
-		// R7: a fresh, distinct session id per context window so each reset is
-		// independently traceable.
-		windowSessionID := task.SessionID
-		if iteration > 0 {
-			windowSessionID = NewSessionID()
-		}
-		lastSessionID = windowSessionID
-
-		// R2: a FRESH SessionState per window — discard the prior one. No message
-		// carryover; the window is re-seeded from scratch.
-		var session SessionState
-
-		// Seed the instruction (R2) then R3: reload the deterministic .spore/
-		// state from the filesystem and inject it as context so the fresh window
-		// knows what is already done / still outstanding.
-		h.config.ContextManager.AppendUserMessage(ctx, &session, task.Instruction)
-		if reload, ok := ralphReloadContext(workspaceRoot); ok {
-			h.config.ContextManager.AppendUserMessage(ctx, &session, reload)
-		}
-		// R3 (issue #58 v2): when a VcsProvider is wired, ALSO reload git history
-		// and inject it as a delimited "Recent VCS history:" section, exactly as
-		// the .spore/ reload content is injected. When the provider is nil (the
-		// default) this section is omitted entirely — Ralph's reloaded context is
-		// then byte-for-byte the v1 behavior (the B4→nil decision).
-		if h.config.VcsProvider != nil {
-			args := VcsLogArgs{MaxEntries: 20}
-			if log, err := h.config.VcsProvider.Log(ctx, args); err == nil {
-				if trimmed := strings.TrimSpace(log); trimmed != "" {
-					block := "Recent VCS history:\n" + trimmed
-					h.config.ContextManager.AppendUserMessage(ctx, &session, block)
-				}
-			}
-		}
-
-		// The per-window bounded ReAct sub-loop. The registered Stop hook (B1)
-		// fires inside it on each FinalResponse; this strategy's OUTER loop then
-		// decides reset vs success off the same filesystem state.
-		windowTask := Task{
-			ID:           task.ID,
-			Instruction:  task.Instruction,
-			SessionID:    windowSessionID,
-			Budget:       task.Budget,
-			LoopStrategy: task.LoopStrategy,
-		}
-		windowCap := allTurns
-		if task.Budget.MaxTurns != nil {
-			windowCap = *task.Budget.MaxTurns
-		}
-		// FRESH per-window budget: the context-window reset resets the turn budget
-		// too. Token fold is accumulated separately via totalUsage.
-		carried := BudgetSnapshot{}
-		windowResult := h.runReActInner(ctx, windowTask, windowCap, session, carried, nil)
-		foldSelfVerifyUsage(&totalUsage, &carried, windowResult)
-		cumulativeTurns += carried.Turns
-
-		// A window that paused / escalated is propagated up unchanged.
-		switch windowResult.Kind {
-		case RunWaitingForHuman:
-			// Not terminal — do not finalize.
-			return windowResult
-		case RunEscalate:
-			h.finalizeObservability(ctx, windowResult.SessionID, TerminalEscalated, "")
-			return windowResult
-		}
-
-		// External completion check (B1): consult the SAME filesystem state the
-		// Stop hook reads. complete => Success; incomplete => reset into the next
-		// window (R1) unless the cap is reached (R5).
-		reason, incomplete := ralphCompletionStatus(workspaceRoot)
-		if !incomplete {
-			output := ""
-			if windowResult.Kind == RunSuccess {
-				output = windowResult.Output
-			}
-			result := RunResult{
-				Kind:      RunSuccess,
-				Output:    output,
-				SessionID: windowSessionID,
-				Usage:     totalUsage,
-				Turns:     cumulativeTurns,
-				// Issue #102: carry the completing window's conversation history.
-				SessionState: windowResult.SessionState,
-			}
-			h.finalizeObservability(ctx, windowSessionID, TerminalSuccess, "")
-			return result
-		}
-		lastReason = reason
-		lastSessionState = windowResult.SessionState
+	var session SessionState
+	h.config.ContextManager.AppendUserMessage(ctx, &session, instruction)
+	if reload, ok := ralphReloadContext(workspaceRoot); ok {
+		h.config.ContextManager.AppendUserMessage(ctx, &session, reload)
 	}
-
-	// R5: ran out of context-window resets without completion.
-	result := RunResult{
-		Kind: RunFailure,
-		Reason: HaltReason{
-			Kind:       HaltRalphCompletionUnmet,
-			Iterations: maxResets,
-			Reason:     lastReason,
-		},
-		SessionID:    lastSessionID,
-		Usage:        totalUsage,
-		Turns:        cumulativeTurns,
-		SessionState: lastSessionState,
+	if h.config.VcsProvider != nil {
+		args := VcsLogArgs{MaxEntries: 20}
+		if log, err := h.config.VcsProvider.Log(ctx, args); err == nil {
+			if trimmed := strings.TrimSpace(log); trimmed != "" {
+				block := "Recent VCS history:\n" + trimmed
+				h.config.ContextManager.AppendUserMessage(ctx, &session, block)
+			}
+		}
 	}
-	h.finalizeObservability(ctx, lastSessionID, TerminalFailure, haltReasonString(result.Reason))
-	return result
+	return session
+}
+
+// RalphCompletionStatus is the Ralph external completion check (issue #58, B1):
+// reads the .spore/ state under the sandbox workspace root and reports (reason,
+// incomplete). incomplete=false means complete. Delegates to the package-level
+// ralphCompletionStatus — the SAME logic the registered Stop hook reads.
+func (h *StandardHarness) RalphCompletionStatus() (string, bool) {
+	workspaceRoot := ""
+	if h.config.Sandbox != nil {
+		workspaceRoot = h.config.Sandbox.WorkspaceRoot()
+	}
+	return ralphCompletionStatus(workspaceRoot)
+}
+
+// RalphMaxResets returns the configured Ralph outer-loop reset cap (B3, default
+// 3 via effectiveMaxResets).
+func (h *StandardHarness) RalphMaxResets() uint32 {
+	return h.config.effectiveMaxResets()
 }

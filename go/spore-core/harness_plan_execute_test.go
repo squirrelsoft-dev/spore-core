@@ -364,18 +364,32 @@ func TestExecutePhaseSuccessOutputIsLastStep(t *testing.T) {
 	}
 }
 
-// Planner-agent routing through the FULL run: the planner runs the plan turn and
-// the default agent runs the execute steps.
-func TestExecutePhasePlannerAgentRouting(t *testing.T) {
+// #124 Q1: the separate planner_agent concept is DROPPED. The plan child's leaf
+// ReactConfig.Agent is now authoritative — to route the plan turn to a distinct
+// agent, register it under a key and point the plan child's ReAct at that key.
+// The execute child resolves the default agent (empty key).
+func TestExecutePhasePlanChildAgentRouting(t *testing.T) {
 	def := NewMockAgent("default")
 	def.Push(planFinal("did the step"))
 	planner := NewMockAgent("planner")
 	planner.Push(planFinal(`{"tasks":["step"]}`))
 
-	cfg := standardCfg(def)
-	cfg.PlannerAgent = planner
+	cfg := standardCfg(def).WithRegistryAgent("planner", planner)
 	h := NewStandardHarness(cfg)
-	r := h.Run(context.Background(), NewHarnessRunOptions(planTask("build a CLI")))
+
+	// Plan child ReAct routes to the "planner" agent; execute child is the default.
+	// A.5: the plan slot is structured, so its leaf carries an output schema.
+	planChild := ReActStrategy(^uint32(0))
+	planChild.ReActCfg.Agent = AgentRef("planner")
+	planChild.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	execChild := ReActStrategy(^uint32(0))
+	strat := PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:    &planChild,
+		Execute: &execChild,
+	})
+	task := NewTask("build a CLI", SessionID("plan-sess"), strat)
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess || r.Output != "did the step" {
 		t.Fatalf("got %+v", r)
 	}
@@ -439,25 +453,33 @@ func TestPlanExecutePersistenceLivesOnRunStoreNotExtras(t *testing.T) {
 // this is the regression that proves the recursion is real. Mirrors Rust's
 // plan_execute_runs_non_react_execute_child_per_task.
 func TestPlanExecuteRunsNonReactExecuteChildPerTask(t *testing.T) {
-	// cfg.Agent runs BOTH the plan turn (JSON) and the per-task build phase.
+	// cfg.Agent runs the plan turn (JSON), the per-task SelfVerifying BUILD phase,
+	// AND — under #124 Q1c — the per-task evaluate phase (the inner worker's
+	// resolved agent). Per task the consumption order is build then evaluate, so
+	// the queue interleaves: plan, build0, eval0, build1, eval1.
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["t0","t1"],"rationale":"r"}`))
 	a.Push(planFinal("built t0"))
+	a.Push(planFinal("evaluated t0"))
 	a.Push(planFinal("built t1"))
-	// The evaluate phase runs on a distinct agent; PASS each task.
-	eval := newRecordingAgent("eval", "PASS")
-	// The verifier records every invocation; PASS each time.
+	a.Push(planFinal("evaluated t1"))
+	// The verifier resolves from the registry under the SelfVerifying evaluator
+	// key (here ""). It records every invocation; PASS each time.
 	v := newSVVerifier(3, "pass", "pass")
-	cfg := standardCfg(a)
-	cfg.EvaluatorAgent = eval
-	cfg.Verifier = v
+	cfg := standardCfg(a).WithRegistryVerifier("", v)
 	h := NewStandardHarness(cfg)
 
+	// A.5: the plan slot's leaf carries an output schema; the SelfVerifying
+	// execute child's worker slot likewise.
+	planChild := ReActStrategy(^uint32(0))
+	planChild.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	worker := ReActStrategy(^uint32(0))
+	worker.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
 	// The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
 	strat := PlanExecuteStrategy(PlanExecuteConfig{
-		Plan: PtrStrategy(ReActStrategy(^uint32(0))),
+		Plan: &planChild,
 		Execute: PtrStrategy(SelfVerifyingStrategy(SelfVerifyingConfig{
-			Inner:     PtrStrategy(ReActStrategy(^uint32(0))),
+			Inner:     &worker,
 			Evaluator: SchemaRef(""),
 		})),
 	})
@@ -527,7 +549,14 @@ func TestPlanExecuteLoopFixtureReplay(t *testing.T) {
 		TerminationPolicy: AlwaysContinuePolicy{},
 	}
 	h := NewStandardHarness(cfg)
-	task := NewTask("build a CLI", SessionID("plan-execute-fixture"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
+	// A.5: the plan slot's leaf carries an output schema (default empty key).
+	planChild := ReActStrategy(^uint32(0))
+	planChild.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	execChild := ReActStrategy(^uint32(0))
+	task := NewTask("build a CLI", SessionID("plan-execute-fixture"), PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:    &planChild,
+		Execute: &execChild,
+	}))
 
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunSuccess {

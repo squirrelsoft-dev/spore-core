@@ -100,13 +100,25 @@ func (v *svVerifier) seenInputs() []SelfVerifyInput {
 var _ Verifier = (*svVerifier)(nil)
 
 func selfVerifyTask() Task {
+	// #124 A.5: the SelfVerifying worker slot is STRUCTURED, so the bare ReAct
+	// worker carries an output schema (registered in selfVerifyCfg).
+	worker := ReActStrategy(^uint32(0))
+	worker.ReActCfg.Output = func() *SchemaRef { s := SchemaRef("worker-schema"); return &s }()
 	return NewTask("build the widget", SessionID("build-sess"),
-		SelfVerifyingStrategy(SelfVerifyingConfig{Inner: PtrStrategy(ReActStrategy(^uint32(0))), Evaluator: SchemaRef("evaluator")}))
+		SelfVerifyingStrategy(SelfVerifyingConfig{Inner: &worker, Evaluator: SchemaRef("evaluator")}))
+}
+
+// selfVerifyRegisterSchema registers the worker output schema selfVerifyTask
+// declares, so A.5 validation passes for the worker slot.
+func selfVerifyRegisterSchema(cfg HarnessConfig) HarnessConfig {
+	return cfg.WithRegistrySchema("worker-schema", json.RawMessage(`{}`))
 }
 
 func selfVerifyCfg(agent Agent, v Verifier) HarnessConfig {
 	cfg := standardCfg(agent)
-	cfg.Verifier = v
+	// #124: the verifier resolves from the registry under the SelfVerifying
+	// evaluator key (Q1a). selfVerifyTask uses Evaluator: SchemaRef("evaluator").
+	cfg = selfVerifyRegisterSchema(cfg).WithRegistryVerifier("evaluator", v)
 	return cfg
 }
 
@@ -133,20 +145,26 @@ func TestSelfVerifyingNotStrategyNotImplemented(t *testing.T) {
 
 func TestSelfVerifyingNilVerifierMisconfigured(t *testing.T) {
 	agent := newRecordingAgent("a", "done")
-	cfg := standardCfg(agent) // Verifier left nil
+	// Worker schema registered so A.5 validation reaches the verifier check; no
+	// verifier registered under "evaluator".
+	cfg := selfVerifyRegisterSchema(standardCfg(agent))
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
 	if r.Kind != RunFailure {
 		t.Fatalf("expected Failure, got %+v", r)
 	}
-	if r.Reason.Kind != HaltSelfVerifyMisconfigured {
-		t.Fatalf("expected SelfVerifyMisconfigured, got %q", r.Reason.Kind)
+	// #124: an unresolvable SelfVerifying verifier is now caught at STARTUP
+	// validation as an UnresolvedHandle (kind "verifier"), before the first turn,
+	// rather than as a runtime SelfVerifyMisconfigured halt.
+	if r.Reason.Kind != HaltConfigurationError {
+		t.Fatalf("expected ConfigurationError, got %q", r.Reason.Kind)
 	}
-	if r.Reason.Reason == "" {
-		t.Fatalf("expected a non-empty misconfigured reason")
+	uh, ok := r.Reason.ConfigError.(*UnresolvedHandleError)
+	if !ok || uh.Kind != "verifier" {
+		t.Fatalf("expected UnresolvedHandle(verifier), got %+v", r.Reason.ConfigError)
 	}
 	if len(agent.turns()) != 0 {
-		t.Fatalf("agent should never run when verifier is nil")
+		t.Fatalf("agent should never run when verifier is unresolved")
 	}
 }
 
@@ -176,15 +194,16 @@ func TestSelfVerifyingPassFirstIteration(t *testing.T) {
 
 func TestSelfVerifyingEvaluateFreshSession(t *testing.T) {
 	build := newRecordingAgent("build", "built")
-	eval := newRecordingAgent("eval", "PASS")
-	cfg := selfVerifyCfg(build, newSVVerifier(3, "pass"))
-	cfg.EvaluatorAgent = eval
+	// #124 Q1c: the evaluate phase runs on the INNER worker's resolved agent
+	// (the same default agent the build phase uses); there is no separate
+	// EvaluatorAgent. The fresh-session / read-only-sandbox contract is preserved.
+	v := newSVVerifier(3, "pass")
+	cfg := selfVerifyCfg(build, v)
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
 	if r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
 	}
-	v := cfg.Verifier.(*svVerifier)
 	inputs := v.seenInputs()
 	if len(inputs) != 1 {
 		t.Fatalf("expected 1 verifier input, got %d", len(inputs))
@@ -207,25 +226,33 @@ func TestSelfVerifyingEvaluateFreshSession(t *testing.T) {
 // ============================================================================
 
 func TestSelfVerifyingRoleEvaluatorChunkInSeed(t *testing.T) {
+	// #124 Q1c: build and evaluate share the inner worker's resolved agent. The
+	// evaluate seed still carries the role-evaluator chunk; the build seed (the
+	// first turn) must not.
 	build := newRecordingAgent("build", "built")
-	eval := newRecordingAgent("eval", "PASS")
 	cfg := selfVerifyCfg(build, newSVVerifier(3, "pass"))
-	cfg.EvaluatorAgent = eval
 	h := NewStandardHarness(cfg)
 	if r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask())); r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
 	}
-	turns := eval.turns()
-	if len(turns) == 0 {
-		t.Fatalf("evaluator agent never ran")
+	turns := build.turns()
+	if len(turns) < 2 {
+		t.Fatalf("expected at least build + evaluate turns, got %d", len(turns))
 	}
-	if !strings.Contains(turns[0].messages, RoleEvaluatorChunk) {
-		t.Fatalf("evaluate seed missing role-evaluator chunk; got:\n%s", turns[0].messages)
-	}
-	// The build agent's seed must NOT carry the evaluator role chunk.
-	bturns := build.turns()
-	if strings.Contains(bturns[0].messages, RoleEvaluatorChunk) {
+	// The first (build) turn must NOT carry the evaluator role chunk.
+	if strings.Contains(turns[0].messages, RoleEvaluatorChunk) {
 		t.Fatalf("build seed must not carry the role-evaluator chunk")
+	}
+	// A later (evaluate) turn MUST carry the role-evaluator chunk.
+	found := false
+	for _, tn := range turns[1:] {
+		if strings.Contains(tn.messages, RoleEvaluatorChunk) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("evaluate seed missing role-evaluator chunk across turns")
 	}
 }
 
@@ -265,10 +292,8 @@ func TestSelfVerifyingEvaluateReadOnlySandbox(t *testing.T) {
 func TestSelfVerifyingFailThenPassInjectsReason(t *testing.T) {
 	const finding = "needs a null check on line 42"
 	build := newRecordingAgent("build", "built")
-	eval := newRecordingAgent("eval", "PASS")
 	v := newSVVerifier(3, finding, "pass")
 	cfg := selfVerifyCfg(build, v)
-	cfg.EvaluatorAgent = eval
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
 	if r.Kind != RunSuccess {
@@ -277,17 +302,26 @@ func TestSelfVerifyingFailThenPassInjectsReason(t *testing.T) {
 	if v.calls != 2 {
 		t.Fatalf("expected 2 verify calls, got %d", v.calls)
 	}
+	// #124 Q1c: build and evaluate share the inner worker's agent, so the
+	// recorded turns interleave [build0, eval0, build1, eval1]. The FIRST turn
+	// (iter0 build) must NOT have seen the finding; a LATER build turn (iter1)
+	// MUST carry the injected reason.
 	bturns := build.turns()
 	if len(bturns) < 2 {
 		t.Fatalf("expected the build agent to run at least twice, got %d", len(bturns))
 	}
-	// The first build turn must NOT have seen the finding; the last one MUST.
 	if strings.Contains(bturns[0].messages, finding) {
 		t.Fatalf("iter0 build context must not contain the finding")
 	}
-	last := bturns[len(bturns)-1]
-	if !strings.Contains(last.messages, finding) {
-		t.Fatalf("iter1 build context must contain injected reason %q; got:\n%s", finding, last.messages)
+	found := false
+	for _, tn := range bturns[1:] {
+		if strings.Contains(tn.messages, finding) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("a later build context must contain injected reason %q", finding)
 	}
 }
 
@@ -340,10 +374,8 @@ func TestSelfVerifyingBudgetsFoldBothPhases(t *testing.T) {
 	// 2 iterations: each iteration runs build (1 turn, 1+1 tokens) + evaluate
 	// (1 turn, 1+1 tokens). Total input/output tokens = 4 each.
 	build := newRecordingAgent("build", "built")
-	eval := newRecordingAgent("eval", "PASS")
 	v := newSVVerifier(3, "again", "pass")
 	cfg := selfVerifyCfg(build, v)
-	cfg.EvaluatorAgent = eval
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
 	if r.Kind != RunSuccess {
@@ -361,10 +393,8 @@ func TestSelfVerifyingBudgetsFoldBothPhases(t *testing.T) {
 
 func TestSelfVerifyingEvaluateSessionsDistinctPerIteration(t *testing.T) {
 	build := newRecordingAgent("build", "built")
-	eval := newRecordingAgent("eval", "PASS")
 	v := newSVVerifier(3, "more", "more", "pass")
 	cfg := selfVerifyCfg(build, v)
-	cfg.EvaluatorAgent = eval
 	h := NewStandardHarness(cfg)
 	if r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask())); r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)

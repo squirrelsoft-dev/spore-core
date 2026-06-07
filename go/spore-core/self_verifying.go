@@ -167,178 +167,29 @@ var _ SandboxProvider = (*ReadOnlySandbox)(nil)
 // SelfVerifying strategy driver
 // ============================================================================
 
-// runSelfVerifying drives the SelfVerifying loop strategy (issue #61).
-//
-// Config fields read (both default nil):
-//   - config.Verifier — the oracle. REQUIRED: nil => Failure
-//     {SelfVerifyMisconfigured} (D4/R11), a typed halt NOT a panic. Its
-//     MaxIterations() (default 3) caps the round-trips (D3); MaxStopBlocks does
-//     NOT enter the picture for this strategy.
-//   - config.EvaluatorAgent — the evaluate-phase agent. Defaulting contract
-//     (D2): EvaluatorAgent if set, else config.Agent (identical to
-//     PlannerAgent). The read-only sandbox and the fresh evaluate session id are
-//     derived INTERNALLY.
-//
-// Terminal HaltReason variants produced (peers, D4):
-//   - SelfVerifyExhausted{Iterations, Reason} — ran out of MaxIterations
-//     round-trips without a pass (clean Default-FAIL exhaustion).
-//   - SelfVerifyMisconfigured{Reason} — config.Verifier is nil.
-//
-// Rules enforced (each maps to a test): R1 build loop to agent-done; R2 fresh
-// evaluate session; R3 evaluate read-only sandbox; R4 role-evaluator chunk in
-// the evaluate seed (presence-only); R5 Default-FAIL keeps looping; R6 findings
-// injected into the build context; R7 stagnation guard; R8 budgets fold both
-// phases; R9 build vs evaluate distinguishable (distinct session ids); R11 nil
-// verifier => SelfVerifyMisconfigured.
-func (h *StandardHarness) runSelfVerifying(
-	ctx context.Context,
-	task Task,
-	session SessionState,
-	budget BudgetSnapshot,
-	onStream StreamSink,
-) RunResult {
-	buildSessionID := task.SessionID
-
-	// D4/R11: a missing verifier is a typed halt, not a panic.
-	if h.config.Verifier == nil {
-		result := RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind:   HaltSelfVerifyMisconfigured,
-				Reason: "SelfVerifying requires config.Verifier, but it is nil",
-			},
-			SessionID: buildSessionID,
-		}
-		h.finalizeObservability(ctx, buildSessionID, TerminalFailure, haltReasonString(result.Reason))
-		return result
-	}
-	verifier := h.config.Verifier
-	maxIterations := verifier.MaxIterations()
-
-	// Shared budget threaded across every build + evaluate sub-run (R8).
-	carried := budget
-	// Cumulative usage across ALL build + evaluate runs of ALL iterations (R8).
-	var totalUsage AggregateUsage
-	// The most recent verifier failure reason (for SelfVerifyExhausted).
-	var lastReason string
-
-	for iteration := uint32(0); iteration < maxIterations; iteration++ {
-		// ── Build phase (R1): bounded ReAct sub-loop carrying the shared budget.
-		//    Iteration 0's seed instruction is already in `session`; later
-		//    iterations already have the prior verdict reason injected as a user
-		//    message (R6).
-		buildTask := Task{
-			ID:           task.ID,
-			Instruction:  task.Instruction,
-			SessionID:    buildSessionID,
-			Budget:       task.Budget,
-			LoopStrategy: task.LoopStrategy,
-		}
-		buildCap := allTurns
-		if task.Budget.MaxTurns != nil {
-			buildCap = *task.Budget.MaxTurns
-		}
-		buildResult := h.runReActInner(ctx, buildTask, buildCap, session, carried, nil)
-		foldSelfVerifyUsage(&totalUsage, &carried, buildResult)
-
-		// A build run that paused / escalated is propagated up unchanged — the
-		// caller must handle it before verification can resume.
-		switch buildResult.Kind {
-		case RunWaitingForHuman:
-			// Not terminal — do not finalize.
-			return buildResult
-		case RunEscalate:
-			h.finalizeObservability(ctx, buildResult.SessionID, TerminalEscalated, "")
-			return buildResult
-		}
-
-		// ── Evaluate phase (R2/R3/R4): a fresh evaluator RUN with a distinct
-		//    generated session id, a read-only sandbox, the evaluator agent (D2),
-		//    and the role-evaluator chunk.
-		evalResult := h.runSelfVerifyEvaluatePhase(ctx, &task, &carried, &totalUsage)
-
-		// ── Verdict.
-		verdict := verifier.Verify(ctx, SelfVerifyInput{
-			BuildResult: buildResult,
-			EvalResult:  evalResult,
-			Workspace:   h.config.Sandbox.WorkspaceRoot(),
-			Iteration:   iteration,
-		})
-		switch verdict.Kind {
-		case SelfVerifyPassed:
-			// Reuse the build run's output as the run's output.
-			output := ""
-			turns := carried.Turns
-			if buildResult.Kind == RunSuccess {
-				output = buildResult.Output
-				turns = buildResult.Turns
-			}
-			result := RunResult{
-				Kind:      RunSuccess,
-				Output:    output,
-				SessionID: buildSessionID,
-				Usage:     totalUsage,
-				Turns:     turns,
-				// Issue #102: carry the passing build run's full conversation
-				// history so the SelfVerifying success resumes losslessly.
-				SessionState: buildResult.SessionState,
-			}
-			h.finalizeObservability(ctx, buildSessionID, TerminalSuccess, "")
-			return result
-		default:
-			// SelfVerifyFailed — R5/R6: Default-FAIL keeps looping; inject the
-			// reason into the build context via the SAME path the Stop-block /
-			// PlanExecute uses (append a user message) so the next build
-			// iteration sees it.
-			lastReason = verdict.Reason
-			h.config.ContextManager.AppendUserMessage(ctx, &session, verdict.Reason)
-		}
-	}
-
-	// R7: ran out of round-trips without a pass — clean Default-FAIL exhaustion.
-	result := RunResult{
-		Kind: RunFailure,
-		Reason: HaltReason{
-			Kind:       HaltSelfVerifyExhausted,
-			Iterations: maxIterations,
-			Reason:     lastReason,
-		},
-		SessionID: buildSessionID,
-		Usage:     totalUsage,
-		Turns:     carried.Turns,
-		// Issue #102: carry the build conversation (with each verdict reason
-		// appended) so the exhausted-failure result is lossless.
-		SessionState: session,
-	}
-	h.finalizeObservability(ctx, buildSessionID, TerminalFailure, haltReasonString(result.Reason))
-	return result
-}
-
 // allTurns is the "no turn cap" sentinel (max uint32), mirroring the execute
 // phase's ^uint32(0).
 const allTurns = ^uint32(0)
 
-// runSelfVerifyEvaluatePhase runs the SelfVerifying evaluate phase (issue #61):
-// a fresh evaluator RUN over a read-only sandbox in a never-shared session.
+// EvaluatePhase runs the SelfVerifying evaluate phase (issue #61, #124): a fresh
+// evaluator RUN over a read-only sandbox in a never-shared session, on the
+// RESOLVED evalAgent (Q1c — the inner worker's resolved agent, threaded by the
+// recursive SelfVerifyingConfig.Run; the harness no longer reads config.Agent /
+// EvaluatorAgent here).
 //
 // Builds a child StandardHarness from a copy of h.config with the Agent swapped
-// to the evaluator agent (D2 defaulting) and the Sandbox wrapped in a
-// ReadOnlySandbox (R3). The evaluator runs a fresh ReAct loop seeded with the
-// role-evaluator chunk (R4, presence-only) plus a review directive, in a freshly
-// generated session (R2/R9). Folds the evaluate run's usage into totalUsage /
-// carried (R8) and returns its terminal RunResult.
-func (h *StandardHarness) runSelfVerifyEvaluatePhase(
+// to evalAgent and the Sandbox wrapped in a ReadOnlySandbox (R3). The evaluator
+// runs a fresh ReAct loop seeded with the role-evaluator chunk (R4,
+// presence-only) plus a review directive, in a freshly generated session
+// (R2/R9). Folds the evaluate run's usage into totalUsage / carried (R8) and
+// returns its terminal RunResult.
+func (h *StandardHarness) EvaluatePhase(
 	ctx context.Context,
 	task *Task,
+	evalAgent Agent,
 	carried *BudgetSnapshot,
 	totalUsage *AggregateUsage,
 ) RunResult {
-	// D2: evaluator agent defaulting — identical contract to PlannerAgent.
-	evaluator := h.config.Agent
-	if h.config.EvaluatorAgent != nil {
-		evaluator = h.config.EvaluatorAgent
-	}
-
 	// R4 (presence-only): prepend the role-evaluator chunk content to the review
 	// directive.
 	directive := fmt.Sprintf(
@@ -363,22 +214,18 @@ func (h *StandardHarness) runSelfVerifyEvaluatePhase(
 		LoopStrategy: ReActStrategy(cap),
 	}
 
-	// Child harness: copy the config, swap agent + sandbox. The copy shares the
-	// same observability / context-manager / tool seams so the evaluate run's
-	// spans land in the SAME trace stream (distinguished by its distinct session
-	// id, R9). The evaluator agent must NOT itself dispatch SelfVerifying, so the
-	// child clears the verifier to avoid any accidental recursion.
+	// Child harness: copy the config, swap sandbox. The copy shares the same
+	// observability / context-manager / tool seams so the evaluate run's spans
+	// land in the SAME trace stream (distinguished by its distinct session id,
+	// R9). The resolved evalAgent runs the fresh ReAct window directly.
 	evalConfig := h.config
-	evalConfig.Agent = evaluator
 	evalConfig.Sandbox = NewReadOnlySandbox(h.config.Sandbox)
-	evalConfig.Verifier = nil
-	evalConfig.EvaluatorAgent = nil
 	evalHarness := NewStandardHarness(evalConfig)
 
 	var evalState SessionState
 	evalHarness.config.ContextManager.AppendUserMessage(ctx, &evalState, directive)
 
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil)
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

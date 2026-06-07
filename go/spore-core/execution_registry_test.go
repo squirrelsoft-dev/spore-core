@@ -233,7 +233,9 @@ func TestValidateTreeWalkPassesWhenFullyWired(t *testing.T) {
 		Agent("ralph-agent", stubAgent{id: "ralph-agent"}).
 		Toolset("plan-tools", NewScriptedToolRegistry()).
 		Toolset("exec-tools", NewScriptedToolRegistry()).
-		Schema("exec-evaluator", json.RawMessage(`{}`)).
+		// #124 Q1a: the SelfVerifying evaluator "exec-evaluator" now resolves as a
+		// VERIFIER (not a schema).
+		Verifier("exec-evaluator", regStubVerifier{}).
 		// A.5 (#124): the structured plan / worker slots now carry output schemas.
 		Schema("plan-schema", json.RawMessage(`{}`)).
 		Schema("worker-schema", json.RawMessage(`{}`)).
@@ -317,11 +319,12 @@ func TestUnresolvedHandleIsStartupErrorBeforeFirstTurn(t *testing.T) {
 	assertUnresolved(t, result.Reason.ConfigError, "toolset", "missing-tools")
 }
 
-func TestEmptyRegistrySkipsStartupValidation(t *testing.T) {
-	// Legacy callers with no registry must NOT trigger validation (Option B
-	// byte-identity). An empty registry + a handle-bearing task must not produce
-	// a HaltConfigurationError; the run proceeds on the legacy path.
-	a := NewMockAgent("legacy")
+func TestDefaultCollaboratorsFoldResolveBareLeaf(t *testing.T) {
+	// #124: the legacy "skip validation when no registry" Option-B path is GONE —
+	// collaborator resolution is the SINGLE path. NewStandardHarness folds the
+	// config's default Agent / ToolRegistry / schema under the empty key, so a
+	// BARE ReAct leaf (empty AgentRef/ToolsetRef) resolves and runs.
+	a := NewMockAgent("default")
 	a.Push(NewFinalResponse("done", turnUsage()))
 	cfg := HarnessConfig{
 		Agent:             a,
@@ -331,10 +334,30 @@ func TestEmptyRegistrySkipsStartupValidation(t *testing.T) {
 		TerminationPolicy: AlwaysContinuePolicy{},
 	}
 	h := NewStandardHarness(cfg)
-	task := NewTask("legacy", NewSessionID(), reactLeaf("unresolved", "unresolved"))
+	task := NewTask("bare", NewSessionID(), ReActStrategy(2))
 	result := h.Run(context.Background(), HarnessRunOptions{Task: task})
-	if result.Reason.Kind == HaltConfigurationError {
-		t.Fatal("empty registry must skip startup validation")
+	if result.Kind != RunSuccess {
+		t.Fatalf("bare leaf with folded default collaborators should run, got %+v", result)
+	}
+}
+
+func TestUnregisteredHandleIsStartupConfigurationError(t *testing.T) {
+	// #124: an unregistered agent handle is now a STARTUP ConfigurationError
+	// (UnresolvedHandle) — there is no legacy bypass.
+	a := NewMockAgent("default")
+	a.Push(NewFinalResponse("done", turnUsage()))
+	cfg := HarnessConfig{
+		Agent:             a,
+		ToolRegistry:      NewScriptedToolRegistry(),
+		Sandbox:           AllowAllSandbox{},
+		ContextManager:    NoopContextManager{},
+		TerminationPolicy: AlwaysContinuePolicy{},
+	}
+	h := NewStandardHarness(cfg)
+	task := NewTask("nope", NewSessionID(), reactLeaf("unresolved", "unresolved"))
+	result := h.Run(context.Background(), HarnessRunOptions{Task: task})
+	if result.Reason.Kind != HaltConfigurationError {
+		t.Fatalf("expected ConfigurationError for an unregistered handle, got %+v", result)
 	}
 }
 

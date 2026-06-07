@@ -140,7 +140,15 @@ func TestCaptureIsDeterministic(t *testing.T) {
 // ============================================================================
 
 func planTask(instruction string) Task {
-	return NewTask(instruction, SessionID("plan-sess"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
+	// #124 A.5: the plan slot is STRUCTURED — its bare ReAct leaf carries an
+	// output schema (resolved under the default empty key folded by the harness).
+	plan := ReActStrategy(^uint32(0))
+	plan.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	exec := ReActStrategy(^uint32(0))
+	return NewTask(instruction, SessionID("plan-sess"), PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:    &plan,
+		Execute: &exec,
+	}))
 }
 
 func planFinal(text string) TurnResult {
@@ -272,20 +280,29 @@ func TestPlanPhaseUnparseableIsPlanPhaseFailed(t *testing.T) {
 	}
 }
 
-// R5: when PlannerAgent is set, the PLANNER runs the plan turn and the default
-// agent does NOT.
-func TestPlanPhaseRoutesToPlannerAgent(t *testing.T) {
+// R5 (#124 Q1): the plan child's leaf ReactConfig.Agent is authoritative — when
+// the plan child routes to a named agent, THAT agent runs the plan turn and the
+// default agent does NOT (the separate planner_agent concept is dropped).
+func TestPlanPhaseRoutesToPlanChildAgent(t *testing.T) {
 	def := NewMockAgent("default")
 	def.Push(planFinal(`{"tasks":["from default"]}`))
 	planner := NewMockAgent("planner")
 	planner.Push(planFinal(`{"tasks":["from planner"],"rationale":"p"}`))
 
-	cfg := standardCfg(def)
-	cfg.PlannerAgent = planner
+	cfg := standardCfg(def).WithRegistryAgent("planner", planner)
 	h := NewStandardHarness(cfg)
 
+	// Plan child ReAct routes to the "planner" agent; execute child is default.
+	planChild := ReActStrategy(^uint32(0))
+	planChild.ReActCfg.Agent = AgentRef("planner")
+	execChild := ReActStrategy(^uint32(0))
+	task := NewTask("do", SessionID("plan-sess"), PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:    &planChild,
+		Execute: &execChild,
+	}))
+
 	state := SessionState{}
-	outcome, failure := h.runPlanPhase(context.Background(), ptrTask(planTask("do")), &state, BudgetSnapshot{}, nil)
+	outcome, failure := h.runPlanPhase(context.Background(), &task, &state, BudgetSnapshot{}, nil)
 	if failure != nil {
 		t.Fatalf("unexpected failure: %+v", *failure)
 	}

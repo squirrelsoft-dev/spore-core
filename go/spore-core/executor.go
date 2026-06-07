@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // ============================================================================
@@ -102,9 +103,69 @@ type PlanPhaseOutcome struct {
 // standard cancellation context (Go CONVENTIONS), threaded as the first arg.
 type StrategyExecutor interface {
 	// ReactWindow runs ONE bounded ReAct turn-loop window over session, carrying
-	// the shared budget. The leaf primitive (the body of runReActInner). Does
-	// NOT finalize observability — the caller (the leaf Run) does.
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult
+	// the shared budget, on the RESOLVED worker agent (#124 — the leaf no longer
+	// reads a default config agent; the recursing ReactConfig.Run resolves
+	// c.Agent from the registry and threads it here). The leaf primitive (the
+	// body of runReActInner). Does NOT finalize observability — the caller (the
+	// leaf Run) does.
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent) RunResult
+
+	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
+	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending
+	// the worker child chain (ReAct.agent; combinators descend into inner /
+	// execute; a Ralph with a non-empty agent override resolves THAT — Q3).
+	// Returns the resolved agent, or a typed UnresolvedHandle failure RunResult.
+	ResolveWorkerAgent(ls *LoopStrategy) (Agent, *RunResult)
+
+	// WorkspaceRoot returns the sandbox workspace root (the verifier-input and
+	// HillClimbing TSV root). Empty when no sandbox is wired.
+	WorkspaceRoot() string
+
+	// AppendUserMessage seeds a user message onto session via the ContextManager
+	// seam (alias of SeedUserMessage for the combinator bodies that thread the
+	// session by value).
+	AppendUserMessage(ctx context.Context, session *SessionState, text string)
+
+	// EvaluatePhase runs a SelfVerifying evaluate phase (#124, Q1c): a fresh
+	// evaluator RUN over a read-only sandbox in a never-shared session, on the
+	// RESOLVED evalAgent (the inner worker's agent). Folds the evaluate run's
+	// usage into totalUsage / carried (R8) and returns its terminal RunResult.
+	EvaluatePhase(ctx context.Context, task *Task, evalAgent Agent, carried *BudgetSnapshot, totalUsage *AggregateUsage) RunResult
+
+	// RalphSeedSession builds a FRESH per-window session re-seeded from the
+	// .spore/ filesystem checkpoint (and the optional VCS history block) plus the
+	// instruction (#124, Ralph R2/R3). Returns the seeded SessionState.
+	RalphSeedSession(ctx context.Context, instruction string) SessionState
+
+	// RalphCompletionStatus is the Ralph external completion check (#124): reads
+	// the .spore/ state and reports (reason, incomplete). incomplete=false means
+	// the task is complete (Success); true means reset into the next window.
+	RalphCompletionStatus() (reason string, incomplete bool)
+
+	// RalphMaxResets returns the configured Ralph outer-loop reset cap (B3).
+	RalphMaxResets() uint32
+
+	// HillEvaluate runs one HillClimbing metric evaluation on the resolved
+	// evaluator over a fresh SessionState (#124). On success ok is true and
+	// (value, dur) carry the result; on failure ok is false and (errStatus,
+	// errMsg) carry the typed failure.
+	HillEvaluate(ctx context.Context, evaluator MetricEvaluator, sessionID SessionID, taskID TaskID) (value float64, dur time.Duration, errStatus HillClimbIterationStatus, errMsg string, ok bool)
+
+	// HillRevert reverts the working tree to HEAD through the sandbox for a
+	// no-improvement HillClimbing iteration (Decision 1). Best-effort.
+	HillRevert(ctx context.Context)
+
+	// HillCommitHash resolves the commit_hash recorded on a TSV row (Decision 1;
+	// v1 always empty).
+	HillCommitHash(ctx context.Context) string
+
+	// HillEmitIteration emits one fire-and-forget per-iteration HillClimbing
+	// observability span. spanSeq is advanced. No-op when no provider is wired.
+	HillEmitIteration(ctx context.Context, sessionID SessionID, taskID TaskID, spanSeq *uint64, iteration uint32, metricValue float64, hasMetric bool, delta float64, hasDelta bool, status HillClimbIterationStatus, reverted bool)
+
+	// HillWriteTSV serializes the HillClimbing results log to
+	// {workspace_root}/.spore/results/{task_id}.tsv (Decisions 2/3). Best-effort.
+	HillWriteTSV(workspaceRoot string, taskID TaskID, rows []HillClimbRow)
 
 	// SeedUserMessage seeds a user message onto session (the ContextManager seam).
 	// Used by the recursive PlanExecuteConfig.Run to seed the planning directive
@@ -144,20 +205,6 @@ type StrategyExecutor interface {
 
 	// PersistTaskList persists a parsed task list through the RunStore seam.
 	PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList)
-
-	// SelfVerifyingLoop drives a whole SelfVerifying loop (runSelfVerifying). The
-	// build phase reuses the leaf ReAct window; the loop is Default-FAIL and
-	// bounded by the verifier's iteration cap (Q1).
-	SelfVerifyingLoop(ctx context.Context, task Task, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult
-
-	// RalphLoop drives a whole Ralph continuation loop (runRalph). Resets the
-	// context window per continuation and resumes from the durable .spore/
-	// checkpoint (A.6 deep-resume).
-	RalphLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult
-
-	// HillClimbingLoop drives a whole HillClimbing loop (runHillClimbing). It
-	// reads the config's direction / max_stagnation / delta off task.LoopStrategy.
-	HillClimbingLoop(ctx context.Context, task Task, budget BudgetSnapshot, onStream StreamSink) RunResult
 
 	// Finalize finalizes observability for a terminal outcome (the
 	// finalizeObservability routing). No-op for non-terminal results.

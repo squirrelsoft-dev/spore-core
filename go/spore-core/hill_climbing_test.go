@@ -102,7 +102,11 @@ func hcConfig(t *testing.T, eval MetricEvaluator) (HarnessConfig, *hcRootedSandb
 		Sandbox:           sb,
 		ContextManager:    NoopContextManager{},
 		TerminationPolicy: AlwaysContinuePolicy{},
-		MetricEvaluator:   eval,
+	}
+	// #124: the metric evaluator resolves from the registry's SIXTH map under the
+	// HillClimbing evaluator key (Q2). hcTask uses Evaluator: AgentRef("").
+	if eval != nil {
+		cfg = cfg.WithRegistryMetricEvaluator("", eval)
 	}
 	return cfg, sb
 }
@@ -119,8 +123,12 @@ func hcTask(direction OptimizationDirection, maxStagnation *uint32, revert bool,
 	if minDelta != nil {
 		delta = *minDelta
 	}
+	// #124 A.5: the propose slot is STRUCTURED — its bare ReAct leaf carries an
+	// output schema (resolved under the default empty key folded by the harness).
+	propose := ReActStrategy(^uint32(0))
+	propose.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
 	t := NewTask("optimize", SessionID("s1"), HillClimbingStrategy(HillClimbingConfig{
-		Inner:                 PtrStrategy(ReActStrategy(^uint32(0))),
+		Inner:                 &propose,
 		Direction:             direction,
 		MaxStagnation:         stag,
 		RevertOnNoImprovement: revert,
@@ -148,12 +156,16 @@ func readTSV(t *testing.T, sb *hcRootedSandbox, taskID TaskID) string {
 // ============================================================================
 
 func TestHillClimbingNilEvaluatorMisconfigured(t *testing.T) {
-	cfg, _ := hcConfig(t, nil)
-	cfg.MetricEvaluator = nil
+	cfg, _ := hcConfig(t, nil) // no metric evaluator registered under ""
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(hcTask(OptimizationMaximize, u32(1), false, nil, nil)))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltHillClimbingMisconfigured {
+	// #124: an unresolvable metric evaluator is caught at startup validation as an
+	// UnresolvedHandle (kind "metric_evaluator"), before the first turn.
+	if r.Kind != RunFailure || r.Reason.Kind != HaltConfigurationError {
 		t.Fatalf("got %+v", r)
+	}
+	if uh, ok := r.Reason.ConfigError.(*UnresolvedHandleError); !ok || uh.Kind != "metric_evaluator" {
+		t.Fatalf("expected UnresolvedHandle(metric_evaluator), got %+v", r.Reason.ConfigError)
 	}
 }
 
@@ -450,10 +462,10 @@ func TestHillClimbingBudgetGate(t *testing.T) {
 // ============================================================================
 
 func TestRenderHillClimbingTSVExactBytes(t *testing.T) {
-	rows := []hillClimbRow{
-		{iteration: 0, commitHash: "", metricValue: 1.0, hasMetric: true, direction: OptimizationMaximize, status: HillClimbKept, duration: 0, description: "d"},
-		{iteration: 1, commitHash: "", metricValue: 2.5, hasMetric: true, direction: OptimizationMaximize, status: HillClimbKept, duration: 1500 * time.Millisecond, description: "d"},
-		{iteration: 2, commitHash: "abc123", hasMetric: false, direction: OptimizationMaximize, status: HillClimbCrashed, duration: 0, description: "d"},
+	rows := []HillClimbRow{
+		{Iteration: 0, CommitHash: "", MetricValue: 1.0, HasMetric: true, Direction: OptimizationMaximize, Status: HillClimbKept, Duration: 0, Description: "d"},
+		{Iteration: 1, CommitHash: "", MetricValue: 2.5, HasMetric: true, Direction: OptimizationMaximize, Status: HillClimbKept, Duration: 1500 * time.Millisecond, Description: "d"},
+		{Iteration: 2, CommitHash: "abc123", HasMetric: false, Direction: OptimizationMaximize, Status: HillClimbCrashed, Duration: 0, Description: "d"},
 	}
 	got := renderHillClimbingTSV(rows)
 	want := "iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n" +

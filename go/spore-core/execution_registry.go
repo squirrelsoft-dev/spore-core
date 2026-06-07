@@ -2,9 +2,10 @@
 // (Composable Execution A.3, issue #120; part of the #117–#131 refactor).
 //
 // # Types
-//   - ExecutionRegistry — five maps of concrete collaborators keyed by string:
-//     agents, toolsets, schemas, verifiers, custom (custom strategies). Trait
-//     objects never serialize, so the registry is NOT JSON-(un)marshalled.
+//   - ExecutionRegistry — six maps of concrete collaborators keyed by string:
+//     agents, toolsets, schemas, verifiers, metricEvaluators (#124, Q2), custom
+//     (custom strategies). Trait objects never serialize, so the registry is NOT
+//     JSON-(un)marshalled.
 //   - ExecutionRegistryBuilder — fluent assembler mirroring the Rust builder.
 //   - StrategyResolution — the result of resolving a StrategyRef: either a
 //     built-in LoopStrategy or a custom RunStrategy.
@@ -299,7 +300,13 @@ type ExecutionRegistry struct {
 	toolsets  map[string]ToolRegistry
 	schemas   map[string]json.RawMessage
 	verifiers map[string]Verifier
-	custom    map[string]RunStrategy
+	// metricEvaluators is the SIXTH map (#124, Q2): HillClimbing metric
+	// evaluators, keyed by the same string HillClimbingConfig.Evaluator carries on
+	// the wire. Runtime-only (never serialized) like the other maps; keeping it
+	// distinct from agents preserves the metric-evaluator wire string while
+	// resolving it to a MetricEvaluator rather than an Agent.
+	metricEvaluators map[string]MetricEvaluator
+	custom           map[string]RunStrategy
 }
 
 // NewExecutionRegistry returns an empty registry (no entries in any of the five
@@ -316,6 +323,7 @@ func (r ExecutionRegistry) IsEmpty() bool {
 		len(r.toolsets) == 0 &&
 		len(r.schemas) == 0 &&
 		len(r.verifiers) == 0 &&
+		len(r.metricEvaluators) == 0 &&
 		len(r.custom) == 0
 }
 
@@ -345,6 +353,16 @@ func (r ExecutionRegistry) ResolveSchema(ref SchemaRef) (json.RawMessage, bool) 
 func (r ExecutionRegistry) ResolveVerifier(key string) (Verifier, bool) {
 	v, ok := r.verifiers[key]
 	return v, ok
+}
+
+// ResolveMetricEvaluator resolves a metric-evaluator key (the string
+// HillClimbingConfig.Evaluator carries, #124 Q2) to its registered
+// MetricEvaluator. ok is false when absent. The wire string is identical to the
+// legacy AgentRef; only the resolution target differs (the sixth
+// metricEvaluators map).
+func (r ExecutionRegistry) ResolveMetricEvaluator(key string) (MetricEvaluator, bool) {
+	m, ok := r.metricEvaluators[key]
+	return m, ok
 }
 
 // ResolveStrategy resolves a StrategyRef: a BuiltIn ref yields the built-in
@@ -430,8 +448,9 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 		if err := r.walkStrategy(ls.SelfVerify.Inner); err != nil {
 			return err
 		}
-		// The evaluator is a SchemaRef (the evaluator schema handle).
-		return r.checkSchema(ls.SelfVerify.Evaluator)
+		// #124 Q1: the evaluator's wire string (a SchemaRef) is the VERIFIER
+		// registry key — resolved against the verifiers map (NO wire change).
+		return r.checkVerifier(ls.SelfVerify.Evaluator)
 	case StrategyRalph:
 		if ls.Ralph == nil {
 			return nil
@@ -452,8 +471,9 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 		if err := r.walkStrategy(ls.HillClimbing.Inner); err != nil {
 			return err
 		}
-		// The evaluator is an AgentRef (the metric-evaluator agent).
-		return r.checkAgent(ls.HillClimbing.Evaluator)
+		// #124 Q2: the evaluator's wire string is resolved against the sixth
+		// metricEvaluators map (not agents).
+		return r.checkMetricEvaluator(ls.HillClimbing.Evaluator)
 	default:
 		return nil
 	}
@@ -497,6 +517,24 @@ func (r ExecutionRegistry) checkSchema(ref SchemaRef) error {
 	return &UnresolvedHandleError{Kind: "schema", Key: string(ref)}
 }
 
+// checkVerifier enforces #124 Q1: a SelfVerifying evaluator (a SchemaRef on the
+// wire) resolves against the verifiers map.
+func (r ExecutionRegistry) checkVerifier(ref SchemaRef) error {
+	if _, ok := r.verifiers[string(ref)]; ok {
+		return nil
+	}
+	return &UnresolvedHandleError{Kind: "verifier", Key: string(ref)}
+}
+
+// checkMetricEvaluator enforces #124 Q2: a HillClimbing evaluator (an AgentRef
+// on the wire) resolves against the sixth metricEvaluators map.
+func (r ExecutionRegistry) checkMetricEvaluator(ref AgentRef) error {
+	if _, ok := r.metricEvaluators[string(ref)]; ok {
+		return nil
+	}
+	return &UnresolvedHandleError{Kind: "metric_evaluator", Key: string(ref)}
+}
+
 // ============================================================================
 // ExecutionRegistryBuilder — fluent assembler
 // ============================================================================
@@ -534,6 +572,12 @@ func (r ExecutionRegistry) intoBuilder() *ExecutionRegistryBuilder {
 		b.registry.verifiers = make(map[string]Verifier, len(r.verifiers))
 		for k, v := range r.verifiers {
 			b.registry.verifiers[k] = v
+		}
+	}
+	if len(r.metricEvaluators) > 0 {
+		b.registry.metricEvaluators = make(map[string]MetricEvaluator, len(r.metricEvaluators))
+		for k, v := range r.metricEvaluators {
+			b.registry.metricEvaluators[k] = v
 		}
 	}
 	if len(r.custom) > 0 {
@@ -586,9 +630,95 @@ func (b *ExecutionRegistryBuilder) Verifier(key string, verifier Verifier) *Exec
 	return b
 }
 
+// MetricEvaluator registers a metric evaluator under key (#124, Q2 — the sixth
+// map; last-wins).
+func (b *ExecutionRegistryBuilder) MetricEvaluator(key string, evaluator MetricEvaluator) *ExecutionRegistryBuilder {
+	if b.registry.metricEvaluators == nil {
+		b.registry.metricEvaluators = make(map[string]MetricEvaluator)
+	}
+	b.registry.metricEvaluators[key] = evaluator
+	return b
+}
+
 // RegisterStrategy registers a custom strategy under key (last-wins).
 func (b *ExecutionRegistryBuilder) RegisterStrategy(key string, strategy RunStrategy) *ExecutionRegistryBuilder {
 	b.registry.RegisterStrategy(key, strategy)
+	return b
+}
+
+// fillDefaultAgent registers agent under the DEFAULT empty-string key ONLY if
+// that key is not already wired (#124 migration seam). NewStandardHarness folds
+// its default config.Agent here so bare ReactConfig leaves (empty AgentRef)
+// resolve to it. An explicitly-registered "" agent wins.
+func (b *ExecutionRegistryBuilder) fillDefaultAgent(agent Agent) *ExecutionRegistryBuilder {
+	if agent == nil {
+		return b
+	}
+	if b.registry.agents == nil {
+		b.registry.agents = make(map[string]Agent)
+	}
+	if _, ok := b.registry.agents[""]; !ok {
+		b.registry.agents[""] = agent
+	}
+	return b
+}
+
+// fillDefaultToolset registers toolset under the empty key only if absent
+// (#124), as fillDefaultAgent but for the default config.ToolRegistry.
+func (b *ExecutionRegistryBuilder) fillDefaultToolset(toolset ToolRegistry) *ExecutionRegistryBuilder {
+	if toolset == nil {
+		return b
+	}
+	if b.registry.toolsets == nil {
+		b.registry.toolsets = make(map[string]ToolRegistry)
+	}
+	if _, ok := b.registry.toolsets[""]; !ok {
+		b.registry.toolsets[""] = toolset
+	}
+	return b
+}
+
+// fillDefaultSchema registers an empty JSON schema under the empty key only if
+// absent (#124), so a structured-slot leaf carrying output SchemaRef("") passes
+// A.5 validation. Mirrors the Rust default-key schema fold.
+func (b *ExecutionRegistryBuilder) fillDefaultSchema() *ExecutionRegistryBuilder {
+	if b.registry.schemas == nil {
+		b.registry.schemas = make(map[string]json.RawMessage)
+	}
+	if _, ok := b.registry.schemas[""]; !ok {
+		b.registry.schemas[""] = json.RawMessage(`{}`)
+	}
+	return b
+}
+
+// fillDefaultVerifier registers verifier under the empty key only if absent
+// (#124), for a default SelfVerifying verifier (the config.Verifier fold).
+func (b *ExecutionRegistryBuilder) fillDefaultVerifier(verifier Verifier) *ExecutionRegistryBuilder {
+	if verifier == nil {
+		return b
+	}
+	if b.registry.verifiers == nil {
+		b.registry.verifiers = make(map[string]Verifier)
+	}
+	if _, ok := b.registry.verifiers[""]; !ok {
+		b.registry.verifiers[""] = verifier
+	}
+	return b
+}
+
+// fillDefaultMetricEvaluator registers evaluator under the empty key only if
+// absent (#124), for a default HillClimbing metric evaluator (the
+// config.MetricEvaluator fold).
+func (b *ExecutionRegistryBuilder) fillDefaultMetricEvaluator(evaluator MetricEvaluator) *ExecutionRegistryBuilder {
+	if evaluator == nil {
+		return b
+	}
+	if b.registry.metricEvaluators == nil {
+		b.registry.metricEvaluators = make(map[string]MetricEvaluator)
+	}
+	if _, ok := b.registry.metricEvaluators[""]; !ok {
+		b.registry.metricEvaluators[""] = evaluator
+	}
 	return b
 }
 

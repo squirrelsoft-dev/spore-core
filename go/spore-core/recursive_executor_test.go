@@ -174,7 +174,8 @@ func outputContractRegistry() ExecutionRegistry {
 		Toolset("t1", NewScriptedToolRegistry()).
 		Schema("plan-schema", json.RawMessage(`{}`)).
 		Schema("worker-schema", json.RawMessage(`{}`)).
-		Schema("eval-schema", json.RawMessage(`{}`)).
+		// #124 Q1a: a SelfVerifying evaluator key resolves as a VERIFIER.
+		Verifier("eval-schema", regStubVerifier{}).
 		Build()
 }
 

@@ -116,7 +116,7 @@ func runOneCompaction(h *StandardHarness, cm ContextManager) AggregateUsage {
 	var usage AggregateUsage
 	session := SessionState{}
 	if cm.ShouldCompact(&session) {
-		h.runCompaction(context.Background(), &session, "sess-c", "task-c", &span, &usage)
+		h.runCompaction(context.Background(), &session, "sess-c", "task-c", &span, &usage, h.config.Agent)
 	}
 	return usage
 }
@@ -287,7 +287,7 @@ func TestCompactionSkippedWhenNotCompactingManager(t *testing.T) {
 	var span uint64
 	var usage AggregateUsage
 	session := SessionState{}
-	h.runCompaction(context.Background(), &session, "s", "t", &span, &usage)
+	h.runCompaction(context.Background(), &session, "s", "t", &span, &usage, h.config.Agent)
 	if agent.turns != 0 {
 		t.Fatalf("expected 0 turns for non-compacting manager, got %d", agent.turns)
 	}
@@ -415,7 +415,7 @@ func TestCompactionLoopFixtureReplay(t *testing.T) {
 			var usage AggregateUsage
 			session := SessionState{}
 			if cm.ShouldCompact(&session) {
-				h.runCompaction(context.Background(), &session, SessionID("sess-"+c.Name), "task", &span, &usage)
+				h.runCompaction(context.Background(), &session, SessionID("sess-"+c.Name), "task", &span, &usage, h.config.Agent)
 			}
 
 			if agent.turns != c.Expected.Attempts {

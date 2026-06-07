@@ -123,288 +123,22 @@ type MetricEvaluator interface {
 // HillClimbing strategy driver
 // ============================================================================
 
-// hillClimbRow is one row of the HillClimbing results log, in iteration order.
+// HillClimbRow is one row of the HillClimbing results log, in iteration order.
 // A pure root-package mirror of metric.ResultsEntry's TSV-relevant fields so
-// renderHillClimbingTSV is unit-testable without the metric package. hasMetric
+// renderHillClimbingTSV is unit-testable without the metric package. HasMetric
 // is false on crashed/timeout rows (metric_value renders EMPTY, Decision 3).
-type hillClimbRow struct {
-	iteration   uint32
-	commitHash  string
-	metricValue float64
-	hasMetric   bool
-	direction   OptimizationDirection
-	status      HillClimbIterationStatus
-	duration    time.Duration
-	description string
-}
-
-// runHillClimbing drives the HillClimbing loop strategy (issue #60).
-//
-// Config fields read:
-//   - config.MetricEvaluator — the scorer. REQUIRED: nil => Failure
-//     {HaltHillClimbingMisconfigured} (Decision 6), a typed halt NOT a panic.
-//   - config.VcsProvider — reserved; v1 records an EMPTY commit_hash regardless
-//     (the harness never commits, Decision 1).
-//
-// Terminal HaltReason variants produced:
-//   - HaltStagnationLimitReached{Iterations, BestMetric} — max_stagnation
-//     configured and N consecutive non-improvements occurred.
-//   - HaltBudgetExceeded — a turn/token/wall/cost cap tripped per iteration.
-//   - HaltHillClimbingMisconfigured{Reason} — nil evaluator (Decision 6) or a
-//     baseline-evaluation error (Decision 7).
-func (h *StandardHarness) runHillClimbing(
-	ctx context.Context,
-	task Task,
-	budget BudgetSnapshot,
-	onStream StreamSink,
-) RunResult {
-	sessionID := task.SessionID
-	workspaceRoot := h.config.Sandbox.WorkspaceRoot()
-
-	// Decision 6: a missing evaluator is a typed halt, not a panic.
-	if h.config.MetricEvaluator == nil {
-		result := RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind:   HaltHillClimbingMisconfigured,
-				Reason: "HillClimbing requires config.MetricEvaluator, but it is nil",
-			},
-			SessionID: sessionID,
-		}
-		h.finalizeObservability(ctx, sessionID, TerminalFailure, haltReasonString(result.Reason))
-		return result
-	}
-	evaluator := h.config.MetricEvaluator
-
-	// #119: HillClimbingConfig now carries required scalar fields. The legacy
-	// executor below was written against Option<u32>/Option<f64> semantics
-	// (nil = "no stagnation cap" / "default 0.0 delta"), so map the new required
-	// fields back here until #124 migrates the body: max_stagnation == MaxUint32
-	// is the "unbounded" sentinel (→ nil), and the delta is always present.
-	cfg := task.LoopStrategy.HillClimbing
-	if cfg == nil {
-		cfg = &HillClimbingConfig{}
-	}
-	direction := cfg.Direction
-	revertOnNoImprovement := cfg.RevertOnNoImprovement
-	var maxStagnation *uint32
-	if cfg.MaxStagnation != ^uint32(0) {
-		v := cfg.MaxStagnation
-		maxStagnation = &v
-	}
-	minImprovementDelta := cfg.MinImprovementDelta
-	description := evaluator.Description()
-
-	// Cumulative usage + turns across ALL agent-turn iterations.
-	var totalUsage AggregateUsage
-	// Shared budget threaded across every agent sub-run.
-	carried := budget
-	// The TSV rows, in iteration order.
-	var rows []hillClimbRow
-	// Per-iteration observability span counter.
-	var spanSeq uint64
-
-	// ── Iteration 0: pure baseline. No agent turn (Decision 5).
-	//    HillClimbing keeps no carried message state of its own (each iteration
-	//    is a fresh sub-run), so a default SessionState is handed to the
-	//    evaluator.
-	baseRes, baseErr := evaluator.Evaluate(ctx, h.config.Sandbox, sessionID, task.ID, SessionState{})
-	if baseErr != nil {
-		// Decision 7: a baseline that cannot be measured is a misconfiguration of
-		// the experiment, not a non-improvement to climb away from — there is no
-		// current best to compare against. Record the failed row, write the TSV,
-		// and halt.
-		rows = append(rows, hillClimbRow{
-			iteration:   0,
-			commitHash:  h.hillClimbingCommitHash(ctx),
-			hasMetric:   false,
-			direction:   direction,
-			status:      baseErr.Status,
-			duration:    0,
-			description: description,
-		})
-		h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, 0, 0, false, 0, false, baseErr.Status, false)
-		h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
-		result := RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind:   HaltHillClimbingMisconfigured,
-				Reason: fmt.Sprintf("baseline evaluation failed: %s", baseErr.Message),
-			},
-			SessionID: sessionID,
-			Usage:     totalUsage,
-			Turns:     carried.Turns,
-		}
-		h.finalizeObservability(ctx, sessionID, TerminalFailure, haltReasonString(result.Reason))
-		return result
-	}
-	currentBest := baseRes.Value
-	rows = append(rows, hillClimbRow{
-		iteration:   0,
-		commitHash:  h.hillClimbingCommitHash(ctx),
-		metricValue: baseRes.Value,
-		hasMetric:   true,
-		direction:   direction,
-		status:      HillClimbKept,
-		duration:    baseRes.Duration,
-		description: description,
-	})
-	h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, 0, baseRes.Value, true, 0, false, HillClimbKept, false)
-
-	// Consecutive non-improvement counter (drives the stagnation halt).
-	var stagnation uint32
-	// The 0-based iteration index; agent turns begin at 1.
-	iteration := uint32(1)
-
-	for {
-		// Budget gate before the iteration's agent turn (mirrors runReAct).
-		turnCap := allTurns
-		if task.Budget.MaxTurns != nil {
-			turnCap = *task.Budget.MaxTurns
-		}
-		if carried.Turns >= turnCap {
-			break
-		}
-		if lt, exceeded := budgetExceeded(task.Budget, carried, time.Now()); exceeded {
-			h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
-			result := RunResult{
-				Kind:      RunFailure,
-				Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: lt},
-				SessionID: sessionID,
-				Usage:     totalUsage,
-				Turns:     carried.Turns,
-			}
-			h.finalizeObservability(ctx, sessionID, TerminalFailure, haltReasonString(result.Reason))
-			return result
-		}
-
-		// ── One bounded agent turn proposes a change. The sub-run carries the
-		//    shared budget so per-iteration turns count toward the cap.
-		iterTask := Task{
-			ID:           task.ID,
-			Instruction:  task.Instruction,
-			SessionID:    sessionID,
-			Budget:       task.Budget,
-			LoopStrategy: task.LoopStrategy,
-		}
-		var iterState SessionState
-		h.config.ContextManager.AppendUserMessage(ctx, &iterState, task.Instruction)
-		turnResult := h.runReActInner(ctx, iterTask, turnCap, iterState, carried, onStream)
-		foldSelfVerifyUsage(&totalUsage, &carried, turnResult)
-
-		// A turn that paused / escalated is propagated up unchanged.
-		switch turnResult.Kind {
-		case RunWaitingForHuman:
-			// Not terminal — do not finalize or write the TSV.
-			return turnResult
-		case RunEscalate:
-			h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
-			h.finalizeObservability(ctx, turnResult.SessionID, TerminalEscalated, "")
-			return turnResult
-		}
-
-		// ── Evaluate the metric after the change.
-		evalRes, evalErr := evaluator.Evaluate(ctx, h.config.Sandbox, sessionID, task.ID, SessionState{})
-		if evalErr != nil {
-			// Crash/timeout/etc.: counts as a non-improvement. Optionally revert,
-			// increment stagnation, record an empty-metric row.
-			reverted := false
-			if revertOnNoImprovement {
-				h.hillClimbingRevert(ctx)
-				reverted = true
-			}
-			stagnation++
-			rows = append(rows, hillClimbRow{
-				iteration:   iteration,
-				commitHash:  h.hillClimbingCommitHash(ctx),
-				hasMetric:   false,
-				direction:   direction,
-				status:      evalErr.Status,
-				duration:    0,
-				description: description,
-			})
-			h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, iteration, 0, false, 0, false, evalErr.Status, reverted)
-		} else {
-			value := evalRes.Value
-			kept := hillClimbShouldKeep(value, currentBest, direction, &minImprovementDelta)
-			var delta float64
-			switch direction {
-			case OptimizationMinimize:
-				delta = currentBest - value
-			default:
-				delta = value - currentBest
-			}
-			if kept {
-				currentBest = value
-				stagnation = 0
-				rows = append(rows, hillClimbRow{
-					iteration:   iteration,
-					commitHash:  h.hillClimbingCommitHash(ctx),
-					metricValue: value,
-					hasMetric:   true,
-					direction:   direction,
-					status:      HillClimbKept,
-					duration:    evalRes.Duration,
-					description: description,
-				})
-				h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, iteration, value, true, delta, true, HillClimbKept, false)
-			} else {
-				// No improvement (Decision 1: optionally revert).
-				reverted := false
-				if revertOnNoImprovement {
-					h.hillClimbingRevert(ctx)
-					reverted = true
-				}
-				stagnation++
-				rows = append(rows, hillClimbRow{
-					iteration:   iteration,
-					commitHash:  h.hillClimbingCommitHash(ctx),
-					metricValue: value,
-					hasMetric:   true,
-					direction:   direction,
-					status:      HillClimbDiscarded,
-					duration:    evalRes.Duration,
-					description: description,
-				})
-				h.emitHillClimbingIteration(ctx, sessionID, task.ID, &spanSeq, iteration, value, true, delta, true, HillClimbDiscarded, reverted)
-			}
-		}
-
-		// ── Stagnation halt (only when a cap is configured).
-		if maxStagnation != nil && stagnation >= *maxStagnation {
-			h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
-			result := RunResult{
-				Kind: RunFailure,
-				Reason: HaltReason{
-					Kind:       HaltStagnationLimitReached,
-					Iterations: stagnation,
-					BestMetric: currentBest,
-				},
-				SessionID: sessionID,
-				Usage:     totalUsage,
-				Turns:     carried.Turns,
-			}
-			h.finalizeObservability(ctx, sessionID, TerminalFailure, haltReasonString(result.Reason))
-			return result
-		}
-
-		// iteration is bounded by the turn budget; saturating add guards overflow.
-		if iteration < allTurns {
-			iteration++
-		}
-	}
-
-	// Budget/turn cap reached without a stagnation halt — clean budget halt.
-	h.writeHillClimbingTSV(workspaceRoot, task.ID, rows)
-	result := RunResult{
-		Kind:      RunFailure,
-		Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
-		SessionID: sessionID,
-		Usage:     totalUsage,
-		Turns:     carried.Turns,
-	}
-	h.finalizeObservability(ctx, sessionID, TerminalFailure, haltReasonString(result.Reason))
-	return result
+// Exported (#124) so the recursive HillClimbingConfig.Run, which now owns the
+// optimization loop, can accumulate rows and hand them to the HillWriteTSV
+// executor primitive.
+type HillClimbRow struct {
+	Iteration   uint32
+	CommitHash  string
+	MetricValue float64
+	HasMetric   bool
+	Direction   OptimizationDirection
+	Status      HillClimbIterationStatus
+	Duration    time.Duration
+	Description string
 }
 
 // hillClimbShouldKeep is the keep-or-revert decision the harness applies after
@@ -476,7 +210,7 @@ func (h *StandardHarness) emitHillClimbingIteration(
 // {workspace_root}/.spore/results/{task_id}.tsv (issue #60, Decisions 2/3).
 // Best-effort: a filesystem error is swallowed (the run outcome is
 // authoritative, the TSV is a diagnostic artifact).
-func (h *StandardHarness) writeHillClimbingTSV(workspaceRoot string, taskID TaskID, rows []hillClimbRow) {
+func (h *StandardHarness) writeHillClimbingTSV(workspaceRoot string, taskID TaskID, rows []HillClimbRow) {
 	body := renderHillClimbingTSV(rows)
 	dir := filepath.Join(workspaceRoot, ".spore", "results")
 	_ = os.MkdirAll(dir, 0o755)
@@ -489,24 +223,24 @@ func (h *StandardHarness) writeHillClimbingTSV(workspaceRoot string, taskID Task
 // iteration in ascending order, trailing newline after every row (including the
 // last) so appends and diffs stay line-oriented. Floats use exactly 6 decimal
 // places; metric_value is EMPTY on crashed/timeout rows.
-func renderHillClimbingTSV(rows []hillClimbRow) string {
+func renderHillClimbingTSV(rows []HillClimbRow) string {
 	var b strings.Builder
 	b.WriteString("iteration\tcommit_hash\tmetric_value\tdirection\tstatus\tduration_secs\tdescription\n")
 	for _, r := range rows {
 		metricValue := ""
-		if r.hasMetric {
-			metricValue = strconv.FormatFloat(r.metricValue, 'f', 6, 64)
+		if r.HasMetric {
+			metricValue = strconv.FormatFloat(r.MetricValue, 'f', 6, 64)
 		}
-		durationSecs := strconv.FormatFloat(r.duration.Seconds(), 'f', 6, 64)
+		durationSecs := strconv.FormatFloat(r.Duration.Seconds(), 'f', 6, 64)
 		b.WriteString(fmt.Sprintf(
 			"%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.iteration,
-			r.commitHash,
+			r.Iteration,
+			r.CommitHash,
 			metricValue,
-			string(r.direction),
-			string(r.status),
+			string(r.Direction),
+			string(r.Status),
 			durationSecs,
-			r.description,
+			r.Description,
 		))
 	}
 	return b.String()

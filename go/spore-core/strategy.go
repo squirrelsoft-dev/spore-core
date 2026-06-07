@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // ============================================================================
@@ -529,12 +530,21 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 		return fail
 	}
 	task := cx.currentTask()
+	// #124: the leaf resolves its worker agent from the registry (the leaf no
+	// longer reads a default config agent). An unresolved handle is a typed
+	// failure recorded verbatim.
+	agent, agentFail := executor.ResolveWorkerAgent(&task.LoopStrategy)
+	if agentFail != nil {
+		_ = cx.takeSession()
+		_ = cx.takeStream()
+		return cx.recordTerminal(*agentFail)
+	}
 	session := cx.takeSession()
 	budget := cx.Scratch.RunBudget
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := cx.takeStream()
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream)
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent)
 	executor.Finalize(ctx, result)
 	return cx.recordTerminal(result)
 }
@@ -834,54 +844,609 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	}
 }
 
-// Run is the SelfVerifying combinator: drive the build↔evaluate loop
-// (Default-FAIL; bounded by the verifier's iteration cap / the run budget — Q1).
-// The build phase recurses through the inner sub-strategy.
+// Run is the SelfVerifying combinator (#124): GENUINELY recursive build↔evaluate
+// loop. Each iteration dispatches c.Inner.Run(ctx, cx) for the build phase (a
+// non-ReAct inner — e.g. PlanExecute — really runs its whole loop per
+// iteration), then runs a fresh evaluate phase on the inner worker's resolved
+// agent (Q1c) and consults the verifier resolved from c.Evaluator's key (Q1a).
+// Passed => Success; Failed => append the reason (Default-FAIL) and loop;
+// exhausted => SelfVerifyExhausted.
 func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	executor, fail := cx.executor()
 	if executor == nil {
 		return fail
 	}
 	task := cx.currentTask()
+	buildSessionID := task.SessionID
 	session := cx.takeSession()
-	budget := cx.Scratch.RunBudget
+	carried := cx.Scratch.RunBudget
+	// Suppress the run's stream sink for the recursive child phases.
 	onStream := cx.takeStream()
-	result := executor.SelfVerifyingLoop(ctx, task, session, budget, onStream)
-	return cx.recordTerminal(result)
+
+	// Q1a: resolve the verifier from c.Evaluator's key (NO wire change).
+	verifier, ok := cx.Registry.ResolveVerifier(string(c.Evaluator))
+	if !ok {
+		result := RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind: HaltSelfVerifyMisconfigured,
+				Reason: fmt.Sprintf(
+					"SelfVerifying requires a verifier registered under key %q", string(c.Evaluator),
+				),
+			},
+			SessionID: buildSessionID,
+		}
+		cx.Stream = onStream
+		return cx.finish(ctx, executor, task, result)
+	}
+	// Q1c: the evaluate-phase agent defaults to the inner worker's resolved agent.
+	evalAgent, evalFail := executor.ResolveWorkerAgent(c.Inner)
+	if evalFail != nil {
+		cx.Stream = onStream
+		return cx.finish(ctx, executor, task, *evalFail)
+	}
+
+	maxIterations := verifier.MaxIterations()
+	var totalUsage AggregateUsage
+	var lastReason string
+
+	for iteration := uint32(0); iteration < maxIterations; iteration++ {
+		// ── Build phase: recurse c.Inner.Run.
+		buildTask := Task{
+			ID:           task.ID,
+			Instruction:  task.Instruction,
+			SessionID:    buildSessionID,
+			Budget:       task.Budget,
+			LoopStrategy: *c.Inner,
+		}
+		btCopy := buildTask
+		cx.Scratch.Task = &btCopy
+		cx.Scratch.RunSession = session
+		cx.Scratch.RunBudget = carried
+		_ = c.Inner.Run(ctx, cx)
+		bo := cx.takeChildOverride()
+		var buildResult RunResult
+		if bo == nil {
+			buildResult = RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:   HaltSelfVerifyMisconfigured,
+					Reason: "build sub-strategy produced no terminal",
+				},
+				SessionID:    buildSessionID,
+				Turns:        carried.Turns,
+				SessionState: session,
+			}
+		} else {
+			buildResult = *bo
+		}
+		foldSelfVerifyUsage(&totalUsage, &carried, buildResult)
+
+		// A paused / escalated build propagates verbatim.
+		switch buildResult.Kind {
+		case RunWaitingForHuman, RunConsult, RunEscalate:
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, buildResult)
+		}
+		// Carry the build's post-run session forward for the next round.
+		if buildResult.Kind == RunSuccess || buildResult.Kind == RunFailure {
+			session = buildResult.SessionState
+		}
+
+		// ── Evaluate phase: a fresh evaluator run on evalAgent.
+		evalResult := executor.EvaluatePhase(ctx, &task, evalAgent, &carried, &totalUsage)
+
+		verdict := verifier.Verify(ctx, SelfVerifyInput{
+			BuildResult: buildResult,
+			EvalResult:  evalResult,
+			Workspace:   executor.WorkspaceRoot(),
+			Iteration:   iteration,
+		})
+		switch verdict.Kind {
+		case SelfVerifyPassed:
+			output := ""
+			turns := carried.Turns
+			finalState := session
+			if buildResult.Kind == RunSuccess {
+				output = buildResult.Output
+				turns = buildResult.Turns
+				finalState = buildResult.SessionState
+			}
+			result := RunResult{
+				Kind:         RunSuccess,
+				Output:       output,
+				SessionID:    buildSessionID,
+				Usage:        totalUsage,
+				Turns:        turns,
+				SessionState: finalState,
+			}
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, result)
+		default:
+			// SelfVerifyFailed — Default-FAIL: inject the reason into the build
+			// context so the next iteration sees it.
+			lastReason = verdict.Reason
+			executor.AppendUserMessage(ctx, &session, verdict.Reason)
+		}
+	}
+
+	result := RunResult{
+		Kind: RunFailure,
+		Reason: HaltReason{
+			Kind:       HaltSelfVerifyExhausted,
+			Iterations: maxIterations,
+			Reason:     lastReason,
+		},
+		SessionID:    buildSessionID,
+		Usage:        totalUsage,
+		Turns:        carried.Turns,
+		SessionState: session,
+	}
+	cx.Stream = onStream
+	return cx.finish(ctx, executor, task, result)
 }
 
-// Run is the Ralph continuation wrapper: reset the context window per window and
-// resume from the durable .spore/ checkpoint (A.6 deep-resume). Each window
-// recurses through the inner sub-strategy. Ralph discards the incoming session
-// state by design (each window is a fresh start re-seeded from the filesystem
-// checkpoint).
+// Run is the Ralph continuation wrapper (#124): GENUINELY recursive. Each
+// context window seeds a FRESH session from the .spore/ checkpoint, then recurses
+// c.Inner.Run(ctx, cx) (a non-ReAct inner — e.g. SelfVerifying — really runs its
+// whole loop per window). Q3: when c.Agent is set it OVERRIDES the inner leaf's
+// agent per window; when unset the worker resolves via the inner leaf.
+// RalphCompletionStatus drives the OUTER reset loop; exhaustion =>
+// RalphCompletionUnmet. Ralph discards the incoming session state by design.
 func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	executor, fail := cx.executor()
 	if executor == nil {
 		return fail
 	}
 	task := cx.currentTask()
-	budget := cx.Scratch.RunBudget
 	onStream := cx.takeStream()
 	_ = cx.takeSession() // discarded: each window re-seeds from the checkpoint.
-	result := executor.RalphLoop(ctx, task, budget, onStream)
-	return cx.recordTerminal(result)
+	maxResets := executor.RalphMaxResets()
+
+	// Q3: when c.Agent is set, override the inner leaf's agent for every window
+	// by rewriting the inner tree's worker leaf handle.
+	innerForWindow := *c.Inner
+	if string(c.Agent) != "" {
+		cloned := *c.Inner
+		overrideWorkerAgent(&cloned, c.Agent)
+		innerForWindow = cloned
+	}
+
+	var totalUsage AggregateUsage
+	var cumulativeTurns uint32
+	lastReason := ".spore/progress.json missing"
+	lastSessionID := task.SessionID
+	var lastSessionState SessionState
+
+	for iteration := uint32(0); iteration < maxResets; iteration++ {
+		windowSessionID := task.SessionID
+		if iteration > 0 {
+			windowSessionID = NewSessionID()
+		}
+		lastSessionID = windowSessionID
+
+		// R2/R3: a FRESH session seeded from the .spore/ checkpoint.
+		session := executor.RalphSeedSession(ctx, task.Instruction)
+
+		windowTask := Task{
+			ID:           task.ID,
+			Instruction:  task.Instruction,
+			SessionID:    windowSessionID,
+			Budget:       task.Budget,
+			LoopStrategy: innerForWindow,
+		}
+		wtCopy := windowTask
+		cx.Scratch.Task = &wtCopy
+		cx.Scratch.RunSession = session
+		// FRESH per-window budget (the reset discards the turn budget).
+		cx.Scratch.RunBudget = BudgetSnapshot{}
+		_ = innerForWindow.Run(ctx, cx)
+		wo := cx.takeChildOverride()
+		var windowResult RunResult
+		if wo == nil {
+			windowResult = RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:       HaltRalphCompletionUnmet,
+					Iterations: iteration + 1,
+					Reason:     "window sub-strategy produced no terminal",
+				},
+				SessionID: windowSessionID,
+			}
+		} else {
+			windowResult = *wo
+		}
+		windowBudget := BudgetSnapshot{}
+		foldSelfVerifyUsage(&totalUsage, &windowBudget, windowResult)
+		cumulativeTurns += windowBudget.Turns
+
+		// A paused / escalated window propagates verbatim.
+		switch windowResult.Kind {
+		case RunWaitingForHuman, RunConsult, RunEscalate:
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, windowResult)
+		}
+
+		reason, incomplete := executor.RalphCompletionStatus()
+		if !incomplete {
+			output := ""
+			finalState := SessionState{}
+			if windowResult.Kind == RunSuccess {
+				output = windowResult.Output
+				finalState = windowResult.SessionState
+			}
+			result := RunResult{
+				Kind:         RunSuccess,
+				Output:       output,
+				SessionID:    windowSessionID,
+				Usage:        totalUsage,
+				Turns:        cumulativeTurns,
+				SessionState: finalState,
+			}
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, result)
+		}
+		lastReason = reason
+		lastSessionState = windowResult.SessionState
+	}
+
+	result := RunResult{
+		Kind: RunFailure,
+		Reason: HaltReason{
+			Kind:       HaltRalphCompletionUnmet,
+			Iterations: maxResets,
+			Reason:     lastReason,
+		},
+		SessionID:    lastSessionID,
+		Usage:        totalUsage,
+		Turns:        cumulativeTurns,
+		SessionState: lastSessionState,
+	}
+	cx.Stream = onStream
+	return cx.finish(ctx, executor, task, result)
 }
 
-// Run is the HillClimbing combinator: iterate the inner sub-strategy, scoring
-// each candidate with the metric; bounded by max_stagnation (Q1). The incoming
-// session is discarded — each iteration re-seeds a fresh window internally.
+// Run is the HillClimbing combinator (#124): GENUINELY recursive optimization
+// loop. Iteration 0 is a pure baseline (no agent turn). Iterations 1.. recurse
+// c.Inner.Run(ctx, cx) to propose a change (a non-ReAct inner — e.g. PlanExecute
+// — really runs its whole loop per iteration), then evaluate the metric
+// (resolved via cx.Registry.ResolveMetricEvaluator, Q2) and keep/revert. Bounded
+// by max_stagnation and the turn budget. The incoming session is discarded.
 func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	executor, fail := cx.executor()
 	if executor == nil {
 		return fail
 	}
 	task := cx.currentTask()
-	budget := cx.Scratch.RunBudget
+	sessionID := task.SessionID
 	onStream := cx.takeStream()
+	carried := cx.Scratch.RunBudget
 	_ = cx.takeSession()
-	result := executor.HillClimbingLoop(ctx, task, budget, onStream)
-	return cx.recordTerminal(result)
+	workspaceRoot := executor.WorkspaceRoot()
+
+	direction := c.Direction
+	revert := c.RevertOnNoImprovement
+	minDelta := c.MinImprovementDelta
+	var maxStagnation *uint32
+	if c.MaxStagnation != ^uint32(0) {
+		v := c.MaxStagnation
+		maxStagnation = &v
+	}
+
+	// Q2: resolve the metric evaluator from c.Evaluator's key.
+	evaluator, ok := cx.Registry.ResolveMetricEvaluator(string(c.Evaluator))
+	if !ok {
+		result := RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind: HaltHillClimbingMisconfigured,
+				Reason: fmt.Sprintf(
+					"HillClimbing requires a metric evaluator registered under key %q", string(c.Evaluator),
+				),
+			},
+			SessionID: sessionID,
+		}
+		cx.Stream = onStream
+		return cx.finish(ctx, executor, task, result)
+	}
+	description := evaluator.Description()
+
+	var totalUsage AggregateUsage
+	var rows []HillClimbRow
+	var spanSeq uint64
+
+	// ── Iteration 0: pure baseline. No agent turn (Decision 5).
+	baseValue, baseDur, baseStatus, baseMsg, baseOK := executor.HillEvaluate(ctx, evaluator, sessionID, task.ID)
+	if !baseOK {
+		// Decision 7: a baseline that cannot be measured is a misconfiguration.
+		rows = append(rows, HillClimbRow{
+			Iteration:   0,
+			CommitHash:  executor.HillCommitHash(ctx),
+			HasMetric:   false,
+			Direction:   direction,
+			Status:      baseStatus,
+			Duration:    0,
+			Description: description,
+		})
+		executor.HillEmitIteration(ctx, sessionID, task.ID, &spanSeq, 0, 0, false, 0, false, baseStatus, false)
+		executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+		result := RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind:   HaltHillClimbingMisconfigured,
+				Reason: fmt.Sprintf("baseline evaluation failed: %s", baseMsg),
+			},
+			SessionID: sessionID,
+			Usage:     totalUsage,
+			Turns:     carried.Turns,
+		}
+		cx.Stream = onStream
+		return cx.finish(ctx, executor, task, result)
+	}
+	currentBest := baseValue
+	rows = append(rows, HillClimbRow{
+		Iteration:   0,
+		CommitHash:  executor.HillCommitHash(ctx),
+		MetricValue: baseValue,
+		HasMetric:   true,
+		Direction:   direction,
+		Status:      HillClimbKept,
+		Duration:    baseDur,
+		Description: description,
+	})
+	executor.HillEmitIteration(ctx, sessionID, task.ID, &spanSeq, 0, baseValue, true, 0, false, HillClimbKept, false)
+
+	var stagnation uint32
+	iteration := uint32(1)
+
+	for {
+		// Budget gate before the iteration's agent turn.
+		turnCap := allTurns
+		if task.Budget.MaxTurns != nil {
+			turnCap = *task.Budget.MaxTurns
+		}
+		if carried.Turns >= turnCap {
+			break
+		}
+		if lt, exceeded := budgetExceeded(task.Budget, carried, time.Now()); exceeded {
+			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			result := RunResult{
+				Kind:      RunFailure,
+				Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: lt},
+				SessionID: sessionID,
+				Usage:     totalUsage,
+				Turns:     carried.Turns,
+			}
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, result)
+		}
+
+		// ── One agent turn proposes a change: recurse c.Inner.Run.
+		iterTask := Task{
+			ID:           task.ID,
+			Instruction:  task.Instruction,
+			SessionID:    sessionID,
+			Budget:       task.Budget,
+			LoopStrategy: *c.Inner,
+		}
+		var iterState SessionState
+		executor.AppendUserMessage(ctx, &iterState, task.Instruction)
+		itCopy := iterTask
+		cx.Scratch.Task = &itCopy
+		cx.Scratch.RunSession = iterState
+		cx.Scratch.RunBudget = carried
+		_ = c.Inner.Run(ctx, cx)
+		to := cx.takeChildOverride()
+		var turnResult RunResult
+		if to == nil {
+			turnResult = RunResult{
+				Kind:      RunFailure,
+				Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+				SessionID: sessionID,
+				Turns:     carried.Turns,
+			}
+		} else {
+			turnResult = *to
+		}
+		foldSelfVerifyUsage(&totalUsage, &carried, turnResult)
+
+		// A paused / escalated turn propagates verbatim.
+		switch turnResult.Kind {
+		case RunWaitingForHuman, RunConsult, RunEscalate:
+			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, turnResult)
+		}
+
+		// ── Evaluate the metric after the change.
+		value, dur, evalStatus, _, evalOK := executor.HillEvaluate(ctx, evaluator, sessionID, task.ID)
+		if !evalOK {
+			reverted := false
+			if revert {
+				executor.HillRevert(ctx)
+				reverted = true
+			}
+			stagnation++
+			rows = append(rows, HillClimbRow{
+				Iteration:   iteration,
+				CommitHash:  executor.HillCommitHash(ctx),
+				HasMetric:   false,
+				Direction:   direction,
+				Status:      evalStatus,
+				Duration:    0,
+				Description: description,
+			})
+			executor.HillEmitIteration(ctx, sessionID, task.ID, &spanSeq, iteration, 0, false, 0, false, evalStatus, reverted)
+		} else {
+			kept := hillClimbShouldKeep(value, currentBest, direction, &minDelta)
+			var delta float64
+			switch direction {
+			case OptimizationMinimize:
+				delta = currentBest - value
+			default:
+				delta = value - currentBest
+			}
+			if kept {
+				currentBest = value
+				stagnation = 0
+				rows = append(rows, HillClimbRow{
+					Iteration:   iteration,
+					CommitHash:  executor.HillCommitHash(ctx),
+					MetricValue: value,
+					HasMetric:   true,
+					Direction:   direction,
+					Status:      HillClimbKept,
+					Duration:    dur,
+					Description: description,
+				})
+				executor.HillEmitIteration(ctx, sessionID, task.ID, &spanSeq, iteration, value, true, delta, true, HillClimbKept, false)
+			} else {
+				reverted := false
+				if revert {
+					executor.HillRevert(ctx)
+					reverted = true
+				}
+				stagnation++
+				rows = append(rows, HillClimbRow{
+					Iteration:   iteration,
+					CommitHash:  executor.HillCommitHash(ctx),
+					MetricValue: value,
+					HasMetric:   true,
+					Direction:   direction,
+					Status:      HillClimbDiscarded,
+					Duration:    dur,
+					Description: description,
+				})
+				executor.HillEmitIteration(ctx, sessionID, task.ID, &spanSeq, iteration, value, true, delta, true, HillClimbDiscarded, reverted)
+			}
+		}
+
+		// ── Stagnation halt (only when a cap is configured).
+		if maxStagnation != nil && stagnation >= *maxStagnation {
+			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			result := RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:       HaltStagnationLimitReached,
+					Iterations: stagnation,
+					BestMetric: currentBest,
+				},
+				SessionID: sessionID,
+				Usage:     totalUsage,
+				Turns:     carried.Turns,
+			}
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, result)
+		}
+
+		if iteration < allTurns {
+			iteration++
+		}
+	}
+
+	// Budget/turn cap reached without a stagnation halt — clean budget halt.
+	executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+	result := RunResult{
+		Kind:      RunFailure,
+		Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+		SessionID: sessionID,
+		Usage:     totalUsage,
+		Turns:     carried.Turns,
+	}
+	cx.Stream = onStream
+	return cx.finish(ctx, executor, task, result)
+}
+
+// workerAgentKeyOf descends a LoopStrategy tree to the worker leaf's agent key
+// (#124). The worker is the agent on the leaf reached by descending the primary
+// worker child chain. A Ralph with a non-empty agent override resolves THAT (Q3).
+func workerAgentKeyOf(ls *LoopStrategy) string {
+	if ls == nil {
+		return ""
+	}
+	switch ls.Kind {
+	case StrategyReAct:
+		if ls.ReActCfg == nil {
+			return ""
+		}
+		return string(ls.ReActCfg.Agent)
+	case StrategyPlanExecute:
+		if ls.PlanExecute == nil {
+			return ""
+		}
+		return workerAgentKeyOf(ls.PlanExecute.Execute)
+	case StrategySelfVerifying:
+		if ls.SelfVerify == nil {
+			return ""
+		}
+		return workerAgentKeyOf(ls.SelfVerify.Inner)
+	case StrategyRalph:
+		if ls.Ralph == nil {
+			return ""
+		}
+		if string(ls.Ralph.Agent) != "" {
+			return string(ls.Ralph.Agent)
+		}
+		return workerAgentKeyOf(ls.Ralph.Inner)
+	case StrategyHillClimbing:
+		if ls.HillClimbing == nil {
+			return ""
+		}
+		return workerAgentKeyOf(ls.HillClimbing.Inner)
+	default:
+		return ""
+	}
+}
+
+// overrideWorkerAgent rewrites the worker leaf's agent handle of ls to agent
+// (#124 Q3 — Ralph's per-window agent override). Mutates the leaf reached by
+// descending the worker child chain. Operates on the *LoopStrategy in place
+// (combinator children are pointers, so descending mutates the shared subtree —
+// callers pass a CLONE).
+func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
+	if ls == nil {
+		return
+	}
+	switch ls.Kind {
+	case StrategyReAct:
+		if ls.ReActCfg != nil {
+			cfg := *ls.ReActCfg
+			cfg.Agent = agent
+			ls.ReActCfg = &cfg
+		}
+	case StrategyPlanExecute:
+		if ls.PlanExecute != nil {
+			child := *ls.PlanExecute.Execute
+			overrideWorkerAgent(&child, agent)
+			cfg := *ls.PlanExecute
+			cfg.Execute = &child
+			ls.PlanExecute = &cfg
+		}
+	case StrategySelfVerifying:
+		if ls.SelfVerify != nil {
+			child := *ls.SelfVerify.Inner
+			overrideWorkerAgent(&child, agent)
+			cfg := *ls.SelfVerify
+			cfg.Inner = &child
+			ls.SelfVerify = &cfg
+		}
+	case StrategyRalph:
+		if ls.Ralph != nil {
+			child := *ls.Ralph.Inner
+			overrideWorkerAgent(&child, agent)
+			cfg := *ls.Ralph
+			cfg.Inner = &child
+			ls.Ralph = &cfg
+		}
+	case StrategyHillClimbing:
+		if ls.HillClimbing != nil {
+			child := *ls.HillClimbing.Inner
+			overrideWorkerAgent(&child, agent)
+			cfg := *ls.HillClimbing
+			cfg.Inner = &child
+			ls.HillClimbing = &cfg
+		}
+	}
 }
 
 // Compile-time interface checks.

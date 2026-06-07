@@ -161,6 +161,9 @@ func writeRalphFeatureList(t *testing.T, root, body string) {
 func ralphCfg(agent Agent, root string) HarnessConfig {
 	cfg := standardCfg(agent)
 	cfg.Sandbox = rootedSandbox{root: root}
+	// #124 Q3: ralphTask sets Agent: "ralph-agent" as the per-window override, so
+	// register the agent under that key (the worker resolves to it per window).
+	cfg = cfg.WithRegistryAgent("ralph-agent", agent)
 	return cfg
 }
 
