@@ -379,11 +379,10 @@ cache halts.
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
 10. **Local `main` push hygiene (standing reminder)** — each per-issue loop's series
-    must be pushed promptly so `origin/main` doesn't drift behind. ⚠️ Current: `origin/main`
-    is **6 commits behind** local `main` (the #125 series `763b53a`→`5ccdb03`, merged
-    ff to local `main`, **not pushed**). Note the standing push-approval gate: an
-    agent-initiated push was denied earlier this session, so **ask before pushing** —
-    the #125 push is awaiting an explicit maintainer OK.
+    must be pushed promptly so `origin/main` doesn't drift behind. ✅ Current: `origin/main`
+    is **level** with local `main` (the #125 series + the Deviation-#14 hardening pushed
+    through `d7913ec`). Note the standing push-approval gate: an agent-initiated push was
+    denied earlier this session, so **ask before pushing**.
     Sub-note: the plan-execute
     scratch run-artifacts are covered by a `workspace/*` wildcard in
     `examples/rust/08-plan-execute/.gitignore` (preserving the tracked `.gitkeep` +
