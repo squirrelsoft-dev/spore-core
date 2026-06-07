@@ -379,9 +379,13 @@ async def test_plan_directive_does_not_leak_into_execute_context() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_execute_steps_accumulate_prior_results() -> None:
-    """A 2-step PlanExecute run: step 1 calls a tool returning a distinctive
-    string; step 2's context must CONTAIN that string (accumulating context)."""
+async def test_execute_steps_two_tier_context_no_transcript_fold() -> None:
+    """#126 two-tier context (REPLACES the pre-#126 linear-folding regression).
+    Linear folding broke on a DAG, so it is GONE. The plan-artifact bridge
+    produces a LINEAR chain with EMPTY blockers, so steps 1 and 2 are INDEPENDENT
+    branches in the DAG sense. Therefore step 2 does NOT see step 1's raw tool
+    result (no transcript fold), but DOES see step 1's compact Tier-2 ledger
+    summary (``researched``)."""
     from spore_core import ToolOutputSuccess
 
     agent = _ScriptedTurnAgent(
@@ -426,21 +430,24 @@ async def test_execute_steps_accumulate_prior_results() -> None:
     # 1 plan turn + (tool call + final) for step 1 + 1 for step 2 = 4.
     assert len(agent.seen) == 4, "plan turn + 3 execute turns"
 
-    # Step 1's SECOND turn (index 2) sees the tool result — sanity check that the
-    # result string is on the wire at all.
+    # Step 1's SECOND turn (index 2) sees its OWN tool result — sanity check that
+    # the result string is on the wire within the step.
     assert "TOKIO_FACTS_123" in _context_texts(agent.seen[2]), (
         f"step-1 final turn should follow its own tool result: {_context_texts(agent.seen[2])!r}"
     )
-    # The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
-    # tool result, proving the execute loop carried it forward.
-    assert "TOKIO_FACTS_123" in _context_texts(agent.seen[3]), (
-        f"step 2 must see step 1's tool result (accumulating context): "
-        f"{_context_texts(agent.seen[3])!r}"
-    )
-    # Step 2 also sees step 1's prior instruction + assistant output.
+    # #126: step 2 (index 3) must NOT carry step 1's raw tool-result transcript —
+    # no linear fold across the DAG.
     step2_text = _context_texts(agent.seen[3])
-    assert "research tokio" in step2_text and "researched" in step2_text, (
-        f"step 2 must see step 1's instruction and output: {step2_text!r}"
+    assert "TOKIO_FACTS_123" not in step2_text, (
+        f"step 2 must NOT see step 1's raw tool result (no transcript fold): {step2_text!r}"
+    )
+    # #126 Tier-2: step 2 DOES see step 1's compact ledger summary ("researched")
+    # and carries its own instruction.
+    assert "researched" in step2_text, (
+        f"step 2 should see step 1's Tier-2 ledger summary: {step2_text!r}"
+    )
+    assert "summarize findings" in step2_text, (
+        f"step 2 must carry its own instruction: {step2_text!r}"
     )
 
 

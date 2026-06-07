@@ -75,6 +75,7 @@ implementation.
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -82,13 +83,18 @@ from .errors import SporeError
 from .hooks import PlanArtifact
 
 __all__ = [
+    "STEP_LEDGER_ELISION_MARKER",
+    "STEP_LEDGER_MAX_ENTRIES",
     "TASK_LIST_EXTRAS_KEY",
     "BlockerRejection",
+    "StepLedgerEntry",
     "Task",
     "TaskList",
     "TaskListError",
     "TaskStatus",
     "plan_artifact_to_task_list",
+    "push_step_ledger",
+    "render_step_ledger",
     "validate_transition",
     "would_create_cycle",
 ]
@@ -289,6 +295,209 @@ class TaskList:
             if task.id == task_id:
                 return task
         raise TaskListError.task_not_found(task_id)
+
+    # ---- DAG scheduling helpers (#126) — pure, deterministic, no I/O ------
+
+    def next_ready(self) -> int | None:
+        """The next READY task to run under the ready-set scheduler (#126): the
+        LOWEST-``id`` ``pending`` task ALL of whose ``blockers`` are
+        ``completed``. Returns its ``id``, or ``None`` when no pending task is
+        currently runnable (every pending task is waiting on an un-completed
+        blocker, or none remain).
+
+        The id tiebreak is deterministic and language-agnostic: among ready
+        tasks, the smallest id always wins, regardless of positional order in
+        :attr:`tasks`.
+        """
+        ready = [
+            t.id
+            for t in self.tasks
+            if t.status == TaskStatus.PENDING and all(self._is_completed(b) for b in t.blockers)
+        ]
+        return min(ready) if ready else None
+
+    def _is_completed(self, task_id: int) -> bool:
+        """Whether the task with ``task_id`` exists and is ``completed``."""
+        return any(t.id == task_id and t.status == TaskStatus.COMPLETED for t in self.tasks)
+
+    def transitive_blockers(self, task_id: int) -> list[int]:
+        """The TRANSITIVE-blocker closure of ``task_id`` (#126, Tier-1 scoped
+        context): the set of all tasks ``task_id`` (transitively) depends on —
+        its direct ``blockers``, their blockers, and so on. Excludes ``task_id``
+        itself. Returned SORTED ascending for deterministic, byte-identical
+        seeding across languages.
+
+        Independent branches (tasks NOT reachable from ``task_id`` via the
+        ``task -> blocker`` edges) never appear, which is what keeps a task's
+        Tier-1 seed free of unrelated branches (#126 AC1 branch isolation).
+        """
+        by_id = {t.id: t for t in self.tasks}
+        seen: set[int] = set()
+        start = by_id.get(task_id)
+        stack: list[int] = list(start.blockers) if start is not None else []
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            t = by_id.get(node)
+            if t is not None:
+                stack.extend(t.blockers)
+        return sorted(seen)
+
+    def transitive_dependents(self, task_id: int) -> list[int]:
+        """The TRANSITIVE-dependent closure of ``task_id`` (#126, failure
+        cascade): every task that depends on ``task_id`` directly or
+        transitively (i.e. has a directed ``task -> blocker`` path reaching
+        ``task_id``). Excludes ``task_id`` itself. Returned SORTED ascending.
+
+        When ``task_id`` fails terminally, exactly these tasks are marked
+        ``blocked``; tasks NOT in this set are unaffected and keep scheduling
+        (#126 AC3).
+        """
+        dependents: set[int] = set()
+        frontier: list[int] = [task_id]
+        while frontier:
+            node = frontier.pop()
+            for t in self.tasks:
+                if t.id == task_id:
+                    continue
+                if node in t.blockers and t.id not in dependents:
+                    dependents.add(t.id)
+                    frontier.append(t.id)
+        return sorted(dependents)
+
+    def has_cycle(self) -> bool:
+        """Whole-graph cycle detection over the ``task -> blocker`` edges (#126,
+        defense-in-depth at execute entry). Generalizes the single-edge
+        :func:`would_create_cycle` check used by :meth:`add`: it inspects the
+        ENTIRE persisted graph (which the ``task_list`` tool authoring path
+        could in principle leave cyclic via out-of-band edits) rather than one
+        prospective ``add``.
+
+        Returns ``True`` iff any directed cycle exists. Pure; O(V+E) via DFS
+        three-coloring (iterative so a pathological graph never blows the
+        stack). Blockers referencing unknown ids are simply ignored (no edge) —
+        an unknown blocker also cannot form a cycle.
+        """
+        by_id = {t.id: t for t in self.tasks}
+        # 0 = unvisited, 1 = on-stack (gray), 2 = done (black).
+        color: dict[int, int] = {}
+        for start in (t.id for t in self.tasks):
+            if color.get(start, 0) != 0:
+                continue
+            # Each stack frame: (node, whether we've already pushed its children).
+            stack: list[tuple[int, bool]] = [(start, False)]
+            on_path: set[int] = set()
+            while stack:
+                node, expanded = stack.pop()
+                if expanded:
+                    color[node] = 2
+                    on_path.discard(node)
+                    continue
+                if color.get(node, 0) == 2:
+                    continue
+                color[node] = 1
+                on_path.add(node)
+                stack.append((node, True))
+                t = by_id.get(node)
+                if t is None:
+                    continue
+                for b in t.blockers:
+                    # An edge to a non-existent task is no edge at all.
+                    if b not in by_id:
+                        continue
+                    if b in on_path:
+                        return True  # back-edge → cycle.
+                    if color.get(b, 0) != 2:
+                        stack.append((b, False))
+        return False
+
+
+# ============================================================================
+# Step ledger (#126 — Tier-2 global running ledger)
+# ============================================================================
+
+#: The maximum number of :class:`StepLedgerEntry` rows the Tier-2 running ledger
+#: retains (#126, RESOLVED spec decision B). Past this bound the ledger drops the
+#: OLDEST entries (a deterministic, NO-model, byte-identical policy — never
+#: summarize). This constant MUST be identical across all four language
+#: implementations.
+STEP_LEDGER_MAX_ENTRIES = 20
+
+#: The static marker row inserted (once) when the Tier-2 ledger drops its oldest
+#: entries past :data:`STEP_LEDGER_MAX_ENTRIES` (#126, decision B). It is a fixed
+#: string — NOT a summary of the elided rows — so the elision note is
+#: byte-identical across languages. Rendered as a leading ledger line by
+#: :func:`render_step_ledger`.
+STEP_LEDGER_ELISION_MARKER = "[older ledger entries elided]"
+
+
+@dataclass
+class StepLedgerEntry:
+    """A single compact row in the Tier-2 global running ledger (#126). Appended
+    on task completion and injected into EVERY subsequent execute step so each
+    step sees a compact record of what has already happened across the whole DAG.
+
+    ``files_touched`` is **harness-observed from write/edit tool calls** during
+    the task's execution — NOT a model-self-reported field. A task whose execute
+    step only *narrated* touching a file (no actual write/edit tool call) records
+    an EMPTY ``files_touched`` (#126 AC2).
+
+    Wire field order is ``task_id, summary, files_touched``. Byte-identical
+    across all four languages (the same serialized shape as :class:`Task`).
+    """
+
+    task_id: int
+    summary: str
+    files_touched: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "summary": self.summary,
+            "files_touched": list(self.files_touched),
+        }
+
+
+def push_step_ledger(ledger: list[StepLedgerEntry], entry: StepLedgerEntry) -> bool:
+    """Append ``entry`` to a bounded Tier-2 running ledger, keeping at most
+    :data:`STEP_LEDGER_MAX_ENTRIES` rows via **drop-oldest** (#126, decision B).
+
+    Pure and deterministic: NO model call, NO summarization. When the push would
+    exceed the bound the oldest entries are removed from the front so exactly the
+    :data:`STEP_LEDGER_MAX_ENTRIES` most-recent entries remain (completion order
+    preserved). Mutates ``ledger`` in place. Returns ``True`` iff at least one
+    entry was dropped on this call (so the caller can render the static
+    :data:`STEP_LEDGER_ELISION_MARKER`).
+    """
+    ledger.append(entry)
+    dropped = False
+    while len(ledger) > STEP_LEDGER_MAX_ENTRIES:
+        ledger.pop(0)
+        dropped = True
+    return dropped
+
+
+def render_step_ledger(ledger: list[StepLedgerEntry], elided: bool) -> str | None:
+    """Render the Tier-2 ledger as a compact, deterministic text block for
+    seeding into an execute step (#126). One line per entry:
+    ``#<id> <summary> [files: a, b]`` (the ``[files: …]`` suffix omitted when
+    ``files_touched`` is empty). When ``elided`` is ``True`` a single leading
+    :data:`STEP_LEDGER_ELISION_MARKER` line is emitted. Returns ``None`` for an
+    empty ledger (nothing to inject).
+    """
+    if not ledger:
+        return None
+    lines: list[str] = []
+    if elided:
+        lines.append(STEP_LEDGER_ELISION_MARKER)
+    for e in ledger:
+        if not e.files_touched:
+            lines.append(f"#{e.task_id} {e.summary}")
+        else:
+            lines.append(f"#{e.task_id} {e.summary} [files: {', '.join(e.files_touched)}]")
+    return "Progress ledger so far:\n" + "\n".join(lines)
 
 
 # ============================================================================
@@ -513,7 +722,26 @@ def plan_artifact_to_task_list(artifact: PlanArtifact) -> TaskList:
     existing list (replanning is out of scope — single parse per accepted plan).
     Wiring this into the plan-acceptance seam is DEFERRED to #59's execute loop;
     #72 ships only this pure function.
+
+    Deprecated (#126, decision C)
+    -----------------------------
+    This flat bridge can only ever produce a LINEAR chain (it always sets
+    ``blockers=[]``), so it cannot express the blocker DAG the #126 ready-set
+    executor walks. The ``task_list`` tool path
+    (:class:`~spore_tools.tools.TaskListTool`, which calls :meth:`TaskList.add`
+    with real blockers) is now the ONE authoring path; the PlanExecute executor
+    reads its :class:`TaskList` from the persisted ``task_list`` store rather
+    than from this bridge. The function is RETAINED (its replay tests stay green,
+    and the executor still falls back to it when nothing was authored via the
+    tool) but should not be used to seed a DAG run. Calling it emits a
+    :class:`DeprecationWarning`.
     """
+    warnings.warn(
+        "plan_artifact_to_task_list is a linear-only bridge; author the task "
+        "list via the `task_list` tool (TaskList.add with blockers). See #126.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     task_list = TaskList()  # next_id == 1
     for step in artifact.tasks:
         # verbatim; appends pending; bumps next_id. Empty blockers can never

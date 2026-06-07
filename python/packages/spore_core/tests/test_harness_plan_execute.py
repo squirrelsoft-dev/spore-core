@@ -20,7 +20,7 @@ from spore_core import (
     FinalResponse,
     HaltReasonBudgetExceeded,
     HaltReasonEmptyPlan,
-    HaltReasonStepFailed,
+    HaltReasonTasksBlockedByFailure,
     HarnessConfig,
     HarnessRunOptions,
     InMemoryObservabilityProvider,
@@ -41,8 +41,6 @@ from spore_core import (
     StorageProvider,
     Task,
     TokenUsage,
-    ToolCall,
-    ToolCallRequested,
 )
 from spore_core.hooks import (
     FunctionHook,
@@ -183,49 +181,56 @@ async def test_empty_plan_fails_with_empty_plan() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Q5: a step that fails (agent error / blocked) aborts the run with StepFailed
-# and does NOT run the next task.
+# #126 AC3 (REPLACES the Q5 blanket abort): a terminal step failure no longer
+# raises StepFailed/aborts on the first failure — it cascade-Blocks only its
+# transitive dependents and KEEPS scheduling unrelated tasks, draining to
+# TasksBlockedByFailure. A linear bridge has NO blocker edges, so the failing
+# task blocks no one; the next (independent) task still completes.
 # ---------------------------------------------------------------------------
 
 
-async def test_step_failure_aborts_with_step_failed() -> None:
+async def test_terminal_failure_cascades_not_blanket_abort() -> None:
     a = _agent()
     a.push(FinalResponse(content=_PLAN_2, usage=_usage()))
-    # task one errors: a tool call with an empty registry → unrecoverable tool
-    # error inside the sub-loop. (MockAgent then has nothing left for task two.)
-    a.push(ToolCallRequested(calls=[ToolCall(id="c", name="missing", input={})], usage=_usage()))
+    # task one (independent — bridge has no blockers) completes.
+    a.push(FinalResponse(content="did task one", usage=_usage()))
+    # task two: no response queued → dry → AgentErrorEmpty terminal failure. The
+    # run does NOT abort before task one ran; it drains to TasksBlockedByFailure.
     h = StandardHarness(_config(a))
     task = _task()
     state = SessionState()
     r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonStepFailed)
-    assert r.reason.task_index == 0
-    assert r.reason.task == "task one"
+    assert isinstance(r.reason, HaltReasonTasksBlockedByFailure)
+    # task 2 is the failing task; it has no dependents → only itself is blocked;
+    # task 1 completed (proving no blanket abort and DAG-ordered draining).
+    assert r.reason.failed_task == 2
+    assert r.reason.blocked == [2]
+    assert r.reason.completed == [1]
     assert r.reason.reason  # carries the underlying reason rendering
-    # task two never ran: the failing task is marked blocked; the next stays
-    # pending (never advanced to in_progress).
     stored = await _stored_task_list(h, task.session_id)
     assert stored is not None
     tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
-    assert tl.tasks[0].status is TaskStatus.BLOCKED
-    assert tl.tasks[1].status is TaskStatus.PENDING
+    assert tl.tasks[0].status is TaskStatus.COMPLETED
+    assert tl.tasks[1].status is TaskStatus.BLOCKED
 
 
 # ---------------------------------------------------------------------------
-# Q5: an agent error in a step also yields StepFailed (not BudgetExceeded).
+# #126 AC3: an agent error in a step also cascades (not BudgetExceeded). With
+# both tasks running dry (no responses queued), both fail terminally; the first
+# failure (task 1) is reported as the trigger.
 # ---------------------------------------------------------------------------
 
 
-async def test_step_agent_error_is_step_failed() -> None:
+async def test_step_agent_error_cascades() -> None:
     a = _agent()
     a.push(FinalResponse(content=_PLAN_2, usage=_usage()))
     # task one: no response queued → MockAgent returns AgentErrorEmpty.
     h = StandardHarness(_config(a))
     r = await h.run(HarnessRunOptions(_task()))
     assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonStepFailed)
-    assert r.reason.task_index == 0
+    assert isinstance(r.reason, HaltReasonTasksBlockedByFailure)
+    assert r.reason.failed_task == 1
 
 
 # ---------------------------------------------------------------------------

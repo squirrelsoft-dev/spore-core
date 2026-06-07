@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import warnings
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1126,6 +1127,24 @@ class StrategyExecutor(Protocol):
         """Persist a parsed task list through the RunStore seam."""
         ...
 
+    async def load_task_list(self, session_id: SessionId) -> object | None:
+        """Load the persisted :class:`~spore_core.tasklist.TaskList` from the
+        RunStore ``task_list`` store (#126, decision C) — the ONE authoring path
+        that can carry real ``blockers``. Returns the parsed list, or ``None``
+        when nothing was persisted (or the blob is unparseable)."""
+        ...
+
+    def take_observed_writes(self) -> list[str]:
+        """Drain + return the harness-OBSERVED write/edit file paths recorded for
+        the currently-running execute step (#126 AC2), clearing the accumulator.
+        Never a model-self-reported field."""
+        ...
+
+    def clear_observed_writes(self) -> None:
+        """Clear the harness-observed write/edit accumulator so the next execute
+        step's ``files_touched`` reflects ONLY its own writes (#126 AC2)."""
+        ...
+
     async def finalize(self, result: RunResult) -> None:
         """Finalize observability for a terminal outcome (no-op for pauses)."""
         ...
@@ -1381,9 +1400,46 @@ async def _run_plan_execute_config(
     task-list persistence after each transition (Q4), and cumulative usage /
     last-output / last-state carry. The harness keeps only LEAF primitives: the
     constrained-plan capture/persist machinery, the deep-resume reconcile, and the
-    ``OnTaskAdvance`` fire — none of which touch the per-task model loop. The
-    ready-set walk lands in #126 (execute runs per task sequentially for now)."""
-    from .tasklist import TaskStatus, plan_artifact_to_task_list
+    ``OnTaskAdvance`` fire — none of which touch the per-task model loop.
+
+    #126 — what this body now does
+    -----------------------------
+    * **Task list source (decision C):** after the plan phase persists the
+      captured artifact (so the legacy plan→tasklist replay path is intact), the
+      executor LOADS its runnable :class:`TaskList` from the persisted
+      ``task_list`` tool store (:meth:`load_task_list`) — the ONE authoring path
+      that can carry real ``blockers``. The plan artifact only seeds an initial
+      linear list when nothing was authored via the tool.
+    * **Cycle re-check (AC5):** :meth:`TaskList.has_cycle` is re-checked at
+      execute entry (defense in depth) → :class:`HaltReasonTaskGraphCycle`.
+    * **Ready-set walk (AC1):** repeatedly pick the LOWEST-id ``pending`` task
+      whose blockers are all ``completed`` (:meth:`TaskList.next_ready`), run it,
+      mark ``completed``, repeat — honoring the blocker DAG, deterministic id
+      tiebreak. v1 runs ready tasks SEQUENTIALLY.
+    * **Two-tier context (AC1 isolation):** each step is seeded with Tier-1 (its
+      TRANSITIVE blockers' final outputs + their ledger rows, decision D) plus
+      Tier-2 (the global running ledger, every step). Independent branches never
+      appear in a task's seed.
+    * **Ledger (decision B):** on completion a
+      :class:`~spore_core.tasklist.StepLedgerEntry` is appended whose
+      ``files_touched`` is HARNESS-OBSERVED from write/edit tool calls
+      (:meth:`take_observed_writes`, AC2) — never self-reported. The ledger is
+      bounded at :data:`STEP_LEDGER_MAX_ENTRIES` via drop-oldest.
+    * **Failure cascade (decision A/E, AC3/AC4):** a terminal task failure
+      (unrecoverable error OR a ``BudgetExhausted`` resolving to ``Fail``) marks
+      its transitive dependents ``blocked`` (tracked in the run-local
+      ``blocked_by_failure`` set) and KEEPS scheduling unrelated tasks; at drain
+      the run returns :class:`HaltReasonTasksBlockedByFailure` with the full
+      completed/blocked partition. A run where every task completes is Success.
+    """
+    from .tasklist import (
+        StepLedgerEntry,
+        TaskList,
+        TaskStatus,
+        plan_artifact_to_task_list,
+        push_step_ledger,
+        render_step_ledger,
+    )
 
     executor = cx._require_executor()
     if isinstance(executor, StrategyOutcomeFailed):
@@ -1458,11 +1514,42 @@ async def _run_plan_execute_config(
         cx.stream = on_stream
         return await cx._finish(executor, task, outcome)
 
-    task_list = plan_artifact_to_task_list(outcome.artifact)
+    # #126 decision C: the runnable task list comes from the persisted
+    # ``task_list`` tool store (the ONE authoring path — it can carry real
+    # blockers). Fall back to the linear plan-artifact bridge only when nothing
+    # was authored via the tool (back-compat with the #59/#124 plan-only path and
+    # its replay fixtures). The plan artifact is still captured+persisted above so
+    # the plan-phase replay tests stay green.
+    persisted = await executor.load_task_list(session_id)
+    if isinstance(persisted, TaskList) and persisted.tasks:
+        task_list = persisted
+    else:
+        # The fallback intentionally uses the deprecated linear bridge (decision
+        # C keeps it working for the plan-only back-compat path); silence its
+        # DeprecationWarning here (mirrors Rust's ``#[allow(deprecated)]``).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            task_list = plan_artifact_to_task_list(outcome.artifact)
     if not task_list.tasks:
         cx.stream = on_stream
         result = RunResultFailure(
             reason=HaltReasonEmptyPlan(),
+            session_id=session_id,
+            usage=outcome.usage,
+            turns=outcome.turns,
+            session_state=SessionState(),
+        )
+        return await cx._finish(executor, task, result)
+
+    # #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+    # depth — ``add_task`` already rejects cycles, but the persisted store could
+    # be cyclic out of band). No task runs.
+    if task_list.has_cycle():
+        cx.stream = on_stream
+        result = RunResultFailure(
+            reason=HaltReasonTaskGraphCycle(
+                reason="persisted task graph contains a directed cycle",
+            ),
             session_id=session_id,
             usage=outcome.usage,
             turns=outcome.turns,
@@ -1477,41 +1564,53 @@ async def _run_plan_execute_config(
     carried.input_tokens += outcome.usage.input_tokens
     carried.output_tokens += outcome.usage.output_tokens
 
-    # ── Phase 2: execute (dispatch ``self.execute`` PER TASK). ──────────────
+    # ── Phase 2: ready-set DAG walk (#126). ─────────────────────────────────
     #
-    # The shared execute context starts from ``base_session`` (NOT the plan
-    # child's polluted session) so the directive never leaks (#93).
-    session_state = base_session
+    # Each step is seeded from a FRESH copy of ``base_session`` (NOT a
+    # forward-folded shared transcript — that breaks on a DAG) plus its Tier-1
+    # scoped context and the Tier-2 global ledger (#93 — the plan directive never
+    # leaks because the plan child ran over a clone).
 
     # A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
     # Completed tasks are not re-run.
     await executor.reconcile_completed_tasks(session_id, task_list)
 
-    total_tasks = len(task_list.tasks)
     total_usage = outcome.usage.model_copy(deep=True)
     last_output = ""
     last_state = SessionState()
 
+    # #126 Tier-1/Tier-2 + cascade run-local state.
+    # - ``final_outputs``: each completed task's ``Success.output`` (Tier-1).
+    # - ``ledger``: the Tier-2 global running ledger (bounded, drop-oldest).
+    # - ``ledger_elided``: sticky flag set the first time entries are dropped.
+    # - ``blocked_by_failure``: tasks cascade-Blocked by a terminal failure
+    #   (decision E — run-local scratch, NOT a TaskStatus variant).
+    # - ``first_failure``: the first terminal failure that triggered a cascade
+    #   (decision A), as ``(task_id, reason)``.
+    final_outputs: dict[int, str] = {}
+    ledger: list[StepLedgerEntry] = []
+    ledger_elided = False
+    blocked_by_failure: set[int] = set()
+    first_failure: tuple[int, str] | None = None
+
     # #125: PlanExecute owns a budget scope for its execute phase. Its POLICY is
-    # the task's global turn ceiling (``TotalSteps``) — the root node's
-    # ``TotalSteps`` subsumes the OLD per-task ``remaining_turns /
-    # remaining_tasks / step_cap`` derivation, which is now DEAD and removed.
-    # Behavior is ``Escalate`` (in-process placeholder; the serialized behavior
-    # field is #129). Enforcement is now ``charge``-based per node.
+    # the task's global turn ceiling (``TotalSteps``). Behavior is ``Escalate``
+    # (in-process placeholder; the serialized behavior field is #129).
     if task.budget.max_turns is not None:
         plan_policy: BudgetPolicy = BudgetPolicyTotalSteps(value=task.budget.max_turns)
     else:
         plan_policy = BudgetPolicyUnlimited()
     cx.push_budget(plan_policy, BudgetExhaustedEscalate(), "plan_execute")
 
-    for index in range(total_tasks):
-        task_id = task_list.tasks[index].id
-        instruction = task_list.tasks[index].description
+    # Total positional count for the OnTaskAdvance hook (stable).
+    total_tasks = len(task_list.tasks)
 
-        # A.6 deep-resume: a task already Completed is skipped.
-        if task_list.tasks[index].status == TaskStatus.COMPLETED:
-            last_output = instruction
-            continue
+    while True:
+        task_id = task_list.next_ready()
+        if task_id is None:
+            break
+        index = next(i for i, t in enumerate(task_list.tasks) if t.id == task_id)
+        instruction = task_list.tasks[index].description
 
         # Mark InProgress and re-persist (Q4).
         task_list.update(task_id, TaskStatus.IN_PROGRESS)
@@ -1519,8 +1618,6 @@ async def _run_plan_execute_config(
 
         # Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step
         # instruction; the (possibly mutated) instruction seeds the execute child.
-        # #125: the dead per-task ``step_cap`` override is gone — the step carries
-        # the task budget verbatim; enforcement is charge-based on this scope.
         step_task = Task(
             id=task.id,
             instruction=instruction,
@@ -1530,26 +1627,48 @@ async def _run_plan_execute_config(
         )
         step_task = await executor.fire_task_advance(session_id, step_task, index, total_tasks)
 
-        # Seed the step instruction as a user message on the SHARED execute
-        # context, then dispatch the execute sub-strategy through ``cx``.
-        await executor.seed_user_message(session_state, step_task.instruction)
+        # #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
+        # session plus, for THIS task's transitive blockers only, their final
+        # outputs + their ledger rows. Independent branches never appear (AC1).
+        step_session = base_session.model_copy(deep=True)
+        blockers = task_list.transitive_blockers(task_id)
+        if blockers:
+            blocker_set = set(blockers)
+            tier1_lines = [
+                f"#{b} result: {final_outputs[b]}" for b in blockers if b in final_outputs
+            ]
+            if tier1_lines:
+                await executor.seed_user_message(
+                    step_session, "Results from upstream tasks:\n" + "\n".join(tier1_lines)
+                )
+            scoped = [e for e in ledger if e.task_id in blocker_set]
+            scoped_block = render_step_ledger(scoped, False)
+            if scoped_block is not None:
+                await executor.seed_user_message(step_session, scoped_block)
+
+        # #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+        # the static elision marker once entries were dropped).
+        ledger_block = render_step_ledger(ledger, ledger_elided)
+        if ledger_block is not None:
+            await executor.seed_user_message(step_session, ledger_block)
+
+        # Finally seed this step's own instruction.
+        await executor.seed_user_message(step_session, step_task.instruction)
+
+        # #126 AC2: clear the observed-write accumulator so this task's
+        # files_touched reflect ONLY the writes this step issues.
+        executor.clear_observed_writes()
 
         cx.scratch.task = step_task
-        cx.scratch.run_session = session_state
+        cx.scratch.run_session = step_session
         cx.scratch.run_budget = carried.model_copy(deep=True)
         # #125: absolute turn count BEFORE this step, so the success path charges
         # only the DELTA against the PlanExecute scope.
         carried_before = carried.turns
         step_outcome = await run_strategy(self.execute, cx)
-        # #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a
-        # StrategyOutcome, never auto-cascaded. PlanExecute does NOT charge the
-        # child's exhaustion against its OWN scope; it surfaces its own typed
-        # BudgetExhausted with the PlanExecute partial (tasklist + statuses +
-        # ledger) and aborts the run.
+
+        # ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────────────
         if isinstance(step_outcome, StrategyOutcomeBudgetExhausted):
-            task_list.update(task_id, TaskStatus.BLOCKED)
-            await executor.persist_task_list(session_id, task_list)
-            partial = _plan_execute_partial_json(task_list)
             scope = cx.budgets.current()
             assert scope is not None, "plan_execute scope pushed above"
             err = BudgetExhausted(
@@ -1559,19 +1678,36 @@ async def _run_plan_execute_config(
                 continues_used=scope.continues_used,
                 phase=scope.phase,
             )
+            resolution = cx.resolve_current()
+            # #126 AC4: a budget-``Fail`` task cascades IDENTICALLY to an
+            # error-failed one — block its transitive dependents and keep
+            # scheduling unrelated tasks.
+            if resolution == ExhaustedResolution.FAIL:
+                task_list.update(task_id, TaskStatus.BLOCKED)
+                for dep in task_list.transitive_dependents(task_id):
+                    task_list.update(dep, TaskStatus.BLOCKED)
+                    blocked_by_failure.add(dep)
+                blocked_by_failure.add(task_id)
+                await executor.persist_task_list(session_id, task_list)
+                if first_failure is None:
+                    first_failure = (task_id, f"budget exhausted (Fail): {scope.policy!r}")
+                continue
+            # Escalate/Continue: surface the partial and abort the run (the
+            # in-process Continue loop is #129; today only Escalate/Fail are
+            # reachable — see #125 notes).
+            task_list.update(task_id, TaskStatus.BLOCKED)
+            await executor.persist_task_list(session_id, task_list)
+            partial = _plan_execute_partial_json(task_list)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
             return _promote_budget_exhausted(err, partial)
+
         sub_result = cx._take_child_override()
 
         if isinstance(sub_result, RunResultSuccess):
-            # Carry the shared budget forward (Q1) and fold this step's
-            # conversation back into the SHARED context so the next step builds on
-            # its results.
             carried.turns = sub_result.turns
-            session_state = sub_result.session_state
-            last_state = session_state
+            last_state = sub_result.session_state
             carried.input_tokens += sub_result.usage.input_tokens
             carried.output_tokens += sub_result.usage.output_tokens
             total_usage.input_tokens += sub_result.usage.input_tokens
@@ -1583,12 +1719,20 @@ async def _run_plan_execute_config(
 
             task_list.complete(task_id)
             await executor.persist_task_list(session_id, task_list)
+
+            # #126: record this task's final output (Tier-1) and append a ledger
+            # entry whose files_touched is HARNESS-OBSERVED (AC2).
+            final_outputs[task_id] = sub_result.output
+            files_touched = executor.take_observed_writes()
+            entry = StepLedgerEntry(
+                task_id=task_id, summary=sub_result.output, files_touched=files_touched
+            )
+            if push_step_ledger(ledger, entry):
+                ledger_elided = True
+
             executor._emit(on_stream, StreamFinalResponse(content=last_output))
 
-            # #125: charge this step's turns against the PlanExecute scope. If the
-            # global ``TotalSteps`` cap is now spent, the PlanExecute node surfaces
-            # its OWN typed BudgetExhausted (partial = tasklist + ledger),
-            # resolving its behavior.
+            # #125: charge this step's turns against the PlanExecute scope.
             charge_err = cx.charge_current(max(0, sub_result.turns - carried_before))
             if charge_err is not None:
                 partial = _plan_execute_partial_json(task_list)
@@ -1598,76 +1742,99 @@ async def _run_plan_execute_config(
                 cx.stream = on_stream
                 if resolution == ExhaustedResolution.FAIL:
                     return _promote_budget_exhausted(charge_err, None)
-                # #129: a granted ``Continue`` must reset this scope
-                # (``resolve_current`` already did via ``consume_continue``) and
-                # RE-RUN this execute step — the in-process loop wiring lands in
-                # #129. It is UNREACHABLE today: live bodies push an ``Escalate``
-                # placeholder behavior (the serialized ``BudgetExhaustedBehavior``
-                # field is a wire change deferred to #129), so ``resolve_current``
-                # only ever yields ``Escalate`` / ``Fail`` here. Until that loop
-                # exists, an (impossible) ``Continue`` is handled EXPLICITLY
-                # (alongside ``Escalate``) as a lossless surface-with-partial
-                # rather than a silent fall-through.
                 if resolution in (
                     ExhaustedResolution.CONTINUE,
                     ExhaustedResolution.ESCALATE,
                 ):
                     return _promote_budget_exhausted(charge_err, partial)
-                # Defensive: ``ExhaustedResolution`` is exhausted above.
                 raise AssertionError(f"unhandled resolution {resolution!r}")
 
         elif isinstance(sub_result, RunResultFailure):
-            # Q5: any non-success step aborts the whole run.
             total_usage.input_tokens += sub_result.usage.input_tokens
             total_usage.output_tokens += sub_result.usage.output_tokens
             total_usage.cache_read_tokens += sub_result.usage.cache_read_tokens
             total_usage.cache_write_tokens += sub_result.usage.cache_write_tokens
             total_usage.cost_usd += sub_result.usage.cost_usd
 
-            task_list.update(task_id, TaskStatus.BLOCKED)
-            await executor.persist_task_list(session_id, task_list)
-
+            # A GLOBAL turn-budget hard stop (#117 backstop) surfaces as a
+            # ``BudgetExceeded`` Failure from the leaf. That is a WHOLE-RUN hard
+            # stop, NOT a single-task terminal failure — it aborts the run verbatim
+            # (preserving the pre-#126 mid-execute budget behavior). It is distinct
+            # from a per-NODE ``BudgetExhausted`` resolving to ``Fail``, which DOES
+            # cascade (AC4, handled above).
             if isinstance(sub_result.reason, HaltReasonBudgetExceeded):
-                terminal_reason: HaltReason = sub_result.reason
-            else:
-                terminal_reason = HaltReasonStepFailed(
-                    task_index=index,
-                    task=task_list.tasks[index].description,
-                    reason=repr(sub_result.reason),
-                )
-            cx.pop_budget()
-            cx.stream = on_stream
-            result = RunResultFailure(
-                reason=terminal_reason,
-                session_id=session_id,
-                usage=total_usage,
-                turns=sub_result.turns,
-                session_state=last_state,
-            )
-            return await cx._finish(executor, task, result)
-
-        else:
-            # A pause / consult / escalate (or a missing terminal) propagates the
-            # whole run.
-            cx.pop_budget()
-            cx.stream = on_stream
-            if sub_result is None:
+                task_list.update(task_id, TaskStatus.BLOCKED)
+                await executor.persist_task_list(session_id, task_list)
+                cx.pop_budget()
+                cx.stream = on_stream
                 result = RunResultFailure(
-                    reason=HaltReasonStepFailed(
-                        task_index=index,
-                        task=task_list.tasks[index].description,
-                        reason="execute sub-strategy produced no terminal",
-                    ),
+                    reason=sub_result.reason,
                     session_id=session_id,
                     usage=total_usage,
-                    turns=carried.turns,
+                    turns=sub_result.turns,
                     session_state=last_state,
                 )
                 return await cx._finish(executor, task, result)
+
+            # #126 AC3: a terminal task FAILURE cascade-blocks its transitive
+            # dependents and KEEPS scheduling unrelated tasks (replaces the Q5
+            # blanket abort).
+            carried.turns = sub_result.turns
+            task_list.update(task_id, TaskStatus.BLOCKED)
+            for dep in task_list.transitive_dependents(task_id):
+                task_list.update(dep, TaskStatus.BLOCKED)
+                blocked_by_failure.add(dep)
+            blocked_by_failure.add(task_id)
+            await executor.persist_task_list(session_id, task_list)
+            if first_failure is None:
+                first_failure = (task_id, repr(sub_result.reason))
+            continue
+
+        elif sub_result is None:
+            # No terminal from the child: treat as a terminal failure of this task
+            # and cascade (same as a Failure).
+            task_list.update(task_id, TaskStatus.BLOCKED)
+            for dep in task_list.transitive_dependents(task_id):
+                task_list.update(dep, TaskStatus.BLOCKED)
+                blocked_by_failure.add(dep)
+            blocked_by_failure.add(task_id)
+            await executor.persist_task_list(session_id, task_list)
+            if first_failure is None:
+                first_failure = (task_id, "execute sub-strategy produced no terminal")
+            continue
+
+        else:
+            # A pause / consult / escalate propagates the whole run verbatim.
+            cx.pop_budget()
+            cx.stream = on_stream
             return await cx._finish(executor, task, sub_result)
 
     cx.pop_budget()
     cx.stream = on_stream
+
+    # ── Drain (#126, decision A). ───────────────────────────────────────────
+    #
+    # A run where a terminal failure cascade-blocked any task returns a PARTIAL
+    # terminal ``Failure`` reporting the full partition. A run where every task
+    # completed returns ``Success`` (output = last step's text).
+    if first_failure is not None:
+        failed_task, fail_reason = first_failure
+        completed = sorted(t.id for t in task_list.tasks if t.status == TaskStatus.COMPLETED)
+        blocked = sorted(blocked_by_failure)
+        result = RunResultFailure(
+            reason=HaltReasonTasksBlockedByFailure(
+                completed=completed,
+                blocked=blocked,
+                failed_task=failed_task,
+                reason=fail_reason,
+            ),
+            session_id=session_id,
+            usage=total_usage,
+            turns=carried.turns,
+            session_state=last_state,
+        )
+        return await cx._finish(executor, task, result)
+
     result = RunResultSuccess(
         output=last_output,
         session_id=session_id,
@@ -3890,6 +4057,37 @@ class HaltReasonConfigurationError(_Model):
     error: HarnessError
 
 
+class HaltReasonTasksBlockedByFailure(_Model):
+    """Returned by the PlanExecute DAG executor (#126, decision A) for a PARTIAL
+    run: a task failed terminally (unrecoverable error or ``BudgetExhausted``
+    resolving to ``Fail``) and its transitive dependents were cascade-``blocked``,
+    while unrelated branches still completed. The run as a whole is a
+    :class:`RunResultFailure`, but the full partition is reported: which tasks
+    ``completed``, which were ``blocked`` by the cascade, the ``failed_task`` that
+    triggered it, and the human-readable ``reason``. (A run where EVERY task
+    completes is a :class:`RunResultSuccess`, as before.) Mirrors Rust's
+    ``HaltReason::TasksBlockedByFailure { completed, blocked, failed_task, reason }``.
+    """
+
+    kind: Literal["tasks_blocked_by_failure"] = "tasks_blocked_by_failure"
+    completed: list[int]
+    blocked: list[int]
+    failed_task: int
+    reason: str
+
+
+class HaltReasonTaskGraphCycle(_Model):
+    """Returned by the PlanExecute DAG executor (#126) when the persisted task
+    graph contains a directed cycle, re-checked at EXECUTE ENTRY as
+    defense-in-depth (``add_task`` already rejects cycles, but the ``task_list``
+    tool path could in principle persist a cyclic graph out of band). No task is
+    run. Carries a human-readable description. Mirrors Rust's
+    ``HaltReason::TaskGraphCycle { reason }``."""
+
+    kind: Literal["task_graph_cycle"] = "task_graph_cycle"
+    reason: str
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -3908,7 +4106,9 @@ HaltReason = Annotated[
     | HaltReasonSelfVerifyMisconfigured
     | HaltReasonHillClimbingMisconfigured
     | HaltReasonRalphCompletionUnmet
-    | HaltReasonConfigurationError,
+    | HaltReasonConfigurationError
+    | HaltReasonTasksBlockedByFailure
+    | HaltReasonTaskGraphCycle,
     Field(discriminator="kind"),
 ]
 
@@ -5147,6 +5347,28 @@ class StandardHarness:
             pass
         config.hooks = chain
         self._config = config
+        # #126: harness-observed write/edit file paths for the CURRENTLY-running
+        # execute step. The tool-dispatch seam pushes the ``path`` of every
+        # ``write_file`` / ``edit_file`` call here as it dispatches; the DAG
+        # executor drains it (:meth:`take_observed_writes`) on task completion to
+        # build the observed ``files_touched`` for that task's
+        # :class:`~spore_core.tasklist.StepLedgerEntry` — never model-self-reported.
+        # Steps run SEQUENTIALLY (v1 ready-set is sequential), so a single shared
+        # accumulator cleared per step is sufficient and deterministic.
+        self._observed_writes: list[str] = []
+
+    def _observe_write_call(self, call: ToolCall) -> None:
+        """#126: record a harness-OBSERVED write/edit at the tool-dispatch seam.
+        Only ``write_file`` / ``edit_file`` calls with a string ``path`` are
+        recorded; de-duplicated against what is already accumulated for the
+        current step. Called from the ReAct loop for the call ACTUALLY dispatched,
+        so the path comes from the real tool call — never a model-self-reported
+        field."""
+        if call.name not in ("write_file", "edit_file"):
+            return
+        path = call.input.get("path")
+        if isinstance(path, str) and path not in self._observed_writes:
+            self._observed_writes.append(path)
 
     def storage(self) -> StorageProvider:
         """The injected :class:`StorageProvider` (issue #73). Defaults to an
@@ -5896,6 +6118,39 @@ class StandardHarness:
         """:class:`StrategyExecutor` primitive: persist a parsed task list
         (delegates to :meth:`_persist_task_list`)."""
         await self._persist_task_list(session_id, task_list)
+
+    async def load_task_list(self, session_id: SessionId) -> object | None:
+        """:class:`StrategyExecutor` primitive: load the persisted
+        :class:`~spore_core.tasklist.TaskList` from the RunStore ``task_list``
+        store (#126, decision C). Returns the parsed list, or ``None`` when
+        nothing was persisted (or the blob is unparseable). Mirrors Rust's
+        ``load_task_list``."""
+        from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList
+
+        try:
+            value = await self._config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
+        except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
+            return None
+        if value is None:
+            return None
+        try:
+            return TaskList.from_dict(value)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 — an unparseable checkpoint is ignored
+            return None
+
+    def take_observed_writes(self) -> list[str]:
+        """:class:`StrategyExecutor` primitive: drain + return the harness-observed
+        write/edit paths for the current step (#126 AC2), clearing the
+        accumulator. Mirrors Rust's ``take_observed_writes``."""
+        observed = self._observed_writes
+        self._observed_writes = []
+        return observed
+
+    def clear_observed_writes(self) -> None:
+        """:class:`StrategyExecutor` primitive: clear the harness-observed
+        write/edit accumulator (#126 AC2). Mirrors Rust's
+        ``clear_observed_writes``."""
+        self._observed_writes = []
 
     async def finalize(self, result: RunResult) -> None:
         """:class:`StrategyExecutor` primitive: finalize observability for a
@@ -7173,6 +7428,13 @@ class StandardHarness:
                     tool_clock = time.monotonic()
                     output = await tool_registry.dispatch(call)
 
+                    # #126 (AC2): record harness-OBSERVED write/edit paths from
+                    # the call ACTUALLY dispatched. This is the single
+                    # file-observation point the PlanExecute DAG executor reads via
+                    # :meth:`take_observed_writes` to build a task's ledger
+                    # ``files_touched`` — never a model-self-reported field.
+                    self._observe_write_call(call)
+
                     # Subagent pause propagation.
                     if isinstance(output, ToolOutputWaitingForHuman):
                         remaining = calls[i + 1 :]
@@ -7852,6 +8114,8 @@ __all__ = [
     "HaltReasonHillClimbingMisconfigured",
     "HaltReasonRalphCompletionUnmet",
     "HaltReasonStrategyNotYetImplemented",
+    "HaltReasonTaskGraphCycle",
+    "HaltReasonTasksBlockedByFailure",
     "HaltReasonTerminationPolicyHalt",
     "HaltReasonUnrecoverableToolError",
     "Harness",
