@@ -23,7 +23,7 @@ from spore_core import (
     FinalResponse,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     NoopContextManager,
     ScriptedToolRegistry,
@@ -384,7 +384,7 @@ async def test_harness_content_on_writes_genai_content_to_jsonl(
         .content_capture(ContentCaptureConfig(enabled=True))
         .build()
     )
-    task = Task.new("do it", SessionId("s1"), LoopStrategyReAct(max_iterations=5))
+    task = Task.new("do it", SessionId("s1"), ReactConfig.per_loop(5))
     await harness.run(HarnessRunOptions(task))
 
     lines = _read_lines(tmp_path, "s1")
@@ -429,7 +429,7 @@ async def test_harness_content_off_writes_no_genai_content(
         .with_observability_outbox(tmp_path)
         .build()
     )
-    task = Task.new("do it", SessionId("s1"), LoopStrategyReAct(max_iterations=5))
+    task = Task.new("do it", SessionId("s1"), ReactConfig.per_loop(5))
     await harness.run(HarnessRunOptions(task))
 
     lines = _read_lines(tmp_path, "s1")
@@ -573,7 +573,7 @@ async def test_harness_content_on_writes_input_messages_to_jsonl(
         .content_capture(ContentCaptureConfig(enabled=True))
         .build()
     )
-    task = Task.new("List the files.", SessionId("s1"), LoopStrategyReAct(max_iterations=5))
+    task = Task.new("List the files.", SessionId("s1"), ReactConfig.per_loop(5))
     await harness.run(HarnessRunOptions(task))
 
     lines = _read_lines(tmp_path, "s1")

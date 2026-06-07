@@ -16,7 +16,7 @@ from spore_core.harness import (
     HaltReasonBudgetExceeded,
     HarnessConfig,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     RunResult,
     RunResultFailure,
     RunResultWaitingForHuman,
@@ -167,7 +167,7 @@ class EvalHarness:
                     max_turns=max_turns,
                     max_wall_time=max(task.timeout, 1),
                 ),
-                loop_strategy=LoopStrategyReAct(max_iterations=max_turns),
+                loop_strategy=ReactConfig.per_loop(max_turns),
             )
 
             # Rule 4: timeout bounds a single run and yields a failed run

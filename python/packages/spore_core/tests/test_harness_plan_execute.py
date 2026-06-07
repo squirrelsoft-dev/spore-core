@@ -25,7 +25,7 @@ from spore_core import (
     HarnessRunOptions,
     InMemoryObservabilityProvider,
     InMemoryStorageProvider,
-    LoopStrategyPlanExecute,
+    PlanExecuteConfig,
     MockAgent,
     ModelAgent,
     NoopContextManager,
@@ -89,7 +89,7 @@ def _task(*, max_turns: int | None = None) -> Task:
     return Task.new(
         "build a CLI",
         SessionId("pe-s1"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
         budget=BudgetLimits(max_turns=max_turns),
     )
 
@@ -439,7 +439,7 @@ async def test_fixture_replay_matches_rust() -> None:
     task = Task.new(
         "build a CLI",
         SessionId("pe-fixture"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
     )
     r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultSuccess)

@@ -27,7 +27,7 @@ from spore_core import (
     HarnessConfig,
     HarnessRunOptions,
     InMemoryStorageProvider,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     PausedState,
     RunResultFailure,
@@ -80,7 +80,7 @@ def _react_task(
     return Task.new(
         instruction,
         SessionId(session_id),
-        LoopStrategyReAct(max_iterations=max_iter),
+        ReactConfig.per_loop(max_iter),
     )
 
 
@@ -275,7 +275,7 @@ async def test_success_session_state_lossless_via_fixture_replay() -> None:
     task = Task.new(
         "read /etc/hosts then summarize",
         SessionId("fixture-session"),
-        LoopStrategyReAct(max_iterations=5),
+        ReactConfig.per_loop(5),
     )
     r = await h.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultSuccess)
@@ -388,7 +388,7 @@ async def test_explicit_session_state_wins_over_auto_load() -> None:
         pending_tool_calls=[],
         approved_results=[],
         human_request=None,
-        task=Task.new("", SessionId("s1"), LoopStrategyReAct(max_iterations=0)),
+        task=Task.new("", SessionId("s1"), ReactConfig.per_loop(0)),
         budget_used=BudgetSnapshot(),
         child_state=None,
     )

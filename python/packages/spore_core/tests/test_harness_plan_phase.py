@@ -22,7 +22,7 @@ from spore_core import (
     HarnessConfig,
     HarnessRunOptions,
     InMemoryStorageProvider,
-    LoopStrategyPlanExecute,
+    PlanExecuteConfig,
     MockAgent,
     ModelAgent,
     NoopContextManager,
@@ -84,7 +84,7 @@ def _plan_task(*, max_turns: int | None = None) -> Task:
     return Task.new(
         "build something",
         SessionId("plan-s1"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
         budget=BudgetLimits(max_turns=max_turns),
     )
 
@@ -311,7 +311,7 @@ async def test_budget_exhausted_before_plan_turn() -> None:
     task = Task.new(
         "build something",
         SessionId("plan-s1"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
         budget=BudgetLimits(max_turns=0),
     )
     state = SessionState()
@@ -506,7 +506,7 @@ async def _drive_plan_phase(response_text: str) -> None:
         Task.new(
             "build something",
             session_id,
-            LoopStrategyPlanExecute(plan_model=None),
+            PlanExecuteConfig.simple(),
         ),
         state,
         BudgetSnapshot(),

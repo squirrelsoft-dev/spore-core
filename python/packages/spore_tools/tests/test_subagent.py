@@ -10,7 +10,7 @@ from spore_core.harness import (
     HaltReasonHumanHalted,
     HarnessRunOptions,
     HumanRequestClarification,
-    LoopStrategyReAct,
+    ReactConfig,
     PausedState,
     RunResult,
     RunResultFailure,
@@ -122,7 +122,7 @@ async def test_subagent_waiting_for_human_propagates_with_parent_call_id() -> No
         task=Task.new(
             instruction="x",
             session_id=sid,
-            loop_strategy=LoopStrategyReAct(max_iterations=1),
+            loop_strategy=ReactConfig.per_loop(1),
         ),
         budget_used=BudgetSnapshot(),
         child_state=None,

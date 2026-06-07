@@ -13,7 +13,7 @@ from spore_core import (
     EmptyToolRegistry,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     NoopContextManager,
     NullSandbox,
     ProviderInfo,
@@ -119,8 +119,8 @@ def test_task_simple_defaults() -> None:
     a = Task.simple("do a thing")
     b = Task.simple("do a thing")
     assert a.instruction == "do a thing"
-    assert isinstance(a.loop_strategy, LoopStrategyReAct)
-    assert a.loop_strategy.max_iterations == 8
+    assert isinstance(a.loop_strategy, ReactConfig)
+    assert a.loop_strategy.max_iterations() == 8
     # Fresh, distinct session ids per call.
     assert a.session_id
     assert a.session_id != b.session_id

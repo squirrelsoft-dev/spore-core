@@ -46,7 +46,7 @@ from spore_core.harness import (
     new_session_id,
 )
 from spore_core.harness import (
-    LoopStrategyReAct,
+    ReactConfig,
     _Model,  # type: ignore[attr-defined]  # internal pydantic base
 )
 from spore_core.model import ToolCall
@@ -190,7 +190,7 @@ class SubagentTool:
         task = Task.new(
             instruction=instruction,
             session_id=session_id,
-            loop_strategy=LoopStrategyReAct(max_iterations=16),
+            loop_strategy=ReactConfig.per_loop(16),
         )
         options = HarnessRunOptions(task=task, session_state=seeded_session)
 
@@ -304,7 +304,7 @@ class SubagentTool:
         task = Task.new(
             instruction=instruction,
             session_id=new_session_id(),
-            loop_strategy=LoopStrategyReAct(max_iterations=16),
+            loop_strategy=ReactConfig.per_loop(16),
         )
         handler_result = await entry.handler.run(HarnessRunOptions(task=task))
         if isinstance(handler_result, RunResultSuccess):

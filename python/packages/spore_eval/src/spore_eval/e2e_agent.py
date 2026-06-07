@@ -70,7 +70,7 @@ from spore_core.cache_provider import OllamaCacheProvider
 from spore_core.context import CompactionConfig
 from spore_core.harness import (
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     RunResultSuccess,
     SessionId,
     SessionState,
@@ -116,7 +116,7 @@ async def _run_scenario(
     window_limit: int,
 ) -> object:
     """Drive the scenario, including the S2 multi-turn and S3 seed."""
-    strategy = LoopStrategyReAct(max_iterations=8)
+    strategy = ReactConfig.per_loop(8)
 
     if scenario is ScenarioId.S2:
         task1 = Task.new(scenario.prompt(), session_id, strategy)
@@ -246,7 +246,7 @@ async def _run_mock(scenario: ScenarioId, session_id: SessionId) -> object:
             observability=None,
         ),
     )
-    task = Task.new(scenario.prompt(), session_id, LoopStrategyReAct(max_iterations=5))
+    task = Task.new(scenario.prompt(), session_id, ReactConfig.per_loop(5))
     return await harness.run(HarnessRunOptions(task))
 
 

@@ -15,7 +15,7 @@ from spore_core import (
     HarnessRunOptions,
     HumanRequestClarification,
     HumanResponseAnswer,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     RunResultSuccess,
     RunResultWaitingForHuman,
@@ -46,7 +46,7 @@ def _tc(call_id: str, name: str) -> ToolCall:
 
 
 def _react_task(session: str = "s1") -> Task:
-    return Task.new("clarify", SessionId(session), LoopStrategyReAct(max_iterations=5))
+    return Task.new("clarify", SessionId(session), ReactConfig.per_loop(5))
 
 
 class _RecordingCM:

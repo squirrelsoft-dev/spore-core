@@ -39,8 +39,8 @@ from spore_core import (
     HumanRequestToolApproval,
     HumanResponseAllow,
     HumanResponseHalt,
-    LoopStrategyHillClimbing,
-    LoopStrategyReAct,
+    HillClimbingConfig,
+    ReactConfig,
     MiddlewareHalt,
     MiddlewareSurfaceToHuman,
     MockAgent,
@@ -109,7 +109,7 @@ def _react_task(max_iter: int = 5) -> Task:
     return Task.new(
         "do something",
         SessionId("s1"),
-        LoopStrategyReAct(max_iterations=max_iter),
+        ReactConfig.per_loop(max_iter),
     )
 
 
@@ -444,11 +444,13 @@ async def test_non_react_strategies_marked_not_yet_implemented() -> None:
     # test at harness.rs:7100). No non-ReAct strategy remains stubbed.
     a = _agent()
     h = StandardHarness(_config(a))
-    s = LoopStrategyHillClimbing(
+    s = HillClimbingConfig(
+        inner=ReactConfig.per_loop(2**31 - 1),
         direction="maximize",
-        max_stagnation=None,
+        max_stagnation=2**31 - 1,
         revert_on_no_improvement=False,
-        min_improvement_delta=None,
+        min_improvement_delta=0.0,
+        evaluator="",
     )
     t = Task.new("do", SessionId("s1"), s)
     r = await h.run(HarnessRunOptions(t))
@@ -603,7 +605,7 @@ async def test_react_loop_dispatches_tool_then_completes() -> None:
     task = Task.new(
         "read /etc/hosts then summarize",
         SessionId("fixture-session"),
-        LoopStrategyReAct(max_iterations=5),
+        ReactConfig.per_loop(5),
     )
     r = await harness.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultSuccess)
@@ -644,7 +646,7 @@ async def test_harness_emits_spans_through_outbox_jsonl(tmp_path: Path) -> None:
         .with_observability_outbox(tmp_path)
         .build()
     )
-    task = Task.new("do work", session_id, LoopStrategyReAct(max_iterations=5))
+    task = Task.new("do work", session_id, ReactConfig.per_loop(5))
     r = await harness.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultSuccess)
 

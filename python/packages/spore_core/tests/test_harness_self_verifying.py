@@ -21,7 +21,7 @@ from spore_core import (
     HaltReasonSelfVerifyMisconfigured,
     HarnessConfig,
     HarnessRunOptions,
-    LoopStrategySelfVerifying,
+    SelfVerifyingConfig,
     MockAgent,
     NoopContextManager,
     ReadOnlySandbox,
@@ -160,7 +160,7 @@ def _task(max_turns: int | None = None) -> Task:
     return Task.new(
         "implement the thing",
         SessionId("build-session"),
-        LoopStrategySelfVerifying(),
+        SelfVerifyingConfig.simple(),
         budget=BudgetLimits(max_turns=max_turns),
     )
 

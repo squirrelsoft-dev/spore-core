@@ -26,8 +26,9 @@ from spore_core import (
     HaltReasonStagnationLimitReached,
     HarnessConfig,
     HarnessRunOptions,
-    LoopStrategyHillClimbing,
+    HillClimbingConfig,
     MetricErrorCrashed,
+    ReactConfig,
     MetricResult,
     MockAgent,
     NoopContextManager,
@@ -158,11 +159,16 @@ def _task(
     return Task.new(
         "optimize the thing",
         SessionId("hc-session"),
-        LoopStrategyHillClimbing(
+        HillClimbingConfig(
+            inner=ReactConfig.per_loop(2**31 - 1),
             direction=direction,  # type: ignore[arg-type]
-            max_stagnation=max_stagnation,
+            # ``max_stagnation`` / ``min_improvement_delta`` are required (#119);
+            # map the old "unset" sentinels to behavior-preserving values: a
+            # never-reached stagnation cap and a zero improvement threshold.
+            max_stagnation=max_stagnation if max_stagnation is not None else 2**31 - 1,
             revert_on_no_improvement=revert,
-            min_improvement_delta=min_delta,
+            min_improvement_delta=min_delta if min_delta is not None else 0.0,
+            evaluator="",
         ),
         budget=BudgetLimits(max_turns=max_turns),
     )

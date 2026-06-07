@@ -35,7 +35,7 @@ from spore_core.harness import (
     HaltReasonHumanHalted,
     HarnessRunOptions,
     HumanRequestReview,
-    LoopStrategyReAct,
+    ReactConfig,
     PausedState,
     RunResult,
     RunResultConsult,
@@ -126,7 +126,7 @@ def _consult_paused() -> PausedState:
         ],
         approved_results=[],
         human_request=None,
-        task=Task.new("audit", SessionId("worker"), LoopStrategyReAct(max_iterations=4)),
+        task=Task.new("audit", SessionId("worker"), ReactConfig.per_loop(4)),
         budget_used=BudgetSnapshot(),
         child_state=None,
     )

@@ -49,7 +49,7 @@ from spore_core.harness import (
     AlwaysContinuePolicy,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     NoopContextManager,
     RunResultSuccess,
     ScriptedToolRegistry,
@@ -614,7 +614,7 @@ def _harness(chain: StandardHookChain, *, max_stop_blocks: int = 8, turns: int =
 
 
 def _task(max_iter: int = 10) -> Task:
-    return Task.new("do something", SessionId("s1"), LoopStrategyReAct(max_iterations=max_iter))
+    return Task.new("do something", SessionId("s1"), ReactConfig.per_loop(max_iter))
 
 
 async def test_harness_stop_block_then_continue() -> None:

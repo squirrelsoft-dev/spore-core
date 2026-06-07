@@ -24,8 +24,8 @@ from spore_core import (
     HaltReasonRalphCompletionUnmet,
     HarnessConfig,
     HarnessRunOptions,
-    LoopStrategyRalph,
-    LoopStrategyReAct,
+    RalphConfig,
+    ReactConfig,
     RunResultFailure,
     RunResultSuccess,
     SandboxViolation,
@@ -166,7 +166,7 @@ def _ralph_task() -> Task:
     return Task.new(
         "implement the thing",
         SessionId("ralph-session"),
-        LoopStrategyRalph(),
+        RalphConfig.simple(),
         budget=BudgetLimits(max_turns=1),
     )
 
@@ -301,7 +301,7 @@ async def test_r7_stop_hook_inert_without_progress_file(tmp_path: Path) -> None:
         termination_policy=AlwaysContinuePolicy(),
     )
     h = StandardHarness(cfg)
-    task = Task.new("do", SessionId("s1"), LoopStrategyReAct(max_iterations=5))
+    task = Task.new("do", SessionId("s1"), ReactConfig.per_loop(5))
     r = await h.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultSuccess)
     assert r.turns == 1

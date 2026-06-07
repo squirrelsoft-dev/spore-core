@@ -32,7 +32,7 @@ from spore_core import (
     HarnessConfig,
     HarnessRunOptions,
     HarnessStreamEvent,
-    LoopStrategyReAct,
+    ReactConfig,
     ModelAgent,
     ModelResponse,
     NoopContextManager,
@@ -104,7 +104,7 @@ def _config(agent: ModelAgent, **overrides: Any) -> HarnessConfig:
 
 
 def _react_task(max_iter: int = 5) -> Task:
-    return Task.new("do something", SessionId("s1"), LoopStrategyReAct(max_iterations=max_iter))
+    return Task.new("do something", SessionId("s1"), ReactConfig.per_loop(max_iter))
 
 
 def _collect() -> tuple[list[HarnessStreamEvent], Any]:

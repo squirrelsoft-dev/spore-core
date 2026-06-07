@@ -16,7 +16,7 @@ from pathlib import Path
 from spore_core.harness import (
     BudgetSnapshot,
     HumanRequestClarification,
-    LoopStrategyReAct,
+    ReactConfig,
     PausedState,
     SessionId,
     SessionState,
@@ -62,7 +62,7 @@ def _paused(session: str) -> PausedState:
         pending_tool_calls=[],
         approved_results=[],
         human_request=HumanRequestClarification(question="?"),
-        task=Task.new("do the thing", _sid(session), LoopStrategyReAct(max_iterations=1)),
+        task=Task.new("do the thing", _sid(session), ReactConfig.per_loop(1)),
         budget_used=BudgetSnapshot(),
         child_state=None,
     )

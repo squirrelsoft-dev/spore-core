@@ -46,7 +46,7 @@ from spore_core import (
     HarnessSignalEnterPlanMode,
     HarnessSignalExitPlanMode,
     HarnessSignalSwitchMode,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     NoopContextManager,
     PausedState,
@@ -90,7 +90,7 @@ def _react_task(session: str = "s1", max_iter: int = 5) -> Task:
     return Task.new(
         "investigate then escalate",
         SessionId(session),
-        LoopStrategyReAct(max_iterations=max_iter),
+        ReactConfig.per_loop(max_iter),
     )
 
 
@@ -263,10 +263,10 @@ async def test_waiting_for_human_not_finalized_contrast() -> None:
 
     child = ChildPausedState(
         session_id=SessionId("child"),
-        task_id=Task.new("c", SessionId("child"), LoopStrategyReAct(max_iterations=1)).id,
+        task_id=Task.new("c", SessionId("child"), ReactConfig.per_loop(1)).id,
         turn_number=0,
         session_state=SessionState(),
-        task=Task.new("c", SessionId("child"), LoopStrategyReAct(max_iterations=1)),
+        task=Task.new("c", SessionId("child"), ReactConfig.per_loop(1)),
         budget_used=BudgetSnapshot(),
         parent_tool_call_id="c1",
         human_request=HumanRequestClarification(question="?"),
@@ -527,7 +527,7 @@ async def test_escalation_loop_replay_returns_escalate() -> None:
     task = Task.new(
         "investigate then decide whether to abort",
         SessionId("fixture-escalation"),
-        LoopStrategyReAct(max_iterations=5),
+        ReactConfig.per_loop(5),
     )
 
     r = await harness.run(HarnessRunOptions(task))

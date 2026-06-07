@@ -109,7 +109,7 @@ async def test_fixture_replay_subagent_scenarios() -> None:
         HaltReasonHumanHalted,
         HarnessRunOptions,
         HumanRequestClarification,
-        LoopStrategyReAct,
+        ReactConfig,
         PausedState,
         RunResult,
         RunResultFailure,
@@ -172,7 +172,7 @@ async def test_fixture_replay_subagent_scenarios() -> None:
                 task=Task.new(
                     instruction="x",
                     session_id=sid,
-                    loop_strategy=LoopStrategyReAct(max_iterations=1),
+                    loop_strategy=ReactConfig.per_loop(1),
                 ),
                 budget_used=BudgetSnapshot(),
                 child_state=None,

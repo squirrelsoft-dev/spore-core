@@ -280,6 +280,10 @@ BudgetExhaustedContinue.model_rebuild()
 
 
 OptimizationDirection = Literal["minimize", "maximize"]
+# Wire alias kept for the old name; the strategy direction literal is unchanged
+# (snake_case ``"minimize"`` / ``"maximize"``). Renamed in #119 to live with the
+# other strategy-config types (Rust ``HillClimbingDirection``).
+HillClimbingDirection = OptimizationDirection
 
 
 class ModelConfig(_Model):
@@ -287,40 +291,247 @@ class ModelConfig(_Model):
     model_id: str
 
 
-class LoopStrategyReAct(_Model):
-    kind: Literal["re_act"] = "re_act"
-    max_iterations: int
+# ============================================================================
+# Composable Execution Part A (issue #119): recursive LoopStrategy config
+# newtypes + per-node collaborator handles + StrategyRef + RunStrategy.
+# ============================================================================
+#
+# ``LoopStrategy`` is a closed, recursive discriminated union of config
+# newtypes. ``ReactConfig`` is the leaf; the rest are combinators holding
+# ``LoopStrategy`` children. Wire format is byte-identical with Rust / TS / Go
+# (see ``fixtures/strategy/``).
+#
+# Handle types (``AgentRef``, ``ToolsetRef``, ``SchemaRef``) are bare strings on
+# the wire (transparent newtypes), modeled here as ``str`` type aliases.
+#
+# The ``RunStrategy`` composition seam is the Python runtime-polymorphism idiom:
+# a ``Protocol`` with ``async def run(...)`` and a single ``match`` site on
+# ``LoopStrategy`` that delegates to each config's ``run``. Per-config bodies are
+# STUBS returning a pending ``StrategyOutcome`` (never raise); real bodies land
+# in #124. ``ExecutionContext`` / ``StrategyOutcome`` are minimal placeholders
+# (full shape owned by #123).
 
 
-class LoopStrategyPlanExecute(_Model):
+# Per-node collaborator handles. Bare strings on the wire (transparent); the
+# registry slice (#120) resolves them to concrete agents/toolsets/schemas.
+AgentRef = str
+ToolsetRef = str
+SchemaRef = str
+
+
+class ReactConfig(_Model):
+    """Leaf ReAct node config. ``budget`` is the renamed ``max_iterations``
+    (semantically ``PerLoop(n)``). Serializes flat next to ``"kind":"react"``."""
+
+    kind: Literal["react"] = "react"
+    budget: BudgetPolicy
+    agent: AgentRef
+    toolset: ToolsetRef
+    # OMITTED from JSON when None (matches Rust ``skip_serializing_if``).
+    output: SchemaRef | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.output is None:
+            data.pop("output", None)
+        return data
+
+    @classmethod
+    def per_loop(cls, value: int) -> ReactConfig:
+        """A bare ReAct leaf with a ``PerLoop { value }`` budget and empty agent
+        / toolset handles (resolution lands with #120). Migration shim for the
+        old ``ReAct { max_iterations }`` shape."""
+        return cls(budget=BudgetPolicyPerLoop(value=value), agent="", toolset="")
+
+    def max_iterations(self) -> int:
+        """The ``max_iterations`` value extracted from a ``PerLoop`` budget; any
+        other budget shape yields ``2**31 - 1`` (matching the legacy executor's
+        unbounded fall-through)."""
+        if isinstance(self.budget, BudgetPolicyPerLoop):
+            return self.budget.value
+        return 2**31 - 1
+
+
+class PlanExecuteConfig(_Model):
+    """PlanExecute combinator: a ``plan`` sub-strategy feeds an ``execute``
+    sub-strategy. ``plan_model`` stays optional/omittable."""
+
     kind: Literal["plan_execute"] = "plan_execute"
+    plan: LoopStrategy
+    execute: LoopStrategy
     plan_model: ModelConfig | None = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if self.plan_model is None:
+            data.pop("plan_model", None)
+        return data
 
-class LoopStrategyRalph(_Model):
-    kind: Literal["ralph"] = "ralph"
+    @classmethod
+    def simple(cls, plan_model: ModelConfig | None = None) -> PlanExecuteConfig:
+        """A PlanExecute whose plan and execute phases are both bare ReAct leaves
+        (migration shim for the old ``PlanExecute { plan_model }`` shape; the
+        live executor does not read the children yet — #124)."""
+        return cls(
+            plan=ReactConfig.per_loop(2**31 - 1),
+            execute=ReactConfig.per_loop(2**31 - 1),
+            plan_model=plan_model,
+        )
 
 
-class LoopStrategySelfVerifying(_Model):
+class SelfVerifyingConfig(_Model):
+    """SelfVerifying combinator: run ``inner``, then judge it against
+    ``evaluator``."""
+
     kind: Literal["self_verifying"] = "self_verifying"
+    inner: LoopStrategy
+    evaluator: SchemaRef
+
+    @classmethod
+    def simple(cls) -> SelfVerifyingConfig:
+        """Migration shim for the old empty ``SelfVerifying`` shape: a bare ReAct
+        inner leaf and an empty evaluator handle (resolution lands with #120)."""
+        return cls(inner=ReactConfig.per_loop(2**31 - 1), evaluator="")
 
 
-class LoopStrategyHillClimbing(_Model):
+class RalphConfig(_Model):
+    """Ralph combinator: re-run ``inner`` under a fixed ``agent`` across
+    context-window resets."""
+
+    kind: Literal["ralph"] = "ralph"
+    inner: LoopStrategy
+    agent: AgentRef
+
+    @classmethod
+    def simple(cls) -> RalphConfig:
+        """Migration shim for the old empty ``Ralph`` shape: a bare ReAct inner
+        leaf and an empty agent handle (resolution lands with #120)."""
+        return cls(inner=ReactConfig.per_loop(2**31 - 1), agent="")
+
+
+class HillClimbingConfig(_Model):
+    """HillClimbing combinator: iterate ``inner``, keeping/reverting per the
+    metric ``evaluator`` and ``direction``. ``max_stagnation`` and
+    ``min_improvement_delta`` are now required (#119)."""
+
     kind: Literal["hill_climbing"] = "hill_climbing"
-    direction: OptimizationDirection
-    max_stagnation: int | None = None
-    revert_on_no_improvement: bool = False
-    min_improvement_delta: float | None = None
+    inner: LoopStrategy
+    direction: HillClimbingDirection
+    max_stagnation: int
+    revert_on_no_improvement: bool
+    min_improvement_delta: float
+    evaluator: AgentRef
 
 
 LoopStrategy = Annotated[
-    LoopStrategyReAct
-    | LoopStrategyPlanExecute
-    | LoopStrategyRalph
-    | LoopStrategySelfVerifying
-    | LoopStrategyHillClimbing,
+    ReactConfig | PlanExecuteConfig | SelfVerifyingConfig | RalphConfig | HillClimbingConfig,
     Field(discriminator="kind"),
 ]
+
+# Resolve the forward references to ``LoopStrategy`` used by the recursive
+# combinator children (``plan``/``execute``/``inner``).
+PlanExecuteConfig.model_rebuild()
+SelfVerifyingConfig.model_rebuild()
+RalphConfig.model_rebuild()
+HillClimbingConfig.model_rebuild()
+
+
+# ── StrategyRef: adjacently-tagged BuiltIn(LoopStrategy) | Custom(str) ───────
+#
+# Adjacently tagged on ``kind``/``value`` to avoid a tag collision with the
+# nested ``LoopStrategy``'s own ``kind``:
+#   - {"kind":"built_in","value":{"kind":"react",...}}
+#   - {"kind":"custom","value":"my-harness::DoubleVerify"}
+
+
+class StrategyRefBuiltIn(_Model):
+    kind: Literal["built_in"] = "built_in"
+    value: LoopStrategy
+
+
+class StrategyRefCustom(_Model):
+    kind: Literal["custom"] = "custom"
+    value: str
+
+
+StrategyRef = Annotated[
+    StrategyRefBuiltIn | StrategyRefCustom,
+    Field(discriminator="kind"),
+]
+
+
+# ── RunStrategy composition seam ─────────────────────────────────────────────
+
+
+@dataclass
+class ExecutionContext:
+    """Placeholder for #119; full shape owned by #123 (StrategyOutcome +
+    ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
+    pre-build #123's budget/usage scaffold here."""
+
+
+class StrategyOutcomePending(_Model):
+    """Per-variant execution is not yet implemented (#124). Stub marker only."""
+
+    kind: Literal["pending"] = "pending"
+
+
+StrategyOutcome = StrategyOutcomePending
+
+
+@runtime_checkable
+class RunStrategy(Protocol):
+    """The runtime composition seam: every strategy node knows how to run itself
+    given an :class:`ExecutionContext`. The single dispatch is one ``match`` on
+    :func:`run_strategy` delegating to per-config ``run``; each per-config body
+    is a STUB returning :class:`StrategyOutcomePending` (never raises) pending
+    #124."""
+
+    async def run(self, cx: ExecutionContext) -> StrategyOutcome: ...
+
+
+async def _run_react_config(_self: ReactConfig, _cx: ExecutionContext) -> StrategyOutcome:
+    return StrategyOutcomePending()
+
+
+async def _run_plan_execute_config(
+    _self: PlanExecuteConfig, _cx: ExecutionContext
+) -> StrategyOutcome:
+    return StrategyOutcomePending()
+
+
+async def _run_self_verifying_config(
+    _self: SelfVerifyingConfig, _cx: ExecutionContext
+) -> StrategyOutcome:
+    return StrategyOutcomePending()
+
+
+async def _run_ralph_config(_self: RalphConfig, _cx: ExecutionContext) -> StrategyOutcome:
+    return StrategyOutcomePending()
+
+
+async def _run_hill_climbing_config(
+    _self: HillClimbingConfig, _cx: ExecutionContext
+) -> StrategyOutcome:
+    return StrategyOutcomePending()
+
+
+async def run_strategy(strategy: LoopStrategy, cx: ExecutionContext) -> StrategyOutcome:
+    """The ONLY ``match`` site in the strategy system — one-line delegation per
+    arm to the inner config's stub ``run`` (real bodies land in #124)."""
+    match strategy:
+        case ReactConfig():
+            return await _run_react_config(strategy, cx)
+        case PlanExecuteConfig():
+            return await _run_plan_execute_config(strategy, cx)
+        case SelfVerifyingConfig():
+            return await _run_self_verifying_config(strategy, cx)
+        case RalphConfig():
+            return await _run_ralph_config(strategy, cx)
+        case HillClimbingConfig():
+            return await _run_hill_climbing_config(strategy, cx)
 
 
 class Task(_Model):
@@ -356,7 +567,7 @@ class Task(_Model):
         return cls.new(
             instruction,
             new_session_id(),
-            LoopStrategyReAct(max_iterations=8),
+            ReactConfig.per_loop(8),
         )
 
 
@@ -3278,7 +3489,7 @@ class StandardHarness:
                 pending_tool_calls=[],
                 approved_results=[],
                 human_request=None,
-                task=Task.new("", session_id, LoopStrategyReAct(max_iterations=0)),
+                task=Task.new("", session_id, ReactConfig.per_loop(0)),
                 budget_used=BudgetSnapshot(),
                 child_state=None,
             )
@@ -3311,12 +3522,12 @@ class StandardHarness:
         if options.session_state is not None:
             session_state = options.session_state
         elif self._config.auto_persist_sessions and isinstance(
-            strategy, LoopStrategyReAct | LoopStrategySelfVerifying
+            strategy, ReactConfig | SelfVerifyingConfig
         ):
             session_state = await self._auto_load_session(task.session_id)
         else:
             session_state = SessionState()
-        if isinstance(strategy, LoopStrategyReAct):
+        if isinstance(strategy, ReactConfig):
             # Seed the task instruction as the initial user message of this run.
             # The compaction adapter intentionally mirrors ``session.messages``
             # and ignores ``task`` on ``assemble``, so the harness must own
@@ -3327,21 +3538,21 @@ class StandardHarness:
             # conversation already exists.
             await self._config.context_manager.append_user_message(session_state, task.instruction)
             return await self._run_react(
-                task, strategy.max_iterations, session_state, budget_used, on_stream
+                task, strategy.max_iterations(), session_state, budget_used, on_stream
             )
-        if isinstance(strategy, LoopStrategyPlanExecute):
+        if isinstance(strategy, PlanExecuteConfig):
             return await self._run_plan_execute(task, session_state, budget_used, on_stream)
-        if isinstance(strategy, LoopStrategyRalph):
+        if isinstance(strategy, RalphConfig):
             # Each context window is a fresh session re-seeded INSIDE
             # ``_run_ralph`` (the context-window reset), so we do NOT pre-seed
             # the instruction here.
             return await self._run_ralph(task, budget_used, on_stream)
-        if isinstance(strategy, LoopStrategySelfVerifying):
+        if isinstance(strategy, SelfVerifyingConfig):
             # Seed the task instruction as the build loop's initial user message,
             # mirroring the ReAct arm (the build phase is a ReAct sub-loop).
             await self._config.context_manager.append_user_message(session_state, task.instruction)
             return await self._run_self_verifying(task, session_state, budget_used, on_stream)
-        if isinstance(strategy, LoopStrategyHillClimbing):
+        if isinstance(strategy, HillClimbingConfig):
             # Each iteration runs its OWN bounded ReAct sub-run that seeds its own
             # fresh session state (iteration 0 is a pure baseline with NO agent
             # turn), so we do NOT pre-seed the instruction here.
@@ -3423,8 +3634,8 @@ class StandardHarness:
                     tr = HarnessToolResult(call_id=call.id, output=output)
                     await self._config.context_manager.append_tool_result(session_state, tr)
             max_iterations = (
-                task.loop_strategy.max_iterations
-                if isinstance(task.loop_strategy, LoopStrategyReAct)
+                task.loop_strategy.max_iterations()
+                if isinstance(task.loop_strategy, ReactConfig)
                 else 2**31 - 1
             )
             return await self._run_react(
@@ -3477,8 +3688,8 @@ class StandardHarness:
 
         # Resume the ReAct loop from where we paused.
         max_iterations = (
-            task.loop_strategy.max_iterations
-            if isinstance(task.loop_strategy, LoopStrategyReAct)
+            task.loop_strategy.max_iterations()
+            if isinstance(task.loop_strategy, ReactConfig)
             else 2**31 - 1
         )
         return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
@@ -3561,8 +3772,8 @@ class StandardHarness:
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
         max_iterations = (
-            task.loop_strategy.max_iterations
-            if isinstance(task.loop_strategy, LoopStrategyReAct)
+            task.loop_strategy.max_iterations()
+            if isinstance(task.loop_strategy, ReactConfig)
             else 2**31 - 1
         )
         return await self._run_react(task, max_iterations, session_state, budget_used, on_stream)
@@ -3860,10 +4071,8 @@ class StandardHarness:
             instruction=directive,
             session_id=eval_session_id,
             budget=task.budget,
-            loop_strategy=LoopStrategyReAct(
-                max_iterations=(
-                    task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
-                )
+            loop_strategy=ReactConfig.per_loop(
+                task.budget.max_turns if task.budget.max_turns is not None else 2**31 - 1
             ),
         )
 
@@ -6075,12 +6284,24 @@ __all__ = [
     "HumanResponseDeny",
     "HumanResponseHalt",
     "HumanResponseReject",
+    "AgentRef",
+    "ExecutionContext",
+    "HillClimbingConfig",
+    "HillClimbingDirection",
     "LoopStrategy",
-    "LoopStrategyHillClimbing",
-    "LoopStrategyPlanExecute",
-    "LoopStrategyRalph",
-    "LoopStrategyReAct",
-    "LoopStrategySelfVerifying",
+    "PlanExecuteConfig",
+    "RalphConfig",
+    "ReactConfig",
+    "RunStrategy",
+    "SchemaRef",
+    "SelfVerifyingConfig",
+    "StrategyOutcome",
+    "StrategyOutcomePending",
+    "StrategyRef",
+    "StrategyRefBuiltIn",
+    "StrategyRefCustom",
+    "ToolsetRef",
+    "run_strategy",
     "HarnessMiddlewareChain",
     "MiddlewareContinue",
     "MiddlewareContinueWithModification",

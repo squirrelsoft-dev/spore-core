@@ -17,7 +17,7 @@ from spore_core.harness import (
     HarnessToolResult,
     HumanRequestClarification,
     HumanRequestToolApproval,
-    LoopStrategyReAct,
+    ReactConfig,
     RunResultSuccess,
     SessionId,
     SessionState,
@@ -62,7 +62,7 @@ def _task() -> Task:
     return Task.new(
         "test task",
         SessionId("sess"),
-        LoopStrategyReAct(max_iterations=5),
+        ReactConfig.per_loop(5),
         budget=BudgetLimits(),
     )
 

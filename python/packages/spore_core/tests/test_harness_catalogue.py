@@ -25,7 +25,7 @@ from spore_core import (
     FinalResponse,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     NoopContextManager,
     RealToolRegistry,
@@ -124,7 +124,7 @@ def _builder(agent: object) -> HarnessBuilder:
 
 
 def _react_task() -> Task:
-    return Task.new("do something", SessionId("s1"), LoopStrategyReAct(max_iterations=2))
+    return Task.new("do something", SessionId("s1"), ReactConfig.per_loop(2))
 
 
 # ---------------------------------------------------------------------------

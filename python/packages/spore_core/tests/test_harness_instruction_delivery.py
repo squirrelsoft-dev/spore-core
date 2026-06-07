@@ -23,8 +23,8 @@ from spore_core import (
     HarnessConfig,
     HarnessRunOptions,
     InMemoryStorageProvider,
-    LoopStrategyPlanExecute,
-    LoopStrategyReAct,
+    PlanExecuteConfig,
+    ReactConfig,
     NoopContextManager,
     RunResultSuccess,
     ScriptedToolRegistry,
@@ -101,7 +101,7 @@ async def test_task_instruction_delivered_as_first_user_message() -> None:
     task = Task.new(
         instruction,
         SessionId("seed-test"),
-        LoopStrategyReAct(max_iterations=4),
+        ReactConfig.per_loop(4),
     )
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
@@ -178,7 +178,7 @@ async def test_default_model_params_are_default() -> None:
             termination_policy=AlwaysContinuePolicy(),
         )
     )
-    task = Task.new("do a thing", SessionId("dflt"), LoopStrategyReAct(max_iterations=4))
+    task = Task.new("do a thing", SessionId("dflt"), ReactConfig.per_loop(4))
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess)
     assert agent.seen, "agent should have seen at least one turn"
@@ -200,7 +200,7 @@ async def test_model_params_reach_react_turn() -> None:
         .model_params(_structured_params())
         .build()
     )
-    task = Task.new("do a thing", SessionId("react"), LoopStrategyReAct(max_iterations=4))
+    task = Task.new("do a thing", SessionId("react"), ReactConfig.per_loop(4))
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess)
     assert agent.seen
@@ -212,7 +212,7 @@ async def test_model_params_reach_plan_phase() -> None:
     plan-turn context carries the flag."""
     agent = _ScriptedCapturingAgent(['{"tasks":["one"],"rationale":"r"}'])
     harness = StandardHarness(_plan_execute_config(agent))
-    task = Task.new("build something", SessionId("plan"), LoopStrategyPlanExecute(plan_model=None))
+    task = Task.new("build something", SessionId("plan"), PlanExecuteConfig.simple())
     state = SessionState()
     await harness._run_plan_phase(task, state, BudgetSnapshot(), None)
     assert len(agent.seen) == 1, "exactly one plan turn"
@@ -230,7 +230,7 @@ async def test_model_params_reach_execute_subloop() -> None:
         ]
     )
     harness = StandardHarness(_plan_execute_config(agent))
-    task = Task.new("build something", SessionId("exec"), LoopStrategyPlanExecute(plan_model=None))
+    task = Task.new("build something", SessionId("exec"), PlanExecuteConfig.simple())
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess)
     # 1 plan turn + 2 execute turns; every captured context carries it.
@@ -335,7 +335,7 @@ async def test_plan_directive_does_not_leak_into_execute_context() -> None:
     task = Task.new(
         "build something",
         SessionId("leak"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
     )
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
@@ -417,7 +417,7 @@ async def test_execute_steps_accumulate_prior_results() -> None:
     task = Task.new(
         "build something",
         SessionId("accum"),
-        LoopStrategyPlanExecute(plan_model=None),
+        PlanExecuteConfig.simple(),
     )
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), f"expected Success, got {result!r}"
@@ -459,7 +459,7 @@ async def test_model_params_reach_streaming_turn() -> None:
         .model_params(_structured_params())
         .build()
     )
-    task = Task.new("do a thing", SessionId("stream"), LoopStrategyReAct(max_iterations=4))
+    task = Task.new("do a thing", SessionId("stream"), ReactConfig.per_loop(4))
     result = await harness.run(HarnessRunOptions(task, on_stream=lambda _ev: None))
     assert isinstance(result, RunResultSuccess)
     assert agent.seen

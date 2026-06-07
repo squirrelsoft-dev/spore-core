@@ -24,7 +24,7 @@ from spore_core.harness import (
     AllowAllSandbox,
     AlwaysContinuePolicy,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     NoopContextManager,
     RunResultSuccess,
     ScriptedToolRegistry,
@@ -98,9 +98,7 @@ async def test_s1_multi_step_multi_tool() -> None:
             observability=None,
         ),
     )
-    task = Task.new(
-        ScenarioId.S1.prompt(), SessionId("s1-test"), LoopStrategyReAct(max_iterations=8)
-    )
+    task = Task.new(ScenarioId.S1.prompt(), SessionId("s1-test"), ReactConfig.per_loop(8))
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), result
     assert result.turns > 2, f"S1 should take >2 turns, got {result.turns}"
@@ -162,13 +160,11 @@ async def test_s2_multi_turn_carries_state() -> None:
         ),
     )
 
-    task1 = Task.new(ScenarioId.S2.prompt(), session_id, LoopStrategyReAct(max_iterations=5))
+    task1 = Task.new(ScenarioId.S2.prompt(), session_id, ReactConfig.per_loop(5))
     r1 = await harness.run(HarnessRunOptions(task1))
     assert isinstance(r1, RunResultSuccess), r1
 
-    task2 = Task.new(
-        "add a second item referencing the first", session_id, LoopStrategyReAct(max_iterations=5)
-    )
+    task2 = Task.new("add a second item referencing the first", session_id, ReactConfig.per_loop(5))
     r2 = await harness.run(HarnessRunOptions(task2, session_state=SessionState()))
     assert isinstance(r2, RunResultSuccess), r2
     assert r2.session_id == session_id, "same session id across turns"
@@ -223,7 +219,7 @@ async def test_s3_live_compaction_reclaims_tokens() -> None:
         ),
     )
 
-    task = Task.new("deploy the payment service", session_id, LoopStrategyReAct(max_iterations=8))
+    task = Task.new("deploy the payment service", session_id, ReactConfig.per_loop(8))
     state = SessionState()
     # Seed a small window with budget over threshold (170/200 = 0.85) + long history.
     seed_compaction_state(state, "deploy the payment service", session_id, task.id, 200, 170, 12)
@@ -296,7 +292,7 @@ async def test_s4_tool_failure_then_recovery() -> None:
         ),
     )
 
-    task = Task.new(ScenarioId.S4.prompt(), session_id, LoopStrategyReAct(max_iterations=8))
+    task = Task.new(ScenarioId.S4.prompt(), session_id, ReactConfig.per_loop(8))
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), f"S4 expected Success, got {result!r}"
     assert result.turns >= 3, "S4: flaky -> recover -> done"
@@ -370,7 +366,7 @@ async def test_s5_shell_pipeline_uppercases_via_bash_command() -> None:
         ),
     )
 
-    task = Task.new(ScenarioId.S5.prompt(), session_id, LoopStrategyReAct(max_iterations=8))
+    task = Task.new(ScenarioId.S5.prompt(), session_id, ReactConfig.per_loop(8))
     result = await harness.run(HarnessRunOptions(task))
     assert isinstance(result, RunResultSuccess), f"S5 expected Success, got {result!r}"
     assert result.turns >= 3, f"S5: bash_command -> read_file -> done, got {result.turns}"

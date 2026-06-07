@@ -43,7 +43,7 @@ from spore_core import (
     ConsultResponseBudgetExhausted,
     HarnessConfig,
     HarnessRunOptions,
-    LoopStrategyReAct,
+    ReactConfig,
     MockAgent,
     NoopContextManager,
     PausedState,
@@ -80,9 +80,7 @@ def _usage(in_t: int = 1, out_t: int = 1) -> TokenUsage:
 
 
 def _react_task(session: str = "s1", max_iter: int = 5) -> Task:
-    return Task.new(
-        "audit the auth module", SessionId(session), LoopStrategyReAct(max_iterations=max_iter)
-    )
+    return Task.new("audit the auth module", SessionId(session), ReactConfig.per_loop(max_iter))
 
 
 def _consult_req() -> ConsultRequest:
