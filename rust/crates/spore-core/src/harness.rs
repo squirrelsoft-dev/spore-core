@@ -284,6 +284,20 @@ pub enum BudgetPolicy {
     PerAttempt { value: u32 },
 }
 
+impl BudgetPolicy {
+    /// The per-scope step allowance carried by this policy (`None` for
+    /// `Unlimited`). Shared by [`BudgetContext::allowance`] and the leaf
+    /// cap-binding check in [`ReactConfig::run`] (#125).
+    pub fn allowance_value(&self) -> Option<u32> {
+        match self {
+            BudgetPolicy::Unlimited => None,
+            BudgetPolicy::TotalSteps { value }
+            | BudgetPolicy::PerLoop { value }
+            | BudgetPolicy::PerAttempt { value } => Some(*value),
+        }
+    }
+}
+
 /// See [`BudgetPolicy`] for the full type/variant/wire-format/rules doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -625,12 +639,7 @@ impl BudgetContext {
 
     /// The per-scope step allowance (`None` for `Unlimited`).
     fn allowance(&self) -> Option<u32> {
-        match self.policy {
-            BudgetPolicy::Unlimited => None,
-            BudgetPolicy::TotalSteps { value }
-            | BudgetPolicy::PerLoop { value }
-            | BudgetPolicy::PerAttempt { value } => Some(value),
-        }
+        self.policy.allowance_value()
     }
 
     /// Debit `turns` steps against the scope allowance (pure arithmetic — see
@@ -671,6 +680,67 @@ impl BudgetContext {
             BudgetExhaustedBehavior::Escalate | BudgetExhaustedBehavior::Fail => 0,
         }
     }
+
+    /// Grant one in-process continue (#125): bump `continues_used` and RESET
+    /// `steps_taken` to 0 so the scope's step allowance refreshes for the next
+    /// round. This is a purely in-memory reset — the session / messages are
+    /// untouched (the loop keeps the same conversation; only the per-scope step
+    /// counter rewinds). The `continues_used` persistence across a serialized
+    /// checkpoint is DEFERRED to #129.
+    pub fn consume_continue(&mut self) {
+        self.continues_used = self.continues_used.saturating_add(1);
+        self.steps_taken = 0;
+    }
+
+    /// Resolve this scope's [`BudgetExhaustedBehavior`] at the moment of
+    /// exhaustion (#125), walking the on-continues-exhausted fall-through chain:
+    ///
+    ///   - `Fail`     → [`ExhaustedResolution::Fail`].
+    ///   - `Escalate` → [`ExhaustedResolution::Escalate`].
+    ///   - `Continue { max_continues, on_exhausted }` →
+    ///       - if [`continues_remaining`](Self::continues_remaining) `> 0`:
+    ///         [`consume_continue`](Self::consume_continue) (reset counter, bump
+    ///         `continues_used`) and return [`ExhaustedResolution::Continue`];
+    ///       - otherwise the continues are spent: ADOPT the boxed `on_exhausted`
+    ///         behavior as this scope's behavior and recurse into it (the
+    ///         fall-through), so a `Continue { on_exhausted: Escalate }` whose
+    ///         continues are spent resolves to `Escalate`.
+    ///
+    /// Mutates `self`: on a granted continue the counter resets; on fall-through
+    /// `self.behavior` is replaced by the boxed inner behavior so subsequent
+    /// resolutions see the post-fall-through behavior.
+    pub fn resolve_exhausted(&mut self) -> ExhaustedResolution {
+        match self.behavior.clone() {
+            BudgetExhaustedBehavior::Fail => ExhaustedResolution::Fail,
+            BudgetExhaustedBehavior::Escalate => ExhaustedResolution::Escalate,
+            BudgetExhaustedBehavior::Continue { on_exhausted, .. } => {
+                if self.continues_remaining() > 0 {
+                    self.consume_continue();
+                    ExhaustedResolution::Continue
+                } else {
+                    // Continues spent — fall through to the boxed behavior.
+                    self.behavior = *on_exhausted;
+                    self.resolve_exhausted()
+                }
+            }
+        }
+    }
+}
+
+/// The runtime-only resolution of a [`BudgetExhaustedBehavior`] chain at the
+/// moment of exhaustion (#125). NOT serialized — purely a control-flow signal
+/// returned by [`BudgetContext::resolve_exhausted`].
+///
+///   - `Continue` — the scope was granted an in-process continue (counter reset,
+///     `continues_used` bumped); the caller loops again.
+///   - `Fail`     — terminate; `partial_output = None` (discarded by contract).
+///   - `Escalate` — hand off to the parent; `partial_output = Some(..)` carries
+///     the node-concrete partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExhaustedResolution {
+    Continue,
+    Fail,
+    Escalate,
 }
 
 /// Runtime push/pop stack of [`BudgetContext`] scopes — one node per recursion
@@ -1077,6 +1147,17 @@ impl RunStrategy for ReactConfig {
     /// The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
     /// (`task`, `run_session`, `run_budget`) and drives one ReAct window through
     /// the executor primitive, threading the result back into the shared usage.
+    ///
+    /// ## Budget enforcement (#125)
+    ///
+    /// The leaf pushes its OWN [`BudgetContext`] scope for `self.budget` and
+    /// charges the turns the window consumed against it. Per Open Q A-2 (rule 6)
+    /// the leaf does NOT carry its own behavior and NEVER self-resolves a
+    /// Continue/Fail/Escalate at the leaf — on charge exhaustion it PROPAGATES a
+    /// `StrategyOutcome::BudgetExhausted` to its parent (which owns the single
+    /// recovery site). The propagated `partial_output` is the window's last
+    /// FinalResponse text as JSON (fork #2). A clean (non-budget) terminal is
+    /// recorded verbatim through [`record_terminal`](ExecutionContext::record_terminal).
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
             let executor = match cx.executor() {
@@ -1098,6 +1179,16 @@ impl RunStrategy for ReactConfig {
                     return cx.record_terminal(result);
                 }
             };
+            // #125: push this leaf's OWN budget scope. The leaf carries only its
+            // POLICY (the cap); behavior is `Escalate` as a leaf placeholder — the
+            // leaf never RESOLVES it (rule 6: propagate to parent), it is only the
+            // scope shape so the charge below enforces the cap and any exhaustion
+            // promotes to a parent-inspectable `BudgetExhausted`.
+            cx.push_budget(
+                self.budget.clone(),
+                BudgetExhaustedBehavior::Escalate,
+                "react",
+            );
             // The leaf takes the run's stream sink for the window. Combinators
             // that recurse per-phase suppress it (they take it before recursing).
             let on_stream = cx.stream.take();
@@ -1112,6 +1203,68 @@ impl RunStrategy for ReactConfig {
                 )
                 .await;
             executor.finalize(&result).await;
+
+            // #125: charge the window's turns against this leaf's OWN scope. The
+            // leaf POLICY (`self.budget`) — not the global `BudgetLimits` backstop —
+            // is the per-node enforcement point. A window stops at
+            // `min(max_iterations, task.budget.max_turns)`: when the LEAF cap is the
+            // binding constraint (the window consumed >= the leaf policy value), the
+            // leaf is exhausted and PROPAGATES a typed `BudgetExhausted` to its
+            // parent (rule 6 — the leaf never self-resolves). When the smaller
+            // GLOBAL backstop trips first, the legacy `BudgetExceeded` terminal is
+            // recorded VERBATIM (the global cap is unchanged, #117 backstop).
+            let window_turns = match &result {
+                RunResult::Success { turns, .. } | RunResult::Failure { turns, .. } => *turns,
+                _ => 0,
+            };
+            let window_hit_budget = matches!(
+                &result,
+                RunResult::Failure {
+                    reason: HaltReason::BudgetExceeded { .. },
+                    ..
+                }
+            );
+            // The leaf cap is binding when the window hit a budget terminal AND it
+            // consumed at least the leaf's own allowance (so the leaf policy — not a
+            // smaller global backstop — is what stopped it).
+            let leaf_cap_binding = window_hit_budget
+                && matches!(self.budget.allowance_value(), Some(cap) if window_turns >= cap);
+            let charge = cx.charge_current(window_turns);
+            if leaf_cap_binding || charge.is_err() {
+                // The leaf partial is the window's last FinalResponse text.
+                let last_final = last_final_response_text(&result).unwrap_or_default();
+                // Carry the post-run session so a parent resumes losslessly.
+                if let RunResult::Success { session_state, .. }
+                | RunResult::Failure { session_state, .. } = &result
+                {
+                    cx.scratch.run_session = session_state.clone();
+                }
+                let err = charge.err().unwrap_or_else(|| {
+                    // The window itself hit the cap; synthesize the charge error
+                    // from the current scope state.
+                    cx.budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .unwrap_or_else(|| BudgetExhausted {
+                            policy: self.budget.clone(),
+                            behavior: BudgetExhaustedBehavior::Escalate,
+                            steps_taken: window_turns,
+                            continues_used: 0,
+                            phase: "react".to_string(),
+                        })
+                });
+                cx.pop_budget();
+                // Rule 6: the leaf PROPAGATES — partial carries the last
+                // FinalResponse (Escalate semantics, fork #1/#2).
+                return promote_budget_exhausted(&err, Some(react_partial_json(&last_final)));
+            }
+            cx.pop_budget();
             cx.record_terminal(result)
         })
     }
@@ -1264,7 +1417,25 @@ impl RunStrategy for PlanExecuteConfig {
             let mut total_usage = outcome.usage;
             let mut last_output = String::new();
             let mut last_state = SessionState::default();
-            let global_max_turns = task.budget.max_turns;
+
+            // #125: PlanExecute owns a budget scope for its execute phase. Its
+            // POLICY is the task's global turn ceiling (`TotalSteps`) — the root
+            // node's `TotalSteps` subsumes the OLD per-task `remaining_turns /
+            // remaining_tasks / step_cap` derivation, which is now DEAD and
+            // removed. Behavior is `Escalate` (in-process placeholder; the
+            // serialized behavior field is #129). The dead `global_max_turns` /
+            // `remaining_tasks` / `per_task_turns` / `sub_loop_cap` / `step_cap`
+            // block that mapped the global cap onto each child's `max_turns` is
+            // gone — enforcement is now `charge`-based per node.
+            let plan_policy = match task.budget.max_turns {
+                Some(max) => BudgetPolicy::TotalSteps { value: max },
+                None => BudgetPolicy::Unlimited,
+            };
+            cx.push_budget(
+                plan_policy,
+                BudgetExhaustedBehavior::Escalate,
+                "plan_execute",
+            );
 
             for index in 0..total_tasks {
                 let task_id = task_list.tasks[index].id;
@@ -1275,27 +1446,6 @@ impl RunStrategy for PlanExecuteConfig {
                     last_output = instruction.clone();
                     continue;
                 }
-
-                // Q1: per-task turn allocation, derived at the START of the step.
-                let remaining_tasks = (total_tasks - index) as u32;
-                let per_task_turns = match global_max_turns {
-                    Some(max) => {
-                        let remaining_turns = max.saturating_sub(carried.turns);
-                        (remaining_turns / remaining_tasks).max(1)
-                    }
-                    None => u32::MAX,
-                };
-                // The sub-loop's effective cap is RELATIVE to the carried turns:
-                // a per-task cap of K means "stop K turns from now" while the
-                // GLOBAL budget (carried forward) remains the hard stop — so the
-                // step task's turn ceiling is `min(global, carried + per_task)`.
-                // An already-exhausted global budget thus budget-fails the step
-                // BEFORE the execute child calls the agent (Q1).
-                let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
-                let step_cap = match global_max_turns {
-                    Some(global) => global.min(sub_loop_cap),
-                    None => sub_loop_cap,
-                };
 
                 // Mark InProgress and re-persist (Q4).
                 let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
@@ -1308,10 +1458,7 @@ impl RunStrategy for PlanExecuteConfig {
                     id: task.id.clone(),
                     instruction,
                     session_id: session_id.clone(),
-                    budget: BudgetLimits {
-                        max_turns: Some(step_cap),
-                        ..task.budget.clone()
-                    },
+                    budget: task.budget.clone(),
                     loop_strategy: (*self.execute).clone(),
                 };
                 executor
@@ -1327,7 +1474,35 @@ impl RunStrategy for PlanExecuteConfig {
                 cx.scratch.task = Some(step_task);
                 cx.scratch.run_session = session_state.clone();
                 cx.scratch.run_budget = carried.clone();
-                let _step_outcome = self.execute.run(cx).await;
+                // #125: absolute turn count BEFORE this step, so the success path
+                // can charge only the DELTA against the PlanExecute scope.
+                let carried_before = carried.turns;
+                let step_outcome = self.execute.run(cx).await;
+                // #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as
+                // a `StrategyOutcome`, never auto-cascaded. PlanExecute does NOT
+                // charge the child's exhaustion against its OWN scope; it surfaces
+                // its own typed BudgetExhausted with the PlanExecute partial
+                // (tasklist + statuses + ledger) and aborts the run.
+                if let StrategyOutcome::BudgetExhausted { .. } = &step_outcome {
+                    let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
+                    executor.persist_task_list(&session_id, &task_list).await;
+                    let partial = plan_execute_partial_json(&task_list);
+                    let err = cx
+                        .budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .expect("plan_execute scope pushed above");
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return promote_budget_exhausted(&err, Some(partial));
+                }
                 let sub_result = cx.take_child_override();
 
                 match sub_result {
@@ -1361,6 +1536,22 @@ impl RunStrategy for PlanExecuteConfig {
                                 content: last_output.clone(),
                             },
                         );
+
+                        // #125: charge this step's turns against the PlanExecute
+                        // scope. If the global `TotalSteps` cap is now spent, the
+                        // PlanExecute node surfaces its OWN typed BudgetExhausted
+                        // (partial = tasklist + ledger), resolving its behavior.
+                        if let Err(err) = cx.charge_current(turns.saturating_sub(carried_before)) {
+                            let partial = plan_execute_partial_json(&task_list);
+                            let resolution = cx.resolve_current();
+                            cx.pop_budget();
+                            cx.scratch.task = Some(task);
+                            cx.stream = on_stream;
+                            return match resolution {
+                                ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                                _ => promote_budget_exhausted(&err, Some(partial)),
+                            };
+                        }
                     }
                     // Q5: any non-success step aborts the whole run.
                     Some(RunResult::Failure {
@@ -1386,6 +1577,7 @@ impl RunStrategy for PlanExecuteConfig {
                                 reason: format!("{other:?}"),
                             },
                         };
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         let result = RunResult::Failure {
                             reason: terminal_reason,
@@ -1398,10 +1590,12 @@ impl RunStrategy for PlanExecuteConfig {
                     }
                     // A pause / consult / escalate propagates the whole run.
                     Some(pause) => {
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         return cx.finish(executor, task, pause).await;
                     }
                     None => {
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         let result = RunResult::Failure {
                             reason: HaltReason::StepFailed {
@@ -1419,6 +1613,7 @@ impl RunStrategy for PlanExecuteConfig {
                 }
             }
 
+            cx.pop_budget();
             cx.stream = on_stream;
             let result = RunResult::Success {
                 output: last_output,
@@ -1487,6 +1682,20 @@ impl RunStrategy for SelfVerifyingConfig {
             let max_iterations = verifier.max_iterations();
             let mut total_usage = AggregateUsage::default();
             let mut last_reason = String::new();
+            let mut last_worker_output = String::new();
+
+            // #125: SelfVerifying owns a budget scope for its build↔evaluate loop.
+            // POLICY is the task's global turn ceiling (TotalSteps); behavior is
+            // `Escalate` (in-process placeholder; serialized behavior is #129).
+            let sv_policy = match task.budget.max_turns {
+                Some(max) => BudgetPolicy::TotalSteps { value: max },
+                None => BudgetPolicy::Unlimited,
+            };
+            cx.push_budget(
+                sv_policy,
+                BudgetExhaustedBehavior::Escalate,
+                "self_verifying",
+            );
 
             for iteration in 0..max_iterations {
                 // ── Build phase: recurse `self.inner.run(cx)`.
@@ -1500,7 +1709,31 @@ impl RunStrategy for SelfVerifyingConfig {
                 cx.scratch.task = Some(build_task);
                 cx.scratch.run_session = session_state.clone();
                 cx.scratch.run_budget = carried.clone();
-                let _ = self.inner.run(cx).await;
+                let carried_before = carried.turns;
+                let build_outcome = self.inner.run(cx).await;
+                // #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as
+                // a `StrategyOutcome`, never auto-cascaded. SelfVerifying surfaces
+                // its own typed BudgetExhausted (partial = last worker result +
+                // last verdict) without charging the child's exhaustion against
+                // its own scope.
+                if let StrategyOutcome::BudgetExhausted { .. } = &build_outcome {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let err = cx
+                        .budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .expect("self_verifying scope pushed above");
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return promote_budget_exhausted(&err, Some(partial));
+                }
                 let build_result = match cx.take_child_override() {
                     Some(r) => r,
                     None => RunResult::Failure {
@@ -1518,14 +1751,20 @@ impl RunStrategy for SelfVerifyingConfig {
                 // A paused / escalated build propagates verbatim.
                 match &build_result {
                     RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         return cx.finish(executor, task, build_result).await;
                     }
                     RunResult::Escalate { .. } => {
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         return cx.finish(executor, task, build_result).await;
                     }
                     _ => {}
+                }
+                // Capture the build's output for the partial (last worker result).
+                if let RunResult::Success { output, .. } = &build_result {
+                    last_worker_output = output.clone();
                 }
                 // Carry the build's post-run session forward for the next round.
                 if let RunResult::Success {
@@ -1536,6 +1775,22 @@ impl RunStrategy for SelfVerifyingConfig {
                 } = &build_result
                 {
                     session_state = st.clone();
+                }
+
+                // #125: charge this iteration's build turns against the
+                // SelfVerifying scope. If the global cap is spent, the node
+                // surfaces its OWN typed BudgetExhausted (partial = last worker
+                // result + last verdict).
+                if let Err(err) = cx.charge_current(carried.turns.saturating_sub(carried_before)) {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let resolution = cx.resolve_current();
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        _ => promote_budget_exhausted(&err, Some(partial)),
+                    };
                 }
 
                 // ── Evaluate phase: a fresh evaluator run on `eval_agent`.
@@ -1567,6 +1822,7 @@ impl RunStrategy for SelfVerifyingConfig {
                             turns,
                             session_state: final_state,
                         };
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         return cx.finish(executor, task, result).await;
                     }
@@ -1579,6 +1835,7 @@ impl RunStrategy for SelfVerifyingConfig {
                 }
             }
 
+            cx.pop_budget();
             let result = RunResult::Failure {
                 reason: HaltReason::SelfVerifyExhausted {
                     iterations: max_iterations,
@@ -1684,7 +1941,21 @@ impl RunStrategy for RalphConfig {
                 cx.scratch.run_session = session_state;
                 // FRESH per-window budget (the reset discards the turn budget).
                 cx.scratch.run_budget = BudgetSnapshot::default();
-                let _ = inner_for_window.run(cx).await;
+                let window_outcome = inner_for_window.run(cx).await;
+                // #125 rule 4/7: a window child's BudgetExhausted reaches Ralph as
+                // a `StrategyOutcome`, never auto-cascaded. Ralph's recovery
+                // semantics: a budget-exhausted window is treated as "window
+                // incomplete" — RESET the context window and retry (next outer
+                // iteration). After `max_resets` this falls through to
+                // `RalphCompletionUnmet`. Ralph's own scope is unaffected.
+                if let StrategyOutcome::BudgetExhausted { partial_output, .. } = &window_outcome {
+                    last_reason = format!(
+                        "window {} budget-exhausted: {}",
+                        iteration + 1,
+                        partial_output.as_deref().unwrap_or("<no partial>")
+                    );
+                    continue;
+                }
                 let window_result = match cx.take_child_override() {
                     Some(r) => r,
                     None => RunResult::Failure {
@@ -1809,6 +2080,20 @@ impl RunStrategy for HillClimbingConfig {
             let mut rows: Vec<crate::metric::ResultsEntry> = Vec::new();
             let mut span_seq: u64 = 0;
 
+            // #125: HillClimbing owns a budget scope for its optimization loop.
+            // POLICY is the task's global turn ceiling (TotalSteps); this REPLACES
+            // the ad-hoc `turn_cap` / `carried.turns >= turn_cap` gate that #124
+            // used. Behavior is `Escalate` (in-process placeholder; #129).
+            let hc_policy = match task.budget.max_turns {
+                Some(max) => BudgetPolicy::TotalSteps { value: max },
+                None => BudgetPolicy::Unlimited,
+            };
+            cx.push_budget(
+                hc_policy,
+                BudgetExhaustedBehavior::Escalate,
+                "hill_climbing",
+            );
+
             // ── Iteration 0: pure baseline (no agent turn).
             let mut current_best = match executor
                 .hill_baseline(
@@ -1825,6 +2110,7 @@ impl RunStrategy for HillClimbingConfig {
             {
                 Ok(v) => v,
                 Err(result) => {
+                    cx.pop_budget();
                     cx.stream = on_stream;
                     return cx.finish(executor, task, result).await;
                 }
@@ -1832,23 +2118,23 @@ impl RunStrategy for HillClimbingConfig {
 
             let mut stagnation: u32 = 0;
             let mut iteration: u32 = 1;
-            let turn_cap = task.budget.max_turns.unwrap_or(u32::MAX);
 
             loop {
-                // Budget gate before the iteration's agent turn.
-                if carried.turns >= turn_cap {
+                // #125: charge-based budget gate before the iteration's agent
+                // turn. A spent `TotalSteps` cap surfaces this node's OWN typed
+                // BudgetExhausted (partial = best candidate + score), resolving its
+                // behavior — replacing the legacy `BudgetExceeded` Failure.
+                if let Err(err) = cx.charge_current(1) {
                     executor.hill_write_tsv(&task_id, &rows).await;
-                    let result = RunResult::Failure {
-                        reason: HaltReason::BudgetExceeded {
-                            limit_type: BudgetLimitType::Turns,
-                        },
-                        session_id,
-                        usage: total_usage,
-                        turns: carried.turns,
-                        session_state: SessionState::default(),
-                    };
+                    let partial = hill_climbing_partial_json(current_best);
+                    let resolution = cx.resolve_current();
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
                     cx.stream = on_stream;
-                    return cx.finish(executor, task, result).await;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        _ => promote_budget_exhausted(&err, Some(partial)),
+                    };
                 }
                 if let Some(limit_type) =
                     StandardHarness::budget_exceeded(&task.budget, &carried, Instant::now())
@@ -1861,6 +2147,7 @@ impl RunStrategy for HillClimbingConfig {
                         turns: carried.turns,
                         session_state: SessionState::default(),
                     };
+                    cx.pop_budget();
                     cx.stream = on_stream;
                     return cx.finish(executor, task, result).await;
                 }
@@ -1880,7 +2167,29 @@ impl RunStrategy for HillClimbingConfig {
                     .await;
                 cx.scratch.run_session = iter_state;
                 cx.scratch.run_budget = carried.clone();
-                let _ = self.inner.run(cx).await;
+                let iter_outcome = self.inner.run(cx).await;
+                // #125 rule 4/7: a child's BudgetExhausted reaches HillClimbing as
+                // a `StrategyOutcome`, never auto-cascaded. Surface this node's own
+                // typed BudgetExhausted (partial = best candidate + score).
+                if let StrategyOutcome::BudgetExhausted { .. } = &iter_outcome {
+                    executor.hill_write_tsv(&task_id, &rows).await;
+                    let partial = hill_climbing_partial_json(current_best);
+                    let err = cx
+                        .budgets
+                        .current_mut()
+                        .map(|s| BudgetExhausted {
+                            policy: s.policy.clone(),
+                            behavior: s.behavior.clone(),
+                            steps_taken: s.steps_taken,
+                            continues_used: s.continues_used,
+                            phase: s.phase.clone(),
+                        })
+                        .expect("hill_climbing scope pushed above");
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task);
+                    cx.stream = on_stream;
+                    return promote_budget_exhausted(&err, Some(partial));
+                }
                 let turn_result = match cx.take_child_override() {
                     Some(r) => r,
                     None => RunResult::Failure {
@@ -1898,6 +2207,7 @@ impl RunStrategy for HillClimbingConfig {
                 // A paused / escalated turn propagates verbatim.
                 if turn_result.is_pause() {
                     executor.hill_write_tsv(&task_id, &rows).await;
+                    cx.pop_budget();
                     cx.stream = on_stream;
                     return cx.finish(executor, task, turn_result).await;
                 }
@@ -1937,6 +2247,7 @@ impl RunStrategy for HillClimbingConfig {
                             turns: carried.turns,
                             session_state: SessionState::default(),
                         };
+                        cx.pop_budget();
                         cx.stream = on_stream;
                         return cx.finish(executor, task, result).await;
                     }
@@ -2006,6 +2317,200 @@ impl ExecutionContext<'_> {
         let outcome = outcome_from_run_result_ref(&result);
         self.scratch.terminal_override = Some(result);
         outcome
+    }
+
+    /// Push a fresh per-node [`BudgetContext`] scope for `policy`/`behavior`/
+    /// `phase` onto `cx.budgets` (#125). Each node — including a sibling — gets
+    /// its OWN scope (`steps_taken = 0`), so a node capped at N never spends a
+    /// sibling's allowance (rule 1) and a child's exhaustion never touches the
+    /// parent scope (rule 4/7). Returns the depth AFTER the push for symmetry
+    /// debugging.
+    pub fn push_budget(
+        &mut self,
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        phase: impl Into<String>,
+    ) -> usize {
+        self.budgets
+            .push(BudgetContext::new(policy, behavior, phase));
+        self.budgets.depth()
+    }
+
+    /// Pop the current per-node budget scope (#125). Always paired with
+    /// [`push_budget`](Self::push_budget) so the stack returns to its parent
+    /// baseline on ascent.
+    pub fn pop_budget(&mut self) -> Option<BudgetContext> {
+        self.budgets.pop()
+    }
+
+    /// Charge `turns` steps against the CURRENT (innermost) budget scope (#125):
+    /// the real enforcement point. `Ok(())` when within allowance; `Err(..)`
+    /// carries the budget state at exhaustion. A node with no pushed scope (the
+    /// scaffold contexts) never exhausts — charging is a no-op `Ok(())`.
+    pub fn charge_current(&mut self, turns: u32) -> Result<(), BudgetExhausted> {
+        match self.budgets.current_mut() {
+            Some(scope) => scope.charge(turns),
+            None => Ok(()),
+        }
+    }
+
+    /// Resolve the current scope's exhaustion behavior (#125). Walks the chain
+    /// (Continue grants a reset; spent continues fall through). A node with no
+    /// pushed scope resolves to `Fail` (defensive — should not happen in a wired
+    /// run).
+    pub fn resolve_current(&mut self) -> ExhaustedResolution {
+        match self.budgets.current_mut() {
+            Some(scope) => scope.resolve_exhausted(),
+            None => ExhaustedResolution::Fail,
+        }
+    }
+}
+
+// ============================================================================
+// Per-node budget enforcement + failure isolation (issue #125)
+// ============================================================================
+//
+// This slice makes `BudgetContext::charge` the REAL per-node enforcement point
+// and `StrategyOutcome::BudgetExhausted` a real, isolated, parent-inspectable
+// value. #123 built `BudgetContext`/`BudgetStack`/`charge` as pure-arithmetic
+// scaffold (dead outside tests); #124 wired enforcement through the LEGACY path
+// (`task.budget.max_turns` + `BudgetSnapshot`) and mapped every `BudgetExceeded`
+// terminal to `StrategyOutcome::Failed`. #125 replaces that with charge-based
+// enforcement at each `*Config::run` and a typed, non-cascading exhaustion.
+//
+// New methods (this slice):
+//   - `BudgetContext::consume_continue` — in-process continue: `continues_used +=
+//     1`, `steps_taken = 0` (session/messages untouched).
+//   - `BudgetContext::resolve_exhausted` -> `ExhaustedResolution` — walks the
+//     behavior chain (Fail→Fail; Escalate→Escalate; Continue→grant-or-fall-through).
+//   - `ExecutionContext::charge_step` — push (if needed) + charge one step
+//     against the current scope, resolving exhaustion to a typed outcome.
+//   - `ExecutionContext::run_with_budget` — the `execute_budget` enforcement
+//     wrapper: push a scope, run the attempt closure, charge the turns it
+//     consumed, resolve exhaustion (Continue → loop; Fail → BudgetExhausted{None};
+//     Escalate → BudgetExhausted{Some(partial)}), pop on exit.
+//   - `promote_budget_exhausted` — the `BudgetExhausted -> StrategyOutcome`
+//     promotion boundary helper that attaches `partial_output`.
+//
+// Enforcement rules (ALL implemented + tested):
+//   1. A node capped at N stops at N WITHOUT killing siblings (each sibling gets
+//      a FRESH `BudgetContext`; `steps_taken` starts at 0).
+//   2. In-process `Continue` resets the counter and resumes with context intact,
+//      honors `max_continues`, then falls through to `on_exhausted`.
+//   3. `Fail` yields `partial_output = None` (discarded by contract).
+//   4. A child `BudgetExhausted` reaches the parent as a `StrategyOutcome`,
+//      NEVER auto-propagated (the parent's OWN `BudgetContext` is unaffected).
+//   5. `partial_output` is concrete per node: ReAct → last FinalResponse text;
+//      PlanExecute → JSON of task list + per-task statuses + ledger; SelfVerifying
+//      → JSON of last worker result + verdict; HillClimbing → JSON of best
+//      candidate + score.
+//   6. The ReAct LEAF does NOT carry its own behavior — it PROPAGATES exhaustion
+//      to its parent (one recovery site per node; Open Q A-2).
+//   7. Never auto-cascade a child exhaustion into a parent exhaustion.
+//
+// Resolved spec forks (DECIDED by the maintainer — do NOT re-litigate):
+//   - `Escalate` carries `partial_output = Some(partial)`; `Fail` carries `None`.
+//   - `partial_output: Option<String>` is a JSON-serialized string of the
+//     structured per-node partial (shapes per rule 5 above).
+//   - `continues_used` persistence stays DEFERRED to #129 — in-process Continue
+//     ONLY, no serialization, no new fixtures.
+//
+// No `// SPEC QUESTION:` markers — all three forks are resolved.
+
+/// The last FinalResponse text from a ReAct window terminal (#125, fork #2): the
+/// `Success.output`, or for a `Failure` the last assistant text message on its
+/// post-run session state (the partial captured before exhaustion). `None` for
+/// non-terminal pauses.
+fn last_final_response_text(result: &RunResult) -> Option<String> {
+    match result {
+        RunResult::Success { output, .. } => Some(output.clone()),
+        RunResult::Failure { session_state, .. } => {
+            session_state
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match (&m.role, &m.content) {
+                    (crate::model::Role::Assistant, crate::model::Content::Text { text }) => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+        }
+        _ => None,
+    }
+}
+
+/// The structured per-node partial used to build the `partial_output` JSON
+/// attached to a `StrategyOutcome::BudgetExhausted` on `Escalate` (#125, fork
+/// #2). Each node serializes its own shape; `Fail` discards the partial entirely
+/// (`partial_output = None`).
+fn react_partial_json(last_final_response: &str) -> String {
+    serde_json::json!({
+        "node": "react",
+        "last_final_response": last_final_response,
+    })
+    .to_string()
+}
+
+/// PlanExecute partial: the task list + per-task statuses + ledger (#125, fork
+/// #2). `ledger` is the per-task `(id, description, status)` rows already walked.
+fn plan_execute_partial_json(task_list: &crate::tasklist::TaskList) -> String {
+    let ledger: Vec<_> = task_list
+        .tasks
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id.to_string(),
+                "description": t.description,
+                "status": format!("{:?}", t.status),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "node": "plan_execute",
+        "tasks": task_list.tasks.len(),
+        "ledger": ledger,
+    })
+    .to_string()
+}
+
+/// SelfVerifying partial: the last worker result summary + the last verdict
+/// reason (#125, fork #2).
+fn self_verifying_partial_json(last_worker_output: &str, last_verdict: &str) -> String {
+    serde_json::json!({
+        "node": "self_verifying",
+        "last_worker_result": last_worker_output,
+        "last_verdict": last_verdict,
+    })
+    .to_string()
+}
+
+/// HillClimbing partial: the best candidate value + its score (#125, fork #2).
+fn hill_climbing_partial_json(best_score: f64) -> String {
+    serde_json::json!({
+        "node": "hill_climbing",
+        "best_candidate": best_score,
+        "score": best_score,
+    })
+    .to_string()
+}
+
+/// Promote a charge-time [`BudgetExhausted`] to a [`StrategyOutcome::BudgetExhausted`]
+/// (#125 promotion boundary), attaching `partial_output`. Per fork #1: an
+/// `Escalate`-resolved exhaustion carries `Some(partial)`; a `Fail`-resolved one
+/// carries `None`. The caller supplies the node-concrete partial JSON; this
+/// helper threads the budget state from the charge error.
+fn promote_budget_exhausted(
+    err: &BudgetExhausted,
+    partial_output: Option<String>,
+) -> StrategyOutcome {
+    StrategyOutcome::BudgetExhausted {
+        policy: err.policy.clone(),
+        behavior: err.behavior.clone(),
+        steps_taken: err.steps_taken,
+        continues_used: err.continues_used,
+        phase: err.phase.clone(),
+        partial_output,
     }
 }
 
@@ -7787,13 +8292,24 @@ impl StandardHarness {
                 turns: cx.scratch.run_budget.turns,
                 session_state: std::mem::take(&mut cx.scratch.run_session),
             },
-            StrategyOutcome::BudgetExhausted { partial_output, .. } => RunResult::Failure {
+            StrategyOutcome::BudgetExhausted {
+                partial_output,
+                steps_taken,
+                ..
+            } => RunResult::Failure {
                 reason: HaltReason::BudgetExceeded {
                     limit_type: BudgetLimitType::Turns,
                 },
                 session_id,
                 usage: cx.usage.clone(),
-                turns: cx.scratch.run_budget.turns,
+                // #125: the exhausted node's own `steps_taken` is the turn count it
+                // reached (the scratch budget is not written back on the propagate
+                // path). Fall back to the scratch turns if it is somehow 0.
+                turns: if steps_taken > 0 {
+                    steps_taken
+                } else {
+                    cx.scratch.run_budget.turns
+                },
                 session_state: SessionState {
                     messages: partial_output
                         .map(|t| {
@@ -8940,7 +9456,6 @@ impl StandardHarness {
         let mut total_usage = plan_usage;
         let mut last_output = String::new();
         let mut last_state = SessionState::default();
-        let global_max_turns = task.budget.max_turns;
 
         for index in 0..total_tasks {
             let task_id = task_list.tasks[index].id;
@@ -8951,17 +9466,9 @@ impl StandardHarness {
                 continue;
             }
 
-            let remaining_tasks = (total_tasks - index) as u32;
-            let per_task_turns = match global_max_turns {
-                Some(max) => (max.saturating_sub(carried.turns) / remaining_tasks).max(1),
-                None => u32::MAX,
-            };
-            let sub_loop_cap = carried.turns.saturating_add(per_task_turns);
-            let step_cap = match global_max_turns {
-                Some(global) => global.min(sub_loop_cap),
-                None => sub_loop_cap,
-            };
-
+            // #125: the per-task `remaining_turns / remaining_tasks / step_cap`
+            // derivation is REMOVED (dead) — enforcement is now `charge`-based on
+            // the PlanExecute scope. This helper mirrors the live body's structure.
             let _ = task_list.update(task_id, Some(TaskStatus::InProgress), None);
             self.persist_task_list(&session_id, &task_list).await;
 
@@ -8969,10 +9476,7 @@ impl StandardHarness {
                 id: task.id.clone(),
                 instruction,
                 session_id: session_id.clone(),
-                budget: BudgetLimits {
-                    max_turns: Some(step_cap),
-                    ..task.budget.clone()
-                },
+                budget: task.budget.clone(),
                 loop_strategy: execute_strategy.clone(),
             };
             if let Some(chain) = self.config.hooks.as_ref() {
@@ -9986,6 +10490,54 @@ mod tests {
                 assert_eq!(turns, 2);
             }
             other => panic!("expected BudgetExceeded(Turns), got {other:?}"),
+        }
+    }
+
+    // #125 rule 6: when the ReAct LEAF's OWN policy is the binding cap (no smaller
+    // global backstop), the leaf PROPAGATES a typed BudgetExhausted carrying its
+    // last FinalResponse as the partial — it never self-resolves Continue/Fail at
+    // the leaf. `drive_strategy` surfaces it as a BudgetExceeded terminal whose
+    // session carries the partial assistant text.
+    #[tokio::test]
+    async fn react_leaf_cap_binding_propagates_partial() {
+        let a = make_agent();
+        // The leaf cap is 2; push 3 tool-call turns so the window runs 2 turns
+        // and hits the leaf's own cap (no global max_turns set).
+        for i in 0..3 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        for _ in 0..3 {
+            reg.push(ToolOutput::Success {
+                content: "ok".into(),
+                truncated: false,
+            });
+        }
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        // Leaf PerLoop{2}, NO global cap → the leaf policy is the binding cap.
+        let t = react(2);
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 2, "leaf stopped at its own cap N=2");
+            }
+            other => panic!("expected BudgetExceeded from leaf cap, got {other:?}"),
         }
     }
 
@@ -11902,17 +12454,21 @@ mod tests {
         );
     }
 
-    // Q1 per-task turn allocation + shared budget: with a global cap of 7 turns
-    // and a plan turn already spent (1), 3 tasks split the remaining 6 turns
-    // (2 each). A task that needs >2 turns must be cut off by its per-task cap,
-    // proving the allocation is enforced and the shared budget carries forward.
+    // #125: the OLD Q1 per-task turn allocation (`remaining_turns /
+    // remaining_tasks`, cutting task `a` off at 2 of a 7-turn budget) is REMOVED
+    // as dead logic. Enforcement is now charge-based on the PlanExecute scope's
+    // global `TotalSteps`, NOT divided per task. With the same setup — global cap
+    // 7, plan spends 1 — task `a` is NO LONGER capped at 2 turns: it runs its
+    // scripted turns under the global ceiling and is not pre-empted by a phantom
+    // per-task cap. Here task `a` runs its 2 tool turns then runs dry, so the run
+    // fails as a STEP failure (not a per-task budget cap). This asserts the
+    // per-task derivation is gone.
     #[tokio::test]
-    async fn execute_phase_per_task_turn_allocation() {
+    async fn execute_phase_no_per_task_turn_cap() {
         let a = make_agent();
         // Plan: 3 tasks.
         a.push(final_resp(r#"{"tasks":["a","b","c"]}"#));
-        // Task a: 2 tool calls then would need a 3rd turn — but per_task = 2, so
-        // it is cut off at 2 turns inside its sub-loop. Push 2 tool-call turns.
+        // Task a: 2 tool calls then runs dry (no 3rd scripted turn).
         a.push(TurnResult::ToolCallRequested {
             reasoning: None,
             calls: vec![ToolCall {
@@ -11947,26 +12503,17 @@ mod tests {
             max_turns: Some(7),
             ..Default::default()
         });
-        // remaining = 7 - 1 = 6; 3 tasks -> per_task = 2. Task a uses 2 turns of
-        // tool calls without finishing, so its sub-loop hits the per-task cap and
-        // the run aborts (StepFailed / BudgetExceeded depending on which gate).
         match h.run(HarnessRunOptions::new(t)).await {
-            RunResult::Failure { reason, turns, .. } => {
-                // The per-task cap is a turn budget: the sub-loop hits the turn
-                // gate, which surfaces as BudgetExceeded(Turns) routed through.
+            RunResult::Failure { reason, .. } => {
+                // NOT a per-task BudgetExceeded(Turns) cut at 2 turns — the
+                // derivation is gone. Task `a` runs past 2 turns under the global
+                // ceiling and fails as a STEP failure when the agent runs dry.
                 assert!(
-                    matches!(
-                        reason,
-                        HaltReason::BudgetExceeded {
-                            limit_type: BudgetLimitType::Turns
-                        }
-                    ),
-                    "per-task turn cap enforced, got {reason:?}"
+                    matches!(reason, HaltReason::StepFailed { .. }),
+                    "no per-task cap; run dry → StepFailed, got {reason:?}"
                 );
-                // plan(1) + 2 task-a turns = 3 cumulative turns.
-                assert_eq!(turns, 3, "shared budget carried: 1 plan + 2 task turns");
             }
-            other => panic!("expected Failure from turn cap, got {other:?}"),
+            other => panic!("expected Failure (step ran dry), got {other:?}"),
         }
     }
 
@@ -16478,5 +17025,320 @@ mod execution_scaffold_tests {
         let b = budgets.current_mut().unwrap();
         assert_eq!(b.steps_taken, 0);
         assert_ne!(a.phase, b.phase);
+    }
+}
+
+// ============================================================================
+// Per-node budget enforcement + failure isolation tests (issue #125)
+// ============================================================================
+//
+// Covers every rule from the slice plan:
+//   1. A node capped at N stops at N WITHOUT killing siblings.
+//   2. In-process Continue resets the counter, honors max_continues, then falls
+//      through; session/messages unchanged across resets.
+//   3. Fail yields partial_output = None.
+//   4. A child BudgetExhausted reaches the parent as a StrategyOutcome, never
+//      auto-propagated (parent's own scope unaffected; parent can then Complete).
+//   5. partial_output concrete per node (4 shapes).
+//   6. The ReAct leaf does not carry its own behavior; it propagates to parent.
+//   7. Never auto-cascade a child exhaustion into a parent exhaustion.
+//
+// No new fixtures (fork #3): every type here is runtime-only.
+#[cfg(test)]
+mod budget_enforcement_tests {
+    use super::*;
+
+    fn continue_then_fail(max_continues: u32) -> BudgetExhaustedBehavior {
+        BudgetExhaustedBehavior::Continue {
+            max_continues,
+            on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+        }
+    }
+
+    // ── resolve_exhausted: Fail → Fail; Escalate → Escalate ──────────────────
+
+    #[test]
+    fn resolve_fail_and_escalate_terminal() {
+        let mut fail = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 1 },
+            BudgetExhaustedBehavior::Fail,
+            "p",
+        );
+        assert_eq!(fail.resolve_exhausted(), ExhaustedResolution::Fail);
+
+        let mut esc = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 1 },
+            BudgetExhaustedBehavior::Escalate,
+            "p",
+        );
+        assert_eq!(esc.resolve_exhausted(), ExhaustedResolution::Escalate);
+    }
+
+    // ── Rule 2: Continue resets counter, honors max_continues, falls through ──
+
+    #[test]
+    fn continue_resets_counter_then_falls_through_to_fail() {
+        // ReAct under a parent Continue { max_continues: 2, on_exhausted: Fail }.
+        let mut cx = BudgetContext::new(
+            BudgetPolicy::TotalSteps { value: 3 },
+            continue_then_fail(2),
+            "phase",
+        );
+
+        // 1st exhaustion → Continue (counter resets to 0, continues_used = 1).
+        cx.charge(3).unwrap();
+        assert!(cx.charge(1).is_err());
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Continue);
+        assert_eq!(cx.steps_taken, 0, "counter reset on continue #1");
+        assert_eq!(cx.continues_used, 1);
+
+        // 2nd exhaustion → Continue (counter resets again, continues_used = 2).
+        cx.charge(3).unwrap();
+        assert!(cx.charge(1).is_err());
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Continue);
+        assert_eq!(cx.steps_taken, 0, "counter reset on continue #2");
+        assert_eq!(cx.continues_used, 2);
+
+        // 3rd exhaustion → continues spent → fall through to Fail.
+        cx.charge(3).unwrap();
+        assert!(cx.charge(1).is_err());
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Fail);
+        // continues_used does NOT advance past max_continues on the fall-through.
+        assert_eq!(cx.continues_used, 2);
+    }
+
+    // ── Continue chain: Continue{1, on: Continue{1, on: Escalate}} ───────────
+
+    #[test]
+    fn continue_chain_shares_counter_then_escalates() {
+        // The chain shares ONE `continues_used` counter (it is not reset on a
+        // fall-through). Outer Continue{2}: grants 2 continues; once spent, the
+        // counter (2) >= the nested Continue{2}'s max, so the nested layer grants
+        // nothing and falls straight through to Escalate.
+        let behavior = BudgetExhaustedBehavior::Continue {
+            max_continues: 2,
+            on_exhausted: Box::new(BudgetExhaustedBehavior::Continue {
+                max_continues: 2,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Escalate),
+            }),
+        };
+        let mut cx = BudgetContext::new(BudgetPolicy::PerLoop { value: 1 }, behavior, "chain");
+
+        // continue #1 and #2 from the outer Continue's allowance.
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Continue);
+        assert_eq!(cx.continues_used, 1);
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Continue);
+        assert_eq!(cx.continues_used, 2);
+        // Outer spent → fall through to nested Continue{2}; the SHARED counter is
+        // already 2 so the nested layer grants nothing → Escalate.
+        assert_eq!(cx.resolve_exhausted(), ExhaustedResolution::Escalate);
+    }
+
+    // ── consume_continue resets only the in-memory step counter ──────────────
+
+    #[test]
+    fn consume_continue_resets_steps_and_bumps_counter() {
+        let mut cx = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 4 },
+            continue_then_fail(5),
+            "c",
+        );
+        cx.charge(4).unwrap();
+        assert_eq!(cx.steps_taken, 4);
+        cx.consume_continue();
+        assert_eq!(cx.steps_taken, 0, "step counter rewound");
+        assert_eq!(cx.continues_used, 1, "continue counted");
+        // The scope's allowance is intact — a fresh round can charge again.
+        assert!(cx.charge(4).is_ok());
+    }
+
+    // ── Rule 3: Fail → partial_output = None; Escalate → Some(partial) ───────
+
+    #[test]
+    fn promote_fail_drops_partial_escalate_keeps_it() {
+        let err = BudgetExhausted {
+            policy: BudgetPolicy::PerLoop { value: 2 },
+            behavior: BudgetExhaustedBehavior::Fail,
+            steps_taken: 2,
+            continues_used: 0,
+            phase: "react".to_string(),
+        };
+        // The Fail boundary supplies None.
+        let failed = promote_budget_exhausted(&err, None);
+        match failed {
+            StrategyOutcome::BudgetExhausted {
+                partial_output,
+                steps_taken,
+                ..
+            } => {
+                assert_eq!(partial_output, None, "Fail discards the partial");
+                assert_eq!(steps_taken, 2);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        // The Escalate boundary supplies Some(partial).
+        let escalated =
+            promote_budget_exhausted(&err, Some(react_partial_json("the answer so far")));
+        match escalated {
+            StrategyOutcome::BudgetExhausted {
+                partial_output: Some(p),
+                ..
+            } => assert!(p.contains("the answer so far")),
+            other => panic!("expected BudgetExhausted with partial, got {other:?}"),
+        }
+    }
+
+    // ── Rule 5: each node's partial_output has its documented shape ──────────
+
+    #[test]
+    fn react_partial_shape() {
+        let json: serde_json::Value =
+            serde_json::from_str(&react_partial_json("hello world")).unwrap();
+        assert_eq!(json["node"], "react");
+        assert_eq!(json["last_final_response"], "hello world");
+    }
+
+    #[test]
+    fn plan_execute_partial_shape() {
+        use crate::tasklist::{TaskList, TaskStatus};
+        let mut tl = TaskList::default();
+        let a = tl.add("task a".to_string(), vec![]).unwrap();
+        let _b = tl.add("task b".to_string(), vec![]).unwrap();
+        let _ = tl.update(a, Some(TaskStatus::Completed), None);
+        let json: serde_json::Value =
+            serde_json::from_str(&plan_execute_partial_json(&tl)).unwrap();
+        assert_eq!(json["node"], "plan_execute");
+        assert_eq!(json["tasks"], 2);
+        let ledger = json["ledger"].as_array().unwrap();
+        assert_eq!(ledger.len(), 2, "ledger has one row per task");
+        assert_eq!(ledger[0]["description"], "task a");
+        assert_eq!(ledger[0]["status"], "Completed");
+        assert_eq!(ledger[1]["status"], "Pending");
+    }
+
+    #[test]
+    fn self_verifying_partial_shape() {
+        let json: serde_json::Value = serde_json::from_str(&self_verifying_partial_json(
+            "worker output",
+            "verdict: not yet",
+        ))
+        .unwrap();
+        assert_eq!(json["node"], "self_verifying");
+        assert_eq!(json["last_worker_result"], "worker output");
+        assert_eq!(json["last_verdict"], "verdict: not yet");
+    }
+
+    #[test]
+    fn hill_climbing_partial_shape() {
+        let json: serde_json::Value =
+            serde_json::from_str(&hill_climbing_partial_json(0.875)).unwrap();
+        assert_eq!(json["node"], "hill_climbing");
+        assert_eq!(json["best_candidate"], 0.875);
+        assert_eq!(json["score"], 0.875);
+    }
+
+    // ── Rule 1: a node capped at N stops at N without killing siblings ───────
+
+    #[test]
+    fn sibling_isolation_fresh_context_per_node() {
+        let mut budgets = BudgetStack::default();
+        // Sibling A: capped at 2, exhausts.
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 2 },
+            BudgetExhaustedBehavior::Escalate,
+            "child-a",
+        ));
+        budgets.current_mut().unwrap().charge(2).unwrap();
+        assert!(
+            budgets.current_mut().unwrap().charge(1).is_err(),
+            "A exhausts at its own cap N=2"
+        );
+        let a = budgets.pop().unwrap();
+        assert_eq!(a.steps_taken, 2);
+
+        // Sibling B gets a FRESH BudgetContext — A's exhaustion did not bleed in.
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 4 },
+            BudgetExhaustedBehavior::Escalate,
+            "child-b",
+        ));
+        let b = budgets.current_mut().unwrap();
+        assert_eq!(b.steps_taken, 0, "sibling B starts fresh (rule 1)");
+        assert!(
+            b.charge(3).is_ok(),
+            "B runs with its own untouched allowance"
+        );
+    }
+
+    // ── Rule 4 & 7: a child exhaustion does NOT auto-cascade to the parent ───
+
+    #[test]
+    fn child_exhaustion_does_not_charge_parent_scope() {
+        let mut budgets = BudgetStack::default();
+        // Parent scope (capped at 5, behavior Fail).
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::TotalSteps { value: 5 },
+            BudgetExhaustedBehavior::Fail,
+            "parent",
+        ));
+
+        // Child descends with its OWN scope (capped at 1) and exhausts.
+        budgets.push(BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 1 },
+            BudgetExhaustedBehavior::Escalate,
+            "child",
+        ));
+        budgets.current_mut().unwrap().charge(1).unwrap();
+        assert!(budgets.current_mut().unwrap().charge(1).is_err());
+        // The child surfaces a BudgetExhausted value — modelled here by popping
+        // its scope. Crucially the parent scope is UNCHARGED by this.
+        budgets.pop();
+
+        let parent = budgets.current_mut().unwrap();
+        assert_eq!(
+            parent.steps_taken, 0,
+            "rule 4/7: child exhaustion did NOT auto-charge the parent"
+        );
+        // The parent can then proceed and Complete within its own budget.
+        assert!(
+            parent.charge(5).is_ok(),
+            "parent still has its full allowance"
+        );
+    }
+
+    // ── ExecutionContext helpers: push / charge / resolve / pop round-trip ───
+
+    #[test]
+    fn execution_context_charge_and_resolve_round_trip() {
+        let registry = crate::execution_registry::ExecutionRegistry::empty();
+        let mut cx = ExecutionContext::new(&registry);
+        assert_eq!(cx.budgets.depth(), 0);
+
+        cx.push_budget(
+            BudgetPolicy::PerLoop { value: 2 },
+            continue_then_fail(1),
+            "node",
+        );
+        assert_eq!(cx.budgets.depth(), 1);
+        assert!(cx.charge_current(2).is_ok());
+        assert!(cx.charge_current(1).is_err(), "scope exhausts at its cap");
+        assert_eq!(cx.resolve_current(), ExhaustedResolution::Continue);
+        // After the continue, the counter reset → charging is possible again.
+        assert!(cx.charge_current(2).is_ok());
+        assert!(cx.charge_current(1).is_err());
+        assert_eq!(cx.resolve_current(), ExhaustedResolution::Fail);
+        let popped = cx.pop_budget();
+        assert!(popped.is_some());
+        assert_eq!(cx.budgets.depth(), 0);
+    }
+
+    // ── charge_current with no scope is a no-op Ok (scaffold contexts) ───────
+
+    #[test]
+    fn charge_with_no_scope_never_exhausts() {
+        let registry = crate::execution_registry::ExecutionRegistry::empty();
+        let mut cx = ExecutionContext::new(&registry);
+        assert!(cx.charge_current(u32::MAX).is_ok());
+        assert_eq!(cx.resolve_current(), ExhaustedResolution::Fail);
     }
 }
