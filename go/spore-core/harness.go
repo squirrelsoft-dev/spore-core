@@ -1970,6 +1970,12 @@ const (
 	// the caller's wiring. Surfaced as a typed halt, NOT a panic. PEER to
 	// HaltSelfVerifyMisconfigured.
 	HaltHillClimbingMisconfigured HaltReasonKind = "hill_climbing_misconfigured"
+	// HaltConfigurationError (issue #120) is returned when ExecutionRegistry.Validate
+	// fails at run entry: a handle referenced by the task's strategy tree is
+	// unresolved against the configured registry, or a StrategyRef.Custom key is
+	// missing. A STARTUP error surfaced before the first turn. Carries the
+	// underlying HarnessError (UnresolvedHandleError or StrategyNotFoundError).
+	HaltConfigurationError HaltReasonKind = "configuration_error"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -1999,6 +2005,9 @@ type HaltReason struct {
 	// step_failed (issue #59, Q5)
 	TaskIndex int    `json:"-"`
 	Task      string `json:"-"`
+	// configuration_error (issue #120): the underlying registry validation error
+	// (UnresolvedHandleError or StrategyNotFoundError).
+	ConfigError HarnessError `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -2094,6 +2103,12 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind   HaltReasonKind `json:"kind"`
 			Reason string         `json:"reason"`
 		}{h.Kind, h.Reason})
+	case HaltConfigurationError:
+		// The nested "error" is itself a "kind"-tagged HarnessError.
+		return json.Marshal(struct {
+			Kind  HaltReasonKind `json:"kind"`
+			Error HarnessError   `json:"error"`
+		}{h.Kind, h.ConfigError})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -2166,6 +2181,15 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			h.PlanError = pe
+		}
+	case HaltConfigurationError:
+		// "error" is a "kind"-tagged HarnessError object here (issue #120).
+		if len(probe.Error) > 0 && string(probe.Error) != "null" {
+			ce, err := UnmarshalHarnessError(probe.Error)
+			if err != nil {
+				return err
+			}
+			h.ConfigError = ce
 		}
 	case HaltSelfVerifyExhausted:
 		// "last_reason" carries the verifier's final failure reason (#61).
@@ -2363,6 +2387,13 @@ type Harness interface {
 // HarnessConfig is the bag of components injected into StandardHarness.
 // Middleware and Observability are optional; the rest are required.
 type HarnessConfig struct {
+	// Agent is the default agent the loop drives.
+	//
+	// Superseded by ExecutionRegistry (issue #120): per-node AgentRef handles
+	// resolved via Registry replace this single collaborator. Kept this slice
+	// (Option B, additive scope) so existing callers and executor consumption
+	// sites stay byte-identical; physical removal + executor migration to registry
+	// resolution lands in #124.
 	Agent             Agent
 	ToolRegistry      ToolRegistry
 	Sandbox           SandboxProvider
@@ -2423,6 +2454,10 @@ type HarnessConfig struct {
 	// non-nil, the one-shot plan turn runs on it; otherwise it runs on the
 	// default Agent. The plan_model field on the strategy stays DESCRIPTIVE
 	// metadata only — there is no ModelConfig→agent factory.
+	//
+	// Superseded by ExecutionRegistry (issue #120): the plan-phase agent is the
+	// plan strategy node's AgentRef resolved via Registry. Kept this slice (Option
+	// B); physical removal + executor migration lands in #124.
 	PlannerAgent Agent // optional
 
 	// Verifier is the oracle for the SelfVerifying loop strategy (issue #61, D2).
@@ -2433,6 +2468,10 @@ type HarnessConfig struct {
 	// strategy. This is a consumer-side interface (go/CONVENTIONS.md): the
 	// standard verifier.Verifier family (#44) is bridged into it via
 	// verifier.AsHarnessVerifier, avoiding a sporecore -> verifier import cycle.
+	//
+	// Superseded by ExecutionRegistry (issue #120): the SelfVerifying evaluator is
+	// resolved from Registry's verifiers map by key. Kept this slice (Option B);
+	// physical removal + executor migration lands in #124.
 	Verifier Verifier // optional (required by SelfVerifying)
 
 	// EvaluatorAgent is the optional alternate agent used for the SelfVerifying
@@ -2442,6 +2481,10 @@ type HarnessConfig struct {
 	// read-only sandbox and the fresh evaluate session id are derived internally
 	// by the strategy — there are no evaluator sandbox / chunk-provider config
 	// fields.
+	//
+	// Superseded by ExecutionRegistry (issue #120): the evaluate-phase agent is a
+	// strategy node's AgentRef resolved via Registry. Kept this slice (Option B);
+	// physical removal + executor migration lands in #124.
 	EvaluatorAgent Agent // optional
 
 	// RunStore is the durable per-run structured-state seam (issue #59, Q4).
@@ -2550,6 +2593,87 @@ type HarnessConfig struct {
 	// matching entry's helper harness deterministically (the A1 mediation seam) —
 	// the orchestrator model is never involved.
 	ConsultHandlers map[string]ConsultHandlerEntry // optional
+
+	// Registry is the runtime resolver for the serializable strategy handles
+	// (AgentRef/ToolsetRef/SchemaRef) and StrategyRef.Custom keys held by a
+	// task's LoopStrategy tree (issue #120). StandardHarness.Run calls
+	// Registry.Validate at entry, so an unresolved handle is a STARTUP error
+	// before the first turn. This slice is ADDITIVE (Option B): the registry
+	// coexists with the superseded single-collaborator fields and is not yet read
+	// by the run bodies (that lands in #123/#124). The zero value is an empty
+	// registry, in which case startup validation is skipped (legacy callers stay
+	// byte-identical). Set it directly, or via the WithRegistry* / RegisterStrategy
+	// convenience methods on HarnessConfig.
+	Registry ExecutionRegistry // optional
+
+	// EscalationMode is the HITL-vs-AFK escalation knob (issue #120, PRD goal
+	// #7): whether budget escalation surfaces to a human or proceeds
+	// autonomously. STORED only this slice — consumed in #130. The zero value
+	// (empty Kind) is treated as EscalationSurfaceToHuman by EffectiveEscalationMode;
+	// set it explicitly to select AFK / autonomous behaviour.
+	EscalationMode EscalationMode // optional (defaults to surface_to_human)
+}
+
+// EffectiveEscalationMode returns the configured EscalationMode, defaulting the
+// zero value (empty Kind) to EscalationSurfaceToHuman — the explicit default
+// (EscalationMode itself has no baked-in default, mirroring the budget-types
+// discipline). Issue #120; consumed in #130.
+func (c HarnessConfig) EffectiveEscalationMode() EscalationMode {
+	if c.EscalationMode.Kind == "" {
+		return SurfaceToHumanEscalation()
+	}
+	return c.EscalationMode
+}
+
+// WithRegistry replaces the whole ExecutionRegistry (issue #120) and returns the
+// updated config (value-receiver fluent style). The registry resolves a task's
+// serializable strategy handles and StrategyRef.Custom keys at run entry.
+func (c HarnessConfig) WithRegistry(registry ExecutionRegistry) HarnessConfig {
+	c.Registry = registry
+	return c
+}
+
+// WithRegistryAgent registers a named agent in the ExecutionRegistry (issue
+// #120, per-key convenience over WithRegistry) and returns the updated config.
+func (c HarnessConfig) WithRegistryAgent(key string, agent Agent) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().Agent(key, agent).Build()
+	return c
+}
+
+// WithRegistryToolset registers a named toolset in the ExecutionRegistry (issue
+// #120) and returns the updated config.
+func (c HarnessConfig) WithRegistryToolset(key string, toolset ToolRegistry) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().Toolset(key, toolset).Build()
+	return c
+}
+
+// WithRegistrySchema registers a named JSON schema in the ExecutionRegistry
+// (issue #120) and returns the updated config.
+func (c HarnessConfig) WithRegistrySchema(key string, schema json.RawMessage) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().Schema(key, schema).Build()
+	return c
+}
+
+// WithRegistryVerifier registers a named verifier in the ExecutionRegistry
+// (issue #120) and returns the updated config.
+func (c HarnessConfig) WithRegistryVerifier(key string, verifier Verifier) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().Verifier(key, verifier).Build()
+	return c
+}
+
+// RegisterStrategy registers a custom strategy in the ExecutionRegistry under
+// key (issue #120). Resolvable later via a StrategyRef.Custom(key). Returns the
+// updated config.
+func (c HarnessConfig) RegisterStrategy(key string, strategy RunStrategy) HarnessConfig {
+	c.Registry = c.Registry.intoBuilder().RegisterStrategy(key, strategy).Build()
+	return c
+}
+
+// WithEscalationMode selects the HITL-vs-AFK escalation mode (issue #120, PRD
+// goal #7) and returns the updated config.
+func (c HarnessConfig) WithEscalationMode(mode EscalationMode) HarnessConfig {
+	c.EscalationMode = mode
+	return c
 }
 
 // SessionStore is the consumer-side view of the pause/resume lifecycle store
@@ -2714,6 +2838,27 @@ func (h *StandardHarness) Run(ctx context.Context, options HarnessRunOptions) Ru
 // fresh (D8).
 func (h *StandardHarness) runInner(ctx context.Context, options HarnessRunOptions) RunResult {
 	task := options.Task
+
+	// Issue #120 startup validation: every serializable handle in the task's
+	// strategy tree must resolve against the configured ExecutionRegistry, BEFORE
+	// the first turn. Validation runs only when the registry is populated, so
+	// existing callers that never wire a registry (and instead use the superseded
+	// single-collaborator fields, Option B) are unaffected byte-for-byte. An
+	// unresolved handle is a startup error.
+	if !h.config.Registry.IsEmpty() {
+		if err := h.config.Registry.Validate(task); err != nil {
+			he, ok := err.(HarnessError)
+			if !ok {
+				he = &StrategyNotFoundError{Key: err.Error()}
+			}
+			return RunResult{
+				Kind:      RunFailure,
+				Reason:    HaltReason{Kind: HaltConfigurationError, ConfigError: he},
+				SessionID: task.SessionID,
+			}
+		}
+	}
+
 	var session SessionState
 	switch {
 	case options.SessionState != nil:
