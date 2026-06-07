@@ -61,7 +61,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
@@ -463,23 +463,230 @@ StrategyRef = Annotated[
 ]
 
 
-# ── RunStrategy composition seam ─────────────────────────────────────────────
+# ============================================================================
+# Composable Execution runtime scaffold (issue #123): StrategyOutcome +
+# ExecutionContext / BudgetContext / BudgetStack / SpanStack.
+# ============================================================================
+#
+# SCAFFOLD ONLY. This slice establishes the typed strategy outcome and the
+# shared, mutable runtime context that threads through a nested strategy tree.
+# ``BudgetContext.charge`` here is PURE ARITHMETIC against a per-scope step
+# allowance — the behavior-chain walk, continue-consumption, and persistence
+# are the later budget-enforcement slice (#124+).
+#
+# Rules established this slice:
+#   - A child's :class:`StrategyOutcomeBudgetExhausted` is an INSPECTABLE value
+#     the parent reads; it does NOT auto-propagate as a failure.
+#   - ``charge`` is pure arithmetic: it debits ``turns`` steps; on success
+#     increments ``steps_taken`` and returns ``None``; on overflow raises
+#     :class:`BudgetExhausted` from current state WITHOUT mutating. It does NOT
+#     walk the behavior chain or consume continues. ``BudgetPolicyUnlimited``
+#     never exhausts.
+#   - Each :class:`BudgetContext` represents ONE scope; the allowance is the
+#     policy's own ``value`` (Unlimited = no cap → ``None``).
+#   - All runtime types here are NEVER serialized — they are plain dataclasses
+#     (NOT pydantic ``_Model``), holding live objects.
+#
+# Resolved spec ambiguities (DECIDED — see issue #123 plan):
+#   1. :class:`ExecutionContext` holds the :class:`ExecutionRegistry` object;
+#      ``run_strategy`` threads the context through. Typed under
+#      ``TYPE_CHECKING`` to avoid the registry↔harness import cycle.
+#   2. ``charge`` is pure arithmetic; :class:`BudgetExhausted` is a dedicated
+#      exception raised by ``charge`` (recoverable-failure-as-raise inside the
+#      harness boundary). :class:`StrategyOutcomeBudgetExhausted` mirrors its
+#      fields and adds ``partial_output``. ``Output`` maps to ``str``.
+#   3. ``continues_used`` is an IN-MEMORY field ONLY in this slice; checkpoint
+#      persistence is DEFERRED to the enforcement slice.
+#   4. :class:`SpanStack` reuses :data:`~spore_core.observability.SpanId`.
+
+
+@dataclass
+class StrategyOutcomeComplete:
+    """The strategy completed and produced its final output. ``Output`` maps to
+    ``str`` in this codebase (mirrors :class:`RunResultSuccess`)."""
+
+    output: str
+
+
+@dataclass
+class StrategyOutcomeBudgetExhausted:
+    """The strategy's budget scope ran out of allowance. Mirrors the
+    :class:`BudgetExhausted` charge-error fields and adds ``partial_output`` —
+    any output produced before exhaustion. Inspectable by a parent, NOT
+    auto-propagating: a parent reads it to decide whether to grant a continue or
+    escalate."""
+
+    policy: BudgetPolicy
+    behavior: BudgetExhaustedBehavior
+    steps_taken: int
+    continues_used: int
+    phase: str
+    partial_output: str | None = None
+
+
+@dataclass
+class StrategyOutcomeFailed:
+    """The strategy halted with a :data:`HarnessError`. Distinguishable from
+    :class:`StrategyOutcomeBudgetExhausted` by callers (``isinstance``)."""
+
+    error: HarnessError
+
+
+# The typed result a strategy node returns. Runtime-only (NOT serialized): a
+# strategy outcome is an in-process value, never persisted. A child's
+# ``BudgetExhausted`` is a value the parent INSPECTS; it does NOT auto-propagate.
+StrategyOutcome = StrategyOutcomeComplete | StrategyOutcomeBudgetExhausted | StrategyOutcomeFailed
+
+
+class BudgetExhausted(SporeError):
+    """Raised by :meth:`BudgetContext.charge` when a debit would exceed the
+    scope's step allowance. Captures the budget state at the moment of
+    exhaustion. Runtime-only (NOT serialized).
+
+    Recoverable-failure-as-raise inside the harness boundary: a strategy
+    promotes a caught :class:`BudgetExhausted` to a
+    :class:`StrategyOutcomeBudgetExhausted` (adding ``partial_output``) at the
+    strategy boundary."""
+
+    def __init__(
+        self,
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        steps_taken: int,
+        continues_used: int,
+        phase: str,
+    ) -> None:
+        self.policy = policy
+        self.behavior = behavior
+        self.steps_taken = steps_taken
+        self.continues_used = continues_used
+        self.phase = phase
+        super().__init__(f"budget exhausted at phase {phase!r}: {steps_taken} steps taken")
+
+
+@dataclass
+class BudgetContext:
+    """One budget scope in the strategy tree. Each recursion node gets its OWN
+    ``BudgetContext``; siblings do NOT share. Runtime-only (NOT serialized).
+
+    The per-scope step allowance is the policy's own ``value``: ``TotalSteps`` /
+    ``PerLoop`` / ``PerAttempt`` all expose ``value`` as the cap for this scope;
+    ``Unlimited`` is uncapped (:meth:`remaining` → ``None``).
+
+    ``continues_used`` is an in-memory field ONLY in this slice; its checkpoint
+    persistence is deferred to the enforcement slice."""
+
+    policy: BudgetPolicy
+    behavior: BudgetExhaustedBehavior
+    phase: str
+    steps_taken: int = 0
+    continues_used: int = 0
+
+    def _allowance(self) -> int | None:
+        """The per-scope step allowance (``None`` for ``Unlimited``)."""
+        if isinstance(self.policy, BudgetPolicyUnlimited):
+            return None
+        return self.policy.value
+
+    def charge(self, turns: int) -> None:
+        """Debit ``turns`` steps against the scope allowance (pure arithmetic).
+        On success increments ``steps_taken``. If the debit would exceed the
+        allowance, raises :class:`BudgetExhausted` from current state WITHOUT
+        mutating. Does NOT walk the behavior chain or consume continues.
+        ``Unlimited`` never exhausts."""
+        allowance = self._allowance()
+        if allowance is not None and self.steps_taken + turns > allowance:
+            raise BudgetExhausted(
+                policy=self.policy,
+                behavior=self.behavior,
+                steps_taken=self.steps_taken,
+                continues_used=self.continues_used,
+                phase=self.phase,
+            )
+        self.steps_taken += turns
+
+    def remaining(self) -> int | None:
+        """Steps left in this scope (``allowance - steps_taken``, saturating ≥
+        0). ``None`` for ``Unlimited`` (no cap)."""
+        allowance = self._allowance()
+        if allowance is None:
+            return None
+        return max(allowance - self.steps_taken, 0)
+
+    def continues_remaining(self) -> int:
+        """Continues left before fall-through. For a ``Continue`` behavior this
+        is ``max_continues - continues_used`` (saturating ≥ 0); for
+        ``Escalate`` / ``Fail`` there are no continues, so ``0``."""
+        if isinstance(self.behavior, BudgetExhaustedContinue):
+            return max(self.behavior.max_continues - self.continues_used, 0)
+        return 0
+
+
+@dataclass
+class BudgetStack:
+    """Runtime push/pop stack of :class:`BudgetContext` scopes — one node per
+    recursion frame, pushed on descent and popped on ascent. Runtime-only (NOT
+    serialized). Siblings get DISTINCT contexts and do not share state."""
+
+    stack: list[BudgetContext] = field(default_factory=list)
+
+    def push(self, cx: BudgetContext) -> None:
+        """Push a new scope onto the stack."""
+        self.stack.append(cx)
+
+    def pop(self) -> BudgetContext | None:
+        """Pop the current scope, returning it (``None`` if empty)."""
+        return self.stack.pop() if self.stack else None
+
+    def current(self) -> BudgetContext | None:
+        """The current (innermost) scope, or ``None`` if empty. The scope is
+        mutable in place (a dataclass), so callers ``charge`` it directly."""
+        return self.stack[-1] if self.stack else None
+
+    def depth(self) -> int:
+        """The current stack depth (recursion frames active)."""
+        return len(self.stack)
+
+
+@dataclass
+class SpanStack:
+    """Runtime push/pop stack of :data:`~spore_core.observability.SpanId`.
+    Runtime-only (NOT serialized)."""
+
+    stack: list[SpanId] = field(default_factory=list)
+
+    def push(self, span_id: SpanId) -> None:
+        """Push a span id onto the stack."""
+        self.stack.append(span_id)
+
+    def pop(self) -> SpanId | None:
+        """Pop the current span id, returning it (``None`` if empty)."""
+        return self.stack.pop() if self.stack else None
+
+    def depth(self) -> int:
+        """The current stack depth."""
+        return len(self.stack)
 
 
 @dataclass
 class ExecutionContext:
-    """Placeholder for #119; full shape owned by #123 (StrategyOutcome +
-    ExecutionContext runtime scaffold). Intentionally near-empty — do NOT
-    pre-build #123's budget/usage scaffold here."""
+    """The one shared, mutable runtime context threaded through a whole nested
+    strategy tree (issue #123). Holds the :class:`ExecutionRegistry` for the
+    duration of the run. Runtime-only — NOT serialized (a plain dataclass
+    holding live objects, incl. an optional non-serializable ``stream`` sink).
 
+    ``registry`` is typed under ``TYPE_CHECKING`` only: the
+    :mod:`~spore_core.execution_registry` module imports :class:`RunStrategy`
+    from here, so a runtime import would cycle."""
 
-class StrategyOutcomePending(_Model):
-    """Per-variant execution is not yet implemented (#124). Stub marker only."""
-
-    kind: Literal["pending"] = "pending"
-
-
-StrategyOutcome = StrategyOutcomePending
+    registry: ExecutionRegistry
+    budgets: BudgetStack = field(default_factory=BudgetStack)
+    usage: AggregateUsage = field(default_factory=AggregateUsage)
+    # ``SessionState`` is defined later in this module, so the factory is
+    # deferred via a lambda (resolved at construction time, never at import).
+    session: SessionState = field(default_factory=lambda: SessionState())
+    spans: SpanStack = field(default_factory=SpanStack)
+    stream: StreamSink | None = None
 
 
 @runtime_checkable
@@ -487,36 +694,37 @@ class RunStrategy(Protocol):
     """The runtime composition seam: every strategy node knows how to run itself
     given an :class:`ExecutionContext`. The single dispatch is one ``match`` on
     :func:`run_strategy` delegating to per-config ``run``; each per-config body
-    is a STUB returning :class:`StrategyOutcomePending` (never raises) pending
-    #124."""
+    is a STUB returning ``StrategyOutcomeComplete("")`` (a benign, matchable
+    placeholder — never raises) pending the per-variant executor slice (#124).
+    The old ``StrategyOutcomePending`` marker is removed this slice."""
 
     async def run(self, cx: ExecutionContext) -> StrategyOutcome: ...
 
 
 async def _run_react_config(_self: ReactConfig, _cx: ExecutionContext) -> StrategyOutcome:
-    return StrategyOutcomePending()
+    return StrategyOutcomeComplete("")
 
 
 async def _run_plan_execute_config(
     _self: PlanExecuteConfig, _cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomePending()
+    return StrategyOutcomeComplete("")
 
 
 async def _run_self_verifying_config(
     _self: SelfVerifyingConfig, _cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomePending()
+    return StrategyOutcomeComplete("")
 
 
 async def _run_ralph_config(_self: RalphConfig, _cx: ExecutionContext) -> StrategyOutcome:
-    return StrategyOutcomePending()
+    return StrategyOutcomeComplete("")
 
 
 async def _run_hill_climbing_config(
     _self: HillClimbingConfig, _cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomePending()
+    return StrategyOutcomeComplete("")
 
 
 async def run_strategy(strategy: LoopStrategy, cx: ExecutionContext) -> StrategyOutcome:
@@ -2298,6 +2506,7 @@ from .observability import (  # noqa: E402
     ObservabilityProvider,
     PricingTable,
     SpanBase,
+    SpanId,
     SpanKind,
     SpanStatusError,
     SpanStatusOk,
@@ -6471,6 +6680,9 @@ __all__ = [
     "HumanResponseHalt",
     "HumanResponseReject",
     "AgentRef",
+    "BudgetContext",
+    "BudgetExhausted",
+    "BudgetStack",
     "ExecutionContext",
     "HillClimbingConfig",
     "HillClimbingDirection",
@@ -6481,8 +6693,11 @@ __all__ = [
     "RunStrategy",
     "SchemaRef",
     "SelfVerifyingConfig",
+    "SpanStack",
     "StrategyOutcome",
-    "StrategyOutcomePending",
+    "StrategyOutcomeBudgetExhausted",
+    "StrategyOutcomeComplete",
+    "StrategyOutcomeFailed",
     "StrategyRef",
     "StrategyRefBuiltIn",
     "StrategyRefCustom",

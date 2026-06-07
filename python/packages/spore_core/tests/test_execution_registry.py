@@ -48,7 +48,7 @@ from spore_core import (
     RunResultSuccess,
     SchemaRef,
     SessionId,
-    StrategyOutcomePending,
+    StrategyOutcomeComplete,
     StrategyRefBuiltIn,
     StrategyRefCustom,
     Task,
@@ -86,8 +86,8 @@ class _StubStrategy:
     """A minimal custom :class:`RunStrategy` (duck-typed). Never invoked in
     these tests — registry resolution is pure lookup."""
 
-    async def run(self, cx: ExecutionContext) -> StrategyOutcomePending:
-        return StrategyOutcomePending()
+    async def run(self, cx: ExecutionContext) -> StrategyOutcomeComplete:
+        return StrategyOutcomeComplete("")
 
 
 def _agent() -> MockAgent:

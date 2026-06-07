@@ -26,7 +26,7 @@ from spore_core.harness import (
     RalphConfig,
     ReactConfig,
     SelfVerifyingConfig,
-    StrategyOutcomePending,
+    StrategyOutcomeComplete,
     StrategyRef,
     StrategyRefBuiltIn,
     StrategyRefCustom,
@@ -210,12 +210,15 @@ def test_strategy_ref_fixture_replay() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RunStrategy stub dispatch — returns a placeholder, never raises (#124)
+# RunStrategy stub dispatch — returns a benign Complete("") placeholder,
+# never raises (#124 lands the real bodies)
 # ---------------------------------------------------------------------------
 
 
-async def test_run_strategy_stub_returns_pending() -> None:
-    cx = ExecutionContext()
+async def test_run_strategy_stub_returns_complete() -> None:
+    from spore_core.execution_registry import ExecutionRegistry
+
+    cx = ExecutionContext(registry=ExecutionRegistry.empty())
     for strategy in (
         ReactConfig.per_loop(1),
         PlanExecuteConfig.simple(),
@@ -232,7 +235,8 @@ async def test_run_strategy_stub_returns_pending() -> None:
         ),
     ):
         outcome = await run_strategy(strategy, cx)
-        assert isinstance(outcome, StrategyOutcomePending)
+        assert isinstance(outcome, StrategyOutcomeComplete)
+        assert outcome.output == ""
 
 
 # ---------------------------------------------------------------------------
