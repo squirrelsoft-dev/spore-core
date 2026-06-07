@@ -64,6 +64,19 @@ type BudgetPolicy struct {
 	Value uint32           `json:"-"`
 }
 
+// AllowanceValue returns the per-scope step allowance carried by this policy and
+// whether it is capped (false for Unlimited). Shared by BudgetContext.allowance
+// and the leaf cap-binding check in ReactConfig.Run (#125).
+func (p BudgetPolicy) AllowanceValue() (uint32, bool) {
+	switch p.Kind {
+	case BudgetUnlimited:
+		return 0, false
+	default:
+		// TotalSteps / PerLoop / PerAttempt all expose Value as the cap.
+		return p.Value, true
+	}
+}
+
 // MarshalJSON serialises BudgetPolicy as a flat tagged object.
 func (p BudgetPolicy) MarshalJSON() ([]byte, error) {
 	switch p.Kind {

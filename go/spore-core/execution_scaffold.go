@@ -184,13 +184,7 @@ func NewBudgetContext(policy BudgetPolicy, behavior BudgetExhaustedBehavior, pha
 // allowance returns the per-scope step allowance and whether the scope is
 // capped (false for Unlimited).
 func (c *BudgetContext) allowance() (uint32, bool) {
-	switch c.Policy.Kind {
-	case BudgetUnlimited:
-		return 0, false
-	default:
-		// TotalSteps / PerLoop / PerAttempt all expose Value as the cap.
-		return c.Policy.Value, true
-	}
+	return c.Policy.AllowanceValue()
 }
 
 // Charge debits turns steps against the scope allowance (pure arithmetic — see
@@ -237,6 +231,78 @@ func (c *BudgetContext) ContinuesRemaining() uint32 {
 		return 0
 	}
 }
+
+// ConsumeContinue grants one in-process continue (#125): it bumps ContinuesUsed
+// and RESETS StepsTaken to 0 so the scope's step allowance refreshes for the next
+// round. This is a purely in-memory reset — the session / messages are untouched
+// (the loop keeps the same conversation; only the per-scope step counter
+// rewinds). ContinuesUsed persistence across a serialized checkpoint is DEFERRED
+// to #129.
+func (c *BudgetContext) ConsumeContinue() {
+	c.ContinuesUsed = saturatingAddU32(c.ContinuesUsed, 1)
+	c.StepsTaken = 0
+}
+
+// ResolveExhausted resolves this scope's BudgetExhaustedBehavior at the moment of
+// exhaustion (#125), walking the on-exhausted fall-through chain:
+//
+//   - Fail     → ExhaustedResolutionFail.
+//   - Escalate → ExhaustedResolutionEscalate.
+//   - Continue{MaxContinues, OnExhausted} →
+//   - if ContinuesRemaining() > 0: ConsumeContinue (reset counter, bump
+//     ContinuesUsed) and return ExhaustedResolutionContinue;
+//   - otherwise the continues are spent: ADOPT the OnExhausted behavior as this
+//     scope's behavior and recurse into it (the fall-through), so a
+//     Continue{OnExhausted: Escalate} whose continues are spent resolves to
+//     Escalate.
+//
+// Mutates the receiver: on a granted continue the counter resets; on fall-through
+// Behavior is replaced by the inner behavior so subsequent resolutions see the
+// post-fall-through behavior.
+func (c *BudgetContext) ResolveExhausted() ExhaustedResolution {
+	switch c.Behavior.Kind {
+	case BehaviorFail:
+		return ExhaustedResolutionFail
+	case BehaviorEscalate:
+		return ExhaustedResolutionEscalate
+	case BehaviorContinue:
+		if c.ContinuesRemaining() > 0 {
+			c.ConsumeContinue()
+			return ExhaustedResolutionContinue
+		}
+		// Continues spent — fall through to the nested behavior. A malformed
+		// Continue with a nil OnExhausted (never produced by the validated
+		// Unmarshal) defensively resolves to Fail.
+		if c.Behavior.OnExhausted == nil {
+			return ExhaustedResolutionFail
+		}
+		c.Behavior = *c.Behavior.OnExhausted
+		return c.ResolveExhausted()
+	default:
+		// Defensive: an unknown behavior resolves to Fail.
+		return ExhaustedResolutionFail
+	}
+}
+
+// ExhaustedResolution is the runtime-only resolution of a
+// BudgetExhaustedBehavior chain at the moment of exhaustion (#125). It is NEVER
+// serialized — purely a control-flow signal returned by
+// BudgetContext.ResolveExhausted:
+//
+//   - Continue — the scope was granted an in-process continue (counter reset,
+//     ContinuesUsed bumped); the caller loops again.
+//   - Fail     — terminate; PartialOutput = nil (discarded by contract).
+//   - Escalate — hand off to the parent; PartialOutput = the node-concrete partial.
+type ExhaustedResolution string
+
+const (
+	// ExhaustedResolutionContinue grants an in-process continue (loop again).
+	ExhaustedResolutionContinue ExhaustedResolution = "continue"
+	// ExhaustedResolutionFail terminates with no partial.
+	ExhaustedResolutionFail ExhaustedResolution = "fail"
+	// ExhaustedResolutionEscalate hands off to the parent with a partial.
+	ExhaustedResolutionEscalate ExhaustedResolution = "escalate"
+)
 
 // ============================================================================
 // BudgetStack — runtime push/pop stack of BudgetContext
@@ -350,6 +416,49 @@ type ExecutionContext struct {
 // stacks and zero-value usage/session and no stream sink.
 func NewExecutionContext(registry *ExecutionRegistry) *ExecutionContext {
 	return &ExecutionContext{Registry: registry}
+}
+
+// ============================================================================
+// ExecutionContext budget-scope helpers (#125)
+// ============================================================================
+
+// PushBudget pushes a fresh per-node BudgetContext scope for policy / behavior /
+// phase onto cx.Budgets (#125). Each node — including a sibling — gets its OWN
+// scope (StepsTaken = 0), so a node capped at N never spends a sibling's
+// allowance (rule 1) and a child's exhaustion never touches the parent scope
+// (rule 4/7). Returns the depth AFTER the push for symmetry debugging.
+func (cx *ExecutionContext) PushBudget(policy BudgetPolicy, behavior BudgetExhaustedBehavior, phase string) int {
+	cx.Budgets.Push(NewBudgetContext(policy, behavior, phase))
+	return cx.Budgets.Depth()
+}
+
+// PopBudget pops the current per-node budget scope (#125). Always paired with
+// PushBudget so the stack returns to its parent baseline on ascent.
+func (cx *ExecutionContext) PopBudget() (BudgetContext, bool) {
+	return cx.Budgets.Pop()
+}
+
+// ChargeCurrent charges turns steps against the CURRENT (innermost) budget scope
+// (#125): the real enforcement point. It returns nil when within allowance, or a
+// non-nil *BudgetExhausted carrying the budget state at exhaustion. A context
+// with no pushed scope (the scaffold contexts) never exhausts — charging is a
+// no-op returning nil.
+func (cx *ExecutionContext) ChargeCurrent(turns uint32) *BudgetExhausted {
+	if scope := cx.Budgets.Current(); scope != nil {
+		return scope.Charge(turns)
+	}
+	return nil
+}
+
+// ResolveCurrent resolves the current scope's exhaustion behavior (#125). It
+// walks the chain (Continue grants a reset; spent continues fall through). A
+// context with no pushed scope resolves to Fail (defensive — should not happen in
+// a wired run).
+func (cx *ExecutionContext) ResolveCurrent() ExhaustedResolution {
+	if scope := cx.Budgets.Current(); scope != nil {
+		return scope.ResolveExhausted()
+	}
+	return ExhaustedResolutionFail
 }
 
 // ============================================================================

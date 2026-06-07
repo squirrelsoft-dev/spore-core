@@ -90,7 +90,27 @@ func (h *StandardHarness) runExecutePhase(
 	}
 	cx := NewExecutionContext(&h.config.Registry)
 	cx.Executor = h
-	result := cfg.runExecuteLoop(ctx, cx, h, task, *session, taskList, carried, planUsage, onStream)
+	result, exhausted := cfg.runExecuteLoop(ctx, cx, h, task, *session, taskList, carried, planUsage, onStream)
+	// #125: a BudgetExhausted is surfaced as a typed StrategyOutcome. Map it back
+	// to the equivalent BudgetExceeded Failure RunResult so this legacy test
+	// helper preserves its single-RunResult signature (mirrors driveStrategy).
+	if exhausted != nil {
+		var messages []Message
+		var turns uint32
+		if exhausted.Exhausted != nil {
+			if exhausted.Exhausted.PartialOutput != nil {
+				messages = []Message{{Role: RoleAssistant, Content: NewTextContent(*exhausted.Exhausted.PartialOutput)}}
+			}
+			turns = exhausted.Exhausted.StepsTaken
+		}
+		result = RunResult{
+			Kind:         RunFailure,
+			Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+			SessionID:    task.SessionID,
+			Turns:        turns,
+			SessionState: SessionState{Messages: messages},
+		}
+	}
 	// Fold the post-run session back into *session so existing assertions that
 	// read the shared state observe the accumulated execute context (matching the
 	// legacy in-place mutation).

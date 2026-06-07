@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -335,6 +336,121 @@ func (cx *ExecutionContext) finish(ctx context.Context, executor StrategyExecuto
 	r := result
 	cx.Scratch.TerminalOverride = &r
 	return outcome
+}
+
+// ============================================================================
+// Per-node budget enforcement + failure isolation helpers (#125)
+// ============================================================================
+//
+// promoteBudgetExhausted is the BudgetExhausted -> StrategyOutcome promotion
+// boundary. The *PartialJSON helpers build the node-concrete partial_output
+// (fork #2: a JSON-serialized string of the per-node partial). Per fork #1, an
+// Escalate-resolved exhaustion carries a non-nil partial; a Fail-resolved one
+// carries nil. lastFinalResponseText extracts the ReAct window's last
+// FinalResponse text from a terminal RunResult.
+
+// promoteBudgetExhausted promotes a charge-time *BudgetExhausted to a
+// StrategyOutcome BudgetExhausted variant (#125 promotion boundary), attaching
+// partialOutput. Per fork #1 the caller passes a non-nil partial for an Escalate
+// resolution and nil for a Fail resolution.
+func promoteBudgetExhausted(err *BudgetExhausted, partialOutput *string) StrategyOutcome {
+	return StrategyBudgetExhausted(*err, partialOutput)
+}
+
+// lastFinalResponseText returns the last FinalResponse text from a ReAct window
+// terminal (#125, fork #2): the Success.Output, or for a Failure the last
+// assistant text message on its post-run session state (the partial captured
+// before exhaustion). Empty for non-terminal pauses.
+func lastFinalResponseText(result RunResult) string {
+	switch result.Kind {
+	case RunSuccess:
+		return result.Output
+	case RunFailure:
+		msgs := result.SessionState.Messages
+		for i := len(msgs) - 1; i >= 0; i-- {
+			m := msgs[i]
+			if m.Role == RoleAssistant && m.Content.Type == ContentTypeText {
+				return m.Content.Text
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+// reactPartialJSON builds the ReAct partial: the window's last FinalResponse text
+// (#125, fork #2).
+func reactPartialJSON(lastFinalResponse string) string {
+	b, _ := json.Marshal(struct {
+		Node              string `json:"node"`
+		LastFinalResponse string `json:"last_final_response"`
+	}{"react", lastFinalResponse})
+	return string(b)
+}
+
+// planExecutePartialJSON builds the PlanExecute partial: the task list + per-task
+// statuses + ledger (#125, fork #2). The ledger is one (id, description, status)
+// row per task.
+func planExecutePartialJSON(taskList TaskList) string {
+	type ledgerRow struct {
+		ID          string `json:"id"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+	}
+	ledger := make([]ledgerRow, 0, len(taskList.Tasks))
+	for _, t := range taskList.Tasks {
+		ledger = append(ledger, ledgerRow{
+			ID:          strconv.FormatUint(uint64(t.ID), 10),
+			Description: t.Description,
+			Status:      string(t.Status),
+		})
+	}
+	b, _ := json.Marshal(struct {
+		Node   string      `json:"node"`
+		Tasks  int         `json:"tasks"`
+		Ledger []ledgerRow `json:"ledger"`
+	}{"plan_execute", len(taskList.Tasks), ledger})
+	return string(b)
+}
+
+// selfVerifyingPartialJSON builds the SelfVerifying partial: the last worker
+// result summary + the last verdict reason (#125, fork #2).
+func selfVerifyingPartialJSON(lastWorkerOutput, lastVerdict string) string {
+	b, _ := json.Marshal(struct {
+		Node             string `json:"node"`
+		LastWorkerResult string `json:"last_worker_result"`
+		LastVerdict      string `json:"last_verdict"`
+	}{"self_verifying", lastWorkerOutput, lastVerdict})
+	return string(b)
+}
+
+// hillClimbingPartialJSON builds the HillClimbing partial: the best candidate
+// value + its score (#125, fork #2).
+func hillClimbingPartialJSON(bestScore float64) string {
+	b, _ := json.Marshal(struct {
+		Node          string  `json:"node"`
+		BestCandidate float64 `json:"best_candidate"`
+		Score         float64 `json:"score"`
+	}{"hill_climbing", bestScore, bestScore})
+	return string(b)
+}
+
+// currentExhausted snapshots the current budget scope into a *BudgetExhausted for
+// promotion (#125). It returns nil when no scope is pushed (defensive — the live
+// bodies always push before charging).
+func (cx *ExecutionContext) currentExhausted() *BudgetExhausted {
+	scope := cx.Budgets.Current()
+	if scope == nil {
+		return nil
+	}
+	return &BudgetExhausted{
+		Policy:        scope.Policy,
+		Behavior:      scope.Behavior,
+		StepsTaken:    scope.StepsTaken,
+		ContinuesUsed: scope.ContinuesUsed,
+		Phase:         scope.Phase,
+	}
 }
 
 // outcomeFromRunResult translates a terminal RunResult into a StrategyOutcome

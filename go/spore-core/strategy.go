@@ -541,11 +541,63 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	}
 	session := cx.takeSession()
 	budget := cx.Scratch.RunBudget
+	// #125: push this leaf's OWN budget scope. The leaf carries only its POLICY
+	// (the cap); behavior is Escalate as a leaf placeholder — the leaf never
+	// RESOLVES it (rule 6: propagate to parent), it is only the scope shape so the
+	// charge below enforces the cap and any exhaustion promotes to a
+	// parent-inspectable BudgetExhausted.
+	cx.PushBudget(c.Budget, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "react")
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := cx.takeStream()
 	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent)
 	executor.Finalize(ctx, result)
+
+	// #125: charge the window's turns against this leaf's OWN scope. The leaf
+	// POLICY (c.Budget) — not the global BudgetLimits backstop — is the per-node
+	// enforcement point. When the LEAF cap is the binding constraint (the window
+	// consumed >= the leaf policy value) the leaf is exhausted and PROPAGATES a
+	// typed BudgetExhausted to its parent (rule 6 — the leaf never self-resolves).
+	// When the smaller GLOBAL backstop trips first, the legacy terminal is recorded
+	// VERBATIM (the global cap is unchanged, #117 backstop).
+	var windowTurns uint32
+	if result.Kind == RunSuccess || result.Kind == RunFailure {
+		windowTurns = result.Turns
+	}
+	windowHitBudget := result.Kind == RunFailure && result.Reason.Kind == HaltBudgetExceeded
+	leafCapBinding := false
+	if windowHitBudget {
+		if cap, capped := c.Budget.AllowanceValue(); capped && windowTurns >= cap {
+			leafCapBinding = true
+		}
+	}
+	charge := cx.ChargeCurrent(windowTurns)
+	if leafCapBinding || charge != nil {
+		// Carry the post-run session so a parent resumes losslessly.
+		if result.Kind == RunSuccess || result.Kind == RunFailure {
+			cx.Scratch.RunSession = result.SessionState
+		}
+		err := charge
+		if err == nil {
+			// The window itself hit the cap; synthesize the charge error from the
+			// current scope state.
+			err = cx.currentExhausted()
+			if err == nil {
+				err = &BudgetExhausted{
+					Policy:     c.Budget,
+					Behavior:   BudgetExhaustedBehavior{Kind: BehaviorEscalate},
+					StepsTaken: windowTurns,
+					Phase:      "react",
+				}
+			}
+		}
+		cx.PopBudget()
+		// Rule 6: the leaf PROPAGATES — partial carries the last FinalResponse
+		// (Escalate semantics, fork #1/#2).
+		partial := reactPartialJSON(lastFinalResponseText(result))
+		return promoteBudgetExhausted(err, &partial)
+	}
+	cx.PopBudget()
 	return cx.recordTerminal(result)
 }
 
@@ -657,7 +709,17 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	//
 	// The shared execute context starts from baseSession (NOT the plan child's
 	// polluted session) so the directive never leaks (#93).
-	result := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, outcome.Usage, onStream)
+	result, exhausted := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, outcome.Usage, onStream)
+	if exhausted != nil {
+		// #125: a BudgetExhausted is surfaced as a typed StrategyOutcome (NOT
+		// collapsed through finish into a Failure override). Restore the parent task
+		// and ensure no stale terminal override masks it on ascent.
+		pt := task
+		cx.Scratch.Task = &pt
+		cx.Scratch.TerminalOverride = nil
+		cx.Stream = onStream
+		return *exhausted
+	}
 	return cx.finish(ctx, executor, task, result)
 }
 
@@ -677,7 +739,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	carried BudgetSnapshot,
 	planUsage AggregateUsage,
 	onStream StreamSink,
-) RunResult {
+) (RunResult, *StrategyOutcome) {
 	sessionID := task.SessionID
 
 	// A.6 deep-resume (Q2): reconcile against the durable checkpoint so
@@ -688,7 +750,20 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	totalUsage := planUsage
 	var lastOutput string
 	var lastState SessionState
-	globalMaxTurns := task.Budget.MaxTurns
+
+	// #125: PlanExecute owns a budget scope for its execute phase. Its POLICY is
+	// the task's global turn ceiling (TotalSteps) — the root node's TotalSteps
+	// subsumes the OLD per-task remaining_turns / remaining_tasks / step_cap
+	// derivation, which is now DEAD and removed. Behavior is Escalate (in-process
+	// placeholder; the serialized behavior field is #129). Enforcement is now
+	// charge-based per node.
+	var planPolicy BudgetPolicy
+	if task.Budget.MaxTurns != nil {
+		planPolicy = BudgetPolicy{Kind: BudgetTotalSteps, Value: *task.Budget.MaxTurns}
+	} else {
+		planPolicy = BudgetPolicy{Kind: BudgetUnlimited}
+	}
+	cx.PushBudget(planPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "plan_execute")
 
 	for index := 0; index < totalTasks; index++ {
 		taskID := taskList.Tasks[index].ID
@@ -700,35 +775,6 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 			continue
 		}
 
-		// Q1: per-task turn allocation, derived at the START of the step.
-		remainingTasks := uint32(totalTasks - index)
-		var stepCap uint32
-		if globalMaxTurns != nil {
-			max := *globalMaxTurns
-			var remainingTurns uint32
-			if max > carried.Turns {
-				remainingTurns = max - carried.Turns
-			}
-			perTaskTurns := remainingTurns / remainingTasks
-			if perTaskTurns < 1 {
-				perTaskTurns = 1
-			}
-			// The sub-loop's effective cap is RELATIVE to the carried turns: a
-			// per-task cap of K means "stop K turns from now" while the GLOBAL
-			// budget (carried forward) remains the hard stop — so the step task's
-			// turn ceiling is min(global, carried + per_task). An already-exhausted
-			// global budget thus budget-fails the step BEFORE the execute child
-			// calls the agent (Q1).
-			subLoopCap := carried.Turns + perTaskTurns
-			if max < subLoopCap {
-				stepCap = max
-			} else {
-				stepCap = subLoopCap
-			}
-		} else {
-			stepCap = ^uint32(0) // max uint32
-		}
-
 		// Mark InProgress and re-persist (Q4).
 		ip := TaskStatusInProgress
 		_ = taskList.Update(taskID, &ip, nil)
@@ -737,13 +783,11 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		// Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step
 		// instruction; the (possibly mutated) instruction seeds the execute
 		// sub-strategy.
-		stepBudget := task.Budget
-		stepBudget.MaxTurns = &stepCap
 		stepTask := Task{
 			ID:           task.ID,
 			Instruction:  instruction,
 			SessionID:    sessionID,
-			Budget:       stepBudget,
+			Budget:       task.Budget,
 			LoopStrategy: *c.Execute,
 		}
 		executor.FireTaskAdvance(ctx, sessionID, &stepTask, index, totalTasks)
@@ -756,10 +800,31 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		cx.Scratch.Task = &stCopy
 		cx.Scratch.RunSession = session
 		cx.Scratch.RunBudget = carried
-		_ = c.Execute.Run(ctx, cx)
+		// #125: absolute turn count BEFORE this step, so the success path can
+		// charge only the DELTA against the PlanExecute scope.
+		carriedBefore := carried.Turns
+		stepOutcome := c.Execute.Run(ctx, cx)
+		// #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a
+		// StrategyOutcome, never auto-cascaded. PlanExecute does NOT charge the
+		// child's exhaustion against its OWN scope; it surfaces its own typed
+		// BudgetExhausted with the PlanExecute partial (tasklist + statuses +
+		// ledger) and aborts the run.
+		if stepOutcome.Kind == StrategyOutcomeBudgetExhausted {
+			blocked := TaskStatusBlocked
+			_ = taskList.Update(taskID, &blocked, nil)
+			executor.PersistTaskList(ctx, sessionID, taskList)
+			partial := planExecutePartialJSON(taskList)
+			err := cx.currentExhausted()
+			cx.PopBudget()
+			_ = cx.takeChildOverride()
+			cx.Scratch.RunSession = session
+			outcome := promoteBudgetExhausted(err, &partial)
+			return RunResult{}, &outcome
+		}
 		subResult := cx.takeChildOverride()
 
 		if subResult == nil {
+			cx.PopBudget()
 			return RunResult{
 				Kind: RunFailure,
 				Reason: HaltReason{
@@ -772,7 +837,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				Usage:        totalUsage,
 				Turns:        carried.Turns,
 				SessionState: lastState,
-			}
+			}, nil
 		}
 
 		switch subResult.Kind {
@@ -795,6 +860,24 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 			_ = taskList.Complete(taskID)
 			executor.PersistTaskList(ctx, sessionID, taskList)
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
+
+			// #125: charge this step's turns against the PlanExecute scope. If the
+			// global TotalSteps cap is now spent, the PlanExecute node surfaces its
+			// OWN typed BudgetExhausted (partial = tasklist + ledger), resolving its
+			// behavior.
+			if chErr := cx.ChargeCurrent(saturatingSubU32(subResult.Turns, carriedBefore)); chErr != nil {
+				partial := planExecutePartialJSON(taskList)
+				resolution := cx.ResolveCurrent()
+				cx.PopBudget()
+				cx.Scratch.RunSession = session
+				var outcome StrategyOutcome
+				if resolution == ExhaustedResolutionFail {
+					outcome = promoteBudgetExhausted(chErr, nil)
+				} else {
+					outcome = promoteBudgetExhausted(chErr, &partial)
+				}
+				return RunResult{}, &outcome
+			}
 
 		case RunFailure:
 			// Q5: any non-success step aborts the whole run.
@@ -819,6 +902,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 					Reason:    haltReasonString(subResult.Reason),
 				}
 			}
+			cx.PopBudget()
 			return RunResult{
 				Kind:         RunFailure,
 				Reason:       terminalReason,
@@ -826,14 +910,16 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				Usage:        totalUsage,
 				Turns:        subResult.Turns,
 				SessionState: lastState,
-			}
+			}, nil
 
 		default:
 			// A pause / consult / escalate propagates the whole run verbatim.
-			return *subResult
+			cx.PopBudget()
+			return *subResult, nil
 		}
 	}
 
+	cx.PopBudget()
 	return RunResult{
 		Kind:         RunSuccess,
 		Output:       lastOutput,
@@ -841,7 +927,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		Usage:        totalUsage,
 		Turns:        carried.Turns,
 		SessionState: lastState,
-	}
+	}, nil
 }
 
 // Run is the SelfVerifying combinator (#124): GENUINELY recursive build↔evaluate
@@ -889,6 +975,18 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 	maxIterations := verifier.MaxIterations()
 	var totalUsage AggregateUsage
 	var lastReason string
+	var lastWorkerOutput string
+
+	// #125: SelfVerifying owns a budget scope for its build↔evaluate loop. POLICY
+	// is the task's global turn ceiling (TotalSteps); behavior is Escalate
+	// (in-process placeholder; serialized behavior is #129).
+	var svPolicy BudgetPolicy
+	if task.Budget.MaxTurns != nil {
+		svPolicy = BudgetPolicy{Kind: BudgetTotalSteps, Value: *task.Budget.MaxTurns}
+	} else {
+		svPolicy = BudgetPolicy{Kind: BudgetUnlimited}
+	}
+	cx.PushBudget(svPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "self_verifying")
 
 	for iteration := uint32(0); iteration < maxIterations; iteration++ {
 		// ── Build phase: recurse c.Inner.Run.
@@ -903,7 +1001,23 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 		cx.Scratch.Task = &btCopy
 		cx.Scratch.RunSession = session
 		cx.Scratch.RunBudget = carried
-		_ = c.Inner.Run(ctx, cx)
+		carriedBefore := carried.Turns
+		buildOutcome := c.Inner.Run(ctx, cx)
+		// #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a
+		// StrategyOutcome, never auto-cascaded. SelfVerifying surfaces its own typed
+		// BudgetExhausted (partial = last worker result + last verdict) without
+		// charging the child's exhaustion against its own scope.
+		if buildOutcome.Kind == StrategyOutcomeBudgetExhausted {
+			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
+			err := cx.currentExhausted()
+			cx.PopBudget()
+			_ = cx.takeChildOverride()
+			pt := task
+			cx.Scratch.Task = &pt
+			cx.Scratch.TerminalOverride = nil
+			cx.Stream = onStream
+			return promoteBudgetExhausted(err, &partial)
+		}
 		bo := cx.takeChildOverride()
 		var buildResult RunResult
 		if bo == nil {
@@ -925,12 +1039,34 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 		// A paused / escalated build propagates verbatim.
 		switch buildResult.Kind {
 		case RunWaitingForHuman, RunConsult, RunEscalate:
+			cx.PopBudget()
 			cx.Stream = onStream
 			return cx.finish(ctx, executor, task, buildResult)
+		}
+		// Capture the build's output for the partial (last worker result).
+		if buildResult.Kind == RunSuccess {
+			lastWorkerOutput = buildResult.Output
 		}
 		// Carry the build's post-run session forward for the next round.
 		if buildResult.Kind == RunSuccess || buildResult.Kind == RunFailure {
 			session = buildResult.SessionState
+		}
+
+		// #125: charge this iteration's build turns against the SelfVerifying scope.
+		// If the global cap is spent, the node surfaces its OWN typed
+		// BudgetExhausted (partial = last worker result + last verdict).
+		if chErr := cx.ChargeCurrent(saturatingSubU32(carried.Turns, carriedBefore)); chErr != nil {
+			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
+			resolution := cx.ResolveCurrent()
+			cx.PopBudget()
+			pt := task
+			cx.Scratch.Task = &pt
+			cx.Scratch.TerminalOverride = nil
+			cx.Stream = onStream
+			if resolution == ExhaustedResolutionFail {
+				return promoteBudgetExhausted(chErr, nil)
+			}
+			return promoteBudgetExhausted(chErr, &partial)
 		}
 
 		// ── Evaluate phase: a fresh evaluator run on evalAgent.
@@ -960,6 +1096,7 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 				Turns:        turns,
 				SessionState: finalState,
 			}
+			cx.PopBudget()
 			cx.Stream = onStream
 			return cx.finish(ctx, executor, task, result)
 		default:
@@ -982,6 +1119,7 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 		Turns:        carried.Turns,
 		SessionState: session,
 	}
+	cx.PopBudget()
 	cx.Stream = onStream
 	return cx.finish(ctx, executor, task, result)
 }
@@ -1040,7 +1178,21 @@ func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 		cx.Scratch.RunSession = session
 		// FRESH per-window budget (the reset discards the turn budget).
 		cx.Scratch.RunBudget = BudgetSnapshot{}
-		_ = innerForWindow.Run(ctx, cx)
+		windowOutcome := innerForWindow.Run(ctx, cx)
+		// #125 rule 4/7: a window child's BudgetExhausted reaches Ralph as a
+		// StrategyOutcome, never auto-cascaded. Ralph's recovery semantics: a
+		// budget-exhausted window is treated as "window incomplete" — RESET the
+		// context window and retry (next outer iteration). After maxResets this
+		// falls through to RalphCompletionUnmet. Ralph's own scope is unaffected.
+		if windowOutcome.Kind == StrategyOutcomeBudgetExhausted {
+			_ = cx.takeChildOverride()
+			partial := "<no partial>"
+			if windowOutcome.Exhausted != nil && windowOutcome.Exhausted.PartialOutput != nil {
+				partial = *windowOutcome.Exhausted.PartialOutput
+			}
+			lastReason = fmt.Sprintf("window %d budget-exhausted: %s", iteration+1, partial)
+			continue
+		}
 		wo := cx.takeChildOverride()
 		var windowResult RunResult
 		if wo == nil {
@@ -1155,6 +1307,18 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 	var rows []HillClimbRow
 	var spanSeq uint64
 
+	// #125: HillClimbing owns a budget scope for its optimization loop. POLICY is
+	// the task's global turn ceiling (TotalSteps); this REPLACES the ad-hoc
+	// turn_cap / carried.Turns >= turnCap gate that #124 used. Behavior is Escalate
+	// (in-process placeholder; #129).
+	var hcPolicy BudgetPolicy
+	if task.Budget.MaxTurns != nil {
+		hcPolicy = BudgetPolicy{Kind: BudgetTotalSteps, Value: *task.Budget.MaxTurns}
+	} else {
+		hcPolicy = BudgetPolicy{Kind: BudgetUnlimited}
+	}
+	cx.PushBudget(hcPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "hill_climbing")
+
 	// ── Iteration 0: pure baseline. No agent turn (Decision 5).
 	baseValue, baseDur, baseStatus, baseMsg, baseOK := executor.HillEvaluate(ctx, evaluator, sessionID, task.ID)
 	if !baseOK {
@@ -1180,6 +1344,7 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			Usage:     totalUsage,
 			Turns:     carried.Turns,
 		}
+		cx.PopBudget()
 		cx.Stream = onStream
 		return cx.finish(ctx, executor, task, result)
 	}
@@ -1200,13 +1365,23 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 	iteration := uint32(1)
 
 	for {
-		// Budget gate before the iteration's agent turn.
-		turnCap := allTurns
-		if task.Budget.MaxTurns != nil {
-			turnCap = *task.Budget.MaxTurns
-		}
-		if carried.Turns >= turnCap {
-			break
+		// #125: charge-based budget gate before the iteration's agent turn. A spent
+		// TotalSteps cap surfaces this node's OWN typed BudgetExhausted (partial =
+		// best candidate + score), resolving its behavior — replacing the legacy
+		// BudgetExceeded Failure.
+		if chErr := cx.ChargeCurrent(1); chErr != nil {
+			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			partial := hillClimbingPartialJSON(currentBest)
+			resolution := cx.ResolveCurrent()
+			cx.PopBudget()
+			pt := task
+			cx.Scratch.Task = &pt
+			cx.Scratch.TerminalOverride = nil
+			cx.Stream = onStream
+			if resolution == ExhaustedResolutionFail {
+				return promoteBudgetExhausted(chErr, nil)
+			}
+			return promoteBudgetExhausted(chErr, &partial)
 		}
 		if lt, exceeded := budgetExceeded(task.Budget, carried, time.Now()); exceeded {
 			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
@@ -1217,6 +1392,7 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 				Usage:     totalUsage,
 				Turns:     carried.Turns,
 			}
+			cx.PopBudget()
 			cx.Stream = onStream
 			return cx.finish(ctx, executor, task, result)
 		}
@@ -1235,7 +1411,22 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 		cx.Scratch.Task = &itCopy
 		cx.Scratch.RunSession = iterState
 		cx.Scratch.RunBudget = carried
-		_ = c.Inner.Run(ctx, cx)
+		iterOutcome := c.Inner.Run(ctx, cx)
+		// #125 rule 4/7: a child's BudgetExhausted reaches HillClimbing as a
+		// StrategyOutcome, never auto-cascaded. Surface this node's own typed
+		// BudgetExhausted (partial = best candidate + score).
+		if iterOutcome.Kind == StrategyOutcomeBudgetExhausted {
+			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			_ = cx.takeChildOverride()
+			partial := hillClimbingPartialJSON(currentBest)
+			err := cx.currentExhausted()
+			cx.PopBudget()
+			pt := task
+			cx.Scratch.Task = &pt
+			cx.Scratch.TerminalOverride = nil
+			cx.Stream = onStream
+			return promoteBudgetExhausted(err, &partial)
+		}
 		to := cx.takeChildOverride()
 		var turnResult RunResult
 		if to == nil {
@@ -1254,6 +1445,7 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 		switch turnResult.Kind {
 		case RunWaitingForHuman, RunConsult, RunEscalate:
 			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
+			cx.PopBudget()
 			cx.Stream = onStream
 			return cx.finish(ctx, executor, task, turnResult)
 		}
@@ -1335,6 +1527,7 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 				Usage:     totalUsage,
 				Turns:     carried.Turns,
 			}
+			cx.PopBudget()
 			cx.Stream = onStream
 			return cx.finish(ctx, executor, task, result)
 		}
@@ -1343,18 +1536,10 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			iteration++
 		}
 	}
-
-	// Budget/turn cap reached without a stagnation halt — clean budget halt.
-	executor.HillWriteTSV(workspaceRoot, task.ID, rows)
-	result := RunResult{
-		Kind:      RunFailure,
-		Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
-		SessionID: sessionID,
-		Usage:     totalUsage,
-		Turns:     carried.Turns,
-	}
-	cx.Stream = onStream
-	return cx.finish(ctx, executor, task, result)
+	// #125: the loop never falls out — the charge-based budget gate at the top
+	// surfaces a typed BudgetExhausted, and stagnation / pause / misconfig all
+	// return from inside. The legacy post-loop "clean budget halt" is now dead and
+	// removed (the turn_cap break it depended on is gone).
 }
 
 // workerAgentKeyOf descends a LoopStrategy tree to the worker leaf's agent key

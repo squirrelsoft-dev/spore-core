@@ -120,10 +120,15 @@ func TestExecutePhaseDrainsPendingInProgressCompleted(t *testing.T) {
 	}
 }
 
-// Q1 per-task turn allocation + shared budget: global cap 7, plan turn spent
-// (1), 3 tasks split the remaining 6 turns (2 each). Task a needs >2 turns and
-// is cut off by its per-task cap, proving allocation + shared-budget carry.
-func TestExecutePhasePerTaskTurnAllocation(t *testing.T) {
+// #125: the OLD Q1 per-task turn allocation (remaining_turns / remaining_tasks,
+// cutting task a off at 2 of a 7-turn budget) is REMOVED as dead logic.
+// Enforcement is now charge-based on the PlanExecute scope's global TotalSteps,
+// NOT divided per task. With the same setup — global cap 7, plan spends 1 — task
+// a is NO LONGER capped at 2 turns: it runs its scripted turns under the global
+// ceiling and is not pre-empted by a phantom per-task cap. Here task a runs its 2
+// tool turns then runs dry, so the run fails as a STEP failure (not a per-task
+// budget cap). This asserts the per-task derivation is gone.
+func TestExecutePhaseNoPerTaskTurnCap(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(planFinal(`{"tasks":["a","b","c"]}`))
 	a.Push(NewToolCallRequested([]ToolCall{{ID: "1", Name: "x", Input: json.RawMessage(`{}`)}}, turnUsage()))
@@ -137,13 +142,13 @@ func TestExecutePhasePerTaskTurnAllocation(t *testing.T) {
 	max := uint32(7)
 	r := h.Run(context.Background(), NewHarnessRunOptions(planTaskBudget(BudgetLimits{MaxTurns: &max})))
 	if r.Kind != RunFailure {
-		t.Fatalf("expected Failure from turn cap, got %+v", r)
+		t.Fatalf("expected Failure (step ran dry), got %+v", r)
 	}
-	if r.Reason.Kind != HaltBudgetExceeded || r.Reason.LimitType != BudgetLimitTurns {
-		t.Fatalf("per-task turn cap enforced, got %+v", r.Reason)
-	}
-	if r.Turns != 3 {
-		t.Fatalf("turns = %d, want 3 (1 plan + 2 task turns)", r.Turns)
+	// NOT a per-task BudgetExceeded(Turns) cut at 2 turns — the derivation is gone.
+	// Task a runs past 2 turns under the global ceiling and fails as a STEP failure
+	// when the agent runs dry.
+	if r.Reason.Kind != HaltStepFailed {
+		t.Fatalf("no per-task cap; run dry -> StepFailed, got %+v", r.Reason)
 	}
 }
 

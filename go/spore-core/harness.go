@@ -2934,18 +2934,27 @@ func (h *StandardHarness) driveStrategy(
 		}
 	case StrategyOutcomeBudgetExhausted:
 		var messages []Message
-		if outcome.Exhausted != nil && outcome.Exhausted.PartialOutput != nil {
-			messages = []Message{{
-				Role:    RoleAssistant,
-				Content: NewTextContent(*outcome.Exhausted.PartialOutput),
-			}}
+		// #125: the exhausted node's own StepsTaken is the turn count it reached
+		// (the scratch budget is not written back on the propagate path). Fall back
+		// to the scratch turns if it is somehow 0.
+		turns := cx.Scratch.RunBudget.Turns
+		if outcome.Exhausted != nil {
+			if outcome.Exhausted.PartialOutput != nil {
+				messages = []Message{{
+					Role:    RoleAssistant,
+					Content: NewTextContent(*outcome.Exhausted.PartialOutput),
+				}}
+			}
+			if outcome.Exhausted.StepsTaken > 0 {
+				turns = outcome.Exhausted.StepsTaken
+			}
 		}
 		return RunResult{
 			Kind:         RunFailure,
 			Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
 			SessionID:    sessionID,
 			Usage:        cx.Usage,
-			Turns:        cx.Scratch.RunBudget.Turns,
+			Turns:        turns,
 			SessionState: SessionState{Messages: messages},
 		}
 	default: // StrategyOutcomeFailed
