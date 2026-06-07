@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-07 by /close (#124 truly complete — genuine composition landed) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Six bricks landed (#117, #118, #119, #120, #123, #124) all `status: complete`, all four languages.** #124 (reopened partial) is now TRULY complete: all five strategies genuinely compose — ReAct (leaf) + PlanExecute + SelfVerifying + Ralph + HillClimbing all recurse into their children via `self.inner.run(cx)`; the monolithic `StandardHarness::run_*` loops + their facades are DELETED; the four legacy collaborator fields are removed and resolved via `ExecutionRegistry` (Deviation #12 resolved). Per-combinator non-ReAct-`inner` regression tests (asserting collaborator-invocation counts) prove the recursion is genuine. With #124 done, **#125 (budget enforcement) and #126 (ready-set walk) are now unblocked.** The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ `origin/main` is **6 commits behind** local `main` (the four #124 recomposition commits + the README composition-docs commit + the earlier reopen-reconcile commit are unpushed — push pending an explicit go-ahead per the standing push gate)._
+_Last updated: 2026-06-07 by /close (#124 complete + pushed; origin level) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Six bricks landed (#117, #118, #119, #120, #123, #124) all `status: complete`, all four languages.** #124 (reopened partial) is now TRULY complete: all five strategies genuinely compose — ReAct (leaf) + PlanExecute + SelfVerifying + Ralph + HillClimbing all recurse into their children via `self.inner.run(cx)`; the monolithic `StandardHarness::run_*` loops + their facades are DELETED; the four legacy collaborator fields are removed and resolved via `ExecutionRegistry` (Deviation #12 resolved). Per-combinator non-ReAct-`inner` regression tests (asserting collaborator-invocation counts) prove the recursion is genuine. With #124 done, **#125 (budget enforcement) and #126 (ready-set walk) are now unblocked.** The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ✅ `origin/main` is level with local `main` (the #124 series, README composition docs, and reconcile commits all pushed through `4aa1970`)._
 
 _**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119, #120, #123, #124 are all done.** The next critical-path items are **#125 (per-node budget enforcement)** and **#126 (ready-set task walk)**, both now unblocked by #124's true completion. #121/#122/#127/#128/#129 remain parallel-grabbable. Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
 
@@ -340,12 +340,11 @@ cache halts.
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
 10. **Local `main` push hygiene (standing reminder)** — each per-issue loop's series
-    must be pushed promptly so `origin/main` doesn't drift behind. ⚠️ **`origin/main`
-    is currently 6 commits behind** local `main`: the reopen-reconcile commit
-    (`a02ba22`), the four #124 recomposition commits (`88eaafa`/`3906b03`/`4852985`/
-    `59601cf`), and the README composition-docs commit (`b2dc2d8`). Push is pending an
-    explicit go-ahead (an agent-initiated push was denied earlier in the session under
-    the standing push-approval gate — ask before pushing). Sub-note: the plan-execute
+    must be pushed promptly so `origin/main` doesn't drift behind. ✅ Current: `origin/main`
+    is **level** with local `main` (the #124 series, README composition docs, and reconcile
+    commits all pushed through `4aa1970`). Note the standing push-approval gate: an
+    agent-initiated push was denied earlier this session, so **ask before pushing**.
+    Sub-note: the plan-execute
     scratch run-artifacts are covered by a `workspace/*` wildcard in
     `examples/rust/08-plan-execute/.gitignore` (preserving the tracked `.gitkeep` +
     canonical `Async_Runtime_Comparison_Report.md`).
@@ -388,27 +387,23 @@ stubs — all resolved in prior loops.)_
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-1. **Push local `main` to `origin`** (Deviation #10) — `origin/main` is 6 commits behind:
-   reopen-reconcile `a02ba22`, the four #124 recomposition commits (`88eaafa`/`3906b03`/
-   `4852985`/`59601cf`), and README docs `b2dc2d8`. Pending an explicit go-ahead under the
-   standing push gate. Do this before starting #125/#126 so the next loop branches from a
-   pushed base.
-2. **#125 — per-node budget enforcement + failure isolation (Composable Execution
-   B.1–B.5).** NOW UNBLOCKED by #124. Flesh out #123's pure-arithmetic `charge` into real
-   enforcement: walk the `BudgetExhaustedBehavior` chain (`Continue`/`Escalate`/`Fail`),
-   consume continues, and ensure a child's `BudgetExhausted` is isolated (never confused
-   with `Failed`, never auto-cascades). Top critical-path item. Grab via `/implement`.
-3. **#126 — ready-set task walk + two-tier context + failure cascade (Part C
+1. **#125 — per-node budget enforcement + failure isolation (Composable Execution
+   B.1–B.5).** NOW UNBLOCKED by #124; the top critical-path item. Flesh out #123's
+   pure-arithmetic `charge` into real enforcement: walk the `BudgetExhaustedBehavior`
+   chain (`Continue`/`Escalate`/`Fail`), consume continues, and ensure a child's
+   `BudgetExhausted` is isolated (never confused with `Failed`, never auto-cascades).
+   Grab via `/implement`.
+2. **#126 — ready-set task walk + two-tier context + failure cascade (Part C
    executor).** NOW UNBLOCKED by #124; parallel-grabbable with #125. Consume #118's
    `Task.blockers` DAG: a ready-set walk over unblocked tasks, two-tier (run vs task)
    context, and failure cascade to transitive dependents only. Grab via `/implement`.
-4. **Refactor finishers (parallel-grabbable now)** — #121 (`SubagentTool` strategy
+3. **Refactor finishers (parallel-grabbable now)** — #121 (`SubagentTool` strategy
    param), #122 (`max_steps()`), #127 (custom-strategy tracer — exercises #120's
    `custom` map + `StrategyNotFound` end-to-end), #128 (observability span attrs),
    #129 (`Continue` checkpoint — owns #123's deferred `continues_used` persistence),
    then #130 (`HumanRequest::BudgetExhausted` HITL resume — consumes #120's
    `EscalationMode` knob), then **#131** (cordyceps capstone — the success bar).
-5. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — file a
+4. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — file a
    mirror issue for TS/Python/Go or accept as a Rust-reference-ahead experiment.
    **Still parked:** examples #109 / #92 + `web_search` #108/#110; harness gaps #115
    (skill loading) and #116 (HITL child-consult resume — overlaps #130); correctness/
