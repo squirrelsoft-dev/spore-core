@@ -871,9 +871,19 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				cx.PopBudget()
 				cx.Scratch.RunSession = session
 				var outcome StrategyOutcome
-				if resolution == ExhaustedResolutionFail {
+				switch resolution {
+				case ExhaustedResolutionFail:
 					outcome = promoteBudgetExhausted(chErr, nil)
-				} else {
+				case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
+					// #129: a granted Continue must reset this scope
+					// (ResolveCurrent already did via ConsumeContinue) and RE-RUN
+					// this execute step — the in-process loop wiring lands in #129.
+					// It is UNREACHABLE today: live bodies push an Escalate
+					// placeholder behavior (the serialized BudgetExhaustedBehavior
+					// field is a wire change deferred to #129), so ResolveCurrent
+					// only ever yields Escalate/Fail here. Until that loop exists,
+					// an (impossible) Continue is handled EXPLICITLY as a lossless
+					// surface-with-partial rather than a silent default fall-through.
 					outcome = promoteBudgetExhausted(chErr, &partial)
 				}
 				return RunResult{}, &outcome
@@ -1063,8 +1073,17 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			cx.Scratch.Task = &pt
 			cx.Scratch.TerminalOverride = nil
 			cx.Stream = onStream
-			if resolution == ExhaustedResolutionFail {
+			switch resolution {
+			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)
+			case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
+				// #129: a granted Continue must reset + RE-RUN this
+				// build↔evaluate iteration (the in-process loop wiring lands in
+				// #129). UNREACHABLE today — live bodies push an Escalate
+				// placeholder, so ResolveCurrent never yields Continue here.
+				// Handle it EXPLICITLY (surface-with-partial) rather than via a
+				// silent default fall-through.
+				return promoteBudgetExhausted(chErr, &partial)
 			}
 			return promoteBudgetExhausted(chErr, &partial)
 		}
@@ -1378,8 +1397,17 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			cx.Scratch.Task = &pt
 			cx.Scratch.TerminalOverride = nil
 			cx.Stream = onStream
-			if resolution == ExhaustedResolutionFail {
+			switch resolution {
+			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)
+			case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
+				// #129: a granted Continue must reset + keep iterating the climb
+				// (the in-process loop wiring lands in #129). UNREACHABLE today —
+				// live bodies push an Escalate placeholder, so ResolveCurrent
+				// never yields Continue here. Handle it EXPLICITLY
+				// (surface-with-partial) rather than via a silent default
+				// fall-through.
+				return promoteBudgetExhausted(chErr, &partial)
 			}
 			return promoteBudgetExhausted(chErr, &partial)
 		}

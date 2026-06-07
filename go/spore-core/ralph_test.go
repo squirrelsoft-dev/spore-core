@@ -2,6 +2,8 @@ package sporecore
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,6 +123,49 @@ func (a *ralphFixedAgent) turnTexts() []string {
 }
 
 var _ Agent = (*ralphFixedAgent)(nil)
+
+// ralphToolLoopingAgent NEVER returns a FinalResponse — every turn requests a
+// tool call, so a bounded ReAct window can only ever exhaust its turn budget (it
+// never terminates cleanly). On its FIRST turn it writes a COMPLETE
+// .spore/progress.json, so any code path that DID consult Ralph's external
+// completion after the window would (wrongly) see "complete" and Success.
+type ralphToolLoopingAgent struct {
+	id    AgentID
+	root  string
+	mu    sync.Mutex
+	calls int
+}
+
+func newRalphToolLoopingAgent(root string) *ralphToolLoopingAgent {
+	return &ralphToolLoopingAgent{id: AgentID("ralph-tool-loop"), root: root}
+}
+
+func (a *ralphToolLoopingAgent) Turn(_ context.Context, _ Context) TurnResult {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.calls == 0 {
+		// Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
+		// completion after a budget-exhausted window it would Success.
+		writeRalphProgress(a.root, ralphWindow{complete: true})
+	}
+	n := a.calls
+	a.calls++
+	return NewToolCallRequested([]ToolCall{{
+		ID:    fmt.Sprintf("c%d", n),
+		Name:  "x",
+		Input: json.RawMessage(`{}`),
+	}}, TokenUsage{InputTokens: 1, OutputTokens: 1})
+}
+
+func (a *ralphToolLoopingAgent) ID() AgentID { return a.id }
+
+func (a *ralphToolLoopingAgent) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+var _ Agent = (*ralphToolLoopingAgent)(nil)
 
 // ============================================================================
 // Helpers
@@ -248,6 +293,52 @@ func TestRalphExhaustsMaxResets(t *testing.T) {
 	}
 	if !strings.Contains(r.Reason.Reason, "task A") {
 		t.Fatalf("last reason should name the remaining task, got %q", r.Reason.Reason)
+	}
+}
+
+// #125 F5: a Ralph window whose INNER LEAF exhausts its OWN budget mid-window
+// (the leaf's PerLoop policy is the binding cap, no smaller global backstop).
+// The window surfaces StrategyOutcome.BudgetExhausted; Ralph must treat it as
+// "window incomplete → RESET and retry" — it must NOT consult external
+// completion (which is COMPLETE on disk here) and must NOT cascade the child's
+// exhaustion into its own terminal. So the run reaches MaxResets windows and
+// ends RalphCompletionUnmet, NOT Success.
+func TestRalphBudgetExhaustedWindowResetsNoCompletionNoCascade(t *testing.T) {
+	dir := t.TempDir()
+	// Seed an incomplete progress file so the window's reload starts incomplete.
+	writeRalphProgress(dir, ralphWindow{complete: false, remaining: []string{"task A"}})
+	agent := newRalphToolLoopingAgent(dir)
+	cfg := ralphCfg(agent, dir)
+	// Provide tool outputs for the looping calls across all windows.
+	reg := NewScriptedToolRegistry()
+	for i := 0; i < 32; i++ {
+		reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
+	}
+	cfg.ToolRegistry = reg
+	cfg.MaxResets = 3
+	h := NewStandardHarness(cfg)
+
+	// Inner leaf carries its OWN binding cap (PerLoop{2}); NO global MaxTurns
+	// backstop, so the leaf policy — not the global cap — exhausts the window and
+	// the new BudgetExhausted path is taken.
+	task := NewTask("build the thing", SessionID("s1"), RalphStrategy(RalphConfig{
+		Inner: PtrStrategy(ReActStrategy(2)),
+		Agent: AgentRef("ralph-agent"),
+	}))
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
+	if r.Kind != RunFailure || r.Reason.Kind != HaltRalphCompletionUnmet {
+		t.Fatalf("expected RalphCompletionUnmet (reset-on-exhaust, no completion, no cascade), got %+v", r)
+	}
+	// Reached MaxResets — completion was NEVER consulted (despite COMPLETE on
+	// disk) and the child's exhaustion did NOT cascade into Ralph's own terminal.
+	if r.Reason.Iterations != 3 {
+		t.Fatalf("expected exactly MaxResets (3) windows, got %d", r.Reason.Iterations)
+	}
+	// Three windows × two leaf turns each = six agent turns total — proving each
+	// exhausted window fully reset and re-ran, not short-circuited.
+	if agent.callCount() != 6 {
+		t.Fatalf("expected 6 agent turns (3 windows × 2 leaf turns each), got %d", agent.callCount())
 	}
 }
 

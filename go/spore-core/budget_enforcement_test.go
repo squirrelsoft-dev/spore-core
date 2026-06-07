@@ -266,8 +266,18 @@ func TestSiblingIsolationFreshContextPerNode(t *testing.T) {
 
 func TestChildExhaustionDoesNotChargeParentScope(t *testing.T) {
 	var budgets BudgetStack
-	// Parent scope (capped at 5, behavior Fail).
+	// Parent scope (TotalSteps{5}) that is ALREADY nearly exhausted: it has spent
+	// 4 of its 5 steps, leaving EXACTLY ONE remaining. This is the adversarial
+	// case for rule 4/7 — if a child's exhaustion auto-cascaded even a single step
+	// onto the parent, the parent would be pushed over its own cap and could no
+	// longer Complete.
 	budgets.Push(NewBudgetContext(BudgetPolicy{Kind: BudgetTotalSteps, Value: 5}, BudgetExhaustedBehavior{Kind: BehaviorFail}, "parent"))
+	if err := budgets.Current().Charge(4); err != nil {
+		t.Fatalf("parent pre-charge(4): %v", err)
+	}
+	if rem, capped := budgets.Current().Remaining(); !capped || rem != 1 {
+		t.Fatalf("parent should start with exactly 1 step left, got rem=%d capped=%v", rem, capped)
+	}
 
 	// Child descends with its OWN scope (capped at 1) and exhausts.
 	budgets.Push(NewBudgetContext(BudgetPolicy{Kind: BudgetPerLoop, Value: 1}, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "child"))
@@ -282,12 +292,21 @@ func TestChildExhaustionDoesNotChargeParentScope(t *testing.T) {
 	budgets.Pop()
 
 	parent := budgets.Current()
-	if parent.StepsTaken != 0 {
-		t.Fatalf("rule 4/7: child exhaustion auto-charged parent (steps=%d)", parent.StepsTaken)
+	if parent.StepsTaken != 4 {
+		t.Fatalf("rule 4/7: child exhaustion did NOT auto-charge the parent — its StepsTaken must be unchanged at 4 (not bumped to 5), got %d", parent.StepsTaken)
 	}
-	// The parent can then proceed and Complete within its own budget.
-	if err := parent.Charge(5); err != nil {
-		t.Fatalf("parent should still have its full allowance: %v", err)
+	if rem, capped := parent.Remaining(); !capped || rem != 1 {
+		t.Fatalf("the parent STILL has its 1 remaining step after the child exhausted, got rem=%d capped=%v", rem, capped)
+	}
+	// The parent can spend its last step and Complete — proving the child's
+	// exhaustion did NOT push it over its own cap.
+	if err := parent.Charge(1); err != nil {
+		t.Fatalf("parent should spend its final step and Complete within its own budget: %v", err)
+	}
+	// And only now is the parent itself exhausted (at its own 5, by its own work
+	// — never by the child's).
+	if parent.Charge(1) == nil {
+		t.Fatal("parent should now be exhausted at its own cap 5, by its own work")
 	}
 }
 
@@ -373,7 +392,46 @@ func TestReactLeafCapBindingPropagatesPartial(t *testing.T) {
 	if r.Reason.Kind != HaltBudgetExceeded || r.Reason.LimitType != BudgetLimitTurns {
 		t.Fatalf("expected BudgetExceeded(Turns), got %+v", r.Reason)
 	}
+	// The surfaced turn count is the EXHAUSTED NODE's own StepsTaken (#125
+	// BudgetExhausted path), which equals the leaf cap N=2 here.
 	if r.Turns != 2 {
 		t.Fatalf("leaf stopped at its own cap N=2, surfaced turns = %d", r.Turns)
+	}
+
+	// The #125 discriminator: the partial flowed through
+	// StrategyOutcome.BudgetExhausted{PartialOutput} → driveStrategy's
+	// BudgetExhausted arm, which materializes the partial as a single assistant
+	// Text message. On PRE-#125 code the leaf's recordTerminal(window_failure)
+	// surfaced the window's RAW session (the tool-call / observation messages),
+	// NOT this node-concrete partial JSON — so these assertions FAIL on the old
+	// path and PROVE the new BudgetExhausted machinery is exercised.
+	msgs := r.SessionState.Messages
+	if len(msgs) != 1 {
+		t.Fatalf("BudgetExhausted arm materializes exactly the partial as one assistant message (not the window's raw transcript), got %d messages", len(msgs))
+	}
+	m := msgs[0]
+	if m.Role != RoleAssistant {
+		t.Fatalf("partial message role = %q, want assistant", m.Role)
+	}
+	if m.Content.Type != ContentTypeText {
+		t.Fatalf("partial content type = %q, want text", m.Content.Type)
+	}
+	// The documented ReAct partial shape (fork #2): the last FinalResponse text
+	// as JSON. This window produced no FinalResponse, so the documented shape
+	// carries an empty last_final_response.
+	if m.Content.Text != reactPartialJSON("") {
+		t.Fatalf("materialized partial = %q, want reactPartialJSON(\"\") = %q", m.Content.Text, reactPartialJSON(""))
+	}
+	// Sanity: the materialized text is genuinely the partial helper's output,
+	// i.e. valid JSON with the node tag — not free-form prose.
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(m.Content.Text), &parsed); err != nil {
+		t.Fatalf("partial is not valid JSON: %v", err)
+	}
+	if parsed["node"] != "react" {
+		t.Fatalf("partial node = %v, want \"react\"", parsed["node"])
+	}
+	if parsed["last_final_response"] != "" {
+		t.Fatalf("partial last_final_response = %v, want \"\"", parsed["last_final_response"])
 	}
 }
