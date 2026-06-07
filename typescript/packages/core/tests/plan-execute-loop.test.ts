@@ -38,6 +38,7 @@ import {
   type TurnResult,
 } from "../src/index.js";
 import type { Hook, HookChain, HookContext, HookDecision, HookEvent } from "../src/hooks/index.js";
+import type { Verifier, VerifierInput, VerifierVerdict } from "../src/verifier/index.js";
 import { StandardHookChain } from "../src/hooks/standard.js";
 import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js";
 import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
@@ -59,8 +60,18 @@ import {
 
 const PLAN_STRATEGY: LoopStrategy = {
   kind: "plan_execute",
-  plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-  execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  plan: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
+  execute: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
 };
 
 function usage(): TokenUsage {
@@ -414,5 +425,71 @@ describe("PlanExecute execute phase (issue #59)", () => {
     // Both tasks Completed on the final persisted checkpoint.
     const list = (await provider.run().get(SID, TASK_LIST_EXTRAS_KEY)) as TaskList;
     expect(list.tasks.every((t) => t.status === "completed")).toBe(true);
+  });
+
+  // ── #124 REGRESSION-PROOF: a NON-ReAct execute child genuinely runs per task ──
+  it("plan_execute_runs_non_react_execute_child_per_task", async () => {
+    // `PlanExecute[plan: ReAct, execute: SelfVerifying[ReAct]]` over a 2-task
+    // plan. The execute child is SelfVerifying — its build↔evaluate loop runs
+    // ONCE PER TASK, so the recording verifier is invoked exactly twice (once per
+    // task). The pre-#124 implementation hardcoded a flat ReAct sub-loop in
+    // `runExecutePhase` and silently DROPPED the SelfVerifying child — the
+    // verifier would have been invoked ZERO times. This proves `c.execute` is
+    // dispatched via `runStrategy(execute, cx)` and a non-ReAct child genuinely
+    // executes its loop per task.
+
+    /** A verifier that records every invocation; PASS each time. */
+    class RecordingVerifier implements Verifier {
+      readonly seen: VerifierInput[] = [];
+      async verify(input: VerifierInput, _signal?: AbortSignal): Promise<VerifierVerdict> {
+        this.seen.push(input);
+        return { kind: "passed" };
+      }
+      maxIterations(): number {
+        return 3;
+      }
+    }
+
+    // cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+    const a = new RecordingAgent(AgentId.of("default"))
+      .push(fr('{"tasks":["t0","t1"],"rationale":"r"}'))
+      .push(fr("built t0"))
+      .push(fr("built t1"));
+    // The evaluate phase runs on a distinct agent (one PASS narration per task).
+    const evaluator = new RecordingAgent(AgentId.of("eval")).push(fr("PASS")).push(fr("PASS"));
+    const verifier = new RecordingVerifier();
+
+    // The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
+    const strategy: LoopStrategy = {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+      },
+      execute: {
+        kind: "self_verifying",
+        inner: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+        },
+        evaluator: "",
+      },
+    };
+    const task = newTask("build a CLI", SID, strategy);
+    const h = new StandardHarness(configWith(a, { evaluatorAgent: evaluator, verifier }));
+
+    const r = await h.run({ task });
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") {
+      expect(r.output).toBe("built t1"); // Q2: last step's final output
+    }
+
+    // The smoking gun: the SelfVerifying evaluator ran ONCE PER TASK (2x). A
+    // dropped execute child would record ZERO verifier invocations.
+    expect(verifier.seen.length).toBe(2);
   });
 });

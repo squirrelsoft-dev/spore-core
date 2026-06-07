@@ -670,8 +670,23 @@ function recordingConfig(agent: RecordingTurnAgent, modelParams: HarnessConfig["
 
 const PLAN_EXECUTE_STRATEGY: LoopStrategy = {
   kind: "plan_execute",
-  plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-  execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  // #124: under genuine recursion the per-task turn cap is allocated by the
+  // PlanExecute combinator and passed via the step task's budget; the execute
+  // child's own `per_loop` budget must not gate below that (an absolute cap that
+  // already includes the carried plan turn). MAX lets the combinator's allocation
+  // be the effective gate — matching the Rust reference's `per_loop(u32::MAX)`.
+  plan: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
+  execute: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
 };
 
 function planTask93(): Task {

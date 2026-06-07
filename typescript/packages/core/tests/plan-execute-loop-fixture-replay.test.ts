@@ -67,8 +67,18 @@ describe("PlanExecute loop fixture replay — plan_execute_loop.jsonl", () => {
     const harness = new StandardHarness(config());
     const task = newTask("build a CLI", SessionId.of("plan-execute-fixture"), {
       kind: "plan_execute",
-      plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-      execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+      },
+      execute: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+      },
     });
     const result = await harness.run({ task });
     expect(result.kind).toBe("success");

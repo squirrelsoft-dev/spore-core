@@ -56,8 +56,18 @@ import {
 
 const PLAN_STRATEGY: LoopStrategy = {
   kind: "plan_execute",
-  plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-  execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  plan: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
+  execute: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
 };
 
 function usage(): TokenUsage {
@@ -251,20 +261,26 @@ describe("PlanExecute plan phase", () => {
     expect(a.ran).toBe(2);
   });
 
-  it("R2: a tool call in the plan turn → plan_phase_failed (no dispatch loop)", async () => {
-    const reg = new ScriptedToolRegistry();
+  // #124 recursion seam (was R2): the plan phase now dispatches the GENUINE
+  // `plan` child (a ReAct loop) capped at ONE turn. A plan turn that requests a
+  // tool instead of emitting the JSON plan cannot complete in its single turn, so
+  // the plan child halts on the cap and the plan phase propagates a terminal
+  // Failure WITHOUT capturing/storing an artifact. (The old one-shot primitive
+  // special-cased a tool call as planning_turn_failed; under genuine recursion
+  // the cap is what stops the loop — the observable contract that a non-plan plan
+  // turn fails the run and stores nothing is preserved.)
+  it("#124: a tool-only plan turn fails the run and stores no artifact", async () => {
+    const reg = new ScriptedToolRegistry().push({ kind: "success", content: "ok" });
     const a = new RecordingAgent(AgentId.of("default")).push(tcr());
-    const h = new StandardHarness(configWith(a, { toolRegistry: reg }));
-    const r = await h.run({ task: planTask() });
+    const state: SessionState = emptySessionState();
+    const storage = inMemoryStorage();
+    const h = new StandardHarness(configWith(a, { toolRegistry: reg, storage }));
+    const r = await h.run({ task: planTask(), session_state: state });
+    // The plan child never emitted a JSON plan, so the run halts terminally.
     expect(r.kind).toBe("failure");
-    if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("plan_phase_failed");
-      if (r.reason.kind === "plan_phase_failed") {
-        expect(r.reason.error.kind).toBe("planning_turn_failed");
-      }
-    }
-    expect(a.ran).toBe(1); // ran once, then stopped — no dispatch loop.
-    expect(reg.callCount).toBe(0); // R2: no tool dispatch.
+    // Nothing captured/stored: no artifact reached the RunStore.
+    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
   it("R3 + R4: artifact captured from response text and persisted to the RunStore", async () => {

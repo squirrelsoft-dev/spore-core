@@ -96,17 +96,11 @@ import {
   type HookChain,
   type HookContext,
 } from "../hooks/index.js";
-import {
-  PLAN_EXECUTE_EXTRAS_KEY,
-  PlanPhaseError,
-  capturePlanArtifact,
-  type PlanArtifact,
-} from "../plan/index.js";
+import { PLAN_EXECUTE_EXTRAS_KEY, capturePlanArtifact, type PlanArtifact } from "../plan/index.js";
 import {
   TASK_LIST_EXTRAS_KEY,
   TaskListSchema,
   completeTask,
-  planArtifactToTaskList,
   serializeTaskList,
   updateTask,
   type TaskList,
@@ -141,6 +135,7 @@ import {
   type EscalationMode,
   type HaltReason,
   HarnessError,
+  InvalidConfiguration,
   type HarnessRunOptions,
   surfaceToHuman,
   type HookPoint,
@@ -794,19 +789,98 @@ export class StandardHarness implements Harness, StrategyExecutor {
     );
   }
 
-  /** {@inheritDoc StrategyExecutor.planPhase} */
-  planPhase(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<PlanPhaseOutcome> {
-    return this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
+  /** {@inheritDoc StrategyExecutor.planDirective} */
+  planDirective(instruction: string): string {
+    return (
+      "Produce a step-by-step plan for the following task. Respond with a " +
+      'single JSON object: {"tasks": [<ordered step strings>], ' +
+      '"rationale": <string>}.\n\nTask:\n' +
+      instruction
+    );
   }
 
-  /** {@inheritDoc StrategyExecutor.executePhase} */
-  executePhase(
+  /** {@inheritDoc StrategyExecutor.seedUserMessage} */
+  async seedUserMessage(sessionState: SessionState, text: string): Promise<void> {
+    await this.config.contextManager.appendUserMessage(sessionState, text);
+  }
+
+  /** {@inheritDoc StrategyExecutor.runPlanSubtree} */
+  async runPlanSubtree(
+    plan: LoopStrategy,
+    planTask: Task,
+    planSession: SessionState,
+    budgetUsed: BudgetSnapshot,
+    signal: AbortSignal | undefined,
+  ): Promise<RunResult | undefined> {
+    // R5/R6: route the planner agent. When `plannerAgent` is configured the plan
+    // child runs against an agent-swapped child harness (same pattern as the
+    // SelfVerifying evaluate phase); otherwise the default agent runs through
+    // `this`. Either way the child's `.run(cx)` drives the WHOLE plan loop
+    // (genuine recursion).
+    const planHarness =
+      this.config.plannerAgent != null
+        ? new StandardHarness({ ...this.config, agent: this.config.plannerAgent })
+        : this;
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    const cx: ExecutionContext = newExecutionContext(registry);
+    cx.executor = planHarness;
+    cx.signal = signal;
+    cx.scratch.runSession = planSession;
+    cx.scratch.runBudget = budgetUsed;
+    cx.scratch.task = planTask;
+    await runStrategy(plan, cx);
+    return cx.scratch.terminalOverride;
+  }
+
+  /** {@inheritDoc StrategyExecutor.capturePlanArtifact} */
+  capturePlanArtifact(
+    sessionId: SessionId,
+    planOutput: string,
+    usage: AggregateUsage,
+    turns: number,
+    signal: AbortSignal | undefined,
+  ): Promise<PlanPhaseOutcome> {
+    return this.captureAndPersistPlan(sessionId, planOutput, usage, turns, signal);
+  }
+
+  /** {@inheritDoc StrategyExecutor.reconcileCompletedTasks} */
+  reconcileCompletedTasks(sessionId: SessionId, taskList: TaskList): Promise<void> {
+    return this.reconcileDeepResume(sessionId, taskList);
+  }
+
+  /** {@inheritDoc StrategyExecutor.fireTaskAdvance} */
+  async fireTaskAdvance(
+    sessionId: SessionId,
+    stepTask: Task,
+    taskIndex: number,
+    totalTasks: number,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    if (!this.config.hooks) return;
+    const ctx: HookContext = {
+      event: "on_task_advance",
+      session_id: sessionId,
+      task: stepTask,
+      task_index: taskIndex,
+      total_tasks: totalTasks,
+    };
+    try {
+      await this.config.hooks.fire(ctx, signal);
+    } catch {
+      // Hook errors are non-fatal; the step proceeds with the current task.
+    }
+  }
+
+  /**
+   * Test-facing driver (#124) for the GENUINE recursive execute phase: drains
+   * `taskList` by dispatching the PlanExecute strategy's `execute` child via
+   * `runStrategy(execute, cx)` per task. Reproduces the execute half of the
+   * combinator {@link runPlanExecuteConfig} so the granular execute regression
+   * tests exercise the real per-task `execute.run(cx)` dispatch (the phase logic
+   * is NOT duplicated for production — production runs through the combinator).
+   * `task.loop_strategy` MUST be a `plan_execute`.
+   */
+  async executePhase(
     task: Task,
     sessionState: SessionState,
     taskList: TaskList,
@@ -815,7 +889,136 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RunResult> {
-    return this.runExecutePhase(task, sessionState, taskList, carried, planUsage, onStream, signal);
+    if (task.loop_strategy.kind !== "plan_execute") {
+      throw new InvalidConfiguration("executePhase requires a plan_execute strategy");
+    }
+    const executeChild = task.loop_strategy.execute;
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    const sessionId = task.session_id;
+
+    await this.reconcileDeepResume(sessionId, taskList);
+
+    const totalTasks = taskList.tasks.length;
+    const totalUsage: AggregateUsage = { ...planUsage };
+    const sharedCarried: BudgetSnapshot = { ...carried };
+    let shared = sessionState;
+    let lastOutput = "";
+    let lastState: SessionState = emptySessionState();
+    const globalMaxTurns = task.budget.max_turns ?? null;
+
+    for (let index = 0; index < totalTasks; index += 1) {
+      const taskId = taskList.tasks[index]!.id;
+      const instruction = taskList.tasks[index]!.description;
+
+      if (taskList.tasks[index]!.status === "completed") {
+        lastOutput = instruction;
+        continue;
+      }
+
+      const remainingTasks = totalTasks - index;
+      let perTaskTurns: number;
+      if (globalMaxTurns != null) {
+        const remainingTurns = Math.max(globalMaxTurns - sharedCarried.turns, 0);
+        perTaskTurns = Math.max(Math.floor(remainingTurns / remainingTasks), 1);
+      } else {
+        perTaskTurns = Number.MAX_SAFE_INTEGER;
+      }
+      const subLoopCap =
+        perTaskTurns === Number.MAX_SAFE_INTEGER
+          ? Number.MAX_SAFE_INTEGER
+          : sharedCarried.turns + perTaskTurns;
+      const stepCap = globalMaxTurns != null ? Math.min(globalMaxTurns, subLoopCap) : subLoopCap;
+
+      updateTask(taskList, taskId, "in_progress");
+      await this.persistTaskList(sessionId, taskList);
+
+      const stepTask: Task = {
+        id: task.id,
+        instruction,
+        session_id: sessionId,
+        budget: { ...task.budget, max_turns: stepCap },
+        loop_strategy: executeChild,
+      };
+      await this.fireTaskAdvance(sessionId, stepTask, index, totalTasks, signal);
+
+      await this.seedUserMessage(shared, stepTask.instruction);
+
+      const cx: ExecutionContext = newExecutionContext(registry);
+      cx.executor = this;
+      cx.signal = signal;
+      cx.scratch.runSession = shared;
+      cx.scratch.runBudget = { ...sharedCarried };
+      cx.scratch.task = stepTask;
+      await runStrategy(executeChild, cx);
+      const subResult = cx.scratch.terminalOverride;
+
+      if (subResult != null && subResult.kind === "success") {
+        sharedCarried.turns = subResult.turns;
+        shared = runResultSessionState(subResult);
+        lastState = { messages: [...shared.messages], extras: { ...shared.extras } };
+        sharedCarried.input_tokens += subResult.usage.input_tokens;
+        sharedCarried.output_tokens += subResult.usage.output_tokens;
+        totalUsage.input_tokens += subResult.usage.input_tokens;
+        totalUsage.output_tokens += subResult.usage.output_tokens;
+        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
+        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
+        totalUsage.cost_usd += subResult.usage.cost_usd;
+        lastOutput = subResult.output;
+        completeTask(taskList, taskId);
+        await this.persistTaskList(sessionId, taskList);
+        emit(onStream, { kind: "final_response", content: lastOutput });
+      } else if (subResult != null && subResult.kind === "failure") {
+        totalUsage.input_tokens += subResult.usage.input_tokens;
+        totalUsage.output_tokens += subResult.usage.output_tokens;
+        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
+        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
+        totalUsage.cost_usd += subResult.usage.cost_usd;
+        updateTask(taskList, taskId, "blocked");
+        await this.persistTaskList(sessionId, taskList);
+        const terminalReason: HaltReason =
+          subResult.reason.kind === "budget_exceeded"
+            ? subResult.reason
+            : {
+                kind: "step_failed",
+                task_index: index,
+                task: taskList.tasks[index]!.description,
+                reason: haltReasonToString(subResult.reason),
+              };
+        return {
+          kind: "failure",
+          reason: terminalReason,
+          session_id: sessionId,
+          usage: totalUsage,
+          turns: subResult.turns,
+          session_state: lastState,
+        };
+      } else if (subResult != null) {
+        return subResult;
+      } else {
+        return {
+          kind: "failure",
+          reason: {
+            kind: "step_failed",
+            task_index: index,
+            task: taskList.tasks[index]!.description,
+            reason: "execute sub-strategy produced no terminal",
+          },
+          session_id: sessionId,
+          usage: totalUsage,
+          turns: sharedCarried.turns,
+          session_state: lastState,
+        };
+      }
+    }
+
+    return {
+      kind: "success",
+      output: lastOutput,
+      session_id: sessionId,
+      usage: totalUsage,
+      turns: sharedCarried.turns,
+      session_state: lastState,
+    };
   }
 
   /** {@inheritDoc StrategyExecutor.selfVerifyingLoop} */
@@ -1126,137 +1329,6 @@ export class StandardHarness implements Harness, StrategyExecutor {
   // --------------------------------------------------------------------------
 
   /**
-   * Drive the `plan_execute` strategy (issue #59) — the two-phase loop.
-   *
-   * ## Phases
-   * 1. **Plan phase** (issue #70, runs EXACTLY ONCE): {@link runPlanPhase} seeds
-   *    a planning directive, runs one constrained planner turn, captures a
-   *    {@link PlanArtifact}, fires `on_plan_created`, and counts the turn against
-   *    the shared budget.
-   * 2. **Execute phase** (issue #59, loops): {@link runExecutePhase} drains the
-   *    task list, running each task in a bounded ReAct sub-loop that BUILDS ON
-   *    the accumulated execute-phase context (prior steps' tool results and
-   *    assistant outputs carry forward).
-   *
-   * Between the phases the artifact is parsed into a {@link TaskList} via
-   * `planArtifactToTaskList` and persisted through the storage seam (Q4) plus
-   * the `extras` mirror.
-   *
-   * ## Resolved spec decisions (issue #59 — all FINAL)
-   * - **Q1:** each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON
-   *   the accumulated execute-phase context — after each successful step its
-   *   conversation (instruction + tool calls + tool results + assistant output)
-   *   is folded back into the shared session, so the next step sees all prior
-   *   steps' results. Steps stay SEQUENTIAL (task N completes before N+1). The
-   *   shared budget still gates: the per-task turn cap is derived at the START of
-   *   each step: `per_task_turns = floor(remaining_turns / remaining_tasks)`,
-   *   floored at 1 (`remaining_tasks` counts the not-yet-started tasks including
-   *   the current one). The shared budget — turns, tokens, observability spans,
-   *   compaction — is carried across EVERY step and the global budget is the hard
-   *   stop.
-   * - **Q2:** on success `output` is the LAST completed step's `final_response`
-   *   text — not a concatenation, not the plan rationale.
-   * - **Q3:** an empty task list ⇒ {@link HaltReason} `empty_plan`.
-   * - **Q4:** the task list / plan are persisted through the {@link StorageProvider}
-   *   / `RunStore` seam ONLY; the #71 sandbox path (`.spore/task_list.json`) is
-   *   NOT used by the execute loop. The `extras` mirror is kept.
-   * - **Q5:** a step's sub-loop erroring or returning a blocked/failed outcome
-   *   ABORTS the whole run with {@link HaltReason} `step_failed`; execution does
-   *   NOT continue to the next task.
-   *
-   * The removed `execute_phase_not_implemented` halt no longer exists. On any
-   * plan-phase failure the underlying `failure` `RunResult` is returned
-   * unchanged (no task list persisted). Like `runReact`, finalizes
-   * observability for the terminal outcome.
-   */
-  private async runPlanExecute(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<RunResult> {
-    const sessionId = task.session_id;
-
-    // ── Phase 1: plan (runs exactly once) ───────────────────────────────────
-    const outcome = await this.runPlanPhase(task, sessionState, budgetUsed, onStream, signal);
-    if (!outcome.ok) {
-      // Plan-phase failure: propagate unchanged (no task list persisted).
-      await this.finalizePlanExecute(outcome.failure);
-      return outcome.failure;
-    }
-
-    // Bridge: parse the accepted plan into a TaskList (#72).
-    const taskList = planArtifactToTaskList(outcome.artifact);
-
-    // Q3: an empty plan is a failure, not a silent success.
-    if (taskList.tasks.length === 0) {
-      const result: RunResult = {
-        kind: "failure",
-        reason: { kind: "empty_plan" },
-        session_id: sessionId,
-        usage: outcome.usage,
-        turns: outcome.turns,
-      };
-      await this.finalizePlanExecute(result);
-      return result;
-    }
-
-    // Q4: persist the task list through the storage seam (RunStore) ONLY, plus
-    // the extras mirror. The #71 sandbox path is intentionally unused.
-    await this.persistTaskList(sessionId, taskList);
-
-    // Carry the shared budget forward: the plan turn already consumed
-    // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
-    const carried: BudgetSnapshot = { ...budgetUsed };
-    carried.turns = outcome.turns;
-    carried.input_tokens += outcome.usage.input_tokens;
-    carried.output_tokens += outcome.usage.output_tokens;
-
-    // ── Phase 2: execute (loops over the task list) ─────────────────────────
-    const result = await this.runExecutePhase(
-      task,
-      sessionState,
-      taskList,
-      carried,
-      outcome.usage,
-      onStream,
-      signal,
-    );
-    await this.finalizePlanExecute(result);
-    return result;
-  }
-
-  /**
-   * Finalize observability for a terminal PlanExecute outcome. Mirrors the tail
-   * of {@link runReact}: `waiting_for_human` is not terminal and is never
-   * flushed here.
-   */
-  private async finalizePlanExecute(result: RunResult): Promise<void> {
-    switch (result.kind) {
-      case "success":
-        await this.finalizeObservability(result.session_id, { kind: "success" });
-        break;
-      case "failure":
-        await this.finalizeObservability(result.session_id, {
-          kind: "failure",
-          reason: haltReasonToString(result.reason),
-        });
-        break;
-      case "waiting_for_human":
-        break;
-      // Consult (issue #114) is non-terminal; do not finalize.
-      case "consult":
-        break;
-      case "escalate":
-        // Escalation propagated from an execute step (#80) is a clean terminal
-        // outcome; finalize with the dedicated `escalated` outcome.
-        await this.finalizeObservability(result.session_id, { kind: "escalated" });
-        break;
-    }
-  }
-
-  /**
    * Persist the parsed {@link TaskList} for the run (Q4). The DURABLE write goes
    * through the `RunStore` seam under `TASK_LIST_EXTRAS_KEY`; the #71
    * sandbox-filesystem path (`.spore/task_list.json`) is intentionally NOT used
@@ -1285,461 +1357,48 @@ export class StandardHarness implements Harness, StrategyExecutor {
   }
 
   /**
-   * Drive the PlanExecute execute phase (issue #59), draining `taskList`.
-   *
-   * Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
-   * accumulated execute-phase context: after each successful step its resulting
-   * conversation (instruction + tool calls + tool results + assistant output) is
-   * folded back into the shared `sessionState`, so the next step's sub-loop
-   * (which clones `sessionState`) sees every prior step's results. The per-task
-   * turn cap is derived at the START of each step from the shared budget:
-   * `per_task_turns = floor(remaining_turns / remaining_tasks)`, floored at 1
-   * (`remaining_tasks` counts not-yet-started tasks including the current one).
-   * The shared budget snapshot (`carried`) is threaded through every step so
-   * early tasks cannot starve later ones and the global budget stays the hard
-   * stop.
-   *
-   * Before each step the task is marked `in_progress` (and `completed` after),
-   * the list is re-persisted (Q4), and `on_task_advance` fires with the correct
-   * `task_index` / `total_tasks` (the hook may rewrite the step instruction).
-   *
-   * Q2: on success `output` is the LAST completed step's `final_response`.
-   * Q5: a step that errors / blocks aborts the run with `step_failed` — no
-   * further tasks run.
-   *
-   * `planUsage` seeds the cumulative {@link AggregateUsage} with the plan turn's
-   * usage so the terminal `RunResult` reflects the WHOLE run.
+   * A.6 deep-resume reconcile (#124, Q2): mark every task already `completed` on
+   * the DURABLE RunStore checkpoint as `completed` in the freshly-parsed
+   * `taskList` so it is NOT re-run. Tasks are matched by `id` (the list is
+   * regenerated deterministically from the same plan artifact). A checkpoint read
+   * hiccup must not block a fresh execute run.
    */
-  private async runExecutePhase(
-    task: Task,
-    sessionState: SessionState,
-    taskList: TaskList,
-    carried: BudgetSnapshot,
-    planUsage: AggregateUsage,
-    onStream: StreamSink | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<RunResult> {
-    const sessionId = task.session_id;
-
-    // A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
-    // already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
-    // after every step (Q4). On a resumed run the freshly-parsed `taskList`
-    // (from the plan artifact) is reconciled with that checkpoint so already-
-    // Completed tasks are NOT re-run — serialize→reset→resume rather than the
-    // old shallow no-op. Tasks are matched by `id` (the list is regenerated
-    // deterministically from the same artifact).
+  private async reconcileDeepResume(sessionId: SessionId, taskList: TaskList): Promise<void> {
     try {
       const saved = await this.storage().run().get(sessionId, TASK_LIST_EXTRAS_KEY);
-      if (saved != null) {
-        const parsed = TaskListSchema.safeParse(saved);
-        if (parsed.success) {
-          const completed = new Set(
-            parsed.data.tasks.filter((s) => s.status === "completed").map((s) => s.id),
-          );
-          for (const t of taskList.tasks) {
-            if (completed.has(t.id)) {
-              t.status = "completed";
-            }
-          }
+      if (saved == null) return;
+      const parsed = TaskListSchema.safeParse(saved);
+      if (!parsed.success) return;
+      const completed = new Set(
+        parsed.data.tasks.filter((s) => s.status === "completed").map((s) => s.id),
+      );
+      for (const t of taskList.tasks) {
+        if (completed.has(t.id)) {
+          t.status = "completed";
         }
       }
     } catch {
       // A checkpoint read hiccup must not block a fresh execute run.
     }
-
-    const totalTasks = taskList.tasks.length;
-    // Cumulative usage across the plan turn + every execute step (Q1).
-    const totalUsage: AggregateUsage = { ...planUsage };
-    // Q2: the success handle is the LAST completed step's final text.
-    let lastOutput = "";
-    // Issue #102: the post-run conversation history threaded into the terminal
-    // result is the LAST step's sub-loop history (each step runs on a clone),
-    // seeded with the plan-phase session so an empty/all-skipped plan still
-    // carries the planning turns forward. Mirrors Rust's `last_state`.
-    let lastState: SessionState = sessionState;
-    // Global turn cap (the hard stop). `null` ⇒ no global turn ceiling.
-    const globalMaxTurns = task.budget.max_turns ?? null;
-
-    for (let index = 0; index < totalTasks; index += 1) {
-      const taskId = taskList.tasks[index]!.id;
-      const instruction = taskList.tasks[index]!.description;
-
-      // A.6 deep-resume: a task already Completed on the durable checkpoint is
-      // NOT re-run — its instruction stays the last-completed output handle.
-      if (taskList.tasks[index]!.status === "completed") {
-        lastOutput = instruction;
-        continue;
-      }
-
-      // Q1: per-task turn allocation, derived at the START of this step.
-      // remaining_tasks = not-yet-started tasks including this one.
-      const remainingTasks = totalTasks - index;
-      let perTaskTurns: number;
-      if (globalMaxTurns != null) {
-        const remainingTurns = Math.max(globalMaxTurns - carried.turns, 0);
-        perTaskTurns = Math.max(Math.floor(remainingTurns / remainingTasks), 1);
-      } else {
-        // No global turn cap: the sub-loop is bounded only by the other
-        // (token / wall / cost) budget gates.
-        perTaskTurns = Number.MAX_SAFE_INTEGER;
-      }
-      // The sub-loop's effective cap is RELATIVE to the carried turns:
-      // runReactInner gates on the cumulative `budgetUsed.turns`, so a per-task
-      // cap of K means "stop K turns from now" while the global budget (carried
-      // forward) remains the hard stop.
-      const subLoopCap =
-        perTaskTurns === Number.MAX_SAFE_INTEGER
-          ? Number.MAX_SAFE_INTEGER
-          : carried.turns + perTaskTurns;
-
-      // Mark in_progress (pending -> in_progress) and re-persist (Q4).
-      updateTask(taskList, taskId, "in_progress");
-      await this.persistTaskList(sessionId, taskList);
-
-      // Fire on_task_advance (pre, mutable). The hook may rewrite the step's
-      // instruction via the carried Task; the (possibly mutated) instruction
-      // seeds the sub-loop.
-      const stepTask: Task = {
-        id: task.id,
-        instruction,
-        session_id: sessionId,
-        budget: task.budget,
-        loop_strategy: task.loop_strategy,
-      };
-      if (this.config.hooks) {
-        const ctx: HookContext = {
-          event: "on_task_advance",
-          session_id: sessionId,
-          task: stepTask,
-          task_index: index,
-          total_tasks: totalTasks,
-        };
-        try {
-          await this.config.hooks.fire(ctx, signal);
-        } catch {
-          // Hook errors are non-fatal; the step proceeds with the current task.
-        }
-      }
-
-      // Seed the (possibly mutated) step instruction as a user message, then run
-      // the bounded ReAct sub-loop carrying the shared budget (Q1). The sub-loop
-      // works on a CLONE of the accumulated session; on success the clone's
-      // resulting state is folded back into `sessionState` so the NEXT step
-      // builds on this step's tool results and assistant output.
-      await this.config.contextManager.appendUserMessage(sessionState, stepTask.instruction);
-      const subState: SessionState = {
-        messages: [...sessionState.messages],
-        extras: { ...sessionState.extras },
-      };
-      const subBudget: BudgetSnapshot = { ...carried };
-
-      const subResult = await this.runReactInner(
-        stepTask,
-        subLoopCap,
-        subState,
-        subBudget,
-        onStream,
-        signal,
-        false,
-      );
-
-      if (subResult.kind === "success") {
-        // Carry the shared budget forward (Q1): cumulative turns are the
-        // sub-loop's absolute count; fold in its token usage.
-        carried.turns = subResult.turns;
-        carried.input_tokens += subResult.usage.input_tokens;
-        carried.output_tokens += subResult.usage.output_tokens;
-        totalUsage.input_tokens += subResult.usage.input_tokens;
-        totalUsage.output_tokens += subResult.usage.output_tokens;
-        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
-        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
-        totalUsage.cost_usd += subResult.usage.cost_usd;
-        lastOutput = subResult.output;
-        // Fold this step's resulting conversation back into the SHARED execute
-        // context so the NEXT step's sub-loop (which clones `sessionState`)
-        // builds on this step's tool results and assistant output, not just its
-        // instruction. The returned step state already contains this step's
-        // instruction + tool calls + tool results + final output.
-        const stepState = runResultSessionState(subResult);
-        sessionState.messages = stepState.messages;
-        sessionState.extras = stepState.extras;
-        // The terminal RunResult carries the LAST completed step's full state
-        // (now the accumulated context, Q2/#102). Snapshot it so a later step's
-        // seeded user message cannot retroactively mutate this result.
-        lastState = {
-          messages: [...sessionState.messages],
-          extras: { ...sessionState.extras },
-        };
-
-        // Mark completed and re-persist (Q4).
-        completeTask(taskList, taskId);
-        await this.persistTaskList(sessionId, taskList);
-        // Surface the completed step's final text to the caller's sink — the
-        // parent-visible step boundary.
-        emit(onStream, { kind: "final_response", content: lastOutput });
-      } else if (subResult.kind === "failure") {
-        // Q5: any non-success step aborts the whole run. A budget halt surfaces
-        // as budget_exceeded (mid-execute exhaustion); other failures surface as
-        // step_failed carrying the step context.
-        totalUsage.input_tokens += subResult.usage.input_tokens;
-        totalUsage.output_tokens += subResult.usage.output_tokens;
-        totalUsage.cache_read_tokens += subResult.usage.cache_read_tokens;
-        totalUsage.cache_write_tokens += subResult.usage.cache_write_tokens;
-        totalUsage.cost_usd += subResult.usage.cost_usd;
-
-        updateTask(taskList, taskId, "blocked");
-        await this.persistTaskList(sessionId, taskList);
-
-        const terminalReason: HaltReason =
-          subResult.reason.kind === "budget_exceeded"
-            ? subResult.reason
-            : {
-                kind: "step_failed",
-                task_index: index,
-                task: taskList.tasks[index]!.description,
-                reason: haltReasonToString(subResult.reason),
-              };
-        return {
-          kind: "failure",
-          reason: terminalReason,
-          session_id: sessionId,
-          usage: totalUsage,
-          turns: subResult.turns,
-          session_state: lastState,
-        };
-      } else {
-        // A step surfacing to a human pauses the whole run; propagate.
-        return subResult;
-      }
-    }
-
-    // Q2: success output is the LAST completed step's final_response text.
-    return {
-      kind: "success",
-      output: lastOutput,
-      session_id: sessionId,
-      usage: totalUsage,
-      turns: carried.turns,
-      session_state: lastState,
-    };
   }
 
   /**
-   * Run the one-shot `plan_execute` plan phase (issue #70).
-   *
-   * Selects the planner agent (Q1: {@link HarnessConfig.plannerAgent} if set,
-   * else the default agent), seeds a planning directive as a user message, runs
-   * EXACTLY ONE constrained turn (R1), expects a `final_response` (a tool call
-   * is a planning failure — R2 — never a dispatch loop), captures the response
-   * via {@link capturePlanArtifact} (R3), fires `on_plan_created` (which may
-   * rewrite the artifact — R11), stores the result in `extras["plan_execute"]`
-   * (R4), emits the turn span (R8), and counts the turn against the shared
-   * budget (R7). A budget exhausted before the turn returns a budget-exceeded
-   * `failure` with no artifact stored (R10).
-   *
-   * On success resolves `{ ok: true, artifact, usage, turns }`. On any failure
-   * resolves `{ ok: false, failure }` with the terminal `failure` `RunResult`.
+   * Capture + persist a {@link PlanArtifact} from the plan child's output text
+   * (#124): R3 (parse), R11 (fire `on_plan_created`, mutable), R4 (persist to the
+   * RunStore under `PLAN_EXECUTE_EXTRAS_KEY`). The model turn that produced
+   * `planOutput` ran elsewhere — the recursive `plan.run(cx)` child — so this
+   * carries no agent call. Returns the captured artifact + accounting on success,
+   * or a terminal `failure` `RunResult` to propagate.
    */
-  private async runPlanPhase(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
+  private async captureAndPersistPlan(
+    sessionId: SessionId,
+    planOutput: string,
+    usage: AggregateUsage,
+    turns: number,
     signal: AbortSignal | undefined,
-  ): Promise<
-    | { ok: true; artifact: PlanArtifact; usage: AggregateUsage; turns: number }
-    | { ok: false; failure: RunResult }
-  > {
-    const sessionId = task.session_id;
-    const startedAt = Date.now();
-    const usage: AggregateUsage = emptyAggregateUsage();
-    const pricing = this.config.pricing ?? PricingTable.DEFAULT;
-
-    // R10: Layer-1 budget gate BEFORE the plan turn. Mirrors runReactInner.
-    const taskMaxTurns = task.budget.max_turns ?? undefined;
-    const effectiveTurnCap =
-      taskMaxTurns != null ? Math.max(taskMaxTurns, 1) : Number.MAX_SAFE_INTEGER;
-    if (budgetUsed.turns >= effectiveTurnCap) {
-      return {
-        ok: false,
-        failure: failure(
-          { kind: "budget_exceeded", limit_type: "turns" },
-          sessionId,
-          usage,
-          budgetUsed.turns,
-        ),
-      };
-    }
-    const overrun = budgetExceeded(task.budget, budgetUsed, startedAt);
-    if (overrun != null) {
-      return {
-        ok: false,
-        failure: failure(
-          { kind: "budget_exceeded", limit_type: overrun },
-          sessionId,
-          usage,
-          budgetUsed.turns,
-        ),
-      };
-    }
-
-    // Q1: select the planner agent (alternate if configured, else default).
-    const planner = this.config.plannerAgent ?? this.config.agent;
-
-    // Seed the planning directive as a user message (reuse ContextManager).
-    // CRITICAL (#93): the directive must NOT mutate the SHARED `sessionState`.
-    // That same state is threaded into the execute phase, where each subtask
-    // sub-loop assembles its context from it. If the directive leaked in,
-    // every execute step would still see "respond with {tasks, rationale}"
-    // and an instruction-following model would re-emit a plan instead of
-    // calling tools. Append to a throwaway CLONE so the plan turn sees the
-    // directive while the shared state stays `[user: task.instruction]`.
-    const directive =
-      "Produce a step-by-step plan for the following task. Respond with a " +
-      'single JSON object: {"tasks": [<ordered step strings>], ' +
-      '"rationale": <string>}.\n\nTask:\n' +
-      task.instruction;
-    const planState = structuredClone(sessionState);
-    await this.config.contextManager.appendUserMessage(planState, directive);
-
-    // Assemble + invoke the planner for exactly ONE turn (R1).
-    const context = await this.config.contextManager.assemble(planState, task, signal);
-    // Per-run model params win unconditionally (issue #93) — same seam as
-    // runReactInner, before the plan turn is dispatched.
-    context.params = this.config.modelParams;
-    emit(onStream, { kind: "turn_start", turn: budgetUsed.turns + 1 });
-    const turnStartedAt = Timestamp.now();
-    const turnClock = Date.now();
-    // Issue #103: stream the plan turn's deltas when a sink is attached.
-    const result = onStream
-      ? await turnStreaming(
-          planner,
-          context,
-          ((): AgentStreamSink => {
-            const streamState = new TurnStreamState();
-            return (ev) => {
-              for (const mapped of mapModelStreamEvent(ev, streamState)) {
-                emit(onStream, mapped);
-              }
-            };
-          })(),
-          signal,
-        )
-      : await planner.turn(context, signal);
-    budgetUsed.turns += 1; // R7: the plan turn counts against the budget.
-
-    // R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
-    // of runReactInner; content capture intentionally omitted (the plan turn
-    // carries no tool calls and #64 content capture is wired in the ReAct loop).
-    {
-      const zero: TokenUsage = { input_tokens: 0, output_tokens: 0 };
-      const u =
-        result.kind === "tool_call_requested" || result.kind === "final_response"
-          ? result.usage
-          : (result.usage ?? zero);
-      let stopReason: StopReason;
-      let toolCallsRequested: number;
-      switch (result.kind) {
-        case "final_response":
-          stopReason = "end_turn";
-          toolCallsRequested = 0;
-          break;
-        case "tool_call_requested":
-          stopReason = "tool_use";
-          toolCallsRequested = result.calls.length;
-          break;
-        default:
-          stopReason = "end_turn";
-          toolCallsRequested = 0;
-          break;
-      }
-      const status: SpanStatus =
-        result.kind === "error"
-          ? { kind: "error", message: JSON.stringify(result.error) }
-          : { kind: "ok" };
-      const base = finishSpanBase(
-        newRootSpanBase(
-          SpanId.of(`${sessionId.asString()}-turn-${budgetUsed.turns}`),
-          sessionId,
-          task.id,
-          "turn",
-          turnStartedAt,
-        ),
-        Timestamp.now(),
-        status,
-        Date.now() - turnClock,
-      );
-      if (this.config.observability) {
-        const turnSpan: TurnSpan = {
-          base,
-          turn_number: budgetUsed.turns,
-          input_tokens: u.input_tokens,
-          output_tokens: u.output_tokens,
-          cache_read_tokens: u.cache_read_tokens ?? null,
-          cache_write_tokens: u.cache_write_tokens ?? null,
-          cost_usd: PricingTable.costFor(
-            pricing,
-            u.input_tokens,
-            u.output_tokens,
-            u.cache_read_tokens,
-            u.cache_write_tokens,
-          ),
-          stop_reason: stopReason,
-          tool_calls_requested: toolCallsRequested,
-          output_text: null,
-          tool_calls: null,
-          input_messages: null,
-        };
-        this.config.observability.emitTurn(turnSpan);
-      }
-    }
-    emit(onStream, { kind: "turn_end", turn: budgetUsed.turns });
-
-    // Classify the one-shot turn. R2: a tool call is a planning failure, NOT a
-    // dispatch loop.
-    let finalText: string;
-    switch (result.kind) {
-      case "final_response":
-        addTurnUsage(usage, result.usage);
-        budgetUsed.input_tokens += result.usage.input_tokens;
-        budgetUsed.output_tokens += result.usage.output_tokens;
-        finalText = result.content;
-        break;
-      case "tool_call_requested": {
-        addTurnUsage(usage, result.usage);
-        const error = PlanPhaseError.planningTurnFailed(
-          "planner requested a tool call in the one-shot plan turn",
-        );
-        return {
-          ok: false,
-          failure: failure(
-            { kind: "plan_phase_failed", error: error.detail },
-            sessionId,
-            usage,
-            budgetUsed.turns,
-          ),
-        };
-      }
-      case "error": {
-        if (result.usage != null) addTurnUsage(usage, result.usage);
-        return {
-          ok: false,
-          failure: failure(
-            { kind: "agent_error", error: result.error },
-            sessionId,
-            usage,
-            budgetUsed.turns,
-          ),
-        };
-      }
-      default: {
-        const _exhaustive: never = result;
-        return _exhaustive;
-      }
-    }
-
+  ): Promise<PlanPhaseOutcome> {
     // R3: capture the artifact from the response text.
-    const captured = capturePlanArtifact(finalText);
+    const captured = capturePlanArtifact(planOutput);
     if (!captured.ok) {
       return {
         ok: false,
@@ -1747,15 +1406,15 @@ export class StandardHarness implements Harness, StrategyExecutor {
           { kind: "plan_phase_failed", error: captured.error.detail },
           sessionId,
           usage,
-          budgetUsed.turns,
+          turns,
         ),
       };
     }
+
     // R11: fire on_plan_created synchronously; the hook may rewrite the artifact
-    // — either by mutating it in place OR by returning a `mutate` decision that
-    // reassigns `ctx.plan` to a new object. Read the final value back off `ctx`
-    // so either path is honored. Errors are non-fatal: a successfully-captured
-    // plan is not lost to a handler error.
+    // — either in place OR by reassigning `ctx.plan`. Read the final value back
+    // off `ctx` so either path is honored. Errors are non-fatal: a successfully-
+    // captured plan is not lost to a handler error.
     const ctx: HookContext = {
       event: "on_plan_created",
       session_id: sessionId,
@@ -1771,11 +1430,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const artifact: PlanArtifact = ctx.plan;
 
     // R4: persist the produced artifact to the RunStore seam under
-    // PLAN_EXECUTE_EXTRAS_KEY as a JSON value (the stable cross-language shape:
-    // `{ tasks, rationale }`). #76 — the durable single source of truth; no
-    // longer mirrored into SessionState.extras. The put failure is swallowed
-    // (matching persistTaskList): a successfully-captured plan must not be lost
-    // to a storage hiccup (the default no-op / in-memory provider never fails).
+    // PLAN_EXECUTE_EXTRAS_KEY (the stable cross-language `{ tasks, rationale }`
+    // shape). #76 — the durable single source of truth, no longer mirrored into
+    // SessionState.extras. The put failure is swallowed (matching persistTaskList):
+    // a successfully-captured plan must not be lost to a storage hiccup.
     try {
       await this.storage().run().put(sessionId, PLAN_EXECUTE_EXTRAS_KEY, {
         tasks: artifact.tasks,
@@ -1785,7 +1443,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // Durable write failure is non-fatal.
     }
 
-    return { ok: true, artifact, usage, turns: budgetUsed.turns };
+    return { ok: true, artifact, usage, turns };
   }
 
   /**
