@@ -52,11 +52,16 @@ interface Case {
   expected: { kind: "success" | "exhausted" | "misconfigured"; iterations?: number };
 }
 
+// #125: per-node enforcement is now genuine, so the build leaf must be
+// UNBOUNDED (matching the Rust `self_verifying_task`'s `react_structured(MAX)`
+// inner). With a tight `per_loop` cap the carried budget would make the leaf's
+// own cap bind on the 2nd build iteration and propagate a budget_exhausted —
+// the verdict sequence (not the leaf cap) is what these cases exercise.
 const SV_STRATEGY: LoopStrategy = {
   kind: "self_verifying",
   inner: {
     kind: "react",
-    budget: { kind: "per_loop", value: 1 },
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
     agent: "",
     toolset: "",
     output: "",

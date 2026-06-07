@@ -220,11 +220,15 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
   });
 
-  it("per-task turn allocation + shared budget carried forward (Q1)", async () => {
-    // Global cap 7; plan turn (1) spent ⇒ 3 tasks split the remaining 6 turns
-    // (2 each). Task "a" makes 2 tool calls without finishing, so its sub-loop
-    // hits the per-task cap (turn budget) and the run aborts — proving both the
-    // allocation and the carried budget.
+  it("no per-task turn cap; step runs dry → step_failed (#125)", async () => {
+    // #125: the OLD Q1 per-task turn allocation (`remaining_turns /
+    // remaining_tasks`, cutting task `a` off at 2 of a 7-turn budget) is REMOVED
+    // as dead logic. Enforcement is now charge-based on the PlanExecute scope's
+    // global `total_steps`, NOT divided per task. With the same setup — global cap
+    // 7, plan spends 1 — task `a` is NO LONGER capped at 2 turns: it runs its 2
+    // tool turns then runs dry (no 3rd scripted turn), so the run fails as a STEP
+    // failure (not a per-task budget cap). This asserts the per-task derivation
+    // is gone.
     const a = new RecordingAgent(AgentId.of("default"))
       .push(fr('{"tasks":["a","b","c"]}'))
       .push(tcr())
@@ -236,11 +240,10 @@ describe("PlanExecute execute phase (issue #59)", () => {
     const r = await h.run({ task: planTask(7) });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      // The per-task cap is a turn budget; the sub-loop hits the turn gate which
-      // surfaces as budget_exceeded(turns) routed through the execute phase.
-      expect(r.reason.kind).toBe("budget_exceeded");
-      if (r.reason.kind === "budget_exceeded") expect(r.reason.limit_type).toBe("turns");
-      expect(r.turns).toBe(3); // 1 plan + 2 task-a turns (shared budget carried)
+      // NOT a per-task budget_exceeded(turns) cut at 2 turns — the derivation is
+      // gone. Task `a` runs past 2 turns under the global ceiling and fails as a
+      // STEP failure when the agent runs dry.
+      expect(r.reason.kind).toBe("step_failed");
     }
   });
 

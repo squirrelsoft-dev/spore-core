@@ -189,6 +189,16 @@ export const BudgetExhaustedBehaviorSchema: z.ZodType<BudgetExhaustedBehavior> =
   ]),
 );
 
+/**
+ * The per-scope step allowance carried by a {@link BudgetPolicy} (`undefined`
+ * for `unlimited`). Shared by {@link BudgetContext.charge}'s allowance and the
+ * leaf cap-binding check in {@link runReactConfig} (#125). Mirrors Rust
+ * `BudgetPolicy::allowance_value`.
+ */
+export function budgetPolicyAllowanceValue(policy: BudgetPolicy): number | undefined {
+  return policy.kind === "unlimited" ? undefined : policy.value;
+}
+
 /** Parse a JSON value into a {@link BudgetPolicy}, rejecting unknown variants. */
 export function budgetPolicyFromJson(value: unknown): BudgetPolicy {
   return BudgetPolicySchema.parse(value);
@@ -662,16 +672,24 @@ export type StrategyOutcome =
 export class BudgetContext {
   stepsTaken = 0;
   continuesUsed = 0;
+  /**
+   * Mutable on the {@link resolveExhausted} fall-through path: when a `continue`
+   * scope's continues are spent it ADOPTS the boxed `on_exhausted` behavior so
+   * subsequent resolutions see the post-fall-through behavior (#125).
+   */
+  behavior: BudgetExhaustedBehavior;
 
   constructor(
     readonly policy: BudgetPolicy,
-    readonly behavior: BudgetExhaustedBehavior,
+    behavior: BudgetExhaustedBehavior,
     readonly phase: string,
-  ) {}
+  ) {
+    this.behavior = behavior;
+  }
 
   /** The per-scope step allowance (`undefined` for `unlimited`). */
   private allowance(): number | undefined {
-    return this.policy.kind === "unlimited" ? undefined : this.policy.value;
+    return budgetPolicyAllowanceValue(this.policy);
   }
 
   /**
@@ -718,7 +736,69 @@ export class BudgetContext {
       ? Math.max(0, this.behavior.max_continues - this.continuesUsed)
       : 0;
   }
+
+  /**
+   * Grant one in-process continue (#125): bump `continuesUsed` and RESET
+   * `stepsTaken` to 0 so the scope's step allowance refreshes for the next
+   * round. A purely in-memory reset — the session / messages are untouched (the
+   * loop keeps the same conversation; only the per-scope step counter rewinds).
+   * `continuesUsed` persistence across a serialized checkpoint is DEFERRED to
+   * #129. Mirrors Rust `BudgetContext::consume_continue`.
+   */
+  consumeContinue(): void {
+    this.continuesUsed += 1;
+    this.stepsTaken = 0;
+  }
+
+  /**
+   * Resolve this scope's {@link BudgetExhaustedBehavior} at the moment of
+   * exhaustion (#125), walking the on-exhausted fall-through chain:
+   *
+   *   - `fail`     → {@link ExhaustedResolution} `fail`.
+   *   - `escalate` → {@link ExhaustedResolution} `escalate`.
+   *   - `continue { max_continues, on_exhausted }`:
+   *       - if {@link continuesRemaining} `> 0`: {@link consumeContinue} (reset
+   *         counter, bump `continuesUsed`) and return `continue`;
+   *       - otherwise the continues are spent: ADOPT the nested `on_exhausted`
+   *         behavior as this scope's behavior and recurse into it (the
+   *         fall-through), so a `continue { on_exhausted: escalate }` whose
+   *         continues are spent resolves to `escalate`.
+   *
+   * Mutates `this`: on a granted continue the counter resets; on fall-through
+   * `this.behavior` is replaced by the nested behavior so subsequent resolutions
+   * see the post-fall-through behavior. Mirrors Rust
+   * `BudgetContext::resolve_exhausted`.
+   */
+  resolveExhausted(): ExhaustedResolution {
+    switch (this.behavior.kind) {
+      case "fail":
+        return "fail";
+      case "escalate":
+        return "escalate";
+      case "continue":
+        if (this.continuesRemaining() > 0) {
+          this.consumeContinue();
+          return "continue";
+        }
+        // Continues spent — fall through to the nested behavior.
+        this.behavior = this.behavior.on_exhausted;
+        return this.resolveExhausted();
+    }
+  }
 }
+
+/**
+ * The runtime-only resolution of a {@link BudgetExhaustedBehavior} chain at the
+ * moment of exhaustion (#125). NOT serialized — purely a control-flow signal
+ * returned by {@link BudgetContext.resolveExhausted}.
+ *
+ *   - `continue` — the scope was granted an in-process continue (counter reset,
+ *     `continuesUsed` bumped); the caller loops again.
+ *   - `fail`     — terminate; `partialOutput = undefined` (discarded by contract).
+ *   - `escalate` — hand off to the parent; `partialOutput = <node JSON>` carries
+ *     the node-concrete partial.
+ */
+export type ExhaustedResolution = "continue" | "fail" | "escalate";
 
 /**
  * Runtime push/pop stack of {@link BudgetContext} scopes — one node per
@@ -1062,6 +1142,61 @@ export function newExecutionContext(registry: ExecutionRegistry): ExecutionConte
   };
 }
 
+// ── ExecutionContext budget-scope helpers (#125) ────────────────────────────
+//
+// `ExecutionContext` is an interface in TS, so the Rust `impl ExecutionContext`
+// budget methods become standalone functions over `cx.budgets`. Each node — even
+// a sibling — pushes its OWN scope (`stepsTaken = 0`), so a node capped at N
+// never spends a sibling's allowance (rule 1) and a child's exhaustion never
+// touches the parent scope (rule 4/7). `chargeCurrent` is the real enforcement
+// point; `resolveCurrent` walks the behavior chain at exhaustion.
+
+/**
+ * Push a fresh per-node {@link BudgetContext} scope for `policy`/`behavior`/
+ * `phase` onto `cx.budgets` (#125). Returns the depth AFTER the push (symmetry
+ * debugging). Mirrors Rust `ExecutionContext::push_budget`.
+ */
+export function pushBudget(
+  cx: ExecutionContext,
+  policy: BudgetPolicy,
+  behavior: BudgetExhaustedBehavior,
+  phase: string,
+): number {
+  cx.budgets.push(new BudgetContext(policy, behavior, phase));
+  return cx.budgets.depth();
+}
+
+/**
+ * Pop the current per-node budget scope (#125). Always paired with
+ * {@link pushBudget}. Mirrors Rust `ExecutionContext::pop_budget`.
+ */
+export function popBudget(cx: ExecutionContext): BudgetContext | undefined {
+  return cx.budgets.pop();
+}
+
+/**
+ * Charge `turns` steps against the CURRENT (innermost) budget scope (#125): the
+ * real enforcement point. `{ ok: true }` when within allowance; `{ ok: false,
+ * error }` carries the budget state at exhaustion. A node with no pushed scope
+ * (scaffold contexts) never exhausts — charging is a no-op `{ ok: true }`.
+ * Mirrors Rust `ExecutionContext::charge_current`.
+ */
+export function chargeCurrent(cx: ExecutionContext, turns: number): ChargeResult {
+  const scope = cx.budgets.current();
+  return scope === undefined ? { ok: true } : scope.charge(turns);
+}
+
+/**
+ * Resolve the current scope's exhaustion behavior (#125). Walks the chain
+ * (continue grants a reset; spent continues fall through). A node with no pushed
+ * scope resolves to `fail` (defensive — should not happen in a wired run).
+ * Mirrors Rust `ExecutionContext::resolve_current`.
+ */
+export function resolveCurrent(cx: ExecutionContext): ExhaustedResolution {
+  const scope = cx.budgets.current();
+  return scope === undefined ? "fail" : scope.resolveExhausted();
+}
+
 /**
  * The runtime composition seam: every strategy node knows how to run itself
  * given an {@link ExecutionContext}. The TS runtime-polymorphism idiom is one
@@ -1211,11 +1346,153 @@ async function finishCombinator(
   return outcome;
 }
 
+// ============================================================================
+// Per-node budget enforcement + failure isolation helpers (issue #125)
+// ============================================================================
+//
+// Makes {@link BudgetContext.charge} the REAL per-node enforcement point and a
+// {@link StrategyOutcome} `budget_exhausted` a real, isolated, parent-inspectable
+// value. The per-node partial shapes (rule 5) and the promotion boundary live
+// here. No new fixtures (fork #3): every type here is runtime-only.
+//
+// Resolved spec forks (DECIDED — do NOT re-litigate):
+//   - `escalate` carries `partialOutput = <node JSON>`; `fail` carries `undefined`.
+//   - `partialOutput` is a JSON string of the structured per-node partial.
+//   - `continuesUsed` persistence is DEFERRED to #129 — in-process continue ONLY.
+
+/**
+ * The last FinalResponse text from a ReAct window terminal (#125, fork #2): the
+ * `success.output`, or for a `failure` the last assistant text message on its
+ * post-run session state (the partial captured before exhaustion). `undefined`
+ * for non-terminal pauses. Mirrors Rust `last_final_response_text`.
+ */
+export function lastFinalResponseText(result: RunResult): string | undefined {
+  if (result.kind === "success") return result.output;
+  if (result.kind === "failure") {
+    const messages = result.session_state?.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i]!;
+      if (m.role === "assistant" && m.content.type === "text") return m.content.text;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * ReAct partial: the window's last FinalResponse text (#125, fork #2). Each node
+ * serializes its own shape; `fail` discards the partial entirely. Mirrors Rust
+ * `react_partial_json`.
+ */
+export function reactPartialJson(lastFinalResponse: string): string {
+  return JSON.stringify({ node: "react", last_final_response: lastFinalResponse });
+}
+
+/**
+ * PlanExecute partial: the task list + per-task statuses + ledger (#125, fork
+ * #2). `ledger` is the per-task `(id, description, status)` rows. Mirrors Rust
+ * `plan_execute_partial_json`.
+ */
+export function planExecutePartialJson(taskList: TaskList): string {
+  const ledger = taskList.tasks.map((t) => ({
+    id: String(t.id),
+    description: t.description,
+    status: t.status,
+  }));
+  return JSON.stringify({
+    node: "plan_execute",
+    tasks: taskList.tasks.length,
+    ledger,
+  });
+}
+
+/**
+ * SelfVerifying partial: the last worker result summary + the last verdict
+ * reason (#125, fork #2). Mirrors Rust `self_verifying_partial_json`.
+ */
+export function selfVerifyingPartialJson(lastWorkerOutput: string, lastVerdict: string): string {
+  return JSON.stringify({
+    node: "self_verifying",
+    last_worker_result: lastWorkerOutput,
+    last_verdict: lastVerdict,
+  });
+}
+
+/**
+ * HillClimbing partial: the best candidate value + its score (#125, fork #2).
+ * Mirrors Rust `hill_climbing_partial_json`.
+ */
+export function hillClimbingPartialJson(bestScore: number): string {
+  return JSON.stringify({ node: "hill_climbing", best_candidate: bestScore, score: bestScore });
+}
+
+/**
+ * Promote a charge-time {@link BudgetExhausted} to a {@link StrategyOutcome}
+ * `budget_exhausted` (#125 promotion boundary), attaching `partialOutput`. Per
+ * fork #1: an `escalate`-resolved exhaustion carries `<node JSON>`; a
+ * `fail`-resolved one carries `undefined`. Mirrors Rust `promote_budget_exhausted`.
+ */
+export function promoteBudgetExhausted(
+  err: BudgetExhausted,
+  partialOutput: string | undefined,
+): StrategyOutcome {
+  return {
+    kind: "budget_exhausted",
+    policy: err.policy,
+    behavior: err.behavior,
+    stepsTaken: err.stepsTaken,
+    continuesUsed: err.continuesUsed,
+    phase: err.phase,
+    partialOutput,
+  };
+}
+
+/**
+ * Snapshot the current budget scope as a {@link BudgetExhausted} (#125). Used by
+ * the combinators to surface their OWN typed exhaustion when a CHILD returned a
+ * `budget_exhausted` outcome (rule 4/7): the parent reads its own scope state
+ * rather than charging the child's exhaustion against itself. `fallback` is the
+ * defensive value when no scope is pushed (should not happen in a wired run).
+ */
+function currentBudgetExhausted(cx: ExecutionContext, fallback: BudgetExhausted): BudgetExhausted {
+  const scope = cx.budgets.current();
+  if (scope === undefined) return fallback;
+  return {
+    policy: scope.policy,
+    behavior: scope.behavior,
+    stepsTaken: scope.stepsTaken,
+    continuesUsed: scope.continuesUsed,
+    phase: scope.phase,
+  };
+}
+
+/** Derive the {@link BudgetPolicy} for a combinator scope from a task's global
+ *  `max_turns` ceiling: `total_steps` when capped, `unlimited` otherwise (#125). */
+function combinatorBudgetPolicy(maxTurns: number | null | undefined): BudgetPolicy {
+  return maxTurns != null ? { kind: "total_steps", value: maxTurns } : { kind: "unlimited" };
+}
+
+/** The in-process `escalate` placeholder behavior every wired `*Config` scope
+ *  pushes (#125): the serialized behavior field is forbidden by fork #3, so the
+ *  Continue/Fail/Escalate chain is exercised via the enforcement primitives. */
+const ESCALATE_PLACEHOLDER: BudgetExhaustedBehavior = { kind: "escalate" };
+
 /**
  * The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
  * (`task`, `runSession`, `runBudget`) and drives one ReAct window through the
  * executor primitive. The leaf takes the run's stream sink for the window
  * (combinators that recurse per-phase suppress it by taking it first).
+ *
+ * ## Budget enforcement (#125)
+ *
+ * The leaf pushes its OWN {@link BudgetContext} scope for `c.budget` and charges
+ * the turns the window consumed against it. Per Open Q A-2 (rule 6) the leaf
+ * does NOT carry its own behavior and NEVER self-resolves a continue/fail/escalate
+ * at the leaf — on charge exhaustion it PROPAGATES a {@link StrategyOutcome}
+ * `budget_exhausted` to its parent (which owns the single recovery site). The
+ * propagated `partialOutput` is the window's last FinalResponse text as JSON
+ * (fork #2). A clean (non-budget) terminal is recorded verbatim through
+ * {@link recordTerminal}.
  */
 async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<StrategyOutcome> {
   const executor = requireExecutor(cx);
@@ -1239,6 +1516,12 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     await executor.finalize(agent);
     return recordTerminal(cx, agent);
   }
+  // #125: push this leaf's OWN budget scope. The leaf carries only its POLICY
+  // (the cap); behavior is the `escalate` placeholder — the leaf never RESOLVES
+  // it (rule 6: propagate to parent), it is only the scope shape so the charge
+  // below enforces the cap and any exhaustion promotes to a parent-inspectable
+  // `budget_exhausted`.
+  pushBudget(cx, c.budget, ESCALATE_PLACEHOLDER, "react");
   const onStream = cx.stream;
   cx.stream = undefined;
   const result = await executor.reactWindow(
@@ -1251,6 +1534,42 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     agent,
   );
   await executor.finalize(result);
+
+  // #125: charge the window's turns against this leaf's OWN scope. The leaf
+  // POLICY (`c.budget`) — not the global BudgetLimits backstop — is the per-node
+  // enforcement point. When the LEAF cap is the binding constraint (the window
+  // consumed >= the leaf policy value), the leaf is exhausted and PROPAGATES a
+  // typed `budget_exhausted` to its parent (rule 6 — the leaf never self-resolves).
+  // When the smaller GLOBAL backstop trips first, the legacy `budget_exceeded`
+  // terminal is recorded VERBATIM (the global cap is unchanged, #117 backstop).
+  const windowTurns = result.kind === "success" || result.kind === "failure" ? result.turns : 0;
+  const windowHitBudget = result.kind === "failure" && result.reason.kind === "budget_exceeded";
+  const leafAllowance = budgetPolicyAllowanceValue(c.budget);
+  const leafCapBinding =
+    windowHitBudget && leafAllowance !== undefined && windowTurns >= leafAllowance;
+  const charge = chargeCurrent(cx, windowTurns);
+  if (leafCapBinding || !charge.ok) {
+    // The leaf partial is the window's last FinalResponse text.
+    const lastFinal = lastFinalResponseText(result) ?? "";
+    // Carry the post-run session so a parent resumes losslessly.
+    if (result.kind === "success" || result.kind === "failure") {
+      cx.scratch.runSession = result.session_state ?? emptySessionState();
+    }
+    const err: BudgetExhausted = !charge.ok
+      ? charge.error
+      : currentBudgetExhausted(cx, {
+          policy: c.budget,
+          behavior: ESCALATE_PLACEHOLDER,
+          stepsTaken: windowTurns,
+          continuesUsed: 0,
+          phase: "react",
+        });
+    popBudget(cx);
+    // Rule 6: the leaf PROPAGATES — partial carries the last FinalResponse
+    // (escalate semantics, fork #1/#2).
+    return promoteBudgetExhausted(err, reactPartialJson(lastFinal));
+  }
+  popBudget(cx);
   return recordTerminal(cx, result);
 }
 
@@ -1484,7 +1803,19 @@ async function runPlanExecuteConfig(
   const totalUsage: AggregateUsage = { ...outcome.usage };
   let lastOutput = "";
   let lastState: SessionState = emptySessionState();
-  const globalMaxTurns = task.budget.max_turns ?? null;
+
+  // #125: PlanExecute owns a budget scope for its execute phase. Its POLICY is
+  // the task's global turn ceiling (`total_steps`) — the root node's
+  // `total_steps` subsumes the OLD per-task `remaining_turns / remaining_tasks /
+  // step_cap` derivation, which is now DEAD and removed. Behavior is the
+  // `escalate` placeholder (the serialized behavior field is #129). Enforcement
+  // is now `charge`-based per node.
+  pushBudget(
+    cx,
+    combinatorBudgetPolicy(task.budget.max_turns),
+    ESCALATE_PLACEHOLDER,
+    "plan_execute",
+  );
 
   for (let index = 0; index < totalTasks; index += 1) {
     const taskId = taskList.tasks[index]!.id;
@@ -1496,26 +1827,6 @@ async function runPlanExecuteConfig(
       continue;
     }
 
-    // Q1: per-task turn allocation, derived at the START of the step.
-    const remainingTasks = totalTasks - index;
-    let perTaskTurns: number;
-    if (globalMaxTurns != null) {
-      const remainingTurns = Math.max(globalMaxTurns - carried.turns, 0);
-      perTaskTurns = Math.max(Math.floor(remainingTurns / remainingTasks), 1);
-    } else {
-      perTaskTurns = Number.MAX_SAFE_INTEGER;
-    }
-    // The sub-loop's effective cap is RELATIVE to the carried turns: a per-task
-    // cap of K means "stop K turns from now" while the GLOBAL budget (carried
-    // forward) remains the hard stop — so the step task's turn ceiling is
-    // `min(global, carried + per_task)`. An already-exhausted global budget thus
-    // budget-fails the step BEFORE the execute child calls the agent (Q1).
-    const subLoopCap =
-      perTaskTurns === Number.MAX_SAFE_INTEGER
-        ? Number.MAX_SAFE_INTEGER
-        : carried.turns + perTaskTurns;
-    const stepCap = globalMaxTurns != null ? Math.min(globalMaxTurns, subLoopCap) : subLoopCap;
-
     // Mark in_progress and re-persist (Q4).
     updateTask(taskList, taskId, "in_progress");
     await executor.persistTaskList(sessionId, taskList);
@@ -1526,7 +1837,7 @@ async function runPlanExecuteConfig(
       id: task.id,
       instruction,
       session_id: sessionId,
-      budget: { ...task.budget, max_turns: stepCap },
+      budget: { ...task.budget },
       loop_strategy: c.execute,
     };
     await executor.fireTaskAdvance(sessionId, stepTask, index, totalTasks, cx.signal);
@@ -1535,10 +1846,34 @@ async function runPlanExecuteConfig(
     // then dispatch the execute sub-strategy.
     await executor.seedUserMessage(sessionState, stepTask.instruction);
 
+    // #125: absolute turn count BEFORE this step, so the success path charges
+    // only the DELTA against the PlanExecute scope.
+    const carriedBefore = carried.turns;
     cx.scratch.task = stepTask;
     cx.scratch.runSession = sessionState;
     cx.scratch.runBudget = { ...carried };
-    await runStrategy(c.execute, cx);
+    const stepOutcome = await runStrategy(c.execute, cx);
+    // #125 rule 4/7: a child's `budget_exhausted` reaches THIS parent as a
+    // `StrategyOutcome`, never auto-cascaded. PlanExecute does NOT charge the
+    // child's exhaustion against its OWN scope; it surfaces its own typed
+    // `budget_exhausted` with the PlanExecute partial (tasklist + statuses +
+    // ledger) and aborts the run.
+    if (stepOutcome.kind === "budget_exhausted") {
+      updateTask(taskList, taskId, "blocked");
+      await executor.persistTaskList(sessionId, taskList);
+      const partial = planExecutePartialJson(taskList);
+      const err = currentBudgetExhausted(cx, {
+        policy: combinatorBudgetPolicy(task.budget.max_turns),
+        behavior: ESCALATE_PLACEHOLDER,
+        stepsTaken: carried.turns,
+        continuesUsed: 0,
+        phase: "plan_execute",
+      });
+      popBudget(cx);
+      cx.scratch.task = task;
+      cx.stream = onStream;
+      return promoteBudgetExhausted(err, partial);
+    }
     const subResult = takeChildOverride(cx);
 
     if (subResult != null && subResult.kind === "success") {
@@ -1564,6 +1899,22 @@ async function runPlanExecuteConfig(
       // Surface the completed step's final text to the caller's sink — the
       // parent-visible step boundary.
       if (onStream != null) onStream({ kind: "final_response", content: lastOutput });
+
+      // #125: charge this step's turns against the PlanExecute scope. If the
+      // global `total_steps` cap is now spent, the PlanExecute node surfaces its
+      // OWN typed `budget_exhausted` (partial = tasklist + ledger), resolving its
+      // behavior.
+      const stepCharge = chargeCurrent(cx, Math.max(0, subResult.turns - carriedBefore));
+      if (!stepCharge.ok) {
+        const partial = planExecutePartialJson(taskList);
+        const resolution = resolveCurrent(cx);
+        popBudget(cx);
+        cx.scratch.task = task;
+        cx.stream = onStream;
+        return resolution === "fail"
+          ? promoteBudgetExhausted(stepCharge.error, undefined)
+          : promoteBudgetExhausted(stepCharge.error, partial);
+      }
     } else if (subResult != null && subResult.kind === "failure") {
       // Q5: any non-success step aborts the whole run.
       totalUsage.input_tokens += subResult.usage.input_tokens;
@@ -1584,6 +1935,7 @@ async function runPlanExecuteConfig(
               task: taskList.tasks[index]!.description,
               reason: haltReasonToString(subResult.reason),
             };
+      popBudget(cx);
       cx.stream = onStream;
       const result: RunResult = {
         kind: "failure",
@@ -1596,9 +1948,11 @@ async function runPlanExecuteConfig(
       return finishCombinator(cx, executor, task, result);
     } else if (subResult != null) {
       // A pause / consult / escalate propagates the whole run.
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, subResult);
     } else {
+      popBudget(cx);
       cx.stream = onStream;
       const result: RunResult = {
         kind: "failure",
@@ -1617,6 +1971,7 @@ async function runPlanExecuteConfig(
     }
   }
 
+  popBudget(cx);
   cx.stream = onStream;
   const result: RunResult = {
     kind: "success",
@@ -1685,6 +2040,17 @@ async function runSelfVerifyingConfig(
   const maxIterations = verifier.maxIterations();
   const totalUsage: AggregateUsage = emptyAggregateUsage();
   let lastReason = "";
+  let lastWorkerOutput = "";
+
+  // #125: SelfVerifying owns a budget scope for its build↔evaluate loop. POLICY
+  // is the task's global turn ceiling (`total_steps`); behavior is the `escalate`
+  // placeholder (the serialized behavior field is #129).
+  pushBudget(
+    cx,
+    combinatorBudgetPolicy(task.budget.max_turns),
+    ESCALATE_PLACEHOLDER,
+    "self_verifying",
+  );
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     // ── Build phase: recurse `runStrategy(c.inner, cx)`.
@@ -1701,7 +2067,26 @@ async function runSelfVerifyingConfig(
       extras: { ...sessionState.extras },
     };
     cx.scratch.runBudget = { ...carried };
-    await runStrategy(c.inner, cx);
+    const carriedBefore = carried.turns;
+    const buildOutcome = await runStrategy(c.inner, cx);
+    // #125 rule 4/7: a child's `budget_exhausted` reaches THIS parent as a
+    // `StrategyOutcome`, never auto-cascaded. SelfVerifying surfaces its own
+    // typed `budget_exhausted` (partial = last worker result + last verdict)
+    // without charging the child's exhaustion against its own scope.
+    if (buildOutcome.kind === "budget_exhausted") {
+      const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
+      const err = currentBudgetExhausted(cx, {
+        policy: combinatorBudgetPolicy(task.budget.max_turns),
+        behavior: ESCALATE_PLACEHOLDER,
+        stepsTaken: carried.turns,
+        continuesUsed: 0,
+        phase: "self_verifying",
+      });
+      popBudget(cx);
+      cx.scratch.task = task;
+      cx.stream = onStream;
+      return promoteBudgetExhausted(err, partial);
+    }
     const buildResult: RunResult = takeChildOverride(cx) ?? {
       kind: "failure",
       reason: {
@@ -1724,12 +2109,32 @@ async function runSelfVerifyingConfig(
       buildResult.kind === "consult" ||
       buildResult.kind === "escalate"
     ) {
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, buildResult);
+    }
+    // Capture the build's output for the partial (last worker result).
+    if (buildResult.kind === "success") {
+      lastWorkerOutput = buildResult.output;
     }
     // Carry the build's post-run session forward for the next round.
     if (buildResult.kind === "success" || buildResult.kind === "failure") {
       sessionState = runResultSessionState(buildResult);
+    }
+
+    // #125: charge this iteration's build turns against the SelfVerifying scope.
+    // If the global cap is spent, the node surfaces its OWN typed
+    // `budget_exhausted` (partial = last worker result + last verdict).
+    const buildCharge = chargeCurrent(cx, Math.max(0, carried.turns - carriedBefore));
+    if (!buildCharge.ok) {
+      const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
+      const resolution = resolveCurrent(cx);
+      popBudget(cx);
+      cx.scratch.task = task;
+      cx.stream = onStream;
+      return resolution === "fail"
+        ? promoteBudgetExhausted(buildCharge.error, undefined)
+        : promoteBudgetExhausted(buildCharge.error, partial);
     }
 
     // ── Evaluate phase: a fresh evaluator run on `evalAgent`.
@@ -1755,6 +2160,7 @@ async function runSelfVerifyingConfig(
         turns,
         session_state: finalState,
       };
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, result);
     }
@@ -1763,6 +2169,7 @@ async function runSelfVerifyingConfig(
     await executor.appendUserMessage(sessionState, verdict.reason);
   }
 
+  popBudget(cx);
   const result: RunResult = {
     kind: "failure",
     reason: { kind: "self_verify_exhausted", iterations: maxIterations, last_reason: lastReason },
@@ -1829,7 +2236,18 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
     cx.scratch.runSession = sessionState;
     // FRESH per-window budget (the reset discards the turn budget).
     cx.scratch.runBudget = emptyBudgetSnapshot();
-    await runStrategy(innerForWindow, cx);
+    const windowOutcome = await runStrategy(innerForWindow, cx);
+    // #125 rule 4/7: a window child's `budget_exhausted` reaches Ralph as a
+    // `StrategyOutcome`, never auto-cascaded. Ralph's recovery semantics: a
+    // budget-exhausted window is treated as "window incomplete" — RESET the
+    // context window and retry (next outer iteration). After `maxResets` this
+    // falls through to `ralph_completion_unmet`. Ralph's own scope is unaffected.
+    if (windowOutcome.kind === "budget_exhausted") {
+      lastReason = `window ${iteration + 1} budget-exhausted: ${
+        windowOutcome.partialOutput ?? "<no partial>"
+      }`;
+      continue;
+    }
     const windowResult: RunResult = takeChildOverride(cx) ?? {
       kind: "failure",
       reason: {
@@ -1951,21 +2369,34 @@ async function runHillClimbingConfig(
 
   let stagnation = 0;
   let iteration = 1;
-  const turnCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+
+  // #125: HillClimbing owns a budget scope for its optimization loop. POLICY is
+  // the task's global turn ceiling (`total_steps`); this REPLACES the ad-hoc
+  // `turnCap` / `carried.turns >= turnCap` gate that #124 used. Behavior is the
+  // `escalate` placeholder (the serialized behavior field is #129).
+  pushBudget(
+    cx,
+    combinatorBudgetPolicy(task.budget.max_turns),
+    ESCALATE_PLACEHOLDER,
+    "hill_climbing",
+  );
 
   for (;;) {
-    // Budget gate before the iteration's agent turn.
-    if (carried.turns >= turnCap) {
+    // #125: charge-based budget gate before the iteration's agent turn. A spent
+    // `total_steps` cap surfaces this node's OWN typed `budget_exhausted`
+    // (partial = best candidate + score), resolving its behavior — replacing the
+    // legacy `budget_exceeded` Failure.
+    const gateCharge = chargeCurrent(cx, 1);
+    if (!gateCharge.ok) {
       await executor.hillWriteTsv(taskId, rows);
-      const result: RunResult = {
-        kind: "failure",
-        reason: { kind: "budget_exceeded", limit_type: "turns" },
-        session_id: sessionId,
-        usage: totalUsage,
-        turns: carried.turns,
-      };
+      const partial = hillClimbingPartialJson(currentBest);
+      const resolution = resolveCurrent(cx);
+      popBudget(cx);
+      cx.scratch.task = task;
       cx.stream = onStream;
-      return finishCombinator(cx, executor, task, result);
+      return resolution === "fail"
+        ? promoteBudgetExhausted(gateCharge.error, undefined)
+        : promoteBudgetExhausted(gateCharge.error, partial);
     }
     const overrun = executor.budgetExceeded(task.budget, carried);
     if (overrun != null) {
@@ -1977,6 +2408,7 @@ async function runHillClimbingConfig(
         usage: totalUsage,
         turns: carried.turns,
       };
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, result);
     }
@@ -1994,7 +2426,25 @@ async function runHillClimbingConfig(
     await executor.appendUserMessage(iterState, task.instruction);
     cx.scratch.runSession = iterState;
     cx.scratch.runBudget = { ...carried };
-    await runStrategy(c.inner, cx);
+    const iterOutcome = await runStrategy(c.inner, cx);
+    // #125 rule 4/7: a child's `budget_exhausted` reaches HillClimbing as a
+    // `StrategyOutcome`, never auto-cascaded. Surface this node's own typed
+    // `budget_exhausted` (partial = best candidate + score).
+    if (iterOutcome.kind === "budget_exhausted") {
+      await executor.hillWriteTsv(taskId, rows);
+      const partial = hillClimbingPartialJson(currentBest);
+      const err = currentBudgetExhausted(cx, {
+        policy: combinatorBudgetPolicy(task.budget.max_turns),
+        behavior: ESCALATE_PLACEHOLDER,
+        stepsTaken: carried.turns,
+        continuesUsed: 0,
+        phase: "hill_climbing",
+      });
+      popBudget(cx);
+      cx.scratch.task = task;
+      cx.stream = onStream;
+      return promoteBudgetExhausted(err, partial);
+    }
     const turnResult: RunResult = takeChildOverride(cx) ?? {
       kind: "failure",
       reason: { kind: "budget_exceeded", limit_type: "turns" },
@@ -2012,6 +2462,7 @@ async function runHillClimbingConfig(
       turnResult.kind === "escalate"
     ) {
       await executor.hillWriteTsv(taskId, rows);
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, turnResult);
     }
@@ -2050,6 +2501,7 @@ async function runHillClimbingConfig(
         usage: totalUsage,
         turns: carried.turns,
       };
+      popBudget(cx);
       cx.stream = onStream;
       return finishCombinator(cx, executor, task, result);
     }

@@ -699,8 +699,21 @@ export class StandardHarness implements Harness, StrategyExecutor {
           reason: { kind: "budget_exceeded", limit_type: "turns" },
           session_id: sessionId,
           usage: cx.usage,
-          turns: cx.scratch.runBudget.turns,
-          session_state: emptySessionState(),
+          // #125: the exhausted node's own `stepsTaken` is the turn count it
+          // reached (the scratch budget is not written back on the propagate
+          // path). Fall back to the scratch turns if it is somehow 0.
+          turns: outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns,
+          // #125: carry the node-concrete partial as an assistant text message so
+          // a parent / caller can inspect what was produced before exhaustion.
+          session_state:
+            outcome.partialOutput != null
+              ? {
+                  messages: [
+                    { role: "assistant", content: { type: "text", text: outcome.partialOutput } },
+                  ],
+                  extras: {},
+                }
+              : emptySessionState(),
         };
     }
   }

@@ -47,9 +47,20 @@ import type { Verifier, VerifierInput, VerifierVerdict } from "../src/verifier/i
 // Helpers
 // --------------------------------------------------------------------------
 
+// #125: the build leaf is UNBOUNDED (matching the Rust `ralph_task`'s
+// `react(MAX)` inner); the per-window turn ceiling comes from the GLOBAL
+// `max_turns: 1` backstop, NOT the leaf's own cap. With a tight `per_loop` leaf
+// cap the leaf would propagate a budget_exhausted that Ralph treats as "window
+// incomplete → reset" BEFORE consulting `.spore/`, masking the completion check
+// these cases exercise.
 const RALPH: LoopStrategy = {
   kind: "ralph",
-  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  inner: {
+    kind: "react",
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+  },
   agent: "",
 };
 const INCOMPLETE = JSON.stringify({ complete: false, remaining: ["task A"] });
