@@ -9,7 +9,8 @@
           "kind": "react",
           "budget": { "kind": "per_loop", "value": 4 },
           "agent": "planner",
-          "toolset": "plan-tools"
+          "toolset": "plan-tools",
+          "output": "plan-schema"
         },
         "execute": {
           "kind": "self_verifying",
@@ -17,7 +18,8 @@
             "kind": "react",
             "budget": { "kind": "per_loop", "value": 12 },
             "agent": "executor",
-            "toolset": "exec-tools"
+            "toolset": "exec-tools",
+            "output": "worker-schema"
           },
           "evaluator": "exec-evaluator"
         }

@@ -229,11 +229,17 @@ impl ExecutionRegistry {
                 Ok(())
             }
             LoopStrategy::PlanExecute(PlanExecuteConfig { plan, execute, .. }) => {
+                // A.5 (#124, Q3): the `plan` slot is STRUCTURED — it must yield a
+                // task graph. A bare `ReAct` there needs an output schema.
+                Self::check_structured_slot(plan, "plan")?;
                 self.walk_strategy(plan)?;
                 self.walk_strategy(execute)?;
                 Ok(())
             }
             LoopStrategy::SelfVerifying(SelfVerifyingConfig { inner, evaluator }) => {
+                // A.5: the `inner` (worker) slot is STRUCTURED — its result must be
+                // evaluable. A bare `ReAct` worker needs an output schema.
+                Self::check_structured_slot(inner, "worker")?;
                 self.walk_strategy(inner)?;
                 // The evaluator is a SchemaRef (the evaluator schema handle).
                 self.check_schema(evaluator)?;
@@ -247,12 +253,30 @@ impl ExecutionRegistry {
             LoopStrategy::HillClimbing(HillClimbingConfig {
                 inner, evaluator, ..
             }) => {
+                // A.5: the `inner` (propose) slot is STRUCTURED — it must yield a
+                // candidate. A bare `ReAct` proposer needs an output schema.
+                Self::check_structured_slot(inner, "propose")?;
                 self.walk_strategy(inner)?;
                 // The evaluator is an AgentRef (the metric-evaluator agent).
                 self.check_agent(evaluator)?;
                 Ok(())
             }
         }
+    }
+
+    /// A.5 output-contract enforcement (#124, Q3): a bare `ReAct` feeding a
+    /// STRUCTURED slot (`plan` ⇒ task graph, `propose` ⇒ candidate, `worker` ⇒
+    /// evaluable result) MUST declare `ReAct.output = Some(SchemaRef)`. A combinator
+    /// child carries its own contract, so this check applies only to the leaf.
+    /// Returns [`HarnessError::InvalidConfiguration`] naming the offending slot.
+    fn check_structured_slot(slot: &LoopStrategy, slot_name: &str) -> Result<(), HarnessError> {
+        if let LoopStrategy::ReAct(ReactConfig { output: None, .. }) = slot {
+            return Err(HarnessError::InvalidConfiguration(format!(
+                "a bare ReAct in the structured `{slot_name}` slot requires \
+                 `output = Some(schema)` so the slot yields a typed result"
+            )));
+        }
+        Ok(())
     }
 
     fn check_agent(&self, r: &AgentRef) -> Result<(), HarnessError> {
@@ -531,6 +555,85 @@ mod tests {
         assert!(reg.validate(&task).is_ok());
     }
 
+    // ---- A.5 output-contract enforcement (#124, Q3) ------------------------
+
+    #[test]
+    fn structured_slot_rejects_bare_react_without_output_schema() {
+        // A PlanExecute whose `plan` slot is a bare ReAct with no output schema
+        // violates the A.5 contract: the structured plan slot must yield a typed
+        // task graph. Validation rejects it BEFORE any handle resolution.
+        let reg = ExecutionRegistry::builder()
+            .agent("a1", Arc::new(StubAgent))
+            .toolset("t1", Arc::new(EmptyToolRegistry))
+            .build();
+        let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(react_leaf("a1", "t1")), // output: None
+            execute: Box::new(react_leaf("a1", "t1")),
+            plan_model: None,
+        });
+        let task = Task::new("contract", SessionId::generate(), tree);
+        match reg.validate(&task) {
+            Err(HarnessError::InvalidConfiguration(msg)) => {
+                assert!(msg.contains("plan"), "error should name the slot: {msg}");
+            }
+            other => {
+                panic!("expected InvalidConfiguration for bare-ReAct plan slot, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn structured_slot_accepts_react_with_output_schema() {
+        let reg = ExecutionRegistry::builder()
+            .agent("a1", Arc::new(StubAgent))
+            .toolset("t1", Arc::new(EmptyToolRegistry))
+            .schema("plan-schema", serde_json::json!({}))
+            .build();
+        let plan = LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 4 },
+            agent: AgentRef("a1".into()),
+            toolset: ToolsetRef("t1".into()),
+            output: Some(SchemaRef("plan-schema".into())),
+        });
+        let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(plan),
+            execute: Box::new(react_leaf("a1", "t1")),
+            plan_model: None,
+        });
+        let task = Task::new("contract", SessionId::generate(), tree);
+        assert!(reg.validate(&task).is_ok());
+    }
+
+    #[test]
+    fn structured_slot_accepts_combinator_child() {
+        // A non-leaf child in a structured slot carries its own contract; the
+        // bare-ReAct check applies only to a leaf, so a PlanExecute plan slot
+        // holding (say) another PlanExecute is accepted.
+        let reg = ExecutionRegistry::builder()
+            .agent("a1", Arc::new(StubAgent))
+            .toolset("t1", Arc::new(EmptyToolRegistry))
+            .schema("worker-schema", serde_json::json!({}))
+            .schema("eval-schema", serde_json::json!({}))
+            .build();
+        let worker = LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 4 },
+            agent: AgentRef("a1".into()),
+            toolset: ToolsetRef("t1".into()),
+            output: Some(SchemaRef("worker-schema".into())),
+        });
+        let inner_sv = LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            inner: Box::new(worker),
+            evaluator: SchemaRef("eval-schema".into()),
+        });
+        let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(inner_sv),
+            execute: Box::new(react_leaf("a1", "t1")),
+            plan_model: None,
+        });
+        let task = Task::new("contract", SessionId::generate(), tree);
+        assert!(reg.validate(&task).is_ok());
+    }
+
     // ---- tree-walk over the nested cordyceps fixture tree ------------------
 
     fn cordyceps_tree() -> LoopStrategy {
@@ -565,6 +668,8 @@ mod tests {
             .toolset("plan-tools", Arc::new(EmptyToolRegistry))
             .toolset("exec-tools", Arc::new(EmptyToolRegistry))
             .schema("exec-evaluator", serde_json::json!({}))
+            .schema("plan-schema", serde_json::json!({}))
+            .schema("worker-schema", serde_json::json!({}))
             .build();
         let task = Task::new("nested", SessionId::generate(), cordyceps_tree());
         assert!(reg.validate(&task).is_ok());

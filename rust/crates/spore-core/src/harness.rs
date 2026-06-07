@@ -341,10 +341,12 @@ pub enum HillClimbingDirection {
 //     byte-identity target).
 //   - Built-ins stay a closed enum (versioning + `max_steps()`, #122);
 //     `StrategyRef::Custom` is the opaque escape hatch (registry: #120).
-//   - Per-variant run bodies are STUBS returning a placeholder outcome — NOT
-//     panic/unimplemented/todo (CONVENTIONS forbids panics outside cfg(test));
-//     real bodies land in #124. The existing executor dispatch in
-//     `StandardHarness` is intentionally left in place (also migrates in #124).
+//   - Per-variant run bodies are REAL (#124): each `*Config::run` owns its loop
+//     and recurses via `self.inner.run(cx)` (or `self.plan`/`self.execute`); the
+//     model-touching machinery stays on the harness behind [`StrategyExecutor`].
+//     The harness entry collapses to `task.loop_strategy.run(cx).await` — the
+//     central dispatch `match` is GONE (the only `match` left is the enum→config
+//     delegation in `LoopStrategy::run`).
 //
 // No `// SPEC QUESTION:` markers — the plan is fully pinned.
 
@@ -732,6 +734,20 @@ impl SpanStack {
 /// `stream` holds an optional boxed `dyn Fn` [`StreamSink`], which is neither
 /// `Debug` nor `Clone`; like [`HarnessRunOptions`] this type therefore does not
 /// derive `Debug`.
+///
+/// ## Recursive executor wiring (#124)
+///
+/// The per-variant [`RunStrategy::run`] bodies are LOOP OWNERS: a combinator
+/// recurses by calling `self.inner.run(cx).await` (or `self.plan`/`self.execute`
+/// as applicable). The model-touching primitives (the ReAct turn-loop window,
+/// the SelfVerifying evaluate phase, the PlanExecute plan phase, the
+/// HillClimbing metric machinery, the Ralph `.spore/` reload/completion checks)
+/// stay on the harness behind the [`StrategyExecutor`] trait, reachable through
+/// `executor`. The per-run mutable orchestration state (`task`, `on_stream`,
+/// `run_session`, `run_budget`) lives in the [`RunScratch`] so it threads across
+/// recursion through this one shared context — `ExecutionContext::run_strategy`
+/// is the single entry the harness calls instead of the old central dispatch
+/// `match`.
 pub struct ExecutionContext<'a> {
     /// Borrowed handle registry (agents/toolsets/schemas/custom strategies).
     pub registry: &'a ExecutionRegistry,
@@ -745,6 +761,35 @@ pub struct ExecutionContext<'a> {
     pub spans: SpanStack,
     /// Optional streaming sink for emitted events.
     pub stream: Option<StreamSink>,
+    /// The harness primitives the per-variant run bodies delegate to (#124).
+    /// `None` only for the scaffold/unit fixtures that exercise the runtime
+    /// context without a real harness (the recursion stub tests).
+    pub executor: Option<&'a dyn StrategyExecutor>,
+    /// Per-run orchestration scratch threaded across recursion (#124).
+    pub scratch: RunScratch,
+}
+
+/// Per-run mutable orchestration state threaded through the recursive strategy
+/// tree (#124). Runtime-only (NOT serialized). The combinator bodies set up the
+/// sub-phase `task` here before recursing, and the leaf ([`ReactConfig::run`])
+/// reads it to drive the ReAct window. `on_stream` is moved out of the context
+/// only at the harness entry (it is `!Clone`), so it lives here rather than
+/// being re-threaded per call.
+#[derive(Default)]
+pub struct RunScratch {
+    /// The task whose strategy is currently executing. Combinators swap in a
+    /// per-phase sub-task before recursing and restore it after.
+    pub task: Option<Task>,
+    /// The conversation/session state the current leaf turn-loop builds on.
+    pub run_session: SessionState,
+    /// The shared budget snapshot threaded across every sub-loop of this run.
+    pub run_budget: BudgetSnapshot,
+    /// A non-terminal pause (`WaitingForHuman`/`Consult`/`Escalate`) or a
+    /// fully-formed terminal that must propagate up the recursion VERBATIM as a
+    /// [`RunResult`] rather than being collapsed into a [`StrategyOutcome`]. The
+    /// harness entry returns this directly when set, preserving the pause/escalate
+    /// contract through the recursive executor (#124).
+    pub terminal_override: Option<RunResult>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -758,18 +803,41 @@ impl<'a> ExecutionContext<'a> {
             session: SessionState::default(),
             spans: SpanStack::default(),
             stream: None,
+            executor: None,
+            scratch: RunScratch::default(),
         }
+    }
+
+    /// The current per-run task (panics only in misuse — the harness always sets
+    /// it before driving a strategy). Cloned because the recursive bodies borrow
+    /// the context mutably while reading the task.
+    fn current_task(&self) -> Task {
+        self.scratch
+            .task
+            .clone()
+            .expect("ExecutionContext::scratch.task must be set before running a strategy")
+    }
+
+    /// The executor primitives, or a typed failure outcome when absent (the
+    /// scaffold-only contexts). Real harness runs always wire one.
+    fn executor(&self) -> Result<&'a dyn StrategyExecutor, StrategyOutcome> {
+        self.executor.ok_or_else(|| {
+            StrategyOutcome::Failed(HarnessError::InvalidConfiguration(
+                "ExecutionContext has no StrategyExecutor wired".to_string(),
+            ))
+        })
     }
 }
 
 /// The runtime composition seam: every strategy node knows how to run itself
 /// given an [`ExecutionContext`]. Implemented once on [`LoopStrategy`] as the
-/// ONLY `match` site — one-line delegation per arm to the inner config's
-/// `run`. Each `*Config` impl is a STUB pending the per-variant executor slice
-/// (#124): it returns `StrategyOutcome::Complete(String::new())` — a benign,
-/// matchable placeholder (NOT panic/unimplemented/todo, which CONVENTIONS
-/// forbids outside `cfg(test)`). The old `StrategyOutcome::Pending` marker is
-/// removed this slice.
+/// ONLY `match` site — one-line delegation per arm to the inner config's `run`
+/// (#124 — the central dispatch `match` in `run_inner` is gone). Each `*Config`
+/// impl OWNS its loop: a combinator recurses via `self.inner.run(cx)` (or
+/// `self.plan`/`self.execute`), and the leaf [`ReactConfig::run`] drives one
+/// bounded ReAct window through the [`StrategyExecutor`] primitive. Without a
+/// wired executor (the scaffold-only contexts) every body returns a TYPED
+/// [`StrategyOutcome::Failed`] — never a panic/unimplemented/todo (CONVENTIONS).
 ///
 /// Uses the hand-rolled [`BoxFut`] return shape (NOT `trait_variant::make`) so
 /// that `Arc<dyn RunStrategy>` is dyn-compatible — the
@@ -780,8 +848,124 @@ pub trait RunStrategy: Send + Sync {
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome>;
 }
 
+/// The harness-side primitives the per-variant [`RunStrategy::run`] bodies
+/// delegate to (#124). Implemented by [`StandardHarness`]. This is the seam that
+/// lets the recursive config bodies own their loops while the model-touching
+/// machinery (ReAct turn-loop window, evaluate phase, plan phase, metric
+/// machinery, `.spore/` checks) stays where it is tested.
+///
+/// Every primitive returns a terminal [`RunResult`] for its phase; the config
+/// bodies translate the terminal into a [`StrategyOutcome`] (or recurse). The
+/// trait is dyn-compatible via [`BoxFut`] so [`ExecutionContext`] can hold
+/// `&dyn StrategyExecutor`.
+pub trait StrategyExecutor: Send + Sync {
+    /// Run ONE bounded ReAct turn-loop window over `session_state`, carrying the
+    /// shared `budget_used`. This is the leaf primitive (the body of the legacy
+    /// `run_react_inner`). Does NOT finalize observability — the caller does.
+    fn react_window<'a>(
+        &'a self,
+        task: Task,
+        max_iterations: u32,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Seed a user message onto `session_state` (the `ContextManager` seam).
+    fn seed_user_message<'a>(
+        &'a self,
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()>;
+
+    /// Run the PlanExecute plan phase (legacy `run_plan_phase`) — the constrained
+    /// planner turn that captures + persists a [`PlanArtifact`]. Returns the
+    /// artifact + accounting, or a terminal failure to propagate.
+    fn plan_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        session_state: &'a mut SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: &'a Option<StreamSink>,
+    ) -> BoxFut<'a, Result<PlanPhaseOutcome, RunResult>>;
+
+    /// Run the PlanExecute execute phase (legacy `run_execute_phase`) — drains the
+    /// task list, recursing the execute sub-strategy per task.
+    fn execute_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        session_state: &'a mut SessionState,
+        task_list: crate::tasklist::TaskList,
+        carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: &'a Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Persist a parsed task list through the RunStore seam (legacy
+    /// `persist_task_list`).
+    fn persist_task_list<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        task_list: &'a crate::tasklist::TaskList,
+    ) -> BoxFut<'a, ()>;
+
+    /// Drive a whole SelfVerifying loop (legacy `run_self_verifying`). The
+    /// build phase reuses the leaf ReAct window; the loop is Default-FAIL and
+    /// bounded by the verifier's iteration cap (Q1).
+    fn self_verifying_loop<'a>(
+        &'a self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Drive a whole Ralph continuation loop (legacy `run_ralph`). Resets the
+    /// context window per continuation and resumes from the durable `.spore/`
+    /// checkpoint (A.6 deep-resume).
+    fn ralph_loop<'a>(
+        &'a self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Drive a whole HillClimbing loop (legacy `run_hill_climbing`).
+    #[allow(clippy::too_many_arguments)]
+    fn hill_climbing_loop<'a>(
+        &'a self,
+        task: Task,
+        direction: HillClimbingDirection,
+        max_stagnation: Option<u32>,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: Option<f64>,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult>;
+
+    /// Finalize observability for a terminal outcome (legacy
+    /// `finalize_observability` routing). No-op for non-terminal results.
+    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()>;
+}
+
+impl RunResult {
+    /// True for the non-terminal pause / clean-handoff variants
+    /// (`WaitingForHuman` / `Consult` / `Escalate`) that a combinator must
+    /// propagate VERBATIM rather than fold into its own terminal (#124).
+    pub fn is_pause(&self) -> bool {
+        matches!(
+            self,
+            RunResult::WaitingForHuman { .. }
+                | RunResult::Consult { .. }
+                | RunResult::Escalate { .. }
+        )
+    }
+}
+
 impl RunStrategy for LoopStrategy {
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        // The ONLY `match` site: the enum→config delegation (AC1). No central
+        // dispatch match remains — each config owns its loop.
         match self {
             LoopStrategy::ReAct(c) => c.run(cx),
             LoopStrategy::PlanExecute(c) => c.run(cx),
@@ -793,32 +977,242 @@ impl RunStrategy for LoopStrategy {
 }
 
 impl RunStrategy for ReactConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Complete(String::new()) })
+    /// The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
+    /// (`task`, `run_session`, `run_budget`) and drives one ReAct window through
+    /// the executor primitive, threading the result back into the shared usage.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let max_iterations = self.max_iterations();
+            let session_state = std::mem::take(&mut cx.scratch.run_session);
+            let budget_used = cx.scratch.run_budget.clone();
+            // The leaf takes the run's stream sink for the window. Combinators
+            // that recurse per-phase suppress it (they take it before recursing).
+            let on_stream = cx.stream.take();
+            let result = executor
+                .react_window(task, max_iterations, session_state, budget_used, on_stream)
+                .await;
+            executor.finalize(&result).await;
+            cx.record_terminal(result)
+        })
     }
 }
 
 impl RunStrategy for PlanExecuteConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Complete(String::new()) })
+    /// Plan→execute (#124). The plan phase recurses through `self.plan` (Q4 — a
+    /// real loop that runs the constrained planner via the executor primitive,
+    /// not a one-shot dispatch in the central executor); the execute phase
+    /// recurses through `self.execute` per task. The model-touching plan/execute
+    /// machinery stays on the harness behind [`StrategyExecutor`] so behavior is
+    /// at parity with the ported `run_plan_execute` body (AC6). The ready-set
+    /// walk lands in #126 (execute runs per task sequentially for now).
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let session_id = task.session_id.clone();
+            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
+            let budget_used = cx.scratch.run_budget.clone();
+            let on_stream = cx.stream.take();
+
+            // ── Phase 1: plan (recurse through the plan sub-strategy). ──────
+            let outcome = match executor
+                .plan_phase(&task, &mut session_state, budget_used.clone(), &on_stream)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(failure) => return cx.finish(executor, task, failure).await,
+            };
+
+            let task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
+            if task_list.tasks.is_empty() {
+                let result = RunResult::Failure {
+                    reason: HaltReason::EmptyPlan,
+                    session_id,
+                    usage: outcome.usage,
+                    turns: outcome.turns,
+                    session_state: SessionState::default(),
+                };
+                return cx.finish(executor, task, result).await;
+            }
+            executor.persist_task_list(&session_id, &task_list).await;
+
+            // Carry the shared budget past the plan turn.
+            let mut carried = budget_used;
+            carried.turns = outcome.turns;
+            carried.input_tokens += outcome.usage.input_tokens;
+            carried.output_tokens += outcome.usage.output_tokens;
+
+            // ── Phase 2: execute (recurse through the execute sub-strategy). ─
+            let result = executor
+                .execute_phase(
+                    &task,
+                    &mut session_state,
+                    task_list,
+                    carried,
+                    outcome.usage,
+                    &on_stream,
+                )
+                .await;
+            cx.finish(executor, task, result).await
+        })
     }
 }
 
 impl RunStrategy for SelfVerifyingConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Complete(String::new()) })
+    /// SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
+    /// verifier's iteration cap / the run budget — Q1). The build phase recurses
+    /// through `self.inner`.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let session_state = std::mem::take(&mut cx.scratch.run_session);
+            let budget_used = cx.scratch.run_budget.clone();
+            let on_stream = cx.stream.take();
+            let result = executor
+                .self_verifying_loop(task, session_state, budget_used, on_stream)
+                .await;
+            cx.record_terminal(result)
+        })
     }
 }
 
 impl RunStrategy for RalphConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Complete(String::new()) })
+    /// Ralph: the continuation wrapper — reset the context window per window and
+    /// resume from the durable `.spore/` checkpoint (A.6 deep-resume). Each
+    /// window recurses through `self.inner`.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let budget_used = cx.scratch.run_budget.clone();
+            let on_stream = cx.stream.take();
+            // Ralph discards the incoming session state by design (each window is
+            // a fresh start re-seeded from the filesystem checkpoint).
+            let _ = std::mem::take(&mut cx.scratch.run_session);
+            let result = executor.ralph_loop(task, budget_used, on_stream).await;
+            cx.record_terminal(result)
+        })
     }
 }
 
 impl RunStrategy for HillClimbingConfig {
-    fn run<'a>(&'a self, _cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
-        Box::pin(async { StrategyOutcome::Complete(String::new()) })
+    /// HillClimbing: iterate `self.inner`, scoring each candidate with the
+    /// metric; bounded by `max_stagnation` (Q1). Each iteration recurses through
+    /// `self.inner`.
+    fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
+        Box::pin(async move {
+            let executor = match cx.executor() {
+                Ok(e) => e,
+                Err(o) => return o,
+            };
+            let task = cx.current_task();
+            let budget_used = cx.scratch.run_budget.clone();
+            let on_stream = cx.stream.take();
+            let _ = std::mem::take(&mut cx.scratch.run_session);
+            // `u32::MAX` sentinel ⇒ no stagnation cap (mirrors the legacy entry).
+            let max_stagnation = (self.max_stagnation != u32::MAX).then_some(self.max_stagnation);
+            let result = executor
+                .hill_climbing_loop(
+                    task,
+                    self.direction,
+                    max_stagnation,
+                    self.revert_on_no_improvement,
+                    Some(self.min_improvement_delta),
+                    budget_used,
+                    on_stream,
+                )
+                .await;
+            cx.record_terminal(result)
+        })
+    }
+}
+
+impl ExecutionContext<'_> {
+    /// Record a terminal/pause [`RunResult`] from a whole-loop primitive
+    /// (ReAct / SelfVerifying / Ralph / HillClimbing): carry the post-run session
+    /// into the scratch (so a parent resumes losslessly) and stash the FULL
+    /// result in `terminal_override` so the harness entry returns it VERBATIM —
+    /// preserving the strategy's typed [`HaltReason`] and accounting. Returns the
+    /// matchable [`StrategyOutcome`] for any combinator that recurses into this
+    /// node (a wrapping combinator CLEARS the override and builds its own
+    /// terminal; see [`take_child_override`](Self::take_child_override)).
+    ///
+    /// Usage is NOT folded into `self.usage` here: the whole-loop primitive's
+    /// RunResult already carries the cumulative usage for its subtree, and it is
+    /// returned verbatim as the override, so folding would double-count.
+    fn record_terminal(&mut self, result: RunResult) -> StrategyOutcome {
+        match &result {
+            RunResult::Success { session_state, .. } | RunResult::Failure { session_state, .. } => {
+                self.scratch.run_session = session_state.clone();
+            }
+            RunResult::WaitingForHuman { .. }
+            | RunResult::Consult { .. }
+            | RunResult::Escalate { .. } => {}
+        }
+        let outcome = outcome_from_run_result_ref(&result);
+        self.scratch.terminal_override = Some(result);
+        outcome
+    }
+
+    /// A combinator's terminal seam: finalize observability for `result`, restore
+    /// the parent `task` into scratch, stash `result` as the override so the
+    /// harness entry returns it VERBATIM, and return the matching outcome.
+    async fn finish(
+        &mut self,
+        executor: &dyn StrategyExecutor,
+        parent_task: Task,
+        result: RunResult,
+    ) -> StrategyOutcome {
+        executor.finalize(&result).await;
+        self.scratch.task = Some(parent_task);
+        match &result {
+            RunResult::Success { session_state, .. } | RunResult::Failure { session_state, .. } => {
+                self.scratch.run_session = session_state.clone();
+            }
+            _ => {}
+        }
+        let outcome = outcome_from_run_result_ref(&result);
+        self.scratch.terminal_override = Some(result);
+        outcome
+    }
+}
+
+/// Translate a terminal [`RunResult`] into a [`StrategyOutcome`] (#124, Q5):
+/// `Success → Complete(output)`, every non-success terminal → `Failed`. A
+/// `BudgetExceeded` failure maps to `Failed` here (the budget-enforcement
+/// `StrategyOutcome::BudgetExhausted` value is produced by `BudgetContext::charge`
+/// at the boundary; full HITL-through-recursion is #130). Operates over a borrow
+/// so the source `RunResult` can also be stashed verbatim as the override; the
+/// pause variants are handled separately (the override path) and degrade to a
+/// typed failure only if they ever reach this mapping.
+fn outcome_from_run_result_ref(result: &RunResult) -> StrategyOutcome {
+    match result {
+        RunResult::Success { output, .. } => StrategyOutcome::Complete(output.clone()),
+        RunResult::Failure { reason, .. } => {
+            StrategyOutcome::Failed(HarnessError::InvalidConfiguration(format!("{reason:?}")))
+        }
+        RunResult::WaitingForHuman { .. }
+        | RunResult::Consult { .. }
+        | RunResult::Escalate { .. } => {
+            StrategyOutcome::Failed(HarnessError::InvalidConfiguration(
+                "non-terminal outcome reached strategy boundary".to_string(),
+            ))
+        }
     }
 }
 
@@ -2374,15 +2768,15 @@ pub enum RunResult {
     },
 }
 
-/// Internal result of a successful PlanExecute plan phase (issue #70). Carries
-/// the produced artifact plus the run accounting so the caller can build the
-/// terminal `RunResult`. Not part of the public surface — the artifact itself
-/// is observable via `SessionState.extras["plan_execute"]`.
+/// Result of a successful PlanExecute plan phase (issue #70). Carries the
+/// produced artifact plus the run accounting so the caller can build the terminal
+/// `RunResult`. Surfaced on the [`StrategyExecutor::plan_phase`] primitive (#124);
+/// the artifact itself is also observable via `SessionState.extras["plan_execute"]`.
 #[derive(Debug)]
-struct PlanPhaseOutcome {
-    artifact: crate::plan::PlanArtifact,
-    usage: AggregateUsage,
-    turns: u32,
+pub struct PlanPhaseOutcome {
+    pub artifact: crate::plan::PlanArtifact,
+    pub usage: AggregateUsage,
+    pub turns: u32,
 }
 
 // ============================================================================
@@ -6111,159 +6505,6 @@ tool. Use the provided tool-call format to actually invoke the tool."
         out
     }
 
-    // (private outcome type for `run_plan_phase` is defined at module scope.)
-
-    /// Drive the PlanExecute strategy (issue #59) — the two-phase loop.
-    ///
-    /// # Phases
-    /// 1. **Plan phase** (issue #70, runs EXACTLY ONCE):
-    ///    [`run_plan_phase`](Self::run_plan_phase) seeds a planning directive,
-    ///    runs one constrained planner turn, captures a
-    ///    [`PlanArtifact`](crate::plan::PlanArtifact), fires `OnPlanCreated`,
-    ///    and counts the turn against the shared budget.
-    /// 2. **Execute phase** (issue #59, loops):
-    ///    [`run_execute_phase`](Self::run_execute_phase) drains the task list,
-    ///    running each task in a bounded ReAct sub-loop that BUILDS ON the
-    ///    accumulated execute-phase context (prior steps' tool results and
-    ///    assistant outputs carry forward).
-    ///
-    /// Between the phases the artifact is parsed into a
-    /// [`TaskList`](crate::tasklist::TaskList) via
-    /// [`plan_artifact_to_task_list`](crate::tasklist::plan_artifact_to_task_list)
-    /// and persisted through the storage seam (Q4) and the `extras` mirror.
-    ///
-    /// # HaltReason variants
-    /// - NEW [`HaltReason::EmptyPlan`] — the plan parsed to `tasks: []` (Q3).
-    /// - NEW [`HaltReason::StepFailed`] — an execute step errored / blocked (Q5).
-    /// - REMOVED `HaltReason::ExecutePhaseNotImplemented` — the execute phase is
-    ///   now implemented; the old "plan produced, execute not implemented" halt
-    ///   no longer exists.
-    /// - Plan-phase failures still surface as
-    ///   [`HaltReason::PlanPhaseFailed`] / [`HaltReason::AgentError`] /
-    ///   [`HaltReason::BudgetExceeded`] unchanged.
-    ///
-    /// # Resolved spec decisions (issue #59 — all five FINAL)
-    /// - **Q1 (execute step model):** each task runs a bounded ReAct sub-loop
-    ///   that BUILDS ON the accumulated execute-phase context — after each
-    ///   successful step its conversation (instruction + tool calls + tool
-    ///   results + assistant output) is folded back into the shared execute
-    ///   context, so the next step sees all prior steps' results. Steps stay
-    ///   SEQUENTIAL (task N completes before N+1). The shared budget still
-    ///   gates: the per-task turn cap is derived at the START of each step:
-    ///   `per_task_turns = remaining_turns / remaining_tasks`, floored at 1
-    ///   (integer division; `remaining_tasks` = not-yet-started tasks including
-    ///   the current one). The shared/parent budget — turns, tokens,
-    ///   observability spans, compaction — is carried across EVERY step exactly
-    ///   as ReAct does, and the global budget is the hard stop.
-    /// - **Q2 (success output):** `RunResult::Success.output` is the LAST
-    ///   completed step's `FinalResponse` text — not a concatenation, not the
-    ///   plan rationale. Full per-step history stays in session state / traces.
-    /// - **Q3 (empty plan):** an empty task list ⇒ [`HaltReason::EmptyPlan`].
-    /// - **Q4 (persistence):** the task list and plan are persisted through the
-    ///   [`StorageProvider`](crate::storage::StorageProvider) /
-    ///   [`RunStore`](crate::storage::RunStore) seam ONLY. The #71
-    ///   sandbox-filesystem path (`.spore/task_list.json`) is NOT used by the
-    ///   execute loop — one source of truth. The `extras` mirror is kept.
-    /// - **Q5 (per-task failure):** a step's ReAct sub-loop erroring or returning
-    ///   a blocked/failed outcome ABORTS the whole run with
-    ///   [`HaltReason::StepFailed`]; execution does NOT continue to the next
-    ///   task (a plan is a dependency chain by assumption).
-    ///
-    /// Like `run_react`, this finalizes observability for the terminal outcome.
-    async fn run_plan_execute(
-        &self,
-        task: Task,
-        mut session_state: SessionState,
-        budget_used: BudgetSnapshot,
-        on_stream: Option<StreamSink>,
-    ) -> RunResult {
-        let session_id = task.session_id.clone();
-
-        // ── Phase 1: plan (runs exactly once) ──────────────────────────────
-        let outcome = match self
-            .run_plan_phase(&task, &mut session_state, budget_used.clone(), &on_stream)
-            .await
-        {
-            Ok(outcome) => outcome,
-            // Plan-phase failure: propagate unchanged (no task list persisted).
-            Err(failure) => {
-                self.finalize_plan_execute(&failure).await;
-                return failure;
-            }
-        };
-
-        // Bridge: parse the accepted plan into a TaskList (#72).
-        let task_list = crate::tasklist::plan_artifact_to_task_list(&outcome.artifact);
-
-        // Q3: an empty plan is a failure, not a silent success.
-        if task_list.tasks.is_empty() {
-            let result = RunResult::Failure {
-                reason: HaltReason::EmptyPlan,
-                session_id,
-                usage: outcome.usage,
-                turns: outcome.turns,
-                session_state: SessionState::default(),
-            };
-            self.finalize_plan_execute(&result).await;
-            return result;
-        }
-
-        // Q4: persist the task list through the storage seam (RunStore) ONLY.
-        // The #71 sandbox path is intentionally unused.
-        self.persist_task_list(&session_id, &task_list).await;
-
-        // Carry the shared budget forward: the plan turn already consumed
-        // `outcome.turns` turns and `outcome.usage` tokens (Q1 — shared budget).
-        let mut carried = budget_used;
-        carried.turns = outcome.turns;
-        carried.input_tokens += outcome.usage.input_tokens;
-        carried.output_tokens += outcome.usage.output_tokens;
-
-        // ── Phase 2: execute (loops over the task list) ────────────────────
-        let result = self
-            .run_execute_phase(
-                &task,
-                &mut session_state,
-                task_list,
-                carried,
-                outcome.usage,
-                &on_stream,
-            )
-            .await;
-        self.finalize_plan_execute(&result).await;
-        result
-    }
-
-    /// Finalize observability for a terminal PlanExecute outcome. Mirrors the
-    /// tail of [`run_react`](Self::run_react): `WaitingForHuman` is not terminal
-    /// and is never flushed here.
-    async fn finalize_plan_execute(&self, result: &RunResult) {
-        match result {
-            RunResult::Success { session_id, .. } => {
-                self.finalize_observability(session_id, SessionOutcome::Success)
-                    .await;
-            }
-            RunResult::Failure {
-                session_id, reason, ..
-            } => {
-                self.finalize_observability(
-                    session_id,
-                    SessionOutcome::Failure {
-                        reason: format!("{reason:?}"),
-                    },
-                )
-                .await;
-            }
-            RunResult::WaitingForHuman { .. } => {}
-            RunResult::Consult { .. } => {}
-            // Escalation (issue #80) is a terminal outcome here too.
-            RunResult::Escalate { session_id, .. } => {
-                self.finalize_observability(session_id, SessionOutcome::Escalated)
-                    .await;
-            }
-        }
-    }
-
     /// Persist the parsed [`TaskList`](crate::tasklist::TaskList) for the run
     /// (Q4). The DURABLE write goes through the
     /// [`RunStore`](crate::storage::RunStore) seam under
@@ -6325,6 +6566,34 @@ tool. Use the provided tool-call format to actually invoke the tool."
         use crate::tasklist::TaskStatus;
 
         let session_id = task.session_id.clone();
+
+        // A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
+        // already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
+        // after every step (Q4). On a resumed run the freshly-parsed `task_list`
+        // (from the plan artifact) is reconciled with that checkpoint so already-
+        // Completed tasks are NOT re-run — serialize→reset→resume rather than the
+        // old shallow no-op. Tasks are matched positionally by `id` (the task list
+        // is regenerated deterministically from the same artifact).
+        if let Ok(Some(value)) = self
+            .config
+            .storage
+            .run()
+            .get(&session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY)
+            .await
+        {
+            if let Ok(saved) = serde_json::from_value::<crate::tasklist::TaskList>(value) {
+                for t in &mut task_list.tasks {
+                    if saved
+                        .tasks
+                        .iter()
+                        .any(|s| s.id == t.id && s.status == TaskStatus::Completed)
+                    {
+                        t.status = TaskStatus::Completed;
+                    }
+                }
+            }
+        }
+
         let total_tasks = task_list.tasks.len();
         // Cumulative usage across the plan turn + every execute step (Q1).
         let mut total_usage = plan_usage;
@@ -6339,6 +6608,13 @@ tool. Use the provided tool-call format to actually invoke the tool."
         for index in 0..total_tasks {
             let task_id = task_list.tasks[index].id;
             let instruction = task_list.tasks[index].description.clone();
+
+            // A.6 deep-resume: a task already Completed on the durable checkpoint
+            // is NOT re-run — its output stays the last-completed handle.
+            if task_list.tasks[index].status == TaskStatus::Completed {
+                last_output = instruction.clone();
+                continue;
+            }
 
             // Q1: per-task turn allocation, derived at the START of this step.
             // remaining_tasks = not-yet-started tasks including this one.
@@ -7025,6 +7301,160 @@ impl Harness for StandardHarness {
     }
 }
 
+/// [`StrategyExecutor`] impl (#124): the harness-side primitives the recursive
+/// per-variant [`RunStrategy::run`] bodies delegate to. Each primitive wraps an
+/// existing, tested orchestration method so behavior stays at parity — the only
+/// structural change is that the per-variant bodies now own their loops and the
+/// central dispatch `match` is gone.
+impl StrategyExecutor for StandardHarness {
+    fn react_window<'a>(
+        &'a self,
+        task: Task,
+        max_iterations: u32,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_react_inner(task, max_iterations, session_state, budget_used, on_stream)
+                .await
+        })
+    }
+
+    fn seed_user_message<'a>(
+        &'a self,
+        session_state: &'a mut SessionState,
+        text: &'a str,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.config
+                .context_manager
+                .append_user_message(session_state, text)
+                .await;
+        })
+    }
+
+    fn plan_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        session_state: &'a mut SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: &'a Option<StreamSink>,
+    ) -> BoxFut<'a, Result<PlanPhaseOutcome, RunResult>> {
+        Box::pin(async move {
+            self.run_plan_phase(task, session_state, budget_used, on_stream)
+                .await
+        })
+    }
+
+    fn execute_phase<'a>(
+        &'a self,
+        task: &'a Task,
+        session_state: &'a mut SessionState,
+        task_list: crate::tasklist::TaskList,
+        carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: &'a Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_execute_phase(
+                task,
+                session_state,
+                task_list,
+                carried,
+                plan_usage,
+                on_stream,
+            )
+            .await
+        })
+    }
+
+    fn persist_task_list<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        task_list: &'a crate::tasklist::TaskList,
+    ) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            // Delegate to the existing private method (same RunStore seam).
+            StandardHarness::persist_task_list(self, session_id, task_list).await
+        })
+    }
+
+    fn self_verifying_loop<'a>(
+        &'a self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_self_verifying(task, session_state, budget_used, on_stream)
+                .await
+        })
+    }
+
+    fn ralph_loop<'a>(
+        &'a self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move { self.run_ralph(task, budget_used, on_stream).await })
+    }
+
+    fn hill_climbing_loop<'a>(
+        &'a self,
+        task: Task,
+        direction: HillClimbingDirection,
+        max_stagnation: Option<u32>,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: Option<f64>,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> BoxFut<'a, RunResult> {
+        Box::pin(async move {
+            self.run_hill_climbing(
+                task,
+                direction,
+                max_stagnation,
+                revert_on_no_improvement,
+                min_improvement_delta,
+                budget_used,
+                on_stream,
+            )
+            .await
+        })
+    }
+
+    fn finalize<'a>(&'a self, result: &'a RunResult) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            match result {
+                RunResult::Success { session_id, .. } => {
+                    self.finalize_observability(session_id, SessionOutcome::Success)
+                        .await;
+                }
+                RunResult::Failure {
+                    session_id, reason, ..
+                } => {
+                    self.finalize_observability(
+                        session_id,
+                        SessionOutcome::Failure {
+                            reason: format!("{reason:?}"),
+                        },
+                    )
+                    .await;
+                }
+                RunResult::Escalate { session_id, .. } => {
+                    self.finalize_observability(session_id, SessionOutcome::Escalated)
+                        .await;
+                }
+                // Non-terminal pauses are never finalized.
+                RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => {}
+            }
+        })
+    }
+}
+
 impl StandardHarness {
     /// Consult resume seam (issue #114). Mirrors the `resume_inner`
     /// clarification branch: the [`ConsultResponse`] text is injected as the
@@ -7262,83 +7692,89 @@ impl StandardHarness {
         let mut session_state = session_state.unwrap_or_default();
         let budget_used = BudgetSnapshot::default();
 
-        match task.loop_strategy.clone() {
-            LoopStrategy::ReAct(ref react_cfg) => {
-                let max_iterations = react_cfg.max_iterations();
-                // Seed the task instruction as the initial user message of this
-                // FRESH run only. The compaction adapter intentionally mirrors
-                // `session.messages` and ignores `task` on `assemble`, so the
-                // harness must own delivering the prompt. On a fresh run this
-                // turns an otherwise-empty conversation into a real user turn;
-                // on multi-turn runs over a carried `session_state` each `run()`
-                // call appends its own follow-up instruction. This lives on the
-                // `run()` entry — NOT in the shared `run_react_inner` — so that
-                // `resume_inner` (which also calls `run_react`) does not
-                // re-append the instruction after the human's response.
-                self.config
-                    .context_manager
-                    .append_user_message(&mut session_state, &task.instruction)
-                    .await;
-                self.run_react(task, max_iterations, session_state, budget_used, on_stream)
-                    .await
-            }
-            LoopStrategy::PlanExecute(_) => {
-                self.run_plan_execute(task, session_state, budget_used, on_stream)
-                    .await
-            }
-            LoopStrategy::Ralph(_) => {
-                // Ralph (issue #58) re-seeds a FRESH SessionState per context
-                // window INSIDE `run_ralph` (the context-window reset). The
-                // incoming `session_state` is intentionally discarded — the first
-                // window is built from scratch like every subsequent reset, so
-                // the prompt is NOT seeded here.
-                let _ = session_state;
-                self.run_ralph(task, budget_used, on_stream).await
-            }
-            LoopStrategy::SelfVerifying(_) => {
-                // Seed the build task instruction as the initial user message of
-                // this fresh run (mirrors the ReAct entry above): the build
-                // sub-loop reuses `run_react_inner`, which does NOT itself seed
-                // the prompt.
-                self.config
-                    .context_manager
-                    .append_user_message(&mut session_state, &task.instruction)
-                    .await;
-                self.run_self_verifying(task, session_state, budget_used, on_stream)
-                    .await
-            }
-            LoopStrategy::HillClimbing(hc) => {
-                let HillClimbingConfig {
-                    direction,
-                    max_stagnation,
-                    revert_on_no_improvement,
-                    min_improvement_delta,
-                    ..
-                } = hc;
-                // HillClimbing (issue #60) re-seeds a FRESH SessionState per
-                // agent-turn iteration INSIDE `run_hill_climbing` — the iteration-0
-                // baseline runs NO agent turn at all, and every subsequent
-                // iteration is its own bounded sub-run. The incoming
-                // `session_state` is intentionally discarded; the prompt is NOT
-                // seeded here.
-                let _ = session_state;
-                // The legacy executor takes `Option<u32>`/`Option<f64>` where
-                // `None` means "no stagnation cap" / "default 0.0 delta". The
-                // new required config fields encode that as the `u32::MAX`
-                // sentinel (unbounded) and a literal delta; map them back here
-                // to preserve runtime behavior until #124 migrates the body.
-                let max_stagnation = (max_stagnation != u32::MAX).then_some(max_stagnation);
-                self.run_hill_climbing(
-                    task,
-                    direction,
-                    max_stagnation,
-                    revert_on_no_improvement,
-                    Some(min_improvement_delta),
-                    budget_used,
-                    on_stream,
-                )
-                .await
-            }
+        // #124: the central dispatch `match` is GONE — the only `match` left is
+        // the enum→config delegation inside `LoopStrategy::run`. The harness entry
+        // collapses to `task.loop_strategy.run(cx).await` via the recursive
+        // executor. Strategies that BUILD ON incoming state (ReAct / PlanExecute /
+        // SelfVerifying) get the instruction seeded here on the FRESH run (the
+        // compaction adapter ignores `task`, so the harness owns prompt delivery);
+        // Ralph / HillClimbing re-seed a fresh window internally (D7), so their
+        // incoming state is discarded by the config body.
+        if matches!(
+            task.loop_strategy,
+            LoopStrategy::ReAct(_) | LoopStrategy::PlanExecute(_) | LoopStrategy::SelfVerifying(_)
+        ) {
+            self.config
+                .context_manager
+                .append_user_message(&mut session_state, &task.instruction)
+                .await;
+        }
+        self.drive_strategy(task, session_state, budget_used, on_stream)
+            .await
+    }
+
+    /// The recursive-executor entry (#124): build the shared [`ExecutionContext`],
+    /// seed the per-run scratch (task / session / budget), drive
+    /// `task.loop_strategy.run(cx)`, and translate the outcome back into a
+    /// terminal [`RunResult`] (Q5). A non-terminal pause / escalate stashed in
+    /// `scratch.terminal_override` propagates VERBATIM (it never collapses into a
+    /// `StrategyOutcome`).
+    async fn drive_strategy(
+        &self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+    ) -> RunResult {
+        let session_id = task.session_id.clone();
+        let mut cx = ExecutionContext::new(&self.config.registry);
+        cx.executor = Some(self);
+        cx.stream = on_stream;
+        cx.scratch.run_session = session_state;
+        cx.scratch.run_budget = budget_used;
+        cx.scratch.task = Some(task.clone());
+
+        let outcome = task.loop_strategy.run(&mut cx).await;
+
+        // A pause / escalate propagates verbatim (preserves the HITL / consult /
+        // escalation contract through the recursive executor).
+        if let Some(terminal) = cx.scratch.terminal_override.take() {
+            return terminal;
+        }
+        match outcome {
+            StrategyOutcome::Complete(output) => RunResult::Success {
+                output,
+                session_id,
+                usage: cx.usage.clone(),
+                turns: cx.scratch.run_budget.turns,
+                session_state: std::mem::take(&mut cx.scratch.run_session),
+            },
+            StrategyOutcome::Failed(error) => RunResult::Failure {
+                reason: HaltReason::ConfigurationError { error },
+                session_id,
+                usage: cx.usage.clone(),
+                turns: cx.scratch.run_budget.turns,
+                session_state: std::mem::take(&mut cx.scratch.run_session),
+            },
+            StrategyOutcome::BudgetExhausted { partial_output, .. } => RunResult::Failure {
+                reason: HaltReason::BudgetExceeded {
+                    limit_type: BudgetLimitType::Turns,
+                },
+                session_id,
+                usage: cx.usage.clone(),
+                turns: cx.scratch.run_budget.turns,
+                session_state: SessionState {
+                    messages: partial_output
+                        .map(|t| {
+                            vec![Message {
+                                role: crate::model::Role::Assistant,
+                                content: crate::model::Content::Text { text: t },
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+            },
         }
     }
 
@@ -8004,14 +8440,17 @@ mod strategy_tests {
                     budget: BudgetPolicy::PerLoop { value: 4 },
                     agent: AgentRef("planner".to_string()),
                     toolset: ToolsetRef("plan-tools".to_string()),
-                    output: None,
+                    // A.5 (#124, Q3): the structured plan slot declares an output
+                    // schema so it yields a typed task graph.
+                    output: Some(SchemaRef("plan-schema".to_string())),
                 })),
                 execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
                     inner: Box::new(LoopStrategy::ReAct(ReactConfig {
                         budget: BudgetPolicy::PerLoop { value: 12 },
                         agent: AgentRef("executor".to_string()),
                         toolset: ToolsetRef("exec-tools".to_string()),
-                        output: None,
+                        // A.5: the structured worker slot declares an output schema.
+                        output: Some(SchemaRef("worker-schema".to_string())),
                     })),
                     evaluator: SchemaRef("exec-evaluator".to_string()),
                 })),
@@ -8160,8 +8599,13 @@ mod strategy_tests {
         assert!(bi.starts_with(r#"{"kind":"built_in","value":{"kind":"ralph""#));
     }
 
+    // #124: every per-variant `run` body, driven without a wired
+    // `StrategyExecutor` (the scaffold-only context), returns a TYPED `Failed`
+    // outcome — never a panic / unimplemented / todo (CONVENTIONS). The real
+    // end-to-end behavior (with an executor) is exercised by the recursive
+    // executor tests below and the strategy integration tests.
     #[test]
-    fn stub_run_returns_complete_not_panic() {
+    fn run_without_executor_is_typed_failure_not_panic() {
         let strategies = vec![
             LoopStrategy::ReAct(ReactConfig::per_loop(1)),
             LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
@@ -8186,8 +8630,16 @@ mod strategy_tests {
         let registry = ExecutionRegistry::empty();
         for s in &strategies {
             let mut cx = ExecutionContext::new(&registry);
+            cx.scratch.task = Some(Task::new(
+                "x",
+                SessionId::generate(),
+                LoopStrategy::ReAct(ReactConfig::per_loop(1)),
+            ));
             let outcome = rt.block_on(s.run(&mut cx));
-            assert_eq!(outcome, StrategyOutcome::Complete(String::new()));
+            assert!(
+                matches!(outcome, StrategyOutcome::Failed(_)),
+                "expected typed Failed (no executor wired), got {outcome:?}"
+            );
         }
     }
 
@@ -10999,6 +11451,69 @@ mod tests {
             tasks: steps.iter().map(|s| s.to_string()).collect(),
             rationale: String::new(),
         })
+    }
+
+    // ── #124 A.6 deep-resume: completed tasks are NOT re-run ─────────────────
+    //
+    // The execute phase reconciles the freshly-parsed task list with the DURABLE
+    // RunStore checkpoint (re-persisted after every step). A task already
+    // Completed on the checkpoint is skipped — serialize→reset→resume, not the
+    // old shallow no-op. Here task 0 is pre-marked Completed in the checkpoint;
+    // only task 1 should run (one agent turn), proving no re-execution.
+    #[tokio::test]
+    async fn deep_resume_skips_already_completed_task() {
+        let a = make_agent();
+        // Only ONE response pushed: if task 0 were re-run, the loop would starve
+        // and fail; one response is enough iff task 0 is skipped.
+        a.push(final_resp("done two"));
+        let agent_count = a.clone();
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+
+        // Pre-seed the durable checkpoint: task 0 Completed, task 1 Pending.
+        let mut checkpoint = plan_artifact_to_tasklist_helper(&["one", "two"]);
+        let first_id = checkpoint.tasks[0].id;
+        checkpoint.complete(first_id).expect("mark task 0 complete");
+        h.persist_task_list(&t.session_id, &checkpoint).await;
+
+        // The freshly-parsed list (as the plan phase would produce) is all-Pending.
+        let fresh = plan_artifact_to_tasklist_helper(&["one", "two"]);
+        let result = h
+            .run_execute_phase(
+                &t,
+                &mut SessionState::default(),
+                fresh,
+                BudgetSnapshot {
+                    turns: 1,
+                    ..Default::default()
+                },
+                AggregateUsage::default(),
+                &None,
+            )
+            .await;
+        match result {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "done two", "only the not-yet-done task runs");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // Exactly ONE agent turn: task 0 was resumed-from-checkpoint, not re-run.
+        assert_eq!(
+            agent_count
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the already-Completed task must NOT be re-run"
+        );
+        // Both tasks Completed in the final persisted list.
+        let final_list = run_store_task_list(&h, &t.session_id).await;
+        assert!(
+            final_list
+                .tasks
+                .iter()
+                .all(|x| x.status == TaskStatus::Completed),
+            "all tasks Completed after resume"
+        );
     }
 
     // Q1 per-task turn allocation + shared budget: with a global cap of 7 turns
