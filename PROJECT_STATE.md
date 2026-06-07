@@ -1,7 +1,7 @@
 # PROJECT STATE
-_Last updated: 2026-06-07 by /close (REOPENED #124 — ACs were wrong) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Five bricks landed (#117, #118, #119, #120, #123) all `status: complete`, all four languages. #124 is REOPENED as PARTIAL** — it shipped genuine recursion for only **2 of 5** strategies (ReAct leaf + PlanExecute); SelfVerifying/Ralph/HillClimbing still delegate to monolithic `StandardHarness::run_*` methods that hardcode a ReAct worker and ignore their `inner` child. The original ACs let this pass (parity-via-reuse); the real goal — implement the composable strategies AND delete the monolithic runs — is ~60% remaining. The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ✅ `origin/main` is level with local `main` (#124's landed commits pushed; the reconcile commit is local-only)._
+_Last updated: 2026-06-07 by /close (#124 truly complete — genuine composition landed) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Six bricks landed (#117, #118, #119, #120, #123, #124) all `status: complete`, all four languages.** #124 (reopened partial) is now TRULY complete: all five strategies genuinely compose — ReAct (leaf) + PlanExecute + SelfVerifying + Ralph + HillClimbing all recurse into their children via `self.inner.run(cx)`; the monolithic `StandardHarness::run_*` loops + their facades are DELETED; the four legacy collaborator fields are removed and resolved via `ExecutionRegistry` (Deviation #12 resolved). Per-combinator non-ReAct-`inner` regression tests (asserting collaborator-invocation counts) prove the recursion is genuine. With #124 done, **#125 (budget enforcement) and #126 (ready-set walk) are now unblocked.** The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor. ⚠️ `origin/main` is **6 commits behind** local `main` (the four #124 recomposition commits + the README composition-docs commit + the earlier reopen-reconcile commit are unpushed — push pending an explicit go-ahead per the standing push gate)._
 
-_**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119, #120, #123 are done; #124 is REOPENED (partial)** and is again the top critical-path item — finish converting SelfVerifying/Ralph/HillClimbing to genuine `self.inner.run(cx)` recursion, **delete** `StandardHarness::run_self_verifying`/`run_ralph`/`run_hill_climbing`, and (folded back in from #125) **remove the four legacy collaborator fields** — they're load-bearing precisely because those monolithic methods read them, so removal is coupled to this composition work, NOT to #125. Each combinator needs a regression test with a non-ReAct `inner` (the analogue of the PlanExecute fix's test). After #124 truly lands, #125 (budget enforcement) and #126 (ready-set walk) open up. #121/#122/#127/#128/#129 remain parallel-grabbable. Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
+_**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119, #120, #123, #124 are all done.** The next critical-path items are **#125 (per-node budget enforcement)** and **#126 (ready-set task walk)**, both now unblocked by #124's true completion. #121/#122/#127/#128/#129 remain parallel-grabbable. Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
@@ -10,7 +10,7 @@ across all four targets: Rust (reference), TypeScript, Python, Go. ✅ `origin/m
 is level with local `main` (this loop's #124 series — rust/ts/py/go — pushed).
 
 **🎯 Active work: the Composable Execution refactor (#117–#131, label
-`loop-strategy-refactor`) — five bricks landed; #124 reopened partial.** The `StandardHarness` hardwires
+`loop-strategy-refactor`) — six bricks landed (#124 now truly complete).** The `StandardHarness` hardwires
 three things the PRD makes composable: (1) loop strategy is a fixed `run()`
 dispatch match — becomes a recursive `LoopStrategy` enum where each variant's
 config struct owns its loop via a `RunStrategy` trait, recursion is
@@ -142,43 +142,49 @@ languages). Cross-language verifier PASS; gates green (rust 9 new / 980 total, t
 1194, py 13 / 1234, go 10). One genuine Go-only blocker surfaced + resolved (Deviation
 #13).
 
-**#124 REOPENED — PARTIAL (`status: blocked`); ~60% remaining.** Originally closed
-`complete`, then reopened on review: its six ACs were **wrong** — they permitted
-parity-via-reuse, so only **2 of 5** strategies are genuinely composable. The brick's
-real goal is to implement the composable strategies AND **delete the monolithic
-harness run-loops** (`StandardHarness::run_self_verifying`/`run_ralph`/
-`run_hill_climbing`) — those are exactly what prevents composition.
+**#124 done (6 of 15, `status: complete`) — TRULY complete after a reopen.** Was
+closed `complete`, reopened on review (its six original ACs permitted parity-via-reuse,
+so only **2 of 5** strategies genuinely composed), then finished this loop. **All five
+strategies now genuinely compose.** The central dispatch `match` is gone —
+`LoopStrategy::run` is a one-line enum→config delegation (AC1). `ReAct` (leaf) runs via
+the executor `react_window` primitive, now resolving its worker agent from the registry
+(`resolve_agent_ref`, threaded through `run_react_inner`/`react_window`). `PlanExecute`,
+`SelfVerifying`, `Ralph`, `HillClimbing` all **genuinely recurse** into their children
+via `self.inner.run(cx)` (PlanExecute: `self.plan.run(cx)` then `self.execute.run(cx)`
+per task). The three monolithic `StandardHarness::run_self_verifying`/`run_ralph`/
+`run_hill_climbing` loops + their `StrategyExecutor` facades (`self_verifying_loop`/
+`ralph_loop`/`hill_climbing_loop`) are **DELETED** in all four languages.
 
-**What genuinely landed (commits stay on `main`):** the central dispatch `match` is
-gone — `LoopStrategy::run` is a one-line enum→config delegation. `ReAct` (leaf) runs
-via the executor `react_window` primitive (correct; no children). `PlanExecute`
-**genuinely recurses** — `self.plan.run(cx)` then `self.execute.run(cx)` per task.
-That PlanExecute recursion was itself a mid-#124 fix: the first cut delegated to a
-harness primitive that hardcoded a flat ReAct sub-loop, silently dropping the
-configured `execute` child (the `parity-shortcut-hid-fake-recursion` lesson); the fix
-(`1a4f46e`/`1003163`/`99ec2f4`/`291f872`) moved orchestration into
-`PlanExecuteConfig::run` and added `plan_execute_runs_non_react_execute_child_per_task`
-(asserts a `SelfVerifying` execute child fires per task). A.5 output-contract
-enforcement (bare ReAct without `output` schema rejected in a structured slot) and A.6
-deep-resume (`deep_resume_skips_already_completed_task`) also landed.
+**The reopen fix (commits `88eaafa`/`3906b03`/`4852985`/`59601cf` + README docs
+`b2dc2d8`):** converted the three combinators to recurse mirroring PlanExecute;
+deleted the monolithic loops + facades; **removed the four legacy collaborator fields**
+(`agent`/`verifier`/`planner_agent`/`evaluator_agent`, plus `metric_evaluator`) and
+resolve all collaborators via `ExecutionRegistry` — builders fold their defaults into
+the registry under the empty key so public construction signatures stay stable;
+`validate()` is **ungated** to a single resolution path. Three design forks were
+resolved wire-stably (commented on the issue): **Q1** `SelfVerifying.evaluator`'s key
+resolves against the verifier map + eval agent defaults to the inner worker (planner
+concept dropped); **Q2** a sixth `metric_evaluators` registry map + `resolve_metric_
+evaluator` (HillClimbing's `evaluator` string wire unchanged); **Q3** `RalphConfig.agent`
+overrides the inner leaf's agent per window when set. **No fixture changes** (wire format
+frozen — pure executor-side recomposition). Semantic shift: a missing verifier/metric
+now surfaces as a startup `ConfigurationError`/`UnresolvedHandle` rather than a runtime
+`*Misconfigured` halt; affected tests migrated.
 
-**What is NOT done (the reopened scope):** `SelfVerifying`, `Ralph`, `HillClimbing`
-each have an `inner: Box<LoopStrategy>` child but **ignore it**. Their `Config::run`
-delegates through `StrategyExecutor::{self_verifying_loop,ralph_loop,hill_climbing_loop}`
-to monolithic `StandardHarness::run_*` methods that **hardcode the worker as
-`LoopStrategy::ReAct(ReactConfig::per_loop(..))`** and read collaborators from
-*harness* config — the identical fake-recursion class as PlanExecute's, never caught
-because no AC required genuine recursion for these three and no test exercises a
-non-ReAct `inner`. So `Ralph[PlanExecute[..]]` today actually runs `Ralph[ReAct]`.
-**Corrected ACs (on the issue):** delete the three monolithic `run_*` (+ their
-`StrategyExecutor` facade); every combinator dispatches its child via
-`self.inner.run(cx)`; a per-combinator regression test with a non-ReAct `inner`;
-**remove the four legacy collaborator fields** (`agent`/`verifier`/`planner_agent`/
-`evaluator_agent`) and resolve via `ExecutionRegistry` — folded **back from #125**
-because the fields are load-bearing precisely in the `run_*` methods this brick
-deletes (Deviation #12). The landed slice's gates are green (rust 976 lib, ts 1201,
-py 1247, go 18 pkgs) but green proves only the 2 composable strategies + parity of
-the 3 monolithic ones.
+**The lesson that caused (and closed) the reopen — the non-ReAct-`inner` tests:** the
+original green proved only the 2 composable strategies + *parity* of the 3 monolithic
+ones, because every test used a ReAct `inner` (which coincides with the hardcoded
+worker). The fix adds a per-combinator regression test with a **non-ReAct `inner`** that
+asserts a COUNT of an inner-combinator-only collaborator invocation (a hardcoded-ReAct
+impl would record ZERO): `self_verifying_runs_non_react_inner_worker`
+(SelfVerifying[PlanExecute[ReAct,ReAct]]), `ralph_runs_non_react_inner_per_window`
+(Ralph[SelfVerifying[ReAct]]), `hill_climbing_runs_non_react_inner_per_iteration`
+(HillClimbing[PlanExecute[ReAct,ReAct]]). Cross-language verifier PASS. Gates green:
+rust 979 lib, ts 1437, py 1248, go all 18+ pkgs. A.5 output-contract + A.6 deep-resume
+behaviors preserved. One benign documented Go divergence (Deviation #4): Go keeps
+`Agent`/`ToolRegistry` as config-struct fields (its public constructor surface) folded
+into the registry + an `IsEmpty()` validate gate for the nil-agent scaffold path —
+behaviorally equivalent for all real harnesses.
 
 **Examples suite — 12 of 13 landed, all four languages each.** Present under
 `examples/{rust,typescript,python,go}/`:
@@ -222,10 +228,10 @@ library (+ a FileSystem/Composite `GuideRegistry`, sibling of #88).
 
 - **All 5 of 5 advertised loop strategies run end-to-end across all four
   languages** — ReAct + PlanExecute + SelfVerifying (#61) + Ralph (#58) +
-  HillClimbing (#60). No loop strategy is stubbed. (As of #124's landed slice
-  ReAct + PlanExecute run through genuine recursive `RunStrategy` dispatch;
-  SelfVerifying/Ralph/HillClimbing still run via the monolithic harness loops —
-  the reopened #124 converts them.)
+  HillClimbing (#60). No loop strategy is stubbed. **As of #124 (complete) all
+  five run through genuine recursive `RunStrategy` dispatch** — every combinator
+  recurses into its child via `self.inner.run(cx)`; the monolithic harness loops
+  are deleted.
 - **Mid-loop consult primitive (#114)** — worker-side `ToolOutput::Consult` →
   `RunResult::Consult` → `SubagentTool` mediates internally (kind→handler map +
   per-kind budget + overflow `SoftFail`/`EscalateToHuman`). #101 is its first
@@ -248,16 +254,11 @@ completion** (label `loop-strategy-refactor`). Make `LoopStrategy`, budget, and 
 task list compositional and mutually consistent, applied byte-identically across all
 four languages where serialized. Work the critical path:
 **117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131**; #117, #118, #119 (the
-keystone strategy seam), #120 (the runtime resolver), and #123 (the `StrategyOutcome`
-+ `ExecutionContext` runtime scaffold) are done, but **#124 is REOPENED (partial) and
-is again the top critical-path item.** Finish it: convert SelfVerifying / Ralph /
-HillClimbing from the monolithic `StandardHarness::run_*` loops (which hardcode a ReAct
-worker and ignore their `inner` child) to genuine `self.inner.run(cx)` recursion,
-**delete those `run_*` methods + their `StrategyExecutor` facade**, add a
-per-combinator regression test with a non-ReAct `inner`, and **remove the four legacy
-collaborator fields** (Deviation #12, folded back here from #125 — they're load-bearing
-only in those `run_*` methods). Only then do **#125 (per-node budget enforcement)** and
-**#126 (ready-set task walk)** open up. #121 (`SubagentTool` strategy param), #122
+keystone strategy seam), #120 (the runtime resolver), #123 (the `StrategyOutcome`
++ `ExecutionContext` runtime scaffold), and **#124 (all five strategies genuinely
+compose; monolithic loops deleted; legacy fields removed) are done.** The next
+critical-path items are now unblocked: **#125 (per-node budget enforcement)** and
+**#126 (ready-set task walk)**. #121 (`SubagentTool` strategy param), #122
 (`max_steps()`), #127 (custom-strategy tracer), #128 (observability), and #129
 (`Continue` checkpoint) remain parallel-grabbable. Use the `/implement` skill per issue (Rust reference + three parallel language agents +
 cross-language verifier). Honor the maintainer's design choice — `RunStrategy` trait +
@@ -305,7 +306,13 @@ cache halts.
    `12-cordyceps` adds one more idiomatic Go choice (benign): the custom context
    manager **embeds** `*StandardCompactionAdapter` (struct-embedding inherits the
    non-`Assemble` methods) rather than delegating each explicitly. #124 adds:
-   `RunStrategy.Run` takes `ctx context.Context` first (no Context in structs).
+   `RunStrategy.Run` takes `ctx context.Context` first (no Context in structs); and —
+   because in Go the config-struct field *is* the public constructor surface — Go keeps
+   `Agent`/`ToolRegistry` as struct fields folded into the registry under the empty key
+   (vs Rust/TS/Python's retained builder `agent` arg) and retains an `IsEmpty()` gate at
+   the validate site to skip validation for the nil-agent scaffold-only path the other
+   three don't expose. Behaviorally equivalent for all real harnesses (validation always
+   runs; missing handle → startup `ConfigurationError`).
 5. **Test-placement divergences (#78/#82)** (benign) — registry-seam / catalogue
    tests live in language-idiomatic spots. Behavior identical.
 6. **#79 cross-language divergences — both verified benign.** (a) narrowed
@@ -333,9 +340,12 @@ cache halts.
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
 10. **Local `main` push hygiene (standing reminder)** — each per-issue loop's series
-    must be pushed promptly so `origin/main` doesn't drift behind. This loop's #124
-    series (`9279df8..291f872`, rust/ts/py/go feat + the genuine-recursion fix) is
-    pushed; `origin/main` is level with local `main`. Sub-note: the plan-execute
+    must be pushed promptly so `origin/main` doesn't drift behind. ⚠️ **`origin/main`
+    is currently 6 commits behind** local `main`: the reopen-reconcile commit
+    (`a02ba22`), the four #124 recomposition commits (`88eaafa`/`3906b03`/`4852985`/
+    `59601cf`), and the README composition-docs commit (`b2dc2d8`). Push is pending an
+    explicit go-ahead (an agent-initiated push was denied earlier in the session under
+    the standing push-approval gate — ask before pushing). Sub-note: the plan-execute
     scratch run-artifacts are covered by a `workspace/*` wildcard in
     `examples/rust/08-plan-execute/.gitignore` (preserving the tracked `.gitkeep` +
     canonical `Async_Runtime_Comparison_Report.md`).
@@ -349,23 +359,16 @@ cache halts.
     child-stream sink). **TS/Python/Go have neither the core `with_stream` seam nor
     the example polish.** Not tracked by an issue yet — decide whether to mirror (file
     an issue) or keep as a Rust-reference-ahead experiment.
-12. **The legacy-collaborator-field removal + registry-resolution migration — OWNED BY
-    THE REOPENED #124** (`scope: debt`) — #120 was ADDITIVE (Option B): the four flat
-    collaborator fields (`agent`/`verifier`/`planner_agent`/`evaluator_agent`) were kept
-    (doc'd as superseded) because `ExecutionContext` (carrying the registry) didn't exist
-    until #123, and `validate()` is gated on a populated registry so legacy callers stay
-    byte-identical. The removal was tagged to #124, then briefly folded into #125, now
-    **moved back to #124** — because the fields are load-bearing precisely in
-    `StandardHarness::run_self_verifying`/`run_ralph`/`run_hill_climbing`, the monolithic
-    methods the reopened #124 must delete to make those three combinators compose. (Verified:
-    46 `planner_agent`/`evaluator_agent` refs remain in `rust/.../harness.rs`.) Once #124's
-    three combinators recurse via `self.inner.run(cx)` and resolve collaborators through
-    `ExecutionRegistry`, the flat fields fall out and `validate()` ungates to a single
-    resolution path. Remove this deviation once #124 truly lands. Sub-note: #119's `RunStrategy` was declared with
-    `#[trait_variant::make(Send)]` (RPITIT, not dyn-compatible) — #120 converted it to a
+12. **#119's `RunStrategy` is a hand-rolled `BoxFut`, not `#[trait_variant::make(Send)]`**
+    (`scope: debt`, Rust-only, benign) — #119 declared `RunStrategy` with
+    `#[trait_variant::make(Send)]` (RPITIT, not dyn-compatible); #120 converted it to a
     hand-rolled `BoxFut` return shape so the `custom: HashMap<String, Arc<dyn
     RunStrategy>>` map can exist. No-op on the wire (the trait never serializes); only
-    Rust affected. #123/#124 build on the `BoxFut` shape.
+    Rust affected. #123/#124 build on the `BoxFut` shape. _(The legacy-collaborator-field
+    removal + registry-resolution migration formerly tracked here is **RESOLVED by #124**:
+    the four fields plus `metric_evaluator` are gone, all collaborators resolve via
+    `ExecutionRegistry`, builders fold defaults under the empty key, and `validate()` is
+    ungated to a single resolution path.)_
 13. **#123 Go `SpanStack` holds `string`, not a typed `SpanId`** (`scope: debt`,
     intentional, documented on the issue + in `execution_scaffold.go`) — Rust/TS/Python
     model `SpanStack` as a stack of their typed `SpanId`; Go cannot, because Go's
@@ -385,25 +388,20 @@ stubs — all resolved in prior loops.)_
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-1. **#124 (REOPENED) — finish genuine composition.** Convert SelfVerifying / Ralph /
-   HillClimbing to dispatch their `inner` child via `self.inner.run(cx)`; **delete**
-   `StandardHarness::run_self_verifying`/`run_ralph`/`run_hill_climbing` and their
-   `StrategyExecutor` facade; add a per-combinator regression test with a non-ReAct
-   `inner` (e.g. `SelfVerifying[PlanExecute[..]]`, `Ralph[SelfVerifying[ReAct]]`); and
-   **remove the four legacy collaborator fields**, resolving all collaborators through
-   `ExecutionRegistry` (Deviation #12, folded back here from #125). Apply byte-identically
-   across all four languages. Grab via `/implement`. This is the gate for the rest of the
-   critical path.
+1. **Push local `main` to `origin`** (Deviation #10) — `origin/main` is 6 commits behind:
+   reopen-reconcile `a02ba22`, the four #124 recomposition commits (`88eaafa`/`3906b03`/
+   `4852985`/`59601cf`), and README docs `b2dc2d8`. Pending an explicit go-ahead under the
+   standing push gate. Do this before starting #125/#126 so the next loop branches from a
+   pushed base.
 2. **#125 — per-node budget enforcement + failure isolation (Composable Execution
-   B.1–B.5).** Flesh out #123's pure-arithmetic `charge` into real enforcement: walk the
-   `BudgetExhaustedBehavior` chain (`Continue`/`Escalate`/`Fail`), consume continues, and
-   ensure a child's `BudgetExhausted` is isolated (never confused with `Failed`, never
-   auto-cascades). **Blocked on #124's true completion** (needs the fully-composable
-   executor). Grab via `/implement`.
+   B.1–B.5).** NOW UNBLOCKED by #124. Flesh out #123's pure-arithmetic `charge` into real
+   enforcement: walk the `BudgetExhaustedBehavior` chain (`Continue`/`Escalate`/`Fail`),
+   consume continues, and ensure a child's `BudgetExhausted` is isolated (never confused
+   with `Failed`, never auto-cascades). Top critical-path item. Grab via `/implement`.
 3. **#126 — ready-set task walk + two-tier context + failure cascade (Part C
-   executor).** Consume #118's `Task.blockers` DAG: a ready-set walk over unblocked
-   tasks, two-tier (run vs task) context, and failure cascade to transitive
-   dependents only. Opens up after #124; parallel-grabbable with #125.
+   executor).** NOW UNBLOCKED by #124; parallel-grabbable with #125. Consume #118's
+   `Task.blockers` DAG: a ready-set walk over unblocked tasks, two-tier (run vs task)
+   context, and failure cascade to transitive dependents only. Grab via `/implement`.
 4. **Refactor finishers (parallel-grabbable now)** — #121 (`SubagentTool` strategy
    param), #122 (`max_steps()`), #127 (custom-strategy tracer — exercises #120's
    `custom` map + `StrategyNotFound` end-to-end), #128 (observability span attrs),
