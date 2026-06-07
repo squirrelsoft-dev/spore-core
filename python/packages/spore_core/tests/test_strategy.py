@@ -26,7 +26,6 @@ from spore_core.harness import (
     RalphConfig,
     ReactConfig,
     SelfVerifyingConfig,
-    StrategyOutcomeComplete,
     StrategyRef,
     StrategyRefBuiltIn,
     StrategyRefCustom,
@@ -62,12 +61,17 @@ def _cordyceps_tree() -> LoopStrategy:
                 budget=BudgetPolicyPerLoop(value=4),
                 agent="planner",
                 toolset="plan-tools",
+                # A.5 (#124): the structured `plan` slot requires an output schema.
+                output="plan-schema",
             ),
             execute=SelfVerifyingConfig(
                 inner=ReactConfig(
                     budget=BudgetPolicyPerLoop(value=12),
                     agent="executor",
                     toolset="exec-tools",
+                    # A.5 (#124): the structured `worker` slot requires an output
+                    # schema.
+                    output="worker-schema",
                 ),
                 evaluator="exec-evaluator",
             ),
@@ -210,21 +214,21 @@ def test_strategy_ref_fixture_replay() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RunStrategy stub dispatch — returns a benign Complete("") placeholder,
-# never raises (#124 lands the real bodies)
+# RunStrategy dispatch — every per-variant body returns a TYPED Failed (never
+# raises) when the ExecutionContext has no StrategyExecutor wired (#124).
+# Mirrors the Rust `run_without_executor_is_typed_failure_not_panic` test.
 # ---------------------------------------------------------------------------
 
 
-async def test_run_strategy_stub_returns_complete() -> None:
+async def test_run_without_executor_is_typed_failure_not_panic() -> None:
     from spore_core.execution_registry import ExecutionRegistry
+    from spore_core.harness import StrategyOutcomeFailed, Task, new_session_id
 
-    cx = ExecutionContext(registry=ExecutionRegistry.empty())
     for strategy in (
         ReactConfig.per_loop(1),
         PlanExecuteConfig.simple(),
         SelfVerifyingConfig.simple(),
         RalphConfig.simple(),
-        _cordyceps_tree(),
         HillClimbingConfig(
             inner=ReactConfig.per_loop(1),
             direction="minimize",
@@ -234,9 +238,12 @@ async def test_run_strategy_stub_returns_complete() -> None:
             evaluator="m",
         ),
     ):
+        cx = ExecutionContext(registry=ExecutionRegistry.empty())
+        # The leaf reads scratch.task; set it so the failure is the missing
+        # executor, not a missing task.
+        cx.scratch.task = Task.new("t", new_session_id(), ReactConfig.per_loop(1))
         outcome = await run_strategy(strategy, cx)
-        assert isinstance(outcome, StrategyOutcomeComplete)
-        assert outcome.output == ""
+        assert isinstance(outcome, StrategyOutcomeFailed)
 
 
 # ---------------------------------------------------------------------------

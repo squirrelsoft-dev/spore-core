@@ -250,6 +250,9 @@ def test_validate_tree_walk_passes_when_fully_wired() -> None:
         .toolset("plan-tools", EmptyToolRegistry())
         .toolset("exec-tools", EmptyToolRegistry())
         .schema("exec-evaluator", {})
+        # A.5 (#124): the structured plan/worker slots now carry output schemas.
+        .schema("plan-schema", {})
+        .schema("worker-schema", {})
         .build()
     )
     task = Task.new("nested", SessionId("s1"), _cordyceps_tree())

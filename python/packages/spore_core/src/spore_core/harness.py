@@ -669,15 +669,48 @@ class SpanStack:
 
 
 @dataclass
+class RunScratch:
+    """Per-run mutable orchestration state threaded through the recursive
+    strategy tree (#124). Runtime-only (NOT serialized).
+
+    The combinator bodies set up the per-phase sub-``task`` here before recursing
+    and restore the parent afterwards; the leaf (:func:`_run_react_config`) reads
+    it to drive the ReAct window. ``on_stream`` lives here (not re-threaded per
+    call) because it is moved out of the context only at the harness entry.
+
+    ``terminal_override`` carries either a non-terminal pause
+    (``WaitingForHuman`` / ``Consult`` / ``Escalate``) or a fully-formed terminal
+    that must propagate up the recursion VERBATIM as a :class:`RunResult` rather
+    than collapse into a :class:`StrategyOutcome` — preserving the typed
+    :class:`HaltReason` and accounting through the recursive executor."""
+
+    task: Task | None = None
+    # ``SessionState`` is defined later in this module; defer the factory.
+    run_session: SessionState = field(default_factory=lambda: SessionState())
+    run_budget: BudgetSnapshot = field(default_factory=lambda: BudgetSnapshot())
+    terminal_override: RunResult | None = None
+
+
+@dataclass
 class ExecutionContext:
     """The one shared, mutable runtime context threaded through a whole nested
-    strategy tree (issue #123). Holds the :class:`ExecutionRegistry` for the
+    strategy tree (issue #123/#124). Holds the :class:`ExecutionRegistry` for the
     duration of the run. Runtime-only — NOT serialized (a plain dataclass
     holding live objects, incl. an optional non-serializable ``stream`` sink).
 
     ``registry`` is typed under ``TYPE_CHECKING`` only: the
     :mod:`~spore_core.execution_registry` module imports :class:`RunStrategy`
-    from here, so a runtime import would cycle."""
+    from here, so a runtime import would cycle.
+
+    ## Recursive executor wiring (#124)
+
+    The per-variant ``run`` bodies are LOOP OWNERS: a combinator recurses by
+    calling ``run_strategy(self.inner, cx)`` (or ``self.plan`` / ``self.execute``
+    as applicable). The model-touching primitives stay on the harness behind the
+    :class:`StrategyExecutor` Protocol, reachable through :attr:`executor`. The
+    per-run orchestration state (``task`` / ``run_session`` / ``run_budget`` /
+    ``terminal_override``) lives in :attr:`scratch` so it threads across recursion
+    through this one shared context."""
 
     registry: ExecutionRegistry
     budgets: BudgetStack = field(default_factory=BudgetStack)
@@ -687,49 +720,344 @@ class ExecutionContext:
     session: SessionState = field(default_factory=lambda: SessionState())
     spans: SpanStack = field(default_factory=SpanStack)
     stream: StreamSink | None = None
+    # The harness primitives the per-variant run bodies delegate to (#124).
+    # ``None`` only for the scaffold/unit fixtures that exercise the runtime
+    # context without a real harness (the recursion stub tests).
+    executor: StrategyExecutor | None = None
+    scratch: RunScratch = field(default_factory=RunScratch)
+
+    def _current_task(self) -> Task:
+        """The current per-run task. The harness always sets it before driving a
+        strategy; cloned (a deep copy) because the recursive bodies mutate the
+        context while reading the task."""
+        if self.scratch.task is None:
+            raise AssertionError(
+                "ExecutionContext.scratch.task must be set before running a strategy"
+            )
+        return self.scratch.task.model_copy(deep=True)
+
+    def _require_executor(self) -> StrategyExecutor | StrategyOutcomeFailed:
+        """The executor primitives, or a TYPED failure outcome when absent (the
+        scaffold-only contexts). Real harness runs always wire one — never a
+        raise (CONVENTIONS: a missing executor is a typed ``Failed``, not a
+        crash)."""
+        if self.executor is None:
+            return StrategyOutcomeFailed(
+                error=HarnessErrorInvalidConfiguration(
+                    reason="ExecutionContext has no StrategyExecutor wired"
+                )
+            )
+        return self.executor
+
+    def _record_terminal(self, result: RunResult) -> StrategyOutcome:
+        """Record a terminal/pause :class:`RunResult` from a whole-loop primitive
+        (ReAct / SelfVerifying / Ralph / HillClimbing): carry the post-run session
+        into the scratch (so a parent resumes losslessly) and stash the FULL
+        result in ``terminal_override`` so the harness entry returns it VERBATIM —
+        preserving the strategy's typed :class:`HaltReason` and accounting.
+        Returns the matchable :class:`StrategyOutcome` for a wrapping combinator.
+
+        Usage is NOT folded into ``self.usage`` here: the primitive's RunResult
+        already carries the cumulative usage for its subtree (returned verbatim as
+        the override), so folding would double-count."""
+        if isinstance(result, RunResultSuccess | RunResultFailure):
+            self.scratch.run_session = result.session_state
+        outcome = _outcome_from_run_result(result)
+        self.scratch.terminal_override = result
+        return outcome
+
+    async def _finish(
+        self,
+        executor: StrategyExecutor,
+        parent_task: Task,
+        result: RunResult,
+    ) -> StrategyOutcome:
+        """A combinator's terminal seam: finalize observability for ``result``,
+        restore the parent ``task`` into scratch, stash ``result`` as the override
+        so the harness entry returns it VERBATIM, and return the matching
+        outcome."""
+        await executor.finalize(result)
+        self.scratch.task = parent_task
+        if isinstance(result, RunResultSuccess | RunResultFailure):
+            self.scratch.run_session = result.session_state
+        outcome = _outcome_from_run_result(result)
+        self.scratch.terminal_override = result
+        return outcome
+
+
+@runtime_checkable
+class StrategyExecutor(Protocol):
+    """The harness-side primitives the per-variant ``run`` bodies delegate to
+    (#124). Implemented by :class:`StandardHarness`. This is the seam that lets
+    the recursive config bodies own their loops while the model-touching
+    machinery (ReAct turn-loop window, evaluate phase, plan phase, metric
+    machinery, ``.spore/`` checks) stays where it is tested.
+
+    Every primitive returns a terminal :class:`RunResult` for its phase; the
+    config bodies translate the terminal into a :class:`StrategyOutcome` (or
+    recurse)."""
+
+    async def react_window(
+        self,
+        task: Task,
+        max_iterations: int,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Run ONE bounded ReAct turn-loop window (the leaf primitive)."""
+        ...
+
+    async def plan_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> _PlanPhaseOutcome | RunResult:
+        """Run the PlanExecute plan phase (a real planner turn capturing +
+        persisting a :class:`PlanArtifact`). Returns the outcome or a terminal
+        failure to propagate."""
+        ...
+
+    async def execute_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        task_list: object,
+        carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Run the PlanExecute execute phase, draining the task list."""
+        ...
+
+    async def persist_task_list(self, session_id: SessionId, task_list: object) -> None:
+        """Persist a parsed task list through the RunStore seam."""
+        ...
+
+    async def self_verifying_loop(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive a whole SelfVerifying loop (Default-FAIL, bounded by the
+        verifier's iteration cap — Q1)."""
+        ...
+
+    async def ralph_loop(
+        self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive a whole Ralph continuation loop (resets the context window per
+        continuation, resumes from the durable ``.spore/`` checkpoint — A.6)."""
+        ...
+
+    async def hill_climbing_loop(
+        self,
+        task: Task,
+        direction: HillClimbingDirection,
+        max_stagnation: int | None,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: float | None,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """Drive a whole HillClimbing loop (bounded by ``max_stagnation``)."""
+        ...
+
+    async def finalize(self, result: RunResult) -> None:
+        """Finalize observability for a terminal outcome (no-op for pauses)."""
+        ...
 
 
 @runtime_checkable
 class RunStrategy(Protocol):
     """The runtime composition seam: every strategy node knows how to run itself
-    given an :class:`ExecutionContext`. The single dispatch is one ``match`` on
-    :func:`run_strategy` delegating to per-config ``run``; each per-config body
-    is a STUB returning ``StrategyOutcomeComplete("")`` (a benign, matchable
-    placeholder — never raises) pending the per-variant executor slice (#124).
-    The old ``StrategyOutcomePending`` marker is removed this slice."""
+    given an :class:`ExecutionContext`. The ONLY dispatch is one ``match`` on
+    :func:`run_strategy` delegating to each config's per-variant ``run`` body
+    (#124 — the central dispatch ``match`` in ``_run_inner`` is GONE). Each
+    per-config body OWNS its loop: a combinator recurses via
+    ``run_strategy(self.inner, cx)`` (or ``self.plan`` / ``self.execute``), and
+    the leaf (:func:`_run_react_config`) drives one bounded ReAct window through
+    the :class:`StrategyExecutor` primitive. Without a wired executor (the
+    scaffold-only contexts) every body returns a TYPED
+    :class:`StrategyOutcomeFailed` — never raises (CONVENTIONS)."""
 
     async def run(self, cx: ExecutionContext) -> StrategyOutcome: ...
 
 
-async def _run_react_config(_self: ReactConfig, _cx: ExecutionContext) -> StrategyOutcome:
-    return StrategyOutcomeComplete("")
+def _outcome_from_run_result(result: RunResult) -> StrategyOutcome:
+    """Translate a terminal :class:`RunResult` into a :class:`StrategyOutcome`
+    (#124, Q5): ``Success → Complete(output)``, every non-success terminal →
+    ``Failed``. A ``BudgetExceeded`` failure maps to ``Failed`` here (the
+    enforcement-slice ``StrategyOutcomeBudgetExhausted`` value is produced by
+    ``BudgetContext.charge`` at the boundary; full HITL-through-recursion is
+    #130). The pause variants are handled separately (the override path) and
+    degrade to a typed failure only if they ever reach this mapping."""
+    if isinstance(result, RunResultSuccess):
+        return StrategyOutcomeComplete(output=result.output)
+    if isinstance(result, RunResultFailure):
+        return StrategyOutcomeFailed(
+            error=HarnessErrorInvalidConfiguration(reason=repr(result.reason))
+        )
+    # WaitingForHuman / Consult / Escalate must travel the override path.
+    return StrategyOutcomeFailed(
+        error=HarnessErrorInvalidConfiguration(
+            reason="non-terminal outcome reached strategy boundary"
+        )
+    )
+
+
+async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> StrategyOutcome:
+    """The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
+    (``task`` / ``run_session`` / ``run_budget``) and drives one ReAct window
+    through the executor primitive, threading the result back into the scratch."""
+    executor = cx._require_executor()
+    if isinstance(executor, StrategyOutcomeFailed):
+        return executor
+    task = cx._current_task()
+    max_iterations = self.max_iterations()
+    session_state = cx.scratch.run_session
+    cx.scratch.run_session = SessionState()
+    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    # The leaf takes the run's stream sink for the window. Combinators that
+    # recurse per-phase suppress it (they take it before recursing).
+    on_stream = cx.stream
+    cx.stream = None
+    result = await executor.react_window(
+        task, max_iterations, session_state, budget_used, on_stream
+    )
+    await executor.finalize(result)
+    return cx._record_terminal(result)
 
 
 async def _run_plan_execute_config(
-    _self: PlanExecuteConfig, _cx: ExecutionContext
+    self: PlanExecuteConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomeComplete("")
+    """Plan→execute (#124). The plan phase recurses through ``self.plan`` (Q4 — a
+    real loop running the constrained planner via the executor primitive); the
+    execute phase recurses through ``self.execute`` per task. Behavior is at
+    parity with the ported ``_run_plan_execute`` body (AC6). The ready-set walk
+    lands in #126 (execute runs per task sequentially for now)."""
+    from .tasklist import plan_artifact_to_task_list
+
+    executor = cx._require_executor()
+    if isinstance(executor, StrategyOutcomeFailed):
+        return executor
+    task = cx._current_task()
+    session_id = task.session_id
+    session_state = cx.scratch.run_session
+    cx.scratch.run_session = SessionState()
+    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    on_stream = cx.stream
+    cx.stream = None
+
+    # ── Phase 1: plan (recurse through the plan sub-strategy). ───────────────
+    outcome = await executor.plan_phase(
+        task, session_state, budget_used.model_copy(deep=True), on_stream
+    )
+    if not isinstance(outcome, _PlanPhaseOutcome):
+        return await cx._finish(executor, task, outcome)
+
+    task_list = plan_artifact_to_task_list(outcome.artifact)
+    if not task_list.tasks:
+        result: RunResult = RunResultFailure(
+            reason=HaltReasonEmptyPlan(),
+            session_id=session_id,
+            usage=outcome.usage,
+            turns=outcome.turns,
+            session_state=SessionState(),
+        )
+        return await cx._finish(executor, task, result)
+    await executor.persist_task_list(session_id, task_list)
+
+    # Carry the shared budget past the plan turn.
+    carried = budget_used.model_copy(deep=True)
+    carried.turns = outcome.turns
+    carried.input_tokens += outcome.usage.input_tokens
+    carried.output_tokens += outcome.usage.output_tokens
+
+    # ── Phase 2: execute (recurse through the execute sub-strategy). ─────────
+    result = await executor.execute_phase(
+        task, session_state, task_list, carried, outcome.usage, on_stream
+    )
+    return await cx._finish(executor, task, result)
 
 
 async def _run_self_verifying_config(
-    _self: SelfVerifyingConfig, _cx: ExecutionContext
+    self: SelfVerifyingConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomeComplete("")
+    """SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
+    verifier's iteration cap / the run budget — Q1). The build phase recurses
+    through ``self.inner``."""
+    executor = cx._require_executor()
+    if isinstance(executor, StrategyOutcomeFailed):
+        return executor
+    task = cx._current_task()
+    session_state = cx.scratch.run_session
+    cx.scratch.run_session = SessionState()
+    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    on_stream = cx.stream
+    cx.stream = None
+    result = await executor.self_verifying_loop(task, session_state, budget_used, on_stream)
+    return cx._record_terminal(result)
 
 
-async def _run_ralph_config(_self: RalphConfig, _cx: ExecutionContext) -> StrategyOutcome:
-    return StrategyOutcomeComplete("")
+async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> StrategyOutcome:
+    """Ralph: the continuation wrapper — reset the context window per window and
+    resume from the durable ``.spore/`` checkpoint (A.6 deep-resume). Each window
+    recurses through ``self.inner``. Ralph discards the incoming session state by
+    design (each window is a fresh start re-seeded from the filesystem
+    checkpoint)."""
+    executor = cx._require_executor()
+    if isinstance(executor, StrategyOutcomeFailed):
+        return executor
+    task = cx._current_task()
+    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    on_stream = cx.stream
+    cx.stream = None
+    cx.scratch.run_session = SessionState()
+    result = await executor.ralph_loop(task, budget_used, on_stream)
+    return cx._record_terminal(result)
 
 
 async def _run_hill_climbing_config(
-    _self: HillClimbingConfig, _cx: ExecutionContext
+    self: HillClimbingConfig, cx: ExecutionContext
 ) -> StrategyOutcome:
-    return StrategyOutcomeComplete("")
+    """HillClimbing: iterate ``self.inner``, scoring each candidate with the
+    metric; bounded by ``max_stagnation`` (Q1). Each iteration recurses through
+    ``self.inner``. Discards the incoming session state (each iteration seeds its
+    own fresh window)."""
+    executor = cx._require_executor()
+    if isinstance(executor, StrategyOutcomeFailed):
+        return executor
+    task = cx._current_task()
+    budget_used = cx.scratch.run_budget.model_copy(deep=True)
+    on_stream = cx.stream
+    cx.stream = None
+    cx.scratch.run_session = SessionState()
+    # ``2**31 - 1`` sentinel ⇒ no stagnation cap (mirrors the legacy entry).
+    max_stagnation = self.max_stagnation if self.max_stagnation != 2**31 - 1 else None
+    result = await executor.hill_climbing_loop(
+        task,
+        self.direction,
+        max_stagnation,
+        self.revert_on_no_improvement,
+        self.min_improvement_delta,
+        budget_used,
+        on_stream,
+    )
+    return cx._record_terminal(result)
 
 
 async def run_strategy(strategy: LoopStrategy, cx: ExecutionContext) -> StrategyOutcome:
     """The ONLY ``match`` site in the strategy system — one-line delegation per
-    arm to the inner config's stub ``run`` (real bodies land in #124)."""
+    arm to the inner config's per-variant ``run`` body (#124)."""
     match strategy:
         case ReactConfig():
             return await _run_react_config(strategy, cx)
@@ -2136,6 +2464,21 @@ class ChildPausedState(_Model):
 # identical to the fixture.
 
 
+class HarnessErrorInvalidConfiguration(_Model):
+    """A strategy tree (or runtime context) was misconfigured — e.g. a bare
+    ``ReAct`` feeding a STRUCTURED slot without an output schema (A.5), or an
+    :class:`ExecutionContext` with no wired :class:`StrategyExecutor`. Mirrors
+    Rust's ``HarnessError::InvalidConfiguration(String)``. Runtime-surfaced (it
+    rides a :class:`StrategyOutcomeFailed`); the ``message`` field is the
+    human-readable reason. Not part of the #120 startup-handle fixture set."""
+
+    kind: Literal["InvalidConfiguration"] = "InvalidConfiguration"
+    reason: str
+
+    def message(self) -> str:
+        return f"invalid configuration: {self.reason}"
+
+
 class HarnessErrorStrategyNotFound(_Model):
     """A ``StrategyRef::Custom(key)`` referenced a custom strategy absent from
     the :class:`~spore_core.execution_registry.ExecutionRegistry`'s ``custom``
@@ -2166,7 +2509,7 @@ class HarnessErrorUnresolvedHandle(_Model):
 
 
 HarnessError = Annotated[
-    HarnessErrorStrategyNotFound | HarnessErrorUnresolvedHandle,
+    HarnessErrorInvalidConfiguration | HarnessErrorStrategyNotFound | HarnessErrorUnresolvedHandle,
     Field(discriminator="kind"),
 ]
 
@@ -3922,45 +4265,17 @@ class StandardHarness:
             session_state = await self._auto_load_session(task.session_id)
         else:
             session_state = SessionState()
-        if isinstance(strategy, ReactConfig):
-            # Seed the task instruction as the initial user message of this run.
-            # The compaction adapter intentionally mirrors ``session.messages``
-            # and ignores ``task`` on ``assemble``, so the harness must own
-            # delivering the prompt. On a fresh run this turns an otherwise-empty
-            # conversation into a real user turn; on multi-turn runs over a
-            # carried ``session_state`` each ``run()`` call appends its own
-            # follow-up instruction. The resume path does not seed — its
-            # conversation already exists.
+        # #124: the central dispatch ``match`` is GONE — the only ``match`` left
+        # is the enum→config delegation inside :func:`run_strategy`. The harness
+        # entry collapses to ``run_strategy(task.loop_strategy, cx)`` via
+        # :meth:`_drive_strategy`. Strategies that BUILD ON incoming state (ReAct
+        # / PlanExecute / SelfVerifying) get the instruction seeded here on the
+        # FRESH run (the compaction adapter ignores ``task``, so the harness owns
+        # prompt delivery); Ralph / HillClimbing re-seed a fresh window internally
+        # (D7), so their incoming state is discarded by the config body.
+        if isinstance(strategy, ReactConfig | PlanExecuteConfig | SelfVerifyingConfig):
             await self._config.context_manager.append_user_message(session_state, task.instruction)
-            return await self._run_react(
-                task, strategy.max_iterations(), session_state, budget_used, on_stream
-            )
-        if isinstance(strategy, PlanExecuteConfig):
-            return await self._run_plan_execute(task, session_state, budget_used, on_stream)
-        if isinstance(strategy, RalphConfig):
-            # Each context window is a fresh session re-seeded INSIDE
-            # ``_run_ralph`` (the context-window reset), so we do NOT pre-seed
-            # the instruction here.
-            return await self._run_ralph(task, budget_used, on_stream)
-        if isinstance(strategy, SelfVerifyingConfig):
-            # Seed the task instruction as the build loop's initial user message,
-            # mirroring the ReAct arm (the build phase is a ReAct sub-loop).
-            await self._config.context_manager.append_user_message(session_state, task.instruction)
-            return await self._run_self_verifying(task, session_state, budget_used, on_stream)
-        if isinstance(strategy, HillClimbingConfig):
-            # Each iteration runs its OWN bounded ReAct sub-run that seeds its own
-            # fresh session state (iteration 0 is a pure baseline with NO agent
-            # turn), so we do NOT pre-seed the instruction here.
-            return await self._run_hill_climbing(
-                task,
-                strategy.direction,
-                strategy.max_stagnation,
-                strategy.revert_on_no_improvement,
-                strategy.min_improvement_delta,
-                budget_used,
-                on_stream,
-            )
-        raise AssertionError(f"unknown loop strategy: {strategy!r}")
+        return await self._drive_strategy(task, session_state, budget_used, on_stream)
 
     async def _auto_load_session(self, session_id: SessionId) -> SessionState:
         """Load the prior :class:`SessionState` for ``session_id`` from the
@@ -4185,6 +4500,180 @@ class StandardHarness:
         if obs is not None:
             obs.set_session_outcome(session_id, outcome)
             await obs.flush_session(session_id)
+
+    # ---- StrategyExecutor protocol (#124) ---------------------------
+    #
+    # The harness-side primitives the recursive per-variant ``run`` bodies
+    # delegate to. Each wraps an existing, tested orchestration method so behavior
+    # stays at parity — the only structural change is that the per-variant bodies
+    # now own their loops and the central dispatch ``match`` is gone.
+
+    async def react_window(
+        self,
+        task: Task,
+        max_iterations: int,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
+        (delegates to :meth:`_run_react_inner`). Does NOT finalize observability —
+        the leaf ``run`` body does."""
+        return await self._run_react_inner(
+            task, max_iterations, session_state, budget_used, on_stream
+        )
+
+    async def plan_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> _PlanPhaseOutcome | RunResult:
+        """:class:`StrategyExecutor` primitive: the PlanExecute plan phase
+        (delegates to :meth:`_run_plan_phase`)."""
+        return await self._run_plan_phase(task, session_state, budget_used, on_stream)
+
+    async def execute_phase(
+        self,
+        task: Task,
+        session_state: SessionState,
+        task_list: object,
+        carried: BudgetSnapshot,
+        plan_usage: AggregateUsage,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: the PlanExecute execute phase
+        (delegates to :meth:`_run_execute_phase`)."""
+        return await self._run_execute_phase(
+            task, session_state, task_list, carried, plan_usage, on_stream
+        )
+
+    async def persist_task_list(self, session_id: SessionId, task_list: object) -> None:
+        """:class:`StrategyExecutor` primitive: persist a parsed task list
+        (delegates to :meth:`_persist_task_list`)."""
+        await self._persist_task_list(session_id, task_list)
+
+    async def self_verifying_loop(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: a whole SelfVerifying loop
+        (delegates to :meth:`_run_self_verifying`)."""
+        return await self._run_self_verifying(task, session_state, budget_used, on_stream)
+
+    async def ralph_loop(
+        self,
+        task: Task,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: a whole Ralph loop (delegates to
+        :meth:`_run_ralph`)."""
+        return await self._run_ralph(task, budget_used, on_stream)
+
+    async def hill_climbing_loop(
+        self,
+        task: Task,
+        direction: HillClimbingDirection,
+        max_stagnation: int | None,
+        revert_on_no_improvement: bool,
+        min_improvement_delta: float | None,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """:class:`StrategyExecutor` primitive: a whole HillClimbing loop
+        (delegates to :meth:`_run_hill_climbing`)."""
+        return await self._run_hill_climbing(
+            task,
+            direction,
+            max_stagnation,
+            revert_on_no_improvement,
+            min_improvement_delta,
+            budget_used,
+            on_stream,
+        )
+
+    async def finalize(self, result: RunResult) -> None:
+        """:class:`StrategyExecutor` primitive: finalize observability for a
+        terminal outcome (no-op for non-terminal pauses). Mirrors the tail of the
+        per-strategy ``_finalize_*`` helpers — routes Success / Failure / Escalate
+        to the matching :class:`SessionOutcome`."""
+        if isinstance(result, RunResultSuccess):
+            await self._finalize_observability(result.session_id, SessionOutcomeSuccess())
+        elif isinstance(result, RunResultFailure):
+            await self._finalize_observability(
+                result.session_id,
+                SessionOutcomeFailure(reason=result.reason.kind),
+            )
+        elif isinstance(result, RunResultEscalate):
+            await self._finalize_observability(result.session_id, SessionOutcomeEscalated())
+        # RunResultWaitingForHuman / RunResultConsult: not terminal, do not finalize.
+
+    async def _drive_strategy(
+        self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: StreamSink | None,
+    ) -> RunResult:
+        """The recursive-executor entry (#124): build the shared
+        :class:`ExecutionContext`, seed the per-run scratch (task / session /
+        budget), drive ``run_strategy(task.loop_strategy, cx)``, and translate the
+        outcome back into a terminal :class:`RunResult` (Q5). A non-terminal pause
+        / escalate stashed in ``scratch.terminal_override`` propagates VERBATIM (it
+        never collapses into a :class:`StrategyOutcome`)."""
+        session_id = task.session_id
+        cx = ExecutionContext(registry=self._config.registry)
+        cx.executor = self
+        cx.stream = on_stream
+        cx.scratch.run_session = session_state
+        cx.scratch.run_budget = budget_used
+        cx.scratch.task = task.model_copy(deep=True)
+
+        outcome = await run_strategy(task.loop_strategy, cx)
+
+        # A pause / escalate (or any verbatim terminal) propagates unchanged.
+        if cx.scratch.terminal_override is not None:
+            return cx.scratch.terminal_override
+        if isinstance(outcome, StrategyOutcomeComplete):
+            return RunResultSuccess(
+                output=outcome.output,
+                session_id=session_id,
+                usage=cx.usage,
+                turns=cx.scratch.run_budget.turns,
+                session_state=cx.scratch.run_session,
+            )
+        if isinstance(outcome, StrategyOutcomeFailed):
+            return RunResultFailure(
+                reason=HaltReasonConfigurationError(error=outcome.error),
+                session_id=session_id,
+                usage=cx.usage,
+                turns=cx.scratch.run_budget.turns,
+                session_state=cx.scratch.run_session,
+            )
+        # StrategyOutcomeBudgetExhausted (not produced by the wrapped primitives
+        # this slice; mapped per Q5 for completeness — full enforcement is #130).
+        messages = (
+            [
+                Message(
+                    role=Role.ASSISTANT,
+                    content=TextContent(text=outcome.partial_output),
+                )
+            ]
+            if outcome.partial_output is not None
+            else []
+        )
+        return RunResultFailure(
+            reason=HaltReasonBudgetExceeded(limit_type="turns"),
+            session_id=session_id,
+            usage=cx.usage,
+            turns=cx.scratch.run_budget.turns,
+            session_state=SessionState(messages=messages),
+        )
 
     # ---- PlanExecute strategy (issues #59 / #70) --------------------
 
@@ -5154,11 +5643,34 @@ class StandardHarness:
         :class:`HaltReasonStepFailed`. Mirrors Rust's ``run_execute_phase``.
         """
         from .hooks import OnTaskAdvanceContext
-        from .tasklist import TaskList, TaskStatus
+        from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
 
         assert isinstance(task_list, TaskList)
         config = self._config
         session_id = task.session_id
+
+        # A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
+        # already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
+        # after every step (Q4). On a resumed run the freshly-parsed ``task_list``
+        # (from the plan artifact) is reconciled with that checkpoint so already-
+        # Completed tasks are NOT re-run — serialize→reset→resume rather than the
+        # old shallow no-op. Tasks are matched by ``id`` (the task list is
+        # regenerated deterministically from the same artifact).
+        try:
+            saved_value = await config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
+        except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
+            saved_value = None
+        if saved_value is not None:
+            try:
+                saved = TaskList.from_dict(saved_value)
+            except Exception:  # noqa: BLE001 — an unparseable checkpoint is ignored
+                saved = None
+            if saved is not None:
+                completed_ids = {s.id for s in saved.tasks if s.status == TaskStatus.COMPLETED}
+                for t in task_list.tasks:
+                    if t.id in completed_ids:
+                        t.status = TaskStatus.COMPLETED
+
         total_tasks = len(task_list.tasks)
         # Cumulative usage across the plan turn + every execute step (Q1).
         total_usage = plan_usage.model_copy(deep=True)
@@ -5170,6 +5682,12 @@ class StandardHarness:
         for index in range(total_tasks):
             task_id = task_list.tasks[index].id
             instruction = task_list.tasks[index].description
+
+            # A.6 deep-resume: a task already Completed on the durable checkpoint
+            # is NOT re-run — its output stays the last-completed handle.
+            if task_list.tasks[index].status == TaskStatus.COMPLETED:
+                last_output = instruction
+                continue
 
             # Q1: per-task turn allocation, derived at the START of this step.
             # remaining_tasks = not-yet-started tasks including this one.
@@ -6690,10 +7208,12 @@ __all__ = [
     "PlanExecuteConfig",
     "RalphConfig",
     "ReactConfig",
+    "RunScratch",
     "RunStrategy",
     "SchemaRef",
     "SelfVerifyingConfig",
     "SpanStack",
+    "StrategyExecutor",
     "StrategyOutcome",
     "StrategyOutcomeBudgetExhausted",
     "StrategyOutcomeComplete",
