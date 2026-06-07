@@ -4,9 +4,14 @@
  */
 
 import type { Context } from "../agent/types.js";
+import type { Agent } from "../agent/interface.js";
 import type { ToolCall, ToolSchema } from "../model/schemas.js";
+import type { Verifier } from "../verifier/types.js";
+import type { MetricEvaluator } from "../metric/types.js";
 
 import type { VcsLogArgs, VcsProvider } from "./vcs.js";
+import { ExecutionRegistry } from "./execution-registry.js";
+import { EmptyToolRegistry } from "../tool-registry/empty.js";
 import type {
   ContextManager,
   HookPoint,
@@ -22,6 +27,34 @@ import type {
   ToolRegistry,
   ToolResultRecord,
 } from "./types.js";
+
+/**
+ * #124 test helper: build an {@link ExecutionRegistry} that registers the given
+ * collaborators under the DEFAULT empty-string key — exactly what
+ * `HarnessBuilder.buildConfig` folds in. Tests that construct a `HarnessConfig`
+ * literally (no builder) use this to supply the default agent / toolset /
+ * verifier / metric evaluator that bare `reactPerLoop` leaves and the default
+ * SelfVerifying / HillClimbing evaluator handles resolve to.
+ */
+export function registryWith(opts: {
+  agent?: Agent;
+  toolset?: ToolRegistry;
+  verifier?: Verifier;
+  metricEvaluator?: MetricEvaluator;
+}): ExecutionRegistry {
+  let b = ExecutionRegistry.builder();
+  if (opts.agent) b = b.agent("", opts.agent);
+  // Bare `reactPerLoop` leaves carry an empty `ToolsetRef`; validation requires
+  // it to resolve. Register a default empty toolset under "" unless overridden.
+  b = b.toolset("", opts.toolset ?? new EmptyToolRegistry());
+  // A.5 structured-slot leaves (`plan` / `worker` / `propose`) declare an output
+  // schema; register a default schema under "" so a leaf with `output: ""`
+  // resolves under validation.
+  b = b.schema("", {});
+  if (opts.verifier) b = b.verifier("", opts.verifier);
+  if (opts.metricEvaluator) b = b.metricEvaluator("", opts.metricEvaluator);
+  return b.build();
+}
 
 export class NoopContextManager implements ContextManager {
   async assemble(session: SessionState, _task: Task): Promise<Context> {

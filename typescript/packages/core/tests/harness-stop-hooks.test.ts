@@ -25,6 +25,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const { StandardHookChain, FunctionHook } = hooks;
@@ -39,7 +40,7 @@ function react(max: number): LoopStrategy {
 
 function baseConfig(agent: MockAgent): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),

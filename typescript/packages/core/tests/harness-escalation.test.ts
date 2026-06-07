@@ -31,6 +31,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 function makeAgent(): MockAgent {
@@ -39,7 +40,7 @@ function makeAgent(): MockAgent {
 
 function standardConfig(agent: MockAgent): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),

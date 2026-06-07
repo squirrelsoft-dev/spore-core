@@ -39,7 +39,9 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
+import type { Verifier, VerifierInput, VerifierVerdict } from "../src/verifier/index.js";
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -118,7 +120,7 @@ function contextText(ctx: Context): string {
 
 function ralphConfig(root: string, agent: Agent, maxResets = 3): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new WorkspaceSandbox(root),
     contextManager: new NoopContextManager(),
@@ -135,6 +137,18 @@ function ralphTask() {
   // final response; max_turns=1 caps the window at one turn, then the OUTER
   // loop checks completion and resets.
   return newTask("implement the feature", SessionId.of("ralph-build"), RALPH, { max_turns: 1 });
+}
+
+/** An always-pass verifier that records every input it sees (#124). */
+class CountingVerifier implements Verifier {
+  readonly seen: VerifierInput[] = [];
+  async verify(input: VerifierInput, _signal?: AbortSignal): Promise<VerifierVerdict> {
+    this.seen.push(input);
+    return { kind: "passed" };
+  }
+  maxIterations(): number {
+    return 3;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -261,7 +275,7 @@ describe("Ralph loop strategy (issue #58)", () => {
       turn: async () => ({ kind: "final_response", content: "done", usage: usage() }),
     };
     const h = new StandardHarness({
-      agent,
+      registry: registryWith({ agent }),
       toolRegistry: new ScriptedToolRegistry(),
       sandbox: new WorkspaceSandbox(dir),
       contextManager: new NoopContextManager(),
@@ -277,5 +291,53 @@ describe("Ralph loop strategy (issue #58)", () => {
     const r = await h.run({ task });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.turns).toBe(1);
+  });
+
+  it("ralph_runs_non_react_inner_per_window (#124): the inner SelfVerifying verifier fires once per window", async () => {
+    // #124: Ralph GENUINELY recurses into `inner` per window. With a non-ReAct
+    // inner (SelfVerifying[ReAct]) the inner verifier must fire at least once per
+    // window. Always-incomplete progress ⇒ Ralph resets until max_resets (2) is
+    // exhausted; the verifier fires once per window (>=2). A hardcoded-ReAct
+    // window would record ZERO verifier invocations.
+    const dir = mkdtempSync(join(tmpdir(), "ralph-nonreact-"));
+    writeProgress(dir, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [INCOMPLETE]);
+    const verifier = new CountingVerifier();
+    const config: HarnessConfig = {
+      registry: registryWith({ agent, verifier }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new WorkspaceSandbox(dir),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      maxResets: 2,
+    };
+    const strategy: LoopStrategy = {
+      kind: "ralph",
+      inner: {
+        kind: "self_verifying",
+        inner: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+          output: "",
+        },
+        evaluator: "",
+      },
+      agent: "",
+    };
+    const h = new StandardHarness(config);
+    const task = newTask("implement", SessionId.of("ralph-nonreact"), strategy, { max_turns: 8 });
+    const r = await h.run({ task });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      expect(r.reason.kind).toBe("ralph_completion_unmet");
+      if (r.reason.kind === "ralph_completion_unmet") {
+        expect(r.reason.iterations).toBe(2); // exactly max_resets windows ran
+      }
+    }
+    // The inner SelfVerifying verifier fired at least once per window (>=2).
+    expect(verifier.seen.length).toBeGreaterThanOrEqual(2);
   });
 });

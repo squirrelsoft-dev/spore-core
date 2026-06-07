@@ -35,6 +35,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,7 +54,7 @@ function config(): HarnessConfig {
   const replay = ReplayModelInterface.fromJsonl(jsonl, provider);
   const agent = new ModelAgent(AgentId.of("plan-execute"), replay);
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
@@ -72,6 +73,7 @@ describe("PlanExecute loop fixture replay — plan_execute_loop.jsonl", () => {
         budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
         agent: "",
         toolset: "",
+        output: "",
       },
       execute: {
         kind: "react",

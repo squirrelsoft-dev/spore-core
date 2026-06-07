@@ -24,6 +24,7 @@ import { describe, expect, it } from "vitest";
 import {
   AgentId,
   EmptyResponse,
+  ExecutionRegistry,
   PLAN_EXECUTE_EXTRAS_KEY,
   SessionId,
   StandardHarness,
@@ -48,7 +49,9 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
+import { EmptyToolRegistry } from "../src/tool-registry/empty.js";
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -61,6 +64,7 @@ const PLAN_STRATEGY: LoopStrategy = {
     budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
     agent: "",
     toolset: "",
+    output: "",
   },
   execute: {
     kind: "react",
@@ -107,15 +111,21 @@ class RecordingAgent implements Agent {
   }
 }
 
-function configWith(agent: Agent, overrides: Partial<HarnessConfig> = {}): HarnessConfig {
+function configWith(
+  agent: Agent,
+  overrides: Partial<HarnessConfig> = {},
+  registry?: ExecutionRegistry,
+): HarnessConfig {
+  // #124: the worker agent folds into the registry under "". A caller may pass a
+  // pre-built registry (e.g. to route the plan leaf to a distinct agent key).
   return {
-    agent,
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
     ...overrides,
+    registry: registry ?? registryWith({ agent }),
   };
 }
 
@@ -309,20 +319,42 @@ describe("PlanExecute plan phase", () => {
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
-  it("R5: when plannerAgent is set, the PLANNER runs the plan turn; the default runs the steps", async () => {
-    // Single-task plan: the planner runs exactly the plan turn, the default runs
-    // exactly the one execute step — proving the plan turn did NOT use the
-    // default agent.
+  it("R5 (#124 Q1): the plan child's leaf agent runs the plan turn; the default worker runs the steps", async () => {
+    // #124 Q1: the planner concept is DROPPED — the plan child's leaf
+    // ReactConfig.agent is authoritative. Route the plan leaf to a distinct
+    // "planner" key; the execute leaf (agent "") resolves the default worker.
     const def = new RecordingAgent(AgentId.of("default")).push(fr("did step"));
     const planner = new RecordingAgent(AgentId.of("planner")).push(fr('{"tasks":["step"]}'));
-    const h = new StandardHarness(configWith(def, { plannerAgent: planner }));
-    const r = await h.run({ task: planTask() });
+    const registry = ExecutionRegistry.builder()
+      .agent("", def)
+      .agent("planner", planner)
+      .toolset("", new EmptyToolRegistry())
+      .schema("", {})
+      .build();
+    const strategy: LoopStrategy = {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "planner",
+        toolset: "",
+        output: "",
+      },
+      execute: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+      },
+    };
+    const h = new StandardHarness(configWith(def, {}, registry));
+    const r = await h.run({ task: newTask("build", PLAN_SID, strategy, { max_turns: null }) });
     expect(r.kind).toBe("success");
-    expect(planner.ran).toBe(1); // planner ran exactly the plan turn
+    expect(planner.ran).toBe(1); // the plan leaf's agent ran exactly the plan turn
     expect(def.ran).toBe(1); // default ran exactly the execute step
   });
 
-  it("R6: with no plannerAgent, the plan turn runs on the default agent", async () => {
+  it("R6: with no distinct plan agent, the plan turn runs on the default worker", async () => {
     // No planner: the default agent runs both the plan turn and the one step.
     const def = new RecordingAgent(AgentId.of("default"))
       .push(fr('{"tasks":["step"]}'))

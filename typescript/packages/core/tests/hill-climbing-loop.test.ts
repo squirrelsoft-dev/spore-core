@@ -46,6 +46,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const { InMemoryObservabilityProvider } = obsNs;
@@ -73,6 +74,31 @@ class AlwaysDoneAgent implements Agent {
     this.ran += 1;
     return fr("done");
   }
+}
+
+/** Scripts a sequence of final responses; records every Context it sees. */
+class ScriptedRecordingAgent implements Agent {
+  readonly contexts: Context[] = [];
+  private readonly results: TurnResult[] = [];
+  constructor(private readonly agentId: AgentId) {}
+  id(): AgentId {
+    return this.agentId;
+  }
+  push(r: TurnResult): this {
+    this.results.push(r);
+    return this;
+  }
+  async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+    this.contexts.push(ctx);
+    return this.results.shift() ?? fr("done");
+  }
+}
+
+/** Flatten a Context's text for substring assertions. */
+function ctxText(ctx: Context): string {
+  return ctx.messages
+    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+    .join("\n");
 }
 
 /**
@@ -163,7 +189,13 @@ function hcStrategy(opts: {
 }): LoopStrategy {
   return {
     kind: "hill_climbing",
-    inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+    inner: {
+      kind: "react",
+      budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+      agent: "",
+      toolset: "",
+      output: "",
+    },
     direction: opts.direction,
     // `max_stagnation`/`min_improvement_delta` are required numbers (#119). The
     // old `null` ("unbounded" / "no delta") inputs map to behavior-preserving
@@ -178,15 +210,19 @@ function hcStrategy(opts: {
 
 const SID = SessionId.of("hc-session");
 
-function config(agent: Agent, overrides: Partial<HarnessConfig> = {}): HarnessConfig {
+function config(
+  agent: Agent,
+  overrides: Partial<HarnessConfig> & { metricEvaluator?: MetricEvaluator } = {},
+): HarnessConfig {
+  const { metricEvaluator, ...rest } = overrides;
   return {
-    agent,
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
-    ...overrides,
+    ...rest,
+    registry: registryWith({ agent, metricEvaluator }),
   };
 }
 
@@ -199,15 +235,17 @@ function task(strategy: LoopStrategy, maxTurns = 100) {
 // --------------------------------------------------------------------------
 
 describe("HillClimbing loop strategy (issue #60)", () => {
-  it("D6: no evaluator → hill_climbing_misconfigured (typed halt, not a throw); agent never runs", async () => {
+  it("D6 (#124): no evaluator → typed STARTUP halt (unresolved metric_evaluator handle); agent never runs", async () => {
     const agent = new AlwaysDoneAgent(AgentId.of("a"));
-    const h = new StandardHarness(config(agent)); // no metricEvaluator
+    const h = new StandardHarness(config(agent)); // no metricEvaluator registered
     const r = await h.run({ task: task(hcStrategy({ direction: "maximize" })) });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("hill_climbing_misconfigured");
-      if (r.reason.kind === "hill_climbing_misconfigured") {
-        expect(r.reason.reason).toContain("metricEvaluator");
+      // #124: resolution is the single path — validation rejects the unresolved
+      // metric-evaluator handle at startup as a `configuration_error`.
+      expect(r.reason.kind).toBe("configuration_error");
+      if (r.reason.kind === "configuration_error") {
+        expect(r.reason.error.kind).toBe("UnresolvedHandle");
       }
     }
     expect(agent.ran).toBe(0);
@@ -472,5 +510,54 @@ describe("HillClimbing loop strategy (issue #60)", () => {
     if (r.kind === "failure") {
       expect(r.reason.kind).not.toBe("strategy_not_yet_implemented");
     }
+  });
+
+  it("hill_climbing_runs_non_react_inner_per_iteration (#124): the inner PlanExecute plan turn fires once per iteration", async () => {
+    // #124: HillClimbing GENUINELY recurses into `inner`. With a non-ReAct inner
+    // (PlanExecute[ReAct, ReAct]) the inner plan turn must fire ONCE PER iteration.
+    // baseline 1.0, iter1 2.0 (improve→keep, stagnation reset), iter2 0.5
+    // (regress→discard, stagnation cap 1 ⇒ halt) ⇒ two agent iterations.
+    const evaluator = new ScriptedMetricEvaluator([1.0, 2.0, 0.5], "maximize");
+    const worker = new ScriptedRecordingAgent(AgentId.of("hc-inner"))
+      .push(fr('{"tasks":["only"],"rationale":"r"}')) // iter1 plan
+      .push(fr("changed iter1")) // iter1 execute
+      .push(fr('{"tasks":["only"],"rationale":"r"}')) // iter2 plan
+      .push(fr("changed iter2")); // iter2 execute
+    const strategy: LoopStrategy = {
+      kind: "hill_climbing",
+      inner: {
+        kind: "plan_execute",
+        plan: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+          output: "",
+        },
+        execute: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+        },
+      },
+      direction: "maximize",
+      max_stagnation: 1,
+      revert_on_no_improvement: false,
+      min_improvement_delta: 0,
+      evaluator: "",
+    };
+    const h = new StandardHarness(config(worker, { metricEvaluator: evaluator }));
+    const r = await h.run({ task: newTask("optimize", SID, strategy, { max_turns: 50 }) });
+    expect(r.kind).toBe("failure");
+    if (r.kind === "failure") {
+      expect(r.reason.kind).toBe("stagnation_limit_reached");
+    }
+    // The inner PlanExecute fired its plan turn ONCE PER iteration (2x). A
+    // hardcoded-ReAct proposer would record ZERO plan turns.
+    const planTurns = worker.contexts.filter((ctx) =>
+      ctxText(ctx).includes("step-by-step plan"),
+    ).length;
+    expect(planTurns).toBe(2);
   });
 });

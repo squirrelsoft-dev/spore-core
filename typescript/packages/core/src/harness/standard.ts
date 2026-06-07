@@ -76,7 +76,7 @@ import {
   type PromptChunk as AssemblyPromptChunk,
 } from "../prompt-assembly/index.js";
 import { KeyTermVerifier, type CompactionVerifier } from "../context/types.js";
-import type { Verifier, VerifierInput } from "../verifier/types.js";
+import type { Verifier } from "../verifier/types.js";
 import {
   shouldKeep,
   iterationStatusFromError,
@@ -136,6 +136,8 @@ import {
   type HaltReason,
   HarnessError,
   InvalidConfiguration,
+  UnresolvedHandle,
+  type AgentRef,
   type HarnessRunOptions,
   surfaceToHuman,
   type HookPoint,
@@ -164,13 +166,6 @@ import { ExecutionRegistry } from "./execution-registry.js";
 
 /** Components injected at construction. Mirrors `HarnessConfig` in the spec. */
 export interface HarnessConfig {
-  /**
-   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): agents are
-   * resolved per-node via a strategy's {@link AgentRef}. Physical removal +
-   * executor migration to registry resolution lands in #124. Still the live
-   * default-agent field this slice (Option B additive scope).
-   */
-  agent: Agent;
   toolRegistry: ToolRegistry;
   sandbox: SandboxProvider;
   contextManager: ContextManager;
@@ -225,47 +220,11 @@ export interface HarnessConfig {
    */
   maxStopBlocks?: number;
   /**
-   * Optional alternate agent used for the `plan_execute` plan phase (issue #70,
-   * Q1). When the loop strategy is `plan_execute` and this is set, the one-shot
-   * plan turn runs on this agent; otherwise it runs on the default {@link agent}.
-   * `plan_model` on the strategy stays DESCRIPTIVE metadata only.
-   *
-   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): resolved
-   * per-node via a strategy's {@link AgentRef}. Physical removal + executor
-   * migration to registry resolution lands in #124.
-   */
-  plannerAgent?: Agent;
-  /**
    * Pluggable source of conditional prompt chunks (issue #79). Loaded at harness
    * construction and fed through {@link "../prompt-assembly/index.js".ContextSourcesBuilder}.
    * Optional; defaults to an empty {@link InMemoryChunkProvider}.
    */
   chunkProvider?: ChunkProvider;
-  /**
-   * Verdict oracle for the `self_verifying` loop strategy (issue #61, D2/D4).
-   * REQUIRED for that strategy: when absent, a `self_verifying` run halts with
-   * `self_verify_misconfigured` (a typed halt, NOT a throw). Its
-   * {@link "../verifier/types.js".Verifier.maxIterations} (default 3) caps the
-   * build↔evaluate round-trips (D3). Ignored by every other strategy.
-   *
-   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): verifiers
-   * are resolved by key from the registry's `verifiers` map. Physical removal +
-   * executor migration to registry resolution lands in #124.
-   */
-  verifier?: Verifier;
-  /**
-   * Optional alternate agent used for the `self_verifying` evaluate phase
-   * (issue #61, D2). Defaulting contract — IDENTICAL to {@link plannerAgent}
-   * (#70): when this is absent, the evaluate phase runs on the default
-   * {@link agent}. The read-only sandbox and the fresh, never-shared session id
-   * for the evaluate run are derived INTERNALLY by the strategy — callers do NOT
-   * supply an evaluator sandbox or chunk provider here.
-   *
-   * @deprecated Superseded by {@link ExecutionRegistry} (issue #120): resolved
-   * per-node via a strategy's {@link AgentRef}. Physical removal + executor
-   * migration to registry resolution lands in #124.
-   */
-  evaluatorAgent?: Agent;
   /**
    * Outer-loop reset cap for the `ralph` loop strategy (issue #58, B3). The
    * maximum number of context-window RESETS the multi-context-window
@@ -286,15 +245,6 @@ export interface HarnessConfig {
    * decision). Ignored by every other strategy.
    */
   vcsProvider?: VcsProvider;
-  /**
-   * Metric oracle for the `hill_climbing` loop strategy (issue #60). REQUIRED
-   * for that strategy: when absent, a `hill_climbing` run halts with
-   * {@link HaltReason} `hill_climbing_misconfigured` (a typed halt, NOT a throw —
-   * Decision 6). The evaluator is called once at iteration 0 to establish the
-   * baseline (no agent turn) and again after each agent turn to score the change.
-   * Ignored by every other strategy.
-   */
-  metricEvaluator?: MetricEvaluator;
   /**
    * Catalogue tools accumulated via {@link HarnessBuilder.tool} / `tools` (issue
    * #81), drained into a populated {@link StandardToolRegistry} at
@@ -639,29 +589,26 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const budgetUsed = emptyBudgetSnapshot();
     const task = options.task;
 
-    // Issue #120 startup validation: every serializable handle in the task's
-    // strategy tree must resolve against the configured ExecutionRegistry,
-    // BEFORE the first turn. Validation runs only when the registry is populated,
-    // so existing callers that never wire a registry (and instead use the
-    // deprecated single-collaborator fields, Option B) are unaffected
-    // byte-for-byte. An unresolved handle is a startup error.
-    const registry = this.config.registry;
-    if (registry != null && !registry.isEmpty()) {
-      try {
-        registry.validate(task);
-      } catch (e) {
-        if (e instanceof HarnessError) {
-          return {
-            kind: "failure",
-            reason: { kind: "configuration_error", error: e },
-            session_id: task.session_id,
-            usage: emptyAggregateUsage(),
-            turns: 0,
-            session_state: emptySessionState(),
-          };
-        }
-        throw e;
+    // #124 startup validation: every serializable handle in the task's strategy
+    // tree must resolve against the configured ExecutionRegistry, BEFORE the
+    // first turn. The legacy single-collaborator fields are gone — resolution is
+    // now the SINGLE path, so validation ALWAYS runs (the `!isEmpty()` gate is
+    // dropped). An unresolved handle is a startup error.
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    try {
+      registry.validate(task);
+    } catch (e) {
+      if (e instanceof HarnessError) {
+        return {
+          kind: "failure",
+          reason: { kind: "configuration_error", error: e },
+          session_id: task.session_id,
+          usage: emptyAggregateUsage(),
+          turns: 0,
+          session_state: emptySessionState(),
+        };
       }
+      throw e;
     }
 
     // Issue #102 auto-load: when enabled AND no explicit session_state was
@@ -774,10 +721,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     budgetUsed: BudgetSnapshot,
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
+    agent: Agent,
   ): Promise<RunResult> {
     // The leaf seeds the task instruction (parity with the old top-level ReAct
-    // entry, which called runReact(.., seedInstruction: true)). The combinators'
-    // own build sub-loops call runReactInner directly with their own seed flag.
+    // entry, which called runReact(.., seedInstruction: true)). The resolved
+    // worker `agent` (#124) drives every turn of this window.
     return this.runReactInner(
       task,
       maxIterations,
@@ -786,7 +734,73 @@ export class StandardHarness implements Harness, StrategyExecutor {
       onStream,
       signal,
       true,
+      agent,
     );
+  }
+
+  /** {@inheritDoc StrategyExecutor.resolveAgentRef} */
+  resolveAgentRef(ref: AgentRef, sessionId: SessionId): Agent | RunResult {
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    const agent = registry.resolveAgent(ref);
+    if (agent !== undefined) return agent;
+    return {
+      kind: "failure",
+      reason: { kind: "configuration_error", error: new UnresolvedHandle("agent", ref) },
+      session_id: sessionId,
+      usage: emptyAggregateUsage(),
+      turns: 0,
+      session_state: emptySessionState(),
+    };
+  }
+
+  /** {@inheritDoc StrategyExecutor.evaluatePhase} */
+  evaluatePhase(
+    task: Task,
+    evalAgent: Agent,
+    carried: BudgetSnapshot,
+    totalUsage: AggregateUsage,
+  ): Promise<RunResult> {
+    return this.runEvaluatePhase(task, evalAgent, carried, totalUsage);
+  }
+
+  /** {@inheritDoc StrategyExecutor.appendUserMessage} */
+  async appendUserMessage(sessionState: SessionState, text: string): Promise<void> {
+    await this.config.contextManager.appendUserMessage(sessionState, text);
+  }
+
+  /** {@inheritDoc StrategyExecutor.workspaceRoot} */
+  workspaceRoot(): string {
+    return this.config.sandbox.workspaceRoot?.() ?? "";
+  }
+
+  /**
+   * Resolve the worker agent for a {@link LoopStrategy} tree from the
+   * {@link ExecutionRegistry} (#124). The worker is the agent on the LEAF
+   * reached by descending the recursion: a `react` leaf's `agent`; a combinator
+   * descends into its primary worker child (`inner` / `execute`). A `ralph` with
+   * a non-empty `agent` override resolves THAT (Q3). Returns the resolved agent,
+   * or a typed `configuration_error` failure {@link RunResult}. Used by the
+   * resume paths, which run a worker ReAct window directly.
+   */
+  private resolveWorkerAgent(ls: LoopStrategy, sessionId: SessionId): Agent | RunResult {
+    return this.resolveAgentRef(StandardHarness.workerAgentKey(ls), sessionId);
+  }
+
+  /** The agent key the worker leaf of `ls` references
+   *  (see {@link resolveWorkerAgent}). */
+  private static workerAgentKey(ls: LoopStrategy): string {
+    switch (ls.kind) {
+      case "react":
+        return ls.agent;
+      case "plan_execute":
+        return StandardHarness.workerAgentKey(ls.execute);
+      case "self_verifying":
+        return StandardHarness.workerAgentKey(ls.inner);
+      case "ralph":
+        return ls.agent !== "" ? ls.agent : StandardHarness.workerAgentKey(ls.inner);
+      case "hill_climbing":
+        return StandardHarness.workerAgentKey(ls.inner);
+    }
   }
 
   /** {@inheritDoc StrategyExecutor.planDirective} */
@@ -812,18 +826,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
     budgetUsed: BudgetSnapshot,
     signal: AbortSignal | undefined,
   ): Promise<RunResult | undefined> {
-    // R5/R6: route the planner agent. When `plannerAgent` is configured the plan
-    // child runs against an agent-swapped child harness (same pattern as the
-    // SelfVerifying evaluate phase); otherwise the default agent runs through
-    // `this`. Either way the child's `.run(cx)` drives the WHOLE plan loop
-    // (genuine recursion).
-    const planHarness =
-      this.config.plannerAgent != null
-        ? new StandardHarness({ ...this.config, agent: this.config.plannerAgent })
-        : this;
+    // #124 Q1: the planner concept is DROPPED — the plan child's leaf
+    // `ReactConfig.agent` is authoritative and resolved by the recursing leaf
+    // itself. The child's `.run(cx)` drives the WHOLE plan loop (genuine
+    // recursion).
     const registry = this.config.registry ?? ExecutionRegistry.empty();
     const cx: ExecutionContext = newExecutionContext(registry);
-    cx.executor = planHarness;
+    cx.executor = this;
     cx.signal = signal;
     cx.scratch.runSession = planSession;
     cx.scratch.runBudget = budgetUsed;
@@ -1021,49 +1030,219 @@ export class StandardHarness implements Harness, StrategyExecutor {
     };
   }
 
-  /** {@inheritDoc StrategyExecutor.selfVerifyingLoop} */
-  selfVerifyingLoop(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-  ): Promise<RunResult> {
-    return this.runSelfVerifying(task, sessionState, budgetUsed, onStream);
+  /** {@inheritDoc StrategyExecutor.ralphSeedSession} */
+  async ralphSeedSession(instruction: string): Promise<SessionState> {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    const sessionState = emptySessionState();
+    await this.config.contextManager.appendUserMessage(sessionState, instruction);
+    const reload = StandardHarness.ralphReloadContext(workspaceRoot);
+    if (reload != null) {
+      await this.config.contextManager.appendUserMessage(sessionState, reload);
+    }
+    // R3 (issue #58 v2): inject git history when a VcsProvider is wired.
+    if (this.config.vcsProvider != null) {
+      const args: VcsLogArgs = { maxEntries: 20 };
+      try {
+        const trimmed = (await this.config.vcsProvider.log(args)).trim();
+        if (trimmed.length > 0) {
+          await this.config.contextManager.appendUserMessage(
+            sessionState,
+            `Recent VCS history:\n${trimmed}`,
+          );
+        }
+      } catch {
+        // A VCS read failure is non-fatal: skip the git section and continue.
+      }
+    }
+    return sessionState;
   }
 
-  /** {@inheritDoc StrategyExecutor.ralphLoop} */
-  ralphLoop(
-    task: Task,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-  ): Promise<RunResult> {
-    return this.runRalph(task, budgetUsed, onStream);
+  /** {@inheritDoc StrategyExecutor.ralphCompletionStatus} */
+  ralphCompletionStatus(): string | null {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    return StandardHarness.ralphCompletionStatus(workspaceRoot);
   }
 
-  /** {@inheritDoc StrategyExecutor.hillClimbingLoop} */
-  hillClimbingLoop(
-    task: Task,
+  /** {@inheritDoc StrategyExecutor.ralphMaxResets} */
+  ralphMaxResets(): number {
+    return this.config.maxResets ?? DEFAULT_MAX_RESETS;
+  }
+
+  /** {@inheritDoc StrategyExecutor.resolveMetricEvaluator} */
+  resolveMetricEvaluator(key: string, sessionId: SessionId): MetricEvaluator | RunResult {
+    const registry = this.config.registry ?? ExecutionRegistry.empty();
+    const evaluator = registry.resolveMetricEvaluator(key);
+    if (evaluator !== undefined) return evaluator;
+    return {
+      kind: "failure",
+      reason: {
+        kind: "hill_climbing_misconfigured",
+        reason: `hill_climbing requires a metric evaluator registered under key ${JSON.stringify(key)}`,
+      },
+      session_id: sessionId,
+      usage: emptyAggregateUsage(),
+      turns: 0,
+      session_state: emptySessionState(),
+    };
+  }
+
+  /** {@inheritDoc StrategyExecutor.hillBaseline} */
+  async hillBaseline(
+    evaluator: MetricEvaluator,
+    sessionId: SessionId,
+    taskId: TaskId,
     direction: HillClimbingDirection,
-    maxStagnation: number | undefined,
+    rows: ResultsEntry[],
+    spanSeq: { value: number },
+    totalUsage: AggregateUsage,
+    turns: number,
+    signal: AbortSignal | undefined,
+  ): Promise<{ ok: true; value: number } | { ok: false; failure: RunResult }> {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    const description = evaluator.description();
+    const snapshot = newSessionStateSnapshot(sessionId, taskId, emptySessionState(), workspaceRoot);
+    const baseline = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
+    if (baseline.kind === "ok") {
+      const value = baseline.result.value;
+      rows.push({
+        iteration: 0,
+        commit_hash: await this.hillClimbingCommitHash(),
+        metric_value: value,
+        direction,
+        status: "kept",
+        duration: baseline.result.duration,
+        description,
+        metadata: {},
+      });
+      this.emitHillClimbingSpan(sessionId, taskId, spanSeq, 0, value, null, "kept", false);
+      return { ok: true, value };
+    }
+    // D7: a baseline that cannot even be measured is a misconfiguration.
+    const status = iterationStatusFromError(baseline.error);
+    rows.push({
+      iteration: 0,
+      commit_hash: await this.hillClimbingCommitHash(),
+      metric_value: NaN,
+      direction,
+      status,
+      duration: 0,
+      description,
+      metadata: {},
+    });
+    this.emitHillClimbingSpan(sessionId, taskId, spanSeq, 0, null, null, status, false);
+    await this.writeHillClimbingTsv(workspaceRoot, taskId, rows);
+    return {
+      ok: false,
+      failure: {
+        kind: "failure",
+        reason: {
+          kind: "hill_climbing_misconfigured",
+          reason: `baseline evaluation failed: ${metricErrorMessage(baseline.error)}`,
+        },
+        session_id: sessionId,
+        usage: totalUsage,
+        turns,
+        session_state: emptySessionState(),
+      },
+    };
+  }
+
+  /** {@inheritDoc StrategyExecutor.hillIteration} */
+  async hillIteration(
+    evaluator: MetricEvaluator,
+    sessionId: SessionId,
+    taskId: TaskId,
+    iteration: number,
+    direction: HillClimbingDirection,
     revertOnNoImprovement: boolean,
     minImprovementDelta: number | undefined,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
+    currentBest: number,
+    rows: ResultsEntry[],
+    spanSeq: { value: number },
     signal: AbortSignal | undefined,
-  ): Promise<RunResult> {
-    // The legacy entry took the raw (sentinel-encoded) fields; the config body
-    // already decoded the `Number.MAX_SAFE_INTEGER` ⇒ "no cap" sentinel to
-    // `undefined`. Re-encode for the legacy method's signature.
-    return this.runHillClimbing(
-      task,
+  ): Promise<{ currentBest: number; nonImprovement: boolean }> {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    const description = evaluator.description();
+    const snapshot = newSessionStateSnapshot(sessionId, taskId, emptySessionState(), workspaceRoot);
+    const evalOutcome = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
+    if (evalOutcome.kind === "ok") {
+      const value = evalOutcome.result.value;
+      const kept = shouldKeep(value, currentBest, direction, minImprovementDelta ?? null);
+      const delta = direction === "minimize" ? currentBest - value : value - currentBest;
+      if (kept) {
+        rows.push({
+          iteration,
+          commit_hash: await this.hillClimbingCommitHash(),
+          metric_value: value,
+          direction,
+          status: "kept",
+          duration: evalOutcome.result.duration,
+          description,
+          metadata: {},
+        });
+        this.emitHillClimbingSpan(
+          sessionId,
+          taskId,
+          spanSeq,
+          iteration,
+          value,
+          delta,
+          "kept",
+          false,
+        );
+        return { currentBest: value, nonImprovement: false };
+      }
+      const reverted = revertOnNoImprovement;
+      if (reverted) await this.hillClimbingRevert(signal);
+      rows.push({
+        iteration,
+        commit_hash: await this.hillClimbingCommitHash(),
+        metric_value: value,
+        direction,
+        status: "discarded",
+        duration: evalOutcome.result.duration,
+        description,
+        metadata: {},
+      });
+      this.emitHillClimbingSpan(
+        sessionId,
+        taskId,
+        spanSeq,
+        iteration,
+        value,
+        delta,
+        "discarded",
+        reverted,
+      );
+      return { currentBest, nonImprovement: true };
+    }
+    // Crash/timeout/etc.: counts as a non-improvement.
+    const status = iterationStatusFromError(evalOutcome.error);
+    const reverted = revertOnNoImprovement;
+    if (reverted) await this.hillClimbingRevert(signal);
+    rows.push({
+      iteration,
+      commit_hash: await this.hillClimbingCommitHash(),
+      metric_value: NaN,
       direction,
-      maxStagnation ?? Number.MAX_SAFE_INTEGER,
-      revertOnNoImprovement,
-      minImprovementDelta ?? 0,
-      budgetUsed,
-      onStream,
-      signal,
-    );
+      status,
+      duration: 0,
+      description,
+      metadata: {},
+    });
+    this.emitHillClimbingSpan(sessionId, taskId, spanSeq, iteration, null, null, status, reverted);
+    return { currentBest, nonImprovement: true };
+  }
+
+  /** {@inheritDoc StrategyExecutor.hillWriteTsv} */
+  async hillWriteTsv(taskId: TaskId, rows: ResultsEntry[]): Promise<void> {
+    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
+    await this.writeHillClimbingTsv(workspaceRoot, taskId, rows);
+  }
+
+  /** {@inheritDoc StrategyExecutor.budgetExceeded} */
+  budgetExceeded(budget: BudgetLimits, used: BudgetSnapshot): BudgetLimitType | null {
+    return budgetExceeded(budget, used, Date.now());
   }
 
   /** {@inheritDoc StrategyExecutor.finalize} */
@@ -1147,6 +1326,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
         state.task.loop_strategy.kind === "react"
           ? reactMaxIterations(state.task.loop_strategy)
           : Number.MAX_SAFE_INTEGER;
+      const agent = this.resolveWorkerAgent(state.task.loop_strategy, state.session_id);
+      if (!("turn" in agent)) return agent;
       return this.runReact(
         state.task,
         maxIter,
@@ -1155,6 +1336,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
         onStream,
         signal,
         false,
+        agent,
       );
     }
 
@@ -1221,7 +1403,18 @@ export class StandardHarness implements Harness, StrategyExecutor {
       state.task.loop_strategy.kind === "react"
         ? reactMaxIterations(state.task.loop_strategy)
         : Number.MAX_SAFE_INTEGER;
-    return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
+    const agent = this.resolveWorkerAgent(state.task.loop_strategy, state.session_id);
+    if (!("turn" in agent)) return agent;
+    return this.runReact(
+      state.task,
+      max,
+      sessionState,
+      state.budget_used,
+      onStream,
+      signal,
+      false,
+      agent,
+    );
   }
 
   /**
@@ -1300,7 +1493,18 @@ export class StandardHarness implements Harness, StrategyExecutor {
       state.task.loop_strategy.kind === "react"
         ? reactMaxIterations(state.task.loop_strategy)
         : Number.MAX_SAFE_INTEGER;
-    return this.runReact(state.task, max, sessionState, state.budget_used, onStream, signal, false);
+    const agent = this.resolveWorkerAgent(state.task.loop_strategy, state.session_id);
+    if (!("turn" in agent)) return agent;
+    return this.runReact(
+      state.task,
+      max,
+      sessionState,
+      state.budget_used,
+      onStream,
+      signal,
+      false,
+      agent,
+    );
   }
 
   // --------------------------------------------------------------------------
@@ -1447,155 +1651,6 @@ export class StandardHarness implements Harness, StrategyExecutor {
   }
 
   /**
-   * Drive the `self_verifying` loop strategy (issue #61).
-   *
-   * A loop-within-a-loop. Each iteration: (1) a bounded ReAct BUILD sub-loop runs
-   * until the agent claims done, carrying the shared budget; (2) a fresh EVALUATE
-   * run executes over a read-only sandbox in a never-shared session with the
-   * evaluator agent and the `role-evaluator` chunk; (3) the {@link Verifier}
-   * renders a verdict. `passed` ⇒ `success`; `failed` ⇒ the reason is injected
-   * into the build context (the SAME user-message path the Stop-block / reject
-   * resume uses — D1) and the loop continues. Running out of the verifier's
-   * `maxIterations` round-trips without a pass yields
-   * `failure { self_verify_exhausted }` (D4 — the stagnation guard / Default-FAIL
-   * contract). An absent `config.verifier` yields `failure
-   * { self_verify_misconfigured }` (D4 — a typed halt, NOT a throw).
-   *
-   * Budgets fold BOTH phases across ALL iterations (R8). Build and evaluate are
-   * distinguishable in traces via distinct session ids: the build keeps the
-   * task's session, each evaluate gets a freshly generated one (R2/R9).
-   */
-  private async runSelfVerifying(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    _onStream: StreamSink | undefined,
-  ): Promise<RunResult> {
-    const buildSessionId = task.session_id;
-
-    // D4/R11: a missing verifier is a typed halt, not a throw.
-    const verifier = this.config.verifier;
-    if (verifier == null) {
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "self_verify_misconfigured",
-          reason: "self_verifying requires `config.verifier`, but it is absent",
-        },
-        session_id: buildSessionId,
-        usage: emptyAggregateUsage(),
-        turns: 0,
-      };
-      await this.finalizeSelfVerifying(result);
-      return result;
-    }
-
-    const maxIterations = verifier.maxIterations();
-    // Shared budget threaded across every build + evaluate sub-run (R8).
-    const carried: BudgetSnapshot = { ...budgetUsed };
-    // Cumulative usage across ALL build + evaluate runs of ALL iterations (R8).
-    const totalUsage: AggregateUsage = emptyAggregateUsage();
-    // The most recent verifier failure reason (for self_verify_exhausted).
-    let lastReason = "";
-
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      // ── Build phase (R1): a bounded ReAct sub-loop carrying the shared
-      //    budget. Iteration 0's seed instruction is delivered by the sub-loop;
-      //    later iterations already have the prior verdict reason injected as a
-      //    user message (R6), so they do NOT re-seed.
-      const buildTask: Task = {
-        id: task.id,
-        instruction: task.instruction,
-        session_id: buildSessionId,
-        budget: task.budget,
-        loop_strategy: task.loop_strategy,
-      };
-      const buildCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
-      const buildResult = await this.runReactInner(
-        buildTask,
-        buildCap,
-        sessionState,
-        { ...carried },
-        // Sub-loops run with a suppressed sink (mirrors PlanExecute); terminal
-        // observability is finalized by this strategy.
-        undefined,
-        undefined,
-        iteration === 0,
-      );
-      foldUsage(totalUsage, carried, buildResult);
-
-      // A build run that paused / escalated is propagated up unchanged — the
-      // caller must handle it before verification can resume.
-      if (buildResult.kind === "waiting_for_human") {
-        return buildResult;
-      }
-      // A build run pausing to consult (issue #114) pauses the whole run;
-      // propagate so the caller (or SubagentTool) mediates.
-      if (buildResult.kind === "consult") {
-        return buildResult;
-      }
-      if (buildResult.kind === "escalate") {
-        await this.finalizeSelfVerifying(buildResult);
-        return buildResult;
-      }
-
-      // ── Evaluate phase (R2/R3/R4): a fresh evaluator RUN. Distinct generated
-      //    session id (never shared with build — R2/R9), a read-only sandbox
-      //    derived internally (R3), the evaluator agent (D2 defaulting), and the
-      //    `role-evaluator` chunk (R4).
-      const evalResult = await this.runEvaluatePhase(task, carried, totalUsage);
-
-      // ── Verdict.
-      const input: VerifierInput = {
-        build_result: buildResult,
-        eval_result: evalResult,
-        workspace: this.config.sandbox.workspaceRoot?.() ?? "",
-        iteration,
-      };
-      const verdict = await verifier.verify(input);
-      if (verdict.kind === "passed") {
-        // Reuse the build run's output as the run's output. Carry the build
-        // run's final conversation history into the terminal result (issue
-        // #102) so a SelfVerifying caller resumes losslessly; fall back to the
-        // running build context for a non-Success build a bespoke verifier
-        // accepted.
-        const output = buildResult.kind === "success" ? buildResult.output : "";
-        const turns = buildResult.kind === "success" ? buildResult.turns : carried.turns;
-        const finalState =
-          buildResult.kind === "success" ? runResultSessionState(buildResult) : sessionState;
-        const result: RunResult = {
-          kind: "success",
-          output,
-          session_id: buildSessionId,
-          usage: totalUsage,
-          turns,
-          session_state: finalState,
-        };
-        await this.finalizeSelfVerifying(result);
-        return result;
-      }
-      // R5/R6: Default-FAIL keeps looping; inject the reason into the build
-      // context via the SAME path the Stop-block uses (append a user message) so
-      // the next build iteration sees it.
-      lastReason = verdict.reason;
-      await this.config.contextManager.appendUserMessage(sessionState, verdict.reason);
-    }
-
-    // R7: ran out of round-trips without a pass — clean exhaustion. Carry the
-    // live build session history (issue #102).
-    const result: RunResult = {
-      kind: "failure",
-      reason: { kind: "self_verify_exhausted", iterations: maxIterations, last_reason: lastReason },
-      session_id: buildSessionId,
-      usage: totalUsage,
-      turns: carried.turns,
-      session_state: sessionState,
-    };
-    await this.finalizeSelfVerifying(result);
-    return result;
-  }
-
-  /**
    * Run the `self_verifying` evaluate phase (issue #61): a fresh evaluator RUN
    * over a read-only sandbox in a never-shared session.
    *
@@ -1609,12 +1664,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
    */
   private async runEvaluatePhase(
     task: Task,
+    evaluator: Agent,
     carried: BudgetSnapshot,
     totalUsage: AggregateUsage,
   ): Promise<RunResult> {
-    // D2: evaluator-agent defaulting — identical contract to plannerAgent.
-    const evaluator = this.config.evaluatorAgent ?? this.config.agent;
-
     // R3: derive a read-only sandbox internally from the build sandbox.
     const readOnlySandbox: SandboxProvider = new ReadOnlySandbox(this.config.sandbox);
 
@@ -1638,12 +1691,12 @@ export class StandardHarness implements Harness, StrategyExecutor {
       loop_strategy: reactPerLoop(task.budget.max_turns ?? Number.MAX_SAFE_INTEGER),
     };
 
-    // Child harness: clone the config, swap agent + sandbox. Cloning shares the
-    // same observability/storage seams so the evaluate run's spans land in the
-    // SAME trace stream (distinguished by its distinct session id).
+    // Child harness: clone the config, swap the sandbox to read-only. Cloning
+    // shares the same observability/storage seams so the evaluate run's spans
+    // land in the SAME trace stream (distinguished by its distinct session id).
+    // The evaluate agent (#124 — no `config.agent`) is passed to `runReact`.
     const evalConfig: HarnessConfig = {
       ...this.config,
-      agent: evaluator,
       sandbox: readOnlySandbox,
     };
     const evalHarness = new StandardHarness(evalConfig);
@@ -1658,6 +1711,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       undefined,
       undefined,
       true,
+      evaluator,
     );
 
     foldUsage(totalUsage, carried, evalResult);
@@ -1680,357 +1734,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
     }
   }
 
-  /**
-   * Finalize observability for a terminal `self_verifying` outcome. Mirrors the
-   * tail of {@link runReact} / {@link finalizePlanExecute}. `waiting_for_human`
-   * is not terminal and is never flushed here.
-   */
-  private async finalizeSelfVerifying(result: RunResult): Promise<void> {
-    switch (result.kind) {
-      case "success":
-        await this.finalizeObservability(result.session_id, { kind: "success" });
-        break;
-      case "failure":
-        await this.finalizeObservability(result.session_id, {
-          kind: "failure",
-          reason: haltReasonToString(result.reason),
-        });
-        break;
-      case "waiting_for_human":
-        break;
-      // Consult (issue #114) is non-terminal; do not finalize.
-      case "consult":
-        break;
-      case "escalate":
-        await this.finalizeObservability(result.session_id, { kind: "escalated" });
-        break;
-    }
-  }
-
   // --------------------------------------------------------------------------
   // HillClimbing (issue #60) — iterative optimization loop
   // --------------------------------------------------------------------------
-
-  /**
-   * Drive the `hill_climbing` loop strategy (issue #60) — the iterative
-   * optimization loop. Establish a baseline metric (iteration 0, NO agent turn),
-   * then for each subsequent iteration: run one bounded ReAct agent turn to
-   * propose a change, re-evaluate the metric, and keep or revert based on
-   * {@link shouldKeep}. The harness — never the agent — writes the results log
-   * to `{workspace_root}/.spore/results/{task_id}.tsv`.
-   *
-   * ## Resolved spec decisions (issue #60 — all FINAL, mirror Rust exactly)
-   * - **D1 (revert):** `revert_on_no_improvement` ⇒ `git reset --hard HEAD` runs
-   *   through the sandbox's `executeCommand` seam directly from the harness. The
-   *   harness NEVER commits; `commit_hash` is the empty string (no VcsProvider).
-   * - **D2/D3 (TSV):** tab-separated, REQUIRED header, one row per iteration in
-   *   ascending order. Floats (`metric_value`, `duration_secs`) use EXACTLY 6
-   *   decimals; `metric_value` is the empty string on crashed/timeout rows;
-   *   `metadata` is excluded. `direction`/`status` are snake_case.
-   * - **D4 (direction):** the payload `direction` is authoritative for the
-   *   keep/revert decision and is the value recorded in the TSV.
-   * - **D5 (baseline):** iteration 0 is a pure baseline measurement — no agent
-   *   turn, `status: kept`, `current_best` set. Agent turns start at iteration 1.
-   * - **D6 (misconfiguration):** an absent `config.metricEvaluator` ⇒ a typed
-   *   halt `hill_climbing_misconfigured`, NOT a throw.
-   * - **D7 (baseline error):** if the iteration-0 baseline evaluation itself
-   *   errors, it is treated as `hill_climbing_misconfigured` (no `current_best`
-   *   to climb from), NOT a stagnation increment.
-   *
-   * ## Loop semantics
-   * Iterations 1+: agent turn → evaluate → `shouldKeep(new, currentBest,
-   * payloadDirection, minImprovementDelta)`. Keep ⇒ `status: kept`, update best,
-   * reset the stagnation counter. No keep ⇒ `status: discarded`, optional revert,
-   * increment the counter. An evaluator error (crashed/timeout) records an
-   * empty-metric row, counts as a non-improvement, and the loop continues.
-   * `max_stagnation = N` ⇒ halt `stagnation_limit_reached { iterations,
-   * best_metric }` after N consecutive non-improvements (an improvement resets
-   * the counter); `null` ⇒ run until the budget / turn cap is hit.
-   */
-  private async runHillClimbing(
-    task: Task,
-    direction: HillClimbingDirection,
-    maxStagnation: number | null,
-    revertOnNoImprovement: boolean,
-    minImprovementDelta: number | null,
-    budgetUsed: BudgetSnapshot,
-    _onStream: StreamSink | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<RunResult> {
-    const sessionId = task.session_id;
-    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
-
-    // D6: a missing evaluator is a typed halt, not a throw.
-    const evaluator = this.config.metricEvaluator;
-    if (evaluator == null) {
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "hill_climbing_misconfigured",
-          reason: "hill_climbing requires `config.metricEvaluator`, but it is absent",
-        },
-        session_id: sessionId,
-        usage: emptyAggregateUsage(),
-        turns: 0,
-      };
-      await this.finalizeHillClimbing(result);
-      return result;
-    }
-
-    const description = evaluator.description();
-    // Per-iteration observability span counter.
-    const spanSeq = { value: 0 };
-    // Cumulative usage + turns across ALL agent-turn iterations.
-    const totalUsage: AggregateUsage = emptyAggregateUsage();
-    // Shared budget threaded across every agent sub-run.
-    const carried: BudgetSnapshot = { ...budgetUsed };
-    // The TSV rows, in iteration order.
-    const rows: ResultsEntry[] = [];
-
-    // A snapshot for the evaluator. HillClimbing keeps no carried message state
-    // of its own (each iteration is a fresh sub-run), so a default SessionState
-    // is the right snapshot to hand the evaluator.
-    const snapshot = newSessionStateSnapshot(
-      sessionId,
-      task.id,
-      emptySessionState(),
-      workspaceRoot,
-    );
-
-    // ── Iteration 0: pure baseline. No agent turn (D5).
-    const baseline = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
-    let currentBest: number;
-    if (baseline.kind === "ok") {
-      currentBest = baseline.result.value;
-      rows.push({
-        iteration: 0,
-        commit_hash: await this.hillClimbingCommitHash(),
-        metric_value: currentBest,
-        direction,
-        status: "kept",
-        duration: baseline.result.duration,
-        description,
-        metadata: {},
-      });
-      this.emitHillClimbingSpan(sessionId, task.id, spanSeq, 0, currentBest, null, "kept", false);
-    } else {
-      // D7: a baseline that cannot even be measured is a misconfiguration of the
-      // experiment, not a non-improvement to climb away from — there is no
-      // `current_best` to compare against. Record the failed row, write the TSV,
-      // and halt.
-      const status = iterationStatusFromError(baseline.error);
-      rows.push({
-        iteration: 0,
-        commit_hash: await this.hillClimbingCommitHash(),
-        // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-        metric_value: NaN,
-        direction,
-        status,
-        duration: 0,
-        description,
-        metadata: {},
-      });
-      this.emitHillClimbingSpan(sessionId, task.id, spanSeq, 0, null, null, status, false);
-      await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
-      const result: RunResult = {
-        kind: "failure",
-        reason: {
-          kind: "hill_climbing_misconfigured",
-          reason: `baseline evaluation failed: ${metricErrorMessage(baseline.error)}`,
-        },
-        session_id: sessionId,
-        usage: totalUsage,
-        turns: carried.turns,
-      };
-      await this.finalizeHillClimbing(result);
-      return result;
-    }
-
-    // Consecutive non-improvement counter (the stagnation halt).
-    let stagnation = 0;
-    // The 0-based iteration index; agent turns begin at 1.
-    let iteration = 1;
-
-    for (;;) {
-      // Budget gate before the iteration's agent turn (mirrors runReactInner).
-      const turnCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
-      if (carried.turns >= turnCap) {
-        break;
-      }
-      const overrun = budgetExceeded(task.budget, carried, Date.now());
-      if (overrun != null) {
-        // A wall-time/cost/token cap reached BEFORE any iteration work is a clean
-        // budget halt. Mirrors runReactInner's contract.
-        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
-        const result: RunResult = {
-          kind: "failure",
-          reason: { kind: "budget_exceeded", limit_type: overrun },
-          session_id: sessionId,
-          usage: totalUsage,
-          turns: carried.turns,
-        };
-        await this.finalizeHillClimbing(result);
-        return result;
-      }
-
-      // ── One bounded agent turn proposes a change. The sub-run carries the
-      //    shared budget so per-iteration turns count toward the cap. Each
-      //    iteration is a fresh, isolated ReAct sub-loop.
-      const iterTask: Task = {
-        id: task.id,
-        instruction: task.instruction,
-        session_id: sessionId,
-        budget: task.budget,
-        loop_strategy: task.loop_strategy,
-      };
-      const iterState = emptySessionState();
-      const turnResult = await this.runReactInner(
-        iterTask,
-        turnCap,
-        iterState,
-        { ...carried },
-        undefined,
-        signal,
-        true,
-      );
-      foldUsage(totalUsage, carried, turnResult);
-
-      // A turn that paused / escalated is propagated up unchanged.
-      if (turnResult.kind === "waiting_for_human") {
-        return turnResult;
-      }
-      // A turn pausing to consult (issue #114) pauses the whole run; propagate.
-      if (turnResult.kind === "consult") {
-        return turnResult;
-      }
-      if (turnResult.kind === "escalate") {
-        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
-        await this.finalizeHillClimbing(turnResult);
-        return turnResult;
-      }
-
-      // ── Evaluate the metric after the change.
-      const evalOutcome = await evaluator.evaluate(this.config.sandbox, snapshot, signal);
-      if (evalOutcome.kind === "ok") {
-        const value = evalOutcome.result.value;
-        const kept = shouldKeep(value, currentBest, direction, minImprovementDelta);
-        const delta = direction === "minimize" ? currentBest - value : value - currentBest;
-        if (kept) {
-          currentBest = value;
-          stagnation = 0;
-          rows.push({
-            iteration,
-            commit_hash: await this.hillClimbingCommitHash(),
-            metric_value: value,
-            direction,
-            status: "kept",
-            duration: evalOutcome.result.duration,
-            description,
-            metadata: {},
-          });
-          this.emitHillClimbingSpan(
-            sessionId,
-            task.id,
-            spanSeq,
-            iteration,
-            value,
-            delta,
-            "kept",
-            false,
-          );
-        } else {
-          // No improvement (D1: optionally revert).
-          const reverted = revertOnNoImprovement;
-          if (reverted) {
-            await this.hillClimbingRevert(signal);
-          }
-          stagnation += 1;
-          rows.push({
-            iteration,
-            commit_hash: await this.hillClimbingCommitHash(),
-            metric_value: value,
-            direction,
-            status: "discarded",
-            duration: evalOutcome.result.duration,
-            description,
-            metadata: {},
-          });
-          this.emitHillClimbingSpan(
-            sessionId,
-            task.id,
-            spanSeq,
-            iteration,
-            value,
-            delta,
-            "discarded",
-            reverted,
-          );
-        }
-      } else {
-        // Crash/timeout/etc.: counts as a non-improvement. Optionally revert,
-        // increment stagnation, record an empty-metric row.
-        const status = iterationStatusFromError(evalOutcome.error);
-        const reverted = revertOnNoImprovement;
-        if (reverted) {
-          await this.hillClimbingRevert(signal);
-        }
-        stagnation += 1;
-        rows.push({
-          iteration,
-          commit_hash: await this.hillClimbingCommitHash(),
-          // Sentinel; excluded from the TSV (crashed/timeout ⇒ empty).
-          metric_value: NaN,
-          direction,
-          status,
-          duration: 0,
-          description,
-          metadata: {},
-        });
-        this.emitHillClimbingSpan(
-          sessionId,
-          task.id,
-          spanSeq,
-          iteration,
-          null,
-          null,
-          status,
-          reverted,
-        );
-      }
-
-      // ── Stagnation halt (only when a cap is configured).
-      if (maxStagnation != null && stagnation >= maxStagnation) {
-        await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
-        const result: RunResult = {
-          kind: "failure",
-          reason: {
-            kind: "stagnation_limit_reached",
-            iterations: stagnation,
-            best_metric: currentBest,
-          },
-          session_id: sessionId,
-          usage: totalUsage,
-          turns: carried.turns,
-        };
-        await this.finalizeHillClimbing(result);
-        return result;
-      }
-
-      iteration += 1;
-    }
-
-    // Budget/turn cap reached without a stagnation halt — clean budget halt.
-    await this.writeHillClimbingTsv(workspaceRoot, task.id, rows);
-    const result: RunResult = {
-      kind: "failure",
-      reason: { kind: "budget_exceeded", limit_type: "turns" },
-      session_id: sessionId,
-      usage: totalUsage,
-      turns: carried.turns,
-    };
-    await this.finalizeHillClimbing(result);
-    return result;
-  }
 
   /**
    * Revert the working tree to current HEAD for a no-improvement iteration
@@ -2140,200 +1846,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
     return out;
   }
 
-  /**
-   * Finalize observability for a terminal `hill_climbing` outcome. Mirrors the
-   * tail of {@link runReact} / {@link finalizeSelfVerifying}. `waiting_for_human`
-   * is not terminal and is never flushed here.
-   */
-  private async finalizeHillClimbing(result: RunResult): Promise<void> {
-    switch (result.kind) {
-      case "success":
-        await this.finalizeObservability(result.session_id, { kind: "success" });
-        break;
-      case "failure":
-        await this.finalizeObservability(result.session_id, {
-          kind: "failure",
-          reason: haltReasonToString(result.reason),
-        });
-        break;
-      case "waiting_for_human":
-        break;
-      // Consult (issue #114) is non-terminal; do not finalize.
-      case "consult":
-        break;
-      case "escalate":
-        await this.finalizeObservability(result.session_id, { kind: "escalated" });
-        break;
-    }
-  }
-
   // --------------------------------------------------------------------------
   // Ralph (issue #58) — multi-context-window continuation loop
   // --------------------------------------------------------------------------
-
-  /**
-   * Drive the `ralph` loop strategy (issue #58) — the multi-context-window
-   * continuation loop. Each OUTER iteration is ONE context window: a FRESH
-   * {@link SessionState} (no message carryover) re-seeded with the instruction
-   * plus the reloaded `.spore/` state, then a bounded inner ReAct sub-loop. The
-   * external completion check (B1) reads `.spore/progress.json` +
-   * `.spore/feature_list.json` — the SAME files the registered `ralph-stop` hook
-   * reads. Incomplete ⇒ reset into a new window; all complete ⇒ `success`.
-   *
-   * ## Resolved spec decisions (issue #58 — all FINAL)
-   * - **B1:** completion is driven off the Stop hook; the OUTER loop consults the
-   *   SAME filesystem check ({@link ralphCompletionStatus}) to decide reset vs
-   *   success. No `completion_check` config field; the deprecated CompletionCheck
-   *   trait is NOT reused.
-   * - **B2:** canonical paths `.spore/progress.json` + `.spore/feature_list.json`.
-   * - **B3:** {@link HarnessConfig.maxResets} (default 3) caps the OUTER loop,
-   *   independent of `max_turns`. Exhausting it with tasks incomplete yields
-   *   {@link HaltReason} `ralph_completion_unmet { iterations, last_reason }`.
-   * - **B4:** v1 reloads ONLY progress + feature_list (no git). Hermetic.
-   *
-   * ## Rules enforced (each maps to a test):
-   * - R1 the model's exit attempt RESETS the context window instead of
-   *   terminating, while tasks remain incomplete.
-   * - R2 each reset builds a FRESH {@link SessionState} — no message carryover.
-   * - R3 the filesystem reload injects the reloaded `.spore/` content into the
-   *   fresh seed.
-   * - R4 `incomplete,incomplete,complete` ⇒ `success` at iteration 3.
-   * - R5 always-incomplete ⇒ exactly `maxResets` iterations ⇒
-   *   `failure { ralph_completion_unmet }`.
-   * - R6 budgets fold across ALL context windows.
-   * - R7 each reset is traceable (a distinct generated session id per window).
-   */
-  private async runRalph(
-    task: Task,
-    _budgetUsed: BudgetSnapshot,
-    _onStream: StreamSink | undefined,
-  ): Promise<RunResult> {
-    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
-    const maxResets = Math.max(this.config.maxResets ?? DEFAULT_MAX_RESETS, 1);
-
-    // Cumulative usage + turns across ALL context windows (R6). Each window is a
-    // fresh start with its own per-window turn budget; token/turn accounting is
-    // accumulated separately for terminal reporting.
-    const totalUsage: AggregateUsage = emptyAggregateUsage();
-    const carriedAccounting: BudgetSnapshot = emptyBudgetSnapshot();
-    // The most recent incompletion reason (for ralph_completion_unmet).
-    let lastReason = ".spore/progress.json missing";
-    // Session id of the most recent context window (terminal accounting).
-    let lastSessionId = task.session_id;
-
-    // The OUTER loop: each iteration is ONE context window (R1). `maxResets`
-    // caps the number of windows (B3).
-    for (let iteration = 0; iteration < maxResets; iteration += 1) {
-      // R7: a fresh, distinct session id per context window so each reset is
-      // independently traceable. Window 0 keeps the task's session id.
-      const windowSessionId = iteration === 0 ? task.session_id : SessionId.generate();
-      lastSessionId = windowSessionId;
-
-      // R2: a FRESH SessionState per window — no message carryover.
-      const sessionState = emptySessionState();
-
-      // R2: seed the instruction, then R3: reload the deterministic `.spore/`
-      // state from the filesystem and inject it as context so the fresh window
-      // knows what is already done / still outstanding.
-      await this.config.contextManager.appendUserMessage(sessionState, task.instruction);
-      const reload = StandardHarness.ralphReloadContext(workspaceRoot);
-      if (reload != null) {
-        await this.config.contextManager.appendUserMessage(sessionState, reload);
-      }
-      // R3 (issue #58 v2): when a VcsProvider is wired, ALSO reload git history
-      // and inject it as a delimited "Recent VCS history:" section, exactly as
-      // the `.spore/` reload content is injected. When the provider is unset
-      // (the default), this section is omitted entirely — Ralph's reloaded
-      // context is then byte-for-byte the v1 behavior (the B4→none decision).
-      if (this.config.vcsProvider != null) {
-        const args: VcsLogArgs = { maxEntries: 20 };
-        try {
-          const trimmed = (await this.config.vcsProvider.log(args)).trim();
-          if (trimmed.length > 0) {
-            await this.config.contextManager.appendUserMessage(
-              sessionState,
-              `Recent VCS history:\n${trimmed}`,
-            );
-          }
-        } catch {
-          // A VCS read failure is non-fatal: skip the git section and continue.
-        }
-      }
-
-      // The per-window bounded ReAct sub-loop. The registered `ralph-stop` hook
-      // (B1) fires inside it on each final response; this strategy's OUTER loop
-      // then decides reset vs success. FRESH per-window budget (the reset
-      // discards the turn budget); token fold is accumulated via `totalUsage`.
-      const windowTask: Task = {
-        id: task.id,
-        instruction: task.instruction,
-        session_id: windowSessionId,
-        budget: task.budget,
-        loop_strategy: task.loop_strategy,
-      };
-      const windowCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
-      const windowResult = await this.runReactInner(
-        windowTask,
-        windowCap,
-        sessionState,
-        emptyBudgetSnapshot(),
-        undefined,
-        undefined,
-        // The instruction is seeded above; the sub-loop must NOT re-seed it.
-        false,
-      );
-      foldUsage(totalUsage, carriedAccounting, windowResult);
-
-      // A window that paused / escalated is propagated up unchanged.
-      if (windowResult.kind === "waiting_for_human") {
-        return windowResult;
-      }
-      // A window pausing to consult (issue #114) pauses the whole run; propagate.
-      if (windowResult.kind === "consult") {
-        return windowResult;
-      }
-      if (windowResult.kind === "escalate") {
-        await this.finalizeSelfVerifying(windowResult);
-        return windowResult;
-      }
-
-      // External completion check (B1): consult the SAME filesystem state the
-      // Stop hook reads. `null` ⇒ done ⇒ success; otherwise tasks remain ⇒ reset
-      // into the next window (R1) unless the cap is reached (R5).
-      const status = StandardHarness.ralphCompletionStatus(workspaceRoot);
-      if (status == null) {
-        const output = windowResult.kind === "success" ? windowResult.output : "";
-        // Carry the final context window's history into the terminal result
-        // (issue #102).
-        const finalState =
-          windowResult.kind === "success"
-            ? runResultSessionState(windowResult)
-            : emptySessionState();
-        const result: RunResult = {
-          kind: "success",
-          output,
-          session_id: windowSessionId,
-          usage: totalUsage,
-          turns: carriedAccounting.turns,
-          session_state: finalState,
-        };
-        await this.finalizeSelfVerifying(result);
-        return result;
-      }
-      lastReason = status;
-    }
-
-    // R5: ran out of context-window resets without completion.
-    const result: RunResult = {
-      kind: "failure",
-      reason: { kind: "ralph_completion_unmet", iterations: maxResets, last_reason: lastReason },
-      session_id: lastSessionId,
-      usage: totalUsage,
-      turns: carriedAccounting.turns,
-    };
-    await this.finalizeSelfVerifying(result);
-    return result;
-  }
 
   /**
    * Ralph external completion check (issue #58, B1). Reads the deterministic
@@ -2445,6 +1960,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     seedInstruction: boolean,
+    agent: Agent,
   ): Promise<RunResult> {
     const result = await this.runReactInner(
       task,
@@ -2454,6 +1970,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       onStream,
       signal,
       seedInstruction,
+      agent,
     );
     switch (result.kind) {
       case "success":
@@ -2489,6 +2006,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     seedInstruction: boolean,
+    agent: Agent,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     // Resolve the effective tool registry once per turn-loop window (issue #91).
@@ -2639,7 +2157,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // `turn` path so the baseline RunResult is byte-identical (back-compat).
       const result = onStream
         ? await turnStreaming(
-            this.config.agent,
+            agent,
             context,
             ((): AgentStreamSink => {
               const streamState = new TurnStreamState();
@@ -2651,7 +2169,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             })(),
             signal,
           )
-        : await this.config.agent.turn(context, signal);
+        : await agent.turn(context, signal);
       budgetUsed.turns += 1;
 
       // Emit a turn span for every model call (issue #12). Fire-and-forget; it
@@ -3243,6 +2761,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
               task.id,
               spanSeq,
               usage,
+              agent,
               signal,
             );
           }
@@ -3295,6 +2814,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     taskId: TaskId,
     spanSeq: number,
     usage: AggregateUsage,
+    agent: Agent,
     signal?: AbortSignal,
   ): Promise<number> {
     const cm = this.config.contextManager;
@@ -3314,7 +2834,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     for (;;) {
       attempt += 1;
       // Run one compaction turn through the agent to produce a summary.
-      const result = await this.config.agent.turn(turn.context, signal);
+      const result = await agent.turn(turn.context, signal);
       let summary: string;
       switch (result.kind) {
         case "final_response":
@@ -3479,10 +2999,9 @@ export class HarnessBuilder {
   private _contentCapture: ContentCaptureConfig = ContentCaptureConfig.default();
   private _hooks?: HookChain;
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
-  private _plannerAgent?: Agent;
   private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
   private _verifier?: Verifier;
-  private _evaluatorAgent?: Agent;
+  private _metricEvaluator?: MetricEvaluator;
   private _vcsProvider?: VcsProvider;
   private readonly _standardTools: StandardTool[] = [];
   private _systemPrompt?: string;
@@ -3625,17 +3144,8 @@ export class HarnessBuilder {
     return this;
   }
 
-  /** Inject an alternate agent for the `plan_execute` plan phase (issue #70,
-   *  Q1). When set and the loop strategy is `plan_execute`, the one-shot plan
-   *  turn runs on this agent; otherwise it runs on the default agent. */
-  plannerAgent(agent: Agent): this {
-    this._plannerAgent = agent;
-    return this;
-  }
-
   /**
-   * Register a per-kind consult handler (issue #114). Analogous to
-   * {@link plannerAgent}. When a worker (run via {@link "@spore/tools".SubagentTool})
+   * Register a per-kind consult handler (issue #114). When a worker (run via {@link "@spore/tools".SubagentTool})
    * pauses with a {@link ConsultRequest} whose `kind` matches `kind`, the
    * orchestrator runs `handler` on the request deterministically (no orchestrator
    * model turn), up to `budget` consults of this kind before applying `overflow`.
@@ -3675,12 +3185,12 @@ export class HarnessBuilder {
     return this;
   }
 
-  /** Inject an alternate agent for the `self_verifying` evaluate phase (issue
-   *  #61, D2). Mirrors {@link plannerAgent}: when set and the strategy is
-   *  `self_verifying`, the evaluate run uses this agent; otherwise it runs on
-   *  the default agent. */
-  evaluatorAgent(agent: Agent): this {
-    this._evaluatorAgent = agent;
+  /** Inject the metric oracle for the `hill_climbing` strategy (issue #60).
+   *  REQUIRED for that strategy — absent it, a `hill_climbing` run halts with
+   *  `hill_climbing_misconfigured`. Ignored by every other strategy. Folded into
+   *  the {@link ExecutionRegistry} under the default key (#124, Q2). */
+  metricEvaluator(evaluator: MetricEvaluator): this {
+    this._metricEvaluator = evaluator;
     return this;
   }
 
@@ -3929,8 +3439,23 @@ export class HarnessBuilder {
         ? StorageProvider.single(new InMemoryStorageProvider())
         : StorageProvider.noOp());
 
+    // #124: the legacy single-collaborator fields are gone — fold the builder's
+    // collaborators into the ExecutionRegistry under the DEFAULT empty-string
+    // handle (`reactPerLoop` leaves use an empty AgentRef/ToolsetRef; the default
+    // SelfVerifying / HillClimbing evaluator likewise uses the empty key).
+    // Explicitly registered handles (via `agentRef` / `verifierRef` / …) take
+    // precedence: `fillDefault*` only fills a key the caller did not already wire.
+    let regBuilder = this._registry
+      .toBuilder()
+      .fillDefaultAgent(this.agent)
+      .fillDefaultToolset(this._toolRegistry);
+    if (this._verifier != null) regBuilder = regBuilder.fillDefaultVerifier(this._verifier);
+    if (this._metricEvaluator != null) {
+      regBuilder = regBuilder.fillDefaultMetricEvaluator(this._metricEvaluator);
+    }
+    const registry = regBuilder.build();
+
     return {
-      agent: this.agent,
       toolRegistry: this._toolRegistry,
       sandbox: this._sandbox,
       contextManager: this._contextManager,
@@ -3944,10 +3469,7 @@ export class HarnessBuilder {
       contentCapture: this._contentCapture,
       hooks: this._hooks,
       maxStopBlocks: this._maxStopBlocks,
-      plannerAgent: this._plannerAgent,
       chunkProvider: this._chunkProvider,
-      verifier: this._verifier,
-      evaluatorAgent: this._evaluatorAgent,
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
       systemPrompt: this._systemPrompt,
@@ -3957,7 +3479,7 @@ export class HarnessBuilder {
       // Only attach when populated so the default config stays byte-for-byte
       // unchanged for callers that never register a consult handler (R9).
       consultHandlers: this._consultHandlers.size > 0 ? this._consultHandlers : undefined,
-      registry: this._registry,
+      registry,
       escalationMode: this._escalationMode,
     };
   }

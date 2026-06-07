@@ -266,7 +266,8 @@ describe("ExecutionRegistry tree-walk over cordyceps_tree.json", () => {
       .agent("ralph-agent", new StubAgent())
       .toolset("plan-tools", new EmptyToolRegistry())
       .toolset("exec-tools", new EmptyToolRegistry())
-      .schema("exec-evaluator", {})
+      // #124 Q1: the SelfVerifying `evaluator` resolves as a VERIFIER key.
+      .verifier("exec-evaluator", new StubVerifier())
       .schema("plan-schema", {})
       .schema("worker-schema", {})
       .build();
@@ -363,7 +364,8 @@ describe("A.5 output-contract enforcement (#124)", () => {
       .agent("a1", new StubAgent())
       .toolset("t1", new EmptyToolRegistry())
       .schema("worker-schema", {})
-      .schema("eval-schema", {})
+      // #124 Q1: the SelfVerifying `evaluator` resolves as a VERIFIER key.
+      .verifier("eval-schema", new StubVerifier())
       .build();
     const innerSv: LoopStrategy = {
       kind: "self_verifying",
@@ -410,7 +412,6 @@ describe("ExecutionRegistry resume", () => {
 describe("StandardHarness startup validation (issue #120)", () => {
   function configWith(registry?: ExecutionRegistry): HarnessConfig {
     return {
-      agent: new StubAgent(),
       toolRegistry: new EmptyToolRegistry(),
       sandbox: new AllowAllSandbox(),
       contextManager: new NoopContextManager(),
@@ -441,22 +442,19 @@ describe("StandardHarness startup validation (issue #120)", () => {
     }
   });
 
-  it("an empty registry skips validation (legacy callers unaffected)", async () => {
-    // The StubAgent throws if a turn is ever attempted. An empty registry must
-    // NOT short-circuit with a configuration_error — it falls through to the
-    // normal run path and reaches the agent turn (which throws here). Reaching
-    // the agent proves validation was skipped, and the error is the agent's, not
-    // a configuration_error.
+  it("#124: validation ALWAYS runs — an empty/absent registry rejects unresolved handles at startup", async () => {
+    // #124 ungated `validate()`: resolution is the single path, so an absent
+    // registry no longer skips validation. A leaf with unresolved handles fails
+    // before the first turn with a configuration_error — the agent is never
+    // reached.
     const harness = new StandardHarness(configWith(undefined));
     const task = newTask("go", SessionId.of("legacy"), reactLeaf("anything", "anything"));
-    let reached = false;
-    try {
-      await harness.run({ task });
-    } catch (e) {
-      reached = true;
-      expect((e as Error).message).toBe("validate() must fail before any agent turn");
+    const result = await harness.run({ task });
+    expect(result.kind).toBe("failure");
+    if (result.kind === "failure") {
+      expect(result.reason.kind).toBe("configuration_error");
+      expect(result.turns).toBe(0);
     }
-    expect(reached).toBe(true);
   });
 });
 

@@ -44,6 +44,7 @@ import {
   ScriptedSandbox,
   ScriptedTerminationPolicy,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 function makeAgent(): MockAgent {
@@ -52,7 +53,7 @@ function makeAgent(): MockAgent {
 
 function standardConfig(agent: MockAgent): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
@@ -365,9 +366,9 @@ describe("Harness — ReAct loop", () => {
   it("rule: every loop strategy is implemented — none returns StrategyNotYetImplemented", async () => {
     // plan_execute (#59), self_verifying (#61), ralph (#58), and hill_climbing
     // (#60) all run their full loops now, covered by their own test suites.
-    // hill_climbing is the last to land: with no metricEvaluator wired it halts
-    // with the typed hill_climbing_misconfigured (#60, Decision 6) — NEVER
-    // strategy_not_yet_implemented.
+    // #124: with no metricEvaluator wired (and no inner output schema) the
+    // single resolution path rejects the strategy at startup with a typed
+    // configuration_error — NEVER strategy_not_yet_implemented.
     const h = new StandardHarness(standardConfig(makeAgent()));
     const strategies: LoopStrategy[] = [
       {
@@ -385,7 +386,7 @@ describe("Harness — ReAct loop", () => {
       expect(r.kind).toBe("failure");
       if (r.kind === "failure") {
         expect(r.reason.kind).not.toBe("strategy_not_yet_implemented");
-        expect(r.reason.kind).toBe("hill_climbing_misconfigured");
+        expect(r.reason.kind).toBe("configuration_error");
       }
     }
   });
@@ -659,7 +660,7 @@ class RecordingTurnAgent implements Agent {
  *  the given (optionally non-default) model params. */
 function recordingConfig(agent: RecordingTurnAgent, modelParams: HarnessConfig["modelParams"]) {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
@@ -680,6 +681,7 @@ const PLAN_EXECUTE_STRATEGY: LoopStrategy = {
     budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
     agent: "",
     toolset: "",
+    output: "",
   },
   execute: {
     kind: "react",

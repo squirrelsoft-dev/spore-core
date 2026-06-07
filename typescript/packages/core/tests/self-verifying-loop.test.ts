@@ -47,6 +47,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 // --------------------------------------------------------------------------
@@ -55,7 +56,16 @@ import {
 
 const SV_STRATEGY: LoopStrategy = {
   kind: "self_verifying",
-  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  inner: {
+    kind: "react",
+    // #124: under genuine recursion the build phase is the inner ReAct's own
+    // loop; a `per_loop` cap of 1 would stop it after a single turn. MAX lets the
+    // build run until the worker claims done (mirrors Rust's react_structured).
+    budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+    agent: "",
+    toolset: "",
+    output: "",
+  },
   evaluator: "",
 };
 
@@ -139,15 +149,22 @@ function fail(reason: string): VerifierVerdict {
   return { kind: "failed", reason };
 }
 
-function configWith(agent: Agent, overrides: Partial<HarnessConfig> = {}): HarnessConfig {
+function configWith(
+  agent: Agent,
+  overrides: Partial<HarnessConfig> & { verifier?: Verifier } = {},
+): HarnessConfig {
+  // #124 Q1: the evaluate-phase agent defaults to the inner worker's agent — so
+  // ONE worker agent drives BOTH build and evaluate (no separate evaluatorAgent).
+  // The verifier folds into the registry under the default "" key.
+  const { verifier, ...rest } = overrides;
   return {
-    agent,
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
-    ...overrides,
+    ...rest,
+    registry: registryWith({ agent, verifier }),
   };
 }
 
@@ -187,13 +204,18 @@ describe("SelfVerifying loop strategy (issue #61)", () => {
     expect(verifier.seen.length).toBe(1);
   });
 
-  it("R11: verifier absent → self_verify_misconfigured (typed halt, not a throw)", async () => {
+  it("R11 (#124): verifier absent → typed STARTUP halt (unresolved verifier handle), not a throw", async () => {
     const agent = new AlwaysDoneAgent(AgentId.of("a"));
-    const h = new StandardHarness(configWith(agent)); // no verifier
+    const h = new StandardHarness(configWith(agent)); // no verifier registered
     const r = await h.run({ task: svTask() });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
-      expect(r.reason.kind).toBe("self_verify_misconfigured");
+      // #124: resolution is the single path — validation rejects the unresolved
+      // verifier handle at startup as a `configuration_error`.
+      expect(r.reason.kind).toBe("configuration_error");
+      if (r.reason.kind === "configuration_error") {
+        expect(r.reason.error.kind).toBe("UnresolvedHandle");
+      }
     }
     // never invoked the agent — it short-circuits before the build phase.
     expect(agent.ran).toBe(0);
@@ -216,45 +238,32 @@ describe("SelfVerifying loop strategy (issue #61)", () => {
     }
   });
 
-  it("R3: evaluate runs over a read-only sandbox; a write is blocked, the build sandbox is untouched", async () => {
-    // The evaluate agent attempts a write_file tool call; the read-only sandbox
-    // must reject it with read_only_violation. The build sandbox (AllowAllSandbox)
-    // is never asked to validate a write — the build agent only claims done.
+  it("R3: evaluate runs over a read-only sandbox; the evaluate write is blocked, the build write is not", async () => {
+    // #124 Q1c: ONE worker agent drives both phases. The build phase writes
+    // (allowed by the writable sandbox) then claims done; the evaluate phase
+    // (same agent, read-only sandbox) tries to write — that write MUST be
+    // rejected — then claims a verdict. Exactly ONE read_only_violation appears.
     const verifier = new ScriptedVerifier([pass()], 3);
+    const worker = new ScriptedAgent(AgentId.of("worker"))
+      .push(tcr("write_file")) // build: write allowed
+      .push(fr("done")) // build: done
+      .push(tcr("write_file")) // evaluate: write rejected (read-only)
+      .push(fr("review done")); // evaluate: verdict
 
-    // Evaluator: requests a write on its first turn, then claims done.
-    const evaluator = new ScriptedAgent(AgentId.of("evaluator"))
-      .push(tcr("write_file"))
-      .push(fr("review done"));
-    const builder = new AlwaysDoneAgent(AgentId.of("builder"));
-
-    // Spy sandbox wrapping AllowAll, to prove the build sandbox saw no write.
-    const buildSandbox = new AllowAllSandbox();
-    let buildValidatedWrite = false;
-    const spyBuild: SandboxProvider = {
-      async validate(call) {
-        if (call.name === "write_file") buildValidatedWrite = true;
-        return buildSandbox.validate(call);
-      },
-    };
-
-    const h = new StandardHarness(
-      configWith(builder, {
-        evaluatorAgent: evaluator,
-        verifier,
-        sandbox: spyBuild,
-      }),
-    );
+    const h = new StandardHarness(configWith(worker, { verifier }));
     const r = await h.run({ task: svTask() });
 
     expect(r.kind).toBe("success");
-    // The evaluate write was blocked at the read-only sandbox — surfaced as a
-    // recoverable tool error, so the evaluate run continued to "review done"
-    // (the verifier still saw a successful eval run).
-    expect(evaluator.ran).toBe(2);
-    // The build sandbox never validated a write (evaluator ran on the read-only
-    // decorator, not the build sandbox).
-    expect(buildValidatedWrite).toBe(false);
+    // The worker took 4 turns (2 build + 2 evaluate).
+    expect(worker.ran).toBe(4);
+    // Exactly the evaluate-phase write (over the read-only sandbox) surfaces a
+    // recoverable read_only_violation fed back as a tool result; the build-phase
+    // write (over the writable sandbox) was NOT rejected.
+    const violations = worker.contexts
+      .map((ctx) => contextText(ctx))
+      .join("\n")
+      .match(/read_only_violation/g);
+    expect(violations?.length ?? 0).toBe(1);
   });
 
   it("R3 (direct): ReadOnlySandbox blocks mutating tools, delegates reads", async () => {
@@ -270,19 +279,20 @@ describe("SelfVerifying loop strategy (issue #61)", () => {
   });
 
   it("R4: the role-evaluator chunk content is present in the evaluate seed (presence-only)", async () => {
+    // #124 Q1c: ONE worker agent; the evaluate-phase turn (its 2nd turn) seeds
+    // the `role-evaluator` chunk marker. The build turn (1st) does not.
     const verifier = new ScriptedVerifier([pass()], 3);
-    const builder = new AlwaysDoneAgent(AgentId.of("builder"));
-    const evaluator = new AlwaysDoneAgent(AgentId.of("evaluator"), "reviewed");
+    const worker = new ScriptedAgent(AgentId.of("worker"))
+      .push(fr("done")) // build turn
+      .push(fr("reviewed")); // evaluate turn
     const chunkProvider = new InMemoryChunkProvider([
       promptChunk("role-evaluator", "YOU-ARE-A-FRESH-EVALUATOR-MARKER"),
     ]);
-    const h = new StandardHarness(
-      configWith(builder, { evaluatorAgent: evaluator, verifier, chunkProvider }),
-    );
+    const h = new StandardHarness(configWith(worker, { verifier, chunkProvider }));
     await h.run({ task: svTask() });
-    expect(evaluator.contexts.length).toBeGreaterThan(0);
-    const seed = contextText(evaluator.contexts[0]!);
-    expect(seed).toContain("YOU-ARE-A-FRESH-EVALUATOR-MARKER");
+    expect(worker.contexts.length).toBe(2);
+    const evalSeed = contextText(worker.contexts[1]!);
+    expect(evalSeed).toContain("YOU-ARE-A-FRESH-EVALUATOR-MARKER");
   });
 
   it("R5: Default-FAIL — an indeterminate evaluator keeps looping then exhausts", async () => {
@@ -345,5 +355,48 @@ describe("SelfVerifying loop strategy (issue #61)", () => {
       expect(r.usage.input_tokens).toBe(4);
       expect(r.usage.output_tokens).toBe(4);
     }
+  });
+
+  it("self_verifying_runs_non_react_inner_worker (#124): the inner PlanExecute drives the build per iteration", async () => {
+    // #124: the SelfVerifying build phase GENUINELY recurses into `inner`. With a
+    // non-ReAct inner (PlanExecute[ReAct, ReAct]) the inner plan turn must fire
+    // per iteration. Worker turns for ONE iteration over a 1-task plan: plan JSON,
+    // execute step, then the evaluate-phase turn.
+    const worker = new ScriptedAgent(AgentId.of("worker"))
+      .push(fr('{"tasks":["only"],"rationale":"r"}')) // inner plan turn
+      .push(fr("did the step")) // inner execute step
+      .push(fr("PASS")); // evaluate phase
+    const verifier = new ScriptedVerifier([pass()], 3);
+    const strategy: LoopStrategy = {
+      kind: "self_verifying",
+      inner: {
+        kind: "plan_execute",
+        plan: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+          output: "",
+        },
+        execute: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+        },
+      },
+      evaluator: "",
+    };
+    const h = new StandardHarness(configWith(worker, { verifier }));
+    const r = await h.run({ task: newTask("build a CLI", SID, strategy, { max_turns: 50 }) });
+    expect(r.kind).toBe("success");
+    // The inner PlanExecute fired its plan turn ⇒ the worker saw the plan
+    // directive. A hardcoded-ReAct build would record ZERO plan turns.
+    const planTurns = worker.contexts.filter((ctx) =>
+      contextText(ctx).includes("step-by-step plan"),
+    ).length;
+    expect(planTurns).toBeGreaterThanOrEqual(1);
+    // The verifier fired (the SelfVerifying loop ran its evaluate phase).
+    expect(verifier.seen.length).toBe(1);
   });
 });

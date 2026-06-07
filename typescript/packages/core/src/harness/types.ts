@@ -23,7 +23,10 @@ import {
 } from "../tasklist/index.js";
 import type { SpanId } from "../observability/types.js";
 import type { Context } from "../agent/types.js";
+import type { Agent } from "../agent/interface.js";
 import type { AgentError } from "../agent/errors.js";
+import type { MetricEvaluator, ResultsEntry } from "../metric/types.js";
+import type { VerifierInput } from "../verifier/types.js";
 import type { PlanPhaseErrorKind } from "../plan/types.js";
 import type { PlanArtifact } from "../plan/types.js";
 import type { Mode } from "../prompt-chunk-registry/types.js";
@@ -811,7 +814,34 @@ export interface StrategyExecutor {
     budgetUsed: BudgetSnapshot,
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
+    agent: Agent,
   ): Promise<RunResult>;
+
+  /**
+   * Resolve an {@link AgentRef} to its registered agent (#124). The leaf and the
+   * combinators resolve their worker agent through this so a missing handle is a
+   * typed terminal {@link RunResult} `failure` rather than a throw. Returns the
+   * failure `RunResult` (NOT the agent) when the key is absent.
+   */
+  resolveAgentRef(ref: AgentRef, sessionId: SessionId): Agent | RunResult;
+
+  /**
+   * Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
+   * read-only sandbox in a never-shared session, on `evalAgent`. Folds the run's
+   * usage into `totalUsage` / `carried`; returns its terminal {@link RunResult}.
+   */
+  evaluatePhase(
+    task: Task,
+    evalAgent: Agent,
+    carried: BudgetSnapshot,
+    totalUsage: AggregateUsage,
+  ): Promise<RunResult>;
+
+  /** Append `text` as a user message on `sessionState` (Default-FAIL re-seed). */
+  appendUserMessage(sessionState: SessionState, text: string): Promise<void>;
+
+  /** The configured sandbox workspace root (#124, for `VerifierInput`). */
+  workspaceRoot(): string;
 
   /**
    * The planning directive seeded before the plan sub-strategy runs (#124, R1):
@@ -880,34 +910,76 @@ export interface StrategyExecutor {
   /** Persist a parsed task list through the RunStore seam (legacy `persistTaskList`). */
   persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void>;
 
-  /** Drive a whole SelfVerifying loop (legacy `runSelfVerifying`). Default-FAIL. */
-  selfVerifyingLoop(
-    task: Task,
-    sessionState: SessionState,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-  ): Promise<RunResult>;
+  /**
+   * Build the per-window Ralph seed session (#124): a fresh session seeded with
+   * `instruction`, the `.spore/` reload context (R3), and the optional VCS
+   * history block — exactly the legacy `runRalph` window setup, minus the model
+   * loop (which now recurses).
+   */
+  ralphSeedSession(instruction: string): Promise<SessionState>;
 
-  /** Drive a whole Ralph continuation loop (legacy `runRalph`). Resets the
-   *  context window per continuation; resumes from the durable `.spore/`
-   *  checkpoint (A.6 deep-resume). */
-  ralphLoop(
-    task: Task,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
-  ): Promise<RunResult>;
+  /** Ralph external completion check (#124): `null` ⇒ complete; a string ⇒
+   *  tasks remain. */
+  ralphCompletionStatus(): string | null;
 
-  /** Drive a whole HillClimbing loop (legacy `runHillClimbing`). */
-  hillClimbingLoop(
-    task: Task,
+  /** The Ralph outer-loop reset cap (`config.maxResets`, #124). */
+  ralphMaxResets(): number;
+
+  /**
+   * Resolve the HillClimbing metric evaluator for `key` (#124, Q2), or the
+   * misconfiguration failure {@link RunResult} when absent.
+   */
+  resolveMetricEvaluator(key: string, sessionId: SessionId): MetricEvaluator | RunResult;
+
+  /**
+   * HillClimbing iteration-0 baseline (#124): evaluate the metric (no agent
+   * turn), record the row + span, and return the baseline value — or the
+   * baseline-evaluation failure {@link RunResult} (already records the failed row
+   * + writes the TSV). Leaf primitive of the legacy `runHillClimbing`.
+   */
+  hillBaseline(
+    evaluator: MetricEvaluator,
+    sessionId: SessionId,
+    taskId: TaskId,
     direction: HillClimbingDirection,
-    maxStagnation: number | undefined,
+    rows: ResultsEntry[],
+    spanSeq: { value: number },
+    totalUsage: AggregateUsage,
+    turns: number,
+    signal: AbortSignal | undefined,
+  ): Promise<{ ok: true; value: number } | { ok: false; failure: RunResult }>;
+
+  /**
+   * HillClimbing per-iteration metric eval + keep/revert decision (#124): the
+   * agent turn already ran (recursively); this evaluates the metric, applies
+   * `shouldKeep`, optionally reverts, records the row + span, and returns the
+   * updated `(currentBest, nonImprovement)`. Leaf primitive of the legacy
+   * `runHillClimbing`.
+   */
+  hillIteration(
+    evaluator: MetricEvaluator,
+    sessionId: SessionId,
+    taskId: TaskId,
+    iteration: number,
+    direction: HillClimbingDirection,
     revertOnNoImprovement: boolean,
     minImprovementDelta: number | undefined,
-    budgetUsed: BudgetSnapshot,
-    onStream: StreamSink | undefined,
+    currentBest: number,
+    rows: ResultsEntry[],
+    spanSeq: { value: number },
     signal: AbortSignal | undefined,
-  ): Promise<RunResult>;
+  ): Promise<{ currentBest: number; nonImprovement: boolean }>;
+
+  /** Write the HillClimbing results TSV (#124, leaf primitive). */
+  hillWriteTsv(taskId: TaskId, rows: ResultsEntry[]): Promise<void>;
+
+  /**
+   * Wall-time / cost / token budget gate (#124): the {@link RunResult}-agnostic
+   * check the HillClimbing loop runs before each iteration's agent turn. Returns
+   * the breached {@link BudgetLimitType} or `null`. Mirrors the static
+   * `StandardHarness.budgetExceeded` used by the legacy loop.
+   */
+  budgetExceeded(budget: BudgetLimits, used: BudgetSnapshot): BudgetLimitType | null;
 
   /** Finalize observability for a terminal outcome. No-op for non-terminal. */
   finalize(result: RunResult): Promise<void>;
@@ -1159,6 +1231,14 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   const sessionState = cx.scratch.runSession;
   cx.scratch.runSession = emptySessionState();
   const budgetUsed = { ...cx.scratch.runBudget };
+  // #124: resolve the worker agent from the registry by THIS leaf's handle
+  // (genuine recursion — no `config.agent`). A missing handle is a typed
+  // terminal failure.
+  const agent = executor.resolveAgentRef(c.agent, task.session_id);
+  if (isRunResult(agent)) {
+    await executor.finalize(agent);
+    return recordTerminal(cx, agent);
+  }
   const onStream = cx.stream;
   cx.stream = undefined;
   const result = await executor.reactWindow(
@@ -1168,9 +1248,91 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     budgetUsed,
     onStream,
     cx.signal,
+    agent,
   );
   await executor.finalize(result);
   return recordTerminal(cx, result);
+}
+
+/** Narrow an executor resolution result to a {@link RunResult} (the failure
+ *  branch of `resolveAgentRef` / `resolveMetricEvaluator`). */
+function isRunResult(value: unknown): value is RunResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "kind" in value &&
+    ((value as { kind: unknown }).kind === "success" ||
+      (value as { kind: unknown }).kind === "failure" ||
+      (value as { kind: unknown }).kind === "waiting_for_human" ||
+      (value as { kind: unknown }).kind === "consult" ||
+      (value as { kind: unknown }).kind === "escalate") &&
+    "session_id" in value
+  );
+}
+
+/**
+ * Descend a {@link LoopStrategy} tree to the worker leaf's agent key (#124).
+ * Mirrors Rust `worker_agent_key_of` — used by SelfVerifying (Q1c: the
+ * evaluate-phase agent defaults to the inner worker's agent) and as the descent
+ * point for Ralph's per-window override.
+ */
+function workerAgentKeyOf(ls: LoopStrategy): string {
+  switch (ls.kind) {
+    case "react":
+      return ls.agent;
+    case "plan_execute":
+      return workerAgentKeyOf(ls.execute);
+    case "self_verifying":
+      return workerAgentKeyOf(ls.inner);
+    case "ralph":
+      return ls.agent !== "" ? ls.agent : workerAgentKeyOf(ls.inner);
+    case "hill_climbing":
+      return workerAgentKeyOf(ls.inner);
+  }
+}
+
+/**
+ * Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
+ * per-window agent override). Returns a structurally-cloned tree with the leaf
+ * reached by descending the worker child chain swapped.
+ */
+function overrideWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
+  switch (ls.kind) {
+    case "react":
+      return { ...ls, agent };
+    case "plan_execute":
+      return { ...ls, execute: overrideWorkerAgent(ls.execute, agent) };
+    case "self_verifying":
+      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+    case "ralph":
+      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+    case "hill_climbing":
+      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+  }
+}
+
+/**
+ * Fold a child terminal's usage + turns into the cumulative `totalUsage` and
+ * the shared `carried` budget snapshot (#124). Mirrors Rust `fold_usage`:
+ * `waiting_for_human` / `consult` are non-terminal pauses and carry nothing;
+ * `success` / `failure` / `escalate` fold usage and advance `carried.turns` to
+ * the max.
+ */
+function foldUsageInto(
+  totalUsage: AggregateUsage,
+  carried: BudgetSnapshot,
+  result: RunResult,
+): void {
+  if (result.kind === "waiting_for_human" || result.kind === "consult") return;
+  const usage = result.usage;
+  totalUsage.input_tokens += usage.input_tokens;
+  totalUsage.output_tokens += usage.output_tokens;
+  totalUsage.cache_read_tokens += usage.cache_read_tokens;
+  totalUsage.cache_write_tokens += usage.cache_write_tokens;
+  totalUsage.cost_usd += usage.cost_usd;
+  carried.input_tokens += usage.input_tokens;
+  carried.output_tokens += usage.output_tokens;
+  carried.turns = Math.max(carried.turns, result.turns);
 }
 
 /**
@@ -1468,16 +1630,19 @@ async function runPlanExecuteConfig(
 }
 
 /**
- * SelfVerifying: drive the build↔evaluate loop (Default-FAIL; bounded by the
- * verifier's iteration cap / the run budget — Q1). The build phase reuses the
- * leaf ReAct window through the executor primitive.
+ * SelfVerifying (#124): GENUINELY recursive build↔evaluate loop. Each iteration
+ * dispatches `runStrategy(c.inner, cx)` for the build phase (a non-ReAct inner —
+ * e.g. PlanExecute — really runs its whole loop per iteration), then runs a fresh
+ * evaluate phase on the inner worker's resolved agent (Q1c) and consults the
+ * verifier resolved from `c.evaluator`'s key (Q1a). Passed ⇒ Success; Failed ⇒
+ * append the reason (Default-FAIL) and loop; exhausted ⇒ `self_verify_exhausted`.
  */
 async function runSelfVerifyingConfig(
-  _c: SelfVerifyingConfig,
+  c: SelfVerifyingConfig,
   cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
   const executor = requireExecutor(cx);
-  if (!("selfVerifyingLoop" in executor)) return executor;
+  if (!("evaluatePhase" in executor)) return executor;
   const task = currentTask(cx);
   if (task === undefined) {
     return {
@@ -1485,24 +1650,143 @@ async function runSelfVerifyingConfig(
       error: new InvalidConfiguration("no task in ExecutionContext scratch"),
     };
   }
-  const sessionState = cx.scratch.runSession;
+  const buildSessionId = task.session_id;
+  let sessionState = cx.scratch.runSession;
   cx.scratch.runSession = emptySessionState();
-  const budgetUsed = { ...cx.scratch.runBudget };
+  const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
+  // Suppress the run's stream sink for the recursive child phases.
   const onStream = cx.stream;
   cx.stream = undefined;
-  const result = await executor.selfVerifyingLoop(task, sessionState, budgetUsed, onStream);
-  return recordTerminal(cx, result);
+
+  // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
+  const verifier = cx.registry.resolveVerifier(c.evaluator);
+  if (verifier == null) {
+    const result: RunResult = {
+      kind: "failure",
+      reason: {
+        kind: "self_verify_misconfigured",
+        reason: `self_verifying requires a verifier registered under key ${JSON.stringify(c.evaluator)}`,
+      },
+      session_id: buildSessionId,
+      usage: emptyAggregateUsage(),
+      turns: 0,
+      session_state: emptySessionState(),
+    };
+    cx.stream = onStream;
+    return finishCombinator(cx, executor, task, result);
+  }
+  // Q1c: the evaluate-phase agent defaults to the inner worker's agent.
+  const evalAgent = executor.resolveAgentRef(workerAgentKeyOf(c.inner), buildSessionId);
+  if (isRunResult(evalAgent)) {
+    cx.stream = onStream;
+    return finishCombinator(cx, executor, task, evalAgent);
+  }
+
+  const maxIterations = verifier.maxIterations();
+  const totalUsage: AggregateUsage = emptyAggregateUsage();
+  let lastReason = "";
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    // ── Build phase: recurse `runStrategy(c.inner, cx)`.
+    const buildTask: Task = {
+      id: task.id,
+      instruction: task.instruction,
+      session_id: buildSessionId,
+      budget: task.budget,
+      loop_strategy: c.inner,
+    };
+    cx.scratch.task = buildTask;
+    cx.scratch.runSession = {
+      messages: [...sessionState.messages],
+      extras: { ...sessionState.extras },
+    };
+    cx.scratch.runBudget = { ...carried };
+    await runStrategy(c.inner, cx);
+    const buildResult: RunResult = takeChildOverride(cx) ?? {
+      kind: "failure",
+      reason: {
+        kind: "self_verify_misconfigured",
+        reason: "build sub-strategy produced no terminal",
+      },
+      session_id: buildSessionId,
+      usage: emptyAggregateUsage(),
+      turns: carried.turns,
+      session_state: {
+        messages: [...sessionState.messages],
+        extras: { ...sessionState.extras },
+      },
+    };
+    foldUsageInto(totalUsage, carried, buildResult);
+
+    // A paused / escalated build propagates verbatim.
+    if (
+      buildResult.kind === "waiting_for_human" ||
+      buildResult.kind === "consult" ||
+      buildResult.kind === "escalate"
+    ) {
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, buildResult);
+    }
+    // Carry the build's post-run session forward for the next round.
+    if (buildResult.kind === "success" || buildResult.kind === "failure") {
+      sessionState = runResultSessionState(buildResult);
+    }
+
+    // ── Evaluate phase: a fresh evaluator run on `evalAgent`.
+    const evalResult = await executor.evaluatePhase(task, evalAgent, carried, totalUsage);
+
+    const input: VerifierInput = {
+      build_result: buildResult,
+      eval_result: evalResult,
+      workspace: executor.workspaceRoot(),
+      iteration,
+    };
+    const verdict = await verifier.verify(input);
+    if (verdict.kind === "passed") {
+      const output = buildResult.kind === "success" ? buildResult.output : "";
+      const turns = buildResult.kind === "success" ? buildResult.turns : carried.turns;
+      const finalState =
+        buildResult.kind === "success" ? runResultSessionState(buildResult) : sessionState;
+      const result: RunResult = {
+        kind: "success",
+        output,
+        session_id: buildSessionId,
+        usage: totalUsage,
+        turns,
+        session_state: finalState,
+      };
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, result);
+    }
+    // Default-FAIL: inject the reason into the build context and loop.
+    lastReason = verdict.reason;
+    await executor.appendUserMessage(sessionState, verdict.reason);
+  }
+
+  const result: RunResult = {
+    kind: "failure",
+    reason: { kind: "self_verify_exhausted", iterations: maxIterations, last_reason: lastReason },
+    session_id: buildSessionId,
+    usage: totalUsage,
+    turns: carried.turns,
+    session_state: sessionState,
+  };
+  cx.stream = onStream;
+  return finishCombinator(cx, executor, task, result);
 }
 
 /**
- * Ralph: the continuation wrapper — reset the context window per window and
- * resume from the durable `.spore/` checkpoint (A.6 deep-resume). Ralph discards
- * the incoming session state by design (each window is a fresh start re-seeded
- * from the filesystem checkpoint).
+ * Ralph (#124): GENUINELY recursive continuation wrapper. Each context window
+ * seeds a FRESH session from the `.spore/` checkpoint, then recurses
+ * `runStrategy(innerForWindow, cx)` (a non-ReAct inner — e.g. SelfVerifying —
+ * really runs its whole loop per window). Q3: when `c.agent` is set it OVERRIDES
+ * the inner leaf's agent per window; when unset the worker resolves via the inner
+ * leaf. `ralphCompletionStatus` drives the OUTER reset loop; exhaustion ⇒
+ * `ralph_completion_unmet`.
  */
-async function runRalphConfig(_c: RalphConfig, cx: ExecutionContext): Promise<StrategyOutcome> {
+async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<StrategyOutcome> {
   const executor = requireExecutor(cx);
-  if (!("ralphLoop" in executor)) return executor;
+  if (!("ralphSeedSession" in executor)) return executor;
   const task = currentTask(cx);
   if (task === undefined) {
     return {
@@ -1510,26 +1794,113 @@ async function runRalphConfig(_c: RalphConfig, cx: ExecutionContext): Promise<St
       error: new InvalidConfiguration("no task in ExecutionContext scratch"),
     };
   }
-  const budgetUsed = { ...cx.scratch.runBudget };
   const onStream = cx.stream;
   cx.stream = undefined;
+  // Ralph discards the incoming session state by design (each window is a fresh
+  // start re-seeded from the filesystem checkpoint).
   cx.scratch.runSession = emptySessionState();
-  const result = await executor.ralphLoop(task, budgetUsed, onStream);
-  return recordTerminal(cx, result);
+  const maxResets = Math.max(executor.ralphMaxResets(), 1);
+
+  // Q3: when `c.agent` is set, override the inner leaf's agent for every window
+  // by rewriting the inner tree's worker leaf handle.
+  const innerForWindow: LoopStrategy =
+    c.agent === "" ? c.inner : overrideWorkerAgent(c.inner, c.agent);
+
+  const totalUsage: AggregateUsage = emptyAggregateUsage();
+  let cumulativeTurns = 0;
+  let lastReason = ".spore/progress.json missing";
+  let lastSessionId = task.session_id;
+
+  for (let iteration = 0; iteration < maxResets; iteration += 1) {
+    const windowSessionId = iteration === 0 ? task.session_id : SessionId.generate();
+    lastSessionId = windowSessionId;
+
+    // R2/R3: a FRESH session seeded from the `.spore/` checkpoint.
+    const sessionState = await executor.ralphSeedSession(task.instruction);
+
+    const windowTask: Task = {
+      id: task.id,
+      instruction: task.instruction,
+      session_id: windowSessionId,
+      budget: task.budget,
+      loop_strategy: innerForWindow,
+    };
+    cx.scratch.task = windowTask;
+    cx.scratch.runSession = sessionState;
+    // FRESH per-window budget (the reset discards the turn budget).
+    cx.scratch.runBudget = emptyBudgetSnapshot();
+    await runStrategy(innerForWindow, cx);
+    const windowResult: RunResult = takeChildOverride(cx) ?? {
+      kind: "failure",
+      reason: {
+        kind: "ralph_completion_unmet",
+        iterations: iteration + 1,
+        last_reason: "window sub-strategy produced no terminal",
+      },
+      session_id: windowSessionId,
+      usage: emptyAggregateUsage(),
+      turns: 0,
+      session_state: emptySessionState(),
+    };
+    const windowBudget = emptyBudgetSnapshot();
+    foldUsageInto(totalUsage, windowBudget, windowResult);
+    cumulativeTurns += windowBudget.turns;
+
+    // A paused / escalated window propagates verbatim.
+    if (
+      windowResult.kind === "waiting_for_human" ||
+      windowResult.kind === "consult" ||
+      windowResult.kind === "escalate"
+    ) {
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, windowResult);
+    }
+
+    const status = executor.ralphCompletionStatus();
+    if (status == null) {
+      const output = windowResult.kind === "success" ? windowResult.output : "";
+      const finalState =
+        windowResult.kind === "success" ? runResultSessionState(windowResult) : emptySessionState();
+      const result: RunResult = {
+        kind: "success",
+        output,
+        session_id: windowSessionId,
+        usage: totalUsage,
+        turns: cumulativeTurns,
+        session_state: finalState,
+      };
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, result);
+    }
+    lastReason = status;
+  }
+
+  const result: RunResult = {
+    kind: "failure",
+    reason: { kind: "ralph_completion_unmet", iterations: maxResets, last_reason: lastReason },
+    session_id: lastSessionId,
+    usage: totalUsage,
+    turns: cumulativeTurns,
+    session_state: emptySessionState(),
+  };
+  cx.stream = onStream;
+  return finishCombinator(cx, executor, task, result);
 }
 
 /**
- * HillClimbing: iterate the inner candidate-producing strategy, scoring each
- * candidate with the metric; bounded by `max_stagnation` (Q1). A
- * `Number.MAX_SAFE_INTEGER` sentinel ⇒ no stagnation cap (mirrors the legacy
- * entry).
+ * HillClimbing (#124): GENUINELY recursive optimization loop. Iteration 0 is a
+ * pure baseline (no agent turn). Iterations 1.. recurse `runStrategy(c.inner,
+ * cx)` to propose a change (a non-ReAct inner — e.g. PlanExecute — really runs
+ * its whole loop per iteration), then evaluate the metric (resolved via
+ * `resolveMetricEvaluator`, Q2) and keep/revert. Bounded by `max_stagnation` and
+ * the turn budget. A `Number.MAX_SAFE_INTEGER` sentinel ⇒ no stagnation cap.
  */
 async function runHillClimbingConfig(
   c: HillClimbingConfig,
   cx: ExecutionContext,
 ): Promise<StrategyOutcome> {
   const executor = requireExecutor(cx);
-  if (!("hillClimbingLoop" in executor)) return executor;
+  if (!("hillBaseline" in executor)) return executor;
   const task = currentTask(cx);
   if (task === undefined) {
     return {
@@ -1537,22 +1908,154 @@ async function runHillClimbingConfig(
       error: new InvalidConfiguration("no task in ExecutionContext scratch"),
     };
   }
-  const budgetUsed = { ...cx.scratch.runBudget };
+  const sessionId = task.session_id;
+  const taskId = task.id;
   const onStream = cx.stream;
   cx.stream = undefined;
+  const carried: BudgetSnapshot = { ...cx.scratch.runBudget };
   cx.scratch.runSession = emptySessionState();
+  const direction = c.direction;
+  const revert = c.revert_on_no_improvement;
+  const minDelta = c.min_improvement_delta;
+  // `Number.MAX_SAFE_INTEGER` sentinel ⇒ no stagnation cap.
   const maxStagnation = c.max_stagnation !== Number.MAX_SAFE_INTEGER ? c.max_stagnation : undefined;
-  const result = await executor.hillClimbingLoop(
-    task,
-    c.direction,
-    maxStagnation,
-    c.revert_on_no_improvement,
-    c.min_improvement_delta,
-    budgetUsed,
-    onStream,
+
+  // Q2: resolve the metric evaluator from `evaluator`'s key.
+  const evaluator = executor.resolveMetricEvaluator(c.evaluator, sessionId);
+  if (isRunResult(evaluator)) {
+    cx.stream = onStream;
+    return finishCombinator(cx, executor, task, evaluator);
+  }
+
+  const totalUsage: AggregateUsage = emptyAggregateUsage();
+  const rows: ResultsEntry[] = [];
+  const spanSeq = { value: 0 };
+
+  // ── Iteration 0: pure baseline (no agent turn).
+  const baseline = await executor.hillBaseline(
+    evaluator,
+    sessionId,
+    taskId,
+    direction,
+    rows,
+    spanSeq,
+    totalUsage,
+    carried.turns,
     cx.signal,
   );
-  return recordTerminal(cx, result);
+  if (!baseline.ok) {
+    cx.stream = onStream;
+    return finishCombinator(cx, executor, task, baseline.failure);
+  }
+  let currentBest = baseline.value;
+
+  let stagnation = 0;
+  let iteration = 1;
+  const turnCap = task.budget.max_turns ?? Number.MAX_SAFE_INTEGER;
+
+  for (;;) {
+    // Budget gate before the iteration's agent turn.
+    if (carried.turns >= turnCap) {
+      await executor.hillWriteTsv(taskId, rows);
+      const result: RunResult = {
+        kind: "failure",
+        reason: { kind: "budget_exceeded", limit_type: "turns" },
+        session_id: sessionId,
+        usage: totalUsage,
+        turns: carried.turns,
+      };
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, result);
+    }
+    const overrun = executor.budgetExceeded(task.budget, carried);
+    if (overrun != null) {
+      await executor.hillWriteTsv(taskId, rows);
+      const result: RunResult = {
+        kind: "failure",
+        reason: { kind: "budget_exceeded", limit_type: overrun },
+        session_id: sessionId,
+        usage: totalUsage,
+        turns: carried.turns,
+      };
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, result);
+    }
+
+    // ── One agent turn proposes a change: recurse `runStrategy(c.inner, cx)`.
+    const iterTask: Task = {
+      id: task.id,
+      instruction: task.instruction,
+      session_id: sessionId,
+      budget: task.budget,
+      loop_strategy: c.inner,
+    };
+    cx.scratch.task = iterTask;
+    const iterState = emptySessionState();
+    await executor.appendUserMessage(iterState, task.instruction);
+    cx.scratch.runSession = iterState;
+    cx.scratch.runBudget = { ...carried };
+    await runStrategy(c.inner, cx);
+    const turnResult: RunResult = takeChildOverride(cx) ?? {
+      kind: "failure",
+      reason: { kind: "budget_exceeded", limit_type: "turns" },
+      session_id: sessionId,
+      usage: emptyAggregateUsage(),
+      turns: carried.turns,
+      session_state: emptySessionState(),
+    };
+    foldUsageInto(totalUsage, carried, turnResult);
+
+    // A paused / escalated turn propagates verbatim.
+    if (
+      turnResult.kind === "waiting_for_human" ||
+      turnResult.kind === "consult" ||
+      turnResult.kind === "escalate"
+    ) {
+      await executor.hillWriteTsv(taskId, rows);
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, turnResult);
+    }
+
+    // ── Evaluate the metric + keep/revert decision.
+    const { currentBest: best, nonImprovement } = await executor.hillIteration(
+      evaluator,
+      sessionId,
+      taskId,
+      iteration,
+      direction,
+      revert,
+      minDelta,
+      currentBest,
+      rows,
+      spanSeq,
+      cx.signal,
+    );
+    currentBest = best;
+    if (nonImprovement) {
+      stagnation += 1;
+    } else {
+      stagnation = 0;
+    }
+
+    if (maxStagnation != null && stagnation >= maxStagnation) {
+      await executor.hillWriteTsv(taskId, rows);
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "stagnation_limit_reached",
+          iterations: stagnation,
+          best_metric: currentBest,
+        },
+        session_id: sessionId,
+        usage: totalUsage,
+        turns: carried.turns,
+      };
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, result);
+    }
+
+    iteration += 1;
+  }
 }
 
 // ── EscalationMode (HITL-vs-AFK config knob, #120) ──────────────────────────

@@ -38,6 +38,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -53,7 +54,13 @@ interface Case {
 
 const SV_STRATEGY: LoopStrategy = {
   kind: "self_verifying",
-  inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+  inner: {
+    kind: "react",
+    budget: { kind: "per_loop", value: 1 },
+    agent: "",
+    toolset: "",
+    output: "",
+  },
   evaluator: "",
 };
 
@@ -103,13 +110,12 @@ describe("SelfVerifying loop fixture replay — self_verifying.json", () => {
           ? undefined
           : new FixtureVerifier(c.verdicts, c.max_iterations);
       const config: HarnessConfig = {
-        agent,
         toolRegistry: new ScriptedToolRegistry(),
         sandbox: new AllowAllSandbox(),
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
         modelParams: { stop_sequences: [] },
-        verifier,
+        registry: registryWith({ agent, verifier }),
       };
       const h = new StandardHarness(config);
       const task = newTask("do the work", SessionId.of(`sv-${c.name}`), SV_STRATEGY, {
@@ -131,9 +137,11 @@ describe("SelfVerifying loop fixture replay — self_verifying.json", () => {
           }
           break;
         case "misconfigured":
+          // #124: with no verifier registered, the single resolution path
+          // rejects the unresolved verifier handle at STARTUP validation.
           expect(r.kind).toBe("failure");
           if (r.kind === "failure") {
-            expect(r.reason.kind).toBe("self_verify_misconfigured");
+            expect(r.reason.kind).toBe("configuration_error");
           }
           break;
       }

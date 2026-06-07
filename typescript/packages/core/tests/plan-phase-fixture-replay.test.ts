@@ -43,6 +43,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -77,7 +78,7 @@ function configFor(exchange: RecordedExchange, storage: StorageProvider): Harnes
   const replay = new ReplayModelInterface([exchange], provider);
   const agent = new ModelAgent(AgentId.of("planner"), replay);
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
@@ -106,6 +107,7 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
         budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
         agent: "",
         toolset: "",
+        output: "",
       },
       execute: {
         kind: "react",
@@ -156,6 +158,7 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
         budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
         agent: "",
         toolset: "",
+        output: "",
       },
       execute: {
         kind: "react",

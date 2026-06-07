@@ -41,6 +41,7 @@ import {
   FixtureVcsProvider,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const RALPH: LoopStrategy = {
@@ -132,7 +133,7 @@ function contextText(ctx: Context): string {
 
 function ralphConfig(root: string, agent: Agent): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new WorkspaceSandbox(root),
     contextManager: new NoopContextManager(),

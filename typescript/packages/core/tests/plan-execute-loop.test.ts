@@ -24,6 +24,8 @@ import { describe, expect, it } from "vitest";
 import {
   AgentId,
   EmptyResponse,
+  EmptyToolRegistry,
+  ExecutionRegistry,
   SessionId,
   StandardHarness,
   emptySessionState,
@@ -52,6 +54,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 // --------------------------------------------------------------------------
@@ -65,6 +68,7 @@ const PLAN_STRATEGY: LoopStrategy = {
     budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
     agent: "",
     toolset: "",
+    output: "",
   },
   execute: {
     kind: "react",
@@ -108,15 +112,20 @@ class RecordingAgent implements Agent {
   }
 }
 
-function configWith(agent: Agent, overrides: Partial<HarnessConfig> = {}): HarnessConfig {
+function configWith(
+  agent: Agent,
+  overrides: Partial<HarnessConfig> & { verifier?: Verifier } = {},
+): HarnessConfig {
+  // #124: the worker agent + any verifier fold into the registry under "".
+  const { verifier, ...rest } = overrides;
   return {
-    agent,
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
-    ...overrides,
+    ...rest,
+    registry: registryWith({ agent, verifier }),
   };
 }
 
@@ -151,11 +160,43 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(a.ran).toBe(4);
   });
 
-  it("planner-agent routing: planner runs the plan turn, default runs the steps (Q1)", async () => {
+  it("plan-leaf agent routing: the plan child's leaf agent runs the plan turn, the worker runs the steps (#124 Q1)", async () => {
+    // #124 Q1: the planner concept is DROPPED — the plan child's leaf
+    // ReactConfig.agent is authoritative. Route the plan leaf to a distinct
+    // "planner" key; the execute leaf (agent "") resolves the default worker.
     const def = new RecordingAgent(AgentId.of("default")).push(fr("did the step"));
     const planner = new RecordingAgent(AgentId.of("planner")).push(fr('{"tasks":["step"]}'));
-    const h = new StandardHarness(configWith(def, { plannerAgent: planner }));
-    const r = await h.run({ task: planTask() });
+    const registry = ExecutionRegistry.builder()
+      .agent("", def)
+      .agent("planner", planner)
+      .toolset("", new EmptyToolRegistry())
+      .schema("plan-schema", {})
+      .build();
+    const strategy: LoopStrategy = {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "planner",
+        toolset: "",
+        output: "plan-schema",
+      },
+      execute: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+      },
+    };
+    const h = new StandardHarness({
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      registry,
+    });
+    const r = await h.run({ task: newTask("build a CLI", SID, strategy, { max_turns: null }) });
     expect(r.kind === "success" && r.output).toBe("did the step");
     expect(planner.ran).toBe(1); // planner ran exactly the plan turn
     expect(def.ran).toBe(1); // default ran exactly the execute step
@@ -450,13 +491,15 @@ describe("PlanExecute execute phase (issue #59)", () => {
       }
     }
 
-    // cfg.agent runs BOTH the plan turn (JSON) and the per-task build phase.
+    // #124 Q1c: ONE worker agent runs the plan turn (JSON), AND each task's
+    // SelfVerifying build + evaluate phases (the evaluate agent defaults to the
+    // inner worker's agent). Queue: plan, build t0, eval t0, build t1, eval t1.
     const a = new RecordingAgent(AgentId.of("default"))
       .push(fr('{"tasks":["t0","t1"],"rationale":"r"}'))
       .push(fr("built t0"))
-      .push(fr("built t1"));
-    // The evaluate phase runs on a distinct agent (one PASS narration per task).
-    const evaluator = new RecordingAgent(AgentId.of("eval")).push(fr("PASS")).push(fr("PASS"));
+      .push(fr("PASS"))
+      .push(fr("built t1"))
+      .push(fr("PASS"));
     const verifier = new RecordingVerifier();
 
     // The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
@@ -467,6 +510,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
         budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
         agent: "",
         toolset: "",
+        output: "",
       },
       execute: {
         kind: "self_verifying",
@@ -475,12 +519,13 @@ describe("PlanExecute execute phase (issue #59)", () => {
           budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
           agent: "",
           toolset: "",
+          output: "",
         },
         evaluator: "",
       },
     };
     const task = newTask("build a CLI", SID, strategy);
-    const h = new StandardHarness(configWith(a, { evaluatorAgent: evaluator, verifier }));
+    const h = new StandardHarness(configWith(a, { verifier }));
 
     const r = await h.run({ task });
     expect(r.kind).toBe("success");

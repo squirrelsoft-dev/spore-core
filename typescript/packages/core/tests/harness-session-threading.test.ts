@@ -41,6 +41,7 @@ import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const { InMemoryStorageProvider, FileSystemStorageProvider, NoOpStorageProvider, StorageProvider } =
@@ -136,7 +137,7 @@ function countingProvider(store: CountingSessionStore): storage.StorageProvider 
 
 function baseConfig(agent: MockAgent): HarnessConfig {
   return {
-    agent,
+    registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
     sandbox: new AllowAllSandbox(),
     contextManager: new RecordingContextManager(),

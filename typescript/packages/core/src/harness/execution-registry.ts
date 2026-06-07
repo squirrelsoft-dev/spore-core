@@ -40,6 +40,7 @@
 
 import type { Agent } from "../agent/interface.js";
 import type { Verifier } from "../verifier/types.js";
+import type { MetricEvaluator } from "../metric/types.js";
 
 import { InvalidConfiguration, StrategyNotFound, UnresolvedHandle } from "./types.js";
 import type {
@@ -75,6 +76,14 @@ export class ExecutionRegistry {
   private readonly toolsets: Map<string, ToolRegistry>;
   private readonly schemas: Map<string, unknown>;
   private readonly verifiers: Map<string, Verifier>;
+  /**
+   * Sixth map (#124, Q2): HillClimbing metric evaluators, keyed by the same
+   * string `HillClimbingConfig.evaluator` carries on the wire. Runtime-only
+   * (never serialized) like the other maps; keeping it distinct from `agents`
+   * preserves the metric-evaluator wire string while resolving it to a
+   * {@link MetricEvaluator} rather than an {@link Agent}.
+   */
+  private readonly metricEvaluators: Map<string, MetricEvaluator>;
   private readonly custom: Map<string, RunStrategy>;
 
   /** Internal — use {@link ExecutionRegistry.empty} or
@@ -84,12 +93,14 @@ export class ExecutionRegistry {
     toolsets?: Map<string, ToolRegistry>;
     schemas?: Map<string, unknown>;
     verifiers?: Map<string, Verifier>;
+    metricEvaluators?: Map<string, MetricEvaluator>;
     custom?: Map<string, RunStrategy>;
   }) {
     this.agents = maps?.agents ?? new Map();
     this.toolsets = maps?.toolsets ?? new Map();
     this.schemas = maps?.schemas ?? new Map();
     this.verifiers = maps?.verifiers ?? new Map();
+    this.metricEvaluators = maps?.metricEvaluators ?? new Map();
     this.custom = maps?.custom ?? new Map();
   }
 
@@ -114,6 +125,7 @@ export class ExecutionRegistry {
       this.toolsets.size === 0 &&
       this.schemas.size === 0 &&
       this.verifiers.size === 0 &&
+      this.metricEvaluators.size === 0 &&
       this.custom.size === 0
     );
   }
@@ -130,6 +142,7 @@ export class ExecutionRegistry {
     for (const [k, v] of this.toolsets) b.toolset(k, v);
     for (const [k, v] of this.schemas) b.schema(k, v);
     for (const [k, v] of this.verifiers) b.verifier(k, v);
+    for (const [k, v] of this.metricEvaluators) b.metricEvaluator(k, v);
     for (const [k, v] of this.custom) b.registerStrategy(k, v);
     return b;
   }
@@ -153,6 +166,16 @@ export class ExecutionRegistry {
   /** Resolve a verifier key to its registered verifier, or `undefined`. */
   resolveVerifier(key: string): Verifier | undefined {
     return this.verifiers.get(key);
+  }
+
+  /**
+   * Resolve a metric-evaluator key (the string `HillClimbingConfig.evaluator`
+   * carries, #124 Q2) to its registered {@link MetricEvaluator}, or `undefined`
+   * if absent. The wire string is identical to the legacy `AgentRef`; only the
+   * resolution target differs (the sixth `metricEvaluators` map).
+   */
+  resolveMetricEvaluator(key: string): MetricEvaluator | undefined {
+    return this.metricEvaluators.get(key);
   }
 
   /**
@@ -214,8 +237,9 @@ export class ExecutionRegistry {
         // evaluable. A bare `ReAct` worker needs an output schema.
         ExecutionRegistry.checkStructuredSlot(ls.inner, "worker");
         this.walkStrategy(ls.inner);
-        // The evaluator is a SchemaRef (the evaluator schema handle).
-        this.checkSchema(ls.evaluator);
+        // #124 Q1: the evaluator's wire string (a `SchemaRef`) is the VERIFIER
+        // registry key — resolved against the `verifiers` map.
+        this.checkVerifier(ls.evaluator);
         return;
       case "ralph":
         this.walkStrategy(ls.inner);
@@ -226,8 +250,9 @@ export class ExecutionRegistry {
         // candidate. A bare `ReAct` proposer needs an output schema.
         ExecutionRegistry.checkStructuredSlot(ls.inner, "propose");
         this.walkStrategy(ls.inner);
-        // The evaluator is an AgentRef (the metric-evaluator agent).
-        this.checkAgent(ls.evaluator);
+        // #124 Q2: the evaluator's wire string is resolved against the sixth
+        // `metricEvaluators` map (not `agents`).
+        this.checkMetricEvaluator(ls.evaluator);
         return;
     }
   }
@@ -265,6 +290,22 @@ export class ExecutionRegistry {
       throw new UnresolvedHandle("schema", ref);
     }
   }
+
+  /** #124 Q1: a SelfVerifying `evaluator` (a {@link SchemaRef} on the wire)
+   *  resolves against the `verifiers` map. */
+  private checkVerifier(ref: SchemaRef): void {
+    if (!this.verifiers.has(ref)) {
+      throw new UnresolvedHandle("verifier", ref);
+    }
+  }
+
+  /** #124 Q2: a HillClimbing `evaluator` (an {@link AgentRef} on the wire)
+   *  resolves against the sixth `metricEvaluators` map. */
+  private checkMetricEvaluator(ref: AgentRef): void {
+    if (!this.metricEvaluators.has(ref)) {
+      throw new UnresolvedHandle("metric_evaluator", ref);
+    }
+  }
 }
 
 /** Fluent assembler for an {@link ExecutionRegistry}, mirroring
@@ -274,6 +315,7 @@ export class ExecutionRegistryBuilder {
   private readonly toolsets = new Map<string, ToolRegistry>();
   private readonly schemas = new Map<string, unknown>();
   private readonly verifiers = new Map<string, Verifier>();
+  private readonly metricEvaluators = new Map<string, MetricEvaluator>();
   private readonly custom = new Map<string, RunStrategy>();
 
   /** Register an agent under `key`. */
@@ -300,9 +342,47 @@ export class ExecutionRegistryBuilder {
     return this;
   }
 
+  /** Register a metric evaluator under `key` (#124, Q2 — the sixth map). */
+  metricEvaluator(key: string, evaluator: MetricEvaluator): this {
+    this.metricEvaluators.set(key, evaluator);
+    return this;
+  }
+
   /** Register a custom strategy under `key`. */
   registerStrategy(key: string, strategy: RunStrategy): this {
     this.custom.set(key, strategy);
+    return this;
+  }
+
+  /**
+   * #124 migration seam: register `agent` under the DEFAULT empty-string key
+   * ONLY if that key is not already wired. `HarnessBuilder` folds its single
+   * agent here so bare `reactPerLoop` leaves (empty `AgentRef`) resolve to it.
+   * An explicitly-registered `""` agent wins.
+   */
+  fillDefaultAgent(agent: Agent): this {
+    if (!this.agents.has("")) this.agents.set("", agent);
+    return this;
+  }
+
+  /** #124: as {@link fillDefaultAgent}, for the default toolset (the builder's
+   *  `toolRegistry`) under the empty key. */
+  fillDefaultToolset(toolset: ToolRegistry): this {
+    if (!this.toolsets.has("")) this.toolsets.set("", toolset);
+    return this;
+  }
+
+  /** #124: as {@link fillDefaultAgent}, for a default SelfVerifying verifier
+   *  (the builder's `verifier`) under the empty key. */
+  fillDefaultVerifier(verifier: Verifier): this {
+    if (!this.verifiers.has("")) this.verifiers.set("", verifier);
+    return this;
+  }
+
+  /** #124: as {@link fillDefaultAgent}, for a default HillClimbing metric
+   *  evaluator under the empty key. */
+  fillDefaultMetricEvaluator(evaluator: MetricEvaluator): this {
+    if (!this.metricEvaluators.has("")) this.metricEvaluators.set("", evaluator);
     return this;
   }
 
@@ -313,6 +393,7 @@ export class ExecutionRegistryBuilder {
       toolsets: this.toolsets,
       schemas: this.schemas,
       verifiers: this.verifiers,
+      metricEvaluators: this.metricEvaluators,
       custom: this.custom,
     });
   }

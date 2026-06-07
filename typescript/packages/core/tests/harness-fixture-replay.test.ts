@@ -30,6 +30,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -54,7 +55,7 @@ describe("Harness fixture replay — react_loop.jsonl", () => {
     });
 
     const config: HarnessConfig = {
-      agent,
+      registry: registryWith({ agent }),
       toolRegistry,
       sandbox: new AllowAllSandbox(),
       contextManager: new NoopContextManager(),

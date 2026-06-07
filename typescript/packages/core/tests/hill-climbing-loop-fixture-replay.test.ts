@@ -43,6 +43,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -167,18 +168,23 @@ describe("HillClimbing fixture replay (issue #60)", () => {
       const agent = new AlwaysDoneAgent(AgentId.of("a"));
 
       const config: HarnessConfig = {
-        agent,
         toolRegistry: new ScriptedToolRegistry(),
         sandbox,
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
         modelParams: { stop_sequences: [] },
-        metricEvaluator: evaluator,
+        registry: registryWith({ agent, metricEvaluator: evaluator }),
       };
 
       const strategy: LoopStrategy = {
         kind: "hill_climbing",
-        inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+        inner: {
+          kind: "react",
+          budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+          agent: "",
+          toolset: "",
+          output: "",
+        },
         direction: sc.payload.direction,
         // `null` ("unbounded" / "no delta") maps to behavior-preserving
         // concretes now that the fields are required (#119): MAX_SAFE_INTEGER

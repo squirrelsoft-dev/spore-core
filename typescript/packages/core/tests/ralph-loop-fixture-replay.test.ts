@@ -42,6 +42,7 @@ import {
   FixtureVcsProvider,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -139,12 +140,12 @@ describe("Ralph loop fixture replay — ralph.json", () => {
       );
       const agent = new ProgressWritingAgent(dir, bodies);
       const config: HarnessConfig = {
-        agent,
         toolRegistry: new ScriptedToolRegistry(),
         sandbox: new WorkspaceSandbox(dir),
         contextManager: new NoopContextManager(),
         terminationPolicy: new AlwaysContinuePolicy(),
         modelParams: { stop_sequences: [] },
+        registry: registryWith({ agent }),
         maxResets: c.max_resets,
         // issue #58 v2: when the case carries a `vcs_log`, wire a
         // FixtureVcsProvider seeded with it; absent ⇒ no provider ⇒ no git

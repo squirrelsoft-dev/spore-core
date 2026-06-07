@@ -36,6 +36,7 @@ import {
   AlwaysContinuePolicy,
   NoopContextManager,
   ScriptedToolRegistry,
+  registryWith,
 } from "../src/harness/testing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -114,7 +115,7 @@ describe("Escalation loop fixture — escalation_loop.jsonl", () => {
     const toolRegistry = new ScriptedToolRegistry().push({ kind: "escalate", signal: abort });
 
     const config: HarnessConfig = {
-      agent,
+      registry: registryWith({ agent }),
       toolRegistry,
       sandbox: new AllowAllSandbox(),
       contextManager: new NoopContextManager(),
