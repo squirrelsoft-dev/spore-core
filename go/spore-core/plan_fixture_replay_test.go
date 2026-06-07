@@ -68,8 +68,9 @@ func responseText(t *testing.T, ex RecordedExchange) string {
 // drivePlanFixture replays a single plan exchange through the full harness and
 // asserts the run consumes the planner turn, parses a non-empty task list, and
 // enters the execute phase — where the single-exchange replay exhausts on the
-// first step and aborts with StepFailed{TaskIndex: 0} (issue #59, Q5). Mirrors
-// the Rust plan_phase_fixture_replay drive_plan_phase.
+// first ready step, cascades, and drains to TasksBlockedByFailure{FailedTask: 1}
+// (#126 — replaces the pre-#126 StepFailed blanket abort). Mirrors the Rust
+// plan_phase_fixture_replay drive_plan_phase.
 func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 	t.Helper()
 	replay := NewReplayModel([]RecordedExchange{ex}, ProviderInfo{
@@ -95,11 +96,14 @@ func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 		Execute: &execChild,
 	}))
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltStepFailed {
-		t.Fatalf("expected StepFailed, got %+v", r)
+	if r.Kind != RunFailure || r.Reason.Kind != HaltTasksBlockedByFailure {
+		t.Fatalf("expected TasksBlockedByFailure, got %+v", r)
 	}
-	if r.Reason.TaskIndex != 0 {
-		t.Fatalf("task index = %d, want 0", r.Reason.TaskIndex)
+	// #126: a failing execute step no longer raises StepFailed; it cascades and
+	// the run drains to TasksBlockedByFailure. With the single-exchange replay
+	// every execute step exhausts, so the FIRST ready task (id 1) is the failure.
+	if r.Reason.FailedTask != 1 {
+		t.Fatalf("failed task = %d, want 1", r.Reason.FailedTask)
 	}
 	if r.Turns < 1 {
 		t.Fatalf("turns = %d, want >= 1 (at least the plan turn)", r.Turns)

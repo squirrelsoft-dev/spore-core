@@ -1976,6 +1976,21 @@ const (
 	// missing. A STARTUP error surfaced before the first turn. Carries the
 	// underlying HarnessError (UnresolvedHandleError or StrategyNotFoundError).
 	HaltConfigurationError HaltReasonKind = "configuration_error"
+	// HaltTasksBlockedByFailure (issue #126, decision A) is returned by the
+	// PlanExecute DAG executor for a PARTIAL run: a task failed terminally
+	// (unrecoverable error or a per-node BudgetExhausted resolving to Fail) and
+	// its transitive dependents were cascade-Blocked, while unrelated branches
+	// still completed. The run as a whole is a Failure, but the full partition is
+	// reported: which tasks Completed, which were Blocked by the cascade, the
+	// FailedTask that triggered it, and the human-readable Reason. (A run where
+	// EVERY task completes is a Success, as before.)
+	HaltTasksBlockedByFailure HaltReasonKind = "tasks_blocked_by_failure"
+	// HaltTaskGraphCycle (issue #126) is returned by the PlanExecute DAG executor
+	// when the persisted task graph contains a directed cycle, re-checked at
+	// EXECUTE ENTRY as defense-in-depth (add_task already rejects cycles, but the
+	// task_list tool path could in principle persist a cyclic graph out of band).
+	// No task is run. Carries a human-readable Reason.
+	HaltTaskGraphCycle HaltReasonKind = "task_graph_cycle"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -2008,6 +2023,10 @@ type HaltReason struct {
 	// configuration_error (issue #120): the underlying registry validation error
 	// (UnresolvedHandleError or StrategyNotFoundError).
 	ConfigError HarnessError `json:"-"`
+	// tasks_blocked_by_failure (issue #126, decision A): the cascade partition.
+	Completed  []uint32 `json:"-"`
+	Blocked    []uint32 `json:"-"`
+	FailedTask uint32   `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -2109,6 +2128,27 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind  HaltReasonKind `json:"kind"`
 			Error HarnessError   `json:"error"`
 		}{h.Kind, h.ConfigError})
+	case HaltTasksBlockedByFailure:
+		completed := h.Completed
+		if completed == nil {
+			completed = []uint32{}
+		}
+		blocked := h.Blocked
+		if blocked == nil {
+			blocked = []uint32{}
+		}
+		return json.Marshal(struct {
+			Kind       HaltReasonKind `json:"kind"`
+			Completed  []uint32       `json:"completed"`
+			Blocked    []uint32       `json:"blocked"`
+			FailedTask uint32         `json:"failed_task"`
+			Reason     string         `json:"reason"`
+		}{h.Kind, completed, blocked, h.FailedTask, h.Reason})
+	case HaltTaskGraphCycle:
+		return json.Marshal(struct {
+			Kind   HaltReasonKind `json:"kind"`
+			Reason string         `json:"reason"`
+		}{h.Kind, h.Reason})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -2130,6 +2170,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 		TaskIndex  int               `json:"task_index"`
 		Task       string            `json:"task"`
 		LastReason string            `json:"last_reason"`
+		Completed  []uint32          `json:"completed"`
+		Blocked    []uint32          `json:"blocked"`
+		FailedTask uint32            `json:"failed_task"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -2145,6 +2188,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 	h.Strategy = probe.Strategy
 	h.TaskIndex = probe.TaskIndex
 	h.Task = probe.Task
+	h.Completed = probe.Completed
+	h.Blocked = probe.Blocked
+	h.FailedTask = probe.FailedTask
 
 	switch probe.Kind {
 	case HaltAgentError:
@@ -2715,6 +2761,14 @@ func (c HarnessConfig) effectiveMaxResets() uint32 {
 // StandardHarness is the canonical Harness implementation.
 type StandardHarness struct {
 	config HarnessConfig
+	// observedWrites accumulates the harness-OBSERVED write/edit tool-call paths
+	// for the current PlanExecute execute step (#126, AC2). The dispatch seam
+	// (observeWriteCall, in the ReAct turn loop) appends here as write_file /
+	// edit_file calls are ACTUALLY dispatched; the DAG executor drains it
+	// (TakeObservedWrites) on task completion to build a StepLedgerEntry. Never a
+	// model-self-reported field.
+	observedWrites   []string
+	observedWritesMu sync.Mutex
 }
 
 // NewStandardHarness constructs a StandardHarness.
@@ -3125,6 +3179,71 @@ func (h *StandardHarness) FireTaskAdvance(ctx context.Context, sessionID Session
 // PersistTaskList persists a parsed task list through the RunStore seam.
 func (h *StandardHarness) PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList) {
 	h.persistTaskList(ctx, sessionID, taskList)
+}
+
+// LoadTaskList reads the persisted TaskList (with real blockers) for sessionID
+// from the RunStore under TaskListExtrasKey (#126, decision C — the ONE
+// authoring path). A storage miss / decode failure yields (TaskList{}, false),
+// and the executor then falls back to the linear plan-artifact bridge.
+func (h *StandardHarness) LoadTaskList(ctx context.Context, sessionID SessionID) (TaskList, bool) {
+	if h.config.RunStore == nil {
+		return TaskList{}, false
+	}
+	raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey)
+	if err != nil || !found {
+		return TaskList{}, false
+	}
+	var list TaskList
+	if json.Unmarshal(raw, &list) != nil {
+		return TaskList{}, false
+	}
+	return list, true
+}
+
+// observeWriteCall records a harness-OBSERVED write/edit at the tool-dispatch
+// seam (#126, AC2). Only write_file / edit_file calls carrying a string "path"
+// are recorded; de-duplicated against what is already accumulated for the
+// current step. Called from the ReAct turn loop for the call ACTUALLY
+// dispatched, so the path comes from the real tool call — never a
+// model-self-reported field.
+func (h *StandardHarness) observeWriteCall(call ToolCall) {
+	if call.Name != "write_file" && call.Name != "edit_file" {
+		return
+	}
+	var probe struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(call.Input, &probe) != nil || probe.Path == "" {
+		return
+	}
+	h.observedWritesMu.Lock()
+	defer h.observedWritesMu.Unlock()
+	for _, p := range h.observedWrites {
+		if p == probe.Path {
+			return
+		}
+	}
+	h.observedWrites = append(h.observedWrites, probe.Path)
+}
+
+// TakeObservedWrites drains and returns the accumulated observed write/edit
+// paths, resetting the accumulator (#126, AC2). The DAG executor calls this on
+// task completion to build a StepLedgerEntry's files_touched.
+func (h *StandardHarness) TakeObservedWrites() []string {
+	h.observedWritesMu.Lock()
+	defer h.observedWritesMu.Unlock()
+	out := h.observedWrites
+	h.observedWrites = nil
+	return out
+}
+
+// ClearObservedWrites clears the observed-write accumulator (#126, AC2). The DAG
+// executor calls this before each step so a task's files_touched reflect ONLY
+// the writes that step issues.
+func (h *StandardHarness) ClearObservedWrites() {
+	h.observedWritesMu.Lock()
+	defer h.observedWritesMu.Unlock()
+	h.observedWrites = nil
 }
 
 // Finalize finalizes observability for a terminal outcome (mirrors the tail of
@@ -3926,6 +4045,10 @@ func (h *StandardHarness) runReActInner(
 				})
 				toolStartedAt := nowRFC3339()
 				toolClock := time.Now()
+				// #126 AC2: record a harness-OBSERVED write/edit at the dispatch seam
+				// for the call ACTUALLY dispatched, so a task's files_touched ledger is
+				// built from real tool calls — never a model-self-reported field.
+				h.observeWriteCall(call)
 				output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 
 				// Clarification pause (issue #81, Q4b): a tool (e.g.

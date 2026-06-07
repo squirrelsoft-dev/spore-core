@@ -145,10 +145,12 @@ func TestExecutePhaseNoPerTaskTurnCap(t *testing.T) {
 		t.Fatalf("expected Failure (step ran dry), got %+v", r)
 	}
 	// NOT a per-task BudgetExceeded(Turns) cut at 2 turns — the derivation is gone.
-	// Task a runs past 2 turns under the global ceiling and fails as a STEP failure
-	// when the agent runs dry.
-	if r.Reason.Kind != HaltStepFailed {
-		t.Fatalf("no per-task cap; run dry -> StepFailed, got %+v", r.Reason)
+	// Task a (id 1) runs past 2 turns under the global ceiling and fails when the
+	// agent runs dry. Under #126 a task failure no longer raises StepFailed /
+	// blanket-aborts; it cascades and the run drains to the partial terminal
+	// TasksBlockedByFailure (the first failure is task id 1).
+	if r.Reason.Kind != HaltTasksBlockedByFailure || r.Reason.FailedTask != 1 {
+		t.Fatalf("no per-task cap; run dry -> TasksBlockedByFailure(failed=1), got %+v", r.Reason)
 	}
 }
 
@@ -299,29 +301,49 @@ func TestExecutePhaseEmptyPlanHalts(t *testing.T) {
 	}
 }
 
-// Q5: a step that errors aborts the whole run with StepFailed carrying the
-// failing index + instruction; later tasks do NOT run.
-func TestExecutePhaseStepFailureAbortsWithStepFailed(t *testing.T) {
+// #126 AC3: a terminal step failure no longer blanket-aborts the run. The
+// failing task is Blocked and its TRANSITIVE DEPENDENTS are cascade-Blocked, but
+// unrelated tasks still complete; the run drains to TasksBlockedByFailure with
+// the partition. The linear plan bridge produces NO blockers, so task "bad"
+// (id 2) has no dependents — only task 2 is blocked, and tasks 1 and 3 complete.
+func TestExecutePhaseStepFailureCascades(t *testing.T) {
 	a := NewMockAgent("planner")
-	a.Push(planFinal(`{"tasks":["good","bad","never"]}`))
+	a.Push(planFinal(`{"tasks":["good","bad","unrelated"]}`))
 	a.Push(planFinal("did good"))
-	a.Push(NewTurnError(NewEmptyResponseError(), nil)) // step "bad" errors
-	a.Push(planFinal("never run"))                     // must NOT be consumed
+	a.Push(NewTurnError(NewEmptyResponseError(), nil)) // step "bad" (id 2) errors
+	a.Push(planFinal("did unrelated"))                 // id 3 is independent → still runs
 	h := NewStandardHarness(standardCfg(a))
 	r := h.Run(context.Background(), NewHarnessRunOptions(planTask("build a CLI")))
-	if r.Kind != RunFailure || r.Reason.Kind != HaltStepFailed {
-		t.Fatalf("expected StepFailed, got %+v", r)
+	if r.Kind != RunFailure || r.Reason.Kind != HaltTasksBlockedByFailure {
+		t.Fatalf("expected TasksBlockedByFailure, got %+v", r)
 	}
-	if r.Reason.TaskIndex != 1 {
-		t.Fatalf("task index = %d, want 1", r.Reason.TaskIndex)
+	if r.Reason.FailedTask != 2 {
+		t.Fatalf("failed task = %d, want 2 (bad)", r.Reason.FailedTask)
 	}
-	if r.Reason.Task != "bad" {
-		t.Fatalf("task = %q, want %q", r.Reason.Task, "bad")
+	// 1 (good) and 3 (unrelated) complete; only 2 (bad) is blocked (no dependents).
+	if want := []uint32{1, 3}; !equalU32s(r.Reason.Completed, want) {
+		t.Fatalf("completed = %v, want %v", r.Reason.Completed, want)
 	}
-	// plan + good + bad consumed; "never" remains queued (the third task never ran).
-	if remaining := len(a.results); remaining != 1 {
-		t.Fatalf("remaining queued responses = %d, want 1 (the 'never' task must not run)", remaining)
+	if want := []uint32{2}; !equalU32s(r.Reason.Blocked, want) {
+		t.Fatalf("blocked = %v, want %v", r.Reason.Blocked, want)
 	}
+	// plan + good + bad + unrelated all consumed (the independent task ran).
+	if remaining := len(a.results); remaining != 0 {
+		t.Fatalf("remaining queued responses = %d, want 0 (the unrelated task runs)", remaining)
+	}
+}
+
+// equalU32s reports element-wise equality of two uint32 slices.
+func equalU32s(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Q4: the task list is persisted through the RunStore seam (not the #71 sandbox
@@ -634,29 +656,29 @@ func contextText(msgs []Message) string {
 	return b.String()
 }
 
-// #93 regression: the execute phase maintains ONE accumulating context across
-// steps. After a successful step its conversation (instruction + tool calls +
-// TOOL RESULTS + assistant output) is folded back into the shared session, so
-// the NEXT step's sub-loop sees prior steps' RESULTS — not just their
-// instructions. Drive a 2-step run where STEP 1 issues a tool call returning a
-// distinctive string and assert STEP 2's context carries it.
-func TestExecuteStepsAccumulatePriorResults(t *testing.T) {
+// #126 two-tier context (REPLACES the pre-#126 linear-folding regression):
+// linear folding broke on a DAG, so it is GONE. The plan-artifact bridge
+// produces a LINEAR chain with EMPTY blockers, so steps 1 and 2 are INDEPENDENT
+// branches in the DAG sense. Therefore:
+//   - step 2 does NOT see step 1's raw tool result (no transcript fold), and
+//   - step 2 DOES see step 1's compact Tier-2 ledger summary ("researched") and
+//     NOT its mid-step tool-result internals.
+func TestExecuteStepsTwoTierContextNoTranscriptFold(t *testing.T) {
 	agent := newPlanRecordingAgent("rec")
-	// Plan turn: a 2-step plan (research -> use the result).
+	// Plan turn: a 2-step LINEAR plan (no blockers from the bridge).
 	agent.push(planFinal(`{"tasks":["research tokio","summarize findings"],"rationale":"r"}`))
-	// Step 1: call a tool, then finalize using its result.
+	// Step 1: call a tool, then finalize with a distinctive summary.
 	agent.push(NewToolCallRequested([]ToolCall{{ID: "1", Name: "lookup", Input: json.RawMessage(`{}`)}}, turnUsage()))
 	agent.push(planFinal("researched"))
-	// Step 2: finalize directly (it must SEE step 1's tool result).
+	// Step 2: finalize directly.
 	agent.push(planFinal("summarized"))
 
 	cfg := standardCfg(agent)
 	// Use a context manager that records assistant turns + tool results into the
-	// session (NoopContextManager drops both), so the accumulated execute context
-	// actually carries step 1's tool result and assistant output forward.
+	// session, so step 1's OWN final turn sees its tool result.
 	cfg.ContextManager = &recordingContextManager{}
 	reg := NewScriptedToolRegistry()
-	// Step 1's tool call returns a distinctive result string.
+	// Step 1's tool call returns a distinctive (internal) result string.
 	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "TOKIO_FACTS_123"})
 	cfg.ToolRegistry = reg
 	h := NewStandardHarness(cfg)
@@ -676,21 +698,20 @@ func TestExecuteStepsAccumulatePriorResults(t *testing.T) {
 		t.Fatalf("captured %d turns, want 4 (plan turn + 3 execute turns)", len(agent.seen))
 	}
 
-	// Step 1's SECOND turn (index 2) sees the tool result — sanity check that
-	// the result string is on the wire at all.
+	// Step 1's SECOND turn (index 2) sees its OWN tool result.
 	if c := contextText(agent.seen[2]); !strings.Contains(c, "TOKIO_FACTS_123") {
 		t.Fatalf("step-1 final turn should follow its own tool result:\n%s", c)
 	}
 
-	// The accumulation guarantee: STEP 2's context (index 3) CONTAINS step 1's
-	// tool result, proving the execute loop carried it forward.
+	// #126: step 2 (index 3) must NOT carry step 1's raw tool-result transcript —
+	// no linear fold across the DAG.
 	step2 := contextText(agent.seen[3])
-	if !strings.Contains(step2, "TOKIO_FACTS_123") {
-		t.Fatalf("step 2 must see step 1's tool result (accumulating context):\n%s", step2)
+	if strings.Contains(step2, "TOKIO_FACTS_123") {
+		t.Fatalf("step 2 must NOT see step 1's raw tool result (no transcript fold):\n%s", step2)
 	}
-	// Step 2 also sees step 1's prior instruction + assistant output.
-	if !strings.Contains(step2, "research tokio") || !strings.Contains(step2, "researched") {
-		t.Fatalf("step 2 must see step 1's instruction and output:\n%s", step2)
+	// #126 Tier-2: step 2 DOES see step 1's compact ledger summary.
+	if !strings.Contains(step2, "researched") {
+		t.Fatalf("step 2 must see step 1's Tier-2 ledger summary:\n%s", step2)
 	}
 }
 

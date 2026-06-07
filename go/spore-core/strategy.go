@@ -33,6 +33,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -686,11 +688,39 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 		return cx.finish(ctx, executor, task, *failure)
 	}
 
-	taskList := PlanArtifactToTaskList(outcome.Artifact)
+	// #126 decision C: the runnable task list comes from the persisted task_list
+	// tool store (the ONE authoring path — it can carry real blockers). Fall back
+	// to the linear plan-artifact bridge only when nothing was authored via the
+	// tool (back-compat with the #59/#124 plan-only path and its replay fixtures).
+	// The plan artifact is still captured+persisted above so the plan-phase replay
+	// tests stay green.
+	var taskList TaskList
+	if persisted, ok := executor.LoadTaskList(ctx, sessionID); ok && len(persisted.Tasks) > 0 {
+		taskList = persisted
+	} else {
+		taskList = PlanArtifactToTaskList(outcome.Artifact)
+	}
 	if len(taskList.Tasks) == 0 {
 		result := RunResult{
 			Kind:      RunFailure,
 			Reason:    HaltReason{Kind: HaltEmptyPlan},
+			SessionID: sessionID,
+			Usage:     outcome.Usage,
+			Turns:     outcome.Turns,
+		}
+		return cx.finish(ctx, executor, task, result)
+	}
+
+	// #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+	// depth — add_task already rejects cycles, but the persisted store could be
+	// cyclic out of band). No task runs.
+	if taskList.HasCycle() {
+		result := RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind:   HaltTaskGraphCycle,
+				Reason: "persisted task graph contains a directed cycle",
+			},
 			SessionID: sessionID,
 			Usage:     outcome.Usage,
 			Turns:     outcome.Turns,
@@ -751,11 +781,26 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	var lastOutput string
 	var lastState SessionState
 
+	// #126 Tier-1/Tier-2 + cascade run-local state (decision D/E):
+	//   - finalOutputs: each completed task's Success.Output (Tier-1).
+	//   - ledger: the Tier-2 global running ledger (bounded, drop-oldest).
+	//   - ledgerElided: sticky flag set the first time entries are dropped.
+	//   - blockedByFailure: tasks cascade-Blocked by a terminal failure (decision
+	//     E — run scratch, NOT a TaskStatus variant).
+	//   - firstFailure*: the first terminal failure that triggered a cascade (A).
+	finalOutputs := make(map[uint32]string)
+	var ledger []StepLedgerEntry
+	ledgerElided := false
+	blockedByFailure := make(map[uint32]struct{})
+	var (
+		firstFailureID     uint32
+		firstFailureReason string
+		hadFailure         bool
+	)
+
 	// #125: PlanExecute owns a budget scope for its execute phase. Its POLICY is
-	// the task's global turn ceiling (TotalSteps) — the root node's TotalSteps
-	// subsumes the OLD per-task remaining_turns / remaining_tasks / step_cap
-	// derivation, which is now DEAD and removed. Behavior is Escalate (in-process
-	// placeholder; the serialized behavior field is #129). Enforcement is now
+	// the task's global turn ceiling (TotalSteps). Behavior is Escalate (in-process
+	// placeholder; the serialized behavior field is #129). Enforcement is
 	// charge-based per node.
 	var planPolicy BudgetPolicy
 	if task.Budget.MaxTurns != nil {
@@ -765,15 +810,42 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	}
 	cx.PushBudget(planPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "plan_execute")
 
-	for index := 0; index < totalTasks; index++ {
-		taskID := taskList.Tasks[index].ID
-		instruction := taskList.Tasks[index].Description
-
-		// A.6 deep-resume: a task already Completed is skipped.
-		if taskList.Tasks[index].Status == TaskStatusCompleted {
-			lastOutput = instruction
-			continue
+	// cascade marks taskID and its transitive dependents Blocked, records the
+	// first failure, and persists (#126 AC3/AC4, decision A/E).
+	cascade := func(taskID uint32, reason string) {
+		blocked := TaskStatusBlocked
+		_ = taskList.Update(taskID, &blocked, nil)
+		for _, dep := range taskList.TransitiveDependents(taskID) {
+			_ = taskList.Update(dep, &blocked, nil)
+			blockedByFailure[dep] = struct{}{}
 		}
+		blockedByFailure[taskID] = struct{}{}
+		executor.PersistTaskList(ctx, sessionID, taskList)
+		if !hadFailure {
+			firstFailureID = taskID
+			firstFailureReason = reason
+			hadFailure = true
+		}
+	}
+
+	// ── Phase 2: ready-set DAG walk (#126). ─────────────────────────────────
+	//
+	// Repeatedly pick the lowest-id Pending task whose blockers are all Completed.
+	// A task whose blocker FAILED is cascade-Blocked (so it is no longer Pending
+	// and never becomes ready). When no Pending task is ready, the walk drains.
+	for {
+		taskID, ok := taskList.NextReady()
+		if !ok {
+			break
+		}
+		index := 0
+		for i := range taskList.Tasks {
+			if taskList.Tasks[i].ID == taskID {
+				index = i
+				break
+			}
+		}
+		instruction := taskList.Tasks[index].Description
 
 		// Mark InProgress and re-persist (Q4).
 		ip := TaskStatusInProgress
@@ -792,62 +864,96 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		}
 		executor.FireTaskAdvance(ctx, sessionID, &stepTask, index, totalTasks)
 
-		// Seed the step instruction as a user message on the SHARED execute
-		// context, then dispatch the execute sub-strategy.
-		executor.SeedUserMessage(ctx, &session, stepTask.Instruction)
+		// #126 Tier-1 scoped context (decision D): seed this step from a FRESH copy
+		// of the base session (NOT a forward-folded shared transcript — that breaks
+		// on a DAG) plus, for THIS task's transitive blockers ONLY, their final
+		// outputs + their ledger rows. Independent branches never appear (AC1).
+		stepSession := cloneSessionState(&session)
+		blockers := taskList.TransitiveBlockers(taskID)
+		if len(blockers) > 0 {
+			blockerSet := make(map[uint32]struct{}, len(blockers))
+			for _, b := range blockers {
+				blockerSet[b] = struct{}{}
+			}
+			// Tier-1: transitive blockers' final outputs (ascending id).
+			var tier1Lines []string
+			for _, b := range blockers {
+				if out, ok := finalOutputs[b]; ok {
+					tier1Lines = append(tier1Lines, fmt.Sprintf("#%d result: %s", b, out))
+				}
+			}
+			if len(tier1Lines) > 0 {
+				executor.SeedUserMessage(ctx, stepSession, "Results from upstream tasks:\n"+strings.Join(tier1Lines, "\n"))
+			}
+			// Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+			var scoped []StepLedgerEntry
+			for _, e := range ledger {
+				if _, ok := blockerSet[e.TaskID]; ok {
+					scoped = append(scoped, e)
+				}
+			}
+			if block, ok := RenderStepLedger(scoped, false); ok {
+				executor.SeedUserMessage(ctx, stepSession, block)
+			}
+		}
+
+		// #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+		// the static elision marker once entries were dropped).
+		if block, ok := RenderStepLedger(ledger, ledgerElided); ok {
+			executor.SeedUserMessage(ctx, stepSession, block)
+		}
+
+		// Finally seed this step's own instruction.
+		executor.SeedUserMessage(ctx, stepSession, stepTask.Instruction)
+
+		// #126 AC2: clear the observed-write accumulator so this task's
+		// files_touched reflect ONLY the writes this step issues.
+		executor.ClearObservedWrites()
 
 		stCopy := stepTask
 		cx.Scratch.Task = &stCopy
-		cx.Scratch.RunSession = session
+		cx.Scratch.RunSession = *stepSession
 		cx.Scratch.RunBudget = carried
 		// #125: absolute turn count BEFORE this step, so the success path can
 		// charge only the DELTA against the PlanExecute scope.
 		carriedBefore := carried.Turns
 		stepOutcome := c.Execute.Run(ctx, cx)
 		// #125 rule 4/7: a child's BudgetExhausted reaches THIS parent as a
-		// StrategyOutcome, never auto-cascaded. PlanExecute does NOT charge the
-		// child's exhaustion against its OWN scope; it surfaces its own typed
-		// BudgetExhausted with the PlanExecute partial (tasklist + statuses +
-		// ledger) and aborts the run.
+		// StrategyOutcome. #126 AC4: a budget-Fail resolution cascades IDENTICALLY
+		// to an error-failed one; an Escalate/Continue resolution surfaces the
+		// partial and aborts the run.
 		if stepOutcome.Kind == StrategyOutcomeBudgetExhausted {
-			blocked := TaskStatusBlocked
-			_ = taskList.Update(taskID, &blocked, nil)
-			executor.PersistTaskList(ctx, sessionID, taskList)
-			partial := planExecutePartialJSON(taskList)
 			err := cx.currentExhausted()
-			cx.PopBudget()
+			resolution := cx.ResolveCurrent()
 			_ = cx.takeChildOverride()
-			cx.Scratch.RunSession = session
-			outcome := promoteBudgetExhausted(err, &partial)
-			return RunResult{}, &outcome
+			switch resolution {
+			case ExhaustedResolutionFail:
+				cascade(taskID, "budget exhausted (Fail)")
+				continue
+			default: // Escalate / Continue (#129): surface the partial and abort.
+				blocked := TaskStatusBlocked
+				_ = taskList.Update(taskID, &blocked, nil)
+				executor.PersistTaskList(ctx, sessionID, taskList)
+				partial := planExecutePartialJSON(taskList)
+				cx.PopBudget()
+				cx.Scratch.RunSession = session
+				outcome := promoteBudgetExhausted(err, &partial)
+				return RunResult{}, &outcome
+			}
 		}
 		subResult := cx.takeChildOverride()
 
 		if subResult == nil {
-			cx.PopBudget()
-			return RunResult{
-				Kind: RunFailure,
-				Reason: HaltReason{
-					Kind:      HaltStepFailed,
-					TaskIndex: index,
-					Task:      taskList.Tasks[index].Description,
-					Reason:    "execute sub-strategy produced no terminal",
-				},
-				SessionID:    sessionID,
-				Usage:        totalUsage,
-				Turns:        carried.Turns,
-				SessionState: lastState,
-			}, nil
+			// No terminal from the child: treat as a terminal failure of this task
+			// and cascade (same as a Failure).
+			cascade(taskID, "execute sub-strategy produced no terminal")
+			continue
 		}
 
 		switch subResult.Kind {
 		case RunSuccess:
-			// Carry the shared budget forward (Q1) and fold this step's
-			// conversation back into the SHARED context so the next step builds on
-			// its results.
 			carried.Turns = subResult.Turns
-			session = subResult.SessionState
-			lastState = session
+			lastState = subResult.SessionState
 			carried.InputTokens += subResult.Usage.InputTokens
 			carried.OutputTokens += subResult.Usage.OutputTokens
 			totalUsage.InputTokens += subResult.Usage.InputTokens
@@ -859,68 +965,73 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 
 			_ = taskList.Complete(taskID)
 			executor.PersistTaskList(ctx, sessionID, taskList)
+
+			// #126: record this task's final output (Tier-1) and append a ledger
+			// entry whose files_touched is HARNESS-OBSERVED (AC2).
+			finalOutputs[taskID] = subResult.Output
+			var dropped bool
+			ledger, dropped = PushStepLedger(ledger, StepLedgerEntry{
+				TaskID:       taskID,
+				Summary:      subResult.Output,
+				FilesTouched: executor.TakeObservedWrites(),
+			})
+			if dropped {
+				ledgerElided = true
+			}
+
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
 
 			// #125: charge this step's turns against the PlanExecute scope. If the
 			// global TotalSteps cap is now spent, the PlanExecute node surfaces its
-			// OWN typed BudgetExhausted (partial = tasklist + ledger), resolving its
-			// behavior.
+			// OWN typed BudgetExhausted (partial = tasklist + ledger).
 			if chErr := cx.ChargeCurrent(saturatingSubU32(subResult.Turns, carriedBefore)); chErr != nil {
 				partial := planExecutePartialJSON(taskList)
 				resolution := cx.ResolveCurrent()
 				cx.PopBudget()
-				cx.Scratch.RunSession = session
+				cx.Scratch.RunSession = lastState
 				var outcome StrategyOutcome
 				switch resolution {
 				case ExhaustedResolutionFail:
 					outcome = promoteBudgetExhausted(chErr, nil)
-				case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
-					// #129: a granted Continue must reset this scope
-					// (ResolveCurrent already did via ConsumeContinue) and RE-RUN
-					// this execute step — the in-process loop wiring lands in #129.
-					// It is UNREACHABLE today: live bodies push an Escalate
-					// placeholder behavior (the serialized BudgetExhaustedBehavior
-					// field is a wire change deferred to #129), so ResolveCurrent
-					// only ever yields Escalate/Fail here. Until that loop exists,
-					// an (impossible) Continue is handled EXPLICITLY as a lossless
-					// surface-with-partial rather than a silent default fall-through.
+				default:
 					outcome = promoteBudgetExhausted(chErr, &partial)
 				}
 				return RunResult{}, &outcome
 			}
 
 		case RunFailure:
-			// Q5: any non-success step aborts the whole run.
+			// A GLOBAL turn-budget hard stop (#117 backstop) surfaces as a
+			// BudgetExceeded Failure from the leaf. That is a WHOLE-RUN hard stop,
+			// NOT a single-task terminal failure — it aborts the run verbatim
+			// (preserving the pre-#126 mid-execute budget behavior). It is distinct
+			// from a per-NODE BudgetExhausted resolving to Fail, which DOES cascade.
 			totalUsage.InputTokens += subResult.Usage.InputTokens
 			totalUsage.OutputTokens += subResult.Usage.OutputTokens
 			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
 			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
 			totalUsage.CostUSD += subResult.Usage.CostUSD
 
-			blocked := TaskStatusBlocked
-			_ = taskList.Update(taskID, &blocked, nil)
-			executor.PersistTaskList(ctx, sessionID, taskList)
-
-			var terminalReason HaltReason
 			if subResult.Reason.Kind == HaltBudgetExceeded {
-				terminalReason = subResult.Reason
-			} else {
-				terminalReason = HaltReason{
-					Kind:      HaltStepFailed,
-					TaskIndex: index,
-					Task:      taskList.Tasks[index].Description,
-					Reason:    haltReasonString(subResult.Reason),
-				}
+				blocked := TaskStatusBlocked
+				_ = taskList.Update(taskID, &blocked, nil)
+				executor.PersistTaskList(ctx, sessionID, taskList)
+				cx.PopBudget()
+				return RunResult{
+					Kind:         RunFailure,
+					Reason:       subResult.Reason,
+					SessionID:    sessionID,
+					Usage:        totalUsage,
+					Turns:        subResult.Turns,
+					SessionState: lastState,
+				}, nil
 			}
-			cx.PopBudget()
-			return RunResult{
-				Kind:         RunFailure,
-				Reason:       terminalReason,
-				SessionID:    sessionID,
-				Usage:        totalUsage,
-				Turns:        subResult.Turns,
-				SessionState: lastState,
-			}, nil
+
+			// #126 AC3: a terminal task FAILURE cascade-blocks its transitive
+			// dependents and KEEPS scheduling unrelated tasks (replaces the Q5
+			// blanket abort).
+			carried.Turns = subResult.Turns
+			cascade(taskID, haltReasonString(subResult.Reason))
+			continue
 
 		default:
 			// A pause / consult / escalate propagates the whole run verbatim.
@@ -930,6 +1041,41 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	}
 
 	cx.PopBudget()
+
+	// ── Drain (#126, decision A). ───────────────────────────────────────────
+	//
+	// A run where a terminal failure cascade-blocked any task returns a PARTIAL
+	// terminal Failure reporting the full partition. A run where every task
+	// completed returns Success (output = last step's text).
+	if hadFailure {
+		var completed []uint32
+		for i := range taskList.Tasks {
+			if taskList.Tasks[i].Status == TaskStatusCompleted {
+				completed = append(completed, taskList.Tasks[i].ID)
+			}
+		}
+		sort.Slice(completed, func(i, j int) bool { return completed[i] < completed[j] })
+		blocked := make([]uint32, 0, len(blockedByFailure))
+		for id := range blockedByFailure {
+			blocked = append(blocked, id)
+		}
+		sort.Slice(blocked, func(i, j int) bool { return blocked[i] < blocked[j] })
+		return RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind:       HaltTasksBlockedByFailure,
+				Completed:  completed,
+				Blocked:    blocked,
+				FailedTask: firstFailureID,
+				Reason:     firstFailureReason,
+			},
+			SessionID:    sessionID,
+			Usage:        totalUsage,
+			Turns:        carried.Turns,
+			SessionState: lastState,
+		}, nil
+	}
+
 	return RunResult{
 		Kind:         RunSuccess,
 		Output:       lastOutput,

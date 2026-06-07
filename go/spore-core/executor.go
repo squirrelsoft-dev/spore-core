@@ -207,6 +207,24 @@ type StrategyExecutor interface {
 	// PersistTaskList persists a parsed task list through the RunStore seam.
 	PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList)
 
+	// LoadTaskList reads the persisted runnable TaskList (with real blockers) from
+	// the RunStore under TaskListExtrasKey (#126, decision C — the ONE authoring
+	// path). Returns (list, true) on a hit, or (TaskList{}, false) on a storage
+	// miss / decode failure (the executor then falls back to the linear plan
+	// artifact bridge).
+	LoadTaskList(ctx context.Context, sessionID SessionID) (TaskList, bool)
+
+	// ClearObservedWrites clears the harness-observed write/edit accumulator
+	// (#126, AC2). The DAG executor calls this before each step so a task's
+	// files_touched reflect ONLY the writes that step issues.
+	ClearObservedWrites()
+
+	// TakeObservedWrites drains and returns the harness-observed write/edit paths
+	// accumulated at the dispatch seam since the last clear (#126, AC2). Used by
+	// the DAG executor on task completion to build a StepLedgerEntry's
+	// files_touched — never a model-self-reported field.
+	TakeObservedWrites() []string
+
 	// Finalize finalizes observability for a terminal outcome (the
 	// finalizeObservability routing). No-op for non-terminal results.
 	Finalize(ctx context.Context, result RunResult)

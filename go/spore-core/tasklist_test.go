@@ -709,3 +709,220 @@ func TestInvalidBlockersErrorWireTag(t *testing.T) {
 		t.Fatalf("wire tag missing: %s", got)
 	}
 }
+
+// ============================================================================
+// #126 DAG helpers + step ledger
+// ============================================================================
+
+// dagList builds the diamond DAG used across the #126 helper tests:
+// 1 (root); 2 -> 1; 3 -> 1; 4 -> 2,3 (diamond); 5 (independent).
+func dagList(t *testing.T) TaskList {
+	t.Helper()
+	l := DefaultTaskList()
+	if _, err := l.Add("a", nil); err != nil { // 1
+		t.Fatal(err)
+	}
+	if _, err := l.Add("b", []uint32{1}); err != nil { // 2 -> 1
+		t.Fatal(err)
+	}
+	if _, err := l.Add("c", []uint32{1}); err != nil { // 3 -> 1
+		t.Fatal(err)
+	}
+	if _, err := l.Add("d", []uint32{2, 3}); err != nil { // 4 -> 2,3
+		t.Fatal(err)
+	}
+	if _, err := l.Add("e", nil); err != nil { // 5 independent
+		t.Fatal(err)
+	}
+	return l
+}
+
+// NextReady picks the lowest-id pending task with all blockers completed.
+func TestNextReadyRespectsBlockersAndIDTiebreak(t *testing.T) {
+	l := dagList(t)
+	// Initially 1 and 5 are ready (no blockers); lowest id wins → 1.
+	if id, ok := l.NextReady(); !ok || id != 1 {
+		t.Fatalf("next ready = (%d,%v), want (1,true)", id, ok)
+	}
+	if err := l.Complete(1); err != nil {
+		t.Fatal(err)
+	}
+	// Now 2, 3, 5 ready (4 still waits on 2 & 3). Lowest is 2.
+	if id, _ := l.NextReady(); id != 2 {
+		t.Fatalf("next ready = %d, want 2", id)
+	}
+	_ = l.Complete(2)
+	if id, _ := l.NextReady(); id != 3 {
+		t.Fatalf("next ready = %d, want 3", id)
+	}
+	_ = l.Complete(3)
+	if id, _ := l.NextReady(); id != 4 {
+		t.Fatalf("next ready = %d, want 4", id)
+	}
+	_ = l.Complete(4)
+	if id, _ := l.NextReady(); id != 5 {
+		t.Fatalf("next ready = %d, want 5", id)
+	}
+	_ = l.Complete(5)
+	if _, ok := l.NextReady(); ok {
+		t.Fatalf("next ready should be exhausted")
+	}
+}
+
+// A pending task whose blocker is NOT completed is never ready.
+func TestNextReadySkipsUnsatisfiedBlockers(t *testing.T) {
+	l := dagList(t)
+	if id, _ := l.NextReady(); id != 1 {
+		t.Fatalf("only 1 and 5 runnable; min is 1, got %d", id)
+	}
+}
+
+// TransitiveBlockers: the full upstream closure, sorted, excluding self.
+func TestTransitiveBlockersClosure(t *testing.T) {
+	l := dagList(t)
+	if got := l.TransitiveBlockers(1); len(got) != 0 {
+		t.Fatalf("blockers(1) = %v, want []", got)
+	}
+	if got := l.TransitiveBlockers(2); !equalU32s(got, []uint32{1}) {
+		t.Fatalf("blockers(2) = %v, want [1]", got)
+	}
+	if got := l.TransitiveBlockers(4); !equalU32s(got, []uint32{1, 2, 3}) {
+		t.Fatalf("blockers(4) = %v, want [1 2 3]", got)
+	}
+	if got := l.TransitiveBlockers(5); len(got) != 0 {
+		t.Fatalf("blockers(5) = %v, want []", got)
+	}
+}
+
+// TransitiveDependents: the full downstream closure, sorted, excluding self.
+func TestTransitiveDependentsClosure(t *testing.T) {
+	l := dagList(t)
+	if got := l.TransitiveDependents(1); !equalU32s(got, []uint32{2, 3, 4}) {
+		t.Fatalf("dependents(1) = %v, want [2 3 4]", got)
+	}
+	if got := l.TransitiveDependents(2); !equalU32s(got, []uint32{4}) {
+		t.Fatalf("dependents(2) = %v, want [4]", got)
+	}
+	if got := l.TransitiveDependents(3); !equalU32s(got, []uint32{4}) {
+		t.Fatalf("dependents(3) = %v, want [4]", got)
+	}
+	if got := l.TransitiveDependents(4); len(got) != 0 {
+		t.Fatalf("dependents(4) = %v, want []", got)
+	}
+	if got := l.TransitiveDependents(5); len(got) != 0 {
+		t.Fatalf("dependents(5) = %v, want []", got)
+	}
+}
+
+// HasCycle: acyclic graphs return false; hand-built cycles return true.
+func TestHasCycleDetectsCycles(t *testing.T) {
+	l := dagList(t)
+	if l.HasCycle() {
+		t.Fatal("diamond DAG is acyclic")
+	}
+
+	// 1 -> 2 -> 1.
+	c := DefaultTaskList()
+	_, _ = c.Add("a", nil)            // 1
+	_, _ = c.Add("b", []uint32{1})    // 2 -> 1
+	c.Tasks[0].Blockers = []uint32{2} // 1 -> 2 closes the cycle
+	if !c.HasCycle() {
+		t.Fatal("expected cycle 1->2->1")
+	}
+
+	// Self-edge is a cycle.
+	s := DefaultTaskList()
+	_, _ = s.Add("x", nil)
+	s.Tasks[0].Blockers = []uint32{1}
+	if !s.HasCycle() {
+		t.Fatal("self-edge is a cycle")
+	}
+}
+
+// HasCycle: an edge to a non-existent task is ignored (no false positive).
+func TestHasCycleIgnoresUnknownBlockers(t *testing.T) {
+	l := DefaultTaskList()
+	_, _ = l.Add("a", nil)
+	l.Tasks[0].Blockers = []uint32{99} // dangling edge
+	if l.HasCycle() {
+		t.Fatal("a dangling edge is not a cycle")
+	}
+}
+
+// PushStepLedger: drop-oldest past N, returns whether anything was dropped.
+func TestStepLedgerDropOldestPastN(t *testing.T) {
+	var ledger []StepLedgerEntry
+	for i := 0; i < StepLedgerMaxEntries; i++ {
+		var dropped bool
+		ledger, dropped = PushStepLedger(ledger, StepLedgerEntry{TaskID: uint32(i + 1), Summary: "s"})
+		if dropped {
+			t.Fatalf("no drop before exceeding N (i=%d)", i)
+		}
+	}
+	if len(ledger) != StepLedgerMaxEntries {
+		t.Fatalf("len = %d, want %d", len(ledger), StepLedgerMaxEntries)
+	}
+	var dropped bool
+	ledger, dropped = PushStepLedger(ledger, StepLedgerEntry{TaskID: 999, Summary: "newest"})
+	if !dropped {
+		t.Fatal("drop fires at N+1")
+	}
+	if len(ledger) != StepLedgerMaxEntries {
+		t.Fatalf("stays bounded at N, got %d", len(ledger))
+	}
+	for _, e := range ledger {
+		if e.TaskID == 1 {
+			t.Fatal("the oldest (task 1) must have been dropped")
+		}
+	}
+	if ledger[len(ledger)-1].TaskID != 999 {
+		t.Fatal("newest must be retained")
+	}
+}
+
+// RenderStepLedger: deterministic text; files suffix only when non-empty;
+// elision marker leads when requested; ("",false) for empty.
+func TestRenderStepLedgerShape(t *testing.T) {
+	if _, ok := RenderStepLedger(nil, false); ok {
+		t.Fatal("empty ledger renders nothing")
+	}
+	entries := []StepLedgerEntry{
+		{TaskID: 1, Summary: "scaffolded"},
+		{TaskID: 2, Summary: "wrote tests", FilesTouched: []string{"a.go", "b.go"}},
+	}
+	rendered, ok := RenderStepLedger(entries, false)
+	if !ok {
+		t.Fatal("expected a rendered block")
+	}
+	if !contains(rendered, "#1 scaffolded") {
+		t.Fatalf("missing #1 line: %s", rendered)
+	}
+	if contains(rendered, "#1 scaffolded [files") {
+		t.Fatalf("empty files must have no suffix: %s", rendered)
+	}
+	if !contains(rendered, "#2 wrote tests [files: a.go, b.go]") {
+		t.Fatalf("missing #2 files suffix: %s", rendered)
+	}
+	if contains(rendered, StepLedgerElisionMarker) {
+		t.Fatalf("no elision marker when not elided: %s", rendered)
+	}
+	elided, _ := RenderStepLedger(entries, true)
+	if !contains(elided, StepLedgerElisionMarker) {
+		t.Fatalf("elision marker should lead: %s", elided)
+	}
+}
+
+// StepLedgerEntry serde field order is task_id, summary, files_touched; empty
+// files_touched serializes as [] (never null).
+func TestStepLedgerEntrySerdeShape(t *testing.T) {
+	e := StepLedgerEntry{TaskID: 7, Summary: "did", FilesTouched: []string{"x"}}
+	got, _ := json.Marshal(e)
+	if string(got) != `{"task_id":7,"summary":"did","files_touched":["x"]}` {
+		t.Fatalf("marshal = %s", got)
+	}
+	empty := StepLedgerEntry{TaskID: 1, Summary: "s"}
+	got2, _ := json.Marshal(empty)
+	if string(got2) != `{"task_id":1,"summary":"s","files_touched":[]}` {
+		t.Fatalf("empty files marshal = %s", got2)
+	}
+}

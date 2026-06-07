@@ -64,6 +64,8 @@ package sporecore
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 // TaskListExtrasKey is the key under which the TaskList is persisted in the
@@ -143,6 +145,95 @@ func (l TaskList) MarshalJSON() ([]byte, error) {
 		a.Tasks = []TaskListItem{}
 	}
 	return json.Marshal(a)
+}
+
+// ============================================================================
+// Step ledger (#126 — Tier-2 global running ledger)
+// ============================================================================
+
+// StepLedgerMaxEntries is the maximum number of StepLedgerEntry rows the Tier-2
+// running ledger retains (#126, RESOLVED spec decision B). Past this bound the
+// ledger drops the OLDEST entries (a deterministic, NO-model, byte-identical
+// policy — never summarize). This constant MUST be identical across all four
+// language implementations.
+const StepLedgerMaxEntries = 20
+
+// StepLedgerElisionMarker is the static marker row inserted (once) when the
+// Tier-2 ledger drops its oldest entries past StepLedgerMaxEntries (#126,
+// decision B). It is a fixed string — NOT a summary of the elided rows — so the
+// elision note is byte-identical across languages. Rendered as a leading ledger
+// line by RenderStepLedger.
+const StepLedgerElisionMarker = "[older ledger entries elided]"
+
+// StepLedgerEntry is a single compact row in the Tier-2 global running ledger
+// (#126). Appended on task completion and injected into EVERY subsequent execute
+// step so each step sees a compact record of what has already happened across
+// the whole DAG.
+//
+// FilesTouched is HARNESS-OBSERVED from write/edit tool calls during the task's
+// execution — NOT a model-self-reported field. A task whose execute step only
+// NARRATED touching a file (no actual write/edit tool call) records an EMPTY
+// FilesTouched (#126 AC2).
+//
+// Wire field order is task_id, summary, files_touched. Byte-identical across all
+// four languages (the same serde shape as TaskListItem).
+type StepLedgerEntry struct {
+	TaskID       uint32   `json:"task_id"`
+	Summary      string   `json:"summary"`
+	FilesTouched []string `json:"files_touched"`
+}
+
+// MarshalJSON renders FilesTouched as [] rather than null when empty, so the
+// serialization is byte-identical to the other languages.
+func (e StepLedgerEntry) MarshalJSON() ([]byte, error) {
+	type alias StepLedgerEntry // avoid recursion
+	a := alias(e)
+	if a.FilesTouched == nil {
+		a.FilesTouched = []string{}
+	}
+	return json.Marshal(a)
+}
+
+// PushStepLedger appends entry to a bounded Tier-2 running ledger, keeping at
+// most StepLedgerMaxEntries rows via drop-oldest (#126, decision B).
+//
+// Pure and deterministic: NO model call, NO summarization. When the push would
+// exceed the bound the oldest entries are removed from the front so exactly the
+// StepLedgerMaxEntries most-recent entries remain (completion order preserved).
+// Returns the updated ledger and true iff at least one entry was dropped on this
+// call (so the caller can render the static StepLedgerElisionMarker).
+func PushStepLedger(ledger []StepLedgerEntry, entry StepLedgerEntry) ([]StepLedgerEntry, bool) {
+	ledger = append(ledger, entry)
+	dropped := false
+	for len(ledger) > StepLedgerMaxEntries {
+		ledger = ledger[1:]
+		dropped = true
+	}
+	return ledger, dropped
+}
+
+// RenderStepLedger renders the Tier-2 ledger as a compact, deterministic text
+// block for seeding into an execute step (#126). One line per entry:
+// "#<id> <summary> [files: a, b]" (the "[files: …]" suffix omitted when
+// FilesTouched is empty). When elided is true a single leading
+// StepLedgerElisionMarker line is emitted. Returns ("", false) for an empty
+// ledger (nothing to inject).
+func RenderStepLedger(ledger []StepLedgerEntry, elided bool) (string, bool) {
+	if len(ledger) == 0 {
+		return "", false
+	}
+	var lines []string
+	if elided {
+		lines = append(lines, StepLedgerElisionMarker)
+	}
+	for _, e := range ledger {
+		if len(e.FilesTouched) == 0 {
+			lines = append(lines, fmt.Sprintf("#%d %s", e.TaskID, e.Summary))
+		} else {
+			lines = append(lines, fmt.Sprintf("#%d %s [files: %s]", e.TaskID, e.Summary, strings.Join(e.FilesTouched, ", ")))
+		}
+	}
+	return "Progress ledger so far:\n" + strings.Join(lines, "\n"), true
 }
 
 // ============================================================================
@@ -410,6 +501,179 @@ func (l *TaskList) find(id uint32) *TaskListItem {
 }
 
 // ============================================================================
+// DAG scheduling helpers (#126) — pure, deterministic, no I/O.
+// ============================================================================
+
+// NextReady returns the next READY task to run under the ready-set scheduler
+// (#126): the LOWEST-id pending task ALL of whose blockers are completed.
+// Returns (id, true), or (0, false) when no pending task is currently runnable
+// (every pending task is waiting on an un-completed blocker, or none remain).
+//
+// The id tiebreak is deterministic and language-agnostic: among ready tasks,
+// the smallest id always wins, regardless of positional order in Tasks.
+func (l *TaskList) NextReady() (uint32, bool) {
+	var (
+		best  uint32
+		found bool
+	)
+	for i := range l.Tasks {
+		t := &l.Tasks[i]
+		if t.Status != TaskStatusPending {
+			continue
+		}
+		ready := true
+		for _, b := range t.Blockers {
+			if !l.isCompleted(b) {
+				ready = false
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+		if !found || t.ID < best {
+			best = t.ID
+			found = true
+		}
+	}
+	return best, found
+}
+
+// isCompleted reports whether the task with id exists and is completed.
+func (l *TaskList) isCompleted(id uint32) bool {
+	t := l.find(id)
+	return t != nil && t.Status == TaskStatusCompleted
+}
+
+// TransitiveBlockers returns the TRANSITIVE-blocker closure of id (#126, Tier-1
+// scoped context): the set of all tasks id (transitively) depends on — its
+// direct blockers, their blockers, and so on. Excludes id itself. Returned
+// SORTED ascending for deterministic, byte-identical seeding across languages.
+//
+// Independent branches (tasks NOT reachable from id via the task -> blocker
+// edges) never appear, which keeps a task's Tier-1 seed free of unrelated
+// branches (#126 AC1 branch isolation).
+func (l *TaskList) TransitiveBlockers(id uint32) []uint32 {
+	seen := make(map[uint32]struct{})
+	var stack []uint32
+	if t := l.find(id); t != nil {
+		stack = append(stack, t.Blockers...)
+	}
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := seen[node]; ok {
+			continue
+		}
+		seen[node] = struct{}{}
+		if t := l.find(node); t != nil {
+			stack = append(stack, t.Blockers...)
+		}
+	}
+	out := make([]uint32, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// TransitiveDependents returns the TRANSITIVE-dependent closure of id (#126,
+// failure cascade): every task that depends on id directly or transitively
+// (i.e. has a directed task -> blocker path reaching id). Excludes id itself.
+// Returned SORTED ascending. When id fails terminally, exactly these tasks are
+// marked Blocked; tasks NOT in this set are unaffected and keep scheduling
+// (#126 AC3).
+func (l *TaskList) TransitiveDependents(id uint32) []uint32 {
+	dependents := make(map[uint32]struct{})
+	frontier := []uint32{id}
+	for len(frontier) > 0 {
+		node := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		for i := range l.Tasks {
+			t := &l.Tasks[i]
+			if t.ID == id {
+				continue
+			}
+			for _, b := range t.Blockers {
+				if b != node {
+					continue
+				}
+				if _, ok := dependents[t.ID]; !ok {
+					dependents[t.ID] = struct{}{}
+					frontier = append(frontier, t.ID)
+				}
+				break
+			}
+		}
+	}
+	out := make([]uint32, 0, len(dependents))
+	for k := range dependents {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// HasCycle reports whether the whole-graph blocker edges (task -> blocker)
+// contain any directed cycle (#126, defense-in-depth at execute entry). It
+// generalizes the single-edge wouldCreateCycle check used by Add: it inspects
+// the ENTIRE persisted graph (which the task_list tool authoring path could in
+// principle leave cyclic via out-of-band edits) rather than one prospective Add.
+//
+// Pure; O(V+E) via iterative DFS three-coloring so a pathological graph never
+// blows the stack. Blockers referencing unknown ids are simply ignored (no
+// edge) — an unknown blocker can never form a cycle.
+func (l *TaskList) HasCycle() bool {
+	const (
+		colorGray  = 1 // on the current DFS path
+		colorBlack = 2 // fully explored
+	)
+	color := make(map[uint32]uint8)
+	for i := range l.Tasks {
+		start := l.Tasks[i].ID
+		if color[start] != 0 {
+			continue
+		}
+		type frame struct {
+			node     uint32
+			expanded bool
+		}
+		stack := []frame{{start, false}}
+		onPath := make(map[uint32]struct{})
+		for len(stack) > 0 {
+			fr := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if fr.expanded {
+				color[fr.node] = colorBlack
+				delete(onPath, fr.node)
+				continue
+			}
+			if color[fr.node] == colorBlack {
+				continue
+			}
+			color[fr.node] = colorGray
+			onPath[fr.node] = struct{}{}
+			stack = append(stack, frame{fr.node, true})
+			if t := l.find(fr.node); t != nil {
+				for _, b := range t.Blockers {
+					if l.find(b) == nil {
+						continue // edge to a non-existent task is no edge at all
+					}
+					if _, gray := onPath[b]; gray {
+						return true // back-edge → cycle
+					}
+					if color[b] != colorBlack {
+						stack = append(stack, frame{b, false})
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// ============================================================================
 // Plan → TaskList parser (issue #72; the bridge between #70 and #59)
 // ============================================================================
 
@@ -435,6 +699,14 @@ func (l *TaskList) find(id uint32) *TaskListItem {
 // plan), so the same artifact always yields the same task list, byte-identical
 // across all four languages. Wiring this into the plan-acceptance seam is
 // DEFERRED to #59; #72 ships only this pure function.
+//
+// Deprecated (#126, decision C): this flat bridge can only ever produce a LINEAR
+// chain (it always sets empty blockers), so it cannot express the blocker DAG
+// the #126 ready-set executor walks. The task_list tool path (TaskList.Add with
+// real blockers) is now the ONE authoring path; the PlanExecute executor reads
+// its TaskList from the persisted task_list store rather than from this bridge.
+// The function is RETAINED (its replay tests stay green) but should not be used
+// to seed a DAG run. Mirrors Rust's #[deprecated] on plan_artifact_to_task_list.
 func PlanArtifactToTaskList(artifact PlanArtifact) TaskList {
 	list := DefaultTaskList() // NextID == 1, Tasks == []
 	for _, step := range artifact.Tasks {
