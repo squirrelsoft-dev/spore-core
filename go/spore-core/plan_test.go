@@ -210,9 +210,15 @@ func TestPlanExecuteExecutePhaseNotImplementedIsGone(t *testing.T) {
 	}
 }
 
-// R2: a tool-call request in the one-shot plan turn is a planning failure
-// (PlanningTurnFailed), never a dispatch loop.
-func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
+// #124 recursion seam (was R2): the plan phase now dispatches the genuine
+// c.Plan child (a ReAct loop) capped at ONE turn. A plan turn that requests a
+// tool instead of emitting the JSON plan cannot complete in its single turn, so
+// the plan child halts (budget) and the plan phase propagates a terminal Failure
+// WITHOUT capturing/storing an artifact. (The old one-shot primitive
+// special-cased a tool call as PlanningTurnFailed; under genuine recursion the
+// cap is what stops the loop — the observable contract that a non-plan plan turn
+// fails the run and stores nothing is preserved.)
+func TestPlanPhaseToolCallFailsAndStoresNoArtifact(t *testing.T) {
 	a := NewMockAgent("planner")
 	a.Push(NewToolCallRequested([]ToolCall{
 		{ID: "c1", Name: "x", Input: json.RawMessage(`{}`)},
@@ -221,6 +227,7 @@ func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
 	cfg := standardCfg(a)
 	cfg.RunStore = store
 	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
 	cfg.ToolRegistry = reg
 	h := NewStandardHarness(cfg)
 
@@ -230,15 +237,11 @@ func TestPlanPhaseToolCallIsPlanningTurnFailed(t *testing.T) {
 	if outcome != nil || failure == nil {
 		t.Fatalf("expected failure, got outcome=%+v failure=%v", outcome, failure)
 	}
-	if failure.Reason.Kind != HaltPlanPhaseFailed || failure.Reason.PlanError == nil ||
-		failure.Reason.PlanError.Kind != PlanErrorPlanningTurnFailed {
-		t.Fatalf("got %+v", failure.Reason)
+	// The plan child never emitted a JSON plan, so the run halts terminally.
+	if failure.Kind != RunFailure {
+		t.Fatalf("expected a terminal Failure, got %+v", failure)
 	}
-	// No tool dispatch happened (R2: not a dispatch loop).
-	if reg.CallCount.Load() != 0 {
-		t.Fatalf("tool registry dispatched %d times", reg.CallCount.Load())
-	}
-	// No artifact stored.
+	// Nothing captured/stored: no artifact reached the RunStore.
 	if _, ok := store.get(task.SessionID, PlanExecuteExtrasKey); ok {
 		t.Fatal("artifact stored despite planning failure")
 	}

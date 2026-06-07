@@ -101,8 +101,9 @@ type PlanExecuteConfig struct {
 }
 
 // PlanExecuteSimple builds a PlanExecute whose plan and execute phases are both
-// bare ReAct leaves (migration shim for the old PlanExecute{plan_model} shape;
-// the live executor does not read the children yet — #124).
+// bare ReAct leaves (migration shim for the old PlanExecute{plan_model} shape).
+// As of #124 the executor genuinely dispatches both children: the plan child via
+// Plan.Run and the execute child via Execute.Run per task.
 func PlanExecuteSimple(planModel *ModelConfig) PlanExecuteConfig {
 	plan := ReActStrategy(^uint32(0))
 	exec := ReActStrategy(^uint32(0))
@@ -538,13 +539,21 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	return cx.recordTerminal(result)
 }
 
-// Run is the plan→execute combinator (#124). The plan phase recurses through the
-// plan sub-strategy via the executor primitive (Q4 — a real loop building the
-// task graph, not a one-shot dispatch); the execute phase recurses through the
-// execute sub-strategy per task. The model-touching plan/execute machinery stays
-// on the harness behind StrategyExecutor so behavior is at parity with the
-// ported runPlanExecute body (AC6). The ready-set walk lands in #126 (execute
-// runs per task sequentially for now).
+// Run is the plan→execute combinator (#124). GENUINELY recursive: the plan phase
+// dispatches c.Plan.Run (seeding the planning directive + a one-turn budget on
+// the scratch first) and the execute phase dispatches c.Execute.Run ONCE PER
+// TASK. The child strategy's full loop runs for each phase — a non-ReAct execute
+// child (SelfVerifying / HillClimbing) really executes per task, not a hardcoded
+// flat ReAct (the defeated-the-point bug this fixes).
+//
+// This config body OWNS the orchestration: per-task turn/budget allocation (Q1),
+// the OnTaskAdvance hook (pre, mutable), seeding each step instruction as a user
+// message, A.6 deep-resume against the durable RunStore checkpoint, task-list
+// persistence after each transition (Q4), and cumulative usage / last-output /
+// last-state carry. The harness keeps only LEAF primitives: the constrained-plan
+// capture/persist machinery, the deep-resume reconcile, and the OnTaskAdvance
+// fire — none of which touch the per-task model loop. The ready-set walk lands in
+// #126 (execute runs per task sequentially for now).
 func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
 	executor, fail := cx.executor()
 	if executor == nil {
@@ -552,12 +561,65 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	}
 	task := cx.currentTask()
 	sessionID := task.SessionID
-	session := cx.takeSession()
+	// The incoming shared execute session ( [user: task.instruction] ).
+	baseSession := cx.takeSession()
 	budget := cx.Scratch.RunBudget
+	// PlanExecute suppresses the run's stream sink for its phases (parent-visible
+	// step boundaries are re-emitted on the caller's sink). Take it now and keep
+	// it OUT of cx.Stream so the recursive children run with a suppressed sink.
 	onStream := cx.takeStream()
 
-	// ── Phase 1: plan (recurse through the plan sub-strategy). ──────────────
-	outcome, failure := executor.PlanPhase(ctx, &task, &session, budget, onStream)
+	// ── Phase 1: plan (dispatch through c.Plan). ────────────────────────────
+	//
+	// Seed the planning directive onto a CLONE of the base session so the shared
+	// execute context stays [user: task.instruction] (#93 — a leaked directive
+	// would make every execute step re-emit a plan). Cap the plan child at ONE
+	// turn (R1): the plan is a single constrained turn that yields the JSON
+	// artifact, but never beyond the task's global turn ceiling (R10).
+	directive := executor.PlanDirective(task.Instruction)
+	planSession := baseSession
+	executor.SeedUserMessage(ctx, &planSession, directive)
+	planCap := saturatingAddU32(budget.Turns, 1)
+	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < planCap {
+		planCap = *task.Budget.MaxTurns
+	}
+	planBudget := task.Budget
+	planBudget.MaxTurns = &planCap
+	planTask := Task{
+		ID:           task.ID,
+		Instruction:  directive,
+		SessionID:    sessionID,
+		Budget:       planBudget,
+		LoopStrategy: *c.Plan,
+	}
+	planResult := executor.RunPlanSubtree(ctx, c.Plan, planTask, planSession, budget)
+	if planResult == nil {
+		result := RunResult{
+			Kind: RunFailure,
+			Reason: HaltReason{
+				Kind: HaltPlanPhaseFailed,
+				PlanError: &PlanPhaseError{
+					Kind:    PlanErrorPlanningTurnFailed,
+					Message: "plan sub-strategy produced no terminal",
+				},
+			},
+			SessionID: sessionID,
+			Turns:     budget.Turns,
+		}
+		return cx.finish(ctx, executor, task, result)
+	}
+	if planResult.Kind != RunSuccess {
+		// A non-success plan terminal (budget / agent error / pause) propagates
+		// verbatim — the run never reaches execute.
+		return cx.finish(ctx, executor, task, *planResult)
+	}
+	planOutput := planResult.Output
+	planUsageAgg := planResult.Usage
+	planTurns := planResult.Turns
+
+	// Capture + persist the artifact from the plan child's output (R3/R4/R11) —
+	// the harness-side machinery, no model turn.
+	outcome, failure := executor.CapturePlanArtifact(ctx, sessionID, planOutput, planUsageAgg, planTurns)
 	if failure != nil {
 		return cx.finish(ctx, executor, task, *failure)
 	}
@@ -581,9 +643,195 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	carried.InputTokens += outcome.Usage.InputTokens
 	carried.OutputTokens += outcome.Usage.OutputTokens
 
-	// ── Phase 2: execute (recurse through the execute sub-strategy). ────────
-	result := executor.ExecutePhase(ctx, &task, &session, taskList, carried, outcome.Usage, onStream)
+	// ── Phase 2: execute (dispatch c.Execute PER TASK). ─────────────────────
+	//
+	// The shared execute context starts from baseSession (NOT the plan child's
+	// polluted session) so the directive never leaks (#93).
+	result := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, outcome.Usage, onStream)
 	return cx.finish(ctx, executor, task, result)
+}
+
+// runExecuteLoop drains taskList by dispatching c.Execute.Run ONCE PER TASK
+// (#124). It owns the per-task orchestration: A.6 deep-resume reconcile, Q1
+// per-task turn allocation, the OnTaskAdvance hook, seeding each step instruction
+// as a user message on the SHARED execute context, task-list persistence after
+// each transition (Q4), and cumulative usage / last-output / last-state carry.
+// Returns the terminal RunResult for the execute phase.
+func (c *PlanExecuteConfig) runExecuteLoop(
+	ctx context.Context,
+	cx *ExecutionContext,
+	executor StrategyExecutor,
+	task *Task,
+	session SessionState,
+	taskList TaskList,
+	carried BudgetSnapshot,
+	planUsage AggregateUsage,
+	onStream StreamSink,
+) RunResult {
+	sessionID := task.SessionID
+
+	// A.6 deep-resume (Q2): reconcile against the durable checkpoint so
+	// already-Completed tasks are not re-run.
+	executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
+
+	totalTasks := len(taskList.Tasks)
+	totalUsage := planUsage
+	var lastOutput string
+	var lastState SessionState
+	globalMaxTurns := task.Budget.MaxTurns
+
+	for index := 0; index < totalTasks; index++ {
+		taskID := taskList.Tasks[index].ID
+		instruction := taskList.Tasks[index].Description
+
+		// A.6 deep-resume: a task already Completed is skipped.
+		if taskList.Tasks[index].Status == TaskStatusCompleted {
+			lastOutput = instruction
+			continue
+		}
+
+		// Q1: per-task turn allocation, derived at the START of the step.
+		remainingTasks := uint32(totalTasks - index)
+		var stepCap uint32
+		if globalMaxTurns != nil {
+			max := *globalMaxTurns
+			var remainingTurns uint32
+			if max > carried.Turns {
+				remainingTurns = max - carried.Turns
+			}
+			perTaskTurns := remainingTurns / remainingTasks
+			if perTaskTurns < 1 {
+				perTaskTurns = 1
+			}
+			// The sub-loop's effective cap is RELATIVE to the carried turns: a
+			// per-task cap of K means "stop K turns from now" while the GLOBAL
+			// budget (carried forward) remains the hard stop — so the step task's
+			// turn ceiling is min(global, carried + per_task). An already-exhausted
+			// global budget thus budget-fails the step BEFORE the execute child
+			// calls the agent (Q1).
+			subLoopCap := carried.Turns + perTaskTurns
+			if max < subLoopCap {
+				stepCap = max
+			} else {
+				stepCap = subLoopCap
+			}
+		} else {
+			stepCap = ^uint32(0) // max uint32
+		}
+
+		// Mark InProgress and re-persist (Q4).
+		ip := TaskStatusInProgress
+		_ = taskList.Update(taskID, &ip, nil)
+		executor.PersistTaskList(ctx, sessionID, taskList)
+
+		// Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step
+		// instruction; the (possibly mutated) instruction seeds the execute
+		// sub-strategy.
+		stepBudget := task.Budget
+		stepBudget.MaxTurns = &stepCap
+		stepTask := Task{
+			ID:           task.ID,
+			Instruction:  instruction,
+			SessionID:    sessionID,
+			Budget:       stepBudget,
+			LoopStrategy: *c.Execute,
+		}
+		executor.FireTaskAdvance(ctx, sessionID, &stepTask, index, totalTasks)
+
+		// Seed the step instruction as a user message on the SHARED execute
+		// context, then dispatch the execute sub-strategy.
+		executor.SeedUserMessage(ctx, &session, stepTask.Instruction)
+
+		stCopy := stepTask
+		cx.Scratch.Task = &stCopy
+		cx.Scratch.RunSession = session
+		cx.Scratch.RunBudget = carried
+		_ = c.Execute.Run(ctx, cx)
+		subResult := cx.takeChildOverride()
+
+		if subResult == nil {
+			return RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:      HaltStepFailed,
+					TaskIndex: index,
+					Task:      taskList.Tasks[index].Description,
+					Reason:    "execute sub-strategy produced no terminal",
+				},
+				SessionID:    sessionID,
+				Usage:        totalUsage,
+				Turns:        carried.Turns,
+				SessionState: lastState,
+			}
+		}
+
+		switch subResult.Kind {
+		case RunSuccess:
+			// Carry the shared budget forward (Q1) and fold this step's
+			// conversation back into the SHARED context so the next step builds on
+			// its results.
+			carried.Turns = subResult.Turns
+			session = subResult.SessionState
+			lastState = session
+			carried.InputTokens += subResult.Usage.InputTokens
+			carried.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.InputTokens += subResult.Usage.InputTokens
+			totalUsage.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
+			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
+			totalUsage.CostUSD += subResult.Usage.CostUSD
+			lastOutput = subResult.Output
+
+			_ = taskList.Complete(taskID)
+			executor.PersistTaskList(ctx, sessionID, taskList)
+			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
+
+		case RunFailure:
+			// Q5: any non-success step aborts the whole run.
+			totalUsage.InputTokens += subResult.Usage.InputTokens
+			totalUsage.OutputTokens += subResult.Usage.OutputTokens
+			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
+			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
+			totalUsage.CostUSD += subResult.Usage.CostUSD
+
+			blocked := TaskStatusBlocked
+			_ = taskList.Update(taskID, &blocked, nil)
+			executor.PersistTaskList(ctx, sessionID, taskList)
+
+			var terminalReason HaltReason
+			if subResult.Reason.Kind == HaltBudgetExceeded {
+				terminalReason = subResult.Reason
+			} else {
+				terminalReason = HaltReason{
+					Kind:      HaltStepFailed,
+					TaskIndex: index,
+					Task:      taskList.Tasks[index].Description,
+					Reason:    haltReasonString(subResult.Reason),
+				}
+			}
+			return RunResult{
+				Kind:         RunFailure,
+				Reason:       terminalReason,
+				SessionID:    sessionID,
+				Usage:        totalUsage,
+				Turns:        subResult.Turns,
+				SessionState: lastState,
+			}
+
+		default:
+			// A pause / consult / escalate propagates the whole run verbatim.
+			return *subResult
+		}
+	}
+
+	return RunResult{
+		Kind:         RunSuccess,
+		Output:       lastOutput,
+		SessionID:    sessionID,
+		Usage:        totalUsage,
+		Turns:        carried.Turns,
+		SessionState: lastState,
+	}
 }
 
 // Run is the SelfVerifying combinator: drive the build↔evaluate loop

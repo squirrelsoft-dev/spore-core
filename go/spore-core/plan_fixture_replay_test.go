@@ -84,7 +84,9 @@ func drivePlanFixture(t *testing.T, ex RecordedExchange) {
 		TerminationPolicy: AlwaysContinuePolicy{},
 	}
 	h := NewStandardHarness(cfg)
-	task := NewTask("build something", SessionID("plan-fixture"), LoopStrategy{Kind: StrategyPlanExecute})
+	// #124: PlanExecute now genuinely recurses into its plan/execute children, so
+	// the strategy must carry a real config (both phases default ReAct leaves).
+	task := NewTask("build something", SessionID("plan-fixture"), PlanExecuteStrategy(PlanExecuteSimple(nil)))
 	r := h.Run(context.Background(), NewHarnessRunOptions(task))
 	if r.Kind != RunFailure || r.Reason.Kind != HaltStepFailed {
 		t.Fatalf("expected StepFailed, got %+v", r)

@@ -432,6 +432,52 @@ func TestPlanExecutePersistenceLivesOnRunStoreNotExtras(t *testing.T) {
 	}
 }
 
+// #124: PlanExecute genuinely recurses into a NON-ReAct execute child. With a
+// SelfVerifying execute child over a 2-task plan, the scripted verifier must be
+// invoked exactly twice (once per task). The old hardcoded-ReAct execute impl
+// dropped the SelfVerifying child entirely and would record ZERO invocations —
+// this is the regression that proves the recursion is real. Mirrors Rust's
+// plan_execute_runs_non_react_execute_child_per_task.
+func TestPlanExecuteRunsNonReactExecuteChildPerTask(t *testing.T) {
+	// cfg.Agent runs BOTH the plan turn (JSON) and the per-task build phase.
+	a := NewMockAgent("planner")
+	a.Push(planFinal(`{"tasks":["t0","t1"],"rationale":"r"}`))
+	a.Push(planFinal("built t0"))
+	a.Push(planFinal("built t1"))
+	// The evaluate phase runs on a distinct agent; PASS each task.
+	eval := newRecordingAgent("eval", "PASS")
+	// The verifier records every invocation; PASS each time.
+	v := newSVVerifier(3, "pass", "pass")
+	cfg := standardCfg(a)
+	cfg.EvaluatorAgent = eval
+	cfg.Verifier = v
+	h := NewStandardHarness(cfg)
+
+	// The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
+	strat := PlanExecuteStrategy(PlanExecuteConfig{
+		Plan: PtrStrategy(ReActStrategy(^uint32(0))),
+		Execute: PtrStrategy(SelfVerifyingStrategy(SelfVerifyingConfig{
+			Inner:     PtrStrategy(ReActStrategy(^uint32(0))),
+			Evaluator: SchemaRef(""),
+		})),
+	})
+	task := NewTask("build a CLI", SessionID("plan-sess"), strat)
+
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+	if r.Output != "built t1" {
+		t.Fatalf("Q2: output = %q, want last step's final output %q", r.Output, "built t1")
+	}
+
+	// The smoking gun: the SelfVerifying evaluator ran ONCE PER TASK (2x). A
+	// dropped execute child would record ZERO verifier invocations.
+	if v.calls != 2 {
+		t.Fatalf("the SelfVerifying execute child must run its evaluator once per task; got %d invocations", v.calls)
+	}
+}
+
 func equalInts(a, b []int) bool {
 	if len(a) != len(b) {
 		return false

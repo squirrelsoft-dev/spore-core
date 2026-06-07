@@ -106,14 +106,41 @@ type StrategyExecutor interface {
 	// NOT finalize observability — the caller (the leaf Run) does.
 	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink) RunResult
 
-	// PlanPhase runs the PlanExecute plan phase (runPlanPhase) — the constrained
-	// planner turn that captures + persists a PlanArtifact. Returns the artifact
-	// + accounting, or a non-nil terminal failure to propagate.
-	PlanPhase(ctx context.Context, task *Task, session *SessionState, budget BudgetSnapshot, onStream StreamSink) (PlanPhaseOutcome, *RunResult)
+	// SeedUserMessage seeds a user message onto session (the ContextManager seam).
+	// Used by the recursive PlanExecuteConfig.Run to seed the planning directive
+	// and each step instruction (#124).
+	SeedUserMessage(ctx context.Context, session *SessionState, text string)
 
-	// ExecutePhase runs the PlanExecute execute phase (runExecutePhase) — drains
-	// the task list, recursing the execute sub-strategy per task.
-	ExecutePhase(ctx context.Context, task *Task, session *SessionState, taskList TaskList, carried BudgetSnapshot, planUsage AggregateUsage, onStream StreamSink) RunResult
+	// PlanDirective returns the planning directive seeded before the plan
+	// sub-strategy runs (R1) — the "respond with a single JSON plan" instruction
+	// wrapped around the task instruction.
+	PlanDirective(instruction string) string
+
+	// RunPlanSubtree dispatches the plan sub-strategy plan for planTask over
+	// planSession, returning its terminal RunResult (#124). Genuinely recursive —
+	// the child's Run drives its whole loop. Routes the configured PlannerAgent
+	// (R5/R6) by running the child against an agent-swapped child harness when one
+	// is set; otherwise the default agent runs the plan turn. Returns nil only if
+	// the child produced no terminal.
+	RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult
+
+	// CapturePlanArtifact captures + persists a PlanArtifact from the plan
+	// sub-strategy's final output text (#124): R3 (parse), R11 (fire OnPlanCreated,
+	// mutable), R4 (persist to the RunStore under PlanExecuteExtrasKey). The model
+	// turn that produced planOutput ran elsewhere — the recursive plan child — so
+	// this carries no agent call. Returns the captured outcome, or a non-nil
+	// terminal failure to propagate.
+	CapturePlanArtifact(ctx context.Context, sessionID SessionID, planOutput string, usage AggregateUsage, turns uint32) (PlanPhaseOutcome, *RunResult)
+
+	// ReconcileCompletedTasks marks every task already Completed on the DURABLE
+	// RunStore checkpoint as Completed in taskList so it is NOT re-run (A.6
+	// deep-resume).
+	ReconcileCompletedTasks(ctx context.Context, sessionID SessionID, taskList *TaskList)
+
+	// FireTaskAdvance fires the OnTaskAdvance hook (pre, mutable) for an execute
+	// step. The hook may rewrite stepTask.Instruction; the (possibly mutated)
+	// instruction is what the execute sub-strategy then runs.
+	FireTaskAdvance(ctx context.Context, sessionID SessionID, stepTask *Task, taskIndex, totalTasks int)
 
 	// PersistTaskList persists a parsed task list through the RunStore seam.
 	PersistTaskList(ctx context.Context, sessionID SessionID, taskList TaskList)
@@ -231,6 +258,19 @@ func (cx *ExecutionContext) recordTerminal(result RunResult) StrategyOutcome {
 	r := result
 	cx.Scratch.TerminalOverride = &r
 	return outcome
+}
+
+// takeChildOverride takes the FULL terminal RunResult a child strategy stashed
+// into Scratch.TerminalOverride when it returned from Run (#124). A combinator
+// that recurses per-phase / per-task calls this immediately after each child Run
+// to fold the child's usage / turns / session back into the shared execute
+// context. Clearing the override is REQUIRED: the combinator builds its OWN
+// terminal once the whole loop finishes (via finish), and a stale child override
+// would otherwise propagate verbatim and mask it.
+func (cx *ExecutionContext) takeChildOverride() *RunResult {
+	r := cx.Scratch.TerminalOverride
+	cx.Scratch.TerminalOverride = nil
+	return r
 }
 
 // finish is a combinator's terminal seam: finalize observability for result,

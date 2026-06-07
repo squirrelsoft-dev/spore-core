@@ -2980,10 +2980,47 @@ func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterati
 	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream)
 }
 
-// PlanPhase runs the PlanExecute plan phase. Adapts the private
-// (*planPhaseOutcome, *RunResult) shape to the public seam shape.
-func (h *StandardHarness) PlanPhase(ctx context.Context, task *Task, session *SessionState, budget BudgetSnapshot, onStream StreamSink) (PlanPhaseOutcome, *RunResult) {
-	outcome, failure := h.runPlanPhase(ctx, task, session, budget, onStream)
+// SeedUserMessage seeds a user message onto session (the ContextManager seam).
+func (h *StandardHarness) SeedUserMessage(ctx context.Context, session *SessionState, text string) {
+	h.config.ContextManager.AppendUserMessage(ctx, session, text)
+}
+
+// PlanDirective returns the planning directive seeded before the plan
+// sub-strategy runs (R1) — the "respond with a single JSON plan" instruction
+// wrapped around the task. Dispatched by the recursive PlanExecuteConfig.Run
+// before c.Plan.Run (#124).
+func (h *StandardHarness) PlanDirective(instruction string) string {
+	return planDirective(instruction)
+}
+
+// RunPlanSubtree dispatches the plan sub-strategy plan for planTask over
+// planSession, returning its terminal RunResult (#124). Genuinely recursive —
+// the child's Run drives its WHOLE loop. Routes the configured PlannerAgent
+// (R5/R6) by running the child against an agent-swapped child harness when one is
+// set; otherwise the default agent runs through h. Either way the child's Run
+// drives the whole plan loop. Returns nil if the child produced no terminal.
+func (h *StandardHarness) RunPlanSubtree(ctx context.Context, plan *LoopStrategy, planTask Task, planSession SessionState, budget BudgetSnapshot) *RunResult {
+	driver := h
+	if h.config.PlannerAgent != nil {
+		planCfg := h.config
+		planCfg.Agent = h.config.PlannerAgent
+		driver = NewStandardHarness(planCfg)
+	}
+	cx := NewExecutionContext(&driver.config.Registry)
+	cx.Executor = driver
+	cx.Scratch.RunSession = planSession
+	cx.Scratch.RunBudget = budget
+	pt := planTask
+	cx.Scratch.Task = &pt
+	_ = plan.Run(ctx, cx)
+	return cx.takeChildOverride()
+}
+
+// CapturePlanArtifact captures + persists a PlanArtifact from the plan
+// sub-strategy's output text (R3/R4/R11). Adapts the private capture helper to
+// the public seam shape.
+func (h *StandardHarness) CapturePlanArtifact(ctx context.Context, sessionID SessionID, planOutput string, usage AggregateUsage, turns uint32) (PlanPhaseOutcome, *RunResult) {
+	outcome, failure := h.captureAndPersistPlan(ctx, sessionID, planOutput, usage, turns)
 	if failure != nil {
 		return PlanPhaseOutcome{}, failure
 	}
@@ -2994,9 +3031,25 @@ func (h *StandardHarness) PlanPhase(ctx context.Context, task *Task, session *Se
 	}, nil
 }
 
-// ExecutePhase runs the PlanExecute execute phase.
-func (h *StandardHarness) ExecutePhase(ctx context.Context, task *Task, session *SessionState, taskList TaskList, carried BudgetSnapshot, planUsage AggregateUsage, onStream StreamSink) RunResult {
-	return h.runExecutePhase(ctx, task, session, taskList, carried, planUsage, onStream)
+// ReconcileCompletedTasks marks every task already Completed on the durable
+// RunStore checkpoint as Completed in taskList (A.6 deep-resume).
+func (h *StandardHarness) ReconcileCompletedTasks(ctx context.Context, sessionID SessionID, taskList *TaskList) {
+	h.reconcileDeepResume(ctx, sessionID, taskList)
+}
+
+// FireTaskAdvance fires the OnTaskAdvance hook (pre, mutable) for an execute
+// step. The hook may rewrite stepTask.Instruction.
+func (h *StandardHarness) FireTaskAdvance(ctx context.Context, sessionID SessionID, stepTask *Task, taskIndex, totalTasks int) {
+	if h.config.Hooks != nil {
+		hctx := &HookContext{
+			Event:      HookEventOnTaskAdvance,
+			SessionID:  sessionID,
+			Task:       stepTask,
+			TaskIndex:  taskIndex,
+			TotalTasks: totalTasks,
+		}
+		_, _ = h.config.Hooks.Fire(ctx, hctx)
+	}
 }
 
 // PersistTaskList persists a parsed task list through the RunStore seam.
@@ -3264,120 +3317,6 @@ type planPhaseOutcome struct {
 	turns    uint32
 }
 
-// runPlanExecute drives the PlanExecute strategy (issues #70 + #59).
-//
-//  1. Plan phase (runs once): runPlanPhase seeds a planning directive, runs one
-//     constrained planner turn, captures a PlanArtifact, fires OnPlanCreated,
-//     and counts the turn against the shared budget.
-//  2. Execute phase (loops): runExecutePhase drains the parsed task list,
-//     running each task in a bounded ReAct sub-loop that BUILDS ON the
-//     accumulated execute-phase context (prior steps' tool results and
-//     assistant outputs carry forward).
-//
-// Between the phases the artifact is parsed into a TaskList via
-// PlanArtifactToTaskList and persisted through the RunStore seam (Q4) plus the
-// extras mirror.
-//
-// HaltReason variants:
-//   - NEW HaltEmptyPlan — the plan parsed to tasks: [] (Q3).
-//   - NEW HaltStepFailed — an execute step errored / blocked (Q5).
-//   - REMOVED HaltExecutePhaseNotImplemented — the execute phase is now
-//     implemented; the old "plan produced, execute not implemented" halt is gone.
-//   - Plan-phase failures still surface as HaltPlanPhaseFailed / HaltAgentError /
-//     HaltBudgetExceeded unchanged.
-//
-// Resolved spec decisions (issue #59 — all five FINAL):
-//   - Q1 (execute step model): each task runs a bounded ReAct sub-loop that
-//     BUILDS ON the accumulated execute-phase context — after each successful
-//     step its conversation (instruction + tool calls + tool results +
-//     assistant output) is folded back into the shared execute context, so the
-//     next step sees all prior steps' results. Steps stay SEQUENTIAL (task N
-//     completes before N+1). The shared budget still gates: the per-task turn
-//     cap is derived at the START of each step:
-//     per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
-//     division; remaining_tasks = not-yet-started tasks including the current
-//     one). The shared/parent budget — turns, tokens, observability spans,
-//     compaction — is carried across EVERY step, and the global budget is the
-//     hard stop.
-//   - Q2 (success output): RunResult.Output is the LAST completed step's final
-//     text — not a concatenation, not the plan rationale.
-//   - Q3 (empty plan): an empty task list ⇒ HaltEmptyPlan.
-//   - Q4 (persistence): the task list is persisted through the RunStore seam
-//     ONLY. The #71 sandbox-filesystem path (.spore/task_list.json) is NOT used
-//     by the execute loop — one source of truth. The extras mirror is kept.
-//   - Q5 (per-task failure): a step's ReAct sub-loop erroring or returning a
-//     blocked/failed outcome ABORTS the whole run with HaltStepFailed; execution
-//     does NOT continue to the next task (a plan is a dependency chain).
-//
-// Like runReAct, this finalizes observability for the terminal outcome.
-func (h *StandardHarness) runPlanExecute(
-	ctx context.Context,
-	task Task,
-	session SessionState,
-	budget BudgetSnapshot,
-	onStream StreamSink,
-) RunResult {
-	sessionID := task.SessionID
-
-	// ── Phase 1: plan (runs exactly once) ──────────────────────────────────
-	outcome, failure := h.runPlanPhase(ctx, &task, &session, budget, onStream)
-	if failure != nil {
-		// Plan-phase failure: propagate unchanged (no task list persisted).
-		h.finalizePlanExecute(ctx, *failure)
-		return *failure
-	}
-
-	// Bridge: parse the accepted plan into a TaskList (#72).
-	taskList := PlanArtifactToTaskList(outcome.artifact)
-
-	// Q3: an empty plan is a failure, not a silent success.
-	if len(taskList.Tasks) == 0 {
-		result := RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltEmptyPlan},
-			SessionID: sessionID,
-			Usage:     outcome.usage,
-			Turns:     outcome.turns,
-		}
-		h.finalizePlanExecute(ctx, result)
-		return result
-	}
-
-	// Q4: persist the task list through the RunStore seam ONLY. The #71 sandbox
-	// path is intentionally unused.
-	h.persistTaskList(ctx, sessionID, taskList)
-
-	// Carry the shared budget forward: the plan turn already consumed
-	// outcome.turns turns and outcome.usage tokens (Q1 — shared budget).
-	carried := budget
-	carried.Turns = outcome.turns
-	carried.InputTokens += outcome.usage.InputTokens
-	carried.OutputTokens += outcome.usage.OutputTokens
-
-	// ── Phase 2: execute (loops over the task list) ────────────────────────
-	result := h.runExecutePhase(ctx, &task, &session, taskList, carried, outcome.usage, onStream)
-	h.finalizePlanExecute(ctx, result)
-	return result
-}
-
-// finalizePlanExecute finalizes observability for a terminal PlanExecute
-// outcome. Mirrors the tail of runReAct: WaitingForHuman is not terminal and is
-// never flushed here.
-func (h *StandardHarness) finalizePlanExecute(ctx context.Context, result RunResult) {
-	switch result.Kind {
-	case RunSuccess:
-		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
-	case RunFailure:
-		h.finalizeObservability(ctx, result.SessionID, TerminalFailure, haltReasonString(result.Reason))
-	case RunEscalate:
-		// Escalation is a clean terminal outcome (issue #80) — finalize with
-		// the dedicated Escalated outcome.
-		h.finalizeObservability(ctx, result.SessionID, TerminalEscalated, "")
-	case RunWaitingForHuman:
-		// Not terminal — do not flush.
-	}
-}
-
 // persistTaskList persists the parsed TaskList for the run (Q4). The DURABLE
 // write goes through the RunStore seam under TaskListExtrasKey; the #71
 // sandbox-filesystem path (.spore/task_list.json) is intentionally NOT used —
@@ -3396,426 +3335,28 @@ func (h *StandardHarness) persistTaskList(ctx context.Context, sessionID Session
 	}
 }
 
-// runExecutePhase drives the PlanExecute execute phase (issue #59), draining
-// taskList.
-//
-// Per Q1 each task runs a bounded, SEQUENTIAL ReAct sub-loop that BUILDS ON the
-// accumulated execute-phase context: after each successful step its resulting
-// conversation (instruction + tool calls + tool results + assistant output) is
-// folded back into the shared session, so the next step's sub-loop (which copies
-// the shared session) sees every prior step's results. The per-task turn cap is
-// derived at the START of each step from the shared budget:
-// per_task_turns = remaining_turns / remaining_tasks, floored at 1 (integer
-// division; remaining_tasks counts the not-yet-started tasks including the
-// current one). The shared budget snapshot (carried) is threaded through every
-// step so early tasks cannot starve later ones and the global budget stays the
-// hard stop.
-//
-// Before each step the task is marked InProgress (and Completed after), the list
-// is re-persisted (Q4), and OnTaskAdvance fires with the correct task_index /
-// total_tasks (the hook may rewrite the step instruction).
-//
-// Q2: on success Output is the LAST completed step's final response.
-// Q5: a step that errors / blocks aborts the run with HaltStepFailed — no
-// further tasks run.
-//
-// planUsage seeds the cumulative AggregateUsage with the plan turn's usage so
-// the terminal RunResult reflects the WHOLE run.
-func (h *StandardHarness) runExecutePhase(
-	ctx context.Context,
-	task *Task,
-	session *SessionState,
-	taskList TaskList,
-	carried BudgetSnapshot,
-	planUsage AggregateUsage,
-	onStream StreamSink,
-) RunResult {
-	sessionID := task.SessionID
-
-	// A.6 deep-resume (#124, Q2): the execute phase's progress (which tasks are
-	// already Completed) lives in the DURABLE RunStore checkpoint, re-persisted
-	// after every step (Q4). On a resumed run the freshly-parsed taskList (from
-	// the plan artifact) is reconciled with that checkpoint so already-Completed
-	// tasks are NOT re-run — serialize→reset→resume rather than the old shallow
-	// no-op. Tasks are matched by id (the task list is regenerated
-	// deterministically from the same artifact). A read miss / error starts fresh.
-	if h.config.RunStore != nil {
-		if raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey); err == nil && found {
-			var saved TaskList
-			if json.Unmarshal(raw, &saved) == nil {
-				for i := range taskList.Tasks {
-					for j := range saved.Tasks {
-						if saved.Tasks[j].ID == taskList.Tasks[i].ID && saved.Tasks[j].Status == TaskStatusCompleted {
-							taskList.Tasks[i].Status = TaskStatusCompleted
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	totalTasks := len(taskList.Tasks)
-	// Cumulative usage across the plan turn + every execute step (Q1).
-	totalUsage := planUsage
-	// Q2: the success handle is the LAST completed step's final text.
-	var lastOutput string
-	// Issue #102: the LAST completed step's full conversation history, carried
-	// onto the terminal Success so PlanExecute resumes losslessly. Each step runs
-	// its ReAct sub-loop over a copy of the shared session and folds its result
-	// back into that shared session on success (#93), so the most recent step's
-	// returned SessionState is the richest, fully accumulated post-run history.
-	var lastSessionState SessionState
-
-	for index := 0; index < totalTasks; index++ {
-		taskID := taskList.Tasks[index].ID
-		instruction := taskList.Tasks[index].Description
-
-		// A.6 deep-resume: a task already Completed on the durable checkpoint is
-		// NOT re-run — its description stays the last-completed output handle.
-		if taskList.Tasks[index].Status == TaskStatusCompleted {
-			lastOutput = instruction
-			continue
-		}
-
-		// Q1: per-task turn allocation, derived at the START of this step.
-		// remaining_tasks = not-yet-started tasks including this one.
-		remainingTasks := uint32(totalTasks - index)
-		var subLoopCap uint32
-		if task.Budget.MaxTurns != nil {
-			max := *task.Budget.MaxTurns
-			var remainingTurns uint32
-			if max > carried.Turns {
-				remainingTurns = max - carried.Turns
-			}
-			perTaskTurns := remainingTurns / remainingTasks
-			if perTaskTurns < 1 {
-				perTaskTurns = 1
-			}
-			// The sub-loop's effective cap is RELATIVE to the carried turns:
-			// runReActInner gates on the cumulative budget.Turns, so a per-task
-			// cap of K means "stop K turns from now" while the global budget
-			// (carried forward) remains the hard stop.
-			subLoopCap = carried.Turns + perTaskTurns
-		} else {
-			// No global turn cap: each step's sub-loop is bounded only by the
-			// other (token / wall / cost) budget gates.
-			subLoopCap = ^uint32(0) // max uint32
-		}
-
-		// Mark InProgress (Pending -> InProgress) and re-persist (Q4).
-		ip := TaskStatusInProgress
-		_ = taskList.Update(taskID, &ip, nil)
-		h.persistTaskList(ctx, sessionID, taskList)
-
-		// Fire OnTaskAdvance (pre, mutable). The hook may rewrite the step's
-		// instruction via the carried Task; the (possibly mutated) instruction
-		// seeds the sub-loop.
-		stepTask := Task{
-			ID:           task.ID,
-			Instruction:  instruction,
-			SessionID:    sessionID,
-			Budget:       task.Budget,
-			LoopStrategy: task.LoopStrategy,
-		}
-		if h.config.Hooks != nil {
-			hctx := &HookContext{
-				Event:      HookEventOnTaskAdvance,
-				SessionID:  sessionID,
-				Task:       &stepTask,
-				TaskIndex:  index,
-				TotalTasks: totalTasks,
-			}
-			_, _ = h.config.Hooks.Fire(ctx, hctx)
-		}
-
-		// Seed the step instruction as a user message, then run the bounded
-		// ReAct sub-loop carrying the shared budget (Q1). The sub-loop runs with
-		// a suppressed (nil) sink; the parent-visible step boundary is emitted
-		// below on completion.
-		h.config.ContextManager.AppendUserMessage(ctx, session, stepTask.Instruction)
-
-		subResult := h.runReActInner(ctx, stepTask, subLoopCap, *session, carried, nil)
-
-		switch subResult.Kind {
-		case RunSuccess:
-			// Carry the shared budget forward (Q1): cumulative turns are the
-			// sub-loop's absolute count; fold in its token usage.
-			carried.Turns = subResult.Turns
-			carried.InputTokens += subResult.Usage.InputTokens
-			carried.OutputTokens += subResult.Usage.OutputTokens
-			totalUsage.InputTokens += subResult.Usage.InputTokens
-			totalUsage.OutputTokens += subResult.Usage.OutputTokens
-			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
-			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
-			totalUsage.CostUSD += subResult.Usage.CostUSD
-			lastOutput = subResult.Output
-			// Fold this step's resulting conversation back into the SHARED
-			// execute context so the NEXT step's sub-loop (which copies
-			// *session) builds on this step's tool results and assistant
-			// output, not just its instruction. The returned SessionState
-			// already contains this step's instruction + tool calls + tool
-			// results + final output.
-			*session = subResult.SessionState
-			// Issue #102: the terminal Success carries the LAST completed
-			// step's full state — now the accumulated execute context.
-			lastSessionState = *session
-
-			// Mark Completed and re-persist (Q4).
-			_ = taskList.Complete(taskID)
-			h.persistTaskList(ctx, sessionID, taskList)
-			// Surface the completed step's final text to the caller's sink.
-			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: lastOutput})
-
-		case RunFailure:
-			// Q5: any non-success step aborts the whole run. A budget halt
-			// surfaces as BudgetExceeded (mid-execute exhaustion); other
-			// failures surface as StepFailed carrying the step context.
-			totalUsage.InputTokens += subResult.Usage.InputTokens
-			totalUsage.OutputTokens += subResult.Usage.OutputTokens
-			totalUsage.CacheReadTokens += subResult.Usage.CacheReadTokens
-			totalUsage.CacheWriteTokens += subResult.Usage.CacheWriteTokens
-			totalUsage.CostUSD += subResult.Usage.CostUSD
-
-			blocked := TaskStatusBlocked
-			_ = taskList.Update(taskID, &blocked, nil)
-			h.persistTaskList(ctx, sessionID, taskList)
-
-			var terminalReason HaltReason
-			if subResult.Reason.Kind == HaltBudgetExceeded {
-				// Budget exhaustion mid-execute is its own halt — keep it
-				// distinct from a step's own failure.
-				terminalReason = subResult.Reason
-			} else {
-				terminalReason = HaltReason{
-					Kind:      HaltStepFailed,
-					TaskIndex: index,
-					Task:      taskList.Tasks[index].Description,
-					Reason:    haltReasonString(subResult.Reason),
-				}
-			}
-			return RunResult{
-				Kind:      RunFailure,
-				Reason:    terminalReason,
-				SessionID: sessionID,
-				Usage:     totalUsage,
-				Turns:     subResult.Turns,
-				// Issue #102: carry the failing step's conversation history.
-				SessionState: subResult.SessionState,
-			}
-
-		case RunWaitingForHuman:
-			// A step surfacing to a human pauses the whole run; propagate.
-			return subResult
-
-		case RunConsult:
-			// A step pausing to consult (issue #114) pauses the whole run;
-			// propagate the consult so the caller (or SubagentTool) mediates.
-			return subResult
-
-		case RunEscalate:
-			// A step escalating (issue #80) terminates the whole run cleanly;
-			// propagate the signal and preserved state up.
-			return subResult
-		}
-	}
-
-	// Q2: success output is the LAST completed step's final response text.
-	return RunResult{
-		Kind:         RunSuccess,
-		Output:       lastOutput,
-		SessionID:    sessionID,
-		Usage:        totalUsage,
-		Turns:        carried.Turns,
-		SessionState: lastSessionState,
-	}
-}
-
-// runPlanPhase runs the one-shot PlanExecute plan phase (issue #70).
-//
-// Selects the planner agent (Q1: config.PlannerAgent if set, else the default
-// agent), seeds a planning directive as a user message, runs EXACTLY ONE
-// constrained turn (R1), expects a FinalResponse (a tool call is a planning
-// failure — R2 — never a dispatch loop), captures the response via
-// CapturePlanArtifact (R3), fires OnPlanCreated (which may rewrite the artifact
-// — R11), stores the result in Extras["plan_execute"] (R4), emits the turn span
-// (R8), and counts the turn against the shared budget (R7). A budget exhausted
-// before the turn returns a budget-exceeded failure with no artifact stored
-// (R10).
-//
-// On success returns (*planPhaseOutcome, nil). On any failure returns
-// (nil, *RunResult) carrying the terminal failure to propagate.
-func (h *StandardHarness) runPlanPhase(
-	ctx context.Context,
-	task *Task,
-	session *SessionState,
-	budget BudgetSnapshot,
-	onStream StreamSink,
-) (outcome *planPhaseOutcome, failure *RunResult) {
-	// Issue #102: stamp the plan-phase conversation history onto any failure
-	// result this function returns. Per #93 the planning directive lands on a
-	// throwaway CLONE (planState), so *session stays the seeded
-	// `[user: task.instruction]` — reading it in a defer captures that clean
-	// state at whichever failure return fired, so every PlanPhaseFailed /
-	// AgentError / BudgetExceeded exit carries the shared history (without the
-	// directive leaking in) without threading SessionState through each
-	// construction site.
-	defer func() {
-		if failure != nil && failure.Kind == RunFailure {
-			failure.SessionState = *session
-		}
-	}()
-	sessionID := task.SessionID
-	startedAt := time.Now()
-	usage := AggregateUsage{}
-
-	// R10: Layer-1 budget gate BEFORE the plan turn. Mirrors runReActInner.
-	effectiveTurnCap := uint32(1)
-	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns > effectiveTurnCap {
-		effectiveTurnCap = *task.Budget.MaxTurns
-	}
-	if budget.Turns >= effectiveTurnCap {
-		return nil, &RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
-			SessionID: sessionID,
-			Usage:     usage,
-			Turns:     budget.Turns,
-		}
-	}
-	if lt, over := budgetExceeded(task.Budget, budget, startedAt); over {
-		return nil, &RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltBudgetExceeded, LimitType: lt},
-			SessionID: sessionID,
-			Usage:     usage,
-			Turns:     budget.Turns,
-		}
-	}
-
-	// Q1: select the planner agent (alternate if configured, else default).
-	planner := h.config.Agent
-	if h.config.PlannerAgent != nil {
-		planner = h.config.PlannerAgent
-	}
-
-	// Seed the planning directive as a user message (reuse ContextManager).
-	// CRITICAL (#93): the directive must NOT mutate the SHARED `session`.
-	// That same state is threaded into the execute phase, where each subtask
-	// sub-loop assembles its context from it. If the directive leaked in,
-	// every execute step would still see "respond with {tasks, rationale}"
-	// and an instruction-following model would re-emit a plan instead of
-	// calling tools. Append to a throwaway CLONE so the plan turn sees the
-	// directive while the shared state stays `[user: task.instruction]`.
-	directive := fmt.Sprintf(
+// planDirective returns the planning directive seeded before the constrained
+// plan turn (R1): the "respond with a single JSON plan object" instruction
+// wrapped around the task. Seeded by the recursive PlanExecuteConfig.Run plan
+// dispatch before c.Plan.Run (#124).
+func planDirective(instruction string) string {
+	return fmt.Sprintf(
 		"Produce a step-by-step plan for the following task. Respond with a "+
 			"single JSON object: {\"tasks\": [<ordered step strings>], "+
 			"\"rationale\": <string>}.\n\nTask:\n%s",
-		task.Instruction,
+		instruction,
 	)
-	planState := cloneSessionState(session)
-	h.config.ContextManager.AppendUserMessage(ctx, planState, directive)
+}
 
-	// Assemble + invoke the planner for exactly ONE turn (R1).
-	c := h.config.ContextManager.Assemble(ctx, planState, task)
-	// Per-run model params win unconditionally (issue #93) — same seam as
-	// runReActInner, before the plan turn is dispatched.
-	c.Params = h.config.ModelParams
-	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
-	turnStartedAt := nowRFC3339()
-	turnClock := time.Now()
-	result := h.runStreamingTurn(ctx, planner, c, onStream)
-	budget.Turns++ // R7: the plan turn counts against the budget.
-
-	// R8: emit exactly one turn span for the plan turn. Mirrors the metrics path
-	// of runReActInner; content capture is intentionally omitted (the plan turn
-	// carries no tool calls and #64 content capture is wired in the ReAct loop
-	// only).
-	if h.config.Observability != nil {
-		var u TokenUsage
-		if result.Usage != nil {
-			u = *result.Usage
-		}
-		var (
-			stopReason         StopReason
-			toolCallsRequested uint32
-			errMsg             string
-		)
-		switch result.Kind {
-		case TurnFinalResponse:
-			stopReason = StopEndTurn
-		case TurnToolCallRequested:
-			stopReason = StopToolUse
-			toolCallsRequested = uint32(len(result.Calls))
-		case TurnError:
-			stopReason = StopEndTurn
-			if result.Err != nil {
-				errMsg = result.Err.Error()
-			}
-		default:
-			stopReason = StopEndTurn
-		}
-		h.config.Observability.EmitTurn(
-			fmt.Sprintf("%s-turn-%d", sessionID, budget.Turns),
-			sessionID,
-			task.ID,
-			budget.Turns,
-			turnStartedAt,
-			uint64(time.Since(turnClock).Milliseconds()),
-			u,
-			h.config.Observability.CostFor(u),
-			stopReason,
-			toolCallsRequested,
-			errMsg,
-			"",  // outputText — content capture omitted for the plan turn.
-			nil, // calls — the plan turn carries no tool calls.
-			nil, // inputMessages — content capture omitted.
-		)
-	}
-	emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnEnd, Turn: budget.Turns})
-
-	// Classify the one-shot turn. R2: a tool call is a planning failure, NOT a
-	// dispatch loop.
-	var finalText string
-	switch result.Kind {
-	case TurnFinalResponse:
-		u := *result.Usage
-		usage.AddTurn(u)
-		budget.InputTokens += uint64(u.InputTokens)
-		budget.OutputTokens += uint64(u.OutputTokens)
-		finalText = result.Content
-	case TurnToolCallRequested:
-		if result.Usage != nil {
-			usage.AddTurn(*result.Usage)
-		}
-		return nil, &RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind: HaltPlanPhaseFailed,
-				PlanError: &PlanPhaseError{
-					Kind:    PlanErrorPlanningTurnFailed,
-					Message: "planner requested a tool call in the one-shot plan turn",
-				},
-			},
-			SessionID: sessionID,
-			Usage:     usage,
-			Turns:     budget.Turns,
-		}
-	case TurnError:
-		if result.Usage != nil {
-			usage.AddTurn(*result.Usage)
-		}
-		return nil, &RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltAgentError, AgentError: result.Err},
-			SessionID: sessionID,
-			Usage:     usage,
-			Turns:     budget.Turns,
-		}
-	}
-
+// captureAndPersistPlan captures + persists a PlanArtifact from the plan
+// sub-strategy's output text (#124): R3 (parse), R11 (fire OnPlanCreated,
+// mutable), R4 (persist to the RunStore under PlanExecuteExtrasKey). The model
+// turn that produced planOutput ran elsewhere — the recursive c.Plan child via
+// c.Plan.Run — so this carries no agent call. Returns the captured outcome, or a
+// non-nil terminal failure to propagate.
+func (h *StandardHarness) captureAndPersistPlan(ctx context.Context, sessionID SessionID, planOutput string, usage AggregateUsage, turns uint32) (*planPhaseOutcome, *RunResult) {
 	// R3: capture the artifact from the response text.
-	artifact, err := CapturePlanArtifact(finalText)
+	artifact, err := CapturePlanArtifact(planOutput)
 	if err != nil {
 		pe, ok := err.(*PlanPhaseError)
 		if !ok {
@@ -3826,14 +3367,12 @@ func (h *StandardHarness) runPlanPhase(
 			Reason:    HaltReason{Kind: HaltPlanPhaseFailed, PlanError: pe},
 			SessionID: sessionID,
 			Usage:     usage,
-			Turns:     budget.Turns,
+			Turns:     turns,
 		}
 	}
 
-	// R11: fire OnPlanCreated synchronously; the hook may rewrite `artifact` in
-	// place via the *PlanArtifact pointer. The stored artifact reflects any
-	// mutation. Hook errors are non-fatal: an observability/handler error must
-	// not lose a successfully-captured plan.
+	// R11: fire OnPlanCreated synchronously; the hook may rewrite artifact in
+	// place. The stored artifact reflects any mutation. Hook errors are non-fatal.
 	if h.config.Hooks != nil {
 		hctx := &HookContext{
 			Event:     HookEventOnPlanCreated,
@@ -3844,10 +3383,9 @@ func (h *StandardHarness) runPlanPhase(
 	}
 
 	// R4: persist the produced artifact to the RunStore seam under
-	// PlanExecuteExtrasKey (#76 — the durable single source of truth; no longer
-	// mirrored into SessionState.Extras). The Put result is swallowed (matching
-	// the execute-phase persist): a successfully-captured plan must not be lost
-	// to a storage hiccup (the default nil/no-op store never fails).
+	// PlanExecuteExtrasKey (#76 — the durable single source of truth). The Put
+	// result is swallowed: a successfully-captured plan must not be lost to a
+	// storage hiccup (the default nil/no-op store never fails).
 	value, marshalErr := json.Marshal(artifact)
 	if marshalErr != nil {
 		return nil, &RunResult{
@@ -3858,18 +3396,40 @@ func (h *StandardHarness) runPlanPhase(
 			},
 			SessionID: sessionID,
 			Usage:     usage,
-			Turns:     budget.Turns,
+			Turns:     turns,
 		}
 	}
 	if h.config.RunStore != nil {
 		_ = h.config.RunStore.Put(ctx, sessionID, PlanExecuteExtrasKey, json.RawMessage(value))
 	}
 
-	return &planPhaseOutcome{
-		artifact: artifact,
-		usage:    usage,
-		turns:    budget.Turns,
-	}, nil
+	return &planPhaseOutcome{artifact: artifact, usage: usage, turns: turns}, nil
+}
+
+// reconcileDeepResume marks every task already Completed on the DURABLE RunStore
+// checkpoint as Completed in taskList so it is NOT re-run (A.6 deep-resume, Q2).
+// Tasks are matched by id (the task list is regenerated deterministically from
+// the same artifact). A read miss / error starts fresh.
+func (h *StandardHarness) reconcileDeepResume(ctx context.Context, sessionID SessionID, taskList *TaskList) {
+	if h.config.RunStore == nil {
+		return
+	}
+	raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey)
+	if err != nil || !found {
+		return
+	}
+	var saved TaskList
+	if json.Unmarshal(raw, &saved) != nil {
+		return
+	}
+	for i := range taskList.Tasks {
+		for j := range saved.Tasks {
+			if saved.Tasks[j].ID == taskList.Tasks[i].ID && saved.Tasks[j].Status == TaskStatusCompleted {
+				taskList.Tasks[i].Status = TaskStatusCompleted
+				break
+			}
+		}
+	}
 }
 
 // runReActInner is the workhorse loop for LoopStrategy ReAct.
