@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     from .context import (
         SessionState as ContextSessionState,
     )
+    from .execution_registry import EscalationMode, ExecutionRegistry
     from .hooks import HookChain
     from .tool_registry import StandardToolRegistry
 
@@ -1912,6 +1913,68 @@ class ChildPausedState(_Model):
 
 
 # ============================================================================
+# HarnessError — serializable error union (issue #120)
+# ============================================================================
+#
+# Mirrors Rust's ``#[serde(tag = "kind")]`` ``HarnessError`` enum. The ``kind``
+# discriminant uses the Rust variant names verbatim (PascalCase — the Rust enum
+# has no ``rename_all``), so the wire tags are ``"StrategyNotFound"`` /
+# ``"UnresolvedHandle"`` (see ``fixtures/harness/registry_errors.json``).
+#
+# ``UnresolvedHandle``'s handle-category field is named ``kind`` in Rust but
+# serializes as ``handle_kind`` (``#[serde(rename = "handle_kind")]``) so it
+# does not collide with the enum's ``kind`` discriminant tag. We model the
+# Python attribute as ``handle_kind`` directly to keep the wire layout byte
+# identical to the fixture.
+
+
+class HarnessErrorStrategyNotFound(_Model):
+    """A ``StrategyRef::Custom(key)`` referenced a custom strategy absent from
+    the :class:`~spore_core.execution_registry.ExecutionRegistry`'s ``custom``
+    map. RECOVERABLE — returned/raised, never a crash (same pattern as a missing
+    ``AgentRef``). Mirrors Rust's ``HarnessError::StrategyNotFound``."""
+
+    kind: Literal["StrategyNotFound"] = "StrategyNotFound"
+    key: str
+
+    def message(self) -> str:
+        return f"custom strategy not found: {self.key}"
+
+
+class HarnessErrorUnresolvedHandle(_Model):
+    """A serializable handle (``AgentRef``/``ToolsetRef``/``SchemaRef``)
+    referenced an entry absent from the
+    :class:`~spore_core.execution_registry.ExecutionRegistry`. The STARTUP-
+    validation error: surfaced before the first turn. Mirrors Rust's
+    ``HarnessError::UnresolvedHandle`` — the handle category serializes as
+    ``handle_kind`` to avoid colliding with the ``kind`` discriminant tag."""
+
+    kind: Literal["UnresolvedHandle"] = "UnresolvedHandle"
+    handle_kind: str
+    key: str
+
+    def message(self) -> str:
+        return f"unresolved {self.handle_kind} handle: {self.key}"
+
+
+HarnessError = Annotated[
+    HarnessErrorStrategyNotFound | HarnessErrorUnresolvedHandle,
+    Field(discriminator="kind"),
+]
+
+
+class HarnessErrorException(SporeError):
+    """Raised form of a :data:`HarnessError` wire variant. Carries the
+    serializable :data:`HarnessError` value so callers can ``isinstance`` /
+    re-serialize it. The registry raises this for startup-validation failures
+    and missing custom-strategy keys (issue #120)."""
+
+    def __init__(self, error: HarnessError) -> None:
+        self.error = error
+        super().__init__(error.message())
+
+
+# ============================================================================
 # HaltReason / RunResult
 # ============================================================================
 
@@ -2083,6 +2146,19 @@ class HaltReasonRalphCompletionUnmet(_Model):
     last_reason: str
 
 
+class HaltReasonConfigurationError(_Model):
+    """Returned by :class:`StandardHarness` when
+    :meth:`~spore_core.execution_registry.ExecutionRegistry.validate` fails at
+    run entry: a handle referenced by the task's strategy tree is unresolved
+    against the configured registry, or a ``StrategyRef.Custom`` key is missing.
+    A STARTUP error surfaced before the first turn (issue #120). Carries the
+    underlying :data:`HarnessError`. Mirrors Rust's
+    ``HaltReason::ConfigurationError { error }``."""
+
+    kind: Literal["configuration_error"] = "configuration_error"
+    error: HarnessError
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -2100,7 +2176,8 @@ HaltReason = Annotated[
     | HaltReasonSelfVerifyExhausted
     | HaltReasonSelfVerifyMisconfigured
     | HaltReasonHillClimbingMisconfigured
-    | HaltReasonRalphCompletionUnmet,
+    | HaltReasonRalphCompletionUnmet
+    | HaltReasonConfigurationError,
     Field(discriminator="kind"),
 ]
 
@@ -2404,7 +2481,16 @@ class HarnessConfig:
         auto_persist_sessions: bool = False,
         prompt_tool_call_flag: PromptToolCallFlag | None = None,
         consult_handlers: dict[str, ConsultHandlerEntry] | None = None,
+        registry: ExecutionRegistry | None = None,
+        escalation_mode: EscalationMode | None = None,
     ) -> None:
+        # Deprecated (superseded by ``registry`` / :class:`ExecutionRegistry`):
+        # the four single-collaborator fields ``agent``, ``verifier``,
+        # ``planner_agent``, ``evaluator_agent`` carry over from the pre-#120
+        # shape. They remain the live collaborators this slice (Option B /
+        # additive scope, #120) — the run bodies continue to read them until the
+        # registry-resolution path replaces them. Physical removal + executor
+        # migration to registry resolution lands in #124.
         self.agent = agent
         # The HillClimbing scoring strategy (issue #60). REQUIRED for the
         # ``HillClimbing`` strategy: when ``None`` the run halts with
@@ -2547,6 +2633,28 @@ class HarnessConfig:
         self.consult_handlers: dict[str, ConsultHandlerEntry] = (
             dict(consult_handlers) if consult_handlers is not None else {}
         )
+        # Runtime resolver for the serializable strategy handles (#120). The
+        # registry resolves per-node ``AgentRef`` / ``ToolsetRef`` / ``SchemaRef``
+        # handles and ``StrategyRef.Custom`` keys; :meth:`StandardHarness.run`
+        # calls ``registry.validate(task)`` at entry (only when the registry is
+        # populated), so an unresolved handle is a startup error before the first
+        # turn. Defaults to an empty registry — legacy callers that never wire one
+        # stay byte-identical (Option B). Supersedes the four deprecated
+        # single-collaborator fields; they are not removed this slice (#124).
+        if registry is None:
+            from .execution_registry import ExecutionRegistry as _ExecutionRegistry
+
+            registry = _ExecutionRegistry.empty()
+        self.registry: ExecutionRegistry = registry
+        # HITL-vs-AFK escalation knob (#120, PRD goal #7). Selects whether budget
+        # escalation surfaces to a human or proceeds autonomously. STORED only
+        # this slice (#130 consumes it); NOT part of the serialized ``Task``.
+        # Defaults to ``SurfaceToHuman`` (the type itself carries no default).
+        if escalation_mode is None:
+            from .execution_registry import EscalationModeSurfaceToHuman
+
+            escalation_mode = EscalationModeSurfaceToHuman()
+        self.escalation_mode: EscalationMode = escalation_mode
 
 
 class HarnessBuilder:
@@ -2619,6 +2727,21 @@ class HarnessBuilder:
         # Per-kind consult handlers (issue #114). Empty by default — consults
         # degrade gracefully (R6). Populated via :meth:`consult_handler`.
         self._consult_handlers: dict[str, ConsultHandlerEntry] = {}
+        # ExecutionRegistry (#120). Defaults to empty so legacy callers stay
+        # byte-identical (Option B). Replaced wholesale via :meth:`registry` or
+        # incrementally via the per-key convenience setters
+        # (:meth:`register_agent` / :meth:`register_toolset` /
+        # :meth:`register_schema` / :meth:`register_verifier` /
+        # :meth:`register_strategy`).
+        from .execution_registry import ExecutionRegistry as _ExecutionRegistry
+
+        self._registry: ExecutionRegistry = _ExecutionRegistry.empty()
+        # HITL-vs-AFK escalation knob (#120). The builder picks the explicit
+        # default (``SurfaceToHuman``); the type itself carries no default. See
+        # :meth:`escalation_mode`.
+        from .execution_registry import EscalationModeSurfaceToHuman as _SurfaceToHuman
+
+        self._escalation_mode: EscalationMode = _SurfaceToHuman()
 
     @classmethod
     def conversational(cls, model: ModelInterface) -> HarnessBuilder:
@@ -2808,6 +2931,49 @@ class HarnessBuilder:
         calls. See :attr:`~spore_core.model.ModelParams.structured_tool_calls`
         for the full behaviour contract. Defaults to ``ModelParams()``."""
         self._model_params = params
+        return self
+
+    def registry(self, registry: ExecutionRegistry) -> HarnessBuilder:
+        """Replace the whole :class:`ExecutionRegistry` (issue #120). The
+        registry resolves the serializable strategy handles at run entry; an
+        unresolved handle becomes a startup error. Mirrors Rust's
+        ``HarnessBuilder::registry``."""
+        self._registry = registry
+        return self
+
+    def register_agent(self, key: str, agent: Agent) -> HarnessBuilder:
+        """Register a named agent in the :class:`ExecutionRegistry` (issue
+        #120). Convenience over :meth:`registry`."""
+        self._registry.agents[key] = agent
+        return self
+
+    def register_toolset(self, key: str, toolset: ToolRegistry) -> HarnessBuilder:
+        """Register a named toolset in the :class:`ExecutionRegistry` (#120)."""
+        self._registry.toolsets[key] = toolset
+        return self
+
+    def register_schema(self, key: str, schema: Any) -> HarnessBuilder:
+        """Register a named JSON schema in the :class:`ExecutionRegistry` (#120)."""
+        self._registry.schemas[key] = schema
+        return self
+
+    def register_verifier(self, key: str, verifier: Any) -> HarnessBuilder:
+        """Register a named verifier in the :class:`ExecutionRegistry` (#120)."""
+        self._registry.verifiers[key] = verifier
+        return self
+
+    def register_strategy(self, key: str, strategy: RunStrategy) -> HarnessBuilder:
+        """Register a custom strategy in the :class:`ExecutionRegistry` under
+        ``key`` (issue #120). Resolvable later via
+        ``registry.resolve_strategy(StrategyRefCustom(value=key))``."""
+        self._registry.custom[key] = strategy
+        return self
+
+    def escalation_mode(self, mode: EscalationMode) -> HarnessBuilder:
+        """Select the HITL-vs-AFK budget-escalation behaviour (issue #120, PRD
+        goal #7). Defaults to ``SurfaceToHuman``. Stored only this slice (#130
+        consumes it). Mirrors Rust's ``HarnessBuilder::escalation_mode``."""
+        self._escalation_mode = mode
         return self
 
     def drain_tools_into_registry(self) -> StandardToolRegistry:
@@ -3031,6 +3197,8 @@ class HarnessBuilder:
             auto_persist_sessions=self._auto_persist_sessions,
             prompt_tool_call_flag=self._prompt_tool_call_flag,
             consult_handlers=self._consult_handlers,
+            registry=self._registry,
+            escalation_mode=self._escalation_mode,
         )
 
     def build(self) -> StandardHarness:
@@ -3512,6 +3680,24 @@ class StandardHarness:
         budget_used = BudgetSnapshot()
 
         strategy = task.loop_strategy
+
+        # Issue #120 startup validation: every serializable handle in the task's
+        # strategy tree must resolve against the configured ExecutionRegistry,
+        # BEFORE the first turn. Validation runs only when the registry is
+        # populated, so existing callers that never wire a registry (and instead
+        # use the deprecated single-collaborator fields, Option B) are unaffected
+        # byte-for-byte. An unresolved handle is a startup error.
+        if not self._config.registry.is_empty():
+            try:
+                self._config.registry.validate(task)
+            except HarnessErrorException as exc:
+                return RunResultFailure(
+                    reason=HaltReasonConfigurationError(error=exc.error),
+                    session_id=task.session_id,
+                    usage=AggregateUsage(),
+                    turns=0,
+                    session_state=SessionState(),
+                )
 
         # Issue #102 auto-load: when enabled AND no explicit session_state was
         # provided AND the strategy seeds incoming state (ReAct / SelfVerifying —
