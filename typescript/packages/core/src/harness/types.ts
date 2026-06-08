@@ -232,6 +232,24 @@ export function budgetExhaustedBehaviorFromJson(value: unknown): BudgetExhausted
 }
 
 /**
+ * The default {@link BudgetExhaustedBehavior} for a config node's serialized
+ * `behavior` field (#129): `escalate`. Two roles (mirrors Rust
+ * `default_budget_behavior`):
+ *   - the zod schema `.default(...)` so a strategy tree serialized BEFORE #129
+ *     (no `behavior` key) still deserializes to the historical placeholder,
+ *     preserving backward-compat reads;
+ *   - the value {@link loopStrategyToJson} stamps when a config omits `behavior`,
+ *     so a bare leaf keeps its pre-#129 propagate-to-parent contract by default.
+ *
+ * The field is NEVER omitted on serialize: it ALWAYS serializes (uniform wire
+ * shape across all five config structs, Q1), so the cross-language fixtures
+ * carry an explicit `"behavior":{"kind":"escalate"}` on every node.
+ */
+export function defaultBudgetBehavior(): BudgetExhaustedBehavior {
+  return { kind: "escalate" };
+}
+
+/**
  * Serialize a {@link BudgetExhaustedBehavior} to a plain object with canonical
  * field order (`kind`, `max_continues`, `on_exhausted`), recursing into the
  * nested behavior, for byte-identical cross-language output.
@@ -374,6 +392,16 @@ const SchemaRefSchema = z.string();
 export interface ReactConfig {
   kind: "react";
   budget: BudgetPolicy;
+  /**
+   * What this node does when its `budget` is spent (#129). CANONICAL POSITION:
+   * IMMEDIATELY after `budget`. A leaf honors its `behavior` ONLY at the
+   * top-level/bare-leaf resolution site ({@link StandardHarness} `driveStrategy`);
+   * in the normal NESTED case the leaf still PROPAGATES exhaustion to its parent
+   * (#125 rule 6 — a nested leaf never self-resolves). Optional in TS for
+   * backward-compat / construction ergonomics, but ALWAYS serialized (Q1):
+   * {@link loopStrategyToJson} emits `{"kind":"escalate"}` when absent.
+   */
+  behavior?: BudgetExhaustedBehavior;
   agent: AgentRef;
   toolset: ToolsetRef;
   output?: SchemaRef;
@@ -388,6 +416,12 @@ export interface PlanExecuteConfig {
   plan: LoopStrategy;
   execute: LoopStrategy;
   plan_model?: ModelConfig;
+  /**
+   * What this combinator does when its execute-phase budget is spent (#129).
+   * Canonical position on a combinator: the LAST field. Always serialized (Q1) —
+   * {@link loopStrategyToJson} emits `{"kind":"escalate"}` when absent.
+   */
+  behavior?: BudgetExhaustedBehavior;
 }
 
 /** SelfVerifying combinator: run `inner`, then judge it against `evaluator`. */
@@ -395,6 +429,12 @@ export interface SelfVerifyingConfig {
   kind: "self_verifying";
   inner: LoopStrategy;
   evaluator: SchemaRef;
+  /**
+   * What this combinator does when its build↔evaluate budget is spent (#129).
+   * Canonical position on a combinator: the LAST field. Always serialized (Q1) —
+   * {@link loopStrategyToJson} emits `{"kind":"escalate"}` when absent.
+   */
+  behavior?: BudgetExhaustedBehavior;
 }
 
 /**
@@ -405,6 +445,15 @@ export interface RalphConfig {
   kind: "ralph";
   inner: LoopStrategy;
   agent: AgentRef;
+  /**
+   * What Ralph does when its OWN scope is spent (#129). Canonical position on a
+   * combinator: the LAST field. Always serialized (Q1) — {@link loopStrategyToJson}
+   * emits `{"kind":"escalate"}` when absent. NOTE: Ralph's window recovery
+   * (reset + retry) is independent of this field — it governs Ralph's own budget
+   * scope, not the per-window child exhaustion (which Ralph already absorbs as
+   * "window incomplete" and retries).
+   */
+  behavior?: BudgetExhaustedBehavior;
 }
 
 /**
@@ -420,6 +469,12 @@ export interface HillClimbingConfig {
   revert_on_no_improvement: boolean;
   min_improvement_delta: number;
   evaluator: AgentRef;
+  /**
+   * What this combinator does when its optimization-loop budget is spent (#129).
+   * Canonical position on a combinator: the LAST field. Always serialized (Q1) —
+   * {@link loopStrategyToJson} emits `{"kind":"escalate"}` when absent.
+   */
+  behavior?: BudgetExhaustedBehavior;
 }
 
 /**
@@ -441,6 +496,9 @@ export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
     z.object({
       kind: z.literal("react"),
       budget: BudgetPolicySchema,
+      // #129: default `escalate` so a pre-#129 tree (no `behavior` key) still
+      // deserializes; always serialized via `loopStrategyToJson`.
+      behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
       agent: AgentRefSchema,
       toolset: ToolsetRefSchema,
       output: SchemaRefSchema.optional(),
@@ -450,16 +508,19 @@ export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
       plan: LoopStrategySchema,
       execute: LoopStrategySchema,
       plan_model: ModelConfigSchema.optional(),
+      behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
     }),
     z.object({
       kind: z.literal("self_verifying"),
       inner: LoopStrategySchema,
       evaluator: SchemaRefSchema,
+      behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
     }),
     z.object({
       kind: z.literal("ralph"),
       inner: LoopStrategySchema,
       agent: AgentRefSchema,
+      behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
     }),
     z.object({
       kind: z.literal("hill_climbing"),
@@ -469,6 +530,7 @@ export const LoopStrategySchema: z.ZodType<LoopStrategy> = z.lazy(() =>
       revert_on_no_improvement: z.boolean(),
       min_improvement_delta: z.number(),
       evaluator: AgentRefSchema,
+      behavior: BudgetExhaustedBehaviorSchema.default(defaultBudgetBehavior()),
     }),
   ]),
 );
@@ -487,9 +549,12 @@ export function loopStrategyFromJson(value: unknown): LoopStrategy {
 export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unknown> {
   switch (strategy.kind) {
     case "react": {
+      // #129: `behavior` is ALWAYS emitted (Q1), immediately after `budget`,
+      // defaulting to `escalate` when the config omits it.
       const out: Record<string, unknown> = {
         kind: "react",
         budget: budgetPolicyToJson(strategy.budget),
+        behavior: budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior()),
         agent: strategy.agent,
         toolset: strategy.toolset,
       };
@@ -497,6 +562,7 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
       return out;
     }
     case "plan_execute": {
+      // #129: `behavior` is the LAST field on a combinator, always emitted (Q1).
       const out: Record<string, unknown> = {
         kind: "plan_execute",
         plan: loopStrategyToJson(strategy.plan),
@@ -508,6 +574,7 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
           model_id: strategy.plan_model.model_id,
         };
       }
+      out.behavior = budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior());
       return out;
     }
     case "self_verifying":
@@ -515,12 +582,14 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
         kind: "self_verifying",
         inner: loopStrategyToJson(strategy.inner),
         evaluator: strategy.evaluator,
+        behavior: budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior()),
       };
     case "ralph":
       return {
         kind: "ralph",
         inner: loopStrategyToJson(strategy.inner),
         agent: strategy.agent,
+        behavior: budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior()),
       };
     case "hill_climbing":
       return {
@@ -531,6 +600,7 @@ export function loopStrategyToJson(strategy: LoopStrategy): Record<string, unkno
         revert_on_no_improvement: strategy.revert_on_no_improvement,
         min_improvement_delta: strategy.min_improvement_delta,
         evaluator: strategy.evaluator,
+        behavior: budgetExhaustedBehaviorToJson(strategy.behavior ?? defaultBudgetBehavior()),
       };
   }
 }
@@ -692,6 +762,28 @@ export class BudgetContext {
     readonly phase: string,
   ) {
     this.behavior = behavior;
+  }
+
+  /**
+   * Reconstruct a RESUMED scope (#129) whose `continuesUsed` is seeded from a
+   * cross-process checkpoint — the sole field of {@link BudgetContext} that must
+   * survive a process pause. `stepsTaken` starts at 0 (the resumed run re-enters
+   * the loop with a fresh per-round step budget; the checkpoint only carries how
+   * many continues were ALREADY spent so a `continue` spanning the pause cannot
+   * exceed `max_continues`). Runtime-only — `continuesUsed` is read off the
+   * `HumanRequest::BudgetExhausted` payload (Q3: NOT a new serialized
+   * {@link BudgetContext}/{@link PausedState} field). Mirrors Rust
+   * `BudgetContext::resumed`.
+   */
+  static resumed(
+    policy: BudgetPolicy,
+    behavior: BudgetExhaustedBehavior,
+    phase: string,
+    continuesUsed: number,
+  ): BudgetContext {
+    const cx = new BudgetContext(policy, behavior, phase);
+    cx.continuesUsed = continuesUsed;
+    return cx;
   }
 
   /** The per-scope step allowance (`undefined` for `unlimited`). */
@@ -1126,6 +1218,18 @@ export interface RunScratch {
   runSession: SessionState;
   runBudget: BudgetSnapshot;
   terminalOverride?: RunResult;
+  /**
+   * Cross-process Continue checkpoint seed (#129): `[phase, continuesUsed]`
+   * carried from a resumed `HumanRequest::BudgetExhausted`. The FIRST
+   * {@link pushBudget} whose `phase` matches seeds the reconstructed scope's
+   * `continuesUsed` (via {@link BudgetContext.resumed}) and CLEARS this seed — so
+   * a `continue` spanning a process pause resumes with the correct continue count
+   * (AC2). Runtime-only; the value rides the request payload, NOT a serialized
+   * {@link BudgetContext}/{@link PausedState} field (Q3). `undefined` on a fresh
+   * run and after the seed is consumed (an in-process continue never sets it →
+   * AC3: no serialization on the in-process path).
+   */
+  resumeContinues?: [string, number];
 }
 
 function newRunScratch(): RunScratch {
@@ -1203,7 +1307,18 @@ export function pushBudget(
   behavior: BudgetExhaustedBehavior,
   phase: string,
 ): number {
-  cx.budgets.push(new BudgetContext(policy, behavior, phase));
+  // #129 (AC2): if a resumed `continue` checkpoint seed is waiting for THIS
+  // phase, reconstruct the scope with its prior `continuesUsed` (consuming the
+  // seed once) instead of zeroing it. The root resumed node pushes first, and
+  // the request's `phase` names that node, so the FIRST matching push restores
+  // the count. Any other push (or a fresh run) is unaffected.
+  const seed = cx.scratch.resumeContinues;
+  if (seed !== undefined && seed[0] === phase) {
+    cx.scratch.resumeContinues = undefined;
+    cx.budgets.push(BudgetContext.resumed(policy, behavior, phase, seed[1]));
+  } else {
+    cx.budgets.push(new BudgetContext(policy, behavior, phase));
+  }
   return cx.budgets.depth();
 }
 
@@ -1651,11 +1766,6 @@ function combinatorBudgetPolicy(maxTurns: number | null | undefined): BudgetPoli
   return maxTurns != null ? { kind: "total_steps", value: maxTurns } : { kind: "unlimited" };
 }
 
-/** The in-process `escalate` placeholder behavior every wired `*Config` scope
- *  pushes (#125): the serialized behavior field is forbidden by fork #3, so the
- *  Continue/Fail/Escalate chain is exercised via the enforcement primitives. */
-const ESCALATE_PLACEHOLDER: BudgetExhaustedBehavior = { kind: "escalate" };
-
 /**
  * The leaf: a bounded ReAct turn-loop window. Reads the per-run scratch
  * (`task`, `runSession`, `runBudget`) and drives one ReAct window through the
@@ -1695,12 +1805,15 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     await executor.finalize(agent);
     return recordTerminal(cx, agent);
   }
-  // #125: push this leaf's OWN budget scope. The leaf carries only its POLICY
-  // (the cap); behavior is the `escalate` placeholder — the leaf never RESOLVES
-  // it (rule 6: propagate to parent), it is only the scope shape so the charge
-  // below enforces the cap and any exhaustion promotes to a parent-inspectable
-  // `budget_exhausted`.
-  pushBudget(cx, c.budget, ESCALATE_PLACEHOLDER, "react");
+  // #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
+  // `behavior` (default `escalate`). The leaf still never RESOLVES it in the
+  // nested case (rule 6: it PROPAGATES a `budget_exhausted` to its parent, which
+  // owns the single recovery site). Carrying the real `behavior` only means the
+  // propagated error reports it, so the TOP-LEVEL/bare-leaf resolution site
+  // (`driveStrategy`) can honor it (Q1 — a bare leaf self-resolves, a nested leaf
+  // does not).
+  const leafBehavior = c.behavior ?? defaultBudgetBehavior();
+  pushBudget(cx, c.budget, leafBehavior, "react");
   const onStream = cx.stream;
   cx.stream = undefined;
   const result = await executor.reactWindow(
@@ -1738,7 +1851,7 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
       ? charge.error
       : currentBudgetExhausted(cx, {
           policy: c.budget,
-          behavior: ESCALATE_PLACEHOLDER,
+          behavior: leafBehavior,
           stepsTaken: windowTurns,
           continuesUsed: 0,
           phase: "react",
@@ -2027,15 +2140,11 @@ async function runPlanExecuteConfig(
   // The first terminal failure that triggered a cascade (decision A).
   let firstFailure: { failedTask: number; reason: string } | undefined;
 
-  // #125: PlanExecute owns a budget scope for its execute phase (`escalate`
-  // placeholder behavior; the serialized behavior field is #129). Enforcement is
-  // `charge`-based per node.
-  pushBudget(
-    cx,
-    combinatorBudgetPolicy(task.budget.max_turns),
-    ESCALATE_PLACEHOLDER,
-    "plan_execute",
-  );
+  // #125/#129: PlanExecute owns a budget scope for its execute phase carrying its
+  // CONFIGURED `behavior` (default `escalate`). Enforcement is `charge`-based per
+  // node.
+  const peBehavior = c.behavior ?? defaultBudgetBehavior();
+  pushBudget(cx, combinatorBudgetPolicy(task.budget.max_turns), peBehavior, "plan_execute");
 
   for (;;) {
     const taskId = nextReady(taskList);
@@ -2108,12 +2217,23 @@ async function runPlanExecuteConfig(
     if (stepOutcome.kind === "budget_exhausted") {
       const err = currentBudgetExhausted(cx, {
         policy: combinatorBudgetPolicy(task.budget.max_turns),
-        behavior: ESCALATE_PLACEHOLDER,
+        behavior: peBehavior,
         stepsTaken: carried.turns,
         continuesUsed: 0,
         phase: "plan_execute",
       });
       const resolution = resolveCurrent(cx);
+      // #129: a granted `continue` loops IN-PROCESS — the scope's `resolveCurrent`
+      // already reset `stepsTaken` and bumped `continuesUsed`. Reset this task to
+      // `pending` and re-enter the ready-set walk so it runs again under the
+      // refreshed scope allowance (NO serialization — AC3). `max_continues` bounds
+      // the loop: once continues are spent, the chain falls through to
+      // `fail`/`escalate`.
+      if (resolution === "continue") {
+        updateTask(taskList, taskId, "pending");
+        await executor.persistTaskList(sessionId, taskList);
+        continue;
+      }
       if (resolution === "fail") {
         // #126 AC4: a budget-`fail` task cascades IDENTICALLY to an error-failed
         // one — block its transitive dependents and keep scheduling unrelated
@@ -2133,11 +2253,11 @@ async function runPlanExecuteConfig(
         }
         continue;
       }
-      // Escalate / Continue: under `autonomous`, surface the partial and abort
-      // the run (the in-process Continue loop is #129; today only escalate/fail
-      // are reachable). Under `surface_to_human` (#130) the node PAUSES with a
-      // `budget_exhausted` request via the `terminalOverride` seam instead of
-      // propagating up. Combinators offer [continue_with_budget, skip, fail].
+      // Escalate: under `autonomous`, surface the partial and abort the run.
+      // Under `surface_to_human` (#130) the node PAUSES with a `budget_exhausted`
+      // request via the `terminalOverride` seam instead of propagating up.
+      // Combinators offer [continue_with_budget, skip, fail]. (#129: `continue` is
+      // handled above as an in-process re-schedule.)
       updateTask(taskList, taskId, "blocked");
       await executor.persistTaskList(sessionId, taskList);
       const partial = planExecutePartialJson(taskList);
@@ -2194,8 +2314,14 @@ async function runPlanExecuteConfig(
       // #125: charge this step's turns against the PlanExecute scope.
       const stepCharge = chargeCurrent(cx, Math.max(0, subResult.turns - carriedBefore));
       if (!stepCharge.ok) {
-        const partial = planExecutePartialJson(taskList);
         const resolution = resolveCurrent(cx);
+        // #129: a granted `continue` refreshes the scope and keeps scheduling the
+        // remaining ready tasks IN-PROCESS (this step already completed). NO
+        // serialization (AC3); do NOT pop the scope.
+        if (resolution === "continue") {
+          continue;
+        }
+        const partial = planExecutePartialJson(taskList);
         popBudget(cx);
         cx.scratch.task = task;
         cx.stream = onStream;
@@ -2204,8 +2330,7 @@ async function runPlanExecuteConfig(
             return promoteBudgetExhausted(stepCharge.error, undefined);
           // #130: under `surface_to_human`, PAUSE with a `budget_exhausted`
           // request instead of propagating up. Combinators offer
-          // [continue_with_budget, skip, fail].
-          case "continue":
+          // [continue_with_budget, skip, fail]. (#129: `continue` handled above.)
           case "escalate":
             if (executor.escalationMode().kind === "surface_to_human") {
               const waiting = promoteBudgetExhaustedToHuman(
@@ -2397,15 +2522,11 @@ async function runSelfVerifyingConfig(
   let lastReason = "";
   let lastWorkerOutput = "";
 
-  // #125: SelfVerifying owns a budget scope for its build↔evaluate loop. POLICY
-  // is the task's global turn ceiling (`total_steps`); behavior is the `escalate`
-  // placeholder (the serialized behavior field is #129).
-  pushBudget(
-    cx,
-    combinatorBudgetPolicy(task.budget.max_turns),
-    ESCALATE_PLACEHOLDER,
-    "self_verifying",
-  );
+  // #125/#129: SelfVerifying owns a budget scope for its build↔evaluate loop.
+  // POLICY is the task's global turn ceiling (`total_steps`); behavior is its
+  // CONFIGURED `behavior` (default `escalate`).
+  const svBehavior = c.behavior ?? defaultBudgetBehavior();
+  pushBudget(cx, combinatorBudgetPolicy(task.budget.max_turns), svBehavior, "self_verifying");
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     // ── Build phase: recurse `runStrategy(c.inner, cx)`.
@@ -2432,7 +2553,7 @@ async function runSelfVerifyingConfig(
       const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
       const err = currentBudgetExhausted(cx, {
         policy: combinatorBudgetPolicy(task.budget.max_turns),
-        behavior: ESCALATE_PLACEHOLDER,
+        behavior: svBehavior,
         stepsTaken: carried.turns,
         continuesUsed: 0,
         phase: "self_verifying",
@@ -2482,24 +2603,25 @@ async function runSelfVerifyingConfig(
     // `budget_exhausted` (partial = last worker result + last verdict).
     const buildCharge = chargeCurrent(cx, Math.max(0, carried.turns - carriedBefore));
     if (!buildCharge.ok) {
-      const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
       const resolution = resolveCurrent(cx);
+      // #129: a granted `continue` resets the scope and RE-RUNS the build↔evaluate
+      // iteration IN-PROCESS (do NOT pop the scope; the loop continues under the
+      // refreshed allowance). NO serialization (AC3). `max_continues` bounds the
+      // loop.
+      if (resolution === "continue") {
+        continue;
+      }
+      const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
       switch (resolution) {
         case "fail":
           return promoteBudgetExhausted(buildCharge.error, undefined);
-        // #129: a granted `continue` must reset + RE-RUN this build↔evaluate
-        // iteration (the in-process loop wiring lands in #129). UNREACHABLE today
-        // — live bodies push an `escalate` placeholder, so `resolveCurrent` never
-        // yields `continue` here. Handle it EXPLICITLY (surface-with-partial)
-        // rather than via a silent fall-through.
-        //
         // #130: under `surface_to_human`, PAUSE with a `budget_exhausted` request
         // instead of propagating up. Combinators offer
-        // [continue_with_budget, skip, fail].
-        case "continue":
+        // [continue_with_budget, skip, fail]. (#129: `continue` handled above as
+        // an in-process re-run.)
         case "escalate":
           if (executor.escalationMode().kind === "surface_to_human") {
             const waiting = promoteBudgetExhaustedToHuman(
@@ -2752,14 +2874,10 @@ async function runHillClimbingConfig(
 
   // #125: HillClimbing owns a budget scope for its optimization loop. POLICY is
   // the task's global turn ceiling (`total_steps`); this REPLACES the ad-hoc
-  // `turnCap` / `carried.turns >= turnCap` gate that #124 used. Behavior is the
-  // `escalate` placeholder (the serialized behavior field is #129).
-  pushBudget(
-    cx,
-    combinatorBudgetPolicy(task.budget.max_turns),
-    ESCALATE_PLACEHOLDER,
-    "hill_climbing",
-  );
+  // `turnCap` / `carried.turns >= turnCap` gate that #124 used. Behavior is its
+  // CONFIGURED `behavior` (default `escalate`) (#129).
+  const hcBehavior = c.behavior ?? defaultBudgetBehavior();
+  pushBudget(cx, combinatorBudgetPolicy(task.budget.max_turns), hcBehavior, "hill_climbing");
 
   for (;;) {
     // #125: charge-based budget gate before the iteration's agent turn. A spent
@@ -2768,25 +2886,25 @@ async function runHillClimbingConfig(
     // legacy `budget_exceeded` Failure.
     const gateCharge = chargeCurrent(cx, 1);
     if (!gateCharge.ok) {
+      const resolution = resolveCurrent(cx);
+      // #129: a granted `continue` resets the scope and KEEPS ITERATING the climb
+      // IN-PROCESS (do NOT pop; the refreshed allowance lets the next charge
+      // pass). NO serialization (AC3). `max_continues` bounds the loop.
+      if (resolution === "continue") {
+        continue;
+      }
       await executor.hillWriteTsv(taskId, rows);
       const partial = hillClimbingPartialJson(currentBest);
-      const resolution = resolveCurrent(cx);
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
       switch (resolution) {
         case "fail":
           return promoteBudgetExhausted(gateCharge.error, undefined);
-        // #129: a granted `continue` must reset + keep iterating the climb (the
-        // in-process loop wiring lands in #129). UNREACHABLE today — live bodies
-        // push an `escalate` placeholder, so `resolveCurrent` never yields
-        // `continue` here. Handle it EXPLICITLY (surface-with-partial) rather
-        // than via a silent fall-through.
-        //
         // #130: under `surface_to_human`, PAUSE with a `budget_exhausted` request
         // instead of propagating up. Combinators offer
-        // [continue_with_budget, skip, fail].
-        case "continue":
+        // [continue_with_budget, skip, fail]. (#129: `continue` handled above as
+        // an in-process iterate.)
         case "escalate":
           if (executor.escalationMode().kind === "surface_to_human") {
             const waiting = promoteBudgetExhaustedToHuman(
@@ -2840,7 +2958,7 @@ async function runHillClimbingConfig(
       const partial = hillClimbingPartialJson(currentBest);
       const err = currentBudgetExhausted(cx, {
         policy: combinatorBudgetPolicy(task.budget.max_turns),
-        behavior: ESCALATE_PLACEHOLDER,
+        behavior: hcBehavior,
         stepsTaken: carried.turns,
         continuesUsed: 0,
         phase: "hill_climbing",
@@ -3933,6 +4051,61 @@ export interface PausedState {
   task: Task;
   budget_used: BudgetSnapshot;
   child_state: ChildPausedState | null;
+}
+
+/**
+ * The SHARED durable checkpoint round-trip (#129, AC1). Both cross-process
+ * `continue` (a `HumanRequest::BudgetExhausted` pause whose request carries
+ * `continues_used`) and Ralph's pause-propagation hand the SAME
+ * {@link PausedState} to the caller for persistence; this is the one seam they
+ * share. It is JUST the `PausedState` serialize/deserialize — NOT a unification
+ * of their CONTEXT policies (Q2): a `continue` resumes preserving
+ * `session_state.messages`; Ralph re-seeds a fresh window from its filesystem
+ * `.spore/progress.json` checkpoint, which stays Ralph-specific.
+ *
+ * Produces the durable blob the caller persists. Mirrors Rust
+ * `PausedState::serialize_checkpoint`.
+ */
+export function serializeCheckpoint(state: PausedState): string {
+  return JSON.stringify(state);
+}
+
+/**
+ * Restore a {@link PausedState} from a durable checkpoint blob (#129, AC1). The
+ * resume side of {@link serializeCheckpoint}. Re-hydrates the {@link SessionId} /
+ * {@link TaskId} newtypes and re-validates the embedded {@link Task} (and its
+ * strategy tree) and {@link HumanRequest} via their zod schemas, so the restored
+ * value is structurally EQUAL to the original. Mirrors Rust
+ * `PausedState::load_checkpoint`.
+ */
+export function loadCheckpoint(blob: string): PausedState {
+  const raw = JSON.parse(blob) as Record<string, unknown>;
+  const hydrateChild = (c: Record<string, unknown>): ChildPausedState => ({
+    session_id: new SessionId(c.session_id as string),
+    task_id: new TaskId(c.task_id as string),
+    turn_number: c.turn_number as number,
+    session_state: SessionStateSchema.parse(c.session_state),
+    pending_tool_calls: (c.pending_tool_calls as ToolCall[]) ?? [],
+    approved_results: (c.approved_results as ToolResultRecord[]) ?? [],
+    human_request: c.human_request == null ? undefined : HumanRequestSchema.parse(c.human_request),
+    task: TaskSchema.parse(c.task),
+    budget_used: BudgetSnapshotSchema.parse(c.budget_used),
+    parent_tool_call_id: c.parent_tool_call_id as string,
+  });
+  return {
+    session_id: new SessionId(raw.session_id as string),
+    task_id: new TaskId(raw.task_id as string),
+    turn_number: raw.turn_number as number,
+    session_state: SessionStateSchema.parse(raw.session_state),
+    pending_tool_calls: (raw.pending_tool_calls as ToolCall[]) ?? [],
+    approved_results: (raw.approved_results as ToolResultRecord[]) ?? [],
+    human_request:
+      raw.human_request == null ? undefined : HumanRequestSchema.parse(raw.human_request),
+    task: TaskSchema.parse(raw.task),
+    budget_used: BudgetSnapshotSchema.parse(raw.budget_used),
+    child_state:
+      raw.child_state == null ? null : hydrateChild(raw.child_state as Record<string, unknown>),
+  };
 }
 
 // ============================================================================

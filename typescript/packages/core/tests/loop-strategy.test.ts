@@ -30,6 +30,7 @@ import {
   runStrategy,
   strategyRefFromJson,
   strategyRefToJson,
+  type BudgetExhaustedBehavior,
   type LoopStrategy,
   type StrategyRef,
 } from "../src/index.js";
@@ -67,6 +68,10 @@ function minifyPreservingOrder(s: string): string {
 }
 
 /** The canonical cordyceps tree `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. */
+// #129: every node carries an explicit `behavior: escalate` (the parse injects
+// the default, so the in-memory tree must include it for deep-equality).
+const ESCALATE: BudgetExhaustedBehavior = { kind: "escalate" };
+
 function cordycepsTree(): LoopStrategy {
   return {
     kind: "ralph",
@@ -75,6 +80,7 @@ function cordycepsTree(): LoopStrategy {
       plan: {
         kind: "react",
         budget: { kind: "per_loop", value: 4 },
+        behavior: ESCALATE,
         agent: "planner",
         toolset: "plan-tools",
         output: "plan-schema",
@@ -84,14 +90,18 @@ function cordycepsTree(): LoopStrategy {
         inner: {
           kind: "react",
           budget: { kind: "per_loop", value: 12 },
+          behavior: ESCALATE,
           agent: "executor",
           toolset: "exec-tools",
           output: "worker-schema",
         },
         evaluator: "exec-evaluator",
+        behavior: ESCALATE,
       },
+      behavior: ESCALATE,
     },
     agent: "ralph-agent",
+    behavior: ESCALATE,
   };
 }
 
@@ -100,40 +110,94 @@ describe("LoopStrategy", () => {
     {
       kind: "react",
       budget: { kind: "per_loop", value: 8 },
+      behavior: ESCALATE,
       agent: "a",
       toolset: "t",
       output: "out",
     },
-    { kind: "react", budget: { kind: "per_loop", value: 3 }, agent: "", toolset: "" },
     {
-      kind: "plan_execute",
-      plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-      execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      kind: "react",
+      budget: { kind: "per_loop", value: 3 },
+      behavior: ESCALATE,
+      agent: "",
+      toolset: "",
     },
     {
       kind: "plan_execute",
-      plan: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
-      execute: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
+      execute: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
+      behavior: ESCALATE,
+    },
+    {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
+      execute: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
       plan_model: { provider: "anthropic", model_id: "claude" },
+      behavior: ESCALATE,
     },
     {
       kind: "self_verifying",
-      inner: { kind: "react", budget: { kind: "per_loop", value: 2 }, agent: "", toolset: "" },
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 2 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
       evaluator: "ev",
+      behavior: ESCALATE,
     },
     {
       kind: "ralph",
-      inner: { kind: "react", budget: { kind: "per_loop", value: 1 }, agent: "", toolset: "" },
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 1 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
       agent: "r",
+      behavior: ESCALATE,
     },
     {
       kind: "hill_climbing",
-      inner: { kind: "react", budget: { kind: "per_loop", value: 5 }, agent: "", toolset: "" },
+      inner: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 5 },
+        behavior: ESCALATE,
+        agent: "",
+        toolset: "",
+      },
       direction: "maximize",
       max_stagnation: 3,
       revert_on_no_improvement: true,
       min_improvement_delta: 0.25,
       evaluator: "metric",
+      behavior: ESCALATE,
     },
   ];
 
@@ -154,8 +218,10 @@ describe("LoopStrategy", () => {
     );
     expect(json).toContain('"kind":"react"');
     expect(json).not.toContain("re_act");
+    // #129: `behavior` is always serialized, immediately after `budget`.
     expect(json).toBe(
-      '{"kind":"react","budget":{"kind":"per_loop","value":8},"agent":"","toolset":""}',
+      '{"kind":"react","budget":{"kind":"per_loop","value":8},' +
+        '"behavior":{"kind":"escalate"},"agent":"","toolset":""}',
     );
   });
 
@@ -199,12 +265,14 @@ describe("LoopStrategy", () => {
   it("serializes the cordyceps tree to the exact compact form", () => {
     expect(JSON.stringify(loopStrategyToJson(cordycepsTree()))).toBe(
       '{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react",' +
-        '"budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools",' +
-        '"output":"plan-schema"},' +
+        '"budget":{"kind":"per_loop","value":4},"behavior":{"kind":"escalate"},' +
+        '"agent":"planner","toolset":"plan-tools","output":"plan-schema"},' +
         '"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":' +
-        '{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools",' +
-        '"output":"worker-schema"},' +
-        '"evaluator":"exec-evaluator"}},"agent":"ralph-agent"}',
+        '{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},' +
+        '"agent":"executor","toolset":"exec-tools","output":"worker-schema"},' +
+        '"evaluator":"exec-evaluator","behavior":{"kind":"escalate"}},' +
+        '"behavior":{"kind":"escalate"}},"agent":"ralph-agent",' +
+        '"behavior":{"kind":"escalate"}}',
     );
   });
 

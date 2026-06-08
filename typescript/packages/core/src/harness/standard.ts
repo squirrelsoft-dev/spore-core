@@ -141,6 +141,9 @@ import {
   type AgentRef,
   autonomous,
   type BudgetExhausted,
+  type BudgetExhaustedBehavior,
+  BudgetContext,
+  budgetPolicyAllowanceValue,
   grantTaskBudget,
   leafEscalationActions,
   promoteBudgetExhaustedToHuman,
@@ -673,90 +676,191 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
   ): Promise<RunResult> {
+    return this.driveStrategyWithResumeSeed(
+      task,
+      sessionState,
+      budgetUsed,
+      onStream,
+      signal,
+      undefined,
+    );
+  }
+
+  /**
+   * `driveStrategy` with an optional cross-process Continue checkpoint seed
+   * (#129, AC2): `resumeContinues = [phase, continuesUsed]` seeds the FIRST
+   * matching budget scope's `continuesUsed` (via {@link BudgetContext.resumed})
+   * so a `continue` that spanned a process pause resumes with the correct
+   * continue count instead of a zeroed one. `undefined` is the fresh-run path.
+   *
+   * #129: the BARE-LEAF resolution site is HERE (a bare leaf never self-resolves
+   * inside its own body — rule 6 — it PROPAGATES a typed `budget_exhausted`, the
+   * single recovery site for a top-level leaf). When the leaf's CONFIGURED
+   * `behavior` resolves to `continue`, the leaf is granted one more round
+   * IN-PROCESS (bump `continuesUsed`, refresh the step cap) and re-driven WITHOUT
+   * any serialization (AC3) — looping until the behavior resolves to
+   * `fail`/`escalate` or the strategy completes. `behaviorForResolution` carries
+   * the resolution chain's mutated state across in-process continues so
+   * `max_continues` is honored.
+   */
+  private async driveStrategyWithResumeSeed(
+    task: Task,
+    sessionState: SessionState,
+    budgetUsed: BudgetSnapshot,
+    onStream: StreamSink | undefined,
+    signal: AbortSignal | undefined,
+    resumeContinues: [string, number] | undefined,
+  ): Promise<RunResult> {
     const sessionId = task.session_id;
     const registry = this.config.registry ?? ExecutionRegistry.empty();
-    const cx: ExecutionContext = newExecutionContext(registry);
-    cx.executor = this;
-    cx.stream = onStream;
-    cx.signal = signal;
-    cx.scratch.runSession = sessionState;
-    cx.scratch.runBudget = budgetUsed;
-    cx.scratch.task = task;
 
-    const outcome = await runStrategy(task.loop_strategy, cx);
+    let currentTask = task;
+    let currentSession = sessionState;
+    let currentBudget = budgetUsed;
+    let currentStream = onStream;
+    // The Continue resolution state threaded across in-process rounds: the
+    // (possibly fallen-through) behavior + how many continues have been spent.
+    let behaviorForResolution: [BudgetExhaustedBehavior, number] | undefined;
+    // #129 (AC2): the cross-process checkpoint seed is consumed by the FIRST
+    // round only (the resumed node's scope); later in-process rounds carry their
+    // continue count via `behaviorForResolution`.
+    let seed = resumeContinues;
 
-    // A pause / escalate (or any fully-formed terminal) propagates verbatim —
-    // preserves the HITL / consult / escalation contract and the strategy's
-    // typed HaltReason + accounting through the recursive executor.
-    if (cx.scratch.terminalOverride !== undefined) {
-      return cx.scratch.terminalOverride;
-    }
-    switch (outcome.kind) {
-      case "complete":
-        return {
-          kind: "success",
-          output: outcome.output,
-          session_id: sessionId,
-          usage: cx.usage,
-          turns: cx.scratch.runBudget.turns,
-          session_state: cx.scratch.runSession,
-        };
-      case "failed":
-        return {
-          kind: "failure",
-          reason: { kind: "configuration_error", error: outcome.error },
-          session_id: sessionId,
-          usage: cx.usage,
-          turns: cx.scratch.runBudget.turns,
-          session_state: cx.scratch.runSession,
-        };
-      case "budget_exhausted": {
-        // #130: a BARE LEAF exhaustion propagates here without ever resolving
-        // (rule 6). Under `surface_to_human`, PAUSE with a `budget_exhausted`
-        // request (a combinator under `surface_to_human` never reaches this arm
-        // — it sets `terminalOverride` and is returned by the early-return
-        // above). A bare leaf offers `[continue_with_budget, fail]` (fork C — no
-        // sibling to `skip` to).
-        // #125: the exhausted node's own `stepsTaken` is the turn count it
-        // reached (the scratch budget is not written back on the propagate
-        // path). Fall back to the scratch turns if it is somehow 0.
-        const turns = outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns;
-        if (this.escalationMode().kind === "surface_to_human") {
-          const err: BudgetExhausted = {
-            policy: outcome.policy,
-            behavior: { kind: "escalate" },
-            stepsTaken: outcome.stepsTaken,
-            continuesUsed: outcome.continuesUsed,
-            phase: outcome.phase,
+    for (;;) {
+      const cx: ExecutionContext = newExecutionContext(registry);
+      cx.executor = this;
+      cx.stream = currentStream;
+      cx.signal = signal;
+      cx.scratch.runSession = currentSession;
+      cx.scratch.runBudget = currentBudget;
+      cx.scratch.task = currentTask;
+      cx.scratch.resumeContinues = seed;
+      seed = undefined;
+
+      const outcome = await runStrategy(currentTask.loop_strategy, cx);
+
+      // A pause / escalate (or any fully-formed terminal) propagates verbatim —
+      // preserves the HITL / consult / escalation contract and the strategy's
+      // typed HaltReason + accounting through the recursive executor.
+      if (cx.scratch.terminalOverride !== undefined) {
+        return cx.scratch.terminalOverride;
+      }
+      switch (outcome.kind) {
+        case "complete":
+          return {
+            kind: "success",
+            output: outcome.output,
+            session_id: sessionId,
+            usage: cx.usage,
+            turns: cx.scratch.runBudget.turns,
+            session_state: cx.scratch.runSession,
           };
-          return promoteBudgetExhaustedToHuman(
-            err,
-            outcome.partialOutput,
-            leafEscalationActions(err),
-            sessionId,
-            task,
-            cx.scratch.runBudget,
-            turns,
+        case "failed":
+          return {
+            kind: "failure",
+            reason: { kind: "configuration_error", error: outcome.error },
+            session_id: sessionId,
+            usage: cx.usage,
+            turns: cx.scratch.runBudget.turns,
+            session_state: cx.scratch.runSession,
+          };
+        case "budget_exhausted": {
+          // #129: a BARE LEAF exhaustion propagates here carrying its CONFIGURED
+          // `behavior` (Q1 — the bare-leaf resolution site honors it; the leaf
+          // body never did). Resolve it ONCE: a `continue` with continues left
+          // re-drives in-process; a spent `continue` falls through to
+          // `fail`/`escalate`. Carry the resolution chain's state across rounds so
+          // `max_continues` is respected. (A combinator under `surface_to_human`
+          // never reaches this arm — it sets `terminalOverride`, returned above.)
+          // #125: the exhausted node's own `stepsTaken` is the turn count it
+          // reached (the scratch budget is not written back on the propagate
+          // path). Fall back to the scratch turns if it is somehow 0.
+          const turns = outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns;
+          // Reconstruct the resolution scope: the FIRST round uses the leaf's
+          // propagated behavior + continuesUsed; later in-process rounds reuse the
+          // threaded (possibly fallen-through) state.
+          const [resolveBehavior, resolveContinues] = behaviorForResolution ?? [
+            outcome.behavior,
+            outcome.continuesUsed,
+          ];
+          const scope = BudgetContext.resumed(
+            outcome.policy,
+            resolveBehavior,
+            outcome.phase,
+            resolveContinues,
           );
+          const resolution = scope.resolveExhausted();
+          if (resolution === "continue") {
+            // In-process continue (AC3: NO serialization). Refresh the leaf's
+            // step cap and re-enter the loop carrying the post-run session so the
+            // conversation context survives (Continue PRESERVES context — AC4).
+            // The granted cap is `stepsTaken + policy.value` so the leaf gets a
+            // fresh window after the checkpoint.
+            const granted = outcome.stepsTaken + (budgetPolicyAllowanceValue(outcome.policy) ?? 1);
+            currentTask = grantTaskBudget(currentTask, granted);
+            currentSession = cx.scratch.runSession;
+            currentBudget = { ...cx.scratch.runBudget };
+            currentStream = cx.stream;
+            // Thread the resolution chain's post-continue state so a subsequent
+            // exhaustion sees the bumped `continuesUsed`.
+            behaviorForResolution = [scope.behavior, scope.continuesUsed];
+            continue;
+          }
+          if (resolution === "escalate") {
+            // #130: a BARE LEAF exhaustion under `surface_to_human` PAUSES with a
+            // `budget_exhausted` request. A bare leaf offers
+            // `[continue_with_budget, fail]` (fork C — no sibling to `skip` to).
+            if (this.escalationMode().kind === "surface_to_human") {
+              const err: BudgetExhausted = {
+                policy: outcome.policy,
+                behavior: scope.behavior,
+                stepsTaken: outcome.stepsTaken,
+                continuesUsed: scope.continuesUsed,
+                phase: outcome.phase,
+              };
+              return promoteBudgetExhaustedToHuman(
+                err,
+                outcome.partialOutput,
+                leafEscalationActions(err),
+                sessionId,
+                currentTask,
+                cx.scratch.runBudget,
+                turns,
+              );
+            }
+            return {
+              kind: "failure",
+              reason: { kind: "budget_exceeded", limit_type: "turns" },
+              session_id: sessionId,
+              usage: cx.usage,
+              turns,
+              // #125: carry the node-concrete partial as an assistant text message
+              // so a parent / caller can inspect what was produced before
+              // exhaustion.
+              session_state:
+                outcome.partialOutput != null
+                  ? {
+                      messages: [
+                        {
+                          role: "assistant",
+                          content: { type: "text", text: outcome.partialOutput },
+                        },
+                      ],
+                      extras: {},
+                    }
+                  : emptySessionState(),
+            };
+          }
+          // Fail contract: the partial is DISCARDED.
+          return {
+            kind: "failure",
+            reason: { kind: "budget_exceeded", limit_type: "turns" },
+            session_id: sessionId,
+            usage: cx.usage,
+            turns,
+            session_state: emptySessionState(),
+          };
         }
-        return {
-          kind: "failure",
-          reason: { kind: "budget_exceeded", limit_type: "turns" },
-          session_id: sessionId,
-          usage: cx.usage,
-          turns,
-          // #125: carry the node-concrete partial as an assistant text message so
-          // a parent / caller can inspect what was produced before exhaustion.
-          session_state:
-            outcome.partialOutput != null
-              ? {
-                  messages: [
-                    { role: "assistant", content: { type: "text", text: outcome.partialOutput } },
-                  ],
-                  extras: {},
-                }
-              : emptySessionState(),
-        };
       }
     }
   }
@@ -1344,24 +1448,39 @@ export class StandardHarness implements Harness, StrategyExecutor {
     const sessionState = state.session_state;
     const pendingCalls = state.pending_tool_calls;
 
-    // Budget-escalation resume (#130): if this pause came from
+    // Budget-escalation resume (#130/#129): if this pause came from
     // `budget_exhausted`, map the operator's `EscalationAction` BEFORE the
     // generic `switch (response)` (mirrors the clarification branch). The node's
-    // budget context is reconstructed from the request fields (carried on
-    // `steps_taken` / `continues_used` — fork E), NOT a durable cross-process
-    // checkpoint (#129).
+    // budget context is reconstructed from the request fields: `steps_taken`
+    // raises the granted cap, and `continues_used` (#129, AC2) is the SOLE budget
+    // field that rides a process pause — it is seeded back into the rebuilt scope
+    // so a `continue` spanning the pause resumes with the correct continue count
+    // (it cannot exceed `max_continues`). Q3: `continues_used` rides the REQUEST
+    // payload, NOT a new serialized budget / PausedState field.
     if (state.human_request?.kind === "budget_exhausted" && response.kind === "escalate") {
       const stepsTaken = state.human_request.steps_taken;
+      const resumeSeed: [string, number] = [
+        state.human_request.phase,
+        state.human_request.continues_used,
+      ];
       const action: EscalationAction = response.action;
       switch (action.kind) {
         // Grant `steps` ADDITIONAL allowance and re-enter the loop from the
         // restored checkpoint. The strategy tree is rebuilt with the node's
         // budget policy raised to `stepsTaken + steps` so the restored scope has
-        // room for `steps` more steps.
+        // room for `steps` more steps, and the resumed scope's `continuesUsed` is
+        // seeded from the request (#129, AC2).
         case "continue_with_budget": {
           const granted = stepsTaken + action.steps;
           const resumedTask = grantTaskBudget(state.task, granted);
-          return this.driveStrategy(resumedTask, sessionState, state.budget_used, onStream, signal);
+          return this.driveStrategyWithResumeSeed(
+            resumedTask,
+            sessionState,
+            state.budget_used,
+            onStream,
+            signal,
+            resumeSeed,
+          );
         }
         // Skip: the node is marked skipped and the outer loop advances. For a
         // combinator (PlanExecute) re-entering the loop from the checkpoint
