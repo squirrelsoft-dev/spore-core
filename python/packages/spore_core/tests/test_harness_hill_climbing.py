@@ -135,7 +135,7 @@ def _config(
     evaluator: Any,
     observability: Any = None,
 ) -> HarnessConfig:
-    from spore_core import AlwaysContinuePolicy, ScriptedToolRegistry
+    from spore_core import AlwaysContinuePolicy, EscalationModeAutonomous, ScriptedToolRegistry
 
     return HarnessConfig(
         agent=_agent(),
@@ -145,6 +145,9 @@ def _config(
         termination_policy=AlwaysContinuePolicy(),
         metric_evaluator=evaluator,
         observability=observability,
+        # #130: pin Autonomous so a budget exhaustion PROPAGATES (the #125 path
+        # these tests assert) rather than pausing under the default SurfaceToHuman.
+        escalation_mode=EscalationModeAutonomous(),
     )
 
 
@@ -241,7 +244,7 @@ async def test_baseline_first_kept_no_agent_turn(tmp_path: Path) -> None:
     ev = ScriptedEvaluator([1.0, 0.5])
     agent = _agent()
     task = _task(max_stagnation=1)
-    from spore_core import AlwaysContinuePolicy, ScriptedToolRegistry
+    from spore_core import AlwaysContinuePolicy, EscalationModeAutonomous, ScriptedToolRegistry
 
     cfg = HarnessConfig(
         agent=agent,
@@ -250,6 +253,9 @@ async def test_baseline_first_kept_no_agent_turn(tmp_path: Path) -> None:
         context_manager=NoopContextManager(),
         termination_policy=AlwaysContinuePolicy(),
         metric_evaluator=ev,
+        # #130: pin Autonomous so a budget exhaustion PROPAGATES (the #125 path
+        # this test asserts) rather than pausing under the default SurfaceToHuman.
+        escalation_mode=EscalationModeAutonomous(),
     )
     h = StandardHarness(cfg)
     r = await h.run(HarnessRunOptions(task))

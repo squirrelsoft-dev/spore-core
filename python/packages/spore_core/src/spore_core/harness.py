@@ -1149,6 +1149,14 @@ class StrategyExecutor(Protocol):
         """Finalize observability for a terminal outcome (no-op for pauses)."""
         ...
 
+    def escalation_mode(self) -> EscalationMode:
+        """The configured budget-escalation mode (#130). The per-config bodies
+        and the strategy driver consult this at each
+        :attr:`ExhaustedResolution.ESCALATE` site: ``SurfaceToHuman`` pauses with
+        a :class:`HumanRequestBudgetExhausted`; ``Autonomous`` keeps the existing
+        propagate behavior."""
+        ...
+
 
 @runtime_checkable
 class RunStrategy(Protocol):
@@ -1296,6 +1304,140 @@ def _promote_budget_exhausted(
         continues_used=err.continues_used,
         phase=err.phase,
         partial_output=partial_output,
+    )
+
+
+# ----- #130: Escalate HITL pause / resume wiring --------------------------
+#
+# The ``escalation_mode`` config knob (#120, previously UNCONSUMED) is read at
+# every ``ExhaustedResolution.ESCALATE`` site. Under ``Autonomous`` the existing
+# propagate behavior is unchanged; under ``SurfaceToHuman`` the node PAUSES with
+# a :class:`HumanRequestBudgetExhausted` request via the ``terminal_override``
+# seam instead of propagating up. ``available_actions`` is ADVISORY (fork D):
+# resume does NOT hard-reject an out-of-set action.
+
+
+def _combinator_escalation_actions(err: BudgetExhausted) -> list[EscalationAction]:
+    """The advisory ``available_actions`` a COMBINATOR (PlanExecute / Ralph /
+    SelfVerifying / HillClimbing) offers on a budget-exhaustion pause (fork C):
+    ``[ContinueWithBudget, Skip, Fail]`` — a combinator CAN skip the node and let
+    its outer loop advance. ``ContinueWithBudget`` seeds ``steps`` from the spent
+    allowance (``steps_taken``) as a sensible default grant."""
+    steps = err.steps_taken
+    return [
+        EscalationActionContinueWithBudget(steps=steps),
+        EscalationActionSkip(),
+        EscalationActionFail(),
+    ]
+
+
+def _leaf_escalation_actions(err: BudgetExhausted) -> list[EscalationAction]:
+    """The advisory ``available_actions`` a BARE LEAF offers on a
+    budget-exhaustion pause (fork C): ``[ContinueWithBudget, Fail]`` — a leaf has
+    no sibling to ``Skip`` to, so ``Skip`` is OMITTED."""
+    steps = err.steps_taken
+    return [
+        EscalationActionContinueWithBudget(steps=steps),
+        EscalationActionFail(),
+    ]
+
+
+def _promote_budget_exhausted_to_human(
+    err: BudgetExhausted,
+    partial_output: str | None,
+    available_actions: list[EscalationAction],
+    session_id: SessionId,
+    task: Task,
+    budget_used: BudgetSnapshot,
+    turn_number: int,
+) -> RunResult:
+    """Promote a charge-time :class:`BudgetExhausted` to a
+    :class:`RunResultWaitingForHuman` (#130 HITL pause boundary). Built ONLY when
+    a node's ``Escalate`` resolution is consulted under
+    :class:`EscalationModeSurfaceToHuman`; carries the node's ``partial_output``
+    and the advisory ``available_actions``. The request also stashes
+    ``steps_taken`` / ``continues_used`` so ``resume`` can reconstruct the node's
+    budget context from the request alone (fork E). Mirrors Rust's
+    ``promote_budget_exhausted_to_human``."""
+    messages = (
+        [Message(role=Role.ASSISTANT, content=TextContent(text=partial_output))]
+        if partial_output is not None
+        else []
+    )
+    request = HumanRequestBudgetExhausted(
+        phase=err.phase,
+        policy=err.policy,
+        steps_taken=err.steps_taken,
+        continues_used=err.continues_used,
+        partial_output=partial_output,
+        available_actions=available_actions,
+    )
+    state = PausedState(
+        session_id=session_id,
+        task_id=task.id,
+        turn_number=turn_number,
+        session_state=SessionState(messages=messages),
+        pending_tool_calls=[],
+        approved_results=[],
+        human_request=request,
+        task=task,
+        budget_used=budget_used,
+        child_state=None,
+    )
+    return RunResultWaitingForHuman(state=state, request=request)
+
+
+def _grant_budget_policy(policy: BudgetPolicy, granted: int) -> BudgetPolicy:
+    """Return ``policy`` with its step cap raised to at least ``granted`` (#130
+    ``ContinueWithBudget``). ``Unlimited`` is untouched; a capped policy is raised
+    only when its current ``value`` is below ``granted``. Mirrors Rust's
+    ``grant_budget_policy``."""
+    if isinstance(policy, BudgetPolicyUnlimited):
+        return policy
+    if policy.value < granted:
+        return policy.model_copy(update={"value": granted})
+    return policy
+
+
+def _grant_strategy_budget(ls: LoopStrategy, granted: int) -> LoopStrategy:
+    """Recurse a :class:`LoopStrategy` tree raising every ReAct leaf's ``budget``
+    cap to at least ``granted`` (#130). The combinator nodes carry no inline
+    policy (they derive it from ``task.budget.max_turns``, raised by
+    :func:`_grant_task_budget`), so this only touches the leaves. Mirrors Rust's
+    ``grant_strategy_budget``."""
+    if isinstance(ls, ReactConfig):
+        return ls.model_copy(update={"budget": _grant_budget_policy(ls.budget, granted)})
+    if isinstance(ls, PlanExecuteConfig):
+        return ls.model_copy(
+            update={
+                "plan": _grant_strategy_budget(ls.plan, granted),
+                "execute": _grant_strategy_budget(ls.execute, granted),
+            }
+        )
+    if isinstance(ls, SelfVerifyingConfig):
+        return ls.model_copy(update={"inner": _grant_strategy_budget(ls.inner, granted)})
+    if isinstance(ls, RalphConfig):
+        return ls.model_copy(update={"inner": _grant_strategy_budget(ls.inner, granted)})
+    if isinstance(ls, HillClimbingConfig):
+        return ls.model_copy(update={"inner": _grant_strategy_budget(ls.inner, granted)})
+    return ls
+
+
+def _grant_task_budget(task: Task, granted: int) -> Task:
+    """Return ``task`` with its strategy tree's budget caps raised to ``granted``
+    (#130 ``ContinueWithBudget``). The ReAct leaf caps live on each node's own
+    ``budget`` policy; the combinator nodes derive their cap from
+    ``task.budget.max_turns``, so BOTH are raised. Fork E: ``granted`` is
+    ``request.steps_taken + steps``, so the restored scope has room for ``steps``
+    more steps after the checkpoint. Mirrors Rust's ``grant_task_budget``."""
+    new_budget = task.budget
+    if task.budget.max_turns is None or task.budget.max_turns < granted:
+        new_budget = task.budget.model_copy(update={"max_turns": granted})
+    return task.model_copy(
+        update={
+            "budget": new_budget,
+            "loop_strategy": _grant_strategy_budget(task.loop_strategy, granted),
+        }
     )
 
 
@@ -1692,15 +1834,30 @@ async def _run_plan_execute_config(
                 if first_failure is None:
                     first_failure = (task_id, f"budget exhausted (Fail): {scope.policy!r}")
                 continue
-            # Escalate/Continue: surface the partial and abort the run (the
-            # in-process Continue loop is #129; today only Escalate/Fail are
-            # reachable — see #125 notes).
+            # Escalate/Continue: under ``Autonomous`` surface the partial and
+            # abort the run (the in-process Continue loop is #129; today only
+            # Escalate/Fail are reachable — see #125 notes). Under
+            # ``SurfaceToHuman`` (#130) the node PAUSES with a
+            # ``BudgetExhausted`` request via the ``terminal_override`` seam.
             task_list.update(task_id, TaskStatus.BLOCKED)
             await executor.persist_task_list(session_id, task_list)
             partial = _plan_execute_partial_json(task_list)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
+            from .execution_registry import EscalationModeSurfaceToHuman
+
+            if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                waiting = _promote_budget_exhausted_to_human(
+                    err,
+                    partial,
+                    _combinator_escalation_actions(err),
+                    session_id,
+                    task,
+                    carried.model_copy(deep=True),
+                    carried.turns,
+                )
+                return cx._record_terminal(waiting)
             return _promote_budget_exhausted(err, partial)
 
         sub_result = cx._take_child_override()
@@ -1746,6 +1903,19 @@ async def _run_plan_execute_config(
                     ExhaustedResolution.CONTINUE,
                     ExhaustedResolution.ESCALATE,
                 ):
+                    from .execution_registry import EscalationModeSurfaceToHuman
+
+                    if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                        waiting = _promote_budget_exhausted_to_human(
+                            charge_err,
+                            partial,
+                            _combinator_escalation_actions(charge_err),
+                            session_id,
+                            task,
+                            carried.model_copy(deep=True),
+                            carried.turns,
+                        )
+                        return cx._record_terminal(waiting)
                     return _promote_budget_exhausted(charge_err, partial)
                 raise AssertionError(f"unhandled resolution {resolution!r}")
 
@@ -1986,6 +2156,19 @@ async def _run_self_verifying_config(
                 ExhaustedResolution.CONTINUE,
                 ExhaustedResolution.ESCALATE,
             ):
+                from .execution_registry import EscalationModeSurfaceToHuman
+
+                if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                    waiting = _promote_budget_exhausted_to_human(
+                        charge_err,
+                        partial,
+                        _combinator_escalation_actions(charge_err),
+                        build_session_id,
+                        task,
+                        carried.model_copy(deep=True),
+                        carried.turns,
+                    )
+                    return cx._record_terminal(waiting)
                 return _promote_budget_exhausted(charge_err, partial)
             # Defensive: ``ExhaustedResolution`` is exhausted above.
             raise AssertionError(f"unhandled resolution {resolution!r}")
@@ -2243,6 +2426,19 @@ async def _run_hill_climbing_config(
                 ExhaustedResolution.CONTINUE,
                 ExhaustedResolution.ESCALATE,
             ):
+                from .execution_registry import EscalationModeSurfaceToHuman
+
+                if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                    waiting = _promote_budget_exhausted_to_human(
+                        charge_err,
+                        partial,
+                        _combinator_escalation_actions(charge_err),
+                        session_id,
+                        task,
+                        carried.model_copy(deep=True),
+                        carried.turns,
+                    )
+                    return cx._record_terminal(waiting)
                 return _promote_budget_exhausted(charge_err, partial)
             # Defensive: ``ExhaustedResolution`` is exhausted above.
             raise AssertionError(f"unhandled resolution {resolution!r}")
@@ -2750,6 +2946,35 @@ TerminationDecision = Annotated[
 RiskLevel = Literal["low", "medium", "high", "critical"]
 
 
+# ----- Escalation actions (issue #130) ------------------------------------
+#
+# ``EscalationAction`` is the operator's choice on a
+# :class:`HumanRequestBudgetExhausted` pause: grant more budget, skip the node,
+# or fail. Internally tagged on ``kind`` (snake_case), byte-identical with the
+# Rust / TS / Go definitions. ``ContinueWithBudget`` carries a NAMED ``steps``
+# field (not positional) — internally-tagged unions cannot carry a tuple payload
+# (mirrors :class:`BudgetPolicyTotalSteps` ``{ value }``).
+
+
+class EscalationActionContinueWithBudget(_Model):
+    kind: Literal["continue_with_budget"] = "continue_with_budget"
+    steps: int
+
+
+class EscalationActionSkip(_Model):
+    kind: Literal["skip"] = "skip"
+
+
+class EscalationActionFail(_Model):
+    kind: Literal["fail"] = "fail"
+
+
+EscalationAction = Annotated[
+    EscalationActionContinueWithBudget | EscalationActionSkip | EscalationActionFail,
+    Field(discriminator="kind"),
+]
+
+
 class HumanRequestToolApproval(_Model):
     kind: Literal["tool_approval"] = "tool_approval"
     calls: list[ToolCall]
@@ -2771,8 +2996,32 @@ class HumanRequestReview(_Model):
     content: str
 
 
+class HumanRequestBudgetExhausted(_Model):
+    """A node's budget scope resolved to ``Escalate`` under
+    :class:`EscalationModeSurfaceToHuman` (#130): the run pauses and surfaces the
+    exhaustion to the operator. Carries the node's ``phase``, its ``policy``, the
+    ``steps_taken`` / ``continues_used`` counters (so ``resume`` can reconstruct
+    the node's budget context — fork E), any ``partial_output`` produced before
+    exhaustion, and the ADVISORY ``available_actions`` the author offers (fork
+    C/D). The operator answers with :class:`HumanResponseEscalate`.
+
+    ``partial_output`` is serialized as ``null`` when absent (mirrors the Rust
+    ``Option<String>`` with no skip-serializing) — NOT omitted."""
+
+    kind: Literal["budget_exhausted"] = "budget_exhausted"
+    phase: str
+    policy: BudgetPolicy
+    steps_taken: int
+    continues_used: int
+    partial_output: str | None = None
+    available_actions: list[EscalationAction] = Field(default_factory=list)
+
+
 HumanRequest = Annotated[
-    HumanRequestToolApproval | HumanRequestClarification | HumanRequestReview,
+    HumanRequestToolApproval
+    | HumanRequestClarification
+    | HumanRequestReview
+    | HumanRequestBudgetExhausted,
     Field(discriminator="kind"),
 ]
 
@@ -2810,6 +3059,16 @@ class HumanResponseReject(_Model):
     reason: str
 
 
+class HumanResponseEscalate(_Model):
+    """The operator's resolution of a :class:`HumanRequestBudgetExhausted` pause
+    (#130): the chosen :class:`EscalationAction`. Distinct from
+    ``Allow`` / ``Halt`` / ``Deny`` so the budget-escalation resume path is
+    unambiguous."""
+
+    kind: Literal["escalate"] = "escalate"
+    action: EscalationAction
+
+
 HumanResponse = Annotated[
     HumanResponseAllow
     | HumanResponseAllowWithModification
@@ -2817,7 +3076,8 @@ HumanResponse = Annotated[
     | HumanResponseHalt
     | HumanResponseAnswer
     | HumanResponseApproveWithFeedback
-    | HumanResponseReject,
+    | HumanResponseReject
+    | HumanResponseEscalate,
     Field(discriminator="kind"),
 ]
 
@@ -5370,6 +5630,13 @@ class StandardHarness:
         if isinstance(path, str) and path not in self._observed_writes:
             self._observed_writes.append(path)
 
+    def escalation_mode(self) -> EscalationMode:
+        """The configured budget-escalation mode (#130, :class:`StrategyExecutor`
+        accessor): returns ``self._config.escalation_mode``. Consulted at each
+        ``ExhaustedResolution.ESCALATE`` site to decide between the autonomous
+        propagate and the HITL pause."""
+        return self._config.escalation_mode
+
     def storage(self) -> StorageProvider:
         """The injected :class:`StorageProvider` (issue #73). Defaults to an
         all-no-op provider when ``.storage(...)`` was never set."""
@@ -5782,6 +6049,56 @@ class StandardHarness:
                 task, max_iterations, session_state, budget_used, on_stream, agent
             )
 
+        # #130: a ``BudgetExhausted`` pause resumes via the operator's chosen
+        # ``EscalationAction`` (carried on a typed :class:`HumanResponseEscalate`).
+        # This branch runs BEFORE the generic ToolApproval / Clarification / Review
+        # response handling below. ``available_actions`` is ADVISORY (fork D): an
+        # out-of-set action is NOT hard-rejected here.
+        if isinstance(state.human_request, HumanRequestBudgetExhausted):
+            req = state.human_request
+            steps_taken = req.steps_taken
+            # ``ContinueWithBudget(steps)``: grant ``steps_taken + steps`` total
+            # allowance and re-enter the loop from the restored checkpoint. The
+            # strategy tree is rebuilt with the node's budget caps raised so the
+            # restored scope has room for ``steps`` more steps (fork E — budget
+            # context reconstructed from the request alone).
+            if isinstance(response, HumanResponseEscalate) and isinstance(
+                response.action, EscalationActionContinueWithBudget
+            ):
+                granted = steps_taken + response.action.steps
+                resumed_task = _grant_task_budget(task, granted)
+                return await self._drive_strategy(
+                    resumed_task, session_state, budget_used, on_stream
+                )
+            # ``Skip``: the node is marked skipped and the outer loop advances. For
+            # a combinator (PlanExecute) the per-task partial already recorded the
+            # blocked task and persisted the list; re-entering the loop from the
+            # checkpoint advances to the remaining ready tasks. For a bare leaf
+            # there is no sibling, so a skip resolves to a clean (empty) Success
+            # carrying whatever partial history was captured.
+            if isinstance(response, HumanResponseEscalate) and isinstance(
+                response.action, EscalationActionSkip
+            ):
+                if isinstance(task.loop_strategy, PlanExecuteConfig):
+                    return await self._drive_strategy(task, session_state, budget_used, on_stream)
+                return RunResultSuccess(
+                    output="",
+                    session_id=session_id,
+                    usage=AggregateUsage(),
+                    turns=state.turn_number,
+                    session_state=session_state,
+                )
+            # ``Fail`` (and any non-``Escalate`` response — out of contract, treated
+            # conservatively as ``Fail``): abort the node and propagate
+            # ``BudgetExceeded``; the partial is discarded (the ``Fail`` contract).
+            return self._fail(
+                HaltReasonBudgetExceeded(limit_type="turns"),
+                session_id,
+                AggregateUsage(),
+                state.turn_number,
+                SessionState(),
+            )
+
         # Subagent depth: a full child.resume() dispatch lives with
         # SubagentTool (#5); for now we surface a placeholder and continue
         # the parent loop — mirrors the Rust reference behavior.
@@ -5789,6 +6106,21 @@ class StandardHarness:
             pass
 
         if isinstance(response, HumanResponseHalt):
+            return self._fail(
+                HaltReasonHumanHalted(),
+                session_id,
+                AggregateUsage(),
+                state.turn_number,
+                session_state,
+            )
+
+        # An ``Escalate`` response delivered to a NON-budget pause is out of
+        # contract (#130): the budget-escalation resume is handled by the
+        # dedicated ``HumanRequestBudgetExhausted`` branch ABOVE, which returns
+        # early. Reaching here means the operator sent an ``EscalationAction`` for
+        # a ToolApproval / Review / ``None`` pause — halt cleanly rather than
+        # mis-resuming the loop.
+        if isinstance(response, HumanResponseEscalate):
             return self._fail(
                 HaltReasonHumanHalted(),
                 session_id,
@@ -6228,6 +6560,31 @@ class StandardHarness:
         # reached (the scratch budget is not written back on the propagate path).
         # Fall back to the scratch turns if it is somehow 0.
         turns = outcome.steps_taken if outcome.steps_taken > 0 else cx.scratch.run_budget.turns
+        # #130: a BARE LEAF exhaustion bubbles up here without ever resolving
+        # (rule 6). Under ``SurfaceToHuman``, PAUSE with a ``BudgetExhausted``
+        # request (a combinator under ``SurfaceToHuman`` never reaches this branch
+        # — it sets ``terminal_override`` and is returned by the early-return
+        # above). A bare leaf offers ``[ContinueWithBudget, Fail]`` (fork C — no
+        # sibling to ``Skip`` to).
+        from .execution_registry import EscalationModeSurfaceToHuman
+
+        if isinstance(self._config.escalation_mode, EscalationModeSurfaceToHuman):
+            err = BudgetExhausted(
+                policy=outcome.policy,
+                behavior=outcome.behavior,
+                steps_taken=outcome.steps_taken,
+                continues_used=outcome.continues_used,
+                phase=outcome.phase,
+            )
+            return _promote_budget_exhausted_to_human(
+                err,
+                outcome.partial_output,
+                _leaf_escalation_actions(err),
+                session_id,
+                task,
+                cx.scratch.run_budget.model_copy(deep=True),
+                turns,
+            )
         return RunResultFailure(
             reason=HaltReasonBudgetExceeded(limit_type="turns"),
             session_id=session_id,
@@ -8130,7 +8487,12 @@ __all__ = [
     "HarnessStreamEvent",
     "HarnessToolResult",
     "HookPoint",
+    "EscalationAction",
+    "EscalationActionContinueWithBudget",
+    "EscalationActionFail",
+    "EscalationActionSkip",
     "HumanRequest",
+    "HumanRequestBudgetExhausted",
     "HumanRequestClarification",
     "HumanRequestReview",
     "HumanRequestToolApproval",
@@ -8140,6 +8502,7 @@ __all__ = [
     "HumanResponseAnswer",
     "HumanResponseApproveWithFeedback",
     "HumanResponseDeny",
+    "HumanResponseEscalate",
     "HumanResponseHalt",
     "HumanResponseReject",
     "AgentRef",

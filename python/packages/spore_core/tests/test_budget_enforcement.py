@@ -366,6 +366,13 @@ def test_charge_with_no_scope_never_exhausts() -> None:
 
 
 def _config(agent: MockAgent, tool_registry: ScriptedToolRegistry) -> HarnessConfig:
+    # #130: this suite asserts the #125 ``Escalate`` PROPAGATE behavior (a budget
+    # exhaustion surfaces as a ``BudgetExceeded`` terminal). Under the default
+    # ``SurfaceToHuman`` mode that exhaustion now PAUSES, so pin ``Autonomous``
+    # explicitly — mirroring the Rust ``standard_config`` used by the propagate
+    # tests.
+    from spore_core import EscalationModeAutonomous
+
     return HarnessConfig(
         agent=agent,
         tool_registry=tool_registry,
@@ -373,6 +380,7 @@ def _config(agent: MockAgent, tool_registry: ScriptedToolRegistry) -> HarnessCon
         context_manager=NoopContextManager(),
         termination_policy=AlwaysContinuePolicy(),
         storage=StorageProvider.single(InMemoryStorageProvider()),
+        escalation_mode=EscalationModeAutonomous(),
     )
 
 
