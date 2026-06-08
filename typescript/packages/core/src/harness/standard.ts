@@ -132,12 +132,18 @@ import {
   type ConsultOverflowPolicy,
   type ConsultResponse,
   type ContextManager,
+  type EscalationAction,
   type EscalationMode,
   type HaltReason,
   HarnessError,
   InvalidConfiguration,
   UnresolvedHandle,
   type AgentRef,
+  autonomous,
+  type BudgetExhausted,
+  grantTaskBudget,
+  leafEscalationActions,
+  promoteBudgetExhaustedToHuman,
   type HarnessRunOptions,
   surfaceToHuman,
   type HookPoint,
@@ -704,16 +710,41 @@ export class StandardHarness implements Harness, StrategyExecutor {
           turns: cx.scratch.runBudget.turns,
           session_state: cx.scratch.runSession,
         };
-      case "budget_exhausted":
+      case "budget_exhausted": {
+        // #130: a BARE LEAF exhaustion propagates here without ever resolving
+        // (rule 6). Under `surface_to_human`, PAUSE with a `budget_exhausted`
+        // request (a combinator under `surface_to_human` never reaches this arm
+        // — it sets `terminalOverride` and is returned by the early-return
+        // above). A bare leaf offers `[continue_with_budget, fail]` (fork C — no
+        // sibling to `skip` to).
+        // #125: the exhausted node's own `stepsTaken` is the turn count it
+        // reached (the scratch budget is not written back on the propagate
+        // path). Fall back to the scratch turns if it is somehow 0.
+        const turns = outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns;
+        if (this.escalationMode().kind === "surface_to_human") {
+          const err: BudgetExhausted = {
+            policy: outcome.policy,
+            behavior: { kind: "escalate" },
+            stepsTaken: outcome.stepsTaken,
+            continuesUsed: outcome.continuesUsed,
+            phase: outcome.phase,
+          };
+          return promoteBudgetExhaustedToHuman(
+            err,
+            outcome.partialOutput,
+            leafEscalationActions(err),
+            sessionId,
+            task,
+            cx.scratch.runBudget,
+            turns,
+          );
+        }
         return {
           kind: "failure",
           reason: { kind: "budget_exceeded", limit_type: "turns" },
           session_id: sessionId,
           usage: cx.usage,
-          // #125: the exhausted node's own `stepsTaken` is the turn count it
-          // reached (the scratch budget is not written back on the propagate
-          // path). Fall back to the scratch turns if it is somehow 0.
-          turns: outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns,
+          turns,
           // #125: carry the node-concrete partial as an assistant text message so
           // a parent / caller can inspect what was produced before exhaustion.
           session_state:
@@ -726,6 +757,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 }
               : emptySessionState(),
         };
+      }
     }
   }
 
@@ -1280,6 +1312,18 @@ export class StandardHarness implements Harness, StrategyExecutor {
     }
   }
 
+  /** {@inheritDoc StrategyExecutor.escalationMode} */
+  escalationMode(): EscalationMode {
+    // Mirrors Rust `StandardHarness::escalation_mode` (returns
+    // `self.config.escalation_mode`). In Rust the field is non-optional; here it
+    // is optional, so a raw {@link HarnessConfig} that omits the knob falls back
+    // to {@link autonomous} — preserving the pre-#130 propagate behavior (no
+    // pause) for legacy callers that never set it. The {@link HarnessBuilder}
+    // explicitly defaults the knob to {@link surfaceToHuman}, so builder-based
+    // callers opt into HITL.
+    return this.config.escalationMode ?? autonomous;
+  }
+
   async resume(
     state: PausedState,
     response: HumanResponse,
@@ -1299,6 +1343,64 @@ export class StandardHarness implements Harness, StrategyExecutor {
   ): Promise<RunResult> {
     const sessionState = state.session_state;
     const pendingCalls = state.pending_tool_calls;
+
+    // Budget-escalation resume (#130): if this pause came from
+    // `budget_exhausted`, map the operator's `EscalationAction` BEFORE the
+    // generic `switch (response)` (mirrors the clarification branch). The node's
+    // budget context is reconstructed from the request fields (carried on
+    // `steps_taken` / `continues_used` — fork E), NOT a durable cross-process
+    // checkpoint (#129).
+    if (state.human_request?.kind === "budget_exhausted" && response.kind === "escalate") {
+      const stepsTaken = state.human_request.steps_taken;
+      const action: EscalationAction = response.action;
+      switch (action.kind) {
+        // Grant `steps` ADDITIONAL allowance and re-enter the loop from the
+        // restored checkpoint. The strategy tree is rebuilt with the node's
+        // budget policy raised to `stepsTaken + steps` so the restored scope has
+        // room for `steps` more steps.
+        case "continue_with_budget": {
+          const granted = stepsTaken + action.steps;
+          const resumedTask = grantTaskBudget(state.task, granted);
+          return this.driveStrategy(resumedTask, sessionState, state.budget_used, onStream, signal);
+        }
+        // Skip: the node is marked skipped and the outer loop advances. For a
+        // combinator (PlanExecute) re-entering the loop from the checkpoint
+        // advances to the remaining ready tasks. For a leaf there is no sibling,
+        // so a skip resolves to a clean (empty) Success carrying whatever partial
+        // history was captured.
+        case "skip": {
+          if (state.task.loop_strategy.kind === "plan_execute") {
+            return this.driveStrategy(
+              state.task,
+              sessionState,
+              state.budget_used,
+              onStream,
+              signal,
+            );
+          }
+          return {
+            kind: "success",
+            output: "",
+            session_id: state.session_id,
+            usage: emptyAggregateUsage(),
+            turns: state.turn_number,
+            session_state: sessionState,
+          };
+        }
+        // Fail: abort the node and propagate `budget_exceeded`; the partial is
+        // discarded (the `fail` resolution contract).
+        case "fail":
+          return {
+            kind: "failure",
+            reason: { kind: "budget_exceeded", limit_type: "turns" },
+            session_id: state.session_id,
+            usage: emptyAggregateUsage(),
+            turns: state.turn_number,
+            session_state: emptySessionState(),
+          };
+      }
+    }
+
     // Resolve the effective tool registry for this resumed session — bridges
     // catalogue tools the same way the turn loop does (issue #91), so pending
     // tool calls dispatched during resume thread the run's storage + sandbox.
@@ -1405,6 +1507,22 @@ export class StandardHarness implements Harness, StrategyExecutor {
         }
         break;
       }
+
+      // #130: an `escalate` response paired with a `budget_exhausted` request is
+      // handled by the dedicated branch ABOVE, which returns before this switch.
+      // An `escalate` reaching here is therefore out of contract — the operator
+      // supplied an `EscalationAction` for a `tool_approval` / `review` / `none`
+      // pause — so treat it conservatively as a budget-exceeded failure rather
+      // than silently re-entering the loop.
+      case "escalate":
+        return {
+          kind: "failure",
+          reason: { kind: "budget_exceeded", limit_type: "turns" },
+          session_id: state.session_id,
+          usage: emptyAggregateUsage(),
+          turns: state.turn_number,
+          session_state: emptySessionState(),
+        };
 
       default: {
         const _exhaustive: never = response;

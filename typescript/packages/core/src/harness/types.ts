@@ -1096,6 +1096,14 @@ export interface StrategyExecutor {
 
   /** Finalize observability for a terminal outcome. No-op for non-terminal. */
   finalize(result: RunResult): Promise<void>;
+
+  /**
+   * The configured HITL-vs-AFK {@link EscalationMode} (#130). Consulted at each
+   * `escalate` budget-resolution site: `surface_to_human` PAUSES with a
+   * {@link HumanRequest} `budget_exhausted`; `autonomous` keeps the existing
+   * propagate behavior. Mirrors Rust `StrategyExecutor::escalation_mode`.
+   */
+  escalationMode(): EscalationMode;
 }
 
 /**
@@ -1477,6 +1485,144 @@ export function promoteBudgetExhausted(
     continuesUsed: err.continuesUsed,
     phase: err.phase,
     partialOutput,
+  };
+}
+
+// ============================================================================
+// #130 — budget-exhaustion HITL pause helpers
+// ============================================================================
+
+/**
+ * The advisory `available_actions` a COMBINATOR offers on a budget-exhaustion
+ * pause (#130, fork C): `[continue_with_budget, skip, fail]`. The suggested
+ * `steps` defaults to the scope's own allowance (or 1 for an uncapped scope).
+ * Mirrors Rust `combinator_escalation_actions`.
+ */
+export function combinatorEscalationActions(err: BudgetExhausted): EscalationAction[] {
+  const steps = budgetPolicyAllowanceValue(err.policy) ?? 1;
+  return [{ kind: "continue_with_budget", steps }, { kind: "skip" }, { kind: "fail" }];
+}
+
+/**
+ * The advisory `available_actions` a BARE LEAF offers on a budget-exhaustion
+ * pause (#130, fork C): `[continue_with_budget, fail]` — a leaf has no sibling
+ * tasks to advance to, so `skip` is OMITTED. Mirrors Rust
+ * `leaf_escalation_actions`.
+ */
+export function leafEscalationActions(err: BudgetExhausted): EscalationAction[] {
+  const steps = budgetPolicyAllowanceValue(err.policy) ?? 1;
+  return [{ kind: "continue_with_budget", steps }, { kind: "fail" }];
+}
+
+/**
+ * Promote a charge-time {@link BudgetExhausted} to a {@link RunResult}
+ * `waiting_for_human` (#130 HITL pause boundary). Built ONLY when a node's
+ * `escalate` resolution is consulted under `surface_to_human`; it carries the
+ * node's `partialOutput` and the advisory `available_actions` (combinators pass
+ * {@link combinatorEscalationActions}; a bare leaf passes
+ * {@link leafEscalationActions} — fork C). The {@link PausedState} records the
+ * node's `steps_taken` / `continues_used` (on the request) so `resumeInner` can
+ * reconstruct the node's budget context from the request alone (fork E).
+ *
+ * The `partialOutput` is preserved both on the request (for the operator to
+ * inspect) AND as a single assistant text message on the paused `session_state`
+ * (so a resume re-enters the loop with that context). Mirrors Rust
+ * `promote_budget_exhausted_to_human`.
+ */
+export function promoteBudgetExhaustedToHuman(
+  err: BudgetExhausted,
+  partialOutput: string | undefined,
+  availableActions: EscalationAction[],
+  sessionId: SessionId,
+  task: Task,
+  budgetUsed: BudgetSnapshot,
+  turnNumber: number,
+): RunResult {
+  const sessionState: SessionState =
+    partialOutput != null
+      ? {
+          messages: [{ role: "assistant", content: { type: "text", text: partialOutput } }],
+          extras: {},
+        }
+      : emptySessionState();
+  const request: HumanRequest = {
+    kind: "budget_exhausted",
+    phase: err.phase,
+    policy: err.policy,
+    steps_taken: err.stepsTaken,
+    continues_used: err.continuesUsed,
+    partial_output: partialOutput,
+    available_actions: availableActions,
+  };
+  const state: PausedState = {
+    session_id: sessionId,
+    task_id: task.id,
+    turn_number: turnNumber,
+    session_state: sessionState,
+    pending_tool_calls: [],
+    approved_results: [],
+    human_request: request,
+    task,
+    budget_used: budgetUsed,
+    child_state: null,
+  };
+  return { kind: "waiting_for_human", state, request };
+}
+
+/**
+ * Raise a {@link BudgetPolicy}'s per-scope cap to at least `granted` (#130
+ * `continue_with_budget` grant). `unlimited` is left untouched (already
+ * uncapped); a `total_steps` / `per_loop` / `per_attempt` value below `granted`
+ * is raised to `granted`. Lower grants are no-ops (never SHRINKS an allowance).
+ * Returns a fresh policy — does not mutate. Mirrors Rust `grant_budget_policy`.
+ */
+function grantBudgetPolicy(policy: BudgetPolicy, granted: number): BudgetPolicy {
+  if (policy.kind === "unlimited") return policy;
+  return policy.value < granted ? { kind: policy.kind, value: granted } : policy;
+}
+
+/**
+ * Recurse a {@link LoopStrategy} tree raising every ReAct leaf's `budget` cap to
+ * at least `granted` (#130). The combinator nodes carry no inline policy (they
+ * derive it from `task.budget.max_turns`, raised by {@link grantTaskBudget}), so
+ * this only touches the leaves. Returns a fresh strategy. Mirrors Rust
+ * `grant_strategy_budget`.
+ */
+function grantStrategyBudget(ls: LoopStrategy, granted: number): LoopStrategy {
+  switch (ls.kind) {
+    case "react":
+      return { ...ls, budget: grantBudgetPolicy(ls.budget, granted) };
+    case "plan_execute":
+      return {
+        ...ls,
+        plan: grantStrategyBudget(ls.plan, granted),
+        execute: grantStrategyBudget(ls.execute, granted),
+      };
+    case "self_verifying":
+      return { ...ls, inner: grantStrategyBudget(ls.inner, granted) };
+    case "ralph":
+      return { ...ls, inner: grantStrategyBudget(ls.inner, granted) };
+    case "hill_climbing":
+      return { ...ls, inner: grantStrategyBudget(ls.inner, granted) };
+  }
+}
+
+/**
+ * Reconstruct a resumed task's strategy tree with its budget caps raised to
+ * `granted` (#130 `continue_with_budget`). The ReAct leaf caps live on each
+ * node's own `budget` {@link BudgetPolicy}; the combinator nodes derive their cap
+ * from `task.budget.max_turns`, so BOTH are raised. Fork E: `granted` is
+ * `request.steps_taken + steps`, so the restored scope has room for `steps` more
+ * steps after the checkpoint. Returns a fresh task — does not mutate. Mirrors
+ * Rust `grant_task_budget`.
+ */
+export function grantTaskBudget(task: Task, granted: number): Task {
+  const maxTurns = task.budget.max_turns;
+  const raised = maxTurns == null || maxTurns < granted ? granted : maxTurns;
+  return {
+    ...task,
+    budget: { ...task.budget, max_turns: raised },
+    loop_strategy: grantStrategyBudget(task.loop_strategy, granted),
   };
 }
 
@@ -1987,14 +2133,29 @@ async function runPlanExecuteConfig(
         }
         continue;
       }
-      // Escalate / Continue: surface the partial and abort the run (the
-      // in-process Continue loop is #129; today only escalate/fail are reachable).
+      // Escalate / Continue: under `autonomous`, surface the partial and abort
+      // the run (the in-process Continue loop is #129; today only escalate/fail
+      // are reachable). Under `surface_to_human` (#130) the node PAUSES with a
+      // `budget_exhausted` request via the `terminalOverride` seam instead of
+      // propagating up. Combinators offer [continue_with_budget, skip, fail].
       updateTask(taskList, taskId, "blocked");
       await executor.persistTaskList(sessionId, taskList);
       const partial = planExecutePartialJson(taskList);
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
+      if (executor.escalationMode().kind === "surface_to_human") {
+        const waiting = promoteBudgetExhaustedToHuman(
+          err,
+          partial,
+          combinatorEscalationActions(err),
+          sessionId,
+          task,
+          { ...carried },
+          carried.turns,
+        );
+        return recordTerminal(cx, waiting);
+      }
       return promoteBudgetExhausted(err, partial);
     }
 
@@ -2041,8 +2202,23 @@ async function runPlanExecuteConfig(
         switch (resolution) {
           case "fail":
             return promoteBudgetExhausted(stepCharge.error, undefined);
+          // #130: under `surface_to_human`, PAUSE with a `budget_exhausted`
+          // request instead of propagating up. Combinators offer
+          // [continue_with_budget, skip, fail].
           case "continue":
           case "escalate":
+            if (executor.escalationMode().kind === "surface_to_human") {
+              const waiting = promoteBudgetExhaustedToHuman(
+                stepCharge.error,
+                partial,
+                combinatorEscalationActions(stepCharge.error),
+                sessionId,
+                task,
+                { ...carried },
+                carried.turns,
+              );
+              return recordTerminal(cx, waiting);
+            }
             return promoteBudgetExhausted(stepCharge.error, partial);
         }
       }
@@ -2319,8 +2495,24 @@ async function runSelfVerifyingConfig(
         // — live bodies push an `escalate` placeholder, so `resolveCurrent` never
         // yields `continue` here. Handle it EXPLICITLY (surface-with-partial)
         // rather than via a silent fall-through.
+        //
+        // #130: under `surface_to_human`, PAUSE with a `budget_exhausted` request
+        // instead of propagating up. Combinators offer
+        // [continue_with_budget, skip, fail].
         case "continue":
         case "escalate":
+          if (executor.escalationMode().kind === "surface_to_human") {
+            const waiting = promoteBudgetExhaustedToHuman(
+              buildCharge.error,
+              partial,
+              combinatorEscalationActions(buildCharge.error),
+              buildSessionId,
+              task,
+              { ...carried },
+              carried.turns,
+            );
+            return recordTerminal(cx, waiting);
+          }
           return promoteBudgetExhausted(buildCharge.error, partial);
       }
     }
@@ -2590,8 +2782,24 @@ async function runHillClimbingConfig(
         // push an `escalate` placeholder, so `resolveCurrent` never yields
         // `continue` here. Handle it EXPLICITLY (surface-with-partial) rather
         // than via a silent fall-through.
+        //
+        // #130: under `surface_to_human`, PAUSE with a `budget_exhausted` request
+        // instead of propagating up. Combinators offer
+        // [continue_with_budget, skip, fail].
         case "continue":
         case "escalate":
+          if (executor.escalationMode().kind === "surface_to_human") {
+            const waiting = promoteBudgetExhaustedToHuman(
+              gateCharge.error,
+              partial,
+              combinatorEscalationActions(gateCharge.error),
+              sessionId,
+              task,
+              { ...carried },
+              carried.turns,
+            );
+            return recordTerminal(cx, waiting);
+          }
           return promoteBudgetExhausted(gateCharge.error, partial);
       }
     }
@@ -3510,6 +3718,27 @@ export type { ObservabilityProvider } from "../observability/types.js";
 export const RiskLevelSchema = z.enum(["low", "medium", "high", "critical"]);
 export type RiskLevel = z.infer<typeof RiskLevelSchema>;
 
+/**
+ * The operator's choice on a budget-exhaustion {@link HumanRequest}
+ * `budget_exhausted` pause (#130). Tagged on `kind`, snake_case. The
+ * data-carrying variant uses a NAMED `steps` field (mirroring {@link BudgetPolicy}'s
+ * `value` convention — fork A); the wire form is
+ * `{"kind":"continue_with_budget","steps":N}`.
+ *
+ *   - `continue_with_budget` — grant `steps` ADDITIONAL steps to the node's
+ *     budget scope and resume from the checkpoint.
+ *   - `skip` — mark the current task skipped; a combinator's outer loop advances
+ *     to its sibling tasks. Offered only by combinators (fork C).
+ *   - `fail` — abort the node and propagate `budget_exceeded` (partial
+ *     discarded, mirroring the `fail` resolution contract).
+ */
+export const EscalationActionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("continue_with_budget"), steps: u32 }),
+  z.object({ kind: z.literal("skip") }),
+  z.object({ kind: z.literal("fail") }),
+]);
+export type EscalationAction = z.infer<typeof EscalationActionSchema>;
+
 export const HumanRequestSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("tool_approval"),
@@ -3525,6 +3754,24 @@ export const HumanRequestSchema = z.discriminatedUnion("kind", [
     options: z.array(z.string()).nullable().optional(),
   }),
   z.object({ kind: z.literal("review"), content: z.string() }),
+  // A node's budget scope resolved to `escalate` under `surface_to_human`
+  // (#130): the run pauses and surfaces the exhaustion to the operator. Carries
+  // the node's `phase`, its `policy`, the `steps_taken` / `continues_used`
+  // counters (so `resumeInner` can reconstruct the node's budget context — fork
+  // E), any `partial_output` produced before exhaustion, and the ADVISORY
+  // `available_actions` the author offers (fork C/D). The operator answers with
+  // {@link HumanResponse} `escalate`. Existing variants are UNCHANGED.
+  z.object({
+    kind: z.literal("budget_exhausted"),
+    phase: z.string(),
+    policy: BudgetPolicySchema,
+    steps_taken: u32,
+    continues_used: u32,
+    // Optional — omitted from the wire when absent (a `fail`-resolved partial is
+    // discarded by contract).
+    partial_output: z.string().nullable().optional(),
+    available_actions: z.array(EscalationActionSchema),
+  }),
 ]);
 export type HumanRequest = z.infer<typeof HumanRequestSchema>;
 
@@ -3535,7 +3782,25 @@ export type HumanResponse =
   | { kind: "halt" }
   | { kind: "answer"; text: string }
   | { kind: "approve_with_feedback"; feedback: string }
-  | { kind: "reject"; reason: string };
+  | { kind: "reject"; reason: string }
+  /**
+   * The operator's resolution of a {@link HumanRequest} `budget_exhausted`
+   * pause (#130): the chosen {@link EscalationAction}. Distinct from
+   * `allow`/`halt`/`deny` so the budget-escalation resume path is unambiguous
+   * (fork B).
+   */
+  | { kind: "escalate"; action: EscalationAction };
+
+export const HumanResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("allow") }),
+  z.object({ kind: z.literal("allow_with_modification"), calls: z.array(ToolCallSchema) }),
+  z.object({ kind: z.literal("deny"), reason: z.string() }),
+  z.object({ kind: z.literal("halt") }),
+  z.object({ kind: z.literal("answer"), text: z.string() }),
+  z.object({ kind: z.literal("approve_with_feedback"), feedback: z.string() }),
+  z.object({ kind: z.literal("reject"), reason: z.string() }),
+  z.object({ kind: z.literal("escalate"), action: EscalationActionSchema }),
+]) satisfies z.ZodType<HumanResponse>;
 
 // ============================================================================
 // Mid-loop consult primitive (issue #114)
