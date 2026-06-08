@@ -104,12 +104,14 @@ async fn drive_plan_phase(exchange: RecordedExchange) {
         LoopStrategy::PlanExecute(PlanExecuteConfig {
             plan: Box::new(LoopStrategy::ReAct(ReactConfig {
                 budget: spore_core::BudgetPolicy::PerLoop { value: u32::MAX },
+                behavior: spore_core::BudgetExhaustedBehavior::Escalate,
                 agent: spore_core::AgentRef(String::new()),
                 toolset: spore_core::ToolsetRef(String::new()),
                 output: Some(spore_core::SchemaRef(String::new())),
             })),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model: None,
+            behavior: spore_core::BudgetExhaustedBehavior::Escalate,
         }),
     );
     match harness.run(HarnessRunOptions::new(task)).await {

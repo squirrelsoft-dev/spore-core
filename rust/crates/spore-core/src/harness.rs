@@ -66,6 +66,41 @@
 //!     SelfVerifying only; explicit `with_session_state` wins) + terminal
 //!     auto-persist on top for cross-process continuity by `session_id`.
 //!     OFF by default: zero session-store I/O and byte-identical message flow.
+//! 12. Continue cross-process checkpoint (issue #129). Three parts:
+//!     - **Serialized `behavior` field.** All FIVE strategy config structs
+//!       (`ReactConfig`, `PlanExecuteConfig`, `SelfVerifyingConfig`, `RalphConfig`,
+//!       `HillClimbingConfig`) carry a serialized `behavior:
+//!       BudgetExhaustedBehavior` for a UNIFORM wire shape (Q1). CANONICAL
+//!       POSITION: on `ReactConfig` it is IMMEDIATELY after `budget`; on every
+//!       combinator it is the LAST field. SERDE TREATMENT: `#[serde(default =
+//!       "default_budget_behavior")]` (default `Escalate`) so a tree serialized
+//!       before #129 still deserializes, but the field is NOT `skip_serializing_if`
+//!       — it ALWAYS serializes, so every node carries an explicit
+//!       `"behavior":{"kind":...}`. The parallel-language ports MUST emit the
+//!       field in these exact positions for byte-identity.
+//!     - **`ExhaustedResolution::Continue` is now live (no longer dead).** Each
+//!       combinator's `Continue` arm loops IN-PROCESS (the scope's
+//!       `resolve_current` reset `steps_taken` + bumped `continues_used`); the
+//!       BARE-LEAF resolution site is `drive_strategy`, which honors a top-level
+//!       leaf's `behavior` (a NESTED leaf still PROPAGATES — rule 6 — Q1). The
+//!       in-process Continue path performs NO serialization (AC3).
+//!     - **Resume-side `continues_used` fix (AC2, load-bearing).** A `Continue`
+//!       that spans a process pause resumes with the correct count:
+//!       `resume_inner` reads `continues_used` from the
+//!       `HumanRequest::BudgetExhausted` payload (the SOLE carrier across a pause
+//!       — Q3, NO new serialized `PausedState`/`BudgetSnapshot` field) and seeds
+//!       it back via `BudgetContext::resumed` (a runtime-only constructor) +
+//!       `RunScratch::resume_continues`. Pre-#129 the resume rebuilt the scope
+//!       from `steps_taken` only, ZEROING the counter and over-granting continues.
+//!     - **Shared checkpoint utility (AC1, Q2).** `PausedState::serialize_checkpoint`
+//!       / `load_checkpoint` is the durable pause/resume round-trip reused by BOTH
+//!       the cross-process Continue path AND Ralph's pause-propagation. It is JUST
+//!       the `PausedState` round-trip — it does NOT unify the two paths' CONTEXT
+//!       policies: Continue PRESERVES `session_state.messages`; Ralph DISCARDS +
+//!       re-seeds from its own filesystem `.spore/progress.json` checkpoint
+//!       (`RalphProgress`/`ralph_seed_session`), which stays Ralph-specific.
+//!
+//!     No `// SPEC QUESTION:` markers — all three #129 design forks are resolved.
 //!
 //! ## Component dependencies (forward declarations)
 //!
@@ -311,6 +346,21 @@ pub enum BudgetExhaustedBehavior {
     Fail,
 }
 
+/// The default [`BudgetExhaustedBehavior`] for a config node's serialized
+/// `behavior` field (#129): `Escalate`. Two roles:
+///   - `#[serde(default = "default_budget_behavior")]` so a strategy tree
+///     serialized BEFORE #129 (no `behavior` key) still deserializes to the
+///     historical placeholder, preserving backward-compat reads.
+///   - the value `ReactConfig::per_loop` / migration shims stamp so a bare leaf
+///     keeps its pre-#129 propagate-to-parent contract by default.
+///
+/// The field is NOT `skip_serializing_if`: it ALWAYS serializes (uniform wire
+/// shape across all five config structs, Q1), so the cross-language fixtures
+/// carry an explicit `"behavior":{"kind":"escalate"}` on every node.
+fn default_budget_behavior() -> BudgetExhaustedBehavior {
+    BudgetExhaustedBehavior::Escalate
+}
+
 // ============================================================================
 // Task + loop strategy
 // ============================================================================
@@ -387,6 +437,13 @@ pub struct SchemaRef(pub String);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReactConfig {
     pub budget: BudgetPolicy,
+    /// What this node does when its `budget` is spent (#129). Canonical position:
+    /// IMMEDIATELY after `budget`. A leaf honors its `behavior` ONLY at the
+    /// top-level/bare-leaf resolution site (`drive_strategy`); in the normal
+    /// NESTED case the leaf still PROPAGATES exhaustion to its parent (#125 rule
+    /// 6 — a nested leaf never self-resolves). Always serialized (Q1).
+    #[serde(default = "default_budget_behavior")]
+    pub behavior: BudgetExhaustedBehavior,
     pub agent: AgentRef,
     pub toolset: ToolsetRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +457,7 @@ impl ReactConfig {
     pub fn per_loop(value: u32) -> Self {
         Self {
             budget: BudgetPolicy::PerLoop { value },
+            behavior: default_budget_behavior(),
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
@@ -425,6 +483,10 @@ pub struct PlanExecuteConfig {
     pub execute: Box<LoopStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_model: Option<ModelConfig>,
+    /// What this combinator does when its execute-phase budget is spent (#129).
+    /// Canonical position on a combinator: the LAST field. Always serialized (Q1).
+    #[serde(default = "default_budget_behavior")]
+    pub behavior: BudgetExhaustedBehavior,
 }
 
 impl PlanExecuteConfig {
@@ -436,6 +498,7 @@ impl PlanExecuteConfig {
             plan: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model,
+            behavior: default_budget_behavior(),
         }
     }
 }
@@ -445,6 +508,10 @@ impl PlanExecuteConfig {
 pub struct SelfVerifyingConfig {
     pub inner: Box<LoopStrategy>,
     pub evaluator: SchemaRef,
+    /// What this combinator does when its build↔evaluate budget is spent (#129).
+    /// Canonical position on a combinator: the LAST field. Always serialized (Q1).
+    #[serde(default = "default_budget_behavior")]
+    pub behavior: BudgetExhaustedBehavior,
 }
 
 /// Ralph combinator: re-run `inner` under a fixed `agent` across context-window
@@ -453,6 +520,13 @@ pub struct SelfVerifyingConfig {
 pub struct RalphConfig {
     pub inner: Box<LoopStrategy>,
     pub agent: AgentRef,
+    /// What Ralph does when its own scope is spent (#129). Canonical position on
+    /// a combinator: the LAST field. Always serialized (Q1). NOTE: Ralph's window
+    /// recovery (reset + retry) is independent of this field — it governs Ralph's
+    /// OWN budget scope, not the per-window child exhaustion (which Ralph already
+    /// absorbs as "window incomplete" and retries).
+    #[serde(default = "default_budget_behavior")]
+    pub behavior: BudgetExhaustedBehavior,
 }
 
 /// HillClimbing combinator: iterate `inner`, keeping/reverting per the metric
@@ -466,6 +540,11 @@ pub struct HillClimbingConfig {
     pub revert_on_no_improvement: bool,
     pub min_improvement_delta: f64,
     pub evaluator: AgentRef,
+    /// What this combinator does when its optimization-loop budget is spent
+    /// (#129). Canonical position on a combinator: the LAST field. Always
+    /// serialized (Q1).
+    #[serde(default = "default_budget_behavior")]
+    pub behavior: BudgetExhaustedBehavior,
 }
 
 /// Loop strategy — a closed, recursive serde enum of config newtypes. The
@@ -633,6 +712,29 @@ impl BudgetContext {
             behavior,
             steps_taken: 0,
             continues_used: 0,
+            phase: phase.into(),
+        }
+    }
+
+    /// Reconstruct a RESUMED scope (#129) whose `continues_used` is seeded from a
+    /// cross-process checkpoint — the sole field of [`BudgetContext`] that must
+    /// survive a process pause. `steps_taken` starts at 0 (the resumed run
+    /// re-enters the loop with a fresh per-round step budget; the checkpoint only
+    /// carries how many continues were ALREADY spent so a `Continue` spanning the
+    /// pause cannot exceed `max_continues`). Runtime-only — `continues_used` is
+    /// read off the `HumanRequest::BudgetExhausted` payload (Q3: NOT a new
+    /// serialized `BudgetContext`/`PausedState` field).
+    pub fn resumed(
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        phase: impl Into<String>,
+        continues_used: u32,
+    ) -> Self {
+        Self {
+            policy,
+            behavior,
+            steps_taken: 0,
+            continues_used,
             phase: phase.into(),
         }
     }
@@ -865,6 +967,16 @@ pub struct RunScratch {
     /// harness entry returns this directly when set, preserving the pause/escalate
     /// contract through the recursive executor (#124).
     pub terminal_override: Option<RunResult>,
+    /// Cross-process Continue checkpoint seed (#129): `(phase, continues_used)`
+    /// carried from a resumed [`HumanRequest::BudgetExhausted`]. The FIRST
+    /// [`push_budget`](ExecutionContext::push_budget) whose `phase` matches seeds
+    /// the reconstructed scope's `continues_used` (via [`BudgetContext::resumed`])
+    /// and CLEARS this seed — so a `Continue` spanning a process pause resumes
+    /// with the correct continue count (AC2). Runtime-only; the value rides the
+    /// request payload, NOT a serialized `BudgetContext`/`PausedState` field (Q3).
+    /// `None` on a fresh run and after the seed is consumed (an in-process
+    /// Continue never sets it → AC3: no serialization on the in-process path).
+    pub resume_continues: Option<(String, u32)>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -1214,16 +1326,14 @@ impl RunStrategy for ReactConfig {
                     return cx.record_terminal(result);
                 }
             };
-            // #125: push this leaf's OWN budget scope. The leaf carries only its
-            // POLICY (the cap); behavior is `Escalate` as a leaf placeholder — the
-            // leaf never RESOLVES it (rule 6: propagate to parent), it is only the
-            // scope shape so the charge below enforces the cap and any exhaustion
-            // promotes to a parent-inspectable `BudgetExhausted`.
-            cx.push_budget(
-                self.budget.clone(),
-                BudgetExhaustedBehavior::Escalate,
-                "react",
-            );
+            // #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
+            // `behavior`. The leaf still never RESOLVES it in the nested case (rule
+            // 6: it PROPAGATES a `BudgetExhausted` to its parent, which owns the
+            // single recovery site). Carrying the real `behavior` only means the
+            // propagated error reports it, so the TOP-LEVEL/bare-leaf resolution
+            // site (`drive_strategy`) can honor it (Q1 — a bare leaf self-resolves,
+            // a nested leaf does not).
+            cx.push_budget(self.budget.clone(), self.behavior.clone(), "react");
             // The leaf takes the run's stream sink for the window. Combinators
             // that recurse per-phase suppress it (they take it before recursing).
             let on_stream = cx.stream.take();
@@ -1288,7 +1398,7 @@ impl RunStrategy for ReactConfig {
                         })
                         .unwrap_or_else(|| BudgetExhausted {
                             policy: self.budget.clone(),
-                            behavior: BudgetExhaustedBehavior::Escalate,
+                            behavior: self.behavior.clone(),
                             steps_taken: window_turns,
                             continues_used: 0,
                             phase: "react".to_string(),
@@ -1506,11 +1616,7 @@ impl RunStrategy for PlanExecuteConfig {
                 Some(max) => BudgetPolicy::TotalSteps { value: max },
                 None => BudgetPolicy::Unlimited,
             };
-            cx.push_budget(
-                plan_policy,
-                BudgetExhaustedBehavior::Escalate,
-                "plan_execute",
-            );
+            cx.push_budget(plan_policy, self.behavior.clone(), "plan_execute");
 
             // Total positional count for the OnTaskAdvance hook (stable).
             let total_tasks = task_list.tasks.len();
@@ -1637,13 +1743,23 @@ impl RunStrategy for PlanExecuteConfig {
                             }
                             continue;
                         }
-                        // Escalate/Continue: under `Autonomous`, surface the
-                        // partial and abort the run (the in-process Continue loop
-                        // is #129; today only Escalate/Fail are reachable — see
-                        // #125 notes). Under `SurfaceToHuman` (#130) the node
-                        // PAUSES with a `BudgetExhausted` request via the
-                        // `terminal_override` seam instead of propagating up.
-                        ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
+                        // #129: a granted `Continue` loops IN-PROCESS — the scope's
+                        // `resolve_current` already reset `steps_taken` and bumped
+                        // `continues_used`. Reset this task to `Pending` and re-enter
+                        // the ready-set walk so it runs again under the refreshed
+                        // scope allowance (NO serialization — AC3). `max_continues`
+                        // bounds the loop: once continues are spent, the chain falls
+                        // through to `Fail`/`Escalate`.
+                        ExhaustedResolution::Continue => {
+                            let _ = task_list.update(task_id, Some(TaskStatus::Pending), None);
+                            executor.persist_task_list(&session_id, &task_list).await;
+                            continue;
+                        }
+                        // Escalate: under `Autonomous`, surface the partial and abort
+                        // the run. Under `SurfaceToHuman` (#130) the node PAUSES with
+                        // a `BudgetExhausted` request via the `terminal_override`
+                        // seam instead of propagating up.
+                        ExhaustedResolution::Escalate => {
                             let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
                             executor.persist_task_list(&session_id, &task_list).await;
                             let partial = plan_execute_partial_json(&task_list);
@@ -1713,8 +1829,14 @@ impl RunStrategy for PlanExecuteConfig {
 
                         // #125: charge this step's turns against the PlanExecute scope.
                         if let Err(err) = cx.charge_current(turns.saturating_sub(carried_before)) {
-                            let partial = plan_execute_partial_json(&task_list);
                             let resolution = cx.resolve_current();
+                            // #129: a granted `Continue` refreshes the scope and
+                            // keeps scheduling the remaining ready tasks IN-PROCESS
+                            // (this step already completed). NO serialization (AC3).
+                            if matches!(resolution, ExhaustedResolution::Continue) {
+                                continue;
+                            }
+                            let partial = plan_execute_partial_json(&task_list);
                             cx.pop_budget();
                             cx.scratch.task = Some(task.clone());
                             cx.stream = on_stream;
@@ -1936,11 +2058,7 @@ impl RunStrategy for SelfVerifyingConfig {
                 Some(max) => BudgetPolicy::TotalSteps { value: max },
                 None => BudgetPolicy::Unlimited,
             };
-            cx.push_budget(
-                sv_policy,
-                BudgetExhaustedBehavior::Escalate,
-                "self_verifying",
-            );
+            cx.push_budget(sv_policy, self.behavior.clone(), "self_verifying");
 
             for iteration in 0..max_iterations {
                 // ── Build phase: recurse `self.inner.run(cx)`.
@@ -2029,20 +2147,21 @@ impl RunStrategy for SelfVerifyingConfig {
                 if let Err(err) = cx.charge_current(carried.turns.saturating_sub(carried_before)) {
                     let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
                     let resolution = cx.resolve_current();
+                    // #129: a granted `Continue` resets the scope and RE-RUNS the
+                    // build↔evaluate iteration IN-PROCESS (do NOT pop the scope; the
+                    // loop continues under the refreshed allowance). NO serialization
+                    // (AC3). `max_continues` bounds the loop.
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
                     cx.pop_budget();
                     cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
                     return match resolution {
                         ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
-                        // #129: a granted `Continue` must reset + RE-RUN this
-                        // build↔evaluate iteration (the in-process loop wiring lands
-                        // in #129). UNREACHABLE today — live bodies push an `Escalate`
-                        // placeholder, so `resolve_current` never yields `Continue`
-                        // here. Handle it EXPLICITLY (surface-with-partial) rather
-                        // than via a silent `_` fall-through.
-                        //
-                        // #130: under `SurfaceToHuman`, PAUSE with a
-                        // `BudgetExhausted` request instead of propagating up.
+                        // #129: the in-process `Continue` is handled above; this arm
+                        // is `Escalate`-only now (kept combined for the surface/
+                        // propagate shape).
                         ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
                             if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
                             {
@@ -2358,11 +2477,7 @@ impl RunStrategy for HillClimbingConfig {
                 Some(max) => BudgetPolicy::TotalSteps { value: max },
                 None => BudgetPolicy::Unlimited,
             };
-            cx.push_budget(
-                hc_policy,
-                BudgetExhaustedBehavior::Escalate,
-                "hill_climbing",
-            );
+            cx.push_budget(hc_policy, self.behavior.clone(), "hill_climbing");
 
             // ── Iteration 0: pure baseline (no agent turn).
             let mut current_best = match executor
@@ -2395,20 +2510,24 @@ impl RunStrategy for HillClimbingConfig {
                 // BudgetExhausted (partial = best candidate + score), resolving its
                 // behavior — replacing the legacy `BudgetExceeded` Failure.
                 if let Err(err) = cx.charge_current(1) {
+                    let resolution = cx.resolve_current();
+                    // #129: a granted `Continue` resets the scope and KEEPS ITERATING
+                    // the climb IN-PROCESS (do NOT pop; the refreshed allowance lets
+                    // the next charge pass). NO serialization (AC3). `max_continues`
+                    // bounds the loop.
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
                     executor.hill_write_tsv(&task_id, &rows).await;
                     let partial = hill_climbing_partial_json(current_best);
-                    let resolution = cx.resolve_current();
                     cx.pop_budget();
                     cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
                     return match resolution {
                         ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
-                        // #129: a granted `Continue` must reset + keep iterating the
-                        // climb (the in-process loop wiring lands in #129).
-                        // UNREACHABLE today — live bodies push an `Escalate`
-                        // placeholder, so `resolve_current` never yields `Continue`
-                        // here. Handle it EXPLICITLY (surface-with-partial) rather
-                        // than via a silent `_` fall-through.
+                        // #129: the in-process `Continue` is handled above; this arm
+                        // is `Escalate`-only now (kept combined for the surface/
+                        // propagate shape).
                         //
                         // #130: under `SurfaceToHuman`, PAUSE with a
                         // `BudgetExhausted` request instead of propagating up.
@@ -2626,8 +2745,23 @@ impl ExecutionContext<'_> {
         behavior: BudgetExhaustedBehavior,
         phase: impl Into<String>,
     ) -> usize {
-        self.budgets
-            .push(BudgetContext::new(policy, behavior, phase));
+        let phase = phase.into();
+        // #129 (AC2): if a resumed `Continue` checkpoint seed is waiting for THIS
+        // phase, reconstruct the scope with its prior `continues_used` (consuming
+        // the seed once) instead of zeroing it. The root resumed node pushes
+        // first, and the request's `phase` names that node, so the FIRST matching
+        // push restores the count. Any other push (or a fresh run) is unaffected.
+        let seeded = match &self.scratch.resume_continues {
+            Some((seed_phase, _)) if *seed_phase == phase => {
+                self.scratch.resume_continues.take().map(|(_, c)| c)
+            }
+            _ => None,
+        };
+        let scope = match seeded {
+            Some(continues_used) => BudgetContext::resumed(policy, behavior, phase, continues_used),
+            None => BudgetContext::new(policy, behavior, phase),
+        };
+        self.budgets.push(scope);
         self.budgets.depth()
     }
 
@@ -4451,6 +4585,30 @@ pub struct PausedState {
     pub budget_used: BudgetSnapshot,
     #[serde(default)]
     pub child_state: Option<ChildPausedState>,
+}
+
+impl PausedState {
+    /// The SHARED durable checkpoint round-trip (#129, AC1). Both cross-process
+    /// `Continue` (a `HumanRequest::BudgetExhausted` pause whose request carries
+    /// `continues_used`) and Ralph's pause-propagation hand the SAME
+    /// [`PausedState`] to the caller for persistence; this is the one seam they
+    /// share. It is JUST the `PausedState` serialize/deserialize — NOT a
+    /// unification of their CONTEXT policies (Q2): a `Continue` resumes preserving
+    /// `session_state.messages`; Ralph re-seeds a fresh window from its
+    /// filesystem `.spore/progress.json` checkpoint, which stays Ralph-specific
+    /// ([`RalphProgress`]/[`ralph_seed_session`](StrategyExecutor::ralph_seed_session)).
+    ///
+    /// `serialize_checkpoint` produces the durable blob the caller persists;
+    /// [`load_checkpoint`](Self::load_checkpoint) restores it on resume.
+    pub fn serialize_checkpoint(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Restore a [`PausedState`] from a durable checkpoint blob (#129, AC1). The
+    /// resume side of [`serialize_checkpoint`](Self::serialize_checkpoint).
+    pub fn load_checkpoint(blob: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(blob)
+    }
 }
 
 /// Child paused state. **Deliberately has no `child_state` field** — the type
@@ -8906,96 +9064,188 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
     ) -> RunResult {
+        self.drive_strategy_with_resume_seed(task, session_state, budget_used, on_stream, None)
+            .await
+    }
+
+    /// `drive_strategy` with an optional cross-process Continue checkpoint seed
+    /// (#129, AC2): `resume_continues = Some((phase, continues_used))` seeds the
+    /// FIRST matching budget scope's `continues_used` (via [`BudgetContext::resumed`])
+    /// so a `Continue` that spanned a process pause resumes with the correct
+    /// continue count instead of a zeroed one. `None` is the fresh-run path.
+    async fn drive_strategy_with_resume_seed(
+        &self,
+        task: Task,
+        session_state: SessionState,
+        budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
+        resume_continues: Option<(String, u32)>,
+    ) -> RunResult {
+        // #129: the BARE-LEAF resolution site is `drive_strategy` (a bare leaf
+        // never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
+        // `BudgetExhausted` here, the single recovery site for a top-level leaf).
+        // When the leaf's CONFIGURED `behavior` resolves to `Continue`, grant the
+        // leaf one more round IN-PROCESS (bump `continues_used`, refresh the
+        // step cap) and re-drive WITHOUT any serialization (AC3) — looping until
+        // the behavior resolves to `Fail`/`Escalate` or the strategy completes.
+        // `behavior_for_resolution` carries the resolution chain's mutated state
+        // across in-process continues so `max_continues` is honored.
         let session_id = task.session_id.clone();
-        let mut cx = ExecutionContext::new(&self.config.registry);
-        cx.executor = Some(self);
-        cx.stream = on_stream;
-        cx.scratch.run_session = session_state;
-        cx.scratch.run_budget = budget_used;
-        cx.scratch.task = Some(task.clone());
+        let mut task = task;
+        let mut session_state = session_state;
+        let mut budget_used = budget_used;
+        let mut on_stream = on_stream;
+        // The Continue resolution state threaded across in-process rounds: the
+        // (possibly fallen-through) behavior + how many continues have been spent.
+        let mut behavior_for_resolution: Option<(BudgetExhaustedBehavior, u32)> = None;
+        // #129 (AC2): the cross-process checkpoint seed is consumed by the FIRST
+        // round only (the resumed node's scope); later in-process rounds carry
+        // their continue count via `behavior_for_resolution`.
+        let mut resume_continues = resume_continues;
 
-        let outcome = task.loop_strategy.run(&mut cx).await;
+        loop {
+            let mut cx = ExecutionContext::new(&self.config.registry);
+            cx.executor = Some(self);
+            cx.stream = on_stream.take();
+            cx.scratch.run_session = std::mem::take(&mut session_state);
+            cx.scratch.run_budget = budget_used.clone();
+            cx.scratch.task = Some(task.clone());
+            cx.scratch.resume_continues = resume_continues.take();
 
-        // A pause / escalate propagates verbatim (preserves the HITL / consult /
-        // escalation contract through the recursive executor).
-        if let Some(terminal) = cx.scratch.terminal_override.take() {
-            return terminal;
-        }
-        match outcome {
-            StrategyOutcome::Complete(output) => RunResult::Success {
-                output,
-                session_id,
-                usage: cx.usage.clone(),
-                turns: cx.scratch.run_budget.turns,
-                session_state: std::mem::take(&mut cx.scratch.run_session),
-            },
-            StrategyOutcome::Failed(error) => RunResult::Failure {
-                reason: HaltReason::ConfigurationError { error },
-                session_id,
-                usage: cx.usage.clone(),
-                turns: cx.scratch.run_budget.turns,
-                session_state: std::mem::take(&mut cx.scratch.run_session),
-            },
-            StrategyOutcome::BudgetExhausted {
-                policy,
-                steps_taken,
-                continues_used,
-                phase,
-                partial_output,
-                ..
-            } => {
-                // #130: a BARE LEAF exhaustion propagates here without ever
-                // resolving (rule 6). Under `SurfaceToHuman`, PAUSE with a
-                // `BudgetExhausted` request (a combinator under `SurfaceToHuman`
-                // never reaches this arm — it sets `terminal_override` and is
-                // returned by the early-return above). A bare leaf offers
-                // `[ContinueWithBudget, Fail]` (fork C — no sibling to `Skip` to).
-                let turns = if steps_taken > 0 {
-                    steps_taken
-                } else {
-                    cx.scratch.run_budget.turns
-                };
-                if matches!(self.config.escalation_mode, EscalationMode::SurfaceToHuman) {
-                    let err = BudgetExhausted {
-                        policy,
-                        behavior: BudgetExhaustedBehavior::Escalate,
-                        steps_taken,
-                        continues_used,
-                        phase,
-                    };
-                    let actions = leaf_escalation_actions(&err);
-                    return promote_budget_exhausted_to_human(
-                        &err,
-                        partial_output,
-                        actions,
+            let outcome = task.loop_strategy.run(&mut cx).await;
+
+            // A pause / escalate propagates verbatim (preserves the HITL / consult /
+            // escalation contract through the recursive executor).
+            if let Some(terminal) = cx.scratch.terminal_override.take() {
+                return terminal;
+            }
+            match outcome {
+                StrategyOutcome::Complete(output) => {
+                    return RunResult::Success {
+                        output,
                         session_id,
-                        task,
-                        cx.scratch.run_budget.clone(),
-                        turns,
-                    );
+                        usage: cx.usage.clone(),
+                        turns: cx.scratch.run_budget.turns,
+                        session_state: std::mem::take(&mut cx.scratch.run_session),
+                    }
                 }
-                RunResult::Failure {
-                    reason: HaltReason::BudgetExceeded {
-                        limit_type: BudgetLimitType::Turns,
-                    },
-                    session_id,
-                    usage: cx.usage.clone(),
-                    // #125: the exhausted node's own `steps_taken` is the turn count
-                    // it reached (the scratch budget is not written back on the
-                    // propagate path). Fall back to the scratch turns if it is
-                    // somehow 0.
-                    turns,
-                    session_state: SessionState {
-                        messages: partial_output
-                            .map(|t| {
-                                vec![Message {
-                                    role: crate::model::Role::Assistant,
-                                    content: crate::model::Content::Text { text: t },
-                                }]
-                            })
-                            .unwrap_or_default(),
-                        ..Default::default()
-                    },
+                StrategyOutcome::Failed(error) => {
+                    return RunResult::Failure {
+                        reason: HaltReason::ConfigurationError { error },
+                        session_id,
+                        usage: cx.usage.clone(),
+                        turns: cx.scratch.run_budget.turns,
+                        session_state: std::mem::take(&mut cx.scratch.run_session),
+                    }
+                }
+                StrategyOutcome::BudgetExhausted {
+                    policy,
+                    behavior,
+                    steps_taken,
+                    continues_used,
+                    phase,
+                    partial_output,
+                } => {
+                    // #129: a BARE LEAF exhaustion propagates here carrying its
+                    // CONFIGURED `behavior` (Q1 — the bare-leaf resolution site
+                    // honors it; the leaf body never did). Resolve it ONCE: a
+                    // `Continue` with continues left re-drives in-process; a spent
+                    // `Continue` falls through to `Fail`/`Escalate`. Carry the
+                    // resolution chain's state across rounds so `max_continues` is
+                    // respected. (A combinator under `SurfaceToHuman` never reaches
+                    // this arm — it sets `terminal_override`, returned above.)
+                    let turns = if steps_taken > 0 {
+                        steps_taken
+                    } else {
+                        cx.scratch.run_budget.turns
+                    };
+                    // Reconstruct the resolution scope: the FIRST round uses the
+                    // leaf's propagated behavior + continues_used; later in-process
+                    // rounds reuse the threaded (possibly fallen-through) state.
+                    let (resolve_behavior, resolve_continues) = behavior_for_resolution
+                        .take()
+                        .unwrap_or((behavior, continues_used));
+                    let mut scope = BudgetContext::resumed(
+                        policy.clone(),
+                        resolve_behavior,
+                        phase.clone(),
+                        resolve_continues,
+                    );
+                    let resolution = scope.resolve_exhausted();
+                    match resolution {
+                        ExhaustedResolution::Continue => {
+                            // In-process continue (AC3: NO serialization). Refresh
+                            // the leaf's step cap and re-enter the loop carrying the
+                            // post-run session so the conversation context survives
+                            // (Continue PRESERVES context — AC4). The granted cap is
+                            // `steps_taken + policy.value` so the leaf gets a fresh
+                            // window after the checkpoint.
+                            let granted =
+                                steps_taken.saturating_add(policy.allowance_value().unwrap_or(1));
+                            grant_task_budget(&mut task, granted);
+                            session_state = std::mem::take(&mut cx.scratch.run_session);
+                            budget_used = cx.scratch.run_budget.clone();
+                            on_stream = cx.stream.take();
+                            // Thread the resolution chain's post-continue state so a
+                            // subsequent exhaustion sees the bumped `continues_used`.
+                            behavior_for_resolution =
+                                Some((scope.behavior.clone(), scope.continues_used));
+                            continue;
+                        }
+                        ExhaustedResolution::Escalate => {
+                            if matches!(self.config.escalation_mode, EscalationMode::SurfaceToHuman)
+                            {
+                                let err = BudgetExhausted {
+                                    policy,
+                                    behavior: scope.behavior.clone(),
+                                    steps_taken,
+                                    continues_used: scope.continues_used,
+                                    phase,
+                                };
+                                let actions = leaf_escalation_actions(&err);
+                                return promote_budget_exhausted_to_human(
+                                    &err,
+                                    partial_output,
+                                    actions,
+                                    session_id,
+                                    task,
+                                    cx.scratch.run_budget.clone(),
+                                    turns,
+                                );
+                            }
+                            return RunResult::Failure {
+                                reason: HaltReason::BudgetExceeded {
+                                    limit_type: BudgetLimitType::Turns,
+                                },
+                                session_id,
+                                usage: cx.usage.clone(),
+                                turns,
+                                session_state: SessionState {
+                                    messages: partial_output
+                                        .map(|t| {
+                                            vec![Message {
+                                                role: crate::model::Role::Assistant,
+                                                content: crate::model::Content::Text { text: t },
+                                            }]
+                                        })
+                                        .unwrap_or_default(),
+                                    ..Default::default()
+                                },
+                            };
+                        }
+                        ExhaustedResolution::Fail => {
+                            // Fail contract: the partial is DISCARDED.
+                            return RunResult::Failure {
+                                reason: HaltReason::BudgetExceeded {
+                                    limit_type: BudgetLimitType::Turns,
+                                },
+                                session_id,
+                                usage: cx.usage.clone(),
+                                turns,
+                                session_state: SessionState::default(),
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -9020,24 +9270,31 @@ impl StandardHarness {
             child_state,
         } = state;
 
-        // Budget-escalation resume (#130): if this pause came from
+        // Budget-escalation resume (#130/#129): if this pause came from
         // `HumanRequest::BudgetExhausted`, map the operator's `EscalationAction`
         // BEFORE the generic `match response` (mirrors the Clarification branch).
-        // The node's `BudgetContext` is reconstructed from the request fields
-        // (carried on `req.steps_taken` / `req.continues_used` — fork E), NOT a
-        // durable cross-process checkpoint (#129).
+        // The node's `BudgetContext` is reconstructed from the request fields:
+        // `steps_taken` raises the granted cap, and `continues_used` (#129, AC2)
+        // is the SOLE `BudgetContext` field that rides a process pause — it is
+        // seeded back into the rebuilt scope so a `Continue` spanning the pause
+        // resumes with the correct continue count (it cannot exceed
+        // `max_continues`). Q3: `continues_used` rides the REQUEST payload, NOT a
+        // new serialized `BudgetContext`/`PausedState` field.
         if let Some(HumanRequest::BudgetExhausted {
             steps_taken,
-            continues_used: _,
+            continues_used,
+            phase,
             ..
         }) = &hr
         {
             let steps_taken = *steps_taken;
+            let resume_seed = (phase.clone(), *continues_used);
             match &response {
                 // Grant `steps` ADDITIONAL allowance and re-enter the loop from the
                 // restored checkpoint. The strategy tree is rebuilt with the node's
                 // budget policy raised to `steps_taken + steps` so the restored
-                // scope has room for `steps` more steps.
+                // scope has room for `steps` more steps, and the resumed scope's
+                // `continues_used` is seeded from the request (#129, AC2).
                 HumanResponse::Escalate {
                     action: EscalationAction::ContinueWithBudget { steps },
                 } => {
@@ -9045,7 +9302,13 @@ impl StandardHarness {
                     let mut resumed_task = task.clone();
                     grant_task_budget(&mut resumed_task, granted);
                     return self
-                        .drive_strategy(resumed_task, session_state, budget_used, on_stream)
+                        .drive_strategy_with_resume_seed(
+                            resumed_task,
+                            session_state,
+                            budget_used,
+                            on_stream,
+                            Some(resume_seed),
+                        )
                         .await;
                 }
                 // Skip: the node is marked skipped and the outer loop advances. For
@@ -9792,8 +10055,11 @@ mod strategy_tests {
     /// MUST match `fixtures/strategy/cordyceps_tree.json`.
     fn cordyceps_tree() -> LoopStrategy {
         LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                    behavior: BudgetExhaustedBehavior::Escalate,
                     budget: BudgetPolicy::PerLoop { value: 4 },
                     agent: AgentRef("planner".to_string()),
                     toolset: ToolsetRef("plan-tools".to_string()),
@@ -9802,7 +10068,9 @@ mod strategy_tests {
                     output: Some(SchemaRef("plan-schema".to_string())),
                 })),
                 execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                    behavior: BudgetExhaustedBehavior::Escalate,
                     inner: Box::new(LoopStrategy::ReAct(ReactConfig {
+                        behavior: BudgetExhaustedBehavior::Escalate,
                         budget: BudgetPolicy::PerLoop { value: 12 },
                         agent: AgentRef("executor".to_string()),
                         toolset: ToolsetRef("exec-tools".to_string()),
@@ -9864,6 +10132,7 @@ mod strategy_tests {
     fn each_variant_round_trips() {
         let variants = vec![
             LoopStrategy::ReAct(ReactConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 budget: BudgetPolicy::PerLoop { value: 8 },
                 agent: AgentRef("a".to_string()),
                 toolset: ToolsetRef("t".to_string()),
@@ -9876,14 +10145,17 @@ mod strategy_tests {
                 model_id: "claude".to_string(),
             }))),
             LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
                 evaluator: SchemaRef("ev".to_string()),
             }),
             LoopStrategy::Ralph(RalphConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 agent: AgentRef("r".to_string()),
             }),
             LoopStrategy::HillClimbing(HillClimbingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(5))),
                 direction: HillClimbingDirection::Maximize,
                 max_stagnation: 3,
@@ -9907,7 +10179,7 @@ mod strategy_tests {
         // ReactConfig fields flatten next to the tag (no nesting).
         assert_eq!(
             json,
-            r#"{"kind":"react","budget":{"kind":"per_loop","value":8},"agent":"","toolset":""}"#
+            r#"{"kind":"react","budget":{"kind":"per_loop","value":8},"behavior":{"kind":"escalate"},"agent":"","toolset":""}"#
         );
     }
 
@@ -9967,14 +10239,17 @@ mod strategy_tests {
             LoopStrategy::ReAct(ReactConfig::per_loop(1)),
             LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
             LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 evaluator: SchemaRef("e".to_string()),
             }),
             LoopStrategy::Ralph(RalphConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 agent: AgentRef("r".to_string()),
             }),
             LoopStrategy::HillClimbing(HillClimbingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 direction: HillClimbingDirection::Minimize,
                 max_stagnation: 1,
@@ -10465,6 +10740,7 @@ mod tests {
     // declare an output schema.
     fn react_structured(max: u32) -> LoopStrategy {
         LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: max },
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
@@ -10652,6 +10928,7 @@ mod tests {
         // task's ReAct leaf. run() must validate at entry and fail BEFORE the
         // first turn — NeverCalledAgent panics if a turn ever fires.
         let leaf = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("missing".into()),
             toolset: ToolsetRef("t".into()),
@@ -12452,6 +12729,7 @@ mod tests {
         // STARTUP ConfigurationError (single resolution path) — NOT the generic
         // StrategyNotYetImplemented stub.
         let t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(react_structured(u32::MAX)),
             direction: HillClimbingDirection::Maximize,
             max_stagnation: u32::MAX,
@@ -12487,6 +12765,7 @@ mod tests {
         // #124 A.5: the plan slot is STRUCTURED — its leaf carries an output
         // schema (registered as "" in standard_config). Execute stays a bare leaf.
         task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(react_structured(u32::MAX)),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model: None,
@@ -12903,7 +13182,9 @@ mod tests {
         let h = StandardHarness::new(cfg);
         // A plan tree whose plan leaf routes to "planner".
         let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 budget: BudgetPolicy::PerLoop { value: u32::MAX },
                 agent: AgentRef("planner".into()),
                 toolset: ToolsetRef(String::new()),
@@ -14044,7 +14325,9 @@ mod tests {
         let h = StandardHarness::new(cfg);
         // A plan tree whose plan leaf routes to "planner"; execute uses default.
         let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 budget: BudgetPolicy::PerLoop { value: u32::MAX },
                 agent: AgentRef("planner".into()),
                 toolset: ToolsetRef(String::new()),
@@ -14099,8 +14382,10 @@ mod tests {
 
         // The execute child is a genuine SelfVerifying combinator (NOT a ReAct).
         let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(react_structured(u32::MAX)),
             execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(react_structured(u32::MAX)),
                 evaluator: SchemaRef(String::new()),
             })),
@@ -14150,7 +14435,9 @@ mod tests {
 
         // inner is a genuine PlanExecute combinator (NOT a ReAct).
         let t = task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 plan: Box::new(react_structured(u32::MAX)),
                 execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
                 plan_model: None,
@@ -15256,6 +15543,7 @@ mod tests {
 
     fn self_verifying_task() -> Task {
         task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(react_structured(u32::MAX)),
             evaluator: SchemaRef(String::new()),
         }))
@@ -15844,6 +16132,7 @@ mod tests {
 
     fn ralph_task() -> Task {
         let mut t = task(LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             agent: AgentRef(String::new()),
         }));
@@ -16048,7 +16337,9 @@ mod tests {
 
         // inner is a genuine SelfVerifying combinator (NOT a ReAct).
         let mut t = task(LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(react_structured(u32::MAX)),
                 evaluator: SchemaRef(String::new()),
             })),
@@ -16157,6 +16448,7 @@ mod tests {
         // backstop, so the leaf policy — not the global cap — exhausts the window
         // and the new BudgetExhausted path is taken.
         let mut t = task(LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
             agent: AgentRef(String::new()),
         }));
@@ -16574,6 +16866,7 @@ mod tests {
         // Give a generous turn budget so the loop is bounded by stagnation, not
         // turns, unless a test overrides it.
         let mut t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             // #124 A.5: the propose slot is STRUCTURED — the inner leaf carries an
             // output schema (registered as "" in standard_config).
             inner: Box::new(react_structured(u32::MAX)),
@@ -16806,7 +17099,9 @@ mod tests {
 
         // inner is a genuine PlanExecute combinator (NOT a ReAct).
         let mut t = task(LoopStrategy::HillClimbing(HillClimbingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(LoopStrategy::PlanExecute(PlanExecuteConfig {
+                behavior: BudgetExhaustedBehavior::Escalate,
                 plan: Box::new(react_structured(u32::MAX)),
                 execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
                 plan_model: None,
@@ -18341,6 +18636,7 @@ mod tests {
         let h = StandardHarness::new(cfg);
         // Plan slot is structured (output schema); execute leaf cap = PerLoop{2}.
         let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(react_structured(u32::MAX)),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
             plan_model: None,
@@ -18620,13 +18916,16 @@ mod tests {
                     "build the feature",
                     SessionId::new("sess-130"),
                     LoopStrategy::PlanExecute(PlanExecuteConfig {
+                        behavior: BudgetExhaustedBehavior::Escalate,
                         plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                            behavior: BudgetExhaustedBehavior::Escalate,
                             budget: BudgetPolicy::PerLoop { value: 4 },
                             agent: AgentRef("planner".into()),
                             toolset: ToolsetRef("plan-tools".into()),
                             output: Some(SchemaRef("plan-schema".into())),
                         })),
                         execute: Box::new(LoopStrategy::ReAct(ReactConfig {
+                            behavior: BudgetExhaustedBehavior::Escalate,
                             budget: BudgetPolicy::PerLoop { value: 8 },
                             agent: AgentRef("executor".into()),
                             toolset: ToolsetRef("exec-tools".into()),
@@ -18659,6 +18958,433 @@ mod tests {
             &budget_exhausted_paused_state(),
             "paused_states/budget_exhausted.json",
         );
+    }
+
+    // ========================================================================
+    // #129 — Continue cross-process checkpoint (continues_used survives a pause)
+    // ========================================================================
+
+    /// The canonical `continue_checkpoint.json` value: a bare ReAct leaf carrying
+    /// `Continue{max_continues:2, on_exhausted:Fail}` paused mid-loop with
+    /// `continues_used: 1` on its `HumanRequest::BudgetExhausted`. Cross-language
+    /// byte-identity ground truth for the AC2 resume test.
+    fn continue_checkpoint_paused_state() -> PausedState {
+        PausedState {
+            session_id: SessionId::new("sess-129"),
+            task_id: TaskId::new("task-129"),
+            turn_number: 3,
+            session_state: SessionState {
+                messages: vec![Message {
+                    role: crate::model::Role::Assistant,
+                    content: crate::model::Content::Text {
+                        text: "{\"node\":\"react\",\"last\":\"\"}".into(),
+                    },
+                }],
+                ..Default::default()
+            },
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: Some(HumanRequest::BudgetExhausted {
+                phase: "react".into(),
+                policy: BudgetPolicy::PerLoop { value: 3 },
+                steps_taken: 3,
+                continues_used: 1,
+                partial_output: Some("{\"node\":\"react\",\"last\":\"\"}".into()),
+                available_actions: vec![
+                    EscalationAction::ContinueWithBudget { steps: 3 },
+                    EscalationAction::Fail,
+                ],
+            }),
+            task: {
+                let mut t = Task::new(
+                    "iterate on the patch",
+                    SessionId::new("sess-129"),
+                    LoopStrategy::ReAct(ReactConfig {
+                        budget: BudgetPolicy::PerLoop { value: 3 },
+                        behavior: BudgetExhaustedBehavior::Continue {
+                            max_continues: 2,
+                            on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+                        },
+                        agent: AgentRef("worker".into()),
+                        toolset: ToolsetRef("patch-tools".into()),
+                        output: None,
+                    }),
+                );
+                t.id = TaskId::new("task-129");
+                t
+            },
+            budget_used: BudgetSnapshot {
+                turns: 3,
+                ..Default::default()
+            },
+            child_state: None,
+        }
+    }
+
+    /// AC2 (wire): `continue_checkpoint.json` (de)serializes byte-identically —
+    /// the new fixture capturing a `Continue` node paused with `continues_used>0`.
+    #[test]
+    fn fixture_replay_continue_checkpoint() {
+        let raw =
+            std::fs::read_to_string(h130_fixture_path("paused_states/continue_checkpoint.json"))
+                .expect("fixture present");
+        let parsed: PausedState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, continue_checkpoint_paused_state());
+        h130_assert_fixture_byte_identical(
+            &continue_checkpoint_paused_state(),
+            "paused_states/continue_checkpoint.json",
+        );
+    }
+
+    /// AC2 (LOAD-BEARING, end-to-end): a `Continue` that SPANS a process pause
+    /// resumes with the correct `continues_used` (NOT 0). This test FAILS on
+    /// pre-#129 code, which destructured `continues_used: _` in `resume_inner` and
+    /// rebuilt the scope from `steps_taken` only — ZEROING the counter and
+    /// granting MORE in-process continues than `max_continues` permits.
+    ///
+    /// DISCRIMINATING setup: a `Continue{max_continues:2, on_exhausted:Fail}` leaf
+    /// whose checkpoint records `continues_used: 1` (ONE continue already spent).
+    /// The resumed worker NEVER finishes (always requests a tool), so every
+    /// granted in-process window re-exhausts and the run drains to `Fail`. The
+    /// OBSERVABLE signal is HOW MANY in-process continue-windows ran before the
+    /// fall-through, captured as the terminal `turns`:
+    ///   - CORRECT (#129): `continues_used == 1` → exactly ONE continue remains →
+    ///     a SINGLE re-driven window, then `Fail`.
+    ///   - BUGGY (pre-#129): `continues_used == 0` → TWO continues granted → TWO
+    ///     re-driven windows, then `Fail` — strictly MORE turns.
+    /// The granted per-window cap is `steps_taken + steps = 3 + 1 = 4`, so each
+    /// window consumes 4 turns. On resume the operator's `ContinueWithBudget` runs
+    /// window A; with `continues_used == 1` (one in-process continue left) window B
+    /// runs, then `Fail`: 2 windows ⇒ 8 turns. The bug (zeroed counter) would have
+    /// TWO continues left → windows A, B, C ⇒ 12 turns. We assert `turns == 8`.
+    #[tokio::test]
+    async fn resume_continue_preserves_continues_used_then_falls_through() {
+        // A worker that always requests a tool (never finishes) → every window
+        // re-exhausts the refreshed cap.
+        let a = budget_exhausting_agent(40);
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(40);
+        let h = StandardHarness::new(cfg);
+
+        let mut state = continue_checkpoint_paused_state();
+        // Bare leaf resolving via the default ("") registry handle on resume.
+        state.task.loop_strategy = LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 3 },
+            behavior: BudgetExhaustedBehavior::Continue {
+                max_continues: 2,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+            },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        });
+        // continues_used == 1: ONE continue already spent (only one remains).
+        match state.human_request.as_mut().unwrap() {
+            HumanRequest::BudgetExhausted {
+                continues_used,
+                steps_taken,
+                ..
+            } => {
+                *continues_used = 1;
+                *steps_taken = 3;
+            }
+            _ => panic!("expected BudgetExhausted"),
+        }
+
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps: 1 },
+                },
+                None,
+            )
+            .await;
+        match resumed {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                turns,
+                ..
+            } => {
+                // #129: window A (operator grant) + window B (the ONE remaining
+                // in-process continue) → 2 windows × cap 4 = 8 turns. The bug
+                // (zeroed continues_used) grants a THIRD window → 12 turns.
+                assert_eq!(
+                    turns, 8,
+                    "expected 2 windows (continues_used preserved at 1, one continue \
+                     left); the bug zeroes it and grants an extra window → 12 turns"
+                );
+            }
+            other => panic!("expected BudgetExceeded Failure, got {other:?}"),
+        }
+    }
+
+    /// AC2 (unit, load-bearing core): the resume seam seeds the reconstructed
+    /// scope's `continues_used` from the request via [`BudgetContext::resumed`]
+    /// (NOT 0), and a subsequent exhaustion falls through to `on_exhausted` after
+    /// the REMAINING continues — not a refreshed `max_continues`.
+    #[test]
+    fn budget_context_resumed_seeds_continues_used_and_bounds_chain() {
+        let behavior = BudgetExhaustedBehavior::Continue {
+            max_continues: 2,
+            on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+        };
+        // Reconstruct as the resume seam does: continues_used seeded to 1.
+        let mut scope =
+            BudgetContext::resumed(BudgetPolicy::PerLoop { value: 3 }, behavior, "react", 1);
+        assert_eq!(scope.continues_used, 1, "seeded, NOT zeroed");
+        assert_eq!(scope.steps_taken, 0, "fresh per-round step budget");
+        // Only ONE continue remains (to reach max_continues=2).
+        assert_eq!(scope.continues_remaining(), 1);
+        assert_eq!(scope.resolve_exhausted(), ExhaustedResolution::Continue);
+        assert_eq!(scope.continues_used, 2);
+        // Continues now spent → fall through to on_exhausted=Fail.
+        assert_eq!(scope.resolve_exhausted(), ExhaustedResolution::Fail);
+
+        // Contrast: a FRESH (pre-#129) scope would grant TWO continues — the bug.
+        let fresh = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 3 },
+            BudgetExhaustedBehavior::Continue {
+                max_continues: 2,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+            },
+            "react",
+        );
+        assert_eq!(
+            fresh.continues_remaining(),
+            2,
+            "the bug: full budget refreshed"
+        );
+    }
+
+    /// LIVE Continue reachable (AC: `ExhaustedResolution::Continue` is no longer
+    /// dead): a bare-leaf run with `behavior: Continue{max_continues:1}` exhausts
+    /// in-process, gets a granted continue (counter resets, continues_used bumps),
+    /// loops, and completes — all WITHOUT a pause (AC3: no serialization).
+    #[tokio::test]
+    async fn live_continue_loops_in_process_then_completes() {
+        let a = make_agent();
+        // First window: 2 tool turns exhaust the PerLoop{2} cap → Continue grant.
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c0".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        // After the in-process continue refreshes the cap, the worker completes.
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done after in-process continue".into(),
+            usage: usage(),
+        });
+        // Autonomous so an Escalate fall-through would NOT pause — proving the
+        // success came from the Continue loop, not a HITL pause.
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 2 },
+            behavior: BudgetExhaustedBehavior::Continue {
+                max_continues: 1,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+            },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "done after in-process continue");
+            }
+            other => panic!("expected Success via in-process Continue, got {other:?}"),
+        }
+    }
+
+    /// AC4: a Continue resume PRESERVES the prior `session_state.messages` (the
+    /// conversation context survives the pause), while Ralph DISCARDS + re-seeds.
+    /// Asserts the shared checkpoint utility did NOT unify the context policy.
+    #[tokio::test]
+    async fn continue_resume_preserves_session_context() {
+        // A Continue checkpoint carries one assistant message; the resumed run
+        // must build ON it (not start from an empty session). We assert the
+        // resumed run's history is non-empty (context preserved). A trivial
+        // worker finishes immediately on resume so we can inspect the terminal.
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "resumed with context".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a); // Autonomous: a finish is a clean Success.
+        cfg.tool_registry = tool_reg(1);
+        let h = StandardHarness::new(cfg);
+
+        let mut state = continue_checkpoint_paused_state();
+        // The leaf resolves via the default ("") registry handle on resume.
+        state.task.loop_strategy = LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 3 },
+            behavior: BudgetExhaustedBehavior::Continue {
+                max_continues: 2,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+            },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        });
+        let prior_msg_count = state.session_state.messages.len();
+        assert!(prior_msg_count >= 1, "checkpoint carries prior context");
+
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps: 3 },
+                },
+                None,
+            )
+            .await;
+        match resumed {
+            RunResult::Success {
+                output,
+                session_state,
+                ..
+            } => {
+                assert_eq!(output, "resumed with context");
+                // The resumed session retains the prior assistant message AND the
+                // new turn — it did NOT start from an empty (re-seeded) session.
+                assert!(
+                    session_state.messages.len() > prior_msg_count,
+                    "Continue preserved prior context and appended the resumed turn; \
+                     got {} messages (prior {})",
+                    session_state.messages.len(),
+                    prior_msg_count
+                );
+            }
+            other => panic!("expected Success on resume, got {other:?}"),
+        }
+    }
+
+    /// AC1: the SHARED checkpoint utility round-trips a `PausedState` (the durable
+    /// pause/resume seam reused by both the cross-process Continue path and
+    /// Ralph's pause-propagation). Unit-tested directly.
+    #[test]
+    fn shared_checkpoint_utility_round_trips() {
+        let state = continue_checkpoint_paused_state();
+        let blob = state.serialize_checkpoint().unwrap();
+        let restored = PausedState::load_checkpoint(&blob).unwrap();
+        assert_eq!(restored, state);
+        // The Ralph paused-state (no human_request) ALSO round-trips through the
+        // same utility — proving it is shared, not Continue-specific.
+        let ralph_state = budget_exhausted_paused_state();
+        let blob = ralph_state.serialize_checkpoint().unwrap();
+        assert_eq!(PausedState::load_checkpoint(&blob).unwrap(), ralph_state);
+    }
+
+    /// Leaf behavior (Q1): a NESTED ReAct leaf still PROPAGATES exhaustion to its
+    /// parent (it does NOT self-resolve its `behavior`), while a BARE top-level
+    /// leaf HONORS its `behavior`.
+    ///
+    /// Bare leaf honoring `Fail`: a top-level leaf with `behavior: Fail` resolves
+    /// to a `BudgetExceeded` Failure with the partial DISCARDED — distinct from
+    /// the default `Escalate` placeholder which (under SurfaceToHuman) would
+    /// PAUSE. Under Autonomous both reach Failure, so we assert the partial is
+    /// discarded (the Fail contract) to prove the bare-leaf honored `Fail`.
+    #[tokio::test]
+    async fn bare_leaf_honors_fail_behavior() {
+        let mut cfg = standard_config(budget_exhausting_agent(3));
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 2 },
+            behavior: BudgetExhaustedBehavior::Fail,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                session_state,
+                ..
+            } => {
+                // Fail contract: the partial is DISCARDED (the bare leaf honored
+                // its `Fail` behavior, not the propagate/Escalate path).
+                assert!(session_state.messages.is_empty());
+            }
+            other => panic!("expected BudgetExceeded Failure via leaf Fail, got {other:?}"),
+        }
+    }
+
+    /// A NESTED leaf does NOT self-resolve: its `Continue` behavior is IGNORED by
+    /// the leaf body (it propagates to the parent), so the PARENT combinator's
+    /// `behavior` governs. Here the parent PlanExecute carries the default
+    /// `Escalate` placeholder, so the nested leaf's exhaustion surfaces as the
+    /// PARENT's `plan_execute` pause (phase == "plan_execute"), NOT a leaf-level
+    /// `react` resolution of its own `Continue`.
+    #[tokio::test]
+    async fn nested_leaf_propagates_does_not_self_resolve() {
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["x"]}"#)); // plan
+        for i in 0..4 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("e{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(4);
+        let h = StandardHarness::new(cfg);
+        // The execute leaf carries `Continue` — but NESTED, so the leaf must NOT
+        // self-resolve it; the PlanExecute parent (Escalate placeholder) pauses.
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(react_structured(u32::MAX)),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig {
+                budget: BudgetPolicy::PerLoop { value: 2 },
+                behavior: BudgetExhaustedBehavior::Continue {
+                    max_continues: 1,
+                    on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+                },
+                agent: AgentRef(String::new()),
+                toolset: ToolsetRef(String::new()),
+                output: None,
+            })),
+            plan_model: None,
+            behavior: default_budget_behavior(),
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::WaitingForHuman {
+                request: HumanRequest::BudgetExhausted { phase, .. },
+                ..
+            } => {
+                // The PARENT resolved (phase == plan_execute); the nested leaf did
+                // NOT self-resolve its own `Continue` at the "react" phase.
+                assert_eq!(phase, "plan_execute");
+            }
+            other => panic!("expected parent plan_execute pause, got {other:?}"),
+        }
     }
 }
 

@@ -256,7 +256,9 @@ impl ExecutionRegistry {
                 self.walk_strategy(execute)?;
                 Ok(())
             }
-            LoopStrategy::SelfVerifying(SelfVerifyingConfig { inner, evaluator }) => {
+            LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+                inner, evaluator, ..
+            }) => {
                 // A.5: the `inner` (worker) slot is STRUCTURED — its result must be
                 // evaluable. A bare `ReAct` worker needs an output schema.
                 Self::check_structured_slot(inner, "worker")?;
@@ -266,7 +268,7 @@ impl ExecutionRegistry {
                 self.check_verifier(evaluator)?;
                 Ok(())
             }
-            LoopStrategy::Ralph(RalphConfig { inner, agent }) => {
+            LoopStrategy::Ralph(RalphConfig { inner, agent, .. }) => {
                 self.walk_strategy(inner)?;
                 self.check_agent(agent)?;
                 Ok(())
@@ -464,8 +466,9 @@ mod tests {
     use super::*;
     use crate::agent::{Agent, AgentId, Context, TurnResult};
     use crate::harness::{
-        AgentRef, BoxFut, BudgetPolicy, EmptyToolRegistry, ExecutionContext, LoopStrategy,
-        ReactConfig, SchemaRef, SessionId, StrategyOutcome, Task, ToolsetRef,
+        AgentRef, BoxFut, BudgetExhaustedBehavior, BudgetPolicy, EmptyToolRegistry,
+        ExecutionContext, LoopStrategy, ReactConfig, SchemaRef, SessionId, StrategyOutcome, Task,
+        ToolsetRef,
     };
     use crate::verifier::{Verifier, VerifierInput, VerifierVerdict};
 
@@ -503,6 +506,7 @@ mod tests {
 
     fn react_leaf(agent: &str, toolset: &str) -> LoopStrategy {
         LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef(agent.to_string()),
             toolset: ToolsetRef(toolset.to_string()),
@@ -625,6 +629,7 @@ mod tests {
             .toolset("t1", Arc::new(EmptyToolRegistry))
             .build();
         let leaf = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
@@ -645,6 +650,7 @@ mod tests {
     fn validate_happy_path_react() {
         let reg = fully_wired_registry();
         let leaf = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
@@ -666,6 +672,7 @@ mod tests {
             .toolset("t1", Arc::new(EmptyToolRegistry))
             .build();
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(react_leaf("a1", "t1")), // output: None
             execute: Box::new(react_leaf("a1", "t1")),
             plan_model: None,
@@ -689,12 +696,14 @@ mod tests {
             .schema("plan-schema", serde_json::json!({}))
             .build();
         let plan = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("plan-schema".into())),
         });
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(plan),
             execute: Box::new(react_leaf("a1", "t1")),
             plan_model: None,
@@ -715,16 +724,19 @@ mod tests {
             .verifier("eval-schema", Arc::new(StubVerifier))
             .build();
         let worker = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("worker-schema".into())),
         });
         let inner_sv = LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(worker),
             evaluator: SchemaRef("eval-schema".into()),
         });
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             plan: Box::new(inner_sv),
             execute: Box::new(react_leaf("a1", "t1")),
             plan_model: None,
@@ -783,6 +795,7 @@ mod tests {
         // deserialize and re-resolve every handle against a freshly-built
         // registry — no reconfiguration of the Task required.
         let leaf = LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
             budget: BudgetPolicy::PerLoop { value: 4 },
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),

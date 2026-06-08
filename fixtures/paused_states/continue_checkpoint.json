@@ -1,0 +1,75 @@
+{
+  "session_id": "sess-129",
+  "task_id": "task-129",
+  "turn_number": 3,
+  "session_state": {
+    "messages": [
+      {
+        "role": "assistant",
+        "content": {
+          "type": "text",
+          "text": "{\"node\":\"react\",\"last\":\"\"}"
+        }
+      }
+    ],
+    "extras": {}
+  },
+  "pending_tool_calls": [],
+  "approved_results": [],
+  "human_request": {
+    "kind": "budget_exhausted",
+    "phase": "react",
+    "policy": {
+      "kind": "per_loop",
+      "value": 3
+    },
+    "steps_taken": 3,
+    "continues_used": 1,
+    "partial_output": "{\"node\":\"react\",\"last\":\"\"}",
+    "available_actions": [
+      {
+        "kind": "continue_with_budget",
+        "steps": 3
+      },
+      {
+        "kind": "fail"
+      }
+    ]
+  },
+  "task": {
+    "id": "task-129",
+    "instruction": "iterate on the patch",
+    "session_id": "sess-129",
+    "budget": {
+      "max_turns": null,
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_wall_time": null,
+      "max_cost_usd": null
+    },
+    "loop_strategy": {
+      "kind": "react",
+      "budget": {
+        "kind": "per_loop",
+        "value": 3
+      },
+      "behavior": {
+        "kind": "continue",
+        "max_continues": 2,
+        "on_exhausted": {
+          "kind": "fail"
+        }
+      },
+      "agent": "worker",
+      "toolset": "patch-tools"
+    }
+  },
+  "budget_used": {
+    "turns": 3,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "wall_time": null,
+    "cost_usd": 0.0
+  },
+  "child_state": null
+}

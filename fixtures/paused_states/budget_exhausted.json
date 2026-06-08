@@ -58,6 +58,9 @@
           "kind": "per_loop",
           "value": 4
         },
+        "behavior": {
+          "kind": "escalate"
+        },
         "agent": "planner",
         "toolset": "plan-tools",
         "output": "plan-schema"
@@ -68,9 +71,15 @@
           "kind": "per_loop",
           "value": 8
         },
+        "behavior": {
+          "kind": "escalate"
+        },
         "agent": "executor",
         "toolset": "exec-tools",
         "output": "worker-schema"
+      },
+      "behavior": {
+        "kind": "escalate"
       }
     }
   },

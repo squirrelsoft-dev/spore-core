@@ -79,6 +79,7 @@
           "loop_strategy": {
             "kind": "react",
             "budget": { "kind": "per_loop", "value": 5 },
+            "behavior": { "kind": "escalate" },
             "agent": "",
             "toolset": ""
           },
@@ -137,6 +138,7 @@
           "loop_strategy": {
             "kind": "react",
             "budget": { "kind": "per_loop", "value": 5 },
+            "behavior": { "kind": "escalate" },
             "agent": "",
             "toolset": ""
           },
