@@ -102,6 +102,9 @@ func hcConfig(t *testing.T, eval MetricEvaluator) (HarnessConfig, *hcRootedSandb
 		Sandbox:           sb,
 		ContextManager:    NoopContextManager{},
 		TerminationPolicy: AlwaysContinuePolicy{},
+		// #130: pre-#130 HillClimbing budget tests assert the AUTONOMOUS
+		// propagate/Failure behavior; the default now defaults to SurfaceToHuman.
+		EscalationMode: AutonomousEscalation(),
 	}
 	// #124: the metric evaluator resolves from the registry's SIXTH map under the
 	// HillClimbing evaluator key (Q2). hcTask uses Evaluator: AgentRef("").

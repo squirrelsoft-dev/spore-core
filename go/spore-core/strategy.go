@@ -937,6 +937,17 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				partial := planExecutePartialJSON(taskList)
 				cx.PopBudget()
 				cx.Scratch.RunSession = session
+				// #130: under SurfaceToHuman, PAUSE with a BudgetExhausted request
+				// (combinator actions: [ContinueWithBudget, Skip, Fail]) instead of
+				// propagating up. The waiting RunResult is returned as the terminal
+				// result so Run finishes it as the verbatim override.
+				if executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+					waiting := promoteBudgetExhaustedToHuman(
+						err, &partial, combinatorEscalationActions(err),
+						sessionID, *task, carried, carried.Turns,
+					)
+					return waiting, nil
+				}
 				outcome := promoteBudgetExhausted(err, &partial)
 				return RunResult{}, &outcome
 			}
@@ -989,6 +1000,17 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				resolution := cx.ResolveCurrent()
 				cx.PopBudget()
 				cx.Scratch.RunSession = lastState
+				// #130: under SurfaceToHuman, an Escalate-resolving exhaustion PAUSES
+				// with a BudgetExhausted request (combinator actions) instead of
+				// propagating up.
+				if resolution != ExhaustedResolutionFail &&
+					executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+					waiting := promoteBudgetExhaustedToHuman(
+						chErr, &partial, combinatorEscalationActions(chErr),
+						sessionID, *task, carried, carried.Turns,
+					)
+					return waiting, nil
+				}
 				var outcome StrategyOutcome
 				switch resolution {
 				case ExhaustedResolutionFail:
@@ -1217,8 +1239,19 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			cx.PopBudget()
 			pt := task
 			cx.Scratch.Task = &pt
-			cx.Scratch.TerminalOverride = nil
 			cx.Stream = onStream
+			// #130: under SurfaceToHuman, an Escalate-resolving exhaustion PAUSES
+			// with a BudgetExhausted request (combinator actions) recorded as the
+			// verbatim terminal override instead of propagating up.
+			if resolution != ExhaustedResolutionFail &&
+				executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				waiting := promoteBudgetExhaustedToHuman(
+					chErr, &partial, combinatorEscalationActions(chErr),
+					buildSessionID, task, carried, carried.Turns,
+				)
+				return cx.recordTerminal(waiting)
+			}
+			cx.Scratch.TerminalOverride = nil
 			switch resolution {
 			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)
@@ -1541,8 +1574,19 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			cx.PopBudget()
 			pt := task
 			cx.Scratch.Task = &pt
-			cx.Scratch.TerminalOverride = nil
 			cx.Stream = onStream
+			// #130: under SurfaceToHuman, an Escalate-resolving exhaustion PAUSES
+			// with a BudgetExhausted request (combinator actions) recorded as the
+			// verbatim terminal override instead of propagating up.
+			if resolution != ExhaustedResolutionFail &&
+				executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				waiting := promoteBudgetExhaustedToHuman(
+					chErr, &partial, combinatorEscalationActions(chErr),
+					sessionID, task, carried, carried.Turns,
+				)
+				return cx.recordTerminal(waiting)
+			}
+			cx.Scratch.TerminalOverride = nil
 			switch resolution {
 			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)

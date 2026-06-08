@@ -1531,6 +1531,89 @@ const (
 	RiskCritical RiskLevel = "critical"
 )
 
+// ============================================================================
+// EscalationAction — the operator's choice on a budget-exhaustion pause (#130)
+// ============================================================================
+
+// EscalationActionKind discriminates EscalationAction variants. Wire values are
+// snake_case to match the cross-language serde shape.
+type EscalationActionKind string
+
+const (
+	// EscalationContinueWithBudget grants N more steps and resumes from the
+	// checkpoint. Carries a NAMED Steps field on the wire
+	// ({"kind":"continue_with_budget","steps":N}) — internally-tagged unions
+	// cannot carry a positional/tuple field, mirroring BudgetPolicy's value.
+	EscalationContinueWithBudget EscalationActionKind = "continue_with_budget"
+	// EscalationSkip marks the current task skipped; a combinator's outer loop
+	// advances to its sibling tasks. Offered only by combinators (fork C).
+	EscalationSkip EscalationActionKind = "skip"
+	// EscalationFail aborts the node and propagates BudgetExceeded (the partial
+	// is discarded, mirroring the Fail resolution contract).
+	EscalationFail EscalationActionKind = "fail"
+)
+
+// EscalationAction is the operator's choice on a budget-exhaustion
+// HumanRequest.BudgetExhausted pause (#130). Tagged on Kind, snake_case. Go
+// idiom: a single struct with a Kind discriminator and the data-carrying field
+// (Steps) valid only for the ContinueWithBudget variant — matching the existing
+// HumanRequest / HumanResponse / EscalationMode union shape rather than Rust's
+// enum syntax. The WIRE FORMAT is byte-identical to the Rust serde form.
+type EscalationAction struct {
+	Kind EscalationActionKind
+	// Steps is the granted additional step allowance, valid only when
+	// Kind == EscalationContinueWithBudget.
+	Steps uint32
+}
+
+// ContinueWithBudgetAction builds a ContinueWithBudget escalation action.
+func ContinueWithBudgetAction(steps uint32) EscalationAction {
+	return EscalationAction{Kind: EscalationContinueWithBudget, Steps: steps}
+}
+
+// SkipAction builds a Skip escalation action.
+func SkipAction() EscalationAction { return EscalationAction{Kind: EscalationSkip} }
+
+// FailAction builds a Fail escalation action.
+func FailAction() EscalationAction { return EscalationAction{Kind: EscalationFail} }
+
+// MarshalJSON serialises as a "kind"-tagged object. ContinueWithBudget carries
+// a named "steps" field; Skip / Fail are bare.
+func (a EscalationAction) MarshalJSON() ([]byte, error) {
+	switch a.Kind {
+	case EscalationContinueWithBudget:
+		return json.Marshal(struct {
+			Kind  EscalationActionKind `json:"kind"`
+			Steps uint32               `json:"steps"`
+		}{a.Kind, a.Steps})
+	case EscalationSkip, EscalationFail:
+		return json.Marshal(struct {
+			Kind EscalationActionKind `json:"kind"`
+		}{a.Kind})
+	default:
+		return nil, fmt.Errorf("EscalationAction: unknown kind %q", a.Kind)
+	}
+}
+
+// UnmarshalJSON decodes the "kind"-tagged form.
+func (a *EscalationAction) UnmarshalJSON(data []byte) error {
+	var probe struct {
+		Kind  EscalationActionKind `json:"kind"`
+		Steps uint32               `json:"steps"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	switch probe.Kind {
+	case EscalationContinueWithBudget, EscalationSkip, EscalationFail:
+		a.Kind = probe.Kind
+		a.Steps = probe.Steps
+		return nil
+	default:
+		return fmt.Errorf("EscalationAction: unknown kind %q", probe.Kind)
+	}
+}
+
 // HumanRequestKind discriminates HumanRequest variants.
 type HumanRequestKind string
 
@@ -1538,6 +1621,10 @@ const (
 	HumanReqToolApproval  HumanRequestKind = "tool_approval"
 	HumanReqClarification HumanRequestKind = "clarification"
 	HumanReqReview        HumanRequestKind = "review"
+	// HumanReqBudgetExhausted surfaces a node's budget-scope exhaustion that
+	// resolved to Escalate under EscalationMode.SurfaceToHuman (#130). The
+	// operator answers with a HumanResponse.Escalate carrying an EscalationAction.
+	HumanReqBudgetExhausted HumanRequestKind = "budget_exhausted"
 )
 
 // HumanRequest is the question surfaced to the human-in-the-loop.
@@ -1554,6 +1641,18 @@ type HumanRequest struct {
 	Options *[]string `json:"-"`
 	// review
 	Content string `json:"-"`
+	// budget_exhausted (#130): the exhausted node's context. Phase / Policy /
+	// StepsTaken / ContinuesUsed let resumeInner reconstruct the node's budget
+	// scope from the request alone (fork E — no durable cross-process
+	// checkpoint). PartialOutput is the node's pre-exhaustion output (optional;
+	// omitted from the wire when nil to mirror Rust's Option). AvailableActions
+	// is the ADVISORY action set the author offers (fork C/D).
+	Phase            string
+	Policy           BudgetPolicy
+	StepsTaken       uint32
+	ContinuesUsed    uint32
+	PartialOutput    *string
+	AvailableActions []EscalationAction
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1588,6 +1687,23 @@ func (h HumanRequest) MarshalJSON() ([]byte, error) {
 			Kind    HumanRequestKind `json:"kind"`
 			Content string           `json:"content"`
 		}{h.Kind, h.Content})
+	case HumanReqBudgetExhausted:
+		actions := h.AvailableActions
+		if actions == nil {
+			actions = []EscalationAction{}
+		}
+		// partial_output is emitted as null when nil (matching the Rust
+		// Option<String> with no skip-if-none) — the *string is marshalled
+		// directly so a nil pointer becomes JSON null.
+		return json.Marshal(struct {
+			Kind             HumanRequestKind   `json:"kind"`
+			Phase            string             `json:"phase"`
+			Policy           BudgetPolicy       `json:"policy"`
+			StepsTaken       uint32             `json:"steps_taken"`
+			ContinuesUsed    uint32             `json:"continues_used"`
+			PartialOutput    *string            `json:"partial_output"`
+			AvailableActions []EscalationAction `json:"available_actions"`
+		}{h.Kind, h.Phase, h.Policy, h.StepsTaken, h.ContinuesUsed, h.PartialOutput, actions})
 	default:
 		return nil, fmt.Errorf("HumanRequest: unknown kind %q", h.Kind)
 	}
@@ -1596,12 +1712,18 @@ func (h HumanRequest) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON decodes the flat tagged form.
 func (h *HumanRequest) UnmarshalJSON(data []byte) error {
 	var probe struct {
-		Kind      HumanRequestKind `json:"kind"`
-		Calls     []ToolCall       `json:"calls"`
-		RiskLevel RiskLevel        `json:"risk_level"`
-		Question  string           `json:"question"`
-		Options   *[]string        `json:"options"`
-		Content   string           `json:"content"`
+		Kind             HumanRequestKind   `json:"kind"`
+		Calls            []ToolCall         `json:"calls"`
+		RiskLevel        RiskLevel          `json:"risk_level"`
+		Question         string             `json:"question"`
+		Options          *[]string          `json:"options"`
+		Content          string             `json:"content"`
+		Phase            string             `json:"phase"`
+		Policy           BudgetPolicy       `json:"policy"`
+		StepsTaken       uint32             `json:"steps_taken"`
+		ContinuesUsed    uint32             `json:"continues_used"`
+		PartialOutput    *string            `json:"partial_output"`
+		AvailableActions []EscalationAction `json:"available_actions"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1612,6 +1734,12 @@ func (h *HumanRequest) UnmarshalJSON(data []byte) error {
 	h.Question = probe.Question
 	h.Options = probe.Options
 	h.Content = probe.Content
+	h.Phase = probe.Phase
+	h.Policy = probe.Policy
+	h.StepsTaken = probe.StepsTaken
+	h.ContinuesUsed = probe.ContinuesUsed
+	h.PartialOutput = probe.PartialOutput
+	h.AvailableActions = probe.AvailableActions
 	return nil
 }
 
@@ -1626,6 +1754,11 @@ const (
 	HumanRespAnswer                HumanResponseKind = "answer"
 	HumanRespApproveWithFeedback   HumanResponseKind = "approve_with_feedback"
 	HumanRespReject                HumanResponseKind = "reject"
+	// HumanRespEscalate delivers the operator's resolution of a
+	// HumanRequest.BudgetExhausted pause (#130): the chosen EscalationAction.
+	// Distinct from Allow/Halt/Deny so the budget-escalation resume is
+	// unambiguous.
+	HumanRespEscalate HumanResponseKind = "escalate"
 )
 
 // HumanResponse is the human's reply to a HumanRequest.
@@ -1635,6 +1768,14 @@ type HumanResponse struct {
 	Reason   string            `json:"-"`
 	Text     string            `json:"-"`
 	Feedback string            `json:"-"`
+	// Action carries the operator's choice, valid only when
+	// Kind == HumanRespEscalate (#130).
+	Action EscalationAction `json:"-"`
+}
+
+// EscalateResponse builds a HumanResponse.Escalate carrying an EscalationAction.
+func EscalateResponse(action EscalationAction) HumanResponse {
+	return HumanResponse{Kind: HumanRespEscalate, Action: action}
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -1668,6 +1809,11 @@ func (h HumanResponse) MarshalJSON() ([]byte, error) {
 			Kind     HumanResponseKind `json:"kind"`
 			Feedback string            `json:"feedback"`
 		}{h.Kind, h.Feedback})
+	case HumanRespEscalate:
+		return json.Marshal(struct {
+			Kind   HumanResponseKind `json:"kind"`
+			Action EscalationAction  `json:"action"`
+		}{h.Kind, h.Action})
 	default:
 		return nil, fmt.Errorf("HumanResponse: unknown kind %q", h.Kind)
 	}
@@ -1681,6 +1827,7 @@ func (h *HumanResponse) UnmarshalJSON(data []byte) error {
 		Reason   string            `json:"reason"`
 		Text     string            `json:"text"`
 		Feedback string            `json:"feedback"`
+		Action   EscalationAction  `json:"action"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -1690,6 +1837,7 @@ func (h *HumanResponse) UnmarshalJSON(data []byte) error {
 	h.Reason = probe.Reason
 	h.Text = probe.Text
 	h.Feedback = probe.Feedback
+	h.Action = probe.Action
 	return nil
 }
 
@@ -3002,6 +3150,29 @@ func (h *StandardHarness) driveStrategy(
 			if outcome.Exhausted.StepsTaken > 0 {
 				turns = outcome.Exhausted.StepsTaken
 			}
+		}
+		// #130: a BARE LEAF exhaustion propagates here without ever resolving
+		// (rule 6). Under SurfaceToHuman, PAUSE with a BudgetExhausted request (a
+		// combinator under SurfaceToHuman never reaches this arm — it sets the
+		// terminal override at its escalate site and is returned above). A bare
+		// leaf offers [ContinueWithBudget, Fail] (fork C — no sibling to Skip to).
+		if h.config.EffectiveEscalationMode().Kind == EscalationSurfaceToHuman && outcome.Exhausted != nil {
+			err := &BudgetExhausted{
+				Policy:        outcome.Exhausted.Policy,
+				Behavior:      outcome.Exhausted.Behavior,
+				StepsTaken:    outcome.Exhausted.StepsTaken,
+				ContinuesUsed: outcome.Exhausted.ContinuesUsed,
+				Phase:         outcome.Exhausted.Phase,
+			}
+			return promoteBudgetExhaustedToHuman(
+				err,
+				outcome.Exhausted.PartialOutput,
+				leafEscalationActions(err),
+				sessionID,
+				task,
+				cx.Scratch.RunBudget,
+				turns,
+			)
 		}
 		return RunResult{
 			Kind:         RunFailure,
@@ -4619,6 +4790,57 @@ func (h *StandardHarness) resumeInner(
 		}
 	}
 
+	// Budget-escalation resume (#130): if this pause came from
+	// HumanRequest.BudgetExhausted, map the operator's EscalationAction BEFORE the
+	// generic response handling (mirrors the Clarification branch). The node's
+	// budget context is reconstructed from the request fields (StepsTaken carried
+	// on the request — fork E), NOT a durable cross-process checkpoint (#129).
+	// available_actions is ADVISORY (fork D): an out-of-set action is NOT
+	// hard-rejected.
+	if state.HumanRequest != nil && state.HumanRequest.Kind == HumanReqBudgetExhausted {
+		stepsTaken := state.HumanRequest.StepsTaken
+		switch {
+		case response.Kind == HumanRespEscalate && response.Action.Kind == EscalationContinueWithBudget:
+			// Grant `steps` ADDITIONAL allowance and re-enter the loop from the
+			// restored checkpoint. The strategy tree is rebuilt with the node's
+			// budget policy raised to steps_taken + steps so the restored scope has
+			// room for `steps` more steps.
+			granted := saturatingAddU32(stepsTaken, response.Action.Steps)
+			resumedTask := task
+			grantTaskBudget(&resumedTask, granted)
+			return h.driveStrategy(ctx, resumedTask, session, budget, onStream)
+		case response.Kind == HumanRespEscalate && response.Action.Kind == EscalationSkip:
+			// Skip: the node is marked skipped and the outer loop advances. For a
+			// combinator (PlanExecute) re-entering the loop from the checkpoint
+			// advances to the remaining ready tasks. For a leaf there is no sibling,
+			// so a skip resolves to a clean (empty) Success carrying the captured
+			// session.
+			if task.LoopStrategy.Kind == StrategyPlanExecute {
+				return h.driveStrategy(ctx, task, session, budget, onStream)
+			}
+			return RunResult{
+				Kind:         RunSuccess,
+				Output:       "",
+				SessionID:    state.SessionID,
+				Usage:        AggregateUsage{},
+				Turns:        state.TurnNumber,
+				SessionState: session,
+			}
+		default:
+			// Fail (or any out-of-contract response to a budget pause): abort the
+			// node and propagate BudgetExceeded; the partial is discarded (the Fail
+			// resolution contract).
+			return RunResult{
+				Kind:         RunFailure,
+				Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+				SessionID:    state.SessionID,
+				Usage:        AggregateUsage{},
+				Turns:        state.TurnNumber,
+				SessionState: SessionState{},
+			}
+		}
+	}
+
 	switch response.Kind {
 	case HumanRespHalt:
 		return RunResult{
@@ -4657,6 +4879,19 @@ func (h *StandardHarness) resumeInner(
 			output := dispatchAndUnwrap(ctx, toolRegistry, h.config.Sandbox, call)
 			tr := HarnessToolResult{CallID: call.ID, Output: output}
 			h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
+		}
+	case HumanRespEscalate:
+		// An Escalate response delivered to a NON-budget pause is out of contract
+		// (#130): the budget-escalation resume is handled by the dedicated
+		// HumanReqBudgetExhausted branch above, which returns early. Reaching here
+		// means the operator sent an EscalationAction for a ToolApproval / Review /
+		// nil-request pause — halt cleanly rather than mis-resuming the loop.
+		return RunResult{
+			Kind:         RunFailure,
+			Reason:       HaltReason{Kind: HaltHumanHalted},
+			SessionID:    state.SessionID,
+			Turns:        state.TurnNumber,
+			SessionState: session,
 		}
 	}
 

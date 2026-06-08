@@ -229,3 +229,10 @@ func (h *StandardHarness) RalphCompletionStatus() (string, bool) {
 func (h *StandardHarness) RalphMaxResets() uint32 {
 	return h.config.effectiveMaxResets()
 }
+
+// EscalationMode returns the configured HITL-vs-AFK escalation mode (#130),
+// defaulting the zero value to EscalationSurfaceToHuman via
+// EffectiveEscalationMode. Consulted at each ExhaustedResolutionEscalate site.
+func (h *StandardHarness) EscalationMode() EscalationMode {
+	return h.config.EffectiveEscalationMode()
+}

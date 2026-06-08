@@ -146,6 +146,14 @@ type StrategyExecutor interface {
 	// RalphMaxResets returns the configured Ralph outer-loop reset cap (B3).
 	RalphMaxResets() uint32
 
+	// EscalationMode returns the configured HITL-vs-AFK escalation mode (#130,
+	// PRD goal #7). Consulted at each ExhaustedResolutionEscalate site: under
+	// EscalationSurfaceToHuman the node PAUSES with a
+	// HumanRequest.BudgetExhausted; under EscalationAutonomous the existing
+	// propagate-up behavior is unchanged. The config bodies only hold a
+	// StrategyExecutor, so this accessor is how they read the knob.
+	EscalationMode() EscalationMode
+
 	// HillEvaluate runs one HillClimbing metric evaluation on the resolved
 	// evaluator over a fresh SessionState (#124). On success ok is true and
 	// (value, dur) carry the result; on failure ok is false and (errStatus,
@@ -373,6 +381,156 @@ func (cx *ExecutionContext) finish(ctx context.Context, executor StrategyExecuto
 // resolution and nil for a Fail resolution.
 func promoteBudgetExhausted(err *BudgetExhausted, partialOutput *string) StrategyOutcome {
 	return StrategyBudgetExhausted(*err, partialOutput)
+}
+
+// ============================================================================
+// #130 — Escalate HITL pause helpers
+// ============================================================================
+
+// combinatorEscalationActions is the advisory available_actions a COMBINATOR
+// offers on a budget-exhaustion pause (#130, fork C): [ContinueWithBudget, Skip,
+// Fail]. The suggested steps default to the scope's own allowance (or 1 for an
+// uncapped scope).
+func combinatorEscalationActions(err *BudgetExhausted) []EscalationAction {
+	steps := uint32(1)
+	if v, capped := err.Policy.AllowanceValue(); capped {
+		steps = v
+	}
+	return []EscalationAction{
+		ContinueWithBudgetAction(steps),
+		SkipAction(),
+		FailAction(),
+	}
+}
+
+// leafEscalationActions is the advisory available_actions a BARE LEAF offers on
+// a budget-exhaustion pause (#130, fork C): [ContinueWithBudget, Fail] — a leaf
+// has no sibling tasks to advance to, so Skip is OMITTED.
+func leafEscalationActions(err *BudgetExhausted) []EscalationAction {
+	steps := uint32(1)
+	if v, capped := err.Policy.AllowanceValue(); capped {
+		steps = v
+	}
+	return []EscalationAction{
+		ContinueWithBudgetAction(steps),
+		FailAction(),
+	}
+}
+
+// budgetExhaustedRequest builds the HumanRequest.BudgetExhausted carrying the
+// node's context (#130). resumeInner reconstructs the node's budget scope from
+// StepsTaken / ContinuesUsed (fork E).
+func budgetExhaustedRequest(err *BudgetExhausted, partialOutput *string, actions []EscalationAction) HumanRequest {
+	return HumanRequest{
+		Kind:             HumanReqBudgetExhausted,
+		Phase:            err.Phase,
+		Policy:           err.Policy,
+		StepsTaken:       err.StepsTaken,
+		ContinuesUsed:    err.ContinuesUsed,
+		PartialOutput:    partialOutput,
+		AvailableActions: actions,
+	}
+}
+
+// promoteBudgetExhaustedToHuman builds a RunResult.WaitingForHuman carrying a
+// HumanRequest.BudgetExhausted (#130 HITL pause boundary). Built ONLY when a
+// node's Escalate resolution is consulted under EscalationSurfaceToHuman. The
+// partialOutput is preserved both on the request (for the operator) AND as a
+// single assistant text message on the paused session_state (so a resume
+// re-enters the loop with that context — mirroring the propagate path's
+// reconstruction). The PausedState records StepsTaken / ContinuesUsed on the
+// request so resumeInner can reconstruct the node's budget context from the
+// request alone (fork E).
+func promoteBudgetExhaustedToHuman(
+	err *BudgetExhausted,
+	partialOutput *string,
+	actions []EscalationAction,
+	sessionID SessionID,
+	task Task,
+	budgetUsed BudgetSnapshot,
+	turnNumber uint32,
+) RunResult {
+	var messages []Message
+	if partialOutput != nil {
+		messages = []Message{{
+			Role:    RoleAssistant,
+			Content: NewTextContent(*partialOutput),
+		}}
+	}
+	request := budgetExhaustedRequest(err, partialOutput, actions)
+	req := request
+	state := &PausedState{
+		SessionID:        sessionID,
+		TaskID:           task.ID,
+		TurnNumber:       turnNumber,
+		SessionState:     SessionState{Messages: messages},
+		PendingToolCalls: nil,
+		ApprovedResults:  nil,
+		HumanRequest:     &req,
+		Task:             task,
+		BudgetUsed:       budgetUsed,
+		ChildState:       nil,
+	}
+	return RunResult{Kind: RunWaitingForHuman, State: state, Request: &request}
+}
+
+// grantBudgetPolicy raises a BudgetPolicy's per-scope cap to at least granted
+// (#130 ContinueWithBudget grant). Unlimited is left untouched; a
+// TotalSteps/PerLoop/PerAttempt value below granted is raised to granted. Lower
+// grants are no-ops (never SHRINKS an allowance).
+func grantBudgetPolicy(policy *BudgetPolicy, granted uint32) {
+	switch policy.Kind {
+	case BudgetUnlimited:
+		// already uncapped
+	case BudgetTotalSteps, BudgetPerLoop, BudgetPerAttempt:
+		if policy.Value < granted {
+			policy.Value = granted
+		}
+	}
+}
+
+// grantStrategyBudget recurses a LoopStrategy tree raising every ReAct leaf's
+// budget cap to at least granted (#130). The combinator nodes carry no inline
+// policy (they derive it from task.budget.max_turns, raised by grantTaskBudget),
+// so this only touches the leaves.
+func grantStrategyBudget(ls *LoopStrategy, granted uint32) {
+	switch ls.Kind {
+	case StrategyReAct:
+		if ls.ReActCfg != nil {
+			grantBudgetPolicy(&ls.ReActCfg.Budget, granted)
+		}
+	case StrategyPlanExecute:
+		if ls.PlanExecute != nil {
+			grantStrategyBudget(ls.PlanExecute.Plan, granted)
+			grantStrategyBudget(ls.PlanExecute.Execute, granted)
+		}
+	case StrategySelfVerifying:
+		if ls.SelfVerify != nil {
+			grantStrategyBudget(ls.SelfVerify.Inner, granted)
+		}
+	case StrategyRalph:
+		if ls.Ralph != nil {
+			grantStrategyBudget(ls.Ralph.Inner, granted)
+		}
+	case StrategyHillClimbing:
+		if ls.HillClimbing != nil {
+			grantStrategyBudget(ls.HillClimbing.Inner, granted)
+		}
+	}
+}
+
+// grantTaskBudget reconstructs a resumed task's strategy tree with its budget
+// caps raised to granted (#130 ContinueWithBudget). The ReAct leaf caps live on
+// each node's own budget policy; the combinator nodes derive their cap from
+// task.budget.max_turns, so BOTH are raised. Fork E: granted is
+// request.steps_taken + steps, so the restored scope has room for steps more
+// steps after the checkpoint.
+func grantTaskBudget(task *Task, granted uint32) {
+	if task.Budget.MaxTurns == nil || *task.Budget.MaxTurns < granted {
+		g := granted
+		task.Budget.MaxTurns = &g
+	}
+	grantStrategyBudget(&task.LoopStrategy, granted)
 }
 
 // lastFinalResponseText returns the last FinalResponse text from a ReAct window

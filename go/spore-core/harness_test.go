@@ -16,6 +16,12 @@ func standardCfg(agent Agent) HarnessConfig {
 		Sandbox:           AllowAllSandbox{},
 		ContextManager:    NoopContextManager{},
 		TerminationPolicy: AlwaysContinuePolicy{},
+		// #130: the shared test config drives the AUTONOMOUS (propagate-up)
+		// escalation path so the pre-#130 budget-exhaustion tests keep asserting
+		// their original Failure{BudgetExceeded} / propagate behavior. The new HITL
+		// pause path is exercised by tests that build a SurfaceToHuman config
+		// explicitly (see surfaceCfg in harness_budget_escalation_130_test.go).
+		EscalationMode: AutonomousEscalation(),
 	}
 }
 
