@@ -978,6 +978,15 @@ pub trait StrategyExecutor: Send + Sync {
     /// The configured sandbox workspace root (#124, for `VerifierInput`).
     fn workspace_root(&self) -> std::path::PathBuf;
 
+    /// The configured HITL-vs-AFK escalation knob (#130). The `*Config::run`
+    /// bodies only hold `&dyn StrategyExecutor`, so they consult the
+    /// [`EscalationMode`] through this accessor at each
+    /// [`ExhaustedResolution::Escalate`] site: `SurfaceToHuman` pauses with a
+    /// [`HumanRequest::BudgetExhausted`]; `Autonomous` keeps the existing
+    /// propagate-up behavior. Mirrors [`ralph_max_resets`](Self::ralph_max_resets)
+    /// / [`workspace_root`](Self::workspace_root).
+    fn escalation_mode(&self) -> EscalationMode;
+
     /// Seed a user message onto `session_state` (the `ContextManager` seam).
     fn seed_user_message<'a>(
         &'a self,
@@ -1628,16 +1637,32 @@ impl RunStrategy for PlanExecuteConfig {
                             }
                             continue;
                         }
-                        // Escalate/Continue: surface the partial and abort the run
-                        // (the in-process Continue loop is #129; today only
-                        // Escalate/Fail are reachable — see #125 notes).
+                        // Escalate/Continue: under `Autonomous`, surface the
+                        // partial and abort the run (the in-process Continue loop
+                        // is #129; today only Escalate/Fail are reachable — see
+                        // #125 notes). Under `SurfaceToHuman` (#130) the node
+                        // PAUSES with a `BudgetExhausted` request via the
+                        // `terminal_override` seam instead of propagating up.
                         ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
                             let _ = task_list.update(task_id, Some(TaskStatus::Blocked), None);
                             executor.persist_task_list(&session_id, &task_list).await;
                             let partial = plan_execute_partial_json(&task_list);
                             cx.pop_budget();
-                            cx.scratch.task = Some(task);
+                            cx.scratch.task = Some(task.clone());
                             cx.stream = on_stream;
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                );
+                                return cx.record_terminal(waiting);
+                            }
                             return promote_budget_exhausted(&err, Some(partial));
                         }
                     }
@@ -1691,12 +1716,28 @@ impl RunStrategy for PlanExecuteConfig {
                             let partial = plan_execute_partial_json(&task_list);
                             let resolution = cx.resolve_current();
                             cx.pop_budget();
-                            cx.scratch.task = Some(task);
+                            cx.scratch.task = Some(task.clone());
                             cx.stream = on_stream;
                             return match resolution {
                                 ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
                                 ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
-                                    promote_budget_exhausted(&err, Some(partial))
+                                    if matches!(
+                                        executor.escalation_mode(),
+                                        EscalationMode::SurfaceToHuman
+                                    ) {
+                                        let waiting = promote_budget_exhausted_to_human(
+                                            &err,
+                                            Some(partial),
+                                            combinator_escalation_actions(&err),
+                                            session_id.clone(),
+                                            task,
+                                            carried.clone(),
+                                            carried.turns,
+                                        );
+                                        cx.record_terminal(waiting)
+                                    } else {
+                                        promote_budget_exhausted(&err, Some(partial))
+                                    }
                                 }
                             };
                         }
@@ -1989,7 +2030,7 @@ impl RunStrategy for SelfVerifyingConfig {
                     let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
                     let resolution = cx.resolve_current();
                     cx.pop_budget();
-                    cx.scratch.task = Some(task);
+                    cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
                     return match resolution {
                         ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
@@ -1999,8 +2040,25 @@ impl RunStrategy for SelfVerifyingConfig {
                         // placeholder, so `resolve_current` never yields `Continue`
                         // here. Handle it EXPLICITLY (surface-with-partial) rather
                         // than via a silent `_` fall-through.
+                        //
+                        // #130: under `SurfaceToHuman`, PAUSE with a
+                        // `BudgetExhausted` request instead of propagating up.
                         ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
-                            promote_budget_exhausted(&err, Some(partial))
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    build_session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
                         }
                     };
                 }
@@ -2341,7 +2399,7 @@ impl RunStrategy for HillClimbingConfig {
                     let partial = hill_climbing_partial_json(current_best);
                     let resolution = cx.resolve_current();
                     cx.pop_budget();
-                    cx.scratch.task = Some(task);
+                    cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
                     return match resolution {
                         ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
@@ -2351,8 +2409,25 @@ impl RunStrategy for HillClimbingConfig {
                         // placeholder, so `resolve_current` never yields `Continue`
                         // here. Handle it EXPLICITLY (surface-with-partial) rather
                         // than via a silent `_` fall-through.
+                        //
+                        // #130: under `SurfaceToHuman`, PAUSE with a
+                        // `BudgetExhausted` request instead of propagating up.
                         ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
-                            promote_budget_exhausted(&err, Some(partial))
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
                         }
                     };
                 }
@@ -2743,6 +2818,140 @@ fn promote_budget_exhausted(
         continues_used: err.continues_used,
         phase: err.phase.clone(),
         partial_output,
+    }
+}
+
+/// The advisory `available_actions` a COMBINATOR offers on a budget-exhaustion
+/// pause (#130, fork C): `[ContinueWithBudget, Skip, Fail]`. The suggested
+/// `steps` defaults to the scope's own allowance (or 1 for an uncapped scope).
+fn combinator_escalation_actions(err: &BudgetExhausted) -> Vec<EscalationAction> {
+    let steps = err.policy.allowance_value().unwrap_or(1);
+    vec![
+        EscalationAction::ContinueWithBudget { steps },
+        EscalationAction::Skip,
+        EscalationAction::Fail,
+    ]
+}
+
+/// The advisory `available_actions` a BARE LEAF offers on a budget-exhaustion
+/// pause (#130, fork C): `[ContinueWithBudget, Fail]` — a leaf has no sibling
+/// tasks to advance to, so `Skip` is OMITTED.
+fn leaf_escalation_actions(err: &BudgetExhausted) -> Vec<EscalationAction> {
+    let steps = err.policy.allowance_value().unwrap_or(1);
+    vec![
+        EscalationAction::ContinueWithBudget { steps },
+        EscalationAction::Fail,
+    ]
+}
+
+/// Promote a charge-time [`BudgetExhausted`] to a `RunResult::WaitingForHuman`
+/// (#130 HITL pause boundary). Built ONLY when a node's `Escalate` resolution is
+/// consulted under [`EscalationMode::SurfaceToHuman`]; it carries the node's
+/// `partial_output` and the advisory `available_actions` (combinators pass
+/// `[ContinueWithBudget, Skip, Fail]`; a bare leaf passes
+/// `[ContinueWithBudget, Fail]` — fork C). The `PausedState` records the node's
+/// `steps_taken` / `continues_used` (on the request) so `resume_inner` can
+/// reconstruct the node's [`BudgetContext`] from the request alone (fork E).
+///
+/// The `partial_output` is preserved both on the request (for the operator to
+/// inspect) AND as a single assistant text message on the paused
+/// `session_state` (so a resume re-enters the loop with that context — mirroring
+/// the propagate path's `drive_strategy` reconstruction).
+#[allow(clippy::too_many_arguments)]
+fn promote_budget_exhausted_to_human(
+    err: &BudgetExhausted,
+    partial_output: Option<String>,
+    available_actions: Vec<EscalationAction>,
+    session_id: SessionId,
+    task: Task,
+    budget_used: BudgetSnapshot,
+    turn_number: u32,
+) -> RunResult {
+    let session_state = SessionState {
+        messages: partial_output
+            .clone()
+            .map(|t| {
+                vec![Message {
+                    role: crate::model::Role::Assistant,
+                    content: crate::model::Content::Text { text: t },
+                }]
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let request = HumanRequest::BudgetExhausted {
+        phase: err.phase.clone(),
+        policy: err.policy.clone(),
+        steps_taken: err.steps_taken,
+        continues_used: err.continues_used,
+        partial_output,
+        available_actions,
+    };
+    let task_id = task.id.clone();
+    let state = PausedState {
+        session_id,
+        task_id,
+        turn_number,
+        session_state,
+        pending_tool_calls: Vec::new(),
+        approved_results: Vec::new(),
+        human_request: Some(request.clone()),
+        task,
+        budget_used,
+        child_state: None,
+    };
+    RunResult::WaitingForHuman {
+        state: Box::new(state),
+        request,
+    }
+}
+
+/// Raise a budget [`BudgetPolicy`]'s per-scope cap to at least `granted` (#130
+/// `ContinueWithBudget` grant). `Unlimited` is left untouched (already
+/// uncapped); a `TotalSteps`/`PerLoop`/`PerAttempt` value below `granted` is
+/// raised to `granted`. Lower grants are no-ops (never SHRINKS an allowance).
+fn grant_budget_policy(policy: &mut BudgetPolicy, granted: u32) {
+    match policy {
+        BudgetPolicy::Unlimited => {}
+        BudgetPolicy::TotalSteps { value }
+        | BudgetPolicy::PerLoop { value }
+        | BudgetPolicy::PerAttempt { value } => {
+            if *value < granted {
+                *value = granted;
+            }
+        }
+    }
+}
+
+/// Reconstruct a resumed task's strategy tree with its budget caps raised to
+/// `granted` (#130 `ContinueWithBudget`). The ReAct leaf caps live on each
+/// node's own `budget` [`BudgetPolicy`]; the combinator nodes derive their cap
+/// from `task.budget.max_turns`, so BOTH are raised. Fork E: `granted` is
+/// `request.steps_taken + steps`, so the restored scope has room for `steps`
+/// more steps after the checkpoint.
+fn grant_task_budget(task: &mut Task, granted: u32) {
+    match task.budget.max_turns {
+        Some(max) if max < granted => task.budget.max_turns = Some(granted),
+        None => task.budget.max_turns = Some(granted),
+        _ => {}
+    }
+    grant_strategy_budget(&mut task.loop_strategy, granted);
+}
+
+/// Recurse a [`LoopStrategy`] tree raising every ReAct leaf's `budget` cap to at
+/// least `granted` (#130). The combinator nodes carry no inline policy (they
+/// derive it from `task.budget.max_turns`, raised by
+/// [`grant_task_budget`]), so this only touches the leaves.
+fn grant_strategy_budget(ls: &mut LoopStrategy, granted: u32) {
+    match ls {
+        LoopStrategy::ReAct(c) => grant_budget_policy(&mut c.budget, granted),
+        LoopStrategy::PlanExecute(c) => {
+            grant_strategy_budget(&mut c.plan, granted);
+            grant_strategy_budget(&mut c.execute, granted);
+        }
+        LoopStrategy::SelfVerifying(c) => grant_strategy_budget(&mut c.inner, granted),
+        LoopStrategy::Ralph(c) => grant_strategy_budget(&mut c.inner, granted),
+        LoopStrategy::HillClimbing(c) => grant_strategy_budget(&mut c.inner, granted),
     }
 }
 
@@ -3936,6 +4145,77 @@ pub use crate::observability::ObservabilityProvider;
 // ============================================================================
 // Human-in-the-loop
 // ============================================================================
+//
+// ## Budget escalation HITL resume (issue #130)
+//
+// This section also owns the wiring that connects the `Escalate` budget
+// resolution (#123/#125) to the existing HITL pause/resume seam
+// (`RunResult::WaitingForHuman` + `PausedState` + `resume_inner`). The
+// `escalation_mode` config knob (#120, previously UNCONSUMED) is finally read
+// here.
+//
+// ### New types (#130)
+//   - [`EscalationAction`] — the operator's choice on a budget-exhaustion
+//     pause: `ContinueWithBudget { steps: u32 }` (grant N more steps, resume
+//     from checkpoint) | `Skip` (mark the task skipped, the outer loop
+//     advances) | `Fail` (abort the node, propagate `BudgetExceeded`). Named
+//     `u32` field on `ContinueWithBudget` (serde internally-tagged enums cannot
+//     carry tuple variants — mirrors `BudgetPolicy { value: u32 }`).
+//   - [`HumanRequest::BudgetExhausted`] — a new variant carrying the node's
+//     phase / policy / `steps_taken` / `continues_used` / `partial_output` and
+//     the advisory `available_actions: Vec<EscalationAction>`. The existing
+//     `ToolApproval` / `Clarification` / `Review` variants are UNCHANGED.
+//   - [`HumanResponse::Escalate`] — a new variant delivering the operator's
+//     [`EscalationAction`] on resume. It does NOT overload `Allow` / `Halt` /
+//     `Deny`.
+//
+// ### The `escalation_mode` accessor
+//   - [`StrategyExecutor::escalation_mode`] returns the configured
+//     [`EscalationMode`]. `StandardHarness` returns `self.config.escalation_mode`
+//     (mirrors `ralph_max_resets` / `workspace_root`). The `*Config::run` bodies
+//     only hold `&dyn StrategyExecutor`, so this accessor is required to consult
+//     the knob from a config body.
+//
+// ### Rules enforced (#130)
+//   - At each `ExhaustedResolution::Escalate` site the body consults
+//     `executor.escalation_mode()`:
+//       * `EscalationMode::Autonomous`     → EXISTING behavior unchanged
+//         (surface the partial, propagate `BudgetExhausted` up).
+//       * `EscalationMode::SurfaceToHuman` → build a `PausedState` whose
+//         `human_request = Some(HumanRequest::BudgetExhausted { .. })`, stash it
+//         as `RunResult::WaitingForHuman` through the `terminal_override` seam so
+//         it propagates VERBATIM.
+//   - `available_actions` is ADVISORY for v1 (fork D): `resume` does NOT
+//     hard-reject an out-of-set action. Combinators offer
+//     `[ContinueWithBudget, Skip, Fail]`; a bare leaf OMITS `Skip` and offers
+//     `[ContinueWithBudget, Fail]` (fork C).
+//   - `resume_inner` reconstructs the node's `BudgetContext` from the request's
+//     own `steps_taken` + `continues_used` (fork E — NOT #129's durable
+//     cross-process checkpoint). `ContinueWithBudget { steps }` grants `steps`
+//     additional allowance and re-enters the loop; `Skip` resolves the node
+//     cleanly so the outer loop advances; `Fail` propagates
+//     `Failure { BudgetExceeded }` with the partial discarded.
+//
+// No `// SPEC QUESTION:` markers — all forks are resolved in the #130 plan.
+
+/// The operator's choice on a budget-exhaustion [`HumanRequest::BudgetExhausted`]
+/// pause (#130). Tagged on `kind`, snake_case — internally-tagged, so the
+/// data-carrying variant uses a NAMED `u32` field (tuple variants are not
+/// representable; mirrors [`BudgetPolicy`]'s `value: u32` convention).
+///
+///   - `ContinueWithBudget { steps }` — grant `steps` additional steps to the
+///     node's budget scope and resume from the checkpoint.
+///   - `Skip` — mark the current task skipped; a combinator's outer loop
+///     advances to its sibling tasks. Offered only by combinators (fork C).
+///   - `Fail` — abort the node and propagate `BudgetExceeded` (partial
+///     discarded, mirroring the `Fail` resolution contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EscalationAction {
+    ContinueWithBudget { steps: u32 },
+    Skip,
+    Fail,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -3955,6 +4235,22 @@ pub enum HumanRequest {
     Review {
         content: String,
     },
+    /// A node's budget scope resolved to `Escalate` under
+    /// [`EscalationMode::SurfaceToHuman`] (#130): the run pauses and surfaces the
+    /// exhaustion to the operator. Carries the node's `phase`, its `policy`, the
+    /// `steps_taken` / `continues_used` counters (so `resume_inner` can
+    /// reconstruct the node's [`BudgetContext`] — fork E), any `partial_output`
+    /// produced before exhaustion, and the ADVISORY `available_actions` the
+    /// author offers (fork C/D). The operator answers with
+    /// [`HumanResponse::Escalate`].
+    BudgetExhausted {
+        phase: String,
+        policy: BudgetPolicy,
+        steps_taken: u32,
+        continues_used: u32,
+        partial_output: Option<String>,
+        available_actions: Vec<EscalationAction>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3970,12 +4266,28 @@ pub enum RiskLevel {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HumanResponse {
     Allow,
-    AllowWithModification { calls: Vec<ToolCall> },
-    Deny { reason: String },
+    AllowWithModification {
+        calls: Vec<ToolCall>,
+    },
+    Deny {
+        reason: String,
+    },
     Halt,
-    Answer { text: String },
-    ApproveWithFeedback { feedback: String },
-    Reject { reason: String },
+    Answer {
+        text: String,
+    },
+    ApproveWithFeedback {
+        feedback: String,
+    },
+    Reject {
+        reason: String,
+    },
+    /// The operator's resolution of a [`HumanRequest::BudgetExhausted`] pause
+    /// (#130): the chosen [`EscalationAction`]. Distinct from `Allow`/`Halt`/
+    /// `Deny` so the budget-escalation resume path is unambiguous.
+    Escalate {
+        action: EscalationAction,
+    },
 }
 
 // ============================================================================
@@ -8041,6 +8353,10 @@ impl StrategyExecutor for StandardHarness {
         self.config.max_resets
     }
 
+    fn escalation_mode(&self) -> EscalationMode {
+        self.config.escalation_mode
+    }
+
     fn resolve_metric_evaluator(
         &self,
         key: &str,
@@ -8621,35 +8937,67 @@ impl StandardHarness {
                 session_state: std::mem::take(&mut cx.scratch.run_session),
             },
             StrategyOutcome::BudgetExhausted {
-                partial_output,
+                policy,
                 steps_taken,
+                continues_used,
+                phase,
+                partial_output,
                 ..
-            } => RunResult::Failure {
-                reason: HaltReason::BudgetExceeded {
-                    limit_type: BudgetLimitType::Turns,
-                },
-                session_id,
-                usage: cx.usage.clone(),
-                // #125: the exhausted node's own `steps_taken` is the turn count it
-                // reached (the scratch budget is not written back on the propagate
-                // path). Fall back to the scratch turns if it is somehow 0.
-                turns: if steps_taken > 0 {
+            } => {
+                // #130: a BARE LEAF exhaustion propagates here without ever
+                // resolving (rule 6). Under `SurfaceToHuman`, PAUSE with a
+                // `BudgetExhausted` request (a combinator under `SurfaceToHuman`
+                // never reaches this arm — it sets `terminal_override` and is
+                // returned by the early-return above). A bare leaf offers
+                // `[ContinueWithBudget, Fail]` (fork C — no sibling to `Skip` to).
+                let turns = if steps_taken > 0 {
                     steps_taken
                 } else {
                     cx.scratch.run_budget.turns
-                },
-                session_state: SessionState {
-                    messages: partial_output
-                        .map(|t| {
-                            vec![Message {
-                                role: crate::model::Role::Assistant,
-                                content: crate::model::Content::Text { text: t },
-                            }]
-                        })
-                        .unwrap_or_default(),
-                    ..Default::default()
-                },
-            },
+                };
+                if matches!(self.config.escalation_mode, EscalationMode::SurfaceToHuman) {
+                    let err = BudgetExhausted {
+                        policy,
+                        behavior: BudgetExhaustedBehavior::Escalate,
+                        steps_taken,
+                        continues_used,
+                        phase,
+                    };
+                    let actions = leaf_escalation_actions(&err);
+                    return promote_budget_exhausted_to_human(
+                        &err,
+                        partial_output,
+                        actions,
+                        session_id,
+                        task,
+                        cx.scratch.run_budget.clone(),
+                        turns,
+                    );
+                }
+                RunResult::Failure {
+                    reason: HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                    session_id,
+                    usage: cx.usage.clone(),
+                    // #125: the exhausted node's own `steps_taken` is the turn count
+                    // it reached (the scratch budget is not written back on the
+                    // propagate path). Fall back to the scratch turns if it is
+                    // somehow 0.
+                    turns,
+                    session_state: SessionState {
+                        messages: partial_output
+                            .map(|t| {
+                                vec![Message {
+                                    role: crate::model::Role::Assistant,
+                                    content: crate::model::Content::Text { text: t },
+                                }]
+                            })
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                }
+            }
         }
     }
 
@@ -8671,6 +9019,87 @@ impl StandardHarness {
             budget_used,
             child_state,
         } = state;
+
+        // Budget-escalation resume (#130): if this pause came from
+        // `HumanRequest::BudgetExhausted`, map the operator's `EscalationAction`
+        // BEFORE the generic `match response` (mirrors the Clarification branch).
+        // The node's `BudgetContext` is reconstructed from the request fields
+        // (carried on `req.steps_taken` / `req.continues_used` — fork E), NOT a
+        // durable cross-process checkpoint (#129).
+        if let Some(HumanRequest::BudgetExhausted {
+            steps_taken,
+            continues_used: _,
+            ..
+        }) = &hr
+        {
+            let steps_taken = *steps_taken;
+            match &response {
+                // Grant `steps` ADDITIONAL allowance and re-enter the loop from the
+                // restored checkpoint. The strategy tree is rebuilt with the node's
+                // budget policy raised to `steps_taken + steps` so the restored
+                // scope has room for `steps` more steps.
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps },
+                } => {
+                    let granted = steps_taken.saturating_add(*steps);
+                    let mut resumed_task = task.clone();
+                    grant_task_budget(&mut resumed_task, granted);
+                    return self
+                        .drive_strategy(resumed_task, session_state, budget_used, on_stream)
+                        .await;
+                }
+                // Skip: the node is marked skipped and the outer loop advances. For
+                // a combinator (PlanExecute) the per-task partial already recorded
+                // the blocked task and persisted the list; re-entering the loop from
+                // the checkpoint advances to the remaining ready tasks. For a leaf
+                // there is no sibling, so a skip resolves to a clean (empty)
+                // Success carrying whatever partial history was captured.
+                HumanResponse::Escalate {
+                    action: EscalationAction::Skip,
+                } => {
+                    if matches!(task.loop_strategy, LoopStrategy::PlanExecute(_)) {
+                        return self
+                            .drive_strategy(task, session_state, budget_used, on_stream)
+                            .await;
+                    }
+                    return RunResult::Success {
+                        output: String::new(),
+                        session_id,
+                        usage: AggregateUsage::default(),
+                        turns: turn_number,
+                        session_state,
+                    };
+                }
+                // Fail: abort the node and propagate `BudgetExceeded`; the partial
+                // is discarded (the `Fail` resolution contract).
+                HumanResponse::Escalate {
+                    action: EscalationAction::Fail,
+                } => {
+                    return RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        session_id,
+                        usage: AggregateUsage::default(),
+                        turns: turn_number,
+                        session_state: SessionState::default(),
+                    };
+                }
+                // A non-`Escalate` response to a budget pause is out of contract;
+                // treat it conservatively as a `Fail` (abort + propagate).
+                _ => {
+                    return RunResult::Failure {
+                        reason: HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        session_id,
+                        usage: AggregateUsage::default(),
+                        turns: turn_number,
+                        session_state: SessionState::default(),
+                    };
+                }
+            }
+        }
 
         // Resolve the effective tool registry for this resumed session — bridges
         // catalogue tools the same way the turn loop does, so pending tool calls
@@ -8817,6 +9246,21 @@ impl StandardHarness {
                         .append_tool_result(&mut session_state, &tr)
                         .await;
                 }
+            }
+            // An `Escalate` response delivered to a non-budget pause is out of
+            // contract (#130): the budget-escalation resume is handled by the
+            // dedicated `HumanRequest::BudgetExhausted` branch ABOVE, which
+            // returns early. Reaching here means the operator sent an
+            // `EscalationAction` for a `ToolApproval`/`Review`/`None` pause —
+            // halt cleanly rather than mis-resuming the loop.
+            HumanResponse::Escalate { .. } => {
+                return RunResult::Failure {
+                    reason: HaltReason::HumanHalted,
+                    session_id,
+                    usage: AggregateUsage::default(),
+                    turns: turn_number,
+                    session_state,
+                };
             }
         }
 
@@ -9969,8 +10413,22 @@ mod tests {
             prompt_tool_call_flag: None,
             consult_handlers: std::collections::HashMap::new(),
             registry,
-            escalation_mode: EscalationMode::SurfaceToHuman,
+            // #130: the shared test config drives the AUTONOMOUS (propagate-up)
+            // escalation path so the pre-#130 budget-exhaustion tests keep
+            // asserting their original `Failure { BudgetExceeded }` / propagate
+            // behavior. The new HITL pause path is exercised by tests that build a
+            // `SurfaceToHuman` config explicitly (see `surface_config` below).
+            escalation_mode: EscalationMode::Autonomous,
         }
+    }
+
+    /// A [`standard_config`] clone with `escalation_mode = SurfaceToHuman` (#130):
+    /// the HITL path under test. Budget escalation PAUSES with a
+    /// `HumanRequest::BudgetExhausted` rather than propagating up.
+    fn surface_config(agent: Arc<MockAgent>) -> HarnessConfig {
+        let mut cfg = standard_config(agent);
+        cfg.escalation_mode = EscalationMode::SurfaceToHuman;
+        cfg
     }
 
     fn task(strategy: LoopStrategy) -> Task {
@@ -17630,6 +18088,577 @@ mod tests {
                 other => panic!("expected Failure, got {other:?}"),
             }
         }
+    }
+    // ========================================================================
+    // #130 — HumanRequest::BudgetExhausted + Escalate HITL resume
+    // ========================================================================
+
+    // Local fixture helpers (the `strategy_tests` module's copies are private to
+    // that module). Mirror their behavior: resolve a path under `/fixtures/` and
+    // assert order-preserving byte identity.
+    fn h130_fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../../fixtures/{name}"))
+    }
+
+    fn h130_minify_preserving_order(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in s.chars() {
+            if in_string {
+                out.push(ch);
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+                out.push(ch);
+            } else if !ch.is_whitespace() {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn h130_assert_fixture_byte_identical<T: Serialize>(value: &T, fixture: &str) {
+        let raw = std::fs::read_to_string(h130_fixture_path(fixture)).expect("fixture present");
+        let canonical = h130_minify_preserving_order(&raw);
+        let ours = serde_json::to_string(value).unwrap();
+        assert_eq!(ours, canonical, "{fixture} not byte-identical");
+    }
+
+    // ── serde round-trips of the new types ───────────────────────────────────
+
+    #[test]
+    fn escalation_action_round_trips_every_variant() {
+        for v in [
+            EscalationAction::ContinueWithBudget { steps: 7 },
+            EscalationAction::Skip,
+            EscalationAction::Fail,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: EscalationAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+        // The named-field variant uses the internally-tagged form (no tuple).
+        assert_eq!(
+            serde_json::to_string(&EscalationAction::ContinueWithBudget { steps: 7 }).unwrap(),
+            r#"{"kind":"continue_with_budget","steps":7}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&EscalationAction::Skip).unwrap(),
+            r#"{"kind":"skip"}"#
+        );
+    }
+
+    #[test]
+    fn human_request_budget_exhausted_round_trips() {
+        let req = HumanRequest::BudgetExhausted {
+            phase: "plan_execute".into(),
+            policy: BudgetPolicy::TotalSteps { value: 5 },
+            steps_taken: 5,
+            continues_used: 2,
+            partial_output: Some("{\"node\":\"plan_execute\"}".into()),
+            available_actions: vec![
+                EscalationAction::ContinueWithBudget { steps: 5 },
+                EscalationAction::Skip,
+                EscalationAction::Fail,
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: HumanRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        // The variant tag is snake_case.
+        assert!(json.contains(r#""kind":"budget_exhausted""#));
+    }
+
+    #[test]
+    fn human_response_escalate_round_trips() {
+        let r = HumanResponse::Escalate {
+            action: EscalationAction::ContinueWithBudget { steps: 3 },
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: HumanResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+        assert!(json.contains(r#""kind":"escalate""#));
+    }
+
+    #[test]
+    fn existing_human_request_variants_still_round_trip() {
+        for req in [
+            HumanRequest::ToolApproval {
+                calls: vec![],
+                risk_level: RiskLevel::High,
+            },
+            HumanRequest::Clarification {
+                question: "which?".into(),
+                options: Some(vec!["a".into(), "b".into()]),
+            },
+            HumanRequest::Review {
+                content: "look".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back: HumanRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(req, back);
+        }
+    }
+
+    #[test]
+    fn existing_human_response_variants_still_round_trip() {
+        for r in [
+            HumanResponse::Allow,
+            HumanResponse::AllowWithModification { calls: vec![] },
+            HumanResponse::Deny {
+                reason: "no".into(),
+            },
+            HumanResponse::Halt,
+            HumanResponse::Answer { text: "x".into() },
+            HumanResponse::ApproveWithFeedback {
+                feedback: "ok".into(),
+            },
+            HumanResponse::Reject {
+                reason: "bad".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&r).unwrap();
+            let back: HumanResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(r, back);
+        }
+    }
+
+    // ── accessor ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn standard_harness_escalation_mode_accessor_reflects_config() {
+        let h = StandardHarness::new(surface_config(make_agent()));
+        assert_eq!(h.escalation_mode(), EscalationMode::SurfaceToHuman);
+        let h = StandardHarness::new(standard_config(make_agent()));
+        assert_eq!(h.escalation_mode(), EscalationMode::Autonomous);
+    }
+
+    // ── helper: a bare ReAct leaf whose cap is binding (drives a pause) ───────
+
+    fn budget_exhausting_agent(turns: usize) -> Arc<MockAgent> {
+        let a = make_agent();
+        for i in 0..turns {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        a
+    }
+
+    fn tool_reg(n: usize) -> Arc<ScriptedToolRegistry> {
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        for _ in 0..n {
+            reg.push(ToolOutput::Success {
+                content: "ok".into(),
+                truncated: false,
+            });
+        }
+        reg
+    }
+
+    // ── SurfaceToHuman: a bare leaf PAUSES with the request ──────────────────
+
+    #[tokio::test]
+    async fn surface_to_human_bare_leaf_pauses_with_budget_request() {
+        let mut cfg = surface_config(budget_exhausting_agent(3));
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = react(2); // PerLoop{2}, no global cap → leaf cap binds.
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::WaitingForHuman { request, state } => {
+                // The PausedState mirrors the request verbatim.
+                assert_eq!(state.human_request.as_ref(), Some(&request));
+                assert_eq!(state.session_state.messages.len(), 1);
+                match request {
+                    HumanRequest::BudgetExhausted {
+                        phase,
+                        policy,
+                        steps_taken,
+                        partial_output,
+                        available_actions,
+                        ..
+                    } => {
+                        assert_eq!(phase, "react");
+                        assert_eq!(policy, BudgetPolicy::PerLoop { value: 2 });
+                        assert_eq!(steps_taken, 2);
+                        // A bare leaf omits Skip (fork C).
+                        assert_eq!(
+                            available_actions,
+                            vec![
+                                EscalationAction::ContinueWithBudget { steps: 2 },
+                                EscalationAction::Fail,
+                            ]
+                        );
+                        // The partial is the documented ReAct shape.
+                        assert_eq!(partial_output, Some(react_partial_json("")));
+                    }
+                    other => panic!("expected BudgetExhausted request, got {other:?}"),
+                }
+            }
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+    }
+
+    // ── SurfaceToHuman: a combinator (PlanExecute) pauses with Skip offered ───
+
+    #[tokio::test]
+    async fn surface_to_human_combinator_offers_skip() {
+        // A PlanExecute whose execute leaf carries a SMALL PerLoop cap (smaller
+        // than the global backstop): the execute step exhausts its own leaf cap,
+        // PROPAGATES a `StrategyOutcome::BudgetExhausted` to the PlanExecute scope,
+        // whose `Escalate` resolution PAUSES under SurfaceToHuman (fork C: a
+        // combinator offers all three actions).
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["x","y","z"]}"#)); // plan
+                                                          // Execute step: keep requesting tools past the leaf cap of 2.
+        for i in 0..4 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("e{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(4);
+        let h = StandardHarness::new(cfg);
+        // Plan slot is structured (output schema); execute leaf cap = PerLoop{2}.
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            plan: Box::new(react_structured(u32::MAX)),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
+            plan_model: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::WaitingForHuman {
+                request:
+                    HumanRequest::BudgetExhausted {
+                        phase,
+                        available_actions,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(phase, "plan_execute");
+                // A combinator offers all three actions (fork C).
+                assert!(available_actions.contains(&EscalationAction::Skip));
+                assert!(available_actions.contains(&EscalationAction::Fail));
+                assert!(available_actions
+                    .iter()
+                    .any(|a| matches!(a, EscalationAction::ContinueWithBudget { .. })));
+            }
+            other => panic!("expected combinator BudgetExhausted pause, got {other:?}"),
+        }
+    }
+
+    // ── Autonomous: no pause; existing propagate behavior ────────────────────
+
+    #[tokio::test]
+    async fn autonomous_does_not_pause_propagates_budget_exceeded() {
+        let mut cfg = standard_config(budget_exhausting_agent(3)); // Autonomous.
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = react(2);
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                turns,
+                ..
+            } => assert_eq!(turns, 2),
+            other => panic!("expected BudgetExceeded Failure (no pause), got {other:?}"),
+        }
+    }
+
+    // ── Resume: ContinueWithBudget grants N steps and resumes ────────────────
+
+    #[tokio::test]
+    async fn resume_continue_with_budget_grants_and_resumes() {
+        // First run pauses at the leaf cap of 2.
+        let a = make_agent();
+        // 2 tool turns to exhaust the cap, then a FinalResponse for the resume.
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c0".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "finished after grant".into(),
+            usage: usage(),
+        });
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = react(2);
+        let paused = h.run(HarnessRunOptions::new(t)).await;
+        let state = match paused {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected pause, got {other:?}"),
+        };
+        // Operator grants 5 more steps and resumes.
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps: 5 },
+                },
+                None,
+            )
+            .await;
+        match resumed {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "finished after grant");
+            }
+            other => panic!("expected Success after grant, got {other:?}"),
+        }
+    }
+
+    // ── Resume: Fail propagates Failure{BudgetExceeded}, partial discarded ────
+
+    #[tokio::test]
+    async fn resume_fail_propagates_budget_exceeded() {
+        let mut cfg = surface_config(budget_exhausting_agent(3));
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let state = match h.run(HarnessRunOptions::new(react(2))).await {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected pause, got {other:?}"),
+        };
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::Fail,
+                },
+                None,
+            )
+            .await;
+        match resumed {
+            RunResult::Failure {
+                reason:
+                    HaltReason::BudgetExceeded {
+                        limit_type: BudgetLimitType::Turns,
+                    },
+                session_state,
+                ..
+            } => {
+                // Fail contract: the partial is discarded.
+                assert!(session_state.messages.is_empty());
+            }
+            other => panic!("expected BudgetExceeded Failure, got {other:?}"),
+        }
+    }
+
+    // ── Resume: Skip on a leaf resolves to clean Success ─────────────────────
+
+    #[tokio::test]
+    async fn resume_skip_on_leaf_resolves_clean() {
+        let mut cfg = surface_config(budget_exhausting_agent(3));
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let state = match h.run(HarnessRunOptions::new(react(2))).await {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected pause, got {other:?}"),
+        };
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::Skip,
+                },
+                None,
+            )
+            .await;
+        assert!(matches!(resumed, RunResult::Success { .. }));
+    }
+
+    // ── Resume: Skip on a PlanExecute advances the outer loop ────────────────
+
+    #[tokio::test]
+    async fn resume_skip_on_plan_execute_advances_outer_loop() {
+        // Build a paused PlanExecute state by hand whose persisted task list still
+        // has a ready task, then resume with Skip and confirm the executor
+        // re-enters the loop (does NOT immediately fail/pause again on the same
+        // task). We assert it does NOT return the same WaitingForHuman pause.
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "advanced".into(),
+            usage: usage(),
+        });
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(0);
+        let h = StandardHarness::new(cfg);
+
+        let pe = LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None));
+        let mut t = task(pe);
+        t.budget.max_turns = Some(8);
+        let state = PausedState {
+            session_id: SessionId::new("s1"),
+            task_id: t.id.clone(),
+            turn_number: 1,
+            session_state: SessionState::default(),
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: Some(HumanRequest::BudgetExhausted {
+                phase: "plan_execute".into(),
+                policy: BudgetPolicy::TotalSteps { value: 1 },
+                steps_taken: 1,
+                continues_used: 0,
+                partial_output: Some(react_partial_json("")),
+                available_actions: vec![
+                    EscalationAction::ContinueWithBudget { steps: 1 },
+                    EscalationAction::Skip,
+                    EscalationAction::Fail,
+                ],
+            }),
+            task: t,
+            budget_used: BudgetSnapshot::default(),
+            child_state: None,
+        };
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Escalate {
+                    action: EscalationAction::Skip,
+                },
+                None,
+            )
+            .await;
+        // The Skip re-entered the PlanExecute loop rather than returning the same
+        // pause verbatim: it ran to a terminal (Success or a Failure), NOT a
+        // WaitingForHuman echo of the input.
+        assert!(
+            !matches!(resumed, RunResult::WaitingForHuman { .. }),
+            "Skip should advance the outer loop, not re-pause: {resumed:?}"
+        );
+    }
+
+    // ── grant_task_budget raises caps without shrinking ──────────────────────
+
+    #[test]
+    fn grant_task_budget_raises_leaf_and_global_caps() {
+        let mut t = react(2);
+        grant_task_budget(&mut t, 9);
+        assert_eq!(t.budget.max_turns, Some(9));
+        if let LoopStrategy::ReAct(c) = &t.loop_strategy {
+            assert_eq!(c.budget, BudgetPolicy::PerLoop { value: 9 });
+        } else {
+            panic!("expected ReAct leaf");
+        }
+        // A lower grant never SHRINKS an existing allowance.
+        grant_task_budget(&mut t, 3);
+        assert_eq!(t.budget.max_turns, Some(9));
+    }
+
+    // ── Fixture replay: the cross-language ground truth ──────────────────────
+
+    fn budget_exhausted_paused_state() -> PausedState {
+        PausedState {
+            session_id: SessionId::new("sess-130"),
+            task_id: TaskId::new("task-130"),
+            turn_number: 6,
+            session_state: SessionState {
+                messages: vec![Message {
+                    role: crate::model::Role::Assistant,
+                    content: crate::model::Content::Text {
+                        text: "{\"node\":\"plan_execute\",\"tasks\":2,\"ledger\":[]}".into(),
+                    },
+                }],
+                ..Default::default()
+            },
+            pending_tool_calls: vec![],
+            approved_results: vec![],
+            human_request: Some(HumanRequest::BudgetExhausted {
+                phase: "plan_execute".into(),
+                policy: BudgetPolicy::TotalSteps { value: 6 },
+                steps_taken: 6,
+                continues_used: 1,
+                partial_output: Some(
+                    "{\"node\":\"plan_execute\",\"tasks\":2,\"ledger\":[]}".into(),
+                ),
+                available_actions: vec![
+                    EscalationAction::ContinueWithBudget { steps: 6 },
+                    EscalationAction::Skip,
+                    EscalationAction::Fail,
+                ],
+            }),
+            task: {
+                let mut t = Task::new(
+                    "build the feature",
+                    SessionId::new("sess-130"),
+                    LoopStrategy::PlanExecute(PlanExecuteConfig {
+                        plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                            budget: BudgetPolicy::PerLoop { value: 4 },
+                            agent: AgentRef("planner".into()),
+                            toolset: ToolsetRef("plan-tools".into()),
+                            output: Some(SchemaRef("plan-schema".into())),
+                        })),
+                        execute: Box::new(LoopStrategy::ReAct(ReactConfig {
+                            budget: BudgetPolicy::PerLoop { value: 8 },
+                            agent: AgentRef("executor".into()),
+                            toolset: ToolsetRef("exec-tools".into()),
+                            output: Some(SchemaRef("worker-schema".into())),
+                        })),
+                        plan_model: None,
+                    }),
+                );
+                t.id = TaskId::new("task-130");
+                t.budget.max_turns = Some(6);
+                t
+            },
+            budget_used: BudgetSnapshot {
+                turns: 6,
+                ..Default::default()
+            },
+            child_state: None,
+        }
+    }
+
+    #[test]
+    fn fixture_replay_budget_exhausted_paused_state() {
+        let raw = std::fs::read_to_string(h130_fixture_path("paused_states/budget_exhausted.json"))
+            .expect("fixture present");
+        // Deserializes to the canonical value (field-for-field).
+        let parsed: PausedState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, budget_exhausted_paused_state());
+        // Re-serializes byte-identically (order-preserving minify).
+        h130_assert_fixture_byte_identical(
+            &budget_exhausted_paused_state(),
+            "paused_states/budget_exhausted.json",
+        );
     }
 }
 

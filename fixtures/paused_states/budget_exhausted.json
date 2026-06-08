@@ -1,0 +1,85 @@
+{
+  "session_id": "sess-130",
+  "task_id": "task-130",
+  "turn_number": 6,
+  "session_state": {
+    "messages": [
+      {
+        "role": "assistant",
+        "content": {
+          "type": "text",
+          "text": "{\"node\":\"plan_execute\",\"tasks\":2,\"ledger\":[]}"
+        }
+      }
+    ],
+    "extras": {}
+  },
+  "pending_tool_calls": [],
+  "approved_results": [],
+  "human_request": {
+    "kind": "budget_exhausted",
+    "phase": "plan_execute",
+    "policy": {
+      "kind": "total_steps",
+      "value": 6
+    },
+    "steps_taken": 6,
+    "continues_used": 1,
+    "partial_output": "{\"node\":\"plan_execute\",\"tasks\":2,\"ledger\":[]}",
+    "available_actions": [
+      {
+        "kind": "continue_with_budget",
+        "steps": 6
+      },
+      {
+        "kind": "skip"
+      },
+      {
+        "kind": "fail"
+      }
+    ]
+  },
+  "task": {
+    "id": "task-130",
+    "instruction": "build the feature",
+    "session_id": "sess-130",
+    "budget": {
+      "max_turns": 6,
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "max_wall_time": null,
+      "max_cost_usd": null
+    },
+    "loop_strategy": {
+      "kind": "plan_execute",
+      "plan": {
+        "kind": "react",
+        "budget": {
+          "kind": "per_loop",
+          "value": 4
+        },
+        "agent": "planner",
+        "toolset": "plan-tools",
+        "output": "plan-schema"
+      },
+      "execute": {
+        "kind": "react",
+        "budget": {
+          "kind": "per_loop",
+          "value": 8
+        },
+        "agent": "executor",
+        "toolset": "exec-tools",
+        "output": "worker-schema"
+      }
+    }
+  },
+  "budget_used": {
+    "turns": 6,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "wall_time": null,
+    "cost_usd": 0.0
+  },
+  "child_state": null
+}
