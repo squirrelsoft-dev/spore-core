@@ -90,8 +90,11 @@ def test_react_leaf_roundtrip_and_tag() -> None:
     OMITTED from the wire when ``None``."""
     react = ReactConfig(budget=BudgetPolicyPerLoop(value=8), agent="a", toolset="t")
     wire = _STRATEGY.dump_json(react).decode()
+    # #129: ``behavior`` ALWAYS serializes (default ``escalate``), CANONICAL
+    # POSITION immediately after ``budget``.
     assert wire == (
-        '{"kind":"react","budget":{"kind":"per_loop","value":8},"agent":"a","toolset":"t"}'
+        '{"kind":"react","budget":{"kind":"per_loop","value":8},'
+        '"behavior":{"kind":"escalate"},"agent":"a","toolset":"t"}'
     )
     assert '"re_act"' not in wire
     assert "output" not in wire

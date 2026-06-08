@@ -287,6 +287,24 @@ BudgetExhaustedBehavior = Annotated[
 BudgetExhaustedContinue.model_rebuild()
 
 
+def default_budget_behavior() -> BudgetExhaustedEscalate:
+    """The default :class:`BudgetExhaustedBehavior` for a config node's serialized
+    ``behavior`` field (#129): ``Escalate``. Two roles:
+
+    - as the pydantic ``default_factory`` so a strategy tree serialized BEFORE #129
+      (no ``behavior`` key) still deserializes to the historical placeholder,
+      preserving backward-compat reads;
+    - the value the migration shims (``ReactConfig.per_loop`` / ``*.simple``)
+      stamp so a bare leaf keeps its pre-#129 propagate-to-parent contract by
+      default.
+
+    The field is NOT skip-serialized: it ALWAYS serializes (uniform wire shape
+    across all five config structs, Q1), so the cross-language fixtures carry an
+    explicit ``"behavior":{"kind":"escalate"}`` on every node. Mirrors Rust's
+    ``default_budget_behavior``."""
+    return BudgetExhaustedEscalate()
+
+
 # ============================================================================
 # Task + loop strategy (tagged union on ``kind``)
 # ============================================================================
@@ -338,6 +356,13 @@ class ReactConfig(_Model):
 
     kind: Literal["react"] = "react"
     budget: BudgetPolicy
+    # #129: what this node does when its ``budget`` is spent. CANONICAL POSITION
+    # on ``ReactConfig``: IMMEDIATELY after ``budget``. A leaf honors its
+    # ``behavior`` ONLY at the top-level/bare-leaf resolution site
+    # (:meth:`_drive_strategy`); in the normal NESTED case the leaf still
+    # PROPAGATES exhaustion to its parent (#125 rule 6 — a nested leaf never
+    # self-resolves). Always serialized (Q1).
+    behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
     agent: AgentRef
     toolset: ToolsetRef
     # OMITTED from JSON when None (matches Rust ``skip_serializing_if``).
@@ -374,6 +399,9 @@ class PlanExecuteConfig(_Model):
     plan: LoopStrategy
     execute: LoopStrategy
     plan_model: ModelConfig | None = None
+    # #129: what this combinator does when its execute-phase budget is spent.
+    # CANONICAL POSITION on a combinator: the LAST field. Always serialized (Q1).
+    behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -407,6 +435,9 @@ class SelfVerifyingConfig(_Model):
     kind: Literal["self_verifying"] = "self_verifying"
     inner: LoopStrategy
     evaluator: SchemaRef
+    # #129: what this combinator does when its build↔evaluate budget is spent.
+    # CANONICAL POSITION on a combinator: the LAST field. Always serialized (Q1).
+    behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
 
     @classmethod
     def simple(cls) -> SelfVerifyingConfig:
@@ -432,6 +463,12 @@ class RalphConfig(_Model):
     kind: Literal["ralph"] = "ralph"
     inner: LoopStrategy
     agent: AgentRef
+    # #129: what Ralph does when its own scope is spent. CANONICAL POSITION on a
+    # combinator: the LAST field. Always serialized (Q1). NOTE: Ralph's window
+    # recovery (reset + retry) is independent of this field — it governs Ralph's
+    # OWN budget scope, not the per-window child exhaustion (which Ralph already
+    # absorbs as "window incomplete" and retries).
+    behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
 
     @classmethod
     def simple(cls) -> RalphConfig:
@@ -452,6 +489,9 @@ class HillClimbingConfig(_Model):
     revert_on_no_improvement: bool
     min_improvement_delta: float
     evaluator: AgentRef
+    # #129: what this combinator does when its optimization-loop budget is spent.
+    # CANONICAL POSITION on a combinator: the LAST field. Always serialized (Q1).
+    behavior: BudgetExhaustedBehavior = Field(default_factory=default_budget_behavior)
 
 
 LoopStrategy = Annotated[
@@ -674,6 +714,32 @@ class BudgetContext:
         self.continues_used += 1
         self.steps_taken = 0
 
+    @classmethod
+    def resumed(
+        cls,
+        policy: BudgetPolicy,
+        behavior: BudgetExhaustedBehavior,
+        phase: str,
+        continues_used: int,
+    ) -> BudgetContext:
+        """Reconstruct a RESUMED scope (#129) whose ``continues_used`` is seeded
+        from a cross-process checkpoint — the sole field of :class:`BudgetContext`
+        that must survive a process pause. ``steps_taken`` starts at 0 (the resumed
+        run re-enters the loop with a fresh per-round step budget; the checkpoint
+        only carries how many continues were ALREADY spent so a ``Continue``
+        spanning the pause cannot exceed ``max_continues``). Runtime-only —
+        ``continues_used`` is read off the
+        :class:`HumanRequestBudgetExhausted` payload (Q3: NOT a new serialized
+        :class:`BudgetContext` / :class:`PausedState` field). Mirrors Rust's
+        ``BudgetContext::resumed``."""
+        return cls(
+            policy=policy,
+            behavior=behavior,
+            phase=phase,
+            steps_taken=0,
+            continues_used=continues_used,
+        )
+
     def resolve_exhausted(self) -> ExhaustedResolution:
         """Resolve this scope's :class:`BudgetExhaustedBehavior` at the moment of
         exhaustion (#125), walking the on-exhausted fall-through chain:
@@ -773,6 +839,17 @@ class RunScratch:
     run_session: SessionState = field(default_factory=lambda: SessionState())
     run_budget: BudgetSnapshot = field(default_factory=lambda: BudgetSnapshot())
     terminal_override: RunResult | None = None
+    # Cross-process Continue checkpoint seed (#129): ``(phase, continues_used)``
+    # carried from a resumed :class:`HumanRequestBudgetExhausted`. The FIRST
+    # :meth:`ExecutionContext.push_budget` whose ``phase`` matches seeds the
+    # reconstructed scope's ``continues_used`` (via :meth:`BudgetContext.resumed`)
+    # and CLEARS this seed — so a ``Continue`` spanning a process pause resumes
+    # with the correct continue count (AC2). Runtime-only; the value rides the
+    # request payload, NOT a serialized :class:`BudgetContext` / :class:`PausedState`
+    # field (Q3). ``None`` on a fresh run and after the seed is consumed (an
+    # in-process Continue never sets it → AC3: no serialization on the in-process
+    # path). Mirrors Rust's ``RunScratch::resume_continues``.
+    resume_continues: tuple[str, int] | None = None
 
 
 @dataclass
@@ -892,8 +969,21 @@ class ExecutionContext:
         including a sibling — gets its OWN scope (``steps_taken = 0``), so a node
         capped at N never spends a sibling's allowance (rule 1) and a child's
         exhaustion never touches the parent scope (rule 4/7). Returns the depth
-        AFTER the push. Mirrors Rust's ``push_budget``."""
-        self.budgets.push(BudgetContext(policy=policy, behavior=behavior, phase=phase))
+        AFTER the push. Mirrors Rust's ``push_budget``.
+
+        #129 (AC2): if a resumed ``Continue`` checkpoint seed is waiting for THIS
+        ``phase``, reconstruct the scope with its prior ``continues_used``
+        (consuming the seed once) via :meth:`BudgetContext.resumed` instead of
+        zeroing it. The root resumed node pushes first, and the request's ``phase``
+        names that node, so the FIRST matching push restores the count. Any other
+        push (or a fresh run) is unaffected."""
+        seed = self.scratch.resume_continues
+        if seed is not None and seed[0] == phase:
+            self.scratch.resume_continues = None
+            scope = BudgetContext.resumed(policy, behavior, phase, seed[1])
+        else:
+            scope = BudgetContext(policy=policy, behavior=behavior, phase=phase)
+        self.budgets.push(scope)
         return self.budgets.depth()
 
     def pop_budget(self) -> BudgetContext | None:
@@ -1460,12 +1550,14 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     if isinstance(agent, RunResultFailure):
         await executor.finalize(agent)
         return cx._record_terminal(agent)
-    # #125: push this leaf's OWN budget scope. The leaf carries only its POLICY
-    # (the cap); behavior is ``Escalate`` as a leaf placeholder — the leaf never
-    # RESOLVES it (rule 6: propagate to parent), it is only the scope shape so the
-    # charge below enforces the cap and any exhaustion promotes to a
-    # parent-inspectable ``BudgetExhausted``.
-    cx.push_budget(self.budget, BudgetExhaustedEscalate(), "react")
+    # #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
+    # ``behavior``. The leaf still never RESOLVES it in the nested case (rule 6: it
+    # PROPAGATES a ``BudgetExhausted`` to its parent, which owns the single
+    # recovery site). Carrying the real ``behavior`` only means the propagated
+    # error reports it, so the TOP-LEVEL/bare-leaf resolution site
+    # (:meth:`_drive_strategy`) can honor it (Q1 — a bare leaf self-resolves, a
+    # nested leaf does not).
+    cx.push_budget(self.budget, self.behavior, "react")
     # The leaf takes the run's stream sink for the window. Combinators that
     # recurse per-phase suppress it (they take it before recursing).
     on_stream = cx.stream
@@ -1513,7 +1605,7 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
             else:
                 err = BudgetExhausted(
                     policy=self.budget,
-                    behavior=BudgetExhaustedEscalate(),
+                    behavior=self.behavior,
                     steps_taken=window_turns,
                     continues_used=0,
                     phase="react",
@@ -1742,7 +1834,7 @@ async def _run_plan_execute_config(
         plan_policy: BudgetPolicy = BudgetPolicyTotalSteps(value=task.budget.max_turns)
     else:
         plan_policy = BudgetPolicyUnlimited()
-    cx.push_budget(plan_policy, BudgetExhaustedEscalate(), "plan_execute")
+    cx.push_budget(plan_policy, self.behavior, "plan_execute")
 
     # Total positional count for the OnTaskAdvance hook (stable).
     total_tasks = len(task_list.tasks)
@@ -1821,6 +1913,16 @@ async def _run_plan_execute_config(
                 phase=scope.phase,
             )
             resolution = cx.resolve_current()
+            # #129: a granted ``Continue`` loops IN-PROCESS — the scope's
+            # :meth:`resolve_current` already reset ``steps_taken`` and bumped
+            # ``continues_used``. Reset this task to ``Pending`` and re-enter the
+            # ready-set walk so it runs again under the refreshed scope allowance
+            # (NO serialization — AC3). ``max_continues`` bounds the loop: once
+            # continues are spent, the chain falls through to ``Fail``/``Escalate``.
+            if resolution == ExhaustedResolution.CONTINUE:
+                task_list.update(task_id, TaskStatus.PENDING)
+                await executor.persist_task_list(session_id, task_list)
+                continue
             # #126 AC4: a budget-``Fail`` task cascades IDENTICALLY to an
             # error-failed one — block its transitive dependents and keep
             # scheduling unrelated tasks.
@@ -1834,10 +1936,8 @@ async def _run_plan_execute_config(
                 if first_failure is None:
                     first_failure = (task_id, f"budget exhausted (Fail): {scope.policy!r}")
                 continue
-            # Escalate/Continue: under ``Autonomous`` surface the partial and
-            # abort the run (the in-process Continue loop is #129; today only
-            # Escalate/Fail are reachable — see #125 notes). Under
-            # ``SurfaceToHuman`` (#130) the node PAUSES with a
+            # Escalate: under ``Autonomous`` surface the partial and abort the run.
+            # Under ``SurfaceToHuman`` (#130) the node PAUSES with a
             # ``BudgetExhausted`` request via the ``terminal_override`` seam.
             task_list.update(task_id, TaskStatus.BLOCKED)
             await executor.persist_task_list(session_id, task_list)
@@ -1892,17 +1992,19 @@ async def _run_plan_execute_config(
             # #125: charge this step's turns against the PlanExecute scope.
             charge_err = cx.charge_current(max(0, sub_result.turns - carried_before))
             if charge_err is not None:
-                partial = _plan_execute_partial_json(task_list)
                 resolution = cx.resolve_current()
+                # #129: a granted ``Continue`` refreshes the scope and keeps
+                # scheduling the remaining ready tasks IN-PROCESS (this step already
+                # completed). Do NOT pop the scope. NO serialization (AC3).
+                if resolution == ExhaustedResolution.CONTINUE:
+                    continue
+                partial = _plan_execute_partial_json(task_list)
                 cx.pop_budget()
                 cx.scratch.task = task
                 cx.stream = on_stream
                 if resolution == ExhaustedResolution.FAIL:
                     return _promote_budget_exhausted(charge_err, None)
-                if resolution in (
-                    ExhaustedResolution.CONTINUE,
-                    ExhaustedResolution.ESCALATE,
-                ):
+                if resolution == ExhaustedResolution.ESCALATE:
                     from .execution_registry import EscalationModeSurfaceToHuman
 
                     if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
@@ -2072,7 +2174,7 @@ async def _run_self_verifying_config(
         sv_policy: BudgetPolicy = BudgetPolicyTotalSteps(value=task.budget.max_turns)
     else:
         sv_policy = BudgetPolicyUnlimited()
-    cx.push_budget(sv_policy, BudgetExhaustedEscalate(), "self_verifying")
+    cx.push_budget(sv_policy, self.behavior, "self_verifying")
 
     for iteration in range(max_iterations):
         # ── Build phase: recurse ``run_strategy(self.inner, cx)``.
@@ -2139,23 +2241,22 @@ async def _run_self_verifying_config(
         # BudgetExhausted (partial = last worker result + last verdict).
         charge_err = cx.charge_current(max(0, carried.turns - carried_before))
         if charge_err is not None:
-            partial = _self_verifying_partial_json(last_worker_output, last_reason)
             resolution = cx.resolve_current()
+            # #129: a granted ``Continue`` resets the scope and RE-RUNS the
+            # build↔evaluate iteration IN-PROCESS (do NOT pop the scope; the loop
+            # continues under the refreshed allowance). NO serialization (AC3).
+            # ``max_continues`` bounds the loop.
+            if resolution == ExhaustedResolution.CONTINUE:
+                continue
+            partial = _self_verifying_partial_json(last_worker_output, last_reason)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
             if resolution == ExhaustedResolution.FAIL:
                 return _promote_budget_exhausted(charge_err, None)
-            # #129: a granted ``Continue`` must reset + RE-RUN this
-            # build↔evaluate iteration (the in-process loop wiring lands in
-            # #129). UNREACHABLE today — live bodies push an ``Escalate``
-            # placeholder, so ``resolve_current`` never yields ``Continue`` here.
-            # Handle it EXPLICITLY (alongside ``Escalate``, surface-with-partial)
-            # rather than via a silent fall-through.
-            if resolution in (
-                ExhaustedResolution.CONTINUE,
-                ExhaustedResolution.ESCALATE,
-            ):
+            # #129: the in-process ``Continue`` is handled above; this arm is
+            # ``Escalate``-only now (kept for the surface/propagate shape).
+            if resolution == ExhaustedResolution.ESCALATE:
                 from .execution_registry import EscalationModeSurfaceToHuman
 
                 if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
@@ -2378,7 +2479,7 @@ async def _run_hill_climbing_config(
         hc_policy: BudgetPolicy = BudgetPolicyTotalSteps(value=task.budget.max_turns)
     else:
         hc_policy = BudgetPolicyUnlimited()
-    cx.push_budget(hc_policy, BudgetExhaustedEscalate(), "hill_climbing")
+    cx.push_budget(hc_policy, self.behavior, "hill_climbing")
 
     # ── Iteration 0: pure baseline (no agent turn).
     baseline = await executor.hill_baseline(
@@ -2408,24 +2509,23 @@ async def _run_hill_climbing_config(
         # the legacy ``BudgetExceeded`` Failure.
         charge_err = cx.charge_current(1)
         if charge_err is not None:
+            resolution = cx.resolve_current()
+            # #129: a granted ``Continue`` resets the scope and KEEPS ITERATING the
+            # climb IN-PROCESS (do NOT pop; the refreshed allowance lets the next
+            # charge pass). NO serialization (AC3). ``max_continues`` bounds the
+            # loop.
+            if resolution == ExhaustedResolution.CONTINUE:
+                continue
             await executor.hill_write_tsv(task_id, rows)
             partial = _hill_climbing_partial_json(current_best)
-            resolution = cx.resolve_current()
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
             if resolution == ExhaustedResolution.FAIL:
                 return _promote_budget_exhausted(charge_err, None)
-            # #129: a granted ``Continue`` must reset + keep iterating the climb
-            # (the in-process loop wiring lands in #129). UNREACHABLE today — live
-            # bodies push an ``Escalate`` placeholder, so ``resolve_current``
-            # never yields ``Continue`` here. Handle it EXPLICITLY (alongside
-            # ``Escalate``, surface-with-partial) rather than via a silent
-            # fall-through.
-            if resolution in (
-                ExhaustedResolution.CONTINUE,
-                ExhaustedResolution.ESCALATE,
-            ):
+            # #129: the in-process ``Continue`` is handled above; this arm is
+            # ``Escalate``-only now (kept for the surface/propagate shape).
+            if resolution == ExhaustedResolution.ESCALATE:
                 from .execution_registry import EscalationModeSurfaceToHuman
 
                 if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
@@ -4026,6 +4126,29 @@ class PausedState(_Model):
     task: Task
     budget_used: BudgetSnapshot
     child_state: ChildPausedState | None = None
+
+    def serialize_checkpoint(self) -> str:
+        """The SHARED durable checkpoint round-trip (#129, AC1). Both cross-process
+        ``Continue`` (a :class:`HumanRequestBudgetExhausted` pause whose request
+        carries ``continues_used``) and Ralph's pause-propagation hand the SAME
+        :class:`PausedState` to the caller for persistence; this is the one seam
+        they share. It is JUST the :class:`PausedState` serialize/deserialize — NOT
+        a unification of their CONTEXT policies (Q2): a ``Continue`` resumes
+        preserving ``session_state.messages``; Ralph re-seeds a fresh window from
+        its filesystem ``.spore/progress.json`` checkpoint, which stays
+        Ralph-specific.
+
+        ``serialize_checkpoint`` produces the durable blob the caller persists;
+        :meth:`load_checkpoint` restores it on resume. Mirrors Rust's
+        ``PausedState::serialize_checkpoint``."""
+        return self.model_dump_json()
+
+    @classmethod
+    def load_checkpoint(cls, blob: str) -> PausedState:
+        """Restore a :class:`PausedState` from a durable checkpoint blob (#129,
+        AC1). The resume side of :meth:`serialize_checkpoint`. Mirrors Rust's
+        ``PausedState::load_checkpoint``."""
+        return cls.model_validate_json(blob)
 
 
 class ChildPausedState(_Model):
@@ -6057,18 +6180,26 @@ class StandardHarness:
         if isinstance(state.human_request, HumanRequestBudgetExhausted):
             req = state.human_request
             steps_taken = req.steps_taken
+            # #129 (AC2): ``continues_used`` is the SOLE :class:`BudgetContext`
+            # field that rides a process pause — it is seeded back into the rebuilt
+            # scope so a ``Continue`` spanning the pause resumes with the correct
+            # continue count (it cannot exceed ``max_continues``). Q3:
+            # ``continues_used`` rides the REQUEST payload, NOT a new serialized
+            # :class:`BudgetContext` / :class:`PausedState` field.
+            resume_seed = (req.phase, req.continues_used)
             # ``ContinueWithBudget(steps)``: grant ``steps_taken + steps`` total
             # allowance and re-enter the loop from the restored checkpoint. The
             # strategy tree is rebuilt with the node's budget caps raised so the
-            # restored scope has room for ``steps`` more steps (fork E — budget
-            # context reconstructed from the request alone).
+            # restored scope has room for ``steps`` more steps (fork E), and the
+            # resumed scope's ``continues_used`` is seeded from the request (#129,
+            # AC2).
             if isinstance(response, HumanResponseEscalate) and isinstance(
                 response.action, EscalationActionContinueWithBudget
             ):
                 granted = steps_taken + response.action.steps
                 resumed_task = _grant_task_budget(task, granted)
                 return await self._drive_strategy(
-                    resumed_task, session_state, budget_used, on_stream
+                    resumed_task, session_state, budget_used, on_stream, resume_seed
                 )
             # ``Skip``: the node is marked skipped and the outer loop advances. For
             # a combinator (PlanExecute) the per-task partial already recorded the
@@ -6506,92 +6637,154 @@ class StandardHarness:
         session_state: SessionState,
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
+        resume_continues: tuple[str, int] | None = None,
     ) -> RunResult:
         """The recursive-executor entry (#124): build the shared
         :class:`ExecutionContext`, seed the per-run scratch (task / session /
         budget), drive ``run_strategy(task.loop_strategy, cx)``, and translate the
         outcome back into a terminal :class:`RunResult` (Q5). A non-terminal pause
         / escalate stashed in ``scratch.terminal_override`` propagates VERBATIM (it
-        never collapses into a :class:`StrategyOutcome`)."""
+        never collapses into a :class:`StrategyOutcome`).
+
+        #129: ``_drive_strategy`` is the BARE-LEAF resolution site (a bare leaf
+        never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
+        :class:`StrategyOutcomeBudgetExhausted` here, the single recovery site for
+        a top-level leaf). When the leaf's CONFIGURED ``behavior`` resolves to
+        ``Continue``, grant the leaf one more round IN-PROCESS (bump
+        ``continues_used``, refresh the step cap) and re-drive WITHOUT any
+        serialization (AC3) — looping until the behavior resolves to
+        ``Fail``/``Escalate`` or the strategy completes. ``resume_continues =
+        (phase, continues_used)`` seeds the FIRST matching budget scope's
+        ``continues_used`` (via :meth:`BudgetContext.resumed`) so a ``Continue``
+        that spanned a process pause resumes with the correct continue count (AC2);
+        ``None`` is the fresh-run path."""
         session_id = task.session_id
-        cx = ExecutionContext(registry=self._config.registry)
-        cx.executor = self
-        cx.stream = on_stream
-        cx.scratch.run_session = session_state
-        cx.scratch.run_budget = budget_used
-        cx.scratch.task = task.model_copy(deep=True)
+        # The Continue resolution state threaded across in-process rounds: the
+        # (possibly fallen-through) behavior + how many continues have been spent.
+        behavior_for_resolution: tuple[BudgetExhaustedBehavior, int] | None = None
 
-        outcome = await run_strategy(task.loop_strategy, cx)
+        while True:
+            cx = ExecutionContext(registry=self._config.registry)
+            cx.executor = self
+            cx.stream = on_stream
+            cx.scratch.run_session = session_state
+            cx.scratch.run_budget = budget_used
+            cx.scratch.task = task.model_copy(deep=True)
+            # #129 (AC2): the cross-process checkpoint seed is consumed by the
+            # FIRST round only (the resumed node's scope); later in-process rounds
+            # carry their continue count via ``behavior_for_resolution``.
+            cx.scratch.resume_continues = resume_continues
+            resume_continues = None
 
-        # A pause / escalate (or any verbatim terminal) propagates unchanged.
-        if cx.scratch.terminal_override is not None:
-            return cx.scratch.terminal_override
-        if isinstance(outcome, StrategyOutcomeComplete):
-            return RunResultSuccess(
-                output=outcome.output,
-                session_id=session_id,
-                usage=cx.usage,
-                turns=cx.scratch.run_budget.turns,
-                session_state=cx.scratch.run_session,
-            )
-        if isinstance(outcome, StrategyOutcomeFailed):
-            return RunResultFailure(
-                reason=HaltReasonConfigurationError(error=outcome.error),
-                session_id=session_id,
-                usage=cx.usage,
-                turns=cx.scratch.run_budget.turns,
-                session_state=cx.scratch.run_session,
-            )
-        # StrategyOutcomeBudgetExhausted (#125): the exhausted node propagated a
-        # typed, isolated budget outcome. Surface it as a ``BudgetExceeded``
-        # terminal whose session carries the partial assistant text (when present
-        # — ``Escalate`` carries it, ``Fail`` discards it).
-        messages = (
-            [
-                Message(
-                    role=Role.ASSISTANT,
-                    content=TextContent(text=outcome.partial_output),
+            outcome = await run_strategy(task.loop_strategy, cx)
+
+            # A pause / escalate (or any verbatim terminal) propagates unchanged.
+            if cx.scratch.terminal_override is not None:
+                return cx.scratch.terminal_override
+            if isinstance(outcome, StrategyOutcomeComplete):
+                return RunResultSuccess(
+                    output=outcome.output,
+                    session_id=session_id,
+                    usage=cx.usage,
+                    turns=cx.scratch.run_budget.turns,
+                    session_state=cx.scratch.run_session,
                 )
-            ]
-            if outcome.partial_output is not None
-            else []
-        )
-        # #125: the exhausted node's own ``steps_taken`` is the turn count it
-        # reached (the scratch budget is not written back on the propagate path).
-        # Fall back to the scratch turns if it is somehow 0.
-        turns = outcome.steps_taken if outcome.steps_taken > 0 else cx.scratch.run_budget.turns
-        # #130: a BARE LEAF exhaustion bubbles up here without ever resolving
-        # (rule 6). Under ``SurfaceToHuman``, PAUSE with a ``BudgetExhausted``
-        # request (a combinator under ``SurfaceToHuman`` never reaches this branch
-        # — it sets ``terminal_override`` and is returned by the early-return
-        # above). A bare leaf offers ``[ContinueWithBudget, Fail]`` (fork C — no
-        # sibling to ``Skip`` to).
-        from .execution_registry import EscalationModeSurfaceToHuman
+            if isinstance(outcome, StrategyOutcomeFailed):
+                return RunResultFailure(
+                    reason=HaltReasonConfigurationError(error=outcome.error),
+                    session_id=session_id,
+                    usage=cx.usage,
+                    turns=cx.scratch.run_budget.turns,
+                    session_state=cx.scratch.run_session,
+                )
+            # StrategyOutcomeBudgetExhausted (#125/#129): a BARE LEAF exhaustion
+            # propagated here carrying its CONFIGURED ``behavior`` (Q1 — the
+            # bare-leaf resolution site honors it; the leaf body never did).
+            # Resolve it ONCE: a ``Continue`` with continues left re-drives
+            # in-process; a spent ``Continue`` falls through to ``Fail``/
+            # ``Escalate``. Carry the resolution chain's state across rounds so
+            # ``max_continues`` is respected. (A combinator under ``SurfaceToHuman``
+            # never reaches this arm — it sets ``terminal_override``, returned
+            # above.)
+            #
+            # #125: the exhausted node's own ``steps_taken`` is the turn count it
+            # reached (the scratch budget is not written back on the propagate
+            # path). Fall back to the scratch turns if it is somehow 0.
+            turns = outcome.steps_taken if outcome.steps_taken > 0 else cx.scratch.run_budget.turns
+            # Reconstruct the resolution scope: the FIRST round uses the leaf's
+            # propagated behavior + continues_used; later in-process rounds reuse
+            # the threaded (possibly fallen-through) state.
+            if behavior_for_resolution is not None:
+                resolve_behavior, resolve_continues = behavior_for_resolution
+            else:
+                resolve_behavior, resolve_continues = outcome.behavior, outcome.continues_used
+            scope = BudgetContext.resumed(
+                outcome.policy, resolve_behavior, outcome.phase, resolve_continues
+            )
+            resolution = scope.resolve_exhausted()
 
-        if isinstance(self._config.escalation_mode, EscalationModeSurfaceToHuman):
-            err = BudgetExhausted(
-                policy=outcome.policy,
-                behavior=outcome.behavior,
-                steps_taken=outcome.steps_taken,
-                continues_used=outcome.continues_used,
-                phase=outcome.phase,
+            if resolution == ExhaustedResolution.CONTINUE:
+                # In-process continue (AC3: NO serialization). Refresh the leaf's
+                # step cap and re-enter the loop carrying the post-run session so
+                # the conversation context survives (Continue PRESERVES context —
+                # AC4). The granted cap is ``steps_taken + policy.value`` so the
+                # leaf gets a fresh window after the checkpoint.
+                allowance = budget_allowance_value(outcome.policy)
+                granted = outcome.steps_taken + (allowance if allowance is not None else 1)
+                task = _grant_task_budget(task, granted)
+                session_state = cx.scratch.run_session
+                budget_used = cx.scratch.run_budget.model_copy(deep=True)
+                on_stream = cx.stream
+                # Thread the resolution chain's post-continue state so a subsequent
+                # exhaustion sees the bumped ``continues_used``.
+                behavior_for_resolution = (scope.behavior, scope.continues_used)
+                continue
+
+            from .execution_registry import EscalationModeSurfaceToHuman
+
+            if resolution == ExhaustedResolution.ESCALATE:
+                # #130: a BARE LEAF ``Escalate`` under ``SurfaceToHuman`` PAUSES
+                # with a ``BudgetExhausted`` request offering ``[ContinueWithBudget,
+                # Fail]`` (fork C — no sibling to ``Skip`` to).
+                if isinstance(self._config.escalation_mode, EscalationModeSurfaceToHuman):
+                    err = BudgetExhausted(
+                        policy=outcome.policy,
+                        behavior=scope.behavior,
+                        steps_taken=outcome.steps_taken,
+                        continues_used=scope.continues_used,
+                        phase=outcome.phase,
+                    )
+                    return _promote_budget_exhausted_to_human(
+                        err,
+                        outcome.partial_output,
+                        _leaf_escalation_actions(err),
+                        session_id,
+                        task,
+                        cx.scratch.run_budget.model_copy(deep=True),
+                        turns,
+                    )
+                # Under ``Autonomous``: surface the partial (Escalate carries it).
+                messages = (
+                    [Message(role=Role.ASSISTANT, content=TextContent(text=outcome.partial_output))]
+                    if outcome.partial_output is not None
+                    else []
+                )
+                return RunResultFailure(
+                    reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                    session_id=session_id,
+                    usage=cx.usage,
+                    turns=turns,
+                    session_state=SessionState(messages=messages),
+                )
+
+            # ExhaustedResolution.FAIL: the partial is DISCARDED by contract.
+            return RunResultFailure(
+                reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                session_id=session_id,
+                usage=cx.usage,
+                turns=turns,
+                session_state=SessionState(),
             )
-            return _promote_budget_exhausted_to_human(
-                err,
-                outcome.partial_output,
-                _leaf_escalation_actions(err),
-                session_id,
-                task,
-                cx.scratch.run_budget.model_copy(deep=True),
-                turns,
-            )
-        return RunResultFailure(
-            reason=HaltReasonBudgetExceeded(limit_type="turns"),
-            session_id=session_id,
-            usage=cx.usage,
-            turns=turns,
-            session_state=SessionState(messages=messages),
-        )
 
     async def _run_evaluate_phase(
         self,
