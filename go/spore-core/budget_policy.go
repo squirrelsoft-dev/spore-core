@@ -136,8 +136,14 @@ type BudgetExhaustedBehavior struct {
 	OnExhausted  *BudgetExhaustedBehavior    `json:"-"`
 }
 
-// MarshalJSON serialises BudgetExhaustedBehavior as a flat tagged object.
+// MarshalJSON serialises BudgetExhaustedBehavior as a flat tagged object. A
+// zero-value behavior (Kind == "") is treated as the #129 default (Escalate):
+// the field ALWAYS serializes, so a node built without an explicit behavior
+// still emits the canonical "behavior":{"kind":"escalate"} wire shape.
 func (b BudgetExhaustedBehavior) MarshalJSON() ([]byte, error) {
+	if b.Kind == "" {
+		b.Kind = BehaviorEscalate
+	}
 	switch b.Kind {
 	case BehaviorContinue:
 		if b.OnExhausted == nil {

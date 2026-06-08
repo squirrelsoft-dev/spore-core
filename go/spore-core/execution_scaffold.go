@@ -181,6 +181,24 @@ func NewBudgetContext(policy BudgetPolicy, behavior BudgetExhaustedBehavior, pha
 	}
 }
 
+// ResumedBudgetContext reconstructs a RESUMED scope (#129) whose ContinuesUsed
+// is seeded from a cross-process checkpoint — the sole field of BudgetContext
+// that must survive a process pause. StepsTaken starts at 0 (the resumed run
+// re-enters the loop with a fresh per-round step budget; the checkpoint only
+// carries how many continues were ALREADY spent so a Continue spanning the pause
+// cannot exceed MaxContinues). Runtime-only — ContinuesUsed is read off the
+// HumanRequest BudgetExhausted payload (Q3: NOT a new serialized
+// BudgetContext/PausedState field).
+func ResumedBudgetContext(policy BudgetPolicy, behavior BudgetExhaustedBehavior, phase string, continuesUsed uint32) BudgetContext {
+	return BudgetContext{
+		Policy:        policy,
+		Behavior:      behavior,
+		StepsTaken:    0,
+		ContinuesUsed: continuesUsed,
+		Phase:         phase,
+	}
+}
+
 // allowance returns the per-scope step allowance and whether the scope is
 // capped (false for Unlimited).
 func (c *BudgetContext) allowance() (uint32, bool) {
@@ -263,7 +281,9 @@ func (c *BudgetContext) ResolveExhausted() ExhaustedResolution {
 	switch c.Behavior.Kind {
 	case BehaviorFail:
 		return ExhaustedResolutionFail
-	case BehaviorEscalate:
+	case BehaviorEscalate, "":
+		// A zero-value behavior (Kind == "") is the #129 default (Escalate),
+		// matching the wire-default in BudgetExhaustedBehavior.MarshalJSON.
 		return ExhaustedResolutionEscalate
 	case BehaviorContinue:
 		if c.ContinuesRemaining() > 0 {
@@ -428,6 +448,17 @@ func NewExecutionContext(registry *ExecutionRegistry) *ExecutionContext {
 // allowance (rule 1) and a child's exhaustion never touches the parent scope
 // (rule 4/7). Returns the depth AFTER the push for symmetry debugging.
 func (cx *ExecutionContext) PushBudget(policy BudgetPolicy, behavior BudgetExhaustedBehavior, phase string) int {
+	// #129 (AC2): if a resumed Continue checkpoint seed is waiting for THIS
+	// phase, reconstruct the scope with its prior ContinuesUsed (consuming the
+	// seed once) instead of zeroing it. The root resumed node pushes first, and
+	// the request's phase names that node, so the FIRST matching push restores
+	// the count. Any other push (or a fresh run) is unaffected.
+	if seed := cx.Scratch.ResumeContinues; seed != nil && seed.Phase == phase {
+		continuesUsed := seed.ContinuesUsed
+		cx.Scratch.ResumeContinues = nil
+		cx.Budgets.Push(ResumedBudgetContext(policy, behavior, phase, continuesUsed))
+		return cx.Budgets.Depth()
+	}
 	cx.Budgets.Push(NewBudgetContext(policy, behavior, phase))
 	return cx.Budgets.Depth()
 }

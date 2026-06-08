@@ -41,28 +41,33 @@ func cordycepsTree() LoopStrategy {
 	planSchema := SchemaRef("plan-schema")
 	workerSchema := SchemaRef("worker-schema")
 	plan := LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
-		Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: 4},
-		Agent:   AgentRef("planner"),
-		Toolset: ToolsetRef("plan-tools"),
-		Output:  &planSchema,
+		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: 4},
+		Behavior: defaultBudgetBehavior(),
+		Agent:    AgentRef("planner"),
+		Toolset:  ToolsetRef("plan-tools"),
+		Output:   &planSchema,
 	}}
 	execInner := LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
-		Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: 12},
-		Agent:   AgentRef("executor"),
-		Toolset: ToolsetRef("exec-tools"),
-		Output:  &workerSchema,
+		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: 12},
+		Behavior: defaultBudgetBehavior(),
+		Agent:    AgentRef("executor"),
+		Toolset:  ToolsetRef("exec-tools"),
+		Output:   &workerSchema,
 	}}
 	execute := SelfVerifyingStrategy(SelfVerifyingConfig{
 		Inner:     &execInner,
 		Evaluator: SchemaRef("exec-evaluator"),
+		Behavior:  defaultBudgetBehavior(),
 	})
 	planExec := PlanExecuteStrategy(PlanExecuteConfig{
-		Plan:    &plan,
-		Execute: &execute,
+		Plan:     &plan,
+		Execute:  &execute,
+		Behavior: defaultBudgetBehavior(),
 	})
 	return RalphStrategy(RalphConfig{
-		Inner: &planExec,
-		Agent: AgentRef("ralph-agent"),
+		Inner:    &planExec,
+		Agent:    AgentRef("ralph-agent"),
+		Behavior: defaultBudgetBehavior(),
 	})
 }
 
@@ -74,10 +79,11 @@ func TestLoopStrategyPerVariantRoundTrip(t *testing.T) {
 	out := SchemaRef("out")
 	cases := []LoopStrategy{
 		{Kind: StrategyReAct, ReActCfg: &ReactConfig{
-			Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: 7},
-			Agent:   AgentRef("a"),
-			Toolset: ToolsetRef("t"),
-			Output:  &out,
+			Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: 7},
+			Behavior: defaultBudgetBehavior(),
+			Agent:    AgentRef("a"),
+			Toolset:  ToolsetRef("t"),
+			Output:   &out,
 		}},
 		ReActStrategy(3),
 		PlanExecuteStrategy(PlanExecuteSimple(nil)),
@@ -85,10 +91,12 @@ func TestLoopStrategyPerVariantRoundTrip(t *testing.T) {
 		SelfVerifyingStrategy(SelfVerifyingConfig{
 			Inner:     PtrStrategy(ReActStrategy(2)),
 			Evaluator: SchemaRef("ev"),
+			Behavior:  defaultBudgetBehavior(),
 		}),
 		RalphStrategy(RalphConfig{
-			Inner: PtrStrategy(ReActStrategy(1)),
-			Agent: AgentRef("r"),
+			Inner:    PtrStrategy(ReActStrategy(1)),
+			Agent:    AgentRef("r"),
+			Behavior: defaultBudgetBehavior(),
 		}),
 		HillClimbingStrategy(HillClimbingConfig{
 			Inner:                 PtrStrategy(ReActStrategy(5)),
@@ -97,6 +105,7 @@ func TestLoopStrategyPerVariantRoundTrip(t *testing.T) {
 			RevertOnNoImprovement: true,
 			MinImprovementDelta:   0.25,
 			Evaluator:             AgentRef("metric"),
+			Behavior:              defaultBudgetBehavior(),
 		}),
 	}
 	for i, s := range cases {
@@ -123,7 +132,7 @@ func TestReActTagAndOmittedOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"kind":"react","budget":{"kind":"per_loop","value":8},"agent":"","toolset":""}`
+	want := `{"kind":"react","budget":{"kind":"per_loop","value":8},"behavior":{"kind":"escalate"},"agent":"","toolset":""}`
 	if string(data) != want {
 		t.Fatalf("got %s, want %s", data, want)
 	}
@@ -141,7 +150,7 @@ func TestReActOutputPresentWhenSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"kind":"react","budget":{"kind":"per_loop","value":1},"agent":"a","toolset":"t","output":"schema-1"}`
+	want := `{"kind":"react","budget":{"kind":"per_loop","value":1},"behavior":{"kind":"escalate"},"agent":"a","toolset":"t","output":"schema-1"}`
 	if string(data) != want {
 		t.Fatalf("got %s, want %s", data, want)
 	}
@@ -194,7 +203,7 @@ func TestCordycepsTreeRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(tree, back) {
 		t.Fatalf("cordyceps round-trip mismatch:\n want %+v\n got %+v", tree, back)
 	}
-	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":4},"agent":"planner","toolset":"plan-tools","output":"plan-schema"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"agent":"executor","toolset":"exec-tools","output":"worker-schema"},"evaluator":"exec-evaluator"}},"agent":"ralph-agent"}`
+	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":4},"behavior":{"kind":"escalate"},"agent":"planner","toolset":"plan-tools","output":"plan-schema"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},"agent":"executor","toolset":"exec-tools","output":"worker-schema"},"evaluator":"exec-evaluator","behavior":{"kind":"escalate"}},"behavior":{"kind":"escalate"}},"agent":"ralph-agent","behavior":{"kind":"escalate"}}`
 	if string(data) != want {
 		t.Fatalf("cordyceps bytes mismatch:\n got  %s\n want %s", data, want)
 	}

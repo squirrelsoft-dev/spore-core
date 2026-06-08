@@ -2015,6 +2015,29 @@ func (p PausedState) MarshalJSON() ([]byte, error) {
 	return json.Marshal(a)
 }
 
+// SerializeCheckpoint produces the durable checkpoint blob the caller persists
+// (#129, AC1). The SHARED pause/resume round-trip: both cross-process Continue
+// (a HumanRequest BudgetExhausted pause whose request carries continues_used)
+// and Ralph's pause-propagation hand the SAME PausedState to the caller for
+// persistence; this is the one seam they share. It is JUST the PausedState
+// serialize/deserialize — NOT a unification of their CONTEXT policies (Q2): a
+// Continue resumes preserving session_state.messages; Ralph re-seeds a fresh
+// window from its filesystem .spore/progress.json checkpoint, which stays
+// Ralph-specific. LoadCheckpoint is the resume side.
+func (p PausedState) SerializeCheckpoint() ([]byte, error) {
+	return json.Marshal(p)
+}
+
+// LoadCheckpoint restores a PausedState from a durable checkpoint blob (#129,
+// AC1) — the resume side of SerializeCheckpoint.
+func LoadCheckpoint(blob []byte) (PausedState, error) {
+	var p PausedState
+	if err := json.Unmarshal(blob, &p); err != nil {
+		return PausedState{}, err
+	}
+	return p, nil
+}
+
 // ChildPausedState is the paused state for a subagent. Deliberately has no
 // child_state field — the type system enforces a one-level subagent depth.
 type ChildPausedState struct {
@@ -3108,92 +3131,187 @@ func (h *StandardHarness) driveStrategy(
 	budget BudgetSnapshot,
 	onStream StreamSink,
 ) RunResult {
+	return h.driveStrategyWithResumeSeed(ctx, task, session, budget, onStream, nil)
+}
+
+// driveStrategyWithResumeSeed is driveStrategy with an optional cross-process
+// Continue checkpoint seed (#129, AC2): resumeSeed = (phase, continuesUsed)
+// seeds the FIRST matching budget scope's ContinuesUsed (via
+// ResumedBudgetContext) so a Continue that spanned a process pause resumes with
+// the correct continue count instead of a zeroed one. nil is the fresh-run path.
+//
+// #129: the BARE-LEAF resolution site is driveStrategy (a bare leaf never
+// self-resolves inside its own body — rule 6 — it PROPAGATES a typed
+// BudgetExhausted here, the single recovery site for a top-level leaf). When the
+// leaf's CONFIGURED behavior resolves to Continue, grant the leaf one more round
+// IN-PROCESS (bump ContinuesUsed, refresh the step cap) and re-drive WITHOUT any
+// serialization (AC3) — looping until the behavior resolves to Fail/Escalate or
+// the strategy completes. behaviorForResolution carries the resolution chain's
+// mutated state across in-process continues so MaxContinues is honored.
+func (h *StandardHarness) driveStrategyWithResumeSeed(
+	ctx context.Context,
+	task Task,
+	session SessionState,
+	budget BudgetSnapshot,
+	onStream StreamSink,
+	resumeSeed *ResumeContinueSeed,
+) RunResult {
 	sessionID := task.SessionID
-	cx := NewExecutionContext(&h.config.Registry)
-	cx.Executor = h
-	cx.Stream = onStream
-	cx.Scratch.RunSession = session
-	cx.Scratch.RunBudget = budget
-	taskCopy := task
-	cx.Scratch.Task = &taskCopy
+	// The Continue resolution state threaded across in-process rounds: the
+	// (possibly fallen-through) behavior + how many continues have been spent.
+	var behaviorForResolution *BudgetContext
+	// #129 (AC2): the cross-process checkpoint seed is consumed by the FIRST
+	// round only (the resumed node's scope); later in-process rounds carry their
+	// continue count via behaviorForResolution.
+	for {
+		cx := NewExecutionContext(&h.config.Registry)
+		cx.Executor = h
+		cx.Stream = onStream
+		cx.Scratch.RunSession = session
+		cx.Scratch.RunBudget = budget
+		taskCopy := task
+		cx.Scratch.Task = &taskCopy
+		cx.Scratch.ResumeContinues = resumeSeed
+		resumeSeed = nil
 
-	outcome := task.LoopStrategy.Run(ctx, cx)
+		outcome := task.LoopStrategy.Run(ctx, cx)
 
-	// A pause / escalate propagates verbatim (preserves the HITL / consult /
-	// escalation contract through the recursive executor).
-	if cx.Scratch.TerminalOverride != nil {
-		return *cx.Scratch.TerminalOverride
-	}
-	switch outcome.Kind {
-	case StrategyOutcomeComplete:
-		return RunResult{
-			Kind:         RunSuccess,
-			Output:       outcome.Complete,
-			SessionID:    sessionID,
-			Usage:        cx.Usage,
-			Turns:        cx.Scratch.RunBudget.Turns,
-			SessionState: cx.Scratch.RunSession,
+		// A pause / escalate propagates verbatim (preserves the HITL / consult /
+		// escalation contract through the recursive executor).
+		if cx.Scratch.TerminalOverride != nil {
+			return *cx.Scratch.TerminalOverride
 		}
-	case StrategyOutcomeBudgetExhausted:
-		var messages []Message
-		// #125: the exhausted node's own StepsTaken is the turn count it reached
-		// (the scratch budget is not written back on the propagate path). Fall back
-		// to the scratch turns if it is somehow 0.
-		turns := cx.Scratch.RunBudget.Turns
-		if outcome.Exhausted != nil {
-			if outcome.Exhausted.PartialOutput != nil {
-				messages = []Message{{
-					Role:    RoleAssistant,
-					Content: NewTextContent(*outcome.Exhausted.PartialOutput),
-				}}
+		switch outcome.Kind {
+		case StrategyOutcomeComplete:
+			return RunResult{
+				Kind:         RunSuccess,
+				Output:       outcome.Complete,
+				SessionID:    sessionID,
+				Usage:        cx.Usage,
+				Turns:        cx.Scratch.RunBudget.Turns,
+				SessionState: cx.Scratch.RunSession,
 			}
-			if outcome.Exhausted.StepsTaken > 0 {
-				turns = outcome.Exhausted.StepsTaken
+		case StrategyOutcomeBudgetExhausted:
+			// #129: a BARE LEAF exhaustion propagates here carrying its CONFIGURED
+			// behavior (Q1 — the bare-leaf resolution site honors it; the leaf body
+			// never did). Resolve it ONCE: a Continue with continues left re-drives
+			// in-process; a spent Continue falls through to Fail/Escalate. Carry the
+			// resolution chain's state across rounds so MaxContinues is respected.
+			// (A combinator under SurfaceToHuman never reaches this arm — it sets
+			// the terminal override, returned above.)
+			ex := outcome.Exhausted
+			// #125: the exhausted node's own StepsTaken is the turn count it
+			// reached (the scratch budget is not written back on the propagate
+			// path). Fall back to the scratch turns if it is somehow 0.
+			turns := cx.Scratch.RunBudget.Turns
+			if ex != nil && ex.StepsTaken > 0 {
+				turns = ex.StepsTaken
 			}
-		}
-		// #130: a BARE LEAF exhaustion propagates here without ever resolving
-		// (rule 6). Under SurfaceToHuman, PAUSE with a BudgetExhausted request (a
-		// combinator under SurfaceToHuman never reaches this arm — it sets the
-		// terminal override at its escalate site and is returned above). A bare
-		// leaf offers [ContinueWithBudget, Fail] (fork C — no sibling to Skip to).
-		if h.config.EffectiveEscalationMode().Kind == EscalationSurfaceToHuman && outcome.Exhausted != nil {
-			err := &BudgetExhausted{
-				Policy:        outcome.Exhausted.Policy,
-				Behavior:      outcome.Exhausted.Behavior,
-				StepsTaken:    outcome.Exhausted.StepsTaken,
-				ContinuesUsed: outcome.Exhausted.ContinuesUsed,
-				Phase:         outcome.Exhausted.Phase,
+			if ex == nil {
+				// Defensive: no exhaustion payload — preserve the legacy Failure.
+				return RunResult{
+					Kind:         RunFailure,
+					Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+					SessionID:    sessionID,
+					Usage:        cx.Usage,
+					Turns:        turns,
+					SessionState: SessionState{},
+				}
 			}
-			return promoteBudgetExhaustedToHuman(
-				err,
-				outcome.Exhausted.PartialOutput,
-				leafEscalationActions(err),
-				sessionID,
-				task,
-				cx.Scratch.RunBudget,
-				turns,
-			)
-		}
-		return RunResult{
-			Kind:         RunFailure,
-			Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
-			SessionID:    sessionID,
-			Usage:        cx.Usage,
-			Turns:        turns,
-			SessionState: SessionState{Messages: messages},
-		}
-	default: // StrategyOutcomeFailed
-		var configErr HarnessError = &InvalidConfigurationError{Message: "strategy failed"}
-		if outcome.Failed != nil {
-			configErr = outcome.Failed
-		}
-		return RunResult{
-			Kind:         RunFailure,
-			Reason:       HaltReason{Kind: HaltConfigurationError, ConfigError: configErr},
-			SessionID:    sessionID,
-			Usage:        cx.Usage,
-			Turns:        cx.Scratch.RunBudget.Turns,
-			SessionState: cx.Scratch.RunSession,
+			// Reconstruct the resolution scope: the FIRST round uses the leaf's
+			// propagated behavior + ContinuesUsed; later in-process rounds reuse
+			// the threaded (possibly fallen-through) state.
+			var scope BudgetContext
+			if behaviorForResolution != nil {
+				scope = ResumedBudgetContext(ex.Policy, behaviorForResolution.Behavior, ex.Phase, behaviorForResolution.ContinuesUsed)
+				behaviorForResolution = nil
+			} else {
+				scope = ResumedBudgetContext(ex.Policy, ex.Behavior, ex.Phase, ex.ContinuesUsed)
+			}
+			resolution := scope.ResolveExhausted()
+			switch resolution {
+			case ExhaustedResolutionContinue:
+				// In-process continue (AC3: NO serialization). Refresh the leaf's
+				// step cap and re-enter the loop carrying the post-run session so
+				// the conversation context survives (Continue PRESERVES context —
+				// AC4). The granted cap is StepsTaken + policy.value so the leaf
+				// gets a fresh window after the checkpoint.
+				allowance, capped := ex.Policy.AllowanceValue()
+				if !capped {
+					allowance = 1
+				}
+				granted := saturatingAddU32(ex.StepsTaken, allowance)
+				grantTaskBudget(&task, granted)
+				session = cx.Scratch.RunSession
+				budget = cx.Scratch.RunBudget
+				// Thread the resolution chain's post-continue state so a
+				// subsequent exhaustion sees the bumped ContinuesUsed.
+				threaded := scope
+				behaviorForResolution = &threaded
+				continue
+			case ExhaustedResolutionEscalate:
+				// #130: a BARE LEAF exhaustion under SurfaceToHuman PAUSES with a
+				// BudgetExhausted request (a combinator under SurfaceToHuman never
+				// reaches this arm — it sets the terminal override at its escalate
+				// site and is returned above). A bare leaf offers
+				// [ContinueWithBudget, Fail] (fork C — no sibling to Skip to).
+				if h.config.EffectiveEscalationMode().Kind == EscalationSurfaceToHuman {
+					err := &BudgetExhausted{
+						Policy:        ex.Policy,
+						Behavior:      scope.Behavior,
+						StepsTaken:    ex.StepsTaken,
+						ContinuesUsed: scope.ContinuesUsed,
+						Phase:         ex.Phase,
+					}
+					return promoteBudgetExhaustedToHuman(
+						err,
+						ex.PartialOutput,
+						leafEscalationActions(err),
+						sessionID,
+						task,
+						cx.Scratch.RunBudget,
+						turns,
+					)
+				}
+				var messages []Message
+				if ex.PartialOutput != nil {
+					messages = []Message{{
+						Role:    RoleAssistant,
+						Content: NewTextContent(*ex.PartialOutput),
+					}}
+				}
+				return RunResult{
+					Kind:         RunFailure,
+					Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+					SessionID:    sessionID,
+					Usage:        cx.Usage,
+					Turns:        turns,
+					SessionState: SessionState{Messages: messages},
+				}
+			default: // ExhaustedResolutionFail
+				// Fail contract: the partial is DISCARDED.
+				return RunResult{
+					Kind:         RunFailure,
+					Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+					SessionID:    sessionID,
+					Usage:        cx.Usage,
+					Turns:        turns,
+					SessionState: SessionState{},
+				}
+			}
+		default: // StrategyOutcomeFailed
+			var configErr HarnessError = &InvalidConfigurationError{Message: "strategy failed"}
+			if outcome.Failed != nil {
+				configErr = outcome.Failed
+			}
+			return RunResult{
+				Kind:         RunFailure,
+				Reason:       HaltReason{Kind: HaltConfigurationError, ConfigError: configErr},
+				SessionID:    sessionID,
+				Usage:        cx.Usage,
+				Turns:        cx.Scratch.RunBudget.Turns,
+				SessionState: cx.Scratch.RunSession,
+			}
 		}
 	}
 }
@@ -4804,11 +4922,17 @@ func (h *StandardHarness) resumeInner(
 			// Grant `steps` ADDITIONAL allowance and re-enter the loop from the
 			// restored checkpoint. The strategy tree is rebuilt with the node's
 			// budget policy raised to steps_taken + steps so the restored scope has
-			// room for `steps` more steps.
+			// room for `steps` more steps, and the resumed scope's ContinuesUsed is
+			// seeded from the request (#129, AC2). Q3: continues_used rides the
+			// REQUEST payload, NOT a new serialized BudgetContext/PausedState field.
 			granted := saturatingAddU32(stepsTaken, response.Action.Steps)
 			resumedTask := task
 			grantTaskBudget(&resumedTask, granted)
-			return h.driveStrategy(ctx, resumedTask, session, budget, onStream)
+			seed := &ResumeContinueSeed{
+				Phase:         state.HumanRequest.Phase,
+				ContinuesUsed: state.HumanRequest.ContinuesUsed,
+			}
+			return h.driveStrategyWithResumeSeed(ctx, resumedTask, session, budget, onStream, seed)
 		case response.Kind == HumanRespEscalate && response.Action.Kind == EscalationSkip:
 			// Skip: the node is marked skipped and the outer loop advances. For a
 			// combinator (PlanExecute) re-entering the loop from the checkpoint

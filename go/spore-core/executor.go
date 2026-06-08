@@ -264,6 +264,24 @@ type RunScratch struct {
 	// entry (driveStrategy) returns this directly when set, preserving the
 	// pause/escalate contract through the recursive executor (#124).
 	TerminalOverride *RunResult
+	// ResumeContinues is the cross-process Continue checkpoint seed (#129):
+	// (phase, continuesUsed) carried from a resumed HumanRequest BudgetExhausted.
+	// The FIRST PushBudget whose phase matches seeds the reconstructed scope's
+	// ContinuesUsed (via ResumedBudgetContext) and CLEARS this seed — so a
+	// Continue spanning a process pause resumes with the correct continue count
+	// (AC2). Runtime-only; the value rides the request payload, NOT a serialized
+	// BudgetContext/PausedState field (Q3). Nil on a fresh run and after the seed
+	// is consumed (an in-process Continue never sets it → AC3: no serialization
+	// on the in-process path).
+	ResumeContinues *ResumeContinueSeed
+}
+
+// ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):
+// the phase naming the resumed node's budget scope plus the ContinuesUsed count
+// that rode the HumanRequest BudgetExhausted payload across the pause.
+type ResumeContinueSeed struct {
+	Phase         string
+	ContinuesUsed uint32
 }
 
 // ============================================================================

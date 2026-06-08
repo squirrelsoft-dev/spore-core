@@ -65,9 +65,15 @@ type SchemaRef string
 // "kind":"react": kind, budget, agent, toolset, output (output omitted when
 // empty/absent).
 type ReactConfig struct {
-	Budget  BudgetPolicy
-	Agent   AgentRef
-	Toolset ToolsetRef
+	Budget BudgetPolicy
+	// Behavior is what this node does when its Budget is spent (#129). Canonical
+	// wire position: IMMEDIATELY after budget. A leaf honors its Behavior ONLY at
+	// the top-level/bare-leaf resolution site (driveStrategy); in the normal
+	// NESTED case the leaf still PROPAGATES exhaustion to its parent (#125 rule
+	// 6 — a nested leaf never self-resolves). Always serialized (Q1).
+	Behavior BudgetExhaustedBehavior
+	Agent    AgentRef
+	Toolset  ToolsetRef
 	// Output is omitted from JSON when nil (matches Rust Option + skip-if-none).
 	Output *SchemaRef
 }
@@ -77,11 +83,37 @@ type ReactConfig struct {
 // This is the migration shim for the old ReAct{max_iterations} shape.
 func ReactPerLoop(value uint32) ReactConfig {
 	return ReactConfig{
-		Budget:  BudgetPolicy{Kind: BudgetPerLoop, Value: value},
-		Agent:   AgentRef(""),
-		Toolset: ToolsetRef(""),
-		Output:  nil,
+		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: value},
+		Behavior: defaultBudgetBehavior(),
+		Agent:    AgentRef(""),
+		Toolset:  ToolsetRef(""),
+		Output:   nil,
 	}
+}
+
+// defaultBudgetBehavior is the default BudgetExhaustedBehavior for a config
+// node's serialized behavior field (#129): Escalate. Two roles:
+//   - the value UnmarshalJSON seeds when a strategy tree serialized BEFORE #129
+//     omits the behavior key, preserving backward-compat reads;
+//   - the value the migration shims stamp so a bare leaf keeps its pre-#129
+//     propagate-to-parent contract by default.
+//
+// The field is NOT omitempty: it ALWAYS serializes (uniform wire shape across
+// all five config structs, Q1), so the cross-language fixtures carry an explicit
+// "behavior":{"kind":"escalate"} on every node.
+func defaultBudgetBehavior() BudgetExhaustedBehavior {
+	return BudgetExhaustedBehavior{Kind: BehaviorEscalate}
+}
+
+// behaviorOrDefault returns the decoded behavior, or defaultBudgetBehavior() if
+// the field was absent (a pre-#129 tree). The behavior probe is a pointer so an
+// absent key (nil) is distinguished from a present-but-Escalate one (#129
+// backward-compat reads).
+func behaviorOrDefault(b *BudgetExhaustedBehavior) BudgetExhaustedBehavior {
+	if b == nil {
+		return defaultBudgetBehavior()
+	}
+	return *b
 }
 
 // MaxIterations extracts the max_iterations value from a PerLoop budget; any
@@ -101,6 +133,10 @@ type PlanExecuteConfig struct {
 	Execute *LoopStrategy
 	// PlanModel is omitted from JSON when nil.
 	PlanModel *ModelConfig
+	// Behavior is what this combinator does when its execute-phase budget is
+	// spent (#129). Canonical wire position on a combinator: the LAST field.
+	// Always serialized (Q1).
+	Behavior BudgetExhaustedBehavior
 }
 
 // PlanExecuteSimple builds a PlanExecute whose plan and execute phases are both
@@ -114,6 +150,7 @@ func PlanExecuteSimple(planModel *ModelConfig) PlanExecuteConfig {
 		Plan:      &plan,
 		Execute:   &exec,
 		PlanModel: planModel,
+		Behavior:  defaultBudgetBehavior(),
 	}
 }
 
@@ -122,6 +159,10 @@ func PlanExecuteSimple(planModel *ModelConfig) PlanExecuteConfig {
 type SelfVerifyingConfig struct {
 	Inner     *LoopStrategy
 	Evaluator SchemaRef
+	// Behavior is what this combinator does when its build↔evaluate budget is
+	// spent (#129). Canonical wire position on a combinator: the LAST field.
+	// Always serialized (Q1).
+	Behavior BudgetExhaustedBehavior
 }
 
 // RalphConfig is the Ralph combinator: re-run inner under a fixed agent across
@@ -129,6 +170,12 @@ type SelfVerifyingConfig struct {
 type RalphConfig struct {
 	Inner *LoopStrategy
 	Agent AgentRef
+	// Behavior is what Ralph does when its own scope is spent (#129). Canonical
+	// wire position on a combinator: the LAST field. Always serialized (Q1).
+	// NOTE: Ralph's window recovery (reset + retry) is independent of this field
+	// — it governs Ralph's OWN budget scope, not the per-window child exhaustion
+	// (which Ralph already absorbs as "window incomplete" and retries).
+	Behavior BudgetExhaustedBehavior
 }
 
 // HillClimbingConfig is the HillClimbing combinator: iterate inner, keeping or
@@ -141,6 +188,10 @@ type HillClimbingConfig struct {
 	RevertOnNoImprovement bool
 	MinImprovementDelta   float64
 	Evaluator             AgentRef
+	// Behavior is what this combinator does when its optimization-loop budget is
+	// spent (#129). Canonical wire position on a combinator: the LAST field.
+	// Always serialized (Q1).
+	Behavior BudgetExhaustedBehavior
 }
 
 // ============================================================================
@@ -228,71 +279,77 @@ func (s LoopStrategy) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("LoopStrategy: react requires config")
 		}
 		c := s.ReActCfg
-		// Key order: kind, budget, agent, toolset, [output].
+		// Key order: kind, budget, behavior, agent, toolset, [output].
 		type reactFlat struct {
-			Kind    LoopStrategyKind `json:"kind"`
-			Budget  BudgetPolicy     `json:"budget"`
-			Agent   AgentRef         `json:"agent"`
-			Toolset ToolsetRef       `json:"toolset"`
-			Output  *SchemaRef       `json:"output,omitempty"`
+			Kind     LoopStrategyKind        `json:"kind"`
+			Budget   BudgetPolicy            `json:"budget"`
+			Behavior BudgetExhaustedBehavior `json:"behavior"`
+			Agent    AgentRef                `json:"agent"`
+			Toolset  ToolsetRef              `json:"toolset"`
+			Output   *SchemaRef              `json:"output,omitempty"`
 		}
-		return json.Marshal(reactFlat{s.Kind, c.Budget, c.Agent, c.Toolset, c.Output})
+		return json.Marshal(reactFlat{s.Kind, c.Budget, c.Behavior, c.Agent, c.Toolset, c.Output})
 	case StrategyPlanExecute:
 		if s.PlanExecute == nil {
 			return nil, fmt.Errorf("LoopStrategy: plan_execute requires config")
 		}
 		c := s.PlanExecute
-		// Key order: kind, plan, execute, [plan_model].
+		// Key order: kind, plan, execute, [plan_model], behavior (LAST).
 		type planExecuteFlat struct {
-			Kind      LoopStrategyKind `json:"kind"`
-			Plan      *LoopStrategy    `json:"plan"`
-			Execute   *LoopStrategy    `json:"execute"`
-			PlanModel *ModelConfig     `json:"plan_model,omitempty"`
+			Kind      LoopStrategyKind        `json:"kind"`
+			Plan      *LoopStrategy           `json:"plan"`
+			Execute   *LoopStrategy           `json:"execute"`
+			PlanModel *ModelConfig            `json:"plan_model,omitempty"`
+			Behavior  BudgetExhaustedBehavior `json:"behavior"`
 		}
-		return json.Marshal(planExecuteFlat{s.Kind, c.Plan, c.Execute, c.PlanModel})
+		return json.Marshal(planExecuteFlat{s.Kind, c.Plan, c.Execute, c.PlanModel, c.Behavior})
 	case StrategySelfVerifying:
 		if s.SelfVerify == nil {
 			return nil, fmt.Errorf("LoopStrategy: self_verifying requires config")
 		}
 		c := s.SelfVerify
-		// Key order: kind, inner, evaluator.
+		// Key order: kind, inner, evaluator, behavior (LAST).
 		type selfVerifyFlat struct {
-			Kind      LoopStrategyKind `json:"kind"`
-			Inner     *LoopStrategy    `json:"inner"`
-			Evaluator SchemaRef        `json:"evaluator"`
+			Kind      LoopStrategyKind        `json:"kind"`
+			Inner     *LoopStrategy           `json:"inner"`
+			Evaluator SchemaRef               `json:"evaluator"`
+			Behavior  BudgetExhaustedBehavior `json:"behavior"`
 		}
-		return json.Marshal(selfVerifyFlat{s.Kind, c.Inner, c.Evaluator})
+		return json.Marshal(selfVerifyFlat{s.Kind, c.Inner, c.Evaluator, c.Behavior})
 	case StrategyRalph:
 		if s.Ralph == nil {
 			return nil, fmt.Errorf("LoopStrategy: ralph requires config")
 		}
 		c := s.Ralph
-		// Key order: kind, inner, agent.
+		// Key order: kind, inner, agent, behavior (LAST).
 		type ralphFlat struct {
-			Kind  LoopStrategyKind `json:"kind"`
-			Inner *LoopStrategy    `json:"inner"`
-			Agent AgentRef         `json:"agent"`
+			Kind     LoopStrategyKind        `json:"kind"`
+			Inner    *LoopStrategy           `json:"inner"`
+			Agent    AgentRef                `json:"agent"`
+			Behavior BudgetExhaustedBehavior `json:"behavior"`
 		}
-		return json.Marshal(ralphFlat{s.Kind, c.Inner, c.Agent})
+		return json.Marshal(ralphFlat{s.Kind, c.Inner, c.Agent, c.Behavior})
 	case StrategyHillClimbing:
 		if s.HillClimbing == nil {
 			return nil, fmt.Errorf("LoopStrategy: hill_climbing requires config")
 		}
 		c := s.HillClimbing
 		// Key order: kind, inner, direction, max_stagnation,
-		// revert_on_no_improvement, min_improvement_delta, evaluator.
+		// revert_on_no_improvement, min_improvement_delta, evaluator, behavior
+		// (LAST).
 		type hillFlat struct {
-			Kind                  LoopStrategyKind      `json:"kind"`
-			Inner                 *LoopStrategy         `json:"inner"`
-			Direction             OptimizationDirection `json:"direction"`
-			MaxStagnation         uint32                `json:"max_stagnation"`
-			RevertOnNoImprovement bool                  `json:"revert_on_no_improvement"`
-			MinImprovementDelta   float64               `json:"min_improvement_delta"`
-			Evaluator             AgentRef              `json:"evaluator"`
+			Kind                  LoopStrategyKind        `json:"kind"`
+			Inner                 *LoopStrategy           `json:"inner"`
+			Direction             OptimizationDirection   `json:"direction"`
+			MaxStagnation         uint32                  `json:"max_stagnation"`
+			RevertOnNoImprovement bool                    `json:"revert_on_no_improvement"`
+			MinImprovementDelta   float64                 `json:"min_improvement_delta"`
+			Evaluator             AgentRef                `json:"evaluator"`
+			Behavior              BudgetExhaustedBehavior `json:"behavior"`
 		}
 		return json.Marshal(hillFlat{
 			s.Kind, c.Inner, c.Direction, c.MaxStagnation,
-			c.RevertOnNoImprovement, c.MinImprovementDelta, c.Evaluator,
+			c.RevertOnNoImprovement, c.MinImprovementDelta, c.Evaluator, c.Behavior,
 		})
 	default:
 		return nil, fmt.Errorf("LoopStrategy: unknown kind %q", s.Kind)
@@ -311,26 +368,29 @@ func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
 	switch kindProbe.Kind {
 	case StrategyReAct:
 		var probe struct {
-			Budget  BudgetPolicy `json:"budget"`
-			Agent   AgentRef     `json:"agent"`
-			Toolset ToolsetRef   `json:"toolset"`
-			Output  *SchemaRef   `json:"output"`
+			Budget   BudgetPolicy             `json:"budget"`
+			Behavior *BudgetExhaustedBehavior `json:"behavior"`
+			Agent    AgentRef                 `json:"agent"`
+			Toolset  ToolsetRef               `json:"toolset"`
+			Output   *SchemaRef               `json:"output"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
 		}
 		s.ReActCfg = &ReactConfig{
-			Budget:  probe.Budget,
-			Agent:   probe.Agent,
-			Toolset: probe.Toolset,
-			Output:  probe.Output,
+			Budget:   probe.Budget,
+			Behavior: behaviorOrDefault(probe.Behavior),
+			Agent:    probe.Agent,
+			Toolset:  probe.Toolset,
+			Output:   probe.Output,
 		}
 		return nil
 	case StrategyPlanExecute:
 		var probe struct {
-			Plan      *LoopStrategy `json:"plan"`
-			Execute   *LoopStrategy `json:"execute"`
-			PlanModel *ModelConfig  `json:"plan_model"`
+			Plan      *LoopStrategy            `json:"plan"`
+			Execute   *LoopStrategy            `json:"execute"`
+			PlanModel *ModelConfig             `json:"plan_model"`
+			Behavior  *BudgetExhaustedBehavior `json:"behavior"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
@@ -339,36 +399,48 @@ func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
 			Plan:      probe.Plan,
 			Execute:   probe.Execute,
 			PlanModel: probe.PlanModel,
+			Behavior:  behaviorOrDefault(probe.Behavior),
 		}
 		return nil
 	case StrategySelfVerifying:
 		var probe struct {
-			Inner     *LoopStrategy `json:"inner"`
-			Evaluator SchemaRef     `json:"evaluator"`
+			Inner     *LoopStrategy            `json:"inner"`
+			Evaluator SchemaRef                `json:"evaluator"`
+			Behavior  *BudgetExhaustedBehavior `json:"behavior"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
 		}
-		s.SelfVerify = &SelfVerifyingConfig{Inner: probe.Inner, Evaluator: probe.Evaluator}
+		s.SelfVerify = &SelfVerifyingConfig{
+			Inner:     probe.Inner,
+			Evaluator: probe.Evaluator,
+			Behavior:  behaviorOrDefault(probe.Behavior),
+		}
 		return nil
 	case StrategyRalph:
 		var probe struct {
-			Inner *LoopStrategy `json:"inner"`
-			Agent AgentRef      `json:"agent"`
+			Inner    *LoopStrategy            `json:"inner"`
+			Agent    AgentRef                 `json:"agent"`
+			Behavior *BudgetExhaustedBehavior `json:"behavior"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
 		}
-		s.Ralph = &RalphConfig{Inner: probe.Inner, Agent: probe.Agent}
+		s.Ralph = &RalphConfig{
+			Inner:    probe.Inner,
+			Agent:    probe.Agent,
+			Behavior: behaviorOrDefault(probe.Behavior),
+		}
 		return nil
 	case StrategyHillClimbing:
 		var probe struct {
-			Inner                 *LoopStrategy         `json:"inner"`
-			Direction             OptimizationDirection `json:"direction"`
-			MaxStagnation         uint32                `json:"max_stagnation"`
-			RevertOnNoImprovement bool                  `json:"revert_on_no_improvement"`
-			MinImprovementDelta   float64               `json:"min_improvement_delta"`
-			Evaluator             AgentRef              `json:"evaluator"`
+			Inner                 *LoopStrategy            `json:"inner"`
+			Direction             OptimizationDirection    `json:"direction"`
+			MaxStagnation         uint32                   `json:"max_stagnation"`
+			RevertOnNoImprovement bool                     `json:"revert_on_no_improvement"`
+			MinImprovementDelta   float64                  `json:"min_improvement_delta"`
+			Evaluator             AgentRef                 `json:"evaluator"`
+			Behavior              *BudgetExhaustedBehavior `json:"behavior"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
@@ -380,6 +452,7 @@ func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
 			RevertOnNoImprovement: probe.RevertOnNoImprovement,
 			MinImprovementDelta:   probe.MinImprovementDelta,
 			Evaluator:             probe.Evaluator,
+			Behavior:              behaviorOrDefault(probe.Behavior),
 		}
 		return nil
 	default:
@@ -543,12 +616,13 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	}
 	session := cx.takeSession()
 	budget := cx.Scratch.RunBudget
-	// #125: push this leaf's OWN budget scope. The leaf carries only its POLICY
-	// (the cap); behavior is Escalate as a leaf placeholder — the leaf never
-	// RESOLVES it (rule 6: propagate to parent), it is only the scope shape so the
-	// charge below enforces the cap and any exhaustion promotes to a
-	// parent-inspectable BudgetExhausted.
-	cx.PushBudget(c.Budget, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "react")
+	// #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
+	// Behavior. The leaf still never RESOLVES it in the nested case (rule 6: it
+	// PROPAGATES a BudgetExhausted to its parent, which owns the single recovery
+	// site). Carrying the real Behavior only means the propagated error reports
+	// it, so the TOP-LEVEL/bare-leaf resolution site (driveStrategy) can honor it
+	// (Q1 — a bare leaf self-resolves, a nested leaf does not).
+	cx.PushBudget(c.Budget, c.Behavior, "react")
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := cx.takeStream()
@@ -587,7 +661,7 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 			if err == nil {
 				err = &BudgetExhausted{
 					Policy:     c.Budget,
-					Behavior:   BudgetExhaustedBehavior{Kind: BehaviorEscalate},
+					Behavior:   c.Behavior,
 					StepsTaken: windowTurns,
 					Phase:      "react",
 				}
@@ -808,7 +882,7 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	} else {
 		planPolicy = BudgetPolicy{Kind: BudgetUnlimited}
 	}
-	cx.PushBudget(planPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "plan_execute")
+	cx.PushBudget(planPolicy, c.Behavior, "plan_execute")
 
 	// cascade marks taskID and its transitive dependents Blocked, records the
 	// first failure, and persists (#126 AC3/AC4, decision A/E).
@@ -927,10 +1001,21 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 			resolution := cx.ResolveCurrent()
 			_ = cx.takeChildOverride()
 			switch resolution {
+			case ExhaustedResolutionContinue:
+				// #129: a granted Continue loops IN-PROCESS — ResolveCurrent already
+				// reset StepsTaken and bumped ContinuesUsed. Reset this task to
+				// Pending and re-enter the ready-set walk so it runs again under the
+				// refreshed scope allowance (NO serialization — AC3). MaxContinues
+				// bounds the loop: once continues are spent, the chain falls through
+				// to Fail/Escalate.
+				pending := TaskStatusPending
+				_ = taskList.Update(taskID, &pending, nil)
+				executor.PersistTaskList(ctx, sessionID, taskList)
+				continue
 			case ExhaustedResolutionFail:
 				cascade(taskID, "budget exhausted (Fail)")
 				continue
-			default: // Escalate / Continue (#129): surface the partial and abort.
+			default: // Escalate: surface the partial and abort.
 				blocked := TaskStatusBlocked
 				_ = taskList.Update(taskID, &blocked, nil)
 				executor.PersistTaskList(ctx, sessionID, taskList)
@@ -996,8 +1081,14 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 			// global TotalSteps cap is now spent, the PlanExecute node surfaces its
 			// OWN typed BudgetExhausted (partial = tasklist + ledger).
 			if chErr := cx.ChargeCurrent(saturatingSubU32(subResult.Turns, carriedBefore)); chErr != nil {
-				partial := planExecutePartialJSON(taskList)
 				resolution := cx.ResolveCurrent()
+				// #129: a granted Continue refreshes the scope and keeps scheduling
+				// the remaining ready tasks IN-PROCESS (this step already completed).
+				// NO serialization (AC3).
+				if resolution == ExhaustedResolutionContinue {
+					continue
+				}
+				partial := planExecutePartialJSON(taskList)
 				cx.PopBudget()
 				cx.Scratch.RunSession = lastState
 				// #130: under SurfaceToHuman, an Escalate-resolving exhaustion PAUSES
@@ -1164,7 +1255,7 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 	} else {
 		svPolicy = BudgetPolicy{Kind: BudgetUnlimited}
 	}
-	cx.PushBudget(svPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "self_verifying")
+	cx.PushBudget(svPolicy, c.Behavior, "self_verifying")
 
 	for iteration := uint32(0); iteration < maxIterations; iteration++ {
 		// ── Build phase: recurse c.Inner.Run.
@@ -1234,8 +1325,15 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 		// If the global cap is spent, the node surfaces its OWN typed
 		// BudgetExhausted (partial = last worker result + last verdict).
 		if chErr := cx.ChargeCurrent(saturatingSubU32(carried.Turns, carriedBefore)); chErr != nil {
-			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
 			resolution := cx.ResolveCurrent()
+			// #129: a granted Continue resets the scope and RE-RUNS the
+			// build↔evaluate iteration IN-PROCESS (do NOT pop the scope; the loop
+			// continues under the refreshed allowance). NO serialization (AC3).
+			// MaxContinues bounds the loop.
+			if resolution == ExhaustedResolutionContinue {
+				continue
+			}
+			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
 			cx.PopBudget()
 			pt := task
 			cx.Scratch.Task = &pt
@@ -1255,16 +1353,11 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			switch resolution {
 			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)
-			case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
-				// #129: a granted Continue must reset + RE-RUN this
-				// build↔evaluate iteration (the in-process loop wiring lands in
-				// #129). UNREACHABLE today — live bodies push an Escalate
-				// placeholder, so ResolveCurrent never yields Continue here.
-				// Handle it EXPLICITLY (surface-with-partial) rather than via a
-				// silent default fall-through.
+			default:
+				// #129: the in-process Continue is handled above; this is
+				// Escalate-only now (the surface/propagate shape).
 				return promoteBudgetExhausted(chErr, &partial)
 			}
-			return promoteBudgetExhausted(chErr, &partial)
 		}
 
 		// ── Evaluate phase: a fresh evaluator run on evalAgent.
@@ -1515,7 +1608,7 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 	} else {
 		hcPolicy = BudgetPolicy{Kind: BudgetUnlimited}
 	}
-	cx.PushBudget(hcPolicy, BudgetExhaustedBehavior{Kind: BehaviorEscalate}, "hill_climbing")
+	cx.PushBudget(hcPolicy, c.Behavior, "hill_climbing")
 
 	// ── Iteration 0: pure baseline. No agent turn (Decision 5).
 	baseValue, baseDur, baseStatus, baseMsg, baseOK := executor.HillEvaluate(ctx, evaluator, sessionID, task.ID)
@@ -1568,9 +1661,15 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 		// best candidate + score), resolving its behavior — replacing the legacy
 		// BudgetExceeded Failure.
 		if chErr := cx.ChargeCurrent(1); chErr != nil {
+			resolution := cx.ResolveCurrent()
+			// #129: a granted Continue resets the scope and KEEPS ITERATING the
+			// climb IN-PROCESS (do NOT pop; the refreshed allowance lets the next
+			// charge pass). NO serialization (AC3). MaxContinues bounds the loop.
+			if resolution == ExhaustedResolutionContinue {
+				continue
+			}
 			executor.HillWriteTSV(workspaceRoot, task.ID, rows)
 			partial := hillClimbingPartialJSON(currentBest)
-			resolution := cx.ResolveCurrent()
 			cx.PopBudget()
 			pt := task
 			cx.Scratch.Task = &pt
@@ -1590,16 +1689,11 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			switch resolution {
 			case ExhaustedResolutionFail:
 				return promoteBudgetExhausted(chErr, nil)
-			case ExhaustedResolutionContinue, ExhaustedResolutionEscalate:
-				// #129: a granted Continue must reset + keep iterating the climb
-				// (the in-process loop wiring lands in #129). UNREACHABLE today —
-				// live bodies push an Escalate placeholder, so ResolveCurrent
-				// never yields Continue here. Handle it EXPLICITLY
-				// (surface-with-partial) rather than via a silent default
-				// fall-through.
+			default:
+				// #129: the in-process Continue is handled above; this is
+				// Escalate-only now (the surface/propagate shape).
 				return promoteBudgetExhausted(chErr, &partial)
 			}
-			return promoteBudgetExhausted(chErr, &partial)
 		}
 		if lt, exceeded := budgetExceeded(task.Budget, carried, time.Now()); exceeded {
 			executor.HillWriteTSV(workspaceRoot, task.ID, rows)

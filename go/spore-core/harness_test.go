@@ -429,7 +429,7 @@ func TestLoopStrategyJSONTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"kind":"react","budget":{"kind":"per_loop","value":5},"agent":"","toolset":""}`
+	want := `{"kind":"react","budget":{"kind":"per_loop","value":5},"behavior":{"kind":"escalate"},"agent":"","toolset":""}`
 	if string(data) != want {
 		t.Fatalf("got %s, want %s", data, want)
 	}
