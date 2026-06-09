@@ -1042,6 +1042,18 @@ pub struct RunScratch {
     /// `None` on a fresh run and after the seed is consumed (an in-process
     /// Continue never sets it → AC3: no serialization on the in-process path).
     pub resume_continues: Option<(String, u32)>,
+    /// Consult re-drive seed (#131): the worker conversation (with the consult
+    /// answer already injected as the pending call's tool result) carried from a
+    /// resumed [`RunResult::Consult`]. When set, a [`PlanExecuteConfig`] walk
+    /// resumes its single `InProgress` task from THIS session (instead of a fresh
+    /// instruction-seeded session) so the consulting worker continues mid-loop,
+    /// its SelfVerifying evaluator still runs, and the ready-set walk proceeds.
+    /// The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the
+    /// session itself rides the serialized [`PausedState::session_state`], so a
+    /// cross-process resume reconstructs this seed in
+    /// [`resume_consult`](Harness::resume_consult). `None` on a fresh run / after
+    /// the seed is consumed.
+    pub consult_resume: Option<SessionState>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -1659,6 +1671,37 @@ impl RunStrategy for PlanExecuteConfig {
                 .reconcile_completed_tasks(&session_id, &mut task_list)
                 .await;
 
+            // #131 consult re-drive: a resumed consult carries the worker
+            // conversation (answer already injected) in `cx.scratch.consult_resume`.
+            // The consulting task is the single `InProgress` task in the durable
+            // list (PlanExecute marks a task InProgress before running it). Reset
+            // it to `Pending` so `next_ready` re-schedules it, and remember its id
+            // so its step uses the carried session instead of a fresh one — the
+            // worker then continues mid-loop and its evaluator still runs.
+            let mut consult_resume_session = cx.scratch.consult_resume.take();
+            let consult_resume_task: Option<u32> = if consult_resume_session.is_some() {
+                let in_progress = task_list
+                    .tasks
+                    .iter()
+                    .find(|t| t.status == TaskStatus::InProgress)
+                    .map(|t| t.id);
+                if let Some(tid) = in_progress {
+                    // Reset directly (bypassing `update`'s forward-only transition
+                    // guard, which rejects InProgress->Pending): the consult resume
+                    // legitimately re-schedules the in-flight task.
+                    if let Some(t) = task_list.tasks.iter_mut().find(|t| t.id == tid) {
+                        t.status = TaskStatus::Pending;
+                    }
+                } else {
+                    // No in-progress task to resume (out-of-contract); drop the
+                    // seed so the walk proceeds normally rather than stalling.
+                    consult_resume_session = None;
+                }
+                in_progress
+            } else {
+                None
+            };
+
             let mut total_usage = outcome.usage;
             let mut last_output = String::new();
             let mut last_state = SessionState::default();
@@ -1721,48 +1764,62 @@ impl RunStrategy for PlanExecuteConfig {
                     .fire_task_advance(&session_id, &mut step_task, index, total_tasks)
                     .await;
 
-                // #126 Tier-1 scoped context: seed this step from a FRESH copy of
-                // the base session (NOT a forward-folded shared transcript — that
-                // breaks on a DAG, #126) plus, for THIS task's transitive blockers
-                // only, their final outputs + their ledger rows. Independent
-                // branches never appear (AC1 isolation).
-                let mut step_session = base_session.clone();
-                let blockers = task_list.transitive_blockers(task_id);
-                if !blockers.is_empty() {
-                    let blocker_set: HashSet<u32> = blockers.iter().copied().collect();
-                    // Tier-1: transitive blockers' final outputs (ascending id).
-                    let mut tier1_lines: Vec<String> = Vec::new();
-                    for b in &blockers {
-                        if let Some(out) = final_outputs.get(b) {
-                            tier1_lines.push(format!("#{b} result: {out}"));
+                // #131 consult re-drive: if THIS is the task that was consulting,
+                // resume its worker from the carried conversation (answer already
+                // injected) instead of a fresh instruction-seeded session — the
+                // worker continues mid-loop and its evaluator still runs. Otherwise
+                // build the normal fresh, Tier-1/Tier-2-seeded step session.
+                let step_session = if Some(task_id) == consult_resume_task {
+                    consult_resume_session
+                        .take()
+                        .unwrap_or_else(|| base_session.clone())
+                } else {
+                    // #126 Tier-1 scoped context: seed this step from a FRESH copy
+                    // of the base session (NOT a forward-folded shared transcript —
+                    // that breaks on a DAG, #126) plus, for THIS task's transitive
+                    // blockers only, their final outputs + their ledger rows.
+                    // Independent branches never appear (AC1 isolation).
+                    let mut step_session = base_session.clone();
+                    let blockers = task_list.transitive_blockers(task_id);
+                    if !blockers.is_empty() {
+                        let blocker_set: HashSet<u32> = blockers.iter().copied().collect();
+                        // Tier-1: transitive blockers' final outputs (ascending id).
+                        let mut tier1_lines: Vec<String> = Vec::new();
+                        for b in &blockers {
+                            if let Some(out) = final_outputs.get(b) {
+                                tier1_lines.push(format!("#{b} result: {out}"));
+                            }
+                        }
+                        if !tier1_lines.is_empty() {
+                            let block = format!(
+                                "Results from upstream tasks:\n{}",
+                                tier1_lines.join("\n")
+                            );
+                            executor.seed_user_message(&mut step_session, &block).await;
+                        }
+                        // Tier-1 ledger: the Tier-2 ledger rows for this set.
+                        let scoped: Vec<StepLedgerEntry> = ledger
+                            .iter()
+                            .filter(|e| blocker_set.contains(&e.task_id))
+                            .cloned()
+                            .collect();
+                        if let Some(block) = render_step_ledger(&scoped, false) {
+                            executor.seed_user_message(&mut step_session, &block).await;
                         }
                     }
-                    if !tier1_lines.is_empty() {
-                        let block =
-                            format!("Results from upstream tasks:\n{}", tier1_lines.join("\n"));
+
+                    // #126 Tier-2: inject the FULL global running ledger into EVERY
+                    // step (with the static elision marker once entries dropped).
+                    if let Some(block) = render_step_ledger(&ledger, ledger_elided) {
                         executor.seed_user_message(&mut step_session, &block).await;
                     }
-                    // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-                    let scoped: Vec<StepLedgerEntry> = ledger
-                        .iter()
-                        .filter(|e| blocker_set.contains(&e.task_id))
-                        .cloned()
-                        .collect();
-                    if let Some(block) = render_step_ledger(&scoped, false) {
-                        executor.seed_user_message(&mut step_session, &block).await;
-                    }
-                }
 
-                // #126 Tier-2: inject the FULL global running ledger into EVERY
-                // step (with the static elision marker once entries were dropped).
-                if let Some(block) = render_step_ledger(&ledger, ledger_elided) {
-                    executor.seed_user_message(&mut step_session, &block).await;
-                }
-
-                // Finally seed this step's own instruction.
-                executor
-                    .seed_user_message(&mut step_session, &step_task.instruction)
-                    .await;
+                    // Finally seed this step's own instruction.
+                    executor
+                        .seed_user_message(&mut step_session, &step_task.instruction)
+                        .await;
+                    step_session
+                };
 
                 // #126 AC2: clear the observed-write accumulator so this task's
                 // files_touched reflect ONLY the writes this step issues.
@@ -2786,6 +2843,31 @@ impl ExecutionContext<'_> {
         result: RunResult,
     ) -> StrategyOutcome {
         executor.finalize(&result).await;
+        // #131: a `Consult` propagated from a worker leaf carries the LEAF task,
+        // so a host `resume_consult` would resume only that leaf and lose the
+        // surrounding walk. As the pause unwinds through each combinator's
+        // `finish`, rewrite its `state.task` to the combinator's OWN composed
+        // task; by the top it carries the FULL tree, so `resume_consult` re-drives
+        // the whole strategy (the in-progress task resumes from `consult_resume`).
+        let result = match result {
+            RunResult::Consult {
+                request,
+                mut state,
+                session_id,
+                usage,
+                turns,
+            } => {
+                state.task = parent_task.clone();
+                RunResult::Consult {
+                    request,
+                    state,
+                    session_id,
+                    usage,
+                    turns,
+                }
+            }
+            other => other,
+        };
         self.scratch.task = Some(parent_task);
         match &result {
             RunResult::Success { session_state, .. } | RunResult::Failure { session_state, .. } => {
@@ -8932,6 +9014,30 @@ impl StandardHarness {
                 .await;
         }
 
+        // #131: a consult that surfaced from inside a composed tree carries the
+        // FULL strategy in `task.loop_strategy` (each combinator's `finish`
+        // rewrote the pause's task on the way up). Re-DRIVE that strategy rather
+        // than resuming only the worker leaf: the PlanExecute walk resumes its
+        // in-progress task from the injected worker session (`consult_resume`
+        // seed), so the worker finishes mid-loop, its SelfVerifying evaluator runs,
+        // the task is marked Completed, and the remaining ready-set is walked. A
+        // BARE worker leaf (depth-1, e.g. a SubagentTool-mediated consult) has no
+        // surrounding walk, so it keeps the original leaf-only resume (back-compat).
+        if !matches!(task.loop_strategy, LoopStrategy::ReAct(_)) {
+            return self
+                .drive_strategy_with_resume_seed(
+                    task,
+                    // Top-level session starts fresh; the worker conversation is
+                    // threaded into the in-progress task via the consult seed.
+                    SessionState::default(),
+                    budget_used,
+                    on_stream,
+                    None,
+                    Some(session_state),
+                )
+                .await;
+        }
+
         let max_iterations = match &task.loop_strategy {
             LoopStrategy::ReAct(c) => c.max_iterations(),
             _ => u32::MAX,
@@ -9129,7 +9235,7 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
     ) -> RunResult {
-        self.drive_strategy_with_resume_seed(task, session_state, budget_used, on_stream, None)
+        self.drive_strategy_with_resume_seed(task, session_state, budget_used, on_stream, None, None)
             .await
     }
 
@@ -9138,6 +9244,11 @@ impl StandardHarness {
     /// FIRST matching budget scope's `continues_used` (via [`BudgetContext::resumed`])
     /// so a `Continue` that spanned a process pause resumes with the correct
     /// continue count instead of a zeroed one. `None` is the fresh-run path.
+    ///
+    /// `consult_resume = Some(session)` (#131) seeds the FIRST PlanExecute walk's
+    /// in-progress task with `session` (a worker conversation whose consult answer
+    /// is already injected) so a resumed consult continues mid-loop and walks the
+    /// remaining ready-set. `None` on every non-consult path.
     async fn drive_strategy_with_resume_seed(
         &self,
         task: Task,
@@ -9145,6 +9256,7 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         resume_continues: Option<(String, u32)>,
+        consult_resume: Option<SessionState>,
     ) -> RunResult {
         // #129: the BARE-LEAF resolution site is `drive_strategy` (a bare leaf
         // never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
@@ -9167,6 +9279,9 @@ impl StandardHarness {
         // round only (the resumed node's scope); later in-process rounds carry
         // their continue count via `behavior_for_resolution`.
         let mut resume_continues = resume_continues;
+        // #131: the consult re-drive seed is consumed by the FIRST round's
+        // PlanExecute walk only; later in-process rounds run normally.
+        let mut consult_resume = consult_resume;
 
         loop {
             let mut cx = ExecutionContext::new(&self.config.registry);
@@ -9176,6 +9291,7 @@ impl StandardHarness {
             cx.scratch.run_budget = budget_used.clone();
             cx.scratch.task = Some(task.clone());
             cx.scratch.resume_continues = resume_continues.take();
+            cx.scratch.consult_resume = consult_resume.take();
 
             let outcome = task.loop_strategy.run(&mut cx).await;
 
@@ -9373,6 +9489,7 @@ impl StandardHarness {
                             budget_used,
                             on_stream,
                             Some(resume_seed),
+                            None,
                         )
                         .await;
                 }

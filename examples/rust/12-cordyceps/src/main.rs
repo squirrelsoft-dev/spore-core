@@ -24,8 +24,14 @@
 //! per-node consult mediator (#114) and an architect-side `load_skill` tool
 //! (#115). The declarative tree has NO SubagentTool seam, so:
 //!
-//! - the #114 consult ladder is **dropped** — there is no per-node
-//!   `ToolOutput::Consult` handler in the composed tree;
+//! - the #114 consult ladder is **PRESERVED, with its mediation seam moved**.
+//!   The worker still calls `research_best_practices` / `consult_advisor`, which
+//!   lower to `ToolOutput::Consult`. With no `SubagentTool` to mediate, the
+//!   worker-leaf consult propagates all the way up to a top-level
+//!   [`RunResult::Consult`], and the HOST run loop mediates it — routing by
+//!   `kind` to a helper harness with a per-kind budget + overflow policy
+//!   (`research` → web_search, budget 5, SoftFail; `advice` → cloud advisor,
+//!   budget 3, EscalateToHuman). Identical #114 semantics, host-owned budgets.
 //! - `load_skill` is **dropped** — there is no worker-side per-node seam;
 //! - the `audit` skill is **kept**, but now rides the single GLOBAL
 //!   [`SkillInjectingContextManager`] (the harness's `context_manager`), seeded
@@ -49,20 +55,25 @@
 mod skills;
 mod tools;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
 use spore_core::storage::InMemoryStorageProvider;
 use spore_core::{
-    Agent, AgentId, BudgetLimits, EmptyToolRegistry, EscalationAction, EscalationMode,
-    EvaluatorResponseVerifier, ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager,
-    HarnessContextManagerExt, HarnessRunOptions, HumanRequest, HumanResponse, LoopStrategy,
-    ModelAgent, NullCacheProvider, OllamaModelInterface, RunResult, SessionId,
-    StandardContextManager, StandardTool, StandardTools, StorageProvider, Task, Verifier,
+    Agent, AgentId, BudgetLimits, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
+    ConsultResponse, EmptyToolRegistry, EscalationAction, EscalationMode, EvaluatorResponseVerifier,
+    ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager, HarnessContextManagerExt,
+    HarnessRunOptions, HumanRequest, HumanResponse, LoopStrategy, ModelAgent, NullCacheProvider,
+    OllamaModelInterface, ReactConfig, RunResult, SearchMethod, SessionId, StandardContextManager,
+    StandardTool, StandardTools, StorageProvider, Task, Verifier, WebSearchConfig, WebSearchTool,
     WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 use crate::skills::{SkillCatalog, SkillInjectingContextManager, ACTIVE_SKILLS_KEY};
+use crate::tools::consult::{
+    consult_advisor_tool, research_best_practices_tool, KIND_ADVICE, KIND_RESEARCH,
+};
 use crate::tools::send_message::send_user_message_tool;
 
 /// The canonical composed-strategy fixture, embedded so the example proves the
@@ -158,13 +169,104 @@ fn plan_tools() -> Vec<StandardTool> {
     ]
 }
 
-/// The `exec-tools` catalogue: read-only audit + human observability.
+/// The `exec-tools` catalogue: read-only audit + the #114 consult ladder +
+/// human observability. The two consult tools lower to `ToolOutput::Consult`,
+/// which the host run loop mediates (the seam moved off `SubagentTool`).
 fn exec_tools() -> Vec<StandardTool> {
     vec![
         StandardTools::read_file(),
         StandardTools::grep(),
+        research_best_practices_tool(),
+        consult_advisor_tool(),
         send_user_message_tool("🤖"),
     ]
+}
+
+const RESEARCH_PROMPT: &str = "\
+You are a research worker. A peer agent needs factual, current information on a Rust best-practice \
+or language question.
+
+Use `web_search` to find the answer. Issue focused queries, read the results, and return a \
+concise cited answer in plain text. Do not answer from memory alone — always search first.";
+
+const ADVISOR_PROMPT: &str = "\
+You are a senior Rust advisor. A worker has escalated a candidate finding to you because they \
+need a judgment call.
+
+Use `read_file` and `grep` to examine the specific code in question. Then make a decision: \
+is this a real defect, what is the severity (low / medium / high / critical), and why. \
+Be decisive. State your verdict in one sentence, your reasoning in two. Do not hedge.";
+
+/// Build the SearXNG-backed `web_search` catalogue tool (identical to 06/11).
+fn build_web_search(endpoint: &str) -> StandardTool {
+    let tool = WebSearchTool::with_config(WebSearchConfig {
+        endpoint: endpoint.to_string(),
+        method: SearchMethod::Get,
+        query_param: "q".into(),
+        auth_headers: Vec::new(),
+        body_auth_params: Vec::new(),
+    })
+    .expect("web_search backend config is valid (SearXNG needs no auth env vars)");
+    StandardTool::new(Box::new(tool), WebSearchTool::schema())
+}
+
+/// Build the research handler harness (web_search only) — the `kind="research"`
+/// consult handler. Run host-side on a `ConsultRequest`.
+fn build_research_harness(model_id: &str, base_url: &str, endpoint: &str) -> Arc<dyn Harness> {
+    let model = OllamaModelInterface::with_base_url(model_id, base_url.to_string());
+    Arc::new(
+        HarnessBuilder::conversational(model)
+            .tool(build_web_search(endpoint))
+            .system_prompt(RESEARCH_PROMPT)
+            .build(),
+    )
+}
+
+/// Build the advisor handler harness (cloud model, read_file + grep) — the
+/// `kind="advice"` consult handler. Rides the same Ollama endpoint via
+/// `with_base_url`; only the model id differs (heterogeneous models).
+fn build_advisor_harness(
+    model_id: &str,
+    base_url: &str,
+    repo_sandbox: Arc<WorkspaceScopedSandbox>,
+) -> Arc<dyn Harness> {
+    let model = OllamaModelInterface::with_base_url(model_id, base_url.to_string());
+    Arc::new(
+        HarnessBuilder::conversational(model)
+            .sandbox(repo_sandbox)
+            .tool(StandardTools::read_file())
+            .tool(StandardTools::grep())
+            .system_prompt(ADVISOR_PROMPT)
+            .build(),
+    )
+}
+
+/// Build the HOST-owned `kind → {handler, budget, overflow}` map (#114). The
+/// composed tree has no `SubagentTool`, so the host run loop holds these
+/// entries and mediates each `RunResult::Consult` against them — the per-kind
+/// budget lives for the whole run (see `mediate_consult`).
+fn build_consult_handlers(
+    research: Arc<dyn Harness>,
+    advisor: Arc<dyn Harness>,
+) -> HashMap<String, ConsultHandlerEntry> {
+    let mut handlers = HashMap::new();
+    handlers.insert(
+        KIND_RESEARCH.to_string(),
+        ConsultHandlerEntry {
+            handler: research,
+            budget: 5,
+            overflow: ConsultOverflowPolicy::SoftFail,
+        },
+    );
+    handlers.insert(
+        KIND_ADVICE.to_string(),
+        ConsultHandlerEntry {
+            handler: advisor,
+            budget: 3,
+            overflow: ConsultOverflowPolicy::EscalateToHuman,
+        },
+    );
+    handlers
 }
 
 /// Build a model agent (`Arc<dyn Agent>`) over the local Ollama model.
@@ -265,8 +367,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_id = arg_value(&args, "--model")
         .or_else(|| std::env::var("SPORE_OLLAMA_MODEL").ok())
         .unwrap_or_else(|| "gemma4:e4b".to_string());
+    // The #114 advisor consult handler runs a heterogeneous (cloud) model.
+    let advisor_model_id = arg_value(&args, "--advisor-model")
+        .or_else(|| std::env::var("SPORE_ADVISOR_MODEL").ok())
+        .unwrap_or_else(|| "minimax-m3:cloud".to_string());
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
+
+    // The research consult handler needs a SearXNG JSON endpoint — fail fast
+    // (like examples 06/11) so a missing backend is a startup error, not a
+    // mid-run surprise.
+    let endpoint = match arg_value(&args, "--search-url")
+        .or_else(|| std::env::var("SPORE_WEB_SEARCH_ENDPOINT").ok())
+    {
+        Some(e) if !e.trim().is_empty() => e,
+        _ => {
+            eprintln!(
+                "SPORE_WEB_SEARCH_ENDPOINT is not set.\n\
+                 Set it to a SearXNG JSON endpoint, e.g. \
+                 http://localhost:8888/search?format=json. See .env.example and the README."
+            );
+            std::process::exit(2);
+        }
+    };
 
     let repo_root = std::fs::canonicalize(std::env::current_dir()?)?;
     let workspace_root = repo_root.join("workspace");
@@ -276,13 +399,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
     // = 4 + (12 + 1) = 17. An `Unlimited` anywhere would collapse this to None.
     let tree_preview: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON)?;
-    println!("model      : {model_id}");
-    println!("repo root  : {}", repo_root.display());
-    println!("strategy   : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)");
+    println!("model        : {model_id}");
+    println!("advisor model: {advisor_model_id}");
+    println!("search       : {endpoint}");
+    println!("repo root    : {}", repo_root.display());
+    println!("strategy     : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)");
     println!(
-        "max_steps  : {:?}  (per-window worst case; Unlimited anywhere ⇒ None)",
+        "max_steps    : {:?}  (per-window worst case; Unlimited anywhere ⇒ None)",
         tree_preview.max_steps()
     );
+    println!("consults     : research(web_search, budget 5, soft-fail), advice(advisor, budget 3, escalate)");
     println!();
 
     while let Some(prompt) = read_audit_prompt() {
@@ -295,6 +421,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sandbox_cfg = WorkspaceConfig::scoped(repo_root.clone());
         sandbox_cfg.read_only = true;
         let sandbox = Arc::new(WorkspaceScopedSandbox::new(sandbox_cfg)?);
+
+        // The advisor handler gets its own read-only view of the repo (read_file
+        // + grep) so it can inspect the code the worker is asking about.
+        let mut advisor_cfg = WorkspaceConfig::scoped(repo_root.clone());
+        advisor_cfg.read_only = true;
+        let advisor_sandbox = Arc::new(WorkspaceScopedSandbox::new(advisor_cfg)?);
+
+        // The HOST-owned consult ladder (#114). The seam moved off `SubagentTool`:
+        // the host loop holds these handlers + per-kind budgets for the whole run.
+        let consult_handlers = build_consult_handlers(
+            build_research_harness(&model_id, &base_url, &endpoint),
+            build_advisor_harness(&advisor_model_id, &base_url, advisor_sandbox),
+        );
 
         let registry = build_registry(&model_id, &base_url);
         let context_manager =
@@ -318,6 +457,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build();
 
         let task = build_task(prompt, session);
+        // Per-RUN consult counts (host-owned, #114): how many consults of each
+        // `kind` have already been mediated. Persists across every pause/resume
+        // of THIS audit so the per-kind budget bounds the whole run, not one turn.
+        let mut consult_counts: HashMap<String, u32> = HashMap::new();
         let mut result = harness.run(HarnessRunOptions::new(task)).await;
         loop {
             match result {
@@ -328,6 +471,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 RunResult::Failure { reason, turns, .. } => {
                     eprintln!("\nfailed after {turns} turn(s): {reason:?}");
                     break;
+                }
+                RunResult::Consult { request, state, .. } => {
+                    // A worker leaf consult propagated up through the composed
+                    // tree (no SubagentTool to absorb it). The host mediates.
+                    result = mediate_consult(
+                        &harness,
+                        &consult_handlers,
+                        &mut consult_counts,
+                        request,
+                        *state,
+                    )
+                    .await;
                 }
                 RunResult::WaitingForHuman { state, request } => {
                     result = handle_human_escalation(&harness, *state, request).await;
@@ -342,6 +497,161 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nbye.");
     Ok(())
+}
+
+/// Mediate one worker leaf consult HOST-SIDE (#114, seam relocated off
+/// `SubagentTool`). Routes by `kind`, enforces the per-kind budget held in
+/// `counts` for the whole run, runs the handler harness as a direct child, and
+/// resumes the paused composed tree with the answer — or applies the overflow
+/// policy (`SoftFail` resumes with `BudgetExhausted`; `EscalateToHuman` surfaces
+/// the advisor ladder to the operator). Identical to the old
+/// `SubagentTool::mediate_consult`, only the owner moved.
+async fn mediate_consult(
+    harness: &spore_core::StandardHarness,
+    handlers: &HashMap<String, ConsultHandlerEntry>,
+    counts: &mut HashMap<String, u32>,
+    request: ConsultRequest,
+    state: spore_core::PausedState,
+) -> RunResult {
+    // No handler for this kind ⇒ resume the worker without help (loud, not a
+    // silent stall). Matches SubagentTool R6 graceful degradation in spirit.
+    let Some(entry) = handlers.get(&request.kind) else {
+        eprintln!("\n(no consult handler for kind {:?}; worker proceeds)", request.kind);
+        return harness
+            .resume_consult(
+                state,
+                ConsultResponse::BudgetExhausted {
+                    message: format!(
+                        "no consult handler for kind {:?}; proceed without further help",
+                        request.kind
+                    ),
+                },
+                None,
+            )
+            .await;
+    };
+
+    // Per-kind budget: `used` is how many consults of this kind were already
+    // mediated this run. The handler runs while `used < budget`; the
+    // (budget+1)th consult overflows.
+    let used = counts.entry(request.kind.clone()).or_insert(0);
+    if *used >= entry.budget {
+        return match entry.overflow {
+            ConsultOverflowPolicy::SoftFail => {
+                println!(
+                    "\n(consult budget for {:?} exhausted — worker finishes with what it has)",
+                    request.kind
+                );
+                harness
+                    .resume_consult(
+                        state,
+                        ConsultResponse::BudgetExhausted {
+                            message: format!(
+                                "consult budget for kind {:?} exhausted; proceed without further help",
+                                request.kind
+                            ),
+                        },
+                        None,
+                    )
+                    .await
+            }
+            ConsultOverflowPolicy::EscalateToHuman => {
+                handle_consult_overflow(harness, entry, request, state).await
+            }
+        };
+    }
+
+    // Run the handler harness as a direct child (depth-1, never under the
+    // worker) on the consult rendered to text, then resume with its answer.
+    *used += 1;
+    println!(
+        "\n┌─ consult ({}) → {} of {} budget",
+        request.kind, *used, entry.budget
+    );
+    let instruction = render_consult_instruction(&request);
+    let task = Task::new(
+        instruction,
+        SessionId::generate(),
+        LoopStrategy::ReAct(ReactConfig::per_loop(16)),
+    );
+    let answer = match entry.handler.run(HarnessRunOptions::new(task)).await {
+        RunResult::Success { output, .. } => output,
+        // A handler that does not cleanly complete must not stall the worker —
+        // feed its failure text back as the answer so the worker can adapt.
+        other => format!("consult handler did not complete cleanly: {other:?}"),
+    };
+    println!("└─ consult answer: {}", truncate(&answer, 200));
+    harness
+        .resume_consult(state, ConsultResponse::Answer { text: answer }, None)
+        .await
+}
+
+/// Render a [`ConsultRequest`] to the handler's instruction text (#114).
+fn render_consult_instruction(request: &ConsultRequest) -> String {
+    format!(
+        "A worker agent is requesting help (kind: {kind}).\n\nSituation: {situation}\n\nAttempts so far: {attempts}\n\nQuestion: {question}",
+        kind = request.kind,
+        situation = request.situation,
+        attempts = request.attempts,
+        question = request.question,
+    )
+}
+
+/// The `advice` consult overflowed its budget under `EscalateToHuman`: present
+/// the #114 three-choice ladder to the operator and resume the worker with the
+/// decision. Preserves the original ladder semantics host-side.
+async fn handle_consult_overflow(
+    harness: &spore_core::StandardHarness,
+    entry: &ConsultHandlerEntry,
+    request: ConsultRequest,
+    state: spore_core::PausedState,
+) -> RunResult {
+    println!("\n╔═ HUMAN ESCALATION (advisor budget exhausted) ═");
+    println!("║ situation: {}", truncate(&request.situation, 200));
+    println!("║ question : {}", truncate(&request.question, 200));
+    println!("║ [1] run the advisor once more (host-side)");
+    println!("║ [2] abort this consult — worker proceeds without help");
+    println!("║ [3] type a free-form answer yourself");
+    println!("╚═════════════════════════════════════════════════");
+
+    let choice = prompt_line("> ");
+    match choice.trim() {
+        "2" => {
+            harness
+                .resume_consult(
+                    state,
+                    ConsultResponse::BudgetExhausted {
+                        message: "advisor budget exhausted; proceed without further help".into(),
+                    },
+                    None,
+                )
+                .await
+        }
+        "3" => {
+            let text = prompt_line("answer> ");
+            harness
+                .resume_consult(state, ConsultResponse::Answer { text }, None)
+                .await
+        }
+        // Default ([1] or empty): run the advisor handler once more host-side and
+        // inject its answer — a bounded escape hatch past the per-kind budget.
+        _ => {
+            println!("(running advisor for one more turn…)");
+            let task = Task::new(
+                render_consult_instruction(&request),
+                SessionId::generate(),
+                LoopStrategy::ReAct(ReactConfig::per_loop(16)),
+            );
+            let answer = match entry.handler.run(HarnessRunOptions::new(task)).await {
+                RunResult::Success { output, .. } => output,
+                other => format!("advisor did not complete cleanly: {other:?}"),
+            };
+            println!("advisor: {}", truncate(&answer, 300));
+            harness
+                .resume_consult(state, ConsultResponse::Answer { text: answer }, None)
+                .await
+        }
+    }
 }
 
 /// Present a `BudgetExhausted` pause and resume with the operator's choice. The

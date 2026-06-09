@@ -15,11 +15,13 @@ use std::sync::Arc;
 use spore_core::harness::testing::{
     AllowAllSandbox, AlwaysContinuePolicy, NoopContextManager, ScriptedToolRegistry,
 };
+use spore_core::harness::ToolOutput;
 use spore_core::{
-    Agent, AgentId, BudgetPolicy, EscalationMode, EvaluatorResponseVerifier, ExecutionRegistry,
-    HaltReason, Harness, HarnessConfig, HarnessRunOptions, LoopStrategy, ModelAgent, ProviderInfo,
-    ReplayModelInterface, RunResult, SessionId, StandardHarness, StorageProvider, Task, TaskList,
-    TaskStatus, Verifier, TASK_LIST_EXTRAS_KEY,
+    Agent, AgentId, BudgetPolicy, ConsultRequest, ConsultResponse, EscalationMode,
+    EvaluatorResponseVerifier, ExecutionRegistry, HaltReason, Harness, HarnessConfig,
+    HarnessRunOptions, LoopStrategy, ModelAgent, ProviderInfo, ReplayModelInterface, RunResult,
+    SessionId, StandardHarness, StorageProvider, Task, TaskList, TaskStatus, Verifier,
+    TASK_LIST_EXTRAS_KEY,
 };
 
 fn provider() -> ProviderInfo {
@@ -352,6 +354,129 @@ async fn cordyceps_runaway_bounded() {
         }
         other => panic!("expected TasksBlockedByFailure, got {other:?}"),
     }
+}
+
+// Consult ladder (#114, PRESERVED through the composed tree). A worker leaf
+// consult — with NO `SubagentTool` to mediate it — propagates all the way up to
+// a top-level `RunResult::Consult`. The host (this test) injects an answer via
+// `resume_consult`, the worker finishes, the evaluator passes, and the run
+// completes. This exercises the host-mediation seam the 12-cordyceps example
+// relies on.
+#[tokio::test]
+async fn worker_consult_surfaces_and_host_resumes() {
+    // Build a harness whose GLOBAL tool registry returns a worker-side consult
+    // on the first dispatch (the worker's `consult_advisor` call), then defaults
+    // to plain success for anything after.
+    let tool_registry = Arc::new(
+        spore_core::harness::testing::ScriptedToolRegistry::new(),
+    );
+    tool_registry.push(ToolOutput::Consult {
+        child_state: None,
+        request: ConsultRequest {
+            kind: "advice".into(),
+            situation: "found a suspicious unwrap in module one".into(),
+            attempts: 1,
+            question: "is this a real defect and how severe?".into(),
+        },
+    });
+
+    let jsonl = std::fs::read_to_string(fixture_path("cordyceps_worker_consult.jsonl"))
+        .expect("read consult fixture");
+    let replay = Arc::new(ReplayModelInterface::from_jsonl(&jsonl, provider()).expect("fixture"));
+    let agent = |id: &str| -> Arc<dyn Agent> {
+        Arc::new(ModelAgent::new(AgentId::new(id), replay.clone()))
+    };
+    let storage = Arc::new(StorageProvider::single(Arc::new(
+        spore_core::storage::InMemoryStorageProvider::new(),
+    )));
+    let registry = ExecutionRegistry::builder()
+        .agent("planner", agent("planner"))
+        .agent("executor", agent("executor"))
+        .agent("ralph-agent", agent("ralph-agent"))
+        .toolset("plan-tools", Arc::new(spore_core::EmptyToolRegistry))
+        .toolset("exec-tools", Arc::new(spore_core::EmptyToolRegistry))
+        .schema("plan-schema", serde_json::json!({"type": "object"}))
+        .schema("worker-schema", serde_json::json!({"type": "array"}))
+        .verifier("exec-evaluator", exec_evaluator())
+        .build();
+    let cfg = HarnessConfig {
+        tool_registry,
+        sandbox: Arc::new(AllowAllSandbox),
+        context_manager: Arc::new(NoopContextManager),
+        termination_policy: Arc::new(AlwaysContinuePolicy),
+        middleware: None,
+        observability: None,
+        compaction_verifier: Arc::new(spore_core::KeyTermVerifier),
+        max_compaction_attempts: 2,
+        pricing: spore_core::PricingTable::DEFAULT,
+        content_capture: spore_core::ContentCaptureConfig::default(),
+        tool_call_repair: None,
+        max_repair_attempts: 1,
+        max_stop_blocks: 8,
+        hooks: None,
+        storage: storage.clone(),
+        chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
+        max_resets: 3,
+        vcs_provider: None,
+        catalogue_registry: None,
+        system_prompt: None,
+        model_params: spore_core::ModelParams::default(),
+        auto_persist_sessions: false,
+        prompt_tool_call_flag: None,
+        // NO consult_handlers: the composed tree has no SubagentTool, so the
+        // consult must surface to the host (not be mediated inside the harness).
+        consult_handlers: std::collections::HashMap::new(),
+        registry,
+        escalation_mode: EscalationMode::Autonomous,
+    };
+    let h = StandardHarness::new(cfg);
+
+    // Seed ONE ready task so the execute phase runs exactly one worker.
+    let session = SessionId::new("cordyceps-consult");
+    let mut tl = TaskList::default();
+    tl.add("audit module one".into(), vec![]).unwrap();
+    seed(&storage, &session, &tl).await;
+
+    // First leg: drive to the consult pause.
+    let first = h.run(HarnessRunOptions::new(pe_task("cordyceps-consult"))).await;
+    let (request, state) = match first {
+        RunResult::Consult { request, state, .. } => (request, state),
+        other => panic!("expected RunResult::Consult to surface to the host, got {other:?}"),
+    };
+    assert_eq!(request.kind, "advice", "the advice consult reached the host");
+    assert!(
+        request.question.contains("real defect"),
+        "the request carries the worker's question verbatim"
+    );
+
+    // Host mediation: inject the advisor's answer and resume the composed tree.
+    let resumed = h
+        .resume_consult(
+            *state,
+            ConsultResponse::Answer {
+                text: "Yes — unwrap on untrusted input is a real high-severity panic risk.".into(),
+            },
+            None,
+        )
+        .await;
+    match resumed {
+        // The worker continued mid-loop AFTER the consult (the finding it emitted
+        // post-answer is the run output) — proving the answer was injected and the
+        // SelfVerifying evaluator then cleared the task, not a bare leaf resume.
+        RunResult::Success { output, .. } => assert!(
+            output.contains("advisor-confirmed"),
+            "run output is the post-consult worker finding: {output}"
+        ),
+        other => panic!("expected Success after resume_consult, got {other:?}"),
+    }
+
+    // The worker's task self-verified and completed after the consult.
+    let after = stored_list(&storage, &session).await;
+    assert!(
+        after.tasks.iter().all(|t| t.status == TaskStatus::Completed),
+        "the consulted task completed: {:?}",
+        after.tasks.iter().map(|t| t.status).collect::<Vec<_>>()
+    );
 }
 
 // AC3: the registered `exec-evaluator` is Default-FAIL — Passed only on an

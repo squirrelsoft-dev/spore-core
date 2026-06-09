@@ -92,22 +92,41 @@ prints `Some(17)` before each run.
   (`continue_with_budget` / `skip` / `fail`). The operator picks one; the harness
   resumes by RE-RESOLVING every handle from the registry — no reconfiguration.
 
-## What changed vs. the pre-#131 example (honest note)
+## The #114 consult ladder — PRESERVED, with its mediation seam moved
 
-The old depth-1 example was a hand-built `SubagentTool` orchestrator. Two of its
-features were SubagentTool / per-node seams that the declarative tree does not
-expose, so they were DROPPED:
+The worker still escalates mid-audit through the two consult tools:
 
-- the **#114 consult ladder** (`research_best_practices` → `consult_advisor` →
-  human). The composed tree has no per-node `ToolOutput::Consult` mediator, so
-  there is nowhere to hang a per-kind consult handler.
-- the **#115 `load_skill`** worker-side tool. There is no per-node tool seam in
-  the declarative tree.
+- `research_best_practices` → `kind="research"` → a web_search helper harness
+  (budget 5, overflow **SoftFail**: on exhaustion the worker resumes with a
+  "budget exhausted, proceed" message and finishes on general knowledge);
+- `consult_advisor` → `kind="advice"` → a near-frontier cloud-model advisor with
+  `read_file`/`grep` (budget 3, overflow **EscalateToHuman**: the host surfaces
+  a three-choice ladder — run the advisor once more / proceed without help / type
+  a free-form answer).
 
-The `audit` **skill is KEPT** — but it now rides the single GLOBAL
-`context_manager` (`SkillInjectingContextManager`), seeded ALWAYS-ACTIVE at
-startup. Its procedure reaches the model structurally every turn,
-compaction-proof, with no `load_skill` round-trip.
+Both lower to `ToolOutput::Consult`. The pre-#131 example had a `SubagentTool`
+mediate these per-node. The declarative tree has NO `SubagentTool`, so **the seam
+moved to the host run loop**: a worker-leaf consult propagates up through the
+composed tree to a top-level `RunResult::Consult`, and `main`'s `mediate_consult`
+routes it by `kind` to the helper harness (per-kind budget + overflow, host-owned
+for the whole run), then calls `harness.resume_consult(...)`. Identical #114
+semantics; the budget map just lives in the host instead of a tool.
+
+**Resuming a consult continues the whole walk (#131 core change).** Because the
+consult surfaces from a worker nested inside `PlanExecute`, resuming must do more
+than restart that one leaf — the consulted task must still be self-verified and
+the rest of the ready-set must still run. So each combinator rewrites the pause's
+task to its own composed task on the way up (the pause ends up carrying the FULL
+tree), and `resume_consult` re-drives the strategy: `PlanExecute` resumes its
+in-progress task from the worker's own conversation (answer injected), the
+SelfVerifying evaluator runs, the task is marked `Completed`, and the walk
+proceeds to the remaining tasks.
+
+The **#115 `load_skill`** worker-side tool WAS dropped — there is no per-node tool
+seam in the declarative tree. The `audit` **skill is KEPT**, now riding the single
+GLOBAL `context_manager` (`SkillInjectingContextManager`), seeded ALWAYS-ACTIVE at
+startup: its procedure reaches the model structurally every turn, compaction-proof,
+with no `load_skill` round-trip.
 
 One more honest limitation: the harness dispatches every node's tool calls
 through ONE global catalogue wired on the `HarnessBuilder` (the union of
@@ -120,11 +139,15 @@ is kept read-only by a read-only sandbox + the absence of any write tool.
 ```sh
 ollama serve &
 ollama pull gemma4:e4b
+export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search?format=json  # SearXNG (research consult)
 cargo run        # press enter to accept the default audit prompt; Ctrl-D to quit
 ```
 
 Configuration (see `.env.example`): `SPORE_OLLAMA_MODEL` (default `gemma4:e4b`),
-`SPORE_OLLAMA_BASE_URL` (default `http://localhost:11434`).
+`SPORE_OLLAMA_BASE_URL` (default `http://localhost:11434`),
+`SPORE_ADVISOR_MODEL` (the `advice` consult handler's cloud model, default
+`minimax-m3:cloud`), and `SPORE_WEB_SEARCH_ENDPOINT` (a SearXNG JSON endpoint
+backing the `research` consult — REQUIRED, fail-fast like examples 06/11).
 
 ## Tests
 
