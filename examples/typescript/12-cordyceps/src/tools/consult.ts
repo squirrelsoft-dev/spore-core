@@ -1,14 +1,18 @@
 /**
- * The two consult tools the analysis worker calls to escalate mid-loop
- * (issue #114). Both lower to {@link toolOutput.consult} with a `kind` tag; the
- * `analysis_worker` {@link SubagentTool} mediates by `kind` (research →
- * research_worker, advice → advisor) using the per-kind budgets + overflow
- * policies installed via the subagent's `consultHandlers` map.
+ * The two consult tools the execute worker calls to escalate mid-loop
+ * (issue #114). Both lower to {@link toolOutput.consult} with a `kind` tag.
+ *
+ * In the pre-#131 example a `SubagentTool` mediated these consults. The #131
+ * declarative composition has NO `SubagentTool` seam, so the worker-leaf consult
+ * propagates all the way up to a top-level {@link RunResult} `consult` and the
+ * **host run loop** mediates it instead — routing by `kind` to a helper harness
+ * with a per-kind budget + overflow policy (see `main.ts`'s `mediateConsult`).
+ * The seam moved; the #114 semantics are identical.
  *
  * Neither tool captures any host state — each simply renders its call input into
- * a {@link ConsultRequest} and returns {@link toolOutput.consult}. The worker
- * harness pauses (`RunResult` `consult`) and `SubagentTool` resumes it with the
- * handler's answer (or a `budget_exhausted` message). So these are plain
+ * a {@link ConsultRequest} and returns {@link toolOutput.consult}. The composed
+ * tree pauses (`RunResult` `consult`) and the host resumes it with the handler's
+ * answer (or a `budget_exhausted` message). So these are plain
  * {@link toolRegistry.defineTool} tools — no closed-over state needed.
  */
 

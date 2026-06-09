@@ -683,6 +683,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       onStream,
       signal,
       undefined,
+      undefined,
     );
   }
 
@@ -702,6 +703,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * `fail`/`escalate` or the strategy completes. `behaviorForResolution` carries
    * the resolution chain's mutated state across in-process continues so
    * `max_continues` is honored.
+   *
+   * `consultResume = session` (#131) seeds the FIRST PlanExecute walk's
+   * in-progress task with `session` (a worker conversation whose consult answer
+   * is already injected) so a resumed consult continues mid-loop and walks the
+   * remaining ready-set. `undefined` on every non-consult path.
    */
   private async driveStrategyWithResumeSeed(
     task: Task,
@@ -710,6 +716,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     resumeContinues: [string, number] | undefined,
+    consultResume: SessionState | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     const registry = this.config.registry ?? ExecutionRegistry.empty();
@@ -725,6 +732,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // round only (the resumed node's scope); later in-process rounds carry their
     // continue count via `behaviorForResolution`.
     let seed = resumeContinues;
+    // #131: the consult re-drive seed is consumed by the FIRST round's
+    // PlanExecute walk only; later in-process rounds run normally.
+    let consultSeed = consultResume;
 
     for (;;) {
       const cx: ExecutionContext = newExecutionContext(registry);
@@ -735,7 +745,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
       cx.scratch.runBudget = currentBudget;
       cx.scratch.task = currentTask;
       cx.scratch.resumeContinues = seed;
+      cx.scratch.consultResume = consultSeed;
       seed = undefined;
+      consultSeed = undefined;
 
       const outcome = await runStrategy(currentTask.loop_strategy, cx);
 
@@ -1480,6 +1492,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
             onStream,
             signal,
             resumeSeed,
+            undefined,
           );
         }
         // Skip: the node is marked skipped and the outer loop advances. For a
@@ -1737,6 +1750,29 @@ export class StandardHarness implements Harness, StrategyExecutor {
       const output = await toolRegistry.dispatch(call, signal);
       const tr: ToolResultRecord = { call_id: call.id, output };
       await this.config.contextManager.appendToolResult(sessionState, tr);
+    }
+
+    // #131: a consult that surfaced from inside a composed tree carries the FULL
+    // strategy in `task.loop_strategy` (each combinator's `finish` rewrote the
+    // pause's task on the way up). Re-DRIVE that strategy rather than resuming
+    // only the worker leaf: the PlanExecute walk resumes its in-progress task
+    // from the injected worker session (`consultResume` seed), so the worker
+    // finishes mid-loop, its SelfVerifying evaluator runs, the task is marked
+    // completed, and the remaining ready-set is walked. A BARE worker leaf
+    // (depth-1, e.g. a SubagentTool-mediated consult) has no surrounding walk, so
+    // it keeps the original leaf-only resume (back-compat).
+    if (state.task.loop_strategy.kind !== "react") {
+      return this.driveStrategyWithResumeSeed(
+        state.task,
+        // Top-level session starts fresh; the worker conversation is threaded
+        // into the in-progress task via the consult seed.
+        emptySessionState(),
+        state.budget_used,
+        onStream,
+        signal,
+        undefined,
+        sessionState,
+      );
     }
 
     const max =

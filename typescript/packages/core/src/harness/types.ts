@@ -1335,6 +1335,20 @@ export interface RunScratch {
    * AC3: no serialization on the in-process path).
    */
   resumeContinues?: [string, number];
+  /**
+   * Consult re-drive seed (#131): the worker conversation (with the consult
+   * answer already injected as the pending call's tool result) carried from a
+   * resumed {@link RunResult} `consult`. When set, a {@link PlanExecuteConfig}
+   * walk resumes its single `in_progress` task from THIS session (instead of a
+   * fresh instruction-seeded session) so the consulting worker continues
+   * mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
+   * proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
+   * the session itself rides the serialized {@link PausedState} `sessionState`,
+   * so a cross-process resume reconstructs this seed in
+   * {@link StandardHarness.resumeConsult}. `undefined` on a fresh run / after
+   * the seed is consumed.
+   */
+  consultResume?: SessionState;
 }
 
 function newRunScratch(): RunScratch {
@@ -1598,6 +1612,15 @@ async function finishCombinator(
   result: RunResult,
 ): Promise<StrategyOutcome> {
   await executor.finalize(result);
+  // #131: a `consult` propagated from a worker leaf carries the LEAF task, so a
+  // host `resumeConsult` would resume only that leaf and lose the surrounding
+  // walk. As the pause unwinds through each combinator's `finish`, rewrite its
+  // `state.task` to the combinator's OWN composed task; by the top it carries
+  // the FULL tree, so `resumeConsult` re-drives the whole strategy (the
+  // in-progress task resumes from `consultResume`).
+  if (result.kind === "consult") {
+    result = { ...result, state: { ...result.state, task: parentTask } };
+  }
   cx.scratch.task = parentTask;
   if (result.kind === "success" || result.kind === "failure") {
     cx.scratch.runSession = result.session_state ?? emptySessionState();
@@ -2226,6 +2249,31 @@ async function runPlanExecuteConfig(
   // Completed tasks are not re-run.
   await executor.reconcileCompletedTasks(sessionId, taskList);
 
+  // #131 consult re-drive: a resumed consult carries the worker conversation
+  // (answer already injected) in `cx.scratch.consultResume`. The consulting
+  // task is the single `in_progress` task in the durable list (PlanExecute marks
+  // a task in_progress before running it). Reset it to `pending` so `nextReady`
+  // re-schedules it, and remember its id so its step uses the carried session
+  // instead of a fresh one — the worker then continues mid-loop and its
+  // evaluator still runs.
+  let consultResumeSession = cx.scratch.consultResume;
+  cx.scratch.consultResume = undefined;
+  let consultResumeTask: number | undefined;
+  if (consultResumeSession !== undefined) {
+    const inProgress = taskList.tasks.find((t) => t.status === "in_progress");
+    if (inProgress !== undefined) {
+      // Reset directly (bypassing `updateTask`'s forward-only transition guard,
+      // which rejects in_progress->pending): the consult resume legitimately
+      // re-schedules the in-flight task.
+      inProgress.status = "pending";
+      consultResumeTask = inProgress.id;
+    } else {
+      // No in-progress task to resume (out-of-contract); drop the seed so the
+      // walk proceeds normally rather than stalling.
+      consultResumeSession = undefined;
+    }
+  }
+
   // Total positional count for the on_task_advance hook (stable).
   const totalTasks = taskList.tasks.length;
   const totalUsage: AggregateUsage = { ...outcome.usage };
@@ -2272,39 +2320,50 @@ async function runPlanExecuteConfig(
     };
     await executor.fireTaskAdvance(sessionId, stepTask, index, totalTasks, cx.signal);
 
-    // #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
-    // session (NOT a forward-folded shared transcript — that breaks on a DAG)
-    // plus, for THIS task's transitive blockers ONLY, their final outputs + their
-    // ledger rows. Independent branches never appear (AC1 isolation).
-    const stepSession = structuredClone(baseSession);
-    const blockers = transitiveBlockers(taskList, taskId);
-    if (blockers.length > 0) {
-      const blockerSet = new Set(blockers);
-      // Tier-1: transitive blockers' final outputs (ascending id).
-      const tier1Lines: string[] = [];
-      for (const b of blockers) {
-        const out = finalOutputs.get(b);
-        if (out !== undefined) tier1Lines.push(`#${b} result: ${out}`);
+    // #131 consult re-drive: if THIS is the task that was consulting, resume its
+    // worker from the carried conversation (answer already injected) instead of a
+    // fresh instruction-seeded session — the worker continues mid-loop and its
+    // evaluator still runs. Otherwise build the normal fresh, Tier-1/Tier-2-seeded
+    // step session.
+    let stepSession: SessionState;
+    if (consultResumeTask !== undefined && taskId === consultResumeTask) {
+      stepSession = consultResumeSession ?? structuredClone(baseSession);
+      consultResumeSession = undefined;
+    } else {
+      // #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
+      // session (NOT a forward-folded shared transcript — that breaks on a DAG)
+      // plus, for THIS task's transitive blockers ONLY, their final outputs +
+      // their ledger rows. Independent branches never appear (AC1 isolation).
+      stepSession = structuredClone(baseSession);
+      const blockers = transitiveBlockers(taskList, taskId);
+      if (blockers.length > 0) {
+        const blockerSet = new Set(blockers);
+        // Tier-1: transitive blockers' final outputs (ascending id).
+        const tier1Lines: string[] = [];
+        for (const b of blockers) {
+          const out = finalOutputs.get(b);
+          if (out !== undefined) tier1Lines.push(`#${b} result: ${out}`);
+        }
+        if (tier1Lines.length > 0) {
+          await executor.seedUserMessage(
+            stepSession,
+            `Results from upstream tasks:\n${tier1Lines.join("\n")}`,
+          );
+        }
+        // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+        const scoped = ledger.filter((e) => blockerSet.has(e.task_id));
+        const scopedBlock = renderStepLedger(scoped, false);
+        if (scopedBlock !== undefined) await executor.seedUserMessage(stepSession, scopedBlock);
       }
-      if (tier1Lines.length > 0) {
-        await executor.seedUserMessage(
-          stepSession,
-          `Results from upstream tasks:\n${tier1Lines.join("\n")}`,
-        );
-      }
-      // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-      const scoped = ledger.filter((e) => blockerSet.has(e.task_id));
-      const scopedBlock = renderStepLedger(scoped, false);
-      if (scopedBlock !== undefined) await executor.seedUserMessage(stepSession, scopedBlock);
+
+      // #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+      // the static elision marker once entries were dropped).
+      const tier2Block = renderStepLedger(ledger, ledgerElided);
+      if (tier2Block !== undefined) await executor.seedUserMessage(stepSession, tier2Block);
+
+      // Finally seed this step's own instruction.
+      await executor.seedUserMessage(stepSession, stepTask.instruction);
     }
-
-    // #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-    // the static elision marker once entries were dropped).
-    const tier2Block = renderStepLedger(ledger, ledgerElided);
-    if (tier2Block !== undefined) await executor.seedUserMessage(stepSession, tier2Block);
-
-    // Finally seed this step's own instruction.
-    await executor.seedUserMessage(stepSession, stepTask.instruction);
 
     // #126 AC2: clear the observed-write accumulator so this task's
     // files_touched reflect ONLY the writes this step issues.
