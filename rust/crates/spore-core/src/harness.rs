@@ -568,6 +568,59 @@ pub enum LoopStrategy {
     HillClimbing(HillClimbingConfig),
 }
 
+impl LoopStrategy {
+    /// Advisory worst-case **turn** bound for this strategy tree, computed
+    /// statically before a run (#122).
+    ///
+    /// This is an **advisory pre-run figure**, logged at startup — it is NOT
+    /// the enforcement mechanism. The actual safety ceiling is the per-node
+    /// [`BudgetPolicy`] charged by each `*Config::run` against its own
+    /// [`BudgetContext`]; `max_steps` never gates execution.
+    ///
+    /// The bound is derived **multiplicatively/additively down the tree** and
+    /// is Option-monadic: any `Unlimited` node anywhere in the tree collapses
+    /// the whole figure to `None` ("no finite advisory bound"). It is a
+    /// runtime-only computation and is **never serialized**.
+    ///
+    /// Per-variant rules:
+    /// - `ReAct(c)` ⇒ `c.budget.allowance_value()` (`Unlimited ⇒ None`).
+    /// - `SelfVerifying(c)` ⇒ `inner + 1` — the single read-only evaluator
+    ///   turn is exactly one extra turn.
+    /// - `PlanExecute(c)` ⇒ `plan + execute`. **PER-TASK bound**: a full run's
+    ///   total is `plan + execute_per_task × task_count`, where `task_count` is
+    ///   data-dependent (the plan phase builds the task graph at runtime), so
+    ///   it is intentionally NOT part of this static figure.
+    /// - `Ralph(c)` ⇒ `inner` — **PER-WINDOW bound**, mirroring PlanExecute's
+    ///   per-task treatment. A full run's total is `per_window × max_windows`,
+    ///   where `max_windows` derives from [`HarnessConfig::max_resets`]
+    ///   (default 3) at runtime and is intentionally NOT part of this static
+    ///   figure.
+    /// - `HillClimbing(c)` ⇒ `inner × (max_stagnation + 1)` — the `+1` is the
+    ///   one productive pass; `max_stagnation` non-improving passes follow.
+    ///   The `max_stagnation == u32::MAX` sentinel means unbounded windows ⇒
+    ///   `None` (a semantic unbounded rule, distinct from arithmetic overflow).
+    ///
+    /// Arithmetic uses `checked_add`/`checked_mul`; an unrepresentable bound
+    /// (overflow) yields `None` — an unrepresentable figure is "no finite
+    /// advisory bound".
+    pub fn max_steps(&self) -> Option<u32> {
+        match self {
+            LoopStrategy::ReAct(c) => c.budget.allowance_value(),
+            LoopStrategy::SelfVerifying(c) => c.inner.max_steps()?.checked_add(1),
+            LoopStrategy::PlanExecute(c) => c.plan.max_steps()?.checked_add(c.execute.max_steps()?),
+            LoopStrategy::Ralph(c) => c.inner.max_steps(),
+            LoopStrategy::HillClimbing(c) => {
+                if c.max_stagnation == u32::MAX {
+                    return None;
+                }
+                c.inner
+                    .max_steps()?
+                    .checked_mul(c.max_stagnation.checked_add(1)?)
+            }
+        }
+    }
+}
+
 /// Serializable identity of a strategy: either a closed built-in
 /// [`LoopStrategy`] tree or an opaque `Custom` string key resolved at runtime
 /// (registry: #120). Adjacently tagged on `kind`/`value` to avoid a tag
@@ -579,6 +632,18 @@ pub enum LoopStrategy {
 pub enum StrategyRef {
     BuiltIn(LoopStrategy),
     Custom(String),
+}
+
+impl StrategyRef {
+    /// Advisory worst-case turn bound for this strategy reference (#122).
+    /// `Custom` is opaque to the framework (it cannot be introspected), so it
+    /// yields `None`; `BuiltIn` delegates to [`LoopStrategy::max_steps`].
+    pub fn max_steps(&self) -> Option<u32> {
+        match self {
+            StrategyRef::Custom(_) => None,
+            StrategyRef::BuiltIn(s) => s.max_steps(),
+        }
+    }
 }
 
 // ============================================================================
@@ -10398,6 +10463,184 @@ mod strategy_tests {
             "CHILD_PAUSED_STATE={}",
             serde_json::to_string(&cps).unwrap()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #122: max_steps() advisory worst-case turn bound.
+    // ------------------------------------------------------------------
+
+    /// Build a ReAct leaf carrying an arbitrary budget policy.
+    fn react_with(budget: BudgetPolicy) -> LoopStrategy {
+        LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            budget,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        })
+    }
+
+    fn self_verifying(inner: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            evaluator: SchemaRef("ev".to_string()),
+        })
+    }
+
+    fn plan_execute(plan: LoopStrategy, execute: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            plan: Box::new(plan),
+            execute: Box::new(execute),
+            plan_model: None,
+        })
+    }
+
+    fn ralph(inner: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            agent: AgentRef("r".to_string()),
+        })
+    }
+
+    fn hill_climbing(inner: LoopStrategy, max_stagnation: u32) -> LoopStrategy {
+        LoopStrategy::HillClimbing(HillClimbingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            direction: HillClimbingDirection::Maximize,
+            max_stagnation,
+            revert_on_no_improvement: true,
+            min_improvement_delta: 0.0,
+            evaluator: AgentRef("m".to_string()),
+        })
+    }
+
+    #[test]
+    fn max_steps_react_leaf() {
+        assert_eq!(
+            react_with(BudgetPolicy::PerLoop { value: 4 }).max_steps(),
+            Some(4)
+        );
+        assert_eq!(
+            react_with(BudgetPolicy::TotalSteps { value: 7 }).max_steps(),
+            Some(7)
+        );
+        assert_eq!(
+            react_with(BudgetPolicy::PerAttempt { value: 5 }).max_steps(),
+            Some(5)
+        );
+        assert_eq!(react_with(BudgetPolicy::Unlimited).max_steps(), None);
+    }
+
+    #[test]
+    fn max_steps_self_verifying_adds_one() {
+        let s = self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 }));
+        assert_eq!(s.max_steps(), Some(13));
+    }
+
+    #[test]
+    fn max_steps_plan_execute_is_per_task_sum() {
+        let s = plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            react_with(BudgetPolicy::PerLoop { value: 6 }),
+        );
+        assert_eq!(s.max_steps(), Some(10));
+    }
+
+    #[test]
+    fn max_steps_hill_climbing() {
+        // inner=5, max_stagnation=2 ⇒ 5 * (2 + 1) = 15.
+        let s = hill_climbing(react_with(BudgetPolicy::PerLoop { value: 5 }), 2);
+        assert_eq!(s.max_steps(), Some(15));
+        // u32::MAX sentinel ⇒ unbounded windows ⇒ None.
+        let unbounded = hill_climbing(react_with(BudgetPolicy::PerLoop { value: 5 }), u32::MAX);
+        assert_eq!(unbounded.max_steps(), None);
+    }
+
+    #[test]
+    fn max_steps_ralph_is_per_window() {
+        assert_eq!(
+            ralph(react_with(BudgetPolicy::PerLoop { value: 9 })).max_steps(),
+            Some(9)
+        );
+        // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+        let s = ralph(plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+        ));
+        assert_eq!(s.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_canonical_cordyceps_subtree() {
+        // PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]] = 4 + (12 + 1) = 17.
+        let subtree = plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+        );
+        assert_eq!(subtree.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_cordyceps_fixture_is_17() {
+        // The whole tree's root Ralph wraps PlanExecute, so per-window == 17.
+        let tree = cordyceps_tree();
+        assert_eq!(tree.max_steps(), Some(17));
+
+        let raw = std::fs::read_to_string(fixture_path("strategy/cordyceps_tree.json"))
+            .expect("fixture present");
+        let deserialized: LoopStrategy = serde_json::from_str(&raw).unwrap();
+        assert_eq!(deserialized.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_unlimited_anywhere_is_none() {
+        // Plan leaf unlimited ⇒ None.
+        assert_eq!(
+            plan_execute(
+                react_with(BudgetPolicy::Unlimited),
+                self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+            )
+            .max_steps(),
+            None
+        );
+        // Execute's inner ReAct unlimited ⇒ None.
+        assert_eq!(
+            plan_execute(
+                react_with(BudgetPolicy::PerLoop { value: 4 }),
+                self_verifying(react_with(BudgetPolicy::Unlimited)),
+            )
+            .max_steps(),
+            None
+        );
+        // HillClimbing-wrapped unlimited inner ⇒ None (propagates to root).
+        assert_eq!(
+            ralph(hill_climbing(react_with(BudgetPolicy::Unlimited), 2)).max_steps(),
+            None
+        );
+    }
+
+    #[test]
+    fn max_steps_strategy_ref() {
+        assert_eq!(StrategyRef::Custom("x".to_string()).max_steps(), None);
+        assert_eq!(
+            StrategyRef::BuiltIn(react_with(BudgetPolicy::PerLoop { value: 4 })).max_steps(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn max_steps_overflow_is_none() {
+        // inner = u32::MAX/2, max_stagnation = 3 ⇒ (u32::MAX/2) * 4 overflows ⇒ None.
+        let s = hill_climbing(
+            react_with(BudgetPolicy::PerLoop {
+                value: u32::MAX / 2,
+            }),
+            3,
+        );
+        assert_eq!(s.max_steps(), None);
     }
 }
 
