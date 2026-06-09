@@ -3131,7 +3131,7 @@ func (h *StandardHarness) driveStrategy(
 	budget BudgetSnapshot,
 	onStream StreamSink,
 ) RunResult {
-	return h.driveStrategyWithResumeSeed(ctx, task, session, budget, onStream, nil)
+	return h.driveStrategyWithResumeSeed(ctx, task, session, budget, onStream, nil, nil)
 }
 
 // driveStrategyWithResumeSeed is driveStrategy with an optional cross-process
@@ -3148,6 +3148,11 @@ func (h *StandardHarness) driveStrategy(
 // serialization (AC3) — looping until the behavior resolves to Fail/Escalate or
 // the strategy completes. behaviorForResolution carries the resolution chain's
 // mutated state across in-process continues so MaxContinues is honored.
+//
+// #131: consultResume = &session seeds the FIRST PlanExecute walk's in-progress
+// task with session (a worker conversation whose consult answer is already
+// injected) so a resumed consult continues mid-loop and walks the remaining
+// ready-set. nil on every non-consult path.
 func (h *StandardHarness) driveStrategyWithResumeSeed(
 	ctx context.Context,
 	task Task,
@@ -3155,6 +3160,7 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 	budget BudgetSnapshot,
 	onStream StreamSink,
 	resumeSeed *ResumeContinueSeed,
+	consultResume *SessionState,
 ) RunResult {
 	sessionID := task.SessionID
 	// The Continue resolution state threaded across in-process rounds: the
@@ -3173,6 +3179,10 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 		cx.Scratch.Task = &taskCopy
 		cx.Scratch.ResumeContinues = resumeSeed
 		resumeSeed = nil
+		// #131: the consult re-drive seed is consumed by the FIRST round's
+		// PlanExecute walk only; later in-process rounds run normally.
+		cx.Scratch.ConsultResume = consultResume
+		consultResume = nil
 
 		outcome := task.LoopStrategy.Run(ctx, cx)
 
@@ -4838,6 +4848,30 @@ func (h *StandardHarness) resumeConsultInner(
 		}
 	}
 
+	// #131: a consult that surfaced from inside a composed tree carries the FULL
+	// strategy in task.LoopStrategy (each combinator's finish rewrote the pause's
+	// task on the way up). Re-DRIVE that strategy rather than resuming only the
+	// worker leaf: the PlanExecute walk resumes its in-progress task from the
+	// injected worker session (ConsultResume seed), so the worker finishes
+	// mid-loop, its SelfVerifying evaluator runs, the task is marked Completed, and
+	// the remaining ready-set is walked. A BARE worker leaf (depth-1, e.g. a
+	// SubagentTool-mediated consult) has no surrounding walk, so it keeps the
+	// original leaf-only resume (back-compat).
+	if task.LoopStrategy.Kind != StrategyReAct {
+		// Top-level session starts fresh; the worker conversation is threaded into
+		// the in-progress task via the consult seed.
+		workerSession := session
+		return h.driveStrategyWithResumeSeed(
+			ctx,
+			task,
+			SessionState{},
+			budget,
+			onStream,
+			nil,
+			&workerSession,
+		)
+	}
+
 	agent, agentFail := h.ResolveWorkerAgent(&task.LoopStrategy)
 	if agentFail != nil {
 		af := *agentFail
@@ -4932,7 +4966,7 @@ func (h *StandardHarness) resumeInner(
 				Phase:         state.HumanRequest.Phase,
 				ContinuesUsed: state.HumanRequest.ContinuesUsed,
 			}
-			return h.driveStrategyWithResumeSeed(ctx, resumedTask, session, budget, onStream, seed)
+			return h.driveStrategyWithResumeSeed(ctx, resumedTask, session, budget, onStream, seed, nil)
 		case response.Kind == HumanRespEscalate && response.Action.Kind == EscalationSkip:
 			// Skip: the node is marked skipped and the outer loop advances. For a
 			// combinator (PlanExecute) re-entering the loop from the checkpoint

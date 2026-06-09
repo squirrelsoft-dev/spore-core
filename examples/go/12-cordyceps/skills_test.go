@@ -62,10 +62,7 @@ func TestManifestAlwaysInjectedBodiesOnlyWhenActive(t *testing.T) {
 	cm := NewSkillInjectingContextManager(newPassThroughInner(), store.Run(), testManifest())
 
 	session := sporecore.SessionState{}
-	task := sporecore.NewTask("audit a module", sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 8,
-	})
+	task := sporecore.NewTask("audit a module", sporecore.NewSessionID(), sporecore.ReActStrategy(8))
 
 	// No active skills yet: manifest present, NO body.
 	body := textOf(cm.Assemble(ctx, &session, &task))

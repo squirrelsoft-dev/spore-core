@@ -1,0 +1,30 @@
+{
+  "kind": "ralph",
+  "inner": {
+    "kind": "plan_execute",
+    "plan": {
+      "kind": "react",
+      "budget": { "kind": "per_loop", "value": 4 },
+      "behavior": { "kind": "escalate" },
+      "agent": "planner",
+      "toolset": "plan-tools",
+      "output": "plan-schema"
+    },
+    "execute": {
+      "kind": "self_verifying",
+      "inner": {
+        "kind": "react",
+        "budget": { "kind": "per_loop", "value": 12 },
+        "behavior": { "kind": "escalate" },
+        "agent": "executor",
+        "toolset": "exec-tools",
+        "output": "worker-schema"
+      },
+      "evaluator": "exec-evaluator",
+      "behavior": { "kind": "escalate" }
+    },
+    "behavior": { "kind": "escalate" }
+  },
+  "agent": "ralph-agent",
+  "behavior": { "kind": "escalate" }
+}

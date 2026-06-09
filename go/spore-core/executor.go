@@ -274,6 +274,17 @@ type RunScratch struct {
 	// is consumed (an in-process Continue never sets it → AC3: no serialization
 	// on the in-process path).
 	ResumeContinues *ResumeContinueSeed
+	// ConsultResume is the consult re-drive seed (#131): the worker conversation
+	// (with the consult answer already injected as the pending call's tool result)
+	// carried from a resumed RunConsult. When set, a PlanExecuteConfig walk resumes
+	// its single InProgress task from THIS session (instead of a fresh
+	// instruction-seeded session) so the consulting worker continues mid-loop, its
+	// SelfVerifying evaluator still runs, and the ready-set walk proceeds. The
+	// FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the session
+	// itself rides the serialized PausedState.SessionState, so a cross-process
+	// resume reconstructs this seed in ResumeConsult. Nil on a fresh run / after
+	// the seed is consumed.
+	ConsultResume *SessionState
 }
 
 // ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):
@@ -370,6 +381,17 @@ func (cx *ExecutionContext) takeChildOverride() *RunResult {
 // harness entry returns it VERBATIM, and return the matching outcome.
 func (cx *ExecutionContext) finish(ctx context.Context, executor StrategyExecutor, parentTask Task, result RunResult) StrategyOutcome {
 	executor.Finalize(ctx, result)
+	// #131: a Consult propagated from a worker leaf carries the LEAF task, so a
+	// host ResumeConsult would resume only that leaf and lose the surrounding walk.
+	// As the pause unwinds through each combinator's finish, rewrite its State.Task
+	// to the combinator's OWN composed task; by the top it carries the FULL tree,
+	// so ResumeConsult re-drives the whole strategy (the in-progress task resumes
+	// from ConsultResume).
+	if result.Kind == RunConsult && result.State != nil {
+		st := *result.State
+		st.Task = parentTask
+		result.State = &st
+	}
 	pt := parentTask
 	cx.Scratch.Task = &pt
 	switch result.Kind {

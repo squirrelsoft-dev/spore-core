@@ -978,6 +978,35 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	// already-Completed tasks are not re-run.
 	executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
 
+	// #131 consult re-drive: a resumed consult carries the worker conversation
+	// (answer already injected) in cx.Scratch.ConsultResume. The consulting task is
+	// the single InProgress task in the durable list (PlanExecute marks a task
+	// InProgress before running it). Reset it to Pending so NextReady re-schedules
+	// it, and remember its id so its step uses the carried session instead of a
+	// fresh one — the worker then continues mid-loop and its evaluator still runs.
+	consultResumeSession := cx.Scratch.ConsultResume
+	cx.Scratch.ConsultResume = nil
+	var consultResumeTask uint32
+	var haveConsultResumeTask bool
+	if consultResumeSession != nil {
+		for i := range taskList.Tasks {
+			if taskList.Tasks[i].Status == TaskStatusInProgress {
+				// Reset directly (bypassing Update's forward-only transition guard,
+				// which rejects InProgress->Pending): the consult resume legitimately
+				// re-schedules the in-flight task.
+				taskList.Tasks[i].Status = TaskStatusPending
+				consultResumeTask = taskList.Tasks[i].ID
+				haveConsultResumeTask = true
+				break
+			}
+		}
+		if !haveConsultResumeTask {
+			// No in-progress task to resume (out-of-contract); drop the seed so the
+			// walk proceeds normally rather than stalling.
+			consultResumeSession = nil
+		}
+	}
+
 	totalTasks := len(taskList.Tasks)
 	totalUsage := planUsage
 	var lastOutput string
@@ -1066,47 +1095,58 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		}
 		executor.FireTaskAdvance(ctx, sessionID, &stepTask, index, totalTasks)
 
-		// #126 Tier-1 scoped context (decision D): seed this step from a FRESH copy
-		// of the base session (NOT a forward-folded shared transcript — that breaks
-		// on a DAG) plus, for THIS task's transitive blockers ONLY, their final
-		// outputs + their ledger rows. Independent branches never appear (AC1).
-		stepSession := cloneSessionState(&session)
-		blockers := taskList.TransitiveBlockers(taskID)
-		if len(blockers) > 0 {
-			blockerSet := make(map[uint32]struct{}, len(blockers))
-			for _, b := range blockers {
-				blockerSet[b] = struct{}{}
-			}
-			// Tier-1: transitive blockers' final outputs (ascending id).
-			var tier1Lines []string
-			for _, b := range blockers {
-				if out, ok := finalOutputs[b]; ok {
-					tier1Lines = append(tier1Lines, fmt.Sprintf("#%d result: %s", b, out))
+		// #131 consult re-drive: if THIS is the task that was consulting, resume its
+		// worker from the carried conversation (answer already injected) instead of a
+		// fresh instruction-seeded session — the worker continues mid-loop and its
+		// evaluator still runs. Otherwise build the normal fresh, Tier-1/Tier-2-seeded
+		// step session.
+		var stepSession *SessionState
+		if haveConsultResumeTask && taskID == consultResumeTask && consultResumeSession != nil {
+			stepSession = consultResumeSession
+			consultResumeSession = nil
+		} else {
+			// #126 Tier-1 scoped context (decision D): seed this step from a FRESH copy
+			// of the base session (NOT a forward-folded shared transcript — that breaks
+			// on a DAG) plus, for THIS task's transitive blockers ONLY, their final
+			// outputs + their ledger rows. Independent branches never appear (AC1).
+			stepSession = cloneSessionState(&session)
+			blockers := taskList.TransitiveBlockers(taskID)
+			if len(blockers) > 0 {
+				blockerSet := make(map[uint32]struct{}, len(blockers))
+				for _, b := range blockers {
+					blockerSet[b] = struct{}{}
+				}
+				// Tier-1: transitive blockers' final outputs (ascending id).
+				var tier1Lines []string
+				for _, b := range blockers {
+					if out, ok := finalOutputs[b]; ok {
+						tier1Lines = append(tier1Lines, fmt.Sprintf("#%d result: %s", b, out))
+					}
+				}
+				if len(tier1Lines) > 0 {
+					executor.SeedUserMessage(ctx, stepSession, "Results from upstream tasks:\n"+strings.Join(tier1Lines, "\n"))
+				}
+				// Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+				var scoped []StepLedgerEntry
+				for _, e := range ledger {
+					if _, ok := blockerSet[e.TaskID]; ok {
+						scoped = append(scoped, e)
+					}
+				}
+				if block, ok := RenderStepLedger(scoped, false); ok {
+					executor.SeedUserMessage(ctx, stepSession, block)
 				}
 			}
-			if len(tier1Lines) > 0 {
-				executor.SeedUserMessage(ctx, stepSession, "Results from upstream tasks:\n"+strings.Join(tier1Lines, "\n"))
-			}
-			// Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-			var scoped []StepLedgerEntry
-			for _, e := range ledger {
-				if _, ok := blockerSet[e.TaskID]; ok {
-					scoped = append(scoped, e)
-				}
-			}
-			if block, ok := RenderStepLedger(scoped, false); ok {
+
+			// #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+			// the static elision marker once entries were dropped).
+			if block, ok := RenderStepLedger(ledger, ledgerElided); ok {
 				executor.SeedUserMessage(ctx, stepSession, block)
 			}
-		}
 
-		// #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-		// the static elision marker once entries were dropped).
-		if block, ok := RenderStepLedger(ledger, ledgerElided); ok {
-			executor.SeedUserMessage(ctx, stepSession, block)
+			// Finally seed this step's own instruction.
+			executor.SeedUserMessage(ctx, stepSession, stepTask.Instruction)
 		}
-
-		// Finally seed this step's own instruction.
-		executor.SeedUserMessage(ctx, stepSession, stepTask.Instruction)
 
 		// #126 AC2: clear the observed-write accumulator so this task's
 		// files_touched reflect ONLY the writes this step issues.
