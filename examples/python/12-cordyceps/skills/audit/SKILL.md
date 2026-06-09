@@ -22,13 +22,7 @@ whole file — grep first, then read only the narrow line ranges you need.
 2. **Read narrow.** For each grep hit that looks real, `read_file` only the
    surrounding lines (e.g. a 10–20 line window). Confirm it is a genuine defect
    in context, not a false positive.
-3. **Escalate when unsure** (the consult ladder):
-   - `research_best_practices` — when you are unsure whether a pattern is the
-     idiomatic Rust way or a real smell. Pass a focused `question`.
-   - `consult_advisor` — when you are stuck on whether a finding is real, or how
-     to rank its severity/priority. Reserve for genuine uncertainty.
-   - If a consult comes back "budget exhausted", proceed on your own judgement.
-4. **Keep findings real.** Each finding must name a concrete file, line, and a
+3. **Keep findings real.** Each finding must name a concrete file, line, and a
    specific, actionable problem. No boilerplate ("consider adding tests"), no
    style nits, no speculation. If the module is clean, return an empty array.
 

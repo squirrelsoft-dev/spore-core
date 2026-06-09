@@ -958,6 +958,18 @@ class RunScratch:
     # in-process Continue never sets it → AC3: no serialization on the in-process
     # path). Mirrors Rust's ``RunScratch::resume_continues``.
     resume_continues: tuple[str, int] | None = None
+    # Consult re-drive seed (#131): the worker conversation (with the consult
+    # answer already injected as the pending call's tool result) carried from a
+    # resumed :class:`RunResultConsult`. When set, a :class:`PlanExecuteConfig`
+    # walk resumes its single ``InProgress`` task from THIS session (instead of a
+    # fresh instruction-seeded session) so the consulting worker continues
+    # mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
+    # proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
+    # the session itself rides the serialized ``PausedState.session_state``, so a
+    # cross-process resume reconstructs this seed in
+    # :meth:`StandardHarness.resume_consult`. ``None`` on a fresh run / after the
+    # seed is consumed. Mirrors Rust's ``RunScratch::consult_resume``.
+    consult_resume: SessionState | None = None
 
 
 @dataclass
@@ -1059,6 +1071,17 @@ class ExecutionContext:
         so the harness entry returns it VERBATIM, and return the matching
         outcome."""
         await executor.finalize(result)
+        # #131: a ``Consult`` propagated from a worker leaf carries the LEAF task,
+        # so a host ``resume_consult`` would resume only that leaf and lose the
+        # surrounding walk. As the pause unwinds through each combinator's
+        # ``_finish``, rewrite its ``state.task`` to the combinator's OWN composed
+        # task; by the top it carries the FULL tree, so ``resume_consult``
+        # re-drives the whole strategy (the in-progress task resumes from
+        # ``consult_resume``).
+        if isinstance(result, RunResultConsult):
+            new_state = result.state.model_copy()
+            new_state.task = parent_task
+            result = result.model_copy(update={"state": new_state})
         self.scratch.task = parent_task
         if isinstance(result, RunResultSuccess | RunResultFailure):
             self.scratch.run_session = result.session_state
@@ -1917,6 +1940,34 @@ async def _run_plan_execute_config(
     # Completed tasks are not re-run.
     await executor.reconcile_completed_tasks(session_id, task_list)
 
+    # #131 consult re-drive: a resumed consult carries the worker conversation
+    # (answer already injected) in ``cx.scratch.consult_resume``. The consulting
+    # task is the single ``InProgress`` task in the durable list (PlanExecute
+    # marks a task InProgress before running it). Reset it to ``Pending`` so
+    # ``next_ready`` re-schedules it, and remember its id so its step uses the
+    # carried session instead of a fresh one — the worker then continues mid-loop
+    # and its evaluator still runs.
+    consult_resume_session = cx.scratch.consult_resume
+    cx.scratch.consult_resume = None
+    consult_resume_task: int | None = None
+    if consult_resume_session is not None:
+        in_progress = next(
+            (t.id for t in task_list.tasks if t.status == TaskStatus.IN_PROGRESS),
+            None,
+        )
+        if in_progress is not None:
+            # Reset the status field DIRECTLY (bypassing ``update``'s forward-only
+            # transition guard, which rejects InProgress->Pending): the consult
+            # resume legitimately re-schedules the in-flight task.
+            for t in task_list.tasks:
+                if t.id == in_progress:
+                    t.status = TaskStatus.PENDING
+            consult_resume_task = in_progress
+        else:
+            # No in-progress task to resume (out-of-contract); drop the seed so
+            # the walk proceeds normally rather than stalling.
+            consult_resume_session = None
+
     total_usage = outcome.usage.model_copy(deep=True)
     last_output = ""
     last_state = SessionState()
@@ -1969,33 +2020,47 @@ async def _run_plan_execute_config(
         )
         step_task = await executor.fire_task_advance(session_id, step_task, index, total_tasks)
 
-        # #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
-        # session plus, for THIS task's transitive blockers only, their final
-        # outputs + their ledger rows. Independent branches never appear (AC1).
-        step_session = base_session.model_copy(deep=True)
-        blockers = task_list.transitive_blockers(task_id)
-        if blockers:
-            blocker_set = set(blockers)
-            tier1_lines = [
-                f"#{b} result: {final_outputs[b]}" for b in blockers if b in final_outputs
-            ]
-            if tier1_lines:
-                await executor.seed_user_message(
-                    step_session, "Results from upstream tasks:\n" + "\n".join(tier1_lines)
-                )
-            scoped = [e for e in ledger if e.task_id in blocker_set]
-            scoped_block = render_step_ledger(scoped, False)
-            if scoped_block is not None:
-                await executor.seed_user_message(step_session, scoped_block)
+        # #131 consult re-drive: if THIS is the task that was consulting, resume
+        # its worker from the carried conversation (answer already injected)
+        # instead of a fresh instruction-seeded session — the worker continues
+        # mid-loop and its evaluator still runs. Otherwise build the normal
+        # fresh, Tier-1/Tier-2-seeded step session.
+        if consult_resume_task is not None and task_id == consult_resume_task:
+            step_session = (
+                consult_resume_session
+                if consult_resume_session is not None
+                else base_session.model_copy(deep=True)
+            )
+            consult_resume_session = None
+        else:
+            # #126 Tier-1 scoped context: seed this step from a FRESH copy of the
+            # base session plus, for THIS task's transitive blockers only, their
+            # final outputs + their ledger rows. Independent branches never appear
+            # (AC1).
+            step_session = base_session.model_copy(deep=True)
+            blockers = task_list.transitive_blockers(task_id)
+            if blockers:
+                blocker_set = set(blockers)
+                tier1_lines = [
+                    f"#{b} result: {final_outputs[b]}" for b in blockers if b in final_outputs
+                ]
+                if tier1_lines:
+                    await executor.seed_user_message(
+                        step_session, "Results from upstream tasks:\n" + "\n".join(tier1_lines)
+                    )
+                scoped = [e for e in ledger if e.task_id in blocker_set]
+                scoped_block = render_step_ledger(scoped, False)
+                if scoped_block is not None:
+                    await executor.seed_user_message(step_session, scoped_block)
 
-        # #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-        # the static elision marker once entries were dropped).
-        ledger_block = render_step_ledger(ledger, ledger_elided)
-        if ledger_block is not None:
-            await executor.seed_user_message(step_session, ledger_block)
+            # #126 Tier-2: inject the FULL global running ledger into EVERY step
+            # (with the static elision marker once entries were dropped).
+            ledger_block = render_step_ledger(ledger, ledger_elided)
+            if ledger_block is not None:
+                await executor.seed_user_message(step_session, ledger_block)
 
-        # Finally seed this step's own instruction.
-        await executor.seed_user_message(step_session, step_task.instruction)
+            # Finally seed this step's own instruction.
+            await executor.seed_user_message(step_session, step_task.instruction)
 
         # #126 AC2: clear the observed-write accumulator so this task's
         # files_touched reflect ONLY the writes this step issues.
@@ -6487,6 +6552,28 @@ class StandardHarness:
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
+        # #131: a consult that surfaced from inside a composed tree carries the
+        # FULL strategy in ``task.loop_strategy`` (each combinator's ``_finish``
+        # rewrote the pause's task on the way up). Re-DRIVE that strategy rather
+        # than resuming only the worker leaf: the PlanExecute walk resumes its
+        # in-progress task from the injected worker session (``consult_resume``
+        # seed), so the worker finishes mid-loop, its SelfVerifying evaluator
+        # runs, the task is marked Completed, and the remaining ready-set is
+        # walked. A BARE worker leaf (depth-1, e.g. a SubagentTool-mediated
+        # consult) has no surrounding walk, so it keeps the original leaf-only
+        # resume (back-compat).
+        if not isinstance(task.loop_strategy, ReactConfig):
+            return await self._drive_strategy(
+                task,
+                # Top-level session starts fresh; the worker conversation is
+                # threaded into the in-progress task via the consult seed.
+                SessionState(),
+                budget_used,
+                on_stream,
+                None,
+                session_state,
+            )
+
         max_iterations = (
             task.loop_strategy.max_iterations()
             if isinstance(task.loop_strategy, ReactConfig)
@@ -6746,6 +6833,7 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         resume_continues: tuple[str, int] | None = None,
+        consult_resume: SessionState | None = None,
     ) -> RunResult:
         """The recursive-executor entry (#124): build the shared
         :class:`ExecutionContext`, seed the per-run scratch (task / session /
@@ -6765,7 +6853,12 @@ class StandardHarness:
         (phase, continues_used)`` seeds the FIRST matching budget scope's
         ``continues_used`` (via :meth:`BudgetContext.resumed`) so a ``Continue``
         that spanned a process pause resumes with the correct continue count (AC2);
-        ``None`` is the fresh-run path."""
+        ``None`` is the fresh-run path.
+
+        ``consult_resume = session`` (#131) seeds the FIRST PlanExecute walk's
+        in-progress task with ``session`` (a worker conversation whose consult
+        answer is already injected) so a resumed consult continues mid-loop and
+        walks the remaining ready-set. ``None`` on every non-consult path."""
         session_id = task.session_id
         # The Continue resolution state threaded across in-process rounds: the
         # (possibly fallen-through) behavior + how many continues have been spent.
@@ -6783,6 +6876,10 @@ class StandardHarness:
             # carry their continue count via ``behavior_for_resolution``.
             cx.scratch.resume_continues = resume_continues
             resume_continues = None
+            # #131: the consult re-drive seed is consumed by the FIRST round's
+            # PlanExecute walk only; later in-process rounds run normally.
+            cx.scratch.consult_resume = consult_resume
+            consult_resume = None
 
             outcome = await run_strategy(task.loop_strategy, cx)
 

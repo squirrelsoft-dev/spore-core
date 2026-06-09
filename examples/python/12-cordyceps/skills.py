@@ -1,4 +1,11 @@
-"""Architect-side skill loading (zero core-harness change).
+"""Architect-side skill injection (zero core-harness change).
+
+After the #131 composition rewrite the ``load_skill`` worker-side tool was
+dropped — the declarative tree exposes no per-node tool seam. The ``audit``
+skill is KEPT, now riding the single GLOBAL
+:class:`SkillInjectingContextManager` (the harness's ``context_manager``), seeded
+ALWAYS-ACTIVE at startup. Its procedure reaches the model structurally every
+turn, compaction-proof, with no ``load_skill`` round-trip.
 
 Why this lives in the example, not the harness
 ----------------------------------------------
@@ -8,30 +15,24 @@ Issue #9 added ``GuideType.SKILL`` to the :class:`GuideRegistry`, and the rich
 skills as a Block-3 segment. But the **live** harness loop does not call that
 rich ``assemble`` — it calls :meth:`StandardCompactionAdapter.assemble`, a
 pass-through of ``session.messages`` (see issue #115 / Known Deviation #8). So
-today skills reach the model only as tool-result text, never as structural
-injection.
-
-This module wires the chain end-to-end **architect-side**, exactly the pattern
-issue #115 will absorb into the library:
+today a skill can reach the model only as a tool-result message or via a custom
+context manager — the route this example takes:
 
 1. A :class:`SkillCatalog` scans ``.spore/skills/{name}/SKILL.md`` (project) then
-   ``~/.spore/skills/{name}/SKILL.md`` (user), parses YAML frontmatter
-   ``{name, description}`` + markdown body, and ``register``s each as a skill
-   :class:`Guide` in a :class:`StandardGuideRegistry`. It also keeps a manifest
-   side-list of ``(name, description)`` because :class:`Guide`'s description is
-   not surfaced by ``select`` — the example owns the manifest text.
-2. The ``load_skill`` tool (see :mod:`tools.load_skill`) appends a skill id to
-   ``run_store["active_skills"]``.
-3. :class:`SkillInjectingContextManager` wraps the standard compaction adapter
+   ``~/.spore/skills/{name}/SKILL.md`` (user) plus the bundled ``audit`` skill,
+   parses YAML frontmatter ``{name, description}`` + markdown body, and keeps the
+   manifest side-list of ``(name, description, body)`` the example owns (both the
+   manifest text and the injected body come from this one list, so they agree).
+2. :class:`SkillInjectingContextManager` wraps the standard compaction adapter
    and, in ``assemble``, prepends — **ephemerally**, never into
    ``session.messages`` — (a) the manifest of all skills, and (b) the full body
-   of every active skill. Everything else delegates verbatim to the inner
-   adapter.
+   of every id in ``run_store["active_skills"]``. Everything else delegates
+   verbatim to the inner adapter.
 
-Net effect: the manifest is present every turn (progressive disclosure); a
-loaded skill's body is re-injected every turn until the session is cleared.
-Because the active set lives in ``run_store`` (not the message history), it is
-compaction-proof.
+Net effect: the manifest is present every turn; a loaded skill's body is
+re-injected every turn until the session is cleared. Because the active set lives
+in ``run_store`` (not the message history), it is compaction-proof. ``main.py``
+seeds ``["audit"]`` ALWAYS-ACTIVE at startup.
 """
 
 from __future__ import annotations
@@ -42,32 +43,21 @@ from pathlib import Path
 
 from spore_core import (
     Context,
-    Guide,
-    GuideId,
     GuideQuery,
-    GuideSourceManual,
-    GuideStatusActive,
     GuideType,
     HarnessToolResult,
     Message,
     Role,
     SessionState,
-    StandardGuideRegistry,
     Task,
     TextContent,
 )
 from spore_core.harness import ContextManager as HarnessContextManager
-from spore_core.memory import Timestamp
 from spore_core.storage import RunStore
 
-#: The run-store key under which the ``load_skill`` tool and the context manager
-#: rendezvous on the active-skill id set.
+#: The run-store key under which the global context manager reads the active
+#: skill id set (``main.py`` seeds ``["audit"]`` at startup).
 ACTIVE_SKILLS_KEY = "active_skills"
-
-#: Created-at timestamp stamped on every registered skill guide. The value is
-#: irrelevant to this example (selection never sorts on it) — a fixed constant
-#: keeps registration deterministic.
-_SKILL_CREATED_AT = "2026-06-06T00:00:00Z"
 
 
 @dataclass
@@ -147,29 +137,25 @@ def _upsert(manifest: list[SkillEntry], entry: SkillEntry) -> None:
 
 
 class SkillCatalog:
-    """The example's skill catalog: a :class:`StandardGuideRegistry` (the real
-    seam) plus the manifest side-list the example owns (because ``select`` does
-    not surface a guide's description). Bodies are resolved from the side-list,
-    not re-queried from the registry, so the manifest text and the injected body
-    always agree."""
+    """The example's skill catalog: the manifest side-list the example owns
+    (``{name, description, body}``). After the #131 rewrite the catalog feeds
+    only the GLOBAL :class:`SkillInjectingContextManager` (the ``load_skill`` tool
+    + ``GuideRegistry`` seam were dropped — see the README's "what changed"
+    note); the manifest text and the injected body always agree because both come
+    from this one side-list."""
 
-    def __init__(self, registry: StandardGuideRegistry, manifest: list[SkillEntry]) -> None:
-        self._registry = registry
+    def __init__(self, manifest: list[SkillEntry]) -> None:
         self._manifest = manifest
 
     @classmethod
     async def bootstrap(cls, project_root: Path, bundled_audit: str) -> SkillCatalog:
-        """Scan the project + user skill directories and register the bundled
-        ``audit`` skill so the example is self-contained even with an empty
-        ``.spore/skills/``. Project entries win over user entries; the bundled
-        ``audit`` body seeds ``.spore/skills/audit/SKILL.md`` on first run if
-        absent (documented in the README) but is also registered directly here
-        so the example never depends on that seed having been written."""
-        registry = StandardGuideRegistry()
+        """Scan the project + user skill directories plus the bundled ``audit``
+        skill so the example is self-contained even with an empty
+        ``.spore/skills/``. Project entries win over user entries (last-wins by
+        name)."""
         manifest: list[SkillEntry] = []
 
-        # 1. Bundled audit skill — always present, registered first so a
-        #    project/user override of the same name supersedes it (last-wins).
+        # 1. Bundled audit skill — always present.
         bundled = parse_skill_doc(bundled_audit)
         if bundled is not None:
             _upsert(manifest, bundled)
@@ -184,32 +170,7 @@ class SkillCatalog:
             for entry in _scan_skill_dir(Path(home) / ".spore" / "skills"):
                 _upsert(manifest, entry)
 
-        # Register every manifest entry as a Skill-type guide. The registry
-        # rejects empty content and duplicate-content conflicts; we swallow such
-        # errors so a benign re-register (identical body) does not abort startup.
-        for entry in manifest:
-            guide = Guide(
-                id=GuideId(entry.name),
-                name=entry.name,
-                content=entry.body,
-                guide_type=GuideType.SKILL,
-                domain=None,
-                source=GuideSourceManual(),
-                status=GuideStatusActive(),
-                created_at=Timestamp(_SKILL_CREATED_AT),
-                last_used=None,
-                version=1,
-            )
-            try:
-                await registry.register(guide)
-            except Exception:  # noqa: BLE001 — a conflicting re-register is benign here
-                pass
-
-        return cls(registry, manifest)
-
-    def registry(self) -> StandardGuideRegistry:
-        """The shared registry — handed to the ``load_skill`` tool."""
-        return self._registry
+        return cls(manifest)
 
     def manifest(self) -> list[SkillEntry]:
         """The manifest side-list — handed to the context manager so it can
@@ -256,8 +217,8 @@ class SkillInjectingContextManager:
         out: list[Message] = []
 
         manifest_lines = [
-            "AVAILABLE SKILLS (call `load_skill` with a `skill_id` to activate one; "
-            "its full procedure then stays in context):"
+            "AVAILABLE SKILLS (an ACTIVE skill's full procedure stays in your context "
+            "every turn):"
         ]
         for entry in self._manifest:
             manifest_lines.append(f"- {entry.name}: {entry.description}")
