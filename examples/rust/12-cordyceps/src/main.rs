@@ -57,17 +57,17 @@ mod tools;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use spore_core::storage::InMemoryStorageProvider;
 use spore_core::{
     Agent, AgentId, BudgetLimits, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
     ConsultResponse, EmptyToolRegistry, EscalationAction, EscalationMode, EvaluatorResponseVerifier,
     ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager, HarnessContextManagerExt,
-    HarnessRunOptions, HumanRequest, HumanResponse, LoopStrategy, ModelAgent, NullCacheProvider,
-    OllamaModelInterface, ReactConfig, RunResult, SearchMethod, SessionId, StandardContextManager,
-    StandardTool, StandardTools, StorageProvider, Task, Verifier, WebSearchConfig, WebSearchTool,
-    WorkspaceConfig, WorkspaceScopedSandbox,
+    HarnessRunOptions, HarnessStreamEvent, HumanRequest, HumanResponse, LoopStrategy, ModelAgent,
+    NullCacheProvider, OllamaModelInterface, ReactConfig, RunResult, SearchMethod, SessionId,
+    StandardContextManager, StandardTool, StandardTools, StorageProvider, Task, Verifier,
+    WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 use crate::skills::{SkillCatalog, SkillInjectingContextManager, ACTIVE_SKILLS_KEY};
@@ -461,7 +461,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `kind` have already been mediated. Persists across every pause/resume
         // of THIS audit so the per-kind budget bounds the whole run, not one turn.
         let mut consult_counts: HashMap<String, u32> = HashMap::new();
-        let mut result = harness.run(HarnessRunOptions::new(task)).await;
+        // ONE top-level stream sink now reaches EVERY node of the composed tree:
+        // the combinators thread the sink down and stamp each event with the node
+        // that produced it (kind / agent_id / depth / path), so the trace shows the
+        // plan ReAct, the worker, and the evaluator live, indented by tree depth.
+        // (This is the exact seam an API backing a web UI would forward over SSE.)
+        let mut result = harness
+            .run(HarnessRunOptions::new(task).with_stream(node_stream_sink()))
+            .await;
         loop {
             match result {
                 RunResult::Success { output, turns, .. } => {
@@ -574,7 +581,11 @@ async fn mediate_consult(
         SessionId::generate(),
         LoopStrategy::ReAct(ReactConfig::per_loop(16)),
     );
-    let answer = match entry.handler.run(HarnessRunOptions::new(task)).await {
+    let answer = match entry
+        .handler
+        .run(HarnessRunOptions::new(task).with_stream(node_stream_sink_prefixed("│  ")))
+        .await
+    {
         RunResult::Success { output, .. } => output,
         // A handler that does not cleanly complete must not stall the worker —
         // feed its failure text back as the answer so the worker can adapt.
@@ -642,7 +653,11 @@ async fn handle_consult_overflow(
                 SessionId::generate(),
                 LoopStrategy::ReAct(ReactConfig::per_loop(16)),
             );
-            let answer = match entry.handler.run(HarnessRunOptions::new(task)).await {
+            let answer = match entry
+                .handler
+                .run(HarnessRunOptions::new(task).with_stream(node_stream_sink_prefixed("│  ")))
+                .await
+            {
                 RunResult::Success { output, .. } => output,
                 other => format!("advisor did not complete cleanly: {other:?}"),
             };
@@ -747,6 +762,78 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// The TOP-LEVEL stream sink for the composed run. The declarative tree threads
+/// ONE sink through every node and stamps each event with the node that produced
+/// it ([`HarnessStreamEvent::node`]: kind / agent_id / depth / root→leaf path),
+/// so a single `with_stream` surfaces the WHOLE tree — plan ReAct, worker, and
+/// evaluator — indented by tree depth and labelled by the speaking agent. This is
+/// the exact channel an API backing a web UI subscribes to and forwards over SSE.
+fn node_stream_sink() -> impl Fn(HarnessStreamEvent) + Send + Sync + 'static {
+    node_stream_sink_prefixed("")
+}
+
+/// As [`node_stream_sink`], with a fixed `base` prefix so a consult HANDLER's
+/// (separate, bare-ReAct) run nests visually under its consult banner.
+fn node_stream_sink_prefixed(
+    base: &'static str,
+) -> impl Fn(HarnessStreamEvent) + Send + Sync + 'static {
+    let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    move |event: HarnessStreamEvent| {
+        // Indent by tree depth + a per-node tag (agent_id, else kind) drawn from
+        // the event's attribution. `None` (a bare leaf at the top) ⇒ depth 0.
+        let (depth, tag) = match event.node() {
+            Some(n) => (
+                n.depth as usize,
+                n.agent_id.clone().unwrap_or_else(|| n.kind.clone()),
+            ),
+            None => (0, "·".to_string()),
+        };
+        let indent = format!("{base}{}", "  ".repeat(depth));
+        match event {
+            HarnessStreamEvent::TurnStart { turn, .. } => {
+                println!("{indent}[{tag}] · turn {turn}");
+            }
+            HarnessStreamEvent::ToolCall {
+                call_id, name, args, ..
+            } => {
+                call_names.lock().unwrap().insert(call_id, name.clone());
+                // `send_user_message` renders itself as the 🤖 UserMessage event.
+                if name != "send_user_message" {
+                    println!("{indent}  → {name}({})", truncate(&args.to_string(), 140));
+                }
+            }
+            HarnessStreamEvent::ToolResult {
+                call_id,
+                is_error,
+                content,
+                ..
+            } => {
+                let name = call_names
+                    .lock()
+                    .unwrap()
+                    .remove(&call_id)
+                    .unwrap_or_else(|| "<tool>".to_string());
+                if name != "send_user_message" {
+                    let t = if is_error { "err" } else { "ok" };
+                    println!("{indent}  {name} [{t}]: {}", truncate(&content, 140));
+                }
+            }
+            // A worker `send_user_message` surfaces here (issue #81 out-of-band).
+            HarnessStreamEvent::UserMessage { content, .. } => {
+                println!("{indent}🤖 {}", truncate(&content, 200));
+            }
+            // A node's final assistant text (plan JSON, worker findings, evaluator
+            // verdict) — the substance when a turn emits no tool call.
+            HarnessStreamEvent::FinalResponse { content, .. } => {
+                println!("{indent}⟐ {}", truncate(&content, 200));
+            }
+            // Delta-level events (#103), block start/stop, budget warnings: ignored
+            // here — the coarse events above are enough for a readable trace.
+            _ => {}
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

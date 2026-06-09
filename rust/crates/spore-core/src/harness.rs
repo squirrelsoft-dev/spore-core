@@ -1212,6 +1212,7 @@ pub trait StrategyExecutor: Send + Sync {
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
     ) -> BoxFut<'a, Option<RunResult>>;
 
     /// Reconcile a freshly-parsed task list against the DURABLE RunStore
@@ -1411,9 +1412,13 @@ impl RunStrategy for ReactConfig {
             // site (`drive_strategy`) can honor it (Q1 — a bare leaf self-resolves,
             // a nested leaf does not).
             cx.push_budget(self.budget.clone(), self.behavior.clone(), "react");
-            // The leaf takes the run's stream sink for the window. Combinators
-            // that recurse per-phase suppress it (they take it before recursing).
-            let on_stream = cx.stream.take();
+            // The leaf CLONES (not takes) the run's stream sink so sibling phases
+            // of a combinator parent still inherit it for their own turns, and
+            // WRAPS it so every event this leaf emits is attributed to THIS node
+            // (kind `react` + the resolved agent handle). The wrapper is what the
+            // live agent adapter forwards to, so token deltas carry attribution too.
+            let agent_id = (!self.agent.0.is_empty()).then(|| self.agent.0.clone());
+            let on_stream = wrap_node_sink(cx.stream.clone(), "react", agent_id);
             let result = executor
                 .react_window(
                     task,
@@ -1548,7 +1553,12 @@ impl RunStrategy for PlanExecuteConfig {
             // The incoming shared execute session ( `[user: task.instruction]` ).
             let base_session = std::mem::take(&mut cx.scratch.run_session);
             let budget_used = cx.scratch.run_budget.clone();
+            // Save the parent sink and install a node-attributing wrapper for the
+            // phases (#stream): children inherit `cx.stream` and stream through it,
+            // each event gaining a `plan_execute` hop in its node path. Restored to
+            // the parent on every exit (the `cx.stream = on_stream;` sites below).
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "plan_execute", None);
 
             // ── Phase 1: plan (dispatch through `self.plan`). ───────────────
             let directive = executor.plan_directive(&task.instruction);
@@ -1556,22 +1566,27 @@ impl RunStrategy for PlanExecuteConfig {
             executor
                 .seed_user_message(&mut plan_session, &directive)
                 .await;
-            let plan_cap = match task.budget.max_turns {
-                Some(global) => global.min(budget_used.turns.saturating_add(1)),
-                None => budget_used.turns.saturating_add(1),
-            };
+            // The plan phase runs under the plan sub-strategy's OWN declared budget
+            // (e.g. a ReAct `PerLoop{4}`); the global `max_turns` is only the outer
+            // backstop. Previously this clamped the planner to `turns + 1` — a
+            // SINGLE turn — silently overriding the architect's plan budget and
+            // starving multi-step task-graph authoring (the planner could not both
+            // call `task_list` and finish, so it emitted prose instead).
             let plan_task = Task {
                 id: task.id.clone(),
                 instruction: directive,
                 session_id: session_id.clone(),
-                budget: BudgetLimits {
-                    max_turns: Some(plan_cap),
-                    ..task.budget.clone()
-                },
+                budget: task.budget.clone(),
                 loop_strategy: (*self.plan).clone(),
             };
             let plan_result = executor
-                .run_plan_subtree(&self.plan, plan_task, plan_session, budget_used.clone())
+                .run_plan_subtree(
+                    &self.plan,
+                    plan_task,
+                    plan_session,
+                    budget_used.clone(),
+                    cx.stream.clone(),
+                )
                 .await;
             let (plan_output, plan_usage, plan_turns) = match plan_result {
                 Some(RunResult::Success {
@@ -1942,10 +1957,14 @@ impl RunStrategy for PlanExecuteConfig {
                             ledger_elided = true;
                         }
 
+                        // #stream: emit through the WRAPPED `cx.stream` (not the
+                        // saved parent `on_stream`) so this combinator-surfaced step
+                        // output is attributed to the `plan_execute` node.
                         StandardHarness::emit(
-                            &on_stream,
+                            &cx.stream,
                             StreamEvent::FinalResponse {
                                 content: last_output.clone(),
+                                node: None,
                             },
                         );
 
@@ -2134,8 +2153,11 @@ impl RunStrategy for SelfVerifyingConfig {
             let build_session_id = task.session_id.clone();
             let mut session_state = std::mem::take(&mut cx.scratch.run_session);
             let mut carried = cx.scratch.run_budget.clone();
-            // Suppress the run's stream sink for the recursive child phases.
+            // #stream: save the parent sink, install a `self_verifying`-attributing
+            // wrapper so the build (worker) and evaluate phases stream through it;
+            // restored to the parent on every exit (`cx.stream = on_stream;`).
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "self_verifying", None);
 
             // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
             let verifier = match cx.registry.resolve_verifier(&self.evaluator.0) {
@@ -2398,9 +2420,12 @@ impl RunStrategy for RalphConfig {
     /// Ralph (#124): GENUINELY recursive continuation wrapper. Each context
     /// window seeds a FRESH session from the `.spore/` checkpoint, then recurses
     /// `self.inner.run(cx)` (a non-ReAct inner — e.g. SelfVerifying — really runs
-    /// its whole loop per window). Q3: when `self.agent` is set it OVERRIDES the
-    /// inner leaf's agent per window; when unset the worker resolves via the inner
-    /// leaf. `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
+    /// its whole loop per window). Ralph is an OUTER LOOP that re-runs `inner` as
+    /// the architect declared it — it does NOT replace nodes the inner tree
+    /// already assigned. When `self.agent` is set it only FILLS a worker leaf that
+    /// left its own agent handle EMPTY (the bare-leaf Ralph convenience); an
+    /// explicit leaf agent is authoritative and never overwritten.
+    /// `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
     /// `RalphCompletionUnmet`.
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
@@ -2409,19 +2434,23 @@ impl RunStrategy for RalphConfig {
                 Err(o) => return o,
             };
             let task = cx.current_task();
+            // #stream: save the parent sink, install a `ralph`-attributing wrapper
+            // so each reset window's turns stream through it; restored on exit.
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "ralph", None);
             // Ralph discards the incoming session state by design (each window is
             // a fresh start re-seeded from the filesystem checkpoint).
             let _ = std::mem::take(&mut cx.scratch.run_session);
             let max_resets = self.max_resets(executor);
 
-            // Q3: when `self.agent` is set, override the inner leaf's agent for
-            // every window by rewriting the inner tree's worker leaf handle.
+            // Ralph fills — never replaces. When `self.agent` is set it supplies a
+            // worker agent ONLY where the inner leaf left its handle empty; an
+            // explicitly-declared leaf agent (the architect's node) is authoritative.
             let inner_for_window: LoopStrategy = if self.agent.0.is_empty() {
                 (*self.inner).clone()
             } else {
                 let mut cloned = (*self.inner).clone();
-                override_worker_agent(&mut cloned, &self.agent);
+                fill_empty_worker_agent(&mut cloned, &self.agent);
                 cloned
             };
 
@@ -2539,16 +2568,21 @@ impl RalphConfig {
     }
 }
 
-/// Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
-/// per-window agent override). Mutates the leaf reached by descending the worker
-/// child chain.
-fn override_worker_agent(ls: &mut LoopStrategy, agent: &AgentRef) {
+/// Fill the worker leaf's agent handle of `ls` with `agent` ONLY where the leaf
+/// left it empty — Ralph's bare-leaf convenience. An explicitly-declared leaf
+/// agent is authoritative and is never replaced (the architect's node wins).
+/// Descends the worker child chain to the innermost leaf.
+fn fill_empty_worker_agent(ls: &mut LoopStrategy, agent: &AgentRef) {
     match ls {
-        LoopStrategy::ReAct(c) => c.agent = agent.clone(),
-        LoopStrategy::PlanExecute(c) => override_worker_agent(&mut c.execute, agent),
-        LoopStrategy::SelfVerifying(c) => override_worker_agent(&mut c.inner, agent),
-        LoopStrategy::Ralph(c) => override_worker_agent(&mut c.inner, agent),
-        LoopStrategy::HillClimbing(c) => override_worker_agent(&mut c.inner, agent),
+        LoopStrategy::ReAct(c) => {
+            if c.agent.0.is_empty() {
+                c.agent = agent.clone();
+            }
+        }
+        LoopStrategy::PlanExecute(c) => fill_empty_worker_agent(&mut c.execute, agent),
+        LoopStrategy::SelfVerifying(c) => fill_empty_worker_agent(&mut c.inner, agent),
+        LoopStrategy::Ralph(c) => fill_empty_worker_agent(&mut c.inner, agent),
+        LoopStrategy::HillClimbing(c) => fill_empty_worker_agent(&mut c.inner, agent),
     }
 }
 
@@ -2568,7 +2602,10 @@ impl RunStrategy for HillClimbingConfig {
             let task = cx.current_task();
             let session_id = task.session_id.clone();
             let task_id = task.id.clone();
+            // #stream: save the parent sink, install a `hill_climbing`-attributing
+            // wrapper so each iteration's turns stream through it; restored on exit.
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "hill_climbing", None);
             let mut carried = cx.scratch.run_budget.clone();
             let _ = std::mem::take(&mut cx.scratch.run_session);
             let direction = self.direction;
@@ -3380,9 +3417,13 @@ pub enum BlockKind {
 pub enum StreamEvent {
     TurnStart {
         turn: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     TurnEnd {
         turn: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     ToolCall {
         call_id: String,
@@ -3391,6 +3432,8 @@ pub enum StreamEvent {
         /// `#[serde(default)]` keeps pre-#103 serialized events back-compatible.
         #[serde(default)]
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     ToolResult {
         call_id: String,
@@ -3399,12 +3442,18 @@ pub enum StreamEvent {
         /// pre-#103 serialized events back-compatible.
         #[serde(default)]
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     FinalResponse {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     BudgetWarning {
         limit_type: BudgetLimitType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Emitted when a tool wants to surface a message to the user out-of-band
     /// (issue #81 — `SendMessageTool`). The harness loop recognizes the
@@ -3413,16 +3462,22 @@ pub enum StreamEvent {
     /// the loop continues.
     UserMessage {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     // ── Delta-level streaming (issue #103) ──────────────────────────────────
     /// Streamed text fragment (`model::StreamEvent::ContentBlockDelta`).
     TextDelta {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Streamed reasoning/thinking fragment
     /// (`model::StreamEvent::ThinkingDelta`). Q4.
     ReasoningDelta {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Streamed tool-argument JSON fragment
     /// (`model::StreamEvent::ToolUseDelta`), correlated to a `call_id` via the
@@ -3430,16 +3485,22 @@ pub enum StreamEvent {
     ToolArgsDelta {
         call_id: String,
         partial_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A content block opened (Q2). Emitted the first time a delta for an index
     /// is seen.
     BlockStart {
         index: u32,
         block: BlockKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A content block closed (`model::StreamEvent::ContentBlockStop`). Q2.
     BlockStop {
         index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A tool-use block opened (issue #103). Emitted so consumers can correlate
     /// the subsequent [`StreamEvent::ToolArgsDelta`] fragments and the final
@@ -3451,10 +3512,112 @@ pub enum StreamEvent {
         index: u32,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
 }
 
-pub type StreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
+impl StreamEvent {
+    /// Uniform mutable access to the optional [`NodeAttr`] on any variant — the
+    /// single seam the node-wrapping sinks stamp through ([`wrap_node_sink`]).
+    /// One or-pattern binds the common `node` field across every variant.
+    pub fn node_mut(&mut self) -> &mut Option<NodeAttr> {
+        match self {
+            StreamEvent::TurnStart { node, .. }
+            | StreamEvent::TurnEnd { node, .. }
+            | StreamEvent::ToolCall { node, .. }
+            | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::FinalResponse { node, .. }
+            | StreamEvent::BudgetWarning { node, .. }
+            | StreamEvent::UserMessage { node, .. }
+            | StreamEvent::TextDelta { node, .. }
+            | StreamEvent::ReasoningDelta { node, .. }
+            | StreamEvent::ToolArgsDelta { node, .. }
+            | StreamEvent::BlockStart { node, .. }
+            | StreamEvent::BlockStop { node, .. }
+            | StreamEvent::ToolCallStart { node, .. } => node,
+        }
+    }
+
+    /// The emitting node's attribution, if stamped.
+    pub fn node(&self) -> Option<&NodeAttr> {
+        match self {
+            StreamEvent::TurnStart { node, .. }
+            | StreamEvent::TurnEnd { node, .. }
+            | StreamEvent::ToolCall { node, .. }
+            | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::FinalResponse { node, .. }
+            | StreamEvent::BudgetWarning { node, .. }
+            | StreamEvent::UserMessage { node, .. }
+            | StreamEvent::TextDelta { node, .. }
+            | StreamEvent::ReasoningDelta { node, .. }
+            | StreamEvent::ToolArgsDelta { node, .. }
+            | StreamEvent::BlockStart { node, .. }
+            | StreamEvent::BlockStop { node, .. }
+            | StreamEvent::ToolCallStart { node, .. } => node.as_ref(),
+        }
+    }
+}
+
+/// A user-facing stream sink. `Arc` (not `Box`) so the single sink installed at
+/// the top of a run can be CLONED into every nested node's context and into the
+/// live per-turn agent adapter without being consumed — this is what lets a
+/// composed strategy tree stream every node's events to one channel (the API
+/// the harness backs subscribes to exactly this sink and forwards over SSE).
+pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;
+
+/// Attribution stamped onto every [`StreamEvent`] as it flows up through the
+/// node-wrapping sinks (see [`wrap_node_sink`]). Lets a multi-agent UI route a
+/// frame to the node that produced it. Optional + `skip_serializing_if` so an
+/// un-attributed event (a bare/single-leaf run, or any pre-attribution
+/// consumer) serializes byte-identically to before this field existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeAttr {
+    /// The emitting node's kind: `"react"` (a leaf turn loop), or a combinator
+    /// kind (`"plan_execute"`, `"self_verifying"`, `"ralph"`, `"hill_climbing"`).
+    /// The leaf's kind is the innermost (most specific) — set first.
+    pub kind: String,
+    /// The leaf agent's handle (e.g. `"planner"`/`"executor"`/`"ralph-agent"`),
+    /// when the emitting node is a `react` leaf. `None` for combinator frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Nesting depth of the emitting leaf below the root (root combinator's leaf
+    /// children are progressively deeper). Accumulated as the event passes
+    /// through each combinator wrapper.
+    pub depth: u32,
+    /// Root→leaf node-kind path, accumulated by the wrapper chain (outermost
+    /// first). E.g. `["ralph", "plan_execute", "self_verifying", "react"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+}
+
+/// Wrap a parent sink so every event passing through is stamped for ONE node.
+/// The leaf installs the innermost wrapper (it sets `kind`/`agent_id`/seeds the
+/// path); each enclosing combinator's wrapper PREPENDS its kind to `path` and
+/// bumps `depth`. Stamping is set-once for `kind`/`agent_id` (the innermost leaf
+/// wins) so the event reports who actually spoke, with the full nesting in
+/// `path`. Returns `None` when there is no parent sink (no-op, baseline path).
+fn wrap_node_sink(parent: Option<StreamSink>, kind: &str, agent_id: Option<String>) -> Option<StreamSink> {
+    let parent = parent?;
+    let kind = kind.to_string();
+    Some(Arc::new(move |mut ev: StreamEvent| {
+        match ev.node_mut() {
+            slot @ None => {
+                *slot = Some(NodeAttr {
+                    kind: kind.clone(),
+                    agent_id: agent_id.clone(),
+                    depth: 0,
+                    path: vec![kind.clone()],
+                });
+            }
+            Some(attr) => {
+                attr.path.insert(0, kind.clone());
+                attr.depth += 1;
+            }
+        }
+        parent(ev);
+    }))
+}
 
 /// Per-turn state threaded through [`Harness::map_model_stream_event`] (issue
 /// #103). Tracks which block indices are open and their kind so
@@ -5126,8 +5289,16 @@ impl HarnessRunOptions {
     }
 
     /// Attach a streaming sink for `StreamEvent`s emitted during the run.
-    pub fn with_stream(mut self, on_stream: StreamSink) -> Self {
-        self.on_stream = Some(on_stream);
+    ///
+    /// Generic over `impl Fn` so callers can pass a bare closure, an existing
+    /// `Box<dyn Fn>` (which itself implements `Fn` — back-compat for pre-`Arc`
+    /// callers), or an `Arc<dyn Fn>`; it is wrapped once into the shared
+    /// [`StreamSink`].
+    pub fn with_stream<F>(mut self, on_stream: F) -> Self
+    where
+        F: Fn(StreamEvent) + Send + Sync + 'static,
+    {
+        self.on_stream = Some(Arc::new(on_stream));
         self
     }
 }
@@ -6180,9 +6351,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::Text,
+                        node: None,
                     });
                 }
-                out.push(StreamEvent::TextDelta { content: delta });
+                out.push(StreamEvent::TextDelta {
+                    content: delta,
+                    node: None,
+                });
                 out
             }
             M::ThinkingDelta { index, delta } => {
@@ -6192,9 +6367,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::Reasoning,
+                        node: None,
                     });
                 }
-                out.push(StreamEvent::ReasoningDelta { content: delta });
+                out.push(StreamEvent::ReasoningDelta {
+                    content: delta,
+                    node: None,
+                });
                 out
             }
             M::ToolUseStart { index, id, name } => {
@@ -6207,11 +6386,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::ToolUse,
+                        node: None,
                     });
                     out.push(StreamEvent::ToolCallStart {
                         index,
                         call_id: id,
                         name,
+                        node: None,
                     });
                 }
                 out
@@ -6230,11 +6411,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::ToolUse,
+                        node: None,
                     });
                     out.push(StreamEvent::ToolCallStart {
                         index,
                         call_id,
                         name: String::new(),
+                        node: None,
                     });
                 }
                 let call_id = state
@@ -6245,12 +6428,13 @@ impl StandardHarness {
                 out.push(StreamEvent::ToolArgsDelta {
                     call_id,
                     partial_json,
+                    node: None,
                 });
                 out
             }
             M::ContentBlockStop { index } => {
                 state.open_blocks.remove(&index);
-                vec![StreamEvent::BlockStop { index }]
+                vec![StreamEvent::BlockStop { index, node: None }]
             }
         }
     }
@@ -6700,6 +6884,7 @@ impl StandardHarness {
                 &on_stream,
                 StreamEvent::TurnStart {
                     turn: budget_used.turns + 1,
+                    node: None,
                 },
             );
             let turn_started_at = Timestamp::now();
@@ -6717,36 +6902,33 @@ impl StandardHarness {
                 None
             };
             // Delta-level streaming (issue #103): when a user-facing stream sink
-            // is attached, drive the turn through `turn_streaming` and forward
-            // each raw `model::StreamEvent` mapped to harness `StreamEvent`s.
-            // The adapter collects mapped events into a buffer (it cannot borrow
-            // `on_stream`, which is `Box<dyn Fn>` and not `'static`-shareable);
-            // the buffer is flushed to `on_stream` immediately after the turn,
-            // preserving order: TurnStart → deltas → TurnEnd → coarse events.
-            // When no sink is attached we keep the plain `turn` path so the
-            // baseline RunResult is byte-identical (back-compat).
-            let result = if on_stream.is_some() {
-                // Shared per-turn (TurnStreamState, buffered mapped events). The
-                // adapter is `Fn`, so the mutable mapping state lives behind a
-                // Mutex shared with the post-turn drain.
-                let shared: std::sync::Arc<std::sync::Mutex<(TurnStreamState, Vec<StreamEvent>)>> =
-                    std::sync::Arc::new(std::sync::Mutex::new((
-                        TurnStreamState::default(),
-                        Vec::new(),
-                    )));
-                let sink_shared = shared.clone();
+            // is attached, drive the turn through `turn_streaming` and forward each
+            // raw `model::StreamEvent` mapped to harness `StreamEvent`s.
+            //
+            // #stream: the sink is now an `Arc` (cloneable), so the adapter forwards
+            // each mapped event to it LIVE — the instant the model emits it — rather
+            // than buffering and flushing post-turn (the old `Box`-can't-be-shared
+            // workaround). This is what makes token-by-token SSE / mid-turn cancel
+            // observable. `TurnStreamState` (block + call-id correlation) lives
+            // behind a Mutex shared with the adapter; we map UNDER the lock, RELEASE
+            // it, then forward — never running the user sink under the lock (a
+            // re-entrant sink would deadlock). Order is preserved: TurnStart (emitted
+            // below, before the turn) → live deltas → TurnEnd → coarse events.
+            // When no sink is attached we keep the plain `turn` path so the baseline
+            // RunResult is byte-identical (back-compat).
+            let result = if let Some(sink) = on_stream.clone() {
+                let state =
+                    std::sync::Arc::new(std::sync::Mutex::new(TurnStreamState::default()));
                 let adapter: crate::agent::AgentStreamSink = Box::new(move |ev| {
-                    let mut guard = sink_shared.lock().expect("stream buffer poisoned");
-                    let (state, buffer) = &mut *guard;
-                    let mapped = Self::map_model_stream_event(ev, state);
-                    buffer.extend(mapped);
+                    let mapped = {
+                        let mut guard = state.lock().expect("stream state poisoned");
+                        Self::map_model_stream_event(ev, &mut guard)
+                    };
+                    for m in mapped {
+                        sink(m);
+                    }
                 });
-                let r = agent.turn_streaming(context, adapter).await;
-                let events = std::mem::take(&mut shared.lock().expect("stream buffer poisoned").1);
-                for ev in events {
-                    Self::emit(&on_stream, ev);
-                }
-                r
+                agent.turn_streaming(context, adapter).await
             } else {
                 agent.turn(context).await
             };
@@ -6849,6 +7031,7 @@ impl StandardHarness {
                 &on_stream,
                 StreamEvent::TurnEnd {
                     turn: budget_used.turns,
+                    node: None,
                 },
             );
 
@@ -6995,6 +7178,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 &on_stream,
                                 StreamEvent::FinalResponse {
                                     content: content.clone(),
+                                    node: None,
                                 },
                             );
                             return RunResult::Success {
@@ -7118,6 +7302,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     is_error: true,
                                     // Q5: carry the result content.
                                     content: format!("sandbox: {violation:?}"),
+                                    node: None,
                                 },
                             );
                             self.config
@@ -7135,6 +7320,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 name: call.name.clone(),
                                 // Q5: carry the final tool-call arguments.
                                 args: call.input.clone(),
+                                node: None,
                             },
                         );
                         let tool_started_at = Timestamp::now();
@@ -7377,6 +7563,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     &on_stream,
                                     StreamEvent::UserMessage {
                                         content: content.clone(),
+                                        node: None,
                                     },
                                 );
                             }
@@ -7510,6 +7697,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 call_id: call.id.clone(),
                                 is_error,
                                 content: result_content,
+                                node: None,
                             },
                         );
                         self.config
@@ -8522,6 +8710,7 @@ impl StrategyExecutor for StandardHarness {
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
     ) -> BoxFut<'a, Option<RunResult>> {
         Box::pin(async move {
             // #124 Q1: the planner concept is DROPPED — the plan child's leaf
@@ -8529,6 +8718,9 @@ impl StrategyExecutor for StandardHarness {
             // leaf itself. The child's `.run(cx)` drives the WHOLE plan loop.
             let mut cx = ExecutionContext::new(&self.config.registry);
             cx.executor = Some(self);
+            // #stream: thread the (already `plan_execute`-wrapped) sink into the
+            // plan sub-drive so the plan leaf's turns stream and stay attributed.
+            cx.stream = on_stream;
             cx.scratch.run_session = plan_session;
             cx.scratch.run_budget = budget_used;
             cx.scratch.task = Some(plan_task);
@@ -9271,7 +9463,8 @@ impl StandardHarness {
         let mut task = task;
         let mut session_state = session_state;
         let mut budget_used = budget_used;
-        let mut on_stream = on_stream;
+        // #stream: read-only now — cloned into `cx.stream` each round, never moved.
+        let on_stream = on_stream;
         // The Continue resolution state threaded across in-process rounds: the
         // (possibly fallen-through) behavior + how many continues have been spent.
         let mut behavior_for_resolution: Option<(BudgetExhaustedBehavior, u32)> = None;
@@ -9286,7 +9479,10 @@ impl StandardHarness {
         loop {
             let mut cx = ExecutionContext::new(&self.config.registry);
             cx.executor = Some(self);
-            cx.stream = on_stream.take();
+            // #stream: CLONE (not take) the Arc sink so the binding survives every
+            // in-process re-drive round (a `Continue` rebuilds `cx` at the top of
+            // this loop and re-installs the same sink). Nested nodes wrap it.
+            cx.stream = on_stream.clone();
             cx.scratch.run_session = std::mem::take(&mut session_state);
             cx.scratch.run_budget = budget_used.clone();
             cx.scratch.task = Some(task.clone());
@@ -9366,7 +9562,8 @@ impl StandardHarness {
                             grant_task_budget(&mut task, granted);
                             session_state = std::mem::take(&mut cx.scratch.run_session);
                             budget_used = cx.scratch.run_budget.clone();
-                            on_stream = cx.stream.take();
+                            // #stream: no reclaim needed — `on_stream` (Arc) is
+                            // cloned, never moved, into `cx.stream` each round.
                             // Thread the resolution chain's post-continue state so a
                             // subsequent exhaustion sees the bumped `continues_used`.
                             behavior_for_resolution =
@@ -10809,7 +11006,13 @@ impl StandardHarness {
         };
 
         let plan_result = self
-            .run_plan_subtree(&plan_strategy, plan_task, plan_session, budget_used.clone())
+            .run_plan_subtree(
+                &plan_strategy,
+                plan_task,
+                plan_session,
+                budget_used.clone(),
+                None,
+            )
             .await;
         let (plan_output, usage, turns) = match plan_result {
             Some(RunResult::Success {
@@ -10934,6 +11137,7 @@ impl StandardHarness {
                         on_stream,
                         StreamEvent::FinalResponse {
                             content: last_output.clone(),
+                            node: None,
                         },
                     );
                 }
@@ -12903,7 +13107,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = captured.clone();
         let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(move |ev| {
-            if let StreamEvent::UserMessage { content } = ev {
+            if let StreamEvent::UserMessage { content, .. } = ev {
                 sink.lock().unwrap().push(content);
             }
         }));
@@ -17955,8 +18159,10 @@ mod tests {
             cfg
         }
 
-        fn collect_sink(events: Arc<StdMutex<Vec<StreamEvent>>>) -> StreamSink {
-            Box::new(move |ev| events.lock().unwrap().push(ev))
+        fn collect_sink(
+            events: Arc<StdMutex<Vec<StreamEvent>>>,
+        ) -> impl Fn(StreamEvent) + Send + Sync + 'static {
+            move |ev| events.lock().unwrap().push(ev)
         }
 
         // TextDelta concatenation, ReasoningDelta emission, BlockStart/BlockStop
@@ -17986,14 +18192,14 @@ mod tests {
             // Q3: no message-level markers ever surface on the harness stream.
             assert!(!evs
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { content } if content.is_empty())));
+                .any(|e| matches!(e, StreamEvent::TextDelta { content, .. } if content.is_empty())));
 
             // ReasoningDelta + TextDelta present with the right content.
             assert!(evs
                 .iter()
-                .any(|e| matches!(e, StreamEvent::ReasoningDelta { content } if content == "thinking aloud")));
+                .any(|e| matches!(e, StreamEvent::ReasoningDelta { content, .. } if content == "thinking aloud")));
             assert!(evs.iter().any(
-                |e| matches!(e, StreamEvent::TextDelta { content } if content == "hello world")
+                |e| matches!(e, StreamEvent::TextDelta { content, .. } if content == "hello world")
             ));
 
             // Every delta is bracketed: each BlockStart has a matching BlockStop
@@ -18163,7 +18369,7 @@ mod tests {
         fn block_index_for(evs: &[StreamEvent], kind: BlockKind) -> u32 {
             evs.iter()
                 .find_map(|e| match e {
-                    StreamEvent::BlockStart { index, block } if *block == kind => Some(*index),
+                    StreamEvent::BlockStart { index, block, .. } if *block == kind => Some(*index),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("no BlockStart for {kind:?}"))
@@ -18171,7 +18377,7 @@ mod tests {
 
         fn has_block_stop(evs: &[StreamEvent], index: u32) -> bool {
             evs.iter()
-                .any(|e| matches!(e, StreamEvent::BlockStop { index: i } if *i == index))
+                .any(|e| matches!(e, StreamEvent::BlockStop { index: i, .. } if *i == index))
         }
 
         fn precedes(
@@ -18277,7 +18483,13 @@ mod tests {
                 golden.events
             );
             for (got, exp) in delta_events.iter().zip(golden.events.iter()) {
-                assert_eq!(*got, exp, "event mismatch");
+                // #stream: this golden asserts delta ORDERING/content (#103), not
+                // node attribution — strip the (now-present) `node` so the SHARED
+                // cross-language fixture stays byte-identical. Attribution has its
+                // own test (`composed_tree_streams_attributed_events`).
+                let mut got_norm = (*got).clone();
+                *got_norm.node_mut() = None;
+                assert_eq!(&got_norm, exp, "event mismatch");
             }
         }
 

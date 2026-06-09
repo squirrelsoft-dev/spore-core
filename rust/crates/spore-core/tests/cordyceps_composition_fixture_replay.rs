@@ -316,6 +316,75 @@ async fn plan_builds_dag_execute_walks_readyset() {
     );
 }
 
+// #stream: streaming threads through the COMPOSED tree. ONE top-level sink
+// receives every node's events, each stamped with the node that produced it
+// (kind / agent_id / depth / root→leaf path). This is the seam an API backing a
+// web UI subscribes to and forwards over SSE. Proven here against the same
+// plan→worker→evaluator replay as the ready-set test: plan turns carry the
+// `planner` leaf nested under `plan_execute`; worker turns carry the `executor`
+// leaf nested DEEPER, under `plan_execute → self_verifying`.
+#[tokio::test]
+async fn composed_tree_streams_attributed_events() {
+    use spore_core::HarnessStreamEvent;
+
+    let (h, storage) = harness_for("cordyceps_plan_execute_readyset.jsonl");
+    let session = SessionId::new("cordyceps-stream");
+    let mut tl = TaskList::default();
+    tl.add("audit module one".into(), vec![]).unwrap();
+    tl.add("audit module two".into(), vec![]).unwrap();
+    seed(&storage, &session, &tl).await;
+
+    let events: Arc<std::sync::Mutex<Vec<HarnessStreamEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let result = h
+        .run(
+            HarnessRunOptions::new(pe_task("cordyceps-stream"))
+                .with_stream(move |ev| sink.lock().unwrap().push(ev)),
+        )
+        .await;
+    assert!(matches!(result, RunResult::Success { .. }), "{result:?}");
+
+    let events = events.lock().unwrap();
+    assert!(!events.is_empty(), "the composed tree streamed events");
+
+    // EVERY event from a node inside the tree is attributed — no anonymous
+    // frames reach the sink (the combinators no longer suppress streaming).
+    assert!(
+        events.iter().all(|e| e.node().is_some()),
+        "every streamed event carries node attribution"
+    );
+
+    // Distinct leaf agents are distinguishable on the wire (who is speaking).
+    let agents: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| e.node().and_then(|n| n.agent_id.as_deref()))
+        .collect();
+    assert!(agents.contains("planner"), "plan turns attributed to planner: {agents:?}");
+    assert!(agents.contains("executor"), "worker turns attributed to executor: {agents:?}");
+
+    // The plan leaf sits under `plan_execute`; the worker leaf sits DEEPER, under
+    // `plan_execute → self_verifying` — the path/depth carry the full nesting.
+    let planner = events
+        .iter()
+        .find_map(|e| e.node().filter(|n| n.agent_id.as_deref() == Some("planner")))
+        .expect("a planner-attributed event");
+    let executor = events
+        .iter()
+        .find_map(|e| e.node().filter(|n| n.agent_id.as_deref() == Some("executor")))
+        .expect("an executor-attributed event");
+
+    assert_eq!(planner.kind, "react");
+    assert_eq!(planner.path, vec!["plan_execute", "react"]);
+    assert_eq!(executor.path, vec!["plan_execute", "self_verifying", "react"]);
+    assert!(
+        executor.depth > planner.depth,
+        "the worker leaf is nested deeper than the plan leaf: worker={} plan={}",
+        executor.depth,
+        planner.depth
+    );
+}
+
 // AC4: a single runaway worker node exhausts its own PerLoop{12} budget and
 // FAILS its task; an INDEPENDENT module still completes. The PlanExecute drains
 // to TasksBlockedByFailure with a partition that does NOT cascade to the
