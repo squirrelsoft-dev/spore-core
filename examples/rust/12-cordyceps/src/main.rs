@@ -1,296 +1,262 @@
-//! spore-core example 12 — **cordyceps**: a fully autonomous task-completion
-//! agent (the capstone).
+//! spore-core example 12 — **cordyceps**: the capstone of the Composable
+//! Execution refactor (#117–#131).
 //!
-//! **The thesis: you give it a task; it does not stop until the job is done —
-//! and when a worker gets stuck or uncertain, it asks for help (a sibling
-//! helper, then a human) rather than giving up.**
+//! **The thesis: you describe a strategy as DATA — a composed `LoopStrategy`
+//! tree — wire its string handles to concrete collaborators in an
+//! [`ExecutionRegistry`], and the harness runs the whole nested machine under
+//! one shared budget / usage / observability context.**
 //!
-//! This example composes everything the suite has built — subagents-as-tools
-//! (11), custom sandboxed tools (05), `web_search` (06), `memory` (07),
-//! `task_list` — plus two new capabilities:
-//!
-//! - **Architect-side skill loading** (see [`skills`]): a `load_skill` tool
-//!   activates the bundled `audit` skill at runtime via a `GuideRegistry`, and a
-//!   custom context manager re-injects the skill body every turn
-//!   (compaction-proof). This is the pattern issue #115 will absorb into the
-//!   harness; the live loop's structural skill-injection path is not wired yet
-//!   (see the README and #115).
-//! - **A generalized consult / escalation ladder** (issue #114): the analysis
-//!   worker escalates mid-loop to a research helper (`kind=research`, budget 5,
-//!   soft-fail) and then to a cloud-model advisor (`kind=advice`, budget 3,
-//!   escalate-to-human), resuming each time without ending its run.
-//!
-//! ## Topology (depth-1)
+//! The motivating composition is:
 //!
 //! ```text
-//! orchestrator (ReAct, gemma4:e4b)
-//!   tools: list_dir, grep, task_list, memory, write_file, bash_command,
-//!          analysis_worker (SubagentTool, with consult handlers)
-//!   ├── analysis_worker (Isolated) — audits ONE module
-//!   │     tools: read_file, grep, research_best_practices, consult_advisor,
-//!   │            load_skill
-//!   ├── research_worker (Isolated) — web_search   [consult handler: research]
-//!   └── advisor         (Isolated, cloud model)   [consult handler: advice]
+//! Ralph[ PlanExecute[ ReAct, SelfVerifying[ ReAct ] ] ]
+//! │       │             │      │             │
+//! │       │             │      │             └─ worker: audits ONE module
+//! │       │             │      └─ Default-FAIL evaluator (single read-only turn)
+//! │       │             └─ plan: explores the repo, builds a blocker-aware DAG
+//! │       └─ plan→ready-set: walks the DAG in dependency order, self-verifying each task
+//! └─ continuation wrapper: resets the window, resumes from durable progress
 //! ```
 //!
-//! The orchestrator enumerates crates → modules, adds one `task_list` task per
-//! module, dispatches the analysis worker per task, accumulates findings in
-//! `memory`, finalizes the top 5, writes `workspace/findings.md`, and runs the
-//! y/N issue-filing flow. The audit is READ-ONLY; the only writes are
-//! `workspace/findings.md` and (approved) GitHub issues.
+//! ## What changed vs. the pre-#131 example (HONEST note)
+//!
+//! The old depth-1 example used a hand-built `SubagentTool` orchestrator with a
+//! per-node consult mediator (#114) and an architect-side `load_skill` tool
+//! (#115). The declarative tree has NO SubagentTool seam, so:
+//!
+//! - the #114 consult ladder is **dropped** — there is no per-node
+//!   `ToolOutput::Consult` handler in the composed tree;
+//! - `load_skill` is **dropped** — there is no worker-side per-node seam;
+//! - the `audit` skill is **kept**, but now rides the single GLOBAL
+//!   [`SkillInjectingContextManager`] (the harness's `context_manager`), seeded
+//!   ALWAYS-ACTIVE at startup. The audit procedure reaches the model structurally
+//!   every turn, compaction-proof, with no `load_skill` round-trip.
+//!
+//! ## The tree is DATA
+//!
+//! We do NOT hand-build the [`LoopStrategy`]. We `include_str!` the canonical
+//! fixture `fixtures/strategy/cordyceps_tree.json` and deserialize it — so this
+//! example proves the canonical fixture deserializes and runs.
 //!
 //! ## Run it
 //!
 //! ```sh
 //! ollama serve &
 //! ollama pull gemma4:e4b
-//! export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
 //! cargo run
 //! ```
 
 mod skills;
 mod tools;
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use spore_core::storage::InMemoryStorageProvider;
-use spore_core::tool_registry::StandardToolRegistry;
-use spore_core::tools::{ContextSharing, SubagentTool};
 use spore_core::{
-    BudgetLimits, ConsultHandlerEntry, ConsultOverflowPolicy, Harness, HarnessBuilder,
-    HarnessContextManager, HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent,
-    HumanRequest, HumanResponse, LoopStrategy, NullCacheProvider, OllamaModelInterface,
-    RegisteredToolSchema, RunResult, SearchMethod, SessionId, StandardContextManager, StandardTool,
-    StandardTools, StorageProvider, Task, ToolAnnotations, WebSearchConfig, WebSearchTool,
+    Agent, AgentId, BudgetLimits, EmptyToolRegistry, EscalationAction, EscalationMode,
+    EvaluatorResponseVerifier, ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager,
+    HarnessContextManagerExt, HarnessRunOptions, HumanRequest, HumanResponse, LoopStrategy,
+    ModelAgent, NullCacheProvider, OllamaModelInterface, RunResult, SessionId,
+    StandardContextManager, StandardTool, StandardTools, StorageProvider, Task, Verifier,
     WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
-use crate::skills::{SkillCatalog, SkillInjectingContextManager};
-use crate::tools::consult::{
-    consult_advisor_tool, research_best_practices_tool, KIND_ADVICE, KIND_RESEARCH,
-};
-use crate::tools::load_skill::load_skill_tool;
+use crate::skills::{SkillCatalog, SkillInjectingContextManager, ACTIVE_SKILLS_KEY};
 use crate::tools::send_message::send_user_message_tool;
 
-/// The pre-filled audit prompt the user presses enter to accept (from the
-/// issue). An empty line at the REPL ⇒ this verbatim.
+/// The canonical composed-strategy fixture, embedded so the example proves the
+/// ground-truth tree deserializes (and runs) verbatim — never hand-built.
+pub const CORDYCEPS_TREE_JSON: &str =
+    include_str!("../../../../fixtures/strategy/cordyceps_tree.json");
+
+/// Bundled `audit` skill (the global context_manager's always-active procedure).
+const BUNDLED_AUDIT_SKILL: &str = include_str!("../skills/audit/SKILL.md");
+
+/// The verifier registry key the `SelfVerifying` node's `evaluator` resolves to.
+pub const EXEC_EVALUATOR_KEY: &str = "exec-evaluator";
+
+/// The pre-filled audit prompt (press enter to accept).
 const DEFAULT_AUDIT_PROMPT: &str =
     "Audit this repository for Rust defects. Discover the crates and their modules, audit each \
      module for real, actionable defects, and write a markdown report of the most important \
      findings to `workspace/findings.md`.";
 
-/// Per-worker wall-clock cap. A worker can burn many internal ReAct turns (and
-/// mediated consults); this bounds how long the orchestrator waits on one
-/// delegation.
-const WORKER_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Bundled `audit` skill, embedded so the example is self-contained even with
-/// an empty `.spore/skills/`.
-const BUNDLED_AUDIT_SKILL: &str = include_str!("../skills/audit/SKILL.md");
-
-const ORCHESTRATOR_PROMPT: &str = "\
-You are a cordyceps orchestrator. Your job is to decompose a repo audit into per-module tasks \
-and coordinate subagents to complete them.
+const EXEC_SYSTEM_PROMPT: &str = "\
+You are a cordyceps execution machine. Your strategy is composed declaratively: a Ralph \
+continuation wrapper drives a PlanExecute, whose plan phase explores the repo and builds a \
+blocker-aware task graph via `task_list`, and whose execute phase walks that graph as a \
+ready-set — auditing one module per ready task, each result self-verified by a read-only \
+evaluator (Default-FAIL: only an explicit PASS clears a task).
 
 Before each step, call `send_user_message` with one short sentence telling the watching human \
 what you are about to do and why.
 
-You are already scoped to the repository root. Use `.` for the root and paths relative to it \
-(e.g. `rust/crates`); never prefix a path with the repository's own folder name.
+You are already scoped to the repository root (READ-ONLY). Use `.` for the root and paths \
+relative to it (e.g. `rust/crates`); never prefix a path with the repository's own folder name. \
+The audit is read-only — you have no write tool; never attempt to modify source files.
 
-Your working pattern:
-- Use `list_dir` to discover crates and modules in the repo
-- For each module, add ONE task to `task_list` describing what to audit
-- Dispatch each task to `analysis_worker` with the module path as the instruction
-- Accumulate findings returned by each worker into `memory` under a stable key per module
-- When all tasks are complete, synthesize findings into a markdown report using `write_file`
+Follow the ACTIVE `audit` skill's procedure and output schema exactly: grep first, read narrow, \
+and return findings as a JSON array of {file, line, severity, description}.
 
-Delegate all per-module deep dives to `analysis_worker`. Do not audit modules yourself. \
-The audit is read-only — never modify source files.";
+PLAN phase: explore the repo with `list_dir`/`grep`, then build a blocker-aware task graph with \
+`task_list` (one task per module; add dependencies where one audit should wait on another). \
+RALPH wrapper: resume from durable `task_list` progress after each context-window reset and keep \
+going until every task is done.";
 
-const ANALYSIS_WORKER_PROMPT: &str = "\
-You are a cordyceps analysis worker. You perform a deep-dive audit on exactly ONE module at a time.
-
-Before each step, call `send_user_message` with one short sentence telling the watching human \
-what you are about to do and why.
-
-Before auditing, call `load_skill` with `skill_id` = \"audit\" and follow the returned procedure \
-and output schema exactly.
-
-When you are unsure about a Rust idiom, best practice, or language behavior: escalate to \
-`research_best_practices` with a focused question. Do not guess.
-
-When you have a candidate finding but are unsure whether it is a real defect or how to rank its \
-severity: escalate to `consult_advisor` with the finding and relevant code. Do not file uncertain \
-findings without consulting the advisor first.
-
-Your final answer must conform to the schema defined by the audit skill.";
-
-const RESEARCH_PROMPT: &str = "\
-You are a research worker. A peer agent needs factual, current information on a Rust best-practice \
-or language question.
-
-Use `web_search` to find the answer. Issue focused queries, read the results, and return a \
-concise cited answer in plain text. Do not answer from memory alone — always search first.";
-
-const ADVISOR_PROMPT: &str = "\
-You are a senior Rust advisor. A worker has escalated a candidate finding to you because they \
-need a judgment call.
-
-Use `read_file` and `grep` to examine the specific code in question. Then make a decision: \
-is this a real defect, what is the severity (low / medium / high / critical), and why. \
-Be decisive. State your verdict in one sentence, your reasoning in two. Do not hedge.";
-
-/// The single-parameter input schema every subagent tool advertises.
-fn instruction_schema() -> serde_json::Value {
+/// `plan-schema` — the task-graph contract the plan phase's ReAct emits.
+fn plan_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "instruction": {
-                "type": "string",
-                "description": "The full instruction / task for the worker agent."
-            }
+            "tasks": {
+                "type": "array",
+                "description": "Ordered task-graph entries; each names a module to audit.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "module": { "type": "string", "description": "Module path to audit." },
+                        "blockers": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "1-based ids of tasks this one waits on."
+                        }
+                    },
+                    "required": ["module"]
+                }
+            },
+            "rationale": { "type": "string" }
         },
-        "required": ["instruction"]
+        "required": ["tasks"]
     })
 }
 
-/// Build the SearXNG-backed `web_search` catalogue tool (identical to 06/11).
-fn build_web_search(endpoint: &str) -> StandardTool {
-    let tool = WebSearchTool::with_config(WebSearchConfig {
-        endpoint: endpoint.to_string(),
-        method: SearchMethod::Get,
-        query_param: "q".into(),
-        auth_headers: Vec::new(),
-        body_auth_params: Vec::new(),
+/// `worker-schema` — the per-module finding contract the worker ReAct emits.
+fn worker_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "description": "Findings for ONE module.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "file": { "type": "string", "description": "Path relative to the repo root." },
+                "line": { "type": "integer", "description": "1-based line of the defect." },
+                "severity": { "enum": ["low", "medium", "high", "critical"] },
+                "description": { "type": "string", "description": "Concrete, actionable defect." }
+            },
+            "required": ["file", "line", "severity", "description"]
+        }
     })
-    .expect("web_search backend config is valid (SearXNG needs no auth env vars)");
-    StandardTool::new(Box::new(tool), WebSearchTool::schema())
 }
 
-/// Build the inner standard compaction adapter (the same one
-/// `HarnessBuilder::conversational` installs), so our skill-injecting context
-/// manager can wrap it and delegate every non-`assemble` method to it.
-fn build_inner_context_manager(model_id: &str, base_url: &str) -> Arc<dyn HarnessContextManager> {
+/// The `plan-tools` catalogue: explore + author the task graph (read-only).
+fn plan_tools() -> Vec<StandardTool> {
+    vec![
+        StandardTools::list_dir(),
+        StandardTools::grep(),
+        StandardTools::task_list(),
+    ]
+}
+
+/// The `exec-tools` catalogue: read-only audit + human observability.
+fn exec_tools() -> Vec<StandardTool> {
+    vec![
+        StandardTools::read_file(),
+        StandardTools::grep(),
+        send_user_message_tool("🤖"),
+    ]
+}
+
+/// Build a model agent (`Arc<dyn Agent>`) over the local Ollama model.
+fn model_agent(id: &str, model_id: &str, base_url: &str) -> Arc<dyn Agent> {
     let model = Arc::new(OllamaModelInterface::with_base_url(
         model_id,
         base_url.to_string(),
     ));
-    Arc::new(StandardContextManager::new(
-        model,
+    Arc::new(ModelAgent::new(AgentId::new(id), model))
+}
+
+/// The Default-FAIL self-verification evaluator registered under
+/// `exec-evaluator`. A single read-only turn (`max_iterations = 1`); the
+/// neither-pattern ⇒ Failed contract is built into [`EvaluatorResponseVerifier`].
+pub fn exec_evaluator() -> Arc<dyn Verifier> {
+    Arc::new(
+        EvaluatorResponseVerifier::new(r"(?i)\bPASS\b", r"(?i)\bFAIL\b", 1)
+            .expect("evaluator regexes are valid"),
+    )
+}
+
+/// Assemble the [`ExecutionRegistry`] the cordyceps tree's handles resolve
+/// against: agents `planner`/`executor`/`ralph-agent`, toolsets
+/// `plan-tools`/`exec-tools`, schemas `plan-schema`/`worker-schema`, and the
+/// `exec-evaluator` verifier. The handle STRINGS are ground truth from the
+/// fixture; this is the host-side wiring of those strings to collaborators.
+pub fn build_registry(model_id: &str, base_url: &str) -> ExecutionRegistry {
+    ExecutionRegistry::builder()
+        .agent("planner", model_agent("planner", model_id, base_url))
+        .agent("executor", model_agent("executor", model_id, base_url))
+        .agent(
+            "ralph-agent",
+            model_agent("ralph-agent", model_id, base_url),
+        )
+        // The toolset HANDLES must resolve for `validate()`. The harness run loop
+        // dispatches every node through the single GLOBAL catalogue wired on the
+        // HarnessBuilder (`.tools(...)`), not per-node — a known harness scoping
+        // limitation — so these registry slots only need to be present, not
+        // distinct dispatchers. The real tools live on the builder (see `main`).
+        .toolset("plan-tools", Arc::new(EmptyToolRegistry))
+        .toolset("exec-tools", Arc::new(EmptyToolRegistry))
+        .schema("plan-schema", plan_schema())
+        .schema("worker-schema", worker_schema())
+        .verifier(EXEC_EVALUATOR_KEY, exec_evaluator())
+        .build()
+}
+
+/// Build the GLOBAL skill-injecting context manager with the `audit` skill
+/// seeded ALWAYS-ACTIVE for `session`. Wraps the standard compaction adapter.
+async fn build_global_context_manager(
+    model_id: &str,
+    base_url: &str,
+    storage: &StorageProvider,
+    repo_root: &std::path::Path,
+    session: &SessionId,
+) -> Arc<dyn HarnessContextManager> {
+    let catalog = SkillCatalog::bootstrap(repo_root, BUNDLED_AUDIT_SKILL).await;
+    // Seed `audit` always-active: the global context_manager injects its body
+    // structurally every turn (no `load_skill` round-trip in the composed tree).
+    storage
+        .run()
+        .put(session, ACTIVE_SKILLS_KEY, serde_json::json!(["audit"]))
+        .await
+        .expect("seed active_skills");
+
+    let inner_model = Arc::new(OllamaModelInterface::with_base_url(
+        model_id,
+        base_url.to_string(),
+    ));
+    let inner: Arc<dyn HarnessContextManager> = Arc::new(StandardContextManager::new(
+        inner_model,
         Arc::new(NullCacheProvider),
         spore_core::CompactionConfig::default(),
     ))
-    .into_harness_adapter()
-}
-
-/// Build the research worker harness (web_search only). Used as the
-/// `kind=research` consult handler.
-fn build_research_harness(model_id: &str, base_url: &str, endpoint: &str) -> Arc<dyn Harness> {
-    let model = OllamaModelInterface::with_base_url(model_id, base_url.to_string());
-    Arc::new(
-        HarnessBuilder::conversational(model)
-            .tool(build_web_search(endpoint))
-            .system_prompt(RESEARCH_PROMPT)
-            .build(),
-    )
-}
-
-/// Build the advisor harness (cloud model, read_file + grep). Used as the
-/// `kind=advice` consult handler. Rides the same Ollama endpoint via
-/// `with_base_url`, only the model id differs.
-fn build_advisor_harness(
-    model_id: &str,
-    base_url: &str,
-    repo_sandbox: Arc<WorkspaceScopedSandbox>,
-) -> Arc<dyn Harness> {
-    let model = OllamaModelInterface::with_base_url(model_id, base_url.to_string());
-    Arc::new(
-        HarnessBuilder::conversational(model)
-            .sandbox(repo_sandbox)
-            .tool(StandardTools::read_file())
-            .tool(StandardTools::grep())
-            .system_prompt(ADVISOR_PROMPT)
-            .build(),
-    )
-}
-
-/// Build the analysis worker harness: read_file, grep, the two consult tools,
-/// and load_skill. Isolated; audits ONE module.
-fn build_analysis_harness(
-    model_id: &str,
-    base_url: &str,
-    repo_sandbox: Arc<WorkspaceScopedSandbox>,
-    storage: Arc<StorageProvider>,
-    catalog: &SkillCatalog,
-) -> Arc<dyn Harness> {
-    let model = OllamaModelInterface::with_base_url(model_id, base_url.to_string());
-    // The worker shares the SAME storage as the orchestrator so `load_skill`'s
-    // active-skill write and the context manager's read rendezvous within the
-    // run. (Subagents run Isolated SESSIONS, but the run_store is keyed by the
-    // worker's own session id, so each worker activates `audit` for itself.)
-    let inner_cm = build_inner_context_manager(model_id, base_url);
-    let skill_cm = Arc::new(SkillInjectingContextManager::new(
-        inner_cm,
+    .into_harness_adapter();
+    Arc::new(SkillInjectingContextManager::new(
+        inner,
         storage.run().clone(),
         catalog.manifest(),
-    ));
-    Arc::new(
-        HarnessBuilder::conversational(model)
-            .sandbox(repo_sandbox)
-            .storage(storage)
-            .context_manager(skill_cm)
-            .tool(StandardTools::read_file())
-            .tool(StandardTools::grep())
-            .tool(research_best_practices_tool())
-            .tool(consult_advisor_tool())
-            .tool(load_skill_tool(catalog.registry()))
-            .tool(send_user_message_tool("🤖"))
-            .system_prompt(ANALYSIS_WORKER_PROMPT)
-            .build(),
-    )
+    ))
 }
 
-/// Wrap the analysis worker as a `SubagentTool` with the consult handlers
-/// installed. The two handlers mediate by `kind` (research → research_worker,
-/// advice → advisor) with the per-kind budgets + overflow policies from #114.
-fn build_analysis_tool(
-    analysis: Arc<dyn Harness>,
-    consult_handlers: HashMap<String, ConsultHandlerEntry>,
-) -> StandardTool {
-    let empty_child_registry = StandardToolRegistry::new();
-    let subagent = SubagentTool::new(
-        "analysis_worker",
-        "Delegate a deep-dive audit of ONE Rust module: pass an `instruction` naming the module; \
-         it loads the `audit` skill, audits the module (escalating via consults when stuck), and \
-         returns a JSON array of {file, line, severity, description} findings.",
-        instruction_schema(),
-        WORKER_TIMEOUT,
-        ContextSharing::Isolated,
-        analysis,
-        &empty_child_registry,
-    )
-    .expect("analysis worker has no subagent tools (depth-1 holds)")
-    .with_consult_handlers(consult_handlers)
-    // Make the worker's internal loop visible: its turns/tool-calls print
-    // nested under the `┌─ … └─` delegation boundary.
-    .with_stream(worker_stream_sink());
-
-    StandardTool::new(
-        Box::new(subagent),
-        RegisteredToolSchema {
-            name: "analysis_worker".into(),
-            description: "Deep-dive audit one module via a subagent; returns JSON findings.".into(),
-            parameters: instruction_schema(),
-            annotations: ToolAnnotations {
-                open_world: true,
-                ..Default::default()
-            },
-        },
-    )
+/// Build the cordyceps [`Task`]: the composed tree deserialized from the fixture,
+/// under a generous global backstop so the per-node `PerLoop{12}` worker bound
+/// fires first.
+pub fn build_task(prompt: String, session: SessionId) -> Task {
+    let tree: LoopStrategy =
+        serde_json::from_str(CORDYCEPS_TREE_JSON).expect("cordyceps_tree.json deserializes");
+    Task::new(prompt, session, tree).with_budget(BudgetLimits {
+        max_turns: Some(64),
+        ..BudgetLimits::default()
+    })
 }
 
 #[tokio::main]
@@ -299,188 +265,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_id = arg_value(&args, "--model")
         .or_else(|| std::env::var("SPORE_OLLAMA_MODEL").ok())
         .unwrap_or_else(|| "gemma4:e4b".to_string());
-    let advisor_model_id = arg_value(&args, "--advisor-model")
-        .or_else(|| std::env::var("SPORE_ADVISOR_MODEL").ok())
-        .unwrap_or_else(|| "minimax-m3:cloud".to_string());
     let base_url = std::env::var("SPORE_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| OllamaModelInterface::DEFAULT_BASE_URL.to_string());
 
-    // Required search backend (research worker) — fail fast like 06/11.
-    let endpoint = match arg_value(&args, "--search-url")
-        .or_else(|| std::env::var("SPORE_WEB_SEARCH_ENDPOINT").ok())
-    {
-        Some(e) if !e.trim().is_empty() => e,
-        _ => {
-            eprintln!(
-                "SPORE_WEB_SEARCH_ENDPOINT is not set.\n\
-                 Set it to a SearXNG JSON endpoint, e.g. \
-                 http://localhost:8888/search?format=json. See .env.example and the README."
-            );
-            std::process::exit(2);
-        }
-    };
-
-    // Resolve the repo root (cwd) for the read-only audit sandbox. The report
-    // write target is `workspace/` UNDER that root: the orchestrator's
-    // `write_file("workspace/findings.md")` resolves relative to the sandbox
-    // root (= repo_root), so anchoring here keeps the agent's write, the
-    // completion Stop hook, and the success check all pointed at one path —
-    // whether you run from the example dir or the monorepo root.
-    let repo_root = std::env::current_dir()?;
-    let repo_root = std::fs::canonicalize(&repo_root)?;
+    let repo_root = std::fs::canonicalize(std::env::current_dir()?)?;
     let workspace_root = repo_root.join("workspace");
     std::fs::create_dir_all(&workspace_root)?;
-    let findings_path = workspace_root.join("findings.md");
 
-    // Seed `.spore/skills/audit/SKILL.md` from the bundled copy if absent, so a
-    // user can see the filesystem-registry shape (documented in the README).
-    seed_bundled_audit_skill(&repo_root);
-
-    // One in-memory storage provider, shared by the orchestrator and the
-    // analysis worker so `load_skill` (worker-side write) and the context
-    // manager (read) rendezvous on `run_store["active_skills"]`.
-    let storage = Arc::new(StorageProvider::single(Arc::new(
-        InMemoryStorageProvider::new(),
-    )));
-
-    // Scan + register skills (bundled audit + any project/user skills).
-    let catalog = SkillCatalog::bootstrap(&repo_root, BUNDLED_AUDIT_SKILL).await;
-
-    // The orchestrator can read the whole repo + write into its own workspace.
-    // A workspace-scoped sandbox rooted at the repo lets read_file/grep/list_dir
-    // reach the crates, write_file land findings.md (relative to cwd workspace),
-    // and bash_command run `gh`. For the audit's read-only guarantee we rely on
-    // the orchestrator prompt + skill discipline, not a read-only sandbox,
-    // because it must also write findings.md and (optionally) run `gh`.
-    let orchestrator_sandbox = Arc::new(WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(
-        repo_root.clone(),
-    ))?);
-    // Workers and the advisor get a READ-ONLY view: same root, but their tool
-    // sets (read_file/grep) never write. A dedicated sandbox keeps them scoped.
-    let worker_sandbox = Arc::new(WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(
-        repo_root.clone(),
-    ))?);
-
-    // ---- Build the consult handlers (research + advice) ---------------------
-    let research_handler = build_research_harness(&model_id, &base_url, &endpoint);
-    let advisor_handler =
-        build_advisor_harness(&advisor_model_id, &base_url, worker_sandbox.clone());
-    let mut consult_handlers: HashMap<String, ConsultHandlerEntry> = HashMap::new();
-    consult_handlers.insert(
-        KIND_RESEARCH.to_string(),
-        ConsultHandlerEntry {
-            handler: research_handler,
-            budget: 5,
-            overflow: ConsultOverflowPolicy::SoftFail,
-        },
-    );
-    consult_handlers.insert(
-        KIND_ADVICE.to_string(),
-        ConsultHandlerEntry {
-            handler: advisor_handler.clone(),
-            budget: 3,
-            overflow: ConsultOverflowPolicy::EscalateToHuman,
-        },
-    );
-
-    // ---- Build the analysis worker + wrap it (with consult handlers) --------
-    let analysis = build_analysis_harness(
-        &model_id,
-        &base_url,
-        worker_sandbox.clone(),
-        storage.clone(),
-        &catalog,
-    );
-    let analysis_tool = build_analysis_tool(analysis, consult_handlers);
-
-    // ---- Build the orchestrator --------------------------------------------
-    let orchestrator_model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
-    let orchestrator = HarnessBuilder::conversational(orchestrator_model)
-        .sandbox(orchestrator_sandbox)
-        .storage(storage.clone())
-        .tool(StandardTools::list_dir())
-        .tool(StandardTools::grep())
-        .tool(StandardTools::task_list())
-        .tool(StandardTools::memory())
-        .tool(StandardTools::write_file())
-        .tool(StandardTools::bash_command())
-        .tool(send_user_message_tool("🍄"))
-        .tool(analysis_tool)
-        .system_prompt(ORCHESTRATOR_PROMPT)
-        .build();
-
-    println!("model        : {model_id}");
-    println!("advisor model: {advisor_model_id}");
-    println!("endpoint     : {endpoint}");
-    println!("repo root    : {}", repo_root.display());
-    println!("workspace    : {}", workspace_root.display());
+    // AC5: the fully-bounded tree's worst-case per-window turn count is computable
+    // BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
+    // = 4 + (12 + 1) = 17. An `Unlimited` anywhere would collapse this to None.
+    let tree_preview: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON)?;
+    println!("model      : {model_id}");
+    println!("repo root  : {}", repo_root.display());
+    println!("strategy   : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)");
     println!(
-        "skills       : {}",
-        catalog
-            .manifest()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "max_steps  : {:?}  (per-window worst case; Unlimited anywhere ⇒ None)",
+        tree_preview.max_steps()
     );
-    println!("strategy     : orchestrator=ReAct, workers=ReAct (isolated)\n");
+    println!();
 
-    // ---- REPL: read a prompt, run, report, re-prompt ------------------------
-    // Each run is one audit. A terminal RunResult — success OR unrecoverable
-    // failure — is reported and we land back on the prompt; the process only
-    // exits on EOF (Ctrl-D). An error never drops the user to their shell.
     while let Some(prompt) = read_audit_prompt() {
-        // Stream banners: mirror 11-multi-agent's `┌─ … └─` boundary style, but
-        // for the analysis_worker delegation. Fresh per run (the sink consumes
-        // the call-name map).
-        let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let task = Task::new(
-            prompt,
-            SessionId::generate(),
-            LoopStrategy::ReAct { max_iterations: 64 },
-        )
-        .with_budget(BudgetLimits {
-            max_turns: Some(64),
-            ..BudgetLimits::default()
-        });
-        let options = HarnessRunOptions::new(task).with_stream(stream_sink(call_names));
+        let session = SessionId::generate();
+        let storage = Arc::new(StorageProvider::single(Arc::new(
+            InMemoryStorageProvider::new(),
+        )));
 
-        // Drive the orchestrator, handling the human-escalation ladder. The
-        // inner loop only re-iterates to resume a human pause; every terminal
-        // outcome breaks back out to the REPL prompt above.
-        let mut result = orchestrator.run(options).await;
+        // Read-only repo sandbox: the audit never writes source files.
+        let mut sandbox_cfg = WorkspaceConfig::scoped(repo_root.clone());
+        sandbox_cfg.read_only = true;
+        let sandbox = Arc::new(WorkspaceScopedSandbox::new(sandbox_cfg)?);
+
+        let registry = build_registry(&model_id, &base_url);
+        let context_manager =
+            build_global_context_manager(&model_id, &base_url, &storage, &repo_root, &session)
+                .await;
+
+        // The harness's own model drives the Ralph wrapper; the per-node agents
+        // come from the registry. Compaction/summarization uses this model too.
+        let model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
+        // The harness dispatches every node through ONE global catalogue: the
+        // union of plan-tools + exec-tools (read_file + grep dedupe by last-wins).
+        let harness = HarnessBuilder::conversational(model)
+            .sandbox(sandbox)
+            .storage(storage.clone())
+            .registry(registry)
+            .escalation_mode(EscalationMode::SurfaceToHuman)
+            .system_prompt(EXEC_SYSTEM_PROMPT)
+            .context_manager(context_manager)
+            .tools(plan_tools())
+            .tools(exec_tools())
+            .build();
+
+        let task = build_task(prompt, session);
+        let mut result = harness.run(HarnessRunOptions::new(task)).await;
         loop {
             match result {
                 RunResult::Success { output, turns, .. } => {
-                    println!(
-                        "\norchestrator done ({turns} turn(s)): {}",
-                        truncate(&output, 400)
-                    );
-                    if findings_path.exists() {
-                        println!("\nfindings.md written: {}", findings_path.display());
-                        run_issue_filing_flow(&orchestrator, &findings_path).await;
-                    } else {
-                        eprintln!(
-                            "\nwarning: orchestrator finished but {} was not written.",
-                            findings_path.display()
-                        );
-                    }
+                    println!("\ndone ({turns} turn(s)): {}", truncate(&output, 400));
                     break;
                 }
                 RunResult::Failure { reason, turns, .. } => {
-                    // Unrecoverable for THIS run (e.g. a Layer-1 SandboxViolation):
-                    // report it and fall back to the prompt — do not exit.
-                    eprintln!("\norchestrator failed after {turns} turn(s): {reason:?}");
+                    eprintln!("\nfailed after {turns} turn(s): {reason:?}");
                     break;
                 }
                 RunResult::WaitingForHuman { state, request } => {
-                    // The advice consult budget (3) was exhausted under
-                    // EscalateToHuman: the analysis_worker SubagentTool converted
-                    // the over-budget consult into a human pause, which bubbled
-                    // up here.
-                    result =
-                        handle_human_escalation(&orchestrator, &advisor_handler, *state, request)
-                            .await;
+                    result = handle_human_escalation(&harness, *state, request).await;
                 }
                 other => {
                     eprintln!("\nrun ended unexpectedly: {other:?}");
@@ -494,223 +344,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build the orchestrator stream sink: boundary banners for the analysis worker,
-/// terse lines for the standard tools (mirrors 11-multi-agent).
-fn stream_sink(
-    call_names: Arc<Mutex<HashMap<String, String>>>,
-) -> Box<dyn Fn(HarnessStreamEvent) + Send + Sync> {
-    Box::new(move |event: HarnessStreamEvent| match event {
-        HarnessStreamEvent::TurnStart { turn } => {
-            println!("orchestrator · turn {turn}");
-        }
-        HarnessStreamEvent::ToolCall {
-            call_id,
-            name,
-            args,
-        } => {
-            call_names.lock().unwrap().insert(call_id, name.clone());
-            if name == "send_user_message" {
-                // The tool prints the 🍄 line itself; skip the raw call banner.
-            } else if name == "analysis_worker" {
-                let instruction = args
-                    .get("instruction")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<no instruction>");
-                println!("┌─ orchestrator → analysis_worker");
-                println!("│  received: {}", truncate(instruction, 200));
-            } else {
-                println!(
-                    "  orchestrator → {name}({})",
-                    truncate(&args.to_string(), 140)
-                );
-            }
-        }
-        HarnessStreamEvent::ToolResult {
-            call_id,
-            is_error,
-            content,
-        } => {
-            let name = call_names
-                .lock()
-                .unwrap()
-                .remove(&call_id)
-                .unwrap_or_else(|| "<tool>".to_string());
-            if name == "send_user_message" {
-                // Already rendered as the 🍄 line; its ack is noise.
-            } else if name == "analysis_worker" {
-                let tag = if is_error { "FAILED" } else { "findings" };
-                println!("└─ analysis_worker → orchestrator");
-                println!("   {tag}: {}", truncate(&content, 300));
-            } else {
-                let tag = if is_error { "err" } else { "ok" };
-                println!(
-                    "  {name} → orchestrator [{tag}]: {}",
-                    truncate(&content, 140)
-                );
-            }
-        }
-        _ => {}
-    })
-}
-
-/// Build the analysis worker's CHILD stream sink: its internal turns and tool
-/// calls, printed nested with a `│  ` prefix so they sit visually inside the
-/// `┌─ … └─` delegation boundary the orchestrator sink draws. Returned as an
-/// `Arc` because `SubagentTool` hands each dispatch a fresh sink. `send_user_message`
-/// echoes are suppressed — the tool prints its own 🤖 line.
-fn worker_stream_sink() -> Arc<dyn Fn(HarnessStreamEvent) + Send + Sync> {
-    let call_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    Arc::new(move |event: HarnessStreamEvent| match event {
-        HarnessStreamEvent::TurnStart { turn } => {
-            println!("│  worker · turn {turn}");
-        }
-        HarnessStreamEvent::ToolCall {
-            call_id,
-            name,
-            args,
-        } => {
-            call_names.lock().unwrap().insert(call_id, name.clone());
-            if name == "send_user_message" {
-                // The tool prints its own 🤖 line; skip the raw call banner.
-            } else {
-                println!("│    worker → {name}({})", truncate(&args.to_string(), 120));
-            }
-        }
-        HarnessStreamEvent::ToolResult {
-            call_id,
-            is_error,
-            content,
-        } => {
-            let name = call_names
-                .lock()
-                .unwrap()
-                .remove(&call_id)
-                .unwrap_or_else(|| "<tool>".to_string());
-            if name == "send_user_message" {
-                // Already rendered as the 🤖 line; its ack is noise.
-            } else {
-                let tag = if is_error { "err" } else { "ok" };
-                println!("│    {name} → worker [{tag}]: {}", truncate(&content, 120));
-            }
-        }
-        _ => {}
-    })
-}
-
-/// Handle an advice-budget-exhausted human escalation with the three-choice
-/// ladder. Returns the next `RunResult` (the orchestrator resumed).
-///
-/// IMPORTANT (honest mechanics): the worker's paused consult lives inside the
-/// orchestrator's `PausedState.child_state`, and the harness does NOT yet wire
-/// a child-consult resume through the parent (`resume_inner` no-ops the
-/// `child_state` branch — that lands with the #5/#115 follow-up). So every
-/// choice here resumes the ORCHESTRATOR with the human's decision injected as
-/// guidance; the specific module's in-flight worker audit is dropped. "+1
-/// advisor turn" re-runs the advisor handler HOST-SIDE and injects its answer as
-/// that guidance — the closest we can get to a budget bump without a core
-/// primitive.
+/// Present a `BudgetExhausted` pause and resume with the operator's choice. The
+/// composed tree surfaces a runaway node here under `SurfaceToHuman`; we offer
+/// its `available_actions` and resume by re-resolving handles (no
+/// reconfiguration).
 async fn handle_human_escalation(
-    orchestrator: &spore_core::StandardHarness,
-    advisor_handler: &Arc<dyn Harness>,
+    harness: &spore_core::StandardHarness,
     state: spore_core::PausedState,
     request: HumanRequest,
 ) -> RunResult {
-    let context = match &request {
-        HumanRequest::Review { content } => content.clone(),
-        HumanRequest::Clarification { question, .. } => question.clone(),
-        HumanRequest::ToolApproval { .. } => "tool approval requested".to_string(),
+    let (phase, actions) = match &request {
+        HumanRequest::BudgetExhausted {
+            phase,
+            available_actions,
+            ..
+        } => (phase.clone(), available_actions.clone()),
+        other => {
+            // The composed tree only escalates via BudgetExhausted; anything else
+            // is unexpected — halt cleanly.
+            eprintln!("\nunexpected human request: {other:?}");
+            return harness.resume(state, HumanResponse::Halt, None).await;
+        }
     };
-    println!("\n╔═ HUMAN ESCALATION (advisor budget exhausted) ═");
-    println!("║ {}", truncate(&context, 400));
-    println!("╚═══════════════════════════════════════════════");
-    println!("Choose: [1] +1 advisor turn  [2] abort subagent & chat  [3] free-form answer");
+
+    println!("\n╔═ BUDGET ESCALATION ({phase}) ═══════════════════");
+    for (i, a) in actions.iter().enumerate() {
+        println!("║ [{}] {}", i + 1, describe_action(a));
+    }
+    println!("╚═════════════════════════════════════════════════");
 
     let choice = prompt_line("> ");
-    match choice.trim() {
-        "1" => {
-            // Re-run the advisor handler once, host-side, on the escalation
-            // context; inject its output as the orchestrator's guidance.
-            println!("(running advisor for one more turn…)");
-            let task = Task::new(
-                context,
-                SessionId::generate(),
-                LoopStrategy::ReAct { max_iterations: 16 },
-            );
-            let advice = match advisor_handler.run(HarnessRunOptions::new(task)).await {
-                RunResult::Success { output, .. } => output,
-                other => format!("advisor did not complete cleanly: {other:?}"),
-            };
-            println!("advisor: {}", truncate(&advice, 300));
-            orchestrator
-                .resume(state, HumanResponse::Answer { text: advice }, None)
-                .await
+    let idx = choice
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let action = actions
+        .get(idx)
+        .cloned()
+        // Default to a small budget bump so an empty line keeps the run going.
+        .unwrap_or(EscalationAction::ContinueWithBudget { steps: 12 });
+
+    println!("(resuming with {})", describe_action(&action));
+    harness
+        .resume(state, HumanResponse::Escalate { action }, None)
+        .await
+}
+
+fn describe_action(a: &EscalationAction) -> String {
+    match a {
+        EscalationAction::ContinueWithBudget { steps } => {
+            format!("continue with +{steps} steps")
         }
-        "2" => {
-            println!("(aborting the stuck subagent; returning to the orchestrator…)");
-            orchestrator.resume(state, HumanResponse::Halt, None).await
-        }
-        _ => {
-            let text = if choice.trim() == "3" {
-                prompt_line("your answer> ")
-            } else {
-                choice
-            };
-            orchestrator
-                .resume(state, HumanResponse::Answer { text }, None)
-                .await
-        }
+        EscalationAction::Skip => "skip this task".to_string(),
+        EscalationAction::Fail => "fail this node".to_string(),
     }
 }
 
-/// After a successful audit, present the top-5 and offer to file them as issues.
-/// The model drives `gh issue create` via `bash_command` (no `gh` skill).
-async fn run_issue_filing_flow(
-    orchestrator: &spore_core::StandardHarness,
-    findings: &std::path::Path,
-) {
-    let report = std::fs::read_to_string(findings).unwrap_or_default();
-    println!("\n── top findings (workspace/findings.md) ──");
-    println!("{}", truncate(&report, 1200));
-    println!("──────────────────────────────────────────");
-
-    let answer = prompt_line("File these as GitHub issues? [y/N] ");
-    if !answer.trim().eq_ignore_ascii_case("y") {
-        println!("Not filing. Done.");
-        return;
-    }
-
-    println!("(asking the orchestrator to file the top 5 via `gh issue create`…)");
-    let task = Task::new(
-        "Using `bash_command`, file the TOP 5 findings from workspace/findings.md as GitHub \
-         issues via `gh issue create` — one issue per finding, with a clear title and a body \
-         containing the file, line, severity, and description. Run `gh` once per finding. Report \
-         the issue URLs when done."
-            .to_string(),
-        SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 24 },
-    );
-    match orchestrator.run(HarnessRunOptions::new(task)).await {
-        RunResult::Success { output, .. } => {
-            println!("\nfiling done: {}", truncate(&output, 400));
-        }
-        other => eprintln!("\nfiling did not complete cleanly: {other:?}"),
-    }
-}
-
-/// Seed `.spore/skills/audit/SKILL.md` from the bundled copy if absent.
-fn seed_bundled_audit_skill(repo_root: &std::path::Path) {
-    let dir = repo_root.join(".spore").join("skills").join("audit");
-    let file = dir.join("SKILL.md");
-    if file.exists() {
-        return;
-    }
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(&file, BUNDLED_AUDIT_SKILL);
-    }
-}
-
-/// Read the audit prompt from the REPL: print the default, accept an empty line
-/// as the default verbatim.
 /// Read one audit prompt from the REPL. `Some(prompt)` to run (empty line ⇒ the
 /// default verbatim); `None` on EOF (Ctrl-D), which quits the REPL.
 fn read_audit_prompt() -> Option<String> {
@@ -720,7 +410,7 @@ fn read_audit_prompt() -> Option<String> {
     let _ = std::io::stdout().flush();
     let mut buf = String::new();
     match std::io::stdin().read_line(&mut buf) {
-        Ok(0) => None, // EOF
+        Ok(0) => None,
         Ok(_) => {
             let line = buf.trim_end_matches(['\n', '\r']).to_string();
             if line.trim().is_empty() {
@@ -733,7 +423,6 @@ fn read_audit_prompt() -> Option<String> {
     }
 }
 
-/// Print a prompt and read one line from stdin (trailing newline stripped).
 fn prompt_line(prompt: &str) -> String {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
@@ -750,7 +439,6 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Keep boundary lines readable.
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max {
@@ -758,5 +446,133 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+// ============================================================================
+// Example-crate tests (NO model): the tree is data, max_steps is computable,
+// and the registry validates the real task.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODEL: &str = "gemma4:e4b";
+    const BASE: &str = "http://localhost:11434";
+
+    /// AC: the tree is DATA. Deserialize the included canonical fixture,
+    /// re-serialize, and assert the value round-trips; then assert the expected
+    /// keys / budgets / behaviors are present.
+    #[test]
+    fn tree_is_byte_identical() {
+        let tree: LoopStrategy =
+            serde_json::from_str(CORDYCEPS_TREE_JSON).expect("fixture deserializes");
+        // Round-trip equality at the JSON-value level (key order independent).
+        let reserialized = serde_json::to_value(&tree).unwrap();
+        let original: serde_json::Value = serde_json::from_str(CORDYCEPS_TREE_JSON).unwrap();
+        assert_eq!(reserialized, original, "tree must round-trip through serde");
+
+        // Structural assertions on the canonical shape.
+        let LoopStrategy::Ralph(ralph) = &tree else {
+            panic!("root must be Ralph");
+        };
+        assert_eq!(ralph.agent.0, "ralph-agent");
+        assert!(matches!(
+            ralph.behavior,
+            spore_core::BudgetExhaustedBehavior::Escalate
+        ));
+        let LoopStrategy::PlanExecute(pe) = ralph.inner.as_ref() else {
+            panic!("Ralph inner must be PlanExecute");
+        };
+        // plan = ReAct{planner, plan-tools, plan-schema, PerLoop{4}}
+        let LoopStrategy::ReAct(plan) = pe.plan.as_ref() else {
+            panic!("plan must be ReAct");
+        };
+        assert_eq!(plan.agent.0, "planner");
+        assert_eq!(plan.toolset.0, "plan-tools");
+        assert_eq!(plan.output.as_ref().unwrap().0, "plan-schema");
+        assert_eq!(plan.budget, spore_core::BudgetPolicy::PerLoop { value: 4 });
+        // execute = SelfVerifying{ ReAct{executor, exec-tools, worker-schema, 12}, exec-evaluator }
+        let LoopStrategy::SelfVerifying(sv) = pe.execute.as_ref() else {
+            panic!("execute must be SelfVerifying");
+        };
+        assert_eq!(sv.evaluator.0, "exec-evaluator");
+        let LoopStrategy::ReAct(worker) = sv.inner.as_ref() else {
+            panic!("worker must be ReAct");
+        };
+        assert_eq!(worker.agent.0, "executor");
+        assert_eq!(worker.toolset.0, "exec-tools");
+        assert_eq!(worker.output.as_ref().unwrap().0, "worker-schema");
+        assert_eq!(
+            worker.budget,
+            spore_core::BudgetPolicy::PerLoop { value: 12 }
+        );
+    }
+
+    /// AC5: the fully-bounded tree's per-window worst case is `Some(17)`; one
+    /// `Unlimited` anywhere collapses it to `None`.
+    #[test]
+    fn max_steps_is_17() {
+        let tree: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON).unwrap();
+        assert_eq!(tree.max_steps(), Some(17));
+
+        // Swap the worker's PerLoop{12} for Unlimited ⇒ None.
+        let LoopStrategy::Ralph(mut ralph) = tree else {
+            unreachable!()
+        };
+        let LoopStrategy::PlanExecute(pe) = ralph.inner.as_mut() else {
+            unreachable!()
+        };
+        let LoopStrategy::SelfVerifying(sv) = pe.execute.as_mut() else {
+            unreachable!()
+        };
+        let LoopStrategy::ReAct(worker) = sv.inner.as_mut() else {
+            unreachable!()
+        };
+        worker.budget = spore_core::BudgetPolicy::Unlimited;
+        let mutated = LoopStrategy::Ralph(ralph);
+        assert_eq!(mutated.max_steps(), None);
+    }
+
+    /// AC: handles resolve from the ExecutionRegistry at run entry. Build the
+    /// real registry + task and assert `validate().is_ok()`.
+    #[test]
+    fn registry_validates() {
+        let registry = build_registry(MODEL, BASE);
+        let task = build_task("audit the repo".to_string(), SessionId::generate());
+        assert!(
+            registry.validate(&task).is_ok(),
+            "every handle in the cordyceps task must resolve"
+        );
+    }
+
+    /// The Default-FAIL evaluator: PASS clears, indeterminate output fails.
+    #[tokio::test]
+    async fn exec_evaluator_is_default_fail() {
+        use spore_core::{AggregateUsage, RunResult, SessionState, VerifierInput, VerifierVerdict};
+        let v = exec_evaluator();
+        assert_eq!(v.max_iterations(), 1);
+
+        let success = |out: &str| RunResult::Success {
+            output: out.into(),
+            session_id: SessionId::new("s"),
+            usage: AggregateUsage::default(),
+            turns: 1,
+            session_state: SessionState::default(),
+        };
+        let input = |eval: &str| VerifierInput {
+            build_result: success("audited"),
+            eval_result: success(eval),
+            workspace: std::path::PathBuf::from("/tmp"),
+            iteration: 0,
+        };
+        assert_eq!(
+            v.verify(&input("verdict: PASS")).await,
+            VerifierVerdict::Passed
+        );
+        assert!(matches!(
+            v.verify(&input("hmm, unclear")).await,
+            VerifierVerdict::Failed { .. }
+        ));
     }
 }

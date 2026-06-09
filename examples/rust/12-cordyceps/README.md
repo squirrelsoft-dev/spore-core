@@ -1,244 +1,145 @@
-# Example 12 — cordyceps: a fully autonomous task-completion agent (capstone)
+# Example 12 — cordyceps (the Composable Execution capstone)
 
-> **You give it a task. It does not stop until the job is done — and when a
-> worker gets stuck or uncertain, it asks for help (a sibling helper, then a
-> human) rather than giving up.**
+The capstone of the Composable Execution refactor (#117–#131). It wires and runs
+the motivating composition end-to-end:
 
-This is the capstone of the suite and the "very basic" seed of the
-[`cordyceps`](https://github.com/squirrelsoft-dev/cordyceps) project: a
-Hermes-style autonomous agent. The concrete task here is a **read-only audit of
-this repo's Rust code**. The orchestrator decomposes the work itself
-(crate → module), drives a per-module deep-dive to a finished `findings.md`,
-presents the top 5, and offers to file them as GitHub issues.
-
-It composes everything the suite has built — subagents-as-tools (11), custom
-sandboxed tools (05), `web_search` (06), `memory` (07), `task_list` — and adds
-two new capabilities: **runtime skill loading** and **a generalized
-consult/escalation ladder** (the consumer of #114).
-
-## Topology (depth-1)
-
-```
-orchestrator  (ReAct, gemma4:e4b)
-  tools: list_dir, grep, task_list, memory, write_file, bash_command,
-         analysis_worker (SubagentTool, + consult handlers)
-  ├── analysis_worker  (ReAct, gemma, Isolated) — deep-dive audits ONE module
-  │     tools: read_file, grep, research_best_practices, consult_advisor, load_skill
-  ├── research_worker  (ReAct, gemma, Isolated) — web_search   [consult handler: kind=research]
-  └── advisor          (ReAct, minimax-m3:cloud, Isolated) — read_file, grep  [consult handler: kind=advice]
+```text
+Ralph[ PlanExecute[ ReAct, SelfVerifying[ ReAct ] ] ]
 ```
 
-| Agent | Model | Tools | Role |
-| --- | --- | --- | --- |
-| **orchestrator** | `gemma4:e4b` | `list_dir`, `grep`, `task_list`, `memory`, `write_file`, `bash_command`, `analysis_worker` | enumerate → dispatch → accumulate → top-5 → file |
-| **analysis_worker** | `gemma4:e4b` | `read_file`, `grep`, `research_best_practices`, `consult_advisor`, `load_skill` | audit ONE module, emit JSON findings |
-| **research_worker** | `gemma4:e4b` | `web_search` | `kind=research` consult handler |
-| **advisor** | `minimax-m3:cloud` | `read_file`, `grep` | `kind=advice` consult handler |
+```text
+Ralph (continuation wrapper)        agent: ralph-agent
+  resets the context window, resumes from durable task_list progress
+  └─ PlanExecute
+       ├─ plan:    ReAct            agent: planner   toolset: plan-tools   out: plan-schema   budget: PerLoop{4}
+       │           explores the repo, builds a blocker-aware task graph via `task_list`
+       └─ execute: SelfVerifying     evaluator: exec-evaluator (Default-FAIL)
+            └─ worker: ReAct         agent: executor  toolset: exec-tools   out: worker-schema  budget: PerLoop{12}
+                       audits ONE module per ready task, dependency-ordered
+```
 
-## Why each decision
+The whole tree shares ONE budget / usage / observability context. A single
+runaway node is bounded by its own `BudgetPolicy` without cascading to unrelated
+tasks. A paused tree resumes by re-resolving handles, with no reconfiguration.
 
-### ReAct, not PlanExecute (the orchestrator)
+## The big idea: the strategy is DATA
 
-The orchestrator runs `LoopStrategy::ReAct`, not `PlanExecute`. The PlanExecute
-plan turn is **tool-free** — it cannot call `list_dir` to discover which crates
-and modules actually exist. This audit must *enumerate the repo dynamically*
-(crates under `rust/crates/`, then `src/*.rs` per crate) before it knows what the
-tasks are. ReAct + the `task_list` tool lets the orchestrator interleave
-discovery and task creation: list a crate, add a task per module, dispatch, and
-repeat. (Example 11 shows the PlanExecute case, where the three steps are known
-up front.)
+You do not write the loop. You describe it as a composed `LoopStrategy` tree —
+here loaded VERBATIM from the canonical fixture
+`fixtures/strategy/cordyceps_tree.json`:
 
-### Per-module scoping (one worker per module)
+```rust
+let tree: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON)?;
+```
 
-Each `analysis_worker` audits exactly **one** module and runs `Isolated`: a fresh
-session with no shared mutable state. The worker may burn a dozen turns grepping
-and reading narrow line ranges, but only its final JSON findings cross back into
-the orchestrator's context. This keeps each worker inside its own context window
-and keeps the orchestrator lean across a long, many-module audit. Findings
-accumulate in the `memory` tool, which survives compaction — so a long run does
-not lose earlier modules' findings.
+The tree carries only serializable string HANDLES (`planner`, `exec-tools`,
+`worker-schema`, `exec-evaluator`, …). At run entry the harness resolves each
+handle against an `ExecutionRegistry` you assemble once at startup:
 
-### Heterogeneous models
+```rust
+let registry = ExecutionRegistry::builder()
+    .agent("planner", model_agent(...))
+    .agent("executor", model_agent(...))
+    .agent("ralph-agent", model_agent(...))
+    .toolset("plan-tools", ...)
+    .toolset("exec-tools", ...)
+    .schema("plan-schema", ...)
+    .schema("worker-schema", ...)
+    .verifier("exec-evaluator", exec_evaluator())   // Default-FAIL
+    .build();
+```
 
-The orchestrator and workers run a small **local** model (`gemma4:e4b`); the
-advisor runs a **near-frontier cloud** model (`minimax-m3:cloud`). Cheap, fast
-local inference does the bulk enumeration and grep-first auditing; the expensive
-model is reserved for the hard calls (*is this a real defect? what severity?*),
-and only when a worker escalates to it. All four ride the **same** Ollama
-endpoint — only the model id differs (`OllamaModelInterface::with_base_url`).
+`registry.validate(&task)` walks the tree and reports the FIRST unresolved
+handle as a STARTUP error — before the first model turn. Trait objects never
+enter the serialized `Task`; only string handles do. That is what makes resume
+trivial: a fresh registry re-resolves every handle with no Task reconfiguration.
 
-### Depth-1 → orchestrator-mediated consult
+## What you can read off the tree before running it (AC5)
 
-Subagents cannot spawn subagents (the type system enforces depth-1). So when the
-`analysis_worker` needs help, it does **not** spawn a helper itself. It pauses
-mid-loop with a `RunResult::Consult`, and the `analysis_worker`'s `SubagentTool`
-— sitting at the orchestrator boundary — **mediates** the consult: it routes by
-`kind` to the right handler (which is the *orchestrator's* direct child, depth-1),
-runs it, and resumes the worker with the answer. The orchestrator's model is
-never involved in a consult; mediation is deterministic.
+The worst-case per-window turn count is computable statically:
 
-## The escalation ladder in practice (consumer of #114)
+```text
+Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
+     = 4 + (12 + 1) = 17           // SelfVerifying adds the single evaluator turn
+```
 
-The analysis worker audits on its general knowledge, but escalates mid-loop via
-two custom tools, each lowering to `ToolOutput::consult(ConsultRequest{ kind, … })`:
+```rust
+tree.max_steps()  // == Some(17)
+```
 
-| Tool | `kind` | Routed to | Budget | Overflow |
-| --- | --- | --- | --- | --- |
-| `research_best_practices` | `research` | research_worker (web_search) | **5** | `SoftFail` |
-| `consult_advisor` | `advice` | advisor (cloud model) | **3** | `EscalateToHuman` |
+`max_steps()` is Option-monadic: an `Unlimited` budget anywhere in the tree
+collapses the whole figure to `None` ("no finite advisory bound"). The example
+prints `Some(17)` before each run.
 
-Both handlers are installed on the `analysis_worker` `SubagentTool` via
-`with_consult_handlers` (not on the builder — mediation fires at the tool).
+## How the phases behave
 
-1. **Best-practices research** (`research`, budget 5). Looking up an idiom is
-   *normal*, not distress, so it never reaches the human. On the 6th consult the
-   `SoftFail` policy resumes the worker with `ConsultResponse::BudgetExhausted`
-   and it finishes on general knowledge.
-2. **Advisor** (`advice`, budget 3). For *is-this-real / how-bad-is-this*
-   questions. On the 4th consult, `EscalateToHuman` converts the over-budget
-   consult into `RunResult::WaitingForHuman`, which bubbles up to the REPL with
-   three choices:
-   - **[1] +1 advisor turn** — re-run the advisor once and feed its answer back
-     as guidance;
-   - **[2] abort subagent & chat** — halt the stuck worker, return to the
-     orchestrator;
-   - **[3] free-form** — you answer the worker's question yourself (you play
-     advisor for one turn).
+- **Plan → ready-set (AC2).** The plan phase explores the repo and authors a
+  blocker-aware task graph via the `task_list` tool. The execute phase walks
+  that graph as a READY-SET: it repeatedly picks the lowest-id task whose
+  blockers are all complete, audits it, and advances — dependency-ordered, with
+  independent branches isolated.
+- **Default-FAIL self-verification (AC3).** Each task's worker result is checked
+  by the `exec-evaluator` (`EvaluatorResponseVerifier`, `max_iterations = 1`): a
+  single read-only evaluator turn. Only an explicit `PASS` clears a task;
+  indeterminate output ⇒ `Failed`. Default-FAIL is not configurable.
+- **Bounded runaway, no cascade (AC4).** A node that exhausts its own
+  `BudgetPolicy` resolves to a task FAILURE that blocks only its transitive
+  dependents. Unrelated tasks keep scheduling; at drain the run reports
+  `TasksBlockedByFailure { failed_task, completed, blocked }` with the partition.
+- **Pause → resume re-resolving handles (AC6).** Under
+  `EscalationMode::SurfaceToHuman`, a budget-exhausted node pauses with a
+  `HumanRequest::BudgetExhausted` carrying its `available_actions`
+  (`continue_with_budget` / `skip` / `fail`). The operator picks one; the harness
+  resumes by RE-RESOLVING every handle from the registry — no reconfiguration.
 
-### Honest note on the human-escalation mechanics
+## What changed vs. the pre-#131 example (honest note)
 
-The worker's paused consult lives inside the orchestrator's
-`PausedState.child_state`, and the harness does **not yet wire a child-consult
-resume through the parent** — `resume_inner` currently no-ops the `child_state`
-branch (it lands with the #5/#115 follow-up). So in this example every human
-choice resumes the **orchestrator** with your decision injected as guidance, and
-the specific module's in-flight worker audit is dropped. **"+1 advisor turn"**
-re-runs the advisor handler **host-side** and injects its answer as that guidance
-— the closest we can get to a "budget bump" without a core primitive (there is no
-harness budget-bump). This is a faithful demonstration of the *ladder shape*;
-the lossless child-resume is a tracked follow-up, not something this example
-hacks into core.
+The old depth-1 example was a hand-built `SubagentTool` orchestrator. Two of its
+features were SubagentTool / per-node seams that the declarative tree does not
+expose, so they were DROPPED:
 
-## Skills: loaded at runtime, architect-side
+- the **#114 consult ladder** (`research_best_practices` → `consult_advisor` →
+  human). The composed tree has no per-node `ToolOutput::Consult` mediator, so
+  there is nowhere to hang a per-kind consult handler.
+- the **#115 `load_skill`** worker-side tool. There is no per-node tool seam in
+  the declarative tree.
 
-The `analysis_worker` doesn't hard-code the audit procedure — it **loads** an
-`audit` skill at runtime. This is the suite's first end-to-end skill-loading
-example, and it is wired **architect-side, with zero core-harness change**.
+The `audit` **skill is KEPT** — but it now rides the single GLOBAL
+`context_manager` (`SkillInjectingContextManager`), seeded ALWAYS-ACTIVE at
+startup. Its procedure reaches the model structurally every turn,
+compaction-proof, with no `load_skill` round-trip.
 
-### Why architect-side (the teaching note)
-
-The skill-loading chain the issue originally envisioned —
-`GuideRegistry → pending_skill_injections` (the rich `StandardContextManager`'s
-Block-3 segment) — **isn't live-wired in the harness loop yet**. The live loop
-assembles each turn via `StandardCompactionAdapter::assemble`, a pass-through of
-`session.messages`; the rich `assemble` that would inject `pending_skill_injections`
-(plus chunks and merged memory) is bypassed pending the deferred #7 ContextManager
-migration (cf. Known Deviation #8). So today a skill can reach the model only as a
-tool-result message or via a **custom context manager**.
-
-This example takes the custom-context-manager route and documents it honestly,
-because it is exactly the pattern **#115** will absorb into the library
-(`HarnessBuilder::guide_registry(..)` + a standard `load_skill` tool + sticky
-injection). The companion productionization — a scope-aware
-`FileSystemGuideRegistry`/`CompositeGuideRegistry` over `.spore/skills/` (the
-direct sibling of #88's `FileSystemChunkProvider`) — is also tracked in #115;
-this example inlines the filesystem scan.
-
-### How it works here (three pieces, in `src/skills.rs` + `src/tools/`)
-
-1. **`SkillCatalog`** scans `.spore/skills/{name}/SKILL.md` (project, relative to
-   cwd) then `~/.spore/skills/{name}/SKILL.md` (user), parses YAML frontmatter
-   `{name, description}` + markdown body, and registers each as a
-   `Guide::skill(name, body)` in a `StandardGuideRegistry`. It also keeps a
-   **manifest side-list** of `(name, description)` — `Guide` has no `description`
-   field, so the example owns the manifest text. The bundled `skills/audit/SKILL.md`
-   is embedded (`include_str!`) and always registered, so the example is
-   self-contained even with an empty `.spore/skills/`; on first run it also
-   **seeds** `.spore/skills/audit/SKILL.md` from that bundled copy so you can see
-   the filesystem-registry shape.
-2. **`load_skill` tool** (closes over the registry): confirms the named skill
-   exists, then appends its id to `run_store["active_skills"]` (deduped). No new
-   `ToolOutput` variant — this is the storage-backed flavor (#115 "flavor B").
-3. **`SkillInjectingContextManager`** wraps the standard compaction adapter and,
-   in `assemble` only, prepends — **ephemerally**, never into `session.messages` —
-   (a) a **manifest** of every skill (`name: description`, progressive
-   disclosure), and (b) the **full body** of every id in `run_store["active_skills"]`.
-   Every other trait method delegates verbatim to the inner adapter.
-
-The net effect: the manifest is present **every turn** (the model can choose to
-load a skill by description); a loaded skill's body is **re-injected every turn**
-until the session is cleared. Because the active set lives in `run_store` (not the
-message history), it is **compaction-proof** — a long audit cannot "forget" the
-loaded procedure. A unit test in `src/skills.rs`
-(`manifest_always_injected_bodies_only_when_active`) asserts exactly this:
-manifest always present, body present only after `load_skill`.
-
-## The `audit` skill
-
-`skills/audit/SKILL.md` is a **terse procedure** with grep-first / read-narrow
-discipline (grep the module for risk patterns → `read_file` only the narrow line
-ranges → consult when unsure) plus a **hard output schema**: the worker's final
-answer must be a JSON array of `{ file, line, severity, description }`. That hard
-schema is what lets the orchestrator reliably parse per-module findings into a
-top-5. The discipline keeps each module audit inside the worker's context window.
-
-## REPL flow
-
-1. Opens with the **pre-filled audit prompt** (from the issue). Press **enter**
-   to accept it verbatim, or type your own.
-2. The orchestrator runs the audit, streaming agent boundaries
-   (`┌─ orchestrator → analysis_worker … └─`, mirroring example 11).
-3. On success it writes `workspace/findings.md`, prints the **top 5**, and asks
-   **y/N** to file them as GitHub issues. On `y`, it drives `gh issue create` per
-   finding via `bash_command` (no `gh` skill — the model drives it from general
-   knowledge).
-
-The audit is **READ-ONLY**: the only writes are `workspace/findings.md` and the
-(approved) issues.
-
-## Configuration
-
-| Flag / env | Default | Purpose |
-| --- | --- | --- |
-| `--model` / `SPORE_OLLAMA_MODEL` | `gemma4:e4b` | orchestrator + workers |
-| `--advisor-model` / `SPORE_ADVISOR_MODEL` | `minimax-m3:cloud` | the advisor (cloud) |
-| `--search-url` / `SPORE_WEB_SEARCH_ENDPOINT` | `http://localhost:8888/search?format=json` | research worker's `web_search` |
-| `SPORE_OLLAMA_BASE_URL` | `http://localhost:11434` | shared Ollama endpoint |
-
-**Run gemma4:e4b or better.** Small models (e.g. llama3.2 3B) *narrate* tool use
-instead of emitting tool calls, which would masquerade as a different failure
-than the consult ladder is meant to handle.
-
-## Prerequisites
-
-- Ollama running, with `gemma4:e4b` pulled and an Ollama **cloud** account for
-  the default advisor model (or override `--advisor-model` to a local model).
-- A local **SearXNG** with the JSON format enabled at the default search URL.
-- `gh` CLI authenticated (only for the opt-in issue-filing step).
+One more honest limitation: the harness dispatches every node's tool calls
+through ONE global catalogue wired on the `HarnessBuilder` (the union of
+`plan-tools` + `exec-tools`), not per-node — so the registry toolset HANDLES
+must resolve for `validate()`, but tool scoping is not yet per-node. The audit
+is kept read-only by a read-only sandbox + the absence of any write tool.
 
 ## Run it
 
 ```sh
 ollama serve &
 ollama pull gemma4:e4b
-export SPORE_WEB_SEARCH_ENDPOINT="http://localhost:8888/search?format=json"
-cargo run
-# press enter at the prompt to accept the default audit
+cargo run        # press enter to accept the default audit prompt; Ctrl-D to quit
 ```
 
-## Where cordyceps goes next (out of scope here)
+Configuration (see `.env.example`): `SPORE_OLLAMA_MODEL` (default `gemma4:e4b`),
+`SPORE_OLLAMA_BASE_URL` (default `http://localhost:11434`).
 
-- **First-class skill loading in the harness** — #115 absorbs the architect-side
-  pattern above (manifest + `load_skill` + sticky injection) into `HarnessBuilder`,
-  plus a scope-aware `FileSystemGuideRegistry`/`CompositeGuideRegistry` (sibling
-  of #88) and retiring the dead Block-3 path (reconciling with #7).
-- **Lossless child-consult resume** through the parent (the human-escalation
-  mechanics note above) — the #5/#115 follow-up.
-- **Observability / Phoenix** (#92) — spans emit, but no Phoenix wiring here.
-- **Cross-run persistent memory** (#89) — this example does within-run memory only.
-- **`web_search` multi-provider hardening** (#108/#110) — one SearXNG backend is
-  enough here.
-- **Conversational human escalation** (park the worker while the orchestrator
-  chats) — the human path here is single-instruction.
-- **Skill creation** — this example only *consumes* a skill; writing a new one is
-  a real cordyceps-project feature.
+## Tests
+
+- **Example crate** (no model): `tree_is_byte_identical` (the tree round-trips
+  through serde and has the canonical keys/budgets/behaviors),
+  `max_steps_is_17` (and `Unlimited ⇒ None`), `registry_validates`,
+  `exec_evaluator_is_default_fail`, plus the kept skill-injection unit tests.
+- **Core crate** (deterministic recorded-model replay, in
+  `rust/crates/spore-core/tests/cordyceps_composition_fixture_replay.rs`):
+  `plan_builds_dag_execute_walks_readyset` (AC2),
+  `self_verified_default_fail` (AC3), `cordyceps_runaway_bounded` (AC4),
+  `cordyceps_max_steps_is_17_unlimited_is_none` (AC5), and
+  `resume_reresolves_handles` (AC6).
+
+```sh
+cd examples/rust/12-cordyceps && cargo test
+cd rust && cargo test -p spore-core --test cordyceps_composition_fixture_replay
+```
