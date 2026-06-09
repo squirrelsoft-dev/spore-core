@@ -659,6 +659,111 @@ export function strategyRefToJson(ref: StrategyRef): Record<string, unknown> {
   }
 }
 
+/**
+ * The largest value an advisory `maxSteps` figure may take before it is treated
+ * as "unrepresentable" (a `u32` upper bound, mirroring Rust's `u32::MAX` and the
+ * `checked_*` arithmetic). Any intermediate or final bound exceeding this
+ * collapses to `undefined` — an unrepresentable figure is "no finite advisory
+ * bound", exactly like an `Unlimited` node.
+ */
+const MAX_STEPS_LIMIT = 0xffffffff;
+
+/**
+ * Saturating `a + b` guarded against the `u32` ceiling: `undefined` if either
+ * operand is `undefined` or the sum exceeds {@link MAX_STEPS_LIMIT}. Mirrors
+ * Rust's `checked_add`.
+ */
+function checkedAddSteps(a: number, b: number): number | undefined {
+  const sum = a + b;
+  return sum > MAX_STEPS_LIMIT ? undefined : sum;
+}
+
+/**
+ * Saturating `a * b` guarded against the `u32` ceiling: `undefined` if either
+ * operand is `undefined` or the product exceeds {@link MAX_STEPS_LIMIT}. Mirrors
+ * Rust's `checked_mul`.
+ */
+function checkedMulSteps(a: number, b: number): number | undefined {
+  const product = a * b;
+  return product > MAX_STEPS_LIMIT ? undefined : product;
+}
+
+/**
+ * Advisory worst-case **turn** bound for a fully-bounded strategy tree (#122).
+ *
+ * This is a pre-run advisory figure logged at startup — it is NOT the
+ * enforcement mechanism (the per-node budget ceiling is). It is a runtime-only
+ * computation and is **never serialized**.
+ *
+ * The bound is derived multiplicatively/additively down the tree and is
+ * Option-monadic: any `unlimited` node anywhere collapses the whole figure to
+ * `undefined` ("no finite advisory bound"). An unrepresentable bound (a value
+ * exceeding the `u32` range via overflow) likewise yields `undefined`.
+ *
+ * Per-variant rules:
+ *   - `react` ⇒ `budgetPolicyAllowanceValue(budget)` (`unlimited ⇒ undefined`).
+ *   - `self_verifying` ⇒ `inner + 1` — the single read-only evaluator turn is
+ *     exactly one extra turn.
+ *   - `plan_execute` ⇒ `plan + execute`. **PER-TASK bound**: a full run's total
+ *     is `plan + executePerTask × taskCount`, where `taskCount` is data-dependent
+ *     (the plan phase builds the task graph at runtime), so it is intentionally
+ *     NOT part of this static figure.
+ *   - `ralph` ⇒ `inner` — **PER-WINDOW bound**, mirroring PlanExecute's per-task
+ *     treatment. A full run's total is `perWindow × maxWindows`, where
+ *     `maxWindows` derives from {@link HarnessConfig} `max_resets` (default 3) at
+ *     runtime and is intentionally NOT part of this static figure.
+ *   - `hill_climbing` ⇒ `inner × (max_stagnation + 1)` — the `+1` is the one
+ *     productive pass; `max_stagnation` non-improving passes follow. The
+ *     `max_stagnation === Number.MAX_SAFE_INTEGER` sentinel (the TS encoding of
+ *     Rust's `u32::MAX`) means unbounded windows ⇒ `undefined` (a semantic
+ *     unbounded rule, distinct from arithmetic overflow).
+ *
+ * Mirrors Rust `LoopStrategy::max_steps`.
+ */
+export function loopStrategyMaxSteps(strategy: LoopStrategy): number | undefined {
+  switch (strategy.kind) {
+    case "react":
+      return budgetPolicyAllowanceValue(strategy.budget);
+    case "self_verifying": {
+      const inner = loopStrategyMaxSteps(strategy.inner);
+      return inner === undefined ? undefined : checkedAddSteps(inner, 1);
+    }
+    case "plan_execute": {
+      const plan = loopStrategyMaxSteps(strategy.plan);
+      if (plan === undefined) return undefined;
+      const execute = loopStrategyMaxSteps(strategy.execute);
+      if (execute === undefined) return undefined;
+      return checkedAddSteps(plan, execute);
+    }
+    case "ralph":
+      return loopStrategyMaxSteps(strategy.inner);
+    case "hill_climbing": {
+      // The `Number.MAX_SAFE_INTEGER` sentinel ⇒ unbounded windows ⇒ undefined.
+      if (strategy.max_stagnation === Number.MAX_SAFE_INTEGER) return undefined;
+      const inner = loopStrategyMaxSteps(strategy.inner);
+      if (inner === undefined) return undefined;
+      const windows = checkedAddSteps(strategy.max_stagnation, 1);
+      if (windows === undefined) return undefined;
+      return checkedMulSteps(inner, windows);
+    }
+  }
+}
+
+/**
+ * Advisory worst-case turn bound for a {@link StrategyRef} (#122). `custom` is
+ * opaque to the framework (it cannot be introspected), so it yields `undefined`;
+ * `built_in` delegates to {@link loopStrategyMaxSteps}. Mirrors Rust
+ * `StrategyRef::max_steps`.
+ */
+export function strategyRefMaxSteps(ref: StrategyRef): number | undefined {
+  switch (ref.kind) {
+    case "custom":
+      return undefined;
+    case "built_in":
+      return loopStrategyMaxSteps(ref.value);
+  }
+}
+
 // ── Composable Execution runtime scaffold (#123) ────────────────────────────
 //
 // StrategyOutcome + ExecutionContext / BudgetContext / BudgetStack / SpanStack.

@@ -24,13 +24,16 @@ import {
   SessionId,
   asRunStrategy,
   loopStrategyFromJson,
+  loopStrategyMaxSteps,
   loopStrategyToJson,
   newExecutionContext,
   newTask,
   runStrategy,
   strategyRefFromJson,
+  strategyRefMaxSteps,
   strategyRefToJson,
   type BudgetExhaustedBehavior,
+  type BudgetPolicy,
   type LoopStrategy,
   type StrategyRef,
 } from "../src/index.js";
@@ -399,5 +402,129 @@ describe("fixtures/strategy replay — byte identity", () => {
       custom: strategyRefToJson(custom),
     });
     expect(suiteJson).toBe(minifyPreservingOrder(raw));
+  });
+});
+
+describe("maxSteps — advisory worst-case turn bound (#122)", () => {
+  function react(budget: BudgetPolicy): LoopStrategy {
+    return { kind: "react", budget, agent: "", toolset: "" };
+  }
+
+  function selfVerifying(inner: LoopStrategy): LoopStrategy {
+    return { kind: "self_verifying", inner, evaluator: "ev" };
+  }
+
+  function planExecute(plan: LoopStrategy, execute: LoopStrategy): LoopStrategy {
+    return { kind: "plan_execute", plan, execute };
+  }
+
+  function ralph(inner: LoopStrategy): LoopStrategy {
+    return { kind: "ralph", inner, agent: "r" };
+  }
+
+  function hillClimbing(inner: LoopStrategy, maxStagnation: number): LoopStrategy {
+    return {
+      kind: "hill_climbing",
+      inner,
+      direction: "maximize",
+      max_stagnation: maxStagnation,
+      revert_on_no_improvement: true,
+      min_improvement_delta: 0,
+      evaluator: "metric",
+    };
+  }
+
+  it("react leaf returns its budget allowance (undefined when unlimited)", () => {
+    expect(loopStrategyMaxSteps(react({ kind: "per_loop", value: 4 }))).toBe(4);
+    expect(loopStrategyMaxSteps(react({ kind: "total_steps", value: 7 }))).toBe(7);
+    expect(loopStrategyMaxSteps(react({ kind: "per_attempt", value: 5 }))).toBe(5);
+    expect(loopStrategyMaxSteps(react({ kind: "unlimited" }))).toBeUndefined();
+  });
+
+  it("self_verifying adds exactly one evaluator turn", () => {
+    expect(loopStrategyMaxSteps(selfVerifying(react({ kind: "per_loop", value: 12 })))).toBe(13);
+  });
+
+  it("plan_execute is the per-task sum of plan + execute", () => {
+    const s = planExecute(
+      react({ kind: "per_loop", value: 4 }),
+      react({ kind: "per_loop", value: 6 }),
+    );
+    expect(loopStrategyMaxSteps(s)).toBe(10);
+  });
+
+  it("hill_climbing is inner × (max_stagnation + 1)", () => {
+    // inner=5, max_stagnation=2 ⇒ 5 × (2 + 1) = 15.
+    expect(loopStrategyMaxSteps(hillClimbing(react({ kind: "per_loop", value: 5 }), 2))).toBe(15);
+    // The Number.MAX_SAFE_INTEGER sentinel ⇒ unbounded windows ⇒ undefined.
+    expect(
+      loopStrategyMaxSteps(
+        hillClimbing(react({ kind: "per_loop", value: 5 }), Number.MAX_SAFE_INTEGER),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("ralph is the per-window bound (just its inner)", () => {
+    expect(loopStrategyMaxSteps(ralph(react({ kind: "per_loop", value: 9 })))).toBe(9);
+    // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+    const s = ralph(
+      planExecute(
+        react({ kind: "per_loop", value: 4 }),
+        selfVerifying(react({ kind: "per_loop", value: 12 })),
+      ),
+    );
+    expect(loopStrategyMaxSteps(s)).toBe(17);
+  });
+
+  it("canonical cordyceps subtree PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]] = 17", () => {
+    const subtree = planExecute(
+      react({ kind: "per_loop", value: 4 }),
+      selfVerifying(react({ kind: "per_loop", value: 12 })),
+    );
+    expect(loopStrategyMaxSteps(subtree)).toBe(17);
+  });
+
+  it("the cordyceps fixture's per-window bound is 17", () => {
+    expect(loopStrategyMaxSteps(cordycepsTree())).toBe(17);
+    const parsed = loopStrategyFromJson(JSON.parse(fixture("cordyceps_tree.json")));
+    expect(loopStrategyMaxSteps(parsed)).toBe(17);
+  });
+
+  it("any unlimited node anywhere collapses the whole figure to undefined", () => {
+    // Plan leaf unlimited ⇒ undefined.
+    expect(
+      loopStrategyMaxSteps(
+        planExecute(
+          react({ kind: "unlimited" }),
+          selfVerifying(react({ kind: "per_loop", value: 12 })),
+        ),
+      ),
+    ).toBeUndefined();
+    // Execute's inner ReAct unlimited ⇒ undefined.
+    expect(
+      loopStrategyMaxSteps(
+        planExecute(
+          react({ kind: "per_loop", value: 4 }),
+          selfVerifying(react({ kind: "unlimited" })),
+        ),
+      ),
+    ).toBeUndefined();
+    // HillClimbing-wrapped unlimited inner ⇒ undefined (propagates to root).
+    expect(
+      loopStrategyMaxSteps(ralph(hillClimbing(react({ kind: "unlimited" }), 2))),
+    ).toBeUndefined();
+  });
+
+  it("StrategyRef: custom is undefined, built_in delegates", () => {
+    expect(strategyRefMaxSteps({ kind: "custom", value: "x" })).toBeUndefined();
+    expect(
+      strategyRefMaxSteps({ kind: "built_in", value: react({ kind: "per_loop", value: 4 }) }),
+    ).toBe(4);
+  });
+
+  it("an overflowing bound (exceeds u32 range) yields undefined", () => {
+    // inner ≈ u32::MAX/2, max_stagnation=3 ⇒ (u32::MAX/2) × 4 overflows ⇒ undefined.
+    const s = hillClimbing(react({ kind: "per_loop", value: Math.floor(0xffffffff / 2) }), 3);
+    expect(loopStrategyMaxSteps(s)).toBeUndefined();
   });
 });
