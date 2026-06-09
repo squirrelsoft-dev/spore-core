@@ -542,6 +542,134 @@ func (r *StrategyRef) UnmarshalJSON(data []byte) error {
 }
 
 // ============================================================================
+// MaxSteps — advisory worst-case turn bound (#122)
+// ============================================================================
+
+// MaxSteps returns an advisory worst-case TURN count for a fully-bounded
+// strategy tree, computed BEFORE a run. It is a pre-run advisory figure logged
+// at startup, NOT an enforcement mechanism — the per-node budget ceiling is the
+// safety mechanism. The returned bool is false ("no finite advisory bound")
+// when the tree is not fully bounded; this mirrors BudgetPolicy.AllowanceValue's
+// (value, ok) optional idiom.
+//
+// The bound is derived multiplicatively/additively down the tree and is
+// option-monadic: any Unlimited node anywhere collapses the whole figure to
+// (0, false). It is a runtime-only computation and is NEVER serialized.
+//
+// Per-variant rules:
+//   - ReAct(c)         ⇒ c.Budget.AllowanceValue() (Unlimited ⇒ (0, false)).
+//   - SelfVerifying(c) ⇒ inner + 1 — the single read-only evaluator turn is
+//     exactly one extra turn.
+//   - PlanExecute(c)   ⇒ plan + execute. PER-TASK bound: a full run's total is
+//     plan + executePerTask × taskCount, where taskCount is data-dependent (the
+//     plan phase builds the task graph at runtime), so it is intentionally NOT
+//     part of this static figure.
+//   - Ralph(c)         ⇒ inner — PER-WINDOW bound, mirroring PlanExecute's
+//     per-task treatment. A full run's total is perWindow × maxWindows, where
+//     maxWindows derives from HarnessConfig max resets (default 3) at runtime
+//     and is intentionally NOT part of this static figure.
+//   - HillClimbing(c)  ⇒ inner × (MaxStagnation + 1) — the +1 is the one
+//     productive pass; MaxStagnation non-improving passes follow. The
+//     MaxStagnation == math.MaxUint32 sentinel means unbounded windows ⇒
+//     (0, false) (a semantic unbounded rule, distinct from arithmetic overflow).
+//
+// Arithmetic guards add/mul against uint32 overflow; an unrepresentable bound
+// (overflow) yields (0, false) — an unrepresentable figure is "no finite
+// advisory bound".
+func (s LoopStrategy) MaxSteps() (uint32, bool) {
+	switch s.Kind {
+	case StrategyReAct:
+		if s.ReActCfg == nil {
+			return 0, false
+		}
+		return s.ReActCfg.Budget.AllowanceValue()
+	case StrategySelfVerifying:
+		if s.SelfVerify == nil || s.SelfVerify.Inner == nil {
+			return 0, false
+		}
+		inner, ok := s.SelfVerify.Inner.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		return checkedAddU32(inner, 1)
+	case StrategyPlanExecute:
+		if s.PlanExecute == nil || s.PlanExecute.Plan == nil || s.PlanExecute.Execute == nil {
+			return 0, false
+		}
+		plan, ok := s.PlanExecute.Plan.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		exec, ok := s.PlanExecute.Execute.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		return checkedAddU32(plan, exec)
+	case StrategyRalph:
+		if s.Ralph == nil || s.Ralph.Inner == nil {
+			return 0, false
+		}
+		return s.Ralph.Inner.MaxSteps()
+	case StrategyHillClimbing:
+		if s.HillClimbing == nil || s.HillClimbing.Inner == nil {
+			return 0, false
+		}
+		if s.HillClimbing.MaxStagnation == ^uint32(0) {
+			// Unbounded-windows sentinel ⇒ no finite advisory bound.
+			return 0, false
+		}
+		inner, ok := s.HillClimbing.Inner.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		windows, ok := checkedAddU32(s.HillClimbing.MaxStagnation, 1)
+		if !ok {
+			return 0, false
+		}
+		return checkedMulU32(inner, windows)
+	default:
+		return 0, false
+	}
+}
+
+// MaxSteps is the advisory worst-case turn bound for this strategy reference
+// (#122). Custom is opaque to the framework (it cannot be introspected), so it
+// yields (0, false); BuiltIn delegates to LoopStrategy.MaxSteps.
+func (r StrategyRef) MaxSteps() (uint32, bool) {
+	switch r.Kind {
+	case StrategyRefBuiltIn:
+		if r.BuiltIn == nil {
+			return 0, false
+		}
+		return r.BuiltIn.MaxSteps()
+	default:
+		// Custom (and any unknown kind): opaque ⇒ no finite advisory bound.
+		return 0, false
+	}
+}
+
+// checkedAddU32 returns a+b and true, or (0, false) on uint32 overflow.
+func checkedAddU32(a, b uint32) (uint32, bool) {
+	sum := a + b
+	if sum < a {
+		return 0, false
+	}
+	return sum, true
+}
+
+// checkedMulU32 returns a*b and true, or (0, false) on uint32 overflow.
+func checkedMulU32(a, b uint32) (uint32, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	prod := a * b
+	if prod/b != a {
+		return 0, false
+	}
+	return prod, true
+}
+
+// ============================================================================
 // RunStrategy — the runtime composition seam
 // ============================================================================
 
