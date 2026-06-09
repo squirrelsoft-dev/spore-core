@@ -531,6 +531,114 @@ StrategyRef = Annotated[
 ]
 
 
+# ── max_steps: advisory worst-case turn bound (#122) ─────────────────────────
+#
+# Python ``LoopStrategy`` / ``StrategyRef`` are discriminated-union aliases, not
+# classes, so Rust's ``impl ... { fn max_steps }`` maps to module-level
+# dispatchers — the same idiom as :func:`run_strategy` / :func:`budget_allowance_value`.
+
+# The unbounded-windows sentinel for ``HillClimbingConfig.max_stagnation``: a
+# value of ``2**31 - 1`` (Python's i32-compatible stand-in for Rust's
+# ``u32::MAX``) means "no stagnation cap" and collapses the bound to ``None``.
+# This is a SEMANTIC unbounded rule, distinct from arithmetic overflow below.
+_MAX_STAGNATION_UNBOUNDED = 2**31 - 1
+
+# The u32 representable ceiling (``4294967295``). Python ints are unbounded, so
+# to stay cross-language-identical with Rust's ``checked_add`` / ``checked_mul``
+# (which yield ``None`` on overflow) we guard explicitly: any add/multiply whose
+# result exceeds this ceiling yields ``None`` ("no finite advisory bound").
+_U32_MAX = 2**32 - 1
+
+
+def _checked_add(a: int, b: int) -> int | None:
+    """``a + b``, or ``None`` if the sum exceeds the u32 ceiling. Mirrors Rust's
+    ``u32::checked_add``."""
+    total = a + b
+    return total if total <= _U32_MAX else None
+
+
+def _checked_mul(a: int, b: int) -> int | None:
+    """``a * b``, or ``None`` if the product exceeds the u32 ceiling. Mirrors
+    Rust's ``u32::checked_mul``."""
+    product = a * b
+    return product if product <= _U32_MAX else None
+
+
+def loop_strategy_max_steps(strategy: LoopStrategy) -> int | None:
+    """Advisory worst-case **turn** count for a fully-bounded strategy tree,
+    computed before a run (#122).
+
+    This is a pre-run advisory figure, **not** an enforcement mechanism — the
+    per-node budget ceiling is the safety mechanism. The bound is derived
+    additively/multiplicatively down the tree and is Option-monadic: any
+    ``Unlimited`` node anywhere collapses the whole figure to ``None`` ("no
+    finite advisory bound"). It is a runtime-only computation, **never
+    serialized**.
+
+    Per-variant rules:
+
+    - ``ReactConfig`` ⇒ :func:`budget_allowance_value` of its ``budget``
+      (``Unlimited`` ⇒ ``None``; ``PerLoop`` / ``TotalSteps`` / ``PerAttempt``
+      ⇒ their ``value``).
+    - ``SelfVerifyingConfig`` ⇒ ``inner + 1`` — the single read-only evaluator
+      turn is exactly one extra turn.
+    - ``PlanExecuteConfig`` ⇒ ``plan + execute``. **PER-TASK bound**: a full
+      run's total is ``plan + execute_per_task × task_count``, where
+      ``task_count`` is data-dependent (the plan phase builds the task graph at
+      runtime), so it is intentionally NOT part of this static figure.
+    - ``RalphConfig`` ⇒ ``inner`` — **PER-WINDOW bound**, mirroring
+      PlanExecute's per-task treatment. A full run's total is
+      ``per_window × max_windows``, where ``max_windows`` derives from
+      ``HarnessConfig.max_resets`` (default 3) at runtime and is intentionally
+      NOT part of this static figure.
+    - ``HillClimbingConfig`` ⇒ ``inner × (max_stagnation + 1)`` — the ``+1`` is
+      the one productive pass; ``max_stagnation`` non-improving passes follow.
+      The ``max_stagnation == 2**31 - 1`` sentinel means unbounded windows ⇒
+      ``None`` (a semantic unbounded rule, distinct from arithmetic overflow).
+
+    Arithmetic is u32-checked; an unrepresentable bound (overflow past
+    ``4294967295``) yields ``None``. Mirrors Rust's ``LoopStrategy::max_steps``.
+    """
+    match strategy:
+        case ReactConfig():
+            return budget_allowance_value(strategy.budget)
+        case SelfVerifyingConfig():
+            inner = loop_strategy_max_steps(strategy.inner)
+            return None if inner is None else _checked_add(inner, 1)
+        case PlanExecuteConfig():
+            plan = loop_strategy_max_steps(strategy.plan)
+            execute = loop_strategy_max_steps(strategy.execute)
+            if plan is None or execute is None:
+                return None
+            return _checked_add(plan, execute)
+        case RalphConfig():
+            return loop_strategy_max_steps(strategy.inner)
+        case HillClimbingConfig():
+            if strategy.max_stagnation == _MAX_STAGNATION_UNBOUNDED:
+                return None
+            inner = loop_strategy_max_steps(strategy.inner)
+            if inner is None:
+                return None
+            passes = _checked_add(strategy.max_stagnation, 1)
+            if passes is None:
+                return None
+            return _checked_mul(inner, passes)
+
+
+def strategy_ref_max_steps(ref: StrategyRef) -> int | None:
+    """Advisory worst-case turn bound for a :data:`StrategyRef` (#122).
+
+    ``Custom`` is opaque to the framework (it cannot be introspected), so it
+    yields ``None``; ``BuiltIn`` delegates to :func:`loop_strategy_max_steps`.
+    Mirrors Rust's ``StrategyRef::max_steps``.
+    """
+    match ref:
+        case StrategyRefCustom():
+            return None
+        case StrategyRefBuiltIn():
+            return loop_strategy_max_steps(ref.value)
+
+
 # ============================================================================
 # Composable Execution runtime scaffold (issue #123): StrategyOutcome +
 # ExecutionContext / BudgetContext / BudgetStack / SpanStack.
@@ -8724,6 +8832,8 @@ __all__ = [
     "StrategyRefBuiltIn",
     "StrategyRefCustom",
     "ToolsetRef",
+    "loop_strategy_max_steps",
+    "strategy_ref_max_steps",
     "run_strategy",
     "HarnessMiddlewareChain",
     "MiddlewareContinue",
