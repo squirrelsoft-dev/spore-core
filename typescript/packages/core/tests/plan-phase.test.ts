@@ -29,6 +29,8 @@ import {
   SessionId,
   StandardHarness,
   capturePlanArtifact,
+  capturePlanArtifactWithRepair,
+  extractEmbeddedJsonObject,
   emptySessionState,
   newTask,
   type Agent,
@@ -227,6 +229,78 @@ describe("capturePlanArtifact — Q3 grammar", () => {
     const a = capturePlanArtifact(text);
     const b = capturePlanArtifact(text);
     expect(a).toEqual(b);
+  });
+});
+
+// --------------------------------------------------------------------------
+// prose-repair fallback (Item 1)
+// --------------------------------------------------------------------------
+
+describe("capturePlanArtifactWithRepair — prose-repair fallback", () => {
+  // A clean object that the STRICT grammar already accepts is returned
+  // unchanged by the repair wrapper (repair never runs on a success).
+  it("passes a strict success through unchanged", () => {
+    const r = capturePlanArtifactWithRepair('{"tasks":["a","b"],"rationale":"r"}');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.artifact.tasks).toEqual(["a", "b"]);
+      expect(r.artifact.rationale).toBe("r");
+    }
+  });
+
+  // The live failure mode: the planner wraps its plan JSON in prose. The strict
+  // grammar rejects it; the repair extracts the embedded object.
+  it("extracts plan JSON wrapped in prose", () => {
+    const text =
+      'Sure! Here is the plan:\n{"tasks":["step 1","step 2"],"rationale":"because"}\nLet me know if that works.';
+    // Strict path fails…
+    expect(capturePlanArtifact(text).ok).toBe(false);
+    // …repair rescues it.
+    const r = capturePlanArtifactWithRepair(text);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.artifact.tasks).toEqual(["step 1", "step 2"]);
+      expect(r.artifact.rationale).toBe("because");
+    }
+  });
+
+  // Braces inside string values must NOT confuse the balanced-object scan.
+  it("respects braces inside string values", () => {
+    const text = 'prefix {"tasks":["use the { brace } char","b"]} suffix';
+    const r = capturePlanArtifactWithRepair(text);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.artifact.tasks).toEqual(["use the { brace } char", "b"]);
+    }
+  });
+
+  // The embedded object is captured to its FIRST balanced close (nested objects
+  // are spanned correctly).
+  it("spans nested objects to the first balanced close", () => {
+    const text = 'x {"tasks":["a"],"meta":{"k":"v"}} y';
+    expect(extractEmbeddedJsonObject(text)).toBe('{"tasks":["a"],"meta":{"k":"v"}}');
+  });
+
+  // Repair that still cannot parse a clean plan surfaces the ORIGINAL strict
+  // error, not a repair-specific one.
+  it("returns the original strict error when the embedded object is not a valid plan", () => {
+    // Embedded object exists but is not a valid plan (tasks not an array).
+    const text = 'here: {"tasks":"nope"} end';
+    const r = capturePlanArtifactWithRepair(text);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.kind).toBe("unparseable_plan");
+  });
+
+  // No embedded object at all ⇒ still unparseable_plan, never throws.
+  it("returns unparseable_plan when there is no embedded object", () => {
+    const r = capturePlanArtifactWithRepair("no json here at all");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.kind).toBe("unparseable_plan");
+  });
+
+  // An unbalanced `{` (no matching close) extracts nothing.
+  it("extracts nothing for an unbalanced `{`", () => {
+    expect(extractEmbeddedJsonObject('{"tasks":["a"')).toBeUndefined();
   });
 });
 

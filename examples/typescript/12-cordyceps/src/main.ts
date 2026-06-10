@@ -351,11 +351,15 @@ export function buildRegistry(
       .agent("planner", modelAgent("planner", modelId, baseUrl))
       .agent("executor", modelAgent("executor", modelId, baseUrl))
       .agent("ralph-agent", modelAgent("ralph-agent", modelId, baseUrl))
-      // The toolset HANDLES must resolve for `validate()`. The harness run loop
-      // dispatches every node through the single GLOBAL catalogue wired on the
-      // HarnessBuilder (`.tools(...)`), not per-node — a known harness scoping
-      // limitation — so these registry slots only need to be present, not distinct
-      // dispatchers. The real tools live on the builder (see `main`).
+      // The toolset HANDLES must resolve for `validate()`. Per-node scoping is now
+      // RESOLVED (Issue 2): each node dispatches its OWN toolset catalogue, wired
+      // per-key on the HarnessBuilder (`.toolsetTools("plan-tools", ...)` /
+      // `.toolsetTools("exec-tools", ...)`, see `main`). These registry slots are
+      // validation-only presence entries — never dispatched — so an
+      // `EmptyToolRegistry` placeholder suffices. (`buildConfig` also auto-fills
+      // these same presence entries from `.toolsetTools`; keeping the explicit
+      // entries here makes the standalone registry `validate()` contract
+      // self-consistent without the builder.)
       .toolset("plan-tools", new EmptyToolRegistry())
       .toolset("exec-tools", new EmptyToolRegistry())
       .schema("plan-schema", planSchema())
@@ -511,8 +515,11 @@ async function main(): Promise<void> {
     // from the registry. Compaction/summarization uses this model too.
     const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
     const escalationMode: EscalationMode = { kind: "surface_to_human" };
-    // The harness dispatches every node through ONE global catalogue: the union
-    // of plan-tools + exec-tools (read_file + grep dedupe by last-wins).
+    // Issue 2 (per-node toolset scoping): each node dispatches ONLY its own
+    // toolset. The planner leaf (handle `plan-tools`) sees list_dir/grep/task_list;
+    // the executor leaf (handle `exec-tools`) sees read_file/grep/research/consult/
+    // send_message. The union no longer leaks across nodes — the planner can no
+    // longer call exec-only tools, nor the executor plan-only tools.
     const harness = HarnessBuilder.conversational(model)
       .sandbox(sandbox)
       .storage(storageProvider)
@@ -520,8 +527,8 @@ async function main(): Promise<void> {
       .escalationMode(escalationMode)
       .systemPrompt(EXEC_SYSTEM_PROMPT)
       .contextManager(contextManager)
-      .tools(planTools())
-      .tools(execTools())
+      .toolsetTools("plan-tools", planTools())
+      .toolsetTools("exec-tools", execTools())
       .build();
 
     const task = buildTask(prompt, session);

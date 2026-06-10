@@ -59,9 +59,13 @@
  *
  * ## The strategy split: PlanExecute at the top, ReAct inside
  *
- * The orchestrator runs `{ kind: "plan_execute" }`: it decomposes the job
- * ("research, then write, then save") into subtasks up front and executes them
- * in order — natural for a coordinator. Each worker, by contrast, runs ReAct
+ * The orchestrator runs a composed `PlanExecute(plan: ReAct, execute: ReAct)`
+ * (post-#119): it decomposes the job ("research, then write, then save") into
+ * subtasks up front and executes them in order — natural for a coordinator. The
+ * plan leaf carries a `plan-schema` output contract — `PlanExecute`'s `plan` slot
+ * is STRUCTURED, so a bare `ReAct` there MUST declare an output schema (the
+ * `ExecutionRegistry` validates it at run entry); the only handle registered
+ * explicitly is `plan-schema`. Each worker, by contrast, runs ReAct
  * internally. (The ReAct loop is hardcoded inside `SubagentTool`; a subagent
  * always runs its child as `re_act`.) So the two layers use two different loop
  * strategies, each fit to its level: deliberate planning at the orchestrator,
@@ -98,9 +102,10 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  ExecutionRegistry,
   HarnessBuilder,
   OLLAMA_DEFAULT_BASE_URL,
   OllamaModelInterface,
@@ -108,9 +113,11 @@ import {
   WorkspaceScopedSandbox,
   hooks,
   newTask,
+  reactPerLoop,
   toolRegistry,
   type Harness,
   type HarnessStreamEvent,
+  type LoopStrategy,
 } from "@spore/core";
 import {
   StandardTools,
@@ -187,6 +194,55 @@ class OrchestratorPlanReporter implements hooks.Hook {
   name(): string {
     return "orchestrator-plan-reporter";
   }
+}
+
+/**
+ * The orchestrator plan-phase output contract (`plan-schema`). Post-#119,
+ * `PlanExecute`'s `plan` slot is STRUCTURED: a bare `ReAct` there must declare an
+ * `output` schema so the slot yields a typed task graph
+ * ({@link ExecutionRegistry.validate} enforces this via its structured-slot
+ * check). This is the strict JSON the orchestrator's planner turn returns.
+ */
+function planSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      tasks: {
+        type: "array",
+        description: "Ordered subtasks the orchestrator will delegate in turn.",
+        items: { type: "string" },
+      },
+      rationale: { type: "string" },
+    },
+    required: ["tasks"],
+  };
+}
+
+/**
+ * The {@link ExecutionRegistry} the composed strategy's handles resolve against.
+ * Only `plan-schema` is EXPLICIT; the builder default-fills the empty agent /
+ * toolset handles (`reactPerLoop`) from the orchestrator's own model and tool
+ * catalogue at `build`.
+ */
+export function buildRegistry(): ExecutionRegistry {
+  return ExecutionRegistry.builder().schema("plan-schema", planSchema()).build();
+}
+
+/**
+ * The post-#119 composed strategy: `PlanExecute(plan: ReAct{plan-schema},
+ * execute: ReAct)`. The plan leaf carries the `plan-schema` output contract
+ * required for the structured `plan` slot; both leaves use empty agent/toolset
+ * handles that the builder default-fills and stay effectively unbounded
+ * (`reactPerLoop(Number.MAX_SAFE_INTEGER)`, the TS analogue of Rust's `u32::MAX`)
+ * so the global `max_turns` backstop governs. Old flat shape was
+ * `{ kind: "plan_execute" }`.
+ */
+export function planExecuteStrategy(): LoopStrategy {
+  return {
+    kind: "plan_execute",
+    plan: { ...reactPerLoop(Number.MAX_SAFE_INTEGER), output: "plan-schema" },
+    execute: reactPerLoop(Number.MAX_SAFE_INTEGER),
+  };
 }
 
 /** The single-parameter input schema every worker tool advertises: the
@@ -351,6 +407,11 @@ async function main(): Promise<void> {
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
   const orchestrator = HarnessBuilder.conversational(orchestratorModel)
     .sandbox(sandbox)
+    // The composed strategy's handles resolve against this registry at run entry
+    // (`validate()`). Only `plan-schema` is explicit; the empty agent/toolset
+    // handles of the bare `reactPerLoop` leaves are default-filled from this
+    // orchestrator's own model + tool catalogue at `build`.
+    .registry(buildRegistry())
     .tool(researchTool)
     .tool(writingTool)
     .tool(StandardTools.writeFile())
@@ -358,13 +419,17 @@ async function main(): Promise<void> {
     .hooks(chain) // ← the orchestrator's plan becomes visible through this chain
     .build();
 
-  // The orchestrator plans the three steps up front via plan_execute, then
-  // executes them. The turn budget is divided across subtasks, so give it
-  // generous headroom — each worker dispatch may itself be slow.
+  // The orchestrator plans the three steps up front via the composed
+  // `PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)` tree, then executes
+  // them. The plan leaf carries the `plan-schema` output contract — `PlanExecute`'s
+  // `plan` slot is STRUCTURED, so a bare `ReAct` there MUST declare an output
+  // schema (`registry.validate()` enforces this). The turn budget is divided
+  // across subtasks, so give it generous headroom — each worker dispatch may
+  // itself be slow.
   const task = newTask(
     prompt,
     SessionId.generate(),
-    { kind: "plan_execute" },
+    planExecuteStrategy(),
     { max_turns: 32 },
   );
 
@@ -481,7 +546,18 @@ function truncate(s: string, max: number): string {
   return chars.length <= max ? flat : `${chars.slice(0, max).join("")}…`;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/** Run `main` only when this module is the program entrypoint — NOT when it is
+ *  imported (e.g. by the composition test, which reuses `buildRegistry` /
+ *  `planExecuteStrategy`). */
+function isEntrypoint(): boolean {
+  const arg1 = process.argv[1];
+  if (arg1 === undefined) return false;
+  return import.meta.url === pathToFileURL(arg1).href;
+}
+
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

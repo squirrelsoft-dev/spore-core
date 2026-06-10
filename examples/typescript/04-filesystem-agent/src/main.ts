@@ -47,6 +47,7 @@ import {
   SessionId,
   WorkspaceScopedSandbox,
   newTask,
+  reactPerLoop,
   type HarnessStreamEvent,
 } from "@spore/core";
 import { StandardTools } from "@spore/tools";
@@ -85,10 +86,7 @@ async function main(): Promise<void> {
     .systemPrompt(SYSTEM_PROMPT)
     .build();
 
-  const task = newTask(prompt, SessionId.generate(), {
-    kind: "re_act",
-    max_iterations: 8,
-  });
+  const task = newTask(prompt, SessionId.generate(), reactPerLoop(8));
 
   console.log(`model  : ${modelId}`);
   console.log(`dir    : ${workspaceRoot}`);

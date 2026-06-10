@@ -1099,6 +1099,10 @@ export interface StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     agent: Agent,
+    // Issue 2 (per-node toolset scoping): the leaf's RESOLVED `toolset` handle,
+    // threaded alongside `agent`. Empty ⇒ global-catalogue fallback; a non-empty
+    // handle with its own catalogue ⇒ strict per-node scoping.
+    toolset: ToolsetRef,
   ): Promise<RunResult>;
 
   /**
@@ -1952,6 +1956,10 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     onStream,
     cx.signal,
     agent,
+    // Issue 2: thread THIS leaf's toolset handle down so the window dispatches
+    // the per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
+    // Mirrors `agent`.
+    c.toolset,
   );
   await executor.finalize(result);
 
@@ -2031,22 +2039,23 @@ function workerAgentKeyOf(ls: LoopStrategy): string {
 }
 
 /**
- * Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
- * per-window agent override). Returns a structurally-cloned tree with the leaf
- * reached by descending the worker child chain swapped.
+ * Fill the worker leaf's agent handle of `ls` with `agent` ONLY where the leaf
+ * left it empty — Ralph's bare-leaf convenience. An explicitly-declared leaf
+ * agent is authoritative and is never replaced (the architect's node wins).
+ * Returns a structurally-cloned tree with the worker child chain descended.
  */
-function overrideWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
+function fillEmptyWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
   switch (ls.kind) {
     case "react":
-      return { ...ls, agent };
+      return ls.agent === "" ? { ...ls, agent } : ls;
     case "plan_execute":
-      return { ...ls, execute: overrideWorkerAgent(ls.execute, agent) };
+      return { ...ls, execute: fillEmptyWorkerAgent(ls.execute, agent) };
     case "self_verifying":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
     case "ralph":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
     case "hill_climbing":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
   }
 }
 
@@ -2122,21 +2131,20 @@ async function runPlanExecuteConfig(
   //
   // Seed the planning directive onto a CLONE of the base session so the shared
   // execute context stays `[user: task.instruction]` (#93 — a leaked directive
-  // would make every execute step re-emit a plan). Cap the plan child at ONE
-  // turn (R1) but never beyond the task's global turn ceiling (so an already-
-  // exhausted budget fails the plan turn before it runs — R10).
+  // would make every execute step re-emit a plan). The plan phase runs under the
+  // plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`); the
+  // global `max_turns` is only the outer backstop. Previously this clamped the
+  // planner to `turns + 1` — a SINGLE turn — silently overriding the architect's
+  // plan budget and starving multi-step task-graph authoring (the planner could
+  // not both call `task_list` and finish, so it emitted prose instead).
   const directive = executor.planDirective(task.instruction);
   const planSession = structuredClone(baseSession);
   await executor.seedUserMessage(planSession, directive);
-  const planCap =
-    task.budget.max_turns != null
-      ? Math.min(task.budget.max_turns, budgetUsed.turns + 1)
-      : budgetUsed.turns + 1;
   const planTask: Task = {
     id: task.id,
     instruction: directive,
     session_id: sessionId,
-    budget: { ...task.budget, max_turns: planCap },
+    budget: { ...task.budget },
     loop_strategy: c.plan,
   };
   const planResult = await executor.runPlanSubtree(
@@ -2874,10 +2882,11 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
   cx.scratch.runSession = emptySessionState();
   const maxResets = Math.max(executor.ralphMaxResets(), 1);
 
-  // Q3: when `c.agent` is set, override the inner leaf's agent for every window
-  // by rewriting the inner tree's worker leaf handle.
+  // Ralph fills — never replaces. When `c.agent` is set it supplies a worker
+  // agent ONLY where the inner leaf left its handle empty; an explicitly-declared
+  // leaf agent (the architect's node) is authoritative and is never shadowed.
   const innerForWindow: LoopStrategy =
-    c.agent === "" ? c.inner : overrideWorkerAgent(c.inner, c.agent);
+    c.agent === "" ? c.inner : fillEmptyWorkerAgent(c.inner, c.agent);
 
   const totalUsage: AggregateUsage = emptyAggregateUsage();
   let cumulativeTurns = 0;

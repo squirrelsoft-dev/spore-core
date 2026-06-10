@@ -372,6 +372,22 @@ export class ExecutionRegistryBuilder {
     return this;
   }
 
+  /**
+   * Issue 2 (per-node toolset scoping): register `toolset` under `key` ONLY if
+   * that key is not already wired. {@link HarnessBuilder.buildConfig} calls this
+   * for each per-key catalogue wired via {@link HarnessBuilder.toolsetTools}, so
+   * a leaf carrying that non-empty toolset handle RESOLVES against the registry
+   * ({@link ExecutionRegistry.validate} runs `checkToolset` at run entry)
+   * WITHOUT the caller manually registering a placeholder. An
+   * explicitly-registered toolset under the same key wins. The registry VALUE is
+   * never dispatched (dispatch goes through {@link HarnessConfig.toolsetCatalogues}),
+   * so a no-op {@link "../tool-registry/empty.js".EmptyToolRegistry} is sufficient.
+   */
+  fillToolset(key: string, toolset: ToolRegistry): this {
+    if (!this.toolsets.has(key)) this.toolsets.set(key, toolset);
+    return this;
+  }
+
   /** #124: as {@link fillDefaultAgent}, for a default SelfVerifying verifier
    *  (the builder's `verifier`) under the empty key. */
   fillDefaultVerifier(verifier: Verifier): this {

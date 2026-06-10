@@ -60,6 +60,7 @@ import {
   OllamaModelInterface,
   SessionId,
   newTask,
+  reactPerLoop,
   type HarnessStreamEvent,
 } from "@spore/core";
 
@@ -96,10 +97,7 @@ async function main(): Promise<void> {
     .systemPrompt(SYSTEM_PROMPT)
     .build();
 
-  const task = newTask(prompt, SessionId.generate(), {
-    kind: "re_act",
-    max_iterations: 12,
-  });
+  const task = newTask(prompt, SessionId.generate(), reactPerLoop(12));
 
   console.log(`model  : ${modelId}`);
   console.log(`tools  : remember, recall`);

@@ -96,7 +96,11 @@ import {
   type HookChain,
   type HookContext,
 } from "../hooks/index.js";
-import { PLAN_EXECUTE_EXTRAS_KEY, capturePlanArtifact, type PlanArtifact } from "../plan/index.js";
+import {
+  PLAN_EXECUTE_EXTRAS_KEY,
+  capturePlanArtifactWithRepair,
+  type PlanArtifact,
+} from "../plan/index.js";
 import {
   TASK_LIST_EXTRAS_KEY,
   TaskListSchema,
@@ -139,6 +143,7 @@ import {
   InvalidConfiguration,
   UnresolvedHandle,
   type AgentRef,
+  type ToolsetRef,
   autonomous,
   type BudgetExhausted,
   type BudgetExhaustedBehavior,
@@ -265,6 +270,20 @@ export interface HarnessConfig {
    * unchanged.
    */
   catalogueRegistry?: StandardToolRegistry;
+  /**
+   * Per-toolset catalogues (Issue 2: per-node toolset scoping), keyed by the
+   * non-empty {@link ToolsetRef} handle a leaf carries. Populated by
+   * {@link HarnessBuilder.toolsetTools} — each value is a populated
+   * {@link StandardToolRegistry} folded from that key's catalogue tools. At
+   * dispatch the run loop bridges the matching catalogue per-run via
+   * {@link RealToolRegistry} (same sandbox/session/storage wiring as the global
+   * {@link catalogueRegistry}), so a node with a non-empty `toolset` handle
+   * dispatches ONLY its own tools — strict scoping. A leaf with an EMPTY handle
+   * (`""`) — or a non-empty handle with no entry here — falls back to the global
+   * catalogue / {@link toolRegistry} seam (back-compat with examples 01–11 that
+   * use `.tools()`). Absent / empty (the default) preserves today's behaviour.
+   */
+  toolsetCatalogues?: Map<string, StandardToolRegistry>;
   /**
    * Operating system prompt prepended to each turn's assembled context when the
    * context manager renders none (issue #91). See {@link HarnessBuilder.systemPrompt}.
@@ -407,11 +426,33 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * + sandbox + storage (run store + memory store) thread into every tool
    * dispatch. Otherwise it returns the injected {@link HarnessConfig.toolRegistry}
    * seam unchanged.
+   *
+   * Issue 2 (per-node toolset scoping): `toolset` is the resolving leaf's
+   * {@link ToolsetRef} handle. When it is NON-EMPTY and a per-key catalogue was
+   * registered via {@link HarnessBuilder.toolsetTools}, THAT catalogue is bridged
+   * (so the node dispatches ONLY its own tools — strict scoping). Otherwise
+   * (empty handle, or non-empty handle with no per-key catalogue) the existing
+   * global-catalogue / {@link toolRegistry} seam fallback applies, so examples
+   * 01–11 that use `.tools()` keep working byte-for-byte.
    */
-  private effectiveToolRegistry(sessionId: SessionId): ToolRegistry {
+  private effectiveToolRegistry(sessionId: SessionId, toolset: ToolsetRef): ToolRegistry {
+    const store = this.storage();
+    // Strict per-node scoping: a non-empty handle with its own catalogue.
+    if (toolset.length > 0) {
+      const scoped = this.config.toolsetCatalogues?.get(toolset);
+      if (scoped != null) {
+        return new RealToolRegistry(
+          scoped,
+          this.config.sandbox,
+          sessionId,
+          store.run(),
+          store.memory(),
+        );
+      }
+    }
+    // Fallback: empty handle (back-compat) or unregistered non-empty handle.
     const catalogue = this.config.catalogueRegistry;
     if (catalogue == null) return this.config.toolRegistry;
-    const store = this.storage();
     return new RealToolRegistry(
       catalogue,
       this.config.sandbox,
@@ -894,6 +935,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     agent: Agent,
+    toolset: ToolsetRef,
   ): Promise<RunResult> {
     // The leaf seeds the task instruction (parity with the old top-level ReAct
     // entry, which called runReact(.., seedInstruction: true)). The resolved
@@ -907,6 +949,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       signal,
       true,
       agent,
+      toolset,
     );
   }
 
@@ -1536,7 +1579,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // Resolve the effective tool registry for this resumed session — bridges
     // catalogue tools the same way the turn loop does (issue #91), so pending
     // tool calls dispatched during resume thread the run's storage + sandbox.
-    const toolRegistry = this.effectiveToolRegistry(state.session_id);
+    // Issue 2: resume paths carry no per-node toolset handle in PausedState yet,
+    // so they keep the global-catalogue fallback (empty handle) — byte-for-byte
+    // with pre-Issue-2 behaviour.
+    const toolRegistry = this.effectiveToolRegistry(state.session_id, "");
 
     // Subagent depth: if there's a child, the caller-installed SubagentTool
     // owns the dispatch back into the child harness; without #4/#5 wired up
@@ -1734,7 +1780,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
       this.config.observability.emitContext(span);
     }
 
-    const toolRegistry = this.effectiveToolRegistry(state.session_id);
+    // Issue 2: resume paths carry no per-node toolset handle in PausedState yet,
+    // so they keep the global-catalogue fallback (empty handle) — byte-for-byte
+    // with pre-Issue-2 behaviour.
+    const toolRegistry = this.effectiveToolRegistry(state.session_id, "");
 
     // Inject the consult answer as the RESULT of the head pending (consult) call,
     // then dispatch the remaining pending calls in the same batch.
@@ -1932,8 +1981,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     turns: number,
     signal: AbortSignal | undefined,
   ): Promise<PlanPhaseOutcome> {
-    // R3: capture the artifact from the response text.
-    const captured = capturePlanArtifact(planOutput);
+    // R3: capture the artifact from the response text. Uses the prose-repair
+    // fallback: a planner that wraps its plan JSON in prose still captures (the
+    // strict canonical grammar runs first; repair only rescues a failure).
+    const captured = capturePlanArtifactWithRepair(planOutput);
     if (!captured.ok) {
       return {
         ok: false,
@@ -2293,6 +2344,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     seedInstruction: boolean,
     agent: Agent,
   ): Promise<RunResult> {
+    // Issue 2: the legacy `runReact` wrappers (PlanExecute/DAG execute steps,
+    // single-shot run, resume) carry no per-node toolset handle, so they keep
+    // the global-catalogue fallback (empty handle) — byte-for-byte with
+    // pre-Issue-2 behaviour.
     const result = await this.runReactInner(
       task,
       maxIterations,
@@ -2302,6 +2357,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       signal,
       seedInstruction,
       agent,
+      "",
     );
     switch (result.kind) {
       case "success":
@@ -2338,11 +2394,17 @@ export class StandardHarness implements Harness, StrategyExecutor {
     signal: AbortSignal | undefined,
     seedInstruction: boolean,
     agent: Agent,
+    // Issue 2: the leaf's RESOLVED `toolset` handle (mirrors `agent`). Empty
+    // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
+    // per-key catalogue ⇒ strict per-node scoping.
+    toolset: ToolsetRef,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     // Resolve the effective tool registry once per turn-loop window (issue #91).
     // Bridges catalogue tools per-run via RealToolRegistry, else the slim seam.
-    const toolRegistry = this.effectiveToolRegistry(sessionId);
+    // Issue 2: the per-node toolset catalogue is bridged when the handle is
+    // non-empty and registered; otherwise the global catalogue.
+    const toolRegistry = this.effectiveToolRegistry(sessionId, toolset);
     // Reset the adaptive prompt-based-tool-calling escalation flag at the start
     // of this turn-loop window so detection is scoped to the window and does not
     // leak across run() calls (the flag is shared with the model wrapper for the
@@ -3339,6 +3401,13 @@ export class HarnessBuilder {
   private _metricEvaluator?: MetricEvaluator;
   private _vcsProvider?: VcsProvider;
   private readonly _standardTools: StandardTool[] = [];
+  /**
+   * Issue 2 (per-node toolset scoping): catalogue tools accumulated per toolset
+   * handle via {@link toolsetTools}, additive across calls. At {@link buildConfig}
+   * each key's tools fold into a populated {@link StandardToolRegistry} stored in
+   * {@link HarnessConfig.toolsetCatalogues}.
+   */
+  private readonly _toolsetTools = new Map<string, StandardTool[]>();
   private _systemPrompt?: string;
   private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
@@ -3568,6 +3637,34 @@ export class HarnessBuilder {
   }
 
   /**
+   * Add catalogue {@link StandardTool}s scoped to a specific toolset `key`
+   * (Issue 2: per-node toolset scoping). Mirrors {@link tools}, but instead of
+   * folding into the ONE global catalogue, these tools are folded into a per-`key`
+   * {@link StandardToolRegistry} (last-wins upsert across calls and within the
+   * batch) and stored in {@link HarnessConfig.toolsetCatalogues}.
+   *
+   * At dispatch, a leaf whose `toolset` handle equals `key` resolves ONLY this
+   * catalogue (bridged per-run via {@link RealToolRegistry} with the run's
+   * sandbox/session/storage), so it cannot reach another node's tools — the union
+   * no longer leaks across nodes. A leaf with an EMPTY (`""`) handle, or a
+   * non-empty handle with no entry here, falls back to the global {@link tools}
+   * catalogue / `toolRegistry` seam (back-compat).
+   *
+   * `key` should be a NON-EMPTY handle string; the empty handle is reserved for
+   * the global-catalogue fallback. Calls are ADDITIVE: multiple `.toolsetTools`
+   * for the same key accumulate into that key's bucket.
+   */
+  toolsetTools(key: string, tools: Iterable<StandardTool>): this {
+    let bucket = this._toolsetTools.get(key);
+    if (bucket === undefined) {
+      bucket = [];
+      this._toolsetTools.set(key, bucket);
+    }
+    for (const t of tools) bucket.push(t);
+    return this;
+  }
+
+  /**
    * Set an operating system prompt prepended to each turn's assembled context
    * (issue #91).
    *
@@ -3764,13 +3861,28 @@ export class HarnessBuilder {
       }
       catalogueRegistry = registry;
     }
+    // Issue 2: fold each per-toolset bucket into its own populated
+    // StandardToolRegistry (last-wins upsert), keyed by the toolset handle.
+    // Bridged per-run at dispatch — same as the global catalogue.
+    let toolsetCatalogues: Map<string, StandardToolRegistry> | undefined;
+    if (this._toolsetTools.size > 0) {
+      toolsetCatalogues = new Map();
+      for (const [key, tools] of this._toolsetTools) {
+        const reg = new StandardToolRegistry();
+        const err = reg.tools(tools);
+        if (err) {
+          throw new RegistrationErrorException(err);
+        }
+        toolsetCatalogues.set(key, reg);
+      }
+    }
     // When catalogue tools are present and the caller wired no storage, default
     // to an in-memory provider (not the all-no-op default) so that session-aware
     // tools (todo_write, memory, task_list) actually persist within the run.
     // Pure tools (read_file/write_file via the sandbox) are unaffected.
     const storage =
       this._storage ??
-      (catalogueRegistry != null
+      (catalogueRegistry != null || toolsetCatalogues != null
         ? StorageProvider.single(new InMemoryStorageProvider())
         : StorageProvider.noOp());
 
@@ -3784,6 +3896,19 @@ export class HarnessBuilder {
       .toBuilder()
       .fillDefaultAgent(this.agent)
       .fillDefaultToolset(this._toolRegistry);
+    // Issue 2: a leaf carrying a non-empty `toolset` handle must RESOLVE against
+    // the registry (`ExecutionRegistry.validate` runs `checkToolset` at run
+    // entry). For every per-key catalogue wired via `.toolsetTools`, ensure the
+    // registry has a presence entry under that handle so `validate()` passes
+    // WITHOUT the caller manually registering a placeholder toolset. The registry
+    // VALUE is never dispatched (dispatch goes through `toolsetCatalogues`), so a
+    // no-op `EmptyToolRegistry` is sufficient; an explicitly-registered toolset
+    // under the same key wins.
+    if (toolsetCatalogues != null) {
+      for (const key of toolsetCatalogues.keys()) {
+        regBuilder = regBuilder.fillToolset(key, new EmptyToolRegistry());
+      }
+    }
     if (this._verifier != null) regBuilder = regBuilder.fillDefaultVerifier(this._verifier);
     if (this._metricEvaluator != null) {
       regBuilder = regBuilder.fillDefaultMetricEvaluator(this._metricEvaluator);
@@ -3807,6 +3932,7 @@ export class HarnessBuilder {
       chunkProvider: this._chunkProvider,
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
+      toolsetCatalogues,
       systemPrompt: this._systemPrompt,
       modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,

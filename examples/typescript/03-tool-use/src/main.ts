@@ -32,6 +32,7 @@ import {
   OllamaModelInterface,
   SessionId,
   newTask,
+  reactPerLoop,
   toolOutput,
   type HarnessStreamEvent,
   type ToolCall,
@@ -185,7 +186,7 @@ async function main(): Promise<void> {
   const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const harness = HarnessBuilder.conversational(model).toolRegistry(new LocalTools()).build();
 
-  const task = newTask(prompt, SessionId.generate(), { kind: "re_act", max_iterations: 6 });
+  const task = newTask(prompt, SessionId.generate(), reactPerLoop(6));
 
   console.log(`model  : ${modelId}`);
   console.log(`prompt : ${prompt}\n`);
