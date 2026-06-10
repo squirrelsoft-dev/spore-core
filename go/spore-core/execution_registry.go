@@ -678,6 +678,27 @@ func (b *ExecutionRegistryBuilder) fillDefaultToolset(toolset ToolRegistry) *Exe
 	return b
 }
 
+// fillToolset registers toolset under key ONLY if that key is not already wired
+// (Issue 2: per-node toolset scoping). NewStandardHarness calls this for each
+// per-key catalogue wired via HarnessBuilder.ToolsetTools, so a leaf carrying
+// that non-empty toolset handle RESOLVES against the registry (Validate runs
+// checkToolset at run entry) without the caller manually registering a
+// placeholder. The registry VALUE is never dispatched (dispatch goes through
+// HarnessConfig.ToolsetCatalogues); an explicitly-registered toolset under the
+// same key wins. Mirrors Rust ExecutionRegistryBuilder.fill_toolset.
+func (b *ExecutionRegistryBuilder) fillToolset(key string, toolset ToolRegistry) *ExecutionRegistryBuilder {
+	if toolset == nil {
+		return b
+	}
+	if b.registry.toolsets == nil {
+		b.registry.toolsets = make(map[string]ToolRegistry)
+	}
+	if _, ok := b.registry.toolsets[key]; !ok {
+		b.registry.toolsets[key] = toolset
+	}
+	return b
+}
+
 // fillDefaultSchema registers an empty JSON schema under the empty key only if
 // absent (#124), so a structured-slot leaf carrying output SchemaRef("") passes
 // A.5 validation. Mirrors the Rust default-key schema fold.

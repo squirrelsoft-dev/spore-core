@@ -102,10 +102,7 @@ func run() error {
 		SystemPrompt(systemPrompt).
 		Build()
 
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 12,
-	})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.ReActStrategy(12))
 
 	// Print each turn (Think) and each tool call + result (Act / Observe) from
 	// harness STREAM events — the builder dispatches our tools internally, just

@@ -109,7 +109,11 @@ type StrategyExecutor interface {
 	// c.Agent from the registry and threads it here). The leaf primitive (the
 	// body of runReActInner). Does NOT finalize observability — the caller (the
 	// leaf Run) does.
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent) RunResult
+	//
+	// Issue 2 (per-node toolset scoping): toolset is the leaf's RESOLVED toolset
+	// handle, threaded down alongside agent so the window dispatches the per-node
+	// scoped catalogue (empty handle "" ⇒ global-catalogue fallback).
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending

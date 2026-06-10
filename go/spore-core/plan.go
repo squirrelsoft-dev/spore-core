@@ -156,6 +156,91 @@ func CapturePlanArtifact(finalText string) (PlanArtifact, error) {
 	return PlanArtifact{Tasks: tasks, Rationale: rationale}, nil
 }
 
+// CapturePlanArtifactWithRepair captures a PlanArtifact, falling back to a
+// deterministic PROSE REPAIR when the strict canonical grammar
+// (CapturePlanArtifact) fails.
+//
+// A planner sometimes emits its plan JSON wrapped in prose ("Here is the plan:
+// {...} — let me know…") instead of as a bare object, so the strict grammar
+// rejects it. This fallback extracts the FIRST balanced top-level JSON object
+// embedded in the text (extractEmbeddedJSONObject) and re-parses THAT with the
+// same canonical grammar. It is a pure, always-on fallback: it runs ONLY after
+// the strict path fails, so it can never change a plan the strict grammar
+// already accepts — it can only turn a hard failure into a success. When no
+// embedded object repairs cleanly, the ORIGINAL strict error is returned (it is
+// the more informative diagnostic).
+//
+// Like the strict grammar, this MUST be byte-identical across all four
+// languages — the embedded-object scan is a deterministic ASCII byte walk.
+func CapturePlanArtifactWithRepair(finalText string) (PlanArtifact, error) {
+	artifact, err := CapturePlanArtifact(finalText)
+	if err == nil {
+		return artifact, nil
+	}
+	strictErr := err
+	if candidate, ok := extractEmbeddedJSONObject(finalText); ok {
+		// Re-parse the extracted object with the SAME canonical grammar; if it
+		// still does not parse, surface the original strict error.
+		if repaired, err2 := CapturePlanArtifact(candidate); err2 == nil {
+			return repaired, nil
+		}
+	}
+	return PlanArtifact{}, strictErr
+}
+
+// extractEmbeddedJSONObject extracts the first balanced top-level JSON object
+// ({ … }) embedded in text, or ("", false) if there is no balanced object.
+// Scans from the first '{', tracking brace depth while respecting JSON string
+// literals (a '"' opens/closes a string; a '\' escapes the next char inside
+// one), and returns the slice up to and including the matching '}'. Braces
+// inside strings do not affect depth.
+//
+// Deterministic ASCII byte scan — the structural characters '{' '}' '"' '\' are
+// all single-byte, and slicing happens only at '{'/'}' byte positions (valid
+// UTF-8 boundaries), so multi-byte content inside strings is preserved. MUST be
+// byte-identical across all four languages.
+func extractEmbeddedJSONObject(text string) (string, bool) {
+	b := []byte(text)
+	start := -1
+	for i := 0; i < len(b); i++ {
+		if b[i] == '{' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(b); i++ {
+		c := b[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+		} else {
+			switch c {
+			case '"':
+				inString = true
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					return text[start : i+1], true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
 // isASCIIWS reports whether c is one of the ASCII whitespace bytes the Q3
 // grammar trims. Matches ' ', '\t', '\n', '\r', and the form-feed /
 // vertical-tab — kept to the ASCII set so trimming is byte-identical

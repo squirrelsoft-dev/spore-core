@@ -217,10 +217,7 @@ func main() {
 	cfg.ToolRegistry = registry
 	harness := sporecore.NewStandardHarness(cfg)
 
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 6,
-	})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.ReActStrategy(6))
 	// Print each turn so the "Think" steps are visible alongside the tool calls.
 	options := sporecore.NewHarnessRunOptions(task)
 	toolName := map[string]string{}

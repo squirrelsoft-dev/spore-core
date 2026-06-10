@@ -225,7 +225,9 @@ func (h *StandardHarness) EvaluatePhase(
 	var evalState SessionState
 	evalHarness.config.ContextManager.AppendUserMessage(ctx, &evalState, directive)
 
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent)
+	// Issue 2: the evaluate phase carries no per-node toolset handle, so it threads
+	// the EMPTY handle → global-catalogue fallback, byte-for-byte.
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""))
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

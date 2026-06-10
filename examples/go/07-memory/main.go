@@ -193,10 +193,7 @@ func runPhase(mi sporecore.ModelInterface, memoryPath, systemPrompt, taskPrompt 
 
 	// PIN the session id — both phases pass the same one so recall reads what
 	// store wrote.
-	task := sporecore.NewTask(taskPrompt, session(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 20,
-	})
+	task := sporecore.NewTask(taskPrompt, session(), sporecore.ReActStrategy(20))
 
 	options := sporecore.NewHarnessRunOptions(task)
 	options.OnStream = func(ev sporecore.HarnessStreamEvent) {

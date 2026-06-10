@@ -159,3 +159,55 @@ func TestExplicitStorageIsPreserved(t *testing.T) {
 		t.Fatal("expected the wired run store")
 	}
 }
+
+// ---- Issue 2: ToolsetTools builder fold -----------------------------------
+
+// ToolsetTools folds each per-key bucket into its OWN populated catalogue on
+// HarnessConfig.ToolsetCatalogues (last-wins upsert, additive across calls), and
+// NewStandardHarness auto-fills a registry presence entry for each so a tree
+// referencing the handle passes Validate without a manual placeholder. Mirrors
+// the Rust toolset_tools_autofill_registry_presence_for_validate test.
+func TestToolsetToolsFoldsPerKeyCataloguesAndAutofillsRegistry(t *testing.T) {
+	cfg := builderForCatalogue(sporecore.NewMockAgent("t")).
+		ToolsetTools("plan-tools", echoStandardTool("list_dir")).
+		ToolsetTools("plan-tools", echoStandardTool("task_list")). // additive across calls
+		ToolsetTools("exec-tools", echoStandardTool("read_file")).
+		BuildConfig()
+
+	plan, ok := cfg.ToolsetCatalogues["plan-tools"]
+	if !ok {
+		t.Fatal("expected a plan-tools per-key catalogue")
+	}
+	exec, ok := cfg.ToolsetCatalogues["exec-tools"]
+	if !ok {
+		t.Fatal("expected an exec-tools per-key catalogue")
+	}
+
+	// plan-tools advertises BOTH accumulated tools; exec-tools only its own.
+	planNames := schemaNames(plan)
+	if !planNames["list_dir"] || !planNames["task_list"] {
+		t.Fatalf("plan-tools catalogue must hold list_dir+task_list, got %v", planNames)
+	}
+	if planNames["read_file"] {
+		t.Fatalf("plan-tools catalogue must NOT hold the exec-only read_file, got %v", planNames)
+	}
+	if execNames := schemaNames(exec); !execNames["read_file"] || execNames["list_dir"] {
+		t.Fatalf("exec-tools catalogue must hold only read_file, got %v", execNames)
+	}
+
+	// Catalogue tools present ⇒ in-memory run store defaulted (no storage wired),
+	// mirroring the global-catalogue default. (The NewStandardHarness registry
+	// auto-fill is asserted in the core package's
+	// TestToolsetCataloguesAutofillRegistryPresenceForValidate.)
+	if cfg.ToolRunStore == nil {
+		t.Fatal("expected an in-memory run store default when toolset catalogues are present")
+	}
+}
+
+func schemaNames(reg *sporecore.StandardToolRegistry) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range reg.ActiveSchemas(nil) {
+		out[s.Name] = true
+	}
+	return out
+}

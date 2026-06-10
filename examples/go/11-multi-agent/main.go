@@ -60,9 +60,13 @@
 //
 // # The strategy split: PlanExecute at the top, ReAct inside
 //
-// The orchestrator runs LoopStrategy{Kind: StrategyPlanExecute}: it decomposes
-// the job ("research, then write, then save") into subtasks up front and executes
-// them in order — natural for a coordinator. Each worker, by contrast, runs ReAct
+// The orchestrator runs a composed PlanExecute(plan: ReAct{plan-schema},
+// execute: ReAct) (post-#119): it decomposes the job ("research, then write, then
+// save") into subtasks up front and executes them in order — natural for a
+// coordinator. The plan leaf carries a `plan-schema` output contract —
+// PlanExecute's `plan` slot is STRUCTURED, so a bare ReAct there MUST declare an
+// output schema (ExecutionRegistry.Validate enforces this). Each worker, by
+// contrast, runs ReAct
 // internally. (The ReAct loop is hardcoded inside SubagentTool; a subagent always
 // runs its child as ReAct.) So the two layers use two different loop strategies,
 // each fit to its level: deliberate planning at the orchestrator, step-by-step
@@ -98,6 +102,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -109,6 +114,56 @@ import (
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/ollama"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/tools"
 )
+
+// planSchema is the orchestrator plan-phase output contract (`plan-schema`).
+// Post-#119, PlanExecute's `plan` slot is STRUCTURED: a bare ReAct there must
+// declare an `output` schema so the slot yields a typed task graph
+// (ExecutionRegistry.Validate enforces this via checkStructuredSlot). The
+// contract is {tasks: string[], rationale?: string} with tasks required.
+func planSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered subtasks the orchestrator delegates."
+    },
+    "rationale": { "type": "string" }
+  },
+  "required": ["tasks"]
+}`)
+}
+
+// buildRegistry assembles the ExecutionRegistry the orchestrator strategy's
+// handles resolve against. The plan leaf carries the `plan-schema` output handle;
+// the empty agent/toolset handles (ReactPerLoop uses empty handles) are
+// default-filled by NewStandardHarness from the orchestrator's own model + tools.
+// Old flat shape (LoopStrategy{Kind: StrategyPlanExecute}) had no registry at all.
+func buildRegistry() sporecore.ExecutionRegistry {
+	return sporecore.NewExecutionRegistryBuilder().
+		Schema("plan-schema", planSchema()).
+		Build()
+}
+
+// planExecuteStrategy is the orchestrator's post-#119 composed strategy:
+// PlanExecute(plan: ReAct{plan-schema}, execute: ReAct). The plan leaf carries the
+// `plan-schema` output contract required for the structured `plan` slot; the
+// execute leaf (which dispatches the agent-as-tool workers) is a plain ReAct. The
+// plan/execute leaves are effectively unbounded (PerLoop{MaxUint32}) — the global
+// MaxTurns backstop bounds the run. Old flat shape was
+// LoopStrategy{Kind: StrategyPlanExecute} (PlanExecute config nil).
+func planExecuteStrategy() sporecore.LoopStrategy {
+	plan := sporecore.ReactPerLoop(math.MaxUint32)
+	schema := sporecore.SchemaRef("plan-schema")
+	plan.Output = &schema
+	exec := sporecore.ReactPerLoop(math.MaxUint32)
+	return sporecore.PlanExecuteStrategy(sporecore.PlanExecuteConfig{
+		Plan:     sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &plan}),
+		Execute:  sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &exec}),
+		Behavior: sporecore.BudgetExhaustedBehavior{Kind: sporecore.BehaviorEscalate},
+	})
+}
 
 // workerTimeout is the per-worker wall-clock cap. A worker can burn many internal
 // ReAct turns; this bounds how long the orchestrator will wait on any single
@@ -388,15 +443,20 @@ func run() error {
 		return fmt.Errorf("failed to register plan reporter: %w", err)
 	}
 	cfg.Hooks = chain
+	// Post-#119: the orchestrator's composed strategy resolves its handles against
+	// an ExecutionRegistry. The plan leaf's `plan-schema` output handle is
+	// registered here; NewStandardHarness default-fills the empty agent/toolset
+	// handles from the orchestrator's own model + tools, so the structured `plan`
+	// slot validates.
+	cfg.Registry = buildRegistry()
 	orchestrator := sporecore.NewStandardHarness(cfg)
 
 	// The orchestrator plans the three steps up front via PlanExecute, then
 	// executes them. The turn budget is divided across subtasks, so give it
 	// generous headroom — each worker dispatch may itself be slow.
 	maxTurns := maxOrchestratorTurns
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind: sporecore.StrategyPlanExecute,
-	}).WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), planExecuteStrategy()).
+		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
 
 	// The orchestrator's stream is where the agent boundaries become visible. A
 	// ToolCall to a worker IS the "→ worker" boundary; the matching ToolResult IS

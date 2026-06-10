@@ -268,10 +268,14 @@ func execEvaluator() sporecore.Verifier {
 // verifier. The handle STRINGS are ground truth from the fixture; this is the
 // host-side wiring of those strings to collaborators.
 //
-// The toolset HANDLES must resolve for Validate(). The harness run loop dispatches
-// every node through the single GLOBAL catalogue wired on the builder (.Tools),
-// not per-node — a known harness scoping limitation — so these registry slots only
-// need to be present, not distinct dispatchers. The real tools live on the builder.
+// The toolset HANDLES must resolve for Validate(). Per-node toolset scoping is now
+// RESOLVED (Issue 2): each leaf carrying a non-empty toolset handle dispatches its
+// OWN tools, wired via the builder's .ToolsetTools("plan-tools", ...) /
+// .ToolsetTools("exec-tools", ...) per-key catalogues. These registry slots are
+// presence-only — validation entries the standalone registry's Validate() contract
+// needs, NEVER dispatched (dispatch goes through the builder's per-key catalogues).
+// They are kept so this registry stays self-consistent on its own; an explicit slot
+// wins over the harness's auto-fill (fill-only). The real tools live on the builder.
 func buildRegistry(model, baseURL string) sporecore.ExecutionRegistry {
 	return sporecore.NewExecutionRegistryBuilder().
 		Agent("planner", modelAgent("planner", model, baseURL)).
@@ -434,9 +438,11 @@ func run() error {
 		contextManager := NewSkillInjectingContextManager(inner, runStore, catalog.Manifest())
 
 		// The harness's own model drives the Ralph wrapper; the per-node agents come
-		// from the registry. Compaction/summarization uses this model too. The
-		// harness dispatches every node through ONE global catalogue: the union of
-		// plan-tools + exec-tools (read_file + grep dedupe by last-wins).
+		// from the registry. Compaction/summarization uses this model too. Issue 2
+		// (per-node toolset scoping): the real tools are wired PER TOOLSET, not onto
+		// one global catalogue. Each leaf carrying a non-empty toolset handle
+		// dispatches ONLY its own catalogue — the planner (plan-tools) cannot reach
+		// exec-only tools and the executor (exec-tools) cannot reach plan-only tools.
 		registry := buildRegistry(model, baseURL)
 		harnessModel := ollama.WithBaseURL(model, baseURL)
 		cfg := observability.ConversationalBuilder(harnessModel).
@@ -444,8 +450,8 @@ func run() error {
 			Storage(runStore, nil).
 			ContextManager(contextManager).
 			SystemPrompt(execSystemPrompt).
-			Tools(planTools()...).
-			Tools(execTools()...).
+			ToolsetTools("plan-tools", planTools()...).
+			ToolsetTools("exec-tools", execTools()...).
 			BuildConfig()
 		// The composed tree is wired declaratively: the registry resolves the
 		// node handles, and SurfaceToHuman makes a runaway node pause to the HITL

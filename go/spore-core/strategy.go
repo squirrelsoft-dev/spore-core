@@ -754,7 +754,10 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := cx.takeStream()
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent)
+	// Issue 2: thread THIS leaf's toolset handle down so the window dispatches the
+	// per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
+	// Mirrors agent resolution.
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf
@@ -839,18 +842,14 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	//
 	// Seed the planning directive onto a CLONE of the base session so the shared
 	// execute context stays [user: task.instruction] (#93 — a leaked directive
-	// would make every execute step re-emit a plan). Cap the plan child at ONE
-	// turn (R1): the plan is a single constrained turn that yields the JSON
-	// artifact, but never beyond the task's global turn ceiling (R10).
+	// would make every execute step re-emit a plan). The plan sub-strategy's own
+	// declared budget governs the plan phase (R1): an authored task_list may take
+	// more than one turn. The task's global turn ceiling remains the outer
+	// backstop (R10), enforced by the shared budget — not a turns+1 clamp.
 	directive := executor.PlanDirective(task.Instruction)
 	planSession := baseSession
 	executor.SeedUserMessage(ctx, &planSession, directive)
-	planCap := saturatingAddU32(budget.Turns, 1)
-	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < planCap {
-		planCap = *task.Budget.MaxTurns
-	}
 	planBudget := task.Budget
-	planBudget.MaxTurns = &planCap
 	planTask := Task{
 		ID:           task.ID,
 		Instruction:  directive,
@@ -1586,8 +1585,9 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 // Run is the Ralph continuation wrapper (#124): GENUINELY recursive. Each
 // context window seeds a FRESH session from the .spore/ checkpoint, then recurses
 // c.Inner.Run(ctx, cx) (a non-ReAct inner — e.g. SelfVerifying — really runs its
-// whole loop per window). Q3: when c.Agent is set it OVERRIDES the inner leaf's
-// agent per window; when unset the worker resolves via the inner leaf.
+// whole loop per window). Q3: when c.Agent is set it FILLS the inner leaf's
+// agent per window only where that leaf's handle is empty (an explicit leaf
+// agent stays authoritative); when unset the worker resolves via the inner leaf.
 // RalphCompletionStatus drives the OUTER reset loop; exhaustion =>
 // RalphCompletionUnmet. Ralph discards the incoming session state by design.
 func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
@@ -1600,12 +1600,13 @@ func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	_ = cx.takeSession() // discarded: each window re-seeds from the checkpoint.
 	maxResets := executor.RalphMaxResets()
 
-	// Q3: when c.Agent is set, override the inner leaf's agent for every window
-	// by rewriting the inner tree's worker leaf handle.
+	// Q3: when c.Agent is set, FILL the inner leaf's agent for every window only
+	// where the worker leaf's handle is empty — an explicitly-declared leaf agent
+	// is authoritative and is never shadowed by Ralph's per-window agent.
 	innerForWindow := *c.Inner
 	if string(c.Agent) != "" {
 		cloned := *c.Inner
-		overrideWorkerAgent(&cloned, c.Agent)
+		fillEmptyWorkerAgent(&cloned, c.Agent)
 		innerForWindow = cloned
 	}
 
@@ -2063,26 +2064,29 @@ func workerAgentKeyOf(ls *LoopStrategy) string {
 	}
 }
 
-// overrideWorkerAgent rewrites the worker leaf's agent handle of ls to agent
-// (#124 Q3 — Ralph's per-window agent override). Mutates the leaf reached by
-// descending the worker child chain. Operates on the *LoopStrategy in place
-// (combinator children are pointers, so descending mutates the shared subtree —
-// callers pass a CLONE).
-func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
+// fillEmptyWorkerAgent fills the worker leaf's agent handle of ls with agent
+// ONLY when that leaf's handle is empty (#124 Q3 — Ralph's per-window agent
+// fill). An explicitly-declared leaf agent is authoritative and is left
+// untouched. Mutates the leaf reached by descending the worker child chain.
+// Operates on the *LoopStrategy in place (combinator children are pointers, so
+// descending mutates the shared subtree — callers pass a CLONE).
+func fillEmptyWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	if ls == nil {
 		return
 	}
 	switch ls.Kind {
 	case StrategyReAct:
 		if ls.ReActCfg != nil {
-			cfg := *ls.ReActCfg
-			cfg.Agent = agent
-			ls.ReActCfg = &cfg
+			if string(ls.ReActCfg.Agent) == "" {
+				cfg := *ls.ReActCfg
+				cfg.Agent = agent
+				ls.ReActCfg = &cfg
+			}
 		}
 	case StrategyPlanExecute:
 		if ls.PlanExecute != nil {
 			child := *ls.PlanExecute.Execute
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.PlanExecute
 			cfg.Execute = &child
 			ls.PlanExecute = &cfg
@@ -2090,7 +2094,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategySelfVerifying:
 		if ls.SelfVerify != nil {
 			child := *ls.SelfVerify.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.SelfVerify
 			cfg.Inner = &child
 			ls.SelfVerify = &cfg
@@ -2098,7 +2102,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategyRalph:
 		if ls.Ralph != nil {
 			child := *ls.Ralph.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.Ralph
 			cfg.Inner = &child
 			ls.Ralph = &cfg
@@ -2106,7 +2110,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategyHillClimbing:
 		if ls.HillClimbing != nil {
 			child := *ls.HillClimbing.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.HillClimbing
 			cfg.Inner = &child
 			ls.HillClimbing = &cfg

@@ -12,8 +12,15 @@
 // DISCARDED and (because RevertOnNoImprovement is on) the workspace is
 // `git reset --hard`-ed back to the best-so-far. The loop halts on STAGNATION
 // (MaxStagnation consecutive non-improvements) or BUDGET (MaxTurns). You write
-// NO loop code — you wire a strategy, a metric evaluator, and an observability
-// sink, and the harness runs the climb.
+// NO loop code — you wire a composed strategy, a metric evaluator, and an
+// observability sink, and the harness runs the climb. Post-#119 the strategy is a
+// tree: HillClimbing(inner: ReAct{output: "propose-schema"}, evaluator: ""). The
+// `inner` (propose) slot is STRUCTURED — a bare ReAct there MUST declare an
+// `output` schema (here `propose-schema`) so each iteration yields a scorable
+// candidate (ExecutionRegistry.Validate enforces this). MaxStagnation /
+// MinImprovementDelta are now BARE values (was Option/pointer-wrapped pre-#119),
+// and the `evaluator` is the EMPTY handle (""), which resolves to the registry
+// metric evaluator registered under "".
 //
 // # The contrast with example 09 (SelfVerifying) — the teaching point
 //
@@ -67,14 +74,17 @@
 //     HillClimbingIteration warn. So reportingObservability embeds an
 //     InMemoryObservabilityProvider (which satisfies the full provider interface
 //     AND WarnEmitter) and overrides EmitWarn to print the decision.
-//   - Like 09, the builder has no MetricEvaluator setter, so we build the config
-//     with observability.ConversationalBuilder(...).BuildConfig() and set
-//     cfg.MetricEvaluator on the built config before NewStandardHarness (the same
-//     cfg-field asymmetry 09 uses for cfg.Verifier / cfg.EvaluatorAgent).
+//   - Post-#119/#124, the single-collaborator cfg.MetricEvaluator field is GONE.
+//     The metric evaluator resolves from the ExecutionRegistry under the empty
+//     `evaluator` key. Like 09, the builder has no Registry setter, so we build the
+//     config with observability.ConversationalBuilder(...).BuildConfig() and set
+//     cfg.Registry on the built config before NewStandardHarness (the same
+//     cfg-field asymmetry 09 uses for its registry).
 //
 // # Constants (see their doc comments below)
 //   - MaxIterations  — maps to BudgetLimits.MaxTurns (default 6).
 //   - MaxStagnation  — consecutive non-improvements before halt (2).
+//   - PerIterBudget  — per-iteration build budget for the propose leaf (6).
 //   - ScoreThreshold — DISPLAY annotation only (25). Never terminates.
 //   - dimensionMax / totalMax — 10 per dimension, 30 total.
 //
@@ -98,6 +108,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -128,6 +139,13 @@ const MaxIterations uint32 = 6
 // the loop halts with HaltStagnationLimitReached. The stagnation counter resets
 // to 0 on any kept (strictly-improving) iteration. Maps to MaxStagnation.
 const MaxStagnation uint32 = 2
+
+// PerIterBudget is the per-iteration build budget for the propose leaf. Post-#119,
+// HillClimbing's `inner` is a composed ReAct(ReactPerLoop(PerIterBudget)) — this
+// bounds the turns ONE proposal iteration may take (the build sub-run), while
+// BudgetLimits.MaxTurns bounds the NUMBER of iterations. Six gives a small local
+// model room to read the prior draft and write an improved one in a single pass.
+const PerIterBudget uint32 = 6
 
 // ScoreThreshold is a DISPLAY ANNOTATION ONLY. When a draft's total score (0–30)
 // reaches this, the evaluator marks the printed line `★ crossed target
@@ -281,6 +299,60 @@ func (e *readmeQualityEvaluator) Description() string {
 }
 
 var _ sporecore.MetricEvaluator = (*readmeQualityEvaluator)(nil)
+
+// proposeSchema is the propose-phase output contract (`propose-schema`).
+// Post-#119, HillClimbing's `inner` (propose) slot is STRUCTURED: a bare ReAct
+// there must declare an `output` schema so each iteration yields a scorable
+// candidate (ExecutionRegistry.Validate enforces this via checkStructuredSlot).
+// The contract is {file: string, summary?: string} with file required.
+func proposeSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "file": { "type": "string", "description": "Path of the draft the iteration wrote." },
+    "summary": { "type": "string", "description": "Short description of the change made." }
+  },
+  "required": ["file"]
+}`)
+}
+
+// buildRegistry assembles the ExecutionRegistry the composed strategy's handles
+// resolve against. The propose leaf carries the `propose-schema` output handle;
+// the HillClimbing `evaluator` is the EMPTY handle (""), so the metric evaluator
+// is registered under "" (the default-fill key the #124 single-collaborator seam
+// uses). The empty agent/toolset handles are default-filled by NewStandardHarness
+// from the harness's own model + tools. Old flat shape (the unit
+// LoopStrategy{Kind: StrategyHillClimbing, ...}) had no registry at all.
+func buildRegistry(evaluator sporecore.MetricEvaluator) sporecore.ExecutionRegistry {
+	return sporecore.NewExecutionRegistryBuilder().
+		Schema("propose-schema", proposeSchema()).
+		MetricEvaluator("", evaluator).
+		Build()
+}
+
+// hillClimbingStrategy is the post-#119 composed strategy:
+// HillClimbing(inner: ReAct{propose-schema}, evaluator: ""). The propose leaf
+// carries the `propose-schema` output contract (required for the structured
+// `propose` slot) and a PerLoop{perIterBudget} budget. MaxStagnation /
+// MinImprovementDelta are now BARE values (was Option/pointer-wrapped pre-#119);
+// MinImprovementDelta 0.0 means any strict improvement counts. The `evaluator` is
+// the EMPTY handle (""), which resolves to the registry metric evaluator
+// registered under "". Old flat shape was
+// LoopStrategy{Kind: StrategyHillClimbing, Direction, MaxStagnation: Some(_), ...}.
+func hillClimbingStrategy(perIterBudget uint32) sporecore.LoopStrategy {
+	propose := sporecore.ReactPerLoop(perIterBudget)
+	schema := sporecore.SchemaRef("propose-schema")
+	propose.Output = &schema
+	return sporecore.HillClimbingStrategy(sporecore.HillClimbingConfig{
+		Inner:                 sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &propose}),
+		Direction:             sporecore.OptimizationMaximize,
+		MaxStagnation:         MaxStagnation,
+		RevertOnNoImprovement: true,
+		MinImprovementDelta:   0,
+		Evaluator:             sporecore.AgentRef(""),
+		Behavior:              sporecore.BudgetExhaustedBehavior{Kind: sporecore.BehaviorEscalate},
+	})
+}
 
 // parseDimension parses a `name: <int>` line, clamped to [0, dimensionMax]. A
 // missing or unparseable line scores 0 — a malformed judge reply must not crash
@@ -441,10 +513,12 @@ func run() error {
 
 	// Build harness: conversational preset, workspace sandbox, the minimal file
 	// tool set (write_file + read_file), shared system prompt, the observability
-	// sink. Go wiring asymmetry (mirrors 09): the builder has no MetricEvaluator
-	// setter, so set cfg.MetricEvaluator on the built config before
-	// NewStandardHarness. HillClimbing REQUIRES cfg.MetricEvaluator (a nil one
-	// halts with HaltHillClimbingMisconfigured, not a panic).
+	// sink, and the ExecutionRegistry carrying the `propose-schema` output contract
+	// + the metric evaluator under the empty `evaluator` key. Go wiring asymmetry
+	// (mirrors 09): the builder has no Registry setter, so set cfg.Registry on the
+	// built config before NewStandardHarness. HillClimbing REQUIRES a metric
+	// evaluator (a missing one halts with HaltHillClimbingMisconfigured, not a
+	// panic).
 	cfg := observability.ConversationalBuilder(buildModel).
 		Sandbox(sandbox).
 		Tool(tools.StandardTools{}.WriteFile()). // ← builder writes the draft
@@ -452,21 +526,20 @@ func run() error {
 		SystemPrompt(systemPrompt).
 		Observability(obs).
 		BuildConfig()
-	cfg.MetricEvaluator = evaluator
+	// Post-#119: the propose leaf's `propose-schema` output handle and the
+	// empty-key evaluator metric evaluator resolve against this registry; the
+	// empty agent/toolset handles default-fill from the harness's own model + tools.
+	cfg.Registry = buildRegistry(evaluator)
 	harness := sporecore.NewStandardHarness(cfg)
 
-	// THE STRATEGY. No loop code below — the harness runs the climb. MaxTurns
-	// bounds the NUMBER OF ITERATIONS (the budget ceiling); MaxStagnation can halt
-	// sooner. SPEC NOTE: there is no score-threshold field — by design.
+	// THE STRATEGY. No loop code below — the harness runs the climb via the composed
+	// HillClimbing(inner: ReAct{propose-schema}, evaluator) tree. MaxTurns bounds
+	// the NUMBER OF ITERATIONS (the budget ceiling); MaxStagnation can halt sooner;
+	// the propose leaf's PerLoop{PerIterBudget} bounds ONE proposal's build sub-run.
+	// SPEC NOTE: there is no score-threshold field — by design.
 	maxTurns := maxIterations
-	maxStag := MaxStagnation
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:                  sporecore.StrategyHillClimbing,
-		Direction:             sporecore.OptimizationMaximize,
-		MaxStagnation:         &maxStag,
-		RevertOnNoImprovement: true,
-		MinImprovementDelta:   nil,
-	}).WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), hillClimbingStrategy(PerIterBudget)).
+		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
 
 	fmt.Printf("model         : %s\n", model)
 	fmt.Printf("base url      : %s\n", baseURL)

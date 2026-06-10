@@ -129,10 +129,14 @@ GLOBAL context manager (`SkillInjectingContextManager`), seeded ALWAYS-ACTIVE at
 startup: its procedure reaches the model structurally every turn, compaction-proof,
 with no `load_skill` round-trip.
 
-One more honest limitation: the harness dispatches every node's tool calls through
-ONE global catalogue wired on the builder (the union of `plan-tools` +
-`exec-tools`), not per-node — so the registry toolset HANDLES must resolve for
-`Validate()`, but tool scoping is not yet per-node. The audit is kept read-only by
+Per-node toolset scoping is now in place: each leaf dispatches ONLY its own
+toolset's tools, wired per-toolset on the builder via
+`.ToolsetTools("plan-tools", ...)` / `.ToolsetTools("exec-tools", ...)`. The
+planner (`plan-tools`) cannot reach an exec-only tool (`read_file`) and the worker
+(`exec-tools`) cannot reach a plan-only tool (`task_list`/`list_dir`) — the leaked
+union is closed. The registry toolset HANDLES are validation-only presence entries
+(they must resolve for `Validate()`) and are never dispatched; the real dispatchable
+catalogues live in `HarnessConfig.ToolsetCatalogues`. The audit is kept read-only by
 a read-only sandbox + the absence of any write tool.
 
 ## Run it

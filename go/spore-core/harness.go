@@ -2705,6 +2705,20 @@ type HarnessConfig struct {
 	// ToolContext re-injected each run.
 	CatalogueRegistry *StandardToolRegistry // optional
 
+	// ToolsetCatalogues holds the per-toolset catalogues (Issue 2: per-node
+	// toolset scoping), keyed by the non-empty ToolsetRef handle a leaf carries.
+	// Populated by HarnessBuilder.ToolsetTools — each value is a populated
+	// *StandardToolRegistry folded from that key's catalogue tools. At dispatch
+	// effectiveToolRegistry re-injects the matching catalogue's ToolContext with
+	// the run's SessionID + storage (same wiring as the global CatalogueRegistry),
+	// so a node with a non-empty toolset handle dispatches ONLY its own tools. A
+	// leaf with an EMPTY handle ("") — or a non-empty handle with no entry here —
+	// falls back to the global CatalogueRegistry / ToolRegistry seam (back-compat
+	// with examples 01–11 that use .Tools()). Mirrors Rust
+	// HarnessConfig.toolset_catalogues. Nil/empty (the default) preserves today's
+	// single-catalogue behaviour byte-for-byte.
+	ToolsetCatalogues map[string]*StandardToolRegistry // optional
+
 	// ToolRunStore is the per-run structured-state seam threaded into catalogue
 	// tools' ToolContext (issue #75). Optional; nil means catalogue tools persist
 	// nothing across processes (no-op store). The builder defaults this to an
@@ -2972,11 +2986,22 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 		// output schema (so a structured slot's leaf carrying output SchemaRef("")
 		// resolves under A.5). A nil Agent (scaffold-only config) is left unfolded
 		// so its registry stays empty and startup validation is skipped.
-		c.Registry = c.Registry.intoBuilder().
+		rb := c.Registry.intoBuilder().
 			fillDefaultAgent(c.Agent).
 			fillDefaultToolset(c.ToolRegistry).
-			fillDefaultSchema().
-			Build()
+			fillDefaultSchema()
+		// Issue 2: a leaf carrying a non-empty toolset handle must RESOLVE against
+		// the registry (Validate runs checkToolset at run entry). For every per-key
+		// catalogue wired via HarnessBuilder.ToolsetTools, ensure the registry has a
+		// presence entry under that handle so Validate passes WITHOUT the caller
+		// manually registering a placeholder. The registry VALUE is never dispatched
+		// (dispatch goes through ToolsetCatalogues), so an empty *StandardToolRegistry
+		// is sufficient; an explicitly-registered toolset under the same key wins.
+		// Mirrors Rust build_config's fill_toolset loop.
+		for key := range c.ToolsetCatalogues {
+			rb = rb.fillToolset(key, NewStandardToolRegistry())
+		}
+		c.Registry = rb.Build()
 	}
 	// Best-effort registration: a Stop hook can only fail registration on an
 	// event-class mismatch, which never applies to a sync Stop hook, so the
@@ -3335,9 +3360,12 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // ============================================================================
 
 // ReactWindow runs one bounded ReAct turn-loop window (the leaf primitive) on
-// the RESOLVED worker agent (#124 — threaded by ReactConfig.Run).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent)
+// the RESOLVED worker agent (#124 — threaded by ReactConfig.Run). Issue 2: the
+// resolved toolset handle is threaded down alongside the agent so the window
+// dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
+// fallback).
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -3673,7 +3701,26 @@ func (h *StandardHarness) finalizeObservability(ctx context.Context, sessionID S
 // Unlike Rust — which builds a fresh RealToolRegistry bridge per run — Go's
 // canonical registry IS the harness registry, so the per-run wiring is a
 // SetToolContext call on the shared registry rather than a new bridge object.
-func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID) ToolRegistry {
+//
+// Issue 2 (per-node toolset scoping): toolset is the resolving leaf's ToolsetRef
+// handle. When it is NON-EMPTY and a per-key catalogue was registered via
+// HarnessBuilder.ToolsetTools, THAT catalogue is bridged (its ToolContext
+// re-injected with the run's SessionID + storage), so the node dispatches ONLY
+// its own tools — strict scoping. Otherwise (empty handle, or non-empty handle
+// with no per-key catalogue) the existing global-catalogue / ToolRegistry seam
+// fallback applies, so examples 01–11 that use .Tools() keep working
+// byte-for-byte. Mirrors Rust effective_tool_registry.
+func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset ToolsetRef) ToolRegistry {
+	// Strict per-node scoping: a non-empty handle with its own catalogue.
+	if toolset != "" {
+		if catalogue, ok := h.config.ToolsetCatalogues[string(toolset)]; ok && catalogue != nil {
+			catalogue.SetToolContext(
+				NewToolContext(sessionID, h.config.ToolRunStore, h.config.ToolMemoryStore),
+			)
+			return catalogue
+		}
+	}
+	// Fallback: empty handle (back-compat) or unregistered non-empty handle.
 	if h.config.CatalogueRegistry == nil {
 		return h.config.ToolRegistry
 	}
@@ -3713,7 +3760,11 @@ func (h *StandardHarness) runReAct(
 	onStream StreamSink,
 	agent Agent,
 ) RunResult {
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent)
+	// Issue 2: the legacy runReAct wrappers (PlanExecute/DAG execute steps,
+	// single-shot run, the resume paths) carry no per-node toolset handle, so they
+	// keep the global-catalogue fallback (empty handle) — byte-for-byte with
+	// pre-Issue-2 behaviour.
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""))
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -3828,8 +3879,10 @@ func planDirective(instruction string) string {
 // c.Plan.Run — so this carries no agent call. Returns the captured outcome, or a
 // non-nil terminal failure to propagate.
 func (h *StandardHarness) captureAndPersistPlan(ctx context.Context, sessionID SessionID, planOutput string, usage AggregateUsage, turns uint32) (*planPhaseOutcome, *RunResult) {
-	// R3: capture the artifact from the response text.
-	artifact, err := CapturePlanArtifact(planOutput)
+	// R3: capture the artifact from the response text. Uses the prose-repair
+	// fallback: a planner that wraps its plan JSON in prose still captures (the
+	// strict canonical grammar runs first; repair only rescues a failure).
+	artifact, err := CapturePlanArtifactWithRepair(planOutput)
 	if err != nil {
 		pe, ok := err.(*PlanPhaseError)
 		if !ok {
@@ -3964,6 +4017,10 @@ func (h *StandardHarness) runReActInner(
 	// ReactConfig.Run resolves task.LoopStrategy's leaf agent from the registry;
 	// Ralph may override it per window). The leaf no longer reads config.Agent.
 	agent Agent,
+	// Issue 2: the leaf's RESOLVED toolset handle (mirrors agent). Empty ("") ⇒
+	// global-catalogue fallback; a non-empty handle with its own per-key catalogue
+	// ⇒ strict per-node scoping.
+	toolset ToolsetRef,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -3978,10 +4035,11 @@ func (h *StandardHarness) runReActInner(
 		}
 	}()
 	sessionID := task.SessionID
-	// Resolve the effective tool registry once per turn-loop window. Bridges
-	// catalogue tools per-run (re-injects their ToolContext with this run's
-	// SessionID + storage); otherwise returns the injected ToolRegistry seam.
-	toolRegistry := h.effectiveToolRegistry(sessionID)
+	// Resolve the effective tool registry once per turn-loop window. Bridges the
+	// per-node toolset catalogue (or the global catalogue when the handle is
+	// empty) per-run (re-injects its ToolContext with this run's SessionID +
+	// storage); otherwise returns the injected ToolRegistry seam.
+	toolRegistry := h.effectiveToolRegistry(sessionID, toolset)
 	startedAt := time.Now()
 	usage := AggregateUsage{}
 
@@ -4830,7 +4888,10 @@ func (h *StandardHarness) resumeConsultInner(
 		)
 	}
 
-	toolRegistry := h.effectiveToolRegistry(state.SessionID)
+	// Issue 2: the consult-resume tool-dispatch path carries no per-node toolset
+	// handle, so it threads the EMPTY handle → global-catalogue fallback,
+	// byte-for-byte with pre-Issue-2 behaviour.
+	toolRegistry := h.effectiveToolRegistry(state.SessionID, ToolsetRef(""))
 
 	// Inject the consult answer as the RESULT of the head pending (consult)
 	// call, then dispatch the remaining pending calls in the same batch.
@@ -4902,8 +4963,10 @@ func (h *StandardHarness) resumeInner(
 
 	// Resolve the effective tool registry for this resumed session — bridges
 	// catalogue tools the same way the turn loop does, so pending tool calls
-	// dispatched during resume thread the run's storage + sandbox.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID)
+	// dispatched during resume thread the run's storage + sandbox. Issue 2: this
+	// legacy resume path carries no per-node toolset handle, so it threads the
+	// EMPTY handle → global-catalogue fallback, byte-for-byte.
+	toolRegistry := h.effectiveToolRegistry(state.SessionID, ToolsetRef(""))
 
 	// Subagent depth-1: a child state, if present, would be resumed via the
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness
