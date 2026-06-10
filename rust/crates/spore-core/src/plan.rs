@@ -157,6 +157,76 @@ pub fn capture_plan_artifact(final_text: &str) -> Result<PlanArtifact, PlanPhase
     Ok(PlanArtifact { tasks, rationale })
 }
 
+/// Capture a [`PlanArtifact`], falling back to a deterministic PROSE REPAIR when
+/// the strict canonical grammar ([`capture_plan_artifact`]) fails.
+///
+/// A planner sometimes emits its plan JSON wrapped in prose ("Here is the plan:
+/// `{...}` — let me know…") instead of as a bare object, so the strict grammar
+/// rejects it. This fallback extracts the FIRST balanced top-level JSON object
+/// embedded in the text ([`extract_embedded_json_object`]) and re-parses THAT
+/// with the same canonical grammar. It is a pure, always-on fallback: it runs
+/// ONLY after the strict path fails, so it can never change a plan the strict
+/// grammar already accepts — it can only turn a hard failure into a success.
+/// When no embedded object repairs cleanly, the ORIGINAL strict error is
+/// returned (it is the more informative diagnostic).
+///
+/// Like the strict grammar, this MUST be byte-identical across all four
+/// languages — the embedded-object scan is a deterministic ASCII byte walk.
+pub fn capture_plan_artifact_with_repair(final_text: &str) -> Result<PlanArtifact, PlanPhaseError> {
+    match capture_plan_artifact(final_text) {
+        Ok(artifact) => Ok(artifact),
+        Err(strict_err) => match extract_embedded_json_object(final_text) {
+            // Re-parse the extracted object with the SAME canonical grammar; if
+            // it still does not parse, surface the original strict error.
+            Some(candidate) => capture_plan_artifact(candidate).map_err(|_| strict_err),
+            None => Err(strict_err),
+        },
+    }
+}
+
+/// Extract the first balanced top-level JSON object (`{ … }`) embedded in `text`,
+/// or `None` if there is no balanced object. Scans from the first `{`, tracking
+/// brace depth while respecting JSON string literals (a `"` opens/closes a
+/// string; a `\` escapes the next char inside one), and returns the slice up to
+/// and including the matching `}`. Braces inside strings do not affect depth.
+///
+/// Deterministic ASCII byte scan — the structural characters `{` `}` `"` `\` are
+/// all single-byte, and slicing happens only at `{`/`}` byte positions (valid
+/// UTF-8 char boundaries), so multi-byte content inside strings is preserved.
+/// MUST be byte-identical across all four languages.
+pub(crate) fn extract_embedded_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// ASCII-whitespace predicate. Matches `' '`, `'\t'`, `'\n'`, `'\r'`, and the
 /// form-feed / vertical-tab the JSON-adjacent grammar treats as whitespace —
 /// kept to the ASCII set so trimming is byte-identical cross-language.
@@ -308,5 +378,70 @@ mod tests {
         let a1 = capture_plan_artifact(text).unwrap();
         let a2 = capture_plan_artifact(text).unwrap();
         assert_eq!(a1, a2);
+    }
+
+    // ── Prose-repair fallback (Item 1) ───────────────────────────────────────
+
+    // A clean object that the STRICT grammar already accepts is returned
+    // unchanged by the repair wrapper (repair never runs on a success).
+    #[test]
+    fn repair_passes_through_strict_success() {
+        let text = r#"{"tasks":["a","b"],"rationale":"r"}"#;
+        let artifact = capture_plan_artifact_with_repair(text).unwrap();
+        assert_eq!(artifact.tasks, vec!["a", "b"]);
+        assert_eq!(artifact.rationale, "r");
+    }
+
+    // The live failure mode: the planner wraps its plan JSON in prose. The
+    // strict grammar rejects it; the repair extracts the embedded object.
+    #[test]
+    fn repair_extracts_json_wrapped_in_prose() {
+        let text = "Sure! Here is the plan:\n{\"tasks\":[\"step 1\",\"step 2\"],\"rationale\":\"because\"}\nLet me know if that works.";
+        // Strict path fails…
+        assert!(capture_plan_artifact(text).is_err());
+        // …repair rescues it.
+        let artifact = capture_plan_artifact_with_repair(text).unwrap();
+        assert_eq!(artifact.tasks, vec!["step 1", "step 2"]);
+        assert_eq!(artifact.rationale, "because");
+    }
+
+    // Braces inside string values must NOT confuse the balanced-object scan.
+    #[test]
+    fn repair_respects_braces_inside_strings() {
+        let text = r#"prefix {"tasks":["use the { brace } char","b"]} suffix"#;
+        let artifact = capture_plan_artifact_with_repair(text).unwrap();
+        assert_eq!(artifact.tasks, vec!["use the { brace } char", "b"]);
+    }
+
+    // The embedded object is captured to its FIRST balanced close (nested
+    // objects are spanned correctly).
+    #[test]
+    fn extract_spans_nested_objects() {
+        let text = r#"x {"tasks":["a"],"meta":{"k":"v"}} y"#;
+        let extracted = extract_embedded_json_object(text).unwrap();
+        assert_eq!(extracted, r#"{"tasks":["a"],"meta":{"k":"v"}}"#);
+    }
+
+    // Repair that still cannot parse a clean plan surfaces the ORIGINAL strict
+    // error, not a repair-specific one.
+    #[test]
+    fn repair_failure_returns_strict_error() {
+        // Embedded object exists but is not a valid plan (tasks not an array).
+        let text = r#"here: {"tasks":"nope"} end"#;
+        let err = capture_plan_artifact_with_repair(text).unwrap_err();
+        assert!(matches!(err, PlanPhaseError::UnparseablePlan { .. }));
+    }
+
+    // No embedded object at all ⇒ still UnparseablePlan, never panics.
+    #[test]
+    fn repair_no_object_is_unparseable() {
+        let err = capture_plan_artifact_with_repair("no json here at all").unwrap_err();
+        assert!(matches!(err, PlanPhaseError::UnparseablePlan { .. }));
+    }
+
+    // An unbalanced `{` (no matching close) extracts nothing.
+    #[test]
+    fn extract_unbalanced_object_is_none() {
+        assert!(extract_embedded_json_object("{\"tasks\":[\"a\"").is_none());
     }
 }

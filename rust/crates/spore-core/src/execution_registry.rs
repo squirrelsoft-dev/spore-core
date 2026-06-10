@@ -435,6 +435,18 @@ impl ExecutionRegistryBuilder {
         self
     }
 
+    /// Issue 2 (per-node toolset scoping): register `toolset` under `key` ONLY if
+    /// that key is not already wired. `HarnessBuilder::build_config` calls this
+    /// for each per-key catalogue wired via `HarnessBuilder::toolset_tools`, so a
+    /// leaf carrying that non-empty toolset handle RESOLVES against the registry
+    /// (`validate()` runs `check_toolset` at run entry) without the caller
+    /// manually registering a placeholder. An explicitly-registered toolset under
+    /// the same key wins.
+    pub fn fill_toolset(mut self, key: impl Into<String>, toolset: Arc<dyn ToolRegistry>) -> Self {
+        self.registry.toolsets.entry(key.into()).or_insert(toolset);
+        self
+    }
+
     /// #124: as [`fill_default_agent`](Self::fill_default_agent), for a default
     /// SelfVerifying verifier (the builder's `.verifier(..)`) under the empty key.
     pub fn fill_default_verifier(mut self, verifier: Arc<dyn Verifier>) -> Self {

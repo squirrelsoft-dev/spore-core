@@ -38,8 +38,8 @@
 use std::io::{self, BufRead, Write};
 
 use spore_core::{
-    Harness, HarnessBuilder, HarnessRunOptions, LoopStrategy, OllamaModelInterface, RunResult,
-    SessionId, SessionState, Task,
+    Harness, HarnessBuilder, HarnessRunOptions, LoopStrategy, OllamaModelInterface, ReactConfig,
+    RunResult, SessionId, SessionState, Task,
 };
 
 #[tokio::main]
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let task = Task::new(
             line.clone(),
             session_id.clone(),
-            LoopStrategy::ReAct { max_iterations: 4 },
+            LoopStrategy::ReAct(ReactConfig::per_loop(4)),
         );
         let options = HarnessRunOptions::new(task).with_session_state(state.clone());
 

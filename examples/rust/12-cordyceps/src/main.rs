@@ -301,11 +301,18 @@ pub fn build_registry(model_id: &str, base_url: &str) -> ExecutionRegistry {
             "ralph-agent",
             model_agent("ralph-agent", model_id, base_url),
         )
-        // The toolset HANDLES must resolve for `validate()`. The harness run loop
-        // dispatches every node through the single GLOBAL catalogue wired on the
-        // HarnessBuilder (`.tools(...)`), not per-node — a known harness scoping
-        // limitation — so these registry slots only need to be present, not
-        // distinct dispatchers. The real tools live on the builder (see `main`).
+        // Per-node toolset scoping is now resolved (Issue 2): each leaf dispatches
+        // ONLY its own toolset's catalogue. The real tools are wired per-handle on
+        // the HarnessBuilder via `.toolset_tools("plan-tools", ..)` /
+        // `.toolset_tools("exec-tools", ..)` (see `main`) and bridged per-run, so
+        // the planner can no longer reach exec-only tools and vice-versa.
+        //
+        // These registry slots are now PRESENCE-ONLY: `ExecutionRegistry::validate`
+        // checks every handle resolves, but the value is NEVER dispatched (dispatch
+        // goes through the per-handle catalogues on the builder). The harness also
+        // auto-fills these presence entries from `.toolset_tools`, so wiring them
+        // here is just what keeps the standalone `build_registry().validate()`
+        // contract self-consistent.
         .toolset("plan-tools", Arc::new(EmptyToolRegistry))
         .toolset("exec-tools", Arc::new(EmptyToolRegistry))
         .schema("plan-schema", plan_schema())
@@ -443,8 +450,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The harness's own model drives the Ralph wrapper; the per-node agents
         // come from the registry. Compaction/summarization uses this model too.
         let model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
-        // The harness dispatches every node through ONE global catalogue: the
-        // union of plan-tools + exec-tools (read_file + grep dedupe by last-wins).
+        // Issue 2: each node dispatches ONLY its own toolset's catalogue. The
+        // tools are wired per-handle (`plan-tools` / `exec-tools`) — the planner
+        // can no longer reach exec-only tools (read_file/consult_advisor) and the
+        // executor can no longer reach plan-only tools (task_list/list_dir).
         let harness = HarnessBuilder::conversational(model)
             .sandbox(sandbox)
             .storage(storage.clone())
@@ -452,8 +461,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .escalation_mode(EscalationMode::SurfaceToHuman)
             .system_prompt(EXEC_SYSTEM_PROMPT)
             .context_manager(context_manager)
-            .tools(plan_tools())
-            .tools(exec_tools())
+            .toolset_tools("plan-tools", plan_tools())
+            .toolset_tools("exec-tools", exec_tools())
             .build();
 
         let task = build_task(prompt, session);

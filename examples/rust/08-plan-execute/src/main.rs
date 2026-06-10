@@ -3,14 +3,25 @@
 //! This is the first example to swap the **loop strategy**. Everything else —
 //! the `conversational(model)` builder, the `WorkspaceScopedSandbox`, and the
 //! tool set (`web_search` + `write_file` + `read_file`, identical to 06) — is
-//! held constant. The ONLY substantive change is one line on the `Task`:
+//! held constant. The substantive change is the `LoopStrategy` on the `Task`:
 //!
 //! ```text
 //! // 06 — react step-by-step:
-//! LoopStrategy::ReAct { max_iterations: 10 }
+//! LoopStrategy::ReAct(ReactConfig::per_loop(10))
 //! // 08 — decompose the goal first, then execute each subtask:
-//! LoopStrategy::PlanExecute { plan_model: None }
+//! LoopStrategy::PlanExecute(PlanExecuteConfig {
+//!     plan: ReAct{ output: Some("plan-schema") },  // structured slot ⇒ schema
+//!     execute: ReAct{ .. },
+//!     ..PlanExecuteConfig::simple(None)
+//! })
 //! ```
+//!
+//! Post-#119 the `LoopStrategy` is a recursive enum of config newtypes, so the
+//! strategy is a composed tree rather than a flat literal. `PlanExecute`'s `plan`
+//! slot is STRUCTURED — a bare `ReAct` there MUST declare an `output` schema
+//! (here `plan-schema`), which `ExecutionRegistry::validate` enforces at run
+//! entry. The empty agent / toolset handles on the leaves are default-filled by
+//! the builder; only the `plan-schema` handle is registered explicitly.
 //!
 //! With `PlanExecute`, the harness runs one constrained planner turn FIRST: the
 //! model must return strict JSON `{ "tasks": [...], "rationale": ... }`. That
@@ -76,12 +87,13 @@ use std::sync::Arc;
 
 use spore_core::harness::{BoxFut, ToolOutput};
 use spore_core::{
-    BudgetLimits, CompactionConfig, Harness, HarnessBuilder, HarnessContextManagerExt,
-    HarnessRunOptions, HarnessStreamEvent, Hook, HookChain, HookContext, HookDecision, HookError,
-    HookEvent, LoopStrategy, NullCacheProvider, OllamaModelInterface, RunResult, SandboxProvider,
-    SearchMethod, SessionId, StandardContextManager, StandardHookChain, StandardTool,
-    StandardTools, Task, Tool, ToolCall, ToolContext, WebSearchConfig, WebSearchTool,
-    WorkspaceConfig, WorkspaceScopedSandbox, PLAN_EXECUTE_EXTRAS_KEY,
+    BudgetLimits, CompactionConfig, ExecutionRegistry, Harness, HarnessBuilder,
+    HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent, Hook, HookChain, HookContext,
+    HookDecision, HookError, HookEvent, LoopStrategy, NullCacheProvider, OllamaModelInterface,
+    PlanExecuteConfig, ReactConfig, RunResult, SandboxProvider, SchemaRef, SearchMethod, SessionId,
+    StandardContextManager, StandardHookChain, StandardTool, StandardTools, Task, Tool, ToolCall,
+    ToolContext, WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
+    PLAN_EXECUTE_EXTRAS_KEY,
 };
 
 const SYSTEM_PROMPT: &str = "You are a research-and-writing agent. Your ONLY capabilities are: \
@@ -92,6 +104,51 @@ const SYSTEM_PROMPT: &str = "You are a research-and-writing agent. Your ONLY cap
      installation, or build steps. For each subtask, use web_search to gather current information, \
      then synthesize a clear, cited comparison and save the final document with write_file. Act \
      using tools — do not answer from memory alone.";
+
+/// The plan-phase output contract (`plan-schema`). Post-#119, `PlanExecute`'s
+/// `plan` slot is STRUCTURED: a bare `ReAct` there must declare an `output`
+/// schema so the slot yields a typed task graph (`ExecutionRegistry::validate`
+/// enforces this via `check_structured_slot`). This is the strict JSON the
+/// planner turn returns.
+fn plan_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Ordered subtasks to execute in sequence.",
+                "items": { "type": "string" }
+            },
+            "rationale": { "type": "string" }
+        },
+        "required": ["tasks"]
+    })
+}
+
+/// The registry the composed strategy's handles resolve against. The single
+/// `plan-schema` slot is the only EXPLICIT handle; the builder default-fills the
+/// empty agent/toolset handles (`ReactConfig::per_loop` uses empty handles) from
+/// the harness's own model and global tool catalogue at `build`.
+fn build_registry() -> ExecutionRegistry {
+    ExecutionRegistry::builder()
+        .schema("plan-schema", plan_schema())
+        .build()
+}
+
+/// The post-#119 composed strategy: `PlanExecute(plan: ReAct, execute: ReAct)`.
+/// The plan leaf carries the `plan-schema` output contract (required for the
+/// structured `plan` slot); both leaves use empty agent/toolset handles that the
+/// builder default-fills. Old flat shape was `PlanExecute { plan_model: None }`.
+fn plan_execute_strategy() -> LoopStrategy {
+    let plan = ReactConfig {
+        output: Some(SchemaRef("plan-schema".to_string())),
+        ..ReactConfig::per_loop(u32::MAX)
+    };
+    LoopStrategy::PlanExecute(PlanExecuteConfig {
+        plan: Box::new(LoopStrategy::ReAct(plan)),
+        ..PlanExecuteConfig::simple(None)
+    })
+}
 
 /// Lifecycle hook that prints the PlanExecute plan and each subtask as it runs.
 ///
@@ -314,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
         .context_manager(cm)
+        .registry(build_registry())
         .tool(web_search)
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
@@ -329,25 +387,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .hooks(Arc::new(chain))
         .build();
 
-    // THE ONE-LINE SWAP. 06 used `LoopStrategy::ReAct { max_iterations: 10 }`;
-    // here we decompose first via PlanExecute. The turn budget is divided across
-    // subtasks, so we give it generous headroom.
-    let task = Task::new(
-        prompt.clone(),
-        SessionId::generate(),
-        LoopStrategy::PlanExecute { plan_model: None },
-    )
-    .with_budget(BudgetLimits {
-        max_turns: Some(64),
-        ..BudgetLimits::default()
-    });
+    // THE STRATEGY SWAP. 06 used a bare `LoopStrategy::ReAct(ReactConfig::per_loop(10))`;
+    // here we decompose first via the composed `PlanExecute(plan: ReAct, execute:
+    // ReAct)` tree (post-#119 recursive enum). The plan leaf carries the
+    // `plan-schema` output contract — `PlanExecute`'s `plan` slot is STRUCTURED,
+    // so a bare `ReAct` there MUST declare an output schema. The empty agent /
+    // toolset handles on both leaves are default-filled by the builder from the
+    // harness's own model + global tool catalogue. The turn budget is divided
+    // across subtasks, so we give it generous headroom.
+    let task = Task::new(prompt.clone(), SessionId::generate(), plan_execute_strategy())
+        .with_budget(BudgetLimits {
+            max_turns: Some(64),
+            ..BudgetLimits::default()
+        });
 
     // Print each turn (Think) and each tool call + result (Act / Observe). This is
     // most useful for the plan-phase turn; Rust suppresses the subtask sub-loop
     // stream, so the hooks above are the portable view of execution.
     let options = HarnessRunOptions::new(task).with_stream(Box::new(
         |event: HarnessStreamEvent| match event {
-            HarnessStreamEvent::TurnStart { turn } => println!("think  · turn {turn}"),
+            HarnessStreamEvent::TurnStart { turn, .. } => println!("think  · turn {turn}"),
             HarnessStreamEvent::ToolCall { name, args, .. } => {
                 println!("    act    → {name}({args})");
             }
@@ -410,5 +469,44 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+// ============================================================================
+// Example-crate test (NO model): the composed PlanExecute strategy resolves
+// against the example's registry. This is the regression guard that the
+// post-#119 strategy tree stays validation-clean against current core.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spore_core::{AgentId, EmptyToolRegistry, ModelAgent};
+
+    /// AC: the composed `PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)`
+    /// tree passes `ExecutionRegistry::validate` — the plan slot's output schema
+    /// resolves and the structured-slot contract is satisfied. The leaves use the
+    /// EMPTY agent/toolset handles that `HarnessBuilder::build_config` default-fills
+    /// at `build`; here we mirror that fill (empty-key agent + toolset) so the
+    /// standalone registry validates exactly as the assembled harness would.
+    #[test]
+    fn registry_validates() {
+        let model = Arc::new(OllamaModelInterface::with_base_url(
+            "gemma4:e4b",
+            "http://localhost:11434".to_string(),
+        ));
+        let registry = build_registry()
+            .into_builder()
+            .fill_default_agent(Arc::new(ModelAgent::new(AgentId::new("default"), model)))
+            .fill_default_toolset(Arc::new(EmptyToolRegistry))
+            .build();
+        let task = Task::new(
+            "decompose and execute".to_string(),
+            SessionId::generate(),
+            plan_execute_strategy(),
+        );
+        assert!(
+            registry.validate(&task).is_ok(),
+            "the composed PlanExecute strategy must validate against the registry"
+        );
     }
 }

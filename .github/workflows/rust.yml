@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "rust/**"
+      - "examples/rust/**"
       - "fixtures/**"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
       - "rust/**"
+      - "examples/rust/**"
       - "fixtures/**"
       - ".github/workflows/rust.yml"
 
@@ -34,3 +36,25 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # Compile gate for the standalone example crates. They are NOT part of the
+  # `rust/` workspace (each is its own crate with a path dep on spore-core), so
+  # they drift silently otherwise — this job builds + tests every one against
+  # current core so a core API change that breaks an example fails CI.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build + test every example
+        run: |
+          set -euo pipefail
+          for d in examples/rust/*/; do
+            [ -f "$d/Cargo.toml" ] || continue
+            echo "::group::$d"
+            (cd "$d" && cargo build && cargo test)
+            echo "::endgroup::"
+          done

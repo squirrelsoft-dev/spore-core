@@ -55,7 +55,7 @@ mod tools;
 
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SessionId, Task,
+    OllamaModelInterface, ReactConfig, RunResult, SessionId, Task,
 };
 
 use tools::recall::recall_tool;
@@ -96,14 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 12 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(12)),
     );
     // Print each turn (Think) and each tool call + result (Act / Observe) from
     // harness STREAM events — the builder dispatches our tools internally, just
     // as it does the catalogue in 04.
     let options = HarnessRunOptions::new(task).with_stream(Box::new(
         |event: HarnessStreamEvent| match event {
-            HarnessStreamEvent::TurnStart { turn } => println!("think  · turn {turn}"),
+            HarnessStreamEvent::TurnStart { turn, .. } => println!("think  · turn {turn}"),
             HarnessStreamEvent::ToolCall { name, args, .. } => {
                 println!("    act    → {name}({args})");
             }

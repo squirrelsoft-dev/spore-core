@@ -11,6 +11,25 @@
 //! strategy ([`LoopStrategy::SelfVerifying`]), a [`Verifier`], and an evaluator
 //! agent, and the harness runs the verify→revise cycle for you.
 //!
+//! Post-#119 the strategy is a composed tree, not the old unit literal:
+//!
+//! ```text
+//! // pre-#119: LoopStrategy::SelfVerifying  (unit variant)
+//! // post-#119:
+//! LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+//!     inner: ReAct { output: Some("worker-schema"), budget: PerLoop(max_iterations) },
+//!     evaluator: "",   // empty handle ⇒ default-filled from `.verifier(..)`
+//!     behavior: Escalate,
+//! })
+//! ```
+//!
+//! The `inner` (worker) slot is STRUCTURED — a bare `ReAct` there MUST declare an
+//! `output` schema (here `worker-schema`) so its result is evaluable; this is
+//! enforced by `ExecutionRegistry::validate` at run entry. The `evaluator` stays
+//! the EMPTY handle (`""`), which the builder default-fills from the
+//! single-collaborator `.verifier(..)` setter — so the only handle registered
+//! explicitly is `worker-schema`.
+//!
 //! ## The task the agent-under-test must solve
 //!
 //! Write a Rust function `parse_int_list(&str) -> Result<Vec<i32>, ParseIntListError>`
@@ -85,10 +104,10 @@ use std::sync::Arc;
 
 use spore_core::harness::BoxFut;
 use spore_core::{
-    Agent, AgentId, BudgetLimits, EvaluatorResponseVerifier, HaltReason, Harness, HarnessBuilder,
-    HarnessRunOptions, LoopStrategy, ModelAgent, OllamaModelInterface, RunResult, SessionId,
-    StandardTools, Task, Verifier, VerifierInput, VerifierVerdict, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    BudgetLimits, EvaluatorResponseVerifier, ExecutionRegistry, HaltReason, Harness, HarnessBuilder,
+    HarnessRunOptions, LoopStrategy, OllamaModelInterface, ReactConfig, RunResult, SchemaRef,
+    SelfVerifyingConfig, SessionId, StandardTools, Task, Verifier, VerifierInput, VerifierVerdict,
+    WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 /// The spec the agent must satisfy. It is the `Task` instruction, so the **build**
@@ -206,7 +225,58 @@ fn run_result_output(r: &RunResult) -> String {
         RunResult::Failure { reason, .. } => format!("<run did not complete: {reason:?}>"),
         RunResult::WaitingForHuman { .. } => "<run paused waiting for human>".to_string(),
         RunResult::Escalate { signal, .. } => format!("<run escalated: {signal:?}>"),
+        // This example never wires a consult ladder; a top-level Consult is not
+        // expected here, but the match must stay exhaustive against current core.
+        RunResult::Consult { request, .. } => format!("<run paused on consult: {:?}>", request.kind),
     }
+}
+
+/// The worker (build-phase) output contract (`worker-schema`). Post-#119,
+/// `SelfVerifying`'s `inner` (worker) slot is STRUCTURED: a bare `ReAct` there
+/// must declare an `output` schema so its result is EVALUABLE
+/// (`ExecutionRegistry::validate` enforces this via `check_structured_slot`).
+/// The build agent writes `parse_int_list.rs`; this advertises the path it wrote.
+fn worker_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string", "description": "Path the draft was written to." },
+            "summary": { "type": "string", "description": "What was implemented." }
+        },
+        "required": ["file"]
+    })
+}
+
+/// The registry the composed strategy's handles resolve against. Only the
+/// `worker-schema` is EXPLICIT; the builder default-fills the empty agent /
+/// toolset handles (`ReactConfig::per_loop`) AND the empty-key evaluator from the
+/// single-collaborator setters (`.evaluator_agent(..)` / `.verifier(..)`) at
+/// `build`. So the SelfVerifying `evaluator` stays the EMPTY handle (`""`).
+fn build_registry() -> ExecutionRegistry {
+    ExecutionRegistry::builder()
+        .schema("worker-schema", worker_schema())
+        .build()
+}
+
+/// The post-#119 composed strategy: `SelfVerifying(inner: ReAct, evaluator)`.
+/// The worker leaf carries the `worker-schema` output contract (required for the
+/// structured `worker` slot) and a `per_loop(max_iterations)` build budget. The
+/// `evaluator` is the EMPTY handle (`""`), which the builder default-fills from
+/// `.verifier(..)`. Old flat shape was the unit `LoopStrategy::SelfVerifying`.
+fn self_verifying_strategy(max_iterations: u32) -> LoopStrategy {
+    let worker = ReactConfig {
+        output: Some(SchemaRef("worker-schema".to_string())),
+        ..ReactConfig::per_loop(max_iterations)
+    };
+    LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+        inner: Box::new(LoopStrategy::ReAct(worker)),
+        // The empty SchemaRef resolves to the default verifier the builder folds
+        // in from `.verifier(..)` (#124 single-collaborator migration seam).
+        evaluator: SchemaRef(String::new()),
+        // Mirrors the shim default (`ReactConfig::per_loop` stamps `Escalate`):
+        // a nested combinator propagates exhaustion to its parent.
+        behavior: spore_core::BudgetExhaustedBehavior::Escalate,
+    })
 }
 
 #[tokio::main]
@@ -235,15 +305,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&workspace_root)?;
     let workspace_root = std::fs::canonicalize(&workspace_root)?;
 
-    // The evaluator runs on its own agent instance (the `evaluator_agent` seam).
-    // It shares the harness system prompt and tool set; the harness derives a
-    // read-only sandbox for it internally, so its `write_file` is blocked but
-    // `read_file` works — exactly what a reviewer needs.
-    let evaluator_model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
-    let evaluator_agent: Arc<dyn Agent> = Arc::new(ModelAgent::new(
-        AgentId::new("evaluator"),
-        Arc::new(evaluator_model),
-    ));
+    // Post-#119/#124 the `.evaluator_agent(..)` single-collaborator seam is GONE.
+    // The evaluate phase now defaults to the inner worker's agent (the empty-key
+    // agent the builder default-fills from `conversational(model)`), running a
+    // FRESH evaluator turn that the harness internally derives a read-only sandbox
+    // for — so its `write_file` is blocked but `read_file` works, exactly what a
+    // reviewer needs. The judging seam is the [`Verifier`] below (the SelfVerifying
+    // `evaluator` handle resolves to it via the empty-key default fill).
 
     // The verifier: pattern-match the evaluator's text. `PASS` (word-boundaried,
     // case-insensitive) → Passed; `FAIL: <reason>` → Failed(reason); neither →
@@ -257,15 +325,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build harness: conversational preset, workspace sandbox, the minimal file
     // tool set (write_file for the builder + read_file for the evaluator), shared
-    // system prompt, the evaluator agent, and the verifier.
+    // system prompt, the registry (carrying the `worker-schema` output contract),
+    // and the verifier (folded into the default-key evaluator handle).
     let build_model = OllamaModelInterface::with_base_url(&model_id, base_url.clone());
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
     let harness = HarnessBuilder::conversational(build_model)
         .sandbox(Arc::new(sandbox))
+        .registry(build_registry())
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
-        .evaluator_agent(evaluator_agent)
         .verifier(verifier)
         .build();
 
@@ -275,7 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        LoopStrategy::SelfVerifying,
+        self_verifying_strategy(max_iterations),
     )
     .with_budget(BudgetLimits {
         max_turns: Some(12),
@@ -335,4 +404,48 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+// ============================================================================
+// Example-crate test (NO model): the composed SelfVerifying strategy resolves
+// against the example's registry — the regression guard that the post-#119
+// strategy tree stays validation-clean against current core.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spore_core::{AgentId, EmptyToolRegistry, ModelAgent};
+
+    /// AC: the composed `SelfVerifying(inner: ReAct{worker-schema}, evaluator: "")`
+    /// tree validates — the worker slot's output schema resolves (structured-slot
+    /// contract) and the empty-handle evaluator resolves to the default-filled
+    /// verifier. The leaves use EMPTY agent/toolset/evaluator handles that
+    /// `HarnessBuilder::build_config` default-fills at `build`; here we mirror
+    /// that fill (empty-key agent + toolset + verifier) so the standalone
+    /// registry validates exactly as the assembled harness would.
+    #[test]
+    fn registry_validates() {
+        let model = Arc::new(OllamaModelInterface::with_base_url(
+            "gemma4:e4b",
+            "http://localhost:11434".to_string(),
+        ));
+        let verifier: Arc<dyn Verifier> = Arc::new(
+            EvaluatorResponseVerifier::new(r"(?im)^\s*PASS\s*$", r"(?im)FAIL:\s*.+", 3).unwrap(),
+        );
+        let registry = build_registry()
+            .into_builder()
+            .fill_default_agent(Arc::new(ModelAgent::new(AgentId::new("default"), model)))
+            .fill_default_toolset(Arc::new(EmptyToolRegistry))
+            .fill_default_verifier(verifier)
+            .build();
+        let task = Task::new(
+            "draft parse_int_list".to_string(),
+            SessionId::generate(),
+            self_verifying_strategy(3),
+        );
+        assert!(
+            registry.validate(&task).is_ok(),
+            "the composed SelfVerifying strategy must validate against the registry"
+        );
+    }
 }

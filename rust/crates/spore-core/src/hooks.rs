@@ -1764,6 +1764,7 @@ mod tests {
             max_resets: 3,
             vcs_provider: None,
             catalogue_registry: None,
+            toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
             model_params: crate::model::ModelParams::default(),
             auto_persist_sessions: false,

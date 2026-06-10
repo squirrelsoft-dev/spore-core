@@ -1134,6 +1134,10 @@ pub trait StrategyExecutor: Send + Sync {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
+        // Issue 2 (per-node toolset scoping): the leaf's RESOLVED `toolset`
+        // handle, threaded alongside `agent`. Empty ⇒ global-catalogue fallback;
+        // a non-empty handle with its own catalogue ⇒ strict per-node scoping.
+        toolset: ToolsetRef,
     ) -> BoxFut<'a, RunResult>;
 
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
@@ -1427,6 +1431,10 @@ impl RunStrategy for ReactConfig {
                     budget_used,
                     on_stream,
                     agent,
+                    // Issue 2: thread THIS leaf's toolset handle down so the
+                    // window dispatches the per-node scoped catalogue (empty
+                    // handle ⇒ global-catalogue fallback). Mirrors `agent`.
+                    self.toolset.clone(),
                 )
                 .await;
             executor.finalize(&result).await;
@@ -5429,6 +5437,22 @@ pub struct HarnessConfig {
     /// (which stays the harness-loop seam for custom slim registries). `None`
     /// (the default) preserves the `tool_registry`-only path byte-for-byte.
     pub catalogue_registry: Option<Arc<crate::tool_registry::StandardToolRegistry>>,
+    /// Per-toolset catalogues (Issue 2: per-node toolset scoping), keyed by the
+    /// non-empty `ToolsetRef` handle a leaf carries. Populated by
+    /// [`HarnessBuilder::toolset_tools`] — each value is a populated
+    /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// folded from that key's catalogue tools. At dispatch the run loop bridges
+    /// the matching catalogue per-run via
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry) (same
+    /// sandbox/session/storage wiring as the global
+    /// [`catalogue_registry`](Self::catalogue_registry)), so a node with a
+    /// non-empty `toolset` handle dispatches ONLY its own tools. A leaf with an
+    /// EMPTY handle (`""`) — or a non-empty handle with no entry here — falls
+    /// back to the global catalogue / `tool_registry` seam (back-compat with
+    /// examples 01–11 that use `.tools()`). Empty (the default) preserves
+    /// today's behaviour byte-for-byte.
+    pub toolset_catalogues:
+        std::collections::HashMap<String, Arc<crate::tool_registry::StandardToolRegistry>>,
     /// Operating system prompt prepended to each turn's assembled context when
     /// the context manager renders none (issue #91). See
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
@@ -5516,6 +5540,7 @@ impl Clone for HarnessConfig {
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
+            toolset_catalogues: self.toolset_catalogues.clone(),
             system_prompt: self.system_prompt.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
@@ -5591,6 +5616,14 @@ pub struct HarnessBuilder {
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
     /// [`HarnessBuilder::build_tool_registry`], applying last-wins upsert.
     standard_tools: Vec<crate::tools::StandardTool>,
+    /// Per-toolset catalogue tools (Issue 2: per-node toolset scoping),
+    /// accumulated via [`HarnessBuilder::toolset_tools`] and keyed by the
+    /// non-empty toolset handle a leaf carries. Each bucket is folded into a
+    /// populated [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// (last-wins upsert) at [`build_config`](HarnessBuilder::build_config) and
+    /// stored in [`HarnessConfig::toolset_catalogues`]. Empty (the default)
+    /// preserves today's single-catalogue behaviour byte-for-byte.
+    toolset_tools: std::collections::HashMap<String, Vec<crate::tools::StandardTool>>,
     /// Optional operating system prompt prepended to each turn's assembled
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
@@ -5656,6 +5689,7 @@ impl HarnessBuilder {
             vcs_provider: None,
             metric_evaluator: None,
             standard_tools: Vec::new(),
+            toolset_tools: std::collections::HashMap::new(),
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
@@ -5854,6 +5888,35 @@ impl HarnessBuilder {
     /// Order is preserved, so last-wins upsert still applies across the batch.
     pub fn tools(mut self, tools: impl IntoIterator<Item = crate::tools::StandardTool>) -> Self {
         self.standard_tools.extend(tools);
+        self
+    }
+
+    /// Register catalogue tools SCOPED to a single named toolset handle (Issue 2:
+    /// per-node toolset scoping). Mirrors [`tools`](Self::tools), but instead of
+    /// folding into the ONE global catalogue, these tools are folded into a
+    /// per-`key` [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// (last-wins upsert across calls and within the batch) and stored in
+    /// [`HarnessConfig::toolset_catalogues`].
+    ///
+    /// At dispatch, a leaf whose `toolset` handle equals `key` resolves ONLY this
+    /// catalogue (bridged per-run via
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry) with the run's
+    /// sandbox/session/storage), so it cannot reach another node's tools — the
+    /// union no longer leaks across nodes. A leaf with an EMPTY (`""`) handle, or
+    /// a non-empty handle with no entry here, falls back to the global
+    /// [`tools`](Self::tools) catalogue / `tool_registry` seam (back-compat).
+    ///
+    /// `key` should be a NON-EMPTY handle string; the empty handle is reserved
+    /// for the global-catalogue fallback.
+    pub fn toolset_tools(
+        mut self,
+        key: impl Into<String>,
+        tools: impl IntoIterator<Item = crate::tools::StandardTool>,
+    ) -> Self {
+        self.toolset_tools
+            .entry(key.into())
+            .or_default()
+            .extend(tools);
         self
     }
 
@@ -6150,13 +6213,32 @@ impl HarnessBuilder {
         } else {
             Some(self.drain_tools_into_registry())
         };
+        // Issue 2: fold each per-toolset bucket into its own populated
+        // `StandardToolRegistry` (last-wins upsert), keyed by the toolset handle.
+        // Bridged per-run at dispatch — same as the global catalogue.
+        let toolset_catalogues: std::collections::HashMap<
+            String,
+            Arc<crate::tool_registry::StandardToolRegistry>,
+        > = {
+            use crate::tool_registry::ToolRegistry as _;
+            self.toolset_tools
+                .drain()
+                .map(|(key, tools)| {
+                    let reg = crate::tool_registry::StandardToolRegistry::new();
+                    for t in tools {
+                        let _ = reg.register(t.implementation, t.schema);
+                    }
+                    (key, Arc::new(reg))
+                })
+                .collect()
+        };
         // When catalogue tools are present and the caller wired no storage,
         // default to an in-memory provider (not the all-no-op default) so that
         // session-aware tools (todo_write, memory, task_list) actually persist
         // within the run. Pure tools (read_file/write_file via the sandbox) are
         // unaffected either way.
         let storage = self.storage.unwrap_or_else(|| {
-            if catalogue_registry.is_some() {
+            if catalogue_registry.is_some() || !toolset_catalogues.is_empty() {
                 Arc::new(crate::storage::StorageProvider::single(Arc::new(
                     crate::storage::InMemoryStorageProvider::new(),
                 )))
@@ -6174,6 +6256,17 @@ impl HarnessBuilder {
         let mut reg_builder = self.registry.into_builder();
         reg_builder = reg_builder.fill_default_agent(self.agent);
         reg_builder = reg_builder.fill_default_toolset(self.tool_registry.clone());
+        // Issue 2: a leaf carrying a non-empty `toolset` handle must RESOLVE
+        // against the registry (`ExecutionRegistry::validate` runs `check_toolset`
+        // at run entry). For every per-key catalogue wired via `.toolset_tools`,
+        // ensure the registry has a presence entry under that handle so
+        // `validate()` passes WITHOUT the caller manually registering a
+        // placeholder toolset. The registry VALUE is never dispatched (dispatch
+        // goes through `toolset_catalogues`), so a no-op `EmptyToolRegistry` is
+        // sufficient; an explicitly-registered toolset under the same key wins.
+        for key in toolset_catalogues.keys() {
+            reg_builder = reg_builder.fill_toolset(key.clone(), Arc::new(EmptyToolRegistry));
+        }
         if let Some(v) = self.verifier {
             reg_builder = reg_builder.fill_default_verifier(v);
         }
@@ -6203,6 +6296,7 @@ impl HarnessBuilder {
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider,
             catalogue_registry,
+            toolset_catalogues,
             system_prompt: self.system_prompt,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
@@ -6673,6 +6767,11 @@ impl StandardHarness {
                 budget_used,
                 on_stream,
                 agent,
+                // Issue 2: the legacy `run_react` wrappers (PlanExecute/DAG
+                // execute steps, single-shot run) carry no per-node toolset
+                // handle, so they keep the global-catalogue fallback (empty
+                // handle) — byte-for-byte with pre-Issue-2 behaviour.
+                ToolsetRef(String::new()),
             )
             .await;
         match &result {
@@ -6715,7 +6814,31 @@ impl StandardHarness {
     /// fresh per run so the run's `SessionId` + storage thread into every tool
     /// dispatch. Otherwise it returns the injected
     /// [`tool_registry`](HarnessConfig::tool_registry) seam unchanged.
-    fn effective_tool_registry(&self, session_id: &SessionId) -> Arc<dyn ToolRegistry> {
+    /// Issue 2 (per-node toolset scoping): `toolset` is the resolving leaf's
+    /// `ToolsetRef` handle. When it is NON-EMPTY and a per-key catalogue was
+    /// registered via [`HarnessBuilder::toolset_tools`], THAT catalogue is
+    /// bridged (so the node dispatches ONLY its own tools — strict scoping).
+    /// Otherwise (empty handle, or non-empty handle with no per-key catalogue)
+    /// the existing global-catalogue / `tool_registry` seam fallback applies, so
+    /// examples 01–11 that use `.tools()` keep working byte-for-byte.
+    fn effective_tool_registry(
+        &self,
+        session_id: &SessionId,
+        toolset: &ToolsetRef,
+    ) -> Arc<dyn ToolRegistry> {
+        // Strict per-node scoping: a non-empty handle with its own catalogue.
+        if !toolset.0.is_empty() {
+            if let Some(catalogue) = self.config.toolset_catalogues.get(&toolset.0) {
+                return Arc::new(crate::tool_registry::RealToolRegistry::new(
+                    catalogue.clone(),
+                    self.config.sandbox.clone(),
+                    session_id.clone(),
+                    self.config.storage.run().clone(),
+                    self.config.storage.memory().clone(),
+                ));
+            }
+        }
+        // Fallback: empty handle (back-compat) or unregistered non-empty handle.
         match &self.config.catalogue_registry {
             Some(catalogue) => Arc::new(crate::tool_registry::RealToolRegistry::new(
                 catalogue.clone(),
@@ -6739,11 +6862,16 @@ impl StandardHarness {
         // `ReactConfig::run` resolves `self.agent` from the registry; Ralph may
         // override it per window). The leaf no longer reads `config.agent`.
         agent: Arc<dyn Agent>,
+        // Issue 2: the leaf's RESOLVED `toolset` handle (mirrors `agent`). Empty
+        // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
+        // per-key catalogue ⇒ strict per-node scoping.
+        toolset: ToolsetRef,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
-        // strategies funnel through here). Bridges catalogue tools per-run.
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // strategies funnel through here). Bridges the per-node toolset catalogue
+        // (or the global catalogue when the handle is empty) per-run.
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
         // Reset the adaptive prompt-based-tool-calling escalation flag at the
         // start of this turn-loop window so detection is scoped to the window
         // and does not leak across `run()` calls (the flag is shared with the
@@ -8287,8 +8415,10 @@ tool. Use the provided tool-call format to actually invoke the tool."
         usage: AggregateUsage,
         turns: u32,
     ) -> Result<PlanPhaseOutcome, RunResult> {
-        // R3: capture the artifact from the response text.
-        let mut artifact = match crate::plan::capture_plan_artifact(plan_output) {
+        // R3: capture the artifact from the response text. Uses the prose-repair
+        // fallback: a planner that wraps its plan JSON in prose still captures
+        // (the strict canonical grammar runs first; repair only rescues a failure).
+        let mut artifact = match crate::plan::capture_plan_artifact_with_repair(plan_output) {
             Ok(a) => a,
             Err(e) => {
                 return Err(RunResult::Failure {
@@ -8605,6 +8735,7 @@ impl StrategyExecutor for StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
+        toolset: ToolsetRef,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
             self.run_react_inner(
@@ -8614,6 +8745,7 @@ impl StrategyExecutor for StandardHarness {
                 budget_used,
                 on_stream,
                 agent,
+                toolset,
             )
             .await
         })
@@ -9176,7 +9308,10 @@ impl StandardHarness {
             });
         }
 
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // Issue 2: resume paths carry no per-node toolset handle in `PausedState`
+        // yet, so they keep the global-catalogue fallback (empty handle) —
+        // byte-for-byte with pre-Issue-2 behaviour.
+        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
 
         // Inject the consult answer as the RESULT of the head pending (consult)
         // call, then dispatch the remaining pending calls in the same batch.
@@ -9745,8 +9880,10 @@ impl StandardHarness {
 
         // Resolve the effective tool registry for this resumed session — bridges
         // catalogue tools the same way the turn loop does, so pending tool calls
-        // dispatched during resume thread the run's storage + sandbox.
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // dispatched during resume thread the run's storage + sandbox. Issue 2:
+        // resume carries no per-node toolset handle yet, so it uses the
+        // global-catalogue fallback (empty handle).
+        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
 
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as
@@ -10967,9 +11104,11 @@ mod strategy_tests {
 #[cfg(test)]
 impl StandardHarness {
     /// Drive the recursive plan phase for `task` (whose strategy must be a
-    /// `PlanExecute`): seed the directive, dispatch `plan.run(cx)` capped at one
-    /// turn, then capture + persist the artifact. Mirrors the plan half of
-    /// [`PlanExecuteConfig::run`].
+    /// `PlanExecute`): seed the directive, dispatch `plan.run(cx)` under the
+    /// plan sub-strategy's OWN declared budget (the global `max_turns` is only
+    /// the outer backstop), then capture + persist the artifact. Mirrors the
+    /// plan half of [`PlanExecuteConfig::run`] — it must NOT clamp the planner to
+    /// a single turn or it becomes a stale parallel copy of production.
     async fn run_plan_phase(
         &self,
         task: &Task,
@@ -10990,18 +11129,15 @@ impl StandardHarness {
             .append_user_message(&mut plan_session, &directive)
             .await;
         let _ = on_stream;
-        let plan_cap = match task.budget.max_turns {
-            Some(global) => global.min(budget_used.turns.saturating_add(1)),
-            None => budget_used.turns.saturating_add(1),
-        };
+        // The plan phase runs under the plan sub-strategy's OWN declared budget;
+        // the global `max_turns` is only the outer backstop. (Previously clamped
+        // to `turns + 1` — a single turn — which starved multi-turn `task_list`
+        // authoring and diverged this test seam from production.)
         let plan_task = Task {
             id: task.id.clone(),
             instruction: directive,
             session_id: session_id.clone(),
-            budget: BudgetLimits {
-                max_turns: Some(plan_cap),
-                ..task.budget.clone()
-            },
+            budget: task.budget.clone(),
             loop_strategy: plan_strategy.clone(),
         };
 
@@ -11246,6 +11382,7 @@ mod tests {
             max_resets: 3,
             vcs_provider: None,
             catalogue_registry: None,
+            toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
@@ -11445,7 +11582,7 @@ mod tests {
             .tool(crate::tools::StandardTools::read_file())
             .build_config();
         let h = StandardHarness::new(cfg);
-        let reg = h.effective_tool_registry(&SessionId::new("s1"));
+        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
         // The bridge advertises the catalogue schemas to the model.
         assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
         // And maps an inner dispatch failure (unknown tool) to a *recoverable*
@@ -11470,6 +11607,134 @@ mod tests {
     fn no_catalogue_tools_keeps_tool_registry_seam() {
         let cfg = catalogue_builder(make_agent()).build_config();
         assert!(cfg.catalogue_registry.is_none());
+    }
+
+    // ---- Issue 2: per-node toolset scoping ---------------------------------
+
+    /// Helper: dispatch a tool by name through a bridged registry and report
+    /// whether it resolved to a *successful* tool output (vs an unknown-tool /
+    /// not-available recoverable error).
+    async fn dispatched_ok(reg: &Arc<dyn ToolRegistry>, name: &str) -> bool {
+        let out = reg
+            .dispatch(ToolCall {
+                id: "c".into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        !matches!(out, ToolOutput::Error { .. })
+    }
+
+    /// A node carrying a NON-EMPTY toolset handle dispatches ONLY that toolset's
+    /// catalogue: the planner (`plan-tools` = list_dir/task_list) cannot call an
+    /// exec-only tool (`read_file`), and the executor (`exec-tools` = read_file)
+    /// cannot call a plan-only tool (`task_list`/`list_dir`). The leaked union is
+    /// closed.
+    #[tokio::test]
+    async fn per_node_toolset_scoping_closes_cross_node_leaks() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools(
+                "plan-tools",
+                vec![StandardTools::list_dir(), StandardTools::task_list()],
+            )
+            .toolset_tools("exec-tools", vec![StandardTools::read_file()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let sid = SessionId::new("s1");
+
+        // Planner node: plan-tools only. Its OWN tools advertise; exec-only tools
+        // are NOT available.
+        let plan = h.effective_tool_registry(&sid, &ToolsetRef("plan-tools".into()));
+        assert!(plan.schemas().iter().any(|s| s.name == "list_dir"));
+        assert!(plan.schemas().iter().any(|s| s.name == "task_list"));
+        assert!(!plan.schemas().iter().any(|s| s.name == "read_file"));
+        // The leak the live run exhibited: planner calling an exec-only tool now
+        // resolves to unknown-tool / not-available, NOT success.
+        assert!(!dispatched_ok(&plan, "read_file").await);
+
+        // Executor node: exec-tools only. It cannot reach the plan-only tools.
+        let exec = h.effective_tool_registry(&sid, &ToolsetRef("exec-tools".into()));
+        assert!(exec.schemas().iter().any(|s| s.name == "read_file"));
+        assert!(!exec.schemas().iter().any(|s| s.name == "task_list"));
+        assert!(!exec.schemas().iter().any(|s| s.name == "list_dir"));
+        assert!(!dispatched_ok(&exec, "task_list").await);
+        assert!(!dispatched_ok(&exec, "list_dir").await);
+    }
+
+    /// An unknown tool called by a scoped node still yields the existing
+    /// recoverable unknown-tool failure (no regression of the error path).
+    #[tokio::test]
+    async fn per_node_toolset_unknown_tool_is_recoverable_error() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()));
+        let out = reg
+            .dispatch(ToolCall {
+                id: "c".into(),
+                name: "does_not_exist".into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        assert!(matches!(
+            out,
+            ToolOutput::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    /// A node with an EMPTY toolset handle still sees the GLOBAL catalogue wired
+    /// via `.tools()` (back-compat with examples 01–11 that never scope). The
+    /// per-key catalogues do NOT leak into the empty-handle fallback.
+    #[tokio::test]
+    async fn empty_toolset_handle_falls_back_to_global_catalogue() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .tools(vec![StandardTools::read_file()]) // global catalogue
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()]) // scoped
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let global = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
+        // Empty handle ⇒ global catalogue (read_file), NOT the scoped plan-tools.
+        assert!(global.schemas().iter().any(|s| s.name == "read_file"));
+        assert!(!global.schemas().iter().any(|s| s.name == "list_dir"));
+    }
+
+    /// A non-empty toolset handle with NO registered per-key catalogue falls back
+    /// to the global catalogue / seam (additive change — an unscoped name does
+    /// not strand the node with zero tools).
+    #[tokio::test]
+    async fn unknown_toolset_handle_falls_back_to_global_catalogue() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .tools(vec![StandardTools::read_file()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let reg =
+            h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()));
+        assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
+    }
+
+    /// `build_config` auto-registers a registry presence entry for every per-key
+    /// catalogue, so a tree referencing that toolset handle passes
+    /// `ExecutionRegistry::validate` without the caller wiring a placeholder.
+    #[test]
+    fn toolset_tools_autofill_registry_presence_for_validate() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
+            .build_config();
+        assert!(cfg
+            .registry
+            .resolve_toolset(&ToolsetRef("plan-tools".into()))
+            .is_some());
+        // And the dispatchable catalogue is present.
+        assert!(cfg.toolset_catalogues.contains_key("plan-tools"));
     }
 
     // ---- issue #120: ExecutionRegistry run-entry validation + knob ---------
@@ -15373,6 +15638,7 @@ mod tests {
                 max_resets: 3,
                 vcs_provider: None,
                 catalogue_registry: None,
+                toolset_catalogues: std::collections::HashMap::new(),
                 system_prompt: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,

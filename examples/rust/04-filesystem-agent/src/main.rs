@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SessionId, StandardTools, Task, WorkspaceConfig,
+    OllamaModelInterface, ReactConfig, RunResult, SessionId, StandardTools, Task, WorkspaceConfig,
     WorkspaceScopedSandbox,
 };
 
@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 8 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(8)),
     );
     // Print each turn (Think) and each catalogue tool call + result (Act /
     // Observe). Because the catalogue dispatches internally, the Act/Observe
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dispatch like 03.
     let options = HarnessRunOptions::new(task).with_stream(Box::new(
         |event: HarnessStreamEvent| match event {
-            HarnessStreamEvent::TurnStart { turn } => println!("think  · turn {turn}"),
+            HarnessStreamEvent::TurnStart { turn, .. } => println!("think  · turn {turn}"),
             HarnessStreamEvent::ToolCall { name, args, .. } => {
                 println!("    act    → {name}({args})");
             }

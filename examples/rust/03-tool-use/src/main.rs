@@ -29,7 +29,8 @@ use std::sync::Arc;
 use spore_core::harness::BoxFut;
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, HarnessToolRegistry,
-    LoopStrategy, OllamaModelInterface, RunResult, SessionId, Task, ToolCall, ToolOutput, ToolSchema,
+    LoopStrategy, OllamaModelInterface, ReactConfig, RunResult, SessionId, Task, ToolCall,
+    ToolOutput, ToolSchema,
 };
 
 /// Three trivial, pure-compute tools, exposed through the harness-loop tool
@@ -178,11 +179,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 6 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(6)),
     );
     // Print each turn so the "Think" steps are visible alongside the tool calls.
     let options = HarnessRunOptions::new(task).with_stream(Box::new(|event: HarnessStreamEvent| {
-        if let HarnessStreamEvent::TurnStart { turn } = event {
+        if let HarnessStreamEvent::TurnStart { turn, .. } = event {
             println!("think  · turn {turn}");
         }
     }));
