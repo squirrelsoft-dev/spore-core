@@ -47,8 +47,8 @@ from pathlib import Path
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     StreamToolCall,
     StreamToolResult,
@@ -108,7 +108,7 @@ async def main() -> int:
         .build()
     )
 
-    task = Task.new(prompt, new_session_id(), LoopStrategyReAct(max_iterations=8))
+    task = Task.new(prompt, new_session_id(), ReactConfig.per_loop(8))
 
     # Print each turn (Think) and each catalogue tool call + result (Act /
     # Observe). Because the catalogue dispatches internally, the Act/Observe

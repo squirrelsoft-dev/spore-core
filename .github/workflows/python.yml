@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "python/**"
+      - "examples/python/**"
       - "fixtures/**"
       - ".github/workflows/python.yml"
   pull_request:
     paths:
       - "python/**"
+      - "examples/python/**"
       - "fixtures/**"
       - ".github/workflows/python.yml"
 
@@ -34,3 +36,30 @@ jobs:
         run: uv run ruff format --check .
       - name: Test
         run: uv run pytest
+
+  # Import + validate gate for the standalone example projects (each has its own
+  # pyproject with a path dep on spore_core). A clean `import main` catches stale
+  # top-level symbols (e.g. a removed strategy class), and the per-example
+  # validate tests (where present) exercise the strategy tree against current core.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Setup Python 3.12
+        run: uv python install 3.12
+      - name: Import + test every example
+        run: |
+          set -euo pipefail
+          for d in examples/python/*/; do
+            [ -f "$d/main.py" ] || continue
+            echo "::group::$d"
+            (cd "$d" && uv run python -c "import main")
+            if find "$d" -maxdepth 1 -name 'test_*.py' | grep -q .; then
+              (cd "$d" && uv run pytest -q)
+            fi
+            echo "::endgroup::"
+          done

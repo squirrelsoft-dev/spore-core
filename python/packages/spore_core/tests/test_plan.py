@@ -10,7 +10,11 @@ from __future__ import annotations
 import pytest
 
 from spore_core import PlanArtifact, PlanPhaseError, capture_plan_artifact
-from spore_core.plan import PLAN_EXECUTE_EXTRAS_KEY
+from spore_core.plan import (
+    PLAN_EXECUTE_EXTRAS_KEY,
+    capture_plan_artifact_with_repair,
+    extract_embedded_json_object,
+)
 
 
 # R3 / R9: a known JSON object captures to exact tasks + rationale.
@@ -120,3 +124,67 @@ def test_capture_is_deterministic() -> None:
 def test_extras_key_is_stable() -> None:
     # The cross-language extras key must stay "plan_execute".
     assert PLAN_EXECUTE_EXTRAS_KEY == "plan_execute"
+
+
+# ── Prose-repair fallback (Item 1) ───────────────────────────────────────────
+
+
+def test_repair_passes_through_strict_success() -> None:
+    # A clean object the STRICT grammar already accepts is returned unchanged by
+    # the repair wrapper (repair never runs on a success).
+    artifact = capture_plan_artifact_with_repair('{"tasks":["a","b"],"rationale":"r"}')
+    assert artifact.tasks == ["a", "b"]
+    assert artifact.rationale == "r"
+
+
+def test_repair_extracts_json_wrapped_in_prose() -> None:
+    # The live failure mode: the planner wraps its plan JSON in prose. The strict
+    # grammar rejects it; the repair extracts the embedded object.
+    text = (
+        "Sure! Here is the plan:\n"
+        '{"tasks":["step 1","step 2"],"rationale":"because"}\n'
+        "Let me know if that works."
+    )
+    # Strict path fails…
+    with pytest.raises(PlanPhaseError):
+        capture_plan_artifact(text)
+    # …repair rescues it.
+    artifact = capture_plan_artifact_with_repair(text)
+    assert artifact.tasks == ["step 1", "step 2"]
+    assert artifact.rationale == "because"
+
+
+def test_repair_respects_braces_inside_strings() -> None:
+    # Braces inside string values must NOT confuse the balanced-object scan.
+    text = 'prefix {"tasks":["use the { brace } char","b"]} suffix'
+    artifact = capture_plan_artifact_with_repair(text)
+    assert artifact.tasks == ["use the { brace } char", "b"]
+
+
+def test_extract_spans_nested_objects() -> None:
+    # The embedded object is captured to its FIRST balanced close (nested objects
+    # are spanned correctly).
+    text = 'x {"tasks":["a"],"meta":{"k":"v"}} y'
+    extracted = extract_embedded_json_object(text)
+    assert extracted == '{"tasks":["a"],"meta":{"k":"v"}}'
+
+
+def test_repair_failure_returns_strict_error() -> None:
+    # Repair that still cannot parse a clean plan surfaces the ORIGINAL strict
+    # error, not a repair-specific one. Embedded object exists but is not a valid
+    # plan (tasks not an array).
+    with pytest.raises(PlanPhaseError) as exc_info:
+        capture_plan_artifact_with_repair('here: {"tasks":"nope"} end')
+    assert exc_info.value.kind == "unparseable_plan"
+
+
+def test_repair_no_object_is_unparseable() -> None:
+    # No embedded object at all ⇒ still UnparseablePlan, never crashes.
+    with pytest.raises(PlanPhaseError) as exc_info:
+        capture_plan_artifact_with_repair("no json here at all")
+    assert exc_info.value.kind == "unparseable_plan"
+
+
+def test_extract_unbalanced_object_is_none() -> None:
+    # An unbalanced `{` (no matching close) extracts nothing.
+    assert extract_embedded_json_object('{"tasks":["a"') is None

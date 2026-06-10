@@ -66,11 +66,14 @@ observable.
 The strategy split: PlanExecute at the top, ReAct inside
 --------------------------------------------------------
 
-The orchestrator runs :class:`LoopStrategyPlanExecute`: it decomposes the job
-("research, then write, then save") into subtasks up front and executes them in
-order — natural for a coordinator. Each worker, by contrast, runs ReAct
-internally. (The ReAct loop is hardcoded inside ``SubagentTool``; a subagent
-always runs its child as ``LoopStrategyReAct``.) So the two layers use two
+The orchestrator runs the composed ``PlanExecute(plan: ReAct{plan-schema},
+execute: ReAct)`` strategy (post-#119): it decomposes the job ("research, then
+write, then save") into subtasks up front and executes them in order — natural
+for a coordinator. The plan slot is STRUCTURED, so its bare ``ReactConfig``
+declares the ``plan-schema`` output handle, registered on the
+:class:`ExecutionRegistry`. Each worker, by contrast, runs ReAct internally.
+(The ReAct loop is hardcoded inside ``SubagentTool``; a subagent always runs its
+child as a bare ReAct.) So the two layers use two
 different loop strategies, each fit to its level: deliberate planning at the
 orchestrator, step-by-step tool use inside the workers.
 
@@ -119,6 +122,7 @@ from typing import Any
 
 from spore_core import (
     BudgetLimits,
+    ExecutionRegistry,
     Harness,
     HarnessBuilder,
     HarnessRunOptions,
@@ -127,10 +131,12 @@ from spore_core import (
     HookDecision,
     HookEvent,
     HookSync,
-    LoopStrategyPlanExecute,
+    LoopStrategy,
     OllamaModelInterface,
     OnPlanCreatedContext,
     OnTaskAdvanceContext,
+    PlanExecuteConfig,
+    ReactConfig,
     RegistryToolSchema,
     RunResultSuccess,
     StandardHookChain,
@@ -186,6 +192,46 @@ ORCHESTRATOR_PROMPT = (
     "writing by delegating to the workers — never do it yourself — and always finish "
     "by writing report.md."
 )
+
+
+def plan_schema() -> dict[str, Any]:
+    """The orchestrator plan-phase output contract (``plan-schema``). Post-#119,
+    ``PlanExecute``'s ``plan`` slot is STRUCTURED: a bare :class:`ReactConfig`
+    there must declare an ``output`` schema so the slot yields a typed task graph
+    (:meth:`ExecutionRegistry.validate` enforces this via the structured-slot
+    check)."""
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Ordered subtasks the orchestrator delegates.",
+                "items": {"type": "string"},
+            },
+            "rationale": {"type": "string"},
+        },
+        "required": ["tasks"],
+    }
+
+
+def build_registry() -> ExecutionRegistry:
+    """The registry the orchestrator's composed strategy resolves against. Only the
+    ``plan-schema`` handle is EXPLICIT; the builder default-fills the empty
+    agent/toolset handles (``ReactConfig.per_loop``) from the orchestrator's own
+    model + global tool catalogue (the worker-tools) at ``build``."""
+    return ExecutionRegistry.builder().schema("plan-schema", plan_schema()).build()
+
+
+def plan_execute_strategy() -> LoopStrategy:
+    """The post-#119 composed orchestrator strategy:
+    ``PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)``. The plan leaf carries
+    the ``plan-schema`` output contract required for the structured ``plan`` slot.
+    Old flat shape was ``LoopStrategyPlanExecute()``."""
+    plan = ReactConfig.per_loop(2**31 - 1)
+    plan.output = "plan-schema"
+    strategy = PlanExecuteConfig.simple()
+    strategy.plan = plan
+    return strategy
 
 
 def _instruction_schema() -> dict[str, Any]:
@@ -386,6 +432,7 @@ async def main() -> int:
     orchestrator = (
         HarnessBuilder.conversational(orchestrator_model)
         .sandbox(sandbox)
+        .registry(build_registry())
         .tool(research_tool)
         .tool(writing_tool)
         .tool(StandardTools.write_file())
@@ -394,13 +441,15 @@ async def main() -> int:
         .build()
     )
 
-    # The orchestrator plans the three steps up front via PlanExecute, then
-    # executes them. The turn budget is divided across subtasks, so give it
-    # generous headroom — each worker dispatch may itself be slow.
+    # The orchestrator plans the three steps up front via the composed
+    # ``PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)`` tree (post-#119),
+    # then executes them. The plan leaf carries the ``plan-schema`` output contract
+    # — the ``plan`` slot is STRUCTURED. The turn budget is divided across subtasks,
+    # so give it generous headroom — each worker dispatch may itself be slow.
     task = Task.new(
         prompt,
         new_session_id(),
-        LoopStrategyPlanExecute(),
+        plan_execute_strategy(),
         budget=BudgetLimits(max_turns=32),
     )
 

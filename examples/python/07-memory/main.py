@@ -70,9 +70,9 @@ from pathlib import Path
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     ModelParams,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     SessionId,
     StreamToolCall,
@@ -152,7 +152,7 @@ async def _run_phase(
 
     # PIN the session id — both phases pass the same one so recall reads what
     # store wrote.
-    task = Task.new(task_prompt, SESSION, LoopStrategyReAct(max_iterations=20))
+    task = Task.new(task_prompt, SESSION, ReactConfig.per_loop(20))
 
     def on_stream(event: object) -> None:
         if isinstance(event, StreamTurnStart):

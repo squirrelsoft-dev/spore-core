@@ -9,8 +9,18 @@ an explicit spec, and a :class:`Verifier` turns the critique into a verdict. If
 the verdict is FAIL, the reason is injected back into the build context and the
 loop revises. This repeats until the verifier returns ``Passed`` or
 ``max_iterations`` is exhausted. You write **no loop code** — you wire a strategy
-(:class:`LoopStrategySelfVerifying`), a :class:`Verifier`, and an evaluator
-agent, and the harness runs the verify -> revise cycle for you.
+(the composed ``SelfVerifying(inner: ReAct{worker-schema}, evaluator)`` tree), a
+:class:`Verifier`, and an evaluator agent, and the harness runs the
+verify -> revise cycle for you.
+
+Post-#119 the ``LoopStrategy`` is a recursive union of config newtypes. The
+``SelfVerifying`` ``inner`` (worker) slot is STRUCTURED: a bare
+:class:`ReactConfig` there MUST declare an ``output`` schema handle (here
+``worker-schema``) so its result is evaluable, which
+:meth:`ExecutionRegistry.validate` enforces at run entry. The ``evaluator`` stays
+the EMPTY handle (``""``), which the builder default-fills from ``.verifier(..)``;
+only the ``worker-schema`` handle is registered explicitly on the
+:class:`ExecutionRegistry`.
 
 The task the agent-under-test must solve
 ----------------------------------------
@@ -95,17 +105,21 @@ from pathlib import Path
 
 from spore_core import (
     AgentId,
+    BudgetExhaustedEscalate,
     BudgetLimits,
     EvaluatorResponseVerifier,
+    ExecutionRegistry,
     HaltReasonSelfVerifyExhausted,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategySelfVerifying,
+    LoopStrategy,
     ModelAgent,
     OllamaModelInterface,
+    ReactConfig,
     RunResult,
     RunResultFailure,
     RunResultSuccess,
+    SelfVerifyingConfig,
     Task,
     VerifierInput,
     VerifierVerdict,
@@ -165,6 +179,51 @@ SYSTEM_PROMPT = (
     "  - `FAIL: <which criteria failed and why>` otherwise.\n"
     "Never emit PASS when unsure."
 )
+
+
+def worker_schema() -> dict[str, object]:
+    """The worker (build-phase) output contract (``worker-schema``). Post-#119,
+    ``SelfVerifying``'s ``inner`` (worker) slot is STRUCTURED: a bare
+    :class:`ReactConfig` there must declare an ``output`` schema so its result is
+    EVALUABLE (:meth:`ExecutionRegistry.validate` enforces this via the
+    structured-slot check). The build agent writes ``parse_int_list.py``; this
+    advertises the path it wrote."""
+    return {
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "Path the draft was written to."},
+            "summary": {"type": "string", "description": "What was implemented."},
+        },
+        "required": ["file"],
+    }
+
+
+def build_registry() -> ExecutionRegistry:
+    """The registry the composed strategy's handles resolve against. Only the
+    ``worker-schema`` is EXPLICIT; the builder default-fills the empty agent /
+    toolset handles (``ReactConfig.per_loop``) AND the empty-key evaluator from the
+    single-collaborator setters (``.evaluator_agent(..)`` / ``.verifier(..)``) at
+    ``build``. So the SelfVerifying ``evaluator`` stays the EMPTY handle (``""``)."""
+    return ExecutionRegistry.builder().schema("worker-schema", worker_schema()).build()
+
+
+def self_verifying_strategy(max_iterations: int) -> LoopStrategy:
+    """The post-#119 composed strategy: ``SelfVerifying(inner: ReAct, evaluator)``.
+    The worker leaf carries the ``worker-schema`` output contract (required for the
+    structured ``worker`` slot) and a ``per_loop(max_iterations)`` build budget. The
+    ``evaluator`` is the EMPTY handle (``""``), which the builder default-fills from
+    ``.verifier(..)``. Old flat shape was ``LoopStrategySelfVerifying()``."""
+    worker = ReactConfig.per_loop(max_iterations)
+    worker.output = "worker-schema"
+    return SelfVerifyingConfig(
+        inner=worker,
+        # The empty handle resolves to the default verifier the builder folds in
+        # from ``.verifier(..)`` (#124 single-collaborator migration seam).
+        evaluator="",
+        # Mirrors the shim default (``ReactConfig.per_loop`` stamps ``Escalate``):
+        # a nested combinator propagates exhaustion to its parent.
+        behavior=BudgetExhaustedEscalate(),
+    )
 
 
 def _run_result_output(result: RunResult) -> str:
@@ -282,6 +341,7 @@ async def main() -> int:
     harness = (
         HarnessBuilder.conversational(build_model)
         .sandbox(sandbox)
+        .registry(build_registry())
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
@@ -291,12 +351,15 @@ async def main() -> int:
     )
 
     # THE STRATEGY. There is no loop code below — the harness runs the
-    # verify -> revise cycle. A generous turn budget per build/evaluate sub-run
-    # lets a small model take a few tool calls before claiming done.
+    # verify -> revise cycle over the composed ``SelfVerifying(inner:
+    # ReAct{worker-schema}, evaluator)`` tree (post-#119). The worker leaf carries
+    # the ``worker-schema`` output contract — the ``inner`` slot is STRUCTURED. A
+    # generous turn budget per build/evaluate sub-run lets a small model take a few
+    # tool calls before claiming done.
     task = Task.new(
         prompt,
         new_session_id(),
-        LoopStrategySelfVerifying(),
+        self_verifying_strategy(max_iterations),
         budget=BudgetLimits(max_turns=12),
     )
 

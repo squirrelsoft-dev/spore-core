@@ -364,6 +364,20 @@ class ExecutionRegistryBuilder:
         self.registry.toolsets.setdefault("", toolset)
         return self
 
+    def fill_toolset(self, key: str, toolset: Any) -> ExecutionRegistryBuilder:
+        """Issue 2 (per-node toolset scoping): register ``toolset`` under ``key``
+        ONLY if that key is not already wired. ``HarnessConfig`` calls this for
+        every per-key catalogue accumulated via
+        :meth:`HarnessBuilder.toolset_tools` so a leaf referencing that handle
+        passes ``ExecutionRegistry.validate`` WITHOUT the caller wiring a
+        placeholder. The registry VALUE is never dispatched (dispatch goes through
+        ``HarnessConfig.toolset_catalogues``), so a presence entry suffices; an
+        explicitly-registered toolset under the same key wins. Mirrors
+        :meth:`fill_default_toolset` (and Rust's
+        ``ExecutionRegistryBuilder::fill_toolset``)."""
+        self.registry.toolsets.setdefault(key, toolset)
+        return self
+
     def fill_default_schema(self, schema: Any) -> ExecutionRegistryBuilder:
         """#124: as :meth:`fill_default_agent`, for a default output schema under
         the empty key — so a bare structured-slot leaf (``output=""``) resolves

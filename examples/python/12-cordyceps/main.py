@@ -320,11 +320,12 @@ def build_registry(model_id: str, base_url: str) -> ExecutionRegistry:
         .agent("planner", _model_agent("planner", model_id, base_url))
         .agent("executor", _model_agent("executor", model_id, base_url))
         .agent("ralph-agent", _model_agent("ralph-agent", model_id, base_url))
-        # The toolset HANDLES must resolve for `validate()`. The harness run loop
-        # dispatches every node through the single GLOBAL catalogue wired on the
-        # HarnessBuilder (`.tools(...)`), not per-node — a known harness scoping
-        # limitation — so these registry slots only need to be present, not
-        # distinct dispatchers. The real tools live on the builder (see `main`).
+        # The toolset HANDLES must resolve for `validate()`. Per-node toolset
+        # scoping is now RESOLVED (Issue 2): each leaf dispatches its own toolset's
+        # tools, wired per-toolset on the HarnessBuilder via `.toolset_tools(...)`
+        # (see `main`). These registry slots are validation-only presence entries —
+        # never dispatched — so a no-op `EmptyToolRegistry` is sufficient; the real
+        # dispatchable catalogues live in `HarnessConfig.toolset_catalogues`.
         .toolset("plan-tools", EmptyToolRegistry())
         .toolset("exec-tools", EmptyToolRegistry())
         .schema("plan-schema", _plan_schema())
@@ -641,8 +642,12 @@ async def main() -> int:
         # The harness's own model drives the Ralph wrapper; the per-node agents
         # come from the registry. Compaction/summarization uses this model too.
         model = OllamaModelInterface.with_base_url(model_id, base_url)
-        # The harness dispatches every node through ONE global catalogue: the
-        # union of plan-tools + exec-tools (read_file + grep dedupe by last-wins).
+        # Issue 2 (per-node toolset scoping): each leaf dispatches ONLY its own
+        # toolset. The real tools are wired per-toolset — `plan-tools` for the
+        # planner node, `exec-tools` for the worker node — so the planner cannot
+        # reach an exec-only tool (`read_file`) and the worker cannot reach a
+        # plan-only tool (`task_list`/`list_dir`). The leaf's `toolset` handle on
+        # the serialized tree drives the lookup.
         harness = (
             HarnessBuilder.conversational(model)
             .sandbox(sandbox)
@@ -651,8 +656,8 @@ async def main() -> int:
             .escalation_mode(EscalationModeSurfaceToHuman())
             .system_prompt(EXEC_SYSTEM_PROMPT)
             .context_manager(context_manager)
-            .tools(_plan_tools())
-            .tools(_exec_tools())
+            .toolset_tools("plan-tools", _plan_tools())
+            .toolset_tools("exec-tools", _exec_tools())
             .build()
         )
 
