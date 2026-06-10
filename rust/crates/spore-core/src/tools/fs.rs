@@ -180,12 +180,19 @@ impl ListDirTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: Self::NAME.into(),
-            description: "List directory entries (optionally recursive)".into(),
+            description: "List directory entries (optionally recursive). A recursive \
+                          listing honors .gitignore and skips VCS/build dirs by default; \
+                          set include_ignored to walk everything."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "recursive": {"type": "boolean"},
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Recursive only: when true, include .gitignore-matched and VCS files (default false).",
+                    },
                 },
                 "required": ["path"],
             }),
@@ -248,10 +255,20 @@ impl Tool for ListDirTool {
             };
             let mut entries: Vec<String> = Vec::new();
             if params.recursive {
-                for entry in walkdir::WalkDir::new(&resolved)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
+                // By default the walk honors `.gitignore`/`.ignore` and skips
+                // VCS dirs, so a recursive listing stays focused on source and
+                // is not buried under build artifacts (`target/`, `node_modules/`)
+                // — which alphabetically precede and would truncate away real
+                // source before the model ever sees it. `include_ignored` opts
+                // back into walking everything.
+                let honor_ignores = !params.include_ignored;
+                let walker = ignore::WalkBuilder::new(&resolved)
+                    .standard_filters(honor_ignores)
+                    // Respect `.gitignore` even when the listed tree is not a git
+                    // checkout (the default only honors it inside a `.git` repo).
+                    .require_git(false)
+                    .build();
+                for entry in walker.filter_map(Result::ok) {
                     if let Some(rel) = to_root_relative(entry.path()) {
                         entries.push(rel);
                     }
@@ -609,6 +626,54 @@ mod tests {
                 other => panic!("unexpected read_file output for {entry:?}: {other:?}"),
             }
         }
+    }
+
+    /// A recursive listing honors `.gitignore` by default — build artifacts
+    /// (`target/`) that alphabetically precede real source must not flood/
+    /// truncate the listing — but `include_ignored: true` opts back in.
+    #[tokio::test]
+    async fn list_dir_recursive_respects_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        tokio::fs::write(root.join(".gitignore"), "target/\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lib.rs"), "").await.unwrap();
+        tokio::fs::create_dir(root.join("target")).await.unwrap();
+        tokio::fs::write(root.join("target").join("junk.rs"), "")
+            .await
+            .unwrap();
+        let list = |include_ignored: bool| {
+            let path = root.to_str().unwrap().to_string();
+            async move {
+                let mut params = json!({"path": path, "recursive": true});
+                if include_ignored {
+                    params["include_ignored"] = json!(true);
+                }
+                let r = ListDirTool::new()
+                    .execute(&call("list_dir", params), &AllowAllSandbox, &test_ctx())
+                    .await;
+                match r {
+                    ToolOutput::Success { content, .. } => content,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+
+        // Default: target/ (gitignored) is excluded; source survives.
+        let default = list(false).await;
+        assert!(default.contains("lib.rs"), "source missing: {default:?}");
+        assert!(
+            !default.contains("target"),
+            "gitignored build dir leaked into default listing: {default:?}"
+        );
+
+        // Opt-in: include_ignored walks everything, build artifacts included.
+        let everything = list(true).await;
+        assert!(
+            everything.contains("target/junk.rs"),
+            "include_ignored should surface ignored files: {everything:?}"
+        );
     }
 
     #[tokio::test]

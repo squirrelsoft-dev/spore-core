@@ -174,6 +174,7 @@ fn plan_tools() -> Vec<StandardTool> {
 /// which the host run loop mediates (the seam moved off `SubagentTool`).
 fn exec_tools() -> Vec<StandardTool> {
     vec![
+        StandardTools::list_dir(),
         StandardTools::read_file(),
         StandardTools::grep(),
         research_best_practices_tool(),
@@ -453,7 +454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Issue 2: each node dispatches ONLY its own toolset's catalogue. The
         // tools are wired per-handle (`plan-tools` / `exec-tools`) — the planner
         // can no longer reach exec-only tools (read_file/consult_advisor) and the
-        // executor can no longer reach plan-only tools (task_list/list_dir).
+        // executor can no longer reach the plan-only `task_list` (though `list_dir`
+        // and `grep` appear in both catalogues).
         let harness = HarnessBuilder::conversational(model)
             .sandbox(sandbox)
             .storage(storage.clone())

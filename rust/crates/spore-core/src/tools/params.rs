@@ -38,6 +38,12 @@ pub struct ListDirParams {
     pub path: String,
     #[serde(default)]
     pub recursive: bool,
+    /// When `false` (default), a recursive walk honors `.gitignore`/`.ignore`
+    /// and skips VCS dirs (`.git/`) — keeping the listing focused on source and
+    /// out of the way of build artifacts (`target/`, `node_modules/`). Set
+    /// `true` to walk everything, ignored files included.
+    #[serde(default)]
+    pub include_ignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
