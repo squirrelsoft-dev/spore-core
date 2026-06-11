@@ -84,6 +84,83 @@ export function capturePlanArtifact(finalText: string): CaptureResult {
   return { ok: true, artifact: { tasks, rationale } };
 }
 
+/**
+ * Capture a {@link PlanArtifact}, falling back to a deterministic PROSE REPAIR
+ * when the strict canonical grammar ({@link capturePlanArtifact}) fails.
+ *
+ * A planner sometimes emits its plan JSON wrapped in prose ("Here is the plan:
+ * `{...}` — let me know…") instead of as a bare object, so the strict grammar
+ * rejects it. This fallback extracts the FIRST balanced top-level JSON object
+ * embedded in the text ({@link extractEmbeddedJsonObject}) and re-parses THAT
+ * with the same canonical grammar. It is a pure, always-on fallback: it runs
+ * ONLY after the strict path fails, so it can never change a plan the strict
+ * grammar already accepts — it can only turn a hard failure into a success.
+ * When no embedded object repairs cleanly, the ORIGINAL strict error is
+ * returned (it is the more informative diagnostic).
+ *
+ * Like the strict grammar, this MUST be byte-identical across all four
+ * languages — the embedded-object scan is a deterministic ASCII char walk.
+ */
+export function capturePlanArtifactWithRepair(finalText: string): CaptureResult {
+  const strict = capturePlanArtifact(finalText);
+  if (strict.ok) {
+    return strict;
+  }
+  const candidate = extractEmbeddedJsonObject(finalText);
+  if (candidate === undefined) {
+    return strict;
+  }
+  // Re-parse the extracted object with the SAME canonical grammar; if it still
+  // does not parse, surface the original strict error.
+  const repaired = capturePlanArtifact(candidate);
+  return repaired.ok ? repaired : strict;
+}
+
+/**
+ * Extract the first balanced top-level JSON object (`{ … }`) embedded in `text`,
+ * or `undefined` if there is no balanced object. Scans from the first `{`,
+ * tracking brace depth while respecting JSON string literals (a `"` opens/closes
+ * a string; a `\` escapes the next char inside one), and returns the slice up to
+ * and including the matching `}`. Braces inside strings do not affect depth.
+ *
+ * The structural characters `{` `}` `"` `\` are all single-code-unit ASCII, so
+ * walking JS string code units yields the same result as Rust's byte scan: the
+ * scan branches only on these ASCII chars and slices only at `{`/`}` positions,
+ * leaving any multi-byte content inside string literals intact. MUST be
+ * byte-identical across all four languages.
+ */
+export function extractEmbeddedJsonObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  if (start < 0) {
+    return undefined;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
 function err(message: string): CaptureResult {
   return { ok: false, error: PlanPhaseError.unparseablePlan(message) };
 }

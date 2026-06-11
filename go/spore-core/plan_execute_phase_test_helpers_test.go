@@ -15,8 +15,9 @@ import "context"
 // tests.
 
 // runPlanPhase drives the recursive plan phase for task (whose strategy MUST be a
-// PlanExecute): seed the directive, dispatch plan.Run capped at one turn, then
-// capture + persist the artifact. Mirrors the plan half of PlanExecuteConfig.Run
+// PlanExecute): seed the directive, dispatch plan.Run under the plan
+// sub-strategy's own declared budget, then capture + persist the artifact.
+// Mirrors the plan half of PlanExecuteConfig.Run
 // and preserves the legacy (*planPhaseOutcome, *RunResult) test signature.
 func (h *StandardHarness) runPlanPhase(
 	ctx context.Context,
@@ -36,12 +37,10 @@ func (h *StandardHarness) runPlanPhase(
 	planSession := cloneSessionState(session)
 	h.config.ContextManager.AppendUserMessage(ctx, planSession, directive)
 
-	planCap := saturatingAddU32(budget.Turns, 1)
-	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < planCap {
-		planCap = *task.Budget.MaxTurns
-	}
+	// The plan sub-strategy's own declared budget governs the plan phase (R1): an
+	// authored task_list may take more than one turn. The task's global turn
+	// ceiling remains the outer backstop (R10) — not a turns+1 clamp.
 	planBudget := task.Budget
-	planBudget.MaxTurns = &planCap
 	planTask := Task{
 		ID:           task.ID,
 		Instruction:  directive,

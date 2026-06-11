@@ -1,41 +1,46 @@
-// spore-core example 12 — cordyceps: a fully autonomous task-completion agent
-// (the capstone).
+// spore-core example 12 — cordyceps: the capstone of the Composable Execution
+// refactor (#117–#131).
 //
-// # The thesis: you give it a task; it does not stop until the job is done —
-// and when a worker gets stuck or uncertain, it asks for help (a sibling helper,
-// then a human) rather than giving up.
+// # The thesis: you describe a strategy as DATA — a composed LoopStrategy tree —
+// wire its string handles to concrete collaborators in an ExecutionRegistry, and
+// the harness runs the whole nested machine under one shared budget / usage /
+// observability context.
 //
-// This example composes everything the suite has built — subagents-as-tools (11),
-// custom sandboxed tools (05), web_search (06), memory (07), task_list — plus two
-// new capabilities:
+// The motivating composition is:
 //
-//   - Architect-side skill loading (see skills.go): a load_skill tool activates
-//     the bundled audit skill at runtime via a guideregistry, and a custom
-//     context manager re-injects the skill body every turn (compaction-proof).
-//     This is the pattern issue #115 will absorb into the harness; the live
-//     loop's structural skill-injection path is not wired yet (see the README and
-//     #115).
-//   - A generalized consult / escalation ladder (issue #114): the analysis worker
-//     escalates mid-loop to a research helper (kind=research, budget 5,
-//     soft-fail) and then to a cloud-model advisor (kind=advice, budget 3,
-//     escalate-to-human), resuming each time without ending its run.
+//	Ralph[ PlanExecute[ ReAct, SelfVerifying[ ReAct ] ] ]
+//	│       │             │      │             │
+//	│       │             │      │             └─ worker: audits ONE module
+//	│       │             │      └─ Default-FAIL evaluator (single read-only turn)
+//	│       │             └─ plan: explores the repo, builds a blocker-aware DAG
+//	│       └─ plan→ready-set: walks the DAG in dependency order, self-verifying each task
+//	└─ continuation wrapper: resets the window, resumes from durable progress
 //
-// # Topology (depth-1)
+// # What changed vs. the pre-#131 example (HONEST note)
 //
-//	orchestrator (ReAct, gemma4:e4b)
-//	  tools: list_dir, grep, task_list, memory, write_file, bash_command,
-//	         analysis_worker (SubagentTool, with consult handlers)
-//	  ├── analysis_worker (Isolated) — audits ONE module
-//	  │     tools: read_file, grep, research_best_practices, consult_advisor,
-//	  │            load_skill
-//	  ├── research_worker (Isolated) — web_search   [consult handler: research]
-//	  └── advisor         (Isolated, cloud model)   [consult handler: advice]
+// The old depth-1 example used a hand-built SubagentTool orchestrator with a
+// per-node consult mediator (#114) and an architect-side load_skill tool (#115).
+// The declarative tree has NO SubagentTool seam, so:
 //
-// The orchestrator enumerates crates → modules, adds one task_list task per
-// module, dispatches the analysis worker per task, accumulates findings in
-// memory, finalizes the top 5, writes workspace/findings.md, and runs the y/N
-// issue-filing flow. The audit is READ-ONLY; the only writes are
-// workspace/findings.md and (approved) GitHub issues.
+//   - the #114 consult ladder is PRESERVED, with its mediation seam moved. The
+//     worker still calls research_best_practices / consult_advisor, which lower to
+//     a Consult ToolOutput. With no SubagentTool to mediate, the worker-leaf
+//     consult propagates all the way up to a top-level RunResult.Consult, and the
+//     HOST run loop mediates it — routing by `kind` to a helper harness with a
+//     per-kind budget + overflow policy (research → web_search, budget 5,
+//     SoftFail; advice → cloud advisor, budget 3, EscalateToHuman). Identical
+//     #114 semantics, host-owned budgets.
+//   - load_skill is DROPPED — there is no worker-side per-node seam;
+//   - the audit skill is KEPT, but now rides the single GLOBAL
+//     SkillInjectingContextManager (the harness's context manager), seeded
+//     ALWAYS-ACTIVE at startup. The audit procedure reaches the model structurally
+//     every turn, compaction-proof, with no load_skill round-trip.
+//
+// # The tree is DATA
+//
+// We do NOT hand-build the LoopStrategy. We //go:embed the canonical fixture
+// fixtures/strategy/cordyceps_tree.json and deserialize it — so this example
+// proves the canonical fixture deserializes and runs.
 //
 // # Run it
 //
@@ -53,9 +58,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"time"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
@@ -63,71 +66,121 @@ import (
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/ollama"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/storage"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/tools"
+	"github.com/squirrelsoft-dev/spore-core/go/spore-core/verifier"
 )
 
+// cordycepsTreeJSON is the canonical composed-strategy fixture, embedded so the
+// example proves the ground-truth tree deserializes (and runs) verbatim — never
+// hand-built. Go's //go:embed is the idiomatic equivalent of Rust's include_str!.
+//
+//go:embed cordyceps_tree.json
+var cordycepsTreeJSON []byte
+
 // bundledAuditSkill is the audit skill, embedded so the example is
-// self-contained even with an empty .spore/skills/. Go's //go:embed is the
-// idiomatic equivalent of Rust's include_str!.
+// self-contained even with an empty .spore/skills/.
 //
 //go:embed skills/audit/SKILL.md
 var bundledAuditSkill string
 
-// defaultAuditPrompt is the pre-filled audit prompt the user presses enter to
-// accept (from the issue). An empty line at the REPL ⇒ this verbatim.
-const defaultAuditPrompt = "Audit the current repo for the rust language. Work sequentially by " +
-	"identifying each crate, and each module in the crate, and adding a task to the tasklist for a " +
-	"subagent to do the deep dive audit on."
+// execEvaluatorKey is the verifier registry key the SelfVerifying node's
+// evaluator handle resolves to.
+const execEvaluatorKey = "exec-evaluator"
 
-// workerTimeout is the per-worker wall-clock cap. A worker can burn many internal
-// ReAct turns (and mediated consults); this bounds how long the orchestrator
-// waits on one delegation.
-const workerTimeout = 300 * time.Second
+// defaultAuditPrompt is the pre-filled audit prompt (press enter to accept).
+const defaultAuditPrompt = "Audit this repository for Rust defects. Discover the crates and their " +
+	"modules, audit each module for real, actionable defects, and write a markdown report of the " +
+	"most important findings to `workspace/findings.md`."
 
-// maxOrchestratorTurns is the orchestrator's turn budget.
-const maxOrchestratorTurns uint32 = 64
+const execSystemPrompt = "You are a cordyceps execution machine. Your strategy is composed " +
+	"declaratively: a Ralph continuation wrapper drives a PlanExecute, whose plan phase explores " +
+	"the repo and builds a blocker-aware task graph via `task_list`, and whose execute phase walks " +
+	"that graph as a ready-set — auditing one module per ready task, each result self-verified by a " +
+	"read-only evaluator (Default-FAIL: only an explicit PASS clears a task).\n\n" +
+	"You are already scoped to the repository root (READ-ONLY). Use `.` for the root and paths " +
+	"relative to it (e.g. `rust/crates`); never prefix a path with the repository's own folder " +
+	"name. The audit is read-only — you have no write tool; never attempt to modify source files.\n\n" +
+	"Follow the ACTIVE `audit` skill's procedure and output schema exactly: grep first, read " +
+	"narrow, and return findings as a JSON array of {file, line, severity, description}.\n\n" +
+	"PLAN phase: explore the repo with `list_dir`/`grep`, then build a blocker-aware task graph " +
+	"with `task_list` (one task per module; add dependencies where one audit should wait on " +
+	"another). RALPH wrapper: resume from durable `task_list` progress after each context-window " +
+	"reset and keep going until every task is done."
 
-const orchestratorPrompt = "You are the cordyceps orchestrator: an autonomous Rust-repo auditor. " +
-	"You do not stop until the audit is complete. Work sequentially: (1) use `list_dir` to " +
-	"enumerate the crates under `rust/crates/`, then the modules (`src/*.rs`) in each crate; " +
-	"(2) for each module, add ONE task to the task list (`task_list`) describing the module to " +
-	"audit; (3) for each task, call `analysis_worker` with an `instruction` naming the ONE module " +
-	"to deep-dive audit; (4) accumulate the findings each worker returns into `memory` under a " +
-	"stable key; (5) when every module is audited, pick the TOP 5 most important findings across " +
-	"all modules and write them as a markdown report to `workspace/findings.md` using " +
-	"`write_file`. The audit is READ-ONLY — never modify source files. Delegate the per-module " +
-	"deep dives to `analysis_worker`; do not audit modules yourself. Finish by writing findings.md."
+const researchPrompt = "You are a research worker. A peer agent needs factual, current information " +
+	"on a Rust best-practice or language question. Use `web_search` to find the answer. Issue " +
+	"focused queries, read the results, and return a concise cited answer in plain text. Do not " +
+	"answer from memory alone — always search first."
 
-const analysisWorkerPrompt = "You are an analysis worker: you deep-dive audit exactly ONE Rust " +
-	"module for real, actionable defects. BEFORE auditing, call `load_skill` with `skill_id` = " +
-	"\"audit\" and follow the returned procedure and findings schema EXACTLY. Stay inside the one " +
-	"module you were given. Grep first, read only narrow line ranges, and escalate with " +
-	"`research_best_practices` (idiom questions) or `consult_advisor` (severity / is-this-real " +
-	"questions) when genuinely unsure. Your FINAL answer must be a JSON array of " +
-	"{file, line, severity, description} objects — and nothing else."
+const advisorPrompt = "You are a senior Rust advisor. A worker has escalated a candidate finding " +
+	"to you because they need a judgment call. Use `read_file` and `grep` to examine the specific " +
+	"code in question. Then make a decision: is this a real defect, what is the severity " +
+	"(low / medium / high / critical), and why. Be decisive. State your verdict in one sentence, " +
+	"your reasoning in two. Do not hedge."
 
-const researchPrompt = "You are a research worker. Use the web_search tool to gather current, " +
-	"factual information on the Rust best-practice or idiom question you are given. Issue focused " +
-	"queries, read the results, and return a concise, cited answer as plain text. Act using " +
-	"web_search — do not answer from memory alone."
-
-const advisorPrompt = "You are a senior Rust advisor. A worker is stuck on whether a finding is a " +
-	"real defect, or on how to rank its severity. Use `read_file` and `grep` to investigate the " +
-	"specific code in question, then give a crisp, decisive recommendation: is it a real defect, " +
-	"what severity (low/medium/high/critical), and why. Be concrete and brief."
-
-// instructionSchema is the single-parameter input schema every subagent tool
-// advertises.
-func instructionSchema() json.RawMessage {
+// planSchema — the task-graph contract the plan phase's ReAct emits.
+func planSchema() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "instruction": {
-      "type": "string",
-      "description": "The full instruction / task for the worker agent."
-    }
+    "tasks": {
+      "type": "array",
+      "description": "Ordered task-graph entries; each names a module to audit.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "module": { "type": "string", "description": "Module path to audit." },
+          "blockers": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "description": "1-based ids of tasks this one waits on."
+          }
+        },
+        "required": ["module"]
+      }
+    },
+    "rationale": { "type": "string" }
   },
-  "required": ["instruction"]
+  "required": ["tasks"]
 }`)
+}
+
+// workerSchema — the per-module finding contract the worker ReAct emits.
+func workerSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "array",
+  "description": "Findings for ONE module.",
+  "items": {
+    "type": "object",
+    "properties": {
+      "file": { "type": "string", "description": "Path relative to the repo root." },
+      "line": { "type": "integer", "description": "1-based line of the defect." },
+      "severity": { "enum": ["low", "medium", "high", "critical"] },
+      "description": { "type": "string", "description": "Concrete, actionable defect." }
+    },
+    "required": ["file", "line", "severity", "description"]
+  }
+}`)
+}
+
+// planTools is the plan-tools catalogue: explore + author the task graph (read-only).
+func planTools() []sporecore.StandardTool {
+	return []sporecore.StandardTool{
+		tools.StandardTools{}.ListDir(),
+		tools.StandardTools{}.Grep(),
+		tools.StandardTools{}.TaskList(),
+	}
+}
+
+// execTools is the exec-tools catalogue: read-only audit + the #114 consult
+// ladder. The two consult tools lower to a Consult ToolOutput, which the host run
+// loop mediates (the seam moved off SubagentTool).
+func execTools() []sporecore.StandardTool {
+	return []sporecore.StandardTool{
+		tools.StandardTools{}.ReadFile(),
+		tools.StandardTools{}.Grep(),
+		researchBestPracticesTool(),
+		consultAdvisorTool(),
+	}
 }
 
 // buildWebSearch builds the SearXNG-backed web_search catalogue tool (identical
@@ -146,22 +199,8 @@ func buildWebSearch(endpoint string) (sporecore.StandardTool, error) {
 	return tools.StandardTool{Implementation: tool, Schema: tool.Schema()}, nil
 }
 
-// buildInnerContextManager builds the standard compaction adapter (the same one
-// the conversational preset installs), so the skill-injecting context manager can
-// embed it and inherit every non-Assemble method.
-func buildInnerContextManager(model, baseURL string) *contextmgr.StandardCompactionAdapter {
-	mi := ollama.WithBaseURL(model, baseURL)
-	return contextmgr.NewStandardCompactionAdapter(
-		contextmgr.NewStandardContextManager(
-			mi,
-			contextmgr.NullCacheProvider{},
-			contextmgr.DefaultCompactionConfig(),
-		),
-	)
-}
-
-// buildResearchHarness builds the research worker (web_search only). Used as the
-// kind=research consult handler.
+// buildResearchHarness builds the research handler harness (web_search only) — the
+// kind=research consult handler. Run host-side on a ConsultRequest.
 func buildResearchHarness(model, baseURL, endpoint string) (sporecore.Harness, error) {
 	webSearch, err := buildWebSearch(endpoint)
 	if err != nil {
@@ -174,9 +213,9 @@ func buildResearchHarness(model, baseURL, endpoint string) (sporecore.Harness, e
 		Build(), nil
 }
 
-// buildAdvisorHarness builds the advisor (cloud model, read_file + grep). Used as
-// the kind=advice consult handler. Rides the same Ollama endpoint via WithBaseURL;
-// only the model id differs.
+// buildAdvisorHarness builds the advisor handler harness (cloud model, read_file +
+// grep) — the kind=advice consult handler. Rides the same Ollama endpoint via
+// WithBaseURL; only the model id differs (heterogeneous models).
 func buildAdvisorHarness(model, baseURL string, repoSandbox sporecore.SandboxProvider) sporecore.Harness {
 	mi := ollama.WithBaseURL(model, baseURL)
 	return observability.ConversationalBuilder(mi).
@@ -187,70 +226,108 @@ func buildAdvisorHarness(model, baseURL string, repoSandbox sporecore.SandboxPro
 		Build()
 }
 
-// buildAnalysisHarness builds the analysis worker: read_file, grep, the two
-// consult tools, and load_skill. Isolated; audits ONE module. It shares the SAME
-// run store as the orchestrator so load_skill's active-skill write and the
-// context manager's read rendezvous (keyed by the worker's own session id, so
-// each worker activates audit for itself).
-func buildAnalysisHarness(
-	model, baseURL string,
-	repoSandbox sporecore.SandboxProvider,
-	runStore sporecore.ToolRunStore,
-	catalog *SkillCatalog,
-) sporecore.Harness {
+// buildConsultHandlers builds the HOST-owned kind → {handler, budget, overflow}
+// map (#114). The composed tree has no SubagentTool, so the host run loop holds
+// these entries and mediates each RunResult.Consult against them — the per-kind
+// budget lives for the whole run (see mediateConsult).
+func buildConsultHandlers(research, advisor sporecore.Harness) map[string]sporecore.ConsultHandlerEntry {
+	return map[string]sporecore.ConsultHandlerEntry{
+		kindResearch: {
+			Handler:  research,
+			Budget:   5,
+			Overflow: sporecore.ConsultOverflowPolicy{Kind: sporecore.ConsultOverflowSoftFail},
+		},
+		kindAdvice: {
+			Handler:  advisor,
+			Budget:   3,
+			Overflow: sporecore.ConsultOverflowPolicy{Kind: sporecore.ConsultOverflowEscalateToHuman},
+		},
+	}
+}
+
+// modelAgent builds a model agent (sporecore.Agent) over the local Ollama model.
+func modelAgent(id, model, baseURL string) sporecore.Agent {
 	mi := ollama.WithBaseURL(model, baseURL)
-	inner := buildInnerContextManager(model, baseURL)
-	skillCM := NewSkillInjectingContextManager(inner, runStore, catalog.Manifest())
-	return observability.ConversationalBuilder(mi).
-		Sandbox(repoSandbox).
-		Storage(runStore, nil).
-		ContextManager(skillCM).
-		Tool(tools.StandardTools{}.ReadFile()).
-		Tool(tools.StandardTools{}.Grep()).
-		Tool(researchBestPracticesTool()).
-		Tool(consultAdvisorTool()).
-		Tool(loadSkillTool(catalog.Registry())).
-		SystemPrompt(analysisWorkerPrompt).
+	return sporecore.NewModelAgent(sporecore.AgentID(id), mi)
+}
+
+// execEvaluator is the Default-FAIL self-verification evaluator registered under
+// exec-evaluator. A single read-only turn (MaxIterations = 1); the neither-pattern
+// => Failed contract is built into EvaluatorResponseVerifier.
+func execEvaluator() sporecore.Verifier {
+	v, err := verifier.NewEvaluatorResponseVerifier(`(?i)\bPASS\b`, `(?i)\bFAIL\b`, 1)
+	if err != nil {
+		panic(fmt.Sprintf("evaluator regexes are valid: %v", err))
+	}
+	return verifier.AsHarnessVerifier(v)
+}
+
+// buildRegistry assembles the ExecutionRegistry the cordyceps tree's handles
+// resolve against: agents planner/executor/ralph-agent, toolsets
+// plan-tools/exec-tools, schemas plan-schema/worker-schema, and the exec-evaluator
+// verifier. The handle STRINGS are ground truth from the fixture; this is the
+// host-side wiring of those strings to collaborators.
+//
+// The toolset HANDLES must resolve for Validate(). Per-node toolset scoping is now
+// RESOLVED (Issue 2): each leaf carrying a non-empty toolset handle dispatches its
+// OWN tools, wired via the builder's .ToolsetTools("plan-tools", ...) /
+// .ToolsetTools("exec-tools", ...) per-key catalogues. These registry slots are
+// presence-only — validation entries the standalone registry's Validate() contract
+// needs, NEVER dispatched (dispatch goes through the builder's per-key catalogues).
+// They are kept so this registry stays self-consistent on its own; an explicit slot
+// wins over the harness's auto-fill (fill-only). The real tools live on the builder.
+func buildRegistry(model, baseURL string) sporecore.ExecutionRegistry {
+	return sporecore.NewExecutionRegistryBuilder().
+		Agent("planner", modelAgent("planner", model, baseURL)).
+		Agent("executor", modelAgent("executor", model, baseURL)).
+		Agent("ralph-agent", modelAgent("ralph-agent", model, baseURL)).
+		Toolset("plan-tools", sporecore.NewStandardToolRegistry()).
+		Toolset("exec-tools", sporecore.NewStandardToolRegistry()).
+		Schema("plan-schema", planSchema()).
+		Schema("worker-schema", workerSchema()).
+		Verifier(execEvaluatorKey, execEvaluator()).
 		Build()
 }
 
-// buildAnalysisTool wraps the analysis worker as a SubagentTool with the consult
-// handlers installed. The two handlers mediate by kind (research →
-// research_worker, advice → advisor) with the per-kind budgets + overflow
-// policies from #114.
-func buildAnalysisTool(
-	analysis sporecore.Harness,
-	consultHandlers map[string]sporecore.ConsultHandlerEntry,
-) (sporecore.StandardTool, error) {
-	const name = "analysis_worker"
-	const description = "Delegate a deep-dive audit of ONE Rust module: pass an `instruction` " +
-		"naming the module; it loads the `audit` skill, audits the module (escalating via " +
-		"consults when stuck), and returns a JSON array of {file, line, severity, description} findings."
-
-	emptyChildRegistry := sporecore.NewStandardToolRegistry()
-	subagent, err := tools.NewSubagentTool(
-		name,
-		description,
-		instructionSchema(),
-		workerTimeout,
-		tools.Isolated{},
-		analysis,
-		emptyChildRegistry,
-	)
-	if err != nil {
-		return sporecore.StandardTool{}, fmt.Errorf("failed to build analysis worker tool: %w", err)
+// buildTask builds the cordyceps Task: the composed tree deserialized from the
+// fixture, under a generous global backstop so the per-node PerLoop{12} worker
+// bound fires first.
+func buildTask(prompt string, session sporecore.SessionID) (sporecore.Task, error) {
+	var tree sporecore.LoopStrategy
+	if err := json.Unmarshal(cordycepsTreeJSON, &tree); err != nil {
+		return sporecore.Task{}, fmt.Errorf("cordyceps_tree.json deserializes: %w", err)
 	}
-	subagent = subagent.WithConsultHandlers(consultHandlers)
+	maxTurns := uint32(64)
+	return sporecore.NewTask(prompt, session, tree).
+		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}), nil
+}
 
-	return tools.StandardTool{
-		Implementation: subagent,
-		Schema: sporecore.RegistryToolSchema{
-			Name:        name,
-			Description: "Deep-dive audit one module via a subagent; returns JSON findings.",
-			Parameters:  instructionSchema(),
-			Annotations: sporecore.ToolAnnotations{OpenWorld: true},
-		},
-	}, nil
+// buildInnerContextManager builds the standard compaction adapter (the same one
+// the conversational preset installs), so the global skill-injecting context
+// manager can embed it and inherit every non-Assemble method.
+func buildInnerContextManager(model, baseURL string) *contextmgr.StandardCompactionAdapter {
+	mi := ollama.WithBaseURL(model, baseURL)
+	return contextmgr.NewStandardCompactionAdapter(
+		contextmgr.NewStandardContextManager(
+			mi,
+			contextmgr.NullCacheProvider{},
+			contextmgr.DefaultCompactionConfig(),
+		),
+	)
+}
+
+// seedActiveSkill seeds skillID ALWAYS-ACTIVE for session: the global context
+// manager injects its body structurally every turn (no load_skill round-trip in
+// the composed tree).
+func seedActiveSkill(ctx context.Context, runStore sporecore.RunStore, session sporecore.SessionID, skillID string) error {
+	value, err := json.Marshal([]string{skillID})
+	if err != nil {
+		return fmt.Errorf("marshal active_skills: %w", err)
+	}
+	if err := runStore.Put(ctx, session, activeSkillsKey, value); err != nil {
+		return fmt.Errorf("seed active_skills: %w", err)
+	}
+	return nil
 }
 
 func main() {
@@ -264,13 +341,16 @@ func run() error {
 	ctx := context.Background()
 
 	model := flagOrEnv("--model", "SPORE_OLLAMA_MODEL", "gemma4:e4b")
+	// The #114 advisor consult handler runs a heterogeneous (cloud) model.
 	advisorModel := flagOrEnv("--advisor-model", "SPORE_ADVISOR_MODEL", "minimax-m3:cloud")
 	baseURL := os.Getenv("SPORE_OLLAMA_BASE_URL")
 	if baseURL == "" {
 		baseURL = ollama.DefaultBaseURL
 	}
 
-	// Required search backend (research worker) — fail fast like 06/11.
+	// The research consult handler needs a SearXNG JSON endpoint — fail fast (like
+	// examples 06/11) so a missing backend is a startup error, not a mid-run
+	// surprise.
 	endpoint := strings.TrimSpace(flagValue("--search-url"))
 	if endpoint == "" {
 		endpoint = strings.TrimSpace(os.Getenv("SPORE_WEB_SEARCH_ENDPOINT"))
@@ -282,8 +362,6 @@ func run() error {
 		os.Exit(2)
 	}
 
-	// Resolve the repo root (cwd) for the read-only audit sandbox, and this
-	// example's workspace/ for the report write.
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to resolve repo root: %w", err)
@@ -291,326 +369,331 @@ func run() error {
 	if abs, absErr := filepath.Abs(repoRoot); absErr == nil {
 		repoRoot = abs
 	}
-	workspaceRoot, err := workspaceDir()
-	if err != nil {
-		return err
+	workspaceRoot := filepath.Join(repoRoot, "workspace")
+	if err := os.MkdirAll(workspaceRoot, 0o755); err != nil {
+		return fmt.Errorf("failed to create workspace dir: %w", err)
 	}
 
-	// Seed .spore/skills/audit/SKILL.md from the bundled copy if absent, so a
-	// user can see the filesystem-registry shape (documented in the README).
-	seedBundledAuditSkill(repoRoot)
-
-	// One in-memory storage provider, shared by the orchestrator and the analysis
-	// worker so load_skill (worker-side write) and the context manager (read)
-	// rendezvous on run_store["active_skills"].
-	store := storage.SingleStorageProvider(storage.NewInMemoryStorageProvider())
-	runStore := store.Run()
-
-	// Scan + register skills (bundled audit + any project/user skills).
-	catalog := BootstrapCatalog(ctx, repoRoot, bundledAuditSkill)
-
-	// The orchestrator can read the whole repo + write into its own workspace.
-	// Workers and the advisor get a read-only-by-tool-set view rooted at the same
-	// repo. For the read-only audit guarantee we rely on the prompt + skill
-	// discipline + the workers' tool sets, not a read-only sandbox.
-	orchestratorSandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: repoRoot})
-	if err != nil {
-		return fmt.Errorf("failed to create orchestrator sandbox: %w", err)
+	// AC5: the fully-bounded tree's worst-case per-window turn count is computable
+	// BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]] =
+	// 4 + (12 + 1) = 17. An Unlimited anywhere would collapse this to (_, false).
+	var treePreview sporecore.LoopStrategy
+	if err := json.Unmarshal(cordycepsTreeJSON, &treePreview); err != nil {
+		return fmt.Errorf("cordyceps_tree.json deserializes: %w", err)
 	}
-	workerSandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: repoRoot})
-	if err != nil {
-		return fmt.Errorf("failed to create worker sandbox: %w", err)
+	maxSteps, bounded := treePreview.MaxSteps()
+	maxStepsStr := "Unlimited (no static bound)"
+	if bounded {
+		maxStepsStr = fmt.Sprintf("%d", maxSteps)
 	}
-
-	// ---- Build the consult handlers (research + advice) ---------------------
-	researchHandler, err := buildResearchHarness(model, baseURL, endpoint)
-	if err != nil {
-		return err
-	}
-	advisorHandler := buildAdvisorHarness(advisorModel, baseURL, workerSandbox)
-	consultHandlers := map[string]sporecore.ConsultHandlerEntry{
-		kindResearch: {
-			Handler:  researchHandler,
-			Budget:   5,
-			Overflow: sporecore.ConsultOverflowPolicy{Kind: sporecore.ConsultOverflowSoftFail},
-		},
-		kindAdvice: {
-			Handler:  advisorHandler,
-			Budget:   3,
-			Overflow: sporecore.ConsultOverflowPolicy{Kind: sporecore.ConsultOverflowEscalateToHuman},
-		},
-	}
-
-	// ---- Build the analysis worker + wrap it (with consult handlers) --------
-	analysis := buildAnalysisHarness(model, baseURL, workerSandbox, runStore, catalog)
-	analysisTool, err := buildAnalysisTool(analysis, consultHandlers)
-	if err != nil {
-		return err
-	}
-
-	// ---- Build the orchestrator --------------------------------------------
-	orchestratorModel := ollama.WithBaseURL(model, baseURL)
-	orchestrator := observability.ConversationalBuilder(orchestratorModel).
-		Sandbox(orchestratorSandbox).
-		Storage(runStore, nil).
-		Tool(tools.StandardTools{}.ListDir()).
-		Tool(tools.StandardTools{}.Grep()).
-		Tool(tools.StandardTools{}.TaskList()).
-		Tool(tools.StandardTools{}.Memory()).
-		Tool(tools.StandardTools{}.WriteFile()).
-		Tool(tools.StandardTools{}.BashCommand()).
-		Tool(analysisTool).
-		SystemPrompt(orchestratorPrompt).
-		Build()
 
 	fmt.Printf("model        : %s\n", model)
 	fmt.Printf("advisor model: %s\n", advisorModel)
-	fmt.Printf("endpoint     : %s\n", endpoint)
+	fmt.Printf("search       : %s\n", endpoint)
 	fmt.Printf("repo root    : %s\n", repoRoot)
-	fmt.Printf("workspace    : %s\n", workspaceRoot)
-	fmt.Printf("skills       : %s\n", strings.Join(catalog.Names(), ", "))
-	fmt.Printf("strategy     : orchestrator=ReAct, workers=ReAct (isolated)\n\n")
+	fmt.Printf("strategy     : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)\n")
+	fmt.Printf("max_steps    : %s  (per-window worst case; Unlimited anywhere => none)\n", maxStepsStr)
+	fmt.Printf("consults     : research(web_search, budget 5, soft-fail), advice(advisor, budget 3, escalate)\n\n")
 
-	// ---- REPL: pre-filled prompt, enter accepts the default -----------------
 	reader := bufio.NewScanner(os.Stdin)
-	prompt := readAuditPrompt(reader)
-
-	// Stream banners: mirror 11-multi-agent's ┌─ … └─ boundary style.
-	callNames := map[string]string{}
-	maxTurns := maxOrchestratorTurns
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 64,
-	}).WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
-	options := sporecore.NewHarnessRunOptions(task)
-	options.OnStream = streamSink(callNames)
-
-	// ---- Drive the orchestrator, handling the human-escalation ladder -------
-	result := orchestrator.Run(ctx, options)
 	for {
-		switch result.Kind {
-		case sporecore.RunSuccess:
-			fmt.Printf("\norchestrator done (%d turn(s)): %s\n", result.Turns, truncate(result.Output, 400))
-			findings := filepath.Join(workspaceRoot, "findings.md")
-			if _, statErr := os.Stat(findings); statErr == nil {
-				fmt.Printf("\nfindings.md written: %s\n", findings)
-				runIssueFilingFlow(ctx, orchestrator, reader, findings)
-			} else {
-				fmt.Fprintln(os.Stderr, "\nwarning: orchestrator finished but workspace/findings.md was not written.")
-			}
-			return nil
-		case sporecore.RunFailure:
-			return fmt.Errorf("orchestrator failed after %d turn(s): %+v", result.Turns, result.Reason)
-		case sporecore.RunWaitingForHuman:
-			// The advice consult budget (3) was exhausted under EscalateToHuman:
-			// the analysis_worker SubagentTool converted the over-budget consult
-			// into a human pause, which bubbled up here.
-			result = handleHumanEscalation(ctx, orchestrator, advisorHandler, reader, result)
-		default:
-			return fmt.Errorf("run ended unexpectedly: %s %+v", result.Kind, result.Reason)
+		prompt, ok := readAuditPrompt(reader)
+		if !ok {
+			break
 		}
+
+		session := sporecore.NewSessionID()
+		store := storage.SingleStorageProvider(storage.NewInMemoryStorageProvider())
+		runStore := store.Run()
+
+		// Read-only repo sandbox: the audit never writes source files.
+		sandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: repoRoot, ReadOnly: true})
+		if err != nil {
+			return fmt.Errorf("failed to create repo sandbox: %w", err)
+		}
+		// The advisor handler gets its own read-only view of the repo (read_file +
+		// grep) so it can inspect the code the worker is asking about.
+		advisorSandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: repoRoot, ReadOnly: true})
+		if err != nil {
+			return fmt.Errorf("failed to create advisor sandbox: %w", err)
+		}
+
+		// The HOST-owned consult ladder (#114). The seam moved off SubagentTool:
+		// the host loop holds these handlers + per-kind budgets for the whole run.
+		researchHandler, err := buildResearchHarness(model, baseURL, endpoint)
+		if err != nil {
+			return err
+		}
+		advisorHandler := buildAdvisorHarness(advisorModel, baseURL, advisorSandbox)
+		consultHandlers := buildConsultHandlers(researchHandler, advisorHandler)
+
+		// Scan + register skills, then seed `audit` ALWAYS-ACTIVE so the global
+		// context manager injects its body structurally every turn (no load_skill
+		// round-trip in the composed tree).
+		catalog := BootstrapCatalog(ctx, repoRoot, bundledAuditSkill)
+		if err := seedActiveSkill(ctx, runStore, session, "audit"); err != nil {
+			return err
+		}
+		inner := buildInnerContextManager(model, baseURL)
+		contextManager := NewSkillInjectingContextManager(inner, runStore, catalog.Manifest())
+
+		// The harness's own model drives the Ralph wrapper; the per-node agents come
+		// from the registry. Compaction/summarization uses this model too. Issue 2
+		// (per-node toolset scoping): the real tools are wired PER TOOLSET, not onto
+		// one global catalogue. Each leaf carrying a non-empty toolset handle
+		// dispatches ONLY its own catalogue — the planner (plan-tools) cannot reach
+		// exec-only tools and the executor (exec-tools) cannot reach plan-only tools.
+		registry := buildRegistry(model, baseURL)
+		harnessModel := ollama.WithBaseURL(model, baseURL)
+		cfg := observability.ConversationalBuilder(harnessModel).
+			Sandbox(sandbox).
+			Storage(runStore, nil).
+			ContextManager(contextManager).
+			SystemPrompt(execSystemPrompt).
+			ToolsetTools("plan-tools", planTools()...).
+			ToolsetTools("exec-tools", execTools()...).
+			BuildConfig()
+		// The composed tree is wired declaratively: the registry resolves the
+		// node handles, and SurfaceToHuman makes a runaway node pause to the HITL
+		// REPL (AC6) rather than aborting the whole run.
+		cfg.Registry = registry
+		cfg.EscalationMode = sporecore.SurfaceToHumanEscalation()
+		harness := sporecore.NewStandardHarness(cfg)
+
+		task, err := buildTask(prompt, session)
+		if err != nil {
+			return err
+		}
+
+		// Per-RUN consult counts (host-owned, #114): how many consults of each kind
+		// have already been mediated. Persists across every pause/resume of THIS
+		// audit so the per-kind budget bounds the whole run, not one turn.
+		consultCounts := map[string]uint32{}
+		result := harness.Run(ctx, sporecore.NewHarnessRunOptions(task))
+		for {
+			switch result.Kind {
+			case sporecore.RunSuccess:
+				fmt.Printf("\ndone (%d turn(s)): %s\n", result.Turns, truncate(result.Output, 400))
+				findings := filepath.Join(workspaceRoot, "findings.md")
+				if _, statErr := os.Stat(findings); statErr == nil {
+					fmt.Printf("\nfindings.md written: %s\n", findings)
+				}
+			case sporecore.RunFailure:
+				fmt.Fprintf(os.Stderr, "\nfailed after %d turn(s): %+v\n", result.Turns, result.Reason)
+			case sporecore.RunConsult:
+				// A worker leaf consult propagated up through the composed tree (no
+				// SubagentTool to absorb it). The host mediates.
+				if result.State == nil || result.ConsultRequest == nil {
+					fmt.Fprintln(os.Stderr, "\nconsult arrived without a resumable state; aborting.")
+				} else {
+					result = mediateConsult(ctx, harness, reader, consultHandlers, consultCounts, *result.ConsultRequest, *result.State)
+					continue
+				}
+			case sporecore.RunWaitingForHuman:
+				if result.State == nil {
+					fmt.Fprintln(os.Stderr, "\nescalation arrived without a resumable state; aborting.")
+				} else {
+					result = handleHumanEscalation(ctx, harness, reader, *result.State, result.Request)
+					continue
+				}
+			default:
+				fmt.Fprintf(os.Stderr, "\nrun ended unexpectedly: %s %+v\n", result.Kind, result.Reason)
+			}
+			break
+		}
+	}
+
+	fmt.Println("\nbye.")
+	return nil
+}
+
+// mediateConsult mediates one worker leaf consult HOST-SIDE (#114, seam relocated
+// off SubagentTool). Routes by kind, enforces the per-kind budget held in counts
+// for the whole run, runs the handler harness as a direct child, and resumes the
+// paused composed tree with the answer — or applies the overflow policy (SoftFail
+// resumes with BudgetExhausted; EscalateToHuman surfaces the advisor ladder to the
+// operator). Identical to the old SubagentTool mediate_consult, only the owner
+// moved.
+func mediateConsult(
+	ctx context.Context,
+	harness sporecore.Harness,
+	reader *bufio.Scanner,
+	handlers map[string]sporecore.ConsultHandlerEntry,
+	counts map[string]uint32,
+	request sporecore.ConsultRequest,
+	state sporecore.PausedState,
+) sporecore.RunResult {
+	// No handler for this kind => resume the worker without help (loud, not a
+	// silent stall).
+	entry, ok := handlers[request.Kind]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "\n(no consult handler for kind %q; worker proceeds)\n", request.Kind)
+		return harness.ResumeConsult(ctx, state, sporecore.NewConsultBudgetExhausted(
+			fmt.Sprintf("no consult handler for kind %q; proceed without further help", request.Kind)), nil)
+	}
+
+	// Per-kind budget: counts[kind] is how many consults of this kind were already
+	// mediated this run. The handler runs while used < budget; the (budget+1)th
+	// consult overflows.
+	if counts[request.Kind] >= entry.Budget {
+		switch entry.Overflow.Kind {
+		case sporecore.ConsultOverflowSoftFail:
+			fmt.Printf("\n(consult budget for %q exhausted — worker finishes with what it has)\n", request.Kind)
+			return harness.ResumeConsult(ctx, state, sporecore.NewConsultBudgetExhausted(
+				fmt.Sprintf("consult budget for kind %q exhausted; proceed without further help", request.Kind)), nil)
+		default: // ConsultOverflowEscalateToHuman
+			return handleConsultOverflow(ctx, harness, reader, entry, request, state)
+		}
+	}
+
+	// Run the handler harness as a direct child (depth-1, never under the worker)
+	// on the consult rendered to text, then resume with its answer.
+	counts[request.Kind]++
+	fmt.Printf("\n┌─ consult (%s) → %d of %d budget\n", request.Kind, counts[request.Kind], entry.Budget)
+	answer := runConsultHandler(ctx, entry.Handler, request)
+	fmt.Printf("└─ consult answer: %s\n", truncate(answer, 200))
+	return harness.ResumeConsult(ctx, state, sporecore.NewConsultAnswer(answer), nil)
+}
+
+// runConsultHandler runs a consult handler harness on the rendered request and
+// returns its answer text (or its failure text, so a handler that does not
+// cleanly complete never stalls the worker).
+func runConsultHandler(ctx context.Context, handler sporecore.Harness, request sporecore.ConsultRequest) string {
+	task := sporecore.NewTask(
+		renderConsultInstruction(request),
+		sporecore.NewSessionID(),
+		sporecore.ReActStrategy(16),
+	)
+	r := handler.Run(ctx, sporecore.NewHarnessRunOptions(task))
+	if r.Kind == sporecore.RunSuccess {
+		return r.Output
+	}
+	return fmt.Sprintf("consult handler did not complete cleanly: %s %+v", r.Kind, r.Reason)
+}
+
+// renderConsultInstruction renders a ConsultRequest to the handler's instruction
+// text (#114).
+func renderConsultInstruction(request sporecore.ConsultRequest) string {
+	return fmt.Sprintf(
+		"A worker agent is requesting help (kind: %s).\n\nSituation: %s\n\nAttempts so far: %d\n\nQuestion: %s",
+		request.Kind, request.Situation, request.Attempts, request.Question)
+}
+
+// handleConsultOverflow handles the advice consult overflowing its budget under
+// EscalateToHuman: present the #114 three-choice ladder to the operator and resume
+// the worker with the decision. Preserves the original ladder semantics host-side.
+func handleConsultOverflow(
+	ctx context.Context,
+	harness sporecore.Harness,
+	reader *bufio.Scanner,
+	entry sporecore.ConsultHandlerEntry,
+	request sporecore.ConsultRequest,
+	state sporecore.PausedState,
+) sporecore.RunResult {
+	fmt.Println("\n╔═ HUMAN ESCALATION (advisor budget exhausted) ═")
+	fmt.Printf("║ situation: %s\n", truncate(request.Situation, 200))
+	fmt.Printf("║ question : %s\n", truncate(request.Question, 200))
+	fmt.Println("║ [1] run the advisor once more (host-side)")
+	fmt.Println("║ [2] abort this consult — worker proceeds without help")
+	fmt.Println("║ [3] type a free-form answer yourself")
+	fmt.Println("╚═════════════════════════════════════════════════")
+
+	switch strings.TrimSpace(promptLine(reader, "> ")) {
+	case "2":
+		return harness.ResumeConsult(ctx, state, sporecore.NewConsultBudgetExhausted(
+			"advisor budget exhausted; proceed without further help"), nil)
+	case "3":
+		text := promptLine(reader, "answer> ")
+		return harness.ResumeConsult(ctx, state, sporecore.NewConsultAnswer(text), nil)
+	default:
+		// Default ([1] or empty): run the advisor handler once more host-side and
+		// inject its answer — a bounded escape hatch past the per-kind budget.
+		fmt.Println("(running advisor for one more turn…)")
+		answer := runConsultHandler(ctx, entry.Handler, request)
+		fmt.Printf("advisor: %s\n", truncate(answer, 300))
+		return harness.ResumeConsult(ctx, state, sporecore.NewConsultAnswer(answer), nil)
 	}
 }
 
-// streamSink builds the orchestrator stream sink: boundary banners for the
-// analysis worker, terse lines for the standard tools (mirrors 11-multi-agent).
-func streamSink(callNames map[string]string) func(sporecore.HarnessStreamEvent) {
-	return func(ev sporecore.HarnessStreamEvent) {
-		switch ev.Kind {
-		case sporecore.HarnessStreamTurnStart:
-			fmt.Printf("orchestrator · turn %d\n", ev.Turn)
-		case sporecore.HarnessStreamToolCall:
-			callNames[ev.CallID] = ev.Name
-			if ev.Name == "analysis_worker" {
-				fmt.Println("┌─ orchestrator → analysis_worker")
-				fmt.Printf("│  received: %s\n", truncate(instructionArg(ev.Args), 200))
-			} else {
-				fmt.Printf("  orchestrator → %s(%s)\n", ev.Name, truncate(string(ev.Args), 140))
-			}
-		case sporecore.HarnessStreamToolResult:
-			name, ok := callNames[ev.CallID]
-			if !ok {
-				name = "<tool>"
-			}
-			delete(callNames, ev.CallID)
-			if name == "analysis_worker" {
-				tag := "findings"
-				if ev.IsError {
-					tag = "FAILED"
-				}
-				fmt.Println("└─ analysis_worker → orchestrator")
-				fmt.Printf("   %s: %s\n", tag, truncate(ev.ResultContent, 300))
-			} else {
-				tag := "ok"
-				if ev.IsError {
-					tag = "err"
-				}
-				fmt.Printf("  %s → orchestrator [%s]: %s\n", name, tag, truncate(ev.ResultContent, 140))
-			}
-		}
-	}
-}
-
-// handleHumanEscalation handles an advice-budget-exhausted human escalation with
-// the three-choice ladder. Returns the next RunResult (the orchestrator resumed).
-//
-// IMPORTANT (honest mechanics): the worker's paused consult lives inside the
-// orchestrator's PausedState child state, and the harness does NOT yet wire a
-// child-consult resume through the parent (the #5/#115 follow-up). So every
-// choice here resumes the ORCHESTRATOR with the human's decision injected as
-// guidance; the specific module's in-flight worker audit is dropped. "+1 advisor
-// turn" re-runs the advisor handler HOST-SIDE and injects its answer as that
-// guidance — the closest we can get to a budget bump without a core primitive.
+// handleHumanEscalation presents a BudgetExhausted pause and resumes with the
+// operator's choice. The composed tree surfaces a runaway node here under
+// SurfaceToHuman; we offer its available_actions and resume by re-resolving
+// handles (no reconfiguration).
 func handleHumanEscalation(
 	ctx context.Context,
-	orchestrator sporecore.Harness,
-	advisorHandler sporecore.Harness,
+	harness sporecore.Harness,
 	reader *bufio.Scanner,
-	result sporecore.RunResult,
+	state sporecore.PausedState,
+	request *sporecore.HumanRequest,
 ) sporecore.RunResult {
-	contextText := "advice requested"
-	if result.Request != nil {
-		switch result.Request.Kind {
-		case sporecore.HumanReqReview:
-			contextText = result.Request.Content
-		case sporecore.HumanReqClarification:
-			contextText = result.Request.Question
-		case sporecore.HumanReqToolApproval:
-			contextText = "tool approval requested"
-		}
+	if request == nil || request.Kind != sporecore.HumanReqBudgetExhausted {
+		// The composed tree only escalates via BudgetExhausted; anything else is
+		// unexpected — halt cleanly.
+		fmt.Fprintf(os.Stderr, "\nunexpected human request: %+v\n", request)
+		return harness.Resume(ctx, state, sporecore.HumanResponse{Kind: sporecore.HumanRespHalt}, nil)
 	}
-	fmt.Println("\n╔═ HUMAN ESCALATION (advisor budget exhausted) ═")
-	fmt.Printf("║ %s\n", truncate(contextText, 400))
-	fmt.Println("╚═══════════════════════════════════════════════")
-	fmt.Println("Choose: [1] +1 advisor turn  [2] abort subagent & chat  [3] free-form answer")
 
-	if result.State == nil {
-		fmt.Fprintln(os.Stderr, "escalation arrived without a resumable state; aborting.")
-		return sporecore.RunResult{Kind: sporecore.RunFailure}
+	fmt.Printf("\n╔═ BUDGET ESCALATION (%s) ═══════════════════\n", request.Phase)
+	actions := request.AvailableActions
+	for i, a := range actions {
+		fmt.Printf("║ [%d] %s\n", i+1, describeAction(a))
 	}
-	state := *result.State
+	fmt.Println("╚═════════════════════════════════════════════════")
 
 	choice := strings.TrimSpace(promptLine(reader, "> "))
-	switch choice {
-	case "1":
-		// Re-run the advisor handler once, host-side, on the escalation context;
-		// inject its output as the orchestrator's guidance.
-		fmt.Println("(running advisor for one more turn…)")
-		advTask := sporecore.NewTask(contextText, sporecore.NewSessionID(), sporecore.LoopStrategy{
-			Kind:          sporecore.StrategyReAct,
-			MaxIterations: 16,
-		})
-		advice := "advisor did not complete cleanly"
-		if r := advisorHandler.Run(ctx, sporecore.NewHarnessRunOptions(advTask)); r.Kind == sporecore.RunSuccess {
-			advice = r.Output
-		}
-		fmt.Printf("advisor: %s\n", truncate(advice, 300))
-		return orchestrator.Resume(ctx, state, sporecore.HumanResponse{Kind: sporecore.HumanRespAnswer, Text: advice}, nil)
-	case "2":
-		fmt.Println("(aborting the stuck subagent; returning to the orchestrator…)")
-		return orchestrator.Resume(ctx, state, sporecore.HumanResponse{Kind: sporecore.HumanRespHalt}, nil)
+	idx := 0
+	if n, err := parseChoice(choice); err == nil && n >= 1 {
+		idx = n - 1
+	}
+	// Default to a small budget bump so an empty line keeps the run going.
+	action := sporecore.EscalationAction{Kind: sporecore.EscalationContinueWithBudget, Steps: 12}
+	if idx >= 0 && idx < len(actions) {
+		action = actions[idx]
+	}
+	fmt.Printf("(resuming with %s)\n", describeAction(action))
+	return harness.Resume(ctx, state, sporecore.HumanResponse{Kind: sporecore.HumanRespEscalate, Action: action}, nil)
+}
+
+func describeAction(a sporecore.EscalationAction) string {
+	switch a.Kind {
+	case sporecore.EscalationContinueWithBudget:
+		return fmt.Sprintf("continue with +%d steps", a.Steps)
+	case sporecore.EscalationSkip:
+		return "skip this task"
 	default:
-		text := choice
-		if choice == "3" {
-			text = promptLine(reader, "your answer> ")
-		}
-		return orchestrator.Resume(ctx, state, sporecore.HumanResponse{Kind: sporecore.HumanRespAnswer, Text: text}, nil)
+		return "fail this node"
 	}
 }
 
-// runIssueFilingFlow presents the top-5 and offers to file them as issues. The
-// model drives gh issue create via bash_command (no gh skill).
-func runIssueFilingFlow(ctx context.Context, orchestrator sporecore.Harness, reader *bufio.Scanner, findings string) {
-	report, _ := os.ReadFile(findings)
-	fmt.Println("\n── top findings (workspace/findings.md) ──")
-	fmt.Println(truncate(string(report), 1200))
-	fmt.Println("──────────────────────────────────────────")
-
-	answer := promptLine(reader, "File these as GitHub issues? [y/N] ")
-	if !strings.EqualFold(strings.TrimSpace(answer), "y") {
-		fmt.Println("Not filing. Done.")
-		return
-	}
-
-	fmt.Println("(asking the orchestrator to file the top 5 via `gh issue create`…)")
-	task := sporecore.NewTask(
-		"Using `bash_command`, file the TOP 5 findings from workspace/findings.md as GitHub "+
-			"issues via `gh issue create` — one issue per finding, with a clear title and a body "+
-			"containing the file, line, severity, and description. Run `gh` once per finding. "+
-			"Report the issue URLs when done.",
-		sporecore.NewSessionID(),
-		sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, MaxIterations: 24},
-	)
-	if r := orchestrator.Run(ctx, sporecore.NewHarnessRunOptions(task)); r.Kind == sporecore.RunSuccess {
-		fmt.Printf("\nfiling done: %s\n", truncate(r.Output, 400))
-	} else {
-		fmt.Fprintf(os.Stderr, "\nfiling did not complete cleanly: %s %+v\n", r.Kind, r.Reason)
-	}
+func parseChoice(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
 }
 
-// seedBundledAuditSkill seeds .spore/skills/audit/SKILL.md from the bundled copy
-// if absent.
-func seedBundledAuditSkill(repoRoot string) {
-	dir := filepath.Join(repoRoot, ".spore", "skills", "audit")
-	file := filepath.Join(dir, "SKILL.md")
-	if _, err := os.Stat(file); err == nil {
-		return
-	}
-	if os.MkdirAll(dir, 0o755) == nil {
-		_ = os.WriteFile(file, []byte(bundledAuditSkill), 0o644)
-	}
-}
-
-// readAuditPrompt reads the audit prompt from the REPL: prints the default,
-// accepts an empty line as the default verbatim.
-func readAuditPrompt(reader *bufio.Scanner) string {
-	fmt.Println("Default audit prompt (press enter to accept, or type your own):")
+// readAuditPrompt reads one audit prompt from the REPL. (prompt, true) to run (an
+// empty line => the default verbatim); ("", false) on EOF (Ctrl-D), which quits.
+func readAuditPrompt(reader *bufio.Scanner) (string, bool) {
+	fmt.Println("Default audit prompt (press enter to accept, type your own, or Ctrl-D to quit):")
 	fmt.Printf("  %s\n", defaultAuditPrompt)
-	line := promptLine(reader, "audit> ")
-	if strings.TrimSpace(line) == "" {
-		return defaultAuditPrompt
+	fmt.Print("audit> ")
+	if !reader.Scan() {
+		return "", false
 	}
-	return line
+	line := strings.TrimRight(reader.Text(), "\r\n")
+	if strings.TrimSpace(line) == "" {
+		return defaultAuditPrompt, true
+	}
+	return line, true
 }
 
-// promptLine prints a prompt and reads one line from the scanner (trailing
-// newline stripped).
+// promptLine prints a prompt and reads one line from the scanner.
 func promptLine(reader *bufio.Scanner, prompt string) string {
 	fmt.Print(prompt)
 	if !reader.Scan() {
 		return ""
 	}
 	return strings.TrimRight(reader.Text(), "\r\n")
-}
-
-// workspaceDir returns the absolute path to this example's workspace/ dir,
-// creating it if needed. It resolves relative to this source file (so `go run .`
-// works from anywhere), falling back to the current working directory.
-func workspaceDir() (string, error) {
-	dir := "workspace"
-	if _, file, _, ok := runtime.Caller(0); ok {
-		dir = filepath.Join(filepath.Dir(file), "workspace")
-	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve workspace dir: %w", err)
-	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return "", fmt.Errorf("failed to create workspace dir %s: %w", abs, err)
-	}
-	return abs, nil
-}
-
-// instructionArg pulls the `instruction` field out of a tool-call args blob for
-// the boundary banner.
-func instructionArg(args json.RawMessage) string {
-	var probe struct {
-		Instruction string `json:"instruction"`
-	}
-	if json.Unmarshal(args, &probe) == nil && probe.Instruction != "" {
-		return probe.Instruction
-	}
-	return "<no instruction>"
 }
 
 // flagValue returns the value following the given flag in os.Args, or "".

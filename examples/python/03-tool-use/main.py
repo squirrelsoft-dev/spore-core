@@ -36,8 +36,8 @@ import time
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     StreamTurnStart,
     Task,
@@ -183,7 +183,7 @@ async def main() -> int:
     model = OllamaModelInterface.with_base_url(model_id, base_url)
     harness = HarnessBuilder.conversational(model).tool_registry(LocalTools()).build()
 
-    task = Task.new(prompt, new_session_id(), LoopStrategyReAct(max_iterations=6))
+    task = Task.new(prompt, new_session_id(), ReactConfig.per_loop(6))
 
     # Print each turn so the "Think" steps are visible alongside the tool calls.
     def on_stream(event: object) -> None:

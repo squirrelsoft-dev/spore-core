@@ -659,6 +659,111 @@ export function strategyRefToJson(ref: StrategyRef): Record<string, unknown> {
   }
 }
 
+/**
+ * The largest value an advisory `maxSteps` figure may take before it is treated
+ * as "unrepresentable" (a `u32` upper bound, mirroring Rust's `u32::MAX` and the
+ * `checked_*` arithmetic). Any intermediate or final bound exceeding this
+ * collapses to `undefined` — an unrepresentable figure is "no finite advisory
+ * bound", exactly like an `Unlimited` node.
+ */
+const MAX_STEPS_LIMIT = 0xffffffff;
+
+/**
+ * Saturating `a + b` guarded against the `u32` ceiling: `undefined` if either
+ * operand is `undefined` or the sum exceeds {@link MAX_STEPS_LIMIT}. Mirrors
+ * Rust's `checked_add`.
+ */
+function checkedAddSteps(a: number, b: number): number | undefined {
+  const sum = a + b;
+  return sum > MAX_STEPS_LIMIT ? undefined : sum;
+}
+
+/**
+ * Saturating `a * b` guarded against the `u32` ceiling: `undefined` if either
+ * operand is `undefined` or the product exceeds {@link MAX_STEPS_LIMIT}. Mirrors
+ * Rust's `checked_mul`.
+ */
+function checkedMulSteps(a: number, b: number): number | undefined {
+  const product = a * b;
+  return product > MAX_STEPS_LIMIT ? undefined : product;
+}
+
+/**
+ * Advisory worst-case **turn** bound for a fully-bounded strategy tree (#122).
+ *
+ * This is a pre-run advisory figure logged at startup — it is NOT the
+ * enforcement mechanism (the per-node budget ceiling is). It is a runtime-only
+ * computation and is **never serialized**.
+ *
+ * The bound is derived multiplicatively/additively down the tree and is
+ * Option-monadic: any `unlimited` node anywhere collapses the whole figure to
+ * `undefined` ("no finite advisory bound"). An unrepresentable bound (a value
+ * exceeding the `u32` range via overflow) likewise yields `undefined`.
+ *
+ * Per-variant rules:
+ *   - `react` ⇒ `budgetPolicyAllowanceValue(budget)` (`unlimited ⇒ undefined`).
+ *   - `self_verifying` ⇒ `inner + 1` — the single read-only evaluator turn is
+ *     exactly one extra turn.
+ *   - `plan_execute` ⇒ `plan + execute`. **PER-TASK bound**: a full run's total
+ *     is `plan + executePerTask × taskCount`, where `taskCount` is data-dependent
+ *     (the plan phase builds the task graph at runtime), so it is intentionally
+ *     NOT part of this static figure.
+ *   - `ralph` ⇒ `inner` — **PER-WINDOW bound**, mirroring PlanExecute's per-task
+ *     treatment. A full run's total is `perWindow × maxWindows`, where
+ *     `maxWindows` derives from {@link HarnessConfig} `max_resets` (default 3) at
+ *     runtime and is intentionally NOT part of this static figure.
+ *   - `hill_climbing` ⇒ `inner × (max_stagnation + 1)` — the `+1` is the one
+ *     productive pass; `max_stagnation` non-improving passes follow. The
+ *     `max_stagnation === Number.MAX_SAFE_INTEGER` sentinel (the TS encoding of
+ *     Rust's `u32::MAX`) means unbounded windows ⇒ `undefined` (a semantic
+ *     unbounded rule, distinct from arithmetic overflow).
+ *
+ * Mirrors Rust `LoopStrategy::max_steps`.
+ */
+export function loopStrategyMaxSteps(strategy: LoopStrategy): number | undefined {
+  switch (strategy.kind) {
+    case "react":
+      return budgetPolicyAllowanceValue(strategy.budget);
+    case "self_verifying": {
+      const inner = loopStrategyMaxSteps(strategy.inner);
+      return inner === undefined ? undefined : checkedAddSteps(inner, 1);
+    }
+    case "plan_execute": {
+      const plan = loopStrategyMaxSteps(strategy.plan);
+      if (plan === undefined) return undefined;
+      const execute = loopStrategyMaxSteps(strategy.execute);
+      if (execute === undefined) return undefined;
+      return checkedAddSteps(plan, execute);
+    }
+    case "ralph":
+      return loopStrategyMaxSteps(strategy.inner);
+    case "hill_climbing": {
+      // The `Number.MAX_SAFE_INTEGER` sentinel ⇒ unbounded windows ⇒ undefined.
+      if (strategy.max_stagnation === Number.MAX_SAFE_INTEGER) return undefined;
+      const inner = loopStrategyMaxSteps(strategy.inner);
+      if (inner === undefined) return undefined;
+      const windows = checkedAddSteps(strategy.max_stagnation, 1);
+      if (windows === undefined) return undefined;
+      return checkedMulSteps(inner, windows);
+    }
+  }
+}
+
+/**
+ * Advisory worst-case turn bound for a {@link StrategyRef} (#122). `custom` is
+ * opaque to the framework (it cannot be introspected), so it yields `undefined`;
+ * `built_in` delegates to {@link loopStrategyMaxSteps}. Mirrors Rust
+ * `StrategyRef::max_steps`.
+ */
+export function strategyRefMaxSteps(ref: StrategyRef): number | undefined {
+  switch (ref.kind) {
+    case "custom":
+      return undefined;
+    case "built_in":
+      return loopStrategyMaxSteps(ref.value);
+  }
+}
+
 // ── Composable Execution runtime scaffold (#123) ────────────────────────────
 //
 // StrategyOutcome + ExecutionContext / BudgetContext / BudgetStack / SpanStack.
@@ -994,6 +1099,10 @@ export interface StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     agent: Agent,
+    // Issue 2 (per-node toolset scoping): the leaf's RESOLVED `toolset` handle,
+    // threaded alongside `agent`. Empty ⇒ global-catalogue fallback; a non-empty
+    // handle with its own catalogue ⇒ strict per-node scoping.
+    toolset: ToolsetRef,
   ): Promise<RunResult>;
 
   /**
@@ -1230,6 +1339,20 @@ export interface RunScratch {
    * AC3: no serialization on the in-process path).
    */
   resumeContinues?: [string, number];
+  /**
+   * Consult re-drive seed (#131): the worker conversation (with the consult
+   * answer already injected as the pending call's tool result) carried from a
+   * resumed {@link RunResult} `consult`. When set, a {@link PlanExecuteConfig}
+   * walk resumes its single `in_progress` task from THIS session (instead of a
+   * fresh instruction-seeded session) so the consulting worker continues
+   * mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
+   * proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
+   * the session itself rides the serialized {@link PausedState} `sessionState`,
+   * so a cross-process resume reconstructs this seed in
+   * {@link StandardHarness.resumeConsult}. `undefined` on a fresh run / after
+   * the seed is consumed.
+   */
+  consultResume?: SessionState;
 }
 
 function newRunScratch(): RunScratch {
@@ -1493,6 +1616,15 @@ async function finishCombinator(
   result: RunResult,
 ): Promise<StrategyOutcome> {
   await executor.finalize(result);
+  // #131: a `consult` propagated from a worker leaf carries the LEAF task, so a
+  // host `resumeConsult` would resume only that leaf and lose the surrounding
+  // walk. As the pause unwinds through each combinator's `finish`, rewrite its
+  // `state.task` to the combinator's OWN composed task; by the top it carries
+  // the FULL tree, so `resumeConsult` re-drives the whole strategy (the
+  // in-progress task resumes from `consultResume`).
+  if (result.kind === "consult") {
+    result = { ...result, state: { ...result.state, task: parentTask } };
+  }
   cx.scratch.task = parentTask;
   if (result.kind === "success" || result.kind === "failure") {
     cx.scratch.runSession = result.session_state ?? emptySessionState();
@@ -1824,6 +1956,10 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     onStream,
     cx.signal,
     agent,
+    // Issue 2: thread THIS leaf's toolset handle down so the window dispatches
+    // the per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
+    // Mirrors `agent`.
+    c.toolset,
   );
   await executor.finalize(result);
 
@@ -1903,22 +2039,23 @@ function workerAgentKeyOf(ls: LoopStrategy): string {
 }
 
 /**
- * Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
- * per-window agent override). Returns a structurally-cloned tree with the leaf
- * reached by descending the worker child chain swapped.
+ * Fill the worker leaf's agent handle of `ls` with `agent` ONLY where the leaf
+ * left it empty — Ralph's bare-leaf convenience. An explicitly-declared leaf
+ * agent is authoritative and is never replaced (the architect's node wins).
+ * Returns a structurally-cloned tree with the worker child chain descended.
  */
-function overrideWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
+function fillEmptyWorkerAgent(ls: LoopStrategy, agent: AgentRef): LoopStrategy {
   switch (ls.kind) {
     case "react":
-      return { ...ls, agent };
+      return ls.agent === "" ? { ...ls, agent } : ls;
     case "plan_execute":
-      return { ...ls, execute: overrideWorkerAgent(ls.execute, agent) };
+      return { ...ls, execute: fillEmptyWorkerAgent(ls.execute, agent) };
     case "self_verifying":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
     case "ralph":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
     case "hill_climbing":
-      return { ...ls, inner: overrideWorkerAgent(ls.inner, agent) };
+      return { ...ls, inner: fillEmptyWorkerAgent(ls.inner, agent) };
   }
 }
 
@@ -1994,21 +2131,20 @@ async function runPlanExecuteConfig(
   //
   // Seed the planning directive onto a CLONE of the base session so the shared
   // execute context stays `[user: task.instruction]` (#93 — a leaked directive
-  // would make every execute step re-emit a plan). Cap the plan child at ONE
-  // turn (R1) but never beyond the task's global turn ceiling (so an already-
-  // exhausted budget fails the plan turn before it runs — R10).
+  // would make every execute step re-emit a plan). The plan phase runs under the
+  // plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`); the
+  // global `max_turns` is only the outer backstop. Previously this clamped the
+  // planner to `turns + 1` — a SINGLE turn — silently overriding the architect's
+  // plan budget and starving multi-step task-graph authoring (the planner could
+  // not both call `task_list` and finish, so it emitted prose instead).
   const directive = executor.planDirective(task.instruction);
   const planSession = structuredClone(baseSession);
   await executor.seedUserMessage(planSession, directive);
-  const planCap =
-    task.budget.max_turns != null
-      ? Math.min(task.budget.max_turns, budgetUsed.turns + 1)
-      : budgetUsed.turns + 1;
   const planTask: Task = {
     id: task.id,
     instruction: directive,
     session_id: sessionId,
-    budget: { ...task.budget, max_turns: planCap },
+    budget: { ...task.budget },
     loop_strategy: c.plan,
   };
   const planResult = await executor.runPlanSubtree(
@@ -2121,6 +2257,31 @@ async function runPlanExecuteConfig(
   // Completed tasks are not re-run.
   await executor.reconcileCompletedTasks(sessionId, taskList);
 
+  // #131 consult re-drive: a resumed consult carries the worker conversation
+  // (answer already injected) in `cx.scratch.consultResume`. The consulting
+  // task is the single `in_progress` task in the durable list (PlanExecute marks
+  // a task in_progress before running it). Reset it to `pending` so `nextReady`
+  // re-schedules it, and remember its id so its step uses the carried session
+  // instead of a fresh one — the worker then continues mid-loop and its
+  // evaluator still runs.
+  let consultResumeSession = cx.scratch.consultResume;
+  cx.scratch.consultResume = undefined;
+  let consultResumeTask: number | undefined;
+  if (consultResumeSession !== undefined) {
+    const inProgress = taskList.tasks.find((t) => t.status === "in_progress");
+    if (inProgress !== undefined) {
+      // Reset directly (bypassing `updateTask`'s forward-only transition guard,
+      // which rejects in_progress->pending): the consult resume legitimately
+      // re-schedules the in-flight task.
+      inProgress.status = "pending";
+      consultResumeTask = inProgress.id;
+    } else {
+      // No in-progress task to resume (out-of-contract); drop the seed so the
+      // walk proceeds normally rather than stalling.
+      consultResumeSession = undefined;
+    }
+  }
+
   // Total positional count for the on_task_advance hook (stable).
   const totalTasks = taskList.tasks.length;
   const totalUsage: AggregateUsage = { ...outcome.usage };
@@ -2167,39 +2328,50 @@ async function runPlanExecuteConfig(
     };
     await executor.fireTaskAdvance(sessionId, stepTask, index, totalTasks, cx.signal);
 
-    // #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
-    // session (NOT a forward-folded shared transcript — that breaks on a DAG)
-    // plus, for THIS task's transitive blockers ONLY, their final outputs + their
-    // ledger rows. Independent branches never appear (AC1 isolation).
-    const stepSession = structuredClone(baseSession);
-    const blockers = transitiveBlockers(taskList, taskId);
-    if (blockers.length > 0) {
-      const blockerSet = new Set(blockers);
-      // Tier-1: transitive blockers' final outputs (ascending id).
-      const tier1Lines: string[] = [];
-      for (const b of blockers) {
-        const out = finalOutputs.get(b);
-        if (out !== undefined) tier1Lines.push(`#${b} result: ${out}`);
+    // #131 consult re-drive: if THIS is the task that was consulting, resume its
+    // worker from the carried conversation (answer already injected) instead of a
+    // fresh instruction-seeded session — the worker continues mid-loop and its
+    // evaluator still runs. Otherwise build the normal fresh, Tier-1/Tier-2-seeded
+    // step session.
+    let stepSession: SessionState;
+    if (consultResumeTask !== undefined && taskId === consultResumeTask) {
+      stepSession = consultResumeSession ?? structuredClone(baseSession);
+      consultResumeSession = undefined;
+    } else {
+      // #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
+      // session (NOT a forward-folded shared transcript — that breaks on a DAG)
+      // plus, for THIS task's transitive blockers ONLY, their final outputs +
+      // their ledger rows. Independent branches never appear (AC1 isolation).
+      stepSession = structuredClone(baseSession);
+      const blockers = transitiveBlockers(taskList, taskId);
+      if (blockers.length > 0) {
+        const blockerSet = new Set(blockers);
+        // Tier-1: transitive blockers' final outputs (ascending id).
+        const tier1Lines: string[] = [];
+        for (const b of blockers) {
+          const out = finalOutputs.get(b);
+          if (out !== undefined) tier1Lines.push(`#${b} result: ${out}`);
+        }
+        if (tier1Lines.length > 0) {
+          await executor.seedUserMessage(
+            stepSession,
+            `Results from upstream tasks:\n${tier1Lines.join("\n")}`,
+          );
+        }
+        // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+        const scoped = ledger.filter((e) => blockerSet.has(e.task_id));
+        const scopedBlock = renderStepLedger(scoped, false);
+        if (scopedBlock !== undefined) await executor.seedUserMessage(stepSession, scopedBlock);
       }
-      if (tier1Lines.length > 0) {
-        await executor.seedUserMessage(
-          stepSession,
-          `Results from upstream tasks:\n${tier1Lines.join("\n")}`,
-        );
-      }
-      // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-      const scoped = ledger.filter((e) => blockerSet.has(e.task_id));
-      const scopedBlock = renderStepLedger(scoped, false);
-      if (scopedBlock !== undefined) await executor.seedUserMessage(stepSession, scopedBlock);
+
+      // #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+      // the static elision marker once entries were dropped).
+      const tier2Block = renderStepLedger(ledger, ledgerElided);
+      if (tier2Block !== undefined) await executor.seedUserMessage(stepSession, tier2Block);
+
+      // Finally seed this step's own instruction.
+      await executor.seedUserMessage(stepSession, stepTask.instruction);
     }
-
-    // #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-    // the static elision marker once entries were dropped).
-    const tier2Block = renderStepLedger(ledger, ledgerElided);
-    if (tier2Block !== undefined) await executor.seedUserMessage(stepSession, tier2Block);
-
-    // Finally seed this step's own instruction.
-    await executor.seedUserMessage(stepSession, stepTask.instruction);
 
     // #126 AC2: clear the observed-write accumulator so this task's
     // files_touched reflect ONLY the writes this step issues.
@@ -2710,10 +2882,11 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
   cx.scratch.runSession = emptySessionState();
   const maxResets = Math.max(executor.ralphMaxResets(), 1);
 
-  // Q3: when `c.agent` is set, override the inner leaf's agent for every window
-  // by rewriting the inner tree's worker leaf handle.
+  // Ralph fills — never replaces. When `c.agent` is set it supplies a worker
+  // agent ONLY where the inner leaf left its handle empty; an explicitly-declared
+  // leaf agent (the architect's node) is authoritative and is never shadowed.
   const innerForWindow: LoopStrategy =
-    c.agent === "" ? c.inner : overrideWorkerAgent(c.inner, c.agent);
+    c.agent === "" ? c.inner : fillEmptyWorkerAgent(c.inner, c.agent);
 
   const totalUsage: AggregateUsage = emptyAggregateUsage();
   let cumulativeTurns = 0;

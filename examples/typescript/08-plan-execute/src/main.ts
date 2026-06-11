@@ -9,10 +9,15 @@
  *
  * ```ts
  * // 06 — react step-by-step:
- * newTask(prompt, SessionId.generate(), { kind: "re_act", max_iterations: 10 });
- * // 08 — decompose the goal first, then execute each subtask:
- * newTask(prompt, SessionId.generate(), { kind: "plan_execute" }, { max_turns: 64 });
+ * newTask(prompt, SessionId.generate(), reactPerLoop(10));
+ * // 08 — decompose first via a composed PlanExecute(plan: ReAct, execute: ReAct):
+ * newTask(prompt, SessionId.generate(), planExecuteStrategy(), { max_turns: 64 });
  * ```
+ *
+ * Post-#119, `PlanExecute` is a composed tree, not a flat literal. Its `plan`
+ * slot is STRUCTURED — a bare `ReAct` there MUST declare an `output` schema
+ * (here `plan-schema`), which the {@link ExecutionRegistry} validates at run
+ * entry; the only handle registered explicitly is `plan-schema`.
  *
  * With `plan_execute`, the harness runs one constrained planner turn FIRST: the
  * model must return strict JSON `{ "tasks": [...], "rationale": ... }`. That
@@ -65,9 +70,10 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  ExecutionRegistry,
   HarnessBuilder,
   OLLAMA_DEFAULT_BASE_URL,
   OllamaModelInterface,
@@ -77,8 +83,10 @@ import {
   context,
   hooks,
   newTask,
+  reactPerLoop,
   toolRegistry,
   type HarnessStreamEvent,
+  type LoopStrategy,
   type SandboxProvider,
   type ToolCall,
   type ToolOutput,
@@ -98,6 +106,55 @@ const SYSTEM_PROMPT =
   "use web_search to gather current information, then synthesize a clear, cited " +
   "comparison and save the final document with write_file. Act using tools — do " +
   "not answer from memory alone.";
+
+/**
+ * The plan-phase output contract (`plan-schema`). Post-#119, `PlanExecute`'s
+ * `plan` slot is STRUCTURED: a bare `ReAct` there must declare an `output`
+ * schema so the slot yields a typed task graph ({@link ExecutionRegistry.validate}
+ * enforces this via its structured-slot check). This is the strict JSON the
+ * planner turn returns.
+ */
+function planSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      tasks: {
+        type: "array",
+        description: "Ordered subtasks to execute in sequence.",
+        items: { type: "string" },
+      },
+      rationale: { type: "string" },
+    },
+    required: ["tasks"],
+  };
+}
+
+/**
+ * The {@link ExecutionRegistry} the composed strategy's handles resolve against.
+ * The single `plan-schema` slot is the only EXPLICIT handle; the builder
+ * default-fills the empty agent/toolset handles (`reactPerLoop` uses empty
+ * handles) from the harness's own model and global tool catalogue at `build`.
+ */
+export function buildRegistry(): ExecutionRegistry {
+  return ExecutionRegistry.builder().schema("plan-schema", planSchema()).build();
+}
+
+/**
+ * The post-#119 composed strategy: `PlanExecute(plan: ReAct, execute: ReAct)`.
+ * The plan leaf carries the `plan-schema` output contract (required for the
+ * structured `plan` slot); both leaves use empty agent/toolset handles that the
+ * builder default-fills. The plan/execute leaves stay effectively unbounded
+ * (`reactPerLoop(Number.MAX_SAFE_INTEGER)`, the TS analogue of Rust's
+ * `u32::MAX`) so the global `max_turns` backstop governs. Old flat shape was
+ * `{ kind: "plan_execute" }`.
+ */
+export function planExecuteStrategy(): LoopStrategy {
+  return {
+    kind: "plan_execute",
+    plan: { ...reactPerLoop(Number.MAX_SAFE_INTEGER), output: "plan-schema" },
+    execute: reactPerLoop(Number.MAX_SAFE_INTEGER),
+  };
+}
 
 /**
  * Lifecycle hook that prints the PlanExecute plan and each subtask as it runs.
@@ -297,6 +354,11 @@ async function main(): Promise<void> {
   const harness = HarnessBuilder.conversational(model)
     .sandbox(sandbox) // same as 06
     .contextManager(contextManager)
+    // The composed strategy's handles resolve against this registry at run entry
+    // (`validate()`). Only `plan-schema` is explicit; the empty agent/toolset
+    // handles of the bare `reactPerLoop` leaves are default-filled from this
+    // harness's own model + tool catalogue at `build`.
+    .registry(buildRegistry())
     .tool({
       // GET <endpoint>?q=<query>; the endpoint's `?format=json` is preserved.
       // Wrapped in ConciseWebSearch so verbose SearXNG JSON is distilled before
@@ -325,13 +387,17 @@ async function main(): Promise<void> {
     .hooks(chain) // ← the plan becomes visible through the hook chain
     .build();
 
-  // THE ONE-LINE SWAP. 06 used `{ kind: "re_act", max_iterations: 10 }`; here we
-  // decompose first via `{ kind: "plan_execute" }`. The turn budget is divided
-  // across subtasks, so we give it generous headroom via `max_turns`.
+  // THE STRATEGY SWAP. 06 used a bare `reactPerLoop(10)`; here we decompose first
+  // via the composed `PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)` tree
+  // (post-#119 recursive union). The plan leaf carries the `plan-schema` output
+  // contract — `PlanExecute`'s `plan` slot is STRUCTURED, so a bare `ReAct` there
+  // MUST declare an output schema (`registry.validate()` enforces this). The turn
+  // budget is divided across subtasks, so we give it generous headroom via
+  // `max_turns`.
   const task = newTask(
     prompt,
     SessionId.generate(),
-    { kind: "plan_execute" },
+    planExecuteStrategy(),
     { max_turns: 64 },
   );
 
@@ -404,7 +470,18 @@ function truncate(s: string, max: number): string {
   return chars.length <= max ? flat : `${chars.slice(0, max).join("")}…`;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/** Run `main` only when this module is the program entrypoint — NOT when it is
+ *  imported (e.g. by the composition test, which reuses `buildRegistry` /
+ *  `planExecuteStrategy`). */
+function isEntrypoint(): boolean {
+  const arg1 = process.argv[1];
+  if (arg1 === undefined) return false;
+  return import.meta.url === pathToFileURL(arg1).href;
+}
+
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

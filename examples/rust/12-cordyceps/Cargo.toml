@@ -3,7 +3,7 @@ name = "cordyceps"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "spore-core example 12: cordyceps — a fully autonomous Rust-repo auditor that loads a skill at runtime and escalates mid-loop (research → advisor → human) via the #114 consult ladder."
+description = "spore-core example 12: cordyceps — the Composable Execution capstone. Runs the declarative composed strategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (loaded as DATA from fixtures/strategy/cordyceps_tree.json) with handles resolved from an ExecutionRegistry."
 
 [dependencies]
 spore-core = { path = "../../../rust/crates/spore-core" }

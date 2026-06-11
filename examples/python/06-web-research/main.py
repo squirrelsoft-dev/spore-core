@@ -22,7 +22,7 @@ Harness + sandbox pattern reused verbatim from
 :doc:`04-filesystem-agent <../04-filesystem-agent/main>`:
 
 - ``HarnessBuilder.conversational(model)`` — same builder.
-- ``LoopStrategyReAct(max_iterations=...)`` — same loop.
+- ``ReactConfig.per_loop(...)`` — same loop.
 - ``WorkspaceScopedSandbox`` over ``WorkspaceConfig(root=...)`` — same sandbox,
   here scoped to this example's ``workspace/`` dir so ``write_file`` cannot
   escape it. 04 wrote ``SUMMARY.md``; 06 writes ``answer.md``.
@@ -62,9 +62,9 @@ from pathlib import Path
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     ModelParams,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     StreamToolCall,
     StreamToolResult,
@@ -176,7 +176,7 @@ async def main() -> int:
         .build()
     )
 
-    task = Task.new(prompt, new_session_id(), LoopStrategyReAct(max_iterations=10))
+    task = Task.new(prompt, new_session_id(), ReactConfig.per_loop(10))
 
     # Print each turn (Think) and each tool call + result (Act / Observe). The
     # search queries and result snippets show up here because ``web_search``

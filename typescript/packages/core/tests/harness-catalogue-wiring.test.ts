@@ -227,6 +227,102 @@ describe("RealToolRegistry bridge (#91)", () => {
 });
 
 // ============================================================================
+// Issue 2: per-node toolset scoping
+// ============================================================================
+
+/** Dispatch a tool by name through a bridged registry and report whether it
+ *  resolved to a *successful* tool output (vs an unknown-tool / not-available
+ *  recoverable error). Mirrors the Rust `dispatched_ok` helper. */
+async function dispatchedOk(reg: toolRegistry.ToolRegistry, name: string): Promise<boolean> {
+  const out = await reg.dispatch({ id: "c", name, input: {} } as ToolCall);
+  return out.kind !== "error";
+}
+
+/** Reach the private `effectiveToolRegistry` for the Issue 2 resolution tests
+ *  (the seam under test is private; this mirrors the Rust tests that call
+ *  `h.effective_tool_registry(..)` directly). */
+function effectiveFor(
+  h: StandardHarness,
+  sessionId: SessionId,
+  toolset: string,
+): toolRegistry.ToolRegistry {
+  return (
+    h as unknown as {
+      effectiveToolRegistry(s: SessionId, t: string): toolRegistry.ToolRegistry;
+    }
+  ).effectiveToolRegistry(sessionId, toolset);
+}
+
+describe("per-node toolset scoping (Issue 2)", () => {
+  it("closes cross-node leaks: each node dispatches only its own toolset", async () => {
+    const cfg = catalogueBuilder(makeAgent())
+      .toolsetTools("plan-tools", [fakeTool("list_dir"), fakeTool("task_list")])
+      .toolsetTools("exec-tools", [fakeTool("read_file")])
+      .buildConfig();
+    const h = new StandardHarness(cfg);
+    const sid = SessionId.of("s1");
+
+    // Planner node: plan-tools only. Its OWN tools advertise; exec-only tools are
+    // NOT available.
+    const plan = effectiveFor(h, sid, "plan-tools");
+    expect(plan.schemas().some((s) => s.name === "list_dir")).toBe(true);
+    expect(plan.schemas().some((s) => s.name === "task_list")).toBe(true);
+    expect(plan.schemas().some((s) => s.name === "read_file")).toBe(false);
+    // The leak the live run exhibited: planner calling an exec-only tool now
+    // resolves to unknown-tool / not-available, NOT success.
+    expect(await dispatchedOk(plan, "read_file")).toBe(false);
+
+    // Executor node: exec-tools only. It cannot reach the plan-only tools.
+    const exec = effectiveFor(h, sid, "exec-tools");
+    expect(exec.schemas().some((s) => s.name === "read_file")).toBe(true);
+    expect(exec.schemas().some((s) => s.name === "task_list")).toBe(false);
+    expect(exec.schemas().some((s) => s.name === "list_dir")).toBe(false);
+    expect(await dispatchedOk(exec, "task_list")).toBe(false);
+    expect(await dispatchedOk(exec, "list_dir")).toBe(false);
+  });
+
+  it("an unknown tool from a scoped node is a recoverable error", async () => {
+    const cfg = catalogueBuilder(makeAgent())
+      .toolsetTools("plan-tools", [fakeTool("list_dir")])
+      .buildConfig();
+    const h = new StandardHarness(cfg);
+    const reg = effectiveFor(h, SessionId.of("s1"), "plan-tools");
+    const out = await reg.dispatch({ id: "c", name: "does_not_exist", input: {} } as ToolCall);
+    expect(out.kind).toBe("error");
+    if (out.kind === "error") expect(out.recoverable).toBe(true);
+  });
+
+  it("an EMPTY toolset handle falls back to the global catalogue", async () => {
+    const cfg = catalogueBuilder(makeAgent())
+      .tools([fakeTool("read_file")]) // global catalogue
+      .toolsetTools("plan-tools", [fakeTool("list_dir")]) // scoped
+      .buildConfig();
+    const h = new StandardHarness(cfg);
+    const global = effectiveFor(h, SessionId.of("s1"), "");
+    // Empty handle ⇒ global catalogue (read_file), NOT the scoped plan-tools.
+    expect(global.schemas().some((s) => s.name === "read_file")).toBe(true);
+    expect(global.schemas().some((s) => s.name === "list_dir")).toBe(false);
+  });
+
+  it("a non-empty handle with no per-key catalogue falls back to the global catalogue", async () => {
+    const cfg = catalogueBuilder(makeAgent()).tools([fakeTool("read_file")]).buildConfig();
+    const h = new StandardHarness(cfg);
+    const reg = effectiveFor(h, SessionId.of("s1"), "not-wired");
+    expect(reg.schemas().some((s) => s.name === "read_file")).toBe(true);
+  });
+
+  it("toolsetTools auto-fills a registry presence entry so validate() passes", () => {
+    const cfg = catalogueBuilder(makeAgent())
+      .toolsetTools("plan-tools", [fakeTool("list_dir")])
+      .buildConfig();
+    // The registry presence entry resolves for `validate()`.
+    expect(cfg.registry!.resolveToolset("plan-tools")).toBeDefined();
+    // And the dispatchable catalogue is present.
+    expect(cfg.toolsetCatalogues?.has("plan-tools")).toBe(true);
+  });
+});
+
+// ============================================================================
 // system_prompt seam
 // ============================================================================
 

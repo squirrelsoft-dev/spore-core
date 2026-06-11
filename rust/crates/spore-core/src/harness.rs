@@ -568,6 +568,59 @@ pub enum LoopStrategy {
     HillClimbing(HillClimbingConfig),
 }
 
+impl LoopStrategy {
+    /// Advisory worst-case **turn** bound for this strategy tree, computed
+    /// statically before a run (#122).
+    ///
+    /// This is an **advisory pre-run figure**, logged at startup — it is NOT
+    /// the enforcement mechanism. The actual safety ceiling is the per-node
+    /// [`BudgetPolicy`] charged by each `*Config::run` against its own
+    /// [`BudgetContext`]; `max_steps` never gates execution.
+    ///
+    /// The bound is derived **multiplicatively/additively down the tree** and
+    /// is Option-monadic: any `Unlimited` node anywhere in the tree collapses
+    /// the whole figure to `None` ("no finite advisory bound"). It is a
+    /// runtime-only computation and is **never serialized**.
+    ///
+    /// Per-variant rules:
+    /// - `ReAct(c)` ⇒ `c.budget.allowance_value()` (`Unlimited ⇒ None`).
+    /// - `SelfVerifying(c)` ⇒ `inner + 1` — the single read-only evaluator
+    ///   turn is exactly one extra turn.
+    /// - `PlanExecute(c)` ⇒ `plan + execute`. **PER-TASK bound**: a full run's
+    ///   total is `plan + execute_per_task × task_count`, where `task_count` is
+    ///   data-dependent (the plan phase builds the task graph at runtime), so
+    ///   it is intentionally NOT part of this static figure.
+    /// - `Ralph(c)` ⇒ `inner` — **PER-WINDOW bound**, mirroring PlanExecute's
+    ///   per-task treatment. A full run's total is `per_window × max_windows`,
+    ///   where `max_windows` derives from [`HarnessConfig::max_resets`]
+    ///   (default 3) at runtime and is intentionally NOT part of this static
+    ///   figure.
+    /// - `HillClimbing(c)` ⇒ `inner × (max_stagnation + 1)` — the `+1` is the
+    ///   one productive pass; `max_stagnation` non-improving passes follow.
+    ///   The `max_stagnation == u32::MAX` sentinel means unbounded windows ⇒
+    ///   `None` (a semantic unbounded rule, distinct from arithmetic overflow).
+    ///
+    /// Arithmetic uses `checked_add`/`checked_mul`; an unrepresentable bound
+    /// (overflow) yields `None` — an unrepresentable figure is "no finite
+    /// advisory bound".
+    pub fn max_steps(&self) -> Option<u32> {
+        match self {
+            LoopStrategy::ReAct(c) => c.budget.allowance_value(),
+            LoopStrategy::SelfVerifying(c) => c.inner.max_steps()?.checked_add(1),
+            LoopStrategy::PlanExecute(c) => c.plan.max_steps()?.checked_add(c.execute.max_steps()?),
+            LoopStrategy::Ralph(c) => c.inner.max_steps(),
+            LoopStrategy::HillClimbing(c) => {
+                if c.max_stagnation == u32::MAX {
+                    return None;
+                }
+                c.inner
+                    .max_steps()?
+                    .checked_mul(c.max_stagnation.checked_add(1)?)
+            }
+        }
+    }
+}
+
 /// Serializable identity of a strategy: either a closed built-in
 /// [`LoopStrategy`] tree or an opaque `Custom` string key resolved at runtime
 /// (registry: #120). Adjacently tagged on `kind`/`value` to avoid a tag
@@ -579,6 +632,18 @@ pub enum LoopStrategy {
 pub enum StrategyRef {
     BuiltIn(LoopStrategy),
     Custom(String),
+}
+
+impl StrategyRef {
+    /// Advisory worst-case turn bound for this strategy reference (#122).
+    /// `Custom` is opaque to the framework (it cannot be introspected), so it
+    /// yields `None`; `BuiltIn` delegates to [`LoopStrategy::max_steps`].
+    pub fn max_steps(&self) -> Option<u32> {
+        match self {
+            StrategyRef::Custom(_) => None,
+            StrategyRef::BuiltIn(s) => s.max_steps(),
+        }
+    }
 }
 
 // ============================================================================
@@ -977,6 +1042,18 @@ pub struct RunScratch {
     /// `None` on a fresh run and after the seed is consumed (an in-process
     /// Continue never sets it → AC3: no serialization on the in-process path).
     pub resume_continues: Option<(String, u32)>,
+    /// Consult re-drive seed (#131): the worker conversation (with the consult
+    /// answer already injected as the pending call's tool result) carried from a
+    /// resumed [`RunResult::Consult`]. When set, a [`PlanExecuteConfig`] walk
+    /// resumes its single `InProgress` task from THIS session (instead of a fresh
+    /// instruction-seeded session) so the consulting worker continues mid-loop,
+    /// its SelfVerifying evaluator still runs, and the ready-set walk proceeds.
+    /// The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the
+    /// session itself rides the serialized [`PausedState::session_state`], so a
+    /// cross-process resume reconstructs this seed in
+    /// [`resume_consult`](Harness::resume_consult). `None` on a fresh run / after
+    /// the seed is consumed.
+    pub consult_resume: Option<SessionState>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -1057,6 +1134,10 @@ pub trait StrategyExecutor: Send + Sync {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
+        // Issue 2 (per-node toolset scoping): the leaf's RESOLVED `toolset`
+        // handle, threaded alongside `agent`. Empty ⇒ global-catalogue fallback;
+        // a non-empty handle with its own catalogue ⇒ strict per-node scoping.
+        toolset: ToolsetRef,
     ) -> BoxFut<'a, RunResult>;
 
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
@@ -1135,6 +1216,7 @@ pub trait StrategyExecutor: Send + Sync {
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
     ) -> BoxFut<'a, Option<RunResult>>;
 
     /// Reconcile a freshly-parsed task list against the DURABLE RunStore
@@ -1334,9 +1416,13 @@ impl RunStrategy for ReactConfig {
             // site (`drive_strategy`) can honor it (Q1 — a bare leaf self-resolves,
             // a nested leaf does not).
             cx.push_budget(self.budget.clone(), self.behavior.clone(), "react");
-            // The leaf takes the run's stream sink for the window. Combinators
-            // that recurse per-phase suppress it (they take it before recursing).
-            let on_stream = cx.stream.take();
+            // The leaf CLONES (not takes) the run's stream sink so sibling phases
+            // of a combinator parent still inherit it for their own turns, and
+            // WRAPS it so every event this leaf emits is attributed to THIS node
+            // (kind `react` + the resolved agent handle). The wrapper is what the
+            // live agent adapter forwards to, so token deltas carry attribution too.
+            let agent_id = (!self.agent.0.is_empty()).then(|| self.agent.0.clone());
+            let on_stream = wrap_node_sink(cx.stream.clone(), "react", agent_id);
             let result = executor
                 .react_window(
                     task,
@@ -1345,6 +1431,10 @@ impl RunStrategy for ReactConfig {
                     budget_used,
                     on_stream,
                     agent,
+                    // Issue 2: thread THIS leaf's toolset handle down so the
+                    // window dispatches the per-node scoped catalogue (empty
+                    // handle ⇒ global-catalogue fallback). Mirrors `agent`.
+                    self.toolset.clone(),
                 )
                 .await;
             executor.finalize(&result).await;
@@ -1471,7 +1561,12 @@ impl RunStrategy for PlanExecuteConfig {
             // The incoming shared execute session ( `[user: task.instruction]` ).
             let base_session = std::mem::take(&mut cx.scratch.run_session);
             let budget_used = cx.scratch.run_budget.clone();
+            // Save the parent sink and install a node-attributing wrapper for the
+            // phases (#stream): children inherit `cx.stream` and stream through it,
+            // each event gaining a `plan_execute` hop in its node path. Restored to
+            // the parent on every exit (the `cx.stream = on_stream;` sites below).
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "plan_execute", None);
 
             // ── Phase 1: plan (dispatch through `self.plan`). ───────────────
             let directive = executor.plan_directive(&task.instruction);
@@ -1479,22 +1574,27 @@ impl RunStrategy for PlanExecuteConfig {
             executor
                 .seed_user_message(&mut plan_session, &directive)
                 .await;
-            let plan_cap = match task.budget.max_turns {
-                Some(global) => global.min(budget_used.turns.saturating_add(1)),
-                None => budget_used.turns.saturating_add(1),
-            };
+            // The plan phase runs under the plan sub-strategy's OWN declared budget
+            // (e.g. a ReAct `PerLoop{4}`); the global `max_turns` is only the outer
+            // backstop. Previously this clamped the planner to `turns + 1` — a
+            // SINGLE turn — silently overriding the architect's plan budget and
+            // starving multi-step task-graph authoring (the planner could not both
+            // call `task_list` and finish, so it emitted prose instead).
             let plan_task = Task {
                 id: task.id.clone(),
                 instruction: directive,
                 session_id: session_id.clone(),
-                budget: BudgetLimits {
-                    max_turns: Some(plan_cap),
-                    ..task.budget.clone()
-                },
+                budget: task.budget.clone(),
                 loop_strategy: (*self.plan).clone(),
             };
             let plan_result = executor
-                .run_plan_subtree(&self.plan, plan_task, plan_session, budget_used.clone())
+                .run_plan_subtree(
+                    &self.plan,
+                    plan_task,
+                    plan_session,
+                    budget_used.clone(),
+                    cx.stream.clone(),
+                )
                 .await;
             let (plan_output, plan_usage, plan_turns) = match plan_result {
                 Some(RunResult::Success {
@@ -1594,6 +1694,37 @@ impl RunStrategy for PlanExecuteConfig {
                 .reconcile_completed_tasks(&session_id, &mut task_list)
                 .await;
 
+            // #131 consult re-drive: a resumed consult carries the worker
+            // conversation (answer already injected) in `cx.scratch.consult_resume`.
+            // The consulting task is the single `InProgress` task in the durable
+            // list (PlanExecute marks a task InProgress before running it). Reset
+            // it to `Pending` so `next_ready` re-schedules it, and remember its id
+            // so its step uses the carried session instead of a fresh one — the
+            // worker then continues mid-loop and its evaluator still runs.
+            let mut consult_resume_session = cx.scratch.consult_resume.take();
+            let consult_resume_task: Option<u32> = if consult_resume_session.is_some() {
+                let in_progress = task_list
+                    .tasks
+                    .iter()
+                    .find(|t| t.status == TaskStatus::InProgress)
+                    .map(|t| t.id);
+                if let Some(tid) = in_progress {
+                    // Reset directly (bypassing `update`'s forward-only transition
+                    // guard, which rejects InProgress->Pending): the consult resume
+                    // legitimately re-schedules the in-flight task.
+                    if let Some(t) = task_list.tasks.iter_mut().find(|t| t.id == tid) {
+                        t.status = TaskStatus::Pending;
+                    }
+                } else {
+                    // No in-progress task to resume (out-of-contract); drop the
+                    // seed so the walk proceeds normally rather than stalling.
+                    consult_resume_session = None;
+                }
+                in_progress
+            } else {
+                None
+            };
+
             let mut total_usage = outcome.usage;
             let mut last_output = String::new();
             let mut last_state = SessionState::default();
@@ -1656,48 +1787,60 @@ impl RunStrategy for PlanExecuteConfig {
                     .fire_task_advance(&session_id, &mut step_task, index, total_tasks)
                     .await;
 
-                // #126 Tier-1 scoped context: seed this step from a FRESH copy of
-                // the base session (NOT a forward-folded shared transcript — that
-                // breaks on a DAG, #126) plus, for THIS task's transitive blockers
-                // only, their final outputs + their ledger rows. Independent
-                // branches never appear (AC1 isolation).
-                let mut step_session = base_session.clone();
-                let blockers = task_list.transitive_blockers(task_id);
-                if !blockers.is_empty() {
-                    let blocker_set: HashSet<u32> = blockers.iter().copied().collect();
-                    // Tier-1: transitive blockers' final outputs (ascending id).
-                    let mut tier1_lines: Vec<String> = Vec::new();
-                    for b in &blockers {
-                        if let Some(out) = final_outputs.get(b) {
-                            tier1_lines.push(format!("#{b} result: {out}"));
+                // #131 consult re-drive: if THIS is the task that was consulting,
+                // resume its worker from the carried conversation (answer already
+                // injected) instead of a fresh instruction-seeded session — the
+                // worker continues mid-loop and its evaluator still runs. Otherwise
+                // build the normal fresh, Tier-1/Tier-2-seeded step session.
+                let step_session = if Some(task_id) == consult_resume_task {
+                    consult_resume_session
+                        .take()
+                        .unwrap_or_else(|| base_session.clone())
+                } else {
+                    // #126 Tier-1 scoped context: seed this step from a FRESH copy
+                    // of the base session (NOT a forward-folded shared transcript —
+                    // that breaks on a DAG, #126) plus, for THIS task's transitive
+                    // blockers only, their final outputs + their ledger rows.
+                    // Independent branches never appear (AC1 isolation).
+                    let mut step_session = base_session.clone();
+                    let blockers = task_list.transitive_blockers(task_id);
+                    if !blockers.is_empty() {
+                        let blocker_set: HashSet<u32> = blockers.iter().copied().collect();
+                        // Tier-1: transitive blockers' final outputs (ascending id).
+                        let mut tier1_lines: Vec<String> = Vec::new();
+                        for b in &blockers {
+                            if let Some(out) = final_outputs.get(b) {
+                                tier1_lines.push(format!("#{b} result: {out}"));
+                            }
+                        }
+                        if !tier1_lines.is_empty() {
+                            let block =
+                                format!("Results from upstream tasks:\n{}", tier1_lines.join("\n"));
+                            executor.seed_user_message(&mut step_session, &block).await;
+                        }
+                        // Tier-1 ledger: the Tier-2 ledger rows for this set.
+                        let scoped: Vec<StepLedgerEntry> = ledger
+                            .iter()
+                            .filter(|e| blocker_set.contains(&e.task_id))
+                            .cloned()
+                            .collect();
+                        if let Some(block) = render_step_ledger(&scoped, false) {
+                            executor.seed_user_message(&mut step_session, &block).await;
                         }
                     }
-                    if !tier1_lines.is_empty() {
-                        let block =
-                            format!("Results from upstream tasks:\n{}", tier1_lines.join("\n"));
+
+                    // #126 Tier-2: inject the FULL global running ledger into EVERY
+                    // step (with the static elision marker once entries dropped).
+                    if let Some(block) = render_step_ledger(&ledger, ledger_elided) {
                         executor.seed_user_message(&mut step_session, &block).await;
                     }
-                    // Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-                    let scoped: Vec<StepLedgerEntry> = ledger
-                        .iter()
-                        .filter(|e| blocker_set.contains(&e.task_id))
-                        .cloned()
-                        .collect();
-                    if let Some(block) = render_step_ledger(&scoped, false) {
-                        executor.seed_user_message(&mut step_session, &block).await;
-                    }
-                }
 
-                // #126 Tier-2: inject the FULL global running ledger into EVERY
-                // step (with the static elision marker once entries were dropped).
-                if let Some(block) = render_step_ledger(&ledger, ledger_elided) {
-                    executor.seed_user_message(&mut step_session, &block).await;
-                }
-
-                // Finally seed this step's own instruction.
-                executor
-                    .seed_user_message(&mut step_session, &step_task.instruction)
-                    .await;
+                    // Finally seed this step's own instruction.
+                    executor
+                        .seed_user_message(&mut step_session, &step_task.instruction)
+                        .await;
+                    step_session
+                };
 
                 // #126 AC2: clear the observed-write accumulator so this task's
                 // files_touched reflect ONLY the writes this step issues.
@@ -1820,10 +1963,14 @@ impl RunStrategy for PlanExecuteConfig {
                             ledger_elided = true;
                         }
 
+                        // #stream: emit through the WRAPPED `cx.stream` (not the
+                        // saved parent `on_stream`) so this combinator-surfaced step
+                        // output is attributed to the `plan_execute` node.
                         StandardHarness::emit(
-                            &on_stream,
+                            &cx.stream,
                             StreamEvent::FinalResponse {
                                 content: last_output.clone(),
+                                node: None,
                             },
                         );
 
@@ -2012,8 +2159,11 @@ impl RunStrategy for SelfVerifyingConfig {
             let build_session_id = task.session_id.clone();
             let mut session_state = std::mem::take(&mut cx.scratch.run_session);
             let mut carried = cx.scratch.run_budget.clone();
-            // Suppress the run's stream sink for the recursive child phases.
+            // #stream: save the parent sink, install a `self_verifying`-attributing
+            // wrapper so the build (worker) and evaluate phases stream through it;
+            // restored to the parent on every exit (`cx.stream = on_stream;`).
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "self_verifying", None);
 
             // Q1a: resolve the verifier from `evaluator`'s key (NO wire change).
             let verifier = match cx.registry.resolve_verifier(&self.evaluator.0) {
@@ -2276,9 +2426,12 @@ impl RunStrategy for RalphConfig {
     /// Ralph (#124): GENUINELY recursive continuation wrapper. Each context
     /// window seeds a FRESH session from the `.spore/` checkpoint, then recurses
     /// `self.inner.run(cx)` (a non-ReAct inner — e.g. SelfVerifying — really runs
-    /// its whole loop per window). Q3: when `self.agent` is set it OVERRIDES the
-    /// inner leaf's agent per window; when unset the worker resolves via the inner
-    /// leaf. `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
+    /// its whole loop per window). Ralph is an OUTER LOOP that re-runs `inner` as
+    /// the architect declared it — it does NOT replace nodes the inner tree
+    /// already assigned. When `self.agent` is set it only FILLS a worker leaf that
+    /// left its own agent handle EMPTY (the bare-leaf Ralph convenience); an
+    /// explicit leaf agent is authoritative and never overwritten.
+    /// `ralph_completion_status` drives the OUTER reset loop; exhaustion ⇒
     /// `RalphCompletionUnmet`.
     fn run<'a>(&'a self, cx: &'a mut ExecutionContext<'_>) -> BoxFut<'a, StrategyOutcome> {
         Box::pin(async move {
@@ -2287,19 +2440,23 @@ impl RunStrategy for RalphConfig {
                 Err(o) => return o,
             };
             let task = cx.current_task();
+            // #stream: save the parent sink, install a `ralph`-attributing wrapper
+            // so each reset window's turns stream through it; restored on exit.
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "ralph", None);
             // Ralph discards the incoming session state by design (each window is
             // a fresh start re-seeded from the filesystem checkpoint).
             let _ = std::mem::take(&mut cx.scratch.run_session);
             let max_resets = self.max_resets(executor);
 
-            // Q3: when `self.agent` is set, override the inner leaf's agent for
-            // every window by rewriting the inner tree's worker leaf handle.
+            // Ralph fills — never replaces. When `self.agent` is set it supplies a
+            // worker agent ONLY where the inner leaf left its handle empty; an
+            // explicitly-declared leaf agent (the architect's node) is authoritative.
             let inner_for_window: LoopStrategy = if self.agent.0.is_empty() {
                 (*self.inner).clone()
             } else {
                 let mut cloned = (*self.inner).clone();
-                override_worker_agent(&mut cloned, &self.agent);
+                fill_empty_worker_agent(&mut cloned, &self.agent);
                 cloned
             };
 
@@ -2417,16 +2574,21 @@ impl RalphConfig {
     }
 }
 
-/// Rewrite the worker leaf's agent handle of `ls` to `agent` (#124 Q3 — Ralph's
-/// per-window agent override). Mutates the leaf reached by descending the worker
-/// child chain.
-fn override_worker_agent(ls: &mut LoopStrategy, agent: &AgentRef) {
+/// Fill the worker leaf's agent handle of `ls` with `agent` ONLY where the leaf
+/// left it empty — Ralph's bare-leaf convenience. An explicitly-declared leaf
+/// agent is authoritative and is never replaced (the architect's node wins).
+/// Descends the worker child chain to the innermost leaf.
+fn fill_empty_worker_agent(ls: &mut LoopStrategy, agent: &AgentRef) {
     match ls {
-        LoopStrategy::ReAct(c) => c.agent = agent.clone(),
-        LoopStrategy::PlanExecute(c) => override_worker_agent(&mut c.execute, agent),
-        LoopStrategy::SelfVerifying(c) => override_worker_agent(&mut c.inner, agent),
-        LoopStrategy::Ralph(c) => override_worker_agent(&mut c.inner, agent),
-        LoopStrategy::HillClimbing(c) => override_worker_agent(&mut c.inner, agent),
+        LoopStrategy::ReAct(c) => {
+            if c.agent.0.is_empty() {
+                c.agent = agent.clone();
+            }
+        }
+        LoopStrategy::PlanExecute(c) => fill_empty_worker_agent(&mut c.execute, agent),
+        LoopStrategy::SelfVerifying(c) => fill_empty_worker_agent(&mut c.inner, agent),
+        LoopStrategy::Ralph(c) => fill_empty_worker_agent(&mut c.inner, agent),
+        LoopStrategy::HillClimbing(c) => fill_empty_worker_agent(&mut c.inner, agent),
     }
 }
 
@@ -2446,7 +2608,10 @@ impl RunStrategy for HillClimbingConfig {
             let task = cx.current_task();
             let session_id = task.session_id.clone();
             let task_id = task.id.clone();
+            // #stream: save the parent sink, install a `hill_climbing`-attributing
+            // wrapper so each iteration's turns stream through it; restored on exit.
             let on_stream = cx.stream.take();
+            cx.stream = wrap_node_sink(on_stream.clone(), "hill_climbing", None);
             let mut carried = cx.scratch.run_budget.clone();
             let _ = std::mem::take(&mut cx.scratch.run_session);
             let direction = self.direction;
@@ -2721,6 +2886,31 @@ impl ExecutionContext<'_> {
         result: RunResult,
     ) -> StrategyOutcome {
         executor.finalize(&result).await;
+        // #131: a `Consult` propagated from a worker leaf carries the LEAF task,
+        // so a host `resume_consult` would resume only that leaf and lose the
+        // surrounding walk. As the pause unwinds through each combinator's
+        // `finish`, rewrite its `state.task` to the combinator's OWN composed
+        // task; by the top it carries the FULL tree, so `resume_consult` re-drives
+        // the whole strategy (the in-progress task resumes from `consult_resume`).
+        let result = match result {
+            RunResult::Consult {
+                request,
+                mut state,
+                session_id,
+                usage,
+                turns,
+            } => {
+                state.task = parent_task.clone();
+                RunResult::Consult {
+                    request,
+                    state,
+                    session_id,
+                    usage,
+                    turns,
+                }
+            }
+            other => other,
+        };
         self.scratch.task = Some(parent_task);
         match &result {
             RunResult::Success { session_state, .. } | RunResult::Failure { session_state, .. } => {
@@ -3233,9 +3423,13 @@ pub enum BlockKind {
 pub enum StreamEvent {
     TurnStart {
         turn: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     TurnEnd {
         turn: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     ToolCall {
         call_id: String,
@@ -3244,6 +3438,8 @@ pub enum StreamEvent {
         /// `#[serde(default)]` keeps pre-#103 serialized events back-compatible.
         #[serde(default)]
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     ToolResult {
         call_id: String,
@@ -3252,12 +3448,18 @@ pub enum StreamEvent {
         /// pre-#103 serialized events back-compatible.
         #[serde(default)]
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     FinalResponse {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     BudgetWarning {
         limit_type: BudgetLimitType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Emitted when a tool wants to surface a message to the user out-of-band
     /// (issue #81 — `SendMessageTool`). The harness loop recognizes the
@@ -3266,16 +3468,22 @@ pub enum StreamEvent {
     /// the loop continues.
     UserMessage {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     // ── Delta-level streaming (issue #103) ──────────────────────────────────
     /// Streamed text fragment (`model::StreamEvent::ContentBlockDelta`).
     TextDelta {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Streamed reasoning/thinking fragment
     /// (`model::StreamEvent::ThinkingDelta`). Q4.
     ReasoningDelta {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// Streamed tool-argument JSON fragment
     /// (`model::StreamEvent::ToolUseDelta`), correlated to a `call_id` via the
@@ -3283,16 +3491,22 @@ pub enum StreamEvent {
     ToolArgsDelta {
         call_id: String,
         partial_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A content block opened (Q2). Emitted the first time a delta for an index
     /// is seen.
     BlockStart {
         index: u32,
         block: BlockKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A content block closed (`model::StreamEvent::ContentBlockStop`). Q2.
     BlockStop {
         index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
     /// A tool-use block opened (issue #103). Emitted so consumers can correlate
     /// the subsequent [`StreamEvent::ToolArgsDelta`] fragments and the final
@@ -3304,10 +3518,116 @@ pub enum StreamEvent {
         index: u32,
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
     },
 }
 
-pub type StreamSink = Box<dyn Fn(StreamEvent) + Send + Sync>;
+impl StreamEvent {
+    /// Uniform mutable access to the optional [`NodeAttr`] on any variant — the
+    /// single seam the node-wrapping sinks stamp through ([`wrap_node_sink`]).
+    /// One or-pattern binds the common `node` field across every variant.
+    pub fn node_mut(&mut self) -> &mut Option<NodeAttr> {
+        match self {
+            StreamEvent::TurnStart { node, .. }
+            | StreamEvent::TurnEnd { node, .. }
+            | StreamEvent::ToolCall { node, .. }
+            | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::FinalResponse { node, .. }
+            | StreamEvent::BudgetWarning { node, .. }
+            | StreamEvent::UserMessage { node, .. }
+            | StreamEvent::TextDelta { node, .. }
+            | StreamEvent::ReasoningDelta { node, .. }
+            | StreamEvent::ToolArgsDelta { node, .. }
+            | StreamEvent::BlockStart { node, .. }
+            | StreamEvent::BlockStop { node, .. }
+            | StreamEvent::ToolCallStart { node, .. } => node,
+        }
+    }
+
+    /// The emitting node's attribution, if stamped.
+    pub fn node(&self) -> Option<&NodeAttr> {
+        match self {
+            StreamEvent::TurnStart { node, .. }
+            | StreamEvent::TurnEnd { node, .. }
+            | StreamEvent::ToolCall { node, .. }
+            | StreamEvent::ToolResult { node, .. }
+            | StreamEvent::FinalResponse { node, .. }
+            | StreamEvent::BudgetWarning { node, .. }
+            | StreamEvent::UserMessage { node, .. }
+            | StreamEvent::TextDelta { node, .. }
+            | StreamEvent::ReasoningDelta { node, .. }
+            | StreamEvent::ToolArgsDelta { node, .. }
+            | StreamEvent::BlockStart { node, .. }
+            | StreamEvent::BlockStop { node, .. }
+            | StreamEvent::ToolCallStart { node, .. } => node.as_ref(),
+        }
+    }
+}
+
+/// A user-facing stream sink. `Arc` (not `Box`) so the single sink installed at
+/// the top of a run can be CLONED into every nested node's context and into the
+/// live per-turn agent adapter without being consumed — this is what lets a
+/// composed strategy tree stream every node's events to one channel (the API
+/// the harness backs subscribes to exactly this sink and forwards over SSE).
+pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;
+
+/// Attribution stamped onto every [`StreamEvent`] as it flows up through the
+/// node-wrapping sinks (see [`wrap_node_sink`]). Lets a multi-agent UI route a
+/// frame to the node that produced it. Optional + `skip_serializing_if` so an
+/// un-attributed event (a bare/single-leaf run, or any pre-attribution
+/// consumer) serializes byte-identically to before this field existed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeAttr {
+    /// The emitting node's kind: `"react"` (a leaf turn loop), or a combinator
+    /// kind (`"plan_execute"`, `"self_verifying"`, `"ralph"`, `"hill_climbing"`).
+    /// The leaf's kind is the innermost (most specific) — set first.
+    pub kind: String,
+    /// The leaf agent's handle (e.g. `"planner"`/`"executor"`/`"ralph-agent"`),
+    /// when the emitting node is a `react` leaf. `None` for combinator frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Nesting depth of the emitting leaf below the root (root combinator's leaf
+    /// children are progressively deeper). Accumulated as the event passes
+    /// through each combinator wrapper.
+    pub depth: u32,
+    /// Root→leaf node-kind path, accumulated by the wrapper chain (outermost
+    /// first). E.g. `["ralph", "plan_execute", "self_verifying", "react"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+}
+
+/// Wrap a parent sink so every event passing through is stamped for ONE node.
+/// The leaf installs the innermost wrapper (it sets `kind`/`agent_id`/seeds the
+/// path); each enclosing combinator's wrapper PREPENDS its kind to `path` and
+/// bumps `depth`. Stamping is set-once for `kind`/`agent_id` (the innermost leaf
+/// wins) so the event reports who actually spoke, with the full nesting in
+/// `path`. Returns `None` when there is no parent sink (no-op, baseline path).
+fn wrap_node_sink(
+    parent: Option<StreamSink>,
+    kind: &str,
+    agent_id: Option<String>,
+) -> Option<StreamSink> {
+    let parent = parent?;
+    let kind = kind.to_string();
+    Some(Arc::new(move |mut ev: StreamEvent| {
+        match ev.node_mut() {
+            slot @ None => {
+                *slot = Some(NodeAttr {
+                    kind: kind.clone(),
+                    agent_id: agent_id.clone(),
+                    depth: 0,
+                    path: vec![kind.clone()],
+                });
+            }
+            Some(attr) => {
+                attr.path.insert(0, kind.clone());
+                attr.depth += 1;
+            }
+        }
+        parent(ev);
+    }))
+}
 
 /// Per-turn state threaded through [`Harness::map_model_stream_event`] (issue
 /// #103). Tracks which block indices are open and their kind so
@@ -4979,8 +5299,16 @@ impl HarnessRunOptions {
     }
 
     /// Attach a streaming sink for `StreamEvent`s emitted during the run.
-    pub fn with_stream(mut self, on_stream: StreamSink) -> Self {
-        self.on_stream = Some(on_stream);
+    ///
+    /// Generic over `impl Fn` so callers can pass a bare closure, an existing
+    /// `Box<dyn Fn>` (which itself implements `Fn` — back-compat for pre-`Arc`
+    /// callers), or an `Arc<dyn Fn>`; it is wrapped once into the shared
+    /// [`StreamSink`].
+    pub fn with_stream<F>(mut self, on_stream: F) -> Self
+    where
+        F: Fn(StreamEvent) + Send + Sync + 'static,
+    {
+        self.on_stream = Some(Arc::new(on_stream));
         self
     }
 }
@@ -5111,6 +5439,22 @@ pub struct HarnessConfig {
     /// (which stays the harness-loop seam for custom slim registries). `None`
     /// (the default) preserves the `tool_registry`-only path byte-for-byte.
     pub catalogue_registry: Option<Arc<crate::tool_registry::StandardToolRegistry>>,
+    /// Per-toolset catalogues (Issue 2: per-node toolset scoping), keyed by the
+    /// non-empty `ToolsetRef` handle a leaf carries. Populated by
+    /// [`HarnessBuilder::toolset_tools`] — each value is a populated
+    /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// folded from that key's catalogue tools. At dispatch the run loop bridges
+    /// the matching catalogue per-run via
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry) (same
+    /// sandbox/session/storage wiring as the global
+    /// [`catalogue_registry`](Self::catalogue_registry)), so a node with a
+    /// non-empty `toolset` handle dispatches ONLY its own tools. A leaf with an
+    /// EMPTY handle (`""`) — or a non-empty handle with no entry here — falls
+    /// back to the global catalogue / `tool_registry` seam (back-compat with
+    /// examples 01–11 that use `.tools()`). Empty (the default) preserves
+    /// today's behaviour byte-for-byte.
+    pub toolset_catalogues:
+        std::collections::HashMap<String, Arc<crate::tool_registry::StandardToolRegistry>>,
     /// Operating system prompt prepended to each turn's assembled context when
     /// the context manager renders none (issue #91). See
     /// [`HarnessBuilder::system_prompt`]. `None` (the default) preserves
@@ -5198,6 +5542,7 @@ impl Clone for HarnessConfig {
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
             catalogue_registry: self.catalogue_registry.clone(),
+            toolset_catalogues: self.toolset_catalogues.clone(),
             system_prompt: self.system_prompt.clone(),
             model_params: self.model_params.clone(),
             auto_persist_sessions: self.auto_persist_sessions,
@@ -5273,6 +5618,14 @@ pub struct HarnessBuilder {
     /// [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry) by
     /// [`HarnessBuilder::build_tool_registry`], applying last-wins upsert.
     standard_tools: Vec<crate::tools::StandardTool>,
+    /// Per-toolset catalogue tools (Issue 2: per-node toolset scoping),
+    /// accumulated via [`HarnessBuilder::toolset_tools`] and keyed by the
+    /// non-empty toolset handle a leaf carries. Each bucket is folded into a
+    /// populated [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// (last-wins upsert) at [`build_config`](HarnessBuilder::build_config) and
+    /// stored in [`HarnessConfig::toolset_catalogues`]. Empty (the default)
+    /// preserves today's single-catalogue behaviour byte-for-byte.
+    toolset_tools: std::collections::HashMap<String, Vec<crate::tools::StandardTool>>,
     /// Optional operating system prompt prepended to each turn's assembled
     /// context (issue #91) when the context manager renders none. `None` (the
     /// default) preserves today's behaviour. See [`system_prompt`](HarnessBuilder::system_prompt).
@@ -5338,6 +5691,7 @@ impl HarnessBuilder {
             vcs_provider: None,
             metric_evaluator: None,
             standard_tools: Vec::new(),
+            toolset_tools: std::collections::HashMap::new(),
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
@@ -5536,6 +5890,35 @@ impl HarnessBuilder {
     /// Order is preserved, so last-wins upsert still applies across the batch.
     pub fn tools(mut self, tools: impl IntoIterator<Item = crate::tools::StandardTool>) -> Self {
         self.standard_tools.extend(tools);
+        self
+    }
+
+    /// Register catalogue tools SCOPED to a single named toolset handle (Issue 2:
+    /// per-node toolset scoping). Mirrors [`tools`](Self::tools), but instead of
+    /// folding into the ONE global catalogue, these tools are folded into a
+    /// per-`key` [`StandardToolRegistry`](crate::tool_registry::StandardToolRegistry)
+    /// (last-wins upsert across calls and within the batch) and stored in
+    /// [`HarnessConfig::toolset_catalogues`].
+    ///
+    /// At dispatch, a leaf whose `toolset` handle equals `key` resolves ONLY this
+    /// catalogue (bridged per-run via
+    /// [`RealToolRegistry`](crate::tool_registry::RealToolRegistry) with the run's
+    /// sandbox/session/storage), so it cannot reach another node's tools — the
+    /// union no longer leaks across nodes. A leaf with an EMPTY (`""`) handle, or
+    /// a non-empty handle with no entry here, falls back to the global
+    /// [`tools`](Self::tools) catalogue / `tool_registry` seam (back-compat).
+    ///
+    /// `key` should be a NON-EMPTY handle string; the empty handle is reserved
+    /// for the global-catalogue fallback.
+    pub fn toolset_tools(
+        mut self,
+        key: impl Into<String>,
+        tools: impl IntoIterator<Item = crate::tools::StandardTool>,
+    ) -> Self {
+        self.toolset_tools
+            .entry(key.into())
+            .or_default()
+            .extend(tools);
         self
     }
 
@@ -5832,13 +6215,32 @@ impl HarnessBuilder {
         } else {
             Some(self.drain_tools_into_registry())
         };
+        // Issue 2: fold each per-toolset bucket into its own populated
+        // `StandardToolRegistry` (last-wins upsert), keyed by the toolset handle.
+        // Bridged per-run at dispatch — same as the global catalogue.
+        let toolset_catalogues: std::collections::HashMap<
+            String,
+            Arc<crate::tool_registry::StandardToolRegistry>,
+        > = {
+            use crate::tool_registry::ToolRegistry as _;
+            self.toolset_tools
+                .drain()
+                .map(|(key, tools)| {
+                    let reg = crate::tool_registry::StandardToolRegistry::new();
+                    for t in tools {
+                        let _ = reg.register(t.implementation, t.schema);
+                    }
+                    (key, Arc::new(reg))
+                })
+                .collect()
+        };
         // When catalogue tools are present and the caller wired no storage,
         // default to an in-memory provider (not the all-no-op default) so that
         // session-aware tools (todo_write, memory, task_list) actually persist
         // within the run. Pure tools (read_file/write_file via the sandbox) are
         // unaffected either way.
         let storage = self.storage.unwrap_or_else(|| {
-            if catalogue_registry.is_some() {
+            if catalogue_registry.is_some() || !toolset_catalogues.is_empty() {
                 Arc::new(crate::storage::StorageProvider::single(Arc::new(
                     crate::storage::InMemoryStorageProvider::new(),
                 )))
@@ -5856,6 +6258,17 @@ impl HarnessBuilder {
         let mut reg_builder = self.registry.into_builder();
         reg_builder = reg_builder.fill_default_agent(self.agent);
         reg_builder = reg_builder.fill_default_toolset(self.tool_registry.clone());
+        // Issue 2: a leaf carrying a non-empty `toolset` handle must RESOLVE
+        // against the registry (`ExecutionRegistry::validate` runs `check_toolset`
+        // at run entry). For every per-key catalogue wired via `.toolset_tools`,
+        // ensure the registry has a presence entry under that handle so
+        // `validate()` passes WITHOUT the caller manually registering a
+        // placeholder toolset. The registry VALUE is never dispatched (dispatch
+        // goes through `toolset_catalogues`), so a no-op `EmptyToolRegistry` is
+        // sufficient; an explicitly-registered toolset under the same key wins.
+        for key in toolset_catalogues.keys() {
+            reg_builder = reg_builder.fill_toolset(key.clone(), Arc::new(EmptyToolRegistry));
+        }
         if let Some(v) = self.verifier {
             reg_builder = reg_builder.fill_default_verifier(v);
         }
@@ -5885,6 +6298,7 @@ impl HarnessBuilder {
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider,
             catalogue_registry,
+            toolset_catalogues,
             system_prompt: self.system_prompt,
             model_params: self.model_params,
             auto_persist_sessions: self.auto_persist_sessions,
@@ -6033,9 +6447,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::Text,
+                        node: None,
                     });
                 }
-                out.push(StreamEvent::TextDelta { content: delta });
+                out.push(StreamEvent::TextDelta {
+                    content: delta,
+                    node: None,
+                });
                 out
             }
             M::ThinkingDelta { index, delta } => {
@@ -6045,9 +6463,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::Reasoning,
+                        node: None,
                     });
                 }
-                out.push(StreamEvent::ReasoningDelta { content: delta });
+                out.push(StreamEvent::ReasoningDelta {
+                    content: delta,
+                    node: None,
+                });
                 out
             }
             M::ToolUseStart { index, id, name } => {
@@ -6060,11 +6482,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::ToolUse,
+                        node: None,
                     });
                     out.push(StreamEvent::ToolCallStart {
                         index,
                         call_id: id,
                         name,
+                        node: None,
                     });
                 }
                 out
@@ -6083,11 +6507,13 @@ impl StandardHarness {
                     out.push(StreamEvent::BlockStart {
                         index,
                         block: BlockKind::ToolUse,
+                        node: None,
                     });
                     out.push(StreamEvent::ToolCallStart {
                         index,
                         call_id,
                         name: String::new(),
+                        node: None,
                     });
                 }
                 let call_id = state
@@ -6098,12 +6524,13 @@ impl StandardHarness {
                 out.push(StreamEvent::ToolArgsDelta {
                     call_id,
                     partial_json,
+                    node: None,
                 });
                 out
             }
             M::ContentBlockStop { index } => {
                 state.open_blocks.remove(&index);
-                vec![StreamEvent::BlockStop { index }]
+                vec![StreamEvent::BlockStop { index, node: None }]
             }
         }
     }
@@ -6342,6 +6769,11 @@ impl StandardHarness {
                 budget_used,
                 on_stream,
                 agent,
+                // Issue 2: the legacy `run_react` wrappers (PlanExecute/DAG
+                // execute steps, single-shot run) carry no per-node toolset
+                // handle, so they keep the global-catalogue fallback (empty
+                // handle) — byte-for-byte with pre-Issue-2 behaviour.
+                ToolsetRef(String::new()),
             )
             .await;
         match &result {
@@ -6384,7 +6816,31 @@ impl StandardHarness {
     /// fresh per run so the run's `SessionId` + storage thread into every tool
     /// dispatch. Otherwise it returns the injected
     /// [`tool_registry`](HarnessConfig::tool_registry) seam unchanged.
-    fn effective_tool_registry(&self, session_id: &SessionId) -> Arc<dyn ToolRegistry> {
+    /// Issue 2 (per-node toolset scoping): `toolset` is the resolving leaf's
+    /// `ToolsetRef` handle. When it is NON-EMPTY and a per-key catalogue was
+    /// registered via [`HarnessBuilder::toolset_tools`], THAT catalogue is
+    /// bridged (so the node dispatches ONLY its own tools — strict scoping).
+    /// Otherwise (empty handle, or non-empty handle with no per-key catalogue)
+    /// the existing global-catalogue / `tool_registry` seam fallback applies, so
+    /// examples 01–11 that use `.tools()` keep working byte-for-byte.
+    fn effective_tool_registry(
+        &self,
+        session_id: &SessionId,
+        toolset: &ToolsetRef,
+    ) -> Arc<dyn ToolRegistry> {
+        // Strict per-node scoping: a non-empty handle with its own catalogue.
+        if !toolset.0.is_empty() {
+            if let Some(catalogue) = self.config.toolset_catalogues.get(&toolset.0) {
+                return Arc::new(crate::tool_registry::RealToolRegistry::new(
+                    catalogue.clone(),
+                    self.config.sandbox.clone(),
+                    session_id.clone(),
+                    self.config.storage.run().clone(),
+                    self.config.storage.memory().clone(),
+                ));
+            }
+        }
+        // Fallback: empty handle (back-compat) or unregistered non-empty handle.
         match &self.config.catalogue_registry {
             Some(catalogue) => Arc::new(crate::tool_registry::RealToolRegistry::new(
                 catalogue.clone(),
@@ -6408,11 +6864,16 @@ impl StandardHarness {
         // `ReactConfig::run` resolves `self.agent` from the registry; Ralph may
         // override it per window). The leaf no longer reads `config.agent`.
         agent: Arc<dyn Agent>,
+        // Issue 2: the leaf's RESOLVED `toolset` handle (mirrors `agent`). Empty
+        // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
+        // per-key catalogue ⇒ strict per-node scoping.
+        toolset: ToolsetRef,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
-        // strategies funnel through here). Bridges catalogue tools per-run.
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // strategies funnel through here). Bridges the per-node toolset catalogue
+        // (or the global catalogue when the handle is empty) per-run.
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
         // Reset the adaptive prompt-based-tool-calling escalation flag at the
         // start of this turn-loop window so detection is scoped to the window
         // and does not leak across `run()` calls (the flag is shared with the
@@ -6553,6 +7014,7 @@ impl StandardHarness {
                 &on_stream,
                 StreamEvent::TurnStart {
                     turn: budget_used.turns + 1,
+                    node: None,
                 },
             );
             let turn_started_at = Timestamp::now();
@@ -6570,36 +7032,32 @@ impl StandardHarness {
                 None
             };
             // Delta-level streaming (issue #103): when a user-facing stream sink
-            // is attached, drive the turn through `turn_streaming` and forward
-            // each raw `model::StreamEvent` mapped to harness `StreamEvent`s.
-            // The adapter collects mapped events into a buffer (it cannot borrow
-            // `on_stream`, which is `Box<dyn Fn>` and not `'static`-shareable);
-            // the buffer is flushed to `on_stream` immediately after the turn,
-            // preserving order: TurnStart → deltas → TurnEnd → coarse events.
-            // When no sink is attached we keep the plain `turn` path so the
-            // baseline RunResult is byte-identical (back-compat).
-            let result = if on_stream.is_some() {
-                // Shared per-turn (TurnStreamState, buffered mapped events). The
-                // adapter is `Fn`, so the mutable mapping state lives behind a
-                // Mutex shared with the post-turn drain.
-                let shared: std::sync::Arc<std::sync::Mutex<(TurnStreamState, Vec<StreamEvent>)>> =
-                    std::sync::Arc::new(std::sync::Mutex::new((
-                        TurnStreamState::default(),
-                        Vec::new(),
-                    )));
-                let sink_shared = shared.clone();
+            // is attached, drive the turn through `turn_streaming` and forward each
+            // raw `model::StreamEvent` mapped to harness `StreamEvent`s.
+            //
+            // #stream: the sink is now an `Arc` (cloneable), so the adapter forwards
+            // each mapped event to it LIVE — the instant the model emits it — rather
+            // than buffering and flushing post-turn (the old `Box`-can't-be-shared
+            // workaround). This is what makes token-by-token SSE / mid-turn cancel
+            // observable. `TurnStreamState` (block + call-id correlation) lives
+            // behind a Mutex shared with the adapter; we map UNDER the lock, RELEASE
+            // it, then forward — never running the user sink under the lock (a
+            // re-entrant sink would deadlock). Order is preserved: TurnStart (emitted
+            // below, before the turn) → live deltas → TurnEnd → coarse events.
+            // When no sink is attached we keep the plain `turn` path so the baseline
+            // RunResult is byte-identical (back-compat).
+            let result = if let Some(sink) = on_stream.clone() {
+                let state = std::sync::Arc::new(std::sync::Mutex::new(TurnStreamState::default()));
                 let adapter: crate::agent::AgentStreamSink = Box::new(move |ev| {
-                    let mut guard = sink_shared.lock().expect("stream buffer poisoned");
-                    let (state, buffer) = &mut *guard;
-                    let mapped = Self::map_model_stream_event(ev, state);
-                    buffer.extend(mapped);
+                    let mapped = {
+                        let mut guard = state.lock().expect("stream state poisoned");
+                        Self::map_model_stream_event(ev, &mut guard)
+                    };
+                    for m in mapped {
+                        sink(m);
+                    }
                 });
-                let r = agent.turn_streaming(context, adapter).await;
-                let events = std::mem::take(&mut shared.lock().expect("stream buffer poisoned").1);
-                for ev in events {
-                    Self::emit(&on_stream, ev);
-                }
-                r
+                agent.turn_streaming(context, adapter).await
             } else {
                 agent.turn(context).await
             };
@@ -6702,6 +7160,7 @@ impl StandardHarness {
                 &on_stream,
                 StreamEvent::TurnEnd {
                     turn: budget_used.turns,
+                    node: None,
                 },
             );
 
@@ -6848,6 +7307,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 &on_stream,
                                 StreamEvent::FinalResponse {
                                     content: content.clone(),
+                                    node: None,
                                 },
                             );
                             return RunResult::Success {
@@ -6971,6 +7431,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     is_error: true,
                                     // Q5: carry the result content.
                                     content: format!("sandbox: {violation:?}"),
+                                    node: None,
                                 },
                             );
                             self.config
@@ -6988,6 +7449,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 name: call.name.clone(),
                                 // Q5: carry the final tool-call arguments.
                                 args: call.input.clone(),
+                                node: None,
                             },
                         );
                         let tool_started_at = Timestamp::now();
@@ -7230,6 +7692,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     &on_stream,
                                     StreamEvent::UserMessage {
                                         content: content.clone(),
+                                        node: None,
                                     },
                                 );
                             }
@@ -7363,6 +7826,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 call_id: call.id.clone(),
                                 is_error,
                                 content: result_content,
+                                node: None,
                             },
                         );
                         self.config
@@ -7952,8 +8416,10 @@ tool. Use the provided tool-call format to actually invoke the tool."
         usage: AggregateUsage,
         turns: u32,
     ) -> Result<PlanPhaseOutcome, RunResult> {
-        // R3: capture the artifact from the response text.
-        let mut artifact = match crate::plan::capture_plan_artifact(plan_output) {
+        // R3: capture the artifact from the response text. Uses the prose-repair
+        // fallback: a planner that wraps its plan JSON in prose still captures
+        // (the strict canonical grammar runs first; repair only rescues a failure).
+        let mut artifact = match crate::plan::capture_plan_artifact_with_repair(plan_output) {
             Ok(a) => a,
             Err(e) => {
                 return Err(RunResult::Failure {
@@ -8270,6 +8736,7 @@ impl StrategyExecutor for StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
+        toolset: ToolsetRef,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
             self.run_react_inner(
@@ -8279,6 +8746,7 @@ impl StrategyExecutor for StandardHarness {
                 budget_used,
                 on_stream,
                 agent,
+                toolset,
             )
             .await
         })
@@ -8375,6 +8843,7 @@ impl StrategyExecutor for StandardHarness {
         plan_task: Task,
         plan_session: SessionState,
         budget_used: BudgetSnapshot,
+        on_stream: Option<StreamSink>,
     ) -> BoxFut<'a, Option<RunResult>> {
         Box::pin(async move {
             // #124 Q1: the planner concept is DROPPED — the plan child's leaf
@@ -8382,6 +8851,9 @@ impl StrategyExecutor for StandardHarness {
             // leaf itself. The child's `.run(cx)` drives the WHOLE plan loop.
             let mut cx = ExecutionContext::new(&self.config.registry);
             cx.executor = Some(self);
+            // #stream: thread the (already `plan_execute`-wrapped) sink into the
+            // plan sub-drive so the plan leaf's turns stream and stay attributed.
+            cx.stream = on_stream;
             cx.scratch.run_session = plan_session;
             cx.scratch.run_budget = budget_used;
             cx.scratch.task = Some(plan_task);
@@ -8837,7 +9309,10 @@ impl StandardHarness {
             });
         }
 
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // Issue 2: resume paths carry no per-node toolset handle in `PausedState`
+        // yet, so they keep the global-catalogue fallback (empty handle) —
+        // byte-for-byte with pre-Issue-2 behaviour.
+        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
 
         // Inject the consult answer as the RESULT of the head pending (consult)
         // call, then dispatch the remaining pending calls in the same batch.
@@ -8864,6 +9339,30 @@ impl StandardHarness {
             self.config
                 .context_manager
                 .append_tool_result(&mut session_state, &tr)
+                .await;
+        }
+
+        // #131: a consult that surfaced from inside a composed tree carries the
+        // FULL strategy in `task.loop_strategy` (each combinator's `finish`
+        // rewrote the pause's task on the way up). Re-DRIVE that strategy rather
+        // than resuming only the worker leaf: the PlanExecute walk resumes its
+        // in-progress task from the injected worker session (`consult_resume`
+        // seed), so the worker finishes mid-loop, its SelfVerifying evaluator runs,
+        // the task is marked Completed, and the remaining ready-set is walked. A
+        // BARE worker leaf (depth-1, e.g. a SubagentTool-mediated consult) has no
+        // surrounding walk, so it keeps the original leaf-only resume (back-compat).
+        if !matches!(task.loop_strategy, LoopStrategy::ReAct(_)) {
+            return self
+                .drive_strategy_with_resume_seed(
+                    task,
+                    // Top-level session starts fresh; the worker conversation is
+                    // threaded into the in-progress task via the consult seed.
+                    SessionState::default(),
+                    budget_used,
+                    on_stream,
+                    None,
+                    Some(session_state),
+                )
                 .await;
         }
 
@@ -9064,8 +9563,15 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
     ) -> RunResult {
-        self.drive_strategy_with_resume_seed(task, session_state, budget_used, on_stream, None)
-            .await
+        self.drive_strategy_with_resume_seed(
+            task,
+            session_state,
+            budget_used,
+            on_stream,
+            None,
+            None,
+        )
+        .await
     }
 
     /// `drive_strategy` with an optional cross-process Continue checkpoint seed
@@ -9073,6 +9579,11 @@ impl StandardHarness {
     /// FIRST matching budget scope's `continues_used` (via [`BudgetContext::resumed`])
     /// so a `Continue` that spanned a process pause resumes with the correct
     /// continue count instead of a zeroed one. `None` is the fresh-run path.
+    ///
+    /// `consult_resume = Some(session)` (#131) seeds the FIRST PlanExecute walk's
+    /// in-progress task with `session` (a worker conversation whose consult answer
+    /// is already injected) so a resumed consult continues mid-loop and walks the
+    /// remaining ready-set. `None` on every non-consult path.
     async fn drive_strategy_with_resume_seed(
         &self,
         task: Task,
@@ -9080,6 +9591,7 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         resume_continues: Option<(String, u32)>,
+        consult_resume: Option<SessionState>,
     ) -> RunResult {
         // #129: the BARE-LEAF resolution site is `drive_strategy` (a bare leaf
         // never self-resolves inside its own body — rule 6 — it PROPAGATES a typed
@@ -9094,7 +9606,8 @@ impl StandardHarness {
         let mut task = task;
         let mut session_state = session_state;
         let mut budget_used = budget_used;
-        let mut on_stream = on_stream;
+        // #stream: read-only now — cloned into `cx.stream` each round, never moved.
+        let on_stream = on_stream;
         // The Continue resolution state threaded across in-process rounds: the
         // (possibly fallen-through) behavior + how many continues have been spent.
         let mut behavior_for_resolution: Option<(BudgetExhaustedBehavior, u32)> = None;
@@ -9102,15 +9615,22 @@ impl StandardHarness {
         // round only (the resumed node's scope); later in-process rounds carry
         // their continue count via `behavior_for_resolution`.
         let mut resume_continues = resume_continues;
+        // #131: the consult re-drive seed is consumed by the FIRST round's
+        // PlanExecute walk only; later in-process rounds run normally.
+        let mut consult_resume = consult_resume;
 
         loop {
             let mut cx = ExecutionContext::new(&self.config.registry);
             cx.executor = Some(self);
-            cx.stream = on_stream.take();
+            // #stream: CLONE (not take) the Arc sink so the binding survives every
+            // in-process re-drive round (a `Continue` rebuilds `cx` at the top of
+            // this loop and re-installs the same sink). Nested nodes wrap it.
+            cx.stream = on_stream.clone();
             cx.scratch.run_session = std::mem::take(&mut session_state);
             cx.scratch.run_budget = budget_used.clone();
             cx.scratch.task = Some(task.clone());
             cx.scratch.resume_continues = resume_continues.take();
+            cx.scratch.consult_resume = consult_resume.take();
 
             let outcome = task.loop_strategy.run(&mut cx).await;
 
@@ -9185,7 +9705,8 @@ impl StandardHarness {
                             grant_task_budget(&mut task, granted);
                             session_state = std::mem::take(&mut cx.scratch.run_session);
                             budget_used = cx.scratch.run_budget.clone();
-                            on_stream = cx.stream.take();
+                            // #stream: no reclaim needed — `on_stream` (Arc) is
+                            // cloned, never moved, into `cx.stream` each round.
                             // Thread the resolution chain's post-continue state so a
                             // subsequent exhaustion sees the bumped `continues_used`.
                             behavior_for_resolution =
@@ -9308,6 +9829,7 @@ impl StandardHarness {
                             budget_used,
                             on_stream,
                             Some(resume_seed),
+                            None,
                         )
                         .await;
                 }
@@ -9366,8 +9888,10 @@ impl StandardHarness {
 
         // Resolve the effective tool registry for this resumed session — bridges
         // catalogue tools the same way the turn loop does, so pending tool calls
-        // dispatched during resume thread the run's storage + sandbox.
-        let tool_registry = self.effective_tool_registry(&session_id);
+        // dispatched during resume thread the run's storage + sandbox. Issue 2:
+        // resume carries no per-node toolset handle yet, so it uses the
+        // global-catalogue fallback (empty handle).
+        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
 
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as
@@ -10399,6 +10923,184 @@ mod strategy_tests {
             serde_json::to_string(&cps).unwrap()
         );
     }
+
+    // ------------------------------------------------------------------
+    // #122: max_steps() advisory worst-case turn bound.
+    // ------------------------------------------------------------------
+
+    /// Build a ReAct leaf carrying an arbitrary budget policy.
+    fn react_with(budget: BudgetPolicy) -> LoopStrategy {
+        LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            budget,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        })
+    }
+
+    fn self_verifying(inner: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            evaluator: SchemaRef("ev".to_string()),
+        })
+    }
+
+    fn plan_execute(plan: LoopStrategy, execute: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            plan: Box::new(plan),
+            execute: Box::new(execute),
+            plan_model: None,
+        })
+    }
+
+    fn ralph(inner: LoopStrategy) -> LoopStrategy {
+        LoopStrategy::Ralph(RalphConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            agent: AgentRef("r".to_string()),
+        })
+    }
+
+    fn hill_climbing(inner: LoopStrategy, max_stagnation: u32) -> LoopStrategy {
+        LoopStrategy::HillClimbing(HillClimbingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(inner),
+            direction: HillClimbingDirection::Maximize,
+            max_stagnation,
+            revert_on_no_improvement: true,
+            min_improvement_delta: 0.0,
+            evaluator: AgentRef("m".to_string()),
+        })
+    }
+
+    #[test]
+    fn max_steps_react_leaf() {
+        assert_eq!(
+            react_with(BudgetPolicy::PerLoop { value: 4 }).max_steps(),
+            Some(4)
+        );
+        assert_eq!(
+            react_with(BudgetPolicy::TotalSteps { value: 7 }).max_steps(),
+            Some(7)
+        );
+        assert_eq!(
+            react_with(BudgetPolicy::PerAttempt { value: 5 }).max_steps(),
+            Some(5)
+        );
+        assert_eq!(react_with(BudgetPolicy::Unlimited).max_steps(), None);
+    }
+
+    #[test]
+    fn max_steps_self_verifying_adds_one() {
+        let s = self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 }));
+        assert_eq!(s.max_steps(), Some(13));
+    }
+
+    #[test]
+    fn max_steps_plan_execute_is_per_task_sum() {
+        let s = plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            react_with(BudgetPolicy::PerLoop { value: 6 }),
+        );
+        assert_eq!(s.max_steps(), Some(10));
+    }
+
+    #[test]
+    fn max_steps_hill_climbing() {
+        // inner=5, max_stagnation=2 ⇒ 5 * (2 + 1) = 15.
+        let s = hill_climbing(react_with(BudgetPolicy::PerLoop { value: 5 }), 2);
+        assert_eq!(s.max_steps(), Some(15));
+        // u32::MAX sentinel ⇒ unbounded windows ⇒ None.
+        let unbounded = hill_climbing(react_with(BudgetPolicy::PerLoop { value: 5 }), u32::MAX);
+        assert_eq!(unbounded.max_steps(), None);
+    }
+
+    #[test]
+    fn max_steps_ralph_is_per_window() {
+        assert_eq!(
+            ralph(react_with(BudgetPolicy::PerLoop { value: 9 })).max_steps(),
+            Some(9)
+        );
+        // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+        let s = ralph(plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+        ));
+        assert_eq!(s.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_canonical_cordyceps_subtree() {
+        // PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]] = 4 + (12 + 1) = 17.
+        let subtree = plan_execute(
+            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+        );
+        assert_eq!(subtree.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_cordyceps_fixture_is_17() {
+        // The whole tree's root Ralph wraps PlanExecute, so per-window == 17.
+        let tree = cordyceps_tree();
+        assert_eq!(tree.max_steps(), Some(17));
+
+        let raw = std::fs::read_to_string(fixture_path("strategy/cordyceps_tree.json"))
+            .expect("fixture present");
+        let deserialized: LoopStrategy = serde_json::from_str(&raw).unwrap();
+        assert_eq!(deserialized.max_steps(), Some(17));
+    }
+
+    #[test]
+    fn max_steps_unlimited_anywhere_is_none() {
+        // Plan leaf unlimited ⇒ None.
+        assert_eq!(
+            plan_execute(
+                react_with(BudgetPolicy::Unlimited),
+                self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
+            )
+            .max_steps(),
+            None
+        );
+        // Execute's inner ReAct unlimited ⇒ None.
+        assert_eq!(
+            plan_execute(
+                react_with(BudgetPolicy::PerLoop { value: 4 }),
+                self_verifying(react_with(BudgetPolicy::Unlimited)),
+            )
+            .max_steps(),
+            None
+        );
+        // HillClimbing-wrapped unlimited inner ⇒ None (propagates to root).
+        assert_eq!(
+            ralph(hill_climbing(react_with(BudgetPolicy::Unlimited), 2)).max_steps(),
+            None
+        );
+    }
+
+    #[test]
+    fn max_steps_strategy_ref() {
+        assert_eq!(StrategyRef::Custom("x".to_string()).max_steps(), None);
+        assert_eq!(
+            StrategyRef::BuiltIn(react_with(BudgetPolicy::PerLoop { value: 4 })).max_steps(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn max_steps_overflow_is_none() {
+        // inner = u32::MAX/2, max_stagnation = 3 ⇒ (u32::MAX/2) * 4 overflows ⇒ None.
+        let s = hill_climbing(
+            react_with(BudgetPolicy::PerLoop {
+                value: u32::MAX / 2,
+            }),
+            3,
+        );
+        assert_eq!(s.max_steps(), None);
+    }
 }
 
 /// Test-only seams (#124) that drive the GENUINE recursive plan / execute
@@ -10410,9 +11112,11 @@ mod strategy_tests {
 #[cfg(test)]
 impl StandardHarness {
     /// Drive the recursive plan phase for `task` (whose strategy must be a
-    /// `PlanExecute`): seed the directive, dispatch `plan.run(cx)` capped at one
-    /// turn, then capture + persist the artifact. Mirrors the plan half of
-    /// [`PlanExecuteConfig::run`].
+    /// `PlanExecute`): seed the directive, dispatch `plan.run(cx)` under the
+    /// plan sub-strategy's OWN declared budget (the global `max_turns` is only
+    /// the outer backstop), then capture + persist the artifact. Mirrors the
+    /// plan half of [`PlanExecuteConfig::run`] — it must NOT clamp the planner to
+    /// a single turn or it becomes a stale parallel copy of production.
     async fn run_plan_phase(
         &self,
         task: &Task,
@@ -10433,23 +11137,26 @@ impl StandardHarness {
             .append_user_message(&mut plan_session, &directive)
             .await;
         let _ = on_stream;
-        let plan_cap = match task.budget.max_turns {
-            Some(global) => global.min(budget_used.turns.saturating_add(1)),
-            None => budget_used.turns.saturating_add(1),
-        };
+        // The plan phase runs under the plan sub-strategy's OWN declared budget;
+        // the global `max_turns` is only the outer backstop. (Previously clamped
+        // to `turns + 1` — a single turn — which starved multi-turn `task_list`
+        // authoring and diverged this test seam from production.)
         let plan_task = Task {
             id: task.id.clone(),
             instruction: directive,
             session_id: session_id.clone(),
-            budget: BudgetLimits {
-                max_turns: Some(plan_cap),
-                ..task.budget.clone()
-            },
+            budget: task.budget.clone(),
             loop_strategy: plan_strategy.clone(),
         };
 
         let plan_result = self
-            .run_plan_subtree(&plan_strategy, plan_task, plan_session, budget_used.clone())
+            .run_plan_subtree(
+                &plan_strategy,
+                plan_task,
+                plan_session,
+                budget_used.clone(),
+                None,
+            )
             .await;
         let (plan_output, usage, turns) = match plan_result {
             Some(RunResult::Success {
@@ -10574,6 +11281,7 @@ impl StandardHarness {
                         on_stream,
                         StreamEvent::FinalResponse {
                             content: last_output.clone(),
+                            node: None,
                         },
                     );
                 }
@@ -10682,6 +11390,7 @@ mod tests {
             max_resets: 3,
             vcs_provider: None,
             catalogue_registry: None,
+            toolset_catalogues: std::collections::HashMap::new(),
             system_prompt: None,
             model_params: ModelParams::default(),
             auto_persist_sessions: false,
@@ -10881,7 +11590,7 @@ mod tests {
             .tool(crate::tools::StandardTools::read_file())
             .build_config();
         let h = StandardHarness::new(cfg);
-        let reg = h.effective_tool_registry(&SessionId::new("s1"));
+        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
         // The bridge advertises the catalogue schemas to the model.
         assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
         // And maps an inner dispatch failure (unknown tool) to a *recoverable*
@@ -10906,6 +11615,134 @@ mod tests {
     fn no_catalogue_tools_keeps_tool_registry_seam() {
         let cfg = catalogue_builder(make_agent()).build_config();
         assert!(cfg.catalogue_registry.is_none());
+    }
+
+    // ---- Issue 2: per-node toolset scoping ---------------------------------
+
+    /// Helper: dispatch a tool by name through a bridged registry and report
+    /// whether it resolved to a *successful* tool output (vs an unknown-tool /
+    /// not-available recoverable error).
+    async fn dispatched_ok(reg: &Arc<dyn ToolRegistry>, name: &str) -> bool {
+        let out = reg
+            .dispatch(ToolCall {
+                id: "c".into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        !matches!(out, ToolOutput::Error { .. })
+    }
+
+    /// A node carrying a NON-EMPTY toolset handle dispatches ONLY that toolset's
+    /// catalogue: the planner (`plan-tools` = list_dir/task_list) cannot call an
+    /// exec-only tool (`read_file`), and the executor (`exec-tools` = read_file)
+    /// cannot call a plan-only tool (`task_list`/`list_dir`). The leaked union is
+    /// closed.
+    #[tokio::test]
+    async fn per_node_toolset_scoping_closes_cross_node_leaks() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools(
+                "plan-tools",
+                vec![StandardTools::list_dir(), StandardTools::task_list()],
+            )
+            .toolset_tools("exec-tools", vec![StandardTools::read_file()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let sid = SessionId::new("s1");
+
+        // Planner node: plan-tools only. Its OWN tools advertise; exec-only tools
+        // are NOT available.
+        let plan = h.effective_tool_registry(&sid, &ToolsetRef("plan-tools".into()));
+        assert!(plan.schemas().iter().any(|s| s.name == "list_dir"));
+        assert!(plan.schemas().iter().any(|s| s.name == "task_list"));
+        assert!(!plan.schemas().iter().any(|s| s.name == "read_file"));
+        // The leak the live run exhibited: planner calling an exec-only tool now
+        // resolves to unknown-tool / not-available, NOT success.
+        assert!(!dispatched_ok(&plan, "read_file").await);
+
+        // Executor node: exec-tools only. It cannot reach the plan-only tools.
+        let exec = h.effective_tool_registry(&sid, &ToolsetRef("exec-tools".into()));
+        assert!(exec.schemas().iter().any(|s| s.name == "read_file"));
+        assert!(!exec.schemas().iter().any(|s| s.name == "task_list"));
+        assert!(!exec.schemas().iter().any(|s| s.name == "list_dir"));
+        assert!(!dispatched_ok(&exec, "task_list").await);
+        assert!(!dispatched_ok(&exec, "list_dir").await);
+    }
+
+    /// An unknown tool called by a scoped node still yields the existing
+    /// recoverable unknown-tool failure (no regression of the error path).
+    #[tokio::test]
+    async fn per_node_toolset_unknown_tool_is_recoverable_error() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let reg =
+            h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()));
+        let out = reg
+            .dispatch(ToolCall {
+                id: "c".into(),
+                name: "does_not_exist".into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        assert!(matches!(
+            out,
+            ToolOutput::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    /// A node with an EMPTY toolset handle still sees the GLOBAL catalogue wired
+    /// via `.tools()` (back-compat with examples 01–11 that never scope). The
+    /// per-key catalogues do NOT leak into the empty-handle fallback.
+    #[tokio::test]
+    async fn empty_toolset_handle_falls_back_to_global_catalogue() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .tools(vec![StandardTools::read_file()]) // global catalogue
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()]) // scoped
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let global = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef(String::new()));
+        // Empty handle ⇒ global catalogue (read_file), NOT the scoped plan-tools.
+        assert!(global.schemas().iter().any(|s| s.name == "read_file"));
+        assert!(!global.schemas().iter().any(|s| s.name == "list_dir"));
+    }
+
+    /// A non-empty toolset handle with NO registered per-key catalogue falls back
+    /// to the global catalogue / seam (additive change — an unscoped name does
+    /// not strand the node with zero tools).
+    #[tokio::test]
+    async fn unknown_toolset_handle_falls_back_to_global_catalogue() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .tools(vec![StandardTools::read_file()])
+            .build_config();
+        let h = StandardHarness::new(cfg);
+        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()));
+        assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
+    }
+
+    /// `build_config` auto-registers a registry presence entry for every per-key
+    /// catalogue, so a tree referencing that toolset handle passes
+    /// `ExecutionRegistry::validate` without the caller wiring a placeholder.
+    #[test]
+    fn toolset_tools_autofill_registry_presence_for_validate() {
+        use crate::tools::StandardTools;
+        let cfg = catalogue_builder(make_agent())
+            .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
+            .build_config();
+        assert!(cfg
+            .registry
+            .resolve_toolset(&ToolsetRef("plan-tools".into()))
+            .is_some());
+        // And the dispatchable catalogue is present.
+        assert!(cfg.toolset_catalogues.contains_key("plan-tools"));
     }
 
     // ---- issue #120: ExecutionRegistry run-entry validation + knob ---------
@@ -12543,7 +13380,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = captured.clone();
         let opts = HarnessRunOptions::new(react(5)).with_stream(Box::new(move |ev| {
-            if let StreamEvent::UserMessage { content } = ev {
+            if let StreamEvent::UserMessage { content, .. } = ev {
                 sink.lock().unwrap().push(content);
             }
         }));
@@ -14809,6 +15646,7 @@ mod tests {
                 max_resets: 3,
                 vcs_provider: None,
                 catalogue_registry: None,
+                toolset_catalogues: std::collections::HashMap::new(),
                 system_prompt: None,
                 model_params: ModelParams::default(),
                 auto_persist_sessions: false,
@@ -17595,8 +18433,10 @@ mod tests {
             cfg
         }
 
-        fn collect_sink(events: Arc<StdMutex<Vec<StreamEvent>>>) -> StreamSink {
-            Box::new(move |ev| events.lock().unwrap().push(ev))
+        fn collect_sink(
+            events: Arc<StdMutex<Vec<StreamEvent>>>,
+        ) -> impl Fn(StreamEvent) + Send + Sync + 'static {
+            move |ev| events.lock().unwrap().push(ev)
         }
 
         // TextDelta concatenation, ReasoningDelta emission, BlockStart/BlockStop
@@ -17624,16 +18464,16 @@ mod tests {
             let evs = events.lock().unwrap();
 
             // Q3: no message-level markers ever surface on the harness stream.
-            assert!(!evs
-                .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { content } if content.is_empty())));
+            assert!(!evs.iter().any(
+                |e| matches!(e, StreamEvent::TextDelta { content, .. } if content.is_empty())
+            ));
 
             // ReasoningDelta + TextDelta present with the right content.
             assert!(evs
                 .iter()
-                .any(|e| matches!(e, StreamEvent::ReasoningDelta { content } if content == "thinking aloud")));
+                .any(|e| matches!(e, StreamEvent::ReasoningDelta { content, .. } if content == "thinking aloud")));
             assert!(evs.iter().any(
-                |e| matches!(e, StreamEvent::TextDelta { content } if content == "hello world")
+                |e| matches!(e, StreamEvent::TextDelta { content, .. } if content == "hello world")
             ));
 
             // Every delta is bracketed: each BlockStart has a matching BlockStop
@@ -17803,7 +18643,7 @@ mod tests {
         fn block_index_for(evs: &[StreamEvent], kind: BlockKind) -> u32 {
             evs.iter()
                 .find_map(|e| match e {
-                    StreamEvent::BlockStart { index, block } if *block == kind => Some(*index),
+                    StreamEvent::BlockStart { index, block, .. } if *block == kind => Some(*index),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("no BlockStart for {kind:?}"))
@@ -17811,7 +18651,7 @@ mod tests {
 
         fn has_block_stop(evs: &[StreamEvent], index: u32) -> bool {
             evs.iter()
-                .any(|e| matches!(e, StreamEvent::BlockStop { index: i } if *i == index))
+                .any(|e| matches!(e, StreamEvent::BlockStop { index: i, .. } if *i == index))
         }
 
         fn precedes(
@@ -17917,7 +18757,13 @@ mod tests {
                 golden.events
             );
             for (got, exp) in delta_events.iter().zip(golden.events.iter()) {
-                assert_eq!(*got, exp, "event mismatch");
+                // #stream: this golden asserts delta ORDERING/content (#103), not
+                // node attribution — strip the (now-present) `node` so the SHARED
+                // cross-language fixture stays byte-identical. Attribution has its
+                // own test (`composed_tree_streams_attributed_events`).
+                let mut got_norm = (*got).clone();
+                *got_norm.node_mut() = None;
+                assert_eq!(&got_norm, exp, "event mismatch");
             }
         }
 

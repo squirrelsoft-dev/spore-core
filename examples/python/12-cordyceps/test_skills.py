@@ -11,12 +11,12 @@ from __future__ import annotations
 from spore_core import (
     Context,
     HarnessToolResult,
+    ReactConfig,
     SessionId,
     SessionState,
     Task,
     TextContent,
 )
-from spore_core.harness import LoopStrategyReAct
 from spore_core.storage import InMemoryStorageProvider, StorageProvider
 
 from skills import (
@@ -66,7 +66,7 @@ async def test_manifest_always_injected_bodies_only_when_active() -> None:
     cm = SkillInjectingContextManager(_PassThroughInner(), storage.run(), _manifest())
 
     session = SessionState()
-    task = Task.new("audit a module", SessionId("sess-1"), LoopStrategyReAct(max_iterations=8))
+    task = Task.new("audit a module", SessionId("sess-1"), ReactConfig.per_loop(8))
 
     # No active skills yet: manifest present, NO body.
     ctx = await cm.assemble(session, task)

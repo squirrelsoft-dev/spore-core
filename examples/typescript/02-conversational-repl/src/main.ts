@@ -45,6 +45,7 @@ import {
   SessionId,
   emptySessionState,
   newTask,
+  reactPerLoop,
   runResultSessionState,
   type SessionState,
 } from "@spore/core";
@@ -81,7 +82,7 @@ async function main(): Promise<void> {
 
     // Thread the running state into this turn. The harness appends `line` as the
     // new user message before calling the model.
-    const task = newTask(line, sessionId, { kind: "re_act", max_iterations: 4 });
+    const task = newTask(line, sessionId, reactPerLoop(4));
     const result = await harness.run({ task, session_state: state });
 
     if (result.kind === "success") {

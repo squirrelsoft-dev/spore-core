@@ -60,7 +60,7 @@ use std::sync::Arc;
 use memory_provider::MarkdownMemoryProvider;
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SessionId, StandardTools, Task,
+    OllamaModelInterface, ReactConfig, RunResult, SessionId, StandardTools, Task,
 };
 
 /// The pinned session id shared by BOTH phases. See the module docs: memory is
@@ -209,12 +209,12 @@ async fn run_phase(
     let task = Task::new(
         task_prompt.to_string(),
         session(),
-        LoopStrategy::ReAct { max_iterations: 20 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(20)),
     );
 
     let options = HarnessRunOptions::new(task).with_stream(Box::new(
         |event: HarnessStreamEvent| match event {
-            HarnessStreamEvent::TurnStart { turn } => println!("think  · turn {turn}"),
+            HarnessStreamEvent::TurnStart { turn, .. } => println!("think  · turn {turn}"),
             HarnessStreamEvent::ToolCall { name, args, .. } => {
                 println!("    act    → {name}({})", truncate(&args.to_string(), 160));
             }

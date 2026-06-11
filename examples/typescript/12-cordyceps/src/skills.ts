@@ -1,5 +1,5 @@
 /**
- * Architect-side skill loading (zero core-harness change).
+ * Architect-side skill injection (zero core-harness change).
  *
  * ## Why this lives in the example, not the harness
  *
@@ -11,8 +11,17 @@
  * `session.messages` (see issue #115 / Known Deviation #8). So today skills reach
  * the model only as tool-result text, never as structural injection.
  *
- * This module wires the chain end-to-end **architect-side**, exactly the pattern
- * issue #115 will absorb into the library:
+ * ## #131 composition: the `audit` skill rides the GLOBAL context manager
+ *
+ * The pre-#131 example loaded skills on demand via a worker-side `load_skill`
+ * tool. The declarative `LoopStrategy` tree exposes no such per-node seam, so
+ * `load_skill` was dropped. Instead the `audit` skill is seeded ALWAYS-ACTIVE at
+ * startup (`runStore["active_skills"] = ["audit"]`) and injected structurally by
+ * the single GLOBAL {@link SkillInjectingContextManager} the harness runs as its
+ * `context_manager`. The audit procedure reaches the model every turn,
+ * compaction-proof, with no `load_skill` round-trip.
+ *
+ * This module wires the chain end-to-end **architect-side**:
  *
  * 1. A {@link SkillCatalog} scans `.spore/skills/{name}/SKILL.md` (project) then
  *    `~/.spore/skills/{name}/SKILL.md` (user), parses YAML frontmatter
@@ -20,16 +29,13 @@
  *    {@link guideRegistry.Guide} in a {@link guideRegistry.StandardGuideRegistry}.
  *    It also keeps a manifest side-list of `(name, description)` because `Guide`
  *    has no `description` field — the example owns the manifest text.
- * 2. The `load_skill` tool (see `tools/load-skill.ts`) appends a skill id to
- *    `runStore["active_skills"]`.
- * 3. {@link SkillInjectingContextManager} wraps the standard compaction adapter
+ * 2. {@link SkillInjectingContextManager} wraps the standard compaction adapter
  *    and, in `assemble`, prepends — **ephemerally**, never into
  *    `session.messages` — (a) the manifest of all skills, and (b) the full body
  *    of every active skill. Everything else delegates verbatim to the inner
  *    adapter.
  *
- * Net effect: the manifest is present every turn (progressive disclosure); a
- * loaded skill's body is re-injected every turn until the session is cleared.
+ * Net effect: the manifest + the active `audit` body are present every turn.
  * Because the active set lives in `runStore` (not the message history), it is
  * compaction-proof.
  */
@@ -337,8 +343,8 @@ export class SkillInjectingContextManager implements ContextManager {
     const out: Message[] = [];
 
     let manifestText =
-      "AVAILABLE SKILLS (call `load_skill` with a `skill_id` to activate one; " +
-      "its full procedure then stays in context):\n";
+      "AVAILABLE SKILLS (active skills' full procedures are injected below and " +
+      "stay in context every turn):\n";
     for (const entry of this.manifestEntries) {
       manifestText += `- ${entry.name}: ${entry.description}\n`;
     }

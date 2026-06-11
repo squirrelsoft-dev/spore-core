@@ -136,6 +136,97 @@ func TestCaptureIsDeterministic(t *testing.T) {
 }
 
 // ============================================================================
+// CapturePlanArtifactWithRepair — prose-repair fallback. Mirrors the Rust unit
+// tests in rust/crates/spore-core/src/plan.rs.
+// ============================================================================
+
+// A clean object that the STRICT grammar already accepts is returned unchanged
+// by the repair wrapper (repair never runs on a success).
+func TestRepairPassesThroughStrictSuccess(t *testing.T) {
+	a, err := CapturePlanArtifactWithRepair(`{"tasks":["a","b"],"rationale":"r"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(a.Tasks) != 2 || a.Tasks[0] != "a" || a.Tasks[1] != "b" || a.Rationale != "r" {
+		t.Fatalf("got %+v", a)
+	}
+}
+
+// The live failure mode: the planner wraps its plan JSON in prose. The strict
+// grammar rejects it; the repair extracts the embedded object.
+func TestRepairExtractsJSONWrappedInProse(t *testing.T) {
+	text := "Sure! Here is the plan:\n{\"tasks\":[\"step 1\",\"step 2\"],\"rationale\":\"because\"}\nLet me know if that works."
+	// Strict path fails…
+	if _, err := CapturePlanArtifact(text); err == nil {
+		t.Fatalf("expected strict capture to fail")
+	}
+	// …repair rescues it.
+	a, err := CapturePlanArtifactWithRepair(text)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(a.Tasks) != 2 || a.Tasks[0] != "step 1" || a.Tasks[1] != "step 2" || a.Rationale != "because" {
+		t.Fatalf("got %+v", a)
+	}
+}
+
+// Braces inside string values must NOT confuse the balanced-object scan.
+func TestRepairRespectsBracesInsideStrings(t *testing.T) {
+	a, err := CapturePlanArtifactWithRepair(`prefix {"tasks":["use the { brace } char","b"]} suffix`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(a.Tasks) != 2 || a.Tasks[0] != "use the { brace } char" || a.Tasks[1] != "b" {
+		t.Fatalf("got %+v", a)
+	}
+}
+
+// The embedded object is captured to its FIRST balanced close (nested objects
+// are spanned correctly).
+func TestExtractSpansNestedObjects(t *testing.T) {
+	got, ok := extractEmbeddedJSONObject(`x {"tasks":["a"],"meta":{"k":"v"}} y`)
+	if !ok {
+		t.Fatalf("expected an embedded object")
+	}
+	if want := `{"tasks":["a"],"meta":{"k":"v"}}`; got != want {
+		t.Fatalf("extracted = %q, want %q", got, want)
+	}
+}
+
+// Repair that still cannot parse a clean plan surfaces the ORIGINAL strict
+// error, not a repair-specific one.
+func TestRepairFailureReturnsStrictError(t *testing.T) {
+	// Embedded object exists but is not a valid plan (tasks not an array).
+	_, err := CapturePlanArtifactWithRepair(`here: {"tasks":"nope"} end`)
+	pe, ok := err.(*PlanPhaseError)
+	if !ok {
+		t.Fatalf("expected *PlanPhaseError, got %v", err)
+	}
+	if pe.Kind != PlanErrorUnparseablePlan {
+		t.Fatalf("kind = %q", pe.Kind)
+	}
+}
+
+// No embedded object at all ⇒ still UnparseablePlan, never panics.
+func TestRepairNoObjectIsUnparseable(t *testing.T) {
+	_, err := CapturePlanArtifactWithRepair("no json here at all")
+	pe, ok := err.(*PlanPhaseError)
+	if !ok {
+		t.Fatalf("expected *PlanPhaseError, got %v", err)
+	}
+	if pe.Kind != PlanErrorUnparseablePlan {
+		t.Fatalf("kind = %q", pe.Kind)
+	}
+}
+
+// An unbalanced '{' (no matching close) extracts nothing.
+func TestExtractUnbalancedObjectIsNone(t *testing.T) {
+	if _, ok := extractEmbeddedJSONObject(`{"tasks":["a"`); ok {
+		t.Fatalf("expected no embedded object for unbalanced input")
+	}
+}
+
+// ============================================================================
 // Plan-phase driver (R1–R8, R10–R11 + Q4). Mirrors the Rust harness tests.
 // ============================================================================
 

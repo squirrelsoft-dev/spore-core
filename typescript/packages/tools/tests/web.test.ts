@@ -14,7 +14,12 @@ import type { AddressInfo } from "node:net";
 import { harnessTesting, toolRegistry, type ToolCall } from "@spore/core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { WebSearchConfigError, WebSearchTool } from "../src/index.js";
+import {
+  applyWebFetchRange,
+  WebFetchTool,
+  WebSearchConfigError,
+  WebSearchTool,
+} from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
 const ctx = toolRegistry.toolRegistryMock.testCtx();
@@ -424,5 +429,192 @@ describe("web_search #108 — unconfigured backend", () => {
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);
     expect(r.message).toBe("web_search backend not configured");
+  });
+});
+
+// ============================================================================
+// applyWebFetchRange unit tests (#135)
+// ============================================================================
+
+describe("applyWebFetchRange #135 — unit", () => {
+  it("start_byte 0 returns body unchanged with no header", () => {
+    const r = applyWebFetchRange("hello world", 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value).toBe("hello world");
+  });
+
+  it("start_byte 0 on empty body returns empty string with no header", () => {
+    const r = applyWebFetchRange("", 0);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value).toBe("");
+  });
+
+  it("start_byte in the middle prepends header and slices body", () => {
+    const r = applyWebFetchRange("hello world", 6);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value).toBe("[starting at byte 6 of 11]\nworld");
+  });
+
+  it("start_byte at last byte returns last byte with header", () => {
+    const r = applyWebFetchRange("hello", 4);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value).toBe("[starting at byte 4 of 5]\no");
+  });
+
+  it("start_byte exactly at body length is a recoverable error", () => {
+    const r = applyWebFetchRange("hello", 5);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.error.kind).toBe("error");
+    if (r.error.kind !== "error") throw new Error("unreachable");
+    expect(r.error.recoverable).toBe(true);
+    expect(r.error.message).toBe("start_byte 5 exceeds response length 5");
+  });
+
+  it("start_byte past end is a recoverable error", () => {
+    const r = applyWebFetchRange("hello", 10);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.error.kind).toBe("error");
+    if (r.error.kind !== "error") throw new Error("unreachable");
+    expect(r.error.recoverable).toBe(true);
+    expect(r.error.message).toBe("start_byte 10 exceeds response length 5");
+  });
+
+  it("empty body with nonzero start_byte is a recoverable error", () => {
+    const r = applyWebFetchRange("", 1);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.error.kind).toBe("error");
+    if (r.error.kind !== "error") throw new Error("unreachable");
+    expect(r.error.recoverable).toBe(true);
+    expect(r.error.message).toBe("start_byte 1 exceeds response length 0");
+  });
+});
+
+// ============================================================================
+// Fixture replay: web_fetch_range.json (#135)
+// ============================================================================
+
+describe("applyWebFetchRange #135 — fixture replay", () => {
+  interface WebFetchRangeCase {
+    name: string;
+    body: string;
+    start_byte: number;
+    expected?: string;
+    expected_error?: string;
+  }
+
+  it("replays all cases from fixtures/tools/web_fetch_range.json", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const fixturePath = resolve(
+      __dirname,
+      "../../../../fixtures/tools/web_fetch_range.json",
+    );
+    const cases: WebFetchRangeCase[] = JSON.parse(
+      readFileSync(fixturePath, "utf8"),
+    );
+    expect(cases.length).toBeGreaterThan(0);
+
+    for (const c of cases) {
+      const result = applyWebFetchRange(c.body, c.start_byte);
+      if (c.expected !== undefined) {
+        expect(result.ok).toBe(true);
+        if (!result.ok) throw new Error(`case ${c.name}: expected ok`);
+        expect(result.value).toBe(c.expected);
+      } else if (c.expected_error !== undefined) {
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error(`case ${c.name}: expected error`);
+        expect(result.error.kind).toBe("error");
+        if (result.error.kind !== "error")
+          throw new Error(`case ${c.name}: unreachable`);
+        expect(result.error.message).toBe(c.expected_error);
+      } else {
+        throw new Error(`case ${c.name}: missing expected or expected_error`);
+      }
+    }
+  });
+});
+
+// ============================================================================
+// WebFetchTool integration with start_byte via mock HTTP server (#135)
+// ============================================================================
+
+function webFetchCall(input: unknown): ToolCall {
+  return { id: "c1", name: "web_fetch", input };
+}
+
+describe("WebFetchTool #135 — start_byte integration", () => {
+  it("start_byte 0 returns body unchanged (no header)", async () => {
+    const { url, close } = await startCapturingServer("hello world");
+    try {
+      const r = await new WebFetchTool().execute(
+        webFetchCall({ url: `${url}/page`, start_byte: 0 }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      expect(r.kind).toBe("success");
+      if (r.kind !== "success") throw new Error("unreachable");
+      expect(r.content).toBe("hello world");
+    } finally {
+      await close();
+    }
+  });
+
+  it("start_byte mid-body slices with header", async () => {
+    const { url, close } = await startCapturingServer("hello world");
+    try {
+      const r = await new WebFetchTool().execute(
+        webFetchCall({ url: `${url}/page`, start_byte: 6 }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      expect(r.kind).toBe("success");
+      if (r.kind !== "success") throw new Error("unreachable");
+      expect(r.content).toBe("[starting at byte 6 of 11]\nworld");
+    } finally {
+      await close();
+    }
+  });
+
+  it("start_byte past end is a recoverable error", async () => {
+    const { url, close } = await startCapturingServer("hello");
+    try {
+      const r = await new WebFetchTool().execute(
+        webFetchCall({ url: `${url}/page`, start_byte: 99 }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      expect(r.kind).toBe("error");
+      if (r.kind !== "error") throw new Error("unreachable");
+      expect(r.recoverable).toBe(true);
+      expect(r.message).toBe("start_byte 99 exceeds response length 5");
+    } finally {
+      await close();
+    }
+  });
+
+  it("omitting start_byte defaults to 0 (byte-identical to old behavior)", async () => {
+    const { url, close } = await startCapturingServer("body text here");
+    try {
+      const r = await new WebFetchTool().execute(
+        webFetchCall({ url: `${url}/page` }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      expect(r.kind).toBe("success");
+      if (r.kind !== "success") throw new Error("unreachable");
+      expect(r.content).toBe("body text here");
+    } finally {
+      await close();
+    }
   });
 });

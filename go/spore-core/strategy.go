@@ -542,6 +542,134 @@ func (r *StrategyRef) UnmarshalJSON(data []byte) error {
 }
 
 // ============================================================================
+// MaxSteps — advisory worst-case turn bound (#122)
+// ============================================================================
+
+// MaxSteps returns an advisory worst-case TURN count for a fully-bounded
+// strategy tree, computed BEFORE a run. It is a pre-run advisory figure logged
+// at startup, NOT an enforcement mechanism — the per-node budget ceiling is the
+// safety mechanism. The returned bool is false ("no finite advisory bound")
+// when the tree is not fully bounded; this mirrors BudgetPolicy.AllowanceValue's
+// (value, ok) optional idiom.
+//
+// The bound is derived multiplicatively/additively down the tree and is
+// option-monadic: any Unlimited node anywhere collapses the whole figure to
+// (0, false). It is a runtime-only computation and is NEVER serialized.
+//
+// Per-variant rules:
+//   - ReAct(c)         ⇒ c.Budget.AllowanceValue() (Unlimited ⇒ (0, false)).
+//   - SelfVerifying(c) ⇒ inner + 1 — the single read-only evaluator turn is
+//     exactly one extra turn.
+//   - PlanExecute(c)   ⇒ plan + execute. PER-TASK bound: a full run's total is
+//     plan + executePerTask × taskCount, where taskCount is data-dependent (the
+//     plan phase builds the task graph at runtime), so it is intentionally NOT
+//     part of this static figure.
+//   - Ralph(c)         ⇒ inner — PER-WINDOW bound, mirroring PlanExecute's
+//     per-task treatment. A full run's total is perWindow × maxWindows, where
+//     maxWindows derives from HarnessConfig max resets (default 3) at runtime
+//     and is intentionally NOT part of this static figure.
+//   - HillClimbing(c)  ⇒ inner × (MaxStagnation + 1) — the +1 is the one
+//     productive pass; MaxStagnation non-improving passes follow. The
+//     MaxStagnation == math.MaxUint32 sentinel means unbounded windows ⇒
+//     (0, false) (a semantic unbounded rule, distinct from arithmetic overflow).
+//
+// Arithmetic guards add/mul against uint32 overflow; an unrepresentable bound
+// (overflow) yields (0, false) — an unrepresentable figure is "no finite
+// advisory bound".
+func (s LoopStrategy) MaxSteps() (uint32, bool) {
+	switch s.Kind {
+	case StrategyReAct:
+		if s.ReActCfg == nil {
+			return 0, false
+		}
+		return s.ReActCfg.Budget.AllowanceValue()
+	case StrategySelfVerifying:
+		if s.SelfVerify == nil || s.SelfVerify.Inner == nil {
+			return 0, false
+		}
+		inner, ok := s.SelfVerify.Inner.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		return checkedAddU32(inner, 1)
+	case StrategyPlanExecute:
+		if s.PlanExecute == nil || s.PlanExecute.Plan == nil || s.PlanExecute.Execute == nil {
+			return 0, false
+		}
+		plan, ok := s.PlanExecute.Plan.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		exec, ok := s.PlanExecute.Execute.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		return checkedAddU32(plan, exec)
+	case StrategyRalph:
+		if s.Ralph == nil || s.Ralph.Inner == nil {
+			return 0, false
+		}
+		return s.Ralph.Inner.MaxSteps()
+	case StrategyHillClimbing:
+		if s.HillClimbing == nil || s.HillClimbing.Inner == nil {
+			return 0, false
+		}
+		if s.HillClimbing.MaxStagnation == ^uint32(0) {
+			// Unbounded-windows sentinel ⇒ no finite advisory bound.
+			return 0, false
+		}
+		inner, ok := s.HillClimbing.Inner.MaxSteps()
+		if !ok {
+			return 0, false
+		}
+		windows, ok := checkedAddU32(s.HillClimbing.MaxStagnation, 1)
+		if !ok {
+			return 0, false
+		}
+		return checkedMulU32(inner, windows)
+	default:
+		return 0, false
+	}
+}
+
+// MaxSteps is the advisory worst-case turn bound for this strategy reference
+// (#122). Custom is opaque to the framework (it cannot be introspected), so it
+// yields (0, false); BuiltIn delegates to LoopStrategy.MaxSteps.
+func (r StrategyRef) MaxSteps() (uint32, bool) {
+	switch r.Kind {
+	case StrategyRefBuiltIn:
+		if r.BuiltIn == nil {
+			return 0, false
+		}
+		return r.BuiltIn.MaxSteps()
+	default:
+		// Custom (and any unknown kind): opaque ⇒ no finite advisory bound.
+		return 0, false
+	}
+}
+
+// checkedAddU32 returns a+b and true, or (0, false) on uint32 overflow.
+func checkedAddU32(a, b uint32) (uint32, bool) {
+	sum := a + b
+	if sum < a {
+		return 0, false
+	}
+	return sum, true
+}
+
+// checkedMulU32 returns a*b and true, or (0, false) on uint32 overflow.
+func checkedMulU32(a, b uint32) (uint32, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	prod := a * b
+	if prod/b != a {
+		return 0, false
+	}
+	return prod, true
+}
+
+// ============================================================================
 // RunStrategy — the runtime composition seam
 // ============================================================================
 
@@ -626,7 +754,10 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// The leaf takes the run's stream sink for the window; combinators that
 	// recurse per-phase suppress it (they take it before recursing).
 	onStream := cx.takeStream()
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent)
+	// Issue 2: thread THIS leaf's toolset handle down so the window dispatches the
+	// per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
+	// Mirrors agent resolution.
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf
@@ -711,18 +842,14 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	//
 	// Seed the planning directive onto a CLONE of the base session so the shared
 	// execute context stays [user: task.instruction] (#93 — a leaked directive
-	// would make every execute step re-emit a plan). Cap the plan child at ONE
-	// turn (R1): the plan is a single constrained turn that yields the JSON
-	// artifact, but never beyond the task's global turn ceiling (R10).
+	// would make every execute step re-emit a plan). The plan sub-strategy's own
+	// declared budget governs the plan phase (R1): an authored task_list may take
+	// more than one turn. The task's global turn ceiling remains the outer
+	// backstop (R10), enforced by the shared budget — not a turns+1 clamp.
 	directive := executor.PlanDirective(task.Instruction)
 	planSession := baseSession
 	executor.SeedUserMessage(ctx, &planSession, directive)
-	planCap := saturatingAddU32(budget.Turns, 1)
-	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < planCap {
-		planCap = *task.Budget.MaxTurns
-	}
 	planBudget := task.Budget
-	planBudget.MaxTurns = &planCap
 	planTask := Task{
 		ID:           task.ID,
 		Instruction:  directive,
@@ -850,6 +977,35 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	// already-Completed tasks are not re-run.
 	executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
 
+	// #131 consult re-drive: a resumed consult carries the worker conversation
+	// (answer already injected) in cx.Scratch.ConsultResume. The consulting task is
+	// the single InProgress task in the durable list (PlanExecute marks a task
+	// InProgress before running it). Reset it to Pending so NextReady re-schedules
+	// it, and remember its id so its step uses the carried session instead of a
+	// fresh one — the worker then continues mid-loop and its evaluator still runs.
+	consultResumeSession := cx.Scratch.ConsultResume
+	cx.Scratch.ConsultResume = nil
+	var consultResumeTask uint32
+	var haveConsultResumeTask bool
+	if consultResumeSession != nil {
+		for i := range taskList.Tasks {
+			if taskList.Tasks[i].Status == TaskStatusInProgress {
+				// Reset directly (bypassing Update's forward-only transition guard,
+				// which rejects InProgress->Pending): the consult resume legitimately
+				// re-schedules the in-flight task.
+				taskList.Tasks[i].Status = TaskStatusPending
+				consultResumeTask = taskList.Tasks[i].ID
+				haveConsultResumeTask = true
+				break
+			}
+		}
+		if !haveConsultResumeTask {
+			// No in-progress task to resume (out-of-contract); drop the seed so the
+			// walk proceeds normally rather than stalling.
+			consultResumeSession = nil
+		}
+	}
+
 	totalTasks := len(taskList.Tasks)
 	totalUsage := planUsage
 	var lastOutput string
@@ -938,47 +1094,58 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		}
 		executor.FireTaskAdvance(ctx, sessionID, &stepTask, index, totalTasks)
 
-		// #126 Tier-1 scoped context (decision D): seed this step from a FRESH copy
-		// of the base session (NOT a forward-folded shared transcript — that breaks
-		// on a DAG) plus, for THIS task's transitive blockers ONLY, their final
-		// outputs + their ledger rows. Independent branches never appear (AC1).
-		stepSession := cloneSessionState(&session)
-		blockers := taskList.TransitiveBlockers(taskID)
-		if len(blockers) > 0 {
-			blockerSet := make(map[uint32]struct{}, len(blockers))
-			for _, b := range blockers {
-				blockerSet[b] = struct{}{}
-			}
-			// Tier-1: transitive blockers' final outputs (ascending id).
-			var tier1Lines []string
-			for _, b := range blockers {
-				if out, ok := finalOutputs[b]; ok {
-					tier1Lines = append(tier1Lines, fmt.Sprintf("#%d result: %s", b, out))
+		// #131 consult re-drive: if THIS is the task that was consulting, resume its
+		// worker from the carried conversation (answer already injected) instead of a
+		// fresh instruction-seeded session — the worker continues mid-loop and its
+		// evaluator still runs. Otherwise build the normal fresh, Tier-1/Tier-2-seeded
+		// step session.
+		var stepSession *SessionState
+		if haveConsultResumeTask && taskID == consultResumeTask && consultResumeSession != nil {
+			stepSession = consultResumeSession
+			consultResumeSession = nil
+		} else {
+			// #126 Tier-1 scoped context (decision D): seed this step from a FRESH copy
+			// of the base session (NOT a forward-folded shared transcript — that breaks
+			// on a DAG) plus, for THIS task's transitive blockers ONLY, their final
+			// outputs + their ledger rows. Independent branches never appear (AC1).
+			stepSession = cloneSessionState(&session)
+			blockers := taskList.TransitiveBlockers(taskID)
+			if len(blockers) > 0 {
+				blockerSet := make(map[uint32]struct{}, len(blockers))
+				for _, b := range blockers {
+					blockerSet[b] = struct{}{}
+				}
+				// Tier-1: transitive blockers' final outputs (ascending id).
+				var tier1Lines []string
+				for _, b := range blockers {
+					if out, ok := finalOutputs[b]; ok {
+						tier1Lines = append(tier1Lines, fmt.Sprintf("#%d result: %s", b, out))
+					}
+				}
+				if len(tier1Lines) > 0 {
+					executor.SeedUserMessage(ctx, stepSession, "Results from upstream tasks:\n"+strings.Join(tier1Lines, "\n"))
+				}
+				// Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
+				var scoped []StepLedgerEntry
+				for _, e := range ledger {
+					if _, ok := blockerSet[e.TaskID]; ok {
+						scoped = append(scoped, e)
+					}
+				}
+				if block, ok := RenderStepLedger(scoped, false); ok {
+					executor.SeedUserMessage(ctx, stepSession, block)
 				}
 			}
-			if len(tier1Lines) > 0 {
-				executor.SeedUserMessage(ctx, stepSession, "Results from upstream tasks:\n"+strings.Join(tier1Lines, "\n"))
-			}
-			// Tier-1 ledger: the Tier-2 ledger rows for this transitive set.
-			var scoped []StepLedgerEntry
-			for _, e := range ledger {
-				if _, ok := blockerSet[e.TaskID]; ok {
-					scoped = append(scoped, e)
-				}
-			}
-			if block, ok := RenderStepLedger(scoped, false); ok {
+
+			// #126 Tier-2: inject the FULL global running ledger into EVERY step (with
+			// the static elision marker once entries were dropped).
+			if block, ok := RenderStepLedger(ledger, ledgerElided); ok {
 				executor.SeedUserMessage(ctx, stepSession, block)
 			}
-		}
 
-		// #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-		// the static elision marker once entries were dropped).
-		if block, ok := RenderStepLedger(ledger, ledgerElided); ok {
-			executor.SeedUserMessage(ctx, stepSession, block)
+			// Finally seed this step's own instruction.
+			executor.SeedUserMessage(ctx, stepSession, stepTask.Instruction)
 		}
-
-		// Finally seed this step's own instruction.
-		executor.SeedUserMessage(ctx, stepSession, stepTask.Instruction)
 
 		// #126 AC2: clear the observed-write accumulator so this task's
 		// files_touched reflect ONLY the writes this step issues.
@@ -1418,8 +1585,9 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 // Run is the Ralph continuation wrapper (#124): GENUINELY recursive. Each
 // context window seeds a FRESH session from the .spore/ checkpoint, then recurses
 // c.Inner.Run(ctx, cx) (a non-ReAct inner — e.g. SelfVerifying — really runs its
-// whole loop per window). Q3: when c.Agent is set it OVERRIDES the inner leaf's
-// agent per window; when unset the worker resolves via the inner leaf.
+// whole loop per window). Q3: when c.Agent is set it FILLS the inner leaf's
+// agent per window only where that leaf's handle is empty (an explicit leaf
+// agent stays authoritative); when unset the worker resolves via the inner leaf.
 // RalphCompletionStatus drives the OUTER reset loop; exhaustion =>
 // RalphCompletionUnmet. Ralph discards the incoming session state by design.
 func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOutcome {
@@ -1432,12 +1600,13 @@ func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	_ = cx.takeSession() // discarded: each window re-seeds from the checkpoint.
 	maxResets := executor.RalphMaxResets()
 
-	// Q3: when c.Agent is set, override the inner leaf's agent for every window
-	// by rewriting the inner tree's worker leaf handle.
+	// Q3: when c.Agent is set, FILL the inner leaf's agent for every window only
+	// where the worker leaf's handle is empty — an explicitly-declared leaf agent
+	// is authoritative and is never shadowed by Ralph's per-window agent.
 	innerForWindow := *c.Inner
 	if string(c.Agent) != "" {
 		cloned := *c.Inner
-		overrideWorkerAgent(&cloned, c.Agent)
+		fillEmptyWorkerAgent(&cloned, c.Agent)
 		innerForWindow = cloned
 	}
 
@@ -1895,26 +2064,29 @@ func workerAgentKeyOf(ls *LoopStrategy) string {
 	}
 }
 
-// overrideWorkerAgent rewrites the worker leaf's agent handle of ls to agent
-// (#124 Q3 — Ralph's per-window agent override). Mutates the leaf reached by
-// descending the worker child chain. Operates on the *LoopStrategy in place
-// (combinator children are pointers, so descending mutates the shared subtree —
-// callers pass a CLONE).
-func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
+// fillEmptyWorkerAgent fills the worker leaf's agent handle of ls with agent
+// ONLY when that leaf's handle is empty (#124 Q3 — Ralph's per-window agent
+// fill). An explicitly-declared leaf agent is authoritative and is left
+// untouched. Mutates the leaf reached by descending the worker child chain.
+// Operates on the *LoopStrategy in place (combinator children are pointers, so
+// descending mutates the shared subtree — callers pass a CLONE).
+func fillEmptyWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	if ls == nil {
 		return
 	}
 	switch ls.Kind {
 	case StrategyReAct:
 		if ls.ReActCfg != nil {
-			cfg := *ls.ReActCfg
-			cfg.Agent = agent
-			ls.ReActCfg = &cfg
+			if string(ls.ReActCfg.Agent) == "" {
+				cfg := *ls.ReActCfg
+				cfg.Agent = agent
+				ls.ReActCfg = &cfg
+			}
 		}
 	case StrategyPlanExecute:
 		if ls.PlanExecute != nil {
 			child := *ls.PlanExecute.Execute
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.PlanExecute
 			cfg.Execute = &child
 			ls.PlanExecute = &cfg
@@ -1922,7 +2094,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategySelfVerifying:
 		if ls.SelfVerify != nil {
 			child := *ls.SelfVerify.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.SelfVerify
 			cfg.Inner = &child
 			ls.SelfVerify = &cfg
@@ -1930,7 +2102,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategyRalph:
 		if ls.Ralph != nil {
 			child := *ls.Ralph.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.Ralph
 			cfg.Inner = &child
 			ls.Ralph = &cfg
@@ -1938,7 +2110,7 @@ func overrideWorkerAgent(ls *LoopStrategy, agent AgentRef) {
 	case StrategyHillClimbing:
 		if ls.HillClimbing != nil {
 			child := *ls.HillClimbing.Inner
-			overrideWorkerAgent(&child, agent)
+			fillEmptyWorkerAgent(&child, agent)
 			cfg := *ls.HillClimbing
 			cfg.Inner = &child
 			ls.HillClimbing = &cfg

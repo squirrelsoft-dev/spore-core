@@ -6,9 +6,18 @@ tool set (``web_search`` + ``write_file`` + ``read_file``, identical to 06) — 
 held constant. The ONLY substantive change is one line on the :class:`Task`::
 
     # 06 — react step-by-step:
-    LoopStrategyReAct(max_iterations=10)
+    ReactConfig.per_loop(10)
     # 08 — decompose the goal first, then execute each subtask:
-    LoopStrategyPlanExecute()
+    PlanExecuteConfig(plan=ReactConfig(output="plan-schema", ...), ...)
+
+Post-#119 the ``LoopStrategy`` is a recursive union of config newtypes, so the
+strategy is a composed tree rather than a flat literal. ``PlanExecute``'s
+``plan`` slot is STRUCTURED — a bare ``ReactConfig`` there MUST declare an
+``output`` schema handle (here ``plan-schema``), which
+:meth:`ExecutionRegistry.validate` enforces at run entry. The empty agent /
+toolset handles on the leaves are default-filled by the builder; only the
+``plan-schema`` handle is registered explicitly on the
+:class:`ExecutionRegistry` wired via ``.registry(...)``.
 
 With ``PlanExecute``, the harness runs one constrained planner turn FIRST: the
 model must return strict JSON ``{"tasks": [...], "rationale": ...}``. That plan is
@@ -86,6 +95,7 @@ from spore_core import (
     PLAN_EXECUTE_EXTRAS_KEY,
     BudgetLimits,
     CompactionConfig,
+    ExecutionRegistry,
     HarnessBuilder,
     HarnessRunOptions,
     HookContext,
@@ -93,12 +103,14 @@ from spore_core import (
     HookDecision,
     HookEvent,
     HookSync,
-    LoopStrategyPlanExecute,
+    LoopStrategy,
     ModelParams,
     NullCacheProvider,
     OllamaModelInterface,
     OnPlanCreatedContext,
     OnTaskAdvanceContext,
+    PlanExecuteConfig,
+    ReactConfig,
     RunResultSuccess,
     SandboxProvider,
     StandardContextManager,
@@ -130,6 +142,52 @@ SYSTEM_PROMPT = (
     "comparison and save the final document with write_file. Act using tools — do not "
     "answer from memory alone."
 )
+
+
+def plan_schema() -> dict[str, object]:
+    """The plan-phase output contract (``plan-schema``). Post-#119,
+    ``PlanExecute``'s ``plan`` slot is STRUCTURED: a bare ``ReactConfig`` there
+    must declare an ``output`` schema so the slot yields a typed task graph
+    (:meth:`ExecutionRegistry.validate` enforces this via the structured-slot
+    check). This is the strict JSON the planner turn returns."""
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Ordered subtasks to execute in sequence.",
+                "items": {"type": "string"},
+            },
+            "rationale": {"type": "string"},
+        },
+        "required": ["tasks"],
+    }
+
+
+def build_registry() -> ExecutionRegistry:
+    """The registry the composed strategy's handles resolve against. The single
+    ``plan-schema`` slot is the only EXPLICIT handle; the builder default-fills the
+    empty agent/toolset handles (``ReactConfig.per_loop`` uses empty handles) from
+    the harness's own model and global tool catalogue at ``build``."""
+    return ExecutionRegistry.builder().schema("plan-schema", plan_schema()).build()
+
+
+def plan_execute_strategy() -> LoopStrategy:
+    """The post-#119 composed strategy: ``PlanExecute(plan: ReAct, execute: ReAct)``.
+    The plan leaf carries the ``plan-schema`` output contract (required for the
+    structured ``plan`` slot); both leaves use empty agent/toolset handles that the
+    builder default-fills. Old flat shape was ``LoopStrategyPlanExecute()``. The
+    plan leaf is bare and effectively unbounded (``per_loop(2**31 - 1)``); the
+    global ``max_turns`` backstop bounds the whole run."""
+    # The plan leaf is a bare ReAct (empty agent/toolset, default-filled by the
+    # builder) carrying the structured-slot ``plan-schema`` output contract and an
+    # effectively-unbounded ``per_loop`` budget. ``PlanExecuteConfig.simple()``
+    # gives both phases bare ReAct leaves; we override the plan leaf's output.
+    plan = ReactConfig.per_loop(2**31 - 1)
+    plan.output = "plan-schema"
+    strategy = PlanExecuteConfig.simple()
+    strategy.plan = plan
+    return strategy
 
 
 class PlanExecuteReporter:
@@ -340,6 +398,7 @@ async def main() -> int:
     harness = (
         HarnessBuilder.conversational(model)
         .sandbox(sandbox)
+        .registry(build_registry())
         .context_manager(context_manager)
         .tool(web_search)
         .tool(StandardTools.write_file())
@@ -355,14 +414,18 @@ async def main() -> int:
         .build()
     )
 
-    # THE ONE-LINE SWAP. 06 used ``LoopStrategyReAct(max_iterations=10)``; here we
-    # decompose first via PlanExecute. The turn budget is divided across subtasks
-    # (per-task cap = remaining_turns / remaining_tasks), so we give it generous
-    # headroom — an 8-step plan at 64 turns gives each subtask ~8 instead of starving.
+    # THE STRATEGY SWAP. 06 used a bare ``ReactConfig.per_loop(10)``; here we
+    # decompose first via the composed ``PlanExecute(plan: ReAct{plan-schema},
+    # execute: ReAct)`` tree (post-#119). The plan leaf carries the ``plan-schema``
+    # output contract — ``PlanExecute``'s ``plan`` slot is STRUCTURED, so a bare
+    # ``ReAct`` there MUST declare an output schema. The turn budget is divided
+    # across subtasks (per-task cap = remaining_turns / remaining_tasks), so we give
+    # it generous headroom — an 8-step plan at 64 turns gives each subtask ~8
+    # instead of starving.
     task = Task.new(
         prompt,
         new_session_id(),
-        LoopStrategyPlanExecute(),
+        plan_execute_strategy(),
         budget=BudgetLimits(max_turns=64),
     )
 

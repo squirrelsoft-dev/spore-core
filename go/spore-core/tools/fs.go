@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
@@ -30,11 +32,28 @@ func (*ReadFileTool) MayProduceLargeOutput() bool { return true }
 
 func (*ReadFileTool) Schema() sporecore.RegistryToolSchema {
 	return sporecore.RegistryToolSchema{
-		Name:        ReadFileToolName,
-		Description: "Read a file's contents",
+		Name: ReadFileToolName,
+		Description: "Read a file's contents. Optionally read a line range " +
+			"(offset is 1-indexed start, length is max lines, 0 = to EOF) " +
+			"and/or prefix each line with its number via line_numbers. " +
+			"With no optional params the whole file is returned verbatim.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
-			"properties": {"path": {"type": "string"}},
+			"properties": {
+				"path": {"type": "string"},
+				"offset": {
+					"type": "integer",
+					"description": "1-indexed start line (default 1)."
+				},
+				"length": {
+					"type": "integer",
+					"description": "Max lines to return; 0 = no limit / read to EOF (default 0)."
+				},
+				"line_numbers": {
+					"type": "boolean",
+					"description": "Prefix each returned line with its 1-indexed number (default false)."
+				}
+			},
 			"required": ["path"]
 		}`),
 		Annotations: sporecore.ToolAnnotations{ReadOnly: true, Idempotent: true},
@@ -54,7 +73,75 @@ func (t *ReadFileTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if err != nil {
 		return ExecutionFailed(fmt.Sprintf("read failed: %s", err), true).ToToolOutput()
 	}
-	return finishWithPossibleTruncation(ctx, string(data), call.ID, sandbox)
+	out, rangeErr := applyReadRange(string(data), &params)
+	if rangeErr != "" {
+		return sporecore.ToolOutput{Kind: sporecore.ToolOutputError, Message: rangeErr, Recoverable: true}
+	}
+	return finishWithPossibleTruncation(ctx, out, call.ID, sandbox)
+}
+
+// applyReadRange applies the #132 range/line-number transform to a fully-read
+// file body. Returns the content to surface, or a non-empty error string for a
+// recoverable error. With all params at their defaults the original content is
+// returned unchanged (byte-identical to the pre-#132 behavior). Any non-default
+// param prepends a "[lines {start}–{end} of {total}]\n" header (U+2013 en-dash).
+func applyReadRange(content string, params *ReadFileParams) (out string, errMsg string) {
+	isDefault := params.Offset == nil && params.Length == 0 && !params.LineNumbers
+	if isDefault {
+		return content, ""
+	}
+	// Offset == nil means "not provided" → default to 1.
+	// Offset != nil && *Offset == 0 → recoverable error.
+	var offset uint64
+	if params.Offset == nil {
+		offset = 1
+	} else if *params.Offset == 0 {
+		return "", "offset must be ≥ 1 (1-indexed)"
+	} else {
+		offset = *params.Offset
+	}
+	// Empty file: any params still yield empty content with no header.
+	if content == "" {
+		return "", ""
+	}
+	// strings.SplitAfter preserves each line's trailing '\n'; the final line
+	// may or may not end in '\n'. This keeps each slice byte-faithful to the
+	// source. Filter out a trailing empty string (produced when the file ends
+	// with '\n', e.g. "a\nb\n" → ["a\n","b\n",""]).
+	rawLines := strings.SplitAfter(content, "\n")
+	lines := rawLines
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	total := uint64(len(lines))
+	if offset > total {
+		return "", fmt.Sprintf("offset %d exceeds file length %d", offset, total)
+	}
+	end := total
+	if params.Length != 0 {
+		// offset + length - 1, clamped to total (length past EOF is silent).
+		candidate := offset + params.Length - 1
+		if candidate < total {
+			end = candidate
+		}
+	}
+	startIdx := int(offset - 1) // 0-based
+	endIdx := int(end)          // exclusive
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[lines %d–%d of %d]\n", offset, end, total))
+	if params.LineNumbers {
+		width := len(strconv.FormatUint(total, 10))
+		for i, line := range lines[startIdx:endIdx] {
+			n := offset + uint64(i)
+			sb.WriteString(fmt.Sprintf("%*d | %s", width, n, line))
+		}
+	} else {
+		for _, line := range lines[startIdx:endIdx] {
+			sb.WriteString(line)
+		}
+	}
+	return sb.String(), ""
 }
 
 // ============================================================================
@@ -134,13 +221,19 @@ func (*ListDirTool) MayProduceLargeOutput() bool { return false }
 
 func (*ListDirTool) Schema() sporecore.RegistryToolSchema {
 	return sporecore.RegistryToolSchema{
-		Name:        ListDirToolName,
-		Description: "List directory entries (optionally recursive)",
+		Name: ListDirToolName,
+		Description: "List directory entries (optionally recursive). " +
+			"When recursive=true the listing honors .gitignore and skips .git/ by default; " +
+			"set include_ignored=true to walk everything.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"path": {"type": "string"},
-				"recursive": {"type": "boolean"}
+				"recursive": {"type": "boolean"},
+				"include_ignored": {
+					"type": "boolean",
+					"description": "Recursive only: when true, include .gitignore-matched and VCS files (default false)."
+				}
 			},
 			"required": ["path"]
 		}`),
@@ -180,17 +273,34 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 	}
 	var entries []string
 	if params.Recursive {
-		err := filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
+		if params.IncludeIgnored {
+			// include_ignored: walk everything, but always skip .git/.
+			err := filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil // best effort — skip errors
+				}
+				if d.IsDir() && d.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				if rel, ok := toRootRelative(path); ok {
+					entries = append(entries, rel)
+				}
+				return nil
+			})
 			if err != nil {
-				return nil // best effort — skip errors
+				return ExecutionFailed(fmt.Sprintf("walk failed: %s", err), true).ToToolOutput()
 			}
-			if rel, ok := toRootRelative(path); ok {
-				entries = append(entries, rel)
+		} else {
+			// Default: honor .gitignore at each directory; always skip .git/.
+			relPaths, err := walkWithGitignore(resolved)
+			if err != nil {
+				return ExecutionFailed(fmt.Sprintf("walk failed: %s", err), true).ToToolOutput()
 			}
-			return nil
-		})
-		if err != nil {
-			return ExecutionFailed(fmt.Sprintf("walk failed: %s", err), true).ToToolOutput()
+			for _, rel := range relPaths {
+				// Re-anchor onto the caller-supplied path (mirrors toRootRelative).
+				anchored := filepath.Clean(filepath.Join(params.Path, rel))
+				entries = append(entries, filepath.ToSlash(anchored))
+			}
 		}
 	} else {
 		ents, err := os.ReadDir(resolved)
@@ -198,6 +308,10 @@ func (t *ListDirTool) Execute(ctx context.Context, call sporecore.ToolCall, sand
 			return ExecutionFailed(fmt.Sprintf("read_dir failed: %s", err), true).ToToolOutput()
 		}
 		for _, e := range ents {
+			// Always skip .git/ in non-recursive mode too.
+			if e.IsDir() && e.Name() == ".git" {
+				continue
+			}
 			if rel, ok := toRootRelative(filepath.Join(resolved, e.Name())); ok {
 				entries = append(entries, rel)
 			}
@@ -312,6 +426,130 @@ func (t *MoveFileTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 		Kind:    sporecore.ToolOutputSuccess,
 		Content: fmt.Sprintf("moved %s -> %s", params.Src, params.Dst),
 	}
+}
+
+// ============================================================================
+// gitignore-aware walk (stdlib only, #134)
+// ============================================================================
+
+// gitignoreRule represents a single parsed line from a .gitignore file.
+type gitignoreRule struct {
+	pattern  string // after stripping leading / and trailing /
+	negated  bool   // line started with !
+	dirOnly  bool   // line ended with /
+	anchored bool   // line started with / (before stripping) — matches only from root
+}
+
+// parseGitignoreRules parses the contents of a .gitignore file into rules.
+// Blank lines and lines starting with # are skipped. Line order is preserved
+// so that last-match-wins semantics can be applied by the caller.
+func parseGitignoreRules(content string) []gitignoreRule {
+	var rules []gitignoreRule
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimRight(raw, " \t\r")
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		rule := gitignoreRule{}
+		if strings.HasPrefix(line, "!") {
+			rule.negated = true
+			line = line[1:]
+		}
+		if strings.HasSuffix(line, "/") {
+			rule.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
+		}
+		if strings.HasPrefix(line, "/") {
+			rule.anchored = true
+			line = line[1:]
+		}
+		rule.pattern = line
+		if rule.pattern != "" {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+// matchesGitignoreRule reports whether a single gitignore rule applies to an
+// entry with the given name and isDir flag.
+//
+// NOTE: ** (double-star) is out of scope for v1; filepath.Match treats it as a
+// normal multi-character glob on non-separator characters, which is incorrect
+// for cross-directory matches. Real double-star support can be added later.
+func matchesGitignoreRule(rule gitignoreRule, name string, isDir bool) bool {
+	if rule.dirOnly && !isDir {
+		return false
+	}
+	matched, _ := filepath.Match(rule.pattern, name)
+	return matched
+}
+
+// isIgnoredByRules applies gitignore last-match-wins semantics: iterate all
+// rules in order; the last matching rule determines ignore/include. A negated
+// match re-includes an entry that a prior rule would have ignored.
+func isIgnoredByRules(rules []gitignoreRule, name string, isDir bool) bool {
+	ignored := false
+	for _, rule := range rules {
+		if matchesGitignoreRule(rule, name, isDir) {
+			ignored = !rule.negated
+		}
+	}
+	return ignored
+}
+
+// walkWithGitignore recursively walks root, honoring .gitignore files found at
+// each directory level. It always skips .git/ unconditionally. Returns paths
+// relative to root using forward slashes.
+func walkWithGitignore(root string) ([]string, error) {
+	var results []string
+	err := walkWithGitignoreDir(root, root, &results)
+	return results, err
+}
+
+// walkWithGitignoreDir is the recursive implementation backing walkWithGitignore.
+// dir is the absolute path of the current directory; root is the walk origin.
+func walkWithGitignoreDir(root, dir string, results *[]string) error {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil // best effort — skip unreadable dirs
+	}
+
+	// Load .gitignore from the current directory, if present.
+	var rules []gitignoreRule
+	gitignorePath := filepath.Join(dir, ".gitignore")
+	if data, err := os.ReadFile(gitignorePath); err == nil {
+		rules = parseGitignoreRules(string(data))
+	}
+
+	for _, e := range ents {
+		name := e.Name()
+
+		// Always skip .git/ regardless of any rules.
+		if e.IsDir() && name == ".git" {
+			continue
+		}
+
+		// Apply gitignore rules for this directory's .gitignore.
+		if isIgnoredByRules(rules, name, e.IsDir()) {
+			continue
+		}
+
+		// Build the relative path from root to this entry.
+		absPath := filepath.Join(dir, name)
+		rel, relErr := filepath.Rel(root, absPath)
+		if relErr != nil {
+			continue
+		}
+		*results = append(*results, filepath.ToSlash(rel))
+
+		if e.IsDir() {
+			if err := walkWithGitignoreDir(root, absPath, results); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Compile-time interface checks.

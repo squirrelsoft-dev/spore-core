@@ -59,6 +59,7 @@ import {
   OllamaModelInterface,
   SessionId,
   newTask,
+  reactPerLoop,
   type HarnessStreamEvent,
 } from "@spore/core";
 import { StandardTools } from "@spore/tools";
@@ -214,10 +215,7 @@ async function runPhase(
 
   // PIN the session id — both phases pass the same one so recall reads what
   // store wrote.
-  const task = newTask(taskPrompt, SESSION, {
-    kind: "re_act",
-    max_iterations: 20,
-  });
+  const task = newTask(taskPrompt, SESSION, reactPerLoop(20));
 
   const onStream = (event: HarnessStreamEvent): void => {
     switch (event.kind) {

@@ -91,10 +91,7 @@ func main() {
 
 		// Thread the running state into this turn. The harness appends `line`
 		// as the new user message before calling the model.
-		task := sporecore.NewTask(line, sessionID, sporecore.LoopStrategy{
-			Kind:          sporecore.StrategyReAct,
-			MaxIterations: 4,
-		})
+		task := sporecore.NewTask(line, sessionID, sporecore.ReActStrategy(4))
 		threaded := state
 		options := sporecore.NewHarnessRunOptions(task)
 		options.SessionState = &threaded

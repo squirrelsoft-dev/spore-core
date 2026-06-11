@@ -1,0 +1,103 @@
+[
+  {
+    "name": "defaults_no_header_no_numbers",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>" },
+    "expected": {
+      "kind": "success",
+      "content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+    }
+  },
+  {
+    "name": "offset_only",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 3 },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 3\u201310 of 10]\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+    }
+  },
+  {
+    "name": "length_only",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>", "length": 3 },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 1\u20133 of 10]\nline1\nline2\nline3\n"
+    }
+  },
+  {
+    "name": "offset_and_length",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 4, "length": 3 },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 4\u20136 of 10]\nline4\nline5\nline6\n"
+    }
+  },
+  {
+    "name": "line_numbers_only",
+    "initial_content": "alpha\nbeta\ngamma\n",
+    "params": { "path": "<FIXTURE_PATH>", "line_numbers": true },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 1\u20133 of 3]\n1 | alpha\n2 | beta\n3 | gamma\n"
+    }
+  },
+  {
+    "name": "all_three_combined",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 2, "length": 3, "line_numbers": true },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 2\u20134 of 10]\n 2 | line2\n 3 | line3\n 4 | line4\n"
+    }
+  },
+  {
+    "name": "offset_past_eof",
+    "initial_content": "alpha\nbeta\ngamma\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 11 },
+    "expected": {
+      "kind": "error",
+      "recoverable": true,
+      "message_contains": "offset 11 exceeds file length 3"
+    }
+  },
+  {
+    "name": "length_trimmed_at_eof",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 8, "length": 5 },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 8\u201310 of 10]\nline8\nline9\nline10\n"
+    }
+  },
+  {
+    "name": "offset_zero_error",
+    "initial_content": "alpha\nbeta\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 0 },
+    "expected": {
+      "kind": "error",
+      "recoverable": true,
+      "message_contains": "offset"
+    }
+  },
+  {
+    "name": "length_zero_with_offset",
+    "initial_content": "line1\nline2\nline3\nline4\nline5\n",
+    "params": { "path": "<FIXTURE_PATH>", "offset": 3, "length": 0 },
+    "expected": {
+      "kind": "success",
+      "content": "[lines 3\u20135 of 5]\nline3\nline4\nline5\n"
+    }
+  },
+  {
+    "name": "empty_file_defaults",
+    "initial_content": "",
+    "params": { "path": "<FIXTURE_PATH>" },
+    "expected": {
+      "kind": "success",
+      "content": ""
+    }
+  }
+]

@@ -5,6 +5,8 @@
 import { promises as fs } from "node:fs";
 import { join, relative } from "node:path";
 
+import ignore from "ignore";
+
 import type { SandboxProvider, ToolCall, ToolOutput } from "@spore/core";
 import type { toolRegistry } from "@spore/core";
 type Tool = toolRegistry.Tool;
@@ -28,6 +30,94 @@ import {
 } from "./params.js";
 
 // ============================================================================
+// ReadFile range helper (#132)
+// ============================================================================
+
+/**
+ * Split `content` into lines, preserving each line's trailing `\n` (like
+ * Rust's `split_inclusive('\n')`). The final line may or may not end in `\n`.
+ */
+function splitInclusive(content: string): string[] {
+  if (content === "") return [];
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n") {
+      lines.push(content.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  // Trailing fragment (no final newline).
+  if (start < content.length) {
+    lines.push(content.slice(start));
+  }
+  return lines;
+}
+
+/** Parsed-and-defaulted params used by {@link applyReadRange}. */
+export interface ReadRangeOptions {
+  offset: number;
+  length: number;
+  line_numbers: boolean;
+}
+
+/**
+ * Apply the #132 range/line-number transform to a fully-read file body.
+ *
+ * With all params at their defaults the original `content` is returned
+ * unchanged (byte-identical to the pre-#132 behavior). Any non-default param
+ * prepends a `[lines {start}–{end} of {total}]\n` header (U+2013 en-dash).
+ */
+export function applyReadRange(
+  content: string,
+  params: ReadRangeOptions,
+): { ok: true; value: string } | { ok: false; error: string } {
+  const isDefault =
+    params.offset === 1 && params.length === 0 && !params.line_numbers;
+  if (isDefault) return { ok: true, value: content };
+
+  if (params.offset === 0) {
+    return { ok: false, error: "offset must be ≥ 1 (1-indexed)" };
+  }
+
+  // Empty file: any params still yield empty content with no header.
+  if (content === "") return { ok: true, value: "" };
+
+  const lines = splitInclusive(content);
+  const total = lines.length;
+
+  if (params.offset > total) {
+    return {
+      ok: false,
+      error: `offset ${params.offset} exceeds file length ${total}`,
+    };
+  }
+
+  const start = params.offset; // 1-indexed, validated >= 1 and <= total.
+  const end =
+    params.length === 0
+      ? total
+      : Math.min(start + params.length - 1, total);
+
+  const startIdx = start - 1; // convert to 0-indexed
+  const selected = lines.slice(startIdx, end);
+
+  let out = `[lines ${start}–${end} of ${total}]\n`;
+  if (params.line_numbers) {
+    const width = String(total).length;
+    for (let i = 0; i < selected.length; i++) {
+      const n = start + i;
+      out += `${String(n).padStart(width)} | ${selected[i]}`;
+    }
+  } else {
+    for (const line of selected) {
+      out += line;
+    }
+  }
+  return { ok: true, value: out };
+}
+
+// ============================================================================
 // ReadFile
 // ============================================================================
 
@@ -42,10 +132,30 @@ export class ReadFileTool implements Tool {
   static schema(): ToolSchema {
     return {
       name: ReadFileTool.NAME,
-      description: "Read a file's contents",
+      description:
+        "Read a file's contents. Optionally read a line range " +
+        "(offset is 1-indexed start, length is max lines, 0 = to EOF) " +
+        "and/or prefix each line with its number via line_numbers. " +
+        "With no optional params the whole file is returned verbatim.",
       parameters: {
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          offset: {
+            type: "integer",
+            description: "1-indexed start line (default 1).",
+          },
+          length: {
+            type: "integer",
+            description:
+              "Max lines to return; 0 = no limit / read to EOF (default 0).",
+          },
+          line_numbers: {
+            type: "boolean",
+            description:
+              "Prefix each returned line with its 1-indexed number (default false).",
+          },
+        },
         required: ["path"],
       },
       annotations: {
@@ -72,7 +182,15 @@ export class ReadFileTool implements Tool {
       });
     try {
       const content = await fs.readFile(resolved, "utf8");
-      return finishWithPossibleTruncation(content, call.id, sandbox);
+      const rangeResult = applyReadRange(content, {
+        offset: p.value.offset ?? 1,
+        length: p.value.length ?? 0,
+        line_numbers: p.value.line_numbers ?? false,
+      });
+      if (rangeResult.ok) {
+        return finishWithPossibleTruncation(rangeResult.value, call.id, sandbox);
+      }
+      return { kind: "error", message: rangeResult.error, recoverable: true };
     } catch (e) {
       return {
         kind: "error",
@@ -161,12 +279,20 @@ export class ListDirTool implements Tool {
   static schema(): ToolSchema {
     return {
       name: ListDirTool.NAME,
-      description: "List directory entries (optionally recursive)",
+      description:
+        "List directory entries (optionally recursive). Recursive " +
+        "listing honors .gitignore and skips .git/ by default; " +
+        "set include_ignored to walk everything.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string" },
           recursive: { type: "boolean" },
+          include_ignored: {
+            type: "boolean",
+            description:
+              "Recursive only: when true, include .gitignore-matched and VCS files (default false).",
+          },
         },
         required: ["path"],
       },
@@ -220,10 +346,12 @@ export class ListDirTool implements Tool {
     const entries: string[] = [];
     try {
       if (p.value.recursive) {
-        await walk(resolved, toRootRelative, entries);
+        await walk(resolved, resolved, toRootRelative, entries, !p.value.include_ignored);
       } else {
         const items = await fs.readdir(resolved);
         for (const it of items) {
+          // Always skip .git/ in non-recursive mode too.
+          if (it === ".git") continue;
           const rel = toRootRelative(join(resolved, it));
           if (rel !== null) entries.push(rel);
         }
@@ -244,25 +372,98 @@ export class ListDirTool implements Tool {
   }
 }
 
+/**
+ * Collect all `.gitignore` patterns from `root` down to `dir` (inclusive)
+ * into a single `Ignore` instance. Patterns are all tested against paths
+ * relative to `root`, which is the standard multi-directory gitignore model.
+ *
+ * This is called once per recursive `walkFiltered` invocation and the result
+ * is passed down; sibling branches do NOT share the same instance.
+ */
+async function buildIgnore(
+  root: string,
+  dir: string,
+): Promise<ReturnType<typeof ignore>> {
+  const ig = ignore();
+  // Walk from root down to dir, loading each .gitignore along the way.
+  // Build an ordered list of ancestor dirs (root first, dir last).
+  const ancestors: string[] = [];
+  let cur = dir;
+  while (true) {
+    ancestors.unshift(cur);
+    if (cur === root) break;
+    const parent = join(cur, "..");
+    if (parent === cur) break; // filesystem root guard
+    cur = parent;
+  }
+  for (const d of ancestors) {
+    try {
+      const content = await fs.readFile(join(d, ".gitignore"), "utf8");
+      ig.add(content);
+    } catch {
+      // No .gitignore in this dir — continue.
+    }
+  }
+  return ig;
+}
+
+/**
+ * Recursive directory walk.
+ *
+ * When `honorIgnores` is true, `.gitignore` rules are applied: each visited
+ * directory builds a fresh `Ignore` instance from all ancestor `.gitignore`
+ * files (root → dir), then tests each entry as a root-relative path before
+ * recursing. This means root-level patterns like `*.log` correctly filter
+ * files in subdirectories. `.git/` is always skipped regardless of
+ * `honorIgnores`.
+ *
+ * @param dir            - Absolute path of the directory to walk now.
+ * @param root           - Absolute path of the top-level directory (unchanged
+ *                         across recursive calls).
+ * @param toRootRelative - Maps an absolute entry path to the caller-visible
+ *                         relative path (or null to skip the listed root).
+ * @param out            - Accumulator for collected paths.
+ * @param honorIgnores   - When true, apply gitignore rules; when false, walk
+ *                         everything (only `.git/` is always excluded).
+ */
 async function walk(
   dir: string,
+  root: string,
   toRootRelative: (entryAbsolutePath: string) => string | null,
   out: string[],
+  honorIgnores: boolean,
 ): Promise<void> {
-  // Do not emit the listed directory itself; `toRootRelative` returns null for
-  // it anyway, but skipping here avoids pushing intermediate directories.
   let items: import("node:fs").Dirent[];
   try {
     items = await fs.readdir(dir, { withFileTypes: true });
   } catch {
     return;
   }
+
+  // Build the effective ignore instance for this directory level: accumulate
+  // rules from all .gitignore files from root down to `dir`.
+  const ig = honorIgnores ? await buildIgnore(root, dir) : null;
+
   for (const it of items) {
+    // Always skip .git/ unconditionally.
+    if (it.name === ".git") continue;
+
     const full = join(dir, it.name);
+
+    // Apply gitignore filtering when requested. The `ignore` package expects
+    // paths relative to the repository root (no leading `.` or `/`).
+    if (ig !== null) {
+      const relFromRoot = relative(root, full);
+      // Append `/` for directories so directory-only patterns (e.g. `dist/`)
+      // are matched correctly by the ignore package.
+      const testPath = it.isDirectory() ? `${relFromRoot}/` : relFromRoot;
+      if (ig.ignores(testPath)) continue;
+    }
+
     if (it.isDirectory()) {
       const rel = toRootRelative(full);
       if (rel !== null) out.push(rel);
-      await walk(full, toRootRelative, out);
+      await walk(full, root, toRootRelative, out, honorIgnores);
     } else {
       const rel = toRootRelative(full);
       if (rel !== null) out.push(rel);

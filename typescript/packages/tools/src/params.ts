@@ -22,8 +22,17 @@ export function parseParams<T>(
 
 // ---------- Filesystem ----------
 
-export const ReadFileParamsSchema = z.object({ path: z.string() });
-export type ReadFileParams = z.infer<typeof ReadFileParamsSchema>;
+export const ReadFileParamsSchema = z.object({
+  path: z.string(),
+  /** 1-indexed start line. Default 1 (read from the beginning). */
+  offset: z.number().int().nonnegative().default(1),
+  /** Max lines to return. Default 0 = no limit (read to EOF). */
+  length: z.number().int().nonnegative().default(0),
+  /** Prefix each returned line with its 1-indexed number (default false). */
+  line_numbers: z.boolean().default(false),
+});
+/** Output type (post-parse with defaults filled): all fields are required. */
+export type ReadFileParams = z.output<typeof ReadFileParamsSchema>;
 
 export const WriteFileParamsSchema = z.object({
   path: z.string(),
@@ -35,6 +44,11 @@ export type WriteFileParams = z.infer<typeof WriteFileParamsSchema>;
 export const ListDirParamsSchema = z.object({
   path: z.string(),
   recursive: z.boolean().default(false),
+  /**
+   * Recursive only: when false (default), honor `.gitignore` rules and always
+   * skip `.git/`. When true, walk everything (pre-#134 behavior).
+   */
+  include_ignored: z.boolean().default(false),
 });
 export type ListDirParams = z.infer<typeof ListDirParamsSchema>;
 
@@ -107,8 +121,15 @@ export const GrepParamsSchema = z.object({
   path: z.string(),
   recursive: z.boolean().default(false),
   output_mode: GrepOutputModeSchema,
+  /**
+   * Lines of context to show before and after each match (default 0).
+   * When > 0, uses standard grep -C N format: match lines use `:` separator,
+   * context lines use `-`, non-adjacent groups separated by `--`.
+   */
+  context_lines: z.number().int().nonnegative().default(0),
 });
-export type GrepParams = z.infer<typeof GrepParamsSchema>;
+/** Output type (post-parse with defaults filled): all fields are required. */
+export type GrepParams = z.output<typeof GrepParamsSchema>;
 
 // ---------- EditFile (#81) ----------
 
@@ -126,8 +147,11 @@ export type SendMessageParams = z.infer<typeof SendMessageParamsSchema>;
 
 // ---------- Web (#81) ----------
 
-export const WebFetchParamsSchema = z.object({ url: z.string() });
-export type WebFetchParams = z.infer<typeof WebFetchParamsSchema>;
+export const WebFetchParamsSchema = z.object({
+  url: z.string(),
+  start_byte: z.number().int().nonnegative().default(0),
+});
+export type WebFetchParams = z.output<typeof WebFetchParamsSchema>;
 
 export const WebSearchParamsSchema = z.object({ query: z.string() });
 export type WebSearchParams = z.infer<typeof WebSearchParamsSchema>;

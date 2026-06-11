@@ -100,14 +100,17 @@ import time
 from pathlib import Path
 
 from spore_core import (
+    BudgetExhaustedEscalate,
     BudgetLimits,
     EvaluateResult,
+    ExecutionRegistry,
     HaltReasonBudgetExceeded,
     HaltReasonHillClimbingMisconfigured,
     HaltReasonStagnationLimitReached,
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyHillClimbing,
+    HillClimbingConfig,
+    LoopStrategy,
     Message,
     MetricErrorExecutionFailed,
     MetricResult,
@@ -115,6 +118,7 @@ from spore_core import (
     ModelRequest,
     OllamaModelInterface,
     OptimizationDirection,
+    ReactConfig,
     Role,
     RunResultFailure,
     RunResultSuccess,
@@ -149,6 +153,12 @@ MAX_ITERATIONS = 6
 # ``HaltReasonStagnationLimitReached``. The stagnation counter resets to 0 on any
 # kept (strictly-improving) iteration. Maps to ``max_stagnation``.
 MAX_STAGNATION = 2
+
+# Per-iteration build budget for the propose leaf's bare ReAct
+# (``ReactConfig.per_loop(PER_ITER_BUDGET)``). This bounds how many tool-calling
+# turns the build agent gets to produce ONE candidate draft per climb iteration;
+# the outer ``max_turns`` budget bounds the NUMBER of iterations.
+PER_ITER_BUDGET = 8
 
 # DISPLAY ANNOTATION ONLY. When a draft's total score (0–30) reaches this, the
 # evaluator marks the printed line ``★ crossed target threshold``. SPEC NOTE: this
@@ -212,6 +222,55 @@ JUDGE_RUBRIC = (
     "completeness: <0-10>\n"
     "example_quality: <0-10>"
 )
+
+
+def propose_schema() -> dict[str, object]:
+    """The propose-phase output contract (``propose-schema``). Post-#119,
+    ``HillClimbing``'s ``inner`` (propose) slot is STRUCTURED: a bare
+    :class:`ReactConfig` there must declare an ``output`` schema so each iteration
+    yields a scorable candidate (:meth:`ExecutionRegistry.validate` enforces this
+    via the structured-slot check). The build agent rewrites ``DRAFT_FILE``; this
+    advertises the path it wrote."""
+    return {
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "Path the candidate draft was written to."},
+            "summary": {"type": "string", "description": "What this iteration changed."},
+        },
+        "required": ["file"],
+    }
+
+
+def build_registry() -> ExecutionRegistry:
+    """The registry the composed strategy's handles resolve against. Only the
+    ``propose-schema`` is EXPLICIT; the builder default-fills the empty agent /
+    toolset handles (``ReactConfig.per_loop``) AND the empty-key metric evaluator
+    from ``.metric_evaluator(..)`` at ``build``. So the HillClimbing ``evaluator``
+    stays the EMPTY handle (``""``)."""
+    return ExecutionRegistry.builder().schema("propose-schema", propose_schema()).build()
+
+
+def hill_climbing_strategy(per_iter_budget: int) -> LoopStrategy:
+    """The post-#119 composed strategy: ``HillClimbing(inner: ReAct, evaluator)``.
+    The propose leaf carries the ``propose-schema`` output contract (required for
+    the structured ``propose`` slot) and a ``per_loop(per_iter_budget)`` build
+    budget. The ``evaluator`` is the EMPTY handle (``""``), default-filled from
+    ``.metric_evaluator(..)``. Post-#119 ``max_stagnation`` / ``min_improvement_delta``
+    are now BARE (``int`` / ``float``), not ``Optional``. Old flat shape was
+    ``LoopStrategyHillClimbing(direction=..., max_stagnation=..., ...)``."""
+    propose = ReactConfig.per_loop(per_iter_budget)
+    propose.output = "propose-schema"
+    return HillClimbingConfig(
+        inner=propose,
+        direction="maximize",
+        max_stagnation=MAX_STAGNATION,
+        revert_on_no_improvement=True,
+        min_improvement_delta=0.0,
+        # Empty handle ⇒ default-filled metric evaluator from ``.metric_evaluator(..)``.
+        evaluator="",
+        # Mirrors the shim default: a nested combinator propagates exhaustion up.
+        behavior=BudgetExhaustedEscalate(),
+    )
 
 
 def _parse_dimension(text: str, name: str) -> int:
@@ -440,6 +499,7 @@ async def main() -> int:
     harness = (
         HarnessBuilder.conversational(build_model)
         .sandbox(sandbox)
+        .registry(build_registry())
         .tool(StandardTools.write_file())
         .tool(StandardTools.read_file())
         .system_prompt(SYSTEM_PROMPT)
@@ -448,18 +508,17 @@ async def main() -> int:
         .build()
     )
 
-    # THE STRATEGY. No loop code below — the harness runs the climb. ``max_turns``
-    # bounds the NUMBER OF ITERATIONS (the budget ceiling), and ``max_stagnation``
-    # can halt sooner. SPEC NOTE: there is no score-threshold field — by design.
+    # THE STRATEGY. No loop code below — the harness runs the climb over the
+    # composed ``HillClimbing(inner: ReAct{propose-schema}, evaluator)`` tree
+    # (post-#119). The propose leaf carries the ``propose-schema`` output contract
+    # (the ``inner`` slot is STRUCTURED) and a per-iteration build budget. The outer
+    # ``max_turns`` bounds the NUMBER OF ITERATIONS (the budget ceiling), and
+    # ``max_stagnation`` can halt sooner. SPEC NOTE: there is no score-threshold
+    # field — by design.
     task = Task.new(
         prompt,
         new_session_id(),
-        LoopStrategyHillClimbing(
-            direction="maximize",
-            max_stagnation=MAX_STAGNATION,
-            revert_on_no_improvement=True,
-            min_improvement_delta=None,
-        ),
+        hill_climbing_strategy(PER_ITER_BUDGET),
         budget=BudgetLimits(max_turns=max_iterations),
     )
 

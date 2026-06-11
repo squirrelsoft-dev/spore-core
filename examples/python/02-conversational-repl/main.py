@@ -42,8 +42,8 @@ import sys
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     SessionState,
     Task,
@@ -92,7 +92,7 @@ async def main() -> int:
 
         # Thread the running state into this turn. The harness appends ``line``
         # as the new user message before calling the model.
-        task = Task.new(line, session_id, LoopStrategyReAct(max_iterations=4))
+        task = Task.new(line, session_id, ReactConfig.per_loop(4))
         options = HarnessRunOptions(task, session_state=state)
 
         result = await harness.run(options)

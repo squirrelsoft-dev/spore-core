@@ -1,19 +1,18 @@
 # PROJECT STATE
-_Last updated: 2026-06-07 by /close (#130 **complete**, all four languages, cross-language verifier PASS; local `main` is **4 commits ahead** of `origin/main` — `f30caa2`→`06dbc69`→`1831e30`→`97b8775` — **not yet pushed**, awaiting maintainer OK per the standing push gate) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Nine bricks landed (#117, #118, #119, #120, #123, #124, #125, #126, #130) all `status: complete`, all four languages.** #130 (HITL budget-exhausted resume) wired the previously-stored-but-unconsumed #120 `EscalationMode` knob: an `Escalate`-behavior node that exhausts its budget now consults `escalation_mode()` — `SurfaceToHuman` pauses with a new resumable `HumanRequest::BudgetExhausted` (carrying `phase`/`policy`/`steps_taken`/`continues_used`/`partial_output`/`available_actions`), `Autonomous` keeps the prior propagate behavior. New `EscalationAction{ContinueWithBudget{steps}, Skip, Fail}` + `HumanResponse::Escalate{action}`; resume maps each action (Continue grants `steps_taken+steps` and re-enters from checkpoint, Skip advances PlanExecute's outer loop, Fail → `Failure{BudgetExceeded}`). New cross-language fixture `fixtures/paused_states/budget_exhausted.json`. With #130 done, **only the #131 capstone remains on the critical path** — #129/#127/#128/#121/#122 are parallel-grabbable (#131 is gated on #130 ✅ + #129 for the live Continue loop). The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor._
+_Last updated: 2026-06-08 by /close (#129 **complete**, all four languages, cross-language verifier PASS, merged to `main` and **pushed** — `origin/main` is now level at `679297f`; the #130 series is now pushed too, no more drift) — **The Composable Execution refactor (loop strategy / budget / task graph) is the top priority.** A PRD (`spore-core-composable-execution-prd.md`) was broken into **15 tracer-bullet issues #117–#131** (label `loop-strategy-refactor`) via `/to-issues`. The goal is to land #117→#131 to completion: make `LoopStrategy` a composable recursive enum where each variant owns its run loop via a `RunStrategy` trait (no central dispatch match), add a compositional per-node `BudgetPolicy`/`BudgetExhaustedBehavior` budget layer with typed `StrategyOutcome`, and make the task list an explicit blocker DAG with a ready-set walk + failure cascade. Capstone #131 re-expresses the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`. **Ten bricks landed (#117, #118, #119, #120, #123, #124, #125, #126, #130, #129) all `status: complete`, all four languages.** #129 (Continue cross-process checkpoint) wired the two gaps deferred by #125/#130: (1) added a serialized `behavior: BudgetExhaustedBehavior` field to all five config structs (`ReactConfig`/`PlanExecuteConfig`/`SelfVerifyingConfig`/`RalphConfig`/`HillClimbingConfig`) — on `ReactConfig` immediately after `budget`, last field on every combinator, `default = Escalate` but always serializes — and made the previously-dead in-process `ExhaustedResolution::Continue` arms genuinely loop; (2) fixed `resume_inner` to seed `continues_used` from the `HumanRequest::BudgetExhausted` payload (was zeroed) via a runtime-only `BudgetContext::resumed` + `RunScratch::resume_continues`, plus a shared `PausedState::serialize_checkpoint`/`load_checkpoint` utility reused by both Continue and Ralph without unifying their context policies. New fixture `fixtures/paused_states/continue_checkpoint.json`. With #129 done, **only the #131 capstone remains on the critical path** — both its gates (#130 ✅ + #129 ✅) are now satisfied; #127/#128/#121/#122 are parallel-grabbable. The examples suite (prior direction) is parked at 12 of 13 — #109/#92 remain but yield priority to the refactor._
 
-_**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131; **#117, #118, #119, #120, #123, #124, #125, #126, #130 are all done** — the entire critical path **except the #131 capstone** is complete. **#131** (cordyceps composition end-to-end) is the success bar; it is gated on #130 (✅ done) and benefits from #129 (the live in-process `Continue` loop). #121/#122/#127/#128/#129 remain parallel-grabbable (#129 owns #125's deferred Continue wire-field + `continues_used` persistence; #130 deliberately reconstructs its `BudgetContext` from the request payload to stay out of #129's scope). Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call. Note #116 (child-consult resume) overlaps #130's HITL resume seam and may now be cheaper to fold in._
+_**Direction note:** Active direction is the **loop-strategy refactor (#117–#131)**. Critical path: 117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 129 → 131; **#117, #118, #119, #120, #123, #124, #125, #126, #130, #129 are all done** — the entire critical path **except the #131 capstone** is complete. **#131** (cordyceps composition end-to-end) is the success bar; both its gates are now satisfied (#130 ✅ HITL resume + #129 ✅ the live in-process `Continue` loop), so it is fully unblocked and is the **sole remaining critical-path item**. #121/#122/#127/#128 remain parallel-grabbable. (#129 delivered #125's deferred Continue wire-field + `continues_used` persistence; #130 had deliberately reconstructed its `BudgetContext` from the request payload to stay out of #129's scope, and #129's `resume_inner` fix now consumes that payload's `continues_used`.) Design decision baked into the issues (diverges from the PRD's literal sketch, per the maintainer): strategies own their loop via a `RunStrategy` trait with one-line enum delegation, and a `StrategyRef::{BuiltIn, Custom}` escape hatch keeps built-ins a closed serde enum while allowing registered opaque custom strategies (resolves PRD Open Q A-1). The examples suite (#109 `13-coding-agent`, #92 observability) and `web_search` hardening (#108/#110) are now parked behind the refactor. The two #101-spawned harness gaps (#115 skill loading, #116 HITL child-consult resume) and the correctness/safety gates (#34 → #31 → #30) + docs (#27/#35/#36) remain parked pending an explicit maintainer call. Note #116 (child-consult resume) overlaps #130's HITL resume seam and may now be cheaper to fold in._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, demonstrated through a numbered **examples suite** built
-across all four targets: Rust (reference), TypeScript, Python, Go. ⚠️ local `main`
-is **4 commits ahead** of `origin/main` (this loop's #130 four-language series —
-`f30caa2`/`06dbc69`/`1831e30`/`97b8775`) — **not yet pushed**, awaiting maintainer
-OK per the standing push gate (Deviation #10).
+across all four targets: Rust (reference), TypeScript, Python, Go. ✅ local `main`
+and `origin/main` are **level at `679297f`** — the #130 and #129 four-language
+series are both pushed; no drift (push gate Deviation #10 satisfied this loop).
 
 **🎯 Active work: the Composable Execution refactor (#117–#131, label
-`loop-strategy-refactor`) — nine bricks landed (#130 now complete; only the #131
-capstone remains on the critical path).** The `StandardHarness` hardwires
+`loop-strategy-refactor`) — ten bricks landed (#129 now complete; only the #131
+capstone remains on the critical path, and it is now fully unblocked).** The `StandardHarness` hardwires
 three things the PRD makes composable: (1) loop strategy is a fixed `run()`
 dispatch match — becomes a recursive `LoopStrategy` enum where each variant's
 config struct owns its loop via a `RunStrategy` trait, recursion is
@@ -292,6 +291,40 @@ all four. Commits rust `f30caa2` (+15, 1107) / py `06dbc69` (+19, 1311) / ts `18
 (+24, 1640) / go `97b8775` (+19). Cross-language verifier PASS; two benign divergences
 documented (Deviations #16, #17).
 
+**#129 done (10 of 15, `status: complete`).** Continue cross-process checkpoint
+(Part B, B.4/B.7) — wired the two gaps #125/#130 deferred. **(1) Live in-process
+`Continue`:** added a serialized `behavior: BudgetExhaustedBehavior` field to all five
+config structs (`ReactConfig`/`PlanExecuteConfig`/`SelfVerifyingConfig`/`RalphConfig`/
+`HillClimbingConfig`). Before #129, `behavior` was absent from the wire and every
+`push_budget` site hardcoded an `Escalate` placeholder, so `ExhaustedResolution::Continue`
+was **dead code**; now the combinator Continue arms (PlanExecute ×2, SelfVerifying,
+HillClimbing) genuinely loop in-process (consume continue → reset steps → re-enter) and
+`drive_strategy` is the bare-leaf resolution site that honors a **top-level** leaf's
+behavior while a **nested** leaf still propagates (preserves #125 rule-6). **(2) Resume
+seeds `continues_used` (load-bearing AC2):** `resume_inner` previously destructured
+`continues_used: _` and zeroed the counter on the reconstructed `BudgetContext`, letting a
+`Continue` spanning a pause over-grant beyond `max_continues`; it now reads `continues_used`
+off the `HumanRequest::BudgetExhausted` payload (the **sole** carrier — no new field on
+`PausedState`/`BudgetSnapshot`, Q3) and seeds it via the runtime-only `BudgetContext::resumed`
++ `RunScratch::resume_continues`. **(3) Shared checkpoint utility (AC1):**
+`PausedState::serialize_checkpoint`/`load_checkpoint`, the durable pause/resume round-trip
+reused by **both** Continue and Ralph's pause-propagation — **without** unifying their
+context policies (Continue preserves session messages; Ralph discards + re-seeds from its
+Ralph-specific filesystem `.spore/progress.json`, kept separate, Q2). **Wire format:**
+`behavior` sits on `ReactConfig` immediately after `budget`, last field on every combinator;
+`default = Escalate` for backward-compat reads but **always serializes**
+(`"behavior":{"kind":"escalate"}`). Three forks resolved with the maintainer up front
+(Q1 behavior on all five / leaf honors only at bare-leaf site; Q2 share only the
+`PausedState` seam; Q3 HumanRequest is the sole `continues_used` carrier). New fixture
+`fixtures/paused_states/continue_checkpoint.json` (Continue node paused with
+`continues_used: 1`); updated `fixtures/strategy/{cordyceps_tree,paused_state,
+child_paused_state,strategy_ref}.json`, `fixtures/paused_states/budget_exhausted.json`,
+`fixtures/harness/{consult,escalation_signals}.json` (all gained the `behavior` key on
+config nodes, byte-identically). The AC2 end-to-end test is **discriminating** (asserts
+8 turns where pre-#129 zeroed-counter logic over-grants a third window → 12/16). Commits
+rust `43e31ad` (+8, 1115) / py `7b977cf` (+9, 1320) / ts `679297f` (+11, 1511) / go
+`88e766b` (+9). Cross-language verifier PASS; two benign divergences (Deviation #18).
+
 **Examples suite — 12 of 13 landed, all four languages each.** Present under
 `examples/{rust,typescript,python,go}/`:
 `01-hello-agent`, `02-conversational-repl`, `03-tool-use`, `04-filesystem-agent`,
@@ -359,17 +392,18 @@ gate), docs #27/#35/#36. All `scope: deferred`.
 completion** (label `loop-strategy-refactor`). Make `LoopStrategy`, budget, and the
 task list compositional and mutually consistent, applied byte-identically across all
 four languages where serialized. Work the critical path:
-**117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 131**; #117, #118, #119 (the
+**117 → 119 → 120 → 123 → 124 → {125, 126} → 130 → 129 → 131**; #117, #118, #119 (the
 keystone strategy seam), #120 (the runtime resolver), #123 (the `StrategyOutcome`
 + `ExecutionContext` runtime scaffold), **#124 (all five strategies genuinely
 compose; monolithic loops deleted; legacy fields removed), #125 (per-node budget
-enforcement), and #126 (ready-set task walk + two-tier context + failure cascade)
-are done** — the whole path through Part C (the executor) is complete. The next
-critical-path item is **#130 (HITL `HumanRequest::BudgetExhausted` + Escalate
-resume)**, which consumes #125's `BudgetExhausted` + #120's `EscalationMode`, then the
-**#131** capstone. #121 (`SubagentTool` strategy param), #122
-(`max_steps()`), #127 (custom-strategy tracer), #128 (observability), and #129
-(`Continue` checkpoint) remain parallel-grabbable. Use the `/implement` skill per issue (Rust reference + three parallel language agents +
+enforcement), #126 (ready-set task walk + two-tier context + failure cascade), #130
+(HITL `HumanRequest::BudgetExhausted` + Escalate resume), and #129 (Continue
+cross-process checkpoint — live in-process Continue + `continues_used` survives a pause)
+are done** — the entire critical path **except the #131 capstone** is complete. The
+sole remaining critical-path item is **#131** (cordyceps composition end-to-end), now
+fully unblocked (both gates #130 ✅ + #129 ✅ satisfied). #121 (`SubagentTool` strategy
+param), #122 (`max_steps()`), #127 (custom-strategy tracer), and #128 (observability)
+remain parallel-grabbable. Use the `/implement` skill per issue (Rust reference + three parallel language agents +
 cross-language verifier). Honor the maintainer's design choice — `RunStrategy` trait +
 `StrategyRef::Custom` escape hatch — over the PRD's literal recursive-`run_strategy`-
 with-match sketch (A.4). The success bar is #131: the `12-cordyceps` audit runs
@@ -449,11 +483,15 @@ cache halts.
    choices (+1 advisor / abort / free-form) are therefore implemented host-side
    ("+1" re-runs the advisor host-side). Documented in all four #101 READMEs+code.
 10. **Local `main` push hygiene (standing reminder)** — each per-issue loop's series
-    must be pushed promptly so `origin/main` doesn't drift behind. ⚠️ Current: local
-    `main` is **4 commits ahead** of `origin/main` (the #130 four-language series
-    `f30caa2`/`06dbc69`/`1831e30`/`97b8775`) — **not yet pushed**, awaiting maintainer OK.
-    Note the standing push-approval gate: **ask before pushing** (an agent-initiated push
-    was denied in a prior session).
+    must be pushed promptly so `origin/main` doesn't drift behind. ✅ Current: local
+    `main` and `origin/main` are **level at `679297f`** — the #130 series
+    (`f30caa2`/`06dbc69`/`1831e30`/`97b8775`) and the #129 series
+    (`43e31ad`/`7b977cf`/`88e766b`/`679297f`) were both pushed this loop with maintainer
+    OK; no drift. Note the standing push-approval gate: **ask before pushing** (an
+    agent-initiated push was denied in a prior session). The #129 loop also fast-forwarded
+    `main` from the `feat/129-continue-cross-process-checkpoint` branch (now deleted), a
+    departure from the prior series' direct-on-`main` commits — benign, linear history
+    preserved.
     Sub-note: the plan-execute
     scratch run-artifacts are covered by a `workspace/*` wildcard in
     `examples/rust/08-plan-execute/.gitignore` (preserving the tracked `.gitkeep` +
@@ -547,29 +585,34 @@ cache halts.
     `Autonomous` on their config helpers in all four to keep asserting propagate behavior.
     A maintainer may wish to harmonize the raw-config default separately.
 
+18. **#129 benign per-language divergences** (`scope: debt`, benign, documented on the
+    issue) — (a) **Python AC4** asserts context preservation by *membership* (the prior
+    checkpoint message is retained in the resumed session) rather than by *message-count
+    growth* like Rust/TS, because Python's `NoopContextManager` does not append the resumed
+    `FinalResponse` to the session; same intent (context survives the pause), weaker check,
+    documented in a code comment. (b) **Go** uses the established `jsonEqual` value-
+    normalizing helper for the two `cost_usd` float-bearing fixtures (pre-existing stdlib-
+    float convention, same as Deviation #16) and an idiomatic `ResumedBudgetContext`
+    constructor name (vs Rust/Python `BudgetContext::resumed` / TS `BudgetContext.resumed`).
+    No wire/behavior impact; all four pass the same ACs.
+
 _(Former Deviations — HillClimbing/SelfVerifying/Ralph-git-log/MemoryTool/storage-
 scope/sandbox-path/extras-mirror/Rust-dyn/compaction-tokens/observability-content
 stubs — all resolved in prior loops.)_
 
 ## Next Actions
 [3-5 items max, highest priority first. /next surfaces item 1 as "work this next."]
-0. **Push the #130 series to `origin/main`** (awaiting maintainer OK) — local `main` is
-   4 commits ahead (`f30caa2`/`06dbc69`/`1831e30`/`97b8775`). Per the standing push gate,
-   ask before pushing so `origin/main` doesn't keep drifting (Deviation #10).
-1. **#129 — `Continue` cross-process checkpoint (B.4/B.7).** Now the highest-value
-   refactor finisher: it owns #123's deferred `continues_used` persistence **and #125's
-   deferred `BudgetExhaustedBehavior` wire-field** — the one piece that makes the
-   in-process `Continue` loop actually loop through a live run, and a prerequisite for
-   #131's "paused tree resumes" success criterion alongside #130. Grab via `/implement`.
-2. **#131 — cordyceps composition end-to-end (the success bar).** Re-express the
-   `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`: a runaway
-   node bounded by its own `BudgetPolicy` without cascading, a failure cascading only to
-   transitive dependents, and a paused tree resuming by re-resolving handles. Gated on
-   #130 (✅ done) + #129 (live Continue loop). The last critical-path item.
-3. **Other refactor finishers (parallel-grabbable now)** — #121 (`SubagentTool` strategy
+1. **#131 — cordyceps composition end-to-end (the success bar, last critical-path item).**
+   Re-express the `12-cordyceps` audit as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`:
+   a runaway node bounded by its own `BudgetPolicy` without cascading, a failure cascading
+   only to transitive dependents, and a paused tree resuming by re-resolving handles. **Now
+   fully unblocked** — both gates (#130 ✅ HITL resume + #129 ✅ live Continue loop) are
+   satisfied. Grab via `/implement`. Landing this completes the entire #117–#131 refactor.
+2. **Other refactor finishers (parallel-grabbable now)** — #121 (`SubagentTool` strategy
    param), #122 (`max_steps()` advisory bound), #127 (custom-strategy tracer — exercises
    #120's `custom` map + `StrategyNotFound` end-to-end), #128 (observability span attrs).
-4. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — file a
+   None are on the critical path; all can run alongside or after #131.
+3. **Decide on the Rust-only `SubagentTool::with_stream` (Deviation #11)** — file a
    mirror issue for TS/Python/Go or accept as a Rust-reference-ahead experiment.
    **Still parked:** examples #109 / #92 + `web_search` #108/#110; harness gaps #115
    (skill loading) and #116 (HITL child-consult resume — now overlaps #130's resume

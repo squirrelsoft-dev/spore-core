@@ -12,4 +12,10 @@ export {
   type PlanArtifact,
   type PlanPhaseErrorKind,
 } from "./types.js";
-export { capturePlanArtifact, stripCodeFence, type CaptureResult } from "./capture.js";
+export {
+  capturePlanArtifact,
+  capturePlanArtifactWithRepair,
+  extractEmbeddedJsonObject,
+  stripCodeFence,
+  type CaptureResult,
+} from "./capture.js";

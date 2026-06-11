@@ -434,6 +434,16 @@ type HarnessBuilder struct {
 	// mirrors the Rust builder's drain_tools_into_registry + catalogue_registry
 	// seam. Nil accumulator preserves the ToolRegistry-only path.
 	catalogueTools []sporecore.StandardTool
+	// toolsetTools accumulates per-toolset catalogue StandardTools (Issue 2:
+	// per-node toolset scoping), keyed by the non-empty toolset handle a leaf
+	// carries. At build time each bucket is folded into its OWN populated
+	// *StandardToolRegistry (last-wins upsert) and placed on
+	// HarnessConfig.ToolsetCatalogues. A leaf whose toolset handle equals a key
+	// dispatches ONLY that catalogue (strict per-node scoping); an EMPTY handle or
+	// an unwired non-empty handle falls back to the global catalogueTools /
+	// ToolRegistry seam. Mirrors the Rust builder's toolset_tools +
+	// toolset_catalogues seam. Nil accumulator preserves the single-catalogue path.
+	toolsetTools map[string][]sporecore.StandardTool
 	// runStore / memStore are the optional storage seams threaded into catalogue
 	// tools' ToolContext (issue #75/#78). When catalogue tools are present and
 	// neither was set, the builder defaults runStore to an in-memory store so
@@ -586,6 +596,29 @@ func (b *HarnessBuilder) Tools(ts ...sporecore.StandardTool) *HarnessBuilder {
 	return b
 }
 
+// ToolsetTools registers catalogue StandardTools SCOPED to a single named
+// toolset handle (Issue 2: per-node toolset scoping). Mirrors Tools, but instead
+// of folding into the ONE global catalogue, these tools are folded into a
+// per-key *StandardToolRegistry (last-wins upsert across calls and within the
+// batch) and placed on HarnessConfig.ToolsetCatalogues.
+//
+// At dispatch, a leaf whose toolset handle equals key resolves ONLY this
+// catalogue (bridged per-run with the run's sandbox/session/storage), so it
+// cannot reach another node's tools — the union no longer leaks across nodes. A
+// leaf with an EMPTY ("") handle, or a non-empty handle with no entry here,
+// falls back to the global Tools catalogue / ToolRegistry seam (back-compat).
+//
+// key should be a NON-EMPTY handle string; the empty handle is reserved for the
+// global-catalogue fallback. Additive across calls. Mirrors the Rust builder's
+// toolset_tools. Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) ToolsetTools(key string, ts ...sporecore.StandardTool) *HarnessBuilder {
+	if b.toolsetTools == nil {
+		b.toolsetTools = make(map[string][]sporecore.StandardTool)
+	}
+	b.toolsetTools[key] = append(b.toolsetTools[key], ts...)
+	return b
+}
+
 // Sandbox overrides the SandboxProvider — the only path catalogue tools have to
 // the environment (filesystem, process exec). The sandbox is a required builder
 // component (set at NewHarnessBuilder time), but catalogue file tools
@@ -705,16 +738,39 @@ func (b *HarnessBuilder) foldCatalogueRegistry() *sporecore.StandardToolRegistry
 	return reg
 }
 
+// foldToolsetCatalogues folds each accumulated per-toolset bucket into its OWN
+// populated *StandardToolRegistry (last-wins upsert), keyed by the toolset
+// handle, and returns the map, or nil when no toolset tools were added. Bridged
+// per-run at dispatch — same as the global catalogue. Mirrors the Rust builder's
+// build_config toolset_catalogues fold. Drains the accumulator so a second build
+// does not double-register.
+func (b *HarnessBuilder) foldToolsetCatalogues() map[string]*sporecore.StandardToolRegistry {
+	if len(b.toolsetTools) == 0 {
+		return nil
+	}
+	out := make(map[string]*sporecore.StandardToolRegistry, len(b.toolsetTools))
+	for key, ts := range b.toolsetTools {
+		reg := sporecore.NewStandardToolRegistry()
+		for _, t := range ts {
+			_ = reg.Register(t.Implementation, t.Schema)
+		}
+		out[key] = reg
+	}
+	b.toolsetTools = nil
+	return out
+}
+
 // BuildConfig assembles the HarnessConfig without wrapping it in a harness.
 func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 	catalogue := b.foldCatalogueRegistry()
+	toolsetCatalogues := b.foldToolsetCatalogues()
 	// When catalogue tools are present and the caller wired no storage, default
 	// the run store to an in-memory provider (not the no-op default) so that
 	// session-aware tools (task_list, todo_write, memory) actually persist within
 	// the run. Pure tools (read_file/write_file via the sandbox) are unaffected
 	// either way. Mirrors the Rust in-memory storage default.
 	runStore := b.runStore
-	if catalogue != nil && runStore == nil && b.memStore == nil {
+	if (catalogue != nil || len(toolsetCatalogues) > 0) && runStore == nil && b.memStore == nil {
 		runStore = sporecore.NewInMemoryToolRunStore()
 	}
 	cfg := sporecore.HarnessConfig{
@@ -727,6 +783,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		CompactionVerifier:    b.compactionVerifier,
 		MaxCompactionAttempts: b.maxCompactionAttempts,
 		CatalogueRegistry:     catalogue,
+		ToolsetCatalogues:     toolsetCatalogues,
 		ToolRunStore:          runStore,
 		ToolMemoryStore:       b.memStore,
 		SystemPrompt:          b.systemPrompt,

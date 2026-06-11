@@ -17,6 +17,7 @@
 import {
   SessionId,
   newTask,
+  reactPerLoop,
   storage,
   type Context,
   type ContextManager,
@@ -90,10 +91,11 @@ describe("SkillInjectingContextManager", () => {
     );
 
     const session: SessionState = { messages: [], extras: {} };
-    const task = newTask("audit a module", new SessionId("sess-1"), {
-      kind: "re_act",
-      max_iterations: 8,
-    });
+    const task = newTask(
+      "audit a module",
+      new SessionId("sess-1"),
+      reactPerLoop(8),
+    );
 
     // No active skills yet: manifest present, NO body.
     let ctx = await cm.assemble(session, task);
@@ -103,7 +105,7 @@ describe("SkillInjectingContextManager", () => {
     expect(body).toContain("other: Some other skill");
     expect(body).not.toContain("GREP-FIRST PROCEDURE BODY");
 
-    // Activate `audit` (as the load_skill tool does) → body appears next turn.
+    // Activate `audit` (as the startup seed does) → body appears next turn.
     await provider
       .run()
       .put(new SessionId("sess-1"), ACTIVE_SKILLS_KEY, ["audit"]);
@@ -128,10 +130,7 @@ describe("SkillInjectingContextManager", () => {
       messages: [{ role: "user", content: { type: "text", text: "ORIGINAL" } }],
       extras: {},
     };
-    const task = newTask("x", new SessionId("s"), {
-      kind: "re_act",
-      max_iterations: 8,
-    });
+    const task = newTask("x", new SessionId("s"), reactPerLoop(8));
     const ctx = await cm.assemble(session, task);
     // Manifest is first, original message is preserved (never mutated away).
     expect(ctx.messages[0]?.content).toMatchObject({ type: "text" });

@@ -20,9 +20,28 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 
 // ---------- Filesystem ----------
 
+/// Parameters for [`crate::tools::fs::ReadFileTool`]. With all three optional
+/// params at their defaults (`offset = 1`, `length = 0`, `line_numbers =
+/// false`) the read is **byte-identical** to reading the whole file — no
+/// header, no line numbers (#132). Any non-default param prepends a one-line
+/// header `[lines {start}–{end} of {total}]` (U+2013 en-dash).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileParams {
     pub path: String,
+    /// 1-indexed start line. Default `1` (read from the beginning).
+    #[serde(default = "default_read_offset")]
+    pub offset: u64,
+    /// Max lines to return. Default `0` = no limit (read to EOF). A `length`
+    /// that runs past EOF silently returns through the last line.
+    #[serde(default)]
+    pub length: u64,
+    /// When `true`, prefix each returned line with its 1-indexed number,
+    /// right-padded to the digit-width of the file's total line count.
+    #[serde(default)]
+    pub line_numbers: bool,
+}
+fn default_read_offset() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +57,12 @@ pub struct ListDirParams {
     pub path: String,
     #[serde(default)]
     pub recursive: bool,
+    /// When `false` (default), a recursive walk honors `.gitignore`/`.ignore`
+    /// and skips VCS dirs (`.git/`) — keeping the listing focused on source and
+    /// out of the way of build artifacts (`target/`, `node_modules/`). Set
+    /// `true` to walk everything, ignored files included.
+    #[serde(default)]
+    pub include_ignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,7 +212,7 @@ pub enum GrepOutputMode {
 }
 
 /// Parameters for the net-new [`crate::tools::search::GrepTool`]. Distinct from
-/// [`GrepFilesParams`]: adds `output_mode`.
+/// [`GrepFilesParams`]: adds `output_mode` and `context_lines`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepParams {
     pub pattern: String,
@@ -196,6 +221,13 @@ pub struct GrepParams {
     pub recursive: bool,
     #[serde(default)]
     pub output_mode: GrepOutputMode,
+    /// Lines of context to show before and after each match (default: 0).
+    /// When 0 the output is byte-identical to the pre-context behaviour.
+    /// When > 0 the output uses standard `grep -C N` format:
+    /// match lines use `:` separator, context lines use `-`, and non-adjacent
+    /// groups are separated by a `--` line.
+    #[serde(default)]
+    pub context_lines: u32,
 }
 
 // ---------- SendMessage (#81, new) ----------
@@ -235,6 +267,10 @@ pub struct TodoWriteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebFetchParams {
     pub url: String,
+    /// Byte offset into the response body to start reading from.
+    /// Default `0` = existing behavior (no header prepended).
+    #[serde(default)]
+    pub start_byte: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

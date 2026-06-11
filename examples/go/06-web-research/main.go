@@ -154,10 +154,7 @@ func run() error {
 		WithModelParams(sporecore.ModelParams{StructuredToolCalls: structured}).
 		Build()
 
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 10,
-	})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.ReActStrategy(10))
 
 	// Print each turn (Think) and each tool call + result (Act / Observe). The
 	// search queries and result snippets show up here because web_search dispatches

@@ -1,7 +1,7 @@
 [project]
 name = "spore-example-12-cordyceps"
 version = "0.0.0"
-description = "spore-core example 12 — cordyceps: a fully autonomous task-completion agent (Python)"
+description = "spore-core example 12 — cordyceps: the Composable Execution capstone. Runs the declarative composed strategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (loaded as DATA from fixtures/strategy/cordyceps_tree.json) with handles resolved from an ExecutionRegistry (Python)."
 requires-python = ">=3.12"
 dependencies = ["spore-core", "spore-tools"]
 

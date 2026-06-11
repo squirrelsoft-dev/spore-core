@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use spore_core::storage::RunStore;
 use spore_core::{
-    AgentContext, Content, Guide, GuideRegistry, HarnessContextManager, HarnessToolResult, Message,
-    Role, SessionId, SessionState, StandardGuideRegistry, Task,
+    AgentContext, Content, HarnessContextManager, HarnessToolResult, Message, Role, SessionId,
+    SessionState, Task,
 };
 
 use spore_core::harness::BoxFut;
@@ -55,29 +55,24 @@ pub struct SkillEntry {
     pub body: String,
 }
 
-/// The example's skill catalog: a `StandardGuideRegistry` (the real seam) plus
-/// the manifest side-list the example owns (because `Guide` carries no
-/// description). Bodies are resolved from the side-list, not re-queried from the
-/// registry, so the manifest text and the injected body always agree.
+/// The example's skill catalog: the manifest side-list the example owns
+/// (`{name, description, body}`). After the #131 rewrite the catalog feeds only
+/// the GLOBAL [`SkillInjectingContextManager`] (the `load_skill` tool +
+/// `GuideRegistry` seam were dropped — see the README's "what changed" note);
+/// the manifest text and the injected body always agree because both come from
+/// this one side-list.
 pub struct SkillCatalog {
-    registry: Arc<StandardGuideRegistry>,
     manifest: Vec<SkillEntry>,
 }
 
 impl SkillCatalog {
-    /// Scan the project + user skill directories and register the bundled
-    /// `audit` skill so the example is self-contained even with an empty
-    /// `.spore/skills/`. Project entries win over user entries; the bundled
-    /// `audit` body seeds `.spore/skills/audit/SKILL.md` on first run if absent
-    /// (documented in the README) but is also registered directly here so the
-    /// example never depends on that seed having been written.
+    /// Scan the project + user skill directories plus the bundled `audit` skill
+    /// so the example is self-contained even with an empty `.spore/skills/`.
+    /// Project entries win over user entries (last-wins by name).
     pub async fn bootstrap(project_root: &Path, bundled_audit: &str) -> Self {
-        let registry = Arc::new(StandardGuideRegistry::new());
         let mut manifest: Vec<SkillEntry> = Vec::new();
 
-        // 1. Bundled audit skill — always present, registered first so a
-        //    project/user override of the same name supersedes it (last-wins in
-        //    the manifest; the registry treats identical content as a no-op).
+        // 1. Bundled audit skill — always present.
         if let Some(entry) = parse_skill_doc(bundled_audit) {
             upsert(&mut manifest, entry);
         }
@@ -94,21 +89,7 @@ impl SkillCatalog {
             }
         }
 
-        // Register every manifest entry as a Skill-type guide. Empty content is
-        // rejected by the registry; parse_skill_doc already guarantees a body.
-        for entry in &manifest {
-            let _ = registry
-                .register(Guide::skill(entry.name.clone(), entry.body.clone()))
-                .await;
-        }
-
-        Self { registry, manifest }
-    }
-
-    /// The shared registry — handed to the `load_skill` tool and the context
-    /// manager.
-    pub fn registry(&self) -> Arc<StandardGuideRegistry> {
-        self.registry.clone()
+        Self { manifest }
     }
 
     /// The manifest side-list — handed to the context manager so it can render
@@ -413,7 +394,7 @@ mod tests {
         let task = Task::new(
             "audit a module".to_string(),
             SessionId::new("sess-1"),
-            spore_core::LoopStrategy::ReAct { max_iterations: 8 },
+            spore_core::LoopStrategy::ReAct(spore_core::ReactConfig::per_loop(8)),
         );
 
         // No active skills yet: manifest present, NO body.

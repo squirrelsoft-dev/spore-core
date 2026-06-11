@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 
 import anyio
+import pathspec
 
 from spore_core.harness import (
     Operation,
@@ -54,10 +55,30 @@ class ReadFileTool:
     def schema(cls) -> ToolSchema:
         return ToolSchema(
             name=cls.NAME,
-            description="Read a file's contents",
+            description=(
+                "Read a file's contents. Optionally read a line range "
+                "(offset is 1-indexed start, length is max lines, 0 = "
+                "to EOF) and/or prefix each line with its number via "
+                "line_numbers. With no optional params the whole file "
+                "is returned verbatim."
+            ),
             parameters={
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-indexed start line (default 1).",
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "Max lines to return; 0 = no limit / read to EOF (default 0).",
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "description": "Prefix each returned line with its 1-indexed number (default false).",
+                    },
+                },
                 "required": ["path"],
             },
             annotations=ToolAnnotations(read_only=True, idempotent=True),
@@ -75,7 +96,57 @@ class ReadFileTool:
             content = await anyio.to_thread.run_sync(Path(resolved).read_text)
         except OSError as e:
             return ToolOutputError(message=f"read failed: {e}", recoverable=True)
-        return await finish_with_possible_truncation(content, call.id, sandbox)
+        result = _apply_read_range(content, params)
+        if isinstance(result, str):
+            return await finish_with_possible_truncation(result, call.id, sandbox)
+        return result
+
+
+# ============================================================================
+# _apply_read_range (#132)
+# ============================================================================
+
+
+def _apply_read_range(content: str, params: ReadFileParams) -> str | ToolOutputError:
+    """Apply the #132 range/line-number transform to a fully-read file body.
+
+    Returns the transformed content string, or a :class:`ToolOutputError` for
+    recoverable errors. With all params at their defaults the original
+    ``content`` is returned unchanged (byte-identical to the pre-#132 behavior).
+    Any non-default param prepends a ``[lines {start}–{end} of {total}]`` header
+    (U+2013 en-dash).
+    """
+    is_default = params.offset == 1 and params.length == 0 and not params.line_numbers
+    if is_default:
+        return content
+    if params.offset == 0:
+        return ToolOutputError(message="offset must be ≥ 1 (1-indexed)", recoverable=True)
+    # Empty file: any params still yield empty content with no header.
+    if not content:
+        return ""
+    # splitlines(keepends=True) preserves each line's trailing '\n'; the final
+    # line may or may not end in '\n'. This keeps the slice byte-faithful to the
+    # source (Python equivalent of Rust's split_inclusive('\n')).
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+    if params.offset > total:
+        return ToolOutputError(
+            message=f"offset {params.offset} exceeds file length {total}",
+            recoverable=True,
+        )
+    start = params.offset  # 1-indexed, validated >= 1 and <= total
+    end = total if params.length == 0 else min(start + params.length - 1, total)
+    selected = lines[start - 1 : end]
+
+    out = f"[lines {start}–{end} of {total}]\n"
+    if params.line_numbers:
+        width = len(str(total))
+        for i, line in enumerate(selected):
+            n = start + i
+            out += f"{n:>{width}} | {line}"
+    else:
+        out += "".join(selected)
+    return out
 
 
 # ============================================================================
@@ -165,6 +236,14 @@ class ListDirTool:
                 "properties": {
                     "path": {"type": "string"},
                     "recursive": {"type": "boolean"},
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": (
+                            "When false (default) and recursive is true, "
+                            "honor .gitignore rules and always skip .git/. "
+                            "When true, walk everything (still skips .git/)."
+                        ),
+                    },
                 },
                 "required": ["path"],
             },
@@ -207,10 +286,25 @@ class ListDirTool:
 
             out: list[str] = []
             if params.recursive:
-                for p in root.rglob("*"):
-                    rel = to_root_relative(p)
-                    if rel is not None:
-                        out.append(rel)
+                if params.include_ignored:
+                    # Original rglob behavior: walk everything, still skip .git/
+                    for p in root.rglob("*"):
+                        # Always skip .git/ and anything inside it
+                        try:
+                            rel_to_root = p.relative_to(root)
+                        except ValueError:
+                            continue
+                        if rel_to_root.parts and rel_to_root.parts[0] == ".git":
+                            continue
+                        rel = to_root_relative(p)
+                        if rel is not None:
+                            out.append(rel)
+                else:
+                    # Gitignore-aware DFS: honor .gitignore at each directory
+                    for p in _gitignore_walk(root):
+                        rel = to_root_relative(p)
+                        if rel is not None:
+                            out.append(rel)
                 # mirror Rust's WalkDir behavior, which yields the root itself;
                 # to_root_relative skips it (empty relative path), so this is a
                 # no-op for the listed dir but keeps the branches symmetric.
@@ -219,6 +313,9 @@ class ListDirTool:
                     out.append(rel)
             else:
                 for p in root.iterdir():
+                    # Non-recursive: always skip .git/
+                    if p.name == ".git":
+                        continue
                     rel = to_root_relative(p)
                     if rel is not None:
                         out.append(rel)
@@ -332,6 +429,75 @@ class MoveFileTool:
 # ============================================================================
 # helpers
 # ============================================================================
+
+
+def _load_gitignore_spec(directory: Path) -> "pathspec.PathSpec | None":
+    """Load a PathSpec from ``directory/.gitignore``, or None if absent/unreadable."""
+    gitignore_file = directory / ".gitignore"
+    if not gitignore_file.is_file():
+        return None
+    try:
+        lines = gitignore_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    return pathspec.PathSpec.from_lines("gitignore", lines)
+
+
+def _gitignore_walk(root: Path) -> list[Path]:
+    """DFS walk that respects .gitignore rules at each directory level.
+
+    Always skips .git/ unconditionally. At each directory, loads a local
+    .gitignore (if present) and uses pathspec to filter out matched entries
+    before recursing. Parent specs are applied using paths relative to their
+    respective anchor directories, so patterns like ``*.log`` correctly filter
+    files in subdirectories.
+
+    Returns all non-ignored paths (files and directories) under ``root``,
+    not including ``root`` itself.
+    """
+    results: list[Path] = []
+
+    # Stack items: (current_dir, list of (spec, anchor_dir) pairs from all
+    # ancestor .gitignore files including the current one).
+    def _walk(current: Path, ancestor_specs: list[tuple["pathspec.PathSpec", Path]]) -> None:
+        # Load .gitignore for the current directory and extend the spec list.
+        local_spec = _load_gitignore_spec(current)
+        specs = list(ancestor_specs)
+        if local_spec is not None:
+            specs.append((local_spec, current))
+
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            return
+
+        for entry in entries:
+            # Always skip .git/
+            if entry.name == ".git":
+                continue
+            # Apply all ancestor .gitignore specs using paths relative to each
+            # spec's anchor directory.
+            ignored = False
+            for spec, anchor in specs:
+                try:
+                    rel = entry.relative_to(anchor)
+                except ValueError:
+                    continue
+                rel_str = rel.as_posix()
+                # Also try the "dir/" form for directories so patterns like
+                # "dist/" match the directory itself.
+                check_str = rel_str + "/" if entry.is_dir() else rel_str
+                if spec.match_file(check_str) or spec.match_file(rel_str):
+                    ignored = True
+                    break
+            if ignored:
+                continue
+            results.append(entry)
+            if entry.is_dir():
+                _walk(entry, specs)
+
+    _walk(root, [])
+    return results
 
 
 async def _resolve(sandbox: SandboxProvider, path: str, operation: Operation = "read") -> Path:

@@ -14,6 +14,35 @@
 //! consecutive non-improvements) or **budget** (`max_turns`). You write **no loop
 //! code** — you wire a strategy, a metric evaluator, and an observability sink.
 //!
+//! Post-#119 the strategy is a composed tree, not the old struct-variant literal:
+//!
+//! ```text
+//! // pre-#119:
+//! LoopStrategy::HillClimbing {
+//!     direction: OptimizationDirection::Maximize,
+//!     max_stagnation: Some(MAX_STAGNATION),
+//!     revert_on_no_improvement: true,
+//!     min_improvement_delta: None,
+//! }
+//! // post-#119:
+//! LoopStrategy::HillClimbing(HillClimbingConfig {
+//!     inner: ReAct { output: Some("propose-schema"), budget: PerLoop(PER_ITER_BUDGET) },
+//!     direction: HillClimbingDirection::Maximize,   // renamed from OptimizationDirection
+//!     max_stagnation: MAX_STAGNATION,               // now a bare u32 (was Some(_))
+//!     revert_on_no_improvement: true,
+//!     min_improvement_delta: 0.0,                   // now a bare f64 (was None)
+//!     evaluator: "",                                // empty handle ⇒ `.metric_evaluator(..)`
+//!     behavior: Escalate,
+//! })
+//! ```
+//!
+//! The `inner` (propose) slot is STRUCTURED — a bare `ReAct` there MUST declare an
+//! `output` schema (here `propose-schema`) so each iteration yields a scorable
+//! candidate; `ExecutionRegistry::validate` enforces this at run entry. The
+//! `evaluator` stays the EMPTY handle (`""`), default-filled from the
+//! single-collaborator `.metric_evaluator(..)` setter — so the only handle
+//! registered explicitly is `propose-schema`.
+//!
 //! ## The contrast with example 09 (SelfVerifying) — the teaching point
 //!
 //! 09 has a **binary exit condition**: a [`Verifier`](spore_core::Verifier)
@@ -87,12 +116,12 @@ use std::time::Instant;
 use spore_core::harness::BoxFut;
 use spore_core::observability::{WarnEvent, WarnSpan};
 use spore_core::{
-    BudgetLimits, Content, ContentBlock, HaltReason, Harness, HarnessBuilder, HarnessRunOptions,
-    InMemoryObservabilityProvider, Message, MetricError, MetricEvaluator, MetricResult,
-    ModelInterface, ModelParams, ModelRequest, ObservabilityProvider, OllamaModelInterface,
-    OptimizationDirection, Role, RunResult, SessionId, SessionMetrics, SessionOutcome,
-    SessionStateSnapshot, Span, StandardTools, Task, Timestamp, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    BudgetLimits, Content, ContentBlock, ExecutionRegistry, HaltReason, Harness, HarnessBuilder,
+    HarnessRunOptions, HillClimbingConfig, HillClimbingDirection, InMemoryObservabilityProvider,
+    LoopStrategy, Message, MetricError, MetricEvaluator, MetricResult, ModelInterface, ModelParams,
+    ModelRequest, ObservabilityProvider, OllamaModelInterface, ReactConfig, Role, RunResult,
+    SchemaRef, SessionId, SessionMetrics, SessionOutcome, SessionStateSnapshot, Span, StandardTools,
+    Task, Timestamp, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 // ============================================================================
@@ -107,8 +136,16 @@ const MAX_ITERATIONS: u32 = 6;
 
 /// Consecutive non-improvements tolerated before the loop halts with
 /// [`HaltReason::StagnationLimitReached`]. The stagnation counter resets to 0 on
-/// any kept (strictly-improving) iteration. Maps to `max_stagnation: Some(_)`.
+/// any kept (strictly-improving) iteration. Post-#119 maps to the bare
+/// `HillClimbingConfig.max_stagnation: u32` (was `Some(_)`).
 const MAX_STAGNATION: u32 = 2;
+
+/// Per-iteration build budget for the propose leaf. Post-#119, HillClimbing's
+/// `inner` is a composed `ReAct(ReactConfig::per_loop(PER_ITER_BUDGET))` — this
+/// caps how many tool-using turns the build agent gets to PRODUCE ONE candidate
+/// draft per climb step (distinct from `MAX_ITERATIONS`, the count of climb
+/// steps, which maps to `BudgetLimits::max_turns`).
+const PER_ITER_BUDGET: u32 = 8;
 
 /// DISPLAY ANNOTATION ONLY. When a draft's total score (0–30) reaches this, the
 /// evaluator marks the printed line `★ crossed target threshold`. // SPEC NOTE:
@@ -298,8 +335,8 @@ impl<M: ModelInterface + 'static> MetricEvaluator for ReadmeQualityEvaluator<M> 
         })
     }
 
-    fn direction(&self) -> OptimizationDirection {
-        OptimizationDirection::Maximize
+    fn direction(&self) -> HillClimbingDirection {
+        HillClimbingDirection::Maximize
     }
 
     fn description(&self) -> String {
@@ -403,6 +440,62 @@ impl ObservabilityProvider for ReportingObservability {
 }
 
 // ============================================================================
+// Strategy assembly (post-#119 composed tree)
+// ============================================================================
+
+/// The propose-phase output contract (`propose-schema`). Post-#119,
+/// `HillClimbing`'s `inner` (propose) slot is STRUCTURED: a bare `ReAct` there
+/// must declare an `output` schema so each iteration yields a scorable candidate
+/// (`ExecutionRegistry::validate` enforces this via `check_structured_slot`). The
+/// build agent rewrites `DRAFT_FILE`; this advertises the path it wrote.
+fn propose_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "file": { "type": "string", "description": "Path the candidate draft was written to." },
+            "summary": { "type": "string", "description": "What this iteration changed." }
+        },
+        "required": ["file"]
+    })
+}
+
+/// The registry the composed strategy's handles resolve against. Only the
+/// `propose-schema` is EXPLICIT; the builder default-fills the empty agent /
+/// toolset handles (`ReactConfig::per_loop`) AND the empty-key metric evaluator
+/// from `.metric_evaluator(..)` at `build`. So the HillClimbing `evaluator` stays
+/// the EMPTY handle (`""`).
+fn build_registry() -> ExecutionRegistry {
+    ExecutionRegistry::builder()
+        .schema("propose-schema", propose_schema())
+        .build()
+}
+
+/// The post-#119 composed strategy: `HillClimbing(inner: ReAct, evaluator)`. The
+/// propose leaf carries the `propose-schema` output contract (required for the
+/// structured `propose` slot) and a `per_loop(per_iter_budget)` build budget. The
+/// `evaluator` is the EMPTY handle (`""`), which the builder default-fills from
+/// `.metric_evaluator(..)`. `max_stagnation` / `min_improvement_delta` are now
+/// BARE (`u32` / `f64`), not `Option`. Old flat shape was the struct-variant
+/// `LoopStrategy::HillClimbing { direction, max_stagnation: Some(_), .. }`.
+fn hill_climbing_strategy(per_iter_budget: u32) -> LoopStrategy {
+    let propose = ReactConfig {
+        output: Some(SchemaRef("propose-schema".to_string())),
+        ..ReactConfig::per_loop(per_iter_budget)
+    };
+    LoopStrategy::HillClimbing(HillClimbingConfig {
+        inner: Box::new(LoopStrategy::ReAct(propose)),
+        direction: HillClimbingDirection::Maximize,
+        max_stagnation: MAX_STAGNATION,
+        revert_on_no_improvement: true,
+        min_improvement_delta: 0.0,
+        // Empty AgentRef ⇒ default-filled metric evaluator from `.metric_evaluator(..)`.
+        evaluator: spore_core::AgentRef(String::new()),
+        // Mirrors the shim default: a nested combinator propagates exhaustion up.
+        behavior: spore_core::BudgetExhaustedBehavior::Escalate,
+    })
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -453,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
     let harness = HarnessBuilder::conversational(build_model)
         .sandbox(Arc::new(sandbox))
+        .registry(build_registry())
         .tool(StandardTools::write_file())
         .tool(StandardTools::read_file())
         .system_prompt(SYSTEM_PROMPT)
@@ -460,19 +554,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .observability(observability)
         .build();
 
-    // THE STRATEGY. No loop code below — the harness runs the climb. The build
-    // agent gets a generous per-iteration turn budget; `max_turns` bounds the
-    // NUMBER OF ITERATIONS (the budget ceiling), and `max_stagnation` can halt
-    // sooner. SPEC NOTE: there is no score-threshold field — by design.
+    // THE STRATEGY. No loop code below — the harness runs the climb. The composed
+    // `HillClimbing(inner: ReAct{propose-schema}, evaluator)` tree (post-#119)
+    // gives the propose leaf a per-iteration build budget (`PER_ITER_BUDGET`);
+    // `max_turns` bounds the NUMBER OF ITERATIONS (the budget ceiling), and
+    // `max_stagnation` can halt sooner. SPEC NOTE: there is no score-threshold
+    // field — by design.
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        spore_core::LoopStrategy::HillClimbing {
-            direction: OptimizationDirection::Maximize,
-            max_stagnation: Some(MAX_STAGNATION),
-            revert_on_no_improvement: true,
-            min_improvement_delta: None,
-        },
+        hill_climbing_strategy(PER_ITER_BUDGET),
     )
     .with_budget(BudgetLimits {
         max_turns: Some(max_iterations),
@@ -589,4 +680,47 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+// ============================================================================
+// Example-crate test (NO model): the composed HillClimbing strategy resolves
+// against the example's registry — the regression guard that the post-#119
+// strategy tree stays validation-clean against current core.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spore_core::{AgentId, EmptyToolRegistry, ModelAgent};
+
+    /// AC: the composed `HillClimbing(inner: ReAct{propose-schema}, evaluator: "")`
+    /// tree validates — the propose slot's output schema resolves (structured-slot
+    /// contract) and the empty-handle evaluator resolves to the default-filled
+    /// metric evaluator. The leaves use EMPTY agent/toolset/evaluator handles that
+    /// `HarnessBuilder::build_config` default-fills at `build`; here we mirror that
+    /// fill (empty-key agent + toolset + metric evaluator) so the standalone
+    /// registry validates exactly as the assembled harness would.
+    #[test]
+    fn registry_validates() {
+        let model = Arc::new(OllamaModelInterface::with_base_url(
+            "gemma4:e4b",
+            "http://localhost:11434".to_string(),
+        ));
+        let metric: Arc<dyn MetricEvaluator> =
+            Arc::new(ReadmeQualityEvaluator::new(model.clone()));
+        let registry = build_registry()
+            .into_builder()
+            .fill_default_agent(Arc::new(ModelAgent::new(AgentId::new("default"), model)))
+            .fill_default_toolset(Arc::new(EmptyToolRegistry))
+            .fill_default_metric_evaluator(metric)
+            .build();
+        let task = Task::new(
+            "refine the README".to_string(),
+            SessionId::generate(),
+            hill_climbing_strategy(PER_ITER_BUDGET),
+        );
+        assert!(
+            registry.validate(&task).is_ok(),
+            "the composed HillClimbing strategy must validate against the registry"
+        );
+    }
 }

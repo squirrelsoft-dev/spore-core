@@ -531,6 +531,114 @@ StrategyRef = Annotated[
 ]
 
 
+# ── max_steps: advisory worst-case turn bound (#122) ─────────────────────────
+#
+# Python ``LoopStrategy`` / ``StrategyRef`` are discriminated-union aliases, not
+# classes, so Rust's ``impl ... { fn max_steps }`` maps to module-level
+# dispatchers — the same idiom as :func:`run_strategy` / :func:`budget_allowance_value`.
+
+# The unbounded-windows sentinel for ``HillClimbingConfig.max_stagnation``: a
+# value of ``2**31 - 1`` (Python's i32-compatible stand-in for Rust's
+# ``u32::MAX``) means "no stagnation cap" and collapses the bound to ``None``.
+# This is a SEMANTIC unbounded rule, distinct from arithmetic overflow below.
+_MAX_STAGNATION_UNBOUNDED = 2**31 - 1
+
+# The u32 representable ceiling (``4294967295``). Python ints are unbounded, so
+# to stay cross-language-identical with Rust's ``checked_add`` / ``checked_mul``
+# (which yield ``None`` on overflow) we guard explicitly: any add/multiply whose
+# result exceeds this ceiling yields ``None`` ("no finite advisory bound").
+_U32_MAX = 2**32 - 1
+
+
+def _checked_add(a: int, b: int) -> int | None:
+    """``a + b``, or ``None`` if the sum exceeds the u32 ceiling. Mirrors Rust's
+    ``u32::checked_add``."""
+    total = a + b
+    return total if total <= _U32_MAX else None
+
+
+def _checked_mul(a: int, b: int) -> int | None:
+    """``a * b``, or ``None`` if the product exceeds the u32 ceiling. Mirrors
+    Rust's ``u32::checked_mul``."""
+    product = a * b
+    return product if product <= _U32_MAX else None
+
+
+def loop_strategy_max_steps(strategy: LoopStrategy) -> int | None:
+    """Advisory worst-case **turn** count for a fully-bounded strategy tree,
+    computed before a run (#122).
+
+    This is a pre-run advisory figure, **not** an enforcement mechanism — the
+    per-node budget ceiling is the safety mechanism. The bound is derived
+    additively/multiplicatively down the tree and is Option-monadic: any
+    ``Unlimited`` node anywhere collapses the whole figure to ``None`` ("no
+    finite advisory bound"). It is a runtime-only computation, **never
+    serialized**.
+
+    Per-variant rules:
+
+    - ``ReactConfig`` ⇒ :func:`budget_allowance_value` of its ``budget``
+      (``Unlimited`` ⇒ ``None``; ``PerLoop`` / ``TotalSteps`` / ``PerAttempt``
+      ⇒ their ``value``).
+    - ``SelfVerifyingConfig`` ⇒ ``inner + 1`` — the single read-only evaluator
+      turn is exactly one extra turn.
+    - ``PlanExecuteConfig`` ⇒ ``plan + execute``. **PER-TASK bound**: a full
+      run's total is ``plan + execute_per_task × task_count``, where
+      ``task_count`` is data-dependent (the plan phase builds the task graph at
+      runtime), so it is intentionally NOT part of this static figure.
+    - ``RalphConfig`` ⇒ ``inner`` — **PER-WINDOW bound**, mirroring
+      PlanExecute's per-task treatment. A full run's total is
+      ``per_window × max_windows``, where ``max_windows`` derives from
+      ``HarnessConfig.max_resets`` (default 3) at runtime and is intentionally
+      NOT part of this static figure.
+    - ``HillClimbingConfig`` ⇒ ``inner × (max_stagnation + 1)`` — the ``+1`` is
+      the one productive pass; ``max_stagnation`` non-improving passes follow.
+      The ``max_stagnation == 2**31 - 1`` sentinel means unbounded windows ⇒
+      ``None`` (a semantic unbounded rule, distinct from arithmetic overflow).
+
+    Arithmetic is u32-checked; an unrepresentable bound (overflow past
+    ``4294967295``) yields ``None``. Mirrors Rust's ``LoopStrategy::max_steps``.
+    """
+    match strategy:
+        case ReactConfig():
+            return budget_allowance_value(strategy.budget)
+        case SelfVerifyingConfig():
+            inner = loop_strategy_max_steps(strategy.inner)
+            return None if inner is None else _checked_add(inner, 1)
+        case PlanExecuteConfig():
+            plan = loop_strategy_max_steps(strategy.plan)
+            execute = loop_strategy_max_steps(strategy.execute)
+            if plan is None or execute is None:
+                return None
+            return _checked_add(plan, execute)
+        case RalphConfig():
+            return loop_strategy_max_steps(strategy.inner)
+        case HillClimbingConfig():
+            if strategy.max_stagnation == _MAX_STAGNATION_UNBOUNDED:
+                return None
+            inner = loop_strategy_max_steps(strategy.inner)
+            if inner is None:
+                return None
+            passes = _checked_add(strategy.max_stagnation, 1)
+            if passes is None:
+                return None
+            return _checked_mul(inner, passes)
+
+
+def strategy_ref_max_steps(ref: StrategyRef) -> int | None:
+    """Advisory worst-case turn bound for a :data:`StrategyRef` (#122).
+
+    ``Custom`` is opaque to the framework (it cannot be introspected), so it
+    yields ``None``; ``BuiltIn`` delegates to :func:`loop_strategy_max_steps`.
+    Mirrors Rust's ``StrategyRef::max_steps``.
+    """
+    match ref:
+        case StrategyRefCustom():
+            return None
+        case StrategyRefBuiltIn():
+            return loop_strategy_max_steps(ref.value)
+
+
 # ============================================================================
 # Composable Execution runtime scaffold (issue #123): StrategyOutcome +
 # ExecutionContext / BudgetContext / BudgetStack / SpanStack.
@@ -850,6 +958,18 @@ class RunScratch:
     # in-process Continue never sets it → AC3: no serialization on the in-process
     # path). Mirrors Rust's ``RunScratch::resume_continues``.
     resume_continues: tuple[str, int] | None = None
+    # Consult re-drive seed (#131): the worker conversation (with the consult
+    # answer already injected as the pending call's tool result) carried from a
+    # resumed :class:`RunResultConsult`. When set, a :class:`PlanExecuteConfig`
+    # walk resumes its single ``InProgress`` task from THIS session (instead of a
+    # fresh instruction-seeded session) so the consulting worker continues
+    # mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
+    # proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
+    # the session itself rides the serialized ``PausedState.session_state``, so a
+    # cross-process resume reconstructs this seed in
+    # :meth:`StandardHarness.resume_consult`. ``None`` on a fresh run / after the
+    # seed is consumed. Mirrors Rust's ``RunScratch::consult_resume``.
+    consult_resume: SessionState | None = None
 
 
 @dataclass
@@ -951,6 +1071,17 @@ class ExecutionContext:
         so the harness entry returns it VERBATIM, and return the matching
         outcome."""
         await executor.finalize(result)
+        # #131: a ``Consult`` propagated from a worker leaf carries the LEAF task,
+        # so a host ``resume_consult`` would resume only that leaf and lose the
+        # surrounding walk. As the pause unwinds through each combinator's
+        # ``_finish``, rewrite its ``state.task`` to the combinator's OWN composed
+        # task; by the top it carries the FULL tree, so ``resume_consult``
+        # re-drives the whole strategy (the in-progress task resumes from
+        # ``consult_resume``).
+        if isinstance(result, RunResultConsult):
+            new_state = result.state.model_copy()
+            new_state.task = parent_task
+            result = result.model_copy(update={"state": new_state})
         self.scratch.task = parent_task
         if isinstance(result, RunResultSuccess | RunResultFailure):
             self.scratch.run_session = result.session_state
@@ -1053,9 +1184,12 @@ class StrategyExecutor(Protocol):
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         agent: Agent,
+        toolset: ToolsetRef = "",
     ) -> RunResult:
         """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
-        resolved worker ``agent`` (#124)."""
+        resolved worker ``agent`` (#124). Issue 2: ``toolset`` is the leaf's
+        RESOLVED handle — empty (``""``) ⇒ global-catalogue fallback; a non-empty
+        handle with its own catalogue ⇒ strict per-node scoping."""
         ...
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -1563,7 +1697,16 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     on_stream = cx.stream
     cx.stream = None
     result = await executor.react_window(
-        task, max_iterations, session_state, budget_used, on_stream, agent
+        task,
+        max_iterations,
+        session_state,
+        budget_used,
+        on_stream,
+        agent,
+        # Issue 2: thread THIS leaf's toolset handle down so the window dispatches
+        # the per-node scoped catalogue (empty handle ⇒ global-catalogue
+        # fallback). Mirrors ``agent``.
+        self.toolset,
     )
     await executor.finalize(result)
 
@@ -1693,22 +1836,21 @@ async def _run_plan_execute_config(
     #
     # Seed the planning directive onto a CLONE of the base session so the shared
     # execute context stays ``[user: task.instruction]`` (#93 — a leaked directive
-    # would make every execute step re-emit a plan). Cap the plan child at ONE
-    # turn (R1) but never beyond the task's global turn ceiling (so an already-
-    # exhausted budget fails the plan turn before it runs — R10).
+    # would make every execute step re-emit a plan). The plan phase runs under the
+    # plan sub-strategy's OWN declared budget (e.g. a ReAct ``PerLoop{4}``); the
+    # global ``max_turns`` is only the outer backstop. Previously this clamped the
+    # planner to ``turns + 1`` — a SINGLE turn — silently overriding the
+    # architect's plan budget and starving multi-step task-graph authoring (the
+    # planner could not both call ``task_list`` and finish, so it emitted prose
+    # instead).
     directive = executor.plan_directive(task.instruction)
     plan_session = base_session.model_copy(deep=True)
     await executor.seed_user_message(plan_session, directive)
-    plan_cap = budget_used.turns + 1
-    if task.budget.max_turns is not None:
-        plan_cap = min(task.budget.max_turns, plan_cap)
-    plan_budget = task.budget.model_copy(deep=True)
-    plan_budget.max_turns = plan_cap
     plan_task = Task(
         id=task.id,
         instruction=directive,
         session_id=session_id,
-        budget=plan_budget,
+        budget=task.budget.model_copy(deep=True),
         loop_strategy=self.plan,
     )
     plan_result = await executor.run_plan_subtree(
@@ -1809,6 +1951,34 @@ async def _run_plan_execute_config(
     # Completed tasks are not re-run.
     await executor.reconcile_completed_tasks(session_id, task_list)
 
+    # #131 consult re-drive: a resumed consult carries the worker conversation
+    # (answer already injected) in ``cx.scratch.consult_resume``. The consulting
+    # task is the single ``InProgress`` task in the durable list (PlanExecute
+    # marks a task InProgress before running it). Reset it to ``Pending`` so
+    # ``next_ready`` re-schedules it, and remember its id so its step uses the
+    # carried session instead of a fresh one — the worker then continues mid-loop
+    # and its evaluator still runs.
+    consult_resume_session = cx.scratch.consult_resume
+    cx.scratch.consult_resume = None
+    consult_resume_task: int | None = None
+    if consult_resume_session is not None:
+        in_progress = next(
+            (t.id for t in task_list.tasks if t.status == TaskStatus.IN_PROGRESS),
+            None,
+        )
+        if in_progress is not None:
+            # Reset the status field DIRECTLY (bypassing ``update``'s forward-only
+            # transition guard, which rejects InProgress->Pending): the consult
+            # resume legitimately re-schedules the in-flight task.
+            for t in task_list.tasks:
+                if t.id == in_progress:
+                    t.status = TaskStatus.PENDING
+            consult_resume_task = in_progress
+        else:
+            # No in-progress task to resume (out-of-contract); drop the seed so
+            # the walk proceeds normally rather than stalling.
+            consult_resume_session = None
+
     total_usage = outcome.usage.model_copy(deep=True)
     last_output = ""
     last_state = SessionState()
@@ -1861,33 +2031,47 @@ async def _run_plan_execute_config(
         )
         step_task = await executor.fire_task_advance(session_id, step_task, index, total_tasks)
 
-        # #126 Tier-1 scoped context: seed this step from a FRESH copy of the base
-        # session plus, for THIS task's transitive blockers only, their final
-        # outputs + their ledger rows. Independent branches never appear (AC1).
-        step_session = base_session.model_copy(deep=True)
-        blockers = task_list.transitive_blockers(task_id)
-        if blockers:
-            blocker_set = set(blockers)
-            tier1_lines = [
-                f"#{b} result: {final_outputs[b]}" for b in blockers if b in final_outputs
-            ]
-            if tier1_lines:
-                await executor.seed_user_message(
-                    step_session, "Results from upstream tasks:\n" + "\n".join(tier1_lines)
-                )
-            scoped = [e for e in ledger if e.task_id in blocker_set]
-            scoped_block = render_step_ledger(scoped, False)
-            if scoped_block is not None:
-                await executor.seed_user_message(step_session, scoped_block)
+        # #131 consult re-drive: if THIS is the task that was consulting, resume
+        # its worker from the carried conversation (answer already injected)
+        # instead of a fresh instruction-seeded session — the worker continues
+        # mid-loop and its evaluator still runs. Otherwise build the normal
+        # fresh, Tier-1/Tier-2-seeded step session.
+        if consult_resume_task is not None and task_id == consult_resume_task:
+            step_session = (
+                consult_resume_session
+                if consult_resume_session is not None
+                else base_session.model_copy(deep=True)
+            )
+            consult_resume_session = None
+        else:
+            # #126 Tier-1 scoped context: seed this step from a FRESH copy of the
+            # base session plus, for THIS task's transitive blockers only, their
+            # final outputs + their ledger rows. Independent branches never appear
+            # (AC1).
+            step_session = base_session.model_copy(deep=True)
+            blockers = task_list.transitive_blockers(task_id)
+            if blockers:
+                blocker_set = set(blockers)
+                tier1_lines = [
+                    f"#{b} result: {final_outputs[b]}" for b in blockers if b in final_outputs
+                ]
+                if tier1_lines:
+                    await executor.seed_user_message(
+                        step_session, "Results from upstream tasks:\n" + "\n".join(tier1_lines)
+                    )
+                scoped = [e for e in ledger if e.task_id in blocker_set]
+                scoped_block = render_step_ledger(scoped, False)
+                if scoped_block is not None:
+                    await executor.seed_user_message(step_session, scoped_block)
 
-        # #126 Tier-2: inject the FULL global running ledger into EVERY step (with
-        # the static elision marker once entries were dropped).
-        ledger_block = render_step_ledger(ledger, ledger_elided)
-        if ledger_block is not None:
-            await executor.seed_user_message(step_session, ledger_block)
+            # #126 Tier-2: inject the FULL global running ledger into EVERY step
+            # (with the static elision marker once entries were dropped).
+            ledger_block = render_step_ledger(ledger, ledger_elided)
+            if ledger_block is not None:
+                await executor.seed_user_message(step_session, ledger_block)
 
-        # Finally seed this step's own instruction.
-        await executor.seed_user_message(step_session, step_task.instruction)
+            # Finally seed this step's own instruction.
+            await executor.seed_user_message(step_session, step_task.instruction)
 
         # #126 AC2: clear the observed-write accumulator so this task's
         # files_touched reflect ONLY the writes this step issues.
@@ -2324,9 +2508,12 @@ async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> Strategy
     """Ralph (#124): GENUINELY recursive continuation wrapper. Each context window
     seeds a FRESH session from the ``.spore/`` checkpoint, then recurses
     ``run_strategy(self.inner, cx)`` (a non-ReAct inner — e.g. SelfVerifying —
-    really runs its whole loop per window). Q3: when ``self.agent`` is set it
-    OVERRIDES the inner leaf's agent per window; when unset the worker resolves
-    via the inner leaf. ``ralph_completion_status`` drives the OUTER reset loop;
+    really runs its whole loop per window). Ralph is an OUTER LOOP that re-runs
+    ``inner`` as the architect declared it — it does NOT replace nodes the inner
+    tree already assigned. When ``self.agent`` is set it only FILLS a worker leaf
+    that left its own agent handle EMPTY (the bare-leaf Ralph convenience); an
+    explicit leaf agent is authoritative and never overwritten.
+    ``ralph_completion_status`` drives the OUTER reset loop;
     exhaustion ⇒ ``RalphCompletionUnmet``. Ralph discards the incoming session
     state by design (each window is a fresh start re-seeded from the filesystem
     checkpoint)."""
@@ -2339,10 +2526,11 @@ async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> Strategy
     cx.scratch.run_session = SessionState()
     max_resets = max(executor.ralph_max_resets(), 1)
 
-    # Q3: when ``self.agent`` is set, override the inner leaf's agent for every
-    # window by rewriting the inner tree's worker leaf handle.
+    # Ralph fills — never replaces. When ``self.agent`` is set it supplies a
+    # worker agent ONLY where the inner leaf left its handle empty; an
+    # explicitly-declared leaf agent (the architect's node) is authoritative.
     inner_for_window = (
-        self.inner if not self.agent else _override_worker_agent(self.inner, self.agent)
+        self.inner if not self.agent else _fill_empty_worker_agent(self.inner, self.agent)
     )
 
     total_usage = AggregateUsage()
@@ -2680,21 +2868,24 @@ def _worker_agent_key_of(ls: LoopStrategy) -> str:
     raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
 
 
-def _override_worker_agent(ls: LoopStrategy, agent: str) -> LoopStrategy:
-    """Return a copy of ``ls`` with the worker leaf's agent handle rewritten to
-    ``agent`` (#124 Q3 — Ralph's per-window agent override). Mutates the leaf
-    reached by descending the worker child chain. Mirrors Rust's
-    ``override_worker_agent``."""
+def _fill_empty_worker_agent(ls: LoopStrategy, agent: str) -> LoopStrategy:
+    """Return a copy of ``ls`` with the worker leaf's agent handle filled with
+    ``agent`` ONLY where the leaf left it empty — Ralph's bare-leaf convenience.
+    An explicitly-declared leaf agent is authoritative and is never replaced (the
+    architect's node wins). Descends the worker child chain to the innermost leaf.
+    Mirrors Rust's ``fill_empty_worker_agent``."""
     if isinstance(ls, ReactConfig):
-        return ls.model_copy(update={"agent": agent})
+        if not ls.agent:
+            return ls.model_copy(update={"agent": agent})
+        return ls
     if isinstance(ls, PlanExecuteConfig):
-        return ls.model_copy(update={"execute": _override_worker_agent(ls.execute, agent)})
+        return ls.model_copy(update={"execute": _fill_empty_worker_agent(ls.execute, agent)})
     if isinstance(ls, SelfVerifyingConfig):
-        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+        return ls.model_copy(update={"inner": _fill_empty_worker_agent(ls.inner, agent)})
     if isinstance(ls, RalphConfig):
-        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+        return ls.model_copy(update={"inner": _fill_empty_worker_agent(ls.inner, agent)})
     if isinstance(ls, HillClimbingConfig):
-        return ls.model_copy(update={"inner": _override_worker_agent(ls.inner, agent)})
+        return ls.model_copy(update={"inner": _fill_empty_worker_agent(ls.inner, agent)})
     raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
 
 
@@ -4791,6 +4982,7 @@ class HarnessConfig:
         chunk_provider: Any | None = None,
         metric_evaluator: Any | None = None,
         catalogue_registry: StandardToolRegistry | None = None,
+        toolset_catalogues: dict[str, StandardToolRegistry] | None = None,
         system_prompt: str | None = None,
         model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
@@ -4893,6 +5085,22 @@ class HarnessConfig:
         # the harness-loop seam for custom slim registries). ``None`` (the
         # default) preserves the ``tool_registry``-only path unchanged.
         self.catalogue_registry: StandardToolRegistry | None = catalogue_registry
+        # Per-toolset catalogues (Issue 2: per-node toolset scoping), keyed by the
+        # non-empty ``ToolsetRef`` handle a leaf carries. Populated by
+        # :meth:`HarnessBuilder.toolset_tools` — each value is a populated
+        # :class:`StandardToolRegistry` folded from that key's catalogue tools. At
+        # dispatch the run loop bridges the matching catalogue per-run via
+        # :class:`~spore_core.tool_registry.RealToolRegistry` (same
+        # sandbox/session/storage wiring as the global :attr:`catalogue_registry`),
+        # so a node with a non-empty ``toolset`` handle dispatches ONLY its own
+        # tools. A leaf with an EMPTY handle (``""``) — or a non-empty handle with
+        # no entry here — falls back to the global catalogue / ``tool_registry``
+        # seam (back-compat with examples 01–11 that use ``.tools()``). Empty (the
+        # default) preserves today's behaviour. Mirrors Rust's
+        # ``HarnessConfig::toolset_catalogues``.
+        self.toolset_catalogues: dict[str, StandardToolRegistry] = (
+            dict(toolset_catalogues) if toolset_catalogues is not None else {}
+        )
         # Operating system prompt prepended to each turn's assembled context
         # when the context manager renders none (issue #91). See
         # :meth:`HarnessBuilder.system_prompt`. ``None`` (the default) preserves
@@ -4950,6 +5158,16 @@ class HarnessConfig:
         reg_builder = registry.into_builder()
         reg_builder = reg_builder.fill_default_agent(self._fold_agent)
         reg_builder = reg_builder.fill_default_toolset(tool_registry)
+        # Issue 2: a leaf carrying a non-empty ``toolset`` handle must RESOLVE
+        # against the registry (``ExecutionRegistry.validate`` runs
+        # ``check_toolset`` at run entry). For every per-key catalogue wired via
+        # ``.toolset_tools``, ensure the registry has a presence entry under that
+        # handle so ``validate()`` passes WITHOUT the caller manually registering
+        # a placeholder. The registry VALUE is never dispatched (dispatch goes
+        # through ``self.toolset_catalogues``), so a no-op ``EmptyToolRegistry`` is
+        # sufficient; an explicitly-registered toolset under the same key wins.
+        for key in self.toolset_catalogues:
+            reg_builder = reg_builder.fill_toolset(key, EmptyToolRegistry())
         reg_builder = reg_builder.fill_default_schema({})
         if self._fold_verifier is not None:
             reg_builder = reg_builder.fill_default_verifier(self._fold_verifier)
@@ -4991,6 +5209,7 @@ class HarnessConfig:
             storage=self.storage,
             chunk_provider=self.chunk_provider,
             catalogue_registry=self.catalogue_registry,
+            toolset_catalogues=self.toolset_catalogues,
             system_prompt=self.system_prompt,
             model_params=self.model_params,
             auto_persist_sessions=self.auto_persist_sessions,
@@ -5051,6 +5270,14 @@ class HarnessBuilder:
         # ``StandardTool`` lives in ``spore_tools`` and must not be imported
         # here — that would invert the package dependency).
         self._standard_tools: list[Any] = []
+        # Per-toolset catalogue tools accumulated via :meth:`toolset_tools`
+        # (Issue 2: per-node toolset scoping), keyed by the non-empty
+        # ``ToolsetRef`` handle. At :meth:`build_config` each key's tools are
+        # folded into its own populated :class:`StandardToolRegistry` (last-wins
+        # upsert) and stored in ``HarnessConfig.toolset_catalogues``. Empty (the
+        # default) keeps the global-only ``.tools()`` path byte-for-byte. Mirrors
+        # Rust's ``HarnessBuilder::toolset_tools``.
+        self._toolset_tools: dict[str, list[Any]] = {}
         # Optional operating system prompt prepended to each turn's assembled
         # context (issue #91) when the context manager renders none. ``None``
         # (the default) preserves today's behaviour. See :meth:`system_prompt`.
@@ -5182,6 +5409,29 @@ class HarnessBuilder:
         ``StandardTools.coding_set()``). Order is preserved, so last-wins upsert
         still applies across the batch."""
         self._standard_tools.extend(tools)
+        return self
+
+    def toolset_tools(self, key: str, tools: Iterable[Any]) -> HarnessBuilder:
+        """Register catalogue tools SCOPED to a single named toolset handle
+        (Issue 2: per-node toolset scoping). Mirrors :meth:`tools`, but instead of
+        folding into the ONE global catalogue these tools are accumulated into a
+        per-``key`` bucket (additive across calls) and, at
+        :meth:`build_config`, folded into a per-key
+        :class:`StandardToolRegistry` (last-wins upsert) stored in
+        ``HarnessConfig.toolset_catalogues``.
+
+        At dispatch, a leaf whose ``toolset`` handle equals ``key`` resolves ONLY
+        this catalogue (bridged per-run via
+        :class:`~spore_core.tool_registry.RealToolRegistry` with the run's
+        sandbox/session/storage), so it cannot reach another node's tools. A leaf
+        with an EMPTY (``""``) handle, or a non-empty handle with no entry here,
+        falls back to the global :meth:`tools` catalogue / ``tool_registry`` seam
+        (back-compat).
+
+        ``key`` should be a NON-EMPTY handle string; the empty handle is reserved
+        for the global-catalogue fallback. Mirrors Rust's
+        ``HarnessBuilder::toolset_tools``."""
+        self._toolset_tools.setdefault(key, []).extend(tools)
         return self
 
     def tool_registry(self, tool_registry: ToolRegistry) -> HarnessBuilder:
@@ -5503,13 +5753,25 @@ class HarnessBuilder:
         catalogue_registry: StandardToolRegistry | None = (
             self.drain_tools_into_registry() if self._standard_tools else None
         )
+        # Issue 2: fold each per-toolset bucket into its own populated
+        # :class:`StandardToolRegistry` (last-wins upsert), keyed by the toolset
+        # handle. Bridged per-run at dispatch — same as the global catalogue.
+        from .tool_registry import StandardToolRegistry as _Registry
+
+        toolset_catalogues: dict[str, StandardToolRegistry] = {}
+        for key, tools in self._toolset_tools.items():
+            reg = _Registry()
+            for t in tools:
+                reg.register(t.implementation, t.schema)
+            toolset_catalogues[key] = reg
+        self._toolset_tools = {}
         # When catalogue tools are present and the caller wired no storage,
         # default to an in-memory provider (not the all-no-op default) so that
         # session-aware tools (todo_write, memory, task_list) actually persist
         # within the run. Pure tools (read_file/write_file via the sandbox) are
         # unaffected either way.
         storage = self._storage
-        if storage is None and catalogue_registry is not None:
+        if storage is None and (catalogue_registry is not None or toolset_catalogues):
             from .storage import InMemoryStorageProvider
 
             storage = StorageProvider.single(InMemoryStorageProvider())
@@ -5534,6 +5796,7 @@ class HarnessBuilder:
             chunk_provider=self._chunk_provider,
             metric_evaluator=self._metric_evaluator,
             catalogue_registry=catalogue_registry,
+            toolset_catalogues=toolset_catalogues,
             system_prompt=self._system_prompt,
             model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
@@ -5770,7 +6033,9 @@ class StandardHarness:
         (issue #73, expose-only)."""
         return self._config.storage.session()
 
-    def _effective_tool_registry(self, session_id: SessionId) -> ToolRegistry:
+    def _effective_tool_registry(
+        self, session_id: SessionId, toolset: ToolsetRef = ""
+    ) -> ToolRegistry:
         """The harness-loop tool registry to use for a run keyed by
         ``session_id`` (issue #91).
 
@@ -5779,12 +6044,33 @@ class StandardHarness:
         :class:`~spore_core.tool_registry.RealToolRegistry` — built fresh per run
         so the run's :class:`SessionId` + storage thread into every tool
         dispatch. Otherwise it returns the injected
-        :attr:`HarnessConfig.tool_registry` seam unchanged."""
+        :attr:`HarnessConfig.tool_registry` seam unchanged.
+
+        Issue 2 (per-node toolset scoping): ``toolset`` is the resolving leaf's
+        ``ToolsetRef`` handle. When it is NON-EMPTY and a per-key catalogue was
+        registered via :meth:`HarnessBuilder.toolset_tools`, THAT catalogue is
+        bridged (so the node dispatches ONLY its own tools — strict scoping).
+        Otherwise (empty handle, or non-empty handle with no per-key catalogue)
+        the existing global-catalogue / ``tool_registry`` seam fallback applies, so
+        examples 01–11 that use ``.tools()`` keep working byte-for-byte. Mirrors
+        Rust's ``StandardHarness::effective_tool_registry``."""
+        from .tool_registry import RealToolRegistry
+
+        # Strict per-node scoping: a non-empty handle with its own catalogue.
+        if toolset:
+            scoped = self._config.toolset_catalogues.get(toolset)
+            if scoped is not None:
+                return RealToolRegistry(
+                    scoped,
+                    self._config.sandbox,
+                    session_id,
+                    self._config.storage.run(),
+                    self._config.storage.memory(),
+                )
+        # Fallback: empty handle (back-compat) or unregistered non-empty handle.
         catalogue = self._config.catalogue_registry
         if catalogue is None:
             return self._config.tool_registry
-        from .tool_registry import RealToolRegistry
-
         return RealToolRegistry(
             catalogue,
             self._config.sandbox,
@@ -6379,6 +6665,28 @@ class StandardHarness:
                 tr = HarnessToolResult(call_id=call.id, output=output)
                 await self._config.context_manager.append_tool_result(session_state, tr)
 
+        # #131: a consult that surfaced from inside a composed tree carries the
+        # FULL strategy in ``task.loop_strategy`` (each combinator's ``_finish``
+        # rewrote the pause's task on the way up). Re-DRIVE that strategy rather
+        # than resuming only the worker leaf: the PlanExecute walk resumes its
+        # in-progress task from the injected worker session (``consult_resume``
+        # seed), so the worker finishes mid-loop, its SelfVerifying evaluator
+        # runs, the task is marked Completed, and the remaining ready-set is
+        # walked. A BARE worker leaf (depth-1, e.g. a SubagentTool-mediated
+        # consult) has no surrounding walk, so it keeps the original leaf-only
+        # resume (back-compat).
+        if not isinstance(task.loop_strategy, ReactConfig):
+            return await self._drive_strategy(
+                task,
+                # Top-level session starts fresh; the worker conversation is
+                # threaded into the in-progress task via the consult seed.
+                SessionState(),
+                budget_used,
+                on_stream,
+                None,
+                session_state,
+            )
+
         max_iterations = (
             task.loop_strategy.max_iterations()
             if isinstance(task.loop_strategy, ReactConfig)
@@ -6419,12 +6727,15 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         agent: Agent,
+        toolset: ToolsetRef = "",
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
         on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
-        Does NOT finalize observability — the leaf ``run`` body does."""
+        Does NOT finalize observability — the leaf ``run`` body does. Issue 2:
+        ``toolset`` is the leaf's RESOLVED handle, threaded down alongside
+        ``agent``."""
         return await self._run_react_inner(
-            task, max_iterations, session_state, budget_used, on_stream, agent
+            task, max_iterations, session_state, budget_used, on_stream, agent, toolset
         )
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -6638,6 +6949,7 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         resume_continues: tuple[str, int] | None = None,
+        consult_resume: SessionState | None = None,
     ) -> RunResult:
         """The recursive-executor entry (#124): build the shared
         :class:`ExecutionContext`, seed the per-run scratch (task / session /
@@ -6657,7 +6969,12 @@ class StandardHarness:
         (phase, continues_used)`` seeds the FIRST matching budget scope's
         ``continues_used`` (via :meth:`BudgetContext.resumed`) so a ``Continue``
         that spanned a process pause resumes with the correct continue count (AC2);
-        ``None`` is the fresh-run path."""
+        ``None`` is the fresh-run path.
+
+        ``consult_resume = session`` (#131) seeds the FIRST PlanExecute walk's
+        in-progress task with ``session`` (a worker conversation whose consult
+        answer is already injected) so a resumed consult continues mid-loop and
+        walks the remaining ready-set. ``None`` on every non-consult path."""
         session_id = task.session_id
         # The Continue resolution state threaded across in-process rounds: the
         # (possibly fallen-through) behavior + how many continues have been spent.
@@ -6675,6 +6992,10 @@ class StandardHarness:
             # carry their continue count via ``behavior_for_resolution``.
             cx.scratch.resume_continues = resume_continues
             resume_continues = None
+            # #131: the consult re-drive seed is consumed by the FIRST round's
+            # PlanExecute walk only; later in-process rounds run normally.
+            cx.scratch.consult_resume = consult_resume
+            consult_resume = None
 
             outcome = await run_strategy(task.loop_strategy, cx)
 
@@ -7247,11 +7568,15 @@ class StandardHarness:
         ``self.plan`` child — so this carries no agent call. Returns the captured
         outcome + accounting or a terminal failure to propagate. Mirrors Rust's
         ``capture_and_persist_plan``."""
-        from .plan import PLAN_EXECUTE_EXTRAS_KEY, PlanPhaseError, capture_plan_artifact
+        from .plan import (
+            PLAN_EXECUTE_EXTRAS_KEY,
+            PlanPhaseError,
+            capture_plan_artifact_with_repair,
+        )
 
         # R3: capture the artifact from the response text.
         try:
-            artifact = capture_plan_artifact(plan_output)
+            artifact = capture_plan_artifact_with_repair(plan_output)
         except PlanPhaseError as e:
             return self._fail(
                 HaltReasonPlanPhaseFailed(
@@ -7311,12 +7636,14 @@ class StandardHarness:
     ) -> _PlanPhaseOutcome | RunResult:
         """Test helper (#124): drive the genuine recursive plan phase for ``task``
         (whose ``loop_strategy`` must be a :class:`PlanExecuteConfig`) — seed the
-        directive, dispatch ``self.plan`` capped at one turn via
+        directive, dispatch ``self.plan`` under the plan sub-strategy's OWN
+        declared budget (the global ``max_turns`` is only the outer backstop) via
         :meth:`run_plan_subtree`, then capture + persist the artifact via
         :meth:`_capture_and_persist_plan`. Mirrors the plan half of
-        :func:`_run_plan_execute_config` and Rust's cfg-test ``run_plan_phase``.
-        On success returns a :class:`_PlanPhaseOutcome`; on any failure returns the
-        terminal :class:`RunResult` to propagate."""
+        :func:`_run_plan_execute_config` and Rust's cfg-test ``run_plan_phase`` —
+        it must NOT clamp the planner to a single turn or it becomes a stale
+        parallel copy of production. On success returns a :class:`_PlanPhaseOutcome`;
+        on any failure returns the terminal :class:`RunResult` to propagate."""
         assert isinstance(task.loop_strategy, PlanExecuteConfig)
         plan_strategy = task.loop_strategy.plan
         session_id = task.session_id
@@ -7324,16 +7651,15 @@ class StandardHarness:
         directive = self.plan_directive(task.instruction)
         plan_session = session_state.model_copy(deep=True)
         await self.seed_user_message(plan_session, directive)
-        plan_cap = budget_used.turns + 1
-        if task.budget.max_turns is not None:
-            plan_cap = min(task.budget.max_turns, plan_cap)
-        plan_budget = task.budget.model_copy(deep=True)
-        plan_budget.max_turns = plan_cap
+        # The plan phase runs under the plan sub-strategy's OWN declared budget;
+        # the global ``max_turns`` is only the outer backstop. (Previously clamped
+        # to ``turns + 1`` — a single turn — which starved multi-turn ``task_list``
+        # authoring and diverged this test seam from production.)
         plan_task = Task(
             id=task.id,
             instruction=directive,
             session_id=session_id,
-            budget=plan_budget,
+            budget=task.budget.model_copy(deep=True),
             loop_strategy=plan_strategy,
         )
         plan_result = await self.run_plan_subtree(
@@ -7551,11 +7877,17 @@ class StandardHarness:
         # ``_run_react_config`` resolves ``self.agent`` from the registry; Ralph
         # may override it per window). The leaf no longer reads ``config.agent``.
         agent: Agent,
+        # Issue 2: the leaf's RESOLVED ``toolset`` handle (mirrors ``agent``).
+        # Empty (``""``) ⇒ global-catalogue fallback; a non-empty handle with its
+        # own per-key catalogue ⇒ strict per-node scoping. Legacy/resume paths
+        # (no per-node toolset) thread the EMPTY handle → global fallback.
+        toolset: ToolsetRef = "",
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
-        # strategies funnel through here). Bridges catalogue tools per-run.
-        tool_registry = self._effective_tool_registry(session_id)
+        # strategies funnel through here). Bridges the per-node toolset catalogue
+        # (or the global catalogue when the handle is empty) per-run.
+        tool_registry = self._effective_tool_registry(session_id, toolset)
         # Reset the adaptive prompt-based-tool-calling escalation flag at the
         # start of this turn-loop window so detection is scoped to the window and
         # does not leak across run() calls (the flag is shared with the model
@@ -8724,6 +9056,8 @@ __all__ = [
     "StrategyRefBuiltIn",
     "StrategyRefCustom",
     "ToolsetRef",
+    "loop_strategy_max_steps",
+    "strategy_ref_max_steps",
     "run_strategy",
     "HarnessMiddlewareChain",
     "MiddlewareContinue",

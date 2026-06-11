@@ -27,8 +27,25 @@ const (
 
 // ----- Filesystem -----
 
+// ReadFileParams are the parameters for ReadFileTool. With all optional fields
+// at their defaults (Offset=nil, Length=0, LineNumbers=false) the read is
+// byte-identical to reading the whole file — no header, no line numbers (#132).
+// Any non-default param prepends a one-line header
+// "[lines {start}–{end} of {total}]" (U+2013 en-dash).
+//
+// Offset is a *uint64 (pointer) so we can distinguish "not provided" (nil,
+// default=1) from explicitly-zero (0, which is a recoverable error per spec).
 type ReadFileParams struct {
 	Path string `json:"path"`
+	// 1-indexed start line. nil means "not provided" (default = 1).
+	// Explicitly 0 is a recoverable error.
+	Offset *uint64 `json:"offset,omitempty"`
+	// Max lines to return. 0 = no limit / read to EOF (default 0).
+	// A length that runs past EOF silently returns through the last line.
+	Length uint64 `json:"length,omitempty"`
+	// When true, prefix each returned line with its 1-indexed number,
+	// right-padded to the digit-width of the file's total line count.
+	LineNumbers bool `json:"line_numbers,omitempty"`
 }
 
 type WriteFileParams struct {
@@ -38,8 +55,9 @@ type WriteFileParams struct {
 }
 
 type ListDirParams struct {
-	Path      string `json:"path"`
-	Recursive bool   `json:"recursive,omitempty"`
+	Path           string `json:"path"`
+	Recursive      bool   `json:"recursive,omitempty"`
+	IncludeIgnored bool   `json:"include_ignored,omitempty"` // default false
 }
 
 type DeleteFileParams struct {
@@ -121,12 +139,13 @@ const (
 )
 
 // GrepParams are the parameters for the net-new GrepTool. Distinct from
-// GrepFilesParams: adds OutputMode (defaulting to content).
+// GrepFilesParams: adds OutputMode (defaulting to content) and ContextLines.
 type GrepParams struct {
-	Pattern    string         `json:"pattern"`
-	Path       string         `json:"path"`
-	Recursive  bool           `json:"recursive,omitempty"`
-	OutputMode GrepOutputMode `json:"output_mode,omitempty"`
+	Pattern      string         `json:"pattern"`
+	Path         string         `json:"path"`
+	Recursive    bool           `json:"recursive,omitempty"`
+	OutputMode   GrepOutputMode `json:"output_mode,omitempty"`
+	ContextLines uint32         `json:"context_lines,omitempty"` // default 0
 }
 
 // UnmarshalJSON applies the default OutputMode=content when absent or empty.
@@ -178,6 +197,12 @@ type TodoWriteParams struct {
 // WebFetchParams are the parameters for WebFetchTool.
 type WebFetchParams struct {
 	URL string `json:"url"`
+	// StartByte is the byte offset into the response body to start reading from.
+	// Default 0: output is byte-identical to a plain fetch (no header prepended).
+	// 0 < start_byte < body_length: slice body from offset, prepend header.
+	// start_byte >= body_length (non-empty): recoverable error.
+	// Empty body + start_byte > 0: recoverable error.
+	StartByte uint64 `json:"start_byte,omitempty"`
 }
 
 // WebSearchParams are the parameters for WebSearchTool.

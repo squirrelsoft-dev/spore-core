@@ -53,6 +53,8 @@ __all__ = [
     "PlanArtifact",
     "PlanPhaseError",
     "capture_plan_artifact",
+    "capture_plan_artifact_with_repair",
+    "extract_embedded_json_object",
 ]
 
 #: Key under which the produced :class:`PlanArtifact` is stored in
@@ -183,3 +185,75 @@ def capture_plan_artifact(final_text: str) -> PlanArtifact:
             raise PlanPhaseError.unparseable_plan("field `rationale` is not a string")
 
     return PlanArtifact(tasks=tasks, rationale=rationale)
+
+
+def capture_plan_artifact_with_repair(final_text: str) -> PlanArtifact:
+    """Capture a :class:`PlanArtifact`, falling back to a deterministic PROSE
+    REPAIR when the strict canonical grammar (:func:`capture_plan_artifact`)
+    fails.
+
+    A planner sometimes emits its plan JSON wrapped in prose ("Here is the plan:
+    ``{...}`` — let me know…") instead of as a bare object, so the strict grammar
+    rejects it. This fallback extracts the FIRST balanced top-level JSON object
+    embedded in the text (:func:`extract_embedded_json_object`) and re-parses
+    THAT with the same canonical grammar. It is a pure, always-on fallback: it
+    runs ONLY after the strict path fails, so it can never change a plan the
+    strict grammar already accepts — it can only turn a hard failure into a
+    success. When no embedded object repairs cleanly, the ORIGINAL strict error
+    is raised (it is the more informative diagnostic).
+
+    Like the strict grammar, this MUST be byte-identical across all four
+    languages — the embedded-object scan is a deterministic ASCII byte walk.
+    """
+    try:
+        return capture_plan_artifact(final_text)
+    except PlanPhaseError as strict_err:
+        candidate = extract_embedded_json_object(final_text)
+        if candidate is not None:
+            # Re-parse the extracted object with the SAME canonical grammar; if
+            # it still does not parse, surface the original strict error.
+            try:
+                return capture_plan_artifact(candidate)
+            except PlanPhaseError:
+                raise strict_err from None
+        raise strict_err from None
+
+
+def extract_embedded_json_object(text: str) -> str | None:
+    """Extract the first balanced top-level JSON object (``{ … }``) embedded in
+    ``text``, or ``None`` if there is no balanced object. Scans from the first
+    ``{``, tracking brace depth while respecting JSON string literals (a ``"``
+    opens/closes a string; a ``\\`` escapes the next char inside one), and
+    returns the slice up to and including the matching ``}``. Braces inside
+    strings do not affect depth.
+
+    Deterministic ASCII scan — the structural characters ``{`` ``}`` ``"`` ``\\``
+    are all single-byte, and slicing happens only at ``{``/``}`` positions, so
+    multi-byte content inside strings is preserved. MUST be byte-identical
+    across all four languages.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        b = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif b == "\\":
+                escaped = True
+            elif b == '"':
+                in_string = False
+        else:
+            if b == '"':
+                in_string = True
+            elif b == "{":
+                depth += 1
+            elif b == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return None

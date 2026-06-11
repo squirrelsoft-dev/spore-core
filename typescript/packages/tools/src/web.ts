@@ -47,6 +47,43 @@ import { finishWithPossibleTruncation } from "./sandbox-defaults.js";
 // WebFetch
 // ============================================================================
 
+/**
+ * Apply `start_byte` slicing to a fetched response body.
+ *
+ * - `start_byte === 0` → return `body` unchanged (no header).
+ * - `0 < start_byte < byteLength` → prepend `[starting at byte N of total]\n`
+ *   and return the slice from `start_byte`.
+ * - `start_byte >= byteLength` (for non-empty bodies) → recoverable error.
+ * - Empty body + `start_byte > 0` → recoverable error.
+ *
+ * Works in UTF-8 bytes (via `Buffer`) to match Rust's byte semantics.
+ */
+export function applyWebFetchRange(
+  body: string,
+  startByte: number,
+): { ok: true; value: string } | { ok: false; error: ToolOutput } {
+  if (startByte === 0) {
+    return { ok: true, value: body };
+  }
+  const buf = Buffer.from(body, "utf8");
+  const total = buf.length;
+  if (startByte >= total) {
+    return {
+      ok: false,
+      error: {
+        kind: "error",
+        message: `start_byte ${startByte} exceeds response length ${total}`,
+        recoverable: true,
+      },
+    };
+  }
+  const slice = buf.subarray(startByte).toString("utf8");
+  return {
+    ok: true,
+    value: `[starting at byte ${startByte} of ${total}]\n${slice}`,
+  };
+}
+
 export class WebFetchTool implements Tool {
   static readonly NAME = "web_fetch";
   readonly name = WebFetchTool.NAME;
@@ -61,7 +98,15 @@ export class WebFetchTool implements Tool {
       description: "Fetch the contents of a URL",
       parameters: {
         type: "object",
-        properties: { url: { type: "string" } },
+        properties: {
+          url: { type: "string" },
+          start_byte: {
+            type: "integer",
+            description:
+              "Byte offset into the response body to start reading from. Default 0 (no offset, output identical to a plain fetch). Use to page through responses larger than the 64 KB truncation window.",
+            default: 0,
+          },
+        },
         required: ["url"],
       },
       annotations: {
@@ -84,7 +129,9 @@ export class WebFetchTool implements Tool {
     try {
       const resp = await fetch(p.value.url, { method: "GET", signal });
       const body = await resp.text();
-      return finishWithPossibleTruncation(body, call.id, sandbox);
+      const ranged = applyWebFetchRange(body, p.value.start_byte ?? 0);
+      if (!ranged.ok) return ranged.error;
+      return finishWithPossibleTruncation(ranged.value, call.id, sandbox);
     } catch (e) {
       return {
         kind: "error",

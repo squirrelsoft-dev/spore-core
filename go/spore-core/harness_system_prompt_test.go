@@ -42,7 +42,7 @@ func TestEffectiveRegistryBridgesCatalogueTools(t *testing.T) {
 	cfg.CatalogueRegistry = catalogueRegistryWith("read_file")
 	h := NewStandardHarness(cfg)
 
-	reg := h.effectiveToolRegistry(SessionID("s1"))
+	reg := h.effectiveToolRegistry(SessionID("s1"), ToolsetRef(""))
 
 	// Advertises the catalogue schema.
 	var advertised bool
@@ -69,7 +69,7 @@ func TestEffectiveRegistryBridgesCatalogueTools(t *testing.T) {
 func TestEffectiveRegistryKeepsSeamWithoutCatalogue(t *testing.T) {
 	cfg := standardCfg(NewMockAgent("t"))
 	h := NewStandardHarness(cfg)
-	if h.effectiveToolRegistry(SessionID("s1")) != cfg.ToolRegistry {
+	if h.effectiveToolRegistry(SessionID("s1"), ToolsetRef("")) != cfg.ToolRegistry {
 		t.Fatal("expected the injected ToolRegistry seam when no catalogue is set")
 	}
 }
@@ -83,7 +83,7 @@ func TestEffectiveRegistryThreadsSessionAndStorage(t *testing.T) {
 	cfg.ToolRunStore = run
 	h := NewStandardHarness(cfg)
 
-	reg := h.effectiveToolRegistry(SessionID("sess-xyz")).(*StandardToolRegistry)
+	reg := h.effectiveToolRegistry(SessionID("sess-xyz"), ToolsetRef("")).(*StandardToolRegistry)
 	tc := reg.dispatchToolContext()
 	if tc.SessionID != SessionID("sess-xyz") {
 		t.Fatalf("ToolContext SessionID = %q, want sess-xyz", tc.SessionID)

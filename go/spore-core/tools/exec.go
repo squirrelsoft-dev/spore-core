@@ -32,6 +32,27 @@ import (
 )
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+const stderrTruncationThreshold = 8 * 1024
+const stderrHeadBytes = 2 * 1024
+const stderrTailBytes = 2 * 1024
+
+// truncateForMessage truncates s before embedding it in an error message.
+// The threshold is smaller than the general 64 KB output limit because this
+// string lives inside an error message field, not a standalone content field.
+func truncateForMessage(s string) string {
+	if len(s) <= stderrTruncationThreshold {
+		return s
+	}
+	head := s[:stderrHeadBytes]
+	tail := s[len(s)-stderrTailBytes:]
+	elided := len(s) - stderrHeadBytes - stderrTailBytes
+	return fmt.Sprintf("%s\n... [%d bytes elided] ...\n%s", head, elided, tail)
+}
+
+// ============================================================================
 // Exec — shell-free: run one program directly
 // ============================================================================
 
@@ -94,7 +115,7 @@ func (t *ExecTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox
 	}
 	return sporecore.ToolOutput{
 		Kind:        sporecore.ToolOutputError,
-		Message:     fmt.Sprintf("exit %d ; stderr: %s", out.ExitCode, strings.TrimRight(out.Stderr, "\n")),
+		Message:     fmt.Sprintf("exit %d ; stderr: %s", out.ExitCode, truncateForMessage(strings.TrimRight(out.Stderr, "\n"))),
 		Recoverable: true,
 	}
 }
@@ -180,7 +201,7 @@ func (t *BashCommandTool) Execute(ctx context.Context, call sporecore.ToolCall, 
 	}
 	return sporecore.ToolOutput{
 		Kind:        sporecore.ToolOutputError,
-		Message:     fmt.Sprintf("exit %d ; stderr: %s", out.ExitCode, strings.TrimRight(out.Stderr, "\n")),
+		Message:     fmt.Sprintf("exit %d ; stderr: %s", out.ExitCode, truncateForMessage(strings.TrimRight(out.Stderr, "\n"))),
 		Recoverable: true,
 	}
 }
@@ -256,7 +277,7 @@ func (t *RunTestsTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	}
 	return sporecore.ToolOutput{
 		Kind:        sporecore.ToolOutputError,
-		Message:     fmt.Sprintf("tests failed (exit %d): %s", out.ExitCode, combined),
+		Message:     fmt.Sprintf("tests failed (exit %d): %s", out.ExitCode, truncateForMessage(combined)),
 		Recoverable: true,
 	}
 }

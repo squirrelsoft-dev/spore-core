@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "typescript/**"
+      - "examples/typescript/**"
       - "fixtures/**"
       - ".github/workflows/typescript.yml"
   pull_request:
     paths:
       - "typescript/**"
+      - "examples/typescript/**"
       - "fixtures/**"
       - ".github/workflows/typescript.yml"
 
@@ -36,3 +38,36 @@ jobs:
         run: pnpm lint
       - name: Test
         run: pnpm test
+
+  # Link + validate gate for the standalone example packages (each has a `file:`
+  # dep on the workspace core). `pnpm install` re-links every example to current
+  # core; `pnpm test` runs the per-example validate suites (which construct the
+  # strategy tree against current core) where present. NOTE: examples consume
+  # core as TypeScript SOURCE (no dist build), and core's source currently has
+  # pre-existing type errors, so a strict per-example `tsc --noEmit` gate is not
+  # yet viable — that needs a separate "make core typecheck-clean" cleanup. The
+  # composition examples (08-11) all carry validate tests and ARE gated here.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Link + test every example
+        run: |
+          set -euo pipefail
+          for d in examples/typescript/*/; do
+            [ -f "$d/package.json" ] || continue
+            echo "::group::$d"
+            (cd "$d" && pnpm install)
+            if grep -q '"test"[[:space:]]*:' "$d/package.json"; then
+              (cd "$d" && pnpm test)
+            fi
+            echo "::endgroup::"
+          done

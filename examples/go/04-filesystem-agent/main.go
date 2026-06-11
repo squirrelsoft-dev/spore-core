@@ -100,10 +100,7 @@ func run() error {
 		SystemPrompt(systemPrompt).
 		Build()
 
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind:          sporecore.StrategyReAct,
-		MaxIterations: 8,
-	})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.ReActStrategy(8))
 
 	// Print each turn (Think) and each catalogue tool call + result (Act /
 	// Observe). Because the catalogue dispatches internally, the Act/Observe

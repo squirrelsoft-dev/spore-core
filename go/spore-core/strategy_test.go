@@ -374,3 +374,149 @@ func TestFixtureChildPausedState(t *testing.T) {
 		t.Fatalf("child_paused_state re-marshal mismatch:\n got  %s\n want %s", got, compactJSON(t, raw))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MaxSteps — advisory worst-case turn bound (#122)
+// ---------------------------------------------------------------------------
+
+// reactBudget builds a bare ReAct leaf carrying the given budget policy.
+func reactBudget(p BudgetPolicy) LoopStrategy {
+	return LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
+		Budget:   p,
+		Behavior: defaultBudgetBehavior(),
+	}}
+}
+
+func selfVerifying(inner LoopStrategy) LoopStrategy {
+	return SelfVerifyingStrategy(SelfVerifyingConfig{
+		Inner:     PtrStrategy(inner),
+		Evaluator: SchemaRef("ev"),
+		Behavior:  defaultBudgetBehavior(),
+	})
+}
+
+func planExecute(plan, execute LoopStrategy) LoopStrategy {
+	return PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:     PtrStrategy(plan),
+		Execute:  PtrStrategy(execute),
+		Behavior: defaultBudgetBehavior(),
+	})
+}
+
+func ralphOf(inner LoopStrategy) LoopStrategy {
+	return RalphStrategy(RalphConfig{
+		Inner:    PtrStrategy(inner),
+		Agent:    AgentRef("r"),
+		Behavior: defaultBudgetBehavior(),
+	})
+}
+
+func hillClimbing(inner LoopStrategy, maxStagnation uint32) LoopStrategy {
+	return HillClimbingStrategy(HillClimbingConfig{
+		Inner:         PtrStrategy(inner),
+		Direction:     OptimizationMaximize,
+		MaxStagnation: maxStagnation,
+		Evaluator:     AgentRef("metric"),
+		Behavior:      defaultBudgetBehavior(),
+	})
+}
+
+func TestMaxSteps(t *testing.T) {
+	perLoop := func(v uint32) BudgetPolicy { return BudgetPolicy{Kind: BudgetPerLoop, Value: v} }
+	totalSteps := func(v uint32) BudgetPolicy { return BudgetPolicy{Kind: BudgetTotalSteps, Value: v} }
+	perAttempt := func(v uint32) BudgetPolicy { return BudgetPolicy{Kind: BudgetPerAttempt, Value: v} }
+	unlimited := BudgetPolicy{Kind: BudgetUnlimited}
+
+	// Canonical cordyceps subtree: PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]
+	// = 4 + (12 + 1) = 17.
+	cordycepsSubtree := planExecute(
+		reactBudget(perLoop(4)),
+		selfVerifying(reactBudget(perLoop(12))),
+	)
+
+	cases := []struct {
+		name     string
+		strategy LoopStrategy
+		want     uint32
+		ok       bool
+	}{
+		// ReAct leaf — each capped budget shape ⇒ its value; Unlimited ⇒ empty.
+		{"react_per_loop", reactBudget(perLoop(4)), 4, true},
+		{"react_total_steps", reactBudget(totalSteps(7)), 7, true},
+		{"react_per_attempt", reactBudget(perAttempt(5)), 5, true},
+		{"react_unlimited", reactBudget(unlimited), 0, false},
+
+		// SelfVerifying adds exactly one evaluator turn.
+		{"self_verifying_adds_one", selfVerifying(reactBudget(perLoop(12))), 13, true},
+
+		// PlanExecute is the per-task sum plan + execute.
+		{"plan_execute_per_task_sum", planExecute(reactBudget(perLoop(4)), reactBudget(perLoop(6))), 10, true},
+
+		// HillClimbing: inner × (max_stagnation + 1).
+		{"hill_climbing", hillClimbing(reactBudget(perLoop(5)), 2), 15, true},
+
+		// Ralph is the per-window bound (== inner).
+		{"ralph_per_window", ralphOf(reactBudget(perLoop(9))), 9, true},
+
+		// Canonical Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]] ⇒ 17.
+		{"ralph_canonical_cordyceps", ralphOf(cordycepsSubtree), 17, true},
+
+		// The PlanExecute subtree on its own ⇒ 17.
+		{"plan_execute_cordyceps_subtree", cordycepsSubtree, 17, true},
+
+		// Whole canonical tree builder ⇒ 17.
+		{"cordyceps_tree_builder", cordycepsTree(), 17, true},
+
+		// Unlimited anywhere collapses to empty.
+		{"unlimited_plan_leaf", planExecute(
+			reactBudget(unlimited),
+			selfVerifying(reactBudget(perLoop(12))),
+		), 0, false},
+		{"unlimited_execute_inner", planExecute(
+			reactBudget(perLoop(4)),
+			selfVerifying(reactBudget(unlimited)),
+		), 0, false},
+		{"unlimited_under_hill_climbing", ralphOf(hillClimbing(reactBudget(unlimited), 2)), 0, false},
+
+		// HillClimbing unbounded-windows sentinel ⇒ empty.
+		{"hill_climbing_sentinel", hillClimbing(reactBudget(perLoop(5)), ^uint32(0)), 0, false},
+
+		// Overflow ⇒ empty: (MaxUint32/2) × (3 + 1) overflows.
+		{"overflow", hillClimbing(reactBudget(perLoop(^uint32(0)/2)), 3), 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.strategy.MaxSteps()
+			if ok != tc.ok || (ok && got != tc.want) {
+				t.Fatalf("MaxSteps() = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestMaxStepsCordycepsFixtureIs17(t *testing.T) {
+	raw, err := os.ReadFile(strategyFixturePath(t, "cordyceps_tree.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s LoopStrategy
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.MaxSteps()
+	if !ok || got != 17 {
+		t.Fatalf("deserialized cordyceps_tree MaxSteps() = (%d, %v), want (17, true)", got, ok)
+	}
+}
+
+func TestMaxStepsStrategyRef(t *testing.T) {
+	if _, ok := (StrategyRef{Kind: StrategyRefCustom, Custom: "x"}).MaxSteps(); ok {
+		t.Fatal("Custom StrategyRef.MaxSteps() should be empty")
+	}
+	builtIn := StrategyRef{Kind: StrategyRefBuiltIn, BuiltIn: PtrStrategy(reactBudget(BudgetPolicy{Kind: BudgetPerLoop, Value: 4}))}
+	got, ok := builtIn.MaxSteps()
+	if !ok || got != 4 {
+		t.Fatalf("BuiltIn(ReAct{4}).MaxSteps() = (%d, %v), want (4, true)", got, ok)
+	}
+}

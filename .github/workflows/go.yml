@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "go/**"
+      - "examples/go/**"
       - "fixtures/**"
       - ".github/workflows/go.yml"
   pull_request:
     paths:
       - "go/**"
+      - "examples/go/**"
       - "fixtures/**"
       - ".github/workflows/go.yml"
 
@@ -45,4 +47,29 @@ jobs:
         run: |
           for m in spore-core spore-cli spore-eval; do
             (cd "$m" && go test ./...)
+          done
+
+  # Compile gate for the standalone example modules (each is its own Go module
+  # with a replace directive onto spore-core). Not covered by the `test` job
+  # above, so they drift silently otherwise — this builds/vets/tests every one.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: examples/go/*/go.sum
+      - name: Vet + test every example
+        # `go vet` and `go test` both compile every package (including a
+        # test-less `main`), so a core API break fails here — without emitting
+        # stray binaries the way a bare `go build` would.
+        run: |
+          set -euo pipefail
+          for d in examples/go/*/; do
+            [ -f "$d/go.mod" ] || continue
+            echo "::group::$d"
+            (cd "$d" && go vet ./... && go test ./...)
+            echo "::endgroup::"
           done

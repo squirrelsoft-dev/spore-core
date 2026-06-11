@@ -54,15 +54,18 @@
  *         reverted decision (iteration, metric value, delta) — the harness
  *         emits exactly one such event per iteration.
  *
- * ## Wiring note — the metric evaluator seam
+ * ## Wiring note — the post-#119 composed strategy + registry
  *
- * The TypeScript `HarnessBuilder` exposes fluent setters for most seams, but
- * `metricEvaluator` lives on {@link HarnessConfig} without a fluent setter (the
- * Rust builder has `.metric_evaluator(...)`; the TS builder has not grown it
- * yet). So we assemble the config with `builder.buildConfig()`, attach the
- * evaluator to it, and construct `new StandardHarness(config)` — exactly how
- * the core hill-climbing tests wire it. The observability sink DOES have a
- * fluent setter (`.observability(...)`), so that one is wired on the builder.
+ * Post-#119 the strategy is a composed tree:
+ * `HillClimbing(inner: ReAct{propose-schema}, evaluator)`. Its `inner` (propose)
+ * slot is STRUCTURED, so a bare `ReAct` there MUST declare an `output` schema
+ * (here `propose-schema`), which the {@link ExecutionRegistry} validates at run
+ * entry. The `evaluator` stays the EMPTY handle (`""`), default-filled from the
+ * fluent `.metricEvaluator(...)` setter (#124) — so the only handle registered
+ * explicitly is `propose-schema`. The observability sink is wired via
+ * `.observability(...)`. `max_stagnation` / `min_improvement_delta` are now bare
+ * values (no longer `Option`-wrapped), and the direction enum is
+ * `HillClimbingDirection` (renamed from `OptimizationDirection`).
  *
  * ## Constants (see their doc comments below)
  *   - {@link MAX_ITERATIONS}  — maps to `BudgetLimits.max_turns` (default 6).
@@ -93,23 +96,24 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  ExecutionRegistry,
   OLLAMA_DEFAULT_BASE_URL,
   OllamaModelInterface,
   SessionId,
-  StandardHarness,
   WorkspaceScopedSandbox,
   HarnessBuilder,
   newTask,
   metric,
   observability,
+  reactPerLoop,
   termination,
-  type HarnessConfig,
+  type HillClimbingDirection,
+  type LoopStrategy,
   type ModelInterface,
   type ModelRequest,
-  type OptimizationDirection,
   type RunResult,
   type SandboxProvider,
 } from "@spore/core";
@@ -133,6 +137,14 @@ const MAX_ITERATIONS = 6;
  * (strictly-improving) iteration. Maps to `max_stagnation`.
  */
 const MAX_STAGNATION = 2;
+
+/**
+ * Per-iteration build budget for the propose leaf. Post-#119, HillClimbing's
+ * `inner` is a composed `ReAct(reactPerLoop(PER_ITER_BUDGET))` — this bounds the
+ * build agent's tool calls WITHIN one climb iteration. The NUMBER of iterations
+ * is bounded separately by `max_turns`.
+ */
+const PER_ITER_BUDGET = 8;
 
 /**
  * DISPLAY ANNOTATION ONLY. When a draft's total score (0–30) reaches this, the
@@ -198,6 +210,63 @@ Reply with EXACTLY these three lines and nothing else:
 clarity: <0-10>
 completeness: <0-10>
 example_quality: <0-10>`;
+
+/**
+ * The propose-phase output contract (`propose-schema`). Post-#119,
+ * `HillClimbing`'s `inner` (propose) slot is STRUCTURED: a bare `ReAct` there
+ * must declare an `output` schema so each iteration yields a scorable candidate
+ * ({@link ExecutionRegistry.validate} enforces this via its structured-slot
+ * check). The build agent rewrites `DRAFT_FILENAME`; this advertises the path it
+ * wrote.
+ */
+function proposeSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      file: {
+        type: "string",
+        description: "Path the candidate draft was written to.",
+      },
+      summary: { type: "string", description: "What this iteration changed." },
+    },
+    required: ["file"],
+  };
+}
+
+/**
+ * The {@link ExecutionRegistry} the composed strategy's handles resolve against.
+ * Only `propose-schema` is EXPLICIT; the builder default-fills the empty agent /
+ * toolset handles (`reactPerLoop`) AND the empty-key metric evaluator from
+ * `.metricEvaluator(..)` at `build`. So the HillClimbing `evaluator` stays the
+ * EMPTY handle (`""`).
+ */
+export function buildRegistry(): ExecutionRegistry {
+  return ExecutionRegistry.builder()
+    .schema("propose-schema", proposeSchema())
+    .build();
+}
+
+/**
+ * The post-#119 composed strategy: `HillClimbing(inner: ReAct, evaluator)`. The
+ * propose leaf carries the `propose-schema` output contract (required for the
+ * structured `propose` slot) and a `per_loop(perIterBudget)` build budget. The
+ * `evaluator` is the EMPTY handle (`""`), which the builder default-fills from
+ * `.metricEvaluator(..)`. `maxStagnation` / `minImprovementDelta` are now BARE
+ * values (no longer `Option`-wrapped), and the direction enum is
+ * `HillClimbingDirection` (renamed from `OptimizationDirection`). Old flat shape
+ * was `{ kind: "hill_climbing", direction, max_stagnation, ... }`.
+ */
+export function hillClimbingStrategy(perIterBudget: number): LoopStrategy {
+  return {
+    kind: "hill_climbing",
+    inner: { ...reactPerLoop(perIterBudget), output: "propose-schema" },
+    direction: "maximize",
+    max_stagnation: MAX_STAGNATION,
+    revert_on_no_improvement: true,
+    min_improvement_delta: 0,
+    evaluator: "",
+  };
+}
 
 // ============================================================================
 // ReadmeQualityEvaluator — the example-local `MetricEvaluator`.
@@ -329,7 +398,7 @@ class ReadmeQualityEvaluator implements metric.MetricEvaluator {
     };
   }
 
-  direction(): OptimizationDirection {
+  direction(): HillClimbingDirection {
     return "maximize";
   }
 
@@ -418,34 +487,30 @@ async function main(): Promise<void> {
 
   // Build harness: conversational preset, workspace sandbox, the minimal file
   // tool set (write_file + read_file), shared system prompt, the observability
-  // sink (fluent setter), and — because the TS builder has no fluent
-  // `metricEvaluator` setter — the metric evaluator attached to the assembled
-  // HarnessConfig before constructing the harness (the seam the core tests use).
+  // sink, the registry (carrying the `propose-schema` output contract), and the
+  // metric evaluator (folded into the default-key evaluator handle via the fluent
+  // `.metricEvaluator(..)` setter — #124).
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
-  const config: HarnessConfig = HarnessBuilder.conversational(buildModel)
+  const harness = HarnessBuilder.conversational(buildModel)
     .sandbox(sandbox)
+    .registry(buildRegistry())
     .tool(StandardTools.writeFile())
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
     .observability(obs)
-    .buildConfig();
-  config.metricEvaluator = evaluator;
-  const harness = new StandardHarness(config);
+    .metricEvaluator(evaluator)
+    .build();
 
-  // THE STRATEGY. No loop code below — the harness runs the climb. The build
-  // agent gets a generous per-iteration turn budget; `max_turns` bounds the
-  // NUMBER OF ITERATIONS (the budget ceiling), and `max_stagnation` can halt
-  // sooner. SPEC NOTE: there is no score-threshold field — by design.
+  // THE STRATEGY. No loop code below — the harness runs the climb. The propose
+  // leaf carries the `propose-schema` output contract (required for the structured
+  // `propose` slot) and a `per_loop(PER_ITER_BUDGET)` build budget; `max_turns`
+  // bounds the NUMBER OF ITERATIONS (the budget ceiling), and `max_stagnation` can
+  // halt sooner. The empty `evaluator` handle resolves to the metric evaluator
+  // above. SPEC NOTE: there is no score-threshold field — by design.
   const task = newTask(
     prompt,
     SessionId.generate(),
-    {
-      kind: "hill_climbing",
-      direction: "maximize",
-      max_stagnation: MAX_STAGNATION,
-      revert_on_no_improvement: true,
-      min_improvement_delta: null,
-    },
+    hillClimbingStrategy(PER_ITER_BUDGET),
     { max_turns: maxIterations },
   );
 
@@ -585,7 +650,18 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/** Run `main` only when this module is the program entrypoint — NOT when it is
+ *  imported (e.g. by the composition test, which reuses `buildRegistry` /
+ *  `hillClimbingStrategy`). */
+function isEntrypoint(): boolean {
+  const arg1 = process.argv[1];
+  if (arg1 === undefined) return false;
+  return import.meta.url === pathToFileURL(arg1).href;
+}
+
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

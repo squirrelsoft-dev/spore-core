@@ -62,6 +62,72 @@ fn scan_file(path: &Path, re: &regex::Regex, out: &mut Vec<(String, usize, Strin
     }
 }
 
+/// Build the context-aware output for a single file's matches.
+///
+/// `all_lines` is the full file as a slice of lines (not newline-terminated).
+/// `match_indices` is a sorted list of 0-based line indices that matched.
+/// `context` is the number of context lines to show on each side.
+/// Returns the output string in standard `grep -C N` format.
+fn build_context_output(
+    path: &str,
+    all_lines: &[&str],
+    match_indices: &[usize],
+    context: u32,
+) -> String {
+    if match_indices.is_empty() {
+        return String::new();
+    }
+
+    let ctx = context as usize;
+    let last = all_lines.len().saturating_sub(1);
+
+    // Build merged windows: each window is [start, end] (inclusive, 0-based).
+    let mut windows: Vec<(usize, usize)> = Vec::with_capacity(match_indices.len());
+    for &mi in match_indices {
+        let start = mi.saturating_sub(ctx);
+        let end = (mi + ctx).min(last);
+        windows.push((start, end));
+    }
+
+    // Merge overlapping/adjacent windows.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(windows.len());
+    for (start, end) in windows {
+        if let Some(last_win) = merged.last_mut() {
+            // Merge if this window starts at or before the end+1 of the previous.
+            if start <= last_win.1 + 1 {
+                last_win.1 = last_win.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    // Build a set of match line indices for O(1) lookup.
+    let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    for (gi, (win_start, win_end)) in merged.iter().enumerate() {
+        if gi > 0 {
+            parts.push("--".to_string());
+        }
+        for (line_idx, text) in all_lines
+            .iter()
+            .enumerate()
+            .take(win_end + 1)
+            .skip(*win_start)
+        {
+            let line_num = line_idx + 1; // 1-indexed
+            if match_set.contains(&line_idx) {
+                parts.push(format!("{path}:{line_num}:{text}"));
+            } else {
+                parts.push(format!("{path}:{line_num}-{text}"));
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
 impl Tool for GrepFilesTool {
     fn name(&self) -> &str {
         Self::NAME
@@ -235,6 +301,11 @@ impl GrepTool {
                         "type": "string",
                         "enum": ["content", "count", "files_with_matches"],
                     },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Lines of context to show before and after each match (default 0). When > 0, uses standard grep -C N format: match lines use `:` separator, context lines use `-`, non-adjacent groups separated by `--`.",
+                        "minimum": 0,
+                    },
                 },
                 "required": ["pattern", "path"],
             }),
@@ -283,6 +354,12 @@ impl Tool for GrepTool {
                 Ok(p) => p,
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
+
+            // When context_lines > 0 and output_mode is Content, we need per-file
+            // full-line access to build the context windows. Collect files first.
+            let use_context =
+                params.context_lines > 0 && params.output_mode == GrepOutputMode::Content;
+
             let mut matches: Vec<(String, usize, String)> = Vec::new();
             if params.recursive {
                 for entry in walkdir::WalkDir::new(&root)
@@ -306,6 +383,41 @@ impl Tool for GrepTool {
             matches.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
 
             let body = match params.output_mode {
+                GrepOutputMode::Content if use_context => {
+                    // Group matches by file path, then emit context-aware output
+                    // for each file, separated by `--` between non-adjacent groups.
+                    let mut file_groups: Vec<(String, Vec<usize>)> = Vec::new();
+                    for (path, line_num, _) in &matches {
+                        // line_num is 1-indexed; convert to 0-based index.
+                        let idx = line_num - 1;
+                        match file_groups.last_mut() {
+                            Some((last_path, idxs)) if last_path == path => {
+                                idxs.push(idx);
+                            }
+                            _ => file_groups.push((path.clone(), vec![idx])),
+                        }
+                    }
+
+                    let mut file_outputs: Vec<String> = Vec::new();
+                    for (file_path, match_idxs) in &file_groups {
+                        let Ok(content) = std::fs::read_to_string(file_path) else {
+                            continue;
+                        };
+                        let all_lines: Vec<&str> = content.lines().collect();
+                        let out = build_context_output(
+                            file_path,
+                            &all_lines,
+                            match_idxs,
+                            params.context_lines,
+                        );
+                        if !out.is_empty() {
+                            file_outputs.push(out);
+                        }
+                    }
+
+                    // Separate output from different files with `--`.
+                    file_outputs.join("\n--\n")
+                }
                 GrepOutputMode::Content => matches
                     .iter()
                     .map(|(p, n, t)| format!("{p}:{n}:{t}"))

@@ -50,11 +50,43 @@ func (*WebFetchTool) Schema() sporecore.RegistryToolSchema {
 		Description: "Fetch the contents of a URL",
 		Parameters: json.RawMessage(`{
 			"type": "object",
-			"properties": {"url": {"type": "string"}},
+			"properties": {
+				"url": {"type": "string"},
+				"start_byte": {
+					"type": "integer",
+					"description": "Byte offset into the response body to start reading from. Default 0 (no offset, output identical to a plain fetch). Use to page through responses larger than the 64 KB truncation window.",
+					"default": 0
+				}
+			},
 			"required": ["url"]
 		}`),
 		Annotations: sporecore.ToolAnnotations{ReadOnly: true, OpenWorld: true},
 	}
+}
+
+// applyWebFetchRange applies start_byte slicing to a fetched response body.
+//
+//   - start_byte == 0: return body unchanged (no header).
+//   - 0 < start_byte < len(body): prepend "[starting at byte N of total]\n" and
+//     return the slice from start_byte.
+//   - start_byte >= len(body) (non-empty): recoverable error.
+//   - Empty body + start_byte > 0: recoverable error.
+func applyWebFetchRange(body string, startByte uint64) (string, *sporecore.ToolOutput) {
+	if startByte == 0 {
+		return body, nil
+	}
+	bodyBytes := []byte(body)
+	total := uint64(len(bodyBytes))
+	if startByte >= total {
+		out := sporecore.ToolOutput{
+			Kind:        sporecore.ToolOutputError,
+			Message:     fmt.Sprintf("start_byte %d exceeds response length %d", startByte, total),
+			Recoverable: true,
+		}
+		return "", &out
+	}
+	slice := string(bodyBytes[startByte:])
+	return fmt.Sprintf("[starting at byte %d of %d]\n%s", startByte, total, slice), nil
 }
 
 func (t *WebFetchTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
@@ -75,7 +107,11 @@ func (t *WebFetchTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if err != nil {
 		return ExecutionFailed(fmt.Sprintf("web fetch body read failed: %s", err), true).ToToolOutput()
 	}
-	return finishWithPossibleTruncation(ctx, string(body), call.ID, sandbox)
+	sliced, rangeErr := applyWebFetchRange(string(body), params.StartByte)
+	if rangeErr != nil {
+		return *rangeErr
+	}
+	return finishWithPossibleTruncation(ctx, sliced, call.ID, sandbox)
 }
 
 // ============================================================================

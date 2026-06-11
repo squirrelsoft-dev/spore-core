@@ -25,10 +25,29 @@ impl ReadFileTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: Self::NAME.into(),
-            description: "Read a file's contents".into(),
+            description: "Read a file's contents. Optionally read a line range \
+                          (offset is 1-indexed start, length is max lines, 0 = \
+                          to EOF) and/or prefix each line with its number via \
+                          line_numbers. With no optional params the whole file \
+                          is returned verbatim."
+                .into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-indexed start line (default 1).",
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "Max lines to return; 0 = no limit / read to EOF (default 0).",
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "description": "Prefix each returned line with its 1-indexed number (default false).",
+                    },
+                },
                 "required": ["path"],
             }),
             annotations: ToolAnnotations {
@@ -38,6 +57,61 @@ impl ReadFileTool {
             },
         }
     }
+}
+
+/// Apply the #132 range/line-number transform to a fully-read file body.
+///
+/// Returns the content to surface, or a recoverable error message. With all
+/// params at their defaults the original `content` is returned unchanged
+/// (byte-identical to the pre-#132 behavior). Any non-default param prepends a
+/// `[lines {start}–{end} of {total}]\n` header (U+2013 en-dash).
+fn apply_read_range(content: &str, params: &ReadFileParams) -> Result<String, String> {
+    let is_default = params.offset == 1 && params.length == 0 && !params.line_numbers;
+    if is_default {
+        return Ok(content.to_string());
+    }
+    if params.offset == 0 {
+        return Err("offset must be \u{2265} 1 (1-indexed)".to_string());
+    }
+    // Empty file: any params still yield empty content with no header.
+    if content.is_empty() {
+        return Ok(String::new());
+    }
+    // `split_inclusive` preserves each line's trailing '\n'; the final line may
+    // or may not end in '\n'. This keeps the slice byte-faithful to the source.
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total = lines.len() as u64;
+    if params.offset > total {
+        return Err(format!(
+            "offset {} exceeds file length {}",
+            params.offset, total
+        ));
+    }
+    let start = params.offset; // 1-indexed, validated >= 1 and <= total.
+    let end = if params.length == 0 {
+        total
+    } else {
+        // offset + length - 1, clamped to total (length past EOF is silent).
+        (start + params.length - 1).min(total)
+    };
+    let start_idx = (start - 1) as usize;
+    let end_idx = end as usize; // exclusive
+    let selected = &lines[start_idx..end_idx];
+
+    let mut out = String::new();
+    out.push_str(&format!("[lines {start}\u{2013}{end} of {total}]\n"));
+    if params.line_numbers {
+        let width = total.to_string().len();
+        for (i, line) in selected.iter().enumerate() {
+            let n = start + i as u64;
+            out.push_str(&format!("{n:>width$} | {line}"));
+        }
+    } else {
+        for line in selected {
+            out.push_str(line);
+        }
+    }
+    Ok(out)
 }
 
 impl Default for ReadFileTool {
@@ -69,7 +143,13 @@ impl Tool for ReadFileTool {
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
             match tokio::fs::read_to_string(&resolved).await {
-                Ok(content) => finish_with_possible_truncation(content, &call.id, sandbox).await,
+                Ok(content) => match apply_read_range(&content, &params) {
+                    Ok(out) => finish_with_possible_truncation(out, &call.id, sandbox).await,
+                    Err(message) => ToolOutput::Error {
+                        message,
+                        recoverable: true,
+                    },
+                },
                 Err(e) => ToolOutput::Error {
                     message: format!("read failed: {e}"),
                     recoverable: true,
@@ -180,12 +260,19 @@ impl ListDirTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: Self::NAME.into(),
-            description: "List directory entries (optionally recursive)".into(),
+            description: "List directory entries (optionally recursive). A recursive \
+                          listing honors .gitignore and skips VCS/build dirs by default; \
+                          set include_ignored to walk everything."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "recursive": {"type": "boolean"},
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Recursive only: when true, include .gitignore-matched and VCS files (default false).",
+                    },
                 },
                 "required": ["path"],
             }),
@@ -248,10 +335,20 @@ impl Tool for ListDirTool {
             };
             let mut entries: Vec<String> = Vec::new();
             if params.recursive {
-                for entry in walkdir::WalkDir::new(&resolved)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
+                // By default the walk honors `.gitignore`/`.ignore` and skips
+                // VCS dirs, so a recursive listing stays focused on source and
+                // is not buried under build artifacts (`target/`, `node_modules/`)
+                // — which alphabetically precede and would truncate away real
+                // source before the model ever sees it. `include_ignored` opts
+                // back into walking everything.
+                let honor_ignores = !params.include_ignored;
+                let walker = ignore::WalkBuilder::new(&resolved)
+                    .standard_filters(honor_ignores)
+                    // Respect `.gitignore` even when the listed tree is not a git
+                    // checkout (the default only honors it inside a `.git` repo).
+                    .require_git(false)
+                    .build();
+                for entry in walker.filter_map(Result::ok) {
                     if let Some(rel) = to_root_relative(entry.path()) {
                         entries.push(rel);
                     }
@@ -611,6 +708,54 @@ mod tests {
         }
     }
 
+    /// A recursive listing honors `.gitignore` by default — build artifacts
+    /// (`target/`) that alphabetically precede real source must not flood/
+    /// truncate the listing — but `include_ignored: true` opts back in.
+    #[tokio::test]
+    async fn list_dir_recursive_respects_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        tokio::fs::write(root.join(".gitignore"), "target/\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lib.rs"), "").await.unwrap();
+        tokio::fs::create_dir(root.join("target")).await.unwrap();
+        tokio::fs::write(root.join("target").join("junk.rs"), "")
+            .await
+            .unwrap();
+        let list = |include_ignored: bool| {
+            let path = root.to_str().unwrap().to_string();
+            async move {
+                let mut params = json!({"path": path, "recursive": true});
+                if include_ignored {
+                    params["include_ignored"] = json!(true);
+                }
+                let r = ListDirTool::new()
+                    .execute(&call("list_dir", params), &AllowAllSandbox, &test_ctx())
+                    .await;
+                match r {
+                    ToolOutput::Success { content, .. } => content,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+
+        // Default: target/ (gitignored) is excluded; source survives.
+        let default = list(false).await;
+        assert!(default.contains("lib.rs"), "source missing: {default:?}");
+        assert!(
+            !default.contains("target"),
+            "gitignored build dir leaked into default listing: {default:?}"
+        );
+
+        // Opt-in: include_ignored walks everything, build artifacts included.
+        let everything = list(true).await;
+        assert!(
+            everything.contains("target/junk.rs"),
+            "include_ignored should surface ignored files: {everything:?}"
+        );
+    }
+
     #[tokio::test]
     async fn delete_missing_is_recoverable() {
         let sb = AllowAllSandbox;
@@ -733,6 +878,132 @@ mod tests {
             .await;
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ---- #132: read_file range scan + line numbers ----
+
+    fn read_params(v: serde_json::Value) -> ReadFileParams {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn read_range_defaults_are_byte_identical() {
+        let body = "line1\nline2\nline3\n";
+        // Only `path` supplied → all three params default → unchanged content.
+        let params = read_params(json!({"path": "f"}));
+        assert_eq!(apply_read_range(body, &params).unwrap(), body);
+    }
+
+    #[test]
+    fn read_range_offset_header_runs_to_eof() {
+        let body = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        let params = read_params(json!({"path": "f", "offset": 3}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 3\u{2013}10 of 10]\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+        );
+    }
+
+    #[test]
+    fn read_range_length_trims_at_eof_silently() {
+        let body = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        // offset 8 + length 5 would reach line 12, but only 10 lines exist.
+        let params = read_params(json!({"path": "f", "offset": 8, "length": 5}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 8\u{2013}10 of 10]\nline8\nline9\nline10\n"
+        );
+    }
+
+    #[test]
+    fn read_range_line_numbers_pad_to_total_width() {
+        let body = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
+        // total = 10 → width 2 → single-digit numbers are right-padded.
+        let params =
+            read_params(json!({"path": "f", "offset": 2, "length": 3, "line_numbers": true}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 2\u{2013}4 of 10]\n 2 | line2\n 3 | line3\n 4 | line4\n"
+        );
+    }
+
+    #[test]
+    fn read_range_line_numbers_no_pad_when_single_digit_total() {
+        let body = "alpha\nbeta\ngamma\n";
+        let params = read_params(json!({"path": "f", "line_numbers": true}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 1\u{2013}3 of 3]\n1 | alpha\n2 | beta\n3 | gamma\n"
+        );
+    }
+
+    #[test]
+    fn read_range_length_zero_always_means_no_limit() {
+        let body = "line1\nline2\nline3\nline4\nline5\n";
+        // length: 0 with offset > 1 is never an error — it reads to EOF.
+        let params = read_params(json!({"path": "f", "offset": 3, "length": 0}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 3\u{2013}5 of 5]\nline3\nline4\nline5\n"
+        );
+    }
+
+    #[test]
+    fn read_range_offset_zero_is_error() {
+        let body = "alpha\nbeta\n";
+        let params = read_params(json!({"path": "f", "offset": 0}));
+        let err = apply_read_range(body, &params).unwrap_err();
+        assert!(err.contains("offset"), "{err}");
+    }
+
+    #[test]
+    fn read_range_offset_past_eof_is_error() {
+        let body = "alpha\nbeta\ngamma\n";
+        let params = read_params(json!({"path": "f", "offset": 11}));
+        let err = apply_read_range(body, &params).unwrap_err();
+        assert_eq!(err, "offset 11 exceeds file length 3");
+    }
+
+    #[test]
+    fn read_range_empty_file_any_params_no_header() {
+        let params =
+            read_params(json!({"path": "f", "offset": 1, "length": 5, "line_numbers": true}));
+        assert_eq!(apply_read_range("", &params).unwrap(), "");
+    }
+
+    #[test]
+    fn read_range_final_line_without_newline_preserved() {
+        // Last line lacks a trailing '\n'; split_inclusive keeps it verbatim.
+        let body = "a\nb\nc";
+        let params = read_params(json!({"path": "f", "offset": 2}));
+        assert_eq!(
+            apply_read_range(body, &params).unwrap(),
+            "[lines 2\u{2013}3 of 3]\nb\nc"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_with_offset_emits_header_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        tokio::fs::write(&path, "l1\nl2\nl3\n").await.unwrap();
+        let sb = AllowAllSandbox;
+        let r = ReadFileTool::new()
+            .execute(
+                &call(
+                    "read_file",
+                    json!({"path": path.to_str().unwrap(), "offset": 2}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Success { content, .. } => {
+                assert_eq!(content, "[lines 2\u{2013}3 of 3]\nl2\nl3\n");
+            }
             other => panic!("{other:?}"),
         }
     }

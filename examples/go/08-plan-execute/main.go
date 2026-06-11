@@ -3,12 +3,18 @@
 // This is the first example to swap the LOOP STRATEGY. Everything else — the
 // ConversationalBuilder, the WorkspaceScopedSandbox, and the tool set
 // (web_search + write_file + read_file, identical to 06) — is held constant. The
-// ONLY substantive change is one line on the Task:
+// substantive change is the LoopStrategy on the Task:
 //
 //	// 06 — react step-by-step:
-//	LoopStrategy{Kind: StrategyReAct, MaxIterations: 10}
-//	// 08 — decompose the goal first, then execute each subtask:
-//	LoopStrategy{Kind: StrategyPlanExecute}
+//	sporecore.ReActStrategy(10)
+//	// 08 — decompose the goal first, then execute each subtask (post-#119):
+//	PlanExecute(plan: ReAct{output: "plan-schema"}, execute: ReAct)
+//
+// Post-#119 the LoopStrategy is a recursive tree of config newtypes, so the
+// strategy is a composed tree rather than a flat literal. PlanExecute's `plan`
+// slot is STRUCTURED — a bare ReAct there MUST declare an `output` schema (here
+// `plan-schema`), which ExecutionRegistry.Validate enforces at run entry. The
+// empty agent/toolset handles default-fill from the harness's own model + tools.
 //
 // With PlanExecute, the harness runs one constrained planner turn FIRST: the
 // model must return strict JSON {"tasks": [...], "rationale": ...}. That plan is
@@ -80,6 +86,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -91,6 +98,55 @@ import (
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/ollama"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/tools"
 )
+
+// planSchema is the plan-phase output contract (`plan-schema`). Post-#119,
+// PlanExecute's `plan` slot is STRUCTURED: a bare ReAct there must declare an
+// `output` schema so the slot yields a typed task graph
+// (ExecutionRegistry.Validate enforces this via checkStructuredSlot). The
+// contract is {tasks: string[], rationale?: string} with tasks required.
+func planSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered subtasks to execute."
+    },
+    "rationale": { "type": "string" }
+  },
+  "required": ["tasks"]
+}`)
+}
+
+// buildRegistry assembles the ExecutionRegistry the composed strategy's handles
+// resolve against. The plan leaf carries the `plan-schema` output handle; the
+// empty agent/toolset handles (ReactPerLoop uses empty handles) are default-filled
+// by NewStandardHarness from the harness's own model + tools. Old flat shape
+// (LoopStrategy{Kind: StrategyPlanExecute}) had no registry at all.
+func buildRegistry() sporecore.ExecutionRegistry {
+	return sporecore.NewExecutionRegistryBuilder().
+		Schema("plan-schema", planSchema()).
+		Build()
+}
+
+// planExecuteStrategy is the post-#119 composed strategy:
+// PlanExecute(plan: ReAct{plan-schema}, execute: ReAct). The plan leaf carries
+// the `plan-schema` output contract (required for the structured `plan` slot);
+// the execute leaf is a plain ReAct. The plan/execute leaves are effectively
+// unbounded (PerLoop{MaxUint32}) — the global MaxTurns backstop bounds the run.
+// Old flat shape was LoopStrategy{Kind: StrategyPlanExecute} (PlanExecute config nil).
+func planExecuteStrategy() sporecore.LoopStrategy {
+	plan := sporecore.ReactPerLoop(math.MaxUint32)
+	schema := sporecore.SchemaRef("plan-schema")
+	plan.Output = &schema
+	exec := sporecore.ReactPerLoop(math.MaxUint32)
+	return sporecore.PlanExecuteStrategy(sporecore.PlanExecuteConfig{
+		Plan:     sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &plan}),
+		Execute:  sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &exec}),
+		Behavior: sporecore.BudgetExhaustedBehavior{Kind: sporecore.BehaviorEscalate},
+	})
+}
 
 const systemPrompt = "You are a research-and-writing agent. Your ONLY capabilities are: " +
 	"web_search (find current information online), read_file, and write_file (save your work to " +
@@ -363,15 +419,22 @@ func run() error {
 		return fmt.Errorf("failed to register plan reporter: %w", err)
 	}
 	cfg.Hooks = chain
+	// Post-#119: the composed strategy's handles resolve against an
+	// ExecutionRegistry. The plan leaf's `plan-schema` output handle is registered
+	// here; NewStandardHarness default-fills the empty agent/toolset handles from
+	// the harness's own model + tools, so the structured `plan` slot validates.
+	cfg.Registry = buildRegistry()
 	harness := sporecore.NewStandardHarness(cfg)
 
-	// THE ONE-LINE SWAP. 06 used LoopStrategy{Kind: StrategyReAct, MaxIterations:
-	// 10}; here we decompose first via PlanExecute. The turn budget is divided
-	// across subtasks, so we give it generous headroom.
+	// THE STRATEGY SWAP. 06 used a bare LoopStrategy{Kind: StrategyReAct,
+	// MaxIterations: 10}; here we decompose first via the composed
+	// PlanExecute(plan: ReAct{plan-schema}, execute: ReAct). The plan leaf carries
+	// the `plan-schema` output contract — PlanExecute's `plan` slot is STRUCTURED,
+	// so a bare ReAct there MUST declare an output schema. The turn budget is
+	// divided across subtasks, so we give it generous headroom.
 	maxTurns := planMaxTurns
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind: sporecore.StrategyPlanExecute,
-	}).WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), planExecuteStrategy()).
+		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
 
 	// Print each turn (Think) and each tool call + result (Act / Observe). This is
 	// most useful for the plan-phase turn; Go suppresses the subtask sub-loop

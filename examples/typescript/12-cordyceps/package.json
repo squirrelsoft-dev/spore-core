@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "spore-core TypeScript example 12: cordyceps — a fully autonomous task-completion agent (the capstone). A ReAct orchestrator audits this repo's Rust code module-by-module, delegating each deep dive to an isolated analysis worker that loads an `audit` skill at runtime (architect-side GuideRegistry + sticky context-manager injection) and escalates mid-loop via a generalized consult/escalation ladder (#114): research helper (soft-fail) then cloud advisor (escalate-to-human).",
+  "description": "spore-core TypeScript example 12: cordyceps — the Composable Execution capstone (#117–#131). A declarative LoopStrategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] is loaded VERBATIM from the canonical fixture, its string handles wired to collaborators in an ExecutionRegistry, and run end-to-end: plan→ready-set DAG, Default-FAIL self-verify, bounded runaway, resume-by-handle-reresolution, and the #114 consult ladder PRESERVED host-mediated (seam moved off SubagentTool). The `audit` skill rides the global SkillInjectingContextManager always-active.",
   "scripts": {
     "start": "tsx src/main.ts",
     "test": "vitest run",

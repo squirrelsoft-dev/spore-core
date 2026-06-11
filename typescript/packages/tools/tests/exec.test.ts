@@ -171,4 +171,21 @@ describe("BashCommandTool", () => {
     if (r.kind !== "error") throw new Error("unreachable");
     expect(r.recoverable).toBe(true);
   });
+
+  it.runIf(IS_UNIX)("large stderr is truncated in error message", async () => {
+    const sb = new AllowAllSandbox();
+    // awk writes 10 KB to stderr and exits non-zero; verify elision in message.
+    const r = await new BashCommandTool().execute(
+      call("bash_command", {
+        script:
+          "awk 'BEGIN{for(i=0;i<10240;i++)printf \"x\" > \"/dev/stderr\"; exit 1}'",
+      }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    expect(r.message).toContain("bytes elided");
+    expect(r.message.length).toBeLessThan(10 * 1024);
+  });
 });

@@ -40,6 +40,9 @@ def parse_params(model: type[T], call: ToolCall) -> T:
 
 class ReadFileParams(_Params):
     path: str
+    offset: int = 1
+    length: int = 0
+    line_numbers: bool = False
 
 
 class WriteFileParams(_Params):
@@ -51,6 +54,7 @@ class WriteFileParams(_Params):
 class ListDirParams(_Params):
     path: str
     recursive: bool = False
+    include_ignored: bool = False
 
 
 class DeleteFileParams(_Params):
@@ -109,12 +113,14 @@ class GrepOutputMode(str, Enum):
 
 class GrepParams(_Params):
     """Parameters for the net-new :class:`GrepTool` (#81). ``output_mode``
-    defaults to ``content`` (``path:line:text`` per match)."""
+    defaults to ``content`` (``path:line:text`` per match). ``context_lines``
+    adds standard ``grep -C N`` context when > 0 (#133)."""
 
     pattern: str
     path: str
     recursive: bool = False
     output_mode: GrepOutputMode = GrepOutputMode.CONTENT
+    context_lines: int = 0  # lines of context before/after each match (default 0)
 
 
 class FindFilesParams(_Params):
@@ -143,6 +149,7 @@ class SendMessageParams(_Params):
 
 class WebFetchParams(_Params):
     url: str
+    start_byte: int = 0  # default 0 = existing behavior (no header prepended)
 
 
 class WebSearchParams(_Params):

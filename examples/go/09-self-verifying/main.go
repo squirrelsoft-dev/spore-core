@@ -7,9 +7,15 @@
 // spec, and a Verifier turns the critique into a verdict. If the verdict is
 // FAIL, the reason is injected back into the build context and the loop revises.
 // This repeats until the verifier returns Passed or max-iterations is exhausted.
-// You write NO loop code — you wire a strategy (LoopStrategy{Kind:
-// StrategySelfVerifying}), a Verifier, and an evaluator agent, and the harness
-// runs the verify -> revise cycle for you.
+// You write NO loop code — you wire a composed strategy and a Verifier, and the
+// harness runs the verify -> revise cycle for you. Post-#119 the strategy is a
+// tree: SelfVerifying(inner: ReAct{output: "worker-schema"}, evaluator: ""). The
+// `inner` (worker) slot is STRUCTURED — a bare ReAct there MUST declare an
+// `output` schema (here `worker-schema`) so its result is evaluable
+// (ExecutionRegistry.Validate enforces this at run entry). The `evaluator` stays
+// the EMPTY handle (""), which resolves to the registry verifier registered under
+// "". Post-#124 there is NO evaluator-agent setter — the evaluate phase defaults
+// to the inner worker's resolved agent.
 //
 // # The task the agent-under-test must solve
 //
@@ -77,6 +83,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -138,6 +145,54 @@ const systemPrompt = "You work on Go code. Your only tools are write_file (save 
 // buildMaxTurns is a generous per-build/evaluate sub-run turn budget so a small
 // model can take a few tool calls before claiming done.
 const buildMaxTurns uint32 = 12
+
+// workerSchema is the worker (build-phase) output contract (`worker-schema`).
+// Post-#119, SelfVerifying's `inner` (worker) slot is STRUCTURED: a bare ReAct
+// there must declare an `output` schema so its result is EVALUABLE
+// (ExecutionRegistry.Validate enforces this via checkStructuredSlot). The contract
+// is {file: string, summary?: string} with file required.
+func workerSchema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "file": { "type": "string", "description": "Path of the file the worker wrote." },
+    "summary": { "type": "string", "description": "Short description of what was written." }
+  },
+  "required": ["file"]
+}`)
+}
+
+// buildRegistry assembles the ExecutionRegistry the composed strategy's handles
+// resolve against. The worker leaf carries the `worker-schema` output handle; the
+// SelfVerifying `evaluator` is the EMPTY handle (""), so the verifier is
+// registered under "" (the default-fill key the #124 single-collaborator seam
+// uses). The empty agent/toolset handles are default-filled by NewStandardHarness
+// from the harness's own model + tools. Old flat shape (the unit
+// LoopStrategy{Kind: StrategySelfVerifying}) had no registry at all.
+func buildRegistry(harnessVerifier sporecore.Verifier) sporecore.ExecutionRegistry {
+	return sporecore.NewExecutionRegistryBuilder().
+		Schema("worker-schema", workerSchema()).
+		Verifier("", harnessVerifier).
+		Build()
+}
+
+// selfVerifyingStrategy is the post-#119 composed strategy:
+// SelfVerifying(inner: ReAct{worker-schema}, evaluator: ""). The worker leaf
+// carries the `worker-schema` output contract (required for the structured
+// `worker` slot) and a PerLoop{maxIterations} budget. The `evaluator` is the EMPTY
+// handle (""), which resolves to the registry verifier registered under "".
+// Behavior is Escalate (the ReactPerLoop shim default). Old flat shape was the
+// unit LoopStrategy{Kind: StrategySelfVerifying}.
+func selfVerifyingStrategy(maxIterations uint32) sporecore.LoopStrategy {
+	worker := sporecore.ReactPerLoop(maxIterations)
+	schema := sporecore.SchemaRef("worker-schema")
+	worker.Output = &schema
+	return sporecore.SelfVerifyingStrategy(sporecore.SelfVerifyingConfig{
+		Inner:     sporecore.PtrStrategy(sporecore.LoopStrategy{Kind: sporecore.StrategyReAct, ReActCfg: &worker}),
+		Evaluator: sporecore.SchemaRef(""),
+		Behavior:  sporecore.BudgetExhaustedBehavior{Kind: sporecore.BehaviorEscalate},
+	})
+}
 
 // reportingVerifier is a Verifier decorator: it prints the verify -> revise cycle
 // to stdout, then delegates the actual verdict to an inner verifier.
@@ -246,14 +301,12 @@ func run() error {
 		return err
 	}
 
-	// The evaluator runs on its own agent instance (the EvaluatorAgent seam). It
-	// shares the harness system prompt and tool set; the harness derives a
-	// read-only sandbox for it internally, so its write_file is blocked but
-	// read_file works — exactly what a reviewer needs.
-	evaluatorAgent := sporecore.NewModelAgent(
-		sporecore.AgentID("evaluator"),
-		ollama.WithBaseURL(model, baseURL),
-	)
+	// Post-#119/#124: the .evaluator_agent(..) single-collaborator seam is GONE.
+	// The SelfVerifying evaluate phase defaults to the inner worker's resolved
+	// agent — the harness still runs the evaluate phase as a FRESH read-only turn
+	// (write_file blocked, read_file works — exactly what a reviewer needs), so no
+	// separate evaluator agent is wired. The judging seam is the Verifier below
+	// (the SelfVerifying `evaluator` handle resolves to it via the empty-key fill).
 
 	// The verifier: pattern-match the evaluator's text. PASS (anchored,
 	// case-insensitive, multiline) -> Passed; FAIL: <reason> -> Failed(reason);
@@ -274,8 +327,9 @@ func run() error {
 
 	// Build harness: conversational preset, workspace sandbox, the minimal file
 	// tool set (write_file for the builder + read_file for the evaluator), shared
-	// system prompt. Go wiring asymmetry: the builder has no Verifier/Evaluator
-	// setters, so set cfg.Verifier and cfg.EvaluatorAgent on the built config
+	// system prompt, and the ExecutionRegistry carrying the `worker-schema` output
+	// contract + the verifier under the empty `evaluator` key. Go wiring asymmetry:
+	// the builder has no Registry setter, so set cfg.Registry on the built config
 	// before NewStandardHarness (mirrors 08's cfg.Hooks pattern).
 	mi := ollama.WithBaseURL(model, baseURL)
 	sandbox, err := sporecore.NewWorkspaceScopedSandbox(sporecore.WorkspaceConfig{Root: workspaceRoot})
@@ -289,17 +343,21 @@ func run() error {
 		Tool(tools.StandardTools{}.ReadFile()).  // ← evaluator reads it back
 		SystemPrompt(systemPrompt).
 		BuildConfig()
-	cfg.Verifier = harnessVerifier
-	cfg.EvaluatorAgent = evaluatorAgent
+	// Post-#119: the worker leaf's `worker-schema` output handle and the
+	// empty-key evaluator verifier resolve against this registry; the empty
+	// agent/toolset handles default-fill from the harness's own model + tools.
+	cfg.Registry = buildRegistry(harnessVerifier)
 	harness := sporecore.NewStandardHarness(cfg)
 
 	// THE STRATEGY. There is no loop code below — the harness runs the
-	// verify -> revise cycle. A generous turn budget per build/evaluate sub-run
-	// lets a small model take a few tool calls before claiming done.
+	// verify -> revise cycle via the composed SelfVerifying(inner: ReAct, evaluator)
+	// tree. The worker leaf carries the `worker-schema` output contract (required
+	// for the structured `worker` slot) and a PerLoop{maxIterations} budget; a
+	// generous global turn budget lets a small model take a few tool calls per
+	// build/evaluate sub-run before claiming done.
 	maxTurns := buildMaxTurns
-	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), sporecore.LoopStrategy{
-		Kind: sporecore.StrategySelfVerifying,
-	}).WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
+	task := sporecore.NewTask(prompt, sporecore.NewSessionID(), selfVerifyingStrategy(maxIterations)).
+		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns})
 
 	fmt.Printf("model         : %s\n", model)
 	fmt.Printf("base url      : %s\n", baseURL)

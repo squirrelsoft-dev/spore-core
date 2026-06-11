@@ -59,8 +59,8 @@ import sys
 from spore_core import (
     HarnessBuilder,
     HarnessRunOptions,
-    LoopStrategyReAct,
     OllamaModelInterface,
+    ReactConfig,
     RunResultSuccess,
     StreamToolCall,
     StreamToolResult,
@@ -115,7 +115,7 @@ async def main() -> int:
         .build()
     )
 
-    task = Task.new(prompt, new_session_id(), LoopStrategyReAct(max_iterations=12))
+    task = Task.new(prompt, new_session_id(), ReactConfig.per_loop(12))
 
     # Print each turn (Think) and each tool call + result (Act / Observe) from
     # harness STREAM events — the builder dispatches our tools internally, just as

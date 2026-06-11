@@ -20,7 +20,7 @@
 //! [`04-filesystem-agent`](../../04-filesystem-agent):
 //!
 //! - `HarnessBuilder::conversational(model)` — same builder.
-//! - `LoopStrategy::ReAct { max_iterations }` — same loop.
+//! - `LoopStrategy::ReAct(ReactConfig::per_loop(n))` — same loop.
 //! - `WorkspaceScopedSandbox` over `WorkspaceConfig::scoped(root)` — same
 //!   sandbox, here scoped to this example's `workspace/` dir so `write_file`
 //!   cannot escape it. 04 wrote `SUMMARY.md`; 06 writes `answer.md`.
@@ -50,8 +50,8 @@ use std::sync::Arc;
 
 use spore_core::{
     Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, LoopStrategy,
-    OllamaModelInterface, RunResult, SearchMethod, SessionId, StandardTool, StandardTools, Task,
-    WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
+    OllamaModelInterface, ReactConfig, RunResult, SearchMethod, SessionId, StandardTool,
+    StandardTools, Task, WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 const SYSTEM_PROMPT: &str = "You are a web-research agent. Use web_search to find current \
@@ -147,14 +147,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = Task::new(
         prompt.clone(),
         SessionId::generate(),
-        LoopStrategy::ReAct { max_iterations: 10 },
+        LoopStrategy::ReAct(ReactConfig::per_loop(10)),
     );
     // Print each turn (Think) and each tool call + result (Act / Observe). The
     // search queries and result snippets show up here because `web_search`
     // dispatches through the harness like any other catalogue tool.
     let options = HarnessRunOptions::new(task).with_stream(Box::new(
         |event: HarnessStreamEvent| match event {
-            HarnessStreamEvent::TurnStart { turn } => println!("think  · turn {turn}"),
+            HarnessStreamEvent::TurnStart { turn, .. } => println!("think  · turn {turn}"),
             HarnessStreamEvent::ToolCall { name, args, .. } => {
                 println!("    act    → {name}({args})");
             }

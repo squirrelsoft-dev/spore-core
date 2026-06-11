@@ -79,6 +79,28 @@ fn shared_client() -> &'static reqwest::Client {
 
 pub struct WebFetchTool;
 
+/// Apply `start_byte` slicing to a fetched response body.
+///
+/// - `start_byte == 0` → return `body` unchanged (no header).
+/// - `0 < start_byte < body.len()` → prepend `[starting at byte N of total]\n`
+///   and return the slice from `start_byte`.
+/// - `start_byte >= body.len()` (for non-empty bodies) → recoverable error.
+/// - Empty body + `start_byte > 0` → recoverable error.
+pub(crate) fn apply_web_fetch_range(body: &str, start_byte: u64) -> Result<String, ToolOutput> {
+    if start_byte == 0 {
+        return Ok(body.to_string());
+    }
+    let total = body.len() as u64;
+    if start_byte >= total {
+        return Err(ToolOutput::Error {
+            message: format!("start_byte {start_byte} exceeds response length {total}"),
+            recoverable: true,
+        });
+    }
+    let slice = &body[start_byte as usize..];
+    Ok(format!("[starting at byte {start_byte} of {total}]\n{slice}"))
+}
+
 impl WebFetchTool {
     pub const NAME: &'static str = "web_fetch";
     pub fn new() -> Self {
@@ -90,7 +112,14 @@ impl WebFetchTool {
             description: "Fetch the contents of a URL".into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
+                "properties": {
+                    "url": {"type": "string"},
+                    "start_byte": {
+                        "type": "integer",
+                        "description": "Byte offset into the response body to start reading from. Default 0 (no offset, output identical to a plain fetch). Use to page through responses larger than the 64 KB truncation window.",
+                        "default": 0,
+                    }
+                },
                 "required": ["url"],
             }),
             annotations: ToolAnnotations {
@@ -128,7 +157,12 @@ impl Tool for WebFetchTool {
             };
             match shared_client().get(&params.url).send().await {
                 Ok(resp) => match resp.text().await {
-                    Ok(body) => finish_with_possible_truncation(body, &call.id, sandbox).await,
+                    Ok(body) => match apply_web_fetch_range(&body, params.start_byte) {
+                        Ok(sliced) => {
+                            finish_with_possible_truncation(sliced, &call.id, sandbox).await
+                        }
+                        Err(e) => e,
+                    },
                     Err(e) => ToolOutput::Error {
                         message: format!("web fetch body read failed: {e}"),
                         recoverable: true,
@@ -809,6 +843,205 @@ mod tests {
     #[test]
     fn search_method_default_is_post() {
         assert_eq!(SearchMethod::default(), SearchMethod::Post);
+    }
+
+    // ── apply_web_fetch_range unit tests (#135) ───────────────────────────────
+
+    #[test]
+    fn range_start_zero_no_header() {
+        let result = apply_web_fetch_range("hello world", 0).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn range_start_zero_empty_body_no_header() {
+        let result = apply_web_fetch_range("", 0).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn range_start_mid_prepends_header() {
+        let result = apply_web_fetch_range("hello world", 6).unwrap();
+        assert_eq!(result, "[starting at byte 6 of 11]\nworld");
+    }
+
+    #[test]
+    fn range_start_at_last_byte() {
+        let result = apply_web_fetch_range("hello", 4).unwrap();
+        assert_eq!(result, "[starting at byte 4 of 5]\no");
+    }
+
+    #[test]
+    fn range_start_past_end_is_error() {
+        let err = apply_web_fetch_range("hello", 10).unwrap_err();
+        match err {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
+                assert!(recoverable);
+                assert_eq!(message, "start_byte 10 exceeds response length 5");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_start_at_body_len_is_error() {
+        let err = apply_web_fetch_range("hello", 5).unwrap_err();
+        match err {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
+                assert!(recoverable);
+                assert_eq!(message, "start_byte 5 exceeds response length 5");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_empty_body_nonzero_start_is_error() {
+        let err = apply_web_fetch_range("", 1).unwrap_err();
+        match err {
+            ToolOutput::Error {
+                message,
+                recoverable,
+            } => {
+                assert!(recoverable);
+                assert_eq!(message, "start_byte 1 exceeds response length 0");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ── fixture replay: web_fetch_range.json (#135) ───────────────────────────
+
+    #[derive(serde::Deserialize)]
+    struct WebFetchRangeCase {
+        name: String,
+        body: String,
+        start_byte: u64,
+        #[serde(default)]
+        expected: Option<String>,
+        #[serde(default)]
+        expected_error: Option<String>,
+    }
+
+    #[test]
+    fn fixture_replay_web_fetch_range() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/tools/web_fetch_range.json");
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let cases: Vec<WebFetchRangeCase> = serde_json::from_str(&data).unwrap();
+        assert!(!cases.is_empty(), "expected ≥1 case");
+        for c in cases {
+            match apply_web_fetch_range(&c.body, c.start_byte) {
+                Ok(got) => {
+                    assert_eq!(
+                        got,
+                        c.expected.expect("expected field missing for success case"),
+                        "case: {}",
+                        c.name
+                    );
+                }
+                Err(ToolOutput::Error { message, .. }) => {
+                    assert_eq!(
+                        message,
+                        c.expected_error
+                            .expect("expected_error field missing for error case"),
+                        "case: {}",
+                        c.name
+                    );
+                }
+                Err(other) => panic!("{}: unexpected output variant {other:?}", c.name),
+            }
+        }
+    }
+
+    // ── integration: web_fetch with start_byte via mock server (#135) ─────────
+
+    #[tokio::test]
+    async fn web_fetch_start_byte_zero_no_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
+            .mount(&server)
+            .await;
+        let sb = AllowAllSandbox;
+        let url = format!("{}/page", server.uri());
+        let r = WebFetchTool::new()
+            .execute(
+                &call("web_fetch", json!({"url": url, "start_byte": 0})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Success { content, .. } => assert_eq!(content, "hello world"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_start_byte_mid_slices_with_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
+            .mount(&server)
+            .await;
+        let sb = AllowAllSandbox;
+        let url = format!("{}/page", server.uri());
+        let r = WebFetchTool::new()
+            .execute(
+                &call("web_fetch", json!({"url": url, "start_byte": 6})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Success { content, .. } => {
+                assert_eq!(content, "[starting at byte 6 of 11]\nworld")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_start_byte_past_end_is_recoverable_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .mount(&server)
+            .await;
+        let sb = AllowAllSandbox;
+        let url = format!("{}/page", server.uri());
+        let r = WebFetchTool::new()
+            .execute(
+                &call("web_fetch", json!({"url": url, "start_byte": 99})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(
+                    message.contains("start_byte 99 exceeds response length 5"),
+                    "{message}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

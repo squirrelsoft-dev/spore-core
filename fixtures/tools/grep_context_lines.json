@@ -1,0 +1,44 @@
+[
+  {
+    "name": "context_lines_0_no_change",
+    "initial_content": "alpha\nbeta\ngamma\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "beta", "context_lines": 0 },
+    "expected": "<FIXTURE_PATH>:2:beta"
+  },
+  {
+    "name": "single_match_with_context",
+    "initial_content": "one\ntwo\nthree\nfour\nfive\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "three", "context_lines": 1 },
+    "expected": "<FIXTURE_PATH>:2-two\n<FIXTURE_PATH>:3:three\n<FIXTURE_PATH>:4-four"
+  },
+  {
+    "name": "two_matches_overlapping_windows",
+    "initial_content": "a\nb\nc\nd\ne\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "b|d", "context_lines": 2 },
+    "expected": "<FIXTURE_PATH>:1-a\n<FIXTURE_PATH>:2:b\n<FIXTURE_PATH>:3-c\n<FIXTURE_PATH>:4:d\n<FIXTURE_PATH>:5-e"
+  },
+  {
+    "name": "two_matches_non_overlapping",
+    "initial_content": "match1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nmatch10\nline11\nline12\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "match", "context_lines": 1 },
+    "expected": "<FIXTURE_PATH>:1:match1\n<FIXTURE_PATH>:2-line2\n--\n<FIXTURE_PATH>:9-line9\n<FIXTURE_PATH>:10:match10\n<FIXTURE_PATH>:11-line11"
+  },
+  {
+    "name": "context_at_file_start",
+    "initial_content": "match\nline2\nline3\nline4\nline5\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "match", "context_lines": 3 },
+    "expected": "<FIXTURE_PATH>:1:match\n<FIXTURE_PATH>:2-line2\n<FIXTURE_PATH>:3-line3\n<FIXTURE_PATH>:4-line4"
+  },
+  {
+    "name": "context_at_file_end",
+    "initial_content": "line1\nline2\nline3\nline4\nmatch\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "match", "context_lines": 3 },
+    "expected": "<FIXTURE_PATH>:2-line2\n<FIXTURE_PATH>:3-line3\n<FIXTURE_PATH>:4-line4\n<FIXTURE_PATH>:5:match"
+  },
+  {
+    "name": "context_line_is_also_match",
+    "initial_content": "alpha\nbeta\ngamma\n",
+    "params": { "path": "<FIXTURE_PATH>", "pattern": "alpha|beta", "context_lines": 1 },
+    "expected": "<FIXTURE_PATH>:1:alpha\n<FIXTURE_PATH>:2:beta\n<FIXTURE_PATH>:3-gamma"
+  }
+]

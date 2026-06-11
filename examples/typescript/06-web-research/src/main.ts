@@ -48,6 +48,7 @@ import {
   SessionId,
   WorkspaceScopedSandbox,
   newTask,
+  reactPerLoop,
   type HarnessStreamEvent,
 } from "@spore/core";
 import { StandardTools, WebSearchTool } from "@spore/tools";
@@ -134,10 +135,7 @@ async function main(): Promise<void> {
     .modelParams({ structured_tool_calls: structured, stop_sequences: [] })
     .build();
 
-  const task = newTask(prompt, SessionId.generate(), {
-    kind: "re_act",
-    max_iterations: 10,
-  });
+  const task = newTask(prompt, SessionId.generate(), reactPerLoop(10));
 
   console.log(`model    : ${modelId}`);
   console.log(`endpoint : ${endpoint}`);

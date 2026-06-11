@@ -9,8 +9,16 @@
  * into a verdict. If the verdict is FAIL, the reason is injected back into the
  * build context and the loop revises. This repeats until the verifier returns
  * `passed` or `max_iterations` is exhausted. You write **no loop code** — you
- * wire a strategy (`{ kind: "self_verifying" }`), a `Verifier`, and an evaluator
- * agent, and the harness runs the verify→revise cycle for you.
+ * wire a composed strategy (`SelfVerifying(inner: ReAct{worker-schema}, evaluator)`)
+ * and a `Verifier`, and the harness runs the verify→revise cycle for you.
+ *
+ * Post-#119 the strategy is a composed tree: `SelfVerifying`'s `inner` (worker)
+ * slot is STRUCTURED, so a bare `ReAct` there MUST declare an `output` schema
+ * (here `worker-schema`), which the {@link ExecutionRegistry} validates at run
+ * entry. The `evaluator` stays the EMPTY handle (`""`), default-filled from the
+ * single-collaborator `.verifier(..)` setter (the pre-#119 `.evaluatorAgent(..)`
+ * seam was removed in #124 — the evaluate phase now defaults to the worker's
+ * agent). The only handle registered explicitly is `worker-schema`.
  *
  * ## The task the agent-under-test must solve
  *
@@ -88,19 +96,19 @@
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
-  AgentId,
+  ExecutionRegistry,
   HarnessBuilder,
-  ModelAgent,
   OLLAMA_DEFAULT_BASE_URL,
   OllamaModelInterface,
   SessionId,
   WorkspaceScopedSandbox,
   newTask,
+  reactPerLoop,
   verifier,
-  type Agent,
+  type LoopStrategy,
   type RunResult,
 } from "@spore/core";
 import { StandardTools } from "@spore/tools";
@@ -225,7 +233,57 @@ function runResultOutput(r: RunResult): string {
       return "<run paused waiting for human>";
     case "escalate":
       return `<run escalated: ${r.signal.kind}>`;
+    // This example never wires a consult ladder; a top-level consult is not
+    // expected, but the variant must be handled so the switch stays exhaustive.
+    case "consult":
+      return `<run paused on consult: ${r.request.kind}>`;
   }
+}
+
+/**
+ * The worker (build-phase) output contract (`worker-schema`). Post-#119,
+ * `SelfVerifying`'s `inner` (worker) slot is STRUCTURED: a bare `ReAct` there
+ * must declare an `output` schema so its result is EVALUABLE
+ * ({@link ExecutionRegistry.validate} enforces this via its structured-slot
+ * check). The build agent writes the draft file; this advertises the path it wrote.
+ */
+function workerSchema(): unknown {
+  return {
+    type: "object",
+    properties: {
+      file: { type: "string", description: "Path the draft was written to." },
+      summary: { type: "string", description: "What was implemented." },
+    },
+    required: ["file"],
+  };
+}
+
+/**
+ * The {@link ExecutionRegistry} the composed strategy's handles resolve against.
+ * Only `worker-schema` is EXPLICIT; the builder default-fills the empty agent /
+ * toolset handles (`reactPerLoop`) AND the empty-key evaluator from `.verifier(..)`
+ * at `build`. So the SelfVerifying `evaluator` stays the EMPTY handle (`""`).
+ */
+export function buildRegistry(): ExecutionRegistry {
+  return ExecutionRegistry.builder()
+    .schema("worker-schema", workerSchema())
+    .build();
+}
+
+/**
+ * The post-#119 composed strategy: `SelfVerifying(inner: ReAct, evaluator)`. The
+ * worker leaf carries the `worker-schema` output contract (required for the
+ * structured `worker` slot) and a `per_loop(maxIterations)` build budget. The
+ * `evaluator` is the EMPTY handle (`""`), which the builder default-fills from
+ * `.verifier(..)` (#124 single-collaborator migration seam). Old flat shape was
+ * `{ kind: "self_verifying" }`.
+ */
+export function selfVerifyingStrategy(maxIterations: number): LoopStrategy {
+  return {
+    kind: "self_verifying",
+    inner: { ...reactPerLoop(maxIterations), output: "worker-schema" },
+    evaluator: "",
+  };
 }
 
 async function main(): Promise<void> {
@@ -252,15 +310,13 @@ async function main(): Promise<void> {
   mkdirSync(workspaceRoot, { recursive: true });
   const draftPath = join(workspaceRoot, DRAFT_FILENAME);
 
-  // The evaluator runs on its own agent instance (the `evaluatorAgent` seam). It
-  // shares the harness system prompt and tool set; the harness derives a
-  // read-only sandbox for it internally, so its `write_file` is blocked but
-  // `read_file` works — exactly what a reviewer needs.
-  const evaluatorModel = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
-  const evaluatorAgent: Agent = new ModelAgent(
-    AgentId.of("evaluator"),
-    evaluatorModel,
-  );
+  // Post-#119/#124 the `.evaluatorAgent(..)` single-collaborator seam is GONE.
+  // The evaluate phase now defaults to the inner worker's agent (the empty-key
+  // agent the builder default-fills from `conversational(model)`), running a
+  // FRESH evaluator turn for which the harness internally derives a read-only
+  // sandbox — so its `write_file` is blocked but `read_file` works, exactly what a
+  // reviewer needs. The judging seam is the verifier below (the SelfVerifying
+  // `evaluator` empty handle resolves to it via the empty-key default fill).
 
   // The verifier: pattern-match the evaluator's text. `PASS` (anchored,
   // case-insensitive, multiline) → passed; `FAIL: <reason>` → failed(reason);
@@ -279,25 +335,29 @@ async function main(): Promise<void> {
 
   // Build harness: conversational preset, workspace sandbox, the minimal file
   // tool set (write_file for the builder + read_file for the evaluator), shared
-  // system prompt, the evaluator agent, and the verifier.
+  // system prompt, the registry (carrying the `worker-schema` output contract),
+  // and the verifier (folded into the default-key evaluator handle).
   const buildModel = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
   const sandbox = new WorkspaceScopedSandbox({ root: workspaceRoot });
   const harness = HarnessBuilder.conversational(buildModel)
     .sandbox(sandbox)
+    .registry(buildRegistry())
     .tool(StandardTools.writeFile())
     .tool(StandardTools.readFile())
     .systemPrompt(SYSTEM_PROMPT)
-    .evaluatorAgent(evaluatorAgent)
     .verifier(reportingVerifier)
     .build();
 
   // THE STRATEGY. There is no loop code below — the harness runs the
-  // verify→revise cycle. A generous turn budget per build/evaluate sub-run lets a
-  // small model take a few tool calls before claiming done.
+  // verify→revise cycle. The worker leaf carries the `worker-schema` output
+  // contract (required for the structured `worker` slot) and a
+  // `per_loop(maxIterations)` build budget; the empty `evaluator` handle resolves
+  // to the verifier above. A generous `max_turns` per build/evaluate sub-run lets
+  // a small model take a few tool calls before claiming done.
   const task = newTask(
     prompt,
     SessionId.generate(),
-    { kind: "self_verifying" },
+    selfVerifyingStrategy(maxIterations),
     { max_turns: 12 },
   );
 
@@ -374,7 +434,18 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/** Run `main` only when this module is the program entrypoint — NOT when it is
+ *  imported (e.g. by the composition test, which reuses `buildRegistry` /
+ *  `selfVerifyingStrategy`). */
+function isEntrypoint(): boolean {
+  const arg1 = process.argv[1];
+  if (arg1 === undefined) return false;
+  return import.meta.url === pathToFileURL(arg1).href;
+}
+
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

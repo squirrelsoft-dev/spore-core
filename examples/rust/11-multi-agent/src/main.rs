@@ -58,13 +58,17 @@
 //!
 //! ## The strategy split: PlanExecute at the top, ReAct inside
 //!
-//! The orchestrator runs [`LoopStrategy::PlanExecute`]: it decomposes the job
+//! The orchestrator runs a composed [`LoopStrategy::PlanExecute`] (post-#119,
+//! `PlanExecute(plan: ReAct, execute: ReAct)`): it decomposes the job
 //! ("research, then write, then save") into subtasks up front and executes them
-//! in order — natural for a coordinator. Each worker, by contrast, runs ReAct
-//! internally. (The ReAct loop is hardcoded inside `SubagentTool`; a subagent
-//! always runs its child as `ReAct`.) So the two layers use two different loop
-//! strategies, each fit to its level: deliberate planning at the orchestrator,
-//! step-by-step tool use inside the workers.
+//! in order — natural for a coordinator. The plan leaf carries a `plan-schema`
+//! output contract — `PlanExecute`'s `plan` slot is STRUCTURED, so a bare `ReAct`
+//! there MUST declare an output schema (`ExecutionRegistry::validate` enforces
+//! this at run entry). Each worker, by contrast, runs ReAct internally. (The
+//! ReAct loop is hardcoded inside `SubagentTool`; a subagent always runs its
+//! child as `ReAct`.) So the two layers use two different loop strategies, each
+//! fit to its level: deliberate planning at the orchestrator, step-by-step tool
+//! use inside the workers.
 //!
 //! ## Agent boundaries in stdout
 //!
@@ -108,11 +112,11 @@ use spore_core::harness::BoxFut;
 use spore_core::tool_registry::StandardToolRegistry;
 use spore_core::tools::{ContextSharing, SubagentTool};
 use spore_core::{
-    BudgetLimits, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent, Hook, HookChain,
-    HookContext, HookDecision, HookError, HookEvent, LoopStrategy, OllamaModelInterface,
-    RegisteredToolSchema, RunResult, SearchMethod, SessionId, StandardHookChain, StandardTool,
-    StandardTools, Task, ToolAnnotations, WebSearchConfig, WebSearchTool, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    BudgetLimits, ExecutionRegistry, Harness, HarnessBuilder, HarnessRunOptions, HarnessStreamEvent,
+    Hook, HookChain, HookContext, HookDecision, HookError, HookEvent, LoopStrategy,
+    OllamaModelInterface, PlanExecuteConfig, ReactConfig, RegisteredToolSchema, RunResult, SchemaRef,
+    SearchMethod, SessionId, StandardHookChain, StandardTool, StandardTools, Task, ToolAnnotations,
+    WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 /// Per-worker wall-clock cap. A worker can burn many internal ReAct turns; this
@@ -138,6 +142,50 @@ const ORCHESTRATOR_PROMPT: &str = "You are an orchestrator. You coordinate two w
      research worker, asking it to format a polished markdown report; (3) call `write_file` to \
      save the writing worker's markdown verbatim to `report.md`. Do the research and writing by \
      delegating to the workers — never do it yourself — and always finish by writing report.md.";
+
+/// The orchestrator plan-phase output contract (`plan-schema`). Post-#119,
+/// `PlanExecute`'s `plan` slot is STRUCTURED: a bare `ReAct` there must declare
+/// an `output` schema so the slot yields a typed task graph
+/// (`ExecutionRegistry::validate` enforces this via `check_structured_slot`).
+fn plan_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Ordered subtasks the orchestrator delegates.",
+                "items": { "type": "string" }
+            },
+            "rationale": { "type": "string" }
+        },
+        "required": ["tasks"]
+    })
+}
+
+/// The registry the orchestrator's composed strategy resolves against. Only the
+/// `plan-schema` handle is EXPLICIT; the builder default-fills the empty
+/// agent/toolset handles (`ReactConfig::per_loop`) from the orchestrator's own
+/// model + global tool catalogue (the worker-tools) at `build`.
+fn build_registry() -> ExecutionRegistry {
+    ExecutionRegistry::builder()
+        .schema("plan-schema", plan_schema())
+        .build()
+}
+
+/// The post-#119 composed orchestrator strategy:
+/// `PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)`. The plan leaf carries
+/// the `plan-schema` output contract required for the structured `plan` slot.
+/// Old flat shape was `PlanExecute { plan_model: None }`.
+fn plan_execute_strategy() -> LoopStrategy {
+    let plan = ReactConfig {
+        output: Some(SchemaRef("plan-schema".to_string())),
+        ..ReactConfig::per_loop(u32::MAX)
+    };
+    LoopStrategy::PlanExecute(PlanExecuteConfig {
+        plan: Box::new(LoopStrategy::ReAct(plan)),
+        ..PlanExecuteConfig::simple(None)
+    })
+}
 
 /// Lifecycle hook that surfaces the ORCHESTRATOR's PlanExecute plan and each
 /// subtask as it advances. This is the "the orchestrator PLANS, then delegates"
@@ -350,6 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = WorkspaceScopedSandbox::new(WorkspaceConfig::scoped(workspace_root.clone()))?;
     let orchestrator = HarnessBuilder::conversational(orchestrator_model)
         .sandbox(Arc::new(sandbox))
+        .registry(build_registry())
         .tool(research_tool)
         .tool(writing_tool)
         .tool(StandardTools::write_file())
@@ -360,15 +409,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The orchestrator plans the three steps up front via PlanExecute, then
     // executes them. The turn budget is divided across subtasks, so give it
     // generous headroom — each worker dispatch may itself be slow.
-    let task = Task::new(
-        prompt.clone(),
-        SessionId::generate(),
-        LoopStrategy::PlanExecute { plan_model: None },
-    )
-    .with_budget(BudgetLimits {
-        max_turns: Some(32),
-        ..BudgetLimits::default()
-    });
+    let task = Task::new(prompt.clone(), SessionId::generate(), plan_execute_strategy())
+        .with_budget(BudgetLimits {
+            max_turns: Some(32),
+            ..BudgetLimits::default()
+        });
 
     // The orchestrator's stream is where the agent boundaries become visible.
     // A `ToolCall` to a worker IS the "→ worker" boundary; the matching
@@ -383,13 +428,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options =
         HarnessRunOptions::new(task).with_stream(Box::new(move |event: HarnessStreamEvent| {
             match event {
-                HarnessStreamEvent::TurnStart { turn } => {
+                HarnessStreamEvent::TurnStart { turn, .. } => {
                     println!("orchestrator · plan/execute turn {turn}");
                 }
                 HarnessStreamEvent::ToolCall {
                     call_id,
                     name,
                     args,
+                    ..
                 } => {
                     call_names.lock().unwrap().insert(call_id, name.clone());
                     if is_worker(&name) {
@@ -410,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     call_id,
                     is_error,
                     content,
+                    ..
                 } => {
                     let name = call_names
                         .lock()
@@ -479,5 +526,44 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+// ============================================================================
+// Example-crate test (NO model): the orchestrator's composed PlanExecute
+// strategy resolves against the example's registry — the regression guard that
+// the post-#119 strategy tree stays validation-clean against current core.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spore_core::{AgentId, EmptyToolRegistry, ModelAgent};
+
+    /// AC: the composed `PlanExecute(plan: ReAct{plan-schema}, execute: ReAct)`
+    /// tree validates — the plan slot's output schema resolves and the
+    /// structured-slot contract is satisfied. The leaves use the EMPTY
+    /// agent/toolset handles that `HarnessBuilder::build_config` default-fills at
+    /// `build`; here we mirror that fill so the standalone registry validates
+    /// exactly as the assembled orchestrator harness would.
+    #[test]
+    fn registry_validates() {
+        let model = Arc::new(OllamaModelInterface::with_base_url(
+            "gemma4:e4b",
+            "http://localhost:11434".to_string(),
+        ));
+        let registry = build_registry()
+            .into_builder()
+            .fill_default_agent(Arc::new(ModelAgent::new(AgentId::new("default"), model)))
+            .fill_default_toolset(Arc::new(EmptyToolRegistry))
+            .build();
+        let task = Task::new(
+            "research, write, save".to_string(),
+            SessionId::generate(),
+            plan_execute_strategy(),
+        );
+        assert!(
+            registry.validate(&task).is_ok(),
+            "the composed PlanExecute strategy must validate against the registry"
+        );
     }
 }

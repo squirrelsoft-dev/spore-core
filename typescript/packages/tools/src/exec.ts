@@ -31,6 +31,21 @@ type ToolContext = toolRegistry.ToolContext;
 type ToolSchema = toolRegistry.ToolSchema;
 
 import { toolExecutionErrorToOutput } from "./errors.js";
+
+// Truncate a string before embedding it in an error message. Smaller threshold
+// than the general 64 KB output limit because this is inside an error message
+// field, not a standalone content field.
+const STDERR_TRUNCATION_THRESHOLD = 8 * 1024;
+const STDERR_HEAD_CHARS = 2 * 1024;
+const STDERR_TAIL_CHARS = 2 * 1024;
+
+function truncateForMessage(s: string): string {
+  if (s.length <= STDERR_TRUNCATION_THRESHOLD) return s;
+  const head = s.slice(0, STDERR_HEAD_CHARS);
+  const tail = s.slice(s.length - STDERR_TAIL_CHARS);
+  const elided = s.length - STDERR_HEAD_CHARS - STDERR_TAIL_CHARS;
+  return `${head}\n... [${elided} bytes elided] ...\n${tail}`;
+}
 import {
   ExecParamsSchema,
   parseParams,
@@ -120,7 +135,7 @@ export class ExecTool implements Tool {
     }
     return {
       kind: "error",
-      message: `exit ${out.exit_code} ; stderr: ${out.stderr.trimEnd()}`,
+      message: `exit ${out.exit_code} ; stderr: ${truncateForMessage(out.stderr.trimEnd())}`,
       recoverable: true,
     };
   }
@@ -225,7 +240,7 @@ export class BashCommandTool implements Tool {
     }
     return {
       kind: "error",
-      message: `exit ${out.exit_code} ; stderr: ${out.stderr.trimEnd()}`,
+      message: `exit ${out.exit_code} ; stderr: ${truncateForMessage(out.stderr.trimEnd())}`,
       recoverable: true,
     };
   }
@@ -320,7 +335,7 @@ export class RunTestsTool implements Tool {
     }
     return {
       kind: "error",
-      message: `tests failed (exit ${out.exit_code}): ${combined}`,
+      message: `tests failed (exit ${out.exit_code}): ${truncateForMessage(combined)}`,
       recoverable: true,
     };
   }
