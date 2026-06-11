@@ -29,6 +29,10 @@ import (
 
 const telBadMsg = "missing required parameter `description`"
 
+// telN returns a *uint32 for an explicit ErrorLoopThreshold (including 0 to
+// disable). A nil field defaults to 3 via effectiveErrorLoopThreshold.
+func telN(n uint32) *uint32 { return &n }
+
 // telBadCall is the malformed add_task call the weak model repeats (gemma's
 // task_list/add_task-without-description scenario).
 func telBadCall(args string) ToolCall {
@@ -102,7 +106,7 @@ func TestTELAC1SuccessResetsCounterNoTrip(t *testing.T) {
 		}
 	}
 	cfg.ToolRegistry = reg
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(20)))
@@ -121,7 +125,7 @@ func TestTELAC1ArgsChangeStartsFreshRun(t *testing.T) {
 
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 2 // 2N == 4; longest identical run is 1.
+	cfg.ErrorLoopThreshold = telN(2) // 2N == 4; longest identical run is 1.
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(20)))
@@ -142,7 +146,7 @@ func TestTELAC2InjectsOneCorrectiveAtN(t *testing.T) {
 
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(20)))
@@ -164,8 +168,13 @@ func TestTELAC2InjectsOneCorrectiveAtN(t *testing.T) {
 	if !strings.Contains(c, telBadMsg) {
 		t.Fatalf("corrective must carry the bare error: %q", c)
 	}
-	if !strings.Contains(c, `"required"`) {
-		t.Fatalf("corrective must carry the parameter schema: %q", c)
+	// Cross-language byte-identity (#137 divergence A): the rendered schema MUST be
+	// key-sorted (alphabetical, recursive), compact, no HTML escaping — IDENTICAL
+	// to the Rust reference's serde_json output. Assert the EXACT sorted string so
+	// an insertion-order render (json.Compact) can't regress.
+	const wantSchema = `{"properties":{"description":{"type":"string"},"task_list_id":{"type":"string"}},"required":["task_list_id","description"],"type":"object"}`
+	if !strings.Contains(c, "Expected parameter schema: "+wantSchema) {
+		t.Fatalf("corrective schema not byte-identical to Rust.\n got: %q\nwant substring: %q", c, "Expected parameter schema: "+wantSchema)
 	}
 	if !strings.Contains(c, "correctly-typed JSON") {
 		t.Fatalf("corrective must carry the hint: %q", c)
@@ -180,7 +189,7 @@ func TestTELAC3FailTerminalIsToolErrorLoop(t *testing.T) {
 
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(telLeaf(BudgetExhaustedBehavior{Kind: BehaviorFail}, 50)))
@@ -205,7 +214,7 @@ func TestTELAC3EscalateSurfacesToHuman(t *testing.T) {
 
 	cfg := surfaceCfg(a) // EscalationMode SurfaceToHuman
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(telLeaf(BudgetExhaustedBehavior{Kind: BehaviorEscalate}, 50)))
@@ -222,7 +231,7 @@ func TestTELAC3EscalateAutonomousIsToolErrorLoop(t *testing.T) {
 
 	cfg := standardCfg(a) // EscalationMode Autonomous
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(telLeaf(BudgetExhaustedBehavior{Kind: BehaviorEscalate}, 50)))
@@ -247,7 +256,7 @@ func TestTELAC3ContinueGrantsOneWindowThenTerminal(t *testing.T) {
 
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 
 	behavior := BudgetExhaustedBehavior{
 		Kind:         BehaviorContinue,
@@ -309,7 +318,7 @@ func TestTELAC4EmitsDetectedAndBrokenEvents(t *testing.T) {
 	obs := &telLoopObserver{}
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 3
+	cfg.ErrorLoopThreshold = telN(3)
 	cfg.Observability = obs
 
 	var streamDetected, streamBroken []uint32
@@ -353,11 +362,70 @@ func TestTELThresholdZeroDisablesBreaker(t *testing.T) {
 
 	cfg := standardCfg(a)
 	cfg.ToolRegistry = telErrRegistry()
-	cfg.ErrorLoopThreshold = 0
+	cfg.ErrorLoopThreshold = telN(0)
 
 	h := NewStandardHarness(cfg)
 	r := h.Run(context.Background(), NewHarnessRunOptions(reactTask(20)))
 	if r.Kind != RunSuccess || r.Output != "fin" {
 		t.Fatalf("expected Success (breaker off), got kind=%q reason=%+v", r.Kind, r.Reason)
+	}
+}
+
+// Divergence B contract (#137): a default-constructed config defaults N to 3,
+// while an EXPLICIT 0 disables. Pins effectiveErrorLoopThreshold directly.
+func TestTELEffectiveThresholdDefaultsToThree(t *testing.T) {
+	// nil field (a plain HarnessConfig{}) -> 3, the cross-language default.
+	if got := (HarnessConfig{}).effectiveErrorLoopThreshold(); got != 3 {
+		t.Fatalf("default-constructed config N = %d, want 3", got)
+	}
+	// Explicit 0 disables (read verbatim).
+	if got := (HarnessConfig{ErrorLoopThreshold: telN(0)}).effectiveErrorLoopThreshold(); got != 0 {
+		t.Fatalf("explicit 0 N = %d, want 0 (disabled)", got)
+	}
+	// Explicit non-default honored verbatim.
+	if got := (HarnessConfig{ErrorLoopThreshold: telN(5)}).effectiveErrorLoopThreshold(); got != 5 {
+		t.Fatalf("explicit 5 N = %d, want 5", got)
+	}
+}
+
+// Divergence B end-to-end: a NORMALLY-constructed config (ErrorLoopThreshold
+// never set) still trips the breaker at the default 2N == 6 — no manual
+// ErrorLoopThreshold needed (the symptom the verifier flagged).
+func TestTELDefaultConfigTripsAtDefaultN(t *testing.T) {
+	a := NewMockAgent("t")
+	telPushBad(a, 8, telBadArgs)
+
+	cfg := standardCfg(a) // ErrorLoopThreshold left nil → default 3.
+	cfg.ToolRegistry = telErrRegistry()
+
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(telLeaf(BudgetExhaustedBehavior{Kind: BehaviorFail}, 50)))
+	if r.Kind != RunFailure || r.Reason.Kind != HaltToolErrorLoop {
+		t.Fatalf("expected Failure{ToolErrorLoop} from a default config, got kind=%q reason=%+v", r.Kind, r.Reason)
+	}
+	if r.Reason.ConsecutiveErrors != 6 {
+		t.Fatalf("consecutive_errors = %d, want 6 (default 2N)", r.Reason.ConsecutiveErrors)
+	}
+}
+
+// Divergence A: sortedCompactJSON renders object keys alphabetically/recursively,
+// compact, with NO HTML escaping — byte-identical to serde_json's default.
+func TestSortedCompactJSONIsKeySortedAndUnescaped(t *testing.T) {
+	in := []byte(`{"type":"object","properties":{"task_list_id":{"type":"string"},"description":{"type":"string"}},"required":["task_list_id","description"]}`)
+	const want = `{"properties":{"description":{"type":"string"},"task_list_id":{"type":"string"}},"required":["task_list_id","description"],"type":"object"}`
+	got, ok := sortedCompactJSON(in)
+	if !ok {
+		t.Fatal("sortedCompactJSON failed on valid JSON")
+	}
+	if got != want {
+		t.Fatalf("not byte-identical to Rust serde_json:\n got: %s\nwant: %s", got, want)
+	}
+	// No HTML escaping of <, >, & (serde_json does not escape them).
+	esc, ok := sortedCompactJSON([]byte(`{"k":"a<b>c&d"}`))
+	if !ok {
+		t.Fatal("sortedCompactJSON failed on valid JSON with special chars")
+	}
+	if esc != `{"k":"a<b>c&d"}` {
+		t.Fatalf("HTML escaping leaked: got %s, want %s", esc, `{"k":"a<b>c&d"}`)
 	}
 }

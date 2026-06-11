@@ -54,6 +54,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2728,10 +2729,14 @@ type HarnessConfig struct {
 	// (the enrichToolError schema+hint); at 2*N it STOPS looping and resolves the
 	// node's BudgetExhaustedBehavior WITHOUT burning the remaining budget,
 	// terminating with HaltToolErrorLoop (never HaltBudgetExceeded). The 2x
-	// hard-stop multiplier is FIXED. ZERO disables the breaker entirely. The
-	// builder defaults it to 3 (matching the Rust reference); a bare HarnessConfig
-	// literal that does not set it leaves the breaker OFF (back-compat).
-	ErrorLoopThreshold uint32
+	// hard-stop multiplier is FIXED.
+	//
+	// Pointer sentinel so a default-constructed config gets the cross-language
+	// default of 3 while an EXPLICIT 0 disables the breaker (matching the Rust /
+	// TS / Python builder default + explicit-0-disables contract). Read it via
+	// effectiveErrorLoopThreshold: nil -> 3 (the default), *=0 -> disabled, *=n ->
+	// n. Mirrors the house idiom for optional caps (e.g. BudgetLimits.MaxTurns).
+	ErrorLoopThreshold *uint32
 
 	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
 	// strategy (issue #58, B3): the maximum number of context windows the
@@ -3026,6 +3031,20 @@ func (c HarnessConfig) effectiveMaxResets() uint32 {
 		return 3
 	}
 	return c.MaxResets
+}
+
+// effectiveErrorLoopThreshold returns N, the consecutive-recoverable-tool-error
+// breaker trigger (issue #137). A nil ErrorLoopThreshold (a default-constructed
+// config) yields the cross-language default of 3; a non-nil pointer is honored
+// verbatim, so an EXPLICIT 0 disables the breaker. This is the read-time default
+// pattern of effectiveMaxStopBlocks / effectiveMaxResets, extended with a pointer
+// sentinel so explicit-0 is distinguishable from unset (matching the Rust / TS /
+// Python builder-default + explicit-0-disables contract).
+func (c HarnessConfig) effectiveErrorLoopThreshold() uint32 {
+	if c.ErrorLoopThreshold == nil {
+		return 3
+	}
+	return *c.ErrorLoopThreshold
 }
 
 // StandardHarness is the canonical Harness implementation.
@@ -3852,20 +3871,49 @@ func registrySchemas(reg ToolRegistry) []ToolSchema {
 // (issue #137; mirrors the Rust enrich_tool_error). Returns a recoverable
 // ToolOutput.Error carrying the enriched text. schema may be nil — the schema
 // section is then omitted but the hint is always appended.
+//
+// The schema JSON is rendered with object keys sorted lexicographically and
+// recursively, with compact separators and NO HTML escaping, so the bytes are
+// IDENTICAL to the Rust reference (serde_json without preserve_order serializes
+// object keys via a BTreeMap → alphabetically sorted, and does not HTML-escape).
+// json.Compact on the raw bytes would instead preserve insertion order and so
+// diverge from Rust / TS / Python.
 func enrichToolError(message string, schema *ToolSchema) ToolOutput {
 	enriched := message
 	if schema != nil && len(schema.InputSchema) > 0 {
-		// schema.InputSchema is already canonical JSON (json.RawMessage); compact
-		// it so the rendered text is stable.
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, schema.InputSchema); err == nil {
-			enriched += "\n\nExpected parameter schema: " + buf.String()
+		if rendered, ok := sortedCompactJSON(schema.InputSchema); ok {
+			enriched += "\n\nExpected parameter schema: " + rendered
 		}
 	}
 	enriched += "\n\nHint: provide arguments as correctly-typed JSON " +
 		"(e.g. true/false as a bool, 42 as a number, [\"a\"] as an array) " +
 		"rather than as quoted strings."
 	return ToolOutput{Kind: ToolOutputError, Message: enriched, Recoverable: true}
+}
+
+// sortedCompactJSON re-serializes raw JSON with object keys sorted
+// lexicographically/recursively, compact separators, and NO HTML escaping —
+// byte-identical to serde_json's default (sorted BTreeMap, no <>& escaping).
+// Go's encoding/json sorts map[string]any keys recursively; a json.Encoder with
+// SetEscapeHTML(false) suppresses the <>& escaping serde_json never applies.
+// Numbers are preserved verbatim via json.Number (UseNumber) so e.g. integer
+// vs. float spelling round-trips unchanged. Returns false if raw is not valid
+// JSON.
+func sortedCompactJSON(raw json.RawMessage) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var tree any
+	if err := dec.Decode(&tree); err != nil {
+		return "", false
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(tree); err != nil {
+		return "", false
+	}
+	// json.Encoder.Encode appends a trailing newline; strip it.
+	return strings.TrimRight(buf.String(), "\n"), true
 }
 
 // runReAct drives the ReAct loop, then finalizes observability for terminal
@@ -4224,9 +4272,10 @@ func (h *StandardHarness) runReActInner(
 
 	// Consecutive-recoverable-tool-error breaker state (issue #137), keyed by tool
 	// name. Loop-local to this window: a fresh Run / re-driven Continue window
-	// starts with a clean N/2N allowance (AC3 Continue reset). errorLoopN is N; the
-	// hard stop is at 2*N. N == 0 disables the breaker.
-	errorLoopN := h.config.ErrorLoopThreshold
+	// starts with a clean N/2N allowance (AC3 Continue reset). errorLoopN is N (a
+	// nil config field defaults to 3; an explicit 0 disables); the hard stop is at
+	// 2*N.
+	errorLoopN := h.config.effectiveErrorLoopThreshold()
 	errorRuns := map[string]*errorRun{}
 
 	effectiveTurnCap := maxIterations

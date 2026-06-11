@@ -47,8 +47,9 @@ func TestToolErrorLoopBreakerHardStopsAtTwoN(t *testing.T) {
 		Sandbox:           AllowAllSandbox{},
 		ContextManager:    NoopContextManager{},
 		TerminationPolicy: AlwaysContinuePolicy{},
-		// N == 3 → inject at 3 identical errors, hard-stop at 6.
-		ErrorLoopThreshold: 3,
+		// ErrorLoopThreshold left unset: a default-constructed config defaults N to
+		// 3 (effectiveErrorLoopThreshold), matching the Rust / TS / Python default —
+		// inject at 3 identical errors, hard-stop at 6.
 		// Autonomous so the leaf's Fail behavior produces a terminal Failure (not a
 		// HITL pause) at the 2N hard stop.
 		EscalationMode: AutonomousEscalation(),

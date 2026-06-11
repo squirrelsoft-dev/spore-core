@@ -22,9 +22,10 @@ func standardCfg(agent Agent) HarnessConfig {
 		// pause path is exercised by tests that build a SurfaceToHuman config
 		// explicitly (see surfaceCfg in harness_budget_escalation_130_test.go).
 		EscalationMode: AutonomousEscalation(),
-		// #137: default N to 3, matching the builder default and the Rust reference
-		// standard_config. Tests that exercise the breaker override this explicitly.
-		ErrorLoopThreshold: 3,
+		// #137: ErrorLoopThreshold intentionally left nil — a normally-constructed
+		// config defaults to N=3 via effectiveErrorLoopThreshold (matching the Rust /
+		// TS / Python builder default). Tests that exercise the breaker set it
+		// explicitly (telN helper).
 	}
 }
 
