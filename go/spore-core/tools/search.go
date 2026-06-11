@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
@@ -231,12 +232,89 @@ func (*GrepTool) Schema() sporecore.RegistryToolSchema {
 				"output_mode": {
 					"type": "string",
 					"enum": ["content", "count", "files_with_matches"]
+				},
+				"context_lines": {
+					"type": "integer",
+					"description": "Lines of context before and after each match (default 0). When > 0, match lines use colon separator, context lines use dash, non-adjacent groups separated by --.",
+					"minimum": 0
 				}
 			},
 			"required": ["pattern", "path"]
 		}`),
 		Annotations: sporecore.ToolAnnotations{ReadOnly: true},
 	}
+}
+
+// buildContextOutput builds the context-aware grep -C N output for a single
+// file. allLines is the full file split into lines (not newline-terminated).
+// matchIndices is a sorted slice of 0-based line indices that matched the
+// pattern. ctx is the number of context lines on each side.
+//
+// Output format:
+//   - Match lines:   path:lineNum:text   (`:` separator, 1-indexed)
+//   - Context lines: path:lineNum-text   (`-` separator)
+//   - Non-adjacent groups are separated by "--"
+//   - Overlapping/adjacent windows are merged (no line appears twice)
+func buildContextOutput(path string, allLines []string, matchIndices []int, ctx uint32) string {
+	if len(matchIndices) == 0 {
+		return ""
+	}
+
+	c := int(ctx)
+	last := len(allLines) - 1
+
+	// Expand each match into a [start, end] window (0-based, inclusive).
+	type window struct{ start, end int }
+	windows := make([]window, 0, len(matchIndices))
+	for _, mi := range matchIndices {
+		start := mi - c
+		if start < 0 {
+			start = 0
+		}
+		end := mi + c
+		if end > last {
+			end = last
+		}
+		windows = append(windows, window{start, end})
+	}
+
+	// Merge overlapping/adjacent windows.
+	merged := make([]window, 0, len(windows))
+	for _, w := range windows {
+		if n := len(merged); n > 0 && w.start <= merged[n-1].end+1 {
+			if w.end > merged[n-1].end {
+				merged[n-1].end = w.end
+			}
+		} else {
+			merged = append(merged, w)
+		}
+	}
+
+	// Build a set of match indices for O(1) lookup.
+	matchSet := make(map[int]struct{}, len(matchIndices))
+	for _, mi := range matchIndices {
+		matchSet[mi] = struct{}{}
+	}
+
+	var sb strings.Builder
+	for gi, w := range merged {
+		if gi > 0 {
+			sb.WriteString("\n--")
+		}
+		for lineIdx := w.start; lineIdx <= w.end; lineIdx++ {
+			if gi > 0 || lineIdx > w.start {
+				sb.WriteByte('\n')
+			}
+			lineNum := lineIdx + 1 // 1-indexed
+			text := allLines[lineIdx]
+			if _, isMatch := matchSet[lineIdx]; isMatch {
+				fmt.Fprintf(&sb, "%s:%d:%s", path, lineNum, text)
+			} else {
+				fmt.Fprintf(&sb, "%s:%d-%s", path, lineNum, text)
+			}
+		}
+	}
+	return sb.String()
 }
 
 func (t *GrepTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox sporecore.SandboxProvider, _ *sporecore.ToolContext) sporecore.ToolOutput {
@@ -320,11 +398,43 @@ func (t *GrepTool) Execute(ctx context.Context, call sporecore.ToolCall, sandbox
 		}
 		body = joinLines(lines)
 	default: // GrepOutputContent
-		lines := make([]string, len(hits))
-		for i, h := range hits {
-			lines[i] = fmt.Sprintf("%s:%d:%s", h.path, h.line, h.text)
+		if params.ContextLines > 0 {
+			// Group hits by file path, then emit context-aware output per file.
+			// hits are already sorted by path then line.
+			type fileGroup struct {
+				path    string
+				indices []int
+			}
+			var groups []fileGroup
+			for _, h := range hits {
+				idx := h.line - 1 // convert 1-indexed to 0-based
+				if n := len(groups); n > 0 && groups[n-1].path == h.path {
+					groups[n-1].indices = append(groups[n-1].indices, idx)
+				} else {
+					groups = append(groups, fileGroup{path: h.path, indices: []int{idx}})
+				}
+			}
+			var fileOutputs []string
+			for _, g := range groups {
+				data, err := os.ReadFile(g.path)
+				if err != nil {
+					continue
+				}
+				allLines := splitLines(string(data))
+				out := buildContextOutput(g.path, allLines, g.indices, params.ContextLines)
+				if out != "" {
+					fileOutputs = append(fileOutputs, out)
+				}
+			}
+			// Separate output from different files with "--".
+			body = strings.Join(fileOutputs, "\n--\n")
+		} else {
+			lines := make([]string, len(hits))
+			for i, h := range hits {
+				lines[i] = fmt.Sprintf("%s:%d:%s", h.path, h.line, h.text)
+			}
+			body = joinLines(lines)
 		}
-		body = joinLines(lines)
 	}
 	return finishWithPossibleTruncation(ctx, body, call.ID, sandbox)
 }

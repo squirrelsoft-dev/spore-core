@@ -138,12 +138,13 @@ const (
 )
 
 // GrepParams are the parameters for the net-new GrepTool. Distinct from
-// GrepFilesParams: adds OutputMode (defaulting to content).
+// GrepFilesParams: adds OutputMode (defaulting to content) and ContextLines.
 type GrepParams struct {
-	Pattern    string         `json:"pattern"`
-	Path       string         `json:"path"`
-	Recursive  bool           `json:"recursive,omitempty"`
-	OutputMode GrepOutputMode `json:"output_mode,omitempty"`
+	Pattern      string         `json:"pattern"`
+	Path         string         `json:"path"`
+	Recursive    bool           `json:"recursive,omitempty"`
+	OutputMode   GrepOutputMode `json:"output_mode,omitempty"`
+	ContextLines uint32         `json:"context_lines,omitempty"` // default 0
 }
 
 // UnmarshalJSON applies the default OutputMode=content when absent or empty.
