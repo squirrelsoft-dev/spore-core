@@ -116,8 +116,15 @@ export const GrepParamsSchema = z.object({
   path: z.string(),
   recursive: z.boolean().default(false),
   output_mode: GrepOutputModeSchema,
+  /**
+   * Lines of context to show before and after each match (default 0).
+   * When > 0, uses standard grep -C N format: match lines use `:` separator,
+   * context lines use `-`, non-adjacent groups separated by `--`.
+   */
+  context_lines: z.number().int().nonnegative().default(0),
 });
-export type GrepParams = z.infer<typeof GrepParamsSchema>;
+/** Output type (post-parse with defaults filled): all fields are required. */
+export type GrepParams = z.output<typeof GrepParamsSchema>;
 
 // ---------- EditFile (#81) ----------
 

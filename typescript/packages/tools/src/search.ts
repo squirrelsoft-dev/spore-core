@@ -31,6 +31,60 @@ interface GrepHit {
   text: string;
 }
 
+/**
+ * Build context-aware output for a single file's matches.
+ *
+ * @param path     - File path (used as-is in output lines).
+ * @param allLines - All lines of the file (not newline-terminated).
+ * @param matchIndices - Sorted 0-based line indices of matched lines.
+ * @param context  - Number of context lines on each side.
+ * @returns Output string in standard `grep -C N` format.
+ */
+function buildContextOutput(
+  path: string,
+  allLines: string[],
+  matchIndices: number[],
+  context: number,
+): string {
+  if (matchIndices.length === 0) return "";
+
+  const last = allLines.length - 1;
+
+  // Expand each match index into a [start, end] window (0-based, inclusive).
+  const windows: [number, number][] = matchIndices.map((mi) => [
+    Math.max(0, mi - context),
+    Math.min(last, mi + context),
+  ]);
+
+  // Merge overlapping/adjacent windows.
+  const merged: [number, number][] = [];
+  for (const [start, end] of windows) {
+    const prev = merged[merged.length - 1];
+    if (prev && start <= prev[1] + 1) {
+      prev[1] = Math.max(prev[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+
+  // Build a Set of match indices for O(1) lookup.
+  const matchSet = new Set(matchIndices);
+
+  const parts: string[] = [];
+  for (let gi = 0; gi < merged.length; gi++) {
+    if (gi > 0) parts.push("--");
+    const [winStart, winEnd] = merged[gi]!;
+    for (let lineIdx = winStart; lineIdx <= winEnd; lineIdx++) {
+      const lineNum = lineIdx + 1; // 1-indexed
+      const text = allLines[lineIdx] ?? "";
+      const sep = matchSet.has(lineIdx) ? ":" : "-";
+      parts.push(`${path}:${lineNum}${sep}${text}`);
+    }
+  }
+
+  return parts.join("\n");
+}
+
 async function scanFile(
   path: string,
   re: RegExp,
@@ -249,6 +303,12 @@ export class GrepTool implements Tool {
             type: "string",
             enum: ["content", "count", "files_with_matches"],
           },
+          context_lines: {
+            type: "integer",
+            description:
+              "Lines of context to show before and after each match (default 0). When > 0, uses standard grep -C N format: match lines use `:` separator, context lines use `-`, non-adjacent groups separated by `--`.",
+            minimum: 0,
+          },
         },
         required: ["pattern", "path"],
       },
@@ -311,10 +371,48 @@ export class GrepTool implements Tool {
       a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1,
     );
 
+    const contextLines = p.value.context_lines ?? 0;
+    const useContext = contextLines > 0 && p.value.output_mode === "content";
+
     let body = "";
     switch (p.value.output_mode) {
       case "content":
-        body = matches.map((m) => `${m.file}:${m.line}:${m.text}`).join("\n");
+        if (useContext) {
+          // Group matches by file, then emit context-aware output per file.
+          const fileGroups: Map<string, number[]> = new Map();
+          for (const m of matches) {
+            const idx = m.line - 1; // convert 1-indexed to 0-based
+            const group = fileGroups.get(m.file);
+            if (group) group.push(idx);
+            else fileGroups.set(m.file, [idx]);
+          }
+
+          const fileOutputs: string[] = [];
+          for (const [filePath, matchIdxs] of fileGroups) {
+            let content: string;
+            try {
+              content = await fs.readFile(filePath, "utf8");
+            } catch {
+              continue;
+            }
+            const allLines = content.split("\n");
+            // Remove trailing empty element from final newline if present.
+            if (allLines[allLines.length - 1] === "") allLines.pop();
+            const out = buildContextOutput(
+              filePath,
+              allLines,
+              matchIdxs,
+              contextLines,
+            );
+            if (out.length > 0) fileOutputs.push(out);
+          }
+          // Separate output from different files with `--`.
+          body = fileOutputs.join("\n--\n");
+        } else {
+          body = matches
+            .map((m) => `${m.file}:${m.line}:${m.text}`)
+            .join("\n");
+        }
         break;
       case "files_with_matches": {
         // matches are sorted by file; emit each distinct file once.
