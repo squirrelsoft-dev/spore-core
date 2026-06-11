@@ -813,14 +813,39 @@ export interface BudgetExhausted {
 export type ChargeResult = { ok: true } | { ok: false; error: BudgetExhausted };
 
 /**
+ * Why a {@link StrategyOutcome} `budget_exhausted` was raised (issue #137).
+ * Runtime-only (NOT serialized). The single budget-exhaustion resolution site
+ * ({@link StandardHarness} `driveStrategyWithResumeSeed`) routes BOTH causes
+ * through the node's {@link BudgetExhaustedBehavior}, but stamps a DIFFERENT
+ * terminal {@link HaltReason} on the Fail / Escalate→Fail terminals so a caller
+ * can tell a genuine budget exhaustion from an error-grinding circuit-break.
+ *
+ *   - `budget` — the scope's step allowance ran out (the pre-#137 behavior).
+ *     Resolves to {@link HaltReason} `budget_exceeded`.
+ *   - `tool_error_loop` — the ReAct consecutive-recoverable-tool-error breaker
+ *     hard-stopped at `2 * errorLoopThreshold` identical-argument errors for
+ *     `tool`. Resolves to {@link HaltReason} `tool_error_loop` — NEVER
+ *     `budget_exceeded`.
+ */
+export type ExhaustionCause =
+  | { kind: "budget" }
+  | { kind: "tool_error_loop"; tool: string; consecutive_errors: number };
+
+/** The default {@link ExhaustionCause} — genuine budget exhaustion (#137). */
+export function defaultExhaustionCause(): ExhaustionCause {
+  return { kind: "budget" };
+}
+
+/**
  * The typed outcome a strategy node returns. Internally tagged on `kind`
  * (snake_case for symmetry with the other harness unions). Runtime-only — NEVER
  * serialized.
  *
  *   - `complete` — the strategy finished and produced its final `output`
  *     (`Output` maps to `string`, mirroring {@link RunResult}).
- *   - `budget_exhausted` — the strategy's budget scope ran out of allowance.
- *     Mirrors the {@link BudgetExhausted} charge-error fields and adds
+ *   - `budget_exhausted` — the strategy's budget scope ran out of allowance — OR
+ *     (issue #137) the ReAct consecutive-tool-error breaker tripped (see
+ *     `cause`). Mirrors the {@link BudgetExhausted} charge-error fields and adds
  *     `partialOutput` (any output produced before exhaustion). A child's
  *     `budget_exhausted` is an INSPECTABLE value the parent reads (e.g. to grant
  *     a continue or escalate); it does NOT auto-propagate as a failure.
@@ -837,6 +862,12 @@ export type StrategyOutcome =
       continuesUsed: number;
       phase: string;
       partialOutput?: string;
+      /**
+       * What caused this exhaustion (#137): genuine budget vs. an error loop.
+       * Defaults to {@link defaultExhaustionCause} (`budget`) for every pre-#137
+       * path.
+       */
+      cause?: ExhaustionCause;
     }
   | { kind: "failed"; error: HarnessError };
 
@@ -1732,6 +1763,40 @@ export function promoteBudgetExhausted(
     continuesUsed: err.continuesUsed,
     phase: err.phase,
     partialOutput,
+    cause: defaultExhaustionCause(),
+  };
+}
+
+/**
+ * Promote a ReAct tool-error-loop hard-stop (issue #137) to a
+ * {@link StrategyOutcome} `budget_exhausted` carrying a `tool_error_loop`
+ * {@link ExhaustionCause} so it flows through the SAME single budget-exhaustion
+ * resolution site as a real budget exhaustion, but the Fail / Escalate→Fail
+ * terminals report {@link HaltReason} `tool_error_loop` instead of
+ * `budget_exceeded`. The leaf's CONFIGURED `behavior` is carried so the
+ * resolution site can honor Fail / Escalate / Continue (a granted `continue`
+ * re-drives the window with a fresh per-tool error allowance, since the counter
+ * is loop-local to `runReactInner`). `stepsTaken` is the window's turn count at
+ * the break, so the terminal's `turns` reflects work actually done — the breaker
+ * does NOT burn the rest of the budget. Mirrors Rust `promote_tool_error_loop`.
+ */
+export function promoteToolErrorLoop(
+  leafBudget: BudgetPolicy,
+  leafBehavior: BudgetExhaustedBehavior,
+  stepsTaken: number,
+  tool: string,
+  consecutiveErrors: number,
+  partialOutput: string | undefined,
+): StrategyOutcome {
+  return {
+    kind: "budget_exhausted",
+    policy: leafBudget,
+    behavior: leafBehavior,
+    stepsTaken,
+    continuesUsed: 0,
+    phase: "react",
+    partialOutput,
+    cause: { kind: "tool_error_loop", tool, consecutive_errors: consecutiveErrors },
   };
 }
 
@@ -1971,6 +2036,29 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
   // When the smaller GLOBAL backstop trips first, the legacy `budget_exceeded`
   // terminal is recorded VERBATIM (the global cap is unchanged, #117 backstop).
   const windowTurns = result.kind === "success" || result.kind === "failure" ? result.turns : 0;
+  // #137: the window hit the consecutive-tool-error breaker's 2N hard stop.
+  // PROPAGATE it through the SAME single budget-exhaustion resolution site (so
+  // the node's `behavior` governs Fail/Escalate/Continue), but carry the
+  // `tool_error_loop` cause so the terminal reports {@link HaltReason}
+  // `tool_error_loop`, never `budget_exceeded`. The window's turns are still
+  // CHARGED against the leaf scope (accurate accounting), but the breaker stopped
+  // EARLY — the remaining budget is NOT burned. Detection is independent of
+  // `leafCapBinding`.
+  if (result.kind === "failure" && result.reason.kind === "tool_error_loop") {
+    const { tool, consecutive_errors } = result.reason;
+    const lastFinal = lastFinalResponseText(result) ?? "";
+    cx.scratch.runSession = result.session_state ?? emptySessionState();
+    chargeCurrent(cx, windowTurns);
+    popBudget(cx);
+    return promoteToolErrorLoop(
+      c.budget,
+      leafBehavior,
+      windowTurns,
+      tool,
+      consecutive_errors,
+      reactPartialJson(lastFinal),
+    );
+  }
   const windowHitBudget = result.kind === "failure" && result.reason.kind === "budget_exceeded";
   const leafAllowance = budgetPolicyAllowanceValue(c.budget);
   const leafCapBinding =
@@ -3452,7 +3540,21 @@ export type HarnessStreamEvent =
    * model stream does not surface it before args (a documented limitation —
    * the name is recovered on the coarse `tool_call`).
    */
-  | { kind: "tool_call_start"; index: number; call_id: string; name: string };
+  | { kind: "tool_call_start"; index: number; call_id: string; name: string }
+  /**
+   * The consecutive-recoverable-tool-error breaker DETECTED a loop (issue #137):
+   * a tool hit `errorLoopThreshold` (`N`) consecutive identical-argument
+   * recoverable errors and ONE corrective message was injected. A warning — the
+   * loop continues. Carries the tool name and the consecutive-error count (`= N`).
+   */
+  | { kind: "tool_error_loop_detected"; tool: string; consecutive_errors: number }
+  /**
+   * The consecutive-recoverable-tool-error breaker TRIPPED (issue #137): the same
+   * tool reached `2 * errorLoopThreshold` (`2 * N`) consecutive identical-argument
+   * errors and the loop STOPPED to resolve the node's
+   * {@link BudgetExhaustedBehavior}. Carries the tool name and the count (`= 2*N`).
+   */
+  | { kind: "tool_error_loop_broken"; tool: string; consecutive_errors: number };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
 
@@ -4388,6 +4490,18 @@ export type HaltReason =
    * human-readable description.
    */
   | { kind: "task_graph_cycle"; reason: string }
+  /**
+   * Returned by {@link StandardHarness} (issue #137) when the ReAct turn loop's
+   * consecutive-recoverable-tool-error breaker tripped: a tool returned
+   * `2 * errorLoopThreshold` consecutive recoverable {@link ToolOutput} `error`s
+   * with identical arguments, so the loop STOPPED grinding and resolved the
+   * node's {@link BudgetExhaustedBehavior} WITHOUT burning the remaining budget.
+   * This is DISTINCT from `budget_exceeded` (genuine budget exhaustion): the loop
+   * halted early on a detected error loop, not because the step budget ran out.
+   * Carries the offending tool name and the consecutive-error count at the moment
+   * of the hard stop (`2 * N`).
+   */
+  | { kind: "tool_error_loop"; tool: string; consecutive_errors: number }
   /**
    * Returned by {@link StandardHarness} when {@link ExecutionRegistry.validate}
    * fails at run entry (issue #120): a handle referenced by the task's strategy

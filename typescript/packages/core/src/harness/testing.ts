@@ -144,6 +144,9 @@ export class ScriptedSandbox implements SandboxProvider {
 export class ScriptedToolRegistry implements ToolRegistry {
   private readonly outputs: ToolOutput[] = [];
   private readonly haltNames = new Set<string>();
+  private readonly toolSchemas: ToolSchema[] = [];
+  /** When set, EVERY dispatch returns this recoverable error (#137). */
+  private alwaysError?: string;
   callCount = 0;
 
   push(output: ToolOutput): this {
@@ -154,14 +157,33 @@ export class ScriptedToolRegistry implements ToolRegistry {
     this.haltNames.add(name);
     return this;
   }
+  /**
+   * Make EVERY dispatch return the same recoverable {@link ToolOutput} `error`
+   * with `message`, regardless of args (#137 — the gemma
+   * `add_task`-without-`description` grinding scenario). Mirrors Rust's
+   * `ScriptedToolRegistry::always_recoverable_error`.
+   */
+  alwaysRecoverableError(message: string): this {
+    this.alwaysError = message;
+    return this;
+  }
+  /** Advertise a tool schema so `enrichToolError` can render it (#137). Mirrors
+   *  Rust's `ScriptedToolRegistry::with_schema`. */
+  withSchema(schema: ToolSchema): this {
+    this.toolSchemas.push(schema);
+    return this;
+  }
   isAlwaysHalt(toolName: string): boolean {
     return this.haltNames.has(toolName);
   }
   schemas(): ToolSchema[] {
-    return [];
+    return this.toolSchemas;
   }
   async dispatch(_call: ToolCall): Promise<ToolOutput> {
     this.callCount += 1;
+    if (this.alwaysError !== undefined) {
+      return { kind: "error", message: this.alwaysError, recoverable: true };
+    }
     const next = this.outputs.shift();
     return next ?? { kind: "success", content: "ok" };
   }

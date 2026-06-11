@@ -362,7 +362,20 @@ export type ContextOperation =
    * `resumeConsult` seam. `answered` is `false` when the resume carried a
    * budget-exhausted soft-fail rather than a handler answer.
    */
-  | { kind: "consult_resumed"; consult_kind: string; answered: boolean };
+  | { kind: "consult_resumed"; consult_kind: string; answered: boolean }
+  /**
+   * The ReAct consecutive-recoverable-tool-error breaker DETECTED a loop (issue
+   * #137): `tool_name` hit `errorLoopThreshold` (`N`) consecutive
+   * identical-argument recoverable errors and ONE corrective message was injected.
+   */
+  | { kind: "tool_error_loop_detected"; tool_name: string; consecutive_errors: number }
+  /**
+   * The ReAct consecutive-recoverable-tool-error breaker TRIPPED (issue #137):
+   * `tool_name` reached `2 * errorLoopThreshold` (`2 * N`) consecutive
+   * identical-argument errors and the loop STOPPED to resolve the node's budget
+   * behavior.
+   */
+  | { kind: "tool_error_loop_broken"; tool_name: string; consecutive_errors: number };
 
 export interface ContextSpan {
   base: SpanBase;

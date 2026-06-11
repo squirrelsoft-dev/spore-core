@@ -59,7 +59,12 @@ import {
   type TurnSpan,
   type WarnEvent,
 } from "../observability/types.js";
-import type { Message, ModelParams, ToolCall } from "../model/schemas.js";
+import type {
+  Message,
+  ModelParams,
+  ToolCall,
+  ToolSchema as ModelToolSchema,
+} from "../model/schemas.js";
 import { ModelParamsSchema } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
@@ -234,6 +239,19 @@ export interface HarnessConfig {
    */
   maxStopBlocks?: number;
   /**
+   * Consecutive-recoverable-tool-error breaker threshold `N` (issue #137). The
+   * ReAct turn loop tracks, per tool name, the current run of consecutive
+   * recoverable {@link ToolOutput} `error`s keyed on STRUCTURALLY-identical
+   * arguments; ANY success for that tool resets the run. At `N` consecutive
+   * identical-argument failures it injects ONE corrective USER message (the
+   * schema+hint render via {@link enrichToolError}); at `2 * N` it STOPS looping
+   * and resolves the node's {@link BudgetExhaustedBehavior} WITHOUT burning the
+   * remaining budget — terminating with {@link HaltReason} `tool_error_loop`
+   * (never `budget_exceeded`). `0` DISABLES the breaker. Optional; defaults to
+   * `3`. The `2×` hard-stop multiplier is fixed.
+   */
+  errorLoopThreshold?: number;
+  /**
    * Pluggable source of conditional prompt chunks (issue #79). Loaded at harness
    * construction and fed through {@link "../prompt-assembly/index.js".ContextSourcesBuilder}.
    * Optional; defaults to an empty {@link InMemoryChunkProvider}.
@@ -362,6 +380,57 @@ export interface HarnessConfig {
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
 const DEFAULT_MAX_RESETS = 3;
+/** Default consecutive-recoverable-tool-error breaker threshold `N` (#137). */
+const DEFAULT_ERROR_LOOP_THRESHOLD = 3;
+
+/**
+ * The current run of consecutive recoverable tool errors for ONE tool name
+ * (issue #137). Tracked per tool name in a loop-local `Map<string, ErrorRun>`
+ * inside {@link StandardHarness}'s `runReactInner`:
+ *
+ *   - On a recoverable {@link ToolOutput} `error` for tool `T` with args `A`: if
+ *     the existing run for `T` has `args` STRUCTURALLY equal to `A`, `count` is
+ *     incremented; otherwise the run is REPLACED with a fresh `{ args, count: 1 }`
+ *     (covers both the first error and the args-changed case).
+ *   - On ANY success for tool `T`: the entry is REMOVED (AC1 — success resets the
+ *     run regardless of args).
+ *   - At `count === N` (`errorLoopThreshold`): inject ONE corrective message
+ *     (AC2). `injected` is set so the message is NOT re-injected between `N` and
+ *     `2 * N` for the same run.
+ *   - At `count === 2 * N`: stop looping (AC3).
+ */
+interface ErrorRun {
+  /** The tool-call arguments shared by every error in this run. */
+  args: unknown;
+  /** How many consecutive identical-argument recoverable errors so far. */
+  count: number;
+  /** Whether the `N`-threshold corrective message has already been injected for
+   *  THIS run (so we inject exactly once between `N` and `2 * N`). */
+  injected: boolean;
+}
+
+/**
+ * Canonicalize a JSON value for STRUCTURAL equality (#137): object keys sorted
+ * at every level so two argument objects that differ only in key order compare
+ * equal — mirroring Rust's `serde_json::Value` `==`.
+ */
+function canonicalJson(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalJson);
+  if (v !== null && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(obj)
+        .sort()
+        .map((k) => [k, canonicalJson(obj[k])]),
+    );
+  }
+  return v;
+}
+
+/** Structural JSON equality of two tool-call argument values (#137). */
+function structurallyEqualArgs(a: unknown, b: unknown): boolean {
+  return JSON.stringify(canonicalJson(a)) === JSON.stringify(canonicalJson(b));
+}
 
 export class StandardHarness implements Harness, StrategyExecutor {
   /**
@@ -476,6 +545,26 @@ export class StandardHarness implements Harness, StrategyExecutor {
       arguments: truncated ? clipped : call.input,
       arguments_truncated: truncated,
     };
+  }
+
+  /**
+   * Enrich a recoverable tool-error message that survived (or was not eligible
+   * for) repair, so the model gets actionable feedback instead of a bare
+   * message. Appends the tool's parameter schema (when available) plus a short
+   * hint about supplying correctly-typed JSON arguments. Returns the enriched
+   * message text. Reused by the consecutive-tool-error breaker (#137) to render
+   * the ONE corrective message injected at the `N` threshold. Mirrors Rust's
+   * `StandardHarness::enrich_tool_error`.
+   */
+  private static enrichToolError(message: string, schema: ModelToolSchema | undefined): string {
+    let enriched = message;
+    if (schema !== undefined && schema.input_schema !== undefined) {
+      enriched += "\n\nExpected parameter schema: " + JSON.stringify(schema.input_schema);
+    }
+    enriched +=
+      "\n\nHint: provide arguments as correctly-typed JSON (e.g. true/false as a bool, " +
+      '42 as a number, ["a"] as an array) rather than as quoted strings.';
+    return enriched;
   }
 
   /**
@@ -829,6 +918,20 @@ export class StandardHarness implements Harness, StrategyExecutor {
           // reached (the scratch budget is not written back on the propagate
           // path). Fall back to the scratch turns if it is somehow 0.
           const turns = outcome.stepsTaken > 0 ? outcome.stepsTaken : cx.scratch.runBudget.turns;
+          // #137: the terminal `HaltReason` for a Fail / Escalate→Fail resolution
+          // depends on the CAUSE — a genuine budget exhaustion reports
+          // `budget_exceeded`; an error-loop break reports `tool_error_loop`. (A
+          // granted `continue` re-drives the window, whose loop-local error counter
+          // starts fresh — parallel to how a continue resets `stepsTaken`.)
+          const cause = outcome.cause ?? { kind: "budget" };
+          const terminalReason: HaltReason =
+            cause.kind === "tool_error_loop"
+              ? {
+                  kind: "tool_error_loop",
+                  tool: cause.tool,
+                  consecutive_errors: cause.consecutive_errors,
+                }
+              : { kind: "budget_exceeded", limit_type: "turns" };
           // Reconstruct the resolution scope: the FIRST round uses the leaf's
           // propagated behavior + continuesUsed; later in-process rounds reuse the
           // threaded (possibly fallen-through) state.
@@ -883,7 +986,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
             }
             return {
               kind: "failure",
-              reason: { kind: "budget_exceeded", limit_type: "turns" },
+              // #137: tool_error_loop vs budget_exceeded per cause.
+              reason: terminalReason,
               session_id: sessionId,
               usage: cx.usage,
               turns,
@@ -907,7 +1011,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
           // Fail contract: the partial is DISCARDED.
           return {
             kind: "failure",
-            reason: { kind: "budget_exceeded", limit_type: "turns" },
+            // #137: tool_error_loop vs budget_exceeded per cause.
+            reason: terminalReason,
             session_id: sessionId,
             usage: cx.usage,
             turns,
@@ -2425,6 +2530,12 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // consecutive blocks the loop terminates anyway. Boxed so `fireStopHooks`
     // can mutate it.
     const stopBlocks = { value: 0 };
+    // Consecutive-recoverable-tool-error breaker state (issue #137), keyed by
+    // tool name. Loop-local to this window: a fresh run()/re-driven Continue
+    // window starts with a clean N/2N allowance (AC3 Continue reset). `N` is
+    // `errorLoopThreshold`; the hard stop is at `2 * N`. `0` disables the breaker.
+    const errorLoopN = this.config.errorLoopThreshold ?? DEFAULT_ERROR_LOOP_THRESHOLD;
+    const errorRuns = new Map<string, ErrorRun>();
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
@@ -3067,6 +3178,113 @@ export class StandardHarness implements Harness, StrategyExecutor {
 
             const isError = output.kind === "error";
 
+            // ── Consecutive-recoverable-tool-error breaker (#137) ──────────────
+            // `output` here is either a Success or a RECOVERABLE Error (every
+            // other variant returned above). On a success the tool's error run
+            // resets (AC1); on a recoverable error we increment the
+            // identical-args run (AC1 args-variant) and check the N / 2N
+            // thresholds. At N we stash the corrective USER message here and
+            // append it AFTER the tool result below (well-formed conversation:
+            // assistant tool_use → tool result → corrective user message).
+            let pendingCorrective: string | undefined;
+            if (output.kind === "error" && output.recoverable) {
+              const existing = errorRuns.get(call.name);
+              let run: ErrorRun;
+              if (existing !== undefined && structurallyEqualArgs(existing.args, call.input)) {
+                // Same tool, structurally-identical args → extend the run.
+                existing.count += 1;
+                run = existing;
+              } else {
+                // First error, or the args changed → fresh run.
+                run = { args: call.input, count: 1, injected: false };
+                errorRuns.set(call.name, run);
+              }
+              const count = run.count;
+              const twoN = errorLoopN * 2;
+
+              // 2N: HARD STOP (AC3). Do NOT append this last tool result or
+              // continue — return a typed terminal that `runReactConfig` routes
+              // through the node's `BudgetExhaustedBehavior` WITHOUT burning the
+              // rest of the budget. The breaker is disabled when N === 0.
+              if (errorLoopN > 0 && count >= twoN) {
+                // AC4: emit the "broken" pair (stream + obs).
+                emit(onStream, {
+                  kind: "tool_error_loop_broken",
+                  tool: call.name,
+                  consecutive_errors: count,
+                });
+                if (this.config.observability) {
+                  const base = newRootSpanBase(
+                    SpanId.of(`${sessionId.asString()}-tool-error-loop-broken-${spanSeq}`),
+                    sessionId,
+                    task.id,
+                    "context_assembly",
+                    Timestamp.now(),
+                  );
+                  this.config.observability.emitContext({
+                    base,
+                    operation: {
+                      kind: "tool_error_loop_broken",
+                      tool_name: call.name,
+                      consecutive_errors: count,
+                    },
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    utilization_before: 0,
+                    utilization_after: 0,
+                  });
+                }
+                return failure(
+                  { kind: "tool_error_loop", tool: call.name, consecutive_errors: count },
+                  sessionId,
+                  usage,
+                  budgetUsed.turns,
+                  sessionState,
+                );
+              }
+
+              // N: inject ONE corrective message (AC2). Render the schema+hint via
+              // `enrichToolError` (reused) and inject it as a USER-role message —
+              // the SAME channel the Stop-block breaker uses — once per run (do not
+              // re-inject between N and 2N).
+              if (errorLoopN > 0 && count >= errorLoopN && !run.injected) {
+                run.injected = true;
+                const schema = toolRegistry.schemas().find((s) => s.name === call.name);
+                pendingCorrective = StandardHarness.enrichToolError(output.message, schema);
+                // AC4: emit the "detected/warning" pair (stream + obs) BEFORE the
+                // corrective message is appended.
+                emit(onStream, {
+                  kind: "tool_error_loop_detected",
+                  tool: call.name,
+                  consecutive_errors: count,
+                });
+                if (this.config.observability) {
+                  const base = newRootSpanBase(
+                    SpanId.of(`${sessionId.asString()}-tool-error-loop-detected-${spanSeq}`),
+                    sessionId,
+                    task.id,
+                    "context_assembly",
+                    Timestamp.now(),
+                  );
+                  this.config.observability.emitContext({
+                    base,
+                    operation: {
+                      kind: "tool_error_loop_detected",
+                      tool_name: call.name,
+                      consecutive_errors: count,
+                    },
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    utilization_before: 0,
+                    utilization_after: 0,
+                  });
+                }
+              }
+            } else {
+              // AC1: ANY success for this tool resets its run.
+              errorRuns.delete(call.name);
+            }
+
             // Tool-call span (issue #12), child of the current turn. Fire-and-forget.
             if (this.config.observability) {
               let outputSizeBytes = 0;
@@ -3132,6 +3350,15 @@ export class StandardHarness implements Harness, StrategyExecutor {
             });
             await this.config.contextManager.appendToolResult(sessionState, tr);
             approvedResults.push(tr);
+
+            // #137 (AC2): inject the ONE corrective user message at the N
+            // threshold, AFTER this call's tool result is recorded — the same
+            // `appendUserMessage` channel the Stop-block breaker uses, keeping the
+            // conversation well-formed (assistant tool_use → tool result →
+            // corrective user message).
+            if (pendingCorrective !== undefined) {
+              await this.config.contextManager.appendUserMessage(sessionState, pendingCorrective);
+            }
           }
 
           // Middleware: AfterTool
@@ -3396,6 +3623,7 @@ export class HarnessBuilder {
   private _contentCapture: ContentCaptureConfig = ContentCaptureConfig.default();
   private _hooks?: HookChain;
   private _maxStopBlocks = DEFAULT_MAX_STOP_BLOCKS;
+  private _errorLoopThreshold = DEFAULT_ERROR_LOOP_THRESHOLD;
   private _chunkProvider: ChunkProvider = new InMemoryChunkProvider();
   private _verifier?: Verifier;
   private _metricEvaluator?: MetricEvaluator;
@@ -3545,6 +3773,18 @@ export class HarnessBuilder {
    *  Defaults to `8`. */
   maxStopBlocks(max: number): this {
     this._maxStopBlocks = max;
+    return this;
+  }
+
+  /**
+   * Set the consecutive-recoverable-tool-error breaker threshold `N` (issue
+   * #137): inject ONE corrective message at `N` identical-argument failures,
+   * hard-stop at `2 * N` and resolve the node's {@link BudgetExhaustedBehavior}
+   * with {@link HaltReason} `tool_error_loop` (the `2×` multiplier is fixed).
+   * `0` disables the breaker. Defaults to `3`.
+   */
+  errorLoopThreshold(n: number): this {
+    this._errorLoopThreshold = n;
     return this;
   }
 
@@ -3929,6 +4169,7 @@ export class HarnessBuilder {
       contentCapture: this._contentCapture,
       hooks: this._hooks,
       maxStopBlocks: this._maxStopBlocks,
+      errorLoopThreshold: this._errorLoopThreshold,
       chunkProvider: this._chunkProvider,
       vcsProvider: this._vcsProvider,
       catalogueRegistry,
