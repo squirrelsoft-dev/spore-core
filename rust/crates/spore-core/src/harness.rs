@@ -20852,9 +20852,16 @@ mod tests {
         );
         let corrective = correctives[0];
         assert!(corrective.contains(TEL_BAD_MSG), "carries the bare error");
+        // Pin the EXACT key-sorted, compact schema substring (cross-language
+        // source-of-truth, #137): the literal `Expected parameter schema: `
+        // prefix followed by the `add_task` test schema serialized by
+        // `serde_json` (object keys sorted lexicographically — no
+        // `preserve_order`). TS/Python/Go AC2 tests assert this same byte string,
+        // so this guards against a future serde ordering drift in Rust.
+        const EXPECTED_SCHEMA: &str = "Expected parameter schema: {\"properties\":{\"description\":{\"type\":\"string\"},\"task_list_id\":{\"type\":\"string\"}},\"required\":[\"task_list_id\",\"description\"],\"type\":\"object\"}";
         assert!(
-            corrective.contains("\"required\""),
-            "carries the parameter schema"
+            corrective.contains(EXPECTED_SCHEMA),
+            "carries the exact key-sorted parameter schema; got:\n{corrective}"
         );
         assert!(
             corrective.contains("correctly-typed JSON"),
