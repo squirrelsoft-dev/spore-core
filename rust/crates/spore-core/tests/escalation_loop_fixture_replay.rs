@@ -59,6 +59,7 @@ async fn escalation_loop_returns_escalate_and_skips_history_append() {
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
+        toolset_catalogues: Default::default(),
         middleware: None,
         observability: None,
         compaction_verifier: Arc::new(spore_core::KeyTermVerifier),

@@ -54,6 +54,7 @@ fn harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
+        toolset_catalogues: Default::default(),
         middleware: None,
         observability: None,
         compaction_verifier: Arc::new(spore_core::KeyTermVerifier),

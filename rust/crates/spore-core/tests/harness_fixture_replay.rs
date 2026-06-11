@@ -54,6 +54,7 @@ async fn react_loop_dispatches_tool_then_completes() {
         sandbox: Arc::new(AllowAllSandbox),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
+        toolset_catalogues: Default::default(),
         middleware: None,
         observability: None,
         compaction_verifier: Arc::new(spore_core::KeyTermVerifier),
