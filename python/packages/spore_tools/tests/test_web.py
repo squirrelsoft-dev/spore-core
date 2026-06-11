@@ -3,6 +3,9 @@ NEVER hits the live network."""
 
 from __future__ import annotations
 
+import json
+import pathlib
+
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -16,6 +19,7 @@ from spore_tools.tools.web import (
     WebFetchTool,
     WebSearchConfig,
     WebSearchTool,
+    _apply_web_fetch_range,
 )
 
 _CTX = make_test_ctx()
@@ -278,3 +282,122 @@ async def test_get_returns_body_verbatim(httpx_mock: HTTPXMock) -> None:
     r = await tool.execute(_call("web_search", {"query": "t"}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputSuccess)
     assert r.content == raw
+
+
+# ── _apply_web_fetch_range unit tests (#135) ──────────────────────────────────
+
+
+def test_range_start_zero_no_header() -> None:
+    result = _apply_web_fetch_range("hello world", 0)
+    assert result == "hello world"
+
+
+def test_range_start_zero_empty_body_no_header() -> None:
+    result = _apply_web_fetch_range("", 0)
+    assert result == ""
+
+
+def test_range_start_mid_prepends_header() -> None:
+    result = _apply_web_fetch_range("hello world", 6)
+    assert result == "[starting at byte 6 of 11]\nworld"
+
+
+def test_range_start_at_last_byte() -> None:
+    result = _apply_web_fetch_range("hello", 4)
+    assert result == "[starting at byte 4 of 5]\no"
+
+
+def test_range_start_past_end_is_recoverable_error() -> None:
+    result = _apply_web_fetch_range("hello", 10)
+    assert isinstance(result, ToolOutputError)
+    assert result.recoverable is True
+    assert result.message == "start_byte 10 exceeds response length 5"
+
+
+def test_range_start_at_body_len_is_recoverable_error() -> None:
+    result = _apply_web_fetch_range("hello", 5)
+    assert isinstance(result, ToolOutputError)
+    assert result.recoverable is True
+    assert result.message == "start_byte 5 exceeds response length 5"
+
+
+def test_range_empty_body_nonzero_start_is_recoverable_error() -> None:
+    result = _apply_web_fetch_range("", 1)
+    assert isinstance(result, ToolOutputError)
+    assert result.recoverable is True
+    assert result.message == "start_byte 1 exceeds response length 0"
+
+
+# ── fixture replay: web_fetch_range.json (#135) ───────────────────────────────
+
+_FIXTURE_PATH = (
+    pathlib.Path(__file__).parent.parent.parent.parent.parent
+    / "fixtures"
+    / "tools"
+    / "web_fetch_range.json"
+)
+
+
+def test_fixture_replay_web_fetch_range() -> None:
+    if not _FIXTURE_PATH.exists():
+        pytest.skip(f"fixture not found: {_FIXTURE_PATH}")
+    cases = json.loads(_FIXTURE_PATH.read_text())
+    assert len(cases) >= 1, "expected ≥1 case in fixture"
+    for case in cases:
+        name = case["name"]
+        body = case["body"]
+        start_byte = case["start_byte"]
+        result = _apply_web_fetch_range(body, start_byte)
+        if "expected" in case:
+            assert not isinstance(result, ToolOutputError), (
+                f"case {name!r}: expected success but got error: {result.message}"
+            )
+            assert result == case["expected"], f"case {name!r}: output mismatch"
+        elif "expected_error" in case:
+            assert isinstance(result, ToolOutputError), (
+                f"case {name!r}: expected error but got: {result!r}"
+            )
+            assert result.message == case["expected_error"], (
+                f"case {name!r}: error message mismatch"
+            )
+        else:
+            pytest.fail(f"case {name!r}: fixture row has neither 'expected' nor 'expected_error'")
+
+
+# ── integration: web_fetch with start_byte via mock server (#135) ─────────────
+
+
+async def test_web_fetch_start_byte_zero_no_header(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(method="GET", url="https://example.test/page", text="hello world")
+    r = await WebFetchTool().execute(
+        _call("web_fetch", {"url": "https://example.test/page", "start_byte": 0}),
+        AllowAllSandbox(),
+        _CTX,
+    )
+    assert isinstance(r, ToolOutputSuccess)
+    assert r.content == "hello world"
+
+
+async def test_web_fetch_start_byte_mid_slices_with_header(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(method="GET", url="https://example.test/page", text="hello world")
+    r = await WebFetchTool().execute(
+        _call("web_fetch", {"url": "https://example.test/page", "start_byte": 6}),
+        AllowAllSandbox(),
+        _CTX,
+    )
+    assert isinstance(r, ToolOutputSuccess)
+    assert r.content == "[starting at byte 6 of 11]\nworld"
+
+
+async def test_web_fetch_start_byte_past_end_is_recoverable_error(
+    httpx_mock: HTTPXMock,
+) -> None:
+    httpx_mock.add_response(method="GET", url="https://example.test/page", text="hello")
+    r = await WebFetchTool().execute(
+        _call("web_fetch", {"url": "https://example.test/page", "start_byte": 99}),
+        AllowAllSandbox(),
+        _CTX,
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable is True
+    assert "start_byte 99 exceeds response length 5" in r.message

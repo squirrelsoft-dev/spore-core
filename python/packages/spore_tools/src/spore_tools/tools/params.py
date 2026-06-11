@@ -149,6 +149,7 @@ class SendMessageParams(_Params):
 
 class WebFetchParams(_Params):
     url: str
+    start_byte: int = 0  # default 0 = existing behavior (no header prepended)
 
 
 class WebSearchParams(_Params):

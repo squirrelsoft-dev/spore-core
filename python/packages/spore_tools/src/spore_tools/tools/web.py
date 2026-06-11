@@ -61,6 +61,31 @@ from .error import ToolExecutionError
 from .params import WebFetchParams, WebSearchParams, parse_params
 
 
+def _apply_web_fetch_range(body: str, start_byte: int) -> str | ToolOutputError:
+    """Apply ``start_byte`` slicing to a fetched response body.
+
+    - ``start_byte == 0`` → return ``body`` unchanged (no header).
+    - ``0 < start_byte < len(body_bytes)`` → prepend
+      ``[starting at byte N of total]\\n`` and return the slice from
+      ``start_byte``.
+    - ``start_byte >= len(body_bytes)`` (non-empty body) → recoverable error.
+    - Empty body + ``start_byte > 0`` → recoverable error.
+
+    Byte arithmetic uses UTF-8 encoding, identical to the Rust reference.
+    """
+    if start_byte == 0:
+        return body
+    body_bytes = body.encode("utf-8")
+    total = len(body_bytes)
+    if start_byte >= total:
+        return ToolOutputError(
+            message=f"start_byte {start_byte} exceeds response length {total}",
+            recoverable=True,
+        )
+    sliced = body_bytes[start_byte:].decode("utf-8", errors="replace")
+    return f"[starting at byte {start_byte} of {total}]\n{sliced}"
+
+
 class WebFetchTool:
     NAME = "web_fetch"
 
@@ -80,7 +105,19 @@ class WebFetchTool:
             description="Fetch the contents of a URL",
             parameters={
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
+                "properties": {
+                    "url": {"type": "string"},
+                    "start_byte": {
+                        "type": "integer",
+                        "description": (
+                            "Byte offset into the response body to start reading from. "
+                            "Default 0 (no offset, output identical to a plain fetch). "
+                            "Use to page through responses larger than the 64 KB "
+                            "truncation window."
+                        ),
+                        "default": 0,
+                    },
+                },
                 "required": ["url"],
             },
             annotations=ToolAnnotations(read_only=True, open_world=True),
@@ -101,7 +138,10 @@ class WebFetchTool:
             return ToolOutputError(message=f"web fetch failed: {e}", recoverable=True)
         except (UnicodeDecodeError, ValueError) as e:
             return ToolOutputError(message=f"web fetch body read failed: {e}", recoverable=True)
-        return await finish_with_possible_truncation(body, call.id, sandbox)
+        result = _apply_web_fetch_range(body, params.start_byte)
+        if isinstance(result, ToolOutputError):
+            return result
+        return await finish_with_possible_truncation(result, call.id, sandbox)
 
 
 class SearchMethod(str, Enum):
@@ -315,4 +355,5 @@ __all__ = [
     "WebSearchConfig",
     "WebSearchConfigError",
     "WebSearchTool",
+    "_apply_web_fetch_range",
 ]
