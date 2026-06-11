@@ -54,10 +54,30 @@ class ReadFileTool:
     def schema(cls) -> ToolSchema:
         return ToolSchema(
             name=cls.NAME,
-            description="Read a file's contents",
+            description=(
+                "Read a file's contents. Optionally read a line range "
+                "(offset is 1-indexed start, length is max lines, 0 = "
+                "to EOF) and/or prefix each line with its number via "
+                "line_numbers. With no optional params the whole file "
+                "is returned verbatim."
+            ),
             parameters={
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-indexed start line (default 1).",
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "Max lines to return; 0 = no limit / read to EOF (default 0).",
+                    },
+                    "line_numbers": {
+                        "type": "boolean",
+                        "description": "Prefix each returned line with its 1-indexed number (default false).",
+                    },
+                },
                 "required": ["path"],
             },
             annotations=ToolAnnotations(read_only=True, idempotent=True),
@@ -75,7 +95,57 @@ class ReadFileTool:
             content = await anyio.to_thread.run_sync(Path(resolved).read_text)
         except OSError as e:
             return ToolOutputError(message=f"read failed: {e}", recoverable=True)
-        return await finish_with_possible_truncation(content, call.id, sandbox)
+        result = _apply_read_range(content, params)
+        if isinstance(result, str):
+            return await finish_with_possible_truncation(result, call.id, sandbox)
+        return result
+
+
+# ============================================================================
+# _apply_read_range (#132)
+# ============================================================================
+
+
+def _apply_read_range(content: str, params: ReadFileParams) -> str | ToolOutputError:
+    """Apply the #132 range/line-number transform to a fully-read file body.
+
+    Returns the transformed content string, or a :class:`ToolOutputError` for
+    recoverable errors. With all params at their defaults the original
+    ``content`` is returned unchanged (byte-identical to the pre-#132 behavior).
+    Any non-default param prepends a ``[lines {start}–{end} of {total}]`` header
+    (U+2013 en-dash).
+    """
+    is_default = params.offset == 1 and params.length == 0 and not params.line_numbers
+    if is_default:
+        return content
+    if params.offset == 0:
+        return ToolOutputError(message="offset must be ≥ 1 (1-indexed)", recoverable=True)
+    # Empty file: any params still yield empty content with no header.
+    if not content:
+        return ""
+    # splitlines(keepends=True) preserves each line's trailing '\n'; the final
+    # line may or may not end in '\n'. This keeps the slice byte-faithful to the
+    # source (Python equivalent of Rust's split_inclusive('\n')).
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+    if params.offset > total:
+        return ToolOutputError(
+            message=f"offset {params.offset} exceeds file length {total}",
+            recoverable=True,
+        )
+    start = params.offset  # 1-indexed, validated >= 1 and <= total
+    end = total if params.length == 0 else min(start + params.length - 1, total)
+    selected = lines[start - 1 : end]
+
+    out = f"[lines {start}–{end} of {total}]\n"
+    if params.line_numbers:
+        width = len(str(total))
+        for i, line in enumerate(selected):
+            n = start + i
+            out += f"{n:>{width}} | {line}"
+    else:
+        out += "".join(selected)
+    return out
 
 
 # ============================================================================

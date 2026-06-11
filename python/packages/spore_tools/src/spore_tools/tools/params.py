@@ -40,6 +40,9 @@ def parse_params(model: type[T], call: ToolCall) -> T:
 
 class ReadFileParams(_Params):
     path: str
+    offset: int = 1
+    length: int = 0
+    line_numbers: bool = False
 
 
 class WriteFileParams(_Params):
