@@ -685,12 +685,69 @@ class StrategyOutcomeComplete:
 
 
 @dataclass
+class ExhaustionCauseBudget:
+    """The scope's step allowance ran out (the pre-#137 behavior). Resolves to
+    :class:`HaltReasonBudgetExceeded` on a ``Fail`` / ``Escalate``→``Fail``
+    terminal. Mirrors Rust's ``ExhaustionCause::Budget`` (the default)."""
+
+
+@dataclass
+class ExhaustionCauseToolErrorLoop:
+    """The ReAct consecutive-recoverable-tool-error breaker hard-stopped at
+    ``2 * error_loop_threshold`` identical-argument errors for ``tool`` (#137).
+    Resolves to :class:`HaltReasonToolErrorLoop` on a ``Fail`` /
+    ``Escalate``→``Fail`` terminal — NEVER ``BudgetExceeded``. Mirrors Rust's
+    ``ExhaustionCause::ToolErrorLoop { tool, consecutive_errors }``."""
+
+    tool: str
+    consecutive_errors: int
+
+
+# Why a :class:`StrategyOutcomeBudgetExhausted` was raised (issue #137). The
+# budget-exhaustion resolution site (:meth:`StandardHarness._drive_strategy`)
+# routes BOTH causes through the node's ``BudgetExhaustedBehavior``, but stamps a
+# DIFFERENT terminal :data:`HaltReason` so a caller can tell a genuine budget
+# exhaustion from an error-grinding circuit-break. Runtime-only (NOT serialized).
+ExhaustionCause = ExhaustionCauseBudget | ExhaustionCauseToolErrorLoop
+
+
+@dataclass
+class ErrorRun:
+    """The current run of consecutive recoverable tool errors for ONE tool name
+    (issue #137). Tracked per tool name in a loop-local ``dict[str, ErrorRun]``
+    inside :meth:`StandardHarness._run_react_inner`:
+
+    - On a recoverable :class:`ToolOutputError` for tool ``T`` with args ``A``:
+      if the existing run for ``T`` has ``args`` STRUCTURALLY equal to ``A``,
+      ``count`` is incremented; otherwise the run is REPLACED with a fresh
+      ``ErrorRun(args=A, count=1)`` (covers the first error and the args-changed
+      case).
+    - On ANY success for tool ``T``: the entry is REMOVED (AC1 — success resets
+      the run regardless of args).
+    - At ``count == N`` (``error_loop_threshold``): inject ONE corrective message
+      (AC2). ``injected`` is set so the message is NOT re-injected between ``N``
+      and ``2 * N`` for the same run.
+    - At ``count == 2 * N``: stop looping (AC3).
+
+    Mirrors Rust's loop-local ``ErrorRun { args, count, injected }``."""
+
+    args: dict[str, Any]
+    count: int
+    injected: bool = False
+
+
+@dataclass
 class StrategyOutcomeBudgetExhausted:
     """The strategy's budget scope ran out of allowance. Mirrors the
     :class:`BudgetExhausted` charge-error fields and adds ``partial_output`` —
     any output produced before exhaustion. Inspectable by a parent, NOT
     auto-propagating: a parent reads it to decide whether to grant a continue or
-    escalate."""
+    escalate.
+
+    ``cause`` (#137) discriminates a genuine budget exhaustion from a ReAct
+    tool-error-loop break so the single resolution site picks the right terminal
+    :data:`HaltReason`. Defaults to :class:`ExhaustionCauseBudget` for every
+    pre-#137 path."""
 
     policy: BudgetPolicy
     behavior: BudgetExhaustedBehavior
@@ -698,6 +755,7 @@ class StrategyOutcomeBudgetExhausted:
     continues_used: int
     phase: str
     partial_output: str | None = None
+    cause: ExhaustionCause = field(default_factory=ExhaustionCauseBudget)
 
 
 @dataclass
@@ -1531,6 +1589,38 @@ def _promote_budget_exhausted(
     )
 
 
+def _promote_tool_error_loop(
+    leaf_budget: BudgetPolicy,
+    leaf_behavior: BudgetExhaustedBehavior,
+    steps_taken: int,
+    tool: str,
+    consecutive_errors: int,
+    partial_output: str | None,
+) -> StrategyOutcomeBudgetExhausted:
+    """Promote a ReAct tool-error-loop hard-stop (issue #137) to a
+    :class:`StrategyOutcomeBudgetExhausted` carrying
+    :class:`ExhaustionCauseToolErrorLoop` so it flows through the SAME single
+    budget-exhaustion resolution site (:meth:`StandardHarness._drive_strategy`)
+    as a real budget exhaustion, but the ``Fail`` / ``Escalate``→``Fail``
+    terminals report :class:`HaltReasonToolErrorLoop` instead of
+    ``BudgetExceeded``. The leaf's CONFIGURED ``behavior`` is carried so the
+    resolution site can honor ``Fail`` / ``Escalate`` / ``Continue`` (a granted
+    ``Continue`` re-drives the window with a fresh per-tool error allowance, since
+    the counter is loop-local to ``_run_react_inner``). ``steps_taken`` is the
+    window's turn count at the break, so the terminal's ``turns`` reflects work
+    actually done — the breaker does NOT burn the rest of the budget. Mirrors
+    Rust's ``promote_tool_error_loop``."""
+    return StrategyOutcomeBudgetExhausted(
+        policy=leaf_budget,
+        behavior=leaf_behavior,
+        steps_taken=steps_taken,
+        continues_used=0,
+        phase="react",
+        partial_output=partial_output,
+        cause=ExhaustionCauseToolErrorLoop(tool=tool, consecutive_errors=consecutive_errors),
+    )
+
+
 # ----- #130: Escalate HITL pause / resume wiring --------------------------
 #
 # The ``escalation_mode`` config knob (#120, previously UNCONSUMED) is read at
@@ -1721,6 +1811,29 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         window_turns = result.turns
     else:
         window_turns = 0
+    # #137: the window hit the consecutive-tool-error breaker's 2N hard stop.
+    # PROPAGATE it through the SAME single budget-exhaustion resolution site (so
+    # the node's ``behavior`` governs Fail/Escalate/Continue), but carry the
+    # ``ToolErrorLoop`` cause so the terminal reports
+    # :class:`HaltReasonToolErrorLoop`, never ``BudgetExceeded``. The window's
+    # turns are still CHARGED against the leaf scope (accurate accounting), but
+    # the breaker stopped EARLY — the remaining budget is NOT burned. Detection
+    # is independent of ``leaf_cap_binding``.
+    if isinstance(result, RunResultFailure) and isinstance(result.reason, HaltReasonToolErrorLoop):
+        tool = result.reason.tool
+        consecutive_errors = result.reason.consecutive_errors
+        last_final = _last_final_response_text(result) or ""
+        cx.scratch.run_session = result.session_state
+        cx.charge_current(window_turns)
+        cx.pop_budget()
+        return _promote_tool_error_loop(
+            self.budget,
+            self.behavior,
+            window_turns,
+            tool,
+            consecutive_errors,
+            _react_partial_json(last_final),
+        )
     window_hit_budget = isinstance(result, RunResultFailure) and isinstance(
         result.reason, HaltReasonBudgetExceeded
     )
@@ -3085,6 +3198,31 @@ class StreamToolCallStart(_Model):
     name: str
 
 
+class StreamToolErrorLoopDetected(_Model):
+    """The consecutive-recoverable-tool-error breaker DETECTED a loop (issue
+    #137): ``tool`` hit ``error_loop_threshold`` (``N``) consecutive
+    identical-argument recoverable errors and ONE corrective message was
+    injected. A warning — the loop continues. Carries the tool name and the
+    consecutive-error count (``= N``). Mirrors Rust's
+    ``StreamEvent::ToolErrorLoopDetected``."""
+
+    kind: Literal["tool_error_loop_detected"] = "tool_error_loop_detected"
+    tool: str
+    consecutive_errors: int
+
+
+class StreamToolErrorLoopBroken(_Model):
+    """The consecutive-recoverable-tool-error breaker TRIPPED (issue #137):
+    ``tool`` reached ``2 * error_loop_threshold`` (``2 * N``) consecutive
+    identical-argument recoverable errors and the loop STOPPED to resolve the
+    node's ``BudgetExhaustedBehavior``. Carries the tool name and the count
+    (``= 2*N``). Mirrors Rust's ``StreamEvent::ToolErrorLoopBroken``."""
+
+    kind: Literal["tool_error_loop_broken"] = "tool_error_loop_broken"
+    tool: str
+    consecutive_errors: int
+
+
 HarnessStreamEvent = Annotated[
     StreamTurnStart
     | StreamTurnEnd
@@ -3098,7 +3236,9 @@ HarnessStreamEvent = Annotated[
     | StreamToolArgsDelta
     | StreamBlockStart
     | StreamBlockStop
-    | StreamToolCallStart,
+    | StreamToolCallStart
+    | StreamToolErrorLoopDetected
+    | StreamToolErrorLoopBroken,
     Field(discriminator="kind"),
 ]
 
@@ -4497,6 +4637,20 @@ class HaltReasonUnrecoverableToolError(_Model):
     error: str
 
 
+class HaltReasonToolErrorLoop(_Model):
+    """The ReAct consecutive-recoverable-tool-error breaker hard-stopped (issue
+    #137): ``tool`` produced ``2 * error_loop_threshold`` consecutive
+    identical-argument recoverable errors. A typed terminal distinguishing an
+    error-grinding circuit-break from genuine budget exhaustion
+    (:class:`HaltReasonBudgetExceeded`) — the ``Fail`` / ``Escalate``→``Fail``
+    resolution carries THIS reason, never ``BudgetExceeded``. Mirrors Rust's
+    ``HaltReason::ToolErrorLoop { tool, consecutive_errors }``."""
+
+    kind: Literal["tool_error_loop"] = "tool_error_loop"
+    tool: str
+    consecutive_errors: int
+
+
 class HaltReasonHumanHalted(_Model):
     kind: Literal["human_halted"] = "human_halted"
 
@@ -4670,6 +4824,7 @@ HaltReason = Annotated[
     | HaltReasonContextError
     | HaltReasonSandboxViolation
     | HaltReasonUnrecoverableToolError
+    | HaltReasonToolErrorLoop
     | HaltReasonHumanHalted
     | HaltReasonStagnationLimitReached
     | HaltReasonStrategyNotYetImplemented
@@ -4797,6 +4952,8 @@ from .observability import (  # noqa: E402
     ContextOperationCompaction,
     ContextOperationConsultResumed,
     ContextOperationConsultSpawned,
+    ContextOperationToolErrorLoopBroken,
+    ContextOperationToolErrorLoopDetected,
     ContextSpan,
     GenAiMessage,
     GenAiRole,
@@ -4972,6 +5129,7 @@ class HarnessConfig:
         pricing: PricingTable | None = None,
         content_capture: ContentCaptureConfig | None = None,
         max_stop_blocks: int = 8,
+        error_loop_threshold: int = 3,
         max_resets: int = 3,
         vcs_provider: VcsProvider | None = None,
         hooks: HookChain | None = None,
@@ -5027,6 +5185,14 @@ class HarnessConfig:
         # terminates anyway (issue #69, R14). Per-run counter; resume starts
         # fresh. Default 8, matching Claude Code's behavior.
         self.max_stop_blocks = max_stop_blocks
+        # Consecutive-recoverable-tool-error breaker threshold ``N`` (issue #137).
+        # In the ReAct turn-loop, ``N`` consecutive identical-argument recoverable
+        # errors from one tool inject ONE corrective message (AC2); ``2 * N``
+        # hard-stops the loop and resolves the node's ``BudgetExhaustedBehavior``
+        # with :class:`HaltReasonToolErrorLoop` (never ``BudgetExceeded``),
+        # WITHOUT burning the remaining budget (AC3). Defaults to ``3``; ``0``
+        # disables the breaker. Mirrors Rust's ``HarnessConfig::error_loop_threshold``.
+        self.error_loop_threshold = error_loop_threshold
         # Ralph outer-loop reset cap (issue #58, B3). The maximum number of
         # context windows the ``Ralph`` strategy runs before halting with
         # :class:`HaltReasonRalphCompletionUnmet` when tasks are still
@@ -5203,6 +5369,7 @@ class HarnessConfig:
             pricing=self.pricing,
             content_capture=self.content_capture,
             max_stop_blocks=self.max_stop_blocks,
+            error_loop_threshold=self.error_loop_threshold,
             max_resets=self.max_resets,
             vcs_provider=self.vcs_provider,
             hooks=self.hooks,
@@ -5250,6 +5417,7 @@ class HarnessBuilder:
         self._pricing: PricingTable = PricingTable.DEFAULT
         self._content_capture: ContentCaptureConfig | None = None
         self._max_stop_blocks: int = 8
+        self._error_loop_threshold: int = 3
         self._max_resets: int = 3
         self._vcs_provider: VcsProvider | None = None
         self._hooks: HookChain | None = None
@@ -5679,6 +5847,16 @@ class HarnessBuilder:
         self._max_stop_blocks = max_blocks
         return self
 
+    def error_loop_threshold(self, n: int) -> HarnessBuilder:
+        """Set the consecutive-recoverable-tool-error breaker threshold ``N``
+        (issue #137). ``N`` consecutive identical-argument recoverable errors
+        from one tool inject ONE corrective message; ``2 * N`` hard-stops the
+        loop with :class:`HaltReasonToolErrorLoop` (the ``2x`` multiplier is
+        fixed). Defaults to ``3``; ``0`` disables the breaker. Mirrors Rust's
+        ``HarnessBuilder::error_loop_threshold``."""
+        self._error_loop_threshold = n
+        return self
+
     def max_resets(self, max_resets: int) -> HarnessBuilder:
         """Set the Ralph outer-loop reset cap (issue #58, B3) — the maximum
         number of context windows the ``Ralph`` strategy runs before halting
@@ -5788,6 +5966,7 @@ class HarnessBuilder:
             pricing=self._pricing,
             content_capture=self._content_capture,
             max_stop_blocks=self._max_stop_blocks,
+            error_loop_threshold=self._error_loop_threshold,
             max_resets=self._max_resets,
             vcs_provider=self._vcs_provider,
             hooks=self._hooks,
@@ -6096,6 +6275,24 @@ class StandardHarness:
         if isinstance(output, ToolOutputError):
             return output.message
         return ""
+
+    @staticmethod
+    def _enrich_tool_error(message: str, schema: ToolSchema | None) -> ToolOutputError:
+        """Render a recoverable tool-error ``message`` with the tool's parameter
+        schema and a typing hint (issue #137, AC2 reuse). The breaker injects the
+        result's text as the corrective USER message at the ``N`` threshold.
+        Mirrors Rust's ``enrich_tool_error`` byte-for-byte (the schema is dumped
+        as canonical JSON so the rendered text matches across languages)."""
+        enriched = message
+        if schema is not None:
+            schema_json = json.dumps(schema.input_schema, separators=(",", ":"))
+            enriched += "\n\nExpected parameter schema: " + schema_json
+        enriched += (
+            "\n\nHint: provide arguments as correctly-typed JSON "
+            '(e.g. true/false as a bool, 42 as a number, ["a"] as an array) '
+            "rather than as quoted strings."
+        )
+        return ToolOutputError(message=enriched, recoverable=True)
 
     @classmethod
     async def _drive_turn(
@@ -7032,6 +7229,19 @@ class StandardHarness:
             # reached (the scratch budget is not written back on the propagate
             # path). Fall back to the scratch turns if it is somehow 0.
             turns = outcome.steps_taken if outcome.steps_taken > 0 else cx.scratch.run_budget.turns
+            # #137: the terminal :data:`HaltReason` for a ``Fail`` /
+            # ``Escalate``→``Fail`` resolution depends on the CAUSE — a genuine
+            # budget exhaustion reports ``BudgetExceeded``; an error-loop break
+            # reports ``ToolErrorLoop``. (A granted ``Continue`` re-drives the
+            # window, whose loop-local error counter starts fresh.)
+            terminal_reason: HaltReason
+            if isinstance(outcome.cause, ExhaustionCauseToolErrorLoop):
+                terminal_reason = HaltReasonToolErrorLoop(
+                    tool=outcome.cause.tool,
+                    consecutive_errors=outcome.cause.consecutive_errors,
+                )
+            else:
+                terminal_reason = HaltReasonBudgetExceeded(limit_type="turns")
             # Reconstruct the resolution scope: the FIRST round uses the leaf's
             # propagated behavior + continues_used; later in-process rounds reuse
             # the threaded (possibly fallen-through) state.
@@ -7091,7 +7301,8 @@ class StandardHarness:
                     else []
                 )
                 return RunResultFailure(
-                    reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                    # #137: ToolErrorLoop vs BudgetExceeded per cause.
+                    reason=terminal_reason,
                     session_id=session_id,
                     usage=cx.usage,
                     turns=turns,
@@ -7100,7 +7311,8 @@ class StandardHarness:
 
             # ExhaustedResolution.FAIL: the partial is DISCARDED by contract.
             return RunResultFailure(
-                reason=HaltReasonBudgetExceeded(limit_type="turns"),
+                # #137: ToolErrorLoop vs BudgetExceeded per cause.
+                reason=terminal_reason,
                 session_id=session_id,
                 usage=cx.usage,
                 turns=turns,
@@ -7905,6 +8117,12 @@ class StandardHarness:
         # run() — resume starts fresh. After ``max_stop_blocks`` consecutive
         # blocks the loop terminates anyway.
         stop_blocks = 0
+        # Consecutive-recoverable-tool-error breaker state (issue #137), keyed by
+        # tool name. Loop-local to this window: a fresh run()/re-driven
+        # ``Continue`` window starts with a clean N/2N allowance (AC3 Continue
+        # reset). ``N`` is ``error_loop_threshold``; the hard stop is at ``2 * N``.
+        error_loop_n = self._config.error_loop_threshold
+        error_runs: dict[str, ErrorRun] = {}
         if task.budget.max_turns is not None:
             effective_turn_cap = min(task.budget.max_turns, max_iterations)
         else:
@@ -8476,6 +8694,118 @@ class StandardHarness:
                             session_state,
                         )
 
+                    # ── Consecutive-recoverable-tool-error breaker (#137) ──────
+                    # ``output`` here is either a Success or a RECOVERABLE Error
+                    # (every other variant early-returned above). On a success the
+                    # tool's error run resets (AC1); on a recoverable error we
+                    # increment the identical-args run (AC1 args-variant) and check
+                    # the N / 2N thresholds. At N we stash the corrective USER
+                    # message here and append it AFTER the tool result below
+                    # (well-formed conversation: assistant tool_use → tool result
+                    # → corrective user message).
+                    pending_corrective: str | None = None
+                    if isinstance(output, ToolOutputError) and output.recoverable:
+                        run = error_runs.get(call.name)
+                        if run is not None and run.args == call.input:
+                            # Same tool, structurally-identical args → extend.
+                            run.count += 1
+                        else:
+                            # First error, or the args changed → fresh run.
+                            run = ErrorRun(args=call.input, count=1)
+                            error_runs[call.name] = run
+                        count = run.count
+                        two_n = error_loop_n * 2
+
+                        # 2N: HARD STOP (AC3). Do NOT append this last tool result
+                        # or continue — return a typed terminal that
+                        # ``_run_react_config`` routes through the node's
+                        # ``BudgetExhaustedBehavior`` WITHOUT burning the rest of
+                        # the budget. The breaker is disabled when N == 0.
+                        if error_loop_n > 0 and count >= two_n:
+                            # AC4: emit the "broken" pair (stream + obs).
+                            self._emit(
+                                on_stream,
+                                StreamToolErrorLoopBroken(tool=call.name, consecutive_errors=count),
+                            )
+                            if config.observability is not None:
+                                base = SpanBase.new_root(
+                                    new_span_id(f"{session_id}-tool-error-loop-broken-{span_seq}"),
+                                    session_id,
+                                    task.id,
+                                    SpanKind.CONTEXT_ASSEMBLY,
+                                    _now(),
+                                )
+                                config.observability.emit_context(
+                                    ContextSpan(
+                                        base=base,
+                                        operation=ContextOperationToolErrorLoopBroken(
+                                            tool_name=call.name,
+                                            consecutive_errors=count,
+                                        ),
+                                        tokens_before=0,
+                                        tokens_after=0,
+                                        utilization_before=0.0,
+                                        utilization_after=0.0,
+                                    )
+                                )
+                            return self._fail(
+                                HaltReasonToolErrorLoop(tool=call.name, consecutive_errors=count),
+                                session_id,
+                                usage,
+                                budget_used.turns,
+                                session_state,
+                            )
+
+                        # N: inject ONE corrective message (AC2). Render the
+                        # schema+hint via ``_enrich_tool_error`` (reused) and inject
+                        # it as a USER-role message — the SAME channel the Stop-block
+                        # breaker uses — once per run (do not re-inject between N and
+                        # 2N).
+                        if error_loop_n > 0 and count >= error_loop_n and not run.injected:
+                            run.injected = True
+                            schema = next(
+                                (s for s in tool_registry.schemas() if s.name == call.name),
+                                None,
+                            )
+                            corrective = self._enrich_tool_error(output.message, schema).message
+                            # AC4: emit the "detected/warning" pair (stream + obs)
+                            # BEFORE the corrective message is appended.
+                            self._emit(
+                                on_stream,
+                                StreamToolErrorLoopDetected(
+                                    tool=call.name, consecutive_errors=count
+                                ),
+                            )
+                            if config.observability is not None:
+                                base = SpanBase.new_root(
+                                    new_span_id(
+                                        f"{session_id}-tool-error-loop-detected-{span_seq}"
+                                    ),
+                                    session_id,
+                                    task.id,
+                                    SpanKind.CONTEXT_ASSEMBLY,
+                                    _now(),
+                                )
+                                config.observability.emit_context(
+                                    ContextSpan(
+                                        base=base,
+                                        operation=ContextOperationToolErrorLoopDetected(
+                                            tool_name=call.name,
+                                            consecutive_errors=count,
+                                        ),
+                                        tokens_before=0,
+                                        tokens_after=0,
+                                        utilization_before=0.0,
+                                        utilization_after=0.0,
+                                    )
+                                )
+                            # Append AFTER the normal tool-result append below so
+                            # the conversation stays well-formed. Stash it.
+                            pending_corrective = corrective
+                    else:
+                        # AC1: ANY success for this tool resets its run.
+                        error_runs.pop(call.name, None)
+
                     # Tool-call span (issue #12), child of the current turn.
                     if config.observability is not None:
                         if isinstance(output, ToolOutputSuccess):
@@ -8552,6 +8882,14 @@ class StandardHarness:
                     )
                     await config.context_manager.append_tool_result(session_state, tr)
                     approved_results.append(tr)
+
+                    # #137 (AC2): inject the ONE corrective user message at the N
+                    # threshold, AFTER this call's tool result is recorded — same
+                    # ``append_user_message`` channel the Stop-block breaker uses.
+                    if pending_corrective is not None:
+                        await config.context_manager.append_user_message(
+                            session_state, pending_corrective
+                        )
 
                 # Middleware: AfterTool.
                 if config.middleware is not None:
@@ -8999,6 +9337,7 @@ __all__ = [
     "HaltReasonTaskGraphCycle",
     "HaltReasonTasksBlockedByFailure",
     "HaltReasonTerminationPolicyHalt",
+    "HaltReasonToolErrorLoop",
     "HaltReasonUnrecoverableToolError",
     "Harness",
     "HarnessBuilder",
@@ -9034,8 +9373,12 @@ __all__ = [
     "BudgetContext",
     "BudgetExhausted",
     "BudgetStack",
+    "ErrorRun",
     "ExecutionContext",
     "ExhaustedResolution",
+    "ExhaustionCause",
+    "ExhaustionCauseBudget",
+    "ExhaustionCauseToolErrorLoop",
     "HillClimbingConfig",
     "HillClimbingDirection",
     "LoopStrategy",
@@ -9123,6 +9466,8 @@ __all__ = [
     "StreamToolArgsDelta",
     "StreamToolCall",
     "StreamToolCallStart",
+    "StreamToolErrorLoopBroken",
+    "StreamToolErrorLoopDetected",
     "StreamToolResult",
     "StreamTurnEnd",
     "StreamTurnStart",

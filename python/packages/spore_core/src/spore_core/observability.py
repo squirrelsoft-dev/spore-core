@@ -445,13 +445,40 @@ class ContextOperationConsultResumed(_Model):
     answered: bool
 
 
+class ContextOperationToolErrorLoopDetected(_Model):
+    """The ReAct consecutive-recoverable-tool-error breaker DETECTED a loop
+    (issue #137): ``tool_name`` reached ``error_loop_threshold`` (``N``)
+    consecutive identical-argument recoverable errors and ONE corrective message
+    was injected. A warning — the loop continues. Carries the tool name and the
+    consecutive-error count (``= N``). Mirrors Rust's
+    ``ContextOperation::ToolErrorLoopDetected``."""
+
+    kind: Literal["tool_error_loop_detected"] = "tool_error_loop_detected"
+    tool_name: str
+    consecutive_errors: int
+
+
+class ContextOperationToolErrorLoopBroken(_Model):
+    """The ReAct consecutive-recoverable-tool-error breaker TRIPPED (issue #137):
+    ``tool_name`` reached ``2 * error_loop_threshold`` (``2 * N``) consecutive
+    identical-argument recoverable errors and the loop STOPPED to resolve the
+    node's ``BudgetExhaustedBehavior``. Carries the tool name and the count
+    (``= 2*N``). Mirrors Rust's ``ContextOperation::ToolErrorLoopBroken``."""
+
+    kind: Literal["tool_error_loop_broken"] = "tool_error_loop_broken"
+    tool_name: str
+    consecutive_errors: int
+
+
 ContextOperation = Annotated[
     ContextOperationAssembly
     | ContextOperationToolResultAppended
     | ContextOperationCompaction
     | ContextOperationSkillInjected
     | ContextOperationConsultSpawned
-    | ContextOperationConsultResumed,
+    | ContextOperationConsultResumed
+    | ContextOperationToolErrorLoopDetected
+    | ContextOperationToolErrorLoopBroken,
     Field(discriminator="kind"),
 ]
 
@@ -1043,6 +1070,8 @@ __all__ = [
     "ContextOperationConsultResumed",
     "ContextOperationConsultSpawned",
     "ContextOperationSkillInjected",
+    "ContextOperationToolErrorLoopBroken",
+    "ContextOperationToolErrorLoopDetected",
     "ContextOperationToolResultAppended",
     "ContextSpan",
     "GenAiMessage",
