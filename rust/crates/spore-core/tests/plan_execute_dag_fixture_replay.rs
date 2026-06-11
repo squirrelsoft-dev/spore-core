@@ -64,6 +64,7 @@ fn harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
         tool_call_repair: None,
         max_repair_attempts: 1,
         max_stop_blocks: 8,
+        error_loop_threshold: 3,
         hooks: None,
         storage: storage.clone(),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),

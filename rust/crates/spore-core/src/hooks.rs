@@ -1758,6 +1758,7 @@ mod tests {
             tool_call_repair: None,
             max_repair_attempts: 1,
             max_stop_blocks: 8,
+            error_loop_threshold: 3,
             hooks: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),

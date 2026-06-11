@@ -446,6 +446,24 @@ pub enum ContextOperation {
         consult_kind: String,
         answered: bool,
     },
+    /// The ReAct consecutive-recoverable-tool-error breaker DETECTED a loop
+    /// (issue #137): a tool returned `error_loop_threshold` (`N`) consecutive
+    /// recoverable errors with identical arguments, so the loop injected ONE
+    /// corrective message but kept going. A warning, not a stop. Carries the
+    /// offending tool name and the consecutive-error count (`= N`).
+    ToolErrorLoopDetected {
+        tool_name: String,
+        consecutive_errors: u32,
+    },
+    /// The ReAct consecutive-recoverable-tool-error breaker TRIPPED (issue
+    /// #137): the same tool reached `2 * error_loop_threshold` (`2 * N`)
+    /// consecutive identical-argument errors, so the loop STOPPED and resolved
+    /// the node's `BudgetExhaustedBehavior` instead of burning the remaining
+    /// budget. Carries the tool name and the consecutive-error count (`= 2 * N`).
+    ToolErrorLoopBroken {
+        tool_name: String,
+        consecutive_errors: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

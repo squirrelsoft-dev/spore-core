@@ -716,9 +716,17 @@ impl StrategyRef {
 pub enum StrategyOutcome {
     /// The strategy completed and produced its final output.
     Complete(String),
-    /// The strategy's budget scope ran out of allowance. Mirrors the
+    /// The strategy's budget scope ran out of allowance — OR (issue #137) the
+    /// ReAct consecutive-tool-error breaker tripped (see `cause`). Mirrors the
     /// [`BudgetExhausted`] charge-error fields and adds `partial_output` — any
     /// output produced before exhaustion. Inspectable, NOT auto-propagating.
+    ///
+    /// The `cause` discriminant (#137) lets the SINGLE budget-exhaustion
+    /// resolution site (`drive_strategy_with_resume_seed`) pick the right
+    /// terminal [`HaltReason`]: genuine budget exhaustion →
+    /// [`HaltReason::BudgetExceeded`]; an error loop →
+    /// [`HaltReason::ToolErrorLoop`]. Both flow through the node's
+    /// [`BudgetExhaustedBehavior`] (Fail / Escalate / Continue) identically.
     BudgetExhausted {
         policy: BudgetPolicy,
         behavior: BudgetExhaustedBehavior,
@@ -726,9 +734,59 @@ pub enum StrategyOutcome {
         continues_used: u32,
         phase: String,
         partial_output: Option<String>,
+        /// What caused this exhaustion (#137): genuine budget vs. an error loop.
+        /// Defaults to [`ExhaustionCause::Budget`] for every pre-#137 path.
+        cause: ExhaustionCause,
     },
     /// The strategy halted with a harness error.
     Failed(HarnessError),
+}
+
+/// Why a [`StrategyOutcome::BudgetExhausted`] was raised (issue #137). The
+/// budget-exhaustion resolution site routes BOTH causes through the node's
+/// [`BudgetExhaustedBehavior`], but stamps a DIFFERENT terminal
+/// [`HaltReason`] on the Fail / Escalate→Fail terminals so a caller can tell a
+/// genuine budget exhaustion from an error-grinding circuit-break. Runtime-only
+/// (NOT serialized).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ExhaustionCause {
+    /// The scope's step allowance ran out (the pre-#137 behavior). Resolves to
+    /// [`HaltReason::BudgetExceeded`] on a Fail / Escalate→Fail terminal.
+    #[default]
+    Budget,
+    /// The ReAct consecutive-recoverable-tool-error breaker hard-stopped at
+    /// `2 * error_loop_threshold` identical-argument errors for `tool` (#137).
+    /// Resolves to [`HaltReason::ToolErrorLoop`] on a Fail / Escalate→Fail
+    /// terminal — NEVER [`HaltReason::BudgetExceeded`].
+    ToolErrorLoop {
+        tool: String,
+        consecutive_errors: u32,
+    },
+}
+
+/// The current run of consecutive recoverable tool errors for ONE tool name
+/// (issue #137). Tracked per tool name in a loop-local
+/// `HashMap<String, ErrorRun>` inside [`StandardHarness::run_react_inner`]:
+///
+/// - On a recoverable [`ToolOutput::Error`] for tool `T` with args `A`: if the
+///   existing run for `T` has `args` STRUCTURALLY equal to `A`, `count` is
+///   incremented; otherwise the run is REPLACED with a fresh `{ args: A,
+///   count: 1 }` (covers both the first error and the args-changed case).
+/// - On ANY success for tool `T`: the entry is REMOVED (AC1 — success resets the
+///   run regardless of args).
+/// - At `count == N` (`error_loop_threshold`): inject ONE corrective message
+///   (AC2). `injected` is set so the message is NOT re-injected between `N` and
+///   `2 * N` for the same run.
+/// - At `count == 2 * N`: stop looping (AC3).
+#[derive(Debug, Clone, PartialEq)]
+struct ErrorRun {
+    /// The tool-call arguments shared by every error in this run.
+    args: serde_json::Value,
+    /// How many consecutive identical-argument recoverable errors so far.
+    count: u32,
+    /// Whether the `N`-threshold corrective message has already been injected
+    /// for THIS run (so we inject exactly once between `N` and `2 * N`).
+    injected: bool,
 }
 
 /// The error [`BudgetContext::charge`] returns when a debit would exceed the
@@ -1126,6 +1184,7 @@ pub trait StrategyExecutor: Send + Sync {
     /// Run ONE bounded ReAct turn-loop window over `session_state`, carrying the
     /// shared `budget_used`. This is the leaf primitive (the body of the legacy
     /// `run_react_inner`). Does NOT finalize observability — the caller does.
+    #[allow(clippy::too_many_arguments)]
     fn react_window<'a>(
         &'a self,
         task: Task,
@@ -1452,6 +1511,40 @@ impl RunStrategy for ReactConfig {
                 RunResult::Success { turns, .. } | RunResult::Failure { turns, .. } => *turns,
                 _ => 0,
             };
+            // #137: the window hit the consecutive-tool-error breaker's 2N hard
+            // stop. PROPAGATE it through the SAME single budget-exhaustion
+            // resolution site (so the node's `behavior` governs Fail/Escalate/
+            // Continue), but carry the `ToolErrorLoop` cause so the terminal
+            // reports `HaltReason::ToolErrorLoop`, never `BudgetExceeded`. The
+            // window's turns are still CHARGED against the leaf scope (accurate
+            // accounting), but the breaker stopped EARLY — the remaining budget
+            // is NOT burned. Detection is independent of `leaf_cap_binding`.
+            if let RunResult::Failure {
+                reason:
+                    HaltReason::ToolErrorLoop {
+                        tool,
+                        consecutive_errors,
+                    },
+                ..
+            } = &result
+            {
+                let tool = tool.clone();
+                let consecutive_errors = *consecutive_errors;
+                let last_final = last_final_response_text(&result).unwrap_or_default();
+                if let RunResult::Failure { session_state, .. } = &result {
+                    cx.scratch.run_session = session_state.clone();
+                }
+                let _ = cx.charge_current(window_turns);
+                cx.pop_budget();
+                return promote_tool_error_loop(
+                    &self.budget,
+                    &self.behavior,
+                    window_turns,
+                    tool,
+                    consecutive_errors,
+                    Some(react_partial_json(&last_final)),
+                );
+            }
             let window_hit_budget = matches!(
                 &result,
                 RunResult::Failure {
@@ -3142,6 +3235,40 @@ fn promote_budget_exhausted(
         continues_used: err.continues_used,
         phase: err.phase.clone(),
         partial_output,
+        cause: ExhaustionCause::Budget,
+    }
+}
+
+/// Promote a ReAct tool-error-loop hard-stop (issue #137) to a
+/// [`StrategyOutcome::BudgetExhausted`] carrying [`ExhaustionCause::ToolErrorLoop`]
+/// so it flows through the SAME single budget-exhaustion resolution site as a
+/// real budget exhaustion, but the Fail / Escalate→Fail terminals report
+/// [`HaltReason::ToolErrorLoop`] instead of [`HaltReason::BudgetExceeded`]. The
+/// leaf's CONFIGURED `behavior` is carried so the resolution site can honor
+/// Fail / Escalate / Continue (a granted `Continue` re-drives the window with a
+/// fresh per-tool error allowance, since the counter is loop-local to
+/// `run_react_inner`). `steps_taken` is the window's turn count at the break, so
+/// the terminal's `turns` reflects work actually done — the breaker does NOT
+/// burn the rest of the budget.
+fn promote_tool_error_loop(
+    leaf_budget: &BudgetPolicy,
+    leaf_behavior: &BudgetExhaustedBehavior,
+    steps_taken: u32,
+    tool: String,
+    consecutive_errors: u32,
+    partial_output: Option<String>,
+) -> StrategyOutcome {
+    StrategyOutcome::BudgetExhausted {
+        policy: leaf_budget.clone(),
+        behavior: leaf_behavior.clone(),
+        steps_taken,
+        continues_used: 0,
+        phase: "react".to_string(),
+        partial_output,
+        cause: ExhaustionCause::ToolErrorLoop {
+            tool,
+            consecutive_errors,
+        },
     }
 }
 
@@ -3521,6 +3648,27 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
+    /// The consecutive-recoverable-tool-error breaker DETECTED a loop (issue
+    /// #137): a tool hit `error_loop_threshold` (`N`) consecutive
+    /// identical-argument recoverable errors and ONE corrective message was
+    /// injected. A warning — the loop continues. Carries the tool name and the
+    /// consecutive-error count (`= N`).
+    ToolErrorLoopDetected {
+        tool: String,
+        consecutive_errors: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
+    },
+    /// The consecutive-recoverable-tool-error breaker TRIPPED (issue #137): the
+    /// same tool reached `2 * error_loop_threshold` (`2 * N`) consecutive
+    /// identical-argument errors and the loop STOPPED to resolve the node's
+    /// `BudgetExhaustedBehavior`. Carries the tool name and the count (`= 2*N`).
+    ToolErrorLoopBroken {
+        tool: String,
+        consecutive_errors: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
+    },
 }
 
 impl StreamEvent {
@@ -3541,7 +3689,9 @@ impl StreamEvent {
             | StreamEvent::ToolArgsDelta { node, .. }
             | StreamEvent::BlockStart { node, .. }
             | StreamEvent::BlockStop { node, .. }
-            | StreamEvent::ToolCallStart { node, .. } => node,
+            | StreamEvent::ToolCallStart { node, .. }
+            | StreamEvent::ToolErrorLoopDetected { node, .. }
+            | StreamEvent::ToolErrorLoopBroken { node, .. } => node,
         }
     }
 
@@ -3560,7 +3710,9 @@ impl StreamEvent {
             | StreamEvent::ToolArgsDelta { node, .. }
             | StreamEvent::BlockStart { node, .. }
             | StreamEvent::BlockStop { node, .. }
-            | StreamEvent::ToolCallStart { node, .. } => node.as_ref(),
+            | StreamEvent::ToolCallStart { node, .. }
+            | StreamEvent::ToolErrorLoopDetected { node, .. }
+            | StreamEvent::ToolErrorLoopBroken { node, .. } => node.as_ref(),
         }
     }
 }
@@ -5093,6 +5245,20 @@ pub enum HaltReason {
     TaskGraphCycle {
         reason: String,
     },
+    /// Returned by [`StandardHarness`] (issue #137) when the ReAct turn loop's
+    /// consecutive-recoverable-tool-error breaker tripped: a tool returned
+    /// `2 * error_loop_threshold` consecutive recoverable
+    /// [`ToolOutput::Error`]s with identical arguments, so the loop STOPPED
+    /// grinding and resolved the node's [`BudgetExhaustedBehavior`] WITHOUT
+    /// burning the remaining budget. This is DISTINCT from
+    /// [`BudgetExceeded`](Self::BudgetExceeded) (genuine budget exhaustion): the
+    /// loop halted early on a detected error loop, not because the step budget
+    /// ran out. Carries the offending tool name and the consecutive-error count
+    /// at the moment of the hard stop (`2 * N`).
+    ToolErrorLoop {
+        tool: String,
+        consecutive_errors: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5398,6 +5564,18 @@ pub struct HarnessConfig {
     /// counter is PER-RUN — it resets on every `run()` call, so a resumed
     /// session starts fresh. Defaults to `8` (matching Claude Code).
     pub max_stop_blocks: u32,
+    /// Consecutive-recoverable-tool-error breaker threshold `N` (issue #137).
+    /// The ReAct turn loop tracks, per tool name, the current run of
+    /// consecutive recoverable [`ToolOutput::Error`] results keyed on identical
+    /// arguments (any SUCCESS for that tool resets the run). At `N` identical
+    /// failures it injects ONE corrective message (the [`enrich_tool_error`]
+    /// schema+hint, as a USER-role message); at exactly `2 * N` it STOPS
+    /// looping and resolves the node's [`BudgetExhaustedBehavior`] via the
+    /// single budget-exhaustion resolution site — WITHOUT burning the remaining
+    /// budget — terminating with [`HaltReason::ToolErrorLoop`] (never
+    /// [`HaltReason::BudgetExceeded`]). The `2×` hard-stop multiplier is FIXED,
+    /// not an independent field. Defaults to `3`.
+    pub error_loop_threshold: u32,
     /// Lifecycle hook chain (issue #69). When set, the harness fires the wired
     /// lifecycle events (`PreTurn`, `Stop`, `OnError`, …) through it.
     /// `None` (the default) preserves today's behaviour byte-for-byte.
@@ -5536,6 +5714,7 @@ impl Clone for HarnessConfig {
             tool_call_repair: self.tool_call_repair.clone(),
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
+            error_loop_threshold: self.error_loop_threshold,
             hooks: self.hooks.clone(),
             storage: self.storage.clone(),
             chunk_provider: self.chunk_provider.clone(),
@@ -5594,6 +5773,9 @@ pub struct HarnessBuilder {
     tool_call_repair: Option<Arc<dyn ToolCallRepair>>,
     max_repair_attempts: u32,
     max_stop_blocks: u32,
+    /// Consecutive-recoverable-tool-error breaker threshold `N` (issue #137).
+    /// Defaults to `3`. See [`HarnessConfig::error_loop_threshold`].
+    error_loop_threshold: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     /// #124: the default SelfVerifying verifier, folded into the registry under
     /// the empty key at build (no longer a live `HarnessConfig` field).
@@ -5683,6 +5865,7 @@ impl HarnessBuilder {
             tool_call_repair: None,
             max_repair_attempts: 1,
             max_stop_blocks: 8,
+            error_loop_threshold: 3,
             hooks: None,
             verifier: None,
             storage: None,
@@ -6109,6 +6292,17 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set the consecutive-recoverable-tool-error breaker threshold `N`
+    /// (issue #137). At `N` identical-argument recoverable errors for one tool
+    /// the loop injects ONE corrective message; at `2 * N` it stops looping and
+    /// resolves the node's [`BudgetExhaustedBehavior`] with
+    /// [`HaltReason::ToolErrorLoop`] (the `2×` multiplier is fixed). Defaults to
+    /// `3`.
+    pub fn error_loop_threshold(mut self, n: u32) -> Self {
+        self.error_loop_threshold = n;
+        self
+    }
+
     /// Set the outer-loop context-window reset cap for the `Ralph` loop strategy
     /// (issue #58, B3). Defaults to `3`.
     pub fn max_resets(mut self, max: u32) -> Self {
@@ -6290,6 +6484,7 @@ impl HarnessBuilder {
             tool_call_repair: self.tool_call_repair,
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
+            error_loop_threshold: self.error_loop_threshold,
             hooks: self.hooks,
             storage,
             chunk_provider: self.chunk_provider.unwrap_or_else(|| {
@@ -6853,6 +7048,7 @@ impl StandardHarness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_react_inner(
         &self,
         task: Task,
@@ -6888,6 +7084,13 @@ impl StandardHarness {
         // every run() — resume starts fresh. After `max_stop_blocks` consecutive
         // blocks the loop terminates anyway (R14).
         let mut stop_blocks: u32 = 0;
+        // Consecutive-recoverable-tool-error breaker state (issue #137), keyed
+        // by tool name. Loop-local to this window: a fresh `run()`/re-driven
+        // `Continue` window starts with a clean N/2N allowance (AC3 Continue
+        // reset). `N` is `error_loop_threshold`; the hard stop is at `2 * N`.
+        let error_loop_n = self.config.error_loop_threshold;
+        let mut error_runs: std::collections::HashMap<String, ErrorRun> =
+            std::collections::HashMap::new();
         // Monotonic per-run span counter for turn / tool-call span ids, and the
         // most recent turn span — parent for the tool-call spans of that turn.
         let mut span_seq: u64 = 0;
@@ -7720,6 +7923,162 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             };
                         }
 
+                        // ── Consecutive-recoverable-tool-error breaker (#137) ──
+                        // `output` here is either a Success or a RECOVERABLE
+                        // Error (every other variant early-returned above). On a
+                        // success the tool's error run resets (AC1); on a
+                        // recoverable error we increment the identical-args run
+                        // (AC1 args-variant) and check the N / 2N thresholds.
+                        // At N we stash the corrective USER message here and
+                        // append it AFTER the tool result below (well-formed
+                        // conversation: assistant tool_use → tool result →
+                        // corrective user message).
+                        let mut pending_corrective: Option<String> = None;
+                        if let ToolOutput::Error {
+                            recoverable: true, ..
+                        } = &output
+                        {
+                            let run = match error_runs.get_mut(&call.name) {
+                                // Same tool, structurally-identical args → extend
+                                // the run.
+                                Some(existing) if existing.args == call.input => {
+                                    existing.count += 1;
+                                    existing
+                                }
+                                // First error, or the args changed → fresh run.
+                                _ => error_runs
+                                    .entry(call.name.clone())
+                                    .insert_entry(ErrorRun {
+                                        args: call.input.clone(),
+                                        count: 1,
+                                        injected: false,
+                                    })
+                                    .into_mut(),
+                            };
+                            let count = run.count;
+                            let two_n = error_loop_n.saturating_mul(2);
+
+                            // 2N: HARD STOP (AC3). Do NOT append this last tool
+                            // result or continue — return a typed terminal that
+                            // `ReactConfig::run` routes through the node's
+                            // `BudgetExhaustedBehavior` WITHOUT burning the rest
+                            // of the budget. The breaker is disabled when N == 0.
+                            if error_loop_n > 0 && count >= two_n {
+                                // AC4: emit the "broken" pair (stream + obs).
+                                Self::emit(
+                                    &on_stream,
+                                    StreamEvent::ToolErrorLoopBroken {
+                                        tool: call.name.clone(),
+                                        consecutive_errors: count,
+                                        node: None,
+                                    },
+                                );
+                                if let Some(obs) = self.config.observability.as_ref() {
+                                    let base = SpanBase::new_root(
+                                        SpanId::new(format!(
+                                            "{}-tool-error-loop-broken-{}",
+                                            session_id.as_str(),
+                                            span_seq
+                                        )),
+                                        session_id.clone(),
+                                        task.id.clone(),
+                                        SpanKind::ContextAssembly,
+                                        Timestamp::now(),
+                                    );
+                                    obs.emit_context(ContextSpan {
+                                        base,
+                                        operation: ContextOperation::ToolErrorLoopBroken {
+                                            tool_name: call.name.clone(),
+                                            consecutive_errors: count,
+                                        },
+                                        tokens_before: 0,
+                                        tokens_after: 0,
+                                        utilization_before: 0.0,
+                                        utilization_after: 0.0,
+                                    });
+                                }
+                                return RunResult::Failure {
+                                    reason: HaltReason::ToolErrorLoop {
+                                        tool: call.name.clone(),
+                                        consecutive_errors: count,
+                                    },
+                                    session_id,
+                                    usage,
+                                    turns: budget_used.turns,
+                                    session_state: session_state.clone(),
+                                };
+                            }
+
+                            // N: inject ONE corrective message (AC2). Render the
+                            // schema+hint via `enrich_tool_error` (reused
+                            // verbatim) and inject it as a USER-role message —
+                            // the SAME channel the Stop-block breaker uses — once
+                            // per run (do not re-inject between N and 2N).
+                            if error_loop_n > 0 && count >= error_loop_n && !run.injected {
+                                run.injected = true;
+                                let schema = tool_registry
+                                    .schemas()
+                                    .into_iter()
+                                    .find(|s| s.name == call.name);
+                                // `enrich_tool_error` renders the bare message +
+                                // schema + hint; the bare message is this run's
+                                // own error text.
+                                let bare = match &output {
+                                    ToolOutput::Error { message, .. } => message.as_str(),
+                                    _ => "",
+                                };
+                                let corrective =
+                                    match Self::enrich_tool_error(bare, schema.as_ref()) {
+                                        ToolOutput::Error { message, .. } => message,
+                                        // enrich_tool_error always returns Error.
+                                        _ => bare.to_string(),
+                                    };
+                                // AC4: emit the "detected/warning" pair (stream +
+                                // obs) BEFORE the corrective message is appended.
+                                Self::emit(
+                                    &on_stream,
+                                    StreamEvent::ToolErrorLoopDetected {
+                                        tool: call.name.clone(),
+                                        consecutive_errors: count,
+                                        node: None,
+                                    },
+                                );
+                                if let Some(obs) = self.config.observability.as_ref() {
+                                    let base = SpanBase::new_root(
+                                        SpanId::new(format!(
+                                            "{}-tool-error-loop-detected-{}",
+                                            session_id.as_str(),
+                                            span_seq
+                                        )),
+                                        session_id.clone(),
+                                        task.id.clone(),
+                                        SpanKind::ContextAssembly,
+                                        Timestamp::now(),
+                                    );
+                                    obs.emit_context(ContextSpan {
+                                        base,
+                                        operation: ContextOperation::ToolErrorLoopDetected {
+                                            tool_name: call.name.clone(),
+                                            consecutive_errors: count,
+                                        },
+                                        tokens_before: 0,
+                                        tokens_after: 0,
+                                        utilization_before: 0.0,
+                                        utilization_after: 0.0,
+                                    });
+                                }
+                                // Append after the normal tool-result append below
+                                // so the conversation stays well-formed (assistant
+                                // tool_use → tool result → corrective user msg).
+                                // Stash it for injection just after the tool
+                                // result is recorded.
+                                pending_corrective = Some(corrective);
+                            }
+                        } else {
+                            // AC1: ANY success for this tool resets its run.
+                            error_runs.remove(&call.name);
+                        }
+
                         // Tool-call span (issue #12), child of the current turn.
                         if let Some(obs) = self.config.observability.as_ref() {
                             // LLM-native content capture (issue #64): tool args +
@@ -7834,6 +8193,17 @@ tool. Use the provided tool-call format to actually invoke the tool."
                             .append_tool_result(&mut session_state, &tr)
                             .await;
                         approved_results.push(tr);
+
+                        // #137 (AC2): inject the ONE corrective user message at
+                        // the N threshold, AFTER this call's tool result is
+                        // recorded — same `append_user_message` channel the
+                        // Stop-block breaker uses.
+                        if let Some(corrective) = pending_corrective.take() {
+                            self.config
+                                .context_manager
+                                .append_user_message(&mut session_state, &corrective)
+                                .await;
+                        }
                     }
 
                     // Middleware: AfterTool.
@@ -9665,6 +10035,7 @@ impl StandardHarness {
                     continues_used,
                     phase,
                     partial_output,
+                    cause,
                 } => {
                     // #129: a BARE LEAF exhaustion propagates here carrying its
                     // CONFIGURED `behavior` (Q1 — the bare-leaf resolution site
@@ -9678,6 +10049,24 @@ impl StandardHarness {
                         steps_taken
                     } else {
                         cx.scratch.run_budget.turns
+                    };
+                    // #137: the terminal `HaltReason` for a Fail / Escalate→Fail
+                    // resolution depends on the CAUSE — a genuine budget
+                    // exhaustion reports `BudgetExceeded`; an error-loop break
+                    // reports `ToolErrorLoop`. (A granted `Continue` re-drives
+                    // the window, whose loop-local error counter starts fresh —
+                    // parallel to how `consume_continue` resets `steps_taken`.)
+                    let terminal_reason = match &cause {
+                        ExhaustionCause::Budget => HaltReason::BudgetExceeded {
+                            limit_type: BudgetLimitType::Turns,
+                        },
+                        ExhaustionCause::ToolErrorLoop {
+                            tool,
+                            consecutive_errors,
+                        } => HaltReason::ToolErrorLoop {
+                            tool: tool.clone(),
+                            consecutive_errors: *consecutive_errors,
+                        },
                     };
                     // Reconstruct the resolution scope: the FIRST round uses the
                     // leaf's propagated behavior + continues_used; later in-process
@@ -9735,9 +10124,8 @@ impl StandardHarness {
                                 );
                             }
                             return RunResult::Failure {
-                                reason: HaltReason::BudgetExceeded {
-                                    limit_type: BudgetLimitType::Turns,
-                                },
+                                // #137: ToolErrorLoop vs BudgetExceeded per cause.
+                                reason: terminal_reason,
                                 session_id,
                                 usage: cx.usage.clone(),
                                 turns,
@@ -9757,9 +10145,8 @@ impl StandardHarness {
                         ExhaustedResolution::Fail => {
                             // Fail contract: the partial is DISCARDED.
                             return RunResult::Failure {
-                                reason: HaltReason::BudgetExceeded {
-                                    limit_type: BudgetLimitType::Turns,
-                                },
+                                // #137: ToolErrorLoop vs BudgetExceeded per cause.
+                                reason: terminal_reason,
                                 session_id,
                                 usage: cx.usage.clone(),
                                 turns,
@@ -10218,6 +10605,15 @@ pub mod testing {
         outputs: Mutex<std::collections::VecDeque<ToolOutput>>,
         pub call_count: std::sync::atomic::AtomicUsize,
         always_halt: Mutex<Vec<String>>,
+        /// Optional advertised tool schemas (issue #137: lets the error-loop
+        /// breaker's `enrich_tool_error` render a real parameter schema). Empty
+        /// by default — preserving every existing caller's behavior.
+        schemas: Mutex<Vec<ToolSchema>>,
+        /// When non-empty, `dispatch` returns the SAME recoverable error for
+        /// EVERY call regardless of the queued `outputs` (issue #137 — models a
+        /// tool that always rejects a malformed call, e.g. `add_task` missing a
+        /// required `description`). Used by the tool-error-loop replay/tests.
+        sticky_error: Mutex<Option<String>>,
     }
     impl Default for ScriptedToolRegistry {
         fn default() -> Self {
@@ -10230,6 +10626,8 @@ pub mod testing {
                 outputs: Mutex::new(Default::default()),
                 call_count: Default::default(),
                 always_halt: Mutex::new(vec![]),
+                schemas: Mutex::new(vec![]),
+                sticky_error: Mutex::new(None),
             }
         }
         pub fn push(&self, o: ToolOutput) -> &Self {
@@ -10239,11 +10637,30 @@ pub mod testing {
         pub fn mark_always_halt(&self, name: &str) {
             self.always_halt.lock().unwrap().push(name.into());
         }
+        /// Advertise a tool schema (issue #137). Returns `&Self` for chaining.
+        pub fn with_schema(&self, schema: ToolSchema) -> &Self {
+            self.schemas.lock().unwrap().push(schema);
+            self
+        }
+        /// Make every dispatch return the same recoverable error message,
+        /// regardless of arguments (issue #137 error-loop scenario).
+        pub fn always_recoverable_error(&self, message: &str) -> &Self {
+            *self.sticky_error.lock().unwrap() = Some(message.into());
+            self
+        }
     }
     impl ToolRegistry for ScriptedToolRegistry {
         fn dispatch<'a>(&'a self, _call: ToolCall) -> BoxFut<'a, ToolOutput> {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(message) = self.sticky_error.lock().unwrap().clone() {
+                return Box::pin(async move {
+                    ToolOutput::Error {
+                        message,
+                        recoverable: true,
+                    }
+                });
+            }
             let out = self
                 .outputs
                 .lock()
@@ -10261,6 +10678,9 @@ pub mod testing {
                 .unwrap()
                 .iter()
                 .any(|n| n == tool_name)
+        }
+        fn schemas(&self) -> Vec<ToolSchema> {
+            self.schemas.lock().unwrap().clone()
         }
     }
 
@@ -11378,6 +11798,7 @@ mod tests {
             tool_call_repair: None,
             max_repair_attempts: 1,
             max_stop_blocks: 8,
+            error_loop_threshold: 3,
             hooks: None,
             // #76: plan_execute + task_list persistence now lives on the
             // RunStore seam (not SessionState.extras), so the test harness
@@ -15640,6 +16061,7 @@ mod tests {
                 tool_call_repair: None,
                 max_repair_attempts: 1,
                 max_stop_blocks: 8,
+                error_loop_threshold: 3,
                 hooks: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
@@ -20232,6 +20654,422 @@ mod tests {
             other => panic!("expected parent plan_execute pause, got {other:?}"),
         }
     }
+
+    // ========================================================================
+    // Consecutive-recoverable-tool-error breaker (issue #137)
+    // ========================================================================
+    //
+    // Types/rules under test:
+    //   - `HarnessConfig::error_loop_threshold` (N, default 3); hard stop at 2N.
+    //   - Per-tool `ErrorRun { args, count, injected }` loop-local counter:
+    //       * identical-args recoverable error -> count += 1
+    //       * args change OR first error -> fresh run at count 1
+    //       * ANY success for the tool -> run removed (AC1 reset)
+    //   - At N: ONE corrective USER message (enrich_tool_error schema+hint), AC2.
+    //   - At 2N: stop -> resolve node `BudgetExhaustedBehavior`, terminal carries
+    //     `HaltReason::ToolErrorLoop` (never BudgetExceeded), AC3.
+    //   - At BOTH thresholds: a StreamEvent + a ContextOperation, AC4.
+
+    const TEL_BAD_MSG: &str = "missing required parameter `description`";
+
+    /// The malformed `add_task` call the weak model repeats (gemma's
+    /// `task_list`/`add_task`-without-`description` scenario).
+    fn tel_bad_call(args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call_bad".into(),
+            name: "add_task".into(),
+            input: args,
+        }
+    }
+
+    fn tel_bad_args() -> serde_json::Value {
+        serde_json::json!({ "task_list_id": "tl1" })
+    }
+
+    /// Push `k` identical malformed `add_task` tool-call turns.
+    fn tel_push_bad(a: &Arc<MockAgent>, k: u32, args: &serde_json::Value) {
+        for _ in 0..k {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![tel_bad_call(args.clone())],
+                usage: usage(),
+            });
+        }
+    }
+
+    /// A tool registry that always returns the same recoverable error and
+    /// advertises the `add_task` schema (so `enrich_tool_error` can render the
+    /// schema+hint).
+    fn tel_err_registry() -> Arc<ScriptedToolRegistry> {
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.always_recoverable_error(TEL_BAD_MSG);
+        reg.with_schema(ToolSchema {
+            name: "add_task".into(),
+            description: "add a task to a task list".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_list_id": { "type": "string" },
+                    "description": { "type": "string" },
+                },
+                "required": ["task_list_id", "description"],
+            }),
+        });
+        reg
+    }
+
+    fn tel_user_msgs(state: &SessionState) -> Vec<String> {
+        state
+            .messages
+            .iter()
+            .filter_map(|m| match (&m.role, &m.content) {
+                (crate::model::Role::User, crate::model::Content::Text { text }) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tel_leaf(behavior: BudgetExhaustedBehavior, budget: u32) -> Task {
+        task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: budget },
+            behavior,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }))
+    }
+
+    // AC1: a success in the middle resets the counter; the breaker never trips.
+    // error, error, SUCCESS, error, error -> 4 errors but the longest
+    // identical-args run is 2 (< N), so no trip.
+    #[tokio::test]
+    async fn tel_ac1_success_resets_counter_no_trip() {
+        let a = make_agent();
+        tel_push_bad(&a, 2, &tel_bad_args());
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "ok".into(),
+                name: "add_task".into(),
+                input: tel_bad_args(),
+            }],
+            usage: usage(),
+        });
+        tel_push_bad(&a, 2, &tel_bad_args());
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        for recoverable_err in [true, true, false, true, true] {
+            if recoverable_err {
+                reg.push(ToolOutput::Error {
+                    message: TEL_BAD_MSG.into(),
+                    recoverable: true,
+                });
+            } else {
+                reg.push(ToolOutput::Success {
+                    content: "added".into(),
+                    truncated: false,
+                });
+            }
+        }
+        cfg.tool_registry = reg;
+        cfg.error_loop_threshold = 3;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(20))).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "done"),
+            other => panic!("expected Success (no trip), got {other:?}"),
+        }
+    }
+
+    // AC1 args variant: error(argsX), error(argsY) -> the second is a FRESH run
+    // at count 1, so two different-args errors never trip even at N == 2.
+    #[tokio::test]
+    async fn tel_ac1_args_change_starts_fresh_run() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![tel_bad_call(serde_json::json!({ "task_list_id": "X" }))],
+            usage: usage(),
+        });
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![tel_bad_call(serde_json::json!({ "task_list_id": "Y" }))],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "stopped trying".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 2; // 2N == 4; longest identical run is 1.
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(20))).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "stopped trying"),
+            other => panic!("expected Success (args changed, no trip), got {other:?}"),
+        }
+    }
+
+    // AC2: exactly N identical-arg recoverable errors inject exactly ONE
+    // corrective user message carrying the enrich_tool_error schema+hint; a 4th
+    // identical error does NOT re-inject.
+    #[tokio::test]
+    async fn tel_ac2_injects_one_corrective_at_n() {
+        let a = make_agent();
+        // 4 identical errors (N=3 injects at the 3rd; 4th must not re-inject),
+        // then a final response so the run ends cleanly (2N would be 6).
+        tel_push_bad(&a, 4, &tel_bad_args());
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "gave up".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        let h = StandardHarness::new(cfg);
+        let r = h.run(HarnessRunOptions::new(react(20))).await;
+        let state = match &r {
+            RunResult::Success { session_state, .. } => session_state,
+            other => panic!("expected Success, got {other:?}"),
+        };
+        let users = tel_user_msgs(state);
+        let correctives: Vec<&String> = users
+            .iter()
+            .filter(|m| m.contains("Expected parameter schema"))
+            .collect();
+        assert_eq!(
+            correctives.len(),
+            1,
+            "exactly one corrective injected, got {users:?}"
+        );
+        let corrective = correctives[0];
+        assert!(corrective.contains(TEL_BAD_MSG), "carries the bare error");
+        assert!(
+            corrective.contains("\"required\""),
+            "carries the parameter schema"
+        );
+        assert!(
+            corrective.contains("correctly-typed JSON"),
+            "carries the hint"
+        );
+    }
+
+    // AC3 Fail: 2N identical errors under `behavior = Fail` ->
+    // RunResult::Failure { ToolErrorLoop }; budget NOT fully burned.
+    #[tokio::test]
+    async fn tel_ac3_fail_terminal_is_tool_error_loop() {
+        let a = make_agent();
+        tel_push_bad(&a, 8, &tel_bad_args()); // trip is at 2N == 6.
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        let h = StandardHarness::new(cfg);
+        match h
+            .run(HarnessRunOptions::new(tel_leaf(
+                BudgetExhaustedBehavior::Fail,
+                50,
+            )))
+            .await
+        {
+            RunResult::Failure {
+                reason:
+                    HaltReason::ToolErrorLoop {
+                        tool,
+                        consecutive_errors,
+                    },
+                turns,
+                ..
+            } => {
+                assert_eq!(tool, "add_task");
+                assert_eq!(consecutive_errors, 6, "2N == 6");
+                assert!(turns < 50, "budget NOT fully burned, got {turns}");
+            }
+            other => panic!("expected Failure {{ ToolErrorLoop }}, got {other:?}"),
+        }
+    }
+
+    // AC3 Escalate (SurfaceToHuman) -> WaitingForHuman.
+    #[tokio::test]
+    async fn tel_ac3_escalate_surfaces_to_human() {
+        let a = make_agent();
+        tel_push_bad(&a, 8, &tel_bad_args());
+        let mut cfg = surface_config(a); // EscalationMode::SurfaceToHuman
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        let h = StandardHarness::new(cfg);
+        match h
+            .run(HarnessRunOptions::new(tel_leaf(
+                BudgetExhaustedBehavior::Escalate,
+                50,
+            )))
+            .await
+        {
+            RunResult::WaitingForHuman { .. } => {}
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+    }
+
+    // AC3 Escalate (Autonomous) -> propagated Failure carrying ToolErrorLoop
+    // (NOT BudgetExceeded).
+    #[tokio::test]
+    async fn tel_ac3_escalate_autonomous_is_tool_error_loop() {
+        let a = make_agent();
+        tel_push_bad(&a, 8, &tel_bad_args());
+        let mut cfg = standard_config(a); // EscalationMode::Autonomous
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        let h = StandardHarness::new(cfg);
+        match h
+            .run(HarnessRunOptions::new(tel_leaf(
+                BudgetExhaustedBehavior::Escalate,
+                50,
+            )))
+            .await
+        {
+            RunResult::Failure {
+                reason: HaltReason::ToolErrorLoop { tool, .. },
+                turns,
+                ..
+            } => {
+                assert_eq!(tool, "add_task");
+                assert!(turns < 50, "budget NOT fully burned");
+            }
+            other => panic!("expected Failure {{ ToolErrorLoop }}, got {other:?}"),
+        }
+    }
+
+    // AC3 Continue: one extra window granted, then a terminal. With
+    // `Continue { max_continues: 1, on_exhausted: Fail }`, the first 2N trip
+    // grants a continue (fresh window), the second 2N trip falls through to Fail
+    // with ToolErrorLoop.
+    #[tokio::test]
+    async fn tel_ac3_continue_grants_one_window_then_terminal() {
+        let a = make_agent();
+        tel_push_bad(&a, 14, &tel_bad_args()); // 2N (6) + 2N (6) = 12 needed.
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        let strat = tel_leaf(
+            BudgetExhaustedBehavior::Continue {
+                max_continues: 1,
+                on_exhausted: Box::new(BudgetExhaustedBehavior::Fail),
+            },
+            50,
+        );
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(strat)).await {
+            RunResult::Failure {
+                reason: HaltReason::ToolErrorLoop { .. },
+                turns,
+                ..
+            } => {
+                assert!(turns < 50, "budget NOT fully burned, got {turns}");
+            }
+            other => panic!("expected Failure {{ ToolErrorLoop }} after continue, got {other:?}"),
+        }
+    }
+
+    // AC4: capturing StreamSink + recording ObservabilityProvider -> the
+    // detected pair at N and the broken pair at 2N, with tool + count.
+    #[tokio::test]
+    async fn tel_ac4_emits_detected_and_broken_events() {
+        let a = make_agent();
+        tel_push_bad(&a, 8, &tel_bad_args());
+        let obs = Arc::new(crate::observability::InMemoryObservabilityProvider::new());
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 3;
+        cfg.observability = Some(obs.clone());
+        let captured: Arc<std::sync::Mutex<Vec<StreamEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let session_id = SessionId::new("s1");
+        let opts = HarnessRunOptions::new(tel_leaf(BudgetExhaustedBehavior::Fail, 50)).with_stream(
+            move |ev| {
+                sink.lock().unwrap().push(ev);
+            },
+        );
+        let h = StandardHarness::new(cfg);
+        let _ = h.run(opts).await;
+
+        let evs = captured.lock().unwrap();
+        let detected: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolErrorLoopDetected {
+                    tool,
+                    consecutive_errors,
+                    ..
+                } if tool == "add_task" => Some(*consecutive_errors),
+                _ => None,
+            })
+            .collect();
+        let broken: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolErrorLoopBroken {
+                    tool,
+                    consecutive_errors,
+                    ..
+                } if tool == "add_task" => Some(*consecutive_errors),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(detected, vec![3], "one detected at N, count==N");
+        assert_eq!(broken, vec![6], "one broken at 2N, count==2N");
+
+        let spans = obs.context_spans(&session_id);
+        let obs_detected: Vec<u32> = spans
+            .iter()
+            .filter_map(|s| match &s.operation {
+                crate::observability::ContextOperation::ToolErrorLoopDetected {
+                    tool_name,
+                    consecutive_errors,
+                } if tool_name == "add_task" => Some(*consecutive_errors),
+                _ => None,
+            })
+            .collect();
+        let obs_broken: Vec<u32> = spans
+            .iter()
+            .filter_map(|s| match &s.operation {
+                crate::observability::ContextOperation::ToolErrorLoopBroken {
+                    tool_name,
+                    consecutive_errors,
+                } if tool_name == "add_task" => Some(*consecutive_errors),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(obs_detected, vec![3], "obs detected at N");
+        assert_eq!(obs_broken, vec![6], "obs broken at 2N");
+    }
+
+    // Breaker disabled when threshold is 0: no trip, run completes.
+    #[tokio::test]
+    async fn tel_threshold_zero_disables_breaker() {
+        let a = make_agent();
+        tel_push_bad(&a, 5, &tel_bad_args());
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "fin".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tel_err_registry();
+        cfg.error_loop_threshold = 0;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(20))).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "fin"),
+            other => panic!("expected Success (breaker off), got {other:?}"),
+        }
+    }
 }
 
 // ============================================================================
@@ -20364,6 +21202,7 @@ mod execution_scaffold_tests {
             continues_used: 0,
             phase: "p".to_string(),
             partial_output: Some("partial".to_string()),
+            cause: ExhaustionCause::Budget,
         };
         let failed = StrategyOutcome::Failed(HarnessError::InvalidConfiguration("boom".into()));
         let complete = StrategyOutcome::Complete("done".to_string());
