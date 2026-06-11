@@ -223,8 +223,15 @@ describe("Tool-error-loop breaker (#137) — AC2 corrective injection", () => {
     expect(correctives.length).toBe(1);
     const corrective = correctives[0]!;
     expect(corrective).toContain(TEL_BAD_MSG); // carries the bare error
-    expect(corrective).toContain('"required"'); // carries the parameter schema
     expect(corrective).toContain("correctly-typed JSON"); // carries the hint
+    // Cross-language parity (#137): the schema JSON renders with object keys
+    // sorted RECURSIVELY, byte-identical to Rust's serde_json (BTreeMap) output.
+    // This EXACT substring is the Rust-emitted form — guards against a regression
+    // back to insertion-order serialization.
+    const expectedSchema =
+      '{"properties":{"description":{"type":"string"},"task_list_id":{"type":"string"}},' +
+      '"required":["task_list_id","description"],"type":"object"}';
+    expect(corrective).toContain("Expected parameter schema: " + expectedSchema);
   });
 });
 

@@ -555,11 +555,19 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * message text. Reused by the consecutive-tool-error breaker (#137) to render
    * the ONE corrective message injected at the `N` threshold. Mirrors Rust's
    * `StandardHarness::enrich_tool_error`.
+   *
+   * Cross-language parity (#137): the schema JSON is serialized with object keys
+   * sorted RECURSIVELY (via {@link canonicalJson}) so the rendered corrective
+   * message is BYTE-IDENTICAL to Rust's output — Rust's `serde_json` (built
+   * without `preserve_order`) serializes `Value::Object` via a `BTreeMap`, i.e.
+   * alphabetically-sorted keys at every level. Arrays keep their order; only
+   * object keys sort. Compact separators (no spaces) match `JSON.stringify`.
    */
   private static enrichToolError(message: string, schema: ModelToolSchema | undefined): string {
     let enriched = message;
     if (schema !== undefined && schema.input_schema !== undefined) {
-      enriched += "\n\nExpected parameter schema: " + JSON.stringify(schema.input_schema);
+      enriched +=
+        "\n\nExpected parameter schema: " + JSON.stringify(canonicalJson(schema.input_schema));
     }
     enriched +=
       "\n\nHint: provide arguments as correctly-typed JSON (e.g. true/false as a bool, " +
