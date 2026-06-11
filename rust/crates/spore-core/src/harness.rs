@@ -10584,7 +10584,7 @@ mod strategy_tests {
                 behavior: BudgetExhaustedBehavior::Escalate,
                 plan: Box::new(LoopStrategy::ReAct(ReactConfig {
                     behavior: BudgetExhaustedBehavior::Escalate,
-                    budget: BudgetPolicy::PerLoop { value: 4 },
+                    budget: BudgetPolicy::PerLoop { value: 12 },
                     agent: AgentRef("planner".to_string()),
                     toolset: ToolsetRef("plan-tools".to_string()),
                     // A.5 (#124, Q3): the structured plan slot declares an output
@@ -11024,34 +11024,34 @@ mod strategy_tests {
             ralph(react_with(BudgetPolicy::PerLoop { value: 9 })).max_steps(),
             Some(9)
         );
-        // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+        // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 25.
         let s = ralph(plan_execute(
-            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            react_with(BudgetPolicy::PerLoop { value: 12 }),
             self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
         ));
-        assert_eq!(s.max_steps(), Some(17));
+        assert_eq!(s.max_steps(), Some(25));
     }
 
     #[test]
     fn max_steps_canonical_cordyceps_subtree() {
-        // PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]] = 4 + (12 + 1) = 17.
+        // PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]] = 12 + (12 + 1) = 25.
         let subtree = plan_execute(
-            react_with(BudgetPolicy::PerLoop { value: 4 }),
+            react_with(BudgetPolicy::PerLoop { value: 12 }),
             self_verifying(react_with(BudgetPolicy::PerLoop { value: 12 })),
         );
-        assert_eq!(subtree.max_steps(), Some(17));
+        assert_eq!(subtree.max_steps(), Some(25));
     }
 
     #[test]
-    fn max_steps_cordyceps_fixture_is_17() {
-        // The whole tree's root Ralph wraps PlanExecute, so per-window == 17.
+    fn max_steps_cordyceps_fixture_is_25() {
+        // The whole tree's root Ralph wraps PlanExecute, so per-window == 25.
         let tree = cordyceps_tree();
-        assert_eq!(tree.max_steps(), Some(17));
+        assert_eq!(tree.max_steps(), Some(25));
 
         let raw = std::fs::read_to_string(fixture_path("strategy/cordyceps_tree.json"))
             .expect("fixture present");
         let deserialized: LoopStrategy = serde_json::from_str(&raw).unwrap();
-        assert_eq!(deserialized.max_steps(), Some(17));
+        assert_eq!(deserialized.max_steps(), Some(25));
     }
 
     #[test]

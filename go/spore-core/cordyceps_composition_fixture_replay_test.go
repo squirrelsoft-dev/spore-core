@@ -182,11 +182,11 @@ func compSeed(t *testing.T, store *fakeRunStore, sessionID SessionID, list TaskL
 
 // AC5 (static): the canonical tree's per-window worst case is computable before
 // any run; an Unlimited anywhere collapses it to (_, false).
-func TestCordycepsMaxStepsIs17UnlimitedIsNone(t *testing.T) {
+func TestCordycepsMaxStepsIs25UnlimitedIsNone(t *testing.T) {
 	tree := compTree(t)
 	got, ok := tree.MaxSteps()
-	if !ok || got != 17 {
-		t.Fatalf("MaxSteps() = (%d, %v), want (17, true)", got, ok)
+	if !ok || got != 25 {
+		t.Fatalf("MaxSteps() = (%d, %v), want (25, true)", got, ok)
 	}
 
 	// Swap the worker leaf's PerLoop{12} for Unlimited => (_, false).

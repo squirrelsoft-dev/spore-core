@@ -28,7 +28,7 @@
           "kind": "react",
           "budget": {
             "kind": "per_loop",
-            "value": 4
+            "value": 12
           },
           "behavior": {
             "kind": "escalate"

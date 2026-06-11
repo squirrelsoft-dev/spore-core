@@ -416,8 +416,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&workspace_root)?;
 
     // AC5: the fully-bounded tree's worst-case per-window turn count is computable
-    // BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
-    // = 4 + (12 + 1) = 17. An `Unlimited` anywhere would collapse this to None.
+    // BEFORE the run. Ralph[PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]]]
+    // = 12 + (12 + 1) = 25. An `Unlimited` anywhere would collapse this to None.
     let tree_preview: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON)?;
     println!("model        : {model_id}");
     println!("advisor model: {advisor_model_id}");
@@ -931,14 +931,14 @@ mod tests {
         let LoopStrategy::PlanExecute(pe) = ralph.inner.as_ref() else {
             panic!("Ralph inner must be PlanExecute");
         };
-        // plan = ReAct{planner, plan-tools, plan-schema, PerLoop{4}}
+        // plan = ReAct{planner, plan-tools, plan-schema, PerLoop{12}}
         let LoopStrategy::ReAct(plan) = pe.plan.as_ref() else {
             panic!("plan must be ReAct");
         };
         assert_eq!(plan.agent.0, "planner");
         assert_eq!(plan.toolset.0, "plan-tools");
         assert_eq!(plan.output.as_ref().unwrap().0, "plan-schema");
-        assert_eq!(plan.budget, spore_core::BudgetPolicy::PerLoop { value: 4 });
+        assert_eq!(plan.budget, spore_core::BudgetPolicy::PerLoop { value: 12 });
         // execute = SelfVerifying{ ReAct{executor, exec-tools, worker-schema, 12}, exec-evaluator }
         let LoopStrategy::SelfVerifying(sv) = pe.execute.as_ref() else {
             panic!("execute must be SelfVerifying");
@@ -956,12 +956,12 @@ mod tests {
         );
     }
 
-    /// AC5: the fully-bounded tree's per-window worst case is `Some(17)`; one
+    /// AC5: the fully-bounded tree's per-window worst case is `Some(25)`; one
     /// `Unlimited` anywhere collapses it to `None`.
     #[test]
-    fn max_steps_is_17() {
+    fn max_steps_is_25() {
         let tree: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON).unwrap();
-        assert_eq!(tree.max_steps(), Some(17));
+        assert_eq!(tree.max_steps(), Some(25));
 
         // Swap the worker's PerLoop{12} for Unlimited ⇒ None.
         let LoopStrategy::Ralph(mut ralph) = tree else {

@@ -162,9 +162,9 @@ async fn stored_list(storage: &StorageProvider, session: &SessionId) -> TaskList
 // AC5 (static): the canonical tree's per-window worst case is computable before
 // any run; an Unlimited anywhere collapses it to None.
 #[test]
-fn cordyceps_max_steps_is_17_unlimited_is_none() {
+fn cordyceps_max_steps_is_25_unlimited_is_none() {
     let tree = cordyceps_tree();
-    assert_eq!(tree.max_steps(), Some(17));
+    assert_eq!(tree.max_steps(), Some(25));
 
     // Swap the worker leaf's PerLoop{12} for Unlimited ⇒ None.
     let LoopStrategy::Ralph(mut ralph) = tree else {

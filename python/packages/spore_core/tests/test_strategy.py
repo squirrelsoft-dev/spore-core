@@ -58,7 +58,7 @@ def _cordyceps_tree() -> LoopStrategy:
     return RalphConfig(
         inner=PlanExecuteConfig(
             plan=ReactConfig(
-                budget=BudgetPolicyPerLoop(value=4),
+                budget=BudgetPolicyPerLoop(value=12),
                 agent="planner",
                 toolset="plan-tools",
                 # A.5 (#124): the structured `plan` slot requires an output schema.

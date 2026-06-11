@@ -192,9 +192,9 @@ async def _stored_list(storage: StorageProvider, session: SessionId) -> TaskList
 # ---------------------------------------------------------------------------
 
 
-def test_cordyceps_max_steps_is_17_unlimited_is_none() -> None:
+def test_cordyceps_max_steps_is_25_unlimited_is_none() -> None:
     tree = _cordyceps_tree()
-    assert loop_strategy_max_steps(tree) == 17
+    assert loop_strategy_max_steps(tree) == 25
 
     # Swap the worker leaf's PerLoop{12} for Unlimited ⇒ None.
     assert isinstance(tree, RalphConfig)

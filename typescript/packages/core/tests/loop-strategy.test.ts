@@ -82,7 +82,7 @@ function cordycepsTree(): LoopStrategy {
       kind: "plan_execute",
       plan: {
         kind: "react",
-        budget: { kind: "per_loop", value: 4 },
+        budget: { kind: "per_loop", value: 12 },
         behavior: ESCALATE,
         agent: "planner",
         toolset: "plan-tools",
@@ -268,7 +268,7 @@ describe("LoopStrategy", () => {
   it("serializes the cordyceps tree to the exact compact form", () => {
     expect(JSON.stringify(loopStrategyToJson(cordycepsTree()))).toBe(
       '{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react",' +
-        '"budget":{"kind":"per_loop","value":4},"behavior":{"kind":"escalate"},' +
+        '"budget":{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},' +
         '"agent":"planner","toolset":"plan-tools","output":"plan-schema"},' +
         '"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":' +
         '{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},' +
@@ -466,28 +466,28 @@ describe("maxSteps — advisory worst-case turn bound (#122)", () => {
 
   it("ralph is the per-window bound (just its inner)", () => {
     expect(loopStrategyMaxSteps(ralph(react({ kind: "per_loop", value: 9 })))).toBe(9);
-    // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+    // Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 25.
     const s = ralph(
       planExecute(
-        react({ kind: "per_loop", value: 4 }),
+        react({ kind: "per_loop", value: 12 }),
         selfVerifying(react({ kind: "per_loop", value: 12 })),
       ),
     );
-    expect(loopStrategyMaxSteps(s)).toBe(17);
+    expect(loopStrategyMaxSteps(s)).toBe(25);
   });
 
-  it("canonical cordyceps subtree PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]] = 17", () => {
+  it("canonical cordyceps subtree PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]] = 25", () => {
     const subtree = planExecute(
-      react({ kind: "per_loop", value: 4 }),
+      react({ kind: "per_loop", value: 12 }),
       selfVerifying(react({ kind: "per_loop", value: 12 })),
     );
-    expect(loopStrategyMaxSteps(subtree)).toBe(17);
+    expect(loopStrategyMaxSteps(subtree)).toBe(25);
   });
 
-  it("the cordyceps fixture's per-window bound is 17", () => {
-    expect(loopStrategyMaxSteps(cordycepsTree())).toBe(17);
+  it("the cordyceps fixture's per-window bound is 25", () => {
+    expect(loopStrategyMaxSteps(cordycepsTree())).toBe(25);
     const parsed = loopStrategyFromJson(JSON.parse(fixture("cordyceps_tree.json")));
-    expect(loopStrategyMaxSteps(parsed)).toBe(17);
+    expect(loopStrategyMaxSteps(parsed)).toBe(25);
   });
 
   it("any unlimited node anywhere collapses the whole figure to undefined", () => {

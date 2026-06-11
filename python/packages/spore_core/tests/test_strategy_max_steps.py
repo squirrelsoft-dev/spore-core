@@ -132,38 +132,38 @@ def test_hill_climbing() -> None:
 
 def test_ralph_is_per_window() -> None:
     assert loop_strategy_max_steps(_ralph(_react(BudgetPolicyPerLoop(value=9)))) == 9
-    # Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 17.
+    # Canonical cordyceps subtree wrapped in Ralph ⇒ per-window 25.
     s = _ralph(
         _plan_execute(
-            _react(BudgetPolicyPerLoop(value=4)),
+            _react(BudgetPolicyPerLoop(value=12)),
             _self_verifying(_react(BudgetPolicyPerLoop(value=12))),
         )
     )
-    assert loop_strategy_max_steps(s) == 17
+    assert loop_strategy_max_steps(s) == 25
 
 
 # ---------------------------------------------------------------------------
-# Canonical cordyceps subtree ⇒ 4 + (12 + 1) = 17
+# Canonical cordyceps subtree ⇒ 12 + (12 + 1) = 25
 # ---------------------------------------------------------------------------
 
 
 def test_canonical_cordyceps_subtree() -> None:
     subtree = _plan_execute(
-        _react(BudgetPolicyPerLoop(value=4)),
+        _react(BudgetPolicyPerLoop(value=12)),
         _self_verifying(_react(BudgetPolicyPerLoop(value=12))),
     )
-    assert loop_strategy_max_steps(subtree) == 17
+    assert loop_strategy_max_steps(subtree) == 25
 
 
 # ---------------------------------------------------------------------------
-# The whole shared fixture tree (Ralph wraps PlanExecute) ⇒ per-window 17
+# The whole shared fixture tree (Ralph wraps PlanExecute) ⇒ per-window 25
 # ---------------------------------------------------------------------------
 
 
-def test_cordyceps_fixture_is_17() -> None:
+def test_cordyceps_fixture_is_25() -> None:
     raw = (_repo_root() / "fixtures/strategy/cordyceps_tree.json").read_text()
     deserialized = _STRATEGY.validate_json(raw)
-    assert loop_strategy_max_steps(deserialized) == 17
+    assert loop_strategy_max_steps(deserialized) == 25
 
 
 # ---------------------------------------------------------------------------

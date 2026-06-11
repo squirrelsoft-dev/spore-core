@@ -7,7 +7,7 @@
         "kind": "plan_execute",
         "plan": {
           "kind": "react",
-          "budget": { "kind": "per_loop", "value": 4 },
+          "budget": { "kind": "per_loop", "value": 12 },
           "behavior": { "kind": "escalate" },
           "agent": "planner",
           "toolset": "plan-tools",

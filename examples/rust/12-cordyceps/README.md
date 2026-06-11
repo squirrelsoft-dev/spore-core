@@ -11,7 +11,7 @@ Ralph[ PlanExecute[ ReAct, SelfVerifying[ ReAct ] ] ]
 Ralph (continuation wrapper)        agent: ralph-agent
   resets the context window, resumes from durable task_list progress
   └─ PlanExecute
-       ├─ plan:    ReAct            agent: planner   toolset: plan-tools   out: plan-schema   budget: PerLoop{4}
+       ├─ plan:    ReAct            agent: planner   toolset: plan-tools   out: plan-schema   budget: PerLoop{12}
        │           explores the repo, builds a blocker-aware task graph via `task_list`
        └─ execute: SelfVerifying     evaluator: exec-evaluator (Default-FAIL)
             └─ worker: ReAct         agent: executor  toolset: exec-tools   out: worker-schema  budget: PerLoop{12}
@@ -59,17 +59,17 @@ trivial: a fresh registry re-resolves every handle with no Task reconfiguration.
 The worst-case per-window turn count is computable statically:
 
 ```text
-Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
-     = 4 + (12 + 1) = 17           // SelfVerifying adds the single evaluator turn
+Ralph[PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]]]
+     = 12 + (12 + 1) = 25          // SelfVerifying adds the single evaluator turn
 ```
 
 ```rust
-tree.max_steps()  // == Some(17)
+tree.max_steps()  // == Some(25)
 ```
 
 `max_steps()` is Option-monadic: an `Unlimited` budget anywhere in the tree
 collapses the whole figure to `None` ("no finite advisory bound"). The example
-prints `Some(17)` before each run.
+prints `Some(25)` before each run.
 
 ## How the phases behave
 

@@ -41,7 +41,7 @@ func cordycepsTree() LoopStrategy {
 	planSchema := SchemaRef("plan-schema")
 	workerSchema := SchemaRef("worker-schema")
 	plan := LoopStrategy{Kind: StrategyReAct, ReActCfg: &ReactConfig{
-		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: 4},
+		Budget:   BudgetPolicy{Kind: BudgetPerLoop, Value: 12},
 		Behavior: defaultBudgetBehavior(),
 		Agent:    AgentRef("planner"),
 		Toolset:  ToolsetRef("plan-tools"),
@@ -203,7 +203,7 @@ func TestCordycepsTreeRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(tree, back) {
 		t.Fatalf("cordyceps round-trip mismatch:\n want %+v\n got %+v", tree, back)
 	}
-	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":4},"behavior":{"kind":"escalate"},"agent":"planner","toolset":"plan-tools","output":"plan-schema"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},"agent":"executor","toolset":"exec-tools","output":"worker-schema"},"evaluator":"exec-evaluator","behavior":{"kind":"escalate"}},"behavior":{"kind":"escalate"}},"agent":"ralph-agent","behavior":{"kind":"escalate"}}`
+	want := `{"kind":"ralph","inner":{"kind":"plan_execute","plan":{"kind":"react","budget":{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},"agent":"planner","toolset":"plan-tools","output":"plan-schema"},"execute":{"kind":"self_verifying","inner":{"kind":"react","budget":{"kind":"per_loop","value":12},"behavior":{"kind":"escalate"},"agent":"executor","toolset":"exec-tools","output":"worker-schema"},"evaluator":"exec-evaluator","behavior":{"kind":"escalate"}},"behavior":{"kind":"escalate"}},"agent":"ralph-agent","behavior":{"kind":"escalate"}}`
 	if string(data) != want {
 		t.Fatalf("cordyceps bytes mismatch:\n got  %s\n want %s", data, want)
 	}
@@ -427,10 +427,10 @@ func TestMaxSteps(t *testing.T) {
 	perAttempt := func(v uint32) BudgetPolicy { return BudgetPolicy{Kind: BudgetPerAttempt, Value: v} }
 	unlimited := BudgetPolicy{Kind: BudgetUnlimited}
 
-	// Canonical cordyceps subtree: PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]
-	// = 4 + (12 + 1) = 17.
+	// Canonical cordyceps subtree: PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]]
+	// = 12 + (12 + 1) = 25.
 	cordycepsSubtree := planExecute(
-		reactBudget(perLoop(4)),
+		reactBudget(perLoop(12)),
 		selfVerifying(reactBudget(perLoop(12))),
 	)
 
@@ -458,14 +458,14 @@ func TestMaxSteps(t *testing.T) {
 		// Ralph is the per-window bound (== inner).
 		{"ralph_per_window", ralphOf(reactBudget(perLoop(9))), 9, true},
 
-		// Canonical Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]] ⇒ 17.
-		{"ralph_canonical_cordyceps", ralphOf(cordycepsSubtree), 17, true},
+		// Canonical Ralph[PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]]] ⇒ 25.
+		{"ralph_canonical_cordyceps", ralphOf(cordycepsSubtree), 25, true},
 
-		// The PlanExecute subtree on its own ⇒ 17.
-		{"plan_execute_cordyceps_subtree", cordycepsSubtree, 17, true},
+		// The PlanExecute subtree on its own ⇒ 25.
+		{"plan_execute_cordyceps_subtree", cordycepsSubtree, 25, true},
 
-		// Whole canonical tree builder ⇒ 17.
-		{"cordyceps_tree_builder", cordycepsTree(), 17, true},
+		// Whole canonical tree builder ⇒ 25.
+		{"cordyceps_tree_builder", cordycepsTree(), 25, true},
 
 		// Unlimited anywhere collapses to empty.
 		{"unlimited_plan_leaf", planExecute(
@@ -495,7 +495,7 @@ func TestMaxSteps(t *testing.T) {
 	}
 }
 
-func TestMaxStepsCordycepsFixtureIs17(t *testing.T) {
+func TestMaxStepsCordycepsFixtureIs25(t *testing.T) {
 	raw, err := os.ReadFile(strategyFixturePath(t, "cordyceps_tree.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -505,8 +505,8 @@ func TestMaxStepsCordycepsFixtureIs17(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := s.MaxSteps()
-	if !ok || got != 17 {
-		t.Fatalf("deserialized cordyceps_tree MaxSteps() = (%d, %v), want (17, true)", got, ok)
+	if !ok || got != 25 {
+		t.Fatalf("deserialized cordyceps_tree MaxSteps() = (%d, %v), want (25, true)", got, ok)
 	}
 }
 

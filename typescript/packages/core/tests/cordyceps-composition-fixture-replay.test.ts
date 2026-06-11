@@ -150,9 +150,9 @@ async function storedList(storage: StorageProvider, session: SessionId): Promise
 describe("cordyceps composition fixture replay (#131)", () => {
   // AC5 (static): the canonical tree's per-window worst case is computable before
   // any run; an Unlimited anywhere collapses it to undefined.
-  it("max_steps is 17; an Unlimited collapses it to undefined", () => {
+  it("max_steps is 25; an Unlimited collapses it to undefined", () => {
     const tree = cordycepsTree();
-    expect(loopStrategyMaxSteps(tree)).toBe(17);
+    expect(loopStrategyMaxSteps(tree)).toBe(25);
 
     // Swap the worker leaf's PerLoop{12} for Unlimited ⇒ undefined.
     if (tree.kind !== "ralph") throw new Error("unreachable");
