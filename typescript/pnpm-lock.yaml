@@ -103,6 +103,9 @@ importers:
       '@spore/core':
         specifier: workspace:*
         version: link:../core
+      ignore:
+        specifier: ^5.3.2
+        version: 5.3.2
       picomatch:
         specifier: ~2.3.2
         version: 2.3.2

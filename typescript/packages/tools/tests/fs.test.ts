@@ -210,6 +210,107 @@ describe("filesystem tools", () => {
 });
 
 // ============================================================================
+// #134: list_dir gitignore-aware walk
+// ============================================================================
+
+describe("list_dir gitignore (#134)", () => {
+  it("recursive default excludes gitignored files and .git/", async () => {
+    // Build a temp tree:
+    //   .gitignore        — "dist/\n*.log"
+    //   src/main.ts       — tracked
+    //   dist/bundle.js    — ignored via dist/
+    //   .git/config       — always excluded
+    //   logs/app.log      — ignored via *.log
+    const root = realpathSync(await tmp());
+    await writeFile(join(root, ".gitignore"), "dist/\n*.log\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "main.ts"), "// main");
+    await mkdir(join(root, "dist"), { recursive: true });
+    await writeFile(join(root, "dist", "bundle.js"), "// bundle");
+    await mkdir(join(root, ".git"), { recursive: true });
+    await writeFile(join(root, ".git", "config"), "[core]");
+    await mkdir(join(root, "logs"), { recursive: true });
+    await writeFile(join(root, "logs", "app.log"), "log");
+
+    const sb = new AllowAllSandbox();
+    const r = await new ListDirTool().execute(
+      call("list_dir", { path: root, recursive: true }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+
+    const entries = r.content.split("\n").filter((e) => e !== "");
+
+    // Tracked file must appear.
+    expect(entries.some((e) => e.endsWith("src/main.ts"))).toBe(true);
+    // Gitignored files must NOT appear.
+    expect(entries.some((e) => e.includes("dist"))).toBe(false);
+    // .git/ dir and its contents must not appear (use path-segment check to
+    // avoid false positives on the ".gitignore" filename).
+    expect(entries.some((e) => /(^|\/)\.git(\/|$)/.test(e))).toBe(false);
+    expect(entries.some((e) => e.includes("app.log"))).toBe(false);
+  });
+
+  it("recursive include_ignored:true surfaces gitignored files but still skips .git/", async () => {
+    const root = realpathSync(await tmp());
+    await writeFile(join(root, ".gitignore"), "dist/\n*.log\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "main.ts"), "// main");
+    await mkdir(join(root, "dist"), { recursive: true });
+    await writeFile(join(root, "dist", "bundle.js"), "// bundle");
+    await mkdir(join(root, ".git"), { recursive: true });
+    await writeFile(join(root, ".git", "config"), "[core]");
+    await mkdir(join(root, "logs"), { recursive: true });
+    await writeFile(join(root, "logs", "app.log"), "log");
+
+    const sb = new AllowAllSandbox();
+    const r = await new ListDirTool().execute(
+      call("list_dir", { path: root, recursive: true, include_ignored: true }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+
+    const entries = r.content.split("\n").filter((e) => e !== "");
+
+    // Tracked file must appear.
+    expect(entries.some((e) => e.endsWith("src/main.ts"))).toBe(true);
+    // Previously-ignored files now appear.
+    expect(entries.some((e) => e.includes("bundle.js"))).toBe(true);
+    expect(entries.some((e) => e.includes("app.log"))).toBe(true);
+    // .git/ must still be excluded unconditionally (path-segment check).
+    expect(entries.some((e) => /(^|\/)\.git(\/|$)/.test(e))).toBe(false);
+  });
+
+  it("non-recursive listing always excludes .git/", async () => {
+    const root = realpathSync(await tmp());
+    await writeFile(join(root, ".gitignore"), "dist/\n");
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "dist"), { recursive: true });
+    await mkdir(join(root, ".git"), { recursive: true });
+    await writeFile(join(root, "readme.md"), "# readme");
+
+    const sb = new AllowAllSandbox();
+    const r = await new ListDirTool().execute(
+      call("list_dir", { path: root }),
+      sb,
+      ctx,
+    );
+    expect(r.kind).toBe("success");
+    if (r.kind !== "success") throw new Error("unreachable");
+
+    const entries = r.content.split("\n").filter((e) => e !== "");
+    // .git/ must not appear in non-recursive listing (path-segment check).
+    expect(entries.some((e) => /(^|\/)\.git(\/|$)/.test(e))).toBe(false);
+    // Non-recursive: files/dirs at the top level (excluding .git) appear.
+    expect(entries.some((e) => e.includes("readme.md"))).toBe(true);
+  });
+});
+
+// ============================================================================
 // #132: read_file range scan + line numbers — unit tests
 // ============================================================================
 

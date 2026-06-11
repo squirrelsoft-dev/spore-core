@@ -44,6 +44,11 @@ export type WriteFileParams = z.infer<typeof WriteFileParamsSchema>;
 export const ListDirParamsSchema = z.object({
   path: z.string(),
   recursive: z.boolean().default(false),
+  /**
+   * Recursive only: when false (default), honor `.gitignore` rules and always
+   * skip `.git/`. When true, walk everything (pre-#134 behavior).
+   */
+  include_ignored: z.boolean().default(false),
 });
 export type ListDirParams = z.infer<typeof ListDirParamsSchema>;
 
