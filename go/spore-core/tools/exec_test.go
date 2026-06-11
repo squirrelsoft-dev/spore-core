@@ -178,3 +178,44 @@ func TestBashCommandInvalidParams(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 }
+
+func TestBashCommandLargeStderrIsTruncated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix only")
+	}
+	sb := sporecore.AllowAllSandbox{}
+	// awk writes 10 KB to stderr and exits non-zero; verify elision in message.
+	r := NewBashCommandTool().Execute(context.Background(),
+		call("bash_command", "c1", map[string]any{
+			"script": `awk 'BEGIN{for(i=0;i<10240;i++)printf "x" > "/dev/stderr"; exit 1}'`,
+		}), sb, nil)
+	if r.Kind != sporecore.ToolOutputError {
+		t.Fatalf("expected error, got %+v", r)
+	}
+	if !strings.Contains(r.Message, "bytes elided") {
+		t.Fatalf("expected elision marker in message, got %q", r.Message)
+	}
+	if len(r.Message) >= 10*1024 {
+		t.Fatalf("message too long: %d bytes", len(r.Message))
+	}
+}
+
+// ---------------- truncateForMessage unit tests ----------------
+
+func TestTruncateForMessagePassthroughShort(t *testing.T) {
+	s := "small error output"
+	if got := truncateForMessage(s); got != s {
+		t.Fatalf("expected passthrough, got %q", got)
+	}
+}
+
+func TestTruncateForMessageElidesMiddleWhenLarge(t *testing.T) {
+	long := strings.Repeat("x", 10*1024)
+	result := truncateForMessage(long)
+	if !strings.Contains(result, "bytes elided") {
+		t.Fatalf("expected elision marker, got %q", result)
+	}
+	if len(result) >= 8*1024 {
+		t.Fatalf("message too long: %d bytes", len(result))
+	}
+}

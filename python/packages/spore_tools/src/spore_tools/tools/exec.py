@@ -31,6 +31,24 @@ from ._common import finish_with_possible_truncation
 from .error import InvalidParameters, SandboxViolationError, ToolExecutionError
 from .params import ExecParams, RunTestsParams, ShellCommandParams, parse_params
 
+_STDERR_TRUNCATION_THRESHOLD = 8 * 1024
+_STDERR_HEAD = 2 * 1024
+_STDERR_TAIL = 2 * 1024
+
+
+def _truncate_for_message(s: str) -> str:
+    """Truncate a string before embedding it in an error message.
+
+    Smaller threshold than the general 64 KB output limit because this string
+    is embedded inside an error message field, not a standalone content field.
+    """
+    if len(s) <= _STDERR_TRUNCATION_THRESHOLD:
+        return s
+    head = s[:_STDERR_HEAD]
+    tail = s[len(s) - _STDERR_TAIL:]
+    elided = len(s) - _STDERR_HEAD - _STDERR_TAIL
+    return f"{head}\n... [{elided} bytes elided] ...\n{tail}"
+
 
 class ExecTool:
     """Runs one program directly via :meth:`SandboxProvider.execute_command`.
@@ -85,7 +103,7 @@ class ExecTool:
         if out.exit_code == 0:
             return await finish_with_possible_truncation(out.stdout, call.id, sandbox)
         return ToolOutputError(
-            message=f"exit {out.exit_code} ; stderr: {out.stderr.rstrip()}",
+            message=f"exit {out.exit_code} ; stderr: {_truncate_for_message(out.stderr.rstrip())}",
             recoverable=True,
         )
 
@@ -159,7 +177,7 @@ class BashCommandTool:
         if out.exit_code == 0:
             return await finish_with_possible_truncation(out.stdout, call.id, sandbox)
         return ToolOutputError(
-            message=f"exit {out.exit_code} ; stderr: {out.stderr.rstrip()}",
+            message=f"exit {out.exit_code} ; stderr: {_truncate_for_message(out.stderr.rstrip())}",
             recoverable=True,
         )
 
@@ -214,7 +232,7 @@ class RunTestsTool:
         if out.exit_code == 0:
             return await finish_with_possible_truncation(combined, call.id, sandbox)
         return ToolOutputError(
-            message=f"tests failed (exit {out.exit_code}): {combined}",
+            message=f"tests failed (exit {out.exit_code}): {_truncate_for_message(combined)}",
             recoverable=True,
         )
 

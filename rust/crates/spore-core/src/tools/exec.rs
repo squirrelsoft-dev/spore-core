@@ -114,7 +114,11 @@ impl Tool for ExecTool {
                 finish_with_possible_truncation(out.stdout, &call.id, sandbox).await
             } else {
                 ToolOutput::Error {
-                    message: format!("exit {} ; stderr: {}", out.exit_code, out.stderr.trim_end()),
+                    message: format!(
+                        "exit {} ; stderr: {}",
+                        out.exit_code,
+                        truncate_for_message(out.stderr.trim_end())
+                    ),
                     recoverable: true,
                 }
             }
@@ -220,7 +224,11 @@ impl Tool for BashCommandTool {
                 finish_with_possible_truncation(out.stdout, &call.id, sandbox).await
             } else {
                 ToolOutput::Error {
-                    message: format!("exit {} ; stderr: {}", out.exit_code, out.stderr.trim_end()),
+                    message: format!(
+                        "exit {} ; stderr: {}",
+                        out.exit_code,
+                        truncate_for_message(out.stderr.trim_end())
+                    ),
                     recoverable: true,
                 }
             }
@@ -320,12 +328,56 @@ impl Tool for RunTestsTool {
                 finish_with_possible_truncation(combined, &call.id, sandbox).await
             } else {
                 ToolOutput::Error {
-                    message: format!("tests failed (exit {}): {}", out.exit_code, combined),
+                    message: format!(
+                        "tests failed (exit {}): {}",
+                        out.exit_code,
+                        truncate_for_message(&combined)
+                    ),
                     recoverable: true,
                 }
             }
         })
     }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Truncate a string before embedding it in an error message. The threshold
+/// is intentionally smaller than the general 64 KB output threshold because
+/// this string is embedded inside an error `message` field, not returned as
+/// a standalone `content` field — large stderr should not flood context.
+fn truncate_for_message(s: &str) -> String {
+    const THRESHOLD: usize = 8 * 1024;
+    const HEAD: usize = 2 * 1024;
+    const TAIL: usize = 2 * 1024;
+    if s.len() <= THRESHOLD {
+        return s.to_string();
+    }
+    let head_end = floor_char_boundary(s, HEAD);
+    let tail_start = ceil_char_boundary(s, s.len().saturating_sub(TAIL));
+    let elided = tail_start - head_end;
+    format!(
+        "{}\n... [{elided} bytes elided] ...\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 // ============================================================================
@@ -556,5 +608,28 @@ mod tests {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),
         }
+    }
+
+    // ---------------- truncate_for_message ----------------
+
+    #[test]
+    fn truncate_for_message_passthrough_when_short() {
+        let s = "small error output";
+        assert_eq!(truncate_for_message(s), s);
+    }
+
+    #[test]
+    fn truncate_for_message_elides_middle_when_large() {
+        let long = "x".repeat(10 * 1024);
+        let result = truncate_for_message(&long);
+        assert!(
+            result.contains("bytes elided"),
+            "expected elision marker in {result:?}"
+        );
+        assert!(
+            result.len() < 8 * 1024,
+            "message too long: {}",
+            result.len()
+        );
     }
 }

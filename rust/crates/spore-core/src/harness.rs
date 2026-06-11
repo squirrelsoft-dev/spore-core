@@ -1814,10 +1814,8 @@ impl RunStrategy for PlanExecuteConfig {
                             }
                         }
                         if !tier1_lines.is_empty() {
-                            let block = format!(
-                                "Results from upstream tasks:\n{}",
-                                tier1_lines.join("\n")
-                            );
+                            let block =
+                                format!("Results from upstream tasks:\n{}", tier1_lines.join("\n"));
                             executor.seed_user_message(&mut step_session, &block).await;
                         }
                         // Tier-1 ledger: the Tier-2 ledger rows for this set.
@@ -3605,7 +3603,11 @@ pub struct NodeAttr {
 /// bumps `depth`. Stamping is set-once for `kind`/`agent_id` (the innermost leaf
 /// wins) so the event reports who actually spoke, with the full nesting in
 /// `path`. Returns `None` when there is no parent sink (no-op, baseline path).
-fn wrap_node_sink(parent: Option<StreamSink>, kind: &str, agent_id: Option<String>) -> Option<StreamSink> {
+fn wrap_node_sink(
+    parent: Option<StreamSink>,
+    kind: &str,
+    agent_id: Option<String>,
+) -> Option<StreamSink> {
     let parent = parent?;
     let kind = kind.to_string();
     Some(Arc::new(move |mut ev: StreamEvent| {
@@ -7045,8 +7047,7 @@ impl StandardHarness {
             // When no sink is attached we keep the plain `turn` path so the baseline
             // RunResult is byte-identical (back-compat).
             let result = if let Some(sink) = on_stream.clone() {
-                let state =
-                    std::sync::Arc::new(std::sync::Mutex::new(TurnStreamState::default()));
+                let state = std::sync::Arc::new(std::sync::Mutex::new(TurnStreamState::default()));
                 let adapter: crate::agent::AgentStreamSink = Box::new(move |ev| {
                     let mapped = {
                         let mut guard = state.lock().expect("stream state poisoned");
@@ -9562,8 +9563,15 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
     ) -> RunResult {
-        self.drive_strategy_with_resume_seed(task, session_state, budget_used, on_stream, None, None)
-            .await
+        self.drive_strategy_with_resume_seed(
+            task,
+            session_state,
+            budget_used,
+            on_stream,
+            None,
+            None,
+        )
+        .await
     }
 
     /// `drive_strategy` with an optional cross-process Continue checkpoint seed
@@ -11671,7 +11679,8 @@ mod tests {
             .toolset_tools("plan-tools", vec![StandardTools::list_dir()])
             .build_config();
         let h = StandardHarness::new(cfg);
-        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()));
+        let reg =
+            h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("plan-tools".into()));
         let out = reg
             .dispatch(ToolCall {
                 id: "c".into(),
@@ -11715,8 +11724,7 @@ mod tests {
             .tools(vec![StandardTools::read_file()])
             .build_config();
         let h = StandardHarness::new(cfg);
-        let reg =
-            h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()));
+        let reg = h.effective_tool_registry(&SessionId::new("s1"), &ToolsetRef("not-wired".into()));
         assert!(reg.schemas().iter().any(|s| s.name == "read_file"));
     }
 
@@ -18456,9 +18464,9 @@ mod tests {
             let evs = events.lock().unwrap();
 
             // Q3: no message-level markers ever surface on the harness stream.
-            assert!(!evs
-                .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { content, .. } if content.is_empty())));
+            assert!(!evs.iter().any(
+                |e| matches!(e, StreamEvent::TextDelta { content, .. } if content.is_empty())
+            ));
 
             // ReasoningDelta + TextDelta present with the right content.
             assert!(evs

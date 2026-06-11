@@ -360,23 +360,38 @@ async fn composed_tree_streams_attributed_events() {
         .iter()
         .filter_map(|e| e.node().and_then(|n| n.agent_id.as_deref()))
         .collect();
-    assert!(agents.contains("planner"), "plan turns attributed to planner: {agents:?}");
-    assert!(agents.contains("executor"), "worker turns attributed to executor: {agents:?}");
+    assert!(
+        agents.contains("planner"),
+        "plan turns attributed to planner: {agents:?}"
+    );
+    assert!(
+        agents.contains("executor"),
+        "worker turns attributed to executor: {agents:?}"
+    );
 
     // The plan leaf sits under `plan_execute`; the worker leaf sits DEEPER, under
     // `plan_execute → self_verifying` — the path/depth carry the full nesting.
     let planner = events
         .iter()
-        .find_map(|e| e.node().filter(|n| n.agent_id.as_deref() == Some("planner")))
+        .find_map(|e| {
+            e.node()
+                .filter(|n| n.agent_id.as_deref() == Some("planner"))
+        })
         .expect("a planner-attributed event");
     let executor = events
         .iter()
-        .find_map(|e| e.node().filter(|n| n.agent_id.as_deref() == Some("executor")))
+        .find_map(|e| {
+            e.node()
+                .filter(|n| n.agent_id.as_deref() == Some("executor"))
+        })
         .expect("an executor-attributed event");
 
     assert_eq!(planner.kind, "react");
     assert_eq!(planner.path, vec!["plan_execute", "react"]);
-    assert_eq!(executor.path, vec!["plan_execute", "self_verifying", "react"]);
+    assert_eq!(
+        executor.path,
+        vec!["plan_execute", "self_verifying", "react"]
+    );
     assert!(
         executor.depth > planner.depth,
         "the worker leaf is nested deeper than the plan leaf: worker={} plan={}",
@@ -436,9 +451,7 @@ async fn worker_consult_surfaces_and_host_resumes() {
     // Build a harness whose GLOBAL tool registry returns a worker-side consult
     // on the first dispatch (the worker's `consult_advisor` call), then defaults
     // to plain success for anything after.
-    let tool_registry = Arc::new(
-        spore_core::harness::testing::ScriptedToolRegistry::new(),
-    );
+    let tool_registry = Arc::new(spore_core::harness::testing::ScriptedToolRegistry::new());
     tool_registry.push(ToolOutput::Consult {
         child_state: None,
         request: ConsultRequest {
@@ -507,12 +520,17 @@ async fn worker_consult_surfaces_and_host_resumes() {
     seed(&storage, &session, &tl).await;
 
     // First leg: drive to the consult pause.
-    let first = h.run(HarnessRunOptions::new(pe_task("cordyceps-consult"))).await;
+    let first = h
+        .run(HarnessRunOptions::new(pe_task("cordyceps-consult")))
+        .await;
     let (request, state) = match first {
         RunResult::Consult { request, state, .. } => (request, state),
         other => panic!("expected RunResult::Consult to surface to the host, got {other:?}"),
     };
-    assert_eq!(request.kind, "advice", "the advice consult reached the host");
+    assert_eq!(
+        request.kind, "advice",
+        "the advice consult reached the host"
+    );
     assert!(
         request.question.contains("real defect"),
         "the request carries the worker's question verbatim"
@@ -542,7 +560,10 @@ async fn worker_consult_surfaces_and_host_resumes() {
     // The worker's task self-verified and completed after the consult.
     let after = stored_list(&storage, &session).await;
     assert!(
-        after.tasks.iter().all(|t| t.status == TaskStatus::Completed),
+        after
+            .tasks
+            .iter()
+            .all(|t| t.status == TaskStatus::Completed),
         "the consulted task completed: {:?}",
         after.tasks.iter().map(|t| t.status).collect::<Vec<_>>()
     );

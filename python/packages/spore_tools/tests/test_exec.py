@@ -13,7 +13,7 @@ import pytest
 from spore_core.harness import ToolOutputError, ToolOutputSuccess
 from spore_core.model import ToolCall
 from spore_core.tool_registry import AllowAllSandbox, make_test_ctx
-from spore_tools.tools.exec import BashCommandTool, ExecTool
+from spore_tools.tools.exec import BashCommandTool, ExecTool, _truncate_for_message
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX tools only")
 
@@ -128,3 +128,36 @@ async def test_bash_command_invalid_params_returns_recoverable_error() -> None:
     r = await BashCommandTool().execute(_call("bash_command", {}), sb, _CTX)
     assert isinstance(r, ToolOutputError)
     assert r.recoverable is True
+
+
+async def test_bash_command_large_stderr_is_truncated_in_error_message() -> None:
+    if not shutil.which("awk"):
+        pytest.skip("no awk binary")
+    sb = AllowAllSandbox()
+    # awk writes 10 KB to stderr and exits non-zero; verify elision in message.
+    r = await BashCommandTool().execute(
+        _call(
+            "bash_command",
+            {"script": "awk 'BEGIN{for(i=0;i<10240;i++)printf \"x\" > \"/dev/stderr\"; exit 1}'"},
+        ),
+        sb,
+        _CTX,
+    )
+    assert isinstance(r, ToolOutputError)
+    assert "bytes elided" in r.message
+    assert len(r.message) < 10 * 1024
+
+
+# ---------------- _truncate_for_message unit tests ----------------
+
+
+def test_truncate_for_message_passthrough_when_short() -> None:
+    s = "small error output"
+    assert _truncate_for_message(s) == s
+
+
+def test_truncate_for_message_elides_middle_when_large() -> None:
+    long_s = "x" * (10 * 1024)
+    result = _truncate_for_message(long_s)
+    assert "bytes elided" in result
+    assert len(result) < 8 * 1024
