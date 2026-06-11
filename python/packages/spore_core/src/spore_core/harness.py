@@ -6281,11 +6281,15 @@ class StandardHarness:
         """Render a recoverable tool-error ``message`` with the tool's parameter
         schema and a typing hint (issue #137, AC2 reuse). The breaker injects the
         result's text as the corrective USER message at the ``N`` threshold.
-        Mirrors Rust's ``enrich_tool_error`` byte-for-byte (the schema is dumped
-        as canonical JSON so the rendered text matches across languages)."""
+        Mirrors Rust's ``enrich_tool_error`` byte-for-byte: Rust's ``serde_json``
+        (no ``preserve_order``) serializes objects via a ``BTreeMap``, sorting
+        object keys alphabetically and recursively, so the schema JSON must be
+        key-sorted here too (``sort_keys=True``) for the corrective message the
+        model receives to be byte-identical across languages — the repo's
+        canonical form is also key-sorted (``canonicalize_json``)."""
         enriched = message
         if schema is not None:
-            schema_json = json.dumps(schema.input_schema, separators=(",", ":"))
+            schema_json = json.dumps(schema.input_schema, sort_keys=True, separators=(",", ":"))
             enriched += "\n\nExpected parameter schema: " + schema_json
         enriched += (
             "\n\nHint: provide arguments as correctly-typed JSON "

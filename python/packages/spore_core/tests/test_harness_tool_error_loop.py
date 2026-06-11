@@ -76,6 +76,16 @@ _ADD_TASK_SCHEMA = ToolSchema(
     },
 )
 
+# The EXACT schema JSON the corrective message must carry — key-sorted compact
+# form, byte-identical to Rust's ``serde_json`` BTreeMap serialization (#137
+# cross-language consistency). ``required`` element order is preserved (only
+# object keys are sorted, not array elements).
+_EXPECTED_SCHEMA_JSON = (
+    '{"properties":{"description":{"type":"string"},'
+    '"task_list_id":{"type":"string"}},'
+    '"required":["task_list_id","description"],"type":"object"}'
+)
+
 
 class _ErrRegistry:
     """A tool registry that always returns the same recoverable error and
@@ -291,7 +301,13 @@ async def test_ac2_injects_one_corrective_at_n() -> None:
     )
     corrective = correctives[0]
     assert _TEL_BAD_MSG in corrective, "carries the bare error"
-    assert '"required"' in corrective, "carries the parameter schema"
+    # Cross-language consistency (#137): the schema JSON is key-sorted and
+    # byte-identical to Rust's serde_json BTreeMap form — assert the EXACT
+    # substring, not just a loose key match, so a re-introduced insertion-order
+    # serialization can't pass.
+    assert "Expected parameter schema: " + _EXPECTED_SCHEMA_JSON in corrective, (
+        f"carries the exact key-sorted parameter schema, got {corrective!r}"
+    )
     assert "correctly-typed JSON" in corrective, "carries the hint"
 
 
