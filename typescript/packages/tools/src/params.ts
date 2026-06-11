@@ -22,8 +22,17 @@ export function parseParams<T>(
 
 // ---------- Filesystem ----------
 
-export const ReadFileParamsSchema = z.object({ path: z.string() });
-export type ReadFileParams = z.infer<typeof ReadFileParamsSchema>;
+export const ReadFileParamsSchema = z.object({
+  path: z.string(),
+  /** 1-indexed start line. Default 1 (read from the beginning). */
+  offset: z.number().int().nonnegative().default(1),
+  /** Max lines to return. Default 0 = no limit (read to EOF). */
+  length: z.number().int().nonnegative().default(0),
+  /** Prefix each returned line with its 1-indexed number (default false). */
+  line_numbers: z.boolean().default(false),
+});
+/** Output type (post-parse with defaults filled): all fields are required. */
+export type ReadFileParams = z.output<typeof ReadFileParamsSchema>;
 
 export const WriteFileParamsSchema = z.object({
   path: z.string(),

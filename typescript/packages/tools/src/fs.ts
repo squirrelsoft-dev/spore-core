@@ -28,6 +28,94 @@ import {
 } from "./params.js";
 
 // ============================================================================
+// ReadFile range helper (#132)
+// ============================================================================
+
+/**
+ * Split `content` into lines, preserving each line's trailing `\n` (like
+ * Rust's `split_inclusive('\n')`). The final line may or may not end in `\n`.
+ */
+function splitInclusive(content: string): string[] {
+  if (content === "") return [];
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n") {
+      lines.push(content.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  // Trailing fragment (no final newline).
+  if (start < content.length) {
+    lines.push(content.slice(start));
+  }
+  return lines;
+}
+
+/** Parsed-and-defaulted params used by {@link applyReadRange}. */
+export interface ReadRangeOptions {
+  offset: number;
+  length: number;
+  line_numbers: boolean;
+}
+
+/**
+ * Apply the #132 range/line-number transform to a fully-read file body.
+ *
+ * With all params at their defaults the original `content` is returned
+ * unchanged (byte-identical to the pre-#132 behavior). Any non-default param
+ * prepends a `[lines {start}–{end} of {total}]\n` header (U+2013 en-dash).
+ */
+export function applyReadRange(
+  content: string,
+  params: ReadRangeOptions,
+): { ok: true; value: string } | { ok: false; error: string } {
+  const isDefault =
+    params.offset === 1 && params.length === 0 && !params.line_numbers;
+  if (isDefault) return { ok: true, value: content };
+
+  if (params.offset === 0) {
+    return { ok: false, error: "offset must be ≥ 1 (1-indexed)" };
+  }
+
+  // Empty file: any params still yield empty content with no header.
+  if (content === "") return { ok: true, value: "" };
+
+  const lines = splitInclusive(content);
+  const total = lines.length;
+
+  if (params.offset > total) {
+    return {
+      ok: false,
+      error: `offset ${params.offset} exceeds file length ${total}`,
+    };
+  }
+
+  const start = params.offset; // 1-indexed, validated >= 1 and <= total.
+  const end =
+    params.length === 0
+      ? total
+      : Math.min(start + params.length - 1, total);
+
+  const startIdx = start - 1; // convert to 0-indexed
+  const selected = lines.slice(startIdx, end);
+
+  let out = `[lines ${start}–${end} of ${total}]\n`;
+  if (params.line_numbers) {
+    const width = String(total).length;
+    for (let i = 0; i < selected.length; i++) {
+      const n = start + i;
+      out += `${String(n).padStart(width)} | ${selected[i]}`;
+    }
+  } else {
+    for (const line of selected) {
+      out += line;
+    }
+  }
+  return { ok: true, value: out };
+}
+
+// ============================================================================
 // ReadFile
 // ============================================================================
 
@@ -42,10 +130,30 @@ export class ReadFileTool implements Tool {
   static schema(): ToolSchema {
     return {
       name: ReadFileTool.NAME,
-      description: "Read a file's contents",
+      description:
+        "Read a file's contents. Optionally read a line range " +
+        "(offset is 1-indexed start, length is max lines, 0 = to EOF) " +
+        "and/or prefix each line with its number via line_numbers. " +
+        "With no optional params the whole file is returned verbatim.",
       parameters: {
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          offset: {
+            type: "integer",
+            description: "1-indexed start line (default 1).",
+          },
+          length: {
+            type: "integer",
+            description:
+              "Max lines to return; 0 = no limit / read to EOF (default 0).",
+          },
+          line_numbers: {
+            type: "boolean",
+            description:
+              "Prefix each returned line with its 1-indexed number (default false).",
+          },
+        },
         required: ["path"],
       },
       annotations: {
@@ -72,7 +180,15 @@ export class ReadFileTool implements Tool {
       });
     try {
       const content = await fs.readFile(resolved, "utf8");
-      return finishWithPossibleTruncation(content, call.id, sandbox);
+      const rangeResult = applyReadRange(content, {
+        offset: p.value.offset ?? 1,
+        length: p.value.length ?? 0,
+        line_numbers: p.value.line_numbers ?? false,
+      });
+      if (rangeResult.ok) {
+        return finishWithPossibleTruncation(rangeResult.value, call.id, sandbox);
+      }
+      return { kind: "error", message: rangeResult.error, recoverable: true };
     } catch (e) {
       return {
         kind: "error",
