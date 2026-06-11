@@ -119,7 +119,9 @@ to see the top-level structure, then drill into specific subdirectories — do N
 Then author the task graph: for EACH module to audit, call `task_list` with EXACTLY this \
 shape: {\"action\":\"add_task\",\"description\":\"audit <module path>\",\"blockers\":[<ids of \
 earlier tasks this one must wait on; [] if none>]}. The `description` field is REQUIRED on \
-every add_task. Task ids are assigned 1,2,3,... in the order you add them. When every task is \
+every add_task. Each successful add_task returns its result with an `added` field holding the \
+new task's id — read that id and use it when you reference the task in a later task's \
+`blockers` (or in `update_task`/`complete_task`); never guess or predict ids. When every task is \
 added, END the plan phase with a final message that is ONLY this JSON object and no other \
 text: {\"tasks\":[\"<one short string per task, same order>\"],\"rationale\":\"<one \
 sentence>\"} — `tasks` MUST be an array of plain STRINGS, not objects. \
