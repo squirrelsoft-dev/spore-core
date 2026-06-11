@@ -22,6 +22,28 @@ under :data:`~spore_core.tasklist.TASK_LIST_EXTRAS_KEY` (``"task_list"``):
 4. on a mutating action, ``ctx.run_store.put(session_id, "task_list", value)``,
 5. return the serialized current list as success content.
 
+``add_task`` surfaces the assigned id (#143)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On a successful ``add_task``, the success content is the canonical TaskList
+object with ONE extra top-level key ``added`` placed FIRST — the id just
+assigned by :meth:`~spore_core.tasklist.TaskList.add`::
+
+    {"added":3,"tasks":[...],"next_id":4}
+
+The field order is EXACTLY ``added``, then ``tasks``, then ``next_id``, and is
+byte-identical across all four languages so a model can reference a just-added
+task without re-parsing the whole list or predicting ids. The ``added`` key
+appears ONLY on the ``add_task`` success branch — ``update_task``,
+``complete_task``, and ``list_tasks`` keep returning the bare serialized
+TaskList (``{"tasks":[...],"next_id":N}``), unchanged. A rejected ``add_task``
+(self-block / unknown blocker / cycle) still returns a recoverable error with
+NO ``added`` and no list.
+
+CRITICAL: the PERSISTED RunStore blob stays EXACTLY
+``{"tasks":[...],"next_id":N}`` — NO ``added`` key. ``added`` lives only in the
+tool's success content, never in what is persisted; the PlanExecute executor
+depends on the persisted blob shape.
+
 Shared key
 ~~~~~~~~~~
 This standalone tool and the harness-side PlanExecute execute loop persist
@@ -150,11 +172,17 @@ class TaskListTool:
                 return ToolOutputError(message=f"could not parse task list: {e}", recoverable=True)
 
         # 3. Apply the action. Domain errors → recoverable. `list_tasks` does not
-        #    mutate.
+        #    mutate. `added` carries the id assigned by `add` so the add branch
+        #    can surface it in the success content (#143); `None` for the non-add
+        #    (and read-only) actions.
         mutated = False
+        added: int | None = None
         try:
             if isinstance(params, AddTaskParams):
-                task_list.add(params.description, params.blockers)
+                # Capture the assigned id (#143) instead of discarding it. A
+                # rejected blocker set still maps to a recoverable error and
+                # leaves the list untouched.
+                added = task_list.add(params.description, params.blockers)
                 mutated = True
             elif isinstance(params, UpdateTaskParams):
                 task_list.update(params.id, params.status, params.description)
@@ -178,8 +206,21 @@ class TaskListTool:
                     message=f"could not persist task list: {e}", recoverable=True
                 )
 
-        # 5. Return the serialized current list.
-        return ToolOutputSuccess(content=task_list.to_json(), truncated=False)
+        # 5. Return the serialized current list. On `add_task` (#143) splice the
+        #    assigned id in as a leading `added` key so the success content is
+        #    `{"added":N,"tasks":[...],"next_id":M}` — exactly that field order,
+        #    byte-identical across languages. `to_json()` is the canonical compact
+        #    form `{"tasks":[...],"next_id":M}` (separators `(",", ":")`, no
+        #    leading whitespace), so splicing `"added":N,` right after the opening
+        #    brace (index 1) yields the pinned order deterministically. Other
+        #    actions return the bare list unchanged, and the PERSISTED blob
+        #    (step 4) never carries `added`.
+        bare = task_list.to_json()
+        if added is not None:
+            content = f'{{"added":{added},{bare[1:]}'
+        else:
+            content = bare
+        return ToolOutputSuccess(content=content, truncated=False)
 
 
 __all__ = ["TaskListTool"]

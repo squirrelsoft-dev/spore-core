@@ -142,6 +142,19 @@ def _parse_list(out: object) -> TaskList:
     return TaskList.from_json(out.content)
 
 
+def _success_content(out: object) -> str:
+    """Raw success-content string, for #143 byte-level and `added`-key asserts."""
+    assert isinstance(out, ToolOutputSuccess), f"expected Success, got {out!r}"
+    return out.content
+
+
+def _parse_added(out: object) -> int | None:
+    """The `added` field of a success content, or `None` if absent (#143)."""
+    value = json.loads(_success_content(out))
+    raw = value.get("added")
+    return None if raw is None else int(raw)
+
+
 async def _load_from_store(run_store: RunStore, session: str = "test-session") -> TaskList | None:
     value = await run_store.get(SessionId(session), TASK_LIST_EXTRAS_KEY)
     if value is None:
@@ -730,6 +743,148 @@ def test_sandbox_path_escape_is_unrelated() -> None:
 
 
 # ============================================================================
+# #143: add_task surfaces the assigned id as a leading `added` key.
+# ============================================================================
+
+
+# R-143.1: add success content carries `added` == the id `add` returned,
+# R-143.2: which is the persisted task's id, and
+# R-143.3: the full list is still present in the content.
+async def test_add_success_content_carries_assigned_id() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+
+    r = await tool.execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
+
+    # R-143.1: `added` is present and equals the first assigned id (1).
+    assert _parse_added(r) == 1
+    # R-143.3: the full list is still present (and parses, ignoring `added`).
+    list_ = _parse_list(r)
+    assert len(list_.tasks) == 1
+    assert list_.next_id == 2
+    # R-143.2: `added` == the persisted task's id.
+    assert _parse_added(r) == list_.tasks[0].id
+    persisted = await _load_from_store(ctx.run_store)
+    assert persisted is not None
+    assert _parse_added(r) == persisted.tasks[0].id
+
+
+# R-143.4: two adds → `added` is 1 then 2, with next_id 2 then 3.
+async def test_two_adds_surface_sequential_ids() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+
+    r1 = await tool.execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
+    assert _parse_added(r1) == 1
+    assert _parse_list(r1).next_id == 2
+
+    r2 = await tool.execute(_call({"action": "add_task", "description": "b"}), sb, ctx)
+    assert _parse_added(r2) == 2
+    assert _parse_list(r2).next_id == 3
+
+
+# R-143.5: `added` appears ONLY on the add_task branch — never on update_task,
+# complete_task, or list_tasks.
+async def test_added_only_on_add_branch() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+
+    await tool.execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
+
+    upd = await tool.execute(
+        _call({"action": "update_task", "id": 1, "status": "in_progress"}), sb, ctx
+    )
+    assert _parse_added(upd) is None
+
+    comp = await tool.execute(_call({"action": "complete_task", "id": 1}), sb, ctx)
+    assert _parse_added(comp) is None
+
+    listed = await tool.execute(_call({"action": "list_tasks"}), sb, ctx)
+    assert _parse_added(listed) is None
+
+
+# R-143.6: a rejected add (self-block) is a recoverable error with NO `added`
+# and no list.
+async def test_rejected_add_has_no_added_and_no_list() -> None:
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "a", "blockers": [1]}),
+        _AllowAllSandbox(),
+        _in_memory_ctx(),
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable
+    assert "invalid blockers" in r.message
+    # No success content at all → no `added`, no list.
+    assert "added" not in r.message
+    assert "tasks" not in r.message
+
+
+# R-143.7: the PERSISTED blob never carries `added` — only the tool's success
+# content does. The PlanExecute executor depends on this shape.
+async def test_persisted_blob_has_no_added() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    r = await TaskListTool().execute(_call({"action": "add_task", "description": "a"}), sb, ctx)
+    # Success content DOES carry `added`...
+    assert _parse_added(r) == 1
+
+    # ...but the raw persisted blob does NOT carry an `added` key.
+    raw = await ctx.run_store.get(SessionId("test-session"), TASK_LIST_EXTRAS_KEY)
+    assert raw is not None, "persisted blob present"
+    assert "added" not in raw, f"persisted blob: {raw}"
+    # The persisted blob round-trips to a bare TaskList whose canonical
+    # serialization is exactly `{"tasks":[...],"next_id":N}` — no `added`.
+    persisted = TaskList.from_dict(raw)
+    assert persisted.to_json() == (
+        '{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}'
+    )
+
+
+# #143 EXACT BYTES: a known add scenario pins the success content byte-for-byte.
+# This is the cross-language contract the other three languages must match.
+async def test_add_success_content_exact_bytes() -> None:
+    r = await TaskListTool().execute(
+        _call({"action": "add_task", "description": "a"}),
+        _AllowAllSandbox(),
+        _in_memory_ctx(),
+    )
+    assert _success_content(r) == (
+        '{"added":1,"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}'
+    )
+
+
+# #143 usability: the returned id is directly usable. Add A, use A's returned
+# `added` id as a blocker for B, then complete A — proving the surfaced id
+# round-trips through blockers/complete without prediction.
+async def test_returned_id_is_usable_as_blocker_and_for_complete() -> None:
+    ctx = _in_memory_ctx()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+
+    ra = await tool.execute(_call({"action": "add_task", "description": "A"}), sb, ctx)
+    a_id = _parse_added(ra)
+    assert a_id is not None, "A surfaced an id"
+
+    # Use the surfaced id as a blocker for B (no prediction).
+    rb = await tool.execute(
+        _call({"action": "add_task", "description": "B", "blockers": [a_id]}), sb, ctx
+    )
+    b = _parse_list(rb)
+    assert b.tasks[1].blockers == [a_id]
+
+    # Complete A by the surfaced id.
+    rc = await tool.execute(_call({"action": "complete_task", "id": a_id}), sb, ctx)
+    c = _parse_list(rc)
+    a_task = next(t for t in c.tasks if t.id == a_id)
+    assert a_task.status == TaskStatus.COMPLETED
+    # complete_task is not an add branch → no `added`.
+    assert _parse_added(rc) is None
+
+
+# ============================================================================
 # Fixture replay (ground truth — fixtures/tasklist/*.json)
 # ============================================================================
 
@@ -748,11 +903,25 @@ async def test_fixture_replay_operations() -> None:
         for i, step in enumerate(sc["steps"]):
             out = await tool.execute(_call(step["action"]), sb, ctx)
             expected = step["expected"]
+            is_add = step["action"].get("action") == "add_task"
             if expected["ok"]:
                 assert isinstance(out, ToolOutputSuccess), f"{sc['name']} step {i}: {out!r}"
+                # The list portion always survives — `from_json` ignores the
+                # extra `added` key on add steps.
                 got = TaskList.from_json(out.content)
                 want = TaskList.from_dict(expected["list"])
                 assert got == want, f"{sc['name']} step {i}"
+                # #143: add steps carry a leading `added` key equal to the
+                # fixture's `expected["added"]`; non-add steps must NOT carry one.
+                content_added = _parse_added(out)
+                if is_add:
+                    assert content_added == expected["added"], (
+                        f"{sc['name']} step {i}: surfaced added id"
+                    )
+                else:
+                    assert content_added is None, (
+                        f"{sc['name']} step {i}: non-add step must not carry `added`"
+                    )
             else:
                 assert isinstance(out, ToolOutputError), f"{sc['name']} step {i}: {out!r}"
                 assert out.recoverable, f"{sc['name']} step {i}: errors must be recoverable"
