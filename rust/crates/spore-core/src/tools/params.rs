@@ -267,6 +267,10 @@ pub struct TodoWriteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebFetchParams {
     pub url: String,
+    /// Byte offset into the response body to start reading from.
+    /// Default `0` = existing behavior (no header prepended).
+    #[serde(default)]
+    pub start_byte: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

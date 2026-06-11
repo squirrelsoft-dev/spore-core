@@ -1,0 +1,44 @@
+[
+  {
+    "name": "start_byte_0_no_header",
+    "body": "hello world",
+    "start_byte": 0,
+    "expected": "hello world"
+  },
+  {
+    "name": "start_byte_mid",
+    "body": "hello world",
+    "start_byte": 6,
+    "expected": "[starting at byte 6 of 11]\nworld"
+  },
+  {
+    "name": "start_byte_at_last_byte",
+    "body": "hello",
+    "start_byte": 4,
+    "expected": "[starting at byte 4 of 5]\no"
+  },
+  {
+    "name": "start_byte_past_end",
+    "body": "hello",
+    "start_byte": 10,
+    "expected_error": "start_byte 10 exceeds response length 5"
+  },
+  {
+    "name": "start_byte_at_body_length",
+    "body": "hello",
+    "start_byte": 5,
+    "expected_error": "start_byte 5 exceeds response length 5"
+  },
+  {
+    "name": "empty_body_start_byte_0",
+    "body": "",
+    "start_byte": 0,
+    "expected": ""
+  },
+  {
+    "name": "empty_body_start_byte_nonzero",
+    "body": "",
+    "start_byte": 1,
+    "expected_error": "start_byte 1 exceeds response length 0"
+  }
+]
