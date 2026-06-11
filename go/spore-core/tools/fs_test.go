@@ -377,6 +377,212 @@ func TestReadFileWithOffsetEndToEnd(t *testing.T) {
 	}
 }
 
+// ---- #134: list_dir gitignore-aware walk ----
+
+// TestListDirGitignoreExcludesIgnoredFiles verifies that the default recursive
+// walk (include_ignored=false) honors .gitignore rules and always skips .git/.
+func TestListDirGitignoreExcludesIgnoredFiles(t *testing.T) {
+	root := t.TempDir()
+
+	// Write .gitignore that ignores build/ and *.log files.
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("build/\n*.log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Tracked file.
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Ignored build directory.
+	if err := os.MkdirAll(filepath.Join(root, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "build", "output"), []byte("binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Fake .git directory — must always be excluded.
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("[core]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Ignored log file.
+	if err := os.WriteFile(filepath.Join(root, "debug.log"), []byte("logs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sb := sporecore.AllowAllSandbox{}
+	ctx := context.Background()
+
+	// Default walk: gitignore honored.
+	r := NewListDirTool().Execute(ctx,
+		call("list_dir", "c1", map[string]any{"path": root, "recursive": true}), sb, nil)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("list_dir failed: %+v", r)
+	}
+	lines := splitLines(r.Content)
+	linesSet := make(map[string]bool, len(lines))
+	for _, l := range lines {
+		linesSet[l] = true
+	}
+
+	// src/main.go must be present.
+	sawMain := false
+	for l := range linesSet {
+		if strings.HasSuffix(l, "main.go") {
+			sawMain = true
+		}
+	}
+	if !sawMain {
+		t.Fatalf("expected src/main.go in default listing, got: %v", lines)
+	}
+	// build/output must be absent (gitignored).
+	if linesSet[filepath.Join(root, "build", "output")] {
+		t.Fatalf("gitignored build/output leaked into default listing: %v", lines)
+	}
+	// .git/config must be absent unconditionally.
+	if linesSet[filepath.Join(root, ".git", "config")] {
+		t.Fatalf(".git/config leaked into default listing: %v", lines)
+	}
+	// debug.log must be absent (gitignored via *.log).
+	if linesSet[filepath.Join(root, "debug.log")] {
+		t.Fatalf("gitignored debug.log leaked into default listing: %v", lines)
+	}
+}
+
+// TestListDirIncludeIgnoredWalksEverythingExceptGit verifies that
+// include_ignored=true includes gitignored files but still skips .git/.
+func TestListDirIncludeIgnoredWalksEverythingExceptGit(t *testing.T) {
+	root := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("build/\n*.log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "build", "output"), []byte("binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), []byte("[core]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "debug.log"), []byte("logs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sb := sporecore.AllowAllSandbox{}
+	ctx := context.Background()
+
+	// include_ignored=true: walk everything, but still skip .git/.
+	r := NewListDirTool().Execute(ctx,
+		call("list_dir", "c1", map[string]any{"path": root, "recursive": true, "include_ignored": true}), sb, nil)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("list_dir failed: %+v", r)
+	}
+	lines := splitLines(r.Content)
+
+	linesSet2 := make(map[string]bool, len(lines))
+	for _, l := range lines {
+		linesSet2[l] = true
+	}
+
+	// src/main.go must be present.
+	if !linesSet2[filepath.Join(root, "src", "main.go")] {
+		t.Fatalf("expected src/main.go, got: %v", lines)
+	}
+	// build/output must be present (include_ignored overrides gitignore).
+	if !linesSet2[filepath.Join(root, "build", "output")] {
+		t.Fatalf("expected build/output with include_ignored=true, got: %v", lines)
+	}
+	// debug.log must be present (include_ignored overrides gitignore).
+	if !linesSet2[filepath.Join(root, "debug.log")] {
+		t.Fatalf("expected debug.log with include_ignored=true, got: %v", lines)
+	}
+	// .git/config must still be absent.
+	if linesSet2[filepath.Join(root, ".git", "config")] {
+		t.Fatalf(".git/ must be excluded even with include_ignored=true, got: %v", lines)
+	}
+}
+
+// TestListDirNonRecursiveExcludesGit verifies that non-recursive list_dir
+// never emits .git/ regardless of include_ignored.
+func TestListDirNonRecursiveExcludesGit(t *testing.T) {
+	root := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sb := sporecore.AllowAllSandbox{}
+	ctx := context.Background()
+
+	r := NewListDirTool().Execute(ctx,
+		call("list_dir", "c1", map[string]any{"path": root, "recursive": false}), sb, nil)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("%+v", r)
+	}
+	for _, l := range splitLines(r.Content) {
+		if strings.Contains(l, ".git") {
+			t.Fatalf(".git/ must not appear in non-recursive listing, got: %v", splitLines(r.Content))
+		}
+	}
+}
+
+// TestListDirGitignoreNegation verifies that a negation rule (!) re-includes
+// a file that an earlier rule would have excluded.
+func TestListDirGitignoreNegation(t *testing.T) {
+	root := t.TempDir()
+
+	// Ignore all .log files but re-include important.log.
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.log\n!important.log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "debug.log"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "important.log"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sb := sporecore.AllowAllSandbox{}
+	ctx := context.Background()
+
+	r := NewListDirTool().Execute(ctx,
+		call("list_dir", "c1", map[string]any{"path": root, "recursive": true}), sb, nil)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("%+v", r)
+	}
+	lines := splitLines(r.Content)
+
+	linesSet3 := make(map[string]bool, len(lines))
+	for _, l := range lines {
+		linesSet3[l] = true
+	}
+
+	if !linesSet3[filepath.Join(root, "important.log")] {
+		t.Fatalf("important.log should be re-included by negation rule, got: %v", lines)
+	}
+	if linesSet3[filepath.Join(root, "debug.log")] {
+		t.Fatalf("debug.log should be excluded by *.log rule, got: %v", lines)
+	}
+}
+
 // TestReadFileRangeFixtureReplay loads the shared fixture and verifies the Go
 // implementation produces the expected outcome for every case.
 func TestReadFileRangeFixtureReplay(t *testing.T) {

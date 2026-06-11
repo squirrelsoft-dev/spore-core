@@ -55,8 +55,9 @@ type WriteFileParams struct {
 }
 
 type ListDirParams struct {
-	Path      string `json:"path"`
-	Recursive bool   `json:"recursive,omitempty"`
+	Path           string `json:"path"`
+	Recursive      bool   `json:"recursive,omitempty"`
+	IncludeIgnored bool   `json:"include_ignored,omitempty"` // default false
 }
 
 type DeleteFileParams struct {
