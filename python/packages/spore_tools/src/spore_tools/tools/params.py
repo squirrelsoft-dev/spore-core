@@ -112,12 +112,14 @@ class GrepOutputMode(str, Enum):
 
 class GrepParams(_Params):
     """Parameters for the net-new :class:`GrepTool` (#81). ``output_mode``
-    defaults to ``content`` (``path:line:text`` per match)."""
+    defaults to ``content`` (``path:line:text`` per match). ``context_lines``
+    adds standard ``grep -C N`` context when > 0 (#133)."""
 
     pattern: str
     path: str
     recursive: bool = False
     output_mode: GrepOutputMode = GrepOutputMode.CONTENT
+    context_lines: int = 0  # lines of context before/after each match (default 0)
 
 
 class FindFilesParams(_Params):
