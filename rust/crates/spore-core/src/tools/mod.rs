@@ -521,6 +521,45 @@ mod fixture_tests {
         }
     }
 
+    // ---- grep_context_lines.json (#133) ----
+    #[derive(Deserialize)]
+    struct GrepContextCase {
+        name: String,
+        initial_content: String,
+        params: Value,
+        expected: String,
+    }
+
+    #[tokio::test]
+    async fn fixture_replay_grep_context_lines() {
+        use crate::tools::search::GrepTool;
+        use tempfile::TempDir;
+        let data = std::fs::read_to_string(fixture_path("grep_context_lines.json")).unwrap();
+        let cases: Vec<GrepContextCase> = serde_json::from_str(&data).unwrap();
+        assert!(!cases.is_empty());
+        let sb = AllowAllSandbox;
+        for c in cases {
+            let dir = TempDir::new().unwrap();
+            let p = dir.path().join("f.txt");
+            tokio::fs::write(&p, &c.initial_content).await.unwrap();
+            // Replace "<FIXTURE_PATH>" placeholder with the real temp file path.
+            let path_str = p.to_str().unwrap().to_string();
+            let mut input = c.params.clone();
+            input["path"] = Value::String(path_str.clone());
+            // Also substitute placeholder in expected output.
+            let expected = c.expected.replace("<FIXTURE_PATH>", &path_str);
+            let out = GrepTool::new()
+                .execute(&call("grep", input), &sb, &test_ctx())
+                .await;
+            match out {
+                ToolOutput::Success { content, .. } => {
+                    assert_eq!(content, expected, "case: {}", c.name);
+                }
+                other => panic!("{}: expected success, got {other:?}", c.name),
+            }
+        }
+    }
+
     // ---- read_file_range.json (#132) ----
     #[derive(Deserialize)]
     struct ReadRangeExpected {

@@ -212,7 +212,7 @@ pub enum GrepOutputMode {
 }
 
 /// Parameters for the net-new [`crate::tools::search::GrepTool`]. Distinct from
-/// [`GrepFilesParams`]: adds `output_mode`.
+/// [`GrepFilesParams`]: adds `output_mode` and `context_lines`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepParams {
     pub pattern: String,
@@ -221,6 +221,13 @@ pub struct GrepParams {
     pub recursive: bool,
     #[serde(default)]
     pub output_mode: GrepOutputMode,
+    /// Lines of context to show before and after each match (default: 0).
+    /// When 0 the output is byte-identical to the pre-context behaviour.
+    /// When > 0 the output uses standard `grep -C N` format:
+    /// match lines use `:` separator, context lines use `-`, and non-adjacent
+    /// groups are separated by a `--` line.
+    #[serde(default)]
+    pub context_lines: u32,
 }
 
 // ---------- SendMessage (#81, new) ----------
