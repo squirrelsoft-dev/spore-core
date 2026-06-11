@@ -183,6 +183,7 @@ class GrepTool:
                     },
                     "context_lines": {
                         "type": "integer",
+                        "minimum": 0,
                         "description": (
                             "Lines of context to show before and after each match"
                             " (default 0). When > 0, uses standard grep -C N format:"
