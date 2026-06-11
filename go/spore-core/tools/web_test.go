@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
@@ -359,5 +361,185 @@ func TestSearchMethodDefaultIsPost(t *testing.T) {
 	}
 	if r := runSearch(t, tool, "x"); r.Kind != sporecore.ToolOutputSuccess {
 		t.Fatalf("expected success, got %+v", r)
+	}
+}
+
+// ── applyWebFetchRange unit tests (#135) ─────────────────────────────────────
+
+func TestApplyWebFetchRangeStartZeroNoHeader(t *testing.T) {
+	got, errOut := applyWebFetchRange("hello world", 0)
+	if errOut != nil {
+		t.Fatalf("expected success, got error: %+v", errOut)
+	}
+	if got != "hello world" {
+		t.Fatalf("expected %q, got %q", "hello world", got)
+	}
+}
+
+func TestApplyWebFetchRangeStartZeroEmptyBodyNoHeader(t *testing.T) {
+	got, errOut := applyWebFetchRange("", 0)
+	if errOut != nil {
+		t.Fatalf("expected success, got error: %+v", errOut)
+	}
+	if got != "" {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}
+
+func TestApplyWebFetchRangeStartMidPrependsHeader(t *testing.T) {
+	got, errOut := applyWebFetchRange("hello world", 6)
+	if errOut != nil {
+		t.Fatalf("expected success, got error: %+v", errOut)
+	}
+	want := "[starting at byte 6 of 11]\nworld"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestApplyWebFetchRangeStartAtLastByte(t *testing.T) {
+	got, errOut := applyWebFetchRange("hello", 4)
+	if errOut != nil {
+		t.Fatalf("expected success, got error: %+v", errOut)
+	}
+	want := "[starting at byte 4 of 5]\no"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestApplyWebFetchRangeStartPastEndIsError(t *testing.T) {
+	_, errOut := applyWebFetchRange("hello", 10)
+	if errOut == nil {
+		t.Fatal("expected error, got success")
+	}
+	if errOut.Kind != sporecore.ToolOutputError || !errOut.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", errOut)
+	}
+	want := "start_byte 10 exceeds response length 5"
+	if errOut.Message != want {
+		t.Fatalf("expected message %q, got %q", want, errOut.Message)
+	}
+}
+
+func TestApplyWebFetchRangeStartAtBodyLenIsError(t *testing.T) {
+	_, errOut := applyWebFetchRange("hello", 5)
+	if errOut == nil {
+		t.Fatal("expected error, got success")
+	}
+	if errOut.Kind != sporecore.ToolOutputError || !errOut.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", errOut)
+	}
+	want := "start_byte 5 exceeds response length 5"
+	if errOut.Message != want {
+		t.Fatalf("expected message %q, got %q", want, errOut.Message)
+	}
+}
+
+func TestApplyWebFetchRangeEmptyBodyNonzeroStartIsError(t *testing.T) {
+	_, errOut := applyWebFetchRange("", 1)
+	if errOut == nil {
+		t.Fatal("expected error, got success")
+	}
+	if errOut.Kind != sporecore.ToolOutputError || !errOut.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", errOut)
+	}
+	want := "start_byte 1 exceeds response length 0"
+	if errOut.Message != want {
+		t.Fatalf("expected message %q, got %q", want, errOut.Message)
+	}
+}
+
+// ── fixture replay: web_fetch_range.json (#135) ───────────────────────────────
+
+type webFetchRangeCase struct {
+	Name          string  `json:"name"`
+	Body          string  `json:"body"`
+	StartByte     uint64  `json:"start_byte"`
+	Expected      *string `json:"expected,omitempty"`
+	ExpectedError *string `json:"expected_error,omitempty"`
+}
+
+func TestWebFetchRangeFixtureReplay(t *testing.T) {
+	// Walk up from this file's location to find the repo root fixtures dir.
+	_, thisFile, _, _ := runtime.Caller(0)
+	// thisFile: .../go/spore-core/tools/web_test.go → go up 3 dirs
+	fixturesPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "fixtures", "tools", "web_fetch_range.json")
+	data, err := os.ReadFile(fixturesPath)
+	if err != nil {
+		t.Skipf("fixture not found at %s: %v", fixturesPath, err)
+	}
+	var cases []webFetchRangeCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatalf("failed to parse fixture: %v", err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("expected at least one fixture case")
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			got, errOut := applyWebFetchRange(c.Body, c.StartByte)
+			if errOut != nil {
+				if c.ExpectedError == nil {
+					t.Fatalf("unexpected error: %s", errOut.Message)
+				}
+				if errOut.Message != *c.ExpectedError {
+					t.Fatalf("expected error %q, got %q", *c.ExpectedError, errOut.Message)
+				}
+				return
+			}
+			if c.Expected == nil {
+				t.Fatalf("expected success but no 'expected' field in fixture case %q", c.Name)
+			}
+			if got != *c.Expected {
+				t.Fatalf("expected %q, got %q", *c.Expected, got)
+			}
+		})
+	}
+}
+
+// ── integration: web_fetch with start_byte via mock server (#135) ─────────────
+
+func TestWebFetchStartByteZeroNoHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello world"))
+	}))
+	defer srv.Close()
+	r := NewWebFetchTool().Execute(context.Background(),
+		call("web_fetch", "c1", map[string]any{"url": srv.URL + "/page", "start_byte": 0}),
+		sporecore.AllowAllSandbox{}, nil)
+	if r.Kind != sporecore.ToolOutputSuccess || r.Content != "hello world" {
+		t.Fatalf("expected 'hello world', got %+v", r)
+	}
+}
+
+func TestWebFetchStartByteMidSlicesWithHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello world"))
+	}))
+	defer srv.Close()
+	r := NewWebFetchTool().Execute(context.Background(),
+		call("web_fetch", "c1", map[string]any{"url": srv.URL + "/page", "start_byte": 6}),
+		sporecore.AllowAllSandbox{}, nil)
+	want := "[starting at byte 6 of 11]\nworld"
+	if r.Kind != sporecore.ToolOutputSuccess || r.Content != want {
+		t.Fatalf("expected %q, got %+v", want, r)
+	}
+}
+
+func TestWebFetchStartBytePastEndRecoverable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
+	r := NewWebFetchTool().Execute(context.Background(),
+		call("web_fetch", "c1", map[string]any{"url": srv.URL + "/page", "start_byte": 99}),
+		sporecore.AllowAllSandbox{}, nil)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+	want := "start_byte 99 exceeds response length 5"
+	if r.Message != want {
+		t.Fatalf("expected message %q, got %q", want, r.Message)
 	}
 }

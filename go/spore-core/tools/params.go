@@ -197,6 +197,12 @@ type TodoWriteParams struct {
 // WebFetchParams are the parameters for WebFetchTool.
 type WebFetchParams struct {
 	URL string `json:"url"`
+	// StartByte is the byte offset into the response body to start reading from.
+	// Default 0: output is byte-identical to a plain fetch (no header prepended).
+	// 0 < start_byte < body_length: slice body from offset, prepend header.
+	// start_byte >= body_length (non-empty): recoverable error.
+	// Empty body + start_byte > 0: recoverable error.
+	StartByte uint64 `json:"start_byte,omitempty"`
 }
 
 // WebSearchParams are the parameters for WebSearchTool.
