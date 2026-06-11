@@ -41,6 +41,7 @@ export { EditFileTool } from "./edit.js";
 export { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
 export { SendMessageTool } from "./message.js";
 export {
+  applyWebFetchRange,
   WebFetchTool,
   WebSearchTool,
   WebSearchConfigError,

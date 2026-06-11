@@ -147,8 +147,11 @@ export type SendMessageParams = z.infer<typeof SendMessageParamsSchema>;
 
 // ---------- Web (#81) ----------
 
-export const WebFetchParamsSchema = z.object({ url: z.string() });
-export type WebFetchParams = z.infer<typeof WebFetchParamsSchema>;
+export const WebFetchParamsSchema = z.object({
+  url: z.string(),
+  start_byte: z.number().int().nonnegative().default(0),
+});
+export type WebFetchParams = z.output<typeof WebFetchParamsSchema>;
 
 export const WebSearchParamsSchema = z.object({ query: z.string() });
 export type WebSearchParams = z.infer<typeof WebSearchParamsSchema>;
