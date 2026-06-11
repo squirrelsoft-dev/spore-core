@@ -67,10 +67,21 @@ impl TaskListTool {
         // `action` (required) plus the union of per-action fields.
         ToolSchema {
             name: Self::NAME.into(),
-            description: "Manage the persisted task list: add, update, complete, or list tasks"
+            description: "Manage the persisted task list. Actions and their required fields: \
+                          add_task (REQUIRES description; optional blockers = ids of tasks \
+                          that must complete first), update_task (REQUIRES id; optional \
+                          status, description), complete_task (REQUIRES id), list_tasks (no \
+                          other fields)."
                 .into(),
             parameters: json!({
-                "type": "object",
+                "allOf": [
+                    { "if": { "properties": { "action": { "const": "add_task" } } },
+                      "then": { "required": ["description"] } },
+                    { "if": { "properties": { "action": { "const": "update_task" } } },
+                      "then": { "required": ["id"] } },
+                    { "if": { "properties": { "action": { "const": "complete_task" } } },
+                      "then": { "required": ["id"] } }
+                ],
                 "properties": {
                     "action": {
                         "type": "string",
@@ -85,6 +96,7 @@ impl TaskListTool {
                     },
                 },
                 "required": ["action"],
+                "type": "object",
             }),
             // Intentionally NOT read_only: this tool mutates shared on-disk
             // state and must dispatch sequentially. See module docs.
@@ -746,6 +758,25 @@ mod tests {
         assert_eq!(
             props.get("blockers").unwrap(),
             &json!({"type": "array", "items": {"type": "integer"}})
+        );
+    }
+
+    // Per-action requireds are advertised via allOf/if/then so schema-driven
+    // models learn that add_task REQUIRES description (and update/complete
+    // REQUIRE id) — `required: ["action"]` alone taught small models nothing.
+    #[tokio::test]
+    async fn schema_advertises_per_action_requireds() {
+        let s = TaskListTool::schema();
+        let all_of = s.parameters.get("allOf").unwrap().as_array().unwrap();
+        assert_eq!(all_of.len(), 3);
+        let add = &all_of[0];
+        assert_eq!(
+            add.pointer("/if/properties/action/const").unwrap(),
+            &json!("add_task")
+        );
+        assert_eq!(
+            add.pointer("/then/required").unwrap(),
+            &json!(["description"])
         );
     }
 
