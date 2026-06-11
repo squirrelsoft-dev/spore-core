@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
@@ -30,11 +32,28 @@ func (*ReadFileTool) MayProduceLargeOutput() bool { return true }
 
 func (*ReadFileTool) Schema() sporecore.RegistryToolSchema {
 	return sporecore.RegistryToolSchema{
-		Name:        ReadFileToolName,
-		Description: "Read a file's contents",
+		Name: ReadFileToolName,
+		Description: "Read a file's contents. Optionally read a line range " +
+			"(offset is 1-indexed start, length is max lines, 0 = to EOF) " +
+			"and/or prefix each line with its number via line_numbers. " +
+			"With no optional params the whole file is returned verbatim.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
-			"properties": {"path": {"type": "string"}},
+			"properties": {
+				"path": {"type": "string"},
+				"offset": {
+					"type": "integer",
+					"description": "1-indexed start line (default 1)."
+				},
+				"length": {
+					"type": "integer",
+					"description": "Max lines to return; 0 = no limit / read to EOF (default 0)."
+				},
+				"line_numbers": {
+					"type": "boolean",
+					"description": "Prefix each returned line with its 1-indexed number (default false)."
+				}
+			},
 			"required": ["path"]
 		}`),
 		Annotations: sporecore.ToolAnnotations{ReadOnly: true, Idempotent: true},
@@ -54,7 +73,75 @@ func (t *ReadFileTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	if err != nil {
 		return ExecutionFailed(fmt.Sprintf("read failed: %s", err), true).ToToolOutput()
 	}
-	return finishWithPossibleTruncation(ctx, string(data), call.ID, sandbox)
+	out, rangeErr := applyReadRange(string(data), &params)
+	if rangeErr != "" {
+		return sporecore.ToolOutput{Kind: sporecore.ToolOutputError, Message: rangeErr, Recoverable: true}
+	}
+	return finishWithPossibleTruncation(ctx, out, call.ID, sandbox)
+}
+
+// applyReadRange applies the #132 range/line-number transform to a fully-read
+// file body. Returns the content to surface, or a non-empty error string for a
+// recoverable error. With all params at their defaults the original content is
+// returned unchanged (byte-identical to the pre-#132 behavior). Any non-default
+// param prepends a "[lines {start}–{end} of {total}]\n" header (U+2013 en-dash).
+func applyReadRange(content string, params *ReadFileParams) (out string, errMsg string) {
+	isDefault := params.Offset == nil && params.Length == 0 && !params.LineNumbers
+	if isDefault {
+		return content, ""
+	}
+	// Offset == nil means "not provided" → default to 1.
+	// Offset != nil && *Offset == 0 → recoverable error.
+	var offset uint64
+	if params.Offset == nil {
+		offset = 1
+	} else if *params.Offset == 0 {
+		return "", "offset must be ≥ 1 (1-indexed)"
+	} else {
+		offset = *params.Offset
+	}
+	// Empty file: any params still yield empty content with no header.
+	if content == "" {
+		return "", ""
+	}
+	// strings.SplitAfter preserves each line's trailing '\n'; the final line
+	// may or may not end in '\n'. This keeps each slice byte-faithful to the
+	// source. Filter out a trailing empty string (produced when the file ends
+	// with '\n', e.g. "a\nb\n" → ["a\n","b\n",""]).
+	rawLines := strings.SplitAfter(content, "\n")
+	lines := rawLines
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	total := uint64(len(lines))
+	if offset > total {
+		return "", fmt.Sprintf("offset %d exceeds file length %d", offset, total)
+	}
+	end := total
+	if params.Length != 0 {
+		// offset + length - 1, clamped to total (length past EOF is silent).
+		candidate := offset + params.Length - 1
+		if candidate < total {
+			end = candidate
+		}
+	}
+	startIdx := int(offset - 1) // 0-based
+	endIdx := int(end)          // exclusive
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[lines %d–%d of %d]\n", offset, end, total))
+	if params.LineNumbers {
+		width := len(strconv.FormatUint(total, 10))
+		for i, line := range lines[startIdx:endIdx] {
+			n := offset + uint64(i)
+			sb.WriteString(fmt.Sprintf("%*d | %s", width, n, line))
+		}
+	} else {
+		for _, line := range lines[startIdx:endIdx] {
+			sb.WriteString(line)
+		}
+	}
+	return sb.String(), ""
 }
 
 // ============================================================================

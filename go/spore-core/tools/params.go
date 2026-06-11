@@ -27,8 +27,25 @@ const (
 
 // ----- Filesystem -----
 
+// ReadFileParams are the parameters for ReadFileTool. With all optional fields
+// at their defaults (Offset=nil, Length=0, LineNumbers=false) the read is
+// byte-identical to reading the whole file — no header, no line numbers (#132).
+// Any non-default param prepends a one-line header
+// "[lines {start}–{end} of {total}]" (U+2013 en-dash).
+//
+// Offset is a *uint64 (pointer) so we can distinguish "not provided" (nil,
+// default=1) from explicitly-zero (0, which is a recoverable error per spec).
 type ReadFileParams struct {
 	Path string `json:"path"`
+	// 1-indexed start line. nil means "not provided" (default = 1).
+	// Explicitly 0 is a recoverable error.
+	Offset *uint64 `json:"offset,omitempty"`
+	// Max lines to return. 0 = no limit / read to EOF (default 0).
+	// A length that runs past EOF silently returns through the last line.
+	Length uint64 `json:"length,omitempty"`
+	// When true, prefix each returned line with its 1-indexed number,
+	// right-padded to the digit-width of the file's total line count.
+	LineNumbers bool `json:"line_numbers,omitempty"`
 }
 
 type WriteFileParams struct {
