@@ -304,6 +304,15 @@ const (
 	// ContextOpKindConsultResumed — a paused worker was resumed after a consult
 	// (issue #114).
 	ContextOpKindConsultResumed ContextOperationKind = "consult_resumed"
+	// ContextOpKindToolErrorLoopDetected — the ReAct consecutive-recoverable-
+	// tool-error breaker detected a loop at N (issue #137): a tool hit N
+	// consecutive identical-argument recoverable errors and ONE corrective message
+	// was injected. A warning — the loop continues.
+	ContextOpKindToolErrorLoopDetected ContextOperationKind = "tool_error_loop_detected"
+	// ContextOpKindToolErrorLoopBroken — the ReAct breaker tripped at 2*N (issue
+	// #137): the same tool reached 2*N consecutive identical-argument errors and
+	// the loop STOPPED to resolve the node's BudgetExhaustedBehavior.
+	ContextOpKindToolErrorLoopBroken ContextOperationKind = "tool_error_loop_broken"
 )
 
 // ContextOperation is a tagged union. Only the field(s) matching Kind are set.
@@ -325,6 +334,11 @@ type ContextOperation struct {
 	ConsultKind string `json:"consult_kind,omitempty"`
 	// ConsultResumed (issue #114): false => budget-exhausted soft-fail.
 	Answered bool `json:"answered,omitempty"`
+	// ToolErrorLoopDetected / ToolErrorLoopBroken (issue #137): the offending tool
+	// and the consecutive identical-argument recoverable-error count (N at
+	// detected, 2*N at broken). ToolName reuses the field above; ConsecutiveErrors
+	// is the count.
+	ConsecutiveErrors uint32 `json:"consecutive_errors,omitempty"`
 }
 
 // NewContextOpAssembly returns an Assembly operation.
@@ -368,6 +382,26 @@ func NewContextOpConsultSpawned(consultKind string) ContextOperation {
 // NewContextOpConsultResumed returns a ConsultResumed operation (issue #114).
 func NewContextOpConsultResumed(consultKind string, answered bool) ContextOperation {
 	return ContextOperation{Kind: ContextOpKindConsultResumed, ConsultKind: consultKind, Answered: answered}
+}
+
+// NewContextOpToolErrorLoopDetected returns a ToolErrorLoopDetected operation
+// (issue #137): the breaker detected a loop at N for toolName.
+func NewContextOpToolErrorLoopDetected(toolName string, consecutiveErrors uint32) ContextOperation {
+	return ContextOperation{
+		Kind:              ContextOpKindToolErrorLoopDetected,
+		ToolName:          toolName,
+		ConsecutiveErrors: consecutiveErrors,
+	}
+}
+
+// NewContextOpToolErrorLoopBroken returns a ToolErrorLoopBroken operation (issue
+// #137): the breaker tripped at 2*N for toolName.
+func NewContextOpToolErrorLoopBroken(toolName string, consecutiveErrors uint32) ContextOperation {
+	return ContextOperation{
+		Kind:              ContextOpKindToolErrorLoopBroken,
+		ToolName:          toolName,
+		ConsecutiveErrors: consecutiveErrors,
+	}
 }
 
 // ContextSpan is one context operation.

@@ -97,6 +97,41 @@ type StrategyOutcomeExhausted struct {
 	ContinuesUsed uint32
 	Phase         string
 	PartialOutput *string
+	// Cause (issue #137) tells the single budget-exhaustion resolution site
+	// (driveStrategyWithResumeSeed) which terminal HaltReason to stamp on a
+	// Fail / Escalate->Fail resolution: genuine budget exhaustion ->
+	// HaltBudgetExceeded; a ReAct tool-error-loop break -> HaltToolErrorLoop. Both
+	// causes flow through the node's BudgetExhaustedBehavior identically. The zero
+	// value is the Budget cause (every pre-#137 path).
+	Cause ExhaustionCause
+}
+
+// ExhaustionCauseKind discriminates why a StrategyOutcomeExhausted was raised
+// (issue #137). Runtime-only — NEVER serialized.
+type ExhaustionCauseKind string
+
+const (
+	// ExhaustionCauseBudget — the scope's step allowance ran out (the pre-#137
+	// behavior). Resolves to HaltBudgetExceeded on a Fail / Escalate->Fail
+	// terminal. The zero value.
+	ExhaustionCauseBudget ExhaustionCauseKind = ""
+	// ExhaustionCauseToolErrorLoop — the ReAct consecutive-recoverable-tool-error
+	// breaker hard-stopped at 2*ErrorLoopThreshold identical-argument errors for
+	// Tool (issue #137). Resolves to HaltToolErrorLoop on a Fail / Escalate->Fail
+	// terminal — NEVER HaltBudgetExceeded.
+	ExhaustionCauseToolErrorLoop ExhaustionCauseKind = "tool_error_loop"
+)
+
+// ExhaustionCause carries why a StrategyOutcomeExhausted was raised (issue #137).
+// The budget-exhaustion resolution site routes BOTH causes through the node's
+// BudgetExhaustedBehavior, but stamps a DIFFERENT terminal HaltReason on the
+// Fail / Escalate->Fail terminals so a caller can tell a genuine budget
+// exhaustion from an error-grinding circuit-break. Runtime-only.
+type ExhaustionCause struct {
+	Kind ExhaustionCauseKind
+	// Tool / ConsecutiveErrors are populated only for ExhaustionCauseToolErrorLoop.
+	Tool              string
+	ConsecutiveErrors uint32
 }
 
 // StrategyComplete builds a Complete outcome carrying output.

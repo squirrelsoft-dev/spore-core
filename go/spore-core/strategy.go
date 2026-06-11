@@ -771,6 +771,24 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	if result.Kind == RunSuccess || result.Kind == RunFailure {
 		windowTurns = result.Turns
 	}
+
+	// #137: the window hit the consecutive-tool-error breaker's 2N hard stop.
+	// PROPAGATE it through the SAME single budget-exhaustion resolution site (so
+	// the node's Behavior governs Fail/Escalate/Continue), but carry the
+	// ToolErrorLoop cause so the terminal reports HaltToolErrorLoop, never
+	// HaltBudgetExceeded. The window's turns are still CHARGED against the leaf
+	// scope (accurate accounting), but the breaker stopped EARLY — the remaining
+	// budget is NOT burned. Detection is independent of leafCapBinding.
+	if result.Kind == RunFailure && result.Reason.Kind == HaltToolErrorLoop {
+		tool := result.Reason.Tool
+		consecutiveErrors := result.Reason.ConsecutiveErrors
+		// Carry the post-run session so a parent resumes losslessly.
+		cx.Scratch.RunSession = result.SessionState
+		_ = cx.ChargeCurrent(windowTurns)
+		cx.PopBudget()
+		partial := reactPartialJSON(lastFinalResponseText(result))
+		return promoteToolErrorLoop(c.Budget, c.Behavior, windowTurns, tool, consecutiveErrors, &partial)
+	}
 	windowHitBudget := result.Kind == RunFailure && result.Reason.Kind == HaltBudgetExceeded
 	leafCapBinding := false
 	if windowHitBudget {

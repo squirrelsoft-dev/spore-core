@@ -55,6 +55,10 @@ func (o *recordingConsultObserver) EmitConsultResumed(_ string, _ SessionID, _ T
 		answered bool
 	}{kind, answered})
 }
+func (o *recordingConsultObserver) EmitToolErrorLoopDetected(string, SessionID, TaskID, string, string, uint32) {
+}
+func (o *recordingConsultObserver) EmitToolErrorLoopBroken(string, SessionID, TaskID, string, string, uint32) {
+}
 
 var _ HarnessObserver = (*recordingConsultObserver)(nil)
 

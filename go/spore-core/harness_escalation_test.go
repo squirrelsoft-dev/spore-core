@@ -98,6 +98,10 @@ func (o *escalationObserver) EmitHillClimbingIteration(string, SessionID, TaskID
 func (o *escalationObserver) EmitConsultSpawned(string, SessionID, TaskID, string, string) {}
 func (o *escalationObserver) EmitConsultResumed(string, SessionID, TaskID, string, string, bool) {
 }
+func (o *escalationObserver) EmitToolErrorLoopDetected(string, SessionID, TaskID, string, string, uint32) {
+}
+func (o *escalationObserver) EmitToolErrorLoopBroken(string, SessionID, TaskID, string, string, uint32) {
+}
 
 var _ HarnessObserver = (*escalationObserver)(nil)
 

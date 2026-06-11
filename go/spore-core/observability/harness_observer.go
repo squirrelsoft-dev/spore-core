@@ -387,6 +387,44 @@ func (a *HarnessObservabilityAdapter) EmitConsultResumed(
 	})
 }
 
+// EmitToolErrorLoopDetected builds a context span for the ReAct breaker detecting
+// a tool-error loop at N (issue #137) and forwards it. A lightweight root
+// ContextAssembly span carrying the offending tool and the consecutive-error
+// count.
+func (a *HarnessObservabilityAdapter) EmitToolErrorLoopDetected(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	toolName string,
+	consecutiveErrors uint32,
+) {
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindContextAssembly, Timestamp(startedAt))
+	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
+	a.provider.EmitContext(ContextSpan{
+		Base:      base,
+		Operation: NewContextOpToolErrorLoopDetected(toolName, consecutiveErrors),
+	})
+}
+
+// EmitToolErrorLoopBroken builds a context span for the ReAct breaker tripping at
+// 2*N (issue #137) and forwards it.
+func (a *HarnessObservabilityAdapter) EmitToolErrorLoopBroken(
+	spanID string,
+	sessionID sporecore.SessionID,
+	taskID sporecore.TaskID,
+	startedAt string,
+	toolName string,
+	consecutiveErrors uint32,
+) {
+	base := NewRoot(SpanID(spanID), sessionID, taskID, SpanKindContextAssembly, Timestamp(startedAt))
+	base.Finish(Timestamp(startedAt), NewStatusOk(), 0)
+	a.provider.EmitContext(ContextSpan{
+		Base:      base,
+		Operation: NewContextOpToolErrorLoopBroken(toolName, consecutiveErrors),
+	})
+}
+
 // Compile-time interface check.
 var _ sporecore.HarnessObserver = (*HarnessObservabilityAdapter)(nil)
 
@@ -418,6 +456,10 @@ type HarnessBuilder struct {
 	// contextmgr.NewKeyTermVerifier(); maxCompactionAttempts defaults to 2.
 	compactionVerifier    sporecore.CompactionVerifier
 	maxCompactionAttempts uint32
+	// errorLoopThreshold is N, the consecutive-recoverable-tool-error breaker
+	// trigger (issue #137). Defaults to 3 (inject at N, hard-stop at 2*N); 0
+	// disables the breaker. See WithErrorLoopThreshold.
+	errorLoopThreshold uint32
 	// spanStore is the optional ObservabilityStore leg of a StorageProvider
 	// (issue #73), set via WithStorage. When present AND the configured
 	// observability provider is the durable outbox, the builder wires it into
@@ -499,6 +541,7 @@ func NewHarnessBuilder(
 		content:               ContentCaptureConfigFromEnv(),
 		compactionVerifier:    contextmgr.NewKeyTermVerifier(),
 		maxCompactionAttempts: 2,
+		errorLoopThreshold:    3,
 	}
 }
 
@@ -522,6 +565,16 @@ func (b *HarnessBuilder) CompactionVerifier(v sporecore.CompactionVerifier) *Har
 // loop clamps the effective value to a minimum of 1.
 func (b *HarnessBuilder) MaxCompactionAttempts(n uint32) *HarnessBuilder {
 	b.maxCompactionAttempts = n
+	return b
+}
+
+// ErrorLoopThreshold sets N, the consecutive-recoverable-tool-error breaker
+// trigger (issue #137): the ReAct turn loop injects ONE corrective message at N
+// identical-argument recoverable errors for a tool and hard-stops at 2*N,
+// resolving the node's BudgetExhaustedBehavior with HaltToolErrorLoop (the 2x
+// multiplier is fixed). Defaults to 3. Pass 0 to disable the breaker.
+func (b *HarnessBuilder) ErrorLoopThreshold(n uint32) *HarnessBuilder {
+	b.errorLoopThreshold = n
 	return b
 }
 
@@ -782,6 +835,7 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		Middleware:            b.middleware,
 		CompactionVerifier:    b.compactionVerifier,
 		MaxCompactionAttempts: b.maxCompactionAttempts,
+		ErrorLoopThreshold:    b.errorLoopThreshold,
 		CatalogueRegistry:     catalogue,
 		ToolsetCatalogues:     toolsetCatalogues,
 		ToolRunStore:          runStore,

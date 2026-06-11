@@ -332,6 +332,10 @@ func (o *capturingObserver) EmitHillClimbingIteration(string, SessionID, TaskID,
 func (o *capturingObserver) EmitConsultSpawned(string, SessionID, TaskID, string, string) {}
 func (o *capturingObserver) EmitConsultResumed(string, SessionID, TaskID, string, string, bool) {
 }
+func (o *capturingObserver) EmitToolErrorLoopDetected(string, SessionID, TaskID, string, string, uint32) {
+}
+func (o *capturingObserver) EmitToolErrorLoopBroken(string, SessionID, TaskID, string, string, uint32) {
+}
 
 var _ HarnessObserver = (*capturingObserver)(nil)
 

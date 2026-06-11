@@ -427,6 +427,42 @@ func promoteBudgetExhausted(err *BudgetExhausted, partialOutput *string) Strateg
 	return StrategyBudgetExhausted(*err, partialOutput)
 }
 
+// promoteToolErrorLoop promotes a ReAct tool-error-loop hard stop (issue #137)
+// to a StrategyOutcome BudgetExhausted variant carrying ExhaustionCauseToolErrorLoop
+// so it flows through the SAME single budget-exhaustion resolution site as a real
+// budget exhaustion, but the Fail / Escalate->Fail terminals report
+// HaltToolErrorLoop instead of HaltBudgetExceeded. The leaf's CONFIGURED behavior
+// is carried so the resolution site can honor Fail / Escalate / Continue (a
+// granted Continue re-drives the window with a fresh per-tool error allowance,
+// since the counter is loop-local to runReActInner). stepsTaken is the window's
+// turn count at the break, so the terminal's turns reflect work actually done —
+// the breaker does NOT burn the rest of the budget.
+func promoteToolErrorLoop(
+	leafBudget BudgetPolicy,
+	leafBehavior BudgetExhaustedBehavior,
+	stepsTaken uint32,
+	tool string,
+	consecutiveErrors uint32,
+	partialOutput *string,
+) StrategyOutcome {
+	return StrategyOutcome{
+		Kind: StrategyOutcomeBudgetExhausted,
+		Exhausted: &StrategyOutcomeExhausted{
+			Policy:        leafBudget,
+			Behavior:      leafBehavior,
+			StepsTaken:    stepsTaken,
+			ContinuesUsed: 0,
+			Phase:         "react",
+			PartialOutput: partialOutput,
+			Cause: ExhaustionCause{
+				Kind:              ExhaustionCauseToolErrorLoop,
+				Tool:              tool,
+				ConsecutiveErrors: consecutiveErrors,
+			},
+		},
+	}
+}
+
 // ============================================================================
 // #130 — Escalate HITL pause helpers
 // ============================================================================

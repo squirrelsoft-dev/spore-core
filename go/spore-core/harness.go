@@ -49,9 +49,11 @@
 package sporecore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -320,6 +322,19 @@ const (
 	// stream does not surface it before args (a documented model StreamEvent
 	// limitation — name is recovered on the coarse ToolCall).
 	HarnessStreamToolCallStart HarnessStreamEventKind = "tool_call_start"
+
+	// ── Consecutive-recoverable-tool-error breaker (issue #137) ─────────────────
+
+	// HarnessStreamToolErrorLoopDetected: the breaker DETECTED a loop — a tool hit
+	// ErrorLoopThreshold (N) consecutive identical-argument recoverable errors and
+	// ONE corrective message was injected. A warning — the loop continues. Carries
+	// the Tool name and ConsecutiveErrors (= N).
+	HarnessStreamToolErrorLoopDetected HarnessStreamEventKind = "tool_error_loop_detected"
+	// HarnessStreamToolErrorLoopBroken: the breaker TRIPPED — the same tool reached
+	// 2*ErrorLoopThreshold (2*N) consecutive identical-argument errors and the loop
+	// STOPPED to resolve the node's BudgetExhaustedBehavior. Carries the Tool name
+	// and ConsecutiveErrors (= 2*N).
+	HarnessStreamToolErrorLoopBroken HarnessStreamEventKind = "tool_error_loop_broken"
 )
 
 // HarnessStreamEvent is one event emitted while the loop runs.
@@ -366,6 +381,9 @@ type HarnessStreamEvent struct {
 	Index uint32 `json:"-"`
 	// block_start
 	Block BlockKind `json:"-"`
+	// tool_error_loop_detected, tool_error_loop_broken (issue #137)
+	Tool              string `json:"-"`
+	ConsecutiveErrors uint32 `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -435,6 +453,12 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			CallID string                 `json:"call_id"`
 			Name   string                 `json:"name"`
 		}{e.Kind, e.Index, e.CallID, e.Name})
+	case HarnessStreamToolErrorLoopDetected, HarnessStreamToolErrorLoopBroken:
+		return json.Marshal(struct {
+			Kind              HarnessStreamEventKind `json:"kind"`
+			Tool              string                 `json:"tool"`
+			ConsecutiveErrors uint32                 `json:"consecutive_errors"`
+		}{e.Kind, e.Tool, e.ConsecutiveErrors})
 	default:
 		return nil, fmt.Errorf("HarnessStreamEvent: unknown kind %q", e.Kind)
 	}
@@ -1515,6 +1539,34 @@ type HarnessObserver interface {
 		consultKind string,
 		answered bool,
 	)
+
+	// EmitToolErrorLoopDetected records the ReAct consecutive-recoverable-tool-error
+	// breaker DETECTING a loop at N (issue #137): a tool hit ErrorLoopThreshold
+	// consecutive identical-argument recoverable errors and ONE corrective message
+	// was injected. A warning — the loop continues. Carries the tool name and the
+	// consecutive-error count (= N). Fire-and-forget; never affects control flow.
+	EmitToolErrorLoopDetected(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		toolName string,
+		consecutiveErrors uint32,
+	)
+
+	// EmitToolErrorLoopBroken records the ReAct breaker TRIPPING at 2*N (issue
+	// #137): the same tool reached 2*ErrorLoopThreshold consecutive
+	// identical-argument errors and the loop STOPPED to resolve the node's
+	// BudgetExhaustedBehavior. Carries the tool name and the consecutive-error
+	// count (= 2*N). Fire-and-forget; never affects control flow.
+	EmitToolErrorLoopBroken(
+		spanID string,
+		sessionID SessionID,
+		taskID TaskID,
+		startedAt string,
+		toolName string,
+		consecutiveErrors uint32,
+	)
 }
 
 // ============================================================================
@@ -2162,6 +2214,15 @@ const (
 	// task_list tool path could in principle persist a cyclic graph out of band).
 	// No task is run. Carries a human-readable Reason.
 	HaltTaskGraphCycle HaltReasonKind = "task_graph_cycle"
+	// HaltToolErrorLoop (issue #137) is returned when the ReAct turn loop's
+	// consecutive-recoverable-tool-error breaker tripped: a tool returned
+	// 2*ErrorLoopThreshold consecutive recoverable ToolOutput.Error results with
+	// identical arguments, so the loop STOPPED grinding and resolved the node's
+	// BudgetExhaustedBehavior WITHOUT burning the remaining budget. DISTINCT from
+	// HaltBudgetExceeded (genuine budget exhaustion): the loop halted early on a
+	// detected error loop, not because the step budget ran out. Carries the
+	// offending Tool name and the ConsecutiveErrors count at the hard stop (2*N).
+	HaltToolErrorLoop HaltReasonKind = "tool_error_loop"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -2198,6 +2259,10 @@ type HaltReason struct {
 	Completed  []uint32 `json:"-"`
 	Blocked    []uint32 `json:"-"`
 	FailedTask uint32   `json:"-"`
+	// tool_error_loop (issue #137): the consecutive identical-argument
+	// recoverable-error count at the 2*N hard stop. The offending tool name reuses
+	// the Tool field above.
+	ConsecutiveErrors uint32 `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -2320,6 +2385,12 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Kind   HaltReasonKind `json:"kind"`
 			Reason string         `json:"reason"`
 		}{h.Kind, h.Reason})
+	case HaltToolErrorLoop:
+		return json.Marshal(struct {
+			Kind              HaltReasonKind `json:"kind"`
+			Tool              string         `json:"tool"`
+			ConsecutiveErrors uint32         `json:"consecutive_errors"`
+		}{h.Kind, h.Tool, h.ConsecutiveErrors})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -2328,22 +2399,23 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON decodes the flat tagged form.
 func (h *HaltReason) UnmarshalJSON(data []byte) error {
 	var probe struct {
-		Kind       HaltReasonKind    `json:"kind"`
-		LimitType  BudgetLimitType   `json:"limit_type"`
-		Reason     string            `json:"reason"`
-		Hook       HookPoint         `json:"hook"`
-		Error      json.RawMessage   `json:"error"`
-		Violation  *SandboxViolation `json:"violation"`
-		Tool       string            `json:"tool"`
-		Iterations uint32            `json:"iterations"`
-		BestMetric float64           `json:"best_metric"`
-		Strategy   string            `json:"strategy"`
-		TaskIndex  int               `json:"task_index"`
-		Task       string            `json:"task"`
-		LastReason string            `json:"last_reason"`
-		Completed  []uint32          `json:"completed"`
-		Blocked    []uint32          `json:"blocked"`
-		FailedTask uint32            `json:"failed_task"`
+		Kind              HaltReasonKind    `json:"kind"`
+		LimitType         BudgetLimitType   `json:"limit_type"`
+		Reason            string            `json:"reason"`
+		Hook              HookPoint         `json:"hook"`
+		Error             json.RawMessage   `json:"error"`
+		Violation         *SandboxViolation `json:"violation"`
+		Tool              string            `json:"tool"`
+		Iterations        uint32            `json:"iterations"`
+		BestMetric        float64           `json:"best_metric"`
+		Strategy          string            `json:"strategy"`
+		TaskIndex         int               `json:"task_index"`
+		Task              string            `json:"task"`
+		LastReason        string            `json:"last_reason"`
+		Completed         []uint32          `json:"completed"`
+		Blocked           []uint32          `json:"blocked"`
+		FailedTask        uint32            `json:"failed_task"`
+		ConsecutiveErrors uint32            `json:"consecutive_errors"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -2362,6 +2434,7 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 	h.Completed = probe.Completed
 	h.Blocked = probe.Blocked
 	h.FailedTask = probe.FailedTask
+	h.ConsecutiveErrors = probe.ConsecutiveErrors
 
 	switch probe.Kind {
 	case HaltAgentError:
@@ -2647,6 +2720,18 @@ type HarnessConfig struct {
 	// in a single Run before terminating anyway (issue #69). The counter is
 	// per-run (resets each Run call). Zero is treated as the default of 8.
 	MaxStopBlocks uint32
+
+	// ErrorLoopThreshold is N, the consecutive-recoverable-tool-error breaker
+	// trigger (issue #137). The ReAct turn loop tracks, per tool name, the run of
+	// consecutive recoverable ToolOutput.Error results carrying identical
+	// arguments. At N identical-argument errors it injects ONE corrective message
+	// (the enrichToolError schema+hint); at 2*N it STOPS looping and resolves the
+	// node's BudgetExhaustedBehavior WITHOUT burning the remaining budget,
+	// terminating with HaltToolErrorLoop (never HaltBudgetExceeded). The 2x
+	// hard-stop multiplier is FIXED. ZERO disables the breaker entirely. The
+	// builder defaults it to 3 (matching the Rust reference); a bare HarnessConfig
+	// literal that does not set it leaves the breaker OFF (back-compat).
+	ErrorLoopThreshold uint32
 
 	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
 	// strategy (issue #58, B3): the maximum number of context windows the
@@ -3253,6 +3338,19 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 					SessionState: SessionState{},
 				}
 			}
+			// #137: the terminal HaltReason for a Fail / Escalate->Fail resolution
+			// depends on the CAUSE — a genuine budget exhaustion reports
+			// BudgetExceeded; an error-loop break reports ToolErrorLoop. (A granted
+			// Continue re-drives the window, whose loop-local error counter starts
+			// fresh.)
+			terminalReason := HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns}
+			if ex.Cause.Kind == ExhaustionCauseToolErrorLoop {
+				terminalReason = HaltReason{
+					Kind:              HaltToolErrorLoop,
+					Tool:              ex.Cause.Tool,
+					ConsecutiveErrors: ex.Cause.ConsecutiveErrors,
+				}
+			}
 			// Reconstruct the resolution scope: the FIRST round uses the leaf's
 			// propagated behavior + ContinuesUsed; later in-process rounds reuse
 			// the threaded (possibly fallen-through) state.
@@ -3316,8 +3414,9 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 					}}
 				}
 				return RunResult{
-					Kind:         RunFailure,
-					Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+					Kind: RunFailure,
+					// #137: ToolErrorLoop vs BudgetExceeded per cause.
+					Reason:       terminalReason,
 					SessionID:    sessionID,
 					Usage:        cx.Usage,
 					Turns:        turns,
@@ -3326,8 +3425,9 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 			default: // ExhaustedResolutionFail
 				// Fail contract: the partial is DISCARDED.
 				return RunResult{
-					Kind:         RunFailure,
-					Reason:       HaltReason{Kind: HaltBudgetExceeded, LimitType: BudgetLimitTurns},
+					Kind: RunFailure,
+					// #137: ToolErrorLoop vs BudgetExceeded per cause.
+					Reason:       terminalReason,
 					SessionID:    sessionID,
 					Usage:        cx.Usage,
 					Turns:        turns,
@@ -3747,6 +3847,27 @@ func registrySchemas(reg ToolRegistry) []ToolSchema {
 	return out
 }
 
+// enrichToolError renders a recoverable tool-error message annotated with the
+// tool's parameter schema (when known) plus a fixed correctly-typed-JSON hint
+// (issue #137; mirrors the Rust enrich_tool_error). Returns a recoverable
+// ToolOutput.Error carrying the enriched text. schema may be nil — the schema
+// section is then omitted but the hint is always appended.
+func enrichToolError(message string, schema *ToolSchema) ToolOutput {
+	enriched := message
+	if schema != nil && len(schema.InputSchema) > 0 {
+		// schema.InputSchema is already canonical JSON (json.RawMessage); compact
+		// it so the rendered text is stable.
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, schema.InputSchema); err == nil {
+			enriched += "\n\nExpected parameter schema: " + buf.String()
+		}
+	}
+	enriched += "\n\nHint: provide arguments as correctly-typed JSON " +
+		"(e.g. true/false as a bool, 42 as a number, [\"a\"] as an array) " +
+		"rather than as quoted strings."
+	return ToolOutput{Kind: ToolOutputError, Message: enriched, Recoverable: true}
+}
+
 // runReAct drives the ReAct loop, then finalizes observability for terminal
 // outcomes. A WaitingForHuman pause is not terminal, so it is never flushed
 // here — the eventual Resume path reaches a terminal outcome and flushes then.
@@ -4006,6 +4127,45 @@ func (h *StandardHarness) fireStopHooks(
 	return outcome.Reason, true
 }
 
+// errorRun is the current run of consecutive recoverable tool errors for ONE
+// tool name (issue #137). Tracked per tool name in a loop-local
+// map[string]*errorRun inside runReActInner:
+//
+//   - On a recoverable ToolOutput.Error for tool T with args A: if the existing
+//     run for T has args STRUCTURALLY equal to A, count is incremented; otherwise
+//     the run is REPLACED with a fresh {args: A, count: 1} (covers both the first
+//     error and the args-changed case).
+//   - On ANY success for tool T: the entry is REMOVED (AC1 — success resets the
+//     run regardless of args).
+//   - At count == N (ErrorLoopThreshold): inject ONE corrective message (AC2).
+//     injected guards against re-injection between N and 2*N for the same run.
+//   - At count == 2*N: stop looping (AC3).
+type errorRun struct {
+	// args is the tool-call arguments shared by every error in this run.
+	args json.RawMessage
+	// count is how many consecutive identical-argument recoverable errors so far.
+	count uint32
+	// injected records whether the N-threshold corrective message has already
+	// been injected for THIS run (so we inject exactly once between N and 2*N).
+	injected bool
+}
+
+// sameToolArgs reports whether two tool-call argument blobs are structurally
+// equal (issue #137). Compares the parsed JSON values rather than raw bytes so
+// semantically identical args with different whitespace/key order still match.
+func sameToolArgs(a, b json.RawMessage) bool {
+	var va, vb any
+	// Treat an unmarshal failure as a byte comparison fallback (both blobs are
+	// the model's own output, so this is defensive only).
+	if err := json.Unmarshal(a, &va); err != nil {
+		return bytes.Equal(a, b)
+	}
+	if err := json.Unmarshal(b, &vb); err != nil {
+		return bytes.Equal(a, b)
+	}
+	return reflect.DeepEqual(va, vb)
+}
+
 func (h *StandardHarness) runReActInner(
 	ctx context.Context,
 	task Task,
@@ -4061,6 +4221,13 @@ func (h *StandardHarness) runReActInner(
 	// resume starts fresh. After MaxStopBlocks consecutive blocks the loop
 	// terminates anyway.
 	var stopBlocks uint32
+
+	// Consecutive-recoverable-tool-error breaker state (issue #137), keyed by tool
+	// name. Loop-local to this window: a fresh Run / re-driven Continue window
+	// starts with a clean N/2N allowance (AC3 Continue reset). errorLoopN is N; the
+	// hard stop is at 2*N. N == 0 disables the breaker.
+	errorLoopN := h.config.ErrorLoopThreshold
+	errorRuns := map[string]*errorRun{}
 
 	effectiveTurnCap := maxIterations
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
@@ -4546,6 +4713,94 @@ func (h *StandardHarness) runReActInner(
 					}
 				}
 
+				// ── Consecutive-recoverable-tool-error breaker (#137) ──
+				// output here is either a Success or a RECOVERABLE Error (every other
+				// variant early-returned above). On a success the tool's error run
+				// resets (AC1); on a recoverable error we increment the identical-args
+				// run (AC1 args-variant) and check the N / 2N thresholds. At N we stash
+				// the corrective USER message here and append it AFTER the tool result
+				// below (well-formed conversation: assistant tool_use -> tool result ->
+				// corrective user message).
+				var pendingCorrective string
+				if output.Kind == ToolOutputError && output.Recoverable {
+					run, ok := errorRuns[call.Name]
+					if ok && sameToolArgs(run.args, call.Input) {
+						// Same tool, structurally-identical args -> extend the run.
+						run.count++
+					} else {
+						// First error, or the args changed -> fresh run.
+						run = &errorRun{args: call.Input, count: 1}
+						errorRuns[call.Name] = run
+					}
+					count := run.count
+					twoN := errorLoopN * 2
+
+					// 2N: HARD STOP (AC3). Do NOT append this last tool result or
+					// continue — return a typed terminal that ReactConfig.Run routes
+					// through the node's BudgetExhaustedBehavior WITHOUT burning the
+					// rest of the budget. The breaker is disabled when N == 0.
+					if errorLoopN > 0 && count >= twoN {
+						// AC4: emit the "broken" pair (stream + obs).
+						emit(onStream, HarnessStreamEvent{
+							Kind: HarnessStreamToolErrorLoopBroken,
+							Tool: call.Name, ConsecutiveErrors: count,
+						})
+						if h.config.Observability != nil {
+							h.config.Observability.EmitToolErrorLoopBroken(
+								fmt.Sprintf("%s-tool-error-loop-broken-%d", sessionID, spanSeq),
+								sessionID, task.ID, nowRFC3339(), call.Name, count,
+							)
+						}
+						return RunResult{
+							Kind: RunFailure,
+							Reason: HaltReason{
+								Kind:              HaltToolErrorLoop,
+								Tool:              call.Name,
+								ConsecutiveErrors: count,
+							},
+							SessionID: sessionID, Usage: usage, Turns: budget.Turns,
+						}
+					}
+
+					// N: inject ONE corrective message (AC2). Render the schema+hint
+					// via enrichToolError (reused) and inject it as a USER-role message
+					// — the SAME channel the Stop-block breaker uses — once per run (do
+					// not re-inject between N and 2N).
+					if errorLoopN > 0 && count >= errorLoopN && !run.injected {
+						run.injected = true
+						var schema *ToolSchema
+						for _, s := range registrySchemas(toolRegistry) {
+							if s.Name == call.Name {
+								sc := s
+								schema = &sc
+								break
+							}
+						}
+						// enrichToolError renders the bare message + schema + hint; the
+						// bare message is this run's own error text.
+						corrective := enrichToolError(output.Message, schema).Message
+						// AC4: emit the "detected/warning" pair (stream + obs) BEFORE
+						// the corrective message is appended.
+						emit(onStream, HarnessStreamEvent{
+							Kind: HarnessStreamToolErrorLoopDetected,
+							Tool: call.Name, ConsecutiveErrors: count,
+						})
+						if h.config.Observability != nil {
+							h.config.Observability.EmitToolErrorLoopDetected(
+								fmt.Sprintf("%s-tool-error-loop-detected-%d", sessionID, spanSeq),
+								sessionID, task.ID, nowRFC3339(), call.Name, count,
+							)
+						}
+						// Append after the normal tool-result append below so the
+						// conversation stays well-formed (assistant tool_use -> tool
+						// result -> corrective user msg).
+						pendingCorrective = corrective
+					}
+				} else {
+					// AC1: ANY success for this tool resets its run.
+					delete(errorRuns, call.Name)
+				}
+
 				// Tool-call span (issue #12), child of the current turn.
 				if h.config.Observability != nil {
 					var outputSize uint64
@@ -4601,6 +4856,14 @@ func (h *StandardHarness) runReActInner(
 				})
 				h.config.ContextManager.AppendToolResult(ctx, &session, &tr)
 				approved = append(approved, tr)
+
+				// #137 (AC2): inject the N-threshold corrective USER message AFTER
+				// the tool result so the conversation stays well-formed (assistant
+				// tool_use -> tool result -> corrective user message). Same channel
+				// the Stop-block breaker uses.
+				if pendingCorrective != "" {
+					h.config.ContextManager.AppendUserMessage(ctx, &session, pendingCorrective)
+				}
 			}
 
 			// Middleware: AfterTool.
@@ -5235,10 +5498,12 @@ func (AlwaysContinuePolicy) Evaluate(context.Context, *SessionState, *BudgetSnap
 
 // ScriptedToolRegistry is a test ToolRegistry that yields queued outputs.
 type ScriptedToolRegistry struct {
-	mu         sync.Mutex
-	outputs    []ToolOutput
-	alwaysHalt map[string]struct{}
-	CallCount  atomic.Int64
+	mu          sync.Mutex
+	outputs     []ToolOutput
+	alwaysHalt  map[string]struct{}
+	alwaysError *ToolOutput
+	schemas     []RegistryToolSchema
+	CallCount   atomic.Int64
 }
 
 // NewScriptedToolRegistry constructs a ScriptedToolRegistry.
@@ -5254,6 +5519,26 @@ func (s *ScriptedToolRegistry) Push(o ToolOutput) *ScriptedToolRegistry {
 	return s
 }
 
+// AlwaysRecoverableError makes every dispatch return the SAME recoverable error
+// with message, regardless of the queued outputs (issue #137; mirrors the Rust
+// ScriptedToolRegistry::always_recoverable_error). Useful for error-loop tests.
+func (s *ScriptedToolRegistry) AlwaysRecoverableError(message string) *ScriptedToolRegistry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.alwaysError = &ToolOutput{Kind: ToolOutputError, Message: message, Recoverable: true}
+	return s
+}
+
+// WithSchema registers a tool schema advertised via ActiveSchemas (issue #137;
+// mirrors the Rust ScriptedToolRegistry::with_schema). Lets the harness loop's
+// schema lookup find a parameter schema to render in enrichToolError.
+func (s *ScriptedToolRegistry) WithSchema(schema RegistryToolSchema) *ScriptedToolRegistry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.schemas = append(s.schemas, schema)
+	return s
+}
+
 // MarkAlwaysHalt flags tool names as always-halt.
 func (s *ScriptedToolRegistry) MarkAlwaysHalt(name string) {
 	s.mu.Lock()
@@ -5261,11 +5546,15 @@ func (s *ScriptedToolRegistry) MarkAlwaysHalt(name string) {
 	s.alwaysHalt[name] = struct{}{}
 }
 
-// Dispatch returns the next queued output (defaulting to Success "ok").
+// Dispatch returns the next queued output (defaulting to Success "ok"). When
+// AlwaysRecoverableError was set, it returns that error for EVERY call.
 func (s *ScriptedToolRegistry) Dispatch(_ context.Context, call ToolCall, _ SandboxProvider) (HarnessToolResult, error) {
 	s.CallCount.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.alwaysError != nil {
+		return HarnessToolResult{CallID: call.ID, Output: *s.alwaysError}, nil
+	}
 	var out ToolOutput
 	if len(s.outputs) == 0 {
 		out = ToolOutput{Kind: ToolOutputSuccess, Content: "ok"}
@@ -5296,8 +5585,17 @@ func (s *ScriptedToolRegistry) Register(Tool, RegistryToolSchema) error { return
 // RegisterSet is a no-op for the test stub.
 func (s *ScriptedToolRegistry) RegisterSet(ToolSet) error { return nil }
 
-// ActiveSchemas returns an empty slice.
-func (s *ScriptedToolRegistry) ActiveSchemas(*TaskPhase) []RegistryToolSchema { return nil }
+// ActiveSchemas returns the registered schemas (nil unless WithSchema was used).
+func (s *ScriptedToolRegistry) ActiveSchemas(*TaskPhase) []RegistryToolSchema {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.schemas) == 0 {
+		return nil
+	}
+	out := make([]RegistryToolSchema, len(s.schemas))
+	copy(out, s.schemas)
+	return out
+}
 
 // HasSubagentTools always reports false in the scripted stub.
 func (s *ScriptedToolRegistry) HasSubagentTools() bool { return false }
