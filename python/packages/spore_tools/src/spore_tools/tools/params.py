@@ -54,6 +54,7 @@ class WriteFileParams(_Params):
 class ListDirParams(_Params):
     path: str
     recursive: bool = False
+    include_ignored: bool = False
 
 
 class DeleteFileParams(_Params):

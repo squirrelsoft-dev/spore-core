@@ -273,6 +273,96 @@ async def test_read_file_with_offset_emits_header_end_to_end(tmp_path: Path) -> 
 _FIXTURE_PATH = Path(__file__).parents[4] / "fixtures" / "tools" / "read_file_range.json"
 
 
+# ============================================================================
+# #134: list_dir gitignore parity
+# ============================================================================
+
+
+def _has_git_dir(entries: list[str]) -> bool:
+    """Return True if any entry is inside the .git/ directory (not just .gitignore)."""
+    return any(
+        "/.git/" in e or e.endswith("/.git") or e == ".git" or e.startswith(".git/")
+        for e in entries
+    )
+
+
+async def test_list_dir_recursive_excludes_gitignored_files(tmp_path: Path) -> None:
+    """Recursive list_dir respects .gitignore by default."""
+    # Create directory structure
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("# main")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "bundle.js").write_text("// bundle")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "app.log").write_text("log entry")
+    (tmp_path / ".gitignore").write_text("dist/\n*.log\n")
+
+    sb = AllowAllSandbox()
+    r = await ListDirTool().execute(
+        _call("list_dir", {"path": str(tmp_path), "recursive": True}), sb, _CTX
+    )
+    assert isinstance(r, ToolOutputSuccess)
+    entries = r.content.splitlines()
+
+    # Tracked file must appear
+    assert any("main.py" in e for e in entries), f"src/main.py missing from {entries}"
+    # Gitignored files must NOT appear
+    assert not any("bundle.js" in e for e in entries), (
+        f"dist/bundle.js should be excluded: {entries}"
+    )
+    assert not _has_git_dir(entries), f".git dir should be excluded: {entries}"
+    assert not any("app.log" in e for e in entries), f"logs/app.log should be excluded: {entries}"
+
+
+async def test_list_dir_recursive_include_ignored_restores_all(tmp_path: Path) -> None:
+    """Recursive list_dir with include_ignored=True walks everything (except .git/)."""
+    # Create directory structure
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("# main")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "bundle.js").write_text("// bundle")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "app.log").write_text("log entry")
+    (tmp_path / ".gitignore").write_text("dist/\n*.log\n")
+
+    sb = AllowAllSandbox()
+    r = await ListDirTool().execute(
+        _call(
+            "list_dir",
+            {"path": str(tmp_path), "recursive": True, "include_ignored": True},
+        ),
+        sb,
+        _CTX,
+    )
+    assert isinstance(r, ToolOutputSuccess)
+    entries = r.content.splitlines()
+
+    # All non-.git paths must appear
+    assert any("main.py" in e for e in entries), f"src/main.py missing from {entries}"
+    assert any("bundle.js" in e for e in entries), f"dist/bundle.js should be included: {entries}"
+    assert any("app.log" in e for e in entries), f"logs/app.log should be included: {entries}"
+    # .git still excluded
+    assert not _has_git_dir(entries), f".git dir should still be excluded: {entries}"
+
+
+async def test_list_dir_non_recursive_excludes_git_dir(tmp_path: Path) -> None:
+    """Non-recursive list_dir never returns .git/ entries."""
+    (tmp_path / "readme.txt").write_text("hi")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]")
+
+    sb = AllowAllSandbox()
+    r = await ListDirTool().execute(_call("list_dir", {"path": str(tmp_path)}), sb, _CTX)
+    assert isinstance(r, ToolOutputSuccess)
+    entries = r.content.splitlines()
+    assert not _has_git_dir(entries), f".git dir should be excluded: {entries}"
+    assert any("readme.txt" in e for e in entries), f"readme.txt missing: {entries}"
+
+
 async def test_read_file_range_fixture_replay(tmp_path: Path) -> None:
     """Replay every case in fixtures/tools/read_file_range.json byte-identically."""
     cases = json.loads(_FIXTURE_PATH.read_text())

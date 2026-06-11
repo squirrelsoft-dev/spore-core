@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 
 import anyio
+import pathspec
 
 from spore_core.harness import (
     Operation,
@@ -235,6 +236,14 @@ class ListDirTool:
                 "properties": {
                     "path": {"type": "string"},
                     "recursive": {"type": "boolean"},
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": (
+                            "When false (default) and recursive is true, "
+                            "honor .gitignore rules and always skip .git/. "
+                            "When true, walk everything (still skips .git/)."
+                        ),
+                    },
                 },
                 "required": ["path"],
             },
@@ -277,10 +286,25 @@ class ListDirTool:
 
             out: list[str] = []
             if params.recursive:
-                for p in root.rglob("*"):
-                    rel = to_root_relative(p)
-                    if rel is not None:
-                        out.append(rel)
+                if params.include_ignored:
+                    # Original rglob behavior: walk everything, still skip .git/
+                    for p in root.rglob("*"):
+                        # Always skip .git/ and anything inside it
+                        try:
+                            rel_to_root = p.relative_to(root)
+                        except ValueError:
+                            continue
+                        if rel_to_root.parts and rel_to_root.parts[0] == ".git":
+                            continue
+                        rel = to_root_relative(p)
+                        if rel is not None:
+                            out.append(rel)
+                else:
+                    # Gitignore-aware DFS: honor .gitignore at each directory
+                    for p in _gitignore_walk(root):
+                        rel = to_root_relative(p)
+                        if rel is not None:
+                            out.append(rel)
                 # mirror Rust's WalkDir behavior, which yields the root itself;
                 # to_root_relative skips it (empty relative path), so this is a
                 # no-op for the listed dir but keeps the branches symmetric.
@@ -289,6 +313,9 @@ class ListDirTool:
                     out.append(rel)
             else:
                 for p in root.iterdir():
+                    # Non-recursive: always skip .git/
+                    if p.name == ".git":
+                        continue
                     rel = to_root_relative(p)
                     if rel is not None:
                         out.append(rel)
@@ -402,6 +429,75 @@ class MoveFileTool:
 # ============================================================================
 # helpers
 # ============================================================================
+
+
+def _load_gitignore_spec(directory: Path) -> "pathspec.PathSpec | None":
+    """Load a PathSpec from ``directory/.gitignore``, or None if absent/unreadable."""
+    gitignore_file = directory / ".gitignore"
+    if not gitignore_file.is_file():
+        return None
+    try:
+        lines = gitignore_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    return pathspec.PathSpec.from_lines("gitignore", lines)
+
+
+def _gitignore_walk(root: Path) -> list[Path]:
+    """DFS walk that respects .gitignore rules at each directory level.
+
+    Always skips .git/ unconditionally. At each directory, loads a local
+    .gitignore (if present) and uses pathspec to filter out matched entries
+    before recursing. Parent specs are applied using paths relative to their
+    respective anchor directories, so patterns like ``*.log`` correctly filter
+    files in subdirectories.
+
+    Returns all non-ignored paths (files and directories) under ``root``,
+    not including ``root`` itself.
+    """
+    results: list[Path] = []
+
+    # Stack items: (current_dir, list of (spec, anchor_dir) pairs from all
+    # ancestor .gitignore files including the current one).
+    def _walk(current: Path, ancestor_specs: list[tuple["pathspec.PathSpec", Path]]) -> None:
+        # Load .gitignore for the current directory and extend the spec list.
+        local_spec = _load_gitignore_spec(current)
+        specs = list(ancestor_specs)
+        if local_spec is not None:
+            specs.append((local_spec, current))
+
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            return
+
+        for entry in entries:
+            # Always skip .git/
+            if entry.name == ".git":
+                continue
+            # Apply all ancestor .gitignore specs using paths relative to each
+            # spec's anchor directory.
+            ignored = False
+            for spec, anchor in specs:
+                try:
+                    rel = entry.relative_to(anchor)
+                except ValueError:
+                    continue
+                rel_str = rel.as_posix()
+                # Also try the "dir/" form for directories so patterns like
+                # "dist/" match the directory itself.
+                check_str = rel_str + "/" if entry.is_dir() else rel_str
+                if spec.match_file(check_str) or spec.match_file(rel_str):
+                    ignored = True
+                    break
+            if ignored:
+                continue
+            results.append(entry)
+            if entry.is_dir():
+                _walk(entry, specs)
+
+    _walk(root, [])
+    return results
 
 
 async def _resolve(sandbox: SandboxProvider, path: str, operation: Operation = "read") -> Path:
