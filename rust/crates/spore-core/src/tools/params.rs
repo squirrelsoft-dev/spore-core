@@ -20,9 +20,28 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 
 // ---------- Filesystem ----------
 
+/// Parameters for [`crate::tools::fs::ReadFileTool`]. With all three optional
+/// params at their defaults (`offset = 1`, `length = 0`, `line_numbers =
+/// false`) the read is **byte-identical** to reading the whole file — no
+/// header, no line numbers (#132). Any non-default param prepends a one-line
+/// header `[lines {start}–{end} of {total}]` (U+2013 en-dash).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileParams {
     pub path: String,
+    /// 1-indexed start line. Default `1` (read from the beginning).
+    #[serde(default = "default_read_offset")]
+    pub offset: u64,
+    /// Max lines to return. Default `0` = no limit (read to EOF). A `length`
+    /// that runs past EOF silently returns through the last line.
+    #[serde(default)]
+    pub length: u64,
+    /// When `true`, prefix each returned line with its 1-indexed number,
+    /// right-padded to the digit-width of the file's total line count.
+    #[serde(default)]
+    pub line_numbers: bool,
+}
+fn default_read_offset() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

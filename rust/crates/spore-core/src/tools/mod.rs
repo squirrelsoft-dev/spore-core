@@ -520,4 +520,67 @@ mod fixture_tests {
             }
         }
     }
+
+    // ---- read_file_range.json (#132) ----
+    #[derive(Deserialize)]
+    struct ReadRangeExpected {
+        kind: String,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        recoverable: Option<bool>,
+        #[serde(default)]
+        message_contains: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReadRangeCase {
+        name: String,
+        initial_content: String,
+        params: Value,
+        expected: ReadRangeExpected,
+    }
+
+    #[tokio::test]
+    async fn fixture_replay_read_file_range() {
+        use crate::tools::fs::ReadFileTool;
+        use tempfile::TempDir;
+        let data = std::fs::read_to_string(fixture_path("read_file_range.json")).unwrap();
+        let cases: Vec<ReadRangeCase> = serde_json::from_str(&data).unwrap();
+        assert!(!cases.is_empty());
+        let sb = AllowAllSandbox;
+        for c in cases {
+            let dir = TempDir::new().unwrap();
+            let p = dir.path().join("f.txt");
+            tokio::fs::write(&p, &c.initial_content).await.unwrap();
+            // The fixture uses "<FIXTURE_PATH>" as a placeholder; swap in the
+            // real temp-file path at runtime (same pattern as edit_file_cases).
+            let mut input = c.params.clone();
+            input["path"] = Value::String(p.to_str().unwrap().to_string());
+            let out = ReadFileTool::new()
+                .execute(&call("read_file", input), &sb, &test_ctx())
+                .await;
+            match (&out, c.expected.kind.as_str()) {
+                (ToolOutput::Success { content, .. }, "success") => {
+                    assert_eq!(content, &c.expected.content.unwrap(), "{}", c.name);
+                }
+                (
+                    ToolOutput::Error {
+                        recoverable,
+                        message,
+                    },
+                    "error",
+                ) => {
+                    assert_eq!(*recoverable, c.expected.recoverable.unwrap(), "{}", c.name);
+                    if let Some(needle) = c.expected.message_contains.as_deref() {
+                        assert!(
+                            message.contains(needle),
+                            "{}: message {message:?} missing {needle:?}",
+                            c.name
+                        );
+                    }
+                }
+                (other, k) => panic!("{}: expected {k}, got {other:?}", c.name),
+            }
+        }
+    }
 }
