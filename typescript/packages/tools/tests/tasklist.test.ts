@@ -124,11 +124,34 @@ function call(input: unknown): ToolCall {
   return { id: "c1", name: TaskListTool.NAME, input };
 }
 
+/**
+ * The TaskList portion of a success content. On `add_task` the content carries
+ * an extra leading `added` key (#143); strip it so this always yields a bare
+ * TaskList — mirroring the Rust helper that deserializes into a struct ignoring
+ * `added`. Use {@link parseAdded} / {@link successContent} to assert on `added`.
+ */
 function parseList(out: ToolOutput): TaskList {
   if (out.kind !== "success") {
     throw new Error(`expected success, got ${JSON.stringify(out)}`);
   }
-  return JSON.parse(out.content) as TaskList;
+  const { added: _added, ...list } = JSON.parse(out.content) as TaskList & {
+    added?: number;
+  };
+  return list;
+}
+
+/** Raw success-content string, for #143 byte-level and `added`-key asserts. */
+function successContent(out: ToolOutput): string {
+  if (out.kind !== "success") {
+    throw new Error(`expected success, got ${JSON.stringify(out)}`);
+  }
+  return out.content;
+}
+
+/** The `added` field of a success content, or `undefined` if absent (#143). */
+function parseAdded(out: ToolOutput): number | undefined {
+  const v = JSON.parse(successContent(out)) as { added?: number };
+  return v.added;
 }
 
 /** Read the persisted blob straight off a RunStore as a TaskList. */
@@ -429,6 +452,183 @@ describe("TaskListTool", () => {
       "status",
     ]);
   });
+
+  // ==========================================================================
+  // #143: add_task surfaces the assigned id as a leading `added` key.
+  // ==========================================================================
+
+  // R-143.1: add success content carries `added` == the id `addTask` returned,
+  // R-143.2: which is the persisted task's id, and
+  // R-143.3: the full list is still present in the content.
+  it("add success content carries the assigned id", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+
+    const out = await tool.execute(
+      call({ action: "add_task", description: "a" }),
+      sb,
+      ctx,
+    );
+
+    // R-143.1: `added` is present and equals the first assigned id (1).
+    expect(parseAdded(out)).toBe(1);
+    // R-143.3: the full list is still present (and parses, ignoring `added`).
+    const list = parseList(out);
+    expect(list.tasks).toHaveLength(1);
+    expect(list.next_id).toBe(2);
+    // R-143.2: `added` == the persisted task's id.
+    expect(parseAdded(out)).toBe(list.tasks[0].id);
+    const persisted = await loadFromStore(ctx.runStore);
+    expect(parseAdded(out)).toBe(persisted?.tasks[0].id);
+  });
+
+  // R-143.4: two adds → `added` is 1 then 2, with next_id 2 then 3.
+  it("two adds surface sequential ids", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+
+    const r1 = await tool.execute(
+      call({ action: "add_task", description: "a" }),
+      sb,
+      ctx,
+    );
+    expect(parseAdded(r1)).toBe(1);
+    expect(parseList(r1).next_id).toBe(2);
+
+    const r2 = await tool.execute(
+      call({ action: "add_task", description: "b" }),
+      sb,
+      ctx,
+    );
+    expect(parseAdded(r2)).toBe(2);
+    expect(parseList(r2).next_id).toBe(3);
+  });
+
+  // R-143.5: `added` appears ONLY on the add_task branch — never on
+  // update_task, complete_task, or list_tasks.
+  it("added appears only on the add branch", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+
+    await tool.execute(call({ action: "add_task", description: "a" }), sb, ctx);
+
+    const upd = await tool.execute(
+      call({ action: "update_task", id: 1, status: "in_progress" }),
+      sb,
+      ctx,
+    );
+    expect(parseAdded(upd)).toBeUndefined();
+
+    const comp = await tool.execute(
+      call({ action: "complete_task", id: 1 }),
+      sb,
+      ctx,
+    );
+    expect(parseAdded(comp)).toBeUndefined();
+
+    const listed = await tool.execute(call({ action: "list_tasks" }), sb, ctx);
+    expect(parseAdded(listed)).toBeUndefined();
+  });
+
+  // R-143.6: a rejected add (self-block) is a recoverable error with NO `added`
+  // and no list.
+  it("rejected add has no added and no list", async () => {
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a", blockers: [1] }),
+      new AllowAllSandbox(),
+      inMemoryCtx(),
+    );
+    expect(out.kind).toBe("error");
+    if (out.kind === "error") {
+      expect(out.recoverable).toBe(true);
+      expect(out.message).toContain("invalid blockers");
+      // No success content at all → no `added`, no list.
+      expect(out.message).not.toContain("added");
+      expect(out.message).not.toContain("tasks");
+    }
+  });
+
+  // R-143.7: the PERSISTED blob never carries `added` — only the tool's success
+  // content does. The PlanExecute executor depends on this shape.
+  it("persisted blob has no added", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a" }),
+      sb,
+      ctx,
+    );
+    // Success content DOES carry `added`...
+    expect(parseAdded(out)).toBe(1);
+
+    // ...but the raw persisted blob does NOT carry an `added` key.
+    const raw = await ctx.runStore.get(
+      SessionId.of("test-session"),
+      TASK_LIST_KEY,
+    );
+    expect(raw).toBeDefined();
+    expect((raw as Record<string, unknown>).added).toBeUndefined();
+    // The persisted blob round-trips to a bare TaskList whose canonical
+    // serialization is exactly `{"tasks":[...],"next_id":N}` — no `added`.
+    const persisted = tasklist.parseTaskList(JSON.stringify(raw));
+    expect(tasklist.serializeTaskList(persisted)).toBe(
+      '{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}',
+    );
+  });
+
+  // #143 EXACT BYTES: a known add scenario pins the success content
+  // byte-for-byte. This is the cross-language contract the other three
+  // languages must match exactly.
+  it("add success content exact bytes", async () => {
+    const out = await new TaskListTool().execute(
+      call({ action: "add_task", description: "a" }),
+      new AllowAllSandbox(),
+      inMemoryCtx(),
+    );
+    expect(successContent(out)).toBe(
+      '{"added":1,"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}',
+    );
+  });
+
+  // #143 usability: the returned id is directly usable. Add A, use A's returned
+  // `added` id as a blocker for B, then complete A — proving the surfaced id
+  // round-trips through blockers/complete without prediction.
+  it("returned id is usable as a blocker and for complete", async () => {
+    const ctx = inMemoryCtx();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+
+    const ra = await tool.execute(
+      call({ action: "add_task", description: "A" }),
+      sb,
+      ctx,
+    );
+    const aId = parseAdded(ra);
+    expect(aId).toBeDefined();
+
+    // Use the surfaced id as a blocker for B (no prediction).
+    const rb = await tool.execute(
+      call({ action: "add_task", description: "B", blockers: [aId] }),
+      sb,
+      ctx,
+    );
+    expect(parseList(rb).tasks[1].blockers).toEqual([aId]);
+
+    // Complete A by the surfaced id.
+    const rc = await tool.execute(
+      call({ action: "complete_task", id: aId }),
+      sb,
+      ctx,
+    );
+    const c = parseList(rc);
+    const aTask = c.tasks.find((t) => t.id === aId);
+    expect(aTask?.status).toBe("completed");
+    // complete_task is not an add branch → no `added`.
+    expect(parseAdded(rc)).toBeUndefined();
+  });
 });
 
 // ============================================================================
@@ -437,7 +637,14 @@ describe("TaskListTool", () => {
 
 interface OpStep {
   action: unknown;
-  expected: { ok: boolean; list?: TaskList; error?: string };
+  expected: {
+    ok: boolean;
+    list?: TaskList;
+    error?: string;
+    // #143: present on successful add_task steps; the id `addTask` assigned and
+    // the tool must surface as a leading `added` key in the success content.
+    added?: number;
+  };
 }
 interface OpScenario {
   name: string;
@@ -461,11 +668,30 @@ describe("fixture: tasklist operations", () => {
       const tool = new TaskListTool();
       for (let i = 0; i < sc.steps.length; i++) {
         const step = sc.steps[i];
+        const isAdd =
+          (step.action as { action?: unknown } | null)?.action === "add_task";
         const out = await tool.execute(call(step.action), sb, ctx);
         if (step.expected.ok) {
           expect(out.kind, `${sc.name} step ${i}`).toBe("success");
+          // The list portion always survives — parseList strips the extra
+          // `added` key on add steps and yields a bare TaskList.
           const got = parseList(out);
           expect(got, `${sc.name} step ${i}`).toEqual(step.expected.list);
+
+          // #143: add steps carry a leading `added` key equal to the fixture's
+          // `expected.added`; non-add steps must NOT carry one.
+          const contentAdded = parseAdded(out);
+          if (isAdd) {
+            expect(
+              contentAdded,
+              `${sc.name} step ${i}: surfaced added id`,
+            ).toBe(step.expected.added);
+          } else {
+            expect(
+              contentAdded,
+              `${sc.name} step ${i}: non-add step must not carry added`,
+            ).toBeUndefined();
+          }
         } else {
           expect(out.kind, `${sc.name} step ${i}`).toBe("error");
           if (out.kind !== "error") throw new Error("unreachable");

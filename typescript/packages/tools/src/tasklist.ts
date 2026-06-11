@@ -20,6 +20,29 @@
  * 4. on a mutating action, `ctx.runStore.put(sessionId, "task_list", value)`,
  * 5. return the serialized current list as success content.
  *
+ * ## `add_task` surfaces the assigned id (#143)
+ * On a successful `add_task`, the success content is the canonical TaskList
+ * object with ONE extra top-level key `added` placed FIRST — the id just
+ * assigned by {@link "@spore/core".tasklist.addTask}:
+ *
+ * ```json
+ * {"added":3,"tasks":[...],"next_id":4}
+ * ```
+ *
+ * The field order is EXACTLY `added`, then `tasks`, then `next_id`, and is
+ * byte-identical across all four languages so a model can reference a
+ * just-added task without re-parsing the whole list or predicting ids. The
+ * `added` key appears ONLY on the `add_task` success branch — `update_task`,
+ * `complete_task`, and `list_tasks` keep returning the bare serialized TaskList
+ * (`{"tasks":[...],"next_id":N}`), unchanged. A rejected `add_task` (self-block
+ * / unknown blocker / cycle) still returns a recoverable error with NO `added`
+ * and no list.
+ *
+ * CRITICAL: the PERSISTED RunStore blob stays EXACTLY
+ * `{"tasks":[...],"next_id":N}` — NO `added` key. `added` lives only in the
+ * tool's success content, never in what is persisted; the PlanExecute executor
+ * depends on the persisted blob shape.
+ *
  * ### Shared key
  * This standalone tool and the harness-side PlanExecute execute loop persist
  * under the SAME `RunStore` key (`"task_list"`), keyed by `SessionId`. A
@@ -152,14 +175,21 @@ export class TaskListTool implements Tool {
     }
 
     // 3. Apply the action. Domain errors → recoverable. `list_tasks` does not
-    //    mutate.
+    //    mutate. `added` carries the id assigned by `addTask` so the add branch
+    //    can surface it in the success content (#143); `undefined` for the
+    //    non-add (and read-only) actions.
     let mutated = false;
+    let added: number | undefined;
     switch (params.action) {
       case "add_task": {
+        // Capture the assigned id (#143) instead of discarding it. A rejected
+        // blocker set still maps to a recoverable error and leaves the list
+        // untouched.
         const r = addTask(list, params.description, params.blockers);
         if (!r.ok) {
           return { kind: "error", message: r.error.message, recoverable: true };
         }
+        added = r.id;
         mutated = true;
         break;
       }
@@ -214,10 +244,21 @@ export class TaskListTool implements Tool {
       }
     }
 
-    // 5. Return the serialized current list.
+    // 5. Return the serialized current list. On `add_task` (#143) splice the
+    //    assigned id in as a leading `added` key so the success content is
+    //    `{"added":N,"tasks":[...],"next_id":M}` — exactly that field order,
+    //    byte-identical across languages. `serializeTaskList` produces the
+    //    canonical `{"tasks":[...],"next_id":M}` form (always starting with the
+    //    `{` at index 0, never leading whitespace), so splicing `"added":N,`
+    //    right after the opening brace yields the pinned order deterministically.
+    //    Other actions return the bare TaskList unchanged, and the PERSISTED blob
+    //    (step 4) never carries `added`.
+    const bare = serializeTaskList(list);
+    const content =
+      added === undefined ? bare : `{"added":${added},${bare.slice(1)}`;
     return {
       kind: "success",
-      content: serializeTaskList(list),
+      content,
       truncated: false,
     };
   }
