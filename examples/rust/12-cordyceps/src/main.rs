@@ -62,12 +62,12 @@ use std::sync::{Arc, Mutex};
 use spore_core::storage::InMemoryStorageProvider;
 use spore_core::{
     Agent, AgentId, BudgetLimits, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
-    ConsultResponse, EmptyToolRegistry, EscalationAction, EscalationMode, EvaluatorResponseVerifier,
-    ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager, HarnessContextManagerExt,
-    HarnessRunOptions, HarnessStreamEvent, HumanRequest, HumanResponse, LoopStrategy, ModelAgent,
-    NullCacheProvider, OllamaModelInterface, ReactConfig, RunResult, SearchMethod, SessionId,
-    StandardContextManager, StandardTool, StandardTools, StorageProvider, Task, Verifier,
-    WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
+    ConsultResponse, EmptyToolRegistry, EscalationAction, EscalationMode,
+    EvaluatorResponseVerifier, ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager,
+    HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent, HumanRequest, HumanResponse,
+    LoopStrategy, ModelAgent, NullCacheProvider, OllamaModelInterface, ReactConfig, RunResult,
+    SearchMethod, SessionId, StandardContextManager, StandardTool, StandardTools, StorageProvider,
+    Task, Verifier, WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 use crate::skills::{SkillCatalog, SkillInjectingContextManager, ACTIVE_SKILLS_KEY};
@@ -100,8 +100,11 @@ blocker-aware task graph via `task_list`, and whose execute phase walks that gra
 ready-set — auditing one module per ready task, each result self-verified by a read-only \
 evaluator (Default-FAIL: only an explicit PASS clears a task).
 
-Before each step, call `send_user_message` with one short sentence telling the watching human \
-what you are about to do and why.
+Narrate sparingly: call `send_user_message` ONCE at the start of each phase (once when \
+planning begins, once per module audit, once when verification begins) with one short \
+sentence for the watching human. Do not narrate individual tool calls — spend your turns on \
+real actions. When you can, emit the narration call in the SAME turn as your first real \
+action for that phase.
 
 You are already scoped to the repository root (READ-ONLY). Use `.` for the root and paths \
 relative to it (e.g. `rust/crates`); never prefix a path with the repository's own folder name. \
@@ -110,31 +113,39 @@ The audit is read-only — you have no write tool; never attempt to modify sourc
 Follow the ACTIVE `audit` skill's procedure and output schema exactly: grep first, read narrow, \
 and return findings as a JSON array of {file, line, severity, description}.
 
-PLAN phase: explore the repo with `list_dir`/`grep`, then build a blocker-aware task graph with \
-`task_list` (one task per module; add dependencies where one audit should wait on another). \
+PLAN phase: first explore the repo. Start with `list_dir({\"path\":\".\",\"recursive\":false})` \
+to see the top-level structure, then drill into specific subdirectories — do NOT call \
+`list_dir` recursively on the full repo (it returns thousands of entries and floods context). \
+Then author the task graph: for EACH module to audit, call `task_list` with EXACTLY this \
+shape: {\"action\":\"add_task\",\"description\":\"audit <module path>\",\"blockers\":[<ids of \
+earlier tasks this one must wait on; [] if none>]}. The `description` field is REQUIRED on \
+every add_task. Task ids are assigned 1,2,3,... in the order you add them. When every task is \
+added, END the plan phase with a final message that is ONLY this JSON object and no other \
+text: {\"tasks\":[\"<one short string per task, same order>\"],\"rationale\":\"<one \
+sentence>\"} — `tasks` MUST be an array of plain STRINGS, not objects. \
 RALPH wrapper: resume from durable `task_list` progress after each context-window reset and keep \
 going until every task is done.";
 
-/// `plan-schema` — the task-graph contract the plan phase's ReAct emits.
+/// `plan-schema` — the plan phase's FINAL-ANSWER contract: the exact shape the
+/// harness's `capture_plan_artifact` parses (`{tasks: [strings], rationale}`).
+///
+/// HONEST note: `ReactConfig.output` is presence-validated by the registry but
+/// is currently neither delivered to the model nor enforced against the
+/// terminal (see the "deliver + enforce output schemas" core issue). This
+/// schema documents the contract for the human reader. The blocker-aware task
+/// GRAPH is authored separately through the `task_list` tool — it is NOT this
+/// final answer.
 fn plan_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "tasks": {
                 "type": "array",
-                "description": "Ordered task-graph entries; each names a module to audit.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "module": { "type": "string", "description": "Module path to audit." },
-                        "blockers": {
-                            "type": "array",
-                            "items": { "type": "integer" },
-                            "description": "1-based ids of tasks this one waits on."
-                        }
-                    },
-                    "required": ["module"]
-                }
+                "items": { "type": "string" },
+                "description": "Ordered one-line summaries of the planned audits \
+                                (one string per task_list task, same order). The \
+                                authoritative blocker-aware graph lives in the \
+                                task_list store."
             },
             "rationale": { "type": "string" }
         },
@@ -166,6 +177,7 @@ fn plan_tools() -> Vec<StandardTool> {
         StandardTools::list_dir(),
         StandardTools::grep(),
         StandardTools::task_list(),
+        send_user_message_tool("🤖"),
     ]
 }
 
@@ -477,9 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // that produced it (kind / agent_id / depth / path), so the trace shows the
         // plan ReAct, the worker, and the evaluator live, indented by tree depth.
         // (This is the exact seam an API backing a web UI would forward over SSE.)
-        let mut result = harness
-            .run(HarnessRunOptions::new(task).with_stream(node_stream_sink()))
-            .await;
+        // ONE sink, threaded through the initial run AND every resume — passing
+        // `None` to resume would drop the trace for the rest of the run.
+        let sink: spore_core::harness::StreamSink = Arc::new(node_stream_sink());
+        let mut opts = HarnessRunOptions::new(task);
+        opts.on_stream = Some(sink.clone());
+        let mut result = harness.run(opts).await;
         loop {
             match result {
                 RunResult::Success { output, turns, .. } => {
@@ -499,11 +514,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut consult_counts,
                         request,
                         *state,
+                        &sink,
                     )
                     .await;
                 }
                 RunResult::WaitingForHuman { state, request } => {
-                    result = handle_human_escalation(&harness, *state, request).await;
+                    result = handle_human_escalation(&harness, *state, request, &sink).await;
                 }
                 other => {
                     eprintln!("\nrun ended unexpectedly: {other:?}");
@@ -530,11 +546,15 @@ async fn mediate_consult(
     counts: &mut HashMap<String, u32>,
     request: ConsultRequest,
     state: spore_core::PausedState,
+    sink: &spore_core::harness::StreamSink,
 ) -> RunResult {
     // No handler for this kind ⇒ resume the worker without help (loud, not a
     // silent stall). Matches SubagentTool R6 graceful degradation in spirit.
     let Some(entry) = handlers.get(&request.kind) else {
-        eprintln!("\n(no consult handler for kind {:?}; worker proceeds)", request.kind);
+        eprintln!(
+            "\n(no consult handler for kind {:?}; worker proceeds)",
+            request.kind
+        );
         return harness
             .resume_consult(
                 state,
@@ -544,7 +564,7 @@ async fn mediate_consult(
                         request.kind
                     ),
                 },
-                None,
+                Some(sink.clone()),
             )
             .await;
     };
@@ -569,12 +589,12 @@ async fn mediate_consult(
                                 request.kind
                             ),
                         },
-                        None,
+                        Some(sink.clone()),
                     )
                     .await
             }
             ConsultOverflowPolicy::EscalateToHuman => {
-                handle_consult_overflow(harness, entry, request, state).await
+                handle_consult_overflow(harness, entry, request, state, sink).await
             }
         };
     }
@@ -604,7 +624,11 @@ async fn mediate_consult(
     };
     println!("└─ consult answer: {}", truncate(&answer, 200));
     harness
-        .resume_consult(state, ConsultResponse::Answer { text: answer }, None)
+        .resume_consult(
+            state,
+            ConsultResponse::Answer { text: answer },
+            Some(sink.clone()),
+        )
         .await
 }
 
@@ -627,6 +651,7 @@ async fn handle_consult_overflow(
     entry: &ConsultHandlerEntry,
     request: ConsultRequest,
     state: spore_core::PausedState,
+    sink: &spore_core::harness::StreamSink,
 ) -> RunResult {
     println!("\n╔═ HUMAN ESCALATION (advisor budget exhausted) ═");
     println!("║ situation: {}", truncate(&request.situation, 200));
@@ -645,14 +670,14 @@ async fn handle_consult_overflow(
                     ConsultResponse::BudgetExhausted {
                         message: "advisor budget exhausted; proceed without further help".into(),
                     },
-                    None,
+                    Some(sink.clone()),
                 )
                 .await
         }
         "3" => {
             let text = prompt_line("answer> ");
             harness
-                .resume_consult(state, ConsultResponse::Answer { text }, None)
+                .resume_consult(state, ConsultResponse::Answer { text }, Some(sink.clone()))
                 .await
         }
         // Default ([1] or empty): run the advisor handler once more host-side and
@@ -674,7 +699,11 @@ async fn handle_consult_overflow(
             };
             println!("advisor: {}", truncate(&answer, 300));
             harness
-                .resume_consult(state, ConsultResponse::Answer { text: answer }, None)
+                .resume_consult(
+                    state,
+                    ConsultResponse::Answer { text: answer },
+                    Some(sink.clone()),
+                )
                 .await
         }
     }
@@ -688,6 +717,7 @@ async fn handle_human_escalation(
     harness: &spore_core::StandardHarness,
     state: spore_core::PausedState,
     request: HumanRequest,
+    sink: &spore_core::harness::StreamSink,
 ) -> RunResult {
     let (phase, actions) = match &request {
         HumanRequest::BudgetExhausted {
@@ -699,7 +729,9 @@ async fn handle_human_escalation(
             // The composed tree only escalates via BudgetExhausted; anything else
             // is unexpected — halt cleanly.
             eprintln!("\nunexpected human request: {other:?}");
-            return harness.resume(state, HumanResponse::Halt, None).await;
+            return harness
+                .resume(state, HumanResponse::Halt, Some(sink.clone()))
+                .await;
         }
     };
 
@@ -723,7 +755,11 @@ async fn handle_human_escalation(
 
     println!("(resuming with {})", describe_action(&action));
     harness
-        .resume(state, HumanResponse::Escalate { action }, None)
+        .resume(
+            state,
+            HumanResponse::Escalate { action },
+            Some(sink.clone()),
+        )
         .await
 }
 
@@ -807,7 +843,10 @@ fn node_stream_sink_prefixed(
                 println!("{indent}[{tag}] · turn {turn}");
             }
             HarnessStreamEvent::ToolCall {
-                call_id, name, args, ..
+                call_id,
+                name,
+                args,
+                ..
             } => {
                 call_names.lock().unwrap().insert(call_id, name.clone());
                 // `send_user_message` renders itself as the 🤖 UserMessage event.
