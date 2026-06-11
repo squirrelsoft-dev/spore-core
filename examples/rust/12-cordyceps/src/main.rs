@@ -131,7 +131,7 @@ going until every task is done.";
 ///
 /// HONEST note: `ReactConfig.output` is presence-validated by the registry but
 /// is currently neither delivered to the model nor enforced against the
-/// terminal (see the "deliver + enforce output schemas" core issue). This
+/// terminal (see #139, "deliver + enforce output schemas"). This
 /// schema documents the contract for the human reader. The blocker-aware task
 /// GRAPH is authored separately through the `task_list` tool — it is NOT this
 /// final answer.
