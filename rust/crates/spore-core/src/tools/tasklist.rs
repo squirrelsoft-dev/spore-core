@@ -18,6 +18,29 @@
 //! 4. on a mutating action, `ctx.run_store().put(session_id, "task_list", value)`,
 //! 5. return the serialized current list as success content.
 //!
+//! ## `add_task` surfaces the assigned id (#143)
+//! On a successful `add_task`, the success content is the canonical TaskList
+//! object with ONE extra top-level key `added` placed FIRST — the id just
+//! assigned by [`TaskList::add`]:
+//!
+//! ```json
+//! {"added":3,"tasks":[...],"next_id":4}
+//! ```
+//!
+//! The field order is EXACTLY `added`, then `tasks`, then `next_id`, and is
+//! byte-identical across all four languages so a model can reference a
+//! just-added task without re-parsing the whole list or predicting ids. The
+//! `added` key appears ONLY on the `add_task` success branch — `update_task`,
+//! `complete_task`, and `list_tasks` keep returning the bare serialized
+//! TaskList (`{"tasks":[...],"next_id":N}`), unchanged. A rejected `add_task`
+//! (self-block / unknown blocker / cycle) still returns a recoverable error
+//! with NO `added` and no list.
+//!
+//! CRITICAL: the PERSISTED RunStore blob stays EXACTLY
+//! `{"tasks":[...],"next_id":N}` — NO `added` key. `added` lives only in the
+//! tool's success content, never in what is persisted; the PlanExecute executor
+//! depends on the persisted blob shape.
+//!
 //! ### Shared key
 //! This standalone tool and the harness-side PlanExecute execute loop persist
 //! under the SAME `RunStore` key (`"task_list"`), keyed by `SessionId`. A
@@ -154,17 +177,26 @@ impl Tool for TaskListTool {
             };
 
             // 3. Apply the action. Domain errors → recoverable. `list_tasks`
-            //    does not mutate.
+            //    does not mutate. `added` carries the id assigned by `add` so
+            //    the add branch can surface it in the success content (#143);
+            //    `None` for the non-add (and read-only) actions.
+            let mut added: Option<u32> = None;
             let mutated = match params {
                 TaskListParams::AddTask {
                     description,
                     blockers,
                 } => {
-                    if let Err(e) = list.add(description, blockers) {
-                        return ToolOutput::Error {
-                            message: e.to_string(),
-                            recoverable: true,
-                        };
+                    // Capture the assigned id (#143) instead of discarding it.
+                    // A rejected blocker set still maps to a recoverable error
+                    // and leaves the list untouched.
+                    match list.add(description, blockers) {
+                        Ok(id) => added = Some(id),
+                        Err(e) => {
+                            return ToolOutput::Error {
+                                message: e.to_string(),
+                                recoverable: true,
+                            };
+                        }
                     }
                     true
                 }
@@ -214,16 +246,35 @@ impl Tool for TaskListTool {
                 }
             }
 
-            // 5. Return the serialized current list.
-            match serde_json::to_string(&list) {
-                Ok(content) => ToolOutput::Success {
-                    content,
-                    truncated: false,
-                },
-                Err(e) => ToolOutput::Error {
-                    message: format!("could not serialize task list: {e}"),
-                    recoverable: true,
-                },
+            // 5. Return the serialized current list. On `add_task` (#143) splice
+            //    the assigned id in as a leading `added` key so the success
+            //    content is `{"added":N,"tasks":[...],"next_id":M}` — exactly
+            //    that field order, byte-identical across languages. The canonical
+            //    `serde_json` form of `TaskList` is `{"tasks":[...],"next_id":M}`
+            //    (struct fields serialize in declaration order, NOT
+            //    alphabetically), so splicing `"added":N,` right after the
+            //    opening brace yields the pinned order deterministically. Other
+            //    actions return the bare TaskList unchanged, and the PERSISTED
+            //    blob (step 4) never carries `added`.
+            let bare = match serde_json::to_string(&list) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ToolOutput::Error {
+                        message: format!("could not serialize task list: {e}"),
+                        recoverable: true,
+                    };
+                }
+            };
+            let content = match added {
+                // `bare` is the canonical form starting with `{"tasks":`; insert
+                // `"added":N,` after the leading `{` (index 1). `serde_json`
+                // never emits leading whitespace, so byte 0 is always `{`.
+                Some(id) => format!("{{\"added\":{id},{}", &bare[1..]),
+                None => bare,
+            };
+            ToolOutput::Success {
+                content,
+                truncated: false,
             }
         })
     }
@@ -376,6 +427,20 @@ mod tests {
             ToolOutput::Success { content, .. } => serde_json::from_str(content).unwrap(),
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    /// Raw success-content string, for #143 byte-level and `added`-key asserts.
+    fn success_content(out: &ToolOutput) -> &str {
+        match out {
+            ToolOutput::Success { content, .. } => content,
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    /// The `added` field of a success content, or `None` if absent (#143).
+    fn parse_added(out: &ToolOutput) -> Option<u32> {
+        let v: serde_json::Value = serde_json::from_str(success_content(out)).unwrap();
+        v.get("added").map(|a| a.as_u64().unwrap() as u32)
     }
 
     /// Read the persisted blob straight off a RunStore as a `TaskList`.
@@ -789,6 +854,234 @@ mod tests {
     }
 
     // ========================================================================
+    // #143: add_task surfaces the assigned id as a leading `added` key.
+    // ========================================================================
+
+    // R-143.1: add success content carries `added` == the id `add` returned,
+    // R-143.2: which is the persisted task's id, and
+    // R-143.3: the full list is still present in the content.
+    #[tokio::test]
+    async fn add_success_content_carries_assigned_id() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+
+        let r = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "a"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+
+        // R-143.1: `added` is present and equals the first assigned id (1).
+        assert_eq!(parse_added(&r), Some(1));
+        // R-143.3: the full list is still present (and parses, ignoring `added`).
+        let list = parse_list(&r);
+        assert_eq!(list.tasks.len(), 1);
+        assert_eq!(list.next_id, 2);
+        // R-143.2: `added` == the persisted task's id.
+        assert_eq!(parse_added(&r), Some(list.tasks[0].id));
+        let persisted = load_from_store(ctx.run_store(), "test-session")
+            .await
+            .unwrap();
+        assert_eq!(parse_added(&r), Some(persisted.tasks[0].id));
+    }
+
+    // R-143.4: two adds → `added` is 1 then 2, with next_id 2 then 3.
+    #[tokio::test]
+    async fn two_adds_surface_sequential_ids() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+
+        let r1 = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "a"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        assert_eq!(parse_added(&r1), Some(1));
+        assert_eq!(parse_list(&r1).next_id, 2);
+
+        let r2 = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "b"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        assert_eq!(parse_added(&r2), Some(2));
+        assert_eq!(parse_list(&r2).next_id, 3);
+    }
+
+    // R-143.5: `added` appears ONLY on the add_task branch — never on
+    // update_task, complete_task, or list_tasks.
+    #[tokio::test]
+    async fn added_only_on_add_branch() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+
+        tool.execute(
+            &call(json!({"action": "add_task", "description": "a"})),
+            &sb,
+            &ctx,
+        )
+        .await;
+
+        let upd = tool
+            .execute(
+                &call(json!({"action": "update_task", "id": 1, "status": "in_progress"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        assert_eq!(parse_added(&upd), None);
+
+        let comp = tool
+            .execute(
+                &call(json!({"action": "complete_task", "id": 1})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        assert_eq!(parse_added(&comp), None);
+
+        let listed = tool
+            .execute(&call(json!({"action": "list_tasks"})), &sb, &ctx)
+            .await;
+        assert_eq!(parse_added(&listed), None);
+    }
+
+    // R-143.6: a rejected add (self-block) is a recoverable error with NO
+    // `added` and no list.
+    #[tokio::test]
+    async fn rejected_add_has_no_added_and_no_list() {
+        let ctx = in_memory_ctx();
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a", "blockers": [1]})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        match r {
+            ToolOutput::Error {
+                recoverable,
+                message,
+            } => {
+                assert!(recoverable);
+                assert!(message.contains("invalid blockers"), "{message}");
+                // No success content at all → no `added`, no list.
+                assert!(!message.contains("added"), "{message}");
+                assert!(!message.contains("tasks"), "{message}");
+            }
+            other => panic!("expected recoverable error, got {other:?}"),
+        }
+    }
+
+    // R-143.7: the PERSISTED blob never carries `added` — only the tool's
+    // success content does. The PlanExecute executor depends on this shape.
+    #[tokio::test]
+    async fn persisted_blob_has_no_added() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        // Success content DOES carry `added`...
+        assert_eq!(parse_added(&r), Some(1));
+
+        // ...but the raw persisted blob does NOT carry an `added` key.
+        let raw = ctx
+            .run_store()
+            .get(&SessionId::new("test-session"), TASK_LIST_EXTRAS_KEY)
+            .await
+            .unwrap()
+            .expect("persisted blob present");
+        assert!(raw.get("added").is_none(), "persisted blob: {raw}");
+        // The persisted blob round-trips to a bare TaskList whose canonical
+        // serialization is exactly `{"tasks":[...],"next_id":N}` — no `added`.
+        // (The stored value is a serde_json::Value, whose own re-serialization
+        // sorts keys; re-serialize through the TaskList struct to pin the
+        // canonical declaration-order bytes the PlanExecute executor reads.)
+        let persisted: TaskList = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            serde_json::to_string(&persisted).unwrap(),
+            r#"{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}"#
+        );
+    }
+
+    // #143 EXACT BYTES: a known add scenario pins the success content
+    // byte-for-byte. This is the cross-language contract the other three
+    // languages must match exactly.
+    #[tokio::test]
+    async fn add_success_content_exact_bytes() {
+        let ctx = in_memory_ctx();
+        let r = TaskListTool::new()
+            .execute(
+                &call(json!({"action": "add_task", "description": "a"})),
+                &AllowAllSandbox,
+                &ctx,
+            )
+            .await;
+        assert_eq!(
+            success_content(&r),
+            r#"{"added":1,"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}"#
+        );
+    }
+
+    // #143 usability: the returned id is directly usable. Add A, use A's
+    // returned `added` id as a blocker for B, then complete A — proving the
+    // surfaced id round-trips through blockers/complete without prediction.
+    #[tokio::test]
+    async fn returned_id_is_usable_as_blocker_and_for_complete() {
+        let ctx = in_memory_ctx();
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+
+        let ra = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "A"})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        let a_id = parse_added(&ra).expect("A surfaced an id");
+
+        // Use the surfaced id as a blocker for B (no prediction).
+        let rb = tool
+            .execute(
+                &call(json!({"action": "add_task", "description": "B", "blockers": [a_id]})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        let b = parse_list(&rb);
+        assert_eq!(b.tasks[1].blockers, vec![a_id]);
+
+        // Complete A by the surfaced id.
+        let rc = tool
+            .execute(
+                &call(json!({"action": "complete_task", "id": a_id})),
+                &sb,
+                &ctx,
+            )
+            .await;
+        let c = parse_list(&rc);
+        let a_task = c.tasks.iter().find(|t| t.id == a_id).unwrap();
+        assert_eq!(a_task.status, TaskStatus::Completed);
+        // complete_task is not an add branch → no `added`.
+        assert_eq!(parse_added(&rc), None);
+    }
+
+    // ========================================================================
     // Fixture replay (now driven over an in-memory RunStore, not the sandbox)
     // ========================================================================
 
@@ -810,6 +1103,10 @@ mod tests {
         list: Option<TaskList>,
         #[serde(default)]
         error: Option<String>,
+        // #143: present on successful add_task steps; the id `add` assigned and
+        // the tool must surface as a leading `added` key in the success content.
+        #[serde(default)]
+        added: Option<u32>,
     }
     #[derive(serde::Deserialize)]
     struct OpScenario {
@@ -833,13 +1130,42 @@ mod tests {
             let ctx = in_memory_ctx();
             for (i, step) in sc.steps.iter().enumerate() {
                 let out = tool.execute(&call(step.action.clone()), &sb, &ctx).await;
+                let is_add = step.action.get("action").and_then(|a| a.as_str()) == Some("add_task");
                 match (&out, step.expected.ok) {
                     (ToolOutput::Success { content, .. }, true) => {
+                        // The list portion always survives — serde ignores the
+                        // extra `added` key on add steps.
                         let got: TaskList = serde_json::from_str(content).unwrap();
                         let want = step.expected.list.as_ref().unwrap_or_else(|| {
                             panic!("{} step {i}: ok step missing `list`", sc.name)
                         });
                         assert_eq!(&got, want, "{} step {i}", sc.name);
+
+                        // #143: add steps carry a leading `added` key equal to
+                        // the fixture's `expected.added`; non-add steps must NOT
+                        // carry one.
+                        let content_added: Option<u32> =
+                            serde_json::from_str::<serde_json::Value>(content)
+                                .unwrap()
+                                .get("added")
+                                .map(|a| a.as_u64().unwrap() as u32);
+                        if is_add {
+                            let want_added = step.expected.added.unwrap_or_else(|| {
+                                panic!("{} step {i}: add step missing `added`", sc.name)
+                            });
+                            assert_eq!(
+                                content_added,
+                                Some(want_added),
+                                "{} step {i}: surfaced added id",
+                                sc.name
+                            );
+                        } else {
+                            assert_eq!(
+                                content_added, None,
+                                "{} step {i}: non-add step must not carry `added`",
+                                sc.name
+                            );
+                        }
                     }
                     (
                         ToolOutput::Error {

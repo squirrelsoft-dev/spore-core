@@ -6,6 +6,7 @@
         "action": {"action": "add_task", "description": "first"},
         "expected": {
           "ok": true,
+          "added": 1,
           "list": {
             "tasks": [{"id": 1, "description": "first", "status": "pending", "blockers": []}],
             "next_id": 2
@@ -16,6 +17,7 @@
         "action": {"action": "add_task", "description": "second"},
         "expected": {
           "ok": true,
+          "added": 2,
           "list": {
             "tasks": [
               {"id": 1, "description": "first", "status": "pending", "blockers": []},
@@ -86,6 +88,7 @@
         "action": {"action": "add_task", "description": "task"},
         "expected": {
           "ok": true,
+          "added": 1,
           "list": {
             "tasks": [{"id": 1, "description": "task", "status": "pending", "blockers": []}],
             "next_id": 2
@@ -129,6 +132,7 @@
         "action": {"action": "add_task", "description": "build"},
         "expected": {
           "ok": true,
+          "added": 1,
           "list": {
             "tasks": [{"id": 1, "description": "build", "status": "pending", "blockers": []}],
             "next_id": 2
@@ -139,6 +143,7 @@
         "action": {"action": "add_task", "description": "test", "blockers": [1]},
         "expected": {
           "ok": true,
+          "added": 2,
           "list": {
             "tasks": [
               {"id": 1, "description": "build", "status": "pending", "blockers": []},
@@ -152,6 +157,7 @@
         "action": {"action": "add_task", "description": "ship", "blockers": [1, 2]},
         "expected": {
           "ok": true,
+          "added": 3,
           "list": {
             "tasks": [
               {"id": 1, "description": "build", "status": "pending", "blockers": []},
@@ -187,6 +193,7 @@
         "action": {"action": "add_task", "description": "a"},
         "expected": {
           "ok": true,
+          "added": 1,
           "list": {
             "tasks": [{"id": 1, "description": "a", "status": "pending", "blockers": []}],
             "next_id": 2
