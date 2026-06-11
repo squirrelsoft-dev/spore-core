@@ -14,7 +14,28 @@
 //  2. toolCtx.Get(ctx, "task_list") (absent → DefaultTaskList),
 //  3. apply the action (domain errors → recoverable),
 //  4. on a mutating action, toolCtx.Put(ctx, "task_list", value),
-//  5. return the serialized current list as success content.
+//  5. return the serialized current list as success content (on add_task,
+//     prefixed with the assigned id as a leading `added` key — see #143 below).
+//
+// # add_task surfaces the assigned id (#143)
+//
+// On a successful add_task, the success content is the canonical TaskList object
+// with ONE extra top-level key `added` placed FIRST — the id just assigned by
+// TaskList.Add:
+//
+//	{"added":3,"tasks":[...],"next_id":4}
+//
+// The field order is EXACTLY `added`, then `tasks`, then `next_id`, and is
+// byte-identical across all four languages so a model can reference a just-added
+// task without re-parsing the whole list or predicting ids. The `added` key
+// appears ONLY on the add_task success branch — update_task, complete_task, and
+// list_tasks keep returning the bare serialized TaskList ({"tasks":[...],
+// "next_id":N}), unchanged. A rejected add_task (self-block / unknown blocker /
+// cycle) still returns a recoverable error with NO `added` and no list.
+//
+// CRITICAL: the PERSISTED RunStore blob stays EXACTLY {"tasks":[...],"next_id":N}
+// — NO `added` key. `added` lives only in the tool's success content, never in
+// what is persisted; the PlanExecute executor depends on the persisted blob shape.
 //
 // Shared key: this standalone tool and the harness-side PlanExecute execute loop
 // (#76) persist under the SAME RunStore key ("task_list"), keyed by SessionID. A
@@ -117,13 +138,22 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ s
 		}
 	}
 
-	// 3. Apply the action. Domain errors → recoverable. list_tasks does not mutate.
+	// 3. Apply the action. Domain errors → recoverable. list_tasks does not
+	//    mutate. `added` carries the id assigned by Add so the add branch can
+	//    surface it in the success content (#143); it stays nil for the non-add
+	//    (and read-only) actions, which return the bare serialized TaskList.
 	mutated := false
+	var added *uint32
 	switch params.Action {
 	case TaskListActionAddTask:
-		if _, domErr := list.Add(*params.Description, params.Blockers); domErr != nil {
+		// Capture the assigned id (#143) instead of discarding it. A rejected
+		// blocker set still maps to a recoverable error and leaves the list
+		// untouched.
+		id, domErr := list.Add(*params.Description, params.Blockers)
+		if domErr != nil {
 			return ExecutionFailed(domErr.Error(), true).ToToolOutput()
 		}
+		added = &id
 		mutated = true
 	case TaskListActionUpdateTask:
 		if domErr := list.Update(*params.ID, params.Status, params.Description); domErr != nil {
@@ -151,12 +181,29 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ s
 		}
 	}
 
-	// 5. Return the serialized current list.
-	content, err := json.Marshal(list)
+	// 5. Return the serialized current list. On add_task (#143) splice the
+	//    assigned id in as a leading `added` key so the success content is
+	//    {"added":N,"tasks":[...],"next_id":M} — exactly that field order,
+	//    byte-identical across languages. The canonical TaskList marshaling is
+	//    {"tasks":[...],"next_id":M} (struct fields marshal in declaration order,
+	//    NOT alphabetically), so splicing `"added":N,` right after the opening
+	//    brace yields the pinned order deterministically. Re-marshaling a map or
+	//    a new struct is NOT used: encoding/json sorts map keys alphabetically
+	//    (added,next_id,tasks — wrong order), so we splice onto the existing
+	//    canonical bytes. Other actions return the bare TaskList unchanged, and
+	//    the PERSISTED blob (step 4) never carries `added`.
+	bare, err := json.Marshal(list)
 	if err != nil {
 		return ExecutionFailed(fmt.Sprintf("could not serialize task list: %s", err), true).ToToolOutput()
 	}
-	return sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess, Content: string(content)}
+	content := string(bare)
+	if added != nil {
+		// `bare` is the canonical form starting with `{"tasks":`; insert
+		// `"added":N,` after the leading `{` (index 1). encoding/json never
+		// emits leading whitespace, so byte 0 is always `{`.
+		content = fmt.Sprintf("{\"added\":%d,%s", *added, content[1:])
+	}
+	return sporecore.ToolOutput{Kind: sporecore.ToolOutputSuccess, Content: content}
 }
 
 // validateTaskListParams enforces the per-action field requirements that the

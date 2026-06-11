@@ -97,6 +97,32 @@ func parseList(t *testing.T, out sporecore.ToolOutput) sporecore.TaskList {
 	return l
 }
 
+// parseAdded returns the `added` field of a success content, or nil if absent
+// (#143). The content is parsed loosely so the add-only leading key is read
+// without disturbing the bare-TaskList parse path.
+func parseAdded(t *testing.T, out sporecore.ToolOutput) *uint32 {
+	t.Helper()
+	if out.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("expected Success, got %+v", out)
+	}
+	var probe struct {
+		Added *uint32 `json:"added"`
+	}
+	if err := json.Unmarshal([]byte(out.Content), &probe); err != nil {
+		t.Fatalf("unmarshal content %q: %v", out.Content, err)
+	}
+	return probe.Added
+}
+
+// actionName extracts the `action` discriminator from a raw fixture step.
+func actionName(raw json.RawMessage) string {
+	var probe struct {
+		Action string `json:"action"`
+	}
+	_ = json.Unmarshal(raw, &probe)
+	return probe.Action
+}
+
 func TestAddThenListPersistsAndAssignsIDs(t *testing.T) {
 	tc, store := inMemCtx()
 	sb := sporecore.AllowAllSandbox{}
@@ -451,6 +477,208 @@ func TestSchemaIsNotReadOnly(t *testing.T) {
 }
 
 // ============================================================================
+// #143: add_task surfaces the assigned id as a leading `added` key.
+// ============================================================================
+
+// R-143.1: add success content carries `added` == the id Add returned,
+// R-143.2: which is the persisted task's id, and
+// R-143.3: the full list is still present in the content.
+func TestAddSuccessContentCarriesAssignedID(t *testing.T) {
+	tc, store := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	r := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
+
+	// R-143.1: `added` is present and equals the first assigned id (1).
+	got := parseAdded(t, r)
+	if got == nil || *got != 1 {
+		t.Fatalf("added = %v, want 1", got)
+	}
+	// R-143.3: the full list is still present (and parses, ignoring `added`).
+	list := parseList(t, r)
+	if len(list.Tasks) != 1 || list.NextID != 2 {
+		t.Fatalf("list = %+v", list)
+	}
+	// R-143.2: `added` == the persisted task's id.
+	if *got != list.Tasks[0].ID {
+		t.Fatalf("added %d != content task id %d", *got, list.Tasks[0].ID)
+	}
+	persisted, found := loadFromStore(t, store, testSession)
+	if !found {
+		t.Fatal("task_list blob not persisted")
+	}
+	if *got != persisted.Tasks[0].ID {
+		t.Fatalf("added %d != persisted task id %d", *got, persisted.Tasks[0].ID)
+	}
+}
+
+// R-143.4: two adds → `added` is 1 then 2, with next_id 2 then 3.
+func TestTwoAddsSurfaceSequentialIDs(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	r1 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
+	if a := parseAdded(t, r1); a == nil || *a != 1 {
+		t.Fatalf("first add: added = %v, want 1", a)
+	}
+	if parseList(t, r1).NextID != 2 {
+		t.Fatalf("first add: next_id != 2")
+	}
+
+	r2 := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b"}), sb, tc)
+	if a := parseAdded(t, r2); a == nil || *a != 2 {
+		t.Fatalf("second add: added = %v, want 2", a)
+	}
+	if parseList(t, r2).NextID != 3 {
+		t.Fatalf("second add: next_id != 3")
+	}
+}
+
+// R-143.5: `added` appears ONLY on the add_task branch — never on update_task,
+// complete_task, or list_tasks.
+func TestAddedOnlyOnAddBranch(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
+
+	upd := tool.Execute(ctx, tlCall(map[string]any{"action": "update_task", "id": 1, "status": "in_progress"}), sb, tc)
+	if a := parseAdded(t, upd); a != nil {
+		t.Fatalf("update_task carried added = %d", *a)
+	}
+
+	comp := tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": 1}), sb, tc)
+	if a := parseAdded(t, comp); a != nil {
+		t.Fatalf("complete_task carried added = %d", *a)
+	}
+
+	listed := tool.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb, tc)
+	if a := parseAdded(t, listed); a != nil {
+		t.Fatalf("list_tasks carried added = %d", *a)
+	}
+}
+
+// R-143.6: a rejected add (self-block) is a recoverable error with NO `added`
+// and no list.
+func TestRejectedAddHasNoAddedAndNoList(t *testing.T) {
+	tc, _ := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a", "blockers": []uint32{1}}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+	if !strings.Contains(r.Message, "invalid blockers") {
+		t.Fatalf("message %q does not mention invalid blockers", r.Message)
+	}
+	// No success content at all → no `added`, no list.
+	if strings.Contains(r.Message, "added") || strings.Contains(r.Message, "tasks") {
+		t.Fatalf("rejected add leaked added/tasks in message %q", r.Message)
+	}
+	if r.Content != "" {
+		t.Fatalf("rejected add should have no success content, got %q", r.Content)
+	}
+}
+
+// R-143.7: the PERSISTED blob never carries `added` — only the tool's success
+// content does. The PlanExecute executor depends on this shape.
+func TestPersistedBlobHasNoAdded(t *testing.T) {
+	tc, store := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a"}), sb, tc)
+	// Success content DOES carry `added`...
+	if a := parseAdded(t, r); a == nil || *a != 1 {
+		t.Fatalf("success content added = %v, want 1", a)
+	}
+
+	// ...but the raw persisted blob does NOT carry an `added` key.
+	raw, found, err := store.Get(context.Background(), sporecore.SessionID(testSession), sporecore.TaskListExtrasKey)
+	if err != nil || !found {
+		t.Fatalf("persisted blob missing: found=%v err=%v", found, err)
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("unmarshal persisted blob: %v", err)
+	}
+	if _, ok := probe["added"]; ok {
+		t.Fatalf("persisted blob carries `added`: %s", raw)
+	}
+	// The persisted blob round-trips to a bare TaskList whose canonical
+	// serialization is exactly {"tasks":[...],"next_id":N} — no `added`.
+	var persisted sporecore.TaskList
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatalf("parse persisted blob: %v", err)
+	}
+	reser, _ := json.Marshal(persisted)
+	if string(reser) != `{"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}` {
+		t.Fatalf("persisted blob canonical bytes: %s", reser)
+	}
+}
+
+// #143 EXACT BYTES: a known add scenario pins the success content byte-for-byte.
+// This is the cross-language contract the other three languages must match.
+func TestAddSuccessContentExactBytes(t *testing.T) {
+	tc, _ := inMemCtx()
+	r := NewTaskListTool().Execute(context.Background(),
+		tlCall(map[string]any{"action": "add_task", "description": "a"}),
+		sporecore.AllowAllSandbox{}, tc)
+	if r.Kind != sporecore.ToolOutputSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+	want := `{"added":1,"tasks":[{"id":1,"description":"a","status":"pending","blockers":[]}],"next_id":2}`
+	if r.Content != want {
+		t.Fatalf("exact bytes:\n got: %s\nwant: %s", r.Content, want)
+	}
+}
+
+// #143 usability: the returned id is directly usable. Add A, use A's returned
+// `added` id as a blocker for B, then complete A — proving the surfaced id
+// round-trips through blockers/complete without prediction.
+func TestReturnedIDIsUsableAsBlockerAndForComplete(t *testing.T) {
+	tc, _ := inMemCtx()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	ra := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "A"}), sb, tc)
+	aID := parseAdded(t, ra)
+	if aID == nil {
+		t.Fatal("A surfaced no id")
+	}
+
+	// Use the surfaced id as a blocker for B (no prediction).
+	rb := tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "B", "blockers": []uint32{*aID}}), sb, tc)
+	b := parseList(t, rb)
+	if got := b.Tasks[1].Blockers; len(got) != 1 || got[0] != *aID {
+		t.Fatalf("B blockers = %v, want [%d]", got, *aID)
+	}
+
+	// Complete A by the surfaced id.
+	rc := tool.Execute(ctx, tlCall(map[string]any{"action": "complete_task", "id": *aID}), sb, tc)
+	c := parseList(t, rc)
+	var aTask *sporecore.TaskListItem
+	for i := range c.Tasks {
+		if c.Tasks[i].ID == *aID {
+			aTask = &c.Tasks[i]
+		}
+	}
+	if aTask == nil || aTask.Status != sporecore.TaskStatusCompleted {
+		t.Fatalf("A not completed: %+v", aTask)
+	}
+	// complete_task is not an add branch → no `added`.
+	if a := parseAdded(t, rc); a != nil {
+		t.Fatalf("complete_task carried added = %d", *a)
+	}
+}
+
+// ============================================================================
 // Fixture replay (shared ground truth — /fixtures/tasklist)
 // ============================================================================
 
@@ -471,6 +699,10 @@ type opExpected struct {
 	OK    bool                `json:"ok"`
 	List  *sporecore.TaskList `json:"list"`
 	Error string              `json:"error"`
+	// #143: present on successful add_task steps; the id Add assigned and that
+	// the tool must surface as a leading `added` key in the success content. A
+	// pointer so non-add steps (no `added` in the fixture) stay nil.
+	Added *uint32 `json:"added"`
 }
 
 type opScenario struct {
@@ -502,6 +734,7 @@ func TestFixtureReplayOperations(t *testing.T) {
 		tc, _ := inMemCtx()
 		for i, step := range sc.Steps {
 			out := tool.Execute(ctx, sporecore.ToolCall{ID: "c1", Name: TaskListToolName, Input: step.Action}, sb, tc)
+			isAdd := actionName(step.Action) == "add_task"
 			if step.Expected.OK {
 				if out.Kind != sporecore.ToolOutputSuccess {
 					t.Fatalf("%s step %d: expected Success, got %+v", sc.Name, i, out)
@@ -509,9 +742,27 @@ func TestFixtureReplayOperations(t *testing.T) {
 				if step.Expected.List == nil {
 					t.Fatalf("%s step %d: ok step missing `list`", sc.Name, i)
 				}
+				// The list portion always survives — json.Unmarshal into the
+				// TaskList struct silently ignores the extra `added` key on add
+				// steps. Assert structural list equality via re-marshal.
+				gotList := parseList(t, out)
+				gotJSON, _ := json.Marshal(gotList)
 				want, _ := json.Marshal(*step.Expected.List)
-				if out.Content != string(want) {
-					t.Fatalf("%s step %d: list mismatch\n got: %s\nwant: %s", sc.Name, i, out.Content, want)
+				if string(gotJSON) != string(want) {
+					t.Fatalf("%s step %d: list mismatch\n got: %s\nwant: %s", sc.Name, i, gotJSON, want)
+				}
+				// #143: add steps carry a leading `added` key equal to the
+				// fixture's expected.added; non-add steps must NOT carry one.
+				gotAdded := parseAdded(t, out)
+				if isAdd {
+					if step.Expected.Added == nil {
+						t.Fatalf("%s step %d: add step missing `added` in fixture", sc.Name, i)
+					}
+					if gotAdded == nil || *gotAdded != *step.Expected.Added {
+						t.Fatalf("%s step %d: surfaced added id %v, want %d", sc.Name, i, gotAdded, *step.Expected.Added)
+					}
+				} else if gotAdded != nil {
+					t.Fatalf("%s step %d: non-add step must not carry `added`, got %d", sc.Name, i, *gotAdded)
 				}
 			} else {
 				if out.Kind != sporecore.ToolOutputError {
