@@ -74,15 +74,16 @@ from spore_core import (
     EscalationActionFail,
     EscalationActionSkip,
     EscalationModeSurfaceToHuman,
+    CompositeStorageProvider,
     EvaluatorResponseVerifier,
     ExecutionRegistry,
+    FileSystemStorageProvider,
     Harness,
     HarnessBuilder,
     HarnessRunOptions,
     HumanRequestBudgetExhausted,
     HumanResponseEscalate,
     HumanResponseHalt,
-    InMemoryStorageProvider,
     LoopStrategy,
     ModelAgent,
     NullCacheProvider,
@@ -96,11 +97,13 @@ from spore_core import (
     SessionId,
     StandardContextManager,
     StorageProvider,
+    StorageScope,
     Task,
     Verifier,
     WorkspaceConfig,
     WorkspaceScopedSandbox,
     new_session_id,
+    project_id_from_canonical_path,
 )
 from spore_core.compaction_adapter import into_harness_adapter
 from spore_core.harness import ContextManager as HarnessContextManager
@@ -611,6 +614,18 @@ async def main() -> int:
         "consults     : research(web_search, budget 5, soft-fail), "
         "advice(advisor, budget 3, escalate)"
     )
+
+    # #142: a STABLE project id derived from the canonicalized repo root (decision
+    # 5 — derived from the workspace root, not process cwd). It keys the DURABLE
+    # task_list / plan / Ralph checkpoint so they survive Ralph window resets AND
+    # process restarts. ``repo_root`` is already canonicalized (``.resolve()``).
+    project_id = project_id_from_canonical_path(str(repo_root))
+    # The CENTRAL durable root, à la Claude Code: ``~/.spore/projects/<project_id>/``
+    # (decision 1). Falls back to a ``.spore`` dir under the repo if no home dir.
+    home = Path(os.environ.get("HOME") or repo_root)
+    spore_root = home / ".spore" / "projects" / str(project_id)
+    print(f"project id   : {project_id}")
+    print(f"durable root : {spore_root}")
     print()
 
     while True:
@@ -619,7 +634,19 @@ async def main() -> int:
             break
 
         session = new_session_id()
-        storage = StorageProvider.single(InMemoryStorageProvider())
+        # #142: route the DURABLE run domain to a FileSystemStorageProvider under
+        # the central root (atomic write-rename) so the task_list/plan/checkpoint
+        # persist across context-window resets and process restarts. Session and
+        # observability share the same durable root; memory stays project-scoped.
+        durable = FileSystemStorageProvider(spore_root)
+        storage = (
+            CompositeStorageProvider()
+            .run(durable)
+            .session(durable)
+            .observability(durable)
+            .memory(StorageScope.PROJECT, durable)
+            .build()
+        )
 
         # Read-only repo sandbox: the audit never writes source files.
         sandbox = WorkspaceScopedSandbox(WorkspaceConfig(root=repo_root, read_only=True))
@@ -652,6 +679,9 @@ async def main() -> int:
             HarnessBuilder.conversational(model)
             .sandbox(sandbox)
             .storage(storage)
+            # #142: pin the stable project id so durable artifacts key by it
+            # (rather than the per-window ``new_session_id()`` above).
+            .project_id(project_id)
             .registry(registry)
             .escalation_mode(EscalationModeSurfaceToHuman())
             .system_prompt(EXEC_SYSTEM_PROMPT)

@@ -85,7 +85,7 @@ from spore_core.harness import (
     ToolOutputSuccess,
 )
 from spore_core.model import ToolCall
-from spore_core.storage import StorageError
+from spore_core.storage import StorageError, project_namespace
 from spore_core.tasklist import (
     TASK_LIST_EXTRAS_KEY,
     TaskList,
@@ -148,7 +148,14 @@ class TaskListTool:
     async def execute(
         self, call: ToolCall, sandbox: SandboxProvider, ctx: ToolContext
     ) -> ToolOutput:
-        session_id = ctx.session_id
+        # #142: the task_list is a DURABLE artifact — key it by the STABLE
+        # project namespace, NOT the per-window ``session_id`` (which the Ralph
+        # wrapper regenerates every context window). Keying by project_id is what
+        # lets a window reset re-read the prior window's list instead of
+        # re-planning under a session it has never seen. Namespace-reuse: the
+        # project id is projected onto the existing ``session_id`` axis via
+        # ``project_namespace``, so the RunStore protocol stays unchanged.
+        session_id = project_namespace(ctx.project_id)
         run_store = ctx.run_store
 
         # 1. Parse params (bad input → recoverable).
@@ -195,9 +202,9 @@ class TaskListTool:
         except TaskListError as e:
             return ToolOutputError(message=e.message, recoverable=True)
 
-        # 4. Persist the (possibly mutated) list to the run store, keyed by
-        #    SessionId under the shared TASK_LIST_EXTRAS_KEY. We always persist
-        #    on a mutating action; list_tasks skips the write.
+        # 4. Persist the (possibly mutated) list to the run store, keyed by the
+        #    STABLE project namespace (#142) under the shared TASK_LIST_EXTRAS_KEY.
+        #    We always persist on a mutating action; list_tasks skips the write.
         if mutated:
             try:
                 await run_store.put(session_id, TASK_LIST_EXTRAS_KEY, task_list.to_dict())

@@ -11,7 +11,11 @@ cross-language fixture replay. Fully hermetic.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
+
+import pytest
 
 from spore_core.harness import (
     BudgetSnapshot,
@@ -26,15 +30,27 @@ from spore_core.harness import (
 )
 from spore_core.memory import Timestamp
 from spore_core.storage import (
+    ActiveRunDecision,
+    ActiveRunStatus,
     CompositeStorageProvider,
     FileSystemStorageProvider,
     InMemoryStorageProvider,
     MemoryEntry,
     NoOpStorageProvider,
+    ProjectId,
+    ProjectIdError,
+    RunStore,
     StorageProvider,
     StorageScope,
     WorkspaceId,
+    complete_active_run,
+    load_active_run,
     parse_otlp_endpoints,
+    project_id_from_canonical_path,
+    project_id_from_cwd,
+    project_id_from_path,
+    project_namespace,
+    start_or_resume_active_run,
     workspace_id_from_canonical_path,
 )
 
@@ -577,6 +593,7 @@ async def test_tool_context_carries_memory_store_seam() -> None:
     backend = InMemoryStorageProvider()
     ctx = ToolContext(
         session_id=_sid("ctx-test"),
+        project_id=project_id_from_canonical_path("/ctx-test-project"),
         run_store=backend,
         memory_store=backend,
     )
@@ -586,3 +603,344 @@ async def test_tool_context_carries_memory_store_seam() -> None:
     got = await backend.get_memories(StorageScope.PROJECT, _sid("ctx-test"), 10)
     assert len(got) == 1
     assert got[0].content == "via-ctx"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #142 — ProjectId + project-scoped durable storage
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _run_store() -> RunStore:
+    return InMemoryStorageProvider()
+
+
+# ── ProjectId pure derivation ────────────────────────────────────────────────
+
+
+def test_project_id_is_deterministic_and_matches_workspace_id_algorithm() -> None:
+    # Same input → same id, repeatedly.
+    a = project_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    b = project_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    assert a == b
+    # The derivation is byte-identical to WorkspaceId (it delegates to the same
+    # pure algorithm) — the cross-language anchor.
+    w = workspace_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    assert str(a) == str(w)
+    # Form: `{sanitized_basename}-{8hex}`.
+    assert a.startswith("spore-core-")
+    assert len(a) == len("spore-core-") + 8
+
+
+def test_project_id_root_and_special_chars() -> None:
+    assert project_id_from_canonical_path("/").startswith("root-")
+    p = project_id_from_canonical_path("/Users/me/My Project (v2)!")
+    assert p.startswith("my-project-v2-")
+    assert "--" not in p
+
+
+def test_project_id_ignores_trailing_slash() -> None:
+    a = project_id_from_canonical_path("/Users/sbeardsley/dev/spore-core")
+    b = project_id_from_canonical_path("/Users/sbeardsley/dev/spore-core/")
+    assert a == b
+
+
+def test_project_id_returns_a_project_id_str() -> None:
+    # ProjectId is a NewType over str — usable anywhere a str is.
+    p: ProjectId = project_id_from_canonical_path("/a/b/leaf")
+    assert isinstance(p, str)
+
+
+# ── The `/a/b` vs `/a_b` collision-resolution case (the spec's headline) ─────
+
+
+def test_project_id_resolves_slash_underscore_collision() -> None:
+    # A naive "slashes → underscores" slug would map BOTH of these to `a_b`. The
+    # 8-hex SHA-256 suffix of the FULL canonical path keeps them distinct.
+    ab = project_id_from_canonical_path("/a/b")
+    a_b = project_id_from_canonical_path("/a_b")
+    assert ab != a_b, "/a/b and /a_b must derive DISTINCT project ids"
+    # And the pinned exact values (cross-language anchor).
+    assert ab == "b-662b7b62"
+    assert a_b == "a-b-328ff01f"
+
+
+def test_project_namespace_projects_onto_session_axis() -> None:
+    # ``project_namespace`` yields a SessionId whose string IS the derived project
+    # id — the namespace-reuse seam over the RunStore's session-id axis.
+    p = project_id_from_canonical_path("/work/audit-repo")
+    assert str(project_namespace(p)) == str(p)
+    assert str(project_namespace(p)) == "audit-repo-9e8ff6f3"
+
+
+# ── FS-touching constructors: canonicalize FIRST ─────────────────────────────
+
+
+def test_project_id_from_path_canonicalizes_first(tmp_path: Path) -> None:
+    # A real dir + a relative path INTO it must derive the same id as the absolute
+    # canonical path — proving from_path canonicalizes before slugging.
+    nested = tmp_path / "proj"
+    nested.mkdir()
+    canonical = nested.resolve(strict=True)
+    from_path = project_id_from_path(nested)
+    from_canon = project_id_from_canonical_path(str(canonical))
+    assert from_path == from_canon
+
+
+def test_project_id_from_path_resolves_relative_components(tmp_path: Path) -> None:
+    # A path with `..` components canonicalizes to the same id as the direct one.
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    # {tmp}/a/../b  ==  {tmp}/b
+    via_dotdot = a / ".." / "b"
+    direct = project_id_from_path(b)
+    dotted = project_id_from_path(via_dotdot)
+    assert direct == dotted
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation differs on Windows")
+def test_project_id_from_path_resolves_symlink(tmp_path: Path) -> None:
+    # A symlink and its target derive the SAME id (symlink resolved by resolve()).
+    target = tmp_path / "real-proj"
+    target.mkdir()
+    link = tmp_path / "link-proj"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks not permitted on this filesystem")
+    via_target = project_id_from_path(target)
+    via_link = project_id_from_path(link)
+    assert via_target == via_link, "a symlink must resolve to its target's project id"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-specific case-insensitive FS behavior")
+def test_project_id_from_path_macos_case_insensitive(tmp_path: Path) -> None:
+    # macOS's default filesystem is case-insensitive: a dir created lowercase is
+    # reachable via a different-cased path. This assertion is FS-behavior- AND
+    # stdlib-behavior-dependent and is gated on BOTH:
+    #   - the upper-cased path must actually resolve to the same inode (a
+    #     case-insensitive volume — tempdirs on a case-sensitive volume skip), and
+    #   - ``Path.resolve()`` must case-FOLD to the on-disk casing. Unlike Rust's
+    #     ``fs::canonicalize``, CPython's ``realpath`` does NOT case-fold on macOS
+    #     (it only resolves symlinks / ``..``), so the differently-cased basenames
+    #     hash differently. When that is the case there is nothing to assert here —
+    #     the 8-hex suffix already keeps DISTINCT path strings distinct, which is
+    #     the documented behavior. The cross-language case-fold parity is enforced
+    #     at the Rust reference level; Python honours its own stdlib semantics.
+    lower = tmp_path / "caseproj"
+    lower.mkdir()
+    upper = tmp_path / "CASEPROJ"
+    if not os.path.exists(upper):  # case-sensitive volume ⇒ nothing to assert.
+        pytest.skip("filesystem is case-sensitive")
+    if lower.resolve().name == upper.resolve().name:
+        # ``resolve()`` case-folded to one on-disk casing ⇒ same id.
+        assert project_id_from_path(lower) == project_id_from_path(upper)
+    else:
+        # CPython's realpath preserved the as-written casing (the common macOS
+        # case): distinct canonical strings ⇒ distinct (but deterministic) ids.
+        assert project_id_from_path(lower) != project_id_from_path(upper)
+
+
+def test_project_id_from_path_errors_on_missing_path(tmp_path: Path) -> None:
+    # A non-existent path cannot be canonicalized ⇒ ProjectIdError.
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(ProjectIdError):
+        project_id_from_path(missing)
+
+
+def test_project_id_from_cwd_succeeds() -> None:
+    # The process cwd exists, so from_cwd derives an id without error.
+    p = project_id_from_cwd()
+    assert p != ""
+
+
+# ── ProjectId derivation fixture replay (cross-language anchor) ───────────────
+
+
+def test_project_id_derivation_fixture_replay() -> None:
+    cases = json.loads((FIXTURES / "project_id_derivation.json").read_text())
+    assert len(cases) >= 6, "fixture should carry the collision rows"
+    saw_collision_a = False
+    saw_collision_b = False
+    for case in cases:
+        path = case["canonical_path"]
+        expected = case["expected_project_id"]
+        assert project_id_from_canonical_path(path) == expected, f"mismatch for path {path!r}"
+        if path == "/a/b":
+            saw_collision_a = True
+        if path == "/a_b":
+            saw_collision_b = True
+    assert saw_collision_a and saw_collision_b, "fixture must pin both /a/b and /a_b"
+
+
+# ── task_list visible across DIFFERENT sessions with SAME project_id ──────────
+
+
+async def test_run_store_value_visible_across_sessions_same_project() -> None:
+    # The durable seam: write keyed by the project namespace; a DIFFERENT session
+    # reading the SAME project namespace sees it.
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/repo")
+
+    await store.put(project_namespace(project), "task_list", {"tasks": [1, 2]})
+
+    # A fresh session id (mirrors per-Ralph-window regeneration) does NOT change
+    # what the project namespace returns.
+    _fresh_session = SessionId("fresh-window-session")
+    got = await store.get(project_namespace(project), "task_list")
+    assert got == {"tasks": [1, 2]}
+
+
+# ── AC5: cross-window AND cross-process durability via FileSystemStorageProvider
+
+
+async def test_project_durable_survives_window_reset_and_process_restart(tmp_path: Path) -> None:
+    root = tmp_path
+    project = project_id_from_canonical_path("/work/audit-repo")
+    task_list = {
+        "tasks": [{"id": 1, "description": "discover", "status": "completed", "blockers": []}],
+        "next_id": 2,
+    }
+
+    # Window 1 (session A): write the durable task_list under the project ns.
+    provider1: RunStore = FileSystemStorageProvider(root)
+    await provider1.put(project_namespace(project), "task_list", task_list)
+
+    # Window 2 (a DIFFERENT, freshly generated session) over the SAME provider
+    # root reads window 1's list — cross-window survival.
+    provider2: RunStore = FileSystemStorageProvider(root)
+    _window_2_session = SessionId("window-2-session")
+    got = await provider2.get(project_namespace(project), "task_list")
+    assert got == task_list, "window 2 must see window 1's list"
+
+    # A BRAND-NEW FileSystemStorageProvider over the same on-disk root (a fresh
+    # process) reads the same bytes — cross-process durability.
+    fresh: RunStore = FileSystemStorageProvider(root)
+    got2 = await fresh.get(project_namespace(project), "task_list")
+    assert got2 == task_list, "a fresh provider must read the durable list"
+
+
+async def test_project_durable_survival_fixture_replay(tmp_path: Path) -> None:
+    fx = json.loads((FIXTURES / "project_durable_survival.json").read_text())
+    project = project_id_from_canonical_path(fx["project_canonical_path"])
+    # The pinned project id must match.
+    assert project == fx["expected_project_id"]
+    run_key = fx["run_key"]
+    root = tmp_path
+
+    # Window 1 writes the fixture's task_list (under a DISTINCT session id).
+    w1_list = fx["window_1"]["task_list"]
+    provider1: RunStore = FileSystemStorageProvider(root)
+    _session_a = SessionId(fx["window_1"]["session_id"])
+    await provider1.put(project_namespace(project), run_key, w1_list)
+
+    # Window 2 (a different session id) reads the expected list cross-window.
+    provider2: RunStore = FileSystemStorageProvider(root)
+    _session_b = SessionId(fx["window_2"]["session_id"])
+    got = await provider2.get(project_namespace(project), run_key)
+    assert got == fx["window_2"]["expected_task_list"]
+
+    # A fresh provider (cross-process) reads the expected list.
+    fresh: RunStore = FileSystemStorageProvider(root)
+    got2 = await fresh.get(project_namespace(project), run_key)
+    assert got2 == fx["cross_process"]["expected_task_list"]
+
+
+# ── Active-run lifecycle: new / resume / complete ────────────────────────────
+
+
+async def test_active_run_starts_new_when_no_slot() -> None:
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/p")
+    assert await load_active_run(store, project) is None
+
+    decision = await start_or_resume_active_run(
+        store, project, "tag-1", _ts("2026-06-12T00:00:00Z")
+    )
+    assert decision == ActiveRunDecision.STARTED_NEW
+
+    slot = await load_active_run(store, project)
+    assert slot is not None
+    assert slot.run_tag == "tag-1"
+    assert slot.status == ActiveRunStatus.ACTIVE
+    # started_at is the INJECTED timestamp (deterministic, no clock).
+    assert slot.started_at == _ts("2026-06-12T00:00:00Z")
+
+
+async def test_active_run_resumes_on_matching_tag() -> None:
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/p")
+    await start_or_resume_active_run(store, project, "tag-1", _ts("t1"))
+
+    # Same tag ⇒ resume; the original started_at is preserved (slot untouched).
+    decision = await start_or_resume_active_run(store, project, "tag-1", _ts("t2"))
+    assert decision == ActiveRunDecision.RESUMED
+    slot = await load_active_run(store, project)
+    assert slot is not None
+    assert slot.started_at == _ts("t1"), "resume must not restamp"
+
+
+async def test_active_run_starts_fresh_on_different_tag() -> None:
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/p")
+    await start_or_resume_active_run(store, project, "tag-1", _ts("t1"))
+
+    # A DIFFERENT tag is a genuinely new job in the same repo ⇒ start fresh.
+    decision = await start_or_resume_active_run(store, project, "tag-2", _ts("t2"))
+    assert decision == ActiveRunDecision.STARTED_NEW
+    slot = await load_active_run(store, project)
+    assert slot is not None
+    assert slot.run_tag == "tag-2"
+    assert slot.started_at == _ts("t2")
+
+
+async def test_active_run_complete_then_restart_is_fresh() -> None:
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/p")
+    await start_or_resume_active_run(store, project, "tag-1", _ts("t1"))
+
+    await complete_active_run(store, project)
+    slot = await load_active_run(store, project)
+    assert slot is not None
+    assert slot.status == ActiveRunStatus.COMPLETED
+
+    # After completion, even the SAME tag starts a fresh Active slot.
+    decision = await start_or_resume_active_run(store, project, "tag-1", _ts("t3"))
+    assert decision == ActiveRunDecision.STARTED_NEW
+    slot = await load_active_run(store, project)
+    assert slot is not None
+    assert slot.status == ActiveRunStatus.ACTIVE
+    assert slot.started_at == _ts("t3")
+
+
+async def test_complete_active_run_is_noop_without_slot() -> None:
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/empty")
+    # No active slot ⇒ completing is a silent no-op (no error).
+    await complete_active_run(store, project)
+    assert await load_active_run(store, project) is None
+
+
+async def test_active_run_isolated_per_project() -> None:
+    # Two projects over the SAME store keep independent active slots.
+    store = _run_store()
+    p1 = project_id_from_canonical_path("/work/one")
+    p2 = project_id_from_canonical_path("/work/two")
+    await start_or_resume_active_run(store, p1, "a", _ts("t1"))
+    await start_or_resume_active_run(store, p2, "b", _ts("t1"))
+    slot1 = await load_active_run(store, p1)
+    slot2 = await load_active_run(store, p2)
+    assert slot1 is not None and slot1.run_tag == "a"
+    assert slot2 is not None and slot2.run_tag == "b"
+
+
+async def test_active_run_malformed_slot_is_treated_as_absent() -> None:
+    # A malformed slot is treated as "no live run" — the next start mints a fresh
+    # one rather than erroring.
+    store = _run_store()
+    project = project_id_from_canonical_path("/work/garbage")
+    await store.put(project_namespace(project), "active_run", {"not": "an active run"})
+    assert await load_active_run(store, project) is None
+    decision = await start_or_resume_active_run(store, project, "tag-1", _ts("t1"))
+    assert decision == ActiveRunDecision.STARTED_NEW

@@ -7,10 +7,11 @@ across all four languages — the shared fixtures under ``fixtures/tasklist/`` a
 ground truth.
 
 The standalone ``task_list`` tool persists via the ``ToolContext``'s
-``RunStore`` (#75), keyed by ``SessionId`` under ``TASK_LIST_EXTRAS_KEY`` —
-NOT the sandbox filesystem. ``operations.json`` is replayed over a fresh
-in-memory ``RunStore``; ``transitions.json`` / ``serialization.json`` are
-backend-agnostic.
+``RunStore`` (#75), keyed by the STABLE project namespace (#142 —
+``project_namespace(ctx.project_id)``) under ``TASK_LIST_EXTRAS_KEY``, NOT the
+per-window ``SessionId`` and NOT the sandbox filesystem. ``operations.json`` is
+replayed over a fresh in-memory ``RunStore``; ``transitions.json`` /
+``serialization.json`` are backend-agnostic.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ from spore_core.storage import (
     NoOpStorageProvider,
     RunStore,
     StorageBackendError,
+    project_id_from_canonical_path,
+    project_namespace,
 )
 from spore_core.tasklist import (
     TASK_LIST_EXTRAS_KEY,
@@ -112,9 +115,19 @@ class _CorruptRunStore:
         return []
 
 
-def _ctx_with(run_store: RunStore, session: str = "test-session") -> ToolContext:
+def _project_ns(key: str = "test-project") -> SessionId:
+    """The project namespace the tool keys the durable task_list by, derived from
+    a test's distinguishing ``key`` (#142). Tests that want SEPARATE lists pass
+    DIFFERENT keys; tests that want the SAME list pass the SAME key."""
+    return project_namespace(project_id_from_canonical_path(f"/proj/{key}"))
+
+
+def _ctx_with(run_store: RunStore, key: str = "test-project") -> ToolContext:
+    # The ``session_id`` is ephemeral and irrelevant to the durable task_list
+    # (#142); the ``project_id`` derived from ``key`` is the durable namespace.
     return ToolContext(
-        session_id=SessionId(session),
+        session_id=SessionId("ephemeral-session"),
+        project_id=project_id_from_canonical_path(f"/proj/{key}"),
         run_store=run_store,
         memory_store=NoOpStorageProvider(),
     )
@@ -155,8 +168,10 @@ def _parse_added(out: object) -> int | None:
     return None if raw is None else int(raw)
 
 
-async def _load_from_store(run_store: RunStore, session: str = "test-session") -> TaskList | None:
-    value = await run_store.get(SessionId(session), TASK_LIST_EXTRAS_KEY)
+async def _load_from_store(run_store: RunStore, key: str = "test-project") -> TaskList | None:
+    # #142: durable artifacts are keyed by the project namespace derived from
+    # ``key``, not the ephemeral session id.
+    value = await run_store.get(_project_ns(key), TASK_LIST_EXTRAS_KEY)
     if value is None:
         return None
     return TaskList.from_dict(value)
@@ -541,25 +556,58 @@ async def test_persists_to_run_store_not_sandbox() -> None:
     assert persisted == list_
 
 
-# Keyed by SessionId: two sessions over the SAME run store keep separate lists.
-async def test_lists_are_keyed_by_session_id() -> None:
+# #142: keyed by PROJECT id, not session id. Two DIFFERENT project ids over the
+# SAME run store keep separate lists.
+async def test_lists_are_keyed_by_project_id() -> None:
     run_store = InMemoryStorageProvider()
     sb = _AllowAllSandbox()
     tool = TaskListTool()
 
-    ctx_a = _ctx_with(run_store, "session-a")
-    ctx_b = _ctx_with(run_store, "session-b")
+    ctx_a = _ctx_with(run_store, "project-a")
+    ctx_b = _ctx_with(run_store, "project-b")
 
     await tool.execute(_call({"action": "add_task", "description": "a1"}), sb, ctx_a)
     await tool.execute(_call({"action": "add_task", "description": "b1"}), sb, ctx_b)
     await tool.execute(_call({"action": "add_task", "description": "b2"}), sb, ctx_b)
 
-    a = await _load_from_store(run_store, "session-a")
-    b = await _load_from_store(run_store, "session-b")
+    a = await _load_from_store(run_store, "project-a")
+    b = await _load_from_store(run_store, "project-b")
     assert a is not None and b is not None
     assert len(a.tasks) == 1
     assert a.tasks[0].description == "a1"
     assert [t.description for t in b.tasks] == ["b1", "b2"]
+
+
+# #142 (the bug this issue fixes): the task_list is visible across DIFFERENT
+# sessions with the SAME project id. This mirrors the Ralph window-reset path —
+# each window mints a fresh ``SessionId`` but the project id is stable, so
+# window 2 must see window 1's list.
+async def test_task_list_visible_across_sessions_with_same_project() -> None:
+    run_store = InMemoryStorageProvider()
+    sb = _AllowAllSandbox()
+    tool = TaskListTool()
+    project = project_id_from_canonical_path("/proj/shared")
+
+    # Window 1: a distinct session id, but the shared project id.
+    ctx_w1 = ToolContext(
+        session_id=SessionId("window-1-session"),
+        project_id=project,
+        run_store=run_store,
+        memory_store=NoOpStorageProvider(),
+    )
+    await tool.execute(_call({"action": "add_task", "description": "from window 1"}), sb, ctx_w1)
+
+    # Window 2: a DIFFERENT (freshly generated) session id, SAME project id.
+    ctx_w2 = ToolContext(
+        session_id=SessionId("window-2-session"),
+        project_id=project,
+        run_store=run_store,
+        memory_store=NoOpStorageProvider(),
+    )
+    listed = await tool.execute(_call({"action": "list_tasks"}), sb, ctx_w2)
+    list_ = _parse_list(listed)
+    assert len(list_.tasks) == 1, "window 2 must see window 1's list"
+    assert list_.tasks[0].description == "from window 1"
 
 
 # Persist then reload with a FRESH tool over the SAME ctx yields the identical
@@ -831,8 +879,10 @@ async def test_persisted_blob_has_no_added() -> None:
     # Success content DOES carry `added`...
     assert _parse_added(r) == 1
 
-    # ...but the raw persisted blob does NOT carry an `added` key.
-    raw = await ctx.run_store.get(SessionId("test-session"), TASK_LIST_EXTRAS_KEY)
+    # ...but the raw persisted blob does NOT carry an `added` key. #142: the blob
+    # is keyed by the project namespace, not the session id — read it straight off
+    # the ctx's project_id namespace.
+    raw = await ctx.run_store.get(project_namespace(ctx.project_id), TASK_LIST_EXTRAS_KEY)
     assert raw is not None, "persisted blob present"
     assert "added" not in raw, f"persisted blob: {raw}"
     # The persisted blob round-trips to a bare TaskList whose canonical

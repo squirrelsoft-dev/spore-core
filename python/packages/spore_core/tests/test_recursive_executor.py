@@ -63,6 +63,7 @@ from spore_core import (
 )
 from spore_core.harness import HillClimbingConfig, new_session_id
 from spore_core.plan import PlanArtifact
+from spore_core.storage import project_namespace
 from spore_core.tasklist import (
     TASK_LIST_EXTRAS_KEY,
     TaskList,
@@ -171,8 +172,8 @@ async def test_plan_execute_e2e_through_recursive_executor() -> None:
     assert a.call_count == 3
     # Q2: output is the last completed step's final text.
     assert r.output == "did task two"
-    # Both tasks Completed in the persisted list.
-    stored = await h.storage().run().get(task.session_id, TASK_LIST_EXTRAS_KEY)
+    # Both tasks Completed in the persisted list. #142: keyed by the project ns.
+    stored = await h.storage().run().get(project_namespace(h.project_id()), TASK_LIST_EXTRAS_KEY)
     assert stored is not None
     tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
     assert all(t.status is TaskStatus.COMPLETED for t in tl.tasks)
@@ -294,8 +295,8 @@ async def test_deep_resume_skips_already_completed_task() -> None:
     assert result.output == "done two"
     # Exactly ONE agent turn: task 0 was resumed from checkpoint, not re-run.
     assert a.call_count == 1
-    # Both tasks Completed in the final persisted list.
-    stored = await h.storage().run().get(t.session_id, TASK_LIST_EXTRAS_KEY)
+    # Both tasks Completed in the final persisted list. #142: keyed by project ns.
+    stored = await h.storage().run().get(project_namespace(h.project_id()), TASK_LIST_EXTRAS_KEY)
     final_list = TaskList.from_dict(stored)  # type: ignore[arg-type]
     assert all(x.status is TaskStatus.COMPLETED for x in final_list.tasks)
 

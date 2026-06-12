@@ -6,15 +6,18 @@ import json
 
 from spore_core.harness import SessionId, ToolOutputError, ToolOutputSuccess
 from spore_core.model import ToolCall
-from spore_core.storage import InMemoryStorageProvider
+from spore_core.storage import InMemoryStorageProvider, project_id_from_canonical_path
 from spore_core.tool_registry import AllowAllSandbox, ToolContext
 from spore_tools.tools.todo import TODO_STORE_KEY, TodoWriteTool
 
 
 def _ctx() -> ToolContext:
     backend = InMemoryStorageProvider()
+    # todo_write is EPHEMERAL session-keyed state (#142); a fixed test project id
+    # just satisfies the ToolContext constructor.
     return ToolContext(
         session_id=SessionId("todo-session"),
+        project_id=project_id_from_canonical_path("/test-project"),
         run_store=backend,
         memory_store=backend,
     )

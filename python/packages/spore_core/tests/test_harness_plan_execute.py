@@ -49,6 +49,7 @@ from spore_core.hooks import (
     OnTaskAdvanceContext,
     StandardHookChain,
 )
+from spore_core.storage import project_namespace
 from spore_core.tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
 
 
@@ -79,8 +80,11 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
 
 
 async def _stored_task_list(h: StandardHarness, session_id: SessionId) -> object:
-    """Read the persisted task list back through the harness's RunStore (#76)."""
-    return await h.storage().run().get(session_id, TASK_LIST_EXTRAS_KEY)
+    """Read the persisted task list back through the harness's RunStore (#76).
+    #142: durable artifacts are keyed by the project namespace, not the run
+    session id — read it back under ``project_namespace(h.project_id())``."""
+    _ = session_id  # #142: durable readback keys by the project namespace.
+    return await h.storage().run().get(project_namespace(h.project_id()), TASK_LIST_EXTRAS_KEY)
 
 
 def _task(*, max_turns: int | None = None) -> Task:
@@ -377,7 +381,8 @@ async def test_run_store_persistence() -> None:
     task = _task()
     r = await h.run(HarnessRunOptions(task))
     assert isinstance(r, RunResultSuccess)
-    stored = await provider.run().get(task.session_id, TASK_LIST_EXTRAS_KEY)
+    # #142: durable artifacts are keyed by the project namespace.
+    stored = await provider.run().get(project_namespace(h.project_id()), TASK_LIST_EXTRAS_KEY)
     assert stored is not None
     tl = TaskList.from_dict(stored)  # type: ignore[arg-type]
     # Final durable write reflects both tasks completed.
@@ -402,9 +407,10 @@ async def test_persistence_lives_on_run_store_not_extras() -> None:
     r = await h.run(HarnessRunOptions(task, session_state=state))
     assert isinstance(r, RunResultSuccess)
 
-    # Both keys are durable in the RunStore.
-    assert await provider.run().get(task.session_id, PLAN_EXECUTE_EXTRAS_KEY) is not None
-    assert await provider.run().get(task.session_id, TASK_LIST_EXTRAS_KEY) is not None
+    # Both keys are durable in the RunStore. #142: keyed by the project namespace.
+    durable_ns = project_namespace(h.project_id())
+    assert await provider.run().get(durable_ns, PLAN_EXECUTE_EXTRAS_KEY) is not None
+    assert await provider.run().get(durable_ns, TASK_LIST_EXTRAS_KEY) is not None
 
     # Neither key is mirrored into SessionState.extras anymore.
     assert PLAN_EXECUTE_EXTRAS_KEY not in state.extras

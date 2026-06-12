@@ -92,7 +92,7 @@ from .model import ToolCall
 from .model import ToolSchema as ModelToolSchema
 
 if TYPE_CHECKING:
-    from .storage import MemoryStore, RunStore
+    from .storage import MemoryStore, ProjectId, RunStore
 
 # ============================================================================
 # ToolContext — the storage seam handed to every tool (#75)
@@ -107,8 +107,15 @@ class ToolContext:
     It carries the minimum a tool needs to persist durable state via the
     storage layer:
 
-    * ``session_id`` — the run's :class:`SessionId`, the key namespace for the
-      :class:`RunStore`.
+    * ``session_id`` — the run's :class:`SessionId`, the key namespace for
+      EPHEMERAL state that SHOULD reset per Ralph window (conversation/session
+      state, ``active_skills``).
+    * ``project_id`` — the stable :class:`~spore_core.storage.ProjectId` (#142),
+      the key namespace for DURABLE artifacts (the ``task_list``, plan artifact,
+      …) that must survive a Ralph window reset (fresh :class:`SessionId` per
+      window) and process restarts. Durable tools key the :class:`RunStore` by
+      ``project_namespace(ctx.project_id)`` instead of ``session_id`` so the
+      prior window's list is re-read, not orphaned.
     * ``run_store`` — the :class:`RunStore` domain of the configured storage
       provider.
     * ``memory_store`` — the :class:`MemoryStore` domain (#78). Scope-aware: the
@@ -125,6 +132,7 @@ class ToolContext:
     """
 
     session_id: SessionId
+    project_id: ProjectId
     run_store: RunStore
     memory_store: MemoryStore
 
@@ -502,13 +510,14 @@ class RealToolRegistry:
     **recoverable** :class:`ToolOutputError` so the loop appends it as a tool
     result and lets the agent adapt rather than halting.
 
-    It is built **once per run**: ``session_id``, ``run_store``, and
-    ``memory_store`` are injected at construction (the run's :class:`SessionId`
-    is only known at ``run()``-time) and used to build the :class:`ToolContext`
-    forwarded on every dispatch. :class:`~spore_core.harness.HarnessBuilder`
-    wires this automatically when catalogue tools are added via ``.tool()`` /
-    ``.tools()``; construct it directly only when supplying your own
-    :class:`StandardToolRegistry`.
+    It is built **once per run**: ``session_id``, ``project_id`` (#142),
+    ``run_store``, and ``memory_store`` are injected at construction (the run's
+    :class:`SessionId` is only known at ``run()``-time) and used to build the
+    :class:`ToolContext` forwarded on every dispatch. ``project_id`` is the
+    STABLE durable namespace; ``session_id`` is the per-window ephemeral key.
+    :class:`~spore_core.harness.HarnessBuilder` wires this automatically when
+    catalogue tools are added via ``.tool()`` / ``.tools()``; construct it
+    directly only when supplying your own :class:`StandardToolRegistry`.
     """
 
     def __init__(
@@ -516,6 +525,7 @@ class RealToolRegistry:
         inner: StandardToolRegistry,
         sandbox: SandboxProvider,
         session_id: SessionId,
+        project_id: ProjectId,
         run_store: RunStore,
         memory_store: MemoryStore,
     ) -> None:
@@ -523,6 +533,7 @@ class RealToolRegistry:
         self._sandbox = sandbox
         self._ctx = ToolContext(
             session_id=session_id,
+            project_id=project_id,
             run_store=run_store,
             memory_store=memory_store,
         )
@@ -641,13 +652,15 @@ class SubagentMock:
 
 def make_test_ctx() -> ToolContext:
     """Build a throwaway :class:`ToolContext` for tests: a fresh in-memory run
-    store and a fixed test session id. Mirrors the Rust ``mock::test_ctx``
-    (named ``make_test_ctx`` here so pytest does not collect it as a test)."""
-    from .storage import InMemoryStorageProvider
+    store, a fixed test session id, and a fixed test project id (#142). Mirrors
+    the Rust ``mock::test_ctx`` (named ``make_test_ctx`` here so pytest does not
+    collect it as a test)."""
+    from .storage import InMemoryStorageProvider, project_id_from_canonical_path
 
     backend = InMemoryStorageProvider()
     return ToolContext(
         session_id=SessionId("test-session"),
+        project_id=project_id_from_canonical_path("/test-project"),
         run_store=backend,
         memory_store=backend,
     )

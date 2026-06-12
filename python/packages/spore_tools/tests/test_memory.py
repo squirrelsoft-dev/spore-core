@@ -33,9 +33,14 @@ from spore_core.storage import (
     MemoryEntry,
     MemoryStore,
     StorageBackendError,
+    project_id_from_canonical_path,
 )
 from spore_core.tool_registry import ToolContext
 from spore_tools.tools.memory import LOCAL_REJECTED_MESSAGE, MemoryTool
+
+# Memory is EPHEMERAL session-keyed state (#142); the project id is irrelevant to
+# these tests — a fixed test project keeps the ToolContext constructor satisfied.
+_TEST_PROJECT_ID = project_id_from_canonical_path("/test-project")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TOOL_FIXTURES = REPO_ROOT / "fixtures" / "tools"
@@ -75,6 +80,7 @@ class _FailingMemoryStore:
 def _ctx_with(memory_store: MemoryStore, session: str) -> ToolContext:
     return ToolContext(
         session_id=SessionId(session),
+        project_id=_TEST_PROJECT_ID,
         run_store=InMemoryStorageProvider(),
         memory_store=memory_store,
     )
@@ -97,6 +103,7 @@ def _scoped_ctx(session: str = "s") -> tuple[ToolContext, object]:
     memory_store = provider.memory()
     ctx = ToolContext(
         session_id=SessionId(session),
+        project_id=_TEST_PROJECT_ID,
         run_store=InMemoryStorageProvider(),
         memory_store=memory_store,
     )

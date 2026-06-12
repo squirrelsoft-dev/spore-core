@@ -48,8 +48,15 @@ from spore_core import (
     ToolOutputSuccess,
     TurnError,
 )
+from spore_core.storage import project_id_from_canonical_path, project_namespace
 from spore_core.tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
 from spore_core.tasklist import Task as TaskNode
+
+# #142: durable artifacts are keyed by the STABLE project namespace, not the run
+# session id. These tests all use ``AllowAllSandbox`` (workspace root ``/``), so
+# the harness derives this exact project id — the seed/readback helpers key by it
+# so what the test seeds is what the harness reads.
+_DURABLE_NS = project_namespace(project_id_from_canonical_path("/"))
 
 
 def _usage(in_t: int = 1, out_t: int = 1) -> TokenUsage:
@@ -136,12 +143,15 @@ def _plan_task(session: str = "s1") -> Task:
 
 async def _seed_dag(storage: StorageProvider, session: SessionId, tl: TaskList) -> None:
     """Persist an authored DAG task list (the #126 authoring path) so the
-    executor's ``load_task_list`` picks it up over the linear plan bridge."""
-    await storage.run().put(session, TASK_LIST_EXTRAS_KEY, tl.to_dict())
+    executor's ``load_task_list`` picks it up over the linear plan bridge. #142:
+    keyed by the project namespace the harness reads (not the run session id)."""
+    _ = session  # #142: durable write keys by the project namespace.
+    await storage.run().put(_DURABLE_NS, TASK_LIST_EXTRAS_KEY, tl.to_dict())
 
 
 async def _stored(h: StandardHarness, session: SessionId) -> TaskList:
-    value = await h.storage().run().get(session, TASK_LIST_EXTRAS_KEY)
+    _ = session  # #142: durable readback keys by the project namespace.
+    value = await h.storage().run().get(project_namespace(h.project_id()), TASK_LIST_EXTRAS_KEY)
     assert value is not None
     return TaskList.from_dict(value)  # type: ignore[arg-type]
 

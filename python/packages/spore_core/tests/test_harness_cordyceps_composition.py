@@ -54,8 +54,14 @@ from spore_core import (
     Verifier,
 )
 from spore_core.harness import AggregateUsage, loop_strategy_max_steps
+from spore_core.storage import project_id_from_canonical_path, project_namespace
 from spore_core.tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
 from spore_core.verifier import VerifierInput, VerifierVerdictFailed, VerifierVerdictPassed
+
+# #142: durable artifacts are keyed by the STABLE project namespace, not the run
+# session id. These tests all use ``AllowAllSandbox`` (workspace root ``/``), so
+# the harness derives this exact project id — the seed/readback helpers key by it.
+_DURABLE_NS = project_namespace(project_id_from_canonical_path("/"))
 
 _LOOP_STRATEGY_ADAPTER: TypeAdapter[LoopStrategy] = TypeAdapter(LoopStrategy)
 
@@ -177,11 +183,13 @@ def _new_storage() -> StorageProvider:
 
 
 async def _seed(storage: StorageProvider, session: SessionId, tl: TaskList) -> None:
-    await storage.run().put(session, TASK_LIST_EXTRAS_KEY, tl.to_dict())
+    _ = session  # #142: durable write keys by the project namespace.
+    await storage.run().put(_DURABLE_NS, TASK_LIST_EXTRAS_KEY, tl.to_dict())
 
 
 async def _stored_list(storage: StorageProvider, session: SessionId) -> TaskList:
-    value = await storage.run().get(session, TASK_LIST_EXTRAS_KEY)
+    _ = session  # #142: durable readback keys by the project namespace.
+    value = await storage.run().get(_DURABLE_NS, TASK_LIST_EXTRAS_KEY)
     assert value is not None
     return TaskList.from_dict(value)  # type: ignore[arg-type]
 
@@ -212,7 +220,9 @@ def test_cordyceps_max_steps_is_25_unlimited_is_none() -> None:
 
 
 def test_resume_reresolves_handles() -> None:
-    raw = (_repo_root() / "fixtures" / "paused_states" / "cordyceps_budget_exhausted.json").read_text()
+    raw = (
+        _repo_root() / "fixtures" / "paused_states" / "cordyceps_budget_exhausted.json"
+    ).read_text()
     doc = json.loads(raw)
 
     # The paused state carries the FULL cordyceps tree in task.loop_strategy.

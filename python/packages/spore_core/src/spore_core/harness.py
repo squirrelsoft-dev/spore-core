@@ -1283,9 +1283,11 @@ class StrategyExecutor(Protocol):
         context (R3), and the optional VCS history block."""
         ...
 
-    def ralph_completion_status(self) -> str | None:
-        """Ralph external completion check (#124): ``None`` ⇒ complete;
-        ``str`` reason ⇒ tasks remain."""
+    async def ralph_completion_status(self) -> str | None:
+        """Ralph external completion check (#124): ``None`` ⇒ complete; ``str``
+        reason ⇒ tasks remain. ASYNC since #142: the Ralph checkpoint moved off
+        the ``.spore/`` filesystem onto the durable project-id
+        :class:`~spore_core.storage.RunStore`."""
         ...
 
     def ralph_max_resets(self) -> int:
@@ -2703,7 +2705,7 @@ async def _run_ralph_config(self: RalphConfig, cx: ExecutionContext) -> Strategy
             cx.stream = on_stream
             return await cx._finish(executor, task, window_result)
 
-        reason = executor.ralph_completion_status()
+        reason = await executor.ralph_completion_status()
         if reason is None:
             if isinstance(window_result, RunResultSuccess):
                 output = window_result.output
@@ -4979,8 +4981,14 @@ from .observability_outbox import (  # noqa: E402
     OutboxObservabilityProvider,
 )
 from .storage import (  # noqa: E402
+    RALPH_FEATURE_LIST_KEY,
+    RALPH_PROGRESS_KEY,
+    ProjectId,
+    RunStore,
     SessionStore,
+    StorageError,
     StorageProvider,
+    project_namespace,
 )
 
 
@@ -5137,6 +5145,7 @@ class HarnessConfig:
         verifier: Any | None = None,
         evaluator_agent: Agent | None = None,
         storage: StorageProvider | None = None,
+        project_id: ProjectId | None = None,
         chunk_provider: Any | None = None,
         metric_evaluator: Any | None = None,
         catalogue_registry: StandardToolRegistry | None = None,
@@ -5233,6 +5242,31 @@ class HarnessConfig:
         # reach the four domain stores via :meth:`StandardHarness.storage` /
         # :meth:`StandardHarness.session_store`.
         self.storage: StorageProvider = storage if storage is not None else StorageProvider.no_op()
+        # The STABLE project namespace for DURABLE artifacts (issue #142). Where
+        # the per-window :class:`SessionId` is regenerated on every Ralph
+        # context-window reset (``new_session_id()``), this
+        # :class:`~spore_core.storage.ProjectId` stays constant across windows AND
+        # process restarts — which is what lets the ``task_list``, plan artifact,
+        # and Ralph checkpoint persist across a window reset instead of being
+        # orphaned under a regenerated session. Defaults (when unset, e.g. via
+        # :meth:`HarnessBuilder.build_config`) to a project id derived from
+        # ``sandbox.workspace_root()`` (decision 5 — NOT process cwd). Durable
+        # ``RunStore`` call sites key by ``project_namespace(project_id)``
+        # (namespace-reuse on the existing ``session_id`` axis); ephemeral
+        # session/conversation state stays keyed by the per-window
+        # :class:`SessionId`. Mirrors Rust's ``HarnessConfig::project_id``.
+        if project_id is None:
+            from .storage import project_id_from_canonical_path, project_id_from_path
+
+            workspace_root = self.sandbox.workspace_root()
+            try:
+                project_id = project_id_from_path(workspace_root)
+            except StorageError:
+                # The workspace root may not exist on disk yet (e.g. a test stub);
+                # fall back to the PURE derivation over the workspace_root string
+                # so a project_id is ALWAYS present and deterministic.
+                project_id = project_id_from_canonical_path(str(workspace_root))
+        self.project_id: ProjectId = project_id
         # Pluggable chunk source for the #79 prompt assembly engine. Defaults to
         # an empty in-memory provider. Typed ``Any`` to avoid importing
         # ``prompt_assembly`` at module load.
@@ -5374,6 +5408,10 @@ class HarnessConfig:
             vcs_provider=self.vcs_provider,
             hooks=self.hooks,
             storage=self.storage,
+            # #142: the child run keys durable artifacts by the SAME stable
+            # project namespace as the parent (a swapped sandbox must not change
+            # the durable namespace).
+            project_id=self.project_id,
             chunk_provider=self.chunk_provider,
             catalogue_registry=self.catalogue_registry,
             toolset_catalogues=self.toolset_catalogues,
@@ -5426,6 +5464,13 @@ class HarnessBuilder:
         self._evaluator_agent: Agent | None = None
         self._metric_evaluator: Any | None = None
         self._storage: StorageProvider | None = None
+        # The STABLE durable-storage project namespace (issue #142). ``None`` (the
+        # default) resolves at :meth:`build_config` to a
+        # :class:`~spore_core.storage.ProjectId` derived from
+        # ``sandbox.workspace_root()`` (decision 5 — NOT process cwd),
+        # canonicalizing the path first; an explicit :meth:`project_id` always
+        # wins. See :attr:`HarnessConfig.project_id`.
+        self._project_id: ProjectId | None = None
         # Opt-in session-state threading + auto-persist (issue #102). OFF by
         # default — see :meth:`auto_persist_sessions`.
         self._auto_persist_sessions: bool = False
@@ -5760,6 +5805,18 @@ class HarnessBuilder:
         self._storage = storage
         return self
 
+    def project_id(self, project_id: ProjectId) -> HarnessBuilder:
+        """Override the STABLE durable-storage project namespace (issue #142).
+
+        When unset, :meth:`build_config` derives it from
+        ``sandbox.workspace_root()`` (decision 5), canonicalizing the path first.
+        Set this explicitly when the workspace root is not a stable on-disk path
+        (e.g. a fixture-replay tempdir, or to pin a known project across
+        processes). See :attr:`HarnessConfig.project_id`. Mirrors Rust's
+        ``HarnessBuilder::project_id``."""
+        self._project_id = project_id
+        return self
+
     def auto_persist_sessions(self, enabled: bool) -> HarnessBuilder:
         """Opt into conversation-history threading via the :class:`SessionStore`
         (issue #102). OFF by default.
@@ -5972,6 +6029,9 @@ class HarnessBuilder:
             hooks=self._hooks,
             verifier=self._verifier,
             storage=storage,
+            # #142: an explicit project_id wins; ``None`` lets HarnessConfig derive
+            # it from ``sandbox.workspace_root()`` (decision 5).
+            project_id=self._project_id,
             chunk_provider=self._chunk_provider,
             metric_evaluator=self._metric_evaluator,
             catalogue_registry=catalogue_registry,
@@ -5996,48 +6056,60 @@ class HarnessBuilder:
 
 
 class RalphProgress(_Model):
-    """Deserialized ``.spore/progress.json`` (issue #58, B2/B4). The agent
-    writes this each context window to record what it has finished and what
-    remains. ``complete: true`` with an empty ``remaining`` ⇒ progress
-    satisfied. Mirrors Rust's ``RalphProgress``."""
+    """The Ralph progress checkpoint (issue #58, B2/B4; relocated by #142). The
+    agent writes this each context window to record what it has finished and
+    what remains. ``complete: true`` with an empty ``remaining`` ⇒ progress
+    satisfied. #142: the checkpoint moved off ``.spore/progress.json`` onto the
+    durable project-id RunStore. Mirrors Rust's ``RalphProgress``."""
 
     complete: bool = False
     remaining: list[str] = Field(default_factory=list)
 
 
 class RalphFeatureEntry(_Model):
-    """One entry of ``.spore/feature_list.json`` — the
-    :class:`~spore_core.termination.FeatureListCheck` schema (issue #58, B2).
-    Any ``passes: false`` ⇒ incomplete. Mirrors Rust's ``RalphFeatureEntry``."""
+    """One entry of the Ralph feature-list checkpoint — the
+    :class:`~spore_core.termination.FeatureListCheck` schema (issue #58, B2; #142
+    relocated it onto the project-id RunStore). Any ``passes: false`` ⇒
+    incomplete. Mirrors Rust's ``RalphFeatureEntry``."""
 
     name: str
     passes: bool = False
 
 
-def _ralph_completion_status(workspace_root: Path) -> str | None:
-    """Ralph external completion check (issue #58, B1). Reads the deterministic
-    ``.spore/`` files under ``workspace_root`` and reports whether the task is
-    complete. Returns ``None`` when complete, the failure reason when tasks
-    remain. This is the SAME logic the registered :class:`RalphStopHook`
-    applies — one source of truth. Mirrors Rust's ``ralph_completion_status``.
+async def _ralph_completion_status(run_store: RunStore, project: ProjectId) -> str | None:
+    """Ralph external completion check (issue #58, B1; #142 — async, store-backed).
+    Reads the Ralph checkpoint from the durable project-id :class:`RunStore`
+    (NOT the ``.spore/`` filesystem) and reports whether the task is complete.
+    Returns ``None`` when complete, the failure reason when tasks remain. This is
+    the SAME logic the registered :class:`RalphStopHook` applies — one source of
+    truth. Mirrors Rust's ``ralph_completion_status``.
 
-    Contract (B4 — no git):
+    The reason strings stay byte-identical to the legacy ``.spore/``-path
+    messages so the surfaced :class:`HaltReasonRalphCompletionUnmet` text is
+    stable across the storage relocation.
 
-    * ``.spore/progress.json``: ``{"complete": bool, "remaining": [str]}``.
-      ``complete: true`` with an empty ``remaining`` ⇒ progress satisfied.
-      Missing / unreadable / invalid ⇒ incomplete (so the agent learns to
-      write it).
-    * ``.spore/feature_list.json``: a JSON array of ``{"name", "passes"}``. Any
-      ``passes: false`` ⇒ incomplete. A MISSING feature list is tolerated
-      (progress.json is the primary signal); an invalid one is not.
+    Contract (#142, decision 3 — the checkpoint MOVED off the ``.spore/``
+    filesystem onto the durable project-id store):
+
+    * :data:`~spore_core.storage.RALPH_PROGRESS_KEY` →
+      ``{"complete": bool, "remaining": [str]}``. ``complete: true`` with an
+      empty ``remaining`` ⇒ progress satisfied. Absent / unreadable / invalid ⇒
+      incomplete (so the agent learns to write it).
+    * :data:`~spore_core.storage.RALPH_FEATURE_LIST_KEY` → a JSON array of
+      ``{"name", "passes"}``. Any ``passes: false`` ⇒ incomplete. An ABSENT
+      feature list is tolerated (progress is the primary signal); an invalid one
+      is not.
     """
-    progress_path = workspace_root / ".spore" / "progress.json"
+    ns = project_namespace(project)
     try:
-        raw = progress_path.read_text()
-    except OSError:
+        progress_value = await run_store.get(ns, RALPH_PROGRESS_KEY)
+    except StorageError:
+        progress_value = None
+    if progress_value is None:
+        # Absent OR a storage error ⇒ incomplete (the agent must write it).
         return ".spore/progress.json missing"
     try:
-        progress = RalphProgress.model_validate_json(raw)
+        progress = RalphProgress.model_validate(progress_value)
     except ValueError as e:
         return f".spore/progress.json invalid JSON: {e}"
     if not progress.complete:
@@ -6048,13 +6120,14 @@ def _ralph_completion_status(workspace_root: Path) -> str | None:
         return f"remaining: {', '.join(progress.remaining)}"
 
     # Progress says done — corroborate against the feature list when present.
-    feature_path = workspace_root / ".spore" / "feature_list.json"
     try:
-        feature_raw = feature_path.read_text()
-    except OSError:
+        feature_value = await run_store.get(ns, RALPH_FEATURE_LIST_KEY)
+    except StorageError:
+        feature_value = None
+    if feature_value is None:
         return None
     try:
-        entries = TypeAdapter(list[RalphFeatureEntry]).validate_json(feature_raw)
+        entries = TypeAdapter(list[RalphFeatureEntry]).validate_python(feature_value)
     except ValueError as e:
         return f".spore/feature_list.json invalid JSON: {e}"
     incomplete = [e.name for e in entries if not e.passes]
@@ -6063,24 +6136,31 @@ def _ralph_completion_status(workspace_root: Path) -> str | None:
     return None
 
 
-def _ralph_reload_context(workspace_root: Path) -> str | None:
-    """Build the filesystem-reload context block injected into each fresh Ralph
-    context window (issue #58, R3/B4). Returns the verbatim
-    ``.spore/progress.json`` and ``.spore/feature_list.json`` contents (when
-    present) so the re-seeded window knows what is done and what remains.
-    Returns ``None`` when neither file exists. Mirrors Rust's
-    ``ralph_reload_context``."""
+async def _ralph_reload_context(run_store: RunStore, project: ProjectId) -> str | None:
+    """Build the reload context block injected into each fresh Ralph context
+    window (issue #58, R3/B4; #142 — async, store-backed). Reads the checkpoint
+    from the durable project-id :class:`RunStore` (not the ``.spore/``
+    filesystem) and returns the verbatim progress + feature-list JSON (when
+    present) so the re-seeded window knows what is done and what remains. Returns
+    ``None`` when neither checkpoint key is set. The "Reloaded .spore/…" prefix
+    is retained so the seeded prompt text is byte-stable across the relocation.
+    Mirrors Rust's ``ralph_reload_context``."""
+    ns = project_namespace(project)
     parts: list[str] = []
     try:
-        raw = (workspace_root / ".spore" / "progress.json").read_text()
+        progress_value = await run_store.get(ns, RALPH_PROGRESS_KEY)
+    except StorageError:
+        progress_value = None
+    if progress_value is not None:
+        raw = json.dumps(progress_value, separators=(",", ":"))
         parts.append(f"Reloaded .spore/progress.json:\n{raw.strip()}")
-    except OSError:
-        pass
     try:
-        raw = (workspace_root / ".spore" / "feature_list.json").read_text()
+        feature_value = await run_store.get(ns, RALPH_FEATURE_LIST_KEY)
+    except StorageError:
+        feature_value = None
+    if feature_value is not None:
+        raw = json.dumps(feature_value, separators=(",", ":"))
         parts.append(f"Reloaded .spore/feature_list.json:\n{raw.strip()}")
-    except OSError:
-        pass
     if not parts:
         return None
     return "\n\n".join(parts)
@@ -6088,18 +6168,20 @@ def _ralph_reload_context(workspace_root: Path) -> str | None:
 
 class RalphStopHook:
     """``Stop`` hook driving Ralph's multi-context-window continuation (issue
-    #58, B1). At each ``FinalResponse`` it reads ``.spore/progress.json`` under
-    ``workspace_root``: incomplete tasks ⇒ :class:`HookBlock` (the loop
+    #58, B1). At each ``FinalResponse`` it reads the Ralph checkpoint from the
+    durable project-id :class:`RunStore` (#142, decision 3 — moved off
+    ``.spore/progress.json``): incomplete tasks ⇒ :class:`HookBlock` (the loop
     continues), all complete ⇒ :class:`HookContinue` (the loop terminates).
 
-    Registration is harmless for non-Ralph strategies: when
-    ``.spore/progress.json`` is ABSENT the hook returns ``Continue`` and does
-    not interfere with ReAct / PlanExecute / SelfVerifying runs. It only blocks
-    when a progress file is PRESENT and reports incomplete tasks — the Ralph
+    Registration is harmless for non-Ralph strategies: when the progress
+    checkpoint key is UNSET the hook returns ``Continue`` and does not interfere
+    with ReAct / PlanExecute / SelfVerifying runs. It only blocks when the
+    progress checkpoint is PRESENT and reports incomplete tasks — the Ralph
     contract. Mirrors Rust's ``RalphStopHook``."""
 
-    def __init__(self, workspace_root: Path) -> None:
-        self._workspace_root = workspace_root
+    def __init__(self, run_store: RunStore, project_id: ProjectId) -> None:
+        self._run_store = run_store
+        self._project_id = project_id
 
     async def handle(self, ctx: Any) -> Any:
         from .hooks import HookBlock, HookContinue, StopContext
@@ -6107,11 +6189,19 @@ class RalphStopHook:
         # Only act on ``Stop``; any other event is a no-op ``Continue``.
         if not isinstance(ctx, StopContext):
             return HookContinue()
-        # Absent progress file ⇒ do not interfere with non-Ralph runs.
-        progress_path = self._workspace_root / ".spore" / "progress.json"
-        if not progress_path.exists():
+        # Absent checkpoint ⇒ do not interfere with non-Ralph runs. The checkpoint
+        # now lives in the project-id RunStore (#142); when the progress key is
+        # UNSET this is not a Ralph run, so ``Continue``.
+        try:
+            present = (
+                await self._run_store.get(project_namespace(self._project_id), RALPH_PROGRESS_KEY)
+                is not None
+            )
+        except StorageError:
+            present = False
+        if not present:
             return HookContinue()
-        reason = _ralph_completion_status(self._workspace_root)
+        reason = await _ralph_completion_status(self._run_store, self._project_id)
         if reason is None:
             return HookContinue()
         return HookBlock(reason=reason)
@@ -6161,13 +6251,15 @@ class StandardHarness:
         # unaffected. Mirrors Rust's ``StandardHarness::new``.
         from .hooks import StandardHookChain
 
-        workspace_root = config.sandbox.workspace_root()
         chain = config.hooks if config.hooks is not None else StandardHookChain()
         # Best-effort: a duplicate/invalid registration must never raise out of
         # the constructor. The hook subscribes only to the can-block ``Stop``
         # event, so registration cannot be rejected for sync/async mismatch.
+        # #142: the checkpoint moved off ``.spore/progress.json`` onto the durable
+        # project-id RunStore — the hook reads it from ``config.storage.run()`` at
+        # ``config.project_id``.
         try:
-            chain.register(RalphStopHook(workspace_root))
+            chain.register(RalphStopHook(config.storage.run(), config.project_id))
         except Exception:  # noqa: BLE001 — construction must not fail on a hook
             pass
         config.hooks = chain
@@ -6207,6 +6299,13 @@ class StandardHarness:
         all-no-op provider when ``.storage(...)`` was never set."""
         return self._config.storage
 
+    def project_id(self) -> ProjectId:
+        """The STABLE durable-storage project namespace (issue #142). Durable
+        artifacts (the ``task_list``, plan, Ralph checkpoint) are keyed by
+        ``project_namespace(harness.project_id())``; defaults to a project id
+        derived from ``sandbox.workspace_root()`` (decision 5)."""
+        return self._config.project_id
+
     def session_store(self) -> SessionStore:
         """Convenience accessor for the storage layer's :class:`SessionStore`
         (issue #73, expose-only)."""
@@ -6243,6 +6342,7 @@ class StandardHarness:
                     scoped,
                     self._config.sandbox,
                     session_id,
+                    self._config.project_id,
                     self._config.storage.run(),
                     self._config.storage.memory(),
                 )
@@ -6254,6 +6354,7 @@ class StandardHarness:
             catalogue,
             self._config.sandbox,
             session_id,
+            self._config.project_id,
             self._config.storage.run(),
             self._config.storage.memory(),
         )
@@ -6981,10 +7082,11 @@ class StandardHarness:
         session (delegates to :meth:`_ralph_seed_session`)."""
         return await self._ralph_seed_session(instruction)
 
-    def ralph_completion_status(self) -> str | None:
+    async def ralph_completion_status(self) -> str | None:
         """:class:`StrategyExecutor` primitive: Ralph external completion check
-        (delegates to the module-level :func:`_ralph_completion_status`)."""
-        return _ralph_completion_status(self._config.sandbox.workspace_root())
+        (delegates to the module-level :func:`_ralph_completion_status`). #142:
+        reads the checkpoint from the durable project-id RunStore (async)."""
+        return await _ralph_completion_status(self._config.storage.run(), self._config.project_id)
 
     def ralph_max_resets(self) -> int:
         """:class:`StrategyExecutor` primitive: the Ralph outer-loop reset cap."""
@@ -7099,11 +7201,18 @@ class StandardHarness:
         :class:`~spore_core.tasklist.TaskList` from the RunStore ``task_list``
         store (#126, decision C). Returns the parsed list, or ``None`` when
         nothing was persisted (or the blob is unparseable). Mirrors Rust's
-        ``load_task_list``."""
+        ``load_task_list``.
+
+        #142: the task_list is DURABLE — read it from the STABLE project
+        namespace, NOT the per-window ``session_id`` (so the execute phase of a
+        fresh Ralph window sees the prior window's list). The ephemeral
+        ``session_id`` is retained for the seam but unused for this durable read."""
         from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList
 
+        _ = session_id  # #142: ephemeral key — durable read keys by project ns.
+        durable_ns = project_namespace(self._config.project_id)
         try:
-            value = await self._config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
+            value = await self._config.storage.run().get(durable_ns, TASK_LIST_EXTRAS_KEY)
         except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
             return None
         if value is None:
@@ -7514,14 +7623,15 @@ class StandardHarness:
 
     async def _ralph_seed_session(self, instruction: str) -> SessionState:
         """Build the per-window Ralph seed session (#124): a fresh
-        :class:`SessionState` seeded with ``instruction``, the ``.spore/`` reload
-        context (R3), and the optional VCS history block — exactly the legacy
+        :class:`SessionState` seeded with ``instruction``, the reload context
+        (R3), and the optional VCS history block — exactly the legacy
         ``_run_ralph`` window setup, minus the model loop (which now recurses).
-        Mirrors Rust's ``ralph_seed_session``."""
-        workspace_root = self._config.sandbox.workspace_root()
+        #142: the reload context now comes from the durable project-id RunStore
+        checkpoint, not the ``.spore/`` filesystem. Mirrors Rust's
+        ``ralph_seed_session``."""
         session_state = SessionState()
         await self._config.context_manager.append_user_message(session_state, instruction)
-        reload = _ralph_reload_context(workspace_root)
+        reload = await _ralph_reload_context(self._config.storage.run(), self._config.project_id)
         if reload is not None:
             await self._config.context_manager.append_user_message(session_state, reload)
         # R3 (issue #58 v2): inject git history when a ``VcsProvider`` is wired.
@@ -7537,6 +7647,32 @@ class StandardHarness:
                 block = f"Recent VCS history:\n{trimmed}"
                 await self._config.context_manager.append_user_message(session_state, block)
         return session_state
+
+    async def write_ralph_progress(self, complete: bool, remaining: list[str]) -> None:
+        """Write the Ralph progress checkpoint to the durable project-id
+        :class:`~spore_core.storage.RunStore` (#142, decision 3 — the WRITE path
+        the relocated checkpoint needs; nothing wrote ``progress.json`` before).
+        ``complete: true`` + empty ``remaining`` ⇒
+        :func:`_ralph_completion_status` reports done. Mirrors Rust's
+        ``write_ralph_progress``."""
+        progress = RalphProgress(complete=complete, remaining=list(remaining))
+        await self._config.storage.run().put(
+            project_namespace(self._config.project_id),
+            RALPH_PROGRESS_KEY,
+            progress.model_dump(mode="json"),
+        )
+
+    async def write_ralph_feature_list(self, features: list[tuple[str, bool]]) -> None:
+        """Write the Ralph feature-list checkpoint to the durable project-id
+        :class:`~spore_core.storage.RunStore` (#142, decision 3). Each entry is
+        ``{"name", "passes"}``; any ``passes: false`` keeps the run incomplete.
+        Mirrors Rust's ``write_ralph_feature_list``."""
+        entries = [{"name": name, "passes": passes} for (name, passes) in features]
+        await self._config.storage.run().put(
+            project_namespace(self._config.project_id),
+            RALPH_FEATURE_LIST_KEY,
+            entries,
+        )
 
     def budget_exceeded(
         self, budget: BudgetLimits, used: BudgetSnapshot, started_at: float
@@ -7729,13 +7865,20 @@ class StandardHarness:
         redundant ``SessionState.extras`` mirror). Storage failures are
         swallowed: a successful plan must not be lost to a storage hiccup (the
         default no-op provider never fails). Mirrors Rust's ``persist_task_list``.
+
+        #142: the task_list is DURABLE — key it by the STABLE project namespace
+        (``project_namespace(project_id)``), NOT the per-window ``session_id`` the
+        Ralph wrapper regenerates each context window. The incoming ``session_id``
+        remains the seam's ephemeral key and is unused for this durable write.
         """
         from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList
 
         assert isinstance(task_list, TaskList)
+        _ = session_id  # #142: ephemeral key — durable write keys by project ns.
+        durable_ns = project_namespace(self._config.project_id)
         value = task_list.to_dict()
         try:
-            await self._config.storage.run().put(session_id, TASK_LIST_EXTRAS_KEY, value)
+            await self._config.storage.run().put(durable_ns, TASK_LIST_EXTRAS_KEY, value)
         except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
             pass
 
@@ -7751,12 +7894,19 @@ class StandardHarness:
         artifact). Extracted from the legacy execute phase so the recursive
         PlanExecute body owns the per-task loop while the durable-state reconcile
         stays here as a leaf primitive. Mirrors Rust's ``reconcile_deep_resume``.
+
+        #142: the durable checkpoint is keyed by the STABLE project namespace,
+        NOT the per-window ``session_id`` — so deep-resume reads the SAME list a
+        prior Ralph window persisted. The ephemeral ``session_id`` is unused for
+        this durable read.
         """
         from .tasklist import TASK_LIST_EXTRAS_KEY, TaskList, TaskStatus
 
         assert isinstance(task_list, TaskList)
+        _ = session_id  # #142: ephemeral key — durable read keys by project ns.
+        durable_ns = project_namespace(self._config.project_id)
         try:
-            saved_value = await self._config.storage.run().get(session_id, TASK_LIST_EXTRAS_KEY)
+            saved_value = await self._config.storage.run().get(durable_ns, TASK_LIST_EXTRAS_KEY)
         except Exception:  # noqa: BLE001 — a load failure starts fresh, never aborts
             saved_value = None
         if saved_value is None:
@@ -7821,13 +7971,17 @@ class StandardHarness:
 
         # R4: persist the produced artifact to the RunStore seam under
         # PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth; no
-        # longer mirrored into SessionState.extras). Storage failures are
-        # swallowed (matching the task-list persist): a successfully-captured plan
-        # must not be lost to a storage hiccup (the default no-op provider never
-        # fails).
+        # longer mirrored into SessionState.extras). #142: the plan artifact is
+        # DURABLE — key it by the STABLE project namespace, NOT the per-window
+        # ``session_id`` (so a Ralph window reset re-reads the prior window's
+        # plan). Storage failures are swallowed (matching the task-list persist):
+        # a successfully-captured plan must not be lost to a storage hiccup (the
+        # default no-op provider never fails).
         try:
             await self._config.storage.run().put(
-                session_id, PLAN_EXECUTE_EXTRAS_KEY, artifact.model_dump(mode="json")
+                project_namespace(self._config.project_id),
+                PLAN_EXECUTE_EXTRAS_KEY,
+                artifact.model_dump(mode="json"),
             )
         except Exception:  # noqa: BLE001 — a storage hiccup must not lose the plan
             pass

@@ -34,7 +34,7 @@ from spore_core.harness import (
     ToolOutputSuccess,
 )
 from spore_core.model import MockModelInterface, ProviderInfo, TokenUsage, ToolCall
-from spore_core.storage import InMemoryStorageProvider
+from spore_core.storage import InMemoryStorageProvider, project_id_from_canonical_path
 from spore_core.observability import (
     ContextOperationCompaction,
     InMemoryObservabilityProvider,
@@ -49,6 +49,10 @@ from spore_eval.scenarios import (
     build_scenario,
     seed_compaction_state,
 )
+
+# #142: a fixed test project id threaded into the RealToolRegistry bridge — these
+# scenarios exercise the storage seam, not the durable namespace itself.
+_TEST_PROJECT_ID = project_id_from_canonical_path("/e2e-test-project")
 
 
 def _usage() -> TokenUsage:
@@ -276,7 +280,7 @@ async def test_s4_tool_failure_then_recovery() -> None:
     registry = build_real_tool_registry(ScenarioId.S4)
     sandbox = AllowAllSandbox()
     _storage = InMemoryStorageProvider()
-    bridge = RealToolRegistry(registry, sandbox, session_id, _storage, _storage)
+    bridge = RealToolRegistry(registry, sandbox, session_id, _TEST_PROJECT_ID, _storage, _storage)
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -307,6 +311,7 @@ async def test_s4_failing_tool_is_not_always_halt() -> None:
         build_real_tool_registry(ScenarioId.S4),
         AllowAllSandbox(),
         SessionId("s4-halt-test"),
+        _TEST_PROJECT_ID,
         _storage,
         _storage,
     )
@@ -350,7 +355,7 @@ async def test_s5_shell_pipeline_uppercases_via_bash_command() -> None:
     registry = build_real_tool_registry(ScenarioId.S5)
     sandbox = AllowAllSandbox()
     _storage = InMemoryStorageProvider()
-    bridge = RealToolRegistry(registry, sandbox, session_id, _storage, _storage)
+    bridge = RealToolRegistry(registry, sandbox, session_id, _TEST_PROJECT_ID, _storage, _storage)
     schemas = bridge.model_schemas()
 
     harness = build_scenario(
@@ -393,6 +398,7 @@ def _schema_names(scenario: ScenarioId) -> list[str]:
         build_real_tool_registry(scenario),
         AllowAllSandbox(),
         SessionId("schema-test"),
+        _TEST_PROJECT_ID,
         _storage,
         _storage,
     )
@@ -443,6 +449,7 @@ async def test_real_tool_registry_threads_memory_store() -> None:
         StandardToolRegistry(),
         AllowAllSandbox(),
         SessionId("ctx-test"),
+        _TEST_PROJECT_ID,
         InMemoryStorageProvider(),
         memory,
     )

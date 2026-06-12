@@ -315,7 +315,7 @@ async def test_fixture_replay_send_message_event() -> None:
 
 async def test_fixture_replay_todo_write(tmp_path: Path) -> None:
     from spore_core.harness import SessionId, ToolOutputSuccess
-    from spore_core.storage import InMemoryStorageProvider
+    from spore_core.storage import InMemoryStorageProvider, project_id_from_canonical_path
     from spore_core.tool_registry import ToolContext
     from spore_tools.tools.todo import TODO_STORE_KEY, TodoWriteTool
 
@@ -328,6 +328,7 @@ async def test_fixture_replay_todo_write(tmp_path: Path) -> None:
         _backend = InMemoryStorageProvider()
         ctx = ToolContext(
             session_id=SessionId(f"todo-{sc['name']}"),
+            project_id=project_id_from_canonical_path("/test-project"),
             run_store=_backend,
             memory_store=_backend,
         )

@@ -70,6 +70,7 @@ import hashlib
 import json
 import os
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NewType, Protocol, runtime_checkable
 
@@ -229,6 +230,218 @@ def workspace_id_from_canonical_path(path: str) -> WorkspaceId:
     basename = canonical.rsplit("/", 1)[-1]
     sanitized = _sanitize_basename(basename) or "root"
     return WorkspaceId(f"{sanitized}-{hex8}")
+
+
+# ============================================================================
+# ProjectId (#142) — project-scoped durable storage namespace
+# ============================================================================
+
+
+#: A **stable** identifier for a project, used as the durable storage namespace
+#: (issue #142). Where :data:`~spore_core.harness.SessionId` is regenerated per
+#: Ralph context window (``new_session_id()``), a ``ProjectId`` derived from the
+#: workspace root stays constant across windows AND across process restarts —
+#: that stability is the whole point: the ``task_list``, plan artifact, Ralph
+#: checkpoint, and active-run slot persist under it so a window reset re-reads
+#: the prior window's work instead of re-planning from scratch.
+#:
+#: Form ``{sanitized_basename}-{8_hex_chars}``, lowercased — **identical** to
+#: :data:`WorkspaceId`. The two share the exact same pure derivation
+#: (:func:`workspace_id_from_canonical_path`); a ``ProjectId`` differs only in
+#: that it carries FS-touching constructors (:func:`project_id_from_path` /
+#: :func:`project_id_from_cwd`) that canonicalize first. A ``NewType`` over
+#: ``str`` (Python conventions: IDs are ``NewType`` aliases).
+#:
+#: ``/a/b`` vs ``/a_b`` collision policy (RESOLVED): a naive "slashes →
+#: underscores" slug would map both ``/a/b`` and ``/a_b`` to the same string.
+#: This derivation does NOT collide — it slugs ONLY the final basename and
+#: appends the first 8 hex of the SHA-256 of the FULL canonical path string.
+#: ``/a/b`` and ``/a_b`` have different canonical strings, hence different
+#: hashes, hence distinct ids (``b-662b7b62`` vs ``a-b-328ff01f``). Pinned by
+#: ``fixtures/storage/project_id_derivation.json``.
+ProjectId = NewType("ProjectId", str)
+
+
+class ProjectIdError(StorageError):
+    """Raised while deriving a :data:`ProjectId` from the live filesystem (#142).
+
+    The pure derivation :func:`project_id_from_canonical_path` is infallible —
+    only the FS-touching constructors (:func:`project_id_from_path` /
+    :func:`project_id_from_cwd`) can fail, and only because canonicalization
+    touched the filesystem (the path does not exist, a component is not a
+    directory, a permission error, a broken symlink, …). The originating
+    :class:`OSError` is chained via ``__cause__``."""
+
+
+def project_id_from_canonical_path(path: str) -> ProjectId:
+    """Derive a :data:`ProjectId` from an already-OS-canonicalized path.
+
+    **PURE and infallible** — never touches the filesystem. This is the
+    cross-language fixture anchor (``fixtures/storage/project_id_derivation.json``);
+    it reuses the EXACT same algorithm as
+    :func:`workspace_id_from_canonical_path` (``{sanitized_basename}-{8hex}``),
+    so the two derivations are byte-identical for the same input — the 8-hex
+    SHA-256 suffix already resolves the ``/a/b`` vs ``/a_b`` slug collision
+    (distinct canonical strings ⇒ distinct hashes ⇒ distinct ids). Mirrors
+    Rust's ``ProjectId::from_canonical_path``."""
+    # Reuse the WorkspaceId pure algorithm — do NOT duplicate it.
+    return ProjectId(str(workspace_id_from_canonical_path(path)))
+
+
+def project_id_from_path(path: str | Path) -> ProjectId:
+    """Derive a :data:`ProjectId` from a path, **canonicalizing the filesystem
+    FIRST** (resolves symlinks, relative components, and macOS
+    case-insensitivity) before delegating to the pure
+    :func:`project_id_from_canonical_path`. Raises :class:`ProjectIdError` when
+    the path cannot be canonicalized. Mirrors Rust's ``ProjectId::from_path``."""
+    try:
+        canonical = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise ProjectIdError(f"project id canonicalization failed: {exc}") from exc
+    return project_id_from_canonical_path(str(canonical))
+
+
+def project_id_from_cwd() -> ProjectId:
+    """Derive a :data:`ProjectId` from the current working directory,
+    canonicalizing FIRST. Convenience wrapper over :func:`project_id_from_path`
+    for binaries that want the process cwd; the harness itself derives from
+    ``sandbox.workspace_root()``, NOT process cwd (decision 5). Mirrors Rust's
+    ``ProjectId::from_cwd``."""
+    try:
+        cwd = Path.cwd()
+    except OSError as exc:
+        raise ProjectIdError(f"project id canonicalization failed: {exc}") from exc
+    return project_id_from_path(cwd)
+
+
+def project_namespace(project_id: ProjectId) -> SessionId:
+    """Project a :data:`ProjectId` onto the :class:`RunStore`'s ``session_id``
+    string axis — the namespace-reuse seam (#142).
+
+    The :class:`RunStore` protocol is keyed by :class:`~spore_core.harness.SessionId`.
+    Rather than widening that protocol, a ``ProjectId`` is projected onto the
+    same string axis: the returned :class:`SessionId` is NOT a real session —
+    its string IS the derived project id — so durable :meth:`RunStore.get` /
+    :meth:`RunStore.put` calls key by the stable project namespace without
+    changing the protocol. Ephemeral session-keyed state keeps using the real
+    per-window :class:`SessionId`. Mirrors Rust's ``ProjectId::namespace``."""
+    return SessionId(str(project_id))
+
+
+# ============================================================================
+# Active-run lifecycle (#142, decision 2)
+# ============================================================================
+
+
+#: Reserved :class:`RunStore` key (under the project namespace) holding the
+#: :class:`ActiveRun` slot. The caller owns the lifecycle: start-new vs resume
+#: is a deterministic match on the caller-supplied ``run_tag``, NOT
+#: instruction-diffing and NOT auto-on-success. The harness stays stateless
+#: between runs.
+ACTIVE_RUN_KEY = "active_run"
+
+#: Reserved :class:`RunStore` key (under the project namespace) holding the
+#: Ralph progress checkpoint (#142, decision 3). Previously lived at
+#: ``{workspace_root}/.spore/progress.json``; now in the project-id store so it
+#: survives Ralph window resets and process restarts.
+RALPH_PROGRESS_KEY = "ralph_progress"
+
+#: Reserved :class:`RunStore` key (under the project namespace) holding the
+#: Ralph feature-list checkpoint (#142, decision 3). Mirrors the old
+#: ``{workspace_root}/.spore/feature_list.json``.
+RALPH_FEATURE_LIST_KEY = "ralph_feature_list"
+
+
+class ActiveRunStatus(str, Enum):
+    """Lifecycle status of the project's active run (#142)."""
+
+    #: The run is live: a window reset under the SAME ``run_tag`` resumes it.
+    ACTIVE = "active"
+    #: The run was explicitly completed via :func:`complete_active_run`; the slot
+    #: is archived. A subsequent start under a NEW tag begins fresh.
+    COMPLETED = "completed"
+
+
+class ActiveRun(BaseModel):
+    """The active-run slot persisted under :data:`ACTIVE_RUN_KEY` in the project
+    store (#142).
+
+    ``run_tag`` is **caller-supplied** and is the sole start-new-vs-resume
+    discriminator (decision 2): a :func:`start_or_resume_active_run` call whose
+    tag matches a live slot RESUMES; a different tag (or an absent / completed
+    slot) starts FRESH. ``started_at`` is an **injected** timestamp (decision 2
+    — no wall-clock nondeterminism) so tests are deterministic."""
+
+    run_tag: str
+    started_at: Timestamp
+    status: ActiveRunStatus
+
+
+class ActiveRunDecision(str, Enum):
+    """Outcome of :func:`start_or_resume_active_run` (#142): did the slot match
+    (resume) or did the call mint a fresh active slot (start-new)?"""
+
+    #: No live slot matched the tag — a fresh ``ACTIVE`` slot was written.
+    STARTED_NEW = "started_new"
+    #: A live slot under the SAME tag was found — the run reattaches.
+    RESUMED = "resumed"
+
+
+async def load_active_run(run_store: RunStore, project: ProjectId) -> ActiveRun | None:
+    """Read the active-run slot for ``project``, or ``None`` if absent /
+    unparseable (#142). A malformed slot is treated as "no live run" — the next
+    start mints a fresh one rather than erroring. Mirrors Rust's
+    ``load_active_run``."""
+    ns = project_namespace(project)
+    value = await run_store.get(ns, ACTIVE_RUN_KEY)
+    if value is None:
+        return None
+    try:
+        return ActiveRun.model_validate(value)
+    except ValueError:
+        return None
+
+
+async def start_or_resume_active_run(
+    run_store: RunStore,
+    project: ProjectId,
+    run_tag: str,
+    started_at: Timestamp,
+) -> ActiveRunDecision:
+    """Decide start-new vs resume for ``project`` on the caller-supplied
+    ``run_tag`` (#142, decision 2).
+
+    Deterministic: a live (``ACTIVE``) slot under the SAME tag ⇒
+    :attr:`ActiveRunDecision.RESUMED` (the slot is left intact); otherwise a
+    fresh ``ACTIVE`` slot stamped with the injected ``started_at`` is written and
+    :attr:`ActiveRunDecision.STARTED_NEW` is returned. ``started_at`` is injected
+    (not read from a clock) so the result is deterministic in tests. Mirrors
+    Rust's ``start_or_resume_active_run``."""
+    existing = await load_active_run(run_store, project)
+    if (
+        existing is not None
+        and existing.status == ActiveRunStatus.ACTIVE
+        and existing.run_tag == run_tag
+    ):
+        return ActiveRunDecision.RESUMED
+    fresh = ActiveRun(run_tag=run_tag, started_at=started_at, status=ActiveRunStatus.ACTIVE)
+    await run_store.put(project_namespace(project), ACTIVE_RUN_KEY, fresh.model_dump(mode="json"))
+    return ActiveRunDecision.STARTED_NEW
+
+
+async def complete_active_run(run_store: RunStore, project: ProjectId) -> None:
+    """Mark the active run for ``project`` complete (#142, decision 2): flips the
+    slot's status to :attr:`ActiveRunStatus.COMPLETED` so the next
+    :func:`start_or_resume_active_run` (even under the same tag) starts fresh. A
+    no-op when there is no slot to complete. Mirrors Rust's
+    ``complete_active_run``."""
+    existing = await load_active_run(run_store, project)
+    if existing is None:
+        return
+    completed = existing.model_copy(update={"status": ActiveRunStatus.COMPLETED})
+    await run_store.put(
+        project_namespace(project), ACTIVE_RUN_KEY, completed.model_dump(mode="json")
+    )
 
 
 # ============================================================================
@@ -946,6 +1159,12 @@ def parse_otlp_endpoints(raw: str) -> list[str]:
 
 
 __all__ = [
+    "ACTIVE_RUN_KEY",
+    "RALPH_FEATURE_LIST_KEY",
+    "RALPH_PROGRESS_KEY",
+    "ActiveRun",
+    "ActiveRunDecision",
+    "ActiveRunStatus",
     "CompositeStorageProvider",
     "FileSystemStorageProvider",
     "InMemoryStorageProvider",
@@ -954,6 +1173,8 @@ __all__ = [
     "MemoryStore",
     "NoOpStorageProvider",
     "ObservabilityStore",
+    "ProjectId",
+    "ProjectIdError",
     "RunStore",
     "ScopedMemoryRouter",
     "SessionStore",
@@ -965,7 +1186,14 @@ __all__ = [
     "StorageScope",
     "StorageSerializationError",
     "WorkspaceId",
+    "complete_active_run",
+    "load_active_run",
     "merge_memories",
     "parse_otlp_endpoints",
+    "project_id_from_canonical_path",
+    "project_id_from_cwd",
+    "project_id_from_path",
+    "project_namespace",
+    "start_or_resume_active_run",
     "workspace_id_from_canonical_path",
 ]

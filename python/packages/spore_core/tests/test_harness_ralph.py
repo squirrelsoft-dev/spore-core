@@ -3,10 +3,17 @@
 Mirrors ``rust/crates/spore-core/src/harness.rs`` Ralph unit tests and the
 shared fixture at ``fixtures/harness/ralph.json``. Ralph is a
 multi-context-window continuation loop: each window is a FRESH session
-re-seeded with the instruction plus reloaded ``.spore/`` state, driven by a
-registered ``Stop`` hook reading ``.spore/progress.json`` (B1), bounded by the
-``max_resets`` outer cap (B3). Each test maps to one rule; the rule lives in
+re-seeded with the instruction plus reloaded checkpoint state, driven by a
+registered ``Stop`` hook reading the Ralph progress checkpoint (B1), bounded by
+the ``max_resets`` outer cap (B3). Each test maps to one rule; the rule lives in
 the docstring.
+
+#142: the Ralph checkpoint MOVED off the ``.spore/`` filesystem onto the durable
+project-id :class:`RunStore`. The test writer and the harness reader must SHARE
+one store + project id so a write is what the read sees: ``_config`` pins
+``project_id`` from the sandbox root, ``_write_progress`` writes into the SAME
+store at the project namespace, and the agents hold that store so what they
+write is what the harness reads.
 """
 
 from __future__ import annotations
@@ -49,6 +56,15 @@ from spore_core.harness import (
     NoopContextManager,
 )
 from spore_core.model import ModelParams
+from spore_core.storage import (
+    RALPH_FEATURE_LIST_KEY,
+    RALPH_PROGRESS_KEY,
+    InMemoryStorageProvider,
+    RunStore,
+    StorageProvider,
+    project_id_from_canonical_path,
+    project_namespace,
+)
 
 INCOMPLETE = '{"complete": false, "remaining": ["task A"]}'
 COMPLETE = '{"complete": true, "remaining": []}'
@@ -60,8 +76,10 @@ COMPLETE = '{"complete": true, "remaining": []}'
 
 
 class WorkspaceSandbox(BaseSandboxProvider):
-    """Allow-all sandbox whose ``workspace_root`` is a real tempdir, so the
-    Ralph filesystem reload + completion check read real ``.spore/`` files."""
+    """Allow-all sandbox whose ``workspace_root`` is a real tempdir. #142: the
+    Ralph reload + completion check now read the project-id RunStore (not
+    ``.spore/`` files), but the root is still the derivation source for the
+    project id."""
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -73,26 +91,37 @@ class WorkspaceSandbox(BaseSandboxProvider):
         return self._root
 
 
-def _write_progress(root: Path, body: str) -> None:
-    (root / ".spore").mkdir(exist_ok=True)
-    (root / ".spore" / "progress.json").write_text(body)
+def _ralph_ns(root: Path):  # type: ignore[no-untyped-def]
+    """The project namespace the Ralph checkpoint lives under (#142): the project
+    id ``_config`` pins from ``root`` (matching the harness reader), projected
+    onto the ``RunStore`` session-id axis. The test writer and the harness reader
+    MUST agree on this so a write is what the read sees."""
+    return project_namespace(project_id_from_canonical_path(str(root)))
 
 
-def _write_feature_list(root: Path, body: str) -> None:
-    (root / ".spore").mkdir(exist_ok=True)
-    (root / ".spore" / "feature_list.json").write_text(body)
+async def _write_progress(store: RunStore, root: Path, body: str) -> None:
+    """Write the Ralph progress checkpoint into the SHARED run store under the
+    project namespace derived from ``root`` (#142 relocated this off the
+    ``.spore/`` filesystem). ``body`` is the legacy JSON body string."""
+    await store.put(_ralph_ns(root), RALPH_PROGRESS_KEY, json.loads(body))
+
+
+async def _write_feature_list(store: RunStore, root: Path, body: str) -> None:
+    await store.put(_ralph_ns(root), RALPH_FEATURE_LIST_KEY, json.loads(body))
 
 
 class ProgressWritingAgent:
-    """Agent that, on each turn, pops the next progress-file body from a queue
-    and writes it to ``.spore/progress.json`` BEFORE returning a
-    ``FinalResponse`` — modelling "the agent did work this window and updated
+    """Agent that, on each turn, pops the next progress body from a queue and
+    writes it to the SHARED run store under the project namespace BEFORE returning
+    a ``FinalResponse`` — modelling "the agent did work this window and updated
     progress." Records the contexts it saw so tests can assert fresh-state /
-    reload. Mirrors Rust's ``ProgressWritingAgent``."""
+    reload. #142: the Ralph worker holds the shared run store so what it writes is
+    what the harness reads. Mirrors Rust's ``ProgressWritingAgent``."""
 
-    def __init__(self, root: Path, bodies: list[str]) -> None:
+    def __init__(self, store: RunStore, root: Path, bodies: list[str]) -> None:
         self._id = AgentId("ralph-build")
-        self._root = root
+        self._store = store
+        self._ns = _ralph_ns(root)
         self._queue = list(bodies)
         self.seen: list[Context] = []
 
@@ -113,7 +142,7 @@ class ProgressWritingAgent:
     async def turn(self, context: Context) -> FinalResponse:
         self.seen.append(context)
         if self._queue:
-            _write_progress(self._root, self._queue.pop(0))
+            await self._store.put(self._ns, RALPH_PROGRESS_KEY, json.loads(self._queue.pop(0)))
         return FinalResponse(
             content="window done",
             usage=TokenUsage(input_tokens=1, output_tokens=1),
@@ -126,14 +155,15 @@ class ProgressWritingAgent:
 class ToolLoopingAgent:
     """An agent that NEVER returns a ``FinalResponse`` — every turn requests a
     tool call, so a bounded ReAct window can only ever exhaust its turn budget (it
-    never terminates cleanly). On its FIRST turn it writes ``COMPLETE`` to
-    ``.spore/progress.json``, so any code path that DID consult Ralph's external
+    never terminates cleanly). On its FIRST turn it writes ``COMPLETE`` to the
+    SHARED run store, so any code path that DID consult Ralph's external
     completion after the window would (wrongly) see "complete" and Success.
     Mirrors Rust's ``ToolLoopingAgent`` (#125 F5)."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, store: RunStore, root: Path) -> None:
         self._id = AgentId("ralph-tool-loop")
-        self._root = root
+        self._store = store
+        self._ns = _ralph_ns(root)
         self._calls = 0
 
     @property
@@ -142,9 +172,9 @@ class ToolLoopingAgent:
 
     async def turn(self, context: Context) -> ToolCallRequested:
         if self._calls == 0:
-            # Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
-            # completion after a budget-exhausted window it would Success.
-            _write_progress(self._root, COMPLETE)
+            # Mark COMPLETE up front — if Ralph (wrongly) consulted completion
+            # after a budget-exhausted window it would Success.
+            await self._store.put(self._ns, RALPH_PROGRESS_KEY, json.loads(COMPLETE))
         n = self._calls
         self._calls += 1
         return ToolCallRequested(
@@ -176,14 +206,28 @@ class PassThroughContextManager:
         return False
 
 
+def _new_storage() -> StorageProvider:
+    """A fresh in-memory provider the test, the agent, and the harness all share
+    (#142): the agent writes the checkpoint into it and the harness reads from the
+    same store at the same project namespace."""
+    return StorageProvider.single(InMemoryStorageProvider())
+
+
 def _config(
     root: Path,
     agent: Any,
+    storage: StorageProvider,
     *,
     max_resets: int = 3,
     context_manager: Any = None,
     vcs_provider: Any = None,
 ) -> HarnessConfig:
+    """Build a Ralph harness config whose checkpoint store + project namespace are
+    SHARED with ``storage`` (#142). The harness reads the checkpoint from
+    ``cfg.storage`` at ``cfg.project_id``; this pins ``project_id`` from ``root``
+    (the same root ``WorkspaceSandbox`` exposes), so a write the test/agent makes
+    against ``storage`` at ``_ralph_ns(root)`` is exactly what the harness reads.
+    ``agent`` already holds ``storage.run()``."""
     return HarnessConfig(
         agent=agent,
         tool_registry=ScriptedToolRegistry(),
@@ -192,6 +236,10 @@ def _config(
         termination_policy=AlwaysContinuePolicy(),
         max_resets=max_resets,
         vcs_provider=vcs_provider,
+        storage=storage,
+        # #142: pin the project id from the SAME root the sandbox exposes so the
+        # harness reads back what the test/agent writes under ``_ralph_ns(root)``.
+        project_id=project_id_from_canonical_path(str(root)),
     )
 
 
@@ -212,9 +260,10 @@ def _ralph_task() -> Task:
 
 
 async def test_r0_ralph_implemented(tmp_path: Path) -> None:
-    _write_progress(tmp_path, COMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [COMPLETE])
-    h = StandardHarness(_config(tmp_path, agent))
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, COMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [COMPLETE])
+    h = StandardHarness(_config(tmp_path, agent, storage))
     r = await h.run(HarnessRunOptions(_ralph_task()))
     assert isinstance(r, RunResultSuccess)
 
@@ -225,9 +274,10 @@ async def test_r0_ralph_implemented(tmp_path: Path) -> None:
 
 
 async def test_r4_resets_until_complete(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, INCOMPLETE, COMPLETE])
-    h = StandardHarness(_config(tmp_path, agent, max_resets=3))
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, INCOMPLETE, COMPLETE])
+    h = StandardHarness(_config(tmp_path, agent, storage, max_resets=3))
     r = await h.run(HarnessRunOptions(_ralph_task()))
     assert isinstance(r, RunResultSuccess)
     # Exactly three context windows ran (one agent turn each).
@@ -240,9 +290,12 @@ async def test_r4_resets_until_complete(tmp_path: Path) -> None:
 
 
 async def test_r5_exhausts_max_resets(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, INCOMPLETE, INCOMPLETE, INCOMPLETE])
-    h = StandardHarness(_config(tmp_path, agent, max_resets=3))
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(
+        storage.run(), tmp_path, [INCOMPLETE, INCOMPLETE, INCOMPLETE, INCOMPLETE]
+    )
+    h = StandardHarness(_config(tmp_path, agent, storage, max_resets=3))
     r = await h.run(HarnessRunOptions(_ralph_task()))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonRalphCompletionUnmet)
@@ -253,9 +306,10 @@ async def test_r5_exhausts_max_resets(tmp_path: Path) -> None:
 
 
 async def test_r5_single_window_cap(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, INCOMPLETE])
-    h = StandardHarness(_config(tmp_path, agent, max_resets=1))
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, INCOMPLETE])
+    h = StandardHarness(_config(tmp_path, agent, storage, max_resets=1))
     r = await h.run(HarnessRunOptions(_ralph_task()))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonRalphCompletionUnmet)
@@ -281,13 +335,14 @@ async def test_r5_single_window_cap(tmp_path: Path) -> None:
 async def test_ralph_budget_exhausted_window_resets_no_completion_no_cascade(
     tmp_path: Path,
 ) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ToolLoopingAgent(tmp_path)
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ToolLoopingAgent(storage.run(), tmp_path)
     # Provide tool outputs for the looping calls across all windows.
     reg = ScriptedToolRegistry()
     for _ in range(32):
         reg.push(ToolOutputSuccess(content="ok", truncated=False))
-    cfg = _config(tmp_path, agent, max_resets=3)
+    cfg = _config(tmp_path, agent, storage, max_resets=3)
     cfg.tool_registry = reg
     h = StandardHarness(cfg)
 
@@ -320,10 +375,11 @@ async def test_ralph_budget_exhausted_window_resets_no_completion_no_cascade(
 
 
 async def test_r2_fresh_session_per_reset(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, COMPLETE])
     h = StandardHarness(
-        _config(tmp_path, agent, max_resets=3, context_manager=PassThroughContextManager())
+        _config(tmp_path, agent, storage, max_resets=3, context_manager=PassThroughContextManager())
     )
     await h.run(HarnessRunOptions(_ralph_task()))
     texts = agent.seen_text()
@@ -338,15 +394,18 @@ async def test_r2_fresh_session_per_reset(tmp_path: Path) -> None:
 
 
 async def test_r3_reload_injects_filesystem_state(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    _write_feature_list(tmp_path, '[{"name":"login","passes":false}]')
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    await _write_feature_list(storage.run(), tmp_path, '[{"name":"login","passes":false}]')
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, COMPLETE])
     h = StandardHarness(
-        _config(tmp_path, agent, max_resets=3, context_manager=PassThroughContextManager())
+        _config(tmp_path, agent, storage, max_resets=3, context_manager=PassThroughContextManager())
     )
     await h.run(HarnessRunOptions(_ralph_task()))
     texts = agent.seen_text()
-    # Window 1's fresh seed contains the reloaded progress + feature list.
+    # Window 1's fresh seed contains the reloaded progress + feature list. The
+    # "Reloaded .spore/…" prefix is retained (#142) even though the checkpoint now
+    # lives in the project-id RunStore.
     assert "Reloaded .spore/progress.json" in texts[0]
     assert "Reloaded .spore/feature_list.json" in texts[0]
     assert "login" in texts[0]
@@ -358,9 +417,10 @@ async def test_r3_reload_injects_filesystem_state(tmp_path: Path) -> None:
 
 
 async def test_r6_budgets_fold_across_windows(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, INCOMPLETE, COMPLETE])
-    h = StandardHarness(_config(tmp_path, agent, max_resets=3))
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, INCOMPLETE, COMPLETE])
+    h = StandardHarness(_config(tmp_path, agent, storage, max_resets=3))
     r = await h.run(HarnessRunOptions(_ralph_task()))
     assert isinstance(r, RunResultSuccess)
     # Three windows × one turn × (1 in, 1 out) folded.
@@ -399,25 +459,40 @@ async def test_r7_stop_hook_inert_without_progress_file(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_completion_status_feature_list_gate(tmp_path: Path) -> None:
+async def test_completion_status_feature_list_gate() -> None:
+    # #142: the checkpoint lives in the project-id RunStore, not on disk. The
+    # completion-status helper reads ``(run_store, project)``; the test writes the
+    # same checkpoint into the same store under the project namespace.
     from spore_core.harness import _ralph_completion_status
 
-    _write_progress(tmp_path, COMPLETE)
-    _write_feature_list(tmp_path, '[{"name":"login","passes":false}]')
-    status = _ralph_completion_status(tmp_path)
+    storage = _new_storage()
+    project = project_id_from_canonical_path("/feature-gate")
+    ns = project_namespace(project)
+    run = storage.run()
+    await run.put(ns, RALPH_PROGRESS_KEY, json.loads(COMPLETE))
+    await run.put(ns, RALPH_FEATURE_LIST_KEY, [{"name": "login", "passes": False}])
+    status = await _ralph_completion_status(run, project)
     assert status is not None and "login" in status
+    assert "incomplete features" in status
     # Now mark it passing — complete.
-    _write_feature_list(tmp_path, '[{"name":"login","passes":true}]')
-    assert _ralph_completion_status(tmp_path) is None
+    await run.put(ns, RALPH_FEATURE_LIST_KEY, [{"name": "login", "passes": True}])
+    assert await _ralph_completion_status(run, project) is None
 
 
-async def test_completion_status_remaining_nonempty_is_incomplete(tmp_path: Path) -> None:
+async def test_completion_status_remaining_nonempty_is_incomplete() -> None:
     from spore_core.harness import _ralph_completion_status
 
     # complete:true but a non-empty remaining list ⇒ incomplete (fixture case
     # ``complete_but_remaining_nonempty_is_incomplete``).
-    _write_progress(tmp_path, '{"complete": true, "remaining": ["leftover"]}')
-    status = _ralph_completion_status(tmp_path)
+    storage = _new_storage()
+    project = project_id_from_canonical_path("/remaining-gate")
+    run = storage.run()
+    await run.put(
+        project_namespace(project),
+        RALPH_PROGRESS_KEY,
+        {"complete": True, "remaining": ["leftover"]},
+    )
+    status = await _ralph_completion_status(run, project)
     assert status is not None and "leftover" in status
 
 
@@ -436,13 +511,14 @@ async def test_ralph_fixture_replay(tmp_path: Path) -> None:
     for i, case in enumerate(suite["cases"]):
         case_dir = tmp_path / f"case_{i}"
         case_dir.mkdir()
-        # Seed an initial incomplete progress file so window 1 reloads state.
-        _write_progress(case_dir, INCOMPLETE)
+        storage = _new_storage()
+        # Seed an initial incomplete progress checkpoint so window 1 reloads state.
+        await _write_progress(storage.run(), case_dir, INCOMPLETE)
         bodies = [
             json.dumps({"complete": w["complete"], "remaining": w.get("remaining", [])})
             for w in case["windows"]
         ]
-        agent = ProgressWritingAgent(case_dir, bodies)
+        agent = ProgressWritingAgent(storage.run(), case_dir, bodies)
         # issue #58 v2: when the case carries a ``vcs_log``, wire a
         # FixtureVcsProvider seeded with it; absent ⇒ None ⇒ no git section. The
         # PassThroughContextManager records seeds so we can assert injection.
@@ -452,6 +528,7 @@ async def test_ralph_fixture_replay(tmp_path: Path) -> None:
             _config(
                 case_dir,
                 agent,
+                storage,
                 max_resets=case["max_resets"],
                 context_manager=PassThroughContextManager(),
                 vcs_provider=vcs_provider,
@@ -572,13 +649,15 @@ async def test_vcs_git_nonzero_exit_raises(tmp_path: Path) -> None:
 # (c) Ralph with a FixtureVcsProvider injects the vcs_log into reloaded context
 # across a reset.
 async def test_vcs_ralph_injects_log_into_reload(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, COMPLETE])
     vcs_log = "cafe123 implement login\nbeef456 add login tests"
     h = StandardHarness(
         _config(
             tmp_path,
             agent,
+            storage,
             max_resets=3,
             context_manager=PassThroughContextManager(),
             vcs_provider=FixtureVcsProvider(vcs_log, ""),
@@ -592,12 +671,14 @@ async def test_vcs_ralph_injects_log_into_reload(tmp_path: Path) -> None:
 
 # (d) Ralph with vcs_provider=None omits any git section (v1 unchanged).
 async def test_vcs_ralph_none_omits_git_section(tmp_path: Path) -> None:
-    _write_progress(tmp_path, INCOMPLETE)
-    agent = ProgressWritingAgent(tmp_path, [INCOMPLETE, COMPLETE])
+    storage = _new_storage()
+    await _write_progress(storage.run(), tmp_path, INCOMPLETE)
+    agent = ProgressWritingAgent(storage.run(), tmp_path, [INCOMPLETE, COMPLETE])
     h = StandardHarness(
         _config(
             tmp_path,
             agent,
+            storage,
             max_resets=3,
             context_manager=PassThroughContextManager(),
             vcs_provider=None,

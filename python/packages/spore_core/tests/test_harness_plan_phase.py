@@ -46,6 +46,7 @@ from spore_core.hooks import (
     OnPlanCreatedContext,
     StandardHookChain,
 )
+from spore_core.storage import project_namespace
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +76,11 @@ def _config(agent: MockAgent, **overrides: object) -> HarnessConfig:
 
 
 async def _stored_artifact(h: StandardHarness, session_id: SessionId) -> object:
-    """Read the plan artifact back through the harness's RunStore seam (#76)."""
-    return await h.storage().run().get(session_id, PLAN_EXECUTE_EXTRAS_KEY)
+    """Read the plan artifact back through the harness's RunStore seam (#76).
+    #142: the plan artifact is keyed by the project namespace, not the run
+    session id — read it back under ``project_namespace(h.project_id())``."""
+    _ = session_id  # #142: durable readback keys by the project namespace.
+    return await h.storage().run().get(project_namespace(h.project_id()), PLAN_EXECUTE_EXTRAS_KEY)
 
 
 def _plan_task(*, max_turns: int | None = None) -> Task:
