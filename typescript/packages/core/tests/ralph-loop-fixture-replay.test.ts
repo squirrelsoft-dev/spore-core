@@ -15,7 +15,7 @@
  * fixture to make a failing implementation pass.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,7 @@ import {
   SessionId,
   StandardHarness,
   newTask,
+  storage,
   type Agent,
   type Context,
   type HarnessConfig,
@@ -37,6 +38,8 @@ import {
   type ToolCall,
   type TurnResult,
 } from "../src/index.js";
+
+const { ProjectId, StorageProvider, InMemoryStorageProvider, RALPH_PROGRESS_KEY } = storage;
 import {
   AlwaysContinuePolicy,
   FixtureVcsProvider,
@@ -85,18 +88,33 @@ class WorkspaceSandbox implements SandboxProvider {
   }
 }
 
-function writeProgress(root: string, body: string): void {
-  mkdirSync(join(root, ".spore"), { recursive: true });
-  writeFileSync(join(root, ".spore", "progress.json"), body);
+/** Per-test shared Ralph store + pinned project id (#142): the checkpoint moved
+ *  off `.spore/` onto the durable project-id RunStore, so the writer-agent and
+ *  the harness reader share ONE store + project id. */
+function ralphStore(): { storage: storage.StorageProvider; projectId: storage.ProjectId } {
+  return {
+    storage: StorageProvider.single(new InMemoryStorageProvider()),
+    projectId: ProjectId.fromCanonicalPath("/ralph-replay-project"),
+  };
 }
 
-/** Writes the next scripted progress body each turn, then claims done. */
+async function writeProgress(
+  store: storage.StorageProvider,
+  projectId: storage.ProjectId,
+  body: string,
+): Promise<void> {
+  await store.run().put(projectId.namespace(), RALPH_PROGRESS_KEY, JSON.parse(body));
+}
+
+/** Writes the next scripted progress body each turn (to the shared project-id
+ *  RunStore), then claims done. */
 class ProgressWritingAgent implements Agent {
   ran = 0;
   readonly contexts: Context[] = [];
   private i = 0;
   constructor(
-    private readonly root: string,
+    private readonly store: storage.StorageProvider,
+    private readonly projectId: storage.ProjectId,
     private readonly bodies: string[],
   ) {}
   id(): AgentId {
@@ -107,7 +125,7 @@ class ProgressWritingAgent implements Agent {
     this.contexts.push(ctx);
     const body = this.bodies[this.i] ?? this.bodies[this.bodies.length - 1] ?? INCOMPLETE;
     this.i += 1;
-    writeProgress(this.root, body);
+    await writeProgress(this.store, this.projectId, body);
     return { kind: "final_response", content: "done", usage: usage() };
   }
 }
@@ -133,12 +151,13 @@ describe("Ralph loop fixture replay — ralph.json", () => {
   for (const c of loadCases()) {
     it(`${c.name} → ${c.expected.kind}`, async () => {
       const dir = mkdtempSync(join(tmpdir(), "spore-ralph-fx-"));
-      // Seed an initial incomplete progress file so window 1 reloads state.
-      writeProgress(dir, INCOMPLETE);
+      const { storage: store, projectId } = ralphStore();
+      // Seed an initial incomplete progress checkpoint so window 1 reloads state.
+      await writeProgress(store, projectId, INCOMPLETE);
       const bodies = c.windows.map((w) =>
         JSON.stringify({ complete: w.complete, remaining: w.remaining ?? [] }),
       );
-      const agent = new ProgressWritingAgent(dir, bodies);
+      const agent = new ProgressWritingAgent(store, projectId, bodies);
       const config: HarnessConfig = {
         toolRegistry: new ScriptedToolRegistry(),
         sandbox: new WorkspaceSandbox(dir),
@@ -146,6 +165,8 @@ describe("Ralph loop fixture replay — ralph.json", () => {
         terminationPolicy: new AlwaysContinuePolicy(),
         modelParams: { stop_sequences: [] },
         registry: registryWith({ agent }),
+        storage: store,
+        projectId,
         maxResets: c.max_resets,
         // issue #58 v2: when the case carries a `vcs_log`, wire a
         // FixtureVcsProvider seeded with it; absent ⇒ no provider ⇒ no git

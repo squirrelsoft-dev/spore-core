@@ -207,6 +207,7 @@ describe("RealToolRegistry bridge (#91)", () => {
       inner,
       new AllowAllSandbox(),
       SessionId.of("s1"),
+      storage.ProjectId.fromCanonicalPath("/test-project"),
       store.run(),
       store.memory(),
     );

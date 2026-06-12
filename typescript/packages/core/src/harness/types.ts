@@ -1264,8 +1264,9 @@ export interface StrategyExecutor {
   ralphSeedSession(instruction: string): Promise<SessionState>;
 
   /** Ralph external completion check (#124): `null` ⇒ complete; a string ⇒
-   *  tasks remain. */
-  ralphCompletionStatus(): string | null;
+   *  tasks remain. ASYNC since #142: the Ralph checkpoint moved off the
+   *  `.spore/` filesystem onto the durable project-id {@link RunStore}. */
+  ralphCompletionStatus(): Promise<string | null>;
 
   /** The Ralph outer-loop reset cap (`config.maxResets`, #124). */
   ralphMaxResets(): number;
@@ -3037,7 +3038,7 @@ async function runRalphConfig(c: RalphConfig, cx: ExecutionContext): Promise<Str
       return finishCombinator(cx, executor, task, windowResult);
     }
 
-    const status = executor.ralphCompletionStatus();
+    const status = await executor.ralphCompletionStatus();
     if (status == null) {
       const output = windowResult.kind === "success" ? windowResult.output : "";
       const finalState =

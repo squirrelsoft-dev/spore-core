@@ -16,7 +16,7 @@ import type {
   ToolOutput,
   ToolRegistry as HarnessToolRegistry,
 } from "../harness/types.js";
-import type { MemoryStore, RunStore } from "../storage/types.js";
+import type { MemoryStore, ProjectId, RunStore } from "../storage/types.js";
 
 import { ToolContext, type ToolSchema as RegistryToolSchema } from "./types.js";
 import { dispatchErrorMessage } from "./types.js";
@@ -46,12 +46,14 @@ export function toModelSchema(schema: RegistryToolSchema): ModelToolSchema {
  * result and lets the agent adapt rather than halting — S4 depends on this. No
  * bridged tool is marked always-halt.
  *
- * It is built **once per run**: `sessionId`, `runStore`, and `memoryStore` are
- * injected at construction (the run's {@link SessionId} is only known at
- * `run()`-time) and used to build the {@link ToolContext} forwarded on every
- * dispatch. {@link "../harness/index.js".HarnessBuilder} wires this automatically
- * when catalogue tools are added via `.tool()` / `.tools()`; construct it
- * directly only when supplying your own {@link StandardToolRegistry}.
+ * It is built **once per run**: `sessionId`, `projectId`, `runStore`, and
+ * `memoryStore` are injected at construction (the run's {@link SessionId} is only
+ * known at `run()`-time) and used to build the {@link ToolContext} forwarded on
+ * every dispatch. `projectId` (#142) is the STABLE durable namespace; `sessionId`
+ * is the per-window ephemeral key. {@link "../harness/index.js".HarnessBuilder}
+ * wires this automatically when catalogue tools are added via `.tool()` /
+ * `.tools()`; construct it directly only when supplying your own
+ * {@link StandardToolRegistry}.
  */
 export class RealToolRegistry implements HarnessToolRegistry {
   private readonly _schemas: ModelToolSchema[];
@@ -61,14 +63,16 @@ export class RealToolRegistry implements HarnessToolRegistry {
     private readonly inner: StandardToolRegistry,
     private readonly sandbox: SandboxProvider,
     sessionId: SessionId,
+    projectId: ProjectId,
     runStore: RunStore,
     memoryStore: MemoryStore,
   ) {
     // Snapshot the model-facing schemas (sorted by name; activeSchemas already
     // sorts) once at construction; the catalogue is fixed for a run.
     this._schemas = inner.activeSchemas(null).map(toModelSchema);
-    // Build the storage seam once per run from the injected session + stores.
-    this.ctx = new ToolContext(sessionId, runStore, memoryStore);
+    // Build the storage seam once per run from the injected session + project +
+    // stores.
+    this.ctx = new ToolContext(sessionId, projectId, runStore, memoryStore);
   }
 
   /** The model-facing tool schemas, sorted by name. */

@@ -325,7 +325,7 @@ describe("PlanExecute plan phase", () => {
     }
     // #76: the plan artifact was produced + persisted to the RunStore seam
     // before the execute phase ran (no longer mirrored into extras).
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
       tasks: ["a", "b"],
       rationale: "because",
     });
@@ -364,7 +364,7 @@ describe("PlanExecute plan phase", () => {
     // The plan child never emitted a JSON plan, so the run halts terminally.
     expect(r.kind).toBe("failure");
     // Nothing captured/stored: no artifact reached the RunStore.
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -374,7 +374,7 @@ describe("PlanExecute plan phase", () => {
     const storage = inMemoryStorage();
     const h = new StandardHarness(configWith(a, { storage }));
     await h.run({ task: planTask(), session_state: state });
-    const stored = await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY);
+    const stored = await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY);
     expect(stored).toEqual({ tasks: ["a", "b"], rationale: "because" });
     // #76: not mirrored into SessionState.extras.
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
@@ -390,7 +390,7 @@ describe("PlanExecute plan phase", () => {
     if (r.kind === "failure" && r.reason.kind === "plan_phase_failed") {
       expect(r.reason.error.kind).toBe("unparseable_plan");
     }
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -479,7 +479,7 @@ describe("PlanExecute plan phase", () => {
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") expect(r.reason.kind).toBe("budget_exceeded");
     expect(a.ran).toBe(0); // never ran the plan turn.
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toBeUndefined();
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
   });
 
@@ -500,7 +500,7 @@ describe("PlanExecute plan phase", () => {
     const storage = inMemoryStorage();
     const h = new StandardHarness(configWith(a, { hooks: chain, storage }));
     await h.run({ task: planTask(), session_state: state });
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual({
       tasks: ["rewritten"],
       rationale: "by-hook",
     });
@@ -523,8 +523,8 @@ describe("PlanExecute plan phase", () => {
     expect(r.kind).toBe("success");
 
     // Both keys are durable in the RunStore.
-    expect(await storage.run().get(PLAN_SID, PLAN_EXECUTE_EXTRAS_KEY)).not.toBeUndefined();
-    expect(await storage.run().get(PLAN_SID, TASK_LIST_EXTRAS_KEY)).not.toBeUndefined();
+    expect(await storage.run().get(h.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).not.toBeUndefined();
+    expect(await storage.run().get(h.projectId().namespace(), TASK_LIST_EXTRAS_KEY)).not.toBeUndefined();
 
     // Neither key is mirrored into SessionState.extras anymore.
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();

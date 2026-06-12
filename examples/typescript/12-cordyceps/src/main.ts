@@ -57,7 +57,8 @@
 
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -112,7 +113,8 @@ import { sendUserMessageTool } from "./tools/send-message.js";
 
 const { StandardContextManager, intoHarnessAdapter, defaultCompactionConfig } =
   contextNs;
-const { StorageProvider, InMemoryStorageProvider } = storage;
+const { ProjectId, CompositeStorageProvider, FileSystemStorageProvider } =
+  storage;
 const { NullCacheProvider } = cacheProvider;
 const { EvaluatorResponseVerifier } = verifier;
 
@@ -450,9 +452,23 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const repoRoot = process.cwd();
+  // #142: canonicalize the repo root FIRST (resolves symlinks / relative
+  // components / macOS case) so the derived project id is stable.
+  const repoRoot = realpathSync(process.cwd());
   const workspaceRoot = join(repoRoot, "workspace");
   mkdirSync(workspaceRoot, { recursive: true });
+
+  // #142: a STABLE project id derived from the canonicalized repo root (decision
+  // 5 — derived from the workspace root, NOT process cwd). It keys the DURABLE
+  // task_list / plan / Ralph checkpoint so they survive Ralph window resets AND
+  // process restarts. `repoRoot` is already canonicalized above, so the pure
+  // derivation is exact here.
+  const projectId = ProjectId.fromCanonicalPath(repoRoot);
+  // The CENTRAL durable root, à la Claude Code: `~/.spore/projects/<project_id>/`
+  // (decision 1). Tests/CI must point HOME at a tempdir — this never writes to
+  // the real `~/.spore` under test.
+  const sporeRoot = join(homedir(), ".spore", "projects", projectId.asString());
+  mkdirSync(sporeRoot, { recursive: true });
 
   // AC5: the fully-bounded tree's worst-case per-window turn count is computable
   // BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]] =
@@ -462,6 +478,8 @@ async function main(): Promise<void> {
   console.log(`advisor model: ${advisorModelId}`);
   console.log(`search       : ${endpoint}`);
   console.log(`repo root    : ${repoRoot}`);
+  console.log(`project id   : ${projectId.asString()}`);
+  console.log(`durable root : ${sporeRoot}`);
   console.log(
     "strategy     : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)",
   );
@@ -479,9 +497,18 @@ async function main(): Promise<void> {
     if (prompt === undefined) break; // EOF (Ctrl-D) quits the REPL.
 
     const session = SessionId.generate();
-    const storageProvider = StorageProvider.single(
-      new InMemoryStorageProvider(),
-    );
+    // #142: route the DURABLE run domain to a FileSystemStorageProvider under the
+    // central root (atomic write-rename) so the task_list / plan / Ralph
+    // checkpoint persist across context-window resets AND process restarts.
+    // Session and observability share the same durable root; memory stays
+    // project-scoped. The InMemory wiring (RAM-only, lost on crash) is gone.
+    const durable = new FileSystemStorageProvider(sporeRoot);
+    const storageProvider = new CompositeStorageProvider()
+      .run(durable)
+      .session(durable)
+      .observability(durable)
+      .memory("project", durable)
+      .build();
 
     // Read-only repo sandbox: the audit never writes source files.
     const sandbox = new WorkspaceScopedSandbox({
@@ -523,6 +550,9 @@ async function main(): Promise<void> {
     const harness = HarnessBuilder.conversational(model)
       .sandbox(sandbox)
       .storage(storageProvider)
+      // #142: pin the stable project id so durable artifacts key by it (rather
+      // than the per-window SessionId.generate() above).
+      .projectId(projectId)
       .registry(registry)
       .escalationMode(escalationMode)
       .systemPrompt(EXEC_SYSTEM_PROMPT)

@@ -14,7 +14,7 @@
  *   R7 the registered Stop hook is INERT without a progress file (non-Ralph runs).
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +25,7 @@ import {
   SessionId,
   StandardHarness,
   newTask,
+  storage,
   type Agent,
   type Context,
   type HarnessConfig,
@@ -35,6 +36,9 @@ import {
   type ToolCall,
   type TurnResult,
 } from "../src/index.js";
+
+const { ProjectId, StorageProvider, InMemoryStorageProvider, RALPH_PROGRESS_KEY, RALPH_FEATURE_LIST_KEY } =
+  storage;
 import {
   AlwaysContinuePolicy,
   NoopContextManager,
@@ -70,8 +74,11 @@ function usage(): TokenUsage {
   return { input_tokens: 1, output_tokens: 1, cache_read_tokens: null, cache_write_tokens: null };
 }
 
-/** A sandbox that exposes a fixed workspace root so the Ralph `.spore/` files
- *  resolve to a real tempdir. */
+/** A sandbox that exposes a fixed workspace root. #142: the Ralph checkpoint no
+ *  longer lives on `.spore/` — it lives in the durable project-id RunStore — but
+ *  the sandbox still exposes a workspace root the harness derives the default
+ *  project id from. Tests PIN the project id explicitly so the writer and reader
+ *  agree regardless of symlink/canonicalization. */
 class WorkspaceSandbox implements SandboxProvider {
   constructor(private readonly root: string) {}
   async validate(_call: ToolCall): Promise<SandboxViolation | null> {
@@ -82,18 +89,40 @@ class WorkspaceSandbox implements SandboxProvider {
   }
 }
 
-function writeProgress(root: string, body: string): void {
-  mkdirSync(join(root, ".spore"), { recursive: true });
-  writeFileSync(join(root, ".spore", "progress.json"), body);
+/**
+ * Per-test shared Ralph store + pinned project id (#142). The checkpoint moved
+ * off the `.spore/` filesystem onto the durable project-id RunStore, so the
+ * test's writer (the agent) and reader (the harness) MUST share ONE storage
+ * provider and ONE project id — what the agent writes is what the harness reads.
+ */
+function ralphStore(): { storage: storage.StorageProvider; projectId: storage.ProjectId } {
+  return {
+    storage: StorageProvider.single(new InMemoryStorageProvider()),
+    projectId: ProjectId.fromCanonicalPath("/ralph-test-project"),
+  };
 }
 
-function writeFeatureList(root: string, body: string): void {
-  mkdirSync(join(root, ".spore"), { recursive: true });
-  writeFileSync(join(root, ".spore", "feature_list.json"), body);
+/** Write the Ralph progress checkpoint into the SHARED run store under the
+ *  pinned project namespace (#142 relocated this off `.spore/`). `body` is the
+ *  legacy JSON body string, parsed and stored under {@link RALPH_PROGRESS_KEY}. */
+async function writeProgress(
+  store: storage.StorageProvider,
+  projectId: storage.ProjectId,
+  body: string,
+): Promise<void> {
+  await store.run().put(projectId.namespace(), RALPH_PROGRESS_KEY, JSON.parse(body));
 }
 
-/** An agent that, on each turn, writes the next scripted progress body to
- *  `.spore/progress.json` then returns a final response. Records every
+async function writeFeatureList(
+  store: storage.StorageProvider,
+  projectId: storage.ProjectId,
+  body: string,
+): Promise<void> {
+  await store.run().put(projectId.namespace(), RALPH_FEATURE_LIST_KEY, JSON.parse(body));
+}
+
+/** An agent that, on each turn, writes the next scripted progress body to the
+ *  shared project-id RunStore then returns a final response. Records every
  *  assembled context so seed/injection/no-carryover assertions are exact. */
 class ProgressWritingAgent implements Agent {
   ran = 0;
@@ -101,7 +130,8 @@ class ProgressWritingAgent implements Agent {
   private i = 0;
   constructor(
     private readonly agentId: AgentId,
-    private readonly root: string,
+    private readonly store: storage.StorageProvider,
+    private readonly projectId: storage.ProjectId,
     private readonly bodies: string[],
   ) {}
   id(): AgentId {
@@ -112,7 +142,7 @@ class ProgressWritingAgent implements Agent {
     this.contexts.push(ctx);
     const body = this.bodies[this.i] ?? this.bodies[this.bodies.length - 1] ?? INCOMPLETE;
     this.i += 1;
-    writeProgress(this.root, body);
+    await writeProgress(this.store, this.projectId, body);
     return { kind: "final_response", content: "window done", usage: usage() };
   }
 }
@@ -120,8 +150,8 @@ class ProgressWritingAgent implements Agent {
 /**
  * An agent that NEVER returns a final response — every turn requests a tool
  * call, so a bounded ReAct window can only ever exhaust its turn budget (it
- * never terminates cleanly). On its FIRST turn it writes `COMPLETE` to
- * `.spore/progress.json`, so any code path that DID consult Ralph's external
+ * never terminates cleanly). On its FIRST turn it writes `COMPLETE` to the shared
+ * project-id RunStore, so any code path that DID consult Ralph's external
  * completion after the window would (wrongly) see "complete" and Success.
  * Mirrors the Rust `ToolLoopingAgent` (#125 F5).
  */
@@ -129,16 +159,17 @@ class ToolLoopingAgent implements Agent {
   calls = 0;
   constructor(
     private readonly agentId: AgentId,
-    private readonly root: string,
+    private readonly store: storage.StorageProvider,
+    private readonly projectId: storage.ProjectId,
   ) {}
   id(): AgentId {
     return this.agentId;
   }
   async turn(_ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
     if (this.calls === 0) {
-      // Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
+      // Mark COMPLETE in the store up front — if Ralph (wrongly) consulted
       // completion after a budget-exhausted window it would Success.
-      writeProgress(this.root, COMPLETE);
+      await writeProgress(this.store, this.projectId, COMPLETE);
     }
     const n = this.calls;
     this.calls += 1;
@@ -159,7 +190,13 @@ function contextText(ctx: Context): string {
     .join("\n");
 }
 
-function ralphConfig(root: string, agent: Agent, maxResets = 3): HarnessConfig {
+function ralphConfig(
+  root: string,
+  agent: Agent,
+  store: storage.StorageProvider,
+  projectId: storage.ProjectId,
+  maxResets = 3,
+): HarnessConfig {
   return {
     registry: registryWith({ agent }),
     toolRegistry: new ScriptedToolRegistry(),
@@ -167,6 +204,10 @@ function ralphConfig(root: string, agent: Agent, maxResets = 3): HarnessConfig {
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
+    // #142: the harness and the test writer-agent MUST share ONE store + project
+    // id so the checkpoint the agent writes is the one the harness reads.
+    storage: store,
+    projectId,
     maxResets,
   };
 }
@@ -200,13 +241,14 @@ describe("Ralph loop strategy (issue #58)", () => {
   // R4: completion pattern incomplete,incomplete,complete → Success at it. 3.
   it("R1/R4: resets until complete → Success at the 3rd window", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [
       INCOMPLETE,
       INCOMPLETE,
       COMPLETE,
     ]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 3));
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 3));
     const r = await h.run({ task: ralphTask() });
     expect(r.kind).toBe("success");
     // Exactly three context windows ran (one agent turn each).
@@ -216,14 +258,15 @@ describe("Ralph loop strategy (issue #58)", () => {
   // R5: always-incomplete → exactly maxResets windows → ralph_completion_unmet.
   it("R5: always-incomplete → exactly maxResets windows → ralph_completion_unmet", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [
       INCOMPLETE,
       INCOMPLETE,
       INCOMPLETE,
       INCOMPLETE,
     ]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 3));
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 3));
     const r = await h.run({ task: ralphTask() });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
@@ -239,9 +282,10 @@ describe("Ralph loop strategy (issue #58)", () => {
   // R5 boundary: maxResets = 1 → a single window → ralph_completion_unmet.
   it("R5: maxResets=1, always-incomplete → single window → ralph_completion_unmet", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [INCOMPLETE]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 1));
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [INCOMPLETE]);
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 1));
     const r = await h.run({ task: ralphTask() });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure" && r.reason.kind === "ralph_completion_unmet") {
@@ -253,9 +297,13 @@ describe("Ralph loop strategy (issue #58)", () => {
   // R2: each reset builds a FRESH SessionState — no message carryover.
   it("R2: fresh session per reset (no carryover of window 1's output)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [INCOMPLETE, COMPLETE]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 3));
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [
+      INCOMPLETE,
+      COMPLETE,
+    ]);
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 3));
     await h.run({ task: ralphTask() });
     expect(agent.contexts.length).toBe(2);
     // Window 1's assistant "window done" output is NOT present in window 2's
@@ -263,15 +311,21 @@ describe("Ralph loop strategy (issue #58)", () => {
     expect(contextText(agent.contexts[1]!)).not.toContain("window done");
   });
 
-  // R3: the filesystem reload injects `.spore/` state into the fresh seed.
+  // R3: the durable checkpoint reload injects project-store state into the fresh
+  // seed (#142: the reload now reads the project-id RunStore, not `.spore/`).
   it("R3: reload injects progress + feature_list into the fresh seed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    writeFeatureList(dir, JSON.stringify([{ name: "login", passes: false }]));
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [INCOMPLETE, COMPLETE]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 3));
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    await writeFeatureList(store, projectId, JSON.stringify([{ name: "login", passes: false }]));
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [
+      INCOMPLETE,
+      COMPLETE,
+    ]);
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 3));
     await h.run({ task: ralphTask() });
     const w0 = contextText(agent.contexts[0]!);
+    // The reload prefix is retained byte-stable across the relocation.
     expect(w0).toContain("Reloaded .spore/progress.json");
     expect(w0).toContain("Reloaded .spore/feature_list.json");
     expect(w0).toContain("login");
@@ -280,13 +334,14 @@ describe("Ralph loop strategy (issue #58)", () => {
   // R6: budgets fold across ALL context windows (each window adds usage).
   it("R6: budgets fold across all context windows", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [
       INCOMPLETE,
       INCOMPLETE,
       COMPLETE,
     ]);
-    const h = new StandardHarness(ralphConfig(dir, agent, 3));
+    const h = new StandardHarness(ralphConfig(dir, agent, store, projectId, 3));
     const r = await h.run({ task: ralphTask() });
     expect(r.kind).toBe("success");
     if (r.kind === "success") {
@@ -297,14 +352,19 @@ describe("Ralph loop strategy (issue #58)", () => {
   });
 
   // Completion-status helper: progress complete but a feature fails ⇒ still
-  // incomplete (the feature list corroborates).
-  it("completion status: feature-list gate overrides a complete progress file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "spore-ralph-"));
-    writeProgress(dir, COMPLETE);
-    writeFeatureList(dir, JSON.stringify([{ name: "login", passes: false }]));
-    expect(StandardHarness.ralphCompletionStatus(dir)).toContain("login");
-    writeFeatureList(dir, JSON.stringify([{ name: "login", passes: true }]));
-    expect(StandardHarness.ralphCompletionStatus(dir)).toBeNull();
+  // incomplete (the feature list corroborates). #142: reads from the project-id
+  // RunStore via the store-based helper.
+  it("completion status: feature-list gate overrides a complete progress file", async () => {
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, COMPLETE);
+    await writeFeatureList(store, projectId, JSON.stringify([{ name: "login", passes: false }]));
+    expect(
+      await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId),
+    ).toContain("login");
+    await writeFeatureList(store, projectId, JSON.stringify([{ name: "login", passes: true }]));
+    expect(
+      await StandardHarness.ralphCompletionStatusFromStore(store.run(), projectId),
+    ).toBeNull();
   });
 
   // R7: the registered Stop hook is INERT for a workspace without a progress
@@ -341,8 +401,9 @@ describe("Ralph loop strategy (issue #58)", () => {
     // exhausted; the verifier fires once per window (>=2). A hardcoded-ReAct
     // window would record ZERO verifier invocations.
     const dir = mkdtempSync(join(tmpdir(), "ralph-nonreact-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ProgressWritingAgent(AgentId.of("a"), dir, [INCOMPLETE]);
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ProgressWritingAgent(AgentId.of("a"), store, projectId, [INCOMPLETE]);
     const verifier = new CountingVerifier();
     const config: HarnessConfig = {
       registry: registryWith({ agent, verifier }),
@@ -351,6 +412,8 @@ describe("Ralph loop strategy (issue #58)", () => {
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
       modelParams: { stop_sequences: [] },
+      storage: store,
+      projectId,
       maxResets: 2,
     };
     const strategy: LoopStrategy = {
@@ -386,16 +449,17 @@ describe("Ralph loop strategy (issue #58)", () => {
   // (the leaf's per_loop policy is the binding cap, no smaller global backstop).
   // The window surfaces StrategyOutcome `budget_exhausted`; Ralph must treat it
   // as "window incomplete → RESET and retry" — it must NOT consult external
-  // completion (which is COMPLETE on disk here) and must NOT cascade the child's
-  // exhaustion into its own terminal. So the run reaches max_resets windows and
-  // ends `ralph_completion_unmet`, NOT Success.
+  // completion (which is COMPLETE in the store here) and must NOT cascade the
+  // child's exhaustion into its own terminal. So the run reaches max_resets
+  // windows and ends `ralph_completion_unmet`, NOT Success.
   //
   // NOTE: the RALPH helper above uses an UNBOUNDED leaf to AVOID this path
   // (Deviation #14c); this case adds explicit coverage of the BOUNDED path.
   it("F5: a budget-exhausted window resets (no completion consult, no cascade)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-ralph-f5-"));
-    writeProgress(dir, INCOMPLETE);
-    const agent = new ToolLoopingAgent(AgentId.of("ralph-tool-loop"), dir);
+    const { storage: store, projectId } = ralphStore();
+    await writeProgress(store, projectId, INCOMPLETE);
+    const agent = new ToolLoopingAgent(AgentId.of("ralph-tool-loop"), store, projectId);
     // Provide tool outputs for the looping calls across all windows.
     const reg = new ScriptedToolRegistry();
     for (let i = 0; i < 32; i += 1) reg.push({ kind: "success", content: "ok" });
@@ -406,6 +470,8 @@ describe("Ralph loop strategy (issue #58)", () => {
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
       modelParams: { stop_sequences: [] },
+      storage: store,
+      projectId,
       maxResets: 3,
     };
     const h = new StandardHarness(config);

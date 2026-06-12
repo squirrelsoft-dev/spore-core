@@ -7,6 +7,7 @@ import { SessionId } from "../harness/types.js";
 import type { ToolCall } from "../model/schemas.js";
 import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
 import { InMemoryStorageProvider } from "../storage/providers.js";
+import { ProjectId } from "../storage/types.js";
 import { ToolContext, type Tool } from "./types.js";
 
 /** Echo tool — returns its input serialised as JSON. Intended `read_only: true`. */
@@ -55,7 +56,12 @@ export class SubagentMockTool implements Tool {
  */
 export function testCtx(): ToolContext {
   const backend = new InMemoryStorageProvider();
-  return new ToolContext(SessionId.of("test-session"), backend, backend);
+  return new ToolContext(
+    SessionId.of("test-session"),
+    ProjectId.fromCanonicalPath("/test-project"),
+    backend,
+    backend,
+  );
 }
 
 /** Permissive sandbox stub — accepts everything. */

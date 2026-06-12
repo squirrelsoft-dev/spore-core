@@ -10,8 +10,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, existsSync, readdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, existsSync, readdirSync, statSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { tmpdir, platform } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,13 @@ import {
   StorageProvider,
   ScopedMemoryRouter,
   WorkspaceId,
+  ProjectId,
+  ProjectIdError,
+  ACTIVE_RUN_KEY,
+  RALPH_PROGRESS_KEY,
+  loadActiveRun,
+  startOrResumeActiveRun,
+  completeActiveRun,
   newMemoryEntry,
   parseOtlpEndpoints,
   type JsonValue,
@@ -448,6 +455,276 @@ describe("WorkspaceId", () => {
         c.expected_workspace_id,
       );
     }
+  });
+});
+
+// ── ProjectId derivation + namespace (#142) ──────────────────────────────────
+
+describe("ProjectId — pure derivation (#142)", () => {
+  it("delegates to the SAME algorithm as WorkspaceId (byte-identical id)", () => {
+    const path = "/Users/sbeardsley/dev/spore-core";
+    expect(ProjectId.fromCanonicalPath(path).asString()).toBe(
+      WorkspaceId.fromCanonicalPath(path).asString(),
+    );
+  });
+
+  it("is deterministic + pure (same input → same id, form {slug}-{8hex})", () => {
+    const a = ProjectId.fromCanonicalPath("/Users/sbeardsley/dev/spore-core");
+    const b = ProjectId.fromCanonicalPath("/Users/sbeardsley/dev/spore-core");
+    expect(a.asString()).toBe(b.asString());
+    expect(a.equals(b)).toBe(true);
+    expect(a.asString().startsWith("spore-core-")).toBe(true);
+    expect(a.asString().length).toBe("spore-core-".length + 8);
+  });
+
+  it("slug derivation: root → 'root', special chars sanitized + collapsed", () => {
+    expect(ProjectId.fromCanonicalPath("/").asString().startsWith("root-")).toBe(true);
+    const w = ProjectId.fromCanonicalPath("/Users/me/My Project (v2)!");
+    expect(w.asString().startsWith("my-project-v2-")).toBe(true);
+    expect(w.asString().includes("--")).toBe(false);
+  });
+
+  it("trailing slash is normalized away (same id as the no-slash form)", () => {
+    expect(ProjectId.fromCanonicalPath("/Users/sbeardsley/dev/spore-core/").asString()).toBe(
+      ProjectId.fromCanonicalPath("/Users/sbeardsley/dev/spore-core").asString(),
+    );
+  });
+
+  // The whole collision policy: /a/b vs /a_b are DISTINCT ids. The 8-hex SHA-256
+  // suffix of the FULL canonical path resolves what a naive slashes→underscores
+  // slug would collide. NO extra logic needed — the inherited suffix does it.
+  it("`/a/b` and `/a_b` derive DISTINCT ids (8-hex suffix resolves the collision)", () => {
+    const ab = ProjectId.fromCanonicalPath("/a/b").asString();
+    const aUnderscoreB = ProjectId.fromCanonicalPath("/a_b").asString();
+    expect(ab).not.toBe(aUnderscoreB);
+    // Distinct basenames too: `b-…` vs `a-b-…`.
+    expect(ab.startsWith("b-")).toBe(true);
+    expect(aUnderscoreB.startsWith("a-b-")).toBe(true);
+  });
+
+  it("namespace() projects onto the SessionId axis (string IS the project id)", () => {
+    const p = ProjectId.fromCanonicalPath("/proj/x");
+    expect(p.namespace().asString()).toBe(p.asString());
+  });
+
+  it("toJSON / toString surface the derived id string", () => {
+    const p = ProjectId.fromCanonicalPath("/proj/x");
+    expect(p.toString()).toBe(p.asString());
+    expect(JSON.parse(JSON.stringify(p))).toBe(p.asString());
+  });
+});
+
+describe("ProjectId — FS-touching constructors canonicalize FIRST (#142)", () => {
+  it("fromPath canonicalizes a relative path component (resolves `.`/`..`)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "spore-pid-"));
+    const child = join(dir, "child");
+    mkdirSync(child);
+    // A path with a `..` component canonicalizes to the same id as the clean path.
+    const viaDotDot = ProjectId.fromPath(join(child, "..", "child"));
+    const viaClean = ProjectId.fromPath(child);
+    expect(viaDotDot.equals(viaClean)).toBe(true);
+    // And it equals the pure derivation over the OS-canonicalized path.
+    expect(viaClean.equals(ProjectId.fromCanonicalPath(realpathSync(child)))).toBe(true);
+  });
+
+  // Gated: symlink resolution is FS-behavior-dependent.
+  it("fromPath resolves symlinks before deriving (symlink → same id as target)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "spore-pid-link-"));
+    const target = join(dir, "target");
+    mkdirSync(target);
+    const link = join(dir, "link");
+    try {
+      symlinkSync(target, link);
+    } catch {
+      // Symlink creation may be unsupported (e.g. restricted Windows) — skip.
+      return;
+    }
+    expect(ProjectId.fromPath(link).equals(ProjectId.fromPath(target))).toBe(true);
+  });
+
+  // Gated: only meaningful on a case-insensitive filesystem (default macOS).
+  it("fromPath resolves macOS case-insensitivity to one canonical id", () => {
+    if (platform() !== "darwin") return;
+    const dir = mkdtempSync(join(tmpdir(), "spore-pid-Case-"));
+    const sub = join(dir, "MixedCase");
+    mkdirSync(sub);
+    // On a case-insensitive FS, the lowercased path resolves to the same inode;
+    // realpath returns ONE canonical casing, so both derive the SAME id.
+    let lowerExists = false;
+    try {
+      lowerExists = realpathSync(join(dir, "mixedcase")) === realpathSync(sub);
+    } catch {
+      lowerExists = false;
+    }
+    if (!lowerExists) return; // case-sensitive volume — skip.
+    expect(ProjectId.fromPath(join(dir, "mixedcase")).equals(ProjectId.fromPath(sub))).toBe(true);
+  });
+
+  it("fromPath throws ProjectIdError on a non-existent path (canonicalize failure)", () => {
+    const missing = join(tmpdir(), `spore-pid-missing-${Date.now()}-${Math.random()}`);
+    expect(() => ProjectId.fromPath(missing)).toThrow(ProjectIdError);
+    try {
+      ProjectId.fromPath(missing);
+    } catch (e) {
+      expect(e).toBeInstanceOf(ProjectIdError);
+      if (e instanceof ProjectIdError) {
+        expect(e.kind).toBe("canonicalize");
+        expect(e.path).toBe(missing);
+        expect(e.name).toBe("ProjectIdError");
+      }
+    }
+  });
+
+  it("fromCwd derives from the (canonicalized) process cwd", () => {
+    expect(ProjectId.fromCwd().equals(ProjectId.fromPath(process.cwd()))).toBe(true);
+  });
+});
+
+describe("ProjectId — fixture replay project_id_derivation.json (#142)", () => {
+  it("matches every pinned case exactly (cross-language anchor)", () => {
+    const raw = readFileSync(join(fixturesRoot, "project_id_derivation.json"), "utf8");
+    const cases = JSON.parse(raw) as {
+      canonical_path: string;
+      description: string;
+      expected_project_id: string;
+    }[];
+    expect(cases.length).toBeGreaterThanOrEqual(4);
+    for (const c of cases) {
+      expect(ProjectId.fromCanonicalPath(c.canonical_path).asString()).toBe(c.expected_project_id);
+    }
+  });
+});
+
+// ── Project-scoped durable survival (#142) ───────────────────────────────────
+
+describe("project-scoped durable survival (#142)", () => {
+  const KEY = "task_list";
+
+  it("task_list visible across DIFFERENT sessions with the SAME project id", async () => {
+    const provider = StorageProvider.single(new InMemoryStorageProvider());
+    const project = ProjectId.fromCanonicalPath("/work/audit-repo");
+    // Window 1 writes under the project namespace (its session id is irrelevant).
+    const payload: JsonValue = { tasks: [{ id: 1 }], next_id: 2 };
+    await provider.run().put(project.namespace(), KEY, payload);
+    // Window 2 = a FRESH session id, SAME project id → reads window 1's value.
+    const w2 = await provider.run().get(project.namespace(), KEY);
+    expect(w2).toEqual(payload);
+    // A DIFFERENT session id keyed read finds NOTHING — proving project-keying.
+    expect(await provider.run().get(sid("sess-window-2"), KEY)).toBeUndefined();
+  });
+
+  it("survives a fresh provider over the SAME on-disk root (process restart)", async () => {
+    const root = tmpDir();
+    const project = ProjectId.fromCanonicalPath("/work/audit-repo");
+    const payload: JsonValue = { tasks: [{ id: 1 }], next_id: 2 };
+    // Process 1: write through a FileSystemStorageProvider.
+    await new FileSystemStorageProvider(root).put(project.namespace(), KEY, payload);
+    // Process 2: a BRAND-NEW provider over the same root re-reads the same bytes.
+    const reopened = new FileSystemStorageProvider(root);
+    expect(await reopened.get(project.namespace(), KEY)).toEqual(payload);
+  });
+
+  it("fixture replay: project_durable_survival.json (cross-window + cross-process)", async () => {
+    const raw = readFileSync(join(fixturesRoot, "project_durable_survival.json"), "utf8");
+    const fx = JSON.parse(raw) as {
+      project_canonical_path: string;
+      expected_project_id: string;
+      run_key: string;
+      window_1: { session_id: string; task_list: JsonValue };
+      window_2: { expected_task_list: JsonValue };
+      cross_process: { expected_task_list: JsonValue };
+    };
+    // The derived project id matches the fixture's pinned id.
+    const project = ProjectId.fromCanonicalPath(fx.project_canonical_path);
+    expect(project.asString()).toBe(fx.expected_project_id);
+
+    const root = tmpDir();
+    // Window 1: write the list under the project namespace via FS provider.
+    await new FileSystemStorageProvider(root).put(
+      project.namespace(),
+      fx.run_key,
+      fx.window_1.task_list,
+    );
+    // Window 2: a fresh session id (mirrored by a fresh provider here) reads it.
+    const w2 = await new FileSystemStorageProvider(root).get(project.namespace(), fx.run_key);
+    expect(w2).toEqual(fx.window_2.expected_task_list);
+    // Cross-process: yet another provider over the same root reads the same bytes.
+    const xp = await new FileSystemStorageProvider(root).get(project.namespace(), fx.run_key);
+    expect(xp).toEqual(fx.cross_process.expected_task_list);
+  });
+});
+
+// ── Active-run lifecycle (#142) ──────────────────────────────────────────────
+
+describe("active-run lifecycle (#142)", () => {
+  const project = ProjectId.fromCanonicalPath("/work/active-run-project");
+  const t0 = Timestamp.of("2026-06-12T00:00:00Z");
+  const t1 = Timestamp.of("2026-06-12T01:00:00Z");
+
+  it("start: an absent slot mints a fresh active run (started_new)", async () => {
+    const store = new InMemoryStorageProvider();
+    expect(await loadActiveRun(store, project)).toBeUndefined();
+    const decision = await startOrResumeActiveRun(store, project, "tag-A", t0);
+    expect(decision).toBe("started_new");
+    const slot = await loadActiveRun(store, project);
+    expect(slot).toEqual({ run_tag: "tag-A", started_at: t0.asString(), status: "active" });
+  });
+
+  it("resume: the SAME tag over a live slot resumes (slot left intact)", async () => {
+    const store = new InMemoryStorageProvider();
+    await startOrResumeActiveRun(store, project, "tag-A", t0);
+    // A second call under the SAME tag with a DIFFERENT timestamp resumes and
+    // does NOT overwrite the original started_at — the slot is left intact.
+    const decision = await startOrResumeActiveRun(store, project, "tag-A", t1);
+    expect(decision).toBe("resumed");
+    const slot = await loadActiveRun(store, project);
+    expect(slot?.started_at).toBe(t0.asString());
+  });
+
+  it("start-new: a DIFFERENT tag over a live slot starts fresh", async () => {
+    const store = new InMemoryStorageProvider();
+    await startOrResumeActiveRun(store, project, "tag-A", t0);
+    const decision = await startOrResumeActiveRun(store, project, "tag-B", t1);
+    expect(decision).toBe("started_new");
+    const slot = await loadActiveRun(store, project);
+    expect(slot).toEqual({ run_tag: "tag-B", started_at: t1.asString(), status: "active" });
+  });
+
+  it("complete: flips the slot to completed; next start (same tag) is fresh", async () => {
+    const store = new InMemoryStorageProvider();
+    await startOrResumeActiveRun(store, project, "tag-A", t0);
+    await completeActiveRun(store, project);
+    expect((await loadActiveRun(store, project))?.status).toBe("completed");
+    // A completed slot does NOT resume even under the same tag — it starts fresh.
+    const decision = await startOrResumeActiveRun(store, project, "tag-A", t1);
+    expect(decision).toBe("started_new");
+    const slot = await loadActiveRun(store, project);
+    expect(slot).toEqual({ run_tag: "tag-A", started_at: t1.asString(), status: "active" });
+  });
+
+  it("complete on an absent slot is a no-op (no error, no write)", async () => {
+    const store = new InMemoryStorageProvider();
+    await expect(completeActiveRun(store, project)).resolves.toBeUndefined();
+    expect(await loadActiveRun(store, project)).toBeUndefined();
+  });
+
+  it("a malformed slot is treated as no live run (next start mints fresh)", async () => {
+    const store = new InMemoryStorageProvider();
+    // Write garbage under the reserved key.
+    await store.put(project.namespace(), ACTIVE_RUN_KEY, { not: "an active run" });
+    expect(await loadActiveRun(store, project)).toBeUndefined();
+    expect(await startOrResumeActiveRun(store, project, "tag-A", t0)).toBe("started_new");
+  });
+
+  it("the active run is keyed by project, not session (cross-window survival)", async () => {
+    const store = new InMemoryStorageProvider();
+    await startOrResumeActiveRun(store, project, "tag-A", t0);
+    // A different project namespace has NO slot.
+    const other = ProjectId.fromCanonicalPath("/work/other-project");
+    expect(await loadActiveRun(store, other)).toBeUndefined();
+    // The reserved keys are stable strings.
+    expect(ACTIVE_RUN_KEY).toBe("active_run");
+    expect(RALPH_PROGRESS_KEY).toBe("ralph_progress");
   });
 });
 

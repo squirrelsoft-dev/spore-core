@@ -173,6 +173,7 @@ async function runLive(
     registry,
     sandbox,
     sessionId,
+    coreStorage.ProjectId.fromCanonicalPath(workspace),
     new coreStorage.InMemoryStorageProvider(),
     new coreStorage.InMemoryStorageProvider(),
   );

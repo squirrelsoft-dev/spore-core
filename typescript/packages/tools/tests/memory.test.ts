@@ -34,7 +34,8 @@ type StorageScope = storage.StorageScope;
 
 const { Timestamp } = coreMemory;
 const { ToolContext } = toolRegistry;
-const { InMemoryStorageProvider, CompositeStorageProvider } = storage;
+const { InMemoryStorageProvider, CompositeStorageProvider, ProjectId } = storage;
+const TEST_PROJECT = ProjectId.fromCanonicalPath("/test-project");
 
 const here = dirname(fileURLToPath(import.meta.url));
 const toolsFixtures = resolve(here, "../../../../fixtures/tools");
@@ -79,6 +80,7 @@ function ctxWith(
   // in-memory backend here.
   return new ToolContext(
     SessionId.of(session),
+    TEST_PROJECT,
     new InMemoryStorageProvider(),
     memoryStore,
   );
@@ -227,6 +229,7 @@ describe("MemoryTool", () => {
 
     const ctx = new ToolContext(
       sid,
+      TEST_PROJECT,
       new InMemoryStorageProvider(),
       memoryStore,
     );
@@ -264,6 +267,7 @@ describe("MemoryTool", () => {
     }
     const ctx = new ToolContext(
       sid,
+      TEST_PROJECT,
       new InMemoryStorageProvider(),
       memoryStore,
     );
@@ -459,6 +463,7 @@ describe("MemoryTool fixture replay (memory.json)", () => {
         .build();
       const ctx = new ToolContext(
         SessionId.of("fx"),
+        TEST_PROJECT,
         new InMemoryStorageProvider(),
         provider.memory(),
       );

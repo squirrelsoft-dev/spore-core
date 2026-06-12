@@ -16,7 +16,7 @@ import { z } from "zod";
 import type { ToolCall } from "../model/schemas.js";
 import type { SandboxProvider, SandboxViolation, ToolOutput } from "../harness/types.js";
 import type { SessionId } from "../harness/types.js";
-import type { MemoryStore, RunStore } from "../storage/types.js";
+import type { MemoryStore, ProjectId, RunStore } from "../storage/types.js";
 
 // ============================================================================
 // ToolContext — the storage seam handed to every tool (#75)
@@ -27,7 +27,15 @@ import type { MemoryStore, RunStore } from "../storage/types.js";
  * alongside (but separate from) the {@link SandboxProvider}. It carries the
  * minimum a tool needs to persist durable state via the storage layer:
  *
- *   - `sessionId`   — the run's {@link SessionId}, the key namespace for stores.
+ *   - `sessionId`   — the run's {@link SessionId}, the key namespace for
+ *     EPHEMERAL state that SHOULD reset per Ralph window (conversation/session
+ *     state, `active_skills`).
+ *   - `projectId`   — the stable {@link ProjectId} (#142), the key namespace for
+ *     DURABLE artifacts (the `task_list`, plan artifact, …) that must survive a
+ *     Ralph window reset (fresh {@link SessionId} per window) and process
+ *     restarts. Durable tools key the {@link RunStore} by
+ *     `projectId.namespace()` instead of `sessionId`, so the prior window's list
+ *     is re-read, not orphaned.
  *   - `runStore`    — the {@link RunStore} domain of the configured storage
  *     provider.
  *   - `memoryStore` — the {@link MemoryStore} domain (#78). Scope-aware: the tool
@@ -44,13 +52,19 @@ import type { MemoryStore, RunStore } from "../storage/types.js";
  */
 export class ToolContext {
   /**
-   * @param sessionId   The session id keying this run's persisted state.
+   * @param sessionId   The session id keying this run's EPHEMERAL state (resets
+   *                    per Ralph window).
+   * @param projectId   The stable project id (#142) keying this run's DURABLE
+   *                    artifacts — stable across Ralph window resets and process
+   *                    restarts. Durable tools key the {@link RunStore} by
+   *                    `projectId.namespace()`.
    * @param runStore    The run-store domain a tool persists durable state through.
    * @param memoryStore The scope-aware memory-store domain (#78) — the tool
    *                    passes a {@link StorageScope} on each call.
    */
   constructor(
     readonly sessionId: SessionId,
+    readonly projectId: ProjectId,
     readonly runStore: RunStore,
     readonly memoryStore: MemoryStore,
   ) {}

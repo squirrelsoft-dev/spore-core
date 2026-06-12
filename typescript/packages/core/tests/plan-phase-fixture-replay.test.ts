@@ -137,7 +137,7 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
       rationale: "deliver a working CLI incrementally",
     };
     // #76: persisted to the RunStore seam, not mirrored into extras.
-    expect(await storage.run().get(FIXTURE_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
+    expect(await storage.run().get(harness.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
 
     const captured = capturePlanArtifact(responseText(exchanges[0]!));
@@ -184,7 +184,7 @@ describe("PlanExecute plan-phase fixture replay — plan_phase_basic.jsonl", () 
       rationale: "docs follow the code",
     };
     // #76: persisted to the RunStore seam, not mirrored into extras.
-    expect(await storage.run().get(FIXTURE_SID, PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
+    expect(await storage.run().get(harness.projectId().namespace(), PLAN_EXECUTE_EXTRAS_KEY)).toEqual(expected);
     expect(state.extras[PLAN_EXECUTE_EXTRAS_KEY]).toBeUndefined();
 
     const captured = capturePlanArtifact(responseText(exchanges[1]!));

@@ -142,8 +142,10 @@ function peTask(session: string): Task {
   return t;
 }
 
-async function storedList(storage: StorageProvider, session: SessionId): Promise<TaskList> {
-  const value = await storage.run().get(session, "task_list");
+// #142: the task_list is keyed by the STABLE project namespace, NOT the run
+// session id — read it back under the harness's project namespace.
+async function storedList(h: StandardHarness, storage: StorageProvider): Promise<TaskList> {
+  const value = await storage.run().get(h.projectId().namespace(), "task_list");
   return value as TaskList;
 }
 
@@ -227,7 +229,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     expect(r.kind).toBe("success");
 
     // Every ready task was walked and self-verified to completion.
-    const after = await storedList(storage, session);
+    const after = await storedList(h, storage);
     expect(after.tasks.every((t) => t.status === "completed")).toBe(true);
   });
 
@@ -313,7 +315,7 @@ describe("cordyceps composition fixture replay (#131)", () => {
     }
 
     // The worker's task self-verified and completed after the consult.
-    const after = await storedList(storage, session);
+    const after = await storedList(h, storage);
     expect(after.tasks.every((t) => t.status === "completed")).toBe(true);
   });
 

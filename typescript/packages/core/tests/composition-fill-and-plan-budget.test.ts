@@ -17,7 +17,7 @@
  * Each case is constructed to FAIL on the OLD behavior and PASS on the new.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,6 +29,7 @@ import {
   SessionId,
   StandardHarness,
   newTask,
+  storage,
   type Agent,
   type Context,
   type HarnessConfig,
@@ -39,6 +40,8 @@ import {
   type ToolCall,
   type TurnResult,
 } from "../src/index.js";
+
+const { ProjectId, StorageProvider, InMemoryStorageProvider, RALPH_PROGRESS_KEY } = storage;
 import {
   AllowAllSandbox,
   AlwaysContinuePolicy,
@@ -95,7 +98,8 @@ class RecordingAgent implements Agent {
   }
 }
 
-/** Sandbox exposing a fixed workspace root so Ralph's `.spore/` files resolve. */
+/** Sandbox exposing a fixed workspace root. #142: the Ralph checkpoint lives in
+ *  the durable project-id RunStore now, but the sandbox still exposes a root. */
 class WorkspaceSandbox implements SandboxProvider {
   constructor(private readonly root: string) {}
   async validate(_call: ToolCall): Promise<SandboxViolation | null> {
@@ -106,9 +110,14 @@ class WorkspaceSandbox implements SandboxProvider {
   }
 }
 
-function writeProgress(root: string, body: string): void {
-  mkdirSync(join(root, ".spore"), { recursive: true });
-  writeFileSync(join(root, ".spore", "progress.json"), body);
+/** Write the Ralph progress checkpoint into the SHARED run store under the pinned
+ *  project namespace (#142 relocated this off `.spore/`). */
+async function writeProgress(
+  store: storage.StorageProvider,
+  projectId: storage.ProjectId,
+  body: string,
+): Promise<void> {
+  await store.run().put(projectId.namespace(), RALPH_PROGRESS_KEY, JSON.parse(body));
 }
 
 const COMPLETE = JSON.stringify({ complete: true, remaining: [] });
@@ -130,8 +139,12 @@ describe("composition: Ralph fills (Fix A) + plan budget honored (Fix B)", () =>
   // ────────────────────────────────────────────────────────────────────────
   it("Fix A: a non-empty Ralph agent does NOT shadow an explicit executor leaf", async () => {
     const dir = mkdtempSync(join(tmpdir(), "spore-fill-"));
-    // First worker window marks COMPLETE on disk so Ralph succeeds in one window.
-    writeProgress(dir, COMPLETE);
+    // #142: the harness and the test writer share ONE store + pinned project id
+    // so the checkpoint the test seeds is the one the harness reads. Marking
+    // COMPLETE up front so Ralph succeeds in one window.
+    const store = StorageProvider.single(new InMemoryStorageProvider());
+    const projectId = ProjectId.fromCanonicalPath("/composition-fill-project");
+    await writeProgress(store, projectId, COMPLETE);
 
     const planner = new RecordingAgent(AgentId.of("planner")).push(fr('{"tasks":["step"]}'));
     const executor = new RecordingAgent(AgentId.of("executor")).push(fr("did step"));
@@ -153,6 +166,8 @@ describe("composition: Ralph fills (Fix A) + plan budget honored (Fix B)", () =>
       contextManager: new NoopContextManager(),
       terminationPolicy: new AlwaysContinuePolicy(),
       modelParams: { stop_sequences: [] },
+      storage: store,
+      projectId,
       maxResets: 2,
     };
 

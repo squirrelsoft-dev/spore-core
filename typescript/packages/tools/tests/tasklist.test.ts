@@ -105,12 +105,24 @@ class CorruptRunStore implements RunStore {
   }
 }
 
+const { ProjectId } = storage;
+
+/** Derive the project namespace the tool keys the durable task_list by, from a
+ *  test's distinguishing `key` string (#142). Tests that want SEPARATE lists pass
+ *  DIFFERENT keys; tests that want the SAME list pass the SAME key. */
+function projectNs(key: string): SessionId {
+  return ProjectId.fromCanonicalPath(`/proj/${key}`).namespace();
+}
+
 function ctxWith(
   runStore: RunStore,
-  session = "test-session",
+  key = "test-project",
 ): toolRegistry.ToolContext {
+  // The `sessionId` is ephemeral and irrelevant to the durable task_list; the
+  // `projectId` derived from `key` is the durable namespace the tool keys by.
   return new ToolContext(
-    SessionId.of(session),
+    SessionId.of("ephemeral-session"),
+    ProjectId.fromCanonicalPath(`/proj/${key}`),
     runStore,
     new InMemoryStorageProvider(),
   );
@@ -154,12 +166,14 @@ function parseAdded(out: ToolOutput): number | undefined {
   return v.added;
 }
 
-/** Read the persisted blob straight off a RunStore as a TaskList. */
+/** Read the persisted blob straight off a RunStore as a TaskList, keyed by the
+ *  project namespace derived from `key` (#142 — durable artifacts are keyed by
+ *  project_id, not the ephemeral session id). */
 async function loadFromStore(
   runStore: RunStore,
-  session = "test-session",
+  key = "test-project",
 ): Promise<TaskList | undefined> {
-  const v = await runStore.get(SessionId.of(session), TASK_LIST_KEY);
+  const v = await runStore.get(projectNs(key), TASK_LIST_KEY);
   return v === undefined ? undefined : (v as unknown as TaskList);
 }
 
@@ -219,14 +233,15 @@ describe("TaskListTool", () => {
     expect(persisted).toEqual(list);
   });
 
-  // Keyed by SessionId: two sessions over the SAME run store keep separate lists.
-  it("lists are keyed by SessionId", async () => {
+  // #142: keyed by PROJECT id, not session id. Two DIFFERENT project ids over the
+  // SAME run store keep separate lists.
+  it("lists are keyed by project_id", async () => {
     const runStore = new InMemoryStorageProvider();
     const sb = new AllowAllSandbox();
     const tool = new TaskListTool();
 
-    const ctxA = ctxWith(runStore, "session-a");
-    const ctxB = ctxWith(runStore, "session-b");
+    const ctxA = ctxWith(runStore, "project-a");
+    const ctxB = ctxWith(runStore, "project-b");
 
     await tool.execute(
       call({ action: "add_task", description: "a1" }),
@@ -244,12 +259,49 @@ describe("TaskListTool", () => {
       ctxB,
     );
 
-    const a = await loadFromStore(runStore, "session-a");
-    const b = await loadFromStore(runStore, "session-b");
+    const a = await loadFromStore(runStore, "project-a");
+    const b = await loadFromStore(runStore, "project-b");
     expect(a?.tasks).toHaveLength(1);
     expect(a?.tasks[0].description).toBe("a1");
     expect(b?.tasks).toHaveLength(2);
     expect(b?.tasks.map((t) => t.description)).toEqual(["b1", "b2"]);
+  });
+
+  // #142 (the bug this issue fixes): the task_list is visible across DIFFERENT
+  // sessions with the SAME project id. This mirrors the Ralph window-reset path —
+  // each window mints a fresh SessionId but the project id is stable, so window 2
+  // must see window 1's list.
+  it("task_list is visible across sessions with the same project_id", async () => {
+    const runStore = new InMemoryStorageProvider();
+    const sb = new AllowAllSandbox();
+    const tool = new TaskListTool();
+    const project = ProjectId.fromCanonicalPath("/proj/shared");
+
+    // Window 1: a distinct session id, but the shared project id.
+    const ctxW1 = new ToolContext(
+      SessionId.of("window-1-session"),
+      project,
+      runStore,
+      new InMemoryStorageProvider(),
+    );
+    await tool.execute(
+      call({ action: "add_task", description: "from window 1" }),
+      sb,
+      ctxW1,
+    );
+
+    // Window 2: a DIFFERENT (freshly generated) session id, SAME project id.
+    const ctxW2 = new ToolContext(
+      SessionId.generate(),
+      project,
+      runStore,
+      new InMemoryStorageProvider(),
+    );
+    const listed = parseList(
+      await tool.execute(call({ action: "list_tasks" }), sb, ctxW2),
+    );
+    expect(listed.tasks).toHaveLength(1);
+    expect(listed.tasks[0].description).toBe("from window 1");
   });
 
   // Persist then reload with a FRESH tool over the SAME ctx yields identical list.
@@ -564,11 +616,10 @@ describe("TaskListTool", () => {
     // Success content DOES carry `added`...
     expect(parseAdded(out)).toBe(1);
 
-    // ...but the raw persisted blob does NOT carry an `added` key.
-    const raw = await ctx.runStore.get(
-      SessionId.of("test-session"),
-      TASK_LIST_KEY,
-    );
+    // ...but the raw persisted blob does NOT carry an `added` key. #142: the blob
+    // is keyed by the project namespace, not the session id — read it straight off
+    // the ctx's project_id namespace.
+    const raw = await ctx.runStore.get(ctx.projectId.namespace(), TASK_LIST_KEY);
     expect(raw).toBeDefined();
     expect((raw as Record<string, unknown>).added).toBeUndefined();
     // The persisted blob round-trips to a bare TaskList whose canonical

@@ -43,7 +43,7 @@ import type { Hook, HookChain, HookContext, HookDecision, HookEvent } from "../s
 import type { Verifier, VerifierInput, VerifierVerdict } from "../src/verifier/index.js";
 import { StandardHookChain } from "../src/hooks/standard.js";
 import { InMemoryObservabilityProvider } from "../src/observability/in-memory.js";
-import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
+import { InMemoryStorageProvider, ProjectId, StorageProvider } from "../src/storage/index.js";
 import {
   TASK_LIST_EXTRAS_KEY,
   addTask,
@@ -113,6 +113,12 @@ class RecordingAgent implements Agent {
   }
 }
 
+// #142: durable artifacts (task_list, plan) are keyed by the STABLE project
+// namespace, NOT the run session id. Pin a fixed project id in every test config
+// so seed-writes and read-backs key by the SAME namespace the harness uses.
+const TEST_PROJECT = ProjectId.fromCanonicalPath("/test-project");
+const DURABLE_NS = TEST_PROJECT.namespace();
+
 function configWith(
   agent: Agent,
   overrides: Partial<HarnessConfig> & { verifier?: Verifier } = {},
@@ -125,6 +131,7 @@ function configWith(
     contextManager: new NoopContextManager(),
     terminationPolicy: new AlwaysContinuePolicy(),
     modelParams: { stop_sequences: [] },
+    projectId: TEST_PROJECT,
     ...rest,
     registry: registryWith({ agent, verifier }),
   };
@@ -215,7 +222,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
     expect(r.kind).toBe("success");
     // #76: the task list is persisted to the RunStore seam, not mirrored into
     // SessionState.extras.
-    const list = (await provider.run().get(SID, TASK_LIST_EXTRAS_KEY)) as TaskList;
+    const list = (await provider.run().get(DURABLE_NS, TASK_LIST_EXTRAS_KEY)) as TaskList;
     expect(list.tasks.length).toBe(2);
     expect(list.tasks.every((t) => t.status === "completed")).toBe(true);
     expect(state.extras[TASK_LIST_EXTRAS_KEY]).toBeUndefined();
@@ -424,7 +431,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
     const provider = StorageProvider.single(new InMemoryStorageProvider());
     const h = new StandardHarness(configWith(a, { storage: provider }));
     await h.run({ task: planTask() });
-    const stored = await provider.run().get(SID, TASK_LIST_EXTRAS_KEY);
+    const stored = await provider.run().get(DURABLE_NS, TASK_LIST_EXTRAS_KEY);
     expect(stored).not.toBeUndefined();
     const list = stored as TaskList;
     expect(list.tasks.length).toBe(1);
@@ -472,7 +479,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
       ],
       next_id: 3,
     };
-    await provider.run().put(SID, TASK_LIST_EXTRAS_KEY, JSON.parse(JSON.stringify(checkpoint)));
+    await provider.run().put(DURABLE_NS, TASK_LIST_EXTRAS_KEY, JSON.parse(JSON.stringify(checkpoint)));
 
     // The freshly-parsed list (as the plan phase produces) is all-Pending.
     const fresh = planArtifactToTaskList({ tasks: ["one", "two"], rationale: "r" });
@@ -506,7 +513,7 @@ describe("PlanExecute execute phase (issue #59)", () => {
     if (r.kind === "success") expect(r.output).toBe("done two");
 
     // Both tasks Completed on the final persisted checkpoint.
-    const list = (await provider.run().get(SID, TASK_LIST_EXTRAS_KEY)) as TaskList;
+    const list = (await provider.run().get(DURABLE_NS, TASK_LIST_EXTRAS_KEY)) as TaskList;
     expect(list.tasks.every((t) => t.status === "completed")).toBe(true);
   });
 

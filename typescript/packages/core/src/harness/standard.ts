@@ -14,7 +14,6 @@
  * 9. Subagents cannot spawn subagents (depth-1 enforcement in types).
  */
 
-import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -68,7 +67,14 @@ import type {
 import { ModelParamsSchema } from "../model/schemas.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
-import { InMemoryStorageProvider, StorageProvider } from "../storage/index.js";
+import {
+  InMemoryStorageProvider,
+  ProjectId,
+  RALPH_FEATURE_LIST_KEY,
+  RALPH_PROGRESS_KEY,
+  StorageProvider,
+  type RunStore,
+} from "../storage/index.js";
 import {
   RealToolRegistry,
   RegistrationErrorException,
@@ -199,6 +205,22 @@ export interface HarnessConfig {
    * for the observability fan-out.
    */
   storage?: StorageProvider;
+  /**
+   * The STABLE project namespace for DURABLE artifacts (issue #142). Where the
+   * per-window {@link SessionId} is regenerated on every Ralph context-window
+   * reset (`SessionId.generate()`), this {@link ProjectId} stays constant across
+   * windows AND process restarts — which is what lets the `task_list`, plan
+   * artifact, and Ralph checkpoint persist across a window reset instead of being
+   * orphaned under a regenerated session. Optional; when unset the
+   * {@link StandardHarness} constructor derives it from the sandbox workspace root
+   * (decision 5 — NOT process cwd), canonicalizing the path first and falling
+   * back to the pure derivation over the workspace-root string when the path does
+   * not exist on disk. Durable {@link RunStore} call sites key by
+   * `projectId.namespace()` (namespace-reuse on the existing {@link SessionId}
+   * axis); ephemeral session/conversation state stays keyed by the per-window
+   * {@link SessionId}.
+   */
+  projectId?: ProjectId;
   /**
    * Post-compaction verifier (issue #29/#46). The harness runs it after each
    * compaction turn and retries up to `maxCompactionAttempts` before accepting
@@ -444,38 +466,78 @@ export class StandardHarness implements Harness, StrategyExecutor {
    */
   private observedWrites: string[] = [];
 
+  /**
+   * The STABLE durable-storage project namespace (#142), resolved once at
+   * construction. From an explicit {@link HarnessConfig.projectId}, else derived
+   * from the sandbox workspace root (decision 5 — NOT process cwd): the
+   * FS-touching {@link ProjectId.fromPath} canonicalizes first, falling back to
+   * the PURE derivation over the workspace-root string when the path does not
+   * exist on disk so a project id is always present and deterministic. When the
+   * sandbox exposes no workspace root, a fixed `unscoped-project` id keeps durable
+   * sites keyed consistently within the run.
+   */
+  private readonly resolvedProjectId: ProjectId;
+
   constructor(private readonly config: HarnessConfig) {
-    // Issue #58, B1: drive Ralph off the Stop hook. Register a `stop` hook at
-    // construction that reads `.spore/progress.json` under the sandbox's
-    // workspace root: while tasks remain incomplete it blocks (the loop
-    // continues into a new context window); all complete ⇒ continue (the loop
-    // terminates). Absent progress file ⇒ continue, so the hook is INERT for a
-    // non-Ralph run over the same workspace (matching the Rust reference, which
-    // registers the hook at construction).
-    //
-    // Registered ONLY when the sandbox exposes a concrete workspace root —
-    // without one, `.spore/progress.json` cannot be resolved deterministically,
-    // and registering would perturb the `config.hooks`-absent contract every
-    // non-Ralph caller relies on. Goes into the configured chain, or a fresh
-    // `StandardHookChain` when none was supplied.
-    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
-    if (workspaceRoot.length > 0) {
-      const chain = this.config.hooks ?? new StandardHookChain();
-      chain.register(
-        new FunctionHook("ralph-stop", ["stop"], (ctx) => {
-          if (ctx.event !== "stop") return { decision: "continue" };
-          // Absent progress file ⇒ do not interfere with non-Ralph runs over
-          // this workspace (the completion mechanism only engages once a
-          // `.spore/progress.json` is present). Mirrors the Rust RalphStopHook.
-          if (!StandardHarness.ralphProgressFilePresent(workspaceRoot)) {
-            return { decision: "continue" };
-          }
-          const reason = StandardHarness.ralphCompletionStatus(workspaceRoot);
-          return reason == null ? { decision: "continue" } : { decision: "block", reason };
-        }),
-      );
-      this.config = { ...this.config, hooks: chain };
+    // #142: resolve the STABLE project namespace ONCE. An explicit config value
+    // always wins; otherwise derive from the sandbox workspace root.
+    this.resolvedProjectId = StandardHarness.resolveProjectId(config);
+
+    // Issue #58, B1: drive Ralph off the Stop hook. #142: the checkpoint moved
+    // off `.spore/progress.json` onto the durable project-id {@link RunStore}.
+    // Register a `stop` hook at construction that reads the Ralph progress
+    // checkpoint from the store under the stable project id: while tasks remain
+    // incomplete it blocks (the loop continues into a new context window); all
+    // complete ⇒ continue (the loop terminates). When the progress key is UNSET
+    // this is not a Ralph run, so `Continue` — the hook is INERT for non-Ralph
+    // runs. Registration is harmless: it only BLOCKS when the checkpoint is
+    // present and reports incomplete tasks. Goes into the configured chain, or a
+    // fresh `StandardHookChain` when none was supplied.
+    const runStore = this.storage().run();
+    const projectId = this.resolvedProjectId;
+    const chain = this.config.hooks ?? new StandardHookChain();
+    chain.register(
+      new FunctionHook("ralph-stop", ["stop"], async (ctx) => {
+        if (ctx.event !== "stop") return { decision: "continue" };
+        // Absent checkpoint ⇒ do not interfere with non-Ralph runs. Mirrors the
+        // Rust RalphStopHook's progress-present guard.
+        const present = (await runStore.get(projectId.namespace(), RALPH_PROGRESS_KEY)) != null;
+        if (!present) return { decision: "continue" };
+        const reason = await StandardHarness.ralphCompletionStatusFromStore(runStore, projectId);
+        return reason == null ? { decision: "continue" } : { decision: "block", reason };
+      }),
+    );
+    this.config = { ...this.config, hooks: chain };
+  }
+
+  /**
+   * Resolve the durable project id (#142) for a config: an explicit
+   * {@link HarnessConfig.projectId} wins; otherwise derive from the sandbox
+   * workspace root (decision 5). The FS-touching {@link ProjectId.fromPath}
+   * canonicalizes first; if that fails (e.g. the workspace root does not yet
+   * exist on disk, as in a fixture-replay tempdir) fall back to the PURE
+   * derivation over the workspace-root string. An empty workspace root yields a
+   * fixed `unscoped-project` id.
+   */
+  private static resolveProjectId(config: HarnessConfig): ProjectId {
+    if (config.projectId != null) return config.projectId;
+    const workspaceRoot = config.sandbox.workspaceRoot?.() ?? "";
+    if (workspaceRoot.length === 0) {
+      return ProjectId.fromCanonicalPath("/unscoped-project");
     }
+    try {
+      return ProjectId.fromPath(workspaceRoot);
+    } catch {
+      return ProjectId.fromCanonicalPath(workspaceRoot);
+    }
+  }
+
+  /**
+   * The STABLE durable-storage project id (#142) keying this run's DURABLE
+   * artifacts. Resolved once at construction; see {@link resolveProjectId}.
+   */
+  projectId(): ProjectId {
+    return this.resolvedProjectId;
   }
 
   /**
@@ -514,6 +576,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
           scoped,
           this.config.sandbox,
           sessionId,
+          this.resolvedProjectId,
           store.run(),
           store.memory(),
         );
@@ -526,6 +589,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
       catalogue,
       this.config.sandbox,
       sessionId,
+      this.resolvedProjectId,
       store.run(),
       store.memory(),
     );
@@ -1349,10 +1413,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
 
   /** {@inheritDoc StrategyExecutor.ralphSeedSession} */
   async ralphSeedSession(instruction: string): Promise<SessionState> {
-    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
     const sessionState = emptySessionState();
     await this.config.contextManager.appendUserMessage(sessionState, instruction);
-    const reload = StandardHarness.ralphReloadContext(workspaceRoot);
+    // #142: the reload context now comes from the durable project-id RunStore
+    // checkpoint, not the `.spore/` filesystem.
+    const reload = await StandardHarness.ralphReloadContextFromStore(
+      this.storage().run(),
+      this.resolvedProjectId,
+    );
     if (reload != null) {
       await this.config.contextManager.appendUserMessage(sessionState, reload);
     }
@@ -1375,9 +1443,12 @@ export class StandardHarness implements Harness, StrategyExecutor {
   }
 
   /** {@inheritDoc StrategyExecutor.ralphCompletionStatus} */
-  ralphCompletionStatus(): string | null {
-    const workspaceRoot = this.config.sandbox.workspaceRoot?.() ?? "";
-    return StandardHarness.ralphCompletionStatus(workspaceRoot);
+  async ralphCompletionStatus(): Promise<string | null> {
+    // #142: read the checkpoint from the durable project-id RunStore.
+    return StandardHarness.ralphCompletionStatusFromStore(
+      this.storage().run(),
+      this.resolvedProjectId,
+    );
   }
 
   /** {@inheritDoc StrategyExecutor.ralphMaxResets} */
@@ -1990,6 +2061,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * in-memory provider never fails).
    */
   async persistTaskList(sessionId: SessionId, taskList: TaskList): Promise<void> {
+    // #142: the task_list is DURABLE — key it by the STABLE project namespace
+    // (`projectId().namespace()`), NOT the per-window `sessionId` the Ralph
+    // wrapper regenerates each context window. Namespace-reuse keeps the RunStore
+    // interface keyed by {@link SessionId} while the value keyed is the stable
+    // project id. The incoming `sessionId` stays the EPHEMERAL key and is
+    // intentionally unused for this durable write.
+    void sessionId;
     // Serialize via the canonical task-list form, then re-parse to a plain JSON
     // value so the durable blob is byte-identical to the cross-language
     // `{ tasks, next_id }` shape.
@@ -2002,7 +2080,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     try {
       await this.storage()
         .run()
-        .put(sessionId, TASK_LIST_EXTRAS_KEY, value as never);
+        .put(this.resolvedProjectId.namespace(), TASK_LIST_EXTRAS_KEY, value as never);
     } catch {
       // Durable write failure is non-fatal.
     }
@@ -2016,8 +2094,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * bridge). Mirrors Rust's `load_task_list`.
    */
   async loadTaskList(sessionId: SessionId): Promise<TaskList | undefined> {
+    // #142: the task_list is DURABLE — read it from the STABLE project namespace,
+    // NOT the per-window `sessionId` (so the execute phase of a fresh Ralph window
+    // sees the prior window's list). The ephemeral `sessionId` is unused here.
+    void sessionId;
     try {
-      const saved = await this.storage().run().get(sessionId, TASK_LIST_EXTRAS_KEY);
+      const saved = await this.storage()
+        .run()
+        .get(this.resolvedProjectId.namespace(), TASK_LIST_EXTRAS_KEY);
       if (saved == null) return undefined;
       const parsed = TaskListSchema.safeParse(saved);
       return parsed.success ? parsed.data : undefined;
@@ -2061,8 +2145,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * hiccup must not block a fresh execute run.
    */
   private async reconcileDeepResume(sessionId: SessionId, taskList: TaskList): Promise<void> {
+    // #142: the durable checkpoint is keyed by the STABLE project namespace, NOT
+    // the per-window `sessionId` — so deep-resume reads the SAME list a prior
+    // Ralph window persisted. The ephemeral `sessionId` is unused here.
+    void sessionId;
     try {
-      const saved = await this.storage().run().get(sessionId, TASK_LIST_EXTRAS_KEY);
+      const saved = await this.storage()
+        .run()
+        .get(this.resolvedProjectId.namespace(), TASK_LIST_EXTRAS_KEY);
       if (saved == null) return;
       const parsed = TaskListSchema.safeParse(saved);
       if (!parsed.success) return;
@@ -2131,13 +2221,18 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // R4: persist the produced artifact to the RunStore seam under
     // PLAN_EXECUTE_EXTRAS_KEY (the stable cross-language `{ tasks, rationale }`
     // shape). #76 — the durable single source of truth, no longer mirrored into
-    // SessionState.extras. The put failure is swallowed (matching persistTaskList):
-    // a successfully-captured plan must not be lost to a storage hiccup.
+    // SessionState.extras. #142: the plan artifact is DURABLE — key it by the
+    // STABLE project namespace, NOT the per-window `sessionId` (so a Ralph window
+    // reset re-reads the prior window's plan). The put failure is swallowed
+    // (matching persistTaskList): a successfully-captured plan must not be lost to
+    // a storage hiccup.
     try {
-      await this.storage().run().put(sessionId, PLAN_EXECUTE_EXTRAS_KEY, {
-        tasks: artifact.tasks,
-        rationale: artifact.rationale,
-      });
+      await this.storage()
+        .run()
+        .put(this.resolvedProjectId.namespace(), PLAN_EXECUTE_EXTRAS_KEY, {
+          tasks: artifact.tasks,
+          rationale: artifact.rationale,
+        });
     } catch {
       // Durable write failure is non-fatal.
     }
@@ -2346,44 +2441,38 @@ export class StandardHarness implements Harness, StrategyExecutor {
   // --------------------------------------------------------------------------
 
   /**
-   * Ralph external completion check (issue #58, B1). Reads the deterministic
-   * `.spore/` files under `workspaceRoot` and reports whether the task is
-   * complete: `null` when complete, a reason string when tasks remain. This is
-   * the SAME logic the registered `ralph-stop` hook applies — one source of
-   * truth for the completion mechanism.
+   * Ralph external completion check (issue #58, B1). #142, decision 3: the
+   * checkpoint MOVED off the `.spore/` filesystem onto the durable project-id
+   * {@link RunStore}. Reads the checkpoint keyed by `project` and reports whether
+   * the task is complete: `null` when complete, a reason string when tasks
+   * remain. This is the SAME logic the registered `ralph-stop` hook applies — one
+   * source of truth for the completion mechanism.
    *
-   * Contract (B4 — no git):
-   *   - `.spore/progress.json`: `{ "complete": boolean, "remaining": string[] }`.
+   * Contract:
+   *   - {@link RALPH_PROGRESS_KEY} → `{ complete: boolean, remaining: string[] }`.
    *     `complete: true` with empty `remaining` ⇒ progress satisfied.
-   *     Missing/unreadable/invalid ⇒ incomplete (so the agent learns to write it).
-   *   - `.spore/feature_list.json`: a JSON array of `{ "name", "passes" }`. Any
-   *     `passes: false` ⇒ incomplete. A MISSING feature list is tolerated here
-   *     (progress.json is the primary signal); an invalid one is not.
+   *     Absent/unreadable/invalid ⇒ incomplete (so the agent learns to write it).
+   *   - {@link RALPH_FEATURE_LIST_KEY} → a JSON array of `{ name, passes }`. Any
+   *     `passes: false` ⇒ incomplete. An ABSENT feature list is tolerated here
+   *     (progress is the primary signal); an invalid one is not.
+   *
+   * The reason strings stay byte-identical to the legacy `.spore/`-path messages
+   * so the surfaced `ralph_completion_unmet` text is stable across the relocation.
    */
-  /**
-   * Whether `.spore/progress.json` exists under `workspaceRoot` (issue #58).
-   * The registered `ralph-stop` hook uses this to stay INERT for non-Ralph runs
-   * over the same workspace: with no progress file the completion mechanism does
-   * not engage. Mirrors the Rust RalphStopHook's `progress_path.exists()` guard.
-   */
-  static ralphProgressFilePresent(workspaceRoot: string): boolean {
-    return existsSync(join(workspaceRoot, ".spore", "progress.json"));
-  }
-
-  static ralphCompletionStatus(workspaceRoot: string): string | null {
-    const progressPath = join(workspaceRoot, ".spore", "progress.json");
-    let raw: string;
+  static async ralphCompletionStatusFromStore(
+    runStore: RunStore,
+    project: ProjectId,
+  ): Promise<string | null> {
+    const ns = project.namespace();
+    let progressValue: unknown;
     try {
-      raw = readFileSync(progressPath, "utf-8");
+      progressValue = await runStore.get(ns, RALPH_PROGRESS_KEY);
     } catch {
+      // A storage error ⇒ incomplete (the agent must write it).
       return ".spore/progress.json missing";
     }
-    let progress: { complete?: unknown; remaining?: unknown };
-    try {
-      progress = JSON.parse(raw) as { complete?: unknown; remaining?: unknown };
-    } catch (e) {
-      return `.spore/progress.json invalid JSON: ${(e as Error).message}`;
-    }
+    if (progressValue == null) return ".spore/progress.json missing";
+    const progress = progressValue as { complete?: unknown; remaining?: unknown };
     const remaining = Array.isArray(progress.remaining)
       ? (progress.remaining as unknown[]).map(String)
       : [];
@@ -2397,19 +2486,17 @@ export class StandardHarness implements Harness, StrategyExecutor {
     }
 
     // Progress says done — corroborate against the feature list when present.
-    const featurePath = join(workspaceRoot, ".spore", "feature_list.json");
-    let featureRaw: string;
+    let featureValue: unknown;
     try {
-      featureRaw = readFileSync(featurePath, "utf-8");
+      featureValue = await runStore.get(ns, RALPH_FEATURE_LIST_KEY);
     } catch {
-      return null; // A missing feature list is tolerated.
+      return null; // A storage error reading the optional feature list is tolerated.
     }
-    let entries: { name?: unknown; passes?: unknown }[];
-    try {
-      entries = JSON.parse(featureRaw) as { name?: unknown; passes?: unknown }[];
-    } catch (e) {
-      return `.spore/feature_list.json invalid JSON: ${(e as Error).message}`;
+    if (featureValue == null) return null; // A missing feature list is tolerated.
+    if (!Array.isArray(featureValue)) {
+      return ".spore/feature_list.json invalid JSON: not an array";
     }
+    const entries = featureValue as { name?: unknown; passes?: unknown }[];
     const incomplete = entries.filter((x) => x.passes !== true).map((x) => String(x.name));
     if (incomplete.length > 0) {
       return `incomplete features: ${incomplete.join(", ")}`;
@@ -2418,27 +2505,57 @@ export class StandardHarness implements Harness, StrategyExecutor {
   }
 
   /**
-   * Build the filesystem-reload context block injected into each fresh context
-   * window (issue #58, R3). Returns the verbatim `.spore/progress.json` and
-   * `.spore/feature_list.json` contents (when present) so the re-seeded window
-   * knows what is already done and what remains. Returns `null` when neither
-   * file exists (nothing to reload).
+   * Build the reload context block injected into each fresh context window
+   * (issue #58, R3). #142: reads the checkpoint from the durable project-id
+   * {@link RunStore} (not the `.spore/` filesystem) and returns the verbatim
+   * progress + feature-list JSON (when present) so the re-seeded window knows what
+   * is done and what remains. Returns `null` when neither checkpoint key is set.
+   * The `Reloaded .spore/…` prefix is retained so the seeded prompt text is
+   * byte-stable across the relocation.
    */
-  static ralphReloadContext(workspaceRoot: string): string | null {
+  static async ralphReloadContextFromStore(
+    runStore: RunStore,
+    project: ProjectId,
+  ): Promise<string | null> {
+    const ns = project.namespace();
     const parts: string[] = [];
     try {
-      const raw = readFileSync(join(workspaceRoot, ".spore", "progress.json"), "utf-8");
-      parts.push(`Reloaded .spore/progress.json:\n${raw.trim()}`);
+      const v = await runStore.get(ns, RALPH_PROGRESS_KEY);
+      if (v != null) parts.push(`Reloaded .spore/progress.json:\n${JSON.stringify(v)}`);
     } catch {
-      // Absent — nothing to reload from this file.
+      // Absent / error — nothing to reload from this key.
     }
     try {
-      const raw = readFileSync(join(workspaceRoot, ".spore", "feature_list.json"), "utf-8");
-      parts.push(`Reloaded .spore/feature_list.json:\n${raw.trim()}`);
+      const v = await runStore.get(ns, RALPH_FEATURE_LIST_KEY);
+      if (v != null) parts.push(`Reloaded .spore/feature_list.json:\n${JSON.stringify(v)}`);
     } catch {
-      // Absent — nothing to reload from this file.
+      // Absent / error — nothing to reload from this key.
     }
     return parts.length === 0 ? null : parts.join("\n\n");
+  }
+
+  /**
+   * Write the Ralph progress checkpoint to the durable project-id
+   * {@link RunStore} (issue #142, decision 3 — the WRITE path the relocated
+   * checkpoint needs; nothing wrote `progress.json` before). `complete: true` +
+   * empty `remaining` ⇒ {@link ralphCompletionStatusFromStore} reports done.
+   */
+  async writeRalphProgress(complete: boolean, remaining: string[]): Promise<void> {
+    await this.storage()
+      .run()
+      .put(this.resolvedProjectId.namespace(), RALPH_PROGRESS_KEY, { complete, remaining });
+  }
+
+  /**
+   * Write the Ralph feature-list checkpoint to the durable project-id
+   * {@link RunStore} (issue #142, decision 3). Each entry is `{ name, passes }`;
+   * any `passes: false` keeps the run incomplete.
+   */
+  async writeRalphFeatureList(features: readonly [string, boolean][]): Promise<void> {
+    const entries = features.map(([name, passes]) => ({ name, passes }));
+    await this.storage()
+      .run()
+      .put(this.resolvedProjectId.namespace(), RALPH_FEATURE_LIST_KEY, entries);
   }
 
   /**
@@ -3625,6 +3742,7 @@ export class HarnessBuilder {
   private _middleware?: MiddlewareChain;
   private _observability?: ObservabilityProvider;
   private _storage?: StorageProvider;
+  private _projectId?: ProjectId;
   private _compactionVerifier: CompactionVerifier = new KeyTermVerifier();
   private _maxCompactionAttempts = 2;
   private _pricing: PricingTable = PricingTable.DEFAULT;
@@ -3731,6 +3849,19 @@ export class HarnessBuilder {
    *  provider when unset, so existing callers compile and behave unchanged. */
   storage(provider: StorageProvider): this {
     this._storage = provider;
+    return this;
+  }
+
+  /**
+   * Override the STABLE durable-storage project namespace (issue #142). When
+   * unset, the {@link StandardHarness} constructor derives it from the sandbox
+   * workspace root (decision 5), canonicalizing the path first. Set this
+   * explicitly when the workspace root is not a stable on-disk path (e.g. a
+   * fixture-replay tempdir, or to pin a known project across processes). See
+   * {@link HarnessConfig.projectId}.
+   */
+  projectId(projectId: ProjectId): this {
+    this._projectId = projectId;
     return this;
   }
 
@@ -4171,6 +4302,7 @@ export class HarnessBuilder {
       middleware: this._middleware,
       observability: this._observability,
       storage,
+      projectId: this._projectId,
       compactionVerifier: this._compactionVerifier,
       maxCompactionAttempts: this._maxCompactionAttempts,
       pricing: this._pricing,

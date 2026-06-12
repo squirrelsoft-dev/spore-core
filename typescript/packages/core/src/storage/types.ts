@@ -36,8 +36,11 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 
-import type { SessionId } from "../harness/types.js";
+import { z } from "zod";
+
+import { SessionId } from "../harness/types.js";
 import type { PausedState } from "../harness/types.js";
 import type { Timestamp } from "../memory/types.js";
 import type { SessionMetrics } from "../observability/types.js";
@@ -206,6 +209,251 @@ function sanitizeBasename(basename: string): string {
 
 function sha256Hex(input: string): string {
   return createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+// ============================================================================
+// ProjectId (#142) — project-scoped durable storage namespace
+// ============================================================================
+
+/**
+ * A **stable** identifier for a project, used as the durable storage namespace
+ * (issue #142). Where {@link SessionId} is regenerated per Ralph context window
+ * (`SessionId.generate()`), a `ProjectId` derived from the workspace root stays
+ * constant across windows AND across process restarts — that stability is the
+ * whole point: the `task_list`, plan artifact, Ralph checkpoint, and active-run
+ * slot persist under it, so a window reset re-reads the prior window's work
+ * instead of re-planning from scratch.
+ *
+ * Form: `{sanitizedBasename}-{8hex}`, lowercased — **identical** to
+ * {@link WorkspaceId}. The two share the pure derivation
+ * ({@link canonicalizePathString} + {@link sanitizeBasename}); a `ProjectId`
+ * differs only in carrying FS-touching constructors that canonicalize first.
+ *
+ * ## `/a/b` vs `/a_b` collision policy (RESOLVED)
+ * A naive "slashes → underscores" slug would map both `/a/b` and `/a_b` to the
+ * same string. This derivation does NOT collide: it slugs ONLY the final
+ * basename and appends the first 8 hex of the SHA-256 of the FULL canonical path
+ * string. `/a/b` and `/a_b` have different canonical strings, hence different
+ * hashes, hence distinct ids (`b-<h1>` vs `a-b-<h2>`). The fixture
+ * `fixtures/storage/project_id_derivation.json` pins this distinct-id case.
+ *
+ * ## Namespace reuse
+ * The {@link RunStore} interface is keyed by {@link SessionId}. Rather than
+ * widening that interface, a `ProjectId` is projected onto the same string axis
+ * via {@link ProjectId.namespace}, which yields a {@link SessionId}-typed key
+ * whose string is the derived project id. Durable call sites pass that key in
+ * place of the per-window session id, so the interface stays stable while the
+ * value keyed is the stable project namespace. Ephemeral session/conversation
+ * state keeps using the real per-window {@link SessionId}.
+ *
+ * A branded `string` wrapper (class) so a raw `string` can never be passed where
+ * a derived project id is required.
+ */
+export class ProjectId {
+  private constructor(private readonly id: string) {}
+
+  /**
+   * Derive a {@link ProjectId} from an already-OS-canonicalized path. **PURE and
+   * infallible** — it never touches the filesystem. This is the cross-language
+   * fixture anchor (`fixtures/storage/project_id_derivation.json`); it reuses the
+   * EXACT same algorithm as {@link WorkspaceId.fromCanonicalPath}
+   * ({@link canonicalizePathString} + {@link sanitizeBasename} + 8-hex SHA-256),
+   * so the two derivations are byte-identical for the same input.
+   */
+  static fromCanonicalPath(path: string): ProjectId {
+    // Reuse the WorkspaceId pure algorithm — do NOT duplicate it.
+    return new ProjectId(WorkspaceId.fromCanonicalPath(path).asString());
+  }
+
+  /**
+   * Derive a {@link ProjectId} from a path, **canonicalizing the filesystem
+   * FIRST** (resolving symlinks, relative components, and macOS
+   * case-insensitivity via {@link realpathSync}) before delegating to the pure
+   * {@link ProjectId.fromCanonicalPath}. Throws {@link ProjectIdError} (kind
+   * `canonicalize`) if the path cannot be canonicalized (does not exist, a
+   * component is not a directory, a permission error, a broken symlink, …).
+   */
+  static fromPath(path: string): ProjectId {
+    let canonical: string;
+    try {
+      canonical = realpathSync(path);
+    } catch (err) {
+      throw new ProjectIdError(path, err);
+    }
+    return ProjectId.fromCanonicalPath(canonical);
+  }
+
+  /**
+   * Derive a {@link ProjectId} from the current working directory,
+   * canonicalizing FIRST. Convenience wrapper over {@link ProjectId.fromPath} for
+   * binaries that want the process cwd; the harness itself derives from the
+   * sandbox workspace root, NOT process cwd (decision 5).
+   */
+  static fromCwd(): ProjectId {
+    return ProjectId.fromPath(process.cwd());
+  }
+
+  /**
+   * Project this `ProjectId` onto the {@link RunStore}'s {@link SessionId} string
+   * axis (the namespace-reuse seam, #142). The returned {@link SessionId} is NOT
+   * a real session — its string IS the derived project id — so durable
+   * {@link RunStore.get} / {@link RunStore.put} calls key by the stable project
+   * namespace without widening the interface. Ephemeral session-keyed state keeps
+   * using the real per-window {@link SessionId}.
+   */
+  namespace(): SessionId {
+    return SessionId.of(this.id);
+  }
+
+  /** The underlying derived id string. */
+  asString(): string {
+    return this.id;
+  }
+
+  toString(): string {
+    return this.id;
+  }
+
+  toJSON(): string {
+    return this.id;
+  }
+
+  equals(other: ProjectId): boolean {
+    return this.id === other.id;
+  }
+}
+
+/**
+ * Error surfaced while deriving a {@link ProjectId} from the live filesystem
+ * (issue #142). The pure derivation {@link ProjectId.fromCanonicalPath} is
+ * infallible — only the FS-touching constructors ({@link ProjectId.fromPath} /
+ * {@link ProjectId.fromCwd}) can fail, and only because canonicalization touched
+ * the filesystem. Follows the conventions error pattern (a `name`/`kind`).
+ */
+export class ProjectIdError extends Error {
+  override readonly name = "ProjectIdError";
+  readonly kind = "canonicalize" as const;
+  constructor(
+    readonly path: string,
+    cause?: unknown,
+  ) {
+    super(`project id canonicalization failed for ${path}`, { cause });
+  }
+}
+
+// ============================================================================
+// Active-run lifecycle (#142, decision 2)
+// ============================================================================
+
+/**
+ * Reserved {@link RunStore} key under the project namespace holding the
+ * {@link ActiveRun} slot. The caller owns the lifecycle: start-new vs resume is
+ * a deterministic match on the caller-supplied `runTag`, NOT instruction-diffing
+ * and NOT auto-on-success. The harness stays stateless between runs.
+ */
+export const ACTIVE_RUN_KEY = "active_run";
+
+/**
+ * Reserved {@link RunStore} key under the project namespace holding the Ralph
+ * progress checkpoint (issue #142, decision 3). The checkpoint content
+ * previously lived at `{workspaceRoot}/.spore/progress.json` — it now lives in
+ * the project-id store so it survives Ralph window resets and process restarts.
+ */
+export const RALPH_PROGRESS_KEY = "ralph_progress";
+
+/**
+ * Reserved {@link RunStore} key under the project namespace holding the Ralph
+ * feature-list checkpoint (issue #142, decision 3). Mirrors the old
+ * `{workspaceRoot}/.spore/feature_list.json`.
+ */
+export const RALPH_FEATURE_LIST_KEY = "ralph_feature_list";
+
+/** Lifecycle status of the project's active run. */
+export type ActiveRunStatus = "active" | "completed";
+
+/**
+ * The active-run slot persisted under {@link ACTIVE_RUN_KEY} in the project
+ * store.
+ *
+ * `runTag` is **caller-supplied** and is the sole start-new-vs-resume
+ * discriminator (decision 2): a {@link startOrResumeActiveRun} call whose tag
+ * matches a live slot RESUMES; a different tag (or an absent / completed slot)
+ * starts FRESH. `startedAt` is an **injected** timestamp (decision 2 — no
+ * `Date.now()`-style nondeterminism) so tests are deterministic. Serialized
+ * snake_case on the wire for cross-language byte parity.
+ */
+export interface ActiveRun {
+  run_tag: string;
+  started_at: Timestamp;
+  status: ActiveRunStatus;
+}
+
+/** Zod schema for an {@link ActiveRun} slot read back from a {@link RunStore}. */
+export const ActiveRunSchema = z.object({
+  run_tag: z.string(),
+  started_at: z.string(),
+  status: z.enum(["active", "completed"]),
+});
+
+/**
+ * Outcome of {@link startOrResumeActiveRun}: did the slot match (resume) or did
+ * the call mint a fresh active slot (start-new)?
+ */
+export type ActiveRunDecision = "started_new" | "resumed";
+
+/** Read the active-run slot for `project`, or `undefined` if absent /
+ *  unparseable. A malformed slot is treated as "no live run". */
+export async function loadActiveRun(
+  runStore: RunStore,
+  project: ProjectId,
+): Promise<{ run_tag: string; started_at: string; status: ActiveRunStatus } | undefined> {
+  const value = await runStore.get(project.namespace(), ACTIVE_RUN_KEY);
+  if (value == null) return undefined;
+  const parsed = ActiveRunSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Decide start-new vs resume for `project` on the caller-supplied `runTag`
+ * (decision 2). Deterministic: a live (`active`) slot under the SAME tag ⇒
+ * `"resumed"` (the slot is left intact); otherwise a fresh `active` slot stamped
+ * with the injected `startedAt` is written and `"started_new"` is returned.
+ * `startedAt` is injected (not read from a clock) so the result is deterministic
+ * in tests.
+ */
+export async function startOrResumeActiveRun(
+  runStore: RunStore,
+  project: ProjectId,
+  runTag: string,
+  startedAt: Timestamp,
+): Promise<ActiveRunDecision> {
+  const existing = await loadActiveRun(runStore, project);
+  if (existing != null && existing.status === "active" && existing.run_tag === runTag) {
+    return "resumed";
+  }
+  const fresh: JsonValue = {
+    run_tag: runTag,
+    started_at: startedAt.asString(),
+    status: "active",
+  };
+  await runStore.put(project.namespace(), ACTIVE_RUN_KEY, fresh);
+  return "started_new";
+}
+
+/**
+ * Mark the active run for `project` complete (decision 2): flips the slot's
+ * status to `"completed"` so the next {@link startOrResumeActiveRun} (even under
+ * the same tag) starts fresh. A no-op when there is no slot to complete.
+ */
+export async function completeActiveRun(runStore: RunStore, project: ProjectId): Promise<void> {
+  const existing = await loadActiveRun(runStore, project);
+  if (existing == null) return;
+  const completed: JsonValue = {
+    run_tag: existing.run_tag,
+    started_at: existing.started_at,
+    status: "completed",
+  };
+  await runStore.put(project.namespace(), ACTIVE_RUN_KEY, completed);
 }
 
 // ============================================================================

@@ -315,6 +315,7 @@ describe("S4 — tool failure + recovery", () => {
       registry,
       sandbox,
       sessionId,
+      coreStorage.ProjectId.fromCanonicalPath("/test-project"),
       new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
@@ -345,6 +346,7 @@ describe("S4 — tool failure + recovery", () => {
       buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
       SessionId.of("s4-halt"),
+      coreStorage.ProjectId.fromCanonicalPath("/test-project"),
       new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
@@ -361,6 +363,7 @@ describe("S4 — tool failure + recovery", () => {
       buildRealToolRegistry("s4"),
       new AllowAllSandbox(),
       SessionId.of("s4-schemas"),
+      coreStorage.ProjectId.fromCanonicalPath("/test-project"),
       new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
@@ -382,6 +385,7 @@ describe("per-scenario tool catalog", () => {
       buildRealToolRegistry(scenario),
       new AllowAllSandbox(),
       SessionId.of("catalog-test"),
+      coreStorage.ProjectId.fromCanonicalPath("/test-project"),
       new coreStorage.InMemoryStorageProvider(),
       new coreStorage.InMemoryStorageProvider(),
     );
@@ -446,6 +450,7 @@ describe("S5 — real shell pipeline", () => {
         buildRealToolRegistry("s5"),
         sandbox,
         sessionId,
+        coreStorage.ProjectId.fromCanonicalPath("/test-project"),
         new coreStorage.InMemoryStorageProvider(),
         new coreStorage.InMemoryStorageProvider(),
       );

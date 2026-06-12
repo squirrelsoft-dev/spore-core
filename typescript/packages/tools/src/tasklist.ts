@@ -140,7 +140,16 @@ export class TaskListTool implements Tool {
     _sandbox: SandboxProvider,
     ctx: ToolContext,
   ): Promise<ToolOutput> {
-    const { sessionId, runStore } = ctx;
+    // #142: the task_list is a DURABLE artifact — key it by the STABLE project
+    // namespace, NOT the per-window `sessionId` (which the Ralph wrapper
+    // regenerates every context window). Keying by projectId is what lets a
+    // window reset re-read the prior window's list instead of re-planning under a
+    // session it has never seen. Namespace-reuse: the project id is projected
+    // onto the existing {@link SessionId} axis via `projectId.namespace()`, so the
+    // RunStore interface stays unchanged. The `sessionId` stays the EPHEMERAL key
+    // and is intentionally unused for this durable artifact.
+    const { runStore } = ctx;
+    const durableNs = ctx.projectId.namespace();
 
     // 1. Parse params (bad input → recoverable).
     const p = parseParams(TaskListParamsSchema, call);
@@ -151,7 +160,7 @@ export class TaskListTool implements Tool {
     //    error or a malformed blob is recoverable.
     let raw: storage.JsonValue | undefined;
     try {
-      raw = await runStore.get(sessionId, TASK_LIST_EXTRAS_KEY);
+      raw = await runStore.get(durableNs, TASK_LIST_EXTRAS_KEY);
     } catch (e) {
       return {
         kind: "error",
@@ -219,9 +228,9 @@ export class TaskListTool implements Tool {
         break;
     }
 
-    // 4. Persist the (possibly mutated) list to the run store, keyed by
-    //    SessionId under the shared TASK_LIST_EXTRAS_KEY. We always persist on a
-    //    mutating action; list_tasks skips the write.
+    // 4. Persist the (possibly mutated) list to the run store, keyed by the
+    //    STABLE project namespace (#142) under the shared TASK_LIST_EXTRAS_KEY.
+    //    We always persist on a mutating action; list_tasks skips the write.
     if (mutated) {
       let value: storage.JsonValue;
       try {
@@ -234,7 +243,7 @@ export class TaskListTool implements Tool {
         };
       }
       try {
-        await runStore.put(sessionId, TASK_LIST_EXTRAS_KEY, value);
+        await runStore.put(durableNs, TASK_LIST_EXTRAS_KEY, value);
       } catch (e) {
         return {
           kind: "error",

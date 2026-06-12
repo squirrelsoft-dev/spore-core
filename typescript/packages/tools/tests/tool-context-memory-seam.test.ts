@@ -32,6 +32,7 @@ describe("ToolContext memoryStore seam (#78 R9)", () => {
       inner,
       new AllowAllSandbox(),
       SessionId.of("ctx-test"),
+      coreStorage.ProjectId.fromCanonicalPath("/test-project"),
       new InMemoryStorageProvider(),
       memory,
     );

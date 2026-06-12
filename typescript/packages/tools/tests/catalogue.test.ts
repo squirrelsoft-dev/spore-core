@@ -38,7 +38,7 @@ import {
 } from "../src/index.js";
 
 const { AllowAllSandbox } = harnessTesting;
-const { InMemoryStorageProvider } = storage;
+const { InMemoryStorageProvider, ProjectId } = storage;
 const { ToolContext } = toolRegistry;
 
 const ctx = toolRegistry.toolRegistryMock.testCtx();
@@ -481,6 +481,7 @@ describe("TodoWriteTool", () => {
   function inMemoryCtx(): toolRegistry.ToolContext {
     return new ToolContext(
       SessionId.of("todo-session"),
+      ProjectId.fromCanonicalPath("/test-project"),
       new InMemoryStorageProvider(),
       new InMemoryStorageProvider(),
     );
