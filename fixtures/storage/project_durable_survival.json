@@ -1,0 +1,67 @@
+{
+  "description": "AC5 (#142): the durable task_list, keyed by project_id, survives a Ralph window reset (fresh SessionId each window, same project) AND a process restart (a fresh FileSystemStorageProvider over the same root re-reads it). Window 1 writes under session A; window 2 (fresh session B, same project) reads what window 1 wrote; a brand-new provider over the same on-disk root reads the same bytes.",
+  "project_canonical_path": "/work/audit-repo",
+  "expected_project_id": "audit-repo-9e8ff6f3",
+  "run_key": "task_list",
+  "window_1": {
+    "session_id": "sess-window-1",
+    "task_list": {
+      "tasks": [
+        {
+          "id": 1,
+          "description": "discover the crates",
+          "status": "completed",
+          "blockers": []
+        },
+        {
+          "id": 2,
+          "description": "audit module one",
+          "status": "pending",
+          "blockers": []
+        }
+      ],
+      "next_id": 3
+    }
+  },
+  "window_2": {
+    "session_id": "sess-window-2",
+    "comment": "A DIFFERENT session id than window 1 (mirrors SessionId::generate() per Ralph window). Reading the project namespace must return window 1's list verbatim — NOT an empty list.",
+    "expected_task_list": {
+      "tasks": [
+        {
+          "id": 1,
+          "description": "discover the crates",
+          "status": "completed",
+          "blockers": []
+        },
+        {
+          "id": 2,
+          "description": "audit module one",
+          "status": "pending",
+          "blockers": []
+        }
+      ],
+      "next_id": 3
+    }
+  },
+  "cross_process": {
+    "comment": "A fresh FileSystemStorageProvider constructed over the SAME on-disk root (a new process) reads the SAME list under the SAME project namespace — proving crash-resume durability.",
+    "expected_task_list": {
+      "tasks": [
+        {
+          "id": 1,
+          "description": "discover the crates",
+          "status": "completed",
+          "blockers": []
+        },
+        {
+          "id": 2,
+          "description": "audit module one",
+          "status": "pending",
+          "blockers": []
+        }
+      ],
+      "next_id": 3
+    }
+  }
+}

@@ -98,7 +98,9 @@ pub(crate) fn apply_web_fetch_range(body: &str, start_byte: u64) -> Result<Strin
         });
     }
     let slice = &body[start_byte as usize..];
-    Ok(format!("[starting at byte {start_byte} of {total}]\n{slice}"))
+    Ok(format!(
+        "[starting at byte {start_byte} of {total}]\n{slice}"
+    ))
 }
 
 impl WebFetchTool {

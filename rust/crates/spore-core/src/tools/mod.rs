@@ -499,7 +499,12 @@ mod fixture_tests {
         for sc in scenarios {
             let run_store: Arc<dyn RunStore> = Arc::new(InMemoryStorageProvider::new());
             let memory_store: Arc<dyn MemoryStore> = Arc::new(InMemoryStorageProvider::new());
-            let ctx = ToolContext::new(SessionId::new("fx"), run_store.clone(), memory_store);
+            let ctx = ToolContext::new(
+                SessionId::new("fx"),
+                crate::storage::ProjectId::from_canonical_path("/todo-fx-project"),
+                run_store.clone(),
+                memory_store,
+            );
             let tool = TodoWriteTool::new();
             for step in &sc.steps {
                 let out = tool

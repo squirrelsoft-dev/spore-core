@@ -182,6 +182,7 @@ mod tests {
         let storage = StorageProvider::single(Arc::new(InMemoryStorageProvider::new()));
         ToolContext::new(
             crate::harness::SessionId::new("s1"),
+            crate::storage::ProjectId::from_canonical_path("/macros-test-project"),
             storage.run().clone(),
             storage.memory().clone(),
         )

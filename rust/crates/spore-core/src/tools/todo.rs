@@ -125,7 +125,12 @@ mod tests {
 
     fn ctx() -> ToolContext {
         let backend = Arc::new(InMemoryStorageProvider::new());
-        ToolContext::new(SessionId::new("todo-session"), backend.clone(), backend)
+        ToolContext::new(
+            SessionId::new("todo-session"),
+            crate::storage::ProjectId::from_canonical_path("/todo-test-project"),
+            backend.clone(),
+            backend,
+        )
     }
 
     fn call(input: serde_json::Value) -> ToolCall {

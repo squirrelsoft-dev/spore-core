@@ -108,7 +108,14 @@ use crate::storage::{MemoryStore, RunStore};
 /// alongside (but separate from) the [`SandboxProvider`]. It carries the
 /// minimum a tool needs to persist durable state via the storage layer:
 ///
-///   - `session_id`   — the run's [`SessionId`], the key namespace for stores.
+///   - `session_id`   — the run's [`SessionId`], the key namespace for
+///     EPHEMERAL state that SHOULD reset per Ralph window (conversation/session
+///     state, `active_skills`).
+///   - `project_id`   — the stable [`ProjectId`] (#142), the key namespace for
+///     DURABLE artifacts (the `task_list`, plan artifact, …) that must survive a
+///     Ralph window reset (fresh `SessionId` per window) and process restarts.
+///     Durable tools key the [`RunStore`] by `project_id().namespace()` instead
+///     of `session_id` so the prior window's list is re-read, not orphaned.
 ///   - `run_store`    — the [`RunStore`] domain of the configured provider.
 ///   - `memory_store` — the [`MemoryStore`] domain (#78). Scope-aware: the
 ///     tool passes a [`crate::storage::StorageScope`] on every call. For a
@@ -123,27 +130,38 @@ use crate::storage::{MemoryStore, RunStore};
 #[derive(Clone)]
 pub struct ToolContext {
     session_id: SessionId,
+    project_id: crate::storage::ProjectId,
     run_store: Arc<dyn RunStore>,
     memory_store: Arc<dyn MemoryStore>,
 }
 
 impl ToolContext {
-    /// Build a context from the run's session id and the storage seams.
+    /// Build a context from the run's session id, the stable project id (#142),
+    /// and the storage seams.
     pub fn new(
         session_id: SessionId,
+        project_id: crate::storage::ProjectId,
         run_store: Arc<dyn RunStore>,
         memory_store: Arc<dyn MemoryStore>,
     ) -> Self {
         Self {
             session_id,
+            project_id,
             run_store,
             memory_store,
         }
     }
 
-    /// The session id keying this run's persisted state.
+    /// The session id keying this run's EPHEMERAL state (resets per Ralph window).
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// The stable project id (#142) keying this run's DURABLE artifacts — stable
+    /// across Ralph window resets and process restarts. Durable tools key the
+    /// [`RunStore`] by `project_id().namespace()`.
+    pub fn project_id(&self) -> &crate::storage::ProjectId {
+        &self.project_id
     }
 
     /// The run-store domain a tool persists durable state through.
@@ -733,11 +751,16 @@ pub mod mock {
     /// and a fixed test session id. Available to every tool's `#[cfg(test)]`
     /// module via `crate::tool_registry::mock::test_ctx`.
     pub fn test_ctx() -> ToolContext {
-        use crate::storage::InMemoryStorageProvider;
+        use crate::storage::{InMemoryStorageProvider, ProjectId};
         // One in-memory backend serves both the run and (scope-aware) memory
         // seams in tests.
         let backend = Arc::new(InMemoryStorageProvider::new());
-        ToolContext::new(SessionId::new("test-session"), backend.clone(), backend)
+        ToolContext::new(
+            SessionId::new("test-session"),
+            ProjectId::from_canonical_path("/test-project"),
+            backend.clone(),
+            backend,
+        )
     }
 
     /// Permissive sandbox stub — accepts everything.
@@ -793,13 +816,16 @@ pub struct RealToolRegistry {
 impl RealToolRegistry {
     /// Build a bridge over an already-populated [`StandardToolRegistry`].
     ///
-    /// `session_id` + `run_store` + `memory_store` are injected here (the bridge
-    /// is built once per run) and used to construct the [`ToolContext`]
-    /// forwarded on every dispatch — see the storage-seam note on the type.
+    /// `session_id` + `project_id` + `run_store` + `memory_store` are injected
+    /// here (the bridge is built once per run) and used to construct the
+    /// [`ToolContext`] forwarded on every dispatch — see the storage-seam note on
+    /// the type. `project_id` (#142) is the STABLE durable namespace; `session_id`
+    /// is the per-window ephemeral key.
     pub fn new(
         inner: Arc<StandardToolRegistry>,
         sandbox: Arc<dyn SandboxProvider>,
         session_id: SessionId,
+        project_id: crate::storage::ProjectId,
         run_store: Arc<dyn RunStore>,
         memory_store: Arc<dyn MemoryStore>,
     ) -> Self {
@@ -813,7 +839,7 @@ impl RealToolRegistry {
         Self {
             inner,
             sandbox,
-            ctx: ToolContext::new(session_id, run_store, memory_store),
+            ctx: ToolContext::new(session_id, project_id, run_store, memory_store),
             schemas,
         }
     }

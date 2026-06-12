@@ -146,7 +146,15 @@ impl Tool for TaskListTool {
         ctx: &'a ToolContext,
     ) -> BoxFut<'a, ToolOutput> {
         Box::pin(async move {
-            let session_id = ctx.session_id();
+            // #142: the task_list is a DURABLE artifact — key it by the STABLE
+            // project namespace, NOT the per-window `session_id` (which the Ralph
+            // wrapper regenerates every context window). Keying by project_id is
+            // what lets a window reset re-read the prior window's list instead of
+            // re-planning under a session it has never seen. Namespace-reuse: the
+            // project id is projected onto the existing `&SessionId` axis via
+            // `ProjectId::namespace()`, so the RunStore trait stays unchanged.
+            let project_ns = ctx.project_id().namespace();
+            let session_id = &project_ns;
             let run_store = ctx.run_store();
 
             // 1. Parse params (bad input → recoverable).
@@ -226,8 +234,9 @@ impl Tool for TaskListTool {
             };
 
             // 4. Persist the (possibly mutated) list to the run store, keyed by
-            //    SessionId under the shared TASK_LIST_EXTRAS_KEY. We always
-            //    persist on a mutating action; list_tasks skips the write.
+            //    the STABLE project namespace (#142) under the shared
+            //    TASK_LIST_EXTRAS_KEY. We always persist on a mutating action;
+            //    list_tasks skips the write.
             if mutated {
                 let value = match serde_json::to_value(&list) {
                     Ok(v) => v,
@@ -400,18 +409,29 @@ mod tests {
         }
     }
 
-    fn ctx_with(run_store: Arc<dyn RunStore>, session: &str) -> ToolContext {
+    /// Derive the project namespace the tool keys by, from a test's
+    /// distinguishing `key` string (#142). The tool keys the durable task_list
+    /// by `project_id().namespace()`, so tests that want SEPARATE lists pass
+    /// DIFFERENT keys and tests that want the SAME list pass the SAME key.
+    fn project_ns(key: &str) -> SessionId {
+        crate::storage::ProjectId::from_canonical_path(&format!("/proj/{key}")).namespace()
+    }
+
+    fn ctx_with(run_store: Arc<dyn RunStore>, key: &str) -> ToolContext {
         // tasklist tests exercise the run store only; memory is a no-op seam.
+        // The `session_id` is ephemeral and irrelevant to the durable task_list;
+        // the `project_id` derived from `key` is the durable namespace.
         ToolContext::new(
-            SessionId::new(session),
+            SessionId::new("ephemeral-session"),
+            crate::storage::ProjectId::from_canonical_path(&format!("/proj/{key}")),
             run_store,
             Arc::new(NoOpStorageProvider),
         )
     }
 
-    /// A ToolContext over a fresh in-memory run store with a default session id.
+    /// A ToolContext over a fresh in-memory run store with a default project key.
     fn in_memory_ctx() -> ToolContext {
-        ctx_with(Arc::new(InMemoryStorageProvider::new()), "test-session")
+        ctx_with(Arc::new(InMemoryStorageProvider::new()), "test-project")
     }
 
     fn call(input: serde_json::Value) -> ToolCall {
@@ -443,10 +463,12 @@ mod tests {
         v.get("added").map(|a| a.as_u64().unwrap() as u32)
     }
 
-    /// Read the persisted blob straight off a RunStore as a `TaskList`.
-    async fn load_from_store(run_store: &Arc<dyn RunStore>, session: &str) -> Option<TaskList> {
+    /// Read the persisted blob straight off a RunStore as a `TaskList`, keyed by
+    /// the project namespace derived from `key` (#142 — durable artifacts are
+    /// keyed by project_id, not the ephemeral session id).
+    async fn load_from_store(run_store: &Arc<dyn RunStore>, key: &str) -> Option<TaskList> {
         run_store
-            .get(&SessionId::new(session), TASK_LIST_EXTRAS_KEY)
+            .get(&project_ns(key), TASK_LIST_EXTRAS_KEY)
             .await
             .unwrap()
             .map(|v| serde_json::from_value(v).unwrap())
@@ -481,7 +503,7 @@ mod tests {
         assert_eq!(l2.tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [1, 2]);
 
         // The blob actually exists in the run store under the shared key.
-        let persisted = load_from_store(ctx.run_store(), "test-session")
+        let persisted = load_from_store(ctx.run_store(), "test-project")
             .await
             .expect("task_list blob present");
         assert_eq!(persisted, l2);
@@ -511,22 +533,22 @@ mod tests {
             .await;
         let list = parse_list(&r);
         assert_eq!(list.tasks.len(), 1);
-        let persisted = load_from_store(ctx.run_store(), "test-session")
+        let persisted = load_from_store(ctx.run_store(), "test-project")
             .await
             .expect("persisted despite sandbox path denial");
         assert_eq!(persisted, list);
     }
 
-    // Keyed by SessionId: two sessions over the SAME run store keep separate
-    // lists.
+    // #142: keyed by PROJECT id, not session id. Two DIFFERENT project ids over
+    // the SAME run store keep separate lists.
     #[tokio::test]
-    async fn lists_are_keyed_by_session_id() {
+    async fn lists_are_keyed_by_project_id() {
         let run_store: Arc<dyn RunStore> = Arc::new(InMemoryStorageProvider::new());
         let sb = AllowAllSandbox;
         let tool = TaskListTool::new();
 
-        let ctx_a = ctx_with(run_store.clone(), "session-a");
-        let ctx_b = ctx_with(run_store.clone(), "session-b");
+        let ctx_a = ctx_with(run_store.clone(), "project-a");
+        let ctx_b = ctx_with(run_store.clone(), "project-b");
 
         tool.execute(
             &call(json!({"action": "add_task", "description": "a1"})),
@@ -547,8 +569,8 @@ mod tests {
         )
         .await;
 
-        let a = load_from_store(&run_store, "session-a").await.unwrap();
-        let b = load_from_store(&run_store, "session-b").await.unwrap();
+        let a = load_from_store(&run_store, "project-a").await.unwrap();
+        let b = load_from_store(&run_store, "project-b").await.unwrap();
         assert_eq!(a.tasks.len(), 1);
         assert_eq!(a.tasks[0].description, "a1");
         assert_eq!(b.tasks.len(), 2);
@@ -559,6 +581,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["b1", "b2"]
         );
+    }
+
+    // #142 (the bug this issue fixes): the task_list is visible across DIFFERENT
+    // sessions with the SAME project id. This mirrors the Ralph window-reset
+    // path — each window mints a fresh `SessionId` but the project id is stable,
+    // so window 2 must see window 1's list.
+    #[tokio::test]
+    async fn task_list_visible_across_sessions_with_same_project() {
+        let run_store: Arc<dyn RunStore> = Arc::new(InMemoryStorageProvider::new());
+        let sb = AllowAllSandbox;
+        let tool = TaskListTool::new();
+        let project = crate::storage::ProjectId::from_canonical_path("/proj/shared");
+
+        // Window 1: a distinct session id, but the shared project id.
+        let ctx_w1 = ToolContext::new(
+            SessionId::new("window-1-session"),
+            project.clone(),
+            run_store.clone(),
+            Arc::new(NoOpStorageProvider),
+        );
+        tool.execute(
+            &call(json!({"action": "add_task", "description": "from window 1"})),
+            &sb,
+            &ctx_w1,
+        )
+        .await;
+
+        // Window 2: a DIFFERENT (freshly generated) session id, SAME project id.
+        let ctx_w2 = ToolContext::new(
+            SessionId::generate(),
+            project.clone(),
+            run_store.clone(),
+            Arc::new(NoOpStorageProvider),
+        );
+        let listed = tool
+            .execute(&call(json!({"action": "list_tasks"})), &sb, &ctx_w2)
+            .await;
+        let list = parse_list(&listed);
+        assert_eq!(list.tasks.len(), 1, "window 2 must see window 1's list");
+        assert_eq!(list.tasks[0].description, "from window 1");
     }
 
     // Persist then reload with a FRESH tool over the SAME ctx yields the
@@ -882,7 +944,7 @@ mod tests {
         assert_eq!(list.next_id, 2);
         // R-143.2: `added` == the persisted task's id.
         assert_eq!(parse_added(&r), Some(list.tasks[0].id));
-        let persisted = load_from_store(ctx.run_store(), "test-session")
+        let persisted = load_from_store(ctx.run_store(), "test-project")
             .await
             .unwrap();
         assert_eq!(parse_added(&r), Some(persisted.tasks[0].id));
@@ -998,10 +1060,12 @@ mod tests {
         // Success content DOES carry `added`...
         assert_eq!(parse_added(&r), Some(1));
 
-        // ...but the raw persisted blob does NOT carry an `added` key.
+        // ...but the raw persisted blob does NOT carry an `added` key. #142: the
+        // blob is keyed by the project namespace, not the session id — read it
+        // straight off the ctx's project_id namespace.
         let raw = ctx
             .run_store()
-            .get(&SessionId::new("test-session"), TASK_LIST_EXTRAS_KEY)
+            .get(&ctx.project_id().namespace(), TASK_LIST_EXTRAS_KEY)
             .await
             .unwrap()
             .expect("persisted blob present");

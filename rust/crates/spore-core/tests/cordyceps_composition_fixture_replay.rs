@@ -89,6 +89,9 @@ fn harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
         error_loop_threshold: 3,
         hooks: None,
         storage: storage.clone(),
+        // #142: durable artifacts (task_list) are keyed by the project namespace;
+        // pin a known project id so `seed`/`stored_list` key the SAME namespace.
+        project_id: spore_core::ProjectId::from_canonical_path(CORDYCEPS_PROJECT_PATH),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,
@@ -136,11 +139,22 @@ fn pe_task(session: &str) -> Task {
     t
 }
 
-async fn seed(storage: &StorageProvider, session: &SessionId, list: &TaskList) {
+/// #142: the fixed canonical path the test harness derives its durable
+/// `project_id` from (pinned via the `project_id` field in the harness configs).
+const CORDYCEPS_PROJECT_PATH: &str = "/cordyceps-workspace";
+
+/// The durable `RunStore` namespace the harness keys task_list under (#142). The
+/// project id projected onto the session-id axis — `seed`/`stored_list` key this,
+/// NOT the ephemeral run session, so the seeded list is what the harness reads.
+fn project_ns() -> SessionId {
+    spore_core::ProjectId::from_canonical_path(CORDYCEPS_PROJECT_PATH).namespace()
+}
+
+async fn seed(storage: &StorageProvider, _session: &SessionId, list: &TaskList) {
     storage
         .run()
         .put(
-            session,
+            &project_ns(),
             TASK_LIST_EXTRAS_KEY,
             serde_json::to_value(list).unwrap(),
         )
@@ -148,11 +162,11 @@ async fn seed(storage: &StorageProvider, session: &SessionId, list: &TaskList) {
         .unwrap();
 }
 
-async fn stored_list(storage: &StorageProvider, session: &SessionId) -> TaskList {
+async fn stored_list(storage: &StorageProvider, _session: &SessionId) -> TaskList {
     serde_json::from_value(
         storage
             .run()
-            .get(session, TASK_LIST_EXTRAS_KEY)
+            .get(&project_ns(), TASK_LIST_EXTRAS_KEY)
             .await
             .unwrap()
             .unwrap(),
@@ -501,6 +515,9 @@ async fn worker_consult_surfaces_and_host_resumes() {
         error_loop_threshold: 3,
         hooks: None,
         storage: storage.clone(),
+        // #142: durable artifacts (task_list) are keyed by the project namespace;
+        // pin a known project id so `seed`/`stored_list` key the SAME namespace.
+        project_id: spore_core::ProjectId::from_canonical_path(CORDYCEPS_PROJECT_PATH),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,

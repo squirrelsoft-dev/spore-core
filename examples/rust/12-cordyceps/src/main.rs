@@ -59,15 +59,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use spore_core::storage::InMemoryStorageProvider;
+use spore_core::storage::{CompositeStorageProvider, FileSystemStorageProvider};
 use spore_core::{
     Agent, AgentId, BudgetLimits, ConsultHandlerEntry, ConsultOverflowPolicy, ConsultRequest,
     ConsultResponse, EmptyToolRegistry, EscalationAction, EscalationMode,
     EvaluatorResponseVerifier, ExecutionRegistry, Harness, HarnessBuilder, HarnessContextManager,
     HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent, HumanRequest, HumanResponse,
-    LoopStrategy, ModelAgent, NullCacheProvider, OllamaModelInterface, ReactConfig, RunResult,
-    SearchMethod, SessionId, StandardContextManager, StandardTool, StandardTools, StorageProvider,
-    Task, Verifier, WebSearchConfig, WebSearchTool, WorkspaceConfig, WorkspaceScopedSandbox,
+    LoopStrategy, ModelAgent, NullCacheProvider, OllamaModelInterface, ProjectId, ReactConfig,
+    RunResult, SearchMethod, SessionId, StandardContextManager, StandardTool, StandardTools,
+    StorageProvider, Task, Verifier, WebSearchConfig, WebSearchTool, WorkspaceConfig,
+    WorkspaceScopedSandbox,
 };
 
 use crate::skills::{SkillCatalog, SkillInjectingContextManager, ACTIVE_SKILLS_KEY};
@@ -433,11 +434,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("consults     : research(web_search, budget 5, soft-fail), advice(advisor, budget 3, escalate)");
     println!();
 
+    // #142: a STABLE project id derived from the canonicalized repo root (decision
+    // 5 — derived from the workspace root, not process cwd). It keys the DURABLE
+    // task_list / plan / Ralph checkpoint so they survive Ralph window resets AND
+    // process restarts. `repo_root` is already canonicalized above.
+    let project_id = ProjectId::from_canonical_path(&repo_root.to_string_lossy());
+    // The CENTRAL durable root, à la Claude Code: `~/.spore/projects/<project_id>/`
+    // (decision 1). Falls back to a `.spore` dir under the repo if no home dir.
+    let spore_root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repo_root.clone())
+        .join(".spore")
+        .join("projects")
+        .join(project_id.as_str());
+    println!("project id   : {project_id}");
+    println!("durable root : {}", spore_root.display());
+
     while let Some(prompt) = read_audit_prompt() {
         let session = SessionId::generate();
-        let storage = Arc::new(StorageProvider::single(Arc::new(
-            InMemoryStorageProvider::new(),
-        )));
+        // #142: route the DURABLE run domain to a FileSystemStorageProvider under
+        // the central root (atomic write-rename) so the task_list/plan/checkpoint
+        // persist across context-window resets and process restarts. Session and
+        // observability share the same durable root; memory stays project-scoped.
+        let durable = Arc::new(FileSystemStorageProvider::new(spore_root.clone()));
+        let storage = Arc::new(
+            CompositeStorageProvider::new()
+                .run(durable.clone())
+                .session(durable.clone())
+                .observability(durable.clone())
+                .memory(spore_core::storage::StorageScope::Project, durable.clone())
+                .build(),
+        );
 
         // Read-only repo sandbox: the audit never writes source files.
         let mut sandbox_cfg = WorkspaceConfig::scoped(repo_root.clone());
@@ -473,6 +500,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let harness = HarnessBuilder::conversational(model)
             .sandbox(sandbox)
             .storage(storage.clone())
+            // #142: pin the stable project id so durable artifacts key by it
+            // (rather than the per-window SessionId::generate() above).
+            .project_id(project_id.clone())
             .registry(registry)
             .escalation_mode(EscalationMode::SurfaceToHuman)
             .system_prompt(EXEC_SYSTEM_PROMPT)

@@ -318,9 +318,11 @@ mod tests {
 
     fn ctx_with(memory_store: Arc<dyn MemoryStore>, session: &str) -> ToolContext {
         // MemoryTool exercises the memory seam only; the run store is a no-op
-        // in-memory backend here.
+        // in-memory backend here. Memory stays session-keyed (#142 keeps memory
+        // ephemeral); the project_id is a placeholder for the seam.
         ToolContext::new(
             SessionId::new(session),
+            crate::storage::ProjectId::from_canonical_path("/memory-test-project"),
             Arc::new(InMemoryStorageProvider::new()),
             memory_store,
         )
@@ -487,7 +489,12 @@ mod tests {
             }
         }
 
-        let ctx = ToolContext::new(sid, Arc::new(InMemoryStorageProvider::new()), memory_store);
+        let ctx = ToolContext::new(
+            sid,
+            crate::storage::ProjectId::from_canonical_path("/memory-test-project"),
+            Arc::new(InMemoryStorageProvider::new()),
+            memory_store,
+        );
         let tool = MemoryTool::new();
         let out = tool
             .execute(
@@ -731,7 +738,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let ctx = ToolContext::new(sid, Arc::new(InMemoryStorageProvider::new()), memory_store);
+        let ctx = ToolContext::new(
+            sid,
+            crate::storage::ProjectId::from_canonical_path("/memory-test-project"),
+            Arc::new(InMemoryStorageProvider::new()),
+            memory_store,
+        );
         let out = MemoryTool::new()
             .execute(
                 &call(json!({"operation": "read", "scope": "user", "merged": true, "limit": 2})),
@@ -833,6 +845,7 @@ mod tests {
                 .build();
             let ctx = ToolContext::new(
                 SessionId::new("fx"),
+                crate::storage::ProjectId::from_canonical_path("/memory-fx-project"),
                 Arc::new(InMemoryStorageProvider::new()),
                 provider.memory().clone(),
             );

@@ -60,6 +60,7 @@ fn config() -> HarnessConfig {
         error_loop_threshold: 3,
         hooks: None,
         storage: Arc::new(spore_core::StorageProvider::no_op()),
+        project_id: spore_core::ProjectId::from_canonical_path("/test-workspace"),
         chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
         max_resets: 3,
         vcs_provider: None,

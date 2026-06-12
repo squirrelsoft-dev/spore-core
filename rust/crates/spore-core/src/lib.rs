@@ -152,9 +152,11 @@ pub use sensor::{
     SensorTrigger, StandardSensorChain,
 };
 pub use storage::{
-    parse_otlp_endpoints, CompositeStorageProvider, FileSystemStorageProvider,
-    InMemoryStorageProvider, MemoryEntry, MemoryStore, NoOpStorageProvider, ObservabilityStore,
-    RunStore, ScopedMemoryRouter, SessionStore, StorageError, StorageProvider, WorkspaceId,
+    complete_active_run, load_active_run, parse_otlp_endpoints, start_or_resume_active_run,
+    ActiveRun, ActiveRunDecision, ActiveRunStatus, CompositeStorageProvider,
+    FileSystemStorageProvider, InMemoryStorageProvider, MemoryEntry, MemoryStore,
+    NoOpStorageProvider, ObservabilityStore, ProjectId, ProjectIdError, RunStore,
+    ScopedMemoryRouter, SessionStore, StorageError, StorageProvider, WorkspaceId,
 };
 // `plan_artifact_to_task_list` is re-exported but #[deprecated] (#126, decision
 // C — the linear bridge is retained for its replay tests but the `task_list`

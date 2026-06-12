@@ -1,0 +1,37 @@
+[
+  {
+    "canonical_path": "/Users/sbeardsley/dev/spore-core",
+    "description": "normal nested path",
+    "expected_project_id": "spore-core-a73a751e"
+  },
+  {
+    "canonical_path": "/",
+    "description": "root path collapses to the literal basename 'root'",
+    "expected_project_id": "root-8a5edab2"
+  },
+  {
+    "canonical_path": "/Users/me/My Project (v2)!",
+    "description": "basename with spaces and special chars is sanitized and collapsed",
+    "expected_project_id": "my-project-v2-8570de99"
+  },
+  {
+    "canonical_path": "/a/b/c/d/e/f/g/deep-leaf",
+    "description": "deep path uses only the final basename",
+    "expected_project_id": "deep-leaf-9248d78b"
+  },
+  {
+    "canonical_path": "/Users/sbeardsley/dev/spore-core/",
+    "description": "trailing slash is normalized away; same id as the no-slash form",
+    "expected_project_id": "spore-core-a73a751e"
+  },
+  {
+    "canonical_path": "/a/b",
+    "description": "collision case A: nested /a/b. The 8-hex SHA-256 suffix of the full canonical path keeps this DISTINCT from the /a_b slug (which a naive slashes-to-underscores scheme would collide with)",
+    "expected_project_id": "b-662b7b62"
+  },
+  {
+    "canonical_path": "/a_b",
+    "description": "collision case B: single segment /a_b. Distinct id from /a/b because the canonical path strings (and thus their hashes) differ; the basename also differs (a-b vs b)",
+    "expected_project_id": "a-b-328ff01f"
+  }
+]

@@ -1339,8 +1339,10 @@ pub trait StrategyExecutor: Send + Sync {
     fn ralph_seed_session<'a>(&'a self, instruction: &'a str) -> BoxFut<'a, SessionState>;
 
     /// Ralph external completion check (#124, legacy `ralph_completion_status`):
-    /// `None` ⇒ complete; `Some(reason)` ⇒ tasks remain.
-    fn ralph_completion_status(&self) -> Option<String>;
+    /// `None` ⇒ complete; `Some(reason)` ⇒ tasks remain. ASYNC since #142: the
+    /// Ralph checkpoint moved off the `.spore/` filesystem onto the durable
+    /// project-id [`RunStore`](crate::storage::RunStore).
+    fn ralph_completion_status<'a>(&'a self) -> BoxFut<'a, Option<String>>;
 
     /// The Ralph outer-loop reset cap (`config.max_resets`, #124).
     fn ralph_max_resets(&self) -> u32;
@@ -2618,7 +2620,7 @@ impl RunStrategy for RalphConfig {
                     return cx.finish(executor, task, window_result).await;
                 }
 
-                match executor.ralph_completion_status() {
+                match executor.ralph_completion_status().await {
                     None => {
                         let (output, final_state) = match window_result {
                             RunResult::Success {
@@ -5378,7 +5380,11 @@ struct RalphFeatureEntry {
 /// PlanExecute / SelfVerifying runs. It only blocks when a progress file is
 /// PRESENT and reports incomplete tasks — the Ralph contract.
 struct RalphStopHook {
-    workspace_root: std::path::PathBuf,
+    /// #142: the Ralph checkpoint moved off `.spore/` onto the durable project-id
+    /// [`RunStore`](crate::storage::RunStore). The hook reads the checkpoint from
+    /// the store under the stable [`ProjectId`](crate::storage::ProjectId).
+    run_store: Arc<dyn crate::storage::RunStore>,
+    project_id: crate::storage::ProjectId,
 }
 
 impl crate::hooks::Hook for RalphStopHook {
@@ -5391,12 +5397,23 @@ impl crate::hooks::Hook for RalphStopHook {
             if !matches!(ctx, crate::hooks::HookContext::Stop { .. }) {
                 return Ok(crate::hooks::HookDecision::Continue);
             }
-            // Absent progress file ⇒ do not interfere with non-Ralph runs.
-            let progress_path = self.workspace_root.join(".spore/progress.json");
-            if !progress_path.exists() {
+            // Absent checkpoint ⇒ do not interfere with non-Ralph runs. The
+            // checkpoint now lives in the project-id RunStore (#142); when the
+            // progress key is UNSET this is not a Ralph run, so `Continue`.
+            let present = matches!(
+                self.run_store
+                    .get(
+                        &self.project_id.namespace(),
+                        crate::storage::RALPH_PROGRESS_KEY,
+                    )
+                    .await,
+                Ok(Some(_))
+            );
+            if !present {
                 return Ok(crate::hooks::HookDecision::Continue);
             }
-            match StandardHarness::ralph_completion_status(&self.workspace_root) {
+            match StandardHarness::ralph_completion_status(&self.run_store, &self.project_id).await
+            {
                 None => Ok(crate::hooks::HookDecision::Continue),
                 Some(reason) => Ok(crate::hooks::HookDecision::Block { reason }),
             }
@@ -5585,6 +5602,18 @@ pub struct HarnessConfig {
     /// behave unchanged. v1 is expose-only — the run/resume loop is NOT
     /// modified to read/write sessions internally.
     pub storage: Arc<crate::storage::StorageProvider>,
+    /// The STABLE project namespace for DURABLE artifacts (issue #142). Where
+    /// the per-window [`SessionId`] is regenerated on every Ralph context-window
+    /// reset (`SessionId::generate()`), this [`ProjectId`](crate::storage::ProjectId)
+    /// stays constant across windows AND process restarts — which is what lets
+    /// the `task_list`, plan artifact, and Ralph checkpoint persist across a
+    /// window reset instead of being orphaned under a regenerated session.
+    /// Defaults (at build) to a project id derived from
+    /// `sandbox.workspace_root()` (decision 5 — NOT process cwd). Durable
+    /// `RunStore` call sites key by `project_id.namespace()` (namespace-reuse on
+    /// the existing `&SessionId` axis); ephemeral session/conversation state
+    /// stays keyed by the per-window `SessionId`.
+    pub project_id: crate::storage::ProjectId,
     /// Source of conditional prompt chunks (issue #79). Defaults to an empty
     /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider).
     /// The harness loads chunks from it at construction and feeds them through
@@ -5717,6 +5746,7 @@ impl Clone for HarnessConfig {
             error_loop_threshold: self.error_loop_threshold,
             hooks: self.hooks.clone(),
             storage: self.storage.clone(),
+            project_id: self.project_id.clone(),
             chunk_provider: self.chunk_provider.clone(),
             max_resets: self.max_resets,
             vcs_provider: self.vcs_provider.clone(),
@@ -5781,6 +5811,13 @@ pub struct HarnessBuilder {
     /// the empty key at build (no longer a live `HarnessConfig` field).
     verifier: Option<Arc<dyn crate::verifier::Verifier>>,
     storage: Option<Arc<crate::storage::StorageProvider>>,
+    /// The STABLE durable-storage project namespace (issue #142). `None` (the
+    /// default) resolves at [`build_config`](HarnessBuilder::build_config) to a
+    /// [`ProjectId`](crate::storage::ProjectId) derived from
+    /// `sandbox.workspace_root()` (decision 5 — NOT process cwd), canonicalizing
+    /// the path first; an explicit [`project_id`](HarnessBuilder::project_id)
+    /// always wins. See [`HarnessConfig::project_id`].
+    project_id: Option<crate::storage::ProjectId>,
     /// Conditional prompt-chunk source (issue #79). `None` resolves to an empty
     /// [`InMemoryChunkProvider`](crate::prompt_assembly::InMemoryChunkProvider)
     /// at build time.
@@ -5869,6 +5906,7 @@ impl HarnessBuilder {
             hooks: None,
             verifier: None,
             storage: None,
+            project_id: None,
             chunk_provider: None,
             max_resets: 3,
             vcs_provider: None,
@@ -6130,6 +6168,17 @@ impl HarnessBuilder {
     /// compile and behave unchanged.
     pub fn storage(mut self, storage: Arc<crate::storage::StorageProvider>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Override the STABLE durable-storage project namespace (issue #142). When
+    /// unset, [`build_config`](Self::build_config) derives it from
+    /// `sandbox.workspace_root()` (decision 5), canonicalizing the path first.
+    /// Set this explicitly when the workspace root is not a stable on-disk path
+    /// (e.g. a fixture-replay tempdir, or to pin a known project across
+    /// processes). See [`HarnessConfig::project_id`].
+    pub fn project_id(mut self, project_id: crate::storage::ProjectId) -> Self {
+        self.project_id = Some(project_id);
         self
     }
 
@@ -6470,6 +6519,18 @@ impl HarnessBuilder {
             reg_builder = reg_builder.fill_default_metric_evaluator(m);
         }
         let registry = reg_builder.build();
+        // #142: derive the STABLE project namespace from `sandbox.workspace_root()`
+        // (decision 5 — NOT process cwd) unless the caller pinned one explicitly.
+        // The FS-touching `ProjectId::from_path` canonicalizes first; if that
+        // fails (e.g. the workspace root does not yet exist on disk) fall back to
+        // the PURE derivation over the workspace_root string so a `project_id` is
+        // always present and deterministic.
+        let project_id = self.project_id.unwrap_or_else(|| {
+            let workspace_root = self.sandbox.workspace_root();
+            crate::storage::ProjectId::from_path(workspace_root).unwrap_or_else(|_| {
+                crate::storage::ProjectId::from_canonical_path(&workspace_root.to_string_lossy())
+            })
+        });
         HarnessConfig {
             tool_registry: self.tool_registry,
             sandbox: self.sandbox,
@@ -6487,6 +6548,7 @@ impl HarnessBuilder {
             error_loop_threshold: self.error_loop_threshold,
             hooks: self.hooks,
             storage,
+            project_id,
             chunk_provider: self.chunk_provider.unwrap_or_else(|| {
                 Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty())
             }),
@@ -6527,19 +6589,22 @@ pub struct StandardHarness {
 impl StandardHarness {
     pub fn new(config: HarnessConfig) -> Self {
         // Ralph completion mechanism (issue #58, B1): register a `Stop` hook
-        // that drives multi-context-window continuation off `.spore/progress.json`.
-        // Registration is harmless for non-Ralph runs — the hook only BLOCKS when
-        // a progress file is PRESENT and reports incomplete tasks; when the file
-        // is absent (the common case for ReAct / other strategies) it returns
-        // `Continue`, so existing strategies are unaffected byte-for-byte.
-        let workspace_root = config.sandbox.workspace_root().to_path_buf();
+        // that drives multi-context-window continuation off the Ralph checkpoint.
+        // #142: the checkpoint moved off `.spore/progress.json` onto the durable
+        // project-id RunStore. Registration is harmless for non-Ralph runs — the
+        // hook only BLOCKS when the progress checkpoint key is PRESENT and reports
+        // incomplete tasks; when it is absent (the common case for ReAct / other
+        // strategies) it returns `Continue`, so existing strategies are unaffected.
         let chain: Arc<dyn crate::hooks::HookChain> = match config.hooks.clone() {
             Some(c) => c,
             None => Arc::new(crate::hooks::StandardHookChain::new()),
         };
         // Best-effort: a duplicate/invalid registration must never panic the
         // constructor. The hook subscribes only to the can-block `Stop` event.
-        let _ = chain.register(Arc::new(RalphStopHook { workspace_root }));
+        let _ = chain.register(Arc::new(RalphStopHook {
+            run_store: config.storage.run().clone(),
+            project_id: config.project_id.clone(),
+        }));
         let mut config = config;
         config.hooks = Some(chain);
         Self {
@@ -7030,6 +7095,7 @@ impl StandardHarness {
                     catalogue.clone(),
                     self.config.sandbox.clone(),
                     session_id.clone(),
+                    self.config.project_id.clone(),
                     self.config.storage.run().clone(),
                     self.config.storage.memory().clone(),
                 ));
@@ -7041,6 +7107,7 @@ impl StandardHarness {
                 catalogue.clone(),
                 self.config.sandbox.clone(),
                 session_id.clone(),
+                self.config.project_id.clone(),
                 self.config.storage.run().clone(),
                 self.config.storage.memory().clone(),
             )),
@@ -8470,23 +8537,32 @@ tool. Use the provided tool-call format to actually invoke the tool."
     /// [`RalphStopHook`] applies — one source of truth for the completion
     /// mechanism.
     ///
-    /// Contract (both files are written by the strategy/initializer and fixture
-    /// cleanly — B4, no git):
-    ///   - `.spore/progress.json`: `{ "complete": bool, "remaining": [string] }`.
-    ///     `complete: true` with an empty `remaining` ⇒ progress satisfied.
-    ///     Missing/unreadable/invalid ⇒ incomplete (so the agent learns to write
-    ///     it).
-    ///   - `.spore/feature_list.json`: a JSON array of `{ "name", "passes" }`
-    ///     (the [`FeatureListCheck`](crate::termination::FeatureListCheck) schema).
-    ///     Any `passes: false` ⇒ incomplete. A MISSING feature list is tolerated
-    ///     here (progress.json is the primary signal); an invalid one is not.
-    fn ralph_completion_status(workspace_root: &std::path::Path) -> Option<String> {
-        let progress_path = workspace_root.join(".spore/progress.json");
-        let raw = match std::fs::read_to_string(&progress_path) {
-            Ok(s) => s,
-            Err(_) => return Some(".spore/progress.json missing".to_string()),
+    /// Contract (#142, decision 3 — the checkpoint MOVED off the `.spore/`
+    /// filesystem onto the durable project-id [`RunStore`](crate::storage::RunStore)):
+    ///   - [`RALPH_PROGRESS_KEY`](crate::storage::RALPH_PROGRESS_KEY) →
+    ///     `{ "complete": bool, "remaining": [string] }`. `complete: true` with an
+    ///     empty `remaining` ⇒ progress satisfied. Absent/unreadable/invalid ⇒
+    ///     incomplete (so the agent learns to write it).
+    ///   - [`RALPH_FEATURE_LIST_KEY`](crate::storage::RALPH_FEATURE_LIST_KEY) → a
+    ///     JSON array of `{ "name", "passes" }` (the
+    ///     [`FeatureListCheck`](crate::termination::FeatureListCheck) schema). Any
+    ///     `passes: false` ⇒ incomplete. An ABSENT feature list is tolerated here
+    ///     (progress is the primary signal); an invalid one is not.
+    ///
+    /// The reason strings stay byte-identical to the legacy `.spore/`-path
+    /// messages so the surfaced [`HaltReason::RalphCompletionUnmet`] text is
+    /// stable across the storage relocation.
+    async fn ralph_completion_status(
+        run_store: &Arc<dyn crate::storage::RunStore>,
+        project: &crate::storage::ProjectId,
+    ) -> Option<String> {
+        let ns = project.namespace();
+        let progress_value = match run_store.get(&ns, crate::storage::RALPH_PROGRESS_KEY).await {
+            Ok(Some(v)) => v,
+            // Absent OR a storage error ⇒ incomplete (the agent must write it).
+            _ => return Some(".spore/progress.json missing".to_string()),
         };
-        let progress: RalphProgress = match serde_json::from_str(&raw) {
+        let progress: RalphProgress = match serde_json::from_value(progress_value) {
             Ok(p) => p,
             Err(e) => return Some(format!(".spore/progress.json invalid JSON: {e}")),
         };
@@ -8503,9 +8579,11 @@ tool. Use the provided tool-call format to actually invoke the tool."
         }
 
         // Progress says done — corroborate against the feature list when present.
-        let feature_path = workspace_root.join(".spore/feature_list.json");
-        if let Ok(raw) = std::fs::read_to_string(&feature_path) {
-            let entries: Vec<RalphFeatureEntry> = match serde_json::from_str(&raw) {
+        if let Ok(Some(value)) = run_store
+            .get(&ns, crate::storage::RALPH_FEATURE_LIST_KEY)
+            .await
+        {
+            let entries: Vec<RalphFeatureEntry> = match serde_json::from_value(value) {
                 Ok(v) => v,
                 Err(e) => return Some(format!(".spore/feature_list.json invalid JSON: {e}")),
             };
@@ -8521,27 +8599,90 @@ tool. Use the provided tool-call format to actually invoke the tool."
         None
     }
 
-    /// Build the filesystem-reload context block injected into each fresh
-    /// context window (issue #58, R3). Returns the verbatim `.spore/progress.json`
-    /// and `.spore/feature_list.json` contents (when present) so the re-seeded
-    /// window knows what is already done and what remains. Returns `None` when
-    /// neither file exists (nothing to reload).
-    fn ralph_reload_context(workspace_root: &std::path::Path) -> Option<String> {
+    /// Build the reload context block injected into each fresh context window
+    /// (issue #58, R3). #142: reads the checkpoint from the durable project-id
+    /// [`RunStore`](crate::storage::RunStore) (not the `.spore/` filesystem) and
+    /// returns the verbatim progress + feature-list JSON (when present) so the
+    /// re-seeded window knows what is done and what remains. Returns `None` when
+    /// neither checkpoint key is set. The "Reloaded .spore/…" prefix is retained
+    /// so the seeded prompt text is byte-stable across the relocation.
+    async fn ralph_reload_context(
+        run_store: &Arc<dyn crate::storage::RunStore>,
+        project: &crate::storage::ProjectId,
+    ) -> Option<String> {
+        let ns = project.namespace();
         let mut parts: Vec<String> = Vec::new();
-        if let Ok(raw) = std::fs::read_to_string(workspace_root.join(".spore/progress.json")) {
-            parts.push(format!("Reloaded .spore/progress.json:\n{}", raw.trim()));
+        if let Ok(Some(v)) = run_store.get(&ns, crate::storage::RALPH_PROGRESS_KEY).await {
+            if let Ok(raw) = serde_json::to_string(&v) {
+                parts.push(format!("Reloaded .spore/progress.json:\n{}", raw.trim()));
+            }
         }
-        if let Ok(raw) = std::fs::read_to_string(workspace_root.join(".spore/feature_list.json")) {
-            parts.push(format!(
-                "Reloaded .spore/feature_list.json:\n{}",
-                raw.trim()
-            ));
+        if let Ok(Some(v)) = run_store
+            .get(&ns, crate::storage::RALPH_FEATURE_LIST_KEY)
+            .await
+        {
+            if let Ok(raw) = serde_json::to_string(&v) {
+                parts.push(format!(
+                    "Reloaded .spore/feature_list.json:\n{}",
+                    raw.trim()
+                ));
+            }
         }
         if parts.is_empty() {
             None
         } else {
             Some(parts.join("\n\n"))
         }
+    }
+
+    /// Write the Ralph progress checkpoint to the durable project-id
+    /// [`RunStore`](crate::storage::RunStore) (issue #142, decision 3 — the WRITE
+    /// path the relocated checkpoint needs; nothing wrote `progress.json` before).
+    /// `complete: true` + empty `remaining` ⇒
+    /// [`ralph_completion_status`](Self::ralph_completion_status) reports done.
+    pub async fn write_ralph_progress(
+        &self,
+        complete: bool,
+        remaining: Vec<String>,
+    ) -> Result<(), crate::storage::StorageError> {
+        let progress = RalphProgress {
+            complete,
+            remaining,
+        };
+        let value = serde_json::to_value(&progress)
+            .map_err(|e| crate::storage::StorageError::Serialization(e.to_string()))?;
+        self.config
+            .storage
+            .run()
+            .put(
+                &self.config.project_id.namespace(),
+                crate::storage::RALPH_PROGRESS_KEY,
+                value,
+            )
+            .await
+    }
+
+    /// Write the Ralph feature-list checkpoint to the durable project-id
+    /// [`RunStore`](crate::storage::RunStore) (issue #142, decision 3). Each entry
+    /// is `{ "name", "passes" }`; any `passes: false` keeps the run incomplete.
+    pub async fn write_ralph_feature_list(
+        &self,
+        features: &[(String, bool)],
+    ) -> Result<(), crate::storage::StorageError> {
+        let entries: Vec<serde_json::Value> = features
+            .iter()
+            .map(|(name, passes)| serde_json::json!({ "name": name, "passes": passes }))
+            .collect();
+        let value = serde_json::Value::Array(entries);
+        self.config
+            .storage
+            .run()
+            .put(
+                &self.config.project_id.namespace(),
+                crate::storage::RALPH_FEATURE_LIST_KEY,
+                value,
+            )
+            .await
     }
 
     // ========================================================================
@@ -8750,13 +8891,21 @@ tool. Use the provided tool-call format to actually invoke the tool."
         session_id: &SessionId,
         task_list: &crate::tasklist::TaskList,
     ) {
+        // #142: the task_list is DURABLE — key it by the STABLE project namespace
+        // (`project_id.namespace()`), NOT the per-window `session_id` the Ralph
+        // wrapper regenerates each context window. Namespace-reuse keeps the
+        // RunStore trait keyed by `&SessionId` while the value keyed is the
+        // stable project id. The incoming `session_id` remains the EPHEMERAL key
+        // and is intentionally unused for this durable write.
+        let _ = session_id;
+        let durable_ns = self.config.project_id.namespace();
         if let Ok(value) = serde_json::to_value(task_list) {
             // Durable write through the storage seam (RunStore).
             let _ = self
                 .config
                 .storage
                 .run()
-                .put(session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY, value)
+                .put(&durable_ns, crate::tasklist::TASK_LIST_EXTRAS_KEY, value)
                 .await;
         }
     }
@@ -8817,16 +8966,23 @@ tool. Use the provided tool-call format to actually invoke the tool."
 
         // R4: persist the produced artifact to the RunStore seam under
         // PLAN_EXECUTE_EXTRAS_KEY (#76 — the durable single source of truth;
-        // no longer mirrored into SessionState.extras). The put result is
-        // swallowed (matching the execute-phase persist): a successfully
-        // captured plan must not be lost to a storage hiccup.
+        // no longer mirrored into SessionState.extras). #142: the plan artifact
+        // is DURABLE — key it by the STABLE project namespace, NOT the per-window
+        // `session_id` (so a Ralph window reset re-reads the prior window's
+        // plan). The put result is swallowed (matching the execute-phase
+        // persist): a successfully captured plan must not be lost to a storage
+        // hiccup.
         match serde_json::to_value(&artifact) {
             Ok(value) => {
                 let _ = self
                     .config
                     .storage
                     .run()
-                    .put(session_id, crate::plan::PLAN_EXECUTE_EXTRAS_KEY, value)
+                    .put(
+                        &self.config.project_id.namespace(),
+                        crate::plan::PLAN_EXECUTE_EXTRAS_KEY,
+                        value,
+                    )
                     .await;
             }
             Err(e) => {
@@ -8864,11 +9020,19 @@ tool. Use the provided tool-call format to actually invoke the tool."
         task_list: &mut crate::tasklist::TaskList,
     ) {
         use crate::tasklist::TaskStatus;
+        // #142: the durable checkpoint is keyed by the STABLE project namespace,
+        // NOT the per-window `session_id` — so deep-resume reads the SAME list a
+        // prior Ralph window persisted. The ephemeral `session_id` is unused for
+        // this durable read.
+        let _ = session_id;
         if let Ok(Some(value)) = self
             .config
             .storage
             .run()
-            .get(session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY)
+            .get(
+                &self.config.project_id.namespace(),
+                crate::tasklist::TASK_LIST_EXTRAS_KEY,
+            )
             .await
         {
             if let Ok(saved) = serde_json::from_value::<crate::tasklist::TaskList>(value) {
@@ -9277,6 +9441,11 @@ impl StrategyExecutor for StandardHarness {
         &'a self,
         session_id: &'a SessionId,
     ) -> BoxFut<'a, Option<crate::tasklist::TaskList>> {
+        // #142: the task_list is DURABLE — read it from the STABLE project
+        // namespace, NOT the per-window `session_id` (so the execute phase of a
+        // fresh Ralph window sees the prior window's list). The ephemeral
+        // `session_id` is unused for this durable read.
+        let _ = session_id;
         Box::pin(async move {
             // #126 (decision C): the one authoring path — read the persisted
             // TaskList (with real blockers) from the RunStore under
@@ -9286,7 +9455,10 @@ impl StrategyExecutor for StandardHarness {
                 .config
                 .storage
                 .run()
-                .get(session_id, crate::tasklist::TASK_LIST_EXTRAS_KEY)
+                .get(
+                    &self.config.project_id.namespace(),
+                    crate::tasklist::TASK_LIST_EXTRAS_KEY,
+                )
                 .await
             {
                 Ok(Some(value)) => serde_json::from_value::<crate::tasklist::TaskList>(value).ok(),
@@ -9310,13 +9482,16 @@ impl StrategyExecutor for StandardHarness {
 
     fn ralph_seed_session<'a>(&'a self, instruction: &'a str) -> BoxFut<'a, SessionState> {
         Box::pin(async move {
-            let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
             let mut session_state = SessionState::default();
             self.config
                 .context_manager
                 .append_user_message(&mut session_state, instruction)
                 .await;
-            if let Some(reload) = Self::ralph_reload_context(&workspace_root) {
+            // #142: the reload context now comes from the durable project-id
+            // RunStore checkpoint, not the `.spore/` filesystem.
+            if let Some(reload) =
+                Self::ralph_reload_context(self.config.storage.run(), &self.config.project_id).await
+            {
                 self.config
                     .context_manager
                     .append_user_message(&mut session_state, &reload)
@@ -9344,9 +9519,11 @@ impl StrategyExecutor for StandardHarness {
         })
     }
 
-    fn ralph_completion_status(&self) -> Option<String> {
-        let workspace_root = self.config.sandbox.workspace_root().to_path_buf();
-        Self::ralph_completion_status(&workspace_root)
+    fn ralph_completion_status<'a>(&'a self) -> BoxFut<'a, Option<String>> {
+        Box::pin(async move {
+            // #142: read the checkpoint from the durable project-id RunStore.
+            Self::ralph_completion_status(self.config.storage.run(), &self.config.project_id).await
+        })
     }
 
     fn ralph_max_resets(&self) -> u32 {
@@ -11773,6 +11950,19 @@ mod tests {
         Arc::new(MockAgent::new(AgentId::new("test")))
     }
 
+    /// #142: the fixed canonical path the test config helpers derive their
+    /// `project_id` from. Durable artifacts (task_list, plan) are keyed by this
+    /// project namespace, so readback assertions key by `durable_ns()` rather
+    /// than the per-run session id.
+    const TEST_PROJECT_PATH: &str = "/test-workspace";
+
+    /// The durable [`RunStore`] namespace the test harness writes durable
+    /// artifacts under (#142) — the project id projected onto the session-id
+    /// axis. Use this in readback assertions in place of `&t.session_id`.
+    fn durable_ns() -> SessionId {
+        crate::storage::ProjectId::from_canonical_path(TEST_PROJECT_PATH).namespace()
+    }
+
     fn standard_config(agent: Arc<MockAgent>) -> HarnessConfig {
         let a: Arc<dyn Agent> = agent;
         // #124: the legacy single-collaborator fields are gone — the worker agent
@@ -11807,6 +11997,9 @@ mod tests {
             storage: Arc::new(crate::storage::StorageProvider::single(Arc::new(
                 crate::storage::InMemoryStorageProvider::new(),
             ))),
+            // #142: a fixed test project namespace. Durable readback helpers in
+            // these tests key by this project namespace (see `TEST_PROJECT_PATH`).
+            project_id: crate::storage::ProjectId::from_canonical_path(TEST_PROJECT_PATH),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,
@@ -14040,11 +14233,13 @@ mod tests {
 
     // #76: the plan artifact now lives on the RunStore seam (not extras). Read
     // it back through the harness's storage under PLAN_EXECUTE_EXTRAS_KEY.
-    async fn stored_artifact(h: &StandardHarness, session_id: &SessionId) -> PlanArtifact {
+    async fn stored_artifact(h: &StandardHarness, _session_id: &SessionId) -> PlanArtifact {
+        // #142: the plan artifact is keyed by the project namespace, not the run
+        // session id — read it back under `durable_ns()`.
         let v = h
             .storage()
             .run()
-            .get(session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .expect("plan_execute present in run store");
@@ -14145,7 +14340,7 @@ mod tests {
         assert!(h
             .storage()
             .run()
-            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .is_none());
@@ -14562,7 +14757,7 @@ mod tests {
         assert!(h
             .storage()
             .run()
-            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .is_none());
@@ -14651,7 +14846,7 @@ mod tests {
         assert!(h
             .storage()
             .run()
-            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .is_none());
@@ -14663,11 +14858,13 @@ mod tests {
 
     // #76: the task list now lives on the RunStore seam (not extras). Read it
     // back through the harness's storage under TASK_LIST_EXTRAS_KEY.
-    async fn run_store_task_list(h: &StandardHarness, session_id: &SessionId) -> TaskList {
+    async fn run_store_task_list(h: &StandardHarness, _session_id: &SessionId) -> TaskList {
+        // #142: the task list is keyed by the project namespace, not the run
+        // session id — read it back under `durable_ns()`.
         let v = h
             .storage()
             .run()
-            .get(session_id, TASK_LIST_EXTRAS_KEY)
+            .get(&durable_ns(), TASK_LIST_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .expect("task_list present in run store");
@@ -15150,7 +15347,7 @@ mod tests {
         let stored: TaskList = serde_json::from_value(
             h.storage()
                 .run()
-                .get(&session, TASK_LIST_EXTRAS_KEY)
+                .get(&durable_ns(), TASK_LIST_EXTRAS_KEY)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -15463,7 +15660,7 @@ mod tests {
 
         let stored = provider
             .run()
-            .get(&SessionId::new("s1"), TASK_LIST_EXTRAS_KEY)
+            .get(&durable_ns(), TASK_LIST_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .expect("task list present in run store");
@@ -15513,14 +15710,14 @@ mod tests {
         assert!(h
             .storage()
             .run()
-            .get(&t.session_id, PLAN_EXECUTE_EXTRAS_KEY)
+            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .is_some());
         assert!(h
             .storage()
             .run()
-            .get(&t.session_id, TASK_LIST_EXTRAS_KEY)
+            .get(&durable_ns(), TASK_LIST_EXTRAS_KEY)
             .await
             .expect("run store get ok")
             .is_some());
@@ -16064,6 +16261,7 @@ mod tests {
                 error_loop_threshold: 3,
                 hooks: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
+                project_id: crate::storage::ProjectId::from_canonical_path("/test-workspace"),
                 chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
                 max_resets: 3,
                 vcs_provider: None,
@@ -17416,14 +17614,45 @@ mod tests {
         }
     }
 
-    /// Write `.spore/progress.json` under `root` (creating `.spore/`).
-    fn write_progress(root: &std::path::Path, body: &str) {
-        std::fs::create_dir_all(root.join(".spore")).unwrap();
-        std::fs::write(root.join(".spore/progress.json"), body).unwrap();
+    /// The project namespace the Ralph checkpoint lives under (#142): the same
+    /// id the harness derives from `sandbox.workspace_root()`, projected onto the
+    /// `RunStore` session-id axis. The test writer and the harness reader MUST
+    /// agree on this so a write is what the read sees.
+    fn ralph_ns(root: &std::path::Path) -> SessionId {
+        crate::storage::ProjectId::from_canonical_path(&root.to_string_lossy()).namespace()
     }
-    fn write_feature_list(root: &std::path::Path, body: &str) {
-        std::fs::create_dir_all(root.join(".spore")).unwrap();
-        std::fs::write(root.join(".spore/feature_list.json"), body).unwrap();
+
+    /// Write the Ralph progress checkpoint into the SHARED run store under the
+    /// project namespace derived from `root` (#142 relocated this off the
+    /// `.spore/` filesystem). `body` is the legacy JSON body string, parsed to a
+    /// `serde_json::Value` and stored under [`RALPH_PROGRESS_KEY`].
+    async fn write_progress(
+        storage: &Arc<crate::storage::StorageProvider>,
+        root: &std::path::Path,
+        body: &str,
+    ) {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        storage
+            .run()
+            .put(&ralph_ns(root), crate::storage::RALPH_PROGRESS_KEY, value)
+            .await
+            .unwrap();
+    }
+    async fn write_feature_list(
+        storage: &Arc<crate::storage::StorageProvider>,
+        root: &std::path::Path,
+        body: &str,
+    ) {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        storage
+            .run()
+            .put(
+                &ralph_ns(root),
+                crate::storage::RALPH_FEATURE_LIST_KEY,
+                value,
+            )
+            .await
+            .unwrap();
     }
     const INCOMPLETE: &str = r#"{"complete":false,"remaining":["task A"]}"#;
     const COMPLETE: &str = r#"{"complete":true,"remaining":[]}"#;
@@ -17434,15 +17663,21 @@ mod tests {
     /// records the messages it saw so tests can assert fresh-state / reload.
     struct ProgressWritingAgent {
         id: AgentId,
-        root: std::path::PathBuf,
+        run_store: Arc<dyn crate::storage::RunStore>,
+        ns: SessionId,
         progress_queue: StdMutex<std::collections::VecDeque<String>>,
         seen: StdMutex<Vec<Context>>,
     }
     impl ProgressWritingAgent {
-        fn new(root: &std::path::Path, bodies: Vec<&str>) -> Arc<Self> {
+        fn new(
+            run_store: Arc<dyn crate::storage::RunStore>,
+            root: &std::path::Path,
+            bodies: Vec<&str>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 id: AgentId::new("ralph-build"),
-                root: root.to_path_buf(),
+                run_store,
+                ns: ralph_ns(root),
                 progress_queue: StdMutex::new(bodies.into_iter().map(String::from).collect()),
                 seen: StdMutex::new(Vec::new()),
             })
@@ -17471,10 +17706,15 @@ mod tests {
     impl Agent for ProgressWritingAgent {
         fn turn<'a>(&'a self, context: Context) -> BoxFut<'a, TurnResult> {
             self.seen.lock().unwrap().push(context);
-            if let Some(body) = self.progress_queue.lock().unwrap().pop_front() {
-                write_progress(&self.root, &body);
-            }
+            let body = self.progress_queue.lock().unwrap().pop_front();
             Box::pin(async move {
+                if let Some(body) = body {
+                    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    self.run_store
+                        .put(&self.ns, crate::storage::RALPH_PROGRESS_KEY, value)
+                        .await
+                        .unwrap();
+                }
                 TurnResult::FinalResponse {
                     reasoning: None,
                     content: "window done".into(),
@@ -17492,24 +17732,45 @@ mod tests {
         }
     }
 
-    fn ralph_config(root: &std::path::Path, agent: Arc<dyn Agent>) -> HarnessConfig {
+    /// Build a Ralph harness config whose checkpoint store + project namespace
+    /// are SHARED with the returned `Arc<StorageProvider>` (#142). The harness
+    /// reads the checkpoint from `cfg.storage` at `cfg.project_id.namespace()`;
+    /// `ralph_config` derives `project_id` from `root` (the same root the
+    /// `WorkspaceSandbox` exposes), so a write the test/agent makes against the
+    /// returned storage at `ralph_ns(root)` is exactly what the harness reads.
+    /// The storage is the one `standard_config` already built (a fresh in-memory
+    /// store per call), returned here so seed writes target the same instance.
+    ///
+    /// The worker agent is NOT registered here: the Ralph worker agents now hold
+    /// the shared run store (so they write the checkpoint the harness reads), and
+    /// that store only exists after this call — so callers build the agent from
+    /// the returned `storage.run()` and register it via `set_worker_agent`.
+    fn ralph_config(
+        root: &std::path::Path,
+    ) -> (HarnessConfig, Arc<crate::storage::StorageProvider>) {
         let mut cfg = standard_config(make_agent());
-        set_worker_agent(&mut cfg, agent);
         cfg.sandbox = Arc::new(WorkspaceSandbox {
             root: root.to_path_buf(),
         });
         // Use a real context manager so reloaded context lands in messages.
         cfg.context_manager = Arc::new(NoopContextManager);
-        cfg
+        // #142: the checkpoint lives in the project-id RunStore. Derive the
+        // project id from the SAME root the sandbox exposes so the harness reads
+        // back what the test/agent writes under `ralph_ns(root)`.
+        cfg.project_id = crate::storage::ProjectId::from_canonical_path(&root.to_string_lossy());
+        let storage = cfg.storage.clone();
+        (cfg, storage)
     }
 
     // R0: Ralph is implemented — no longer StrategyNotYetImplemented.
     #[tokio::test]
     async fn ralph_no_longer_unimplemented() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), COMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![COMPLETE]);
-        let h = StandardHarness::new(ralph_config(dir.path(), agent));
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), COMPLETE).await;
+        let agent = ProgressWritingAgent::new(storage.run().clone(), dir.path(), vec![COMPLETE]);
+        set_worker_agent(&mut cfg, agent);
+        let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(ralph_task())).await {
             RunResult::Failure {
                 reason: HaltReason::StrategyNotYetImplemented { .. },
@@ -17524,10 +17785,15 @@ mod tests {
     #[tokio::test]
     async fn ralph_resets_until_complete() {
         let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, storage) = ralph_config(dir.path());
         // Start incomplete so the first window's reload sees prior state.
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, INCOMPLETE, COMPLETE]);
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
+            dir.path(),
+            vec![INCOMPLETE, INCOMPLETE, COMPLETE],
+        );
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.max_resets = 3;
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(ralph_task())).await {
@@ -17542,12 +17808,14 @@ mod tests {
     #[tokio::test]
     async fn ralph_exhausts_max_resets() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
         let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
             dir.path(),
             vec![INCOMPLETE, INCOMPLETE, INCOMPLETE, INCOMPLETE],
         );
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.max_resets = 3;
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(ralph_task())).await {
@@ -17580,14 +17848,16 @@ mod tests {
         // incomplete and resets, until `max_resets` is exhausted. With max_resets
         // = 2 the verifier fires exactly ONCE PER WINDOW (2x). A hardcoded-ReAct
         // window would NEVER call the verifier (ZERO invocations).
-        write_progress(dir.path(), INCOMPLETE);
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
         // The worker keeps progress incomplete on every turn it writes.
         let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
             dir.path(),
             vec![INCOMPLETE; 16], // plenty for the blocked build turns + eval turns
         );
         let verifier = Arc::new(ScriptedVerifier::new(vec![], passed(), 3));
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        set_worker_agent(&mut cfg, agent.clone());
         set_default_verifier(&mut cfg, verifier.clone());
         cfg.max_resets = 2;
         // One Stop-block then continue, so the per-window build loop ends quickly
@@ -17632,14 +17902,16 @@ mod tests {
     /// completion after the window would (wrongly) see "complete" and Success.
     struct ToolLoopingAgent {
         id: AgentId,
-        root: std::path::PathBuf,
+        run_store: Arc<dyn crate::storage::RunStore>,
+        ns: SessionId,
         calls: StdMutex<u32>,
     }
     impl ToolLoopingAgent {
-        fn new(root: &std::path::Path) -> Arc<Self> {
+        fn new(run_store: Arc<dyn crate::storage::RunStore>, root: &std::path::Path) -> Arc<Self> {
             Arc::new(Self {
                 id: AgentId::new("ralph-tool-loop"),
-                root: root.to_path_buf(),
+                run_store,
+                ns: ralph_ns(root),
                 calls: StdMutex::new(0),
             })
         }
@@ -17649,15 +17921,22 @@ mod tests {
     }
     impl Agent for ToolLoopingAgent {
         fn turn<'a>(&'a self, _context: Context) -> BoxFut<'a, TurnResult> {
-            let mut c = self.calls.lock().unwrap();
-            if *c == 0 {
-                // Mark COMPLETE on disk up front — if Ralph (wrongly) consulted
-                // completion after a budget-exhausted window it would Success.
-                write_progress(&self.root, COMPLETE);
-            }
-            let n = *c;
-            *c += 1;
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                let n = *c;
+                *c += 1;
+                n
+            };
             Box::pin(async move {
+                if n == 0 {
+                    // Mark COMPLETE up front — if Ralph (wrongly) consulted
+                    // completion after a budget-exhausted window it would Success.
+                    let value: serde_json::Value = serde_json::from_str(COMPLETE).unwrap();
+                    self.run_store
+                        .put(&self.ns, crate::storage::RALPH_PROGRESS_KEY, value)
+                        .await
+                        .unwrap();
+                }
                 TurnResult::ToolCallRequested {
                     reasoning: None,
                     calls: vec![ToolCall {
@@ -17689,9 +17968,10 @@ mod tests {
     #[tokio::test]
     async fn ralph_budget_exhausted_window_resets_no_completion_no_cascade() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ToolLoopingAgent::new(dir.path());
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ToolLoopingAgent::new(storage.run().clone(), dir.path());
+        set_worker_agent(&mut cfg, agent.clone());
         // Provide tool outputs for the looping calls across all windows.
         let reg = Arc::new(ScriptedToolRegistry::new());
         for _ in 0..32 {
@@ -17739,9 +18019,14 @@ mod tests {
     #[tokio::test]
     async fn ralph_fresh_session_per_reset() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
+            dir.path(),
+            vec![INCOMPLETE, COMPLETE],
+        );
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.max_resets = 3;
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
@@ -17761,11 +18046,16 @@ mod tests {
     #[tokio::test]
     async fn ralph_reload_injects_filesystem_state() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        write_feature_list(dir.path(), r#"[{"name":"login","passes":false}]"#);
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        write_feature_list(&storage, dir.path(), r#"[{"name":"login","passes":false}]"#).await;
         // Agent leaves progress incomplete on window 1, complete on window 2.
-        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
+            dir.path(),
+            vec![INCOMPLETE, COMPLETE],
+        );
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.max_resets = 3;
         let h = StandardHarness::new(cfg);
         let _ = h.run(HarnessRunOptions::new(ralph_task())).await;
@@ -17784,9 +18074,14 @@ mod tests {
     #[tokio::test]
     async fn ralph_budgets_fold_across_windows() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, INCOMPLETE, COMPLETE]);
-        let mut cfg = ralph_config(dir.path(), agent);
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
+            dir.path(),
+            vec![INCOMPLETE, INCOMPLETE, COMPLETE],
+        );
+        set_worker_agent(&mut cfg, agent);
         cfg.max_resets = 3;
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(ralph_task())).await {
@@ -17827,17 +18122,53 @@ mod tests {
     // incomplete (the feature list corroborates).
     #[tokio::test]
     async fn ralph_completion_status_feature_list_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), COMPLETE);
-        write_feature_list(dir.path(), r#"[{"name":"login","passes":false}]"#);
-        let status = StandardHarness::ralph_completion_status(dir.path());
+        // #142: the checkpoint lives in the project-id RunStore, not on disk. The
+        // completion-status helper reads `(run_store, project)`; the test writes
+        // the same checkpoint into the same store under the project namespace.
+        let storage = Arc::new(crate::storage::StorageProvider::single(Arc::new(
+            crate::storage::InMemoryStorageProvider::new(),
+        )));
+        let project = crate::storage::ProjectId::from_canonical_path("/feature-gate");
+        let ns = project.namespace();
+        let run = storage.run();
+        run.put(
+            &ns,
+            crate::storage::RALPH_PROGRESS_KEY,
+            serde_json::from_str(COMPLETE).unwrap(),
+        )
+        .await
+        .unwrap();
+        run.put(
+            &ns,
+            crate::storage::RALPH_FEATURE_LIST_KEY,
+            serde_json::json!([{ "name": "login", "passes": false }]),
+        )
+        .await
+        .unwrap();
+        let status = StandardHarness::ralph_completion_status(run, &project).await;
         assert!(
             status.as_deref().unwrap_or("").contains("login"),
             "got: {status:?}"
         );
+        assert!(
+            status
+                .as_deref()
+                .unwrap_or("")
+                .contains("incomplete features"),
+            "got: {status:?}"
+        );
         // Now mark it passing — complete.
-        write_feature_list(dir.path(), r#"[{"name":"login","passes":true}]"#);
-        assert_eq!(StandardHarness::ralph_completion_status(dir.path()), None);
+        run.put(
+            &ns,
+            crate::storage::RALPH_FEATURE_LIST_KEY,
+            serde_json::json!([{ "name": "login", "passes": true }]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            StandardHarness::ralph_completion_status(run, &project).await,
+            None
+        );
     }
 
     // ── VcsProvider seam (issue #58 v2) ─────────────────────────────────────
@@ -17967,9 +18298,14 @@ mod tests {
     #[tokio::test]
     async fn ralph_injects_vcs_log_into_reload() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![INCOMPLETE, COMPLETE]);
-        let mut cfg = ralph_config(dir.path(), agent.clone());
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ProgressWritingAgent::new(
+            storage.run().clone(),
+            dir.path(),
+            vec![INCOMPLETE, COMPLETE],
+        );
+        set_worker_agent(&mut cfg, agent.clone());
         cfg.max_resets = 3;
         cfg.vcs_provider = Some(Arc::new(FixtureVcsProvider::new(
             "cafe123 implement login\nbeef456 add tests\n",
@@ -17990,9 +18326,10 @@ mod tests {
     #[tokio::test]
     async fn ralph_none_vcs_omits_git_section() {
         let dir = tempfile::tempdir().unwrap();
-        write_progress(dir.path(), INCOMPLETE);
-        let agent = ProgressWritingAgent::new(dir.path(), vec![COMPLETE]);
-        let cfg = ralph_config(dir.path(), agent.clone());
+        let (mut cfg, storage) = ralph_config(dir.path());
+        write_progress(&storage, dir.path(), INCOMPLETE).await;
+        let agent = ProgressWritingAgent::new(storage.run().clone(), dir.path(), vec![COMPLETE]);
+        set_worker_agent(&mut cfg, agent.clone());
         // vcs_provider defaults to None.
         assert!(cfg.vcs_provider.is_none());
         let h = StandardHarness::new(cfg);
@@ -18045,8 +18382,9 @@ mod tests {
         let suite: RalphFixtureSuite = serde_json::from_str(&raw).expect("fixture parses");
         for case in suite.cases {
             let dir = tempfile::tempdir().unwrap();
-            // Seed an initial incomplete progress file so window 1 reloads state.
-            write_progress(dir.path(), INCOMPLETE);
+            let (mut cfg, storage) = ralph_config(dir.path());
+            // Seed an initial incomplete progress checkpoint so window 1 reloads state.
+            write_progress(&storage, dir.path(), INCOMPLETE).await;
             let bodies: Vec<String> = case
                 .windows
                 .iter()
@@ -18058,9 +18396,12 @@ mod tests {
                     .to_string()
                 })
                 .collect();
-            let agent =
-                ProgressWritingAgent::new(dir.path(), bodies.iter().map(|s| s.as_str()).collect());
-            let mut cfg = ralph_config(dir.path(), agent.clone());
+            let agent = ProgressWritingAgent::new(
+                storage.run().clone(),
+                dir.path(),
+                bodies.iter().map(|s| s.as_str()).collect(),
+            );
+            set_worker_agent(&mut cfg, agent.clone());
             cfg.max_resets = case.max_resets;
             // issue #58 v2: when the case carries a `vcs_log`, wire a
             // FixtureVcsProvider seeded with it; absent ⇒ None ⇒ no git section.

@@ -1761,6 +1761,7 @@ mod tests {
             error_loop_threshold: 3,
             hooks: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
+            project_id: crate::storage::ProjectId::from_canonical_path("/test-workspace"),
             chunk_provider: Arc::new(crate::prompt_assembly::InMemoryChunkProvider::empty()),
             max_resets: 3,
             vcs_provider: None,

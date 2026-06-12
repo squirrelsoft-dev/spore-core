@@ -790,6 +790,7 @@ async fn tool_context_exposes_threaded_memory_store() {
         inner,
         Arc::new(AllowAllSandbox),
         sid("ctx-test"),
+        ProjectId::from_canonical_path("/ctx-test-project"),
         Arc::new(InMemoryStorageProvider::new()),
         memory.clone(),
     );
@@ -809,4 +810,413 @@ async fn tool_context_exposes_threaded_memory_store() {
         .unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].content, "threaded");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// #142 — ProjectId + project-scoped durable storage
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── ProjectId pure derivation ────────────────────────────────────────────────
+
+#[test]
+fn project_id_is_deterministic_and_matches_workspace_id_algorithm() {
+    // Same input → same id, repeatedly.
+    let a = ProjectId::from_canonical_path("/Users/sbeardsley/dev/spore-core");
+    let b = ProjectId::from_canonical_path("/Users/sbeardsley/dev/spore-core");
+    assert_eq!(a, b);
+    // The derivation is byte-identical to WorkspaceId (it delegates to the same
+    // pure algorithm) — the cross-language anchor.
+    let w = WorkspaceId::from_canonical_path("/Users/sbeardsley/dev/spore-core");
+    assert_eq!(a.as_str(), w.as_str());
+    // Form: `{sanitized_basename}-{8hex}`.
+    assert!(a.as_str().starts_with("spore-core-"));
+    assert_eq!(a.as_str().len(), "spore-core-".len() + 8);
+}
+
+#[test]
+fn project_id_root_and_special_chars() {
+    assert!(ProjectId::from_canonical_path("/")
+        .as_str()
+        .starts_with("root-"));
+    let p = ProjectId::from_canonical_path("/Users/me/My Project (v2)!");
+    assert!(p.as_str().starts_with("my-project-v2-"));
+    assert!(!p.as_str().contains("--"));
+}
+
+#[test]
+fn project_id_ignores_trailing_slash() {
+    let a = ProjectId::from_canonical_path("/Users/sbeardsley/dev/spore-core");
+    let b = ProjectId::from_canonical_path("/Users/sbeardsley/dev/spore-core/");
+    assert_eq!(a, b);
+}
+
+// ── The `/a/b` vs `/a_b` collision-resolution case (the spec's headline) ─────
+
+#[test]
+fn project_id_resolves_slash_underscore_collision() {
+    // A naive "slashes → underscores" slug would map BOTH of these to `a_b`.
+    // The 8-hex SHA-256 suffix of the FULL canonical path keeps them distinct.
+    let ab = ProjectId::from_canonical_path("/a/b");
+    let a_b = ProjectId::from_canonical_path("/a_b");
+    assert_ne!(ab, a_b, "/a/b and /a_b must derive DISTINCT project ids");
+    // And the pinned exact values (cross-language anchor).
+    assert_eq!(ab.as_str(), "b-662b7b62");
+    assert_eq!(a_b.as_str(), "a-b-328ff01f");
+}
+
+#[test]
+fn project_id_namespace_projects_onto_session_axis() {
+    // `namespace()` yields a SessionId whose string IS the derived project id —
+    // the namespace-reuse seam over the RunStore's `&SessionId` axis.
+    let p = ProjectId::from_canonical_path("/work/audit-repo");
+    assert_eq!(p.namespace().as_str(), p.as_str());
+    assert_eq!(p.namespace().as_str(), "audit-repo-9e8ff6f3");
+}
+
+// ── FS-touching constructors: canonicalize FIRST ─────────────────────────────
+
+#[tokio::test]
+async fn project_id_from_path_canonicalizes_first() {
+    // A real dir + a relative path INTO it must derive the same id as the
+    // absolute canonical path — proving from_path canonicalizes before slugging.
+    let tmp = tempfile::tempdir().unwrap();
+    let nested = tmp.path().join("proj");
+    std::fs::create_dir_all(&nested).unwrap();
+    let canonical = std::fs::canonicalize(&nested).unwrap();
+
+    let from_path = ProjectId::from_path(&nested).unwrap();
+    let from_canon = ProjectId::from_canonical_path(&canonical.to_string_lossy());
+    assert_eq!(from_path, from_canon);
+}
+
+#[tokio::test]
+async fn project_id_from_path_resolves_relative_components() {
+    // A path with `..` components canonicalizes to the same id as the direct one.
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    // {tmp}/a/../b  ==  {tmp}/b
+    let via_dotdot = a.join("..").join("b");
+    let direct = ProjectId::from_path(&b).unwrap();
+    let dotted = ProjectId::from_path(&via_dotdot).unwrap();
+    assert_eq!(direct, dotted);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_id_from_path_resolves_symlink() {
+    // A symlink and its target derive the SAME id (symlink resolved by
+    // canonicalize). Unix-only: symlink creation differs on Windows.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("real-proj");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = tmp.path().join("link-proj");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let via_target = ProjectId::from_path(&target).unwrap();
+    let via_link = ProjectId::from_path(&link).unwrap();
+    assert_eq!(
+        via_target, via_link,
+        "a symlink must resolve to its target's project id"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn project_id_from_path_macos_case_insensitive() {
+    // macOS's default filesystem is case-insensitive: a dir created lowercase is
+    // reachable via a different-cased path, and canonicalize returns the
+    // ON-DISK casing — so both derive the same id. (#cfg-gated: this is a
+    // filesystem-behavior-dependent assertion.)
+    let tmp = tempfile::tempdir().unwrap();
+    let lower = tmp.path().join("caseproj");
+    std::fs::create_dir_all(&lower).unwrap();
+    let upper = tmp.path().join("CASEPROJ");
+    // On a case-insensitive FS, `upper` resolves to the same inode as `lower`.
+    if std::fs::canonicalize(&upper).is_ok() {
+        let a = ProjectId::from_path(&lower).unwrap();
+        let b = ProjectId::from_path(&upper).unwrap();
+        assert_eq!(a, b);
+    }
+}
+
+#[tokio::test]
+async fn project_id_from_path_errors_on_missing_path() {
+    // A non-existent path cannot be canonicalized ⇒ Canonicalize error variant.
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("does-not-exist");
+    let err = ProjectId::from_path(&missing).unwrap_err();
+    assert!(matches!(err, ProjectIdError::Canonicalize(_)));
+    // Display does not panic.
+    let _ = err.to_string();
+}
+
+#[test]
+fn project_id_from_cwd_succeeds() {
+    // The process cwd exists, so from_cwd derives an id without error.
+    let p = ProjectId::from_cwd().expect("cwd canonicalizes");
+    assert!(!p.as_str().is_empty());
+}
+
+// ── ProjectId derivation fixture replay (cross-language anchor) ───────────────
+
+#[test]
+fn project_id_derivation_fixture_replay() {
+    let raw = std::fs::read_to_string(fixture_path("project_id_derivation.json"))
+        .expect("project_id_derivation.json present");
+    let cases: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+    assert!(cases.len() >= 6, "fixture should carry the collision rows");
+    let mut saw_collision_a = false;
+    let mut saw_collision_b = false;
+    for case in cases {
+        let path = case["canonical_path"].as_str().unwrap();
+        let expected = case["expected_project_id"].as_str().unwrap();
+        let got = ProjectId::from_canonical_path(path);
+        assert_eq!(got.as_str(), expected, "mismatch for path {path:?}");
+        if path == "/a/b" {
+            saw_collision_a = true;
+        }
+        if path == "/a_b" {
+            saw_collision_b = true;
+        }
+    }
+    assert!(
+        saw_collision_a && saw_collision_b,
+        "fixture must pin both /a/b and /a_b"
+    );
+}
+
+// ── task_list visible across DIFFERENT sessions with SAME project_id ──────────
+
+#[tokio::test]
+async fn run_store_value_visible_across_sessions_same_project() {
+    // The durable seam: write under one session's view but keyed by the project
+    // namespace; a DIFFERENT session reading the SAME project namespace sees it.
+    let store: Arc<dyn RunStore> = Arc::new(InMemoryStorageProvider::new());
+    let project = ProjectId::from_canonical_path("/work/repo");
+
+    store
+        .put(&project.namespace(), "task_list", json!({"tasks": [1, 2]}))
+        .await
+        .unwrap();
+
+    // A fresh session id (mirrors SessionId::generate() per Ralph window) does
+    // NOT change what the project namespace returns.
+    let _fresh_session = SessionId::generate();
+    let got = store.get(&project.namespace(), "task_list").await.unwrap();
+    assert_eq!(got, Some(json!({"tasks": [1, 2]})));
+}
+
+// ── AC5: cross-window AND cross-process durability via FileSystemStorageProvider
+
+#[tokio::test]
+async fn project_durable_survives_window_reset_and_process_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let project = ProjectId::from_canonical_path("/work/audit-repo");
+
+    // Window 1 (session A): write the durable task_list under the project ns.
+    let list = json!({
+        "tasks": [{"id": 1, "description": "discover", "status": "completed", "blockers": []}],
+        "next_id": 2
+    });
+    {
+        let provider: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root.clone()));
+        provider
+            .put(&project.namespace(), "task_list", list.clone())
+            .await
+            .unwrap();
+    }
+
+    // Window 2 (a DIFFERENT, freshly generated session) over the SAME provider
+    // root reads window 1's list — cross-window survival.
+    {
+        let provider: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root.clone()));
+        let _window_2_session = SessionId::generate();
+        let got = provider
+            .get(&project.namespace(), "task_list")
+            .await
+            .unwrap();
+        assert_eq!(got, Some(list.clone()), "window 2 must see window 1's list");
+    }
+
+    // A BRAND-NEW FileSystemStorageProvider over the same on-disk root (a fresh
+    // process) reads the same bytes — cross-process durability.
+    {
+        let fresh: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root.clone()));
+        let got = fresh.get(&project.namespace(), "task_list").await.unwrap();
+        assert_eq!(
+            got,
+            Some(list),
+            "a fresh provider must read the durable list"
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_durable_survival_fixture_replay() {
+    let raw = std::fs::read_to_string(fixture_path("project_durable_survival.json"))
+        .expect("project_durable_survival.json present");
+    let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    let project_path = fx["project_canonical_path"].as_str().unwrap();
+    let project = ProjectId::from_canonical_path(project_path);
+    // The pinned project id must match.
+    assert_eq!(
+        project.as_str(),
+        fx["expected_project_id"].as_str().unwrap()
+    );
+    let run_key = fx["run_key"].as_str().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Window 1 writes the fixture's task_list (under a DISTINCT session id).
+    let w1_list = fx["window_1"]["task_list"].clone();
+    {
+        let provider: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root.clone()));
+        let _session_a = SessionId::new(fx["window_1"]["session_id"].as_str().unwrap());
+        provider
+            .put(&project.namespace(), run_key, w1_list.clone())
+            .await
+            .unwrap();
+    }
+
+    // Window 2 (a different session id) reads the expected list cross-window.
+    {
+        let provider: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root.clone()));
+        let _session_b = SessionId::new(fx["window_2"]["session_id"].as_str().unwrap());
+        let got = provider
+            .get(&project.namespace(), run_key)
+            .await
+            .unwrap()
+            .expect("window 2 sees the list");
+        assert_eq!(got, fx["window_2"]["expected_task_list"]);
+    }
+
+    // A fresh provider (cross-process) reads the expected list.
+    {
+        let fresh: Arc<dyn RunStore> = Arc::new(FileSystemStorageProvider::new(root));
+        let got = fresh
+            .get(&project.namespace(), run_key)
+            .await
+            .unwrap()
+            .expect("fresh provider sees the list");
+        assert_eq!(got, fx["cross_process"]["expected_task_list"]);
+    }
+}
+
+// ── Active-run lifecycle: new / resume / complete ────────────────────────────
+
+fn run_store() -> Arc<dyn RunStore> {
+    Arc::new(InMemoryStorageProvider::new())
+}
+
+#[tokio::test]
+async fn active_run_starts_new_when_no_slot() {
+    let store = run_store();
+    let project = ProjectId::from_canonical_path("/work/p");
+    assert!(load_active_run(&store, &project).await.unwrap().is_none());
+
+    let decision =
+        start_or_resume_active_run(&store, &project, "tag-1", ts("2026-06-12T00:00:00Z"))
+            .await
+            .unwrap();
+    assert_eq!(decision, ActiveRunDecision::StartedNew);
+
+    let slot = load_active_run(&store, &project).await.unwrap().unwrap();
+    assert_eq!(slot.run_tag, "tag-1");
+    assert_eq!(slot.status, ActiveRunStatus::Active);
+    // started_at is the INJECTED timestamp (deterministic, no clock).
+    assert_eq!(slot.started_at, ts("2026-06-12T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn active_run_resumes_on_matching_tag() {
+    let store = run_store();
+    let project = ProjectId::from_canonical_path("/work/p");
+    start_or_resume_active_run(&store, &project, "tag-1", ts("t1"))
+        .await
+        .unwrap();
+
+    // Same tag ⇒ resume; the original started_at is preserved (slot untouched).
+    let decision = start_or_resume_active_run(&store, &project, "tag-1", ts("t2"))
+        .await
+        .unwrap();
+    assert_eq!(decision, ActiveRunDecision::Resumed);
+    let slot = load_active_run(&store, &project).await.unwrap().unwrap();
+    assert_eq!(slot.started_at, ts("t1"), "resume must not restamp");
+}
+
+#[tokio::test]
+async fn active_run_starts_fresh_on_different_tag() {
+    let store = run_store();
+    let project = ProjectId::from_canonical_path("/work/p");
+    start_or_resume_active_run(&store, &project, "tag-1", ts("t1"))
+        .await
+        .unwrap();
+
+    // A DIFFERENT tag is a genuinely new job in the same repo ⇒ start fresh.
+    let decision = start_or_resume_active_run(&store, &project, "tag-2", ts("t2"))
+        .await
+        .unwrap();
+    assert_eq!(decision, ActiveRunDecision::StartedNew);
+    let slot = load_active_run(&store, &project).await.unwrap().unwrap();
+    assert_eq!(slot.run_tag, "tag-2");
+    assert_eq!(slot.started_at, ts("t2"));
+}
+
+#[tokio::test]
+async fn active_run_complete_then_restart_is_fresh() {
+    let store = run_store();
+    let project = ProjectId::from_canonical_path("/work/p");
+    start_or_resume_active_run(&store, &project, "tag-1", ts("t1"))
+        .await
+        .unwrap();
+
+    complete_active_run(&store, &project).await.unwrap();
+    let slot = load_active_run(&store, &project).await.unwrap().unwrap();
+    assert_eq!(slot.status, ActiveRunStatus::Completed);
+
+    // After completion, even the SAME tag starts a fresh Active slot.
+    let decision = start_or_resume_active_run(&store, &project, "tag-1", ts("t3"))
+        .await
+        .unwrap();
+    assert_eq!(decision, ActiveRunDecision::StartedNew);
+    let slot = load_active_run(&store, &project).await.unwrap().unwrap();
+    assert_eq!(slot.status, ActiveRunStatus::Active);
+    assert_eq!(slot.started_at, ts("t3"));
+}
+
+#[tokio::test]
+async fn complete_active_run_is_noop_without_slot() {
+    let store = run_store();
+    let project = ProjectId::from_canonical_path("/work/empty");
+    // No active slot ⇒ completing is a silent no-op (no error).
+    complete_active_run(&store, &project).await.unwrap();
+    assert!(load_active_run(&store, &project).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn active_run_isolated_per_project() {
+    // Two projects over the SAME store keep independent active slots.
+    let store = run_store();
+    let p1 = ProjectId::from_canonical_path("/work/one");
+    let p2 = ProjectId::from_canonical_path("/work/two");
+    start_or_resume_active_run(&store, &p1, "a", ts("t1"))
+        .await
+        .unwrap();
+    start_or_resume_active_run(&store, &p2, "b", ts("t1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        load_active_run(&store, &p1).await.unwrap().unwrap().run_tag,
+        "a"
+    );
+    assert_eq!(
+        load_active_run(&store, &p2).await.unwrap().unwrap().run_tag,
+        "b"
+    );
 }

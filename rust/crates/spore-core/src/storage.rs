@@ -20,6 +20,21 @@
 //!     derivation [`WorkspaceId::from_canonical_path`] →
 //!     `{sanitized_basename}-{8_hex_chars}`, lowercased. The cross-language
 //!     parity anchor; pinned by `fixtures/storage/workspace_id_derivation.json`.
+//!   - [`ProjectId`] (#142) — newtype `ProjectId(String)` for **project-scoped
+//!     durable storage**. The stable namespace under which the `task_list`, the
+//!     plan artifact, the Ralph checkpoint, and the active-run slot survive Ralph
+//!     window resets (fresh `SessionId` per window) AND process restarts. The
+//!     pure-string derivation [`ProjectId::from_canonical_path`] delegates to the
+//!     SAME algorithm as [`WorkspaceId::from_canonical_path`]
+//!     (`{sanitized_basename}-{8_hex_chars}`), so the 8-hex hash suffix already
+//!     resolves the `/a/b` vs `/a_b` slug collision (distinct canonical strings ⇒
+//!     distinct hashes ⇒ distinct ids). The FS-touching
+//!     [`ProjectId::from_cwd`] / [`ProjectId::from_path`] canonicalize FIRST
+//!     (symlinks, relative paths, macOS case-insensitivity) and then delegate to
+//!     the pure path. Pinned by `fixtures/storage/project_id_derivation.json`.
+//!     Errors via [`ProjectIdError`]. Used as the durable namespace by reusing
+//!     the existing `&SessionId` string axis on [`RunStore`] — see
+//!     [`ProjectId::namespace`].
 //!   - [`StorageProvider`] — a struct of four `Arc<dyn _>` domain stores
 //!     (`session`, `memory`, `run`, `observability`) with `.session()` /
 //!     `.memory()` / `.run()` / `.observability()` accessors, a
@@ -77,6 +92,33 @@
 //!     most-recent `limit` entries, newest-first (#78 R8).
 //!   - **Last-writer-wins** for FS non-append writes via rename; no per-key
 //!     locking contract — atomic rename is the only durability guarantee.
+//!
+//! ## Rules enforced (#142 — project-scoped durable storage)
+//!   - **Derivation rule + collision policy.** [`ProjectId::from_canonical_path`]
+//!     is PURE and infallible and delegates to the SAME algorithm as
+//!     [`WorkspaceId::from_canonical_path`] (`{sanitized_basename}-{8_hex_chars}`).
+//!     The 8-hex SHA-256 suffix of the FULL canonical path resolves the `/a/b`
+//!     vs `/a_b` slug collision (distinct paths ⇒ distinct hashes ⇒ distinct
+//!     ids); pinned by `fixtures/storage/project_id_derivation.json`. The
+//!     FS-touching [`ProjectId::from_cwd`] / [`ProjectId::from_path`]
+//!     canonicalize FIRST (symlinks, relative paths, macOS case-insensitivity).
+//!   - **Namespace reuse, not trait widening.** Durable artifacts key the
+//!     [`RunStore`]'s existing `&SessionId` axis via [`ProjectId::namespace`] —
+//!     the trait signature is UNCHANGED. Ephemeral session/conversation state
+//!     stays keyed by the per-window [`SessionId`].
+//!   - **Active-run lifecycle (caller-owned).** [`start_or_resume_active_run`]
+//!     decides start-new vs resume by a deterministic match on the
+//!     caller-supplied `run_tag` (NOT instruction-diffing, NOT auto-on-Success);
+//!     `started_at` is an INJECTED [`Timestamp`] (deterministic in tests).
+//!     [`complete_active_run`] archives the slot so the next start is fresh.
+//!   - **Cross-window + cross-process survival.** A value written under the
+//!     project namespace is read back by a DIFFERENT session (Ralph window reset)
+//!     and by a FRESH [`FileSystemStorageProvider`] over the same root (process
+//!     restart); pinned by `fixtures/storage/project_durable_survival.json`.
+//!   - There are NO `// SPEC QUESTION:` markers in this module — every #142
+//!     decision (central storage root, explicit `complete_active_run` API, the
+//!     Ralph checkpoint on the project store, the new `ProjectId` newtype, and
+//!     deriving from the workspace root) is resolved by the issue maintainer.
 //!
 //! ## Known v1 limitation
 //! Memory addressing stays [`SessionId`]-keyed for v1. v2 should address
@@ -263,6 +305,236 @@ fn sanitize_basename(basename: &str) -> String {
     }
     // Strip leading/trailing `-`.
     out.trim_matches('-').to_string()
+}
+
+// ============================================================================
+// ProjectId (#142) — project-scoped durable storage namespace
+// ============================================================================
+
+/// Errors surfaced while deriving a [`ProjectId`] from the live filesystem.
+/// `#[non_exhaustive]` so new variants can be added without breaking matches.
+/// The pure derivation [`ProjectId::from_canonical_path`] is infallible — only
+/// the FS-touching constructors ([`ProjectId::from_cwd`] / [`ProjectId::from_path`])
+/// can fail, and only because canonicalization touched the filesystem.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProjectIdError {
+    /// Path canonicalization failed (the path does not exist, a component is not
+    /// a directory, a permission error, a broken symlink, …). Carried verbatim
+    /// from `std::fs::canonicalize` / `std::env::current_dir`.
+    #[error("project id canonicalization failed: {0}")]
+    Canonicalize(#[from] std::io::Error),
+}
+
+/// A **stable** identifier for a project, used as the durable storage namespace
+/// (issue #142). Where [`SessionId`] is regenerated per Ralph context window
+/// (`SessionId::generate()`), a `ProjectId` derived from the workspace root
+/// stays constant across windows AND across process restarts — that stability is
+/// the whole point: the `task_list`, plan artifact, Ralph checkpoint, and
+/// active-run slot persist under it so a window reset re-reads the prior window's
+/// work instead of re-planning from scratch.
+///
+/// Form: `{sanitized_basename}-{8_hex_chars}`, lowercased — **identical** to
+/// [`WorkspaceId`]. The two share the pure derivation
+/// ([`canonicalize_path_string`] + [`sanitize_basename`]); a `ProjectId` differs
+/// only in carrying FS-touching constructors that canonicalize first.
+///
+/// ## `/a/b` vs `/a_b` collision policy (RESOLVED)
+/// A naive "slashes → underscores" slug would map both `/a/b` and `/a_b` to the
+/// same string. This derivation does NOT collide: it slugs ONLY the final
+/// basename and appends the **first 8 hex of the SHA-256 of the full canonical
+/// path string**. `/a/b` and `/a_b` have different canonical strings, hence
+/// different hashes, hence distinct ids (`b-<h1>` vs `a-b-<h2>`). The fixture
+/// `fixtures/storage/project_id_derivation.json` pins this distinct-id case.
+///
+/// ## Namespace reuse
+/// The [`RunStore`] trait is keyed by `&SessionId`. Rather than widening that
+/// trait, a `ProjectId` is projected onto the same string axis via
+/// [`ProjectId::namespace`], which yields a [`SessionId`]-typed key whose string
+/// is the derived project id. Durable call sites pass that key in place of the
+/// per-window session id, so the trait signature stays stable while the value
+/// keyed is the stable project namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProjectId(String);
+
+impl ProjectId {
+    /// Derive a [`ProjectId`] from an already-OS-canonicalized path. **PURE and
+    /// infallible** — never touches the filesystem. This is the cross-language
+    /// fixture anchor (`fixtures/storage/project_id_derivation.json`); it reuses
+    /// the exact same [`canonicalize_path_string`] + [`sanitize_basename`] +
+    /// 8-hex-SHA-256 algorithm as [`WorkspaceId::from_canonical_path`], so the
+    /// two derivations are byte-identical for the same input.
+    pub fn from_canonical_path(path: &str) -> Self {
+        // Reuse the WorkspaceId pure algorithm — do NOT duplicate it.
+        ProjectId(WorkspaceId::from_canonical_path(path).into_inner())
+    }
+
+    /// Derive a [`ProjectId`] from a path, **canonicalizing the filesystem
+    /// FIRST** (resolves symlinks, relative components, and macOS
+    /// case-insensitivity) before delegating to the pure
+    /// [`ProjectId::from_canonical_path`]. Fails with
+    /// [`ProjectIdError::Canonicalize`] if the path cannot be canonicalized.
+    pub fn from_path(path: &Path) -> Result<Self, ProjectIdError> {
+        let canonical = fs::canonicalize(path)?;
+        Ok(Self::from_canonical_path(&canonical.to_string_lossy()))
+    }
+
+    /// Derive a [`ProjectId`] from the current working directory, canonicalizing
+    /// FIRST. Convenience wrapper over [`ProjectId::from_path`] for binaries that
+    /// want the process cwd; the harness itself derives from
+    /// `sandbox.workspace_root()`, NOT process cwd (decision 5).
+    pub fn from_cwd() -> Result<Self, ProjectIdError> {
+        let cwd = std::env::current_dir()?;
+        Self::from_path(&cwd)
+    }
+
+    /// Project this `ProjectId` onto the [`RunStore`]'s `&SessionId` string axis
+    /// (the namespace-reuse seam, #142). The returned [`SessionId`] is NOT a real
+    /// session — its string IS the derived project id — so durable
+    /// [`RunStore::get`] / [`RunStore::put`] calls key by the stable project
+    /// namespace without widening the trait. Ephemeral session-keyed state keeps
+    /// using the real per-window [`SessionId`].
+    pub fn namespace(&self) -> SessionId {
+        SessionId::new(self.0.clone())
+    }
+
+    /// The underlying derived id string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume into the inner `String`.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ============================================================================
+// Active-run lifecycle (#142, decision 2)
+// ============================================================================
+
+/// Reserved [`RunStore`] key under the project namespace holding the
+/// [`ActiveRun`] slot. The caller owns the lifecycle: start-new vs resume is a
+/// deterministic match on the caller-supplied `run_tag`, NOT instruction-diffing
+/// and NOT auto-on-Success. The harness stays stateless between runs.
+pub const ACTIVE_RUN_KEY: &str = "active_run";
+
+/// Reserved [`RunStore`] key under the project namespace holding the Ralph
+/// checkpoint (issue #142, decision 3). The checkpoint content previously lived
+/// at `{workspace_root}/.spore/progress.json` — it now lives in the project-id
+/// store so it survives Ralph window resets and process restarts.
+pub const RALPH_PROGRESS_KEY: &str = "ralph_progress";
+
+/// Reserved [`RunStore`] key under the project namespace holding the Ralph
+/// feature-list checkpoint (issue #142, decision 3). Mirrors the old
+/// `{workspace_root}/.spore/feature_list.json`.
+pub const RALPH_FEATURE_LIST_KEY: &str = "ralph_feature_list";
+
+/// Lifecycle status of the project's active run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveRunStatus {
+    /// The run is live: a window reset under the SAME `run_tag` resumes it.
+    Active,
+    /// The run was explicitly completed via [`complete_active_run`]; the slot is
+    /// archived. A subsequent start under a NEW tag begins fresh.
+    Completed,
+}
+
+/// The active-run slot persisted under [`ACTIVE_RUN_KEY`] in the project store.
+///
+/// `run_tag` is **caller-supplied** and is the sole start-new-vs-resume
+/// discriminator (decision 2): a [`start_or_resume_active_run`] call whose tag
+/// matches a live slot RESUMES; a different tag (or an absent / completed slot)
+/// starts FRESH. `started_at` is an **injected** timestamp (decision 4 — no
+/// `Date.now()`-style nondeterminism) so tests are deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveRun {
+    pub run_tag: String,
+    pub started_at: Timestamp,
+    pub status: ActiveRunStatus,
+}
+
+/// Outcome of [`start_or_resume_active_run`]: did the slot match (resume) or did
+/// the call mint a fresh active slot (start-new)?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveRunDecision {
+    /// No live slot matched the tag — a fresh `Active` slot was written.
+    StartedNew,
+    /// A live slot under the SAME tag was found — the run reattaches.
+    Resumed,
+}
+
+/// Read the active-run slot for `project`, or `None` if absent / unparseable.
+pub async fn load_active_run(
+    run_store: &Arc<dyn RunStore>,
+    project: &ProjectId,
+) -> Result<Option<ActiveRun>, StorageError> {
+    let ns = project.namespace();
+    match run_store.get(&ns, ACTIVE_RUN_KEY).await? {
+        Some(value) => match serde_json::from_value(value) {
+            Ok(run) => Ok(Some(run)),
+            // A malformed slot is treated as "no live run" — the next start mints
+            // a fresh one rather than erroring.
+            Err(_) => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Decide start-new vs resume for `project` on the caller-supplied `run_tag`
+/// (decision 2). Deterministic: a live (`Active`) slot under the SAME tag ⇒
+/// [`ActiveRunDecision::Resumed`] (the slot is left intact); otherwise a fresh
+/// `Active` slot stamped with the injected `started_at` is written and
+/// [`ActiveRunDecision::StartedNew`] is returned. `started_at` is injected (not
+/// read from a clock) so the result is deterministic in tests.
+pub async fn start_or_resume_active_run(
+    run_store: &Arc<dyn RunStore>,
+    project: &ProjectId,
+    run_tag: &str,
+    started_at: Timestamp,
+) -> Result<ActiveRunDecision, StorageError> {
+    if let Some(existing) = load_active_run(run_store, project).await? {
+        if existing.status == ActiveRunStatus::Active && existing.run_tag == run_tag {
+            return Ok(ActiveRunDecision::Resumed);
+        }
+    }
+    let fresh = ActiveRun {
+        run_tag: run_tag.to_string(),
+        started_at,
+        status: ActiveRunStatus::Active,
+    };
+    let value =
+        serde_json::to_value(&fresh).map_err(|e| StorageError::Serialization(e.to_string()))?;
+    run_store
+        .put(&project.namespace(), ACTIVE_RUN_KEY, value)
+        .await?;
+    Ok(ActiveRunDecision::StartedNew)
+}
+
+/// Mark the active run for `project` complete (decision 2): flips the slot's
+/// status to [`ActiveRunStatus::Completed`] so the next
+/// [`start_or_resume_active_run`] (even under the same tag) starts fresh. A
+/// no-op when there is no slot to complete.
+pub async fn complete_active_run(
+    run_store: &Arc<dyn RunStore>,
+    project: &ProjectId,
+) -> Result<(), StorageError> {
+    if let Some(mut existing) = load_active_run(run_store, project).await? {
+        existing.status = ActiveRunStatus::Completed;
+        let value = serde_json::to_value(&existing)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        run_store
+            .put(&project.namespace(), ACTIVE_RUN_KEY, value)
+            .await?;
+    }
+    Ok(())
 }
 
 // ============================================================================
