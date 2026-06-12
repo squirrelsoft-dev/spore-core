@@ -1,53 +1,59 @@
 # PROJECT STATE
-_Last updated: 2026-06-11 by /close (#137 **complete** — ReAct tool-error-loop breaker, all four languages, cross-language verifier PASS, fixture-backed). **Phase shift:** the Composable Execution refactor (#117–#131) has landed its full critical path and the `12-cordyceps` capstone is integrated (PR #136 merged). Running that composition live on small local models (gemma) surfaced a **harness-hardening cluster #137–#143** — all "verified in Rust"/"observed live" robustness gaps — which is now the active track. #137 is the first of that cluster done. ⚠️ **Local `main` is ahead of `origin/main` by 13 commits** (the cordyceps polish + the #137 series) — unpushed; the standing push gate requires maintainer OK (Deviation #10)._
+_Last updated: 2026-06-12 by /close (#143 **complete** — `add_task` returns the assigned task id, all four languages, on `main`; formally closed this loop. Implemented in a prior session, never closed — reconciled now. Earlier this same day #142 — project-scoped durable storage / stable `project_id` — was completed + merged + closed; it was the **linchpin** of the harness-hardening cluster #137–#143, so **#138 is now unblocked**.) ⚠️ **Local `main` is 24 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`) — unpushed; standing push gate requires maintainer OK (Deviation #10)._
 
-_**Direction note:** Active direction is **hardening the composed cordyceps runtime for small-local-model reliability (cluster #137–#143)**. The linchpin is **#142** (project-scoped durable storage / stable `project_id`): Ralph mints a fresh `SessionId` per window, so the `task_list` is orphaned on every reset and the tree re-plans from scratch — **#138 depends on #142**, and the same task-survival failure feeds the error-grind loop that #137/#143 attack. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference + three parallel language agents + cross-language verifier)._
+_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. The cluster is now mostly done: **#137 ✅**, **#142 ✅**, **#143 ✅** (all closed). Remaining: **#138** (resume seeding — now unblocked by #142), and the independent parallel gaps **#139/#140/#141** (open, currently unlabeled — triage-labeling was scope-blocked under per-issue `/close`). The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **13 commits
-ahead of `origin/main`** (unpushed cordyceps polish + the #137 series; origin is at
-the PR #136 merge `0954db1`).
+serialized formats byte-identical across all four. Local `main` is **24 commits
+ahead of `origin/main`** (unpushed; origin at the PR #136 merge `0954db1`).
 
 **🎯 Active work: harden the composed `12-cordyceps` runtime for small local models
 — cluster #137–#143.** Running the capstone composition live on gemma exposed a set
-of robustness gaps, each verified in the Rust reference (and several observed live):
+of robustness gaps, each verified in the Rust reference (several observed live):
 
-- **#137 — ReAct tool-error-loop breaker ✅ DONE this loop (`status: complete`).**
-  The ReAct turn loop now tracks consecutive recoverable tool errors per tool name
-  (any success resets); at N (default 3) identical-arg failures it injects ONE
-  corrective message rendering the violated parameter schema; at 2N it stops and
-  resolves via the node's `BudgetExhaustedBehavior` with a typed
-  `HaltReason::ToolErrorLoop` (never `BudgetExceeded`, budget not burned); stream +
-  observability events at both thresholds. Shared fixture
-  `fixtures/model_responses/harness/tool_error_loop.jsonl`; all four languages pin the
-  byte-identical AC2 schema string (key-sorted to match Rust's `serde_json` BTreeMap
-  ordering; Go uses `SetEscapeHTML(false)`). Go also moved `ErrorLoopThreshold` to a
-  `*uint32` sentinel (nil→3, explicit-0→disabled) for default parity. Commits Rust
-  `832b1a2`/`5f47767`, TS `763d4cd`/`6c9df8a`, Py `10d02e5`/`dfa05c4`, Go
-  `d5f6ae2`/`96ab7ff`.
-- **#142 — project-scoped durable storage / stable `project_id` (linchpin, open).**
-  `task_list` persists into `RunStore` keyed by `ctx.session_id()`, but Ralph mints a
-  fresh `SessionId::generate()` per window, so each reset reads an empty list and
-  re-plans; the prior window's list is orphaned. **#138 depends on this.**
-- **#143 — `add_task` should return the assigned id (open).** The tool discards the
-  `u32` id and returns the whole list, so small models must parse/predict ids to use
-  `blockers`/`update_task`/`complete_task` — they get it wrong, feeding the error grind.
-- **#141 — compaction window hardcoded `200_000` (open).** `SessionState::new`
-  hardcodes `window_limit: 200_000`; a 128K/8K local model overruns real context long
-  before the 0.80 trigger, so compaction never fires for the models that need it.
-  `ModelProfile.context_window` exists but is never threaded in.
-- **#139 — `ReactConfig.output` schemas are decorative (open).** Presence-validated
-  by the registry but `ReactConfig::run` never reads it: the schema is never delivered
-  to the model nor enforced on the terminal.
-- **#140 — `PausedState` drops the leaf's toolset handle (open).** Both resume paths
-  resolve tools with the empty global-catalogue fallback, so a node with a per-node
-  toolset resumes against the wrong catalogue.
-- **#138 — resume must seed the stalled worker + skip re-planning (open, depends
-  #142).** `resume_inner`'s `ContinueWithBudget` arm re-enters and re-runs the PLAN
-  phase; the "skip re-plan if task_list non-empty" fix can't fire until #142 makes the
-  list survive Ralph window resets.
+- **#137 — ReAct tool-error-loop breaker ✅ DONE (`status: complete`).** Per-tool
+  consecutive-recoverable-error tracking; corrective schema injection at N (default 3);
+  stop + `BudgetExhaustedBehavior` resolution with typed `HaltReason::ToolErrorLoop` at 2N
+  (budget not burned); stream + observability at both thresholds. Shared fixture
+  `tool_error_loop.jsonl`; byte-identical AC2 schema string in all four; Go `*uint32`
+  sentinel for `ErrorLoopThreshold` default parity.
+- **#142 — project-scoped durable storage / stable `project_id` ✅ DONE THIS LOOP
+  (`status: complete`, CLOSED).** New `ProjectId` newtype derives a stable id from
+  `sandbox.workspace_root()` (canonicalize-first → `{sanitized_basename}-{8hex}`, reusing
+  the existing `WorkspaceId` algorithm; the 8-hex SHA-256 suffix resolves the `/a/b` vs
+  `/a_b` slug collision). Threaded through `ToolContext` → tool registry →
+  `HarnessConfig`/builder. The durable artifacts (`task_list`, plan, **Ralph checkpoint** —
+  moved onto the store) are keyed by `project_id` **only** (not project_id+session) via
+  namespace-reuse on the existing session-id axis (the `RunStore` trait was not widened);
+  ephemeral session state (conversation, `active_skills`) stays session-keyed so it still
+  resets per Ralph window. Active-run lifecycle (new / resume / **complete** via an explicit
+  caller API + caller-supplied run tag). The `12-cordyceps` example now wires
+  `FileSystemStorageProvider` via `CompositeStorageProvider` under central
+  `~/.spore/projects/<project_id>/`. Two shared fixtures (`project_id_derivation.json`,
+  `project_durable_survival.json`) replay byte-identically in all four; verifier
+  independently recomputed all 7 pinned hashes. Commits Rust `6bcabb4`, TS `a037861`,
+  Go `631290f`, Py `5b7804f`. **This makes the task_list survive Ralph window resets AND
+  process restarts — the soil the error-grind grew in — and unblocks #138.**
+- **#143 — `add_task` returns the assigned id ✅ DONE (`status: complete`, CLOSED this loop).**
+  Implemented across all four languages in the prior session (Rust `a1d6053`, Py `b01f2d7`, Go
+  `4c4b586`, TS `e508d23`, docs `5e206e1`) and on `main`; formally closed during this reconcile.
+  Cuts the malformed-call grind: small models no longer parse/predict ids for
+  `blockers`/`update_task`/`complete_task`.
+- **#138 — resume must seed the stalled worker + skip re-planning (open, NOW UNBLOCKED).**
+  `resume_inner`'s `ContinueWithBudget` arm re-enters and re-runs PLAN; the "skip re-plan if
+  task_list non-empty" fix could not fire until #142 made the list survive window resets —
+  **#142 is now landed, so #138 is workable.**
+- **#141 — compaction window hardcoded `200_000` (open).** `SessionState::new` hardcodes
+  `window_limit: 200_000`; `ModelProfile.context_window` exists but is never threaded in, so
+  compaction never fires for the 128K/8K local models that need it.
+- **#139 — `ReactConfig.output` schemas are decorative (open).** Presence-validated by the
+  registry but `ReactConfig::run` never reads it: the schema is never delivered to the model
+  nor enforced on the terminal.
+- **#140 — `PausedState` drops the leaf's toolset handle (open).** Both resume paths resolve
+  tools with the empty global-catalogue fallback, so a node with a per-node toolset resumes
+  against the wrong catalogue.
 
 **Landed: Composable Execution refactor #117–#131 (all `status: complete` except the
 still-open #131 capstone).** Delivered across all four languages, byte-identical where
@@ -86,7 +92,8 @@ runtime; the #114 consult ladder escalates a stuck worker to a sibling then a hu
 heterogeneous models (local gemma + cloud advisor); within-run memory; REPL approval →
 `gh issue create`. #131 re-expresses it as `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]`.
 Core integration merged via **PR #136**; #131 is **functionally landed but still formally
-open** (run `/close 131` after confirming the success criteria).
+open** (run `/close 131` after confirming the success criteria). As of #142 the example
+persists durably under `~/.spore/projects/<project_id>/`.
 
 **Skill loading is architect-side (the #101 design constraint):** the live loop builds
 each turn's prompt via `StandardCompactionAdapter::assemble` (pass-through of
@@ -96,12 +103,12 @@ migration (root cause of Deviation #8). So skills/chunks/memory reach the model 
 tool-result messages. #101 works around this with a `SkillCatalog` + `load_skill` tool +
 a custom context manager; **#115** tracks baking this into the library.
 
-**Harness core (done before the examples push):** all 5 loop strategies run end-to-end
-in all four languages (ReAct/PlanExecute/SelfVerifying/Ralph/HillClimbing — none stubbed,
-all via genuine recursive `RunStrategy` dispatch as of #124); mid-loop consult primitive
-(#114, with the #116 HITL child-consult-resume gap); tool/prompt architecture (#79–82);
-pluggable scope-aware persistence (#73/#75/#76/#78/#82); runnable (#57), debuggable
-(#64/#65), evaluation loop (#26/#68).
+**Harness core:** all 5 loop strategies run end-to-end in all four languages
+(ReAct/PlanExecute/SelfVerifying/Ralph/HillClimbing — none stubbed, all via genuine
+recursive `RunStrategy` dispatch as of #124); mid-loop consult primitive (#114, with the
+#116 HITL child-consult-resume gap); tool/prompt architecture (#79–82); pluggable
+scope-aware persistence (#73/#75/#76/#78/#82) — now with a stable `project_id` durable key
+axis (#142); runnable (#57), debuggable (#64/#65), evaluation loop (#26/#68).
 
 **Examples suite — 12 of 13 landed, all four languages each** under
 `examples/{rust,typescript,python,go}/`: `01-hello-agent` … `11-multi-agent`,
@@ -114,22 +121,23 @@ pluggable scope-aware persistence (#73/#75/#76/#78/#82); runnable (#57), debugga
 
 ## Active Direction
 **Harden the composed `12-cordyceps` runtime so `Ralph[PlanExecute[ReAct,
-SelfVerifying[ReAct]]]` runs reliably on small local models — cluster #137–#143.** These
-are the live-run robustness follow-ups the #131 capstone surfaced, each verified in the
-Rust reference. Drive them with `/implement` (Rust reference → three parallel language
-agents → cross-language verifier), byte-identical where serialized.
+SelfVerifying[ReAct]]]` runs reliably on small local models — cluster #137–#143.** With the
+**linchpin #142 landed**, the task-survival failure that orphaned the `task_list` on every
+Ralph window reset is fixed, and #138 is unblocked. The cluster is now mostly done
+(#137 ✅, #142 ✅, #143 ✅ impl). Drive the remainder with `/implement` (Rust reference →
+three parallel language agents → cross-language verifier), byte-identical where serialized.
 
-The **linchpin is #142** (project-scoped durable storage / stable `project_id`): the
-fresh-`SessionId`-per-Ralph-window bug orphans the `task_list` and forces re-planning, which
-is also the soil the error-grind (#137 done, #143) grows in. **#138 is blocked on #142.**
-The other gaps are independent and parallel-grabbable: **#143** (return `add_task` id — cheap,
-directly cuts error-grind), **#141** (model-configurable compaction window), **#139** (deliver +
-enforce `ReactConfig.output`), **#140** (carry the toolset handle through resume).
+**Work next: #138** (resume seeding) — make `ContinueWithBudget`/consult resume seed the
+stalled worker and skip re-running PLAN when the now-surviving task_list is non-empty. Then
+the independent, parallel-grabbable gaps: **#141** (thread `ModelProfile.context_window` into
+`SessionState.window_limit`), **#139** (deliver + enforce `ReactConfig.output`), **#140**
+(carry the pausing leaf's toolset handle through resume).
 
-**Also outstanding:** formally `/close 131` (confirm the capstone success criteria), and
-push the 13-commit local backlog (maintainer OK required — Deviation #10). Refactor finishers
-**#121** (`SubagentTool` strategy param), **#122** (`max_steps()`), **#127** (custom-strategy
-tracer), **#128** (per-node observability span attrs) remain open, off the critical path.
+**Also outstanding (housekeeping):** run **`/close 131`** (confirm capstone success criteria +
+reconcile — still formally open); push the 24-commit local `main` backlog (maintainer OK
+required — Deviation #10). Refactor finishers **#121**
+(`SubagentTool` strategy param), **#122** (`max_steps()`), **#127** (custom-strategy tracer),
+**#128** (per-node observability span attrs) remain open, off the critical path.
 
 **Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
 gaps #115 (skill loading) and #116 (HITL child-consult resume — overlaps #130's resume seam,
@@ -144,11 +152,14 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    JSONL path stays network-free.
 2. **`task_list` / `todo_write` default persistence is no-op, not a file** (`scope: debt`,
    minor) — #75 retired the sandbox path; standalone tools persist via `RunStore`, which is
-   `no_op()` by default. Durable standalone use requires wiring a real `StorageProvider`. **#142
-   is the issue that makes this real for the cordyceps Ralph loop.**
+   `no_op()` by default. **#142 (landed) makes this real for the cordyceps Ralph loop**: the
+   example now wires `FileSystemStorageProvider` via `CompositeStorageProvider` under
+   `~/.spore/projects/<project_id>/`. The library default is still no-op; durable standalone
+   use still requires wiring a real `StorageProvider`.
 3. **v1 memory keying limitation (#78 Q7), filed as #89** (`scope: deferred`) — `MemoryStore`
    is `SessionId`-keyed; durable cross-session addressing is the v2 feature. No SQL backend yet
-   (#77).
+   (#77). (Note: #142 added a separate `project_id` durable key axis for the run store, not for
+   memory — memory keying is unchanged.)
 4. **Go-specific divergences** (`scope: debt`, minor, documented on the issues) — local `Mode`
    newtype; 3-state `TerminalOutcome`; type-aliased `StandardTool`; explicit `abort` `reason`;
    self-contained `promptassembly` builder; opaque `ToolContext.MemoryStore`; exported
@@ -175,10 +186,11 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    escalation choices are implemented host-side. **Overlaps #140 (toolset handle on resume) and the
    #138 resume-seeding work.**
 10. **Local `main` push hygiene (standing reminder).** ⚠️ **Currently drifted: local `main` is
-    13 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`; unpushed = the
-    cordyceps polish `f0d1d14`/`8a05076`/`be79cd8`/`faa7aae`/`b0065bf` + the #137 series
-    `832b1a2`→`5f47767`). **Ask before pushing** — an agent-initiated push was denied in a prior
-    session; push the backlog with maintainer OK to clear the drift.
+    24 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`). Unpushed = the
+    cordyceps polish + the #137 series + the 2026-06-11 reconcile `dd984b0` + the **#143 series**
+    (`a1d6053`→`5e206e1`) + the **#142 series** (`6bcabb4`→`5b7804f`) + the gitignore hygiene
+    `41a9caf`. **Ask before pushing** — an agent-initiated push was denied in a prior session;
+    push the backlog with maintainer OK to clear the drift.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -214,26 +226,37 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
     `NoopContextManager` doesn't append the resumed `FinalResponse`); (b) Go uses `jsonEqual` for
     the `cost_usd` float fixtures (as #16) and an idiomatic `ResumedBudgetContext` constructor name.
     No wire/behavior impact.
+19. **#142 benign per-language divergences** (`scope: debt`, benign, all documented + verifier-
+    confirmed) — (a) TS `HarnessConfig.projectId` is **optional** (default resolved in the
+    `StandardHarness` ctor) vs Rust's required field, avoiding churn across ~29 config literals;
+    (b) Python `Path.resolve()` does **not** case-fold on macOS (unlike Rust `fs::canonicalize`), so
+    the macOS-gated test asserts stdlib behavior (distinct-but-deterministic ids resolved by the hash
+    suffix); `ProjectId`/`WorkspaceId` are `NewType` aliases ⇒ derivation is module functions, not
+    methods; (c) Go `ProjectID` lives in the `storage` package and is projected onto the `SessionID`
+    axis at the package boundary (storage→sporecore import cycle), `NewStandardHarness` does **not**
+    auto-derive the namespace (the builder `.ProjectID(...)`/example does; empty namespace falls back
+    to session id), and the Ralph progress/feature-list key literals are defined in both packages and
+    pinned equal by `TestRalphKeyLiteralsAgreeAcrossPackages`. All wire/behavior-identical.
 
 _(Former Deviations — HillClimbing/SelfVerifying/Ralph-git-log/MemoryTool/storage-scope/sandbox-
 path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — all resolved in prior
 loops.)_
 
 ## Next Actions
-1. **#142 — project-scoped durable storage / stable `project_id` (linchpin, work this
-   next).** Give the cordyceps Ralph loop a stable identity so the `task_list` survives window
-   resets and process restarts instead of being orphaned under a fresh `SessionId` each window.
-   Unblocks #138 and removes the re-planning waste that feeds the error grind. `/implement`.
-2. **#143 + #141 + #139 + #140 — the parallel hardening gaps (grabbable now, no cross-deps).**
-   #143 (return the `add_task` id — cheap, directly cuts the malformed-call grind #137 broke),
+1. **#138 — resume seeding (now unblocked by #142, work this next).** Make
+   `ContinueWithBudget`/consult resume seed the stalled worker and **skip re-running PLAN** when
+   the (now-surviving) task_list is non-empty. The #142 durable key axis makes the list visible
+   across Ralph windows, so the AC can finally fire. `/implement`.
+2. **#141 + #139 + #140 — the parallel hardening gaps (grabbable now, no cross-deps).**
    #141 (thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction fires
    for small models), #139 (deliver + enforce `ReactConfig.output` schemas), #140 (carry the
    pausing leaf's toolset handle through `PausedState`/resume). Each via `/implement`.
-3. **#138 — resume seeding (after #142).** Make `ContinueWithBudget`/consult resume seed the
-   stalled worker and skip re-running PLAN when the (now-surviving) task_list is non-empty.
-4. **Close out #131 and push the backlog.** Run `/close 131` to confirm the capstone success
-   criteria and reconcile it; push the 13-commit local `main` backlog with maintainer OK
-   (Deviation #10).
+3. **Housekeeping (cheap, do soon).** Run **`/close 131`** (confirm the capstone success criteria
+   + reconcile — still formally open). Apply `status: queued` to the now-unlabeled cluster issues
+   #138/#139/#140/#141 (triage-labeling was scope-blocked under per-issue `/close`). Reconciliation
+   only; no code.
+4. **Push the 24-commit local `main` backlog** (maintainer OK required — Deviation #10) to clear
+   the `origin/main` drift.
 5. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
    docs — on an explicit maintainer call.
