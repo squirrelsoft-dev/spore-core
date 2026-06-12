@@ -2776,6 +2776,21 @@ type HarnessConfig struct {
 	// sporecore package importing the storage package (which would be a cycle).
 	RunStore RunStore // optional
 
+	// ProjectNamespace is the STABLE durable namespace (#142) the DURABLE
+	// RunStore call sites — the task_list / plan checkpoint (persistTaskList,
+	// LoadTaskList, captureAndPersistPlan, reconcileDeepResume), the threaded-in
+	// catalogue tools' task_list, and the Ralph progress / feature-list
+	// checkpoint — key by, instead of the per-window SessionID. It is a
+	// storage.ProjectID.Namespace() value carried as a SessionID (the root
+	// sporecore package cannot import storage; the project id is projected onto
+	// the existing SessionID axis — namespace-reuse, NOT interface widening).
+	// Derived from the sandbox workspace root (decision 5), it stays constant
+	// across Ralph window resets (NewSessionID() per window) and process restarts,
+	// so a window reset re-reads the prior window's durable artifacts. Empty (the
+	// default) falls back to the per-window SessionID, preserving today's
+	// single-process behaviour byte-for-byte.
+	ProjectNamespace SessionID // optional
+
 	// #124: the legacy MetricEvaluator single-collaborator field is GONE. The
 	// HillClimbing metric evaluator resolves from the Registry's SIXTH
 	// metricEvaluators map by the HillClimbing evaluator key (Q2); a default
@@ -3047,6 +3062,19 @@ func (c HarnessConfig) effectiveErrorLoopThreshold() uint32 {
 	return *c.ErrorLoopThreshold
 }
 
+// durableNamespace returns the key axis for DURABLE artifacts (#142): the pinned
+// stable ProjectNamespace when set, otherwise the per-window sessionID. The
+// sessionID param is intentionally retained (the namespace-reuse seam) so the
+// durable call sites keep a stable signature and ephemeral session-keyed state
+// elsewhere is unaffected; when no project namespace is wired the durable sites
+// behave exactly as before (keyed by the session id).
+func (c HarnessConfig) durableNamespace(sessionID SessionID) SessionID {
+	if c.ProjectNamespace != "" {
+		return c.ProjectNamespace
+	}
+	return sessionID
+}
+
 // StandardHarness is the canonical Harness implementation.
 type StandardHarness struct {
 	config HarnessConfig
@@ -3069,10 +3097,13 @@ type StandardHarness struct {
 // the file is absent it returns Continue and does not interfere with ReAct /
 // PlanExecute / SelfVerifying runs.
 func NewStandardHarness(c HarnessConfig) *StandardHarness {
-	workspaceRoot := ""
-	if c.Sandbox != nil {
-		workspaceRoot = c.Sandbox.WorkspaceRoot()
-	}
+	// #142: the STABLE project namespace (HarnessConfig.ProjectNamespace) is
+	// supplied by the storage-aware layer that can reach the derivation algorithm
+	// (the example / a builder ProjectID(...) setter derives storage.ProjectID
+	// from the sandbox workspace root and passes its .Namespace()). The root
+	// sporecore package cannot import storage (a cycle), so it does NOT derive the
+	// namespace here. When ProjectNamespace is empty the durable sites fall back
+	// to the per-window session id — today's single-process behaviour.
 	if c.Hooks == nil {
 		c.Hooks = NewStandardHookChain()
 	}
@@ -3109,8 +3140,10 @@ func NewStandardHarness(c HarnessConfig) *StandardHarness {
 	}
 	// Best-effort registration: a Stop hook can only fail registration on an
 	// event-class mismatch, which never applies to a sync Stop hook, so the
-	// error is intentionally ignored.
-	_ = c.Hooks.Register(newRalphStopHook(workspaceRoot))
+	// error is intentionally ignored. #142: the hook now reads the Ralph
+	// checkpoint from the durable project store (keyed by the project namespace),
+	// not the sandbox filesystem.
+	_ = c.Hooks.Register(newRalphStopHook(c.RunStore, c.ProjectNamespace))
 	return &StandardHarness{config: c}
 }
 
@@ -3635,7 +3668,9 @@ func (h *StandardHarness) LoadTaskList(ctx context.Context, sessionID SessionID)
 	if h.config.RunStore == nil {
 		return TaskList{}, false
 	}
-	raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey)
+	// #142: the task_list is DURABLE — keyed by the stable project namespace, not
+	// the per-window sessionID (retained as the seam param).
+	raw, found, err := h.config.RunStore.Get(ctx, h.config.durableNamespace(sessionID), TaskListExtrasKey)
 	if err != nil || !found {
 		return TaskList{}, false
 	}
@@ -3834,7 +3869,10 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 	if toolset != "" {
 		if catalogue, ok := h.config.ToolsetCatalogues[string(toolset)]; ok && catalogue != nil {
 			catalogue.SetToolContext(
-				NewToolContext(sessionID, h.config.ToolRunStore, h.config.ToolMemoryStore),
+				// #142: pin the stable project namespace so the catalogue task_list
+				// tool keys its DURABLE blob by project_id (surviving Ralph window
+				// resets), while ephemeral session state stays on sessionID.
+				NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
 			)
 			return catalogue
 		}
@@ -3844,7 +3882,7 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 		return h.config.ToolRegistry
 	}
 	h.config.CatalogueRegistry.SetToolContext(
-		NewToolContext(sessionID, h.config.ToolRunStore, h.config.ToolMemoryStore),
+		NewToolContextWithProject(sessionID, h.config.ProjectNamespace, h.config.ToolRunStore, h.config.ToolMemoryStore),
 	)
 	return h.config.CatalogueRegistry
 }
@@ -4022,9 +4060,11 @@ func (h *StandardHarness) persistTaskList(ctx context.Context, sessionID Session
 	if err != nil {
 		return
 	}
-	// Durable write through the RunStore seam (optional).
+	// Durable write through the RunStore seam (optional). #142: keyed by the
+	// stable project namespace (not the per-window sessionID, retained as the seam
+	// param) so a Ralph window reset re-reads it.
 	if h.config.RunStore != nil {
-		_ = h.config.RunStore.Put(ctx, sessionID, TaskListExtrasKey, json.RawMessage(value))
+		_ = h.config.RunStore.Put(ctx, h.config.durableNamespace(sessionID), TaskListExtrasKey, json.RawMessage(value))
 	}
 }
 
@@ -4095,7 +4135,9 @@ func (h *StandardHarness) captureAndPersistPlan(ctx context.Context, sessionID S
 		}
 	}
 	if h.config.RunStore != nil {
-		_ = h.config.RunStore.Put(ctx, sessionID, PlanExecuteExtrasKey, json.RawMessage(value))
+		// #142: the plan artifact is DURABLE — keyed by the stable project
+		// namespace, not the per-window sessionID (retained as the seam param).
+		_ = h.config.RunStore.Put(ctx, h.config.durableNamespace(sessionID), PlanExecuteExtrasKey, json.RawMessage(value))
 	}
 
 	return &planPhaseOutcome{artifact: artifact, usage: usage, turns: turns}, nil
@@ -4109,7 +4151,9 @@ func (h *StandardHarness) reconcileDeepResume(ctx context.Context, sessionID Ses
 	if h.config.RunStore == nil {
 		return
 	}
-	raw, found, err := h.config.RunStore.Get(ctx, sessionID, TaskListExtrasKey)
+	// #142: the durable checkpoint is keyed by the stable project namespace, not
+	// the per-window sessionID (retained as the seam param).
+	raw, found, err := h.config.RunStore.Get(ctx, h.config.durableNamespace(sessionID), TaskListExtrasKey)
 	if err != nil || !found {
 		return
 	}

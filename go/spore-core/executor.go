@@ -138,14 +138,16 @@ type StrategyExecutor interface {
 	EvaluatePhase(ctx context.Context, task *Task, evalAgent Agent, carried *BudgetSnapshot, totalUsage *AggregateUsage) RunResult
 
 	// RalphSeedSession builds a FRESH per-window session re-seeded from the
-	// .spore/ filesystem checkpoint (and the optional VCS history block) plus the
-	// instruction (#124, Ralph R2/R3). Returns the seeded SessionState.
+	// DURABLE project-store checkpoint (#142 — keyed by the stable project
+	// namespace, not the sandbox filesystem) and the optional VCS history block
+	// plus the instruction (#124, Ralph R2/R3). Returns the seeded SessionState.
 	RalphSeedSession(ctx context.Context, instruction string) SessionState
 
-	// RalphCompletionStatus is the Ralph external completion check (#124): reads
-	// the .spore/ state and reports (reason, incomplete). incomplete=false means
-	// the task is complete (Success); true means reset into the next window.
-	RalphCompletionStatus() (reason string, incomplete bool)
+	// RalphCompletionStatus is the Ralph external completion check (#124; rewired
+	// onto the project store in #142): reads the DURABLE checkpoint from the
+	// project store and reports (reason, incomplete). incomplete=false means the
+	// task is complete (Success); true means reset into the next window.
+	RalphCompletionStatus(ctx context.Context) (reason string, incomplete bool)
 
 	// RalphMaxResets returns the configured Ralph outer-loop reset cap (B3).
 	RalphMaxResets() uint32

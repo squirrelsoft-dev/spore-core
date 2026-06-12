@@ -8,14 +8,20 @@
 // # Storage seam (#75)
 //
 // The tool persists via the *ToolContext's RunStore — NOT the sandbox
-// filesystem. It is read-modify-write keyed by the run's SessionID under
-// TaskListExtrasKey ("task_list"):
+// filesystem. It is read-modify-write keyed by the STABLE project namespace
+// (#142 — ToolContext.ProjectNamespace, falling back to SessionID when unset)
+// under TaskListExtrasKey ("task_list"):
 //  1. parse params (bad input → recoverable error),
-//  2. toolCtx.Get(ctx, "task_list") (absent → DefaultTaskList),
+//  2. toolCtx.GetDurable(ctx, "task_list") (absent → DefaultTaskList),
 //  3. apply the action (domain errors → recoverable),
-//  4. on a mutating action, toolCtx.Put(ctx, "task_list", value),
+//  4. on a mutating action, toolCtx.PutDurable(ctx, "task_list", value),
 //  5. return the serialized current list as success content (on add_task,
 //     prefixed with the assigned id as a leading `added` key — see #143 below).
+//
+// Keying by the project namespace (not the per-window SessionID) is the #142 fix:
+// the Ralph wrapper mints a fresh SessionID each context window, so a
+// session-keyed list was orphaned at every window boundary; a project-keyed list
+// survives window resets AND process restarts (with a durable RunStore backend).
 //
 // # add_task surfaces the assigned id (#143)
 //
@@ -38,10 +44,10 @@
 // what is persisted; the PlanExecute executor depends on the persisted blob shape.
 //
 // Shared key: this standalone tool and the harness-side PlanExecute execute loop
-// (#76) persist under the SAME RunStore key ("task_list"), keyed by SessionID. A
-// standalone tool call and a PlanExecute run on the same session intentionally
-// share one blob. The JSON shape is the canonical TaskList serialization
-// ({"tasks":[...],"next_id":N}), unchanged.
+// (#76) persist under the SAME RunStore key ("task_list"), keyed by the project
+// namespace (#142). A standalone tool call and a PlanExecute run on the same
+// project intentionally share one blob. The JSON shape is the canonical TaskList
+// serialization ({"tasks":[...],"next_id":N}), unchanged.
 //
 // Behavior change vs the retired sandbox path: previously the tool persisted to
 // .spore/task_list.json via the sandbox. That path is GONE. With the library's
@@ -124,11 +130,14 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ s
 		return e.ToToolOutput()
 	}
 
-	// 2. Load current list from the run store, keyed by SessionID under the
-	//    shared TaskListExtrasKey (absent → default). A storage error or a
-	//    malformed blob is recoverable.
+	// 2. Load current list from the run store, keyed by the STABLE project
+	//    namespace (#142) under the shared TaskListExtrasKey (absent → default).
+	//    Keying by project_id (not the per-window SessionID the Ralph wrapper
+	//    regenerates) is what lets a window reset re-read the prior window's list
+	//    instead of re-planning under a session it has never seen. A storage error
+	//    or a malformed blob is recoverable.
 	list := sporecore.DefaultTaskList()
-	value, found, err := toolCtx.Get(ctx, sporecore.TaskListExtrasKey)
+	value, found, err := toolCtx.GetDurable(ctx, sporecore.TaskListExtrasKey)
 	if err != nil {
 		return ExecutionFailed(fmt.Sprintf("could not load task list: %s", err), true).ToToolOutput()
 	}
@@ -170,13 +179,14 @@ func (t *TaskListTool) Execute(ctx context.Context, call sporecore.ToolCall, _ s
 	}
 
 	// 4. Persist the (possibly mutated) list through the run store under the
-	//    shared TaskListExtrasKey. list_tasks skips the write.
+	//    shared TaskListExtrasKey, keyed by the STABLE project namespace (#142).
+	//    list_tasks skips the write.
 	if mutated {
 		encoded, err := json.Marshal(list)
 		if err != nil {
 			return ExecutionFailed(fmt.Sprintf("could not serialize task list: %s", err), true).ToToolOutput()
 		}
-		if err := toolCtx.Put(ctx, sporecore.TaskListExtrasKey, encoded); err != nil {
+		if err := toolCtx.PutDurable(ctx, sporecore.TaskListExtrasKey, encoded); err != nil {
 			return ExecutionFailed(fmt.Sprintf("could not persist task list: %s", err), true).ToToolOutput()
 		}
 	}

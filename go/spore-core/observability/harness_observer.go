@@ -522,6 +522,15 @@ type HarnessBuilder struct {
 	// construction path, leaving HarnessConfig.PromptToolCallFlag nil so the
 	// escalation seam is disabled and behaviour is byte-for-byte today's.
 	promptToolCallFlag *atomic.Bool
+	// projectNamespace is the STABLE durable namespace (#142) projected onto the
+	// SessionID axis (a storage.ProjectID.Namespace() value). Set via
+	// ProjectID(...). Empty (the default) leaves HarnessConfig.ProjectNamespace
+	// empty, so durable artifacts fall back to the per-window session id —
+	// today's single-process behaviour. When set, the builder ALSO wires it as
+	// HarnessConfig.RunStore's durable namespace and, if Storage's run store
+	// satisfies the harness-side RunStore interface, threads it through so the
+	// task_list / plan / Ralph checkpoint persist under the project id.
+	projectNamespace sporecore.SessionID
 }
 
 // NewHarnessBuilder starts a builder from the five required components.
@@ -749,6 +758,25 @@ func (b *HarnessBuilder) Storage(runStore sporecore.ToolRunStore, memStore spore
 	return b
 }
 
+// ProjectID pins the STABLE project namespace (#142) the DURABLE artifacts (the
+// task_list, the plan checkpoint, the Ralph progress / feature-list checkpoint,
+// the active-run slot) are keyed by — instead of the per-window SessionID. Pass
+// a storage.ProjectID's Namespace() (the project id projected onto the SessionID
+// axis); the builder cannot import storage (a cycle), so the caller derives the
+// ProjectID from the sandbox workspace root (decision 5) and projects it.
+//
+// Wiring it pins HarnessConfig.ProjectNamespace, and — when the run store passed
+// to Storage(...) also satisfies the harness-side RunStore (Get+Put) — threads
+// that SAME store into HarnessConfig.RunStore so the harness-side durable sites
+// (PlanExecute task_list/plan persistence, deep-resume reconcile) and the Ralph
+// checkpoint readers/writers persist under the project namespace too. Empty (the
+// default) preserves today's session-keyed, single-process behaviour. Returns the
+// receiver for fluent chaining.
+func (b *HarnessBuilder) ProjectID(namespace sporecore.SessionID) *HarnessBuilder {
+	b.projectNamespace = namespace
+	return b
+}
+
 // SessionStore wires the conversation-history persistence store for opt-in
 // session-state threading (issue #102). Pass a *storage.StorageProvider's
 // Session() store — it satisfies the consumer-side sporecore.SessionStore
@@ -849,6 +877,18 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		SessionStore:          b.sessionStore,
 		AutoPersistSessions:   b.autoPersistSessions,
 		PromptToolCallFlag:    b.promptToolCallFlag,
+		ProjectNamespace:      b.projectNamespace,
+	}
+	// #142: when a project namespace is pinned, also wire the harness-side durable
+	// RunStore (the PlanExecute task_list/plan checkpoint + the Ralph checkpoint)
+	// from the SAME store wired via Storage(...). The ToolRunStore (Get+Put)
+	// satisfies the harness-side RunStore (also Get+Put) structurally, so the
+	// task_list the standalone tool writes and the one the harness loop reads
+	// share one backend under the project namespace.
+	if b.projectNamespace != "" {
+		if rs, ok := runStore.(sporecore.RunStore); ok {
+			cfg.RunStore = rs
+		}
 	}
 	if b.provider != nil {
 		cfg.Observability = NewHarnessObserverWithContent(b.provider, b.pricing, b.content)

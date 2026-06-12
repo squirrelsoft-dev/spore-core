@@ -134,12 +134,12 @@ func TestGitVcsLogCommandFailed(t *testing.T) {
 // ============================================================================
 
 func TestRalphInjectsVcsLogIntoReload(t *testing.T) {
-	dir := t.TempDir()
-	a := newRalphAgent(dir,
+	store := newFakeRunStore()
+	a := newRalphAgent(store,
 		ralphWindow{complete: false, remaining: []string{"task A"}},
 		ralphWindow{complete: true},
 	)
-	cfg := ralphCfg(a, dir)
+	cfg := ralphCfg(a, store)
 	cfg.MaxResets = 3
 	cfg.VcsProvider = FixtureVcsProvider{LogOutput: "cafe123 implement login"}
 	h := NewStandardHarness(cfg)
@@ -162,9 +162,9 @@ func TestRalphInjectsVcsLogIntoReload(t *testing.T) {
 // ============================================================================
 
 func TestRalphNilVcsProviderOmitsGitSection(t *testing.T) {
-	dir := t.TempDir()
-	a := newRalphAgent(dir, ralphWindow{complete: true})
-	cfg := ralphCfg(a, dir)
+	store := newFakeRunStore()
+	a := newRalphAgent(store, ralphWindow{complete: true})
+	cfg := ralphCfg(a, store)
 	cfg.MaxResets = 3
 	if cfg.VcsProvider != nil {
 		t.Fatal("VcsProvider should default to nil")

@@ -118,9 +118,9 @@ func TestSelfVerifyingRunsNonReactInnerWorker(t *testing.T) {
 // SelfVerifying nonetheless runs its build->evaluate->verify cycle, so the
 // verifier fires per window.
 type ralphIncompleteAgent struct {
-	id   AgentID
-	root string
-	mu   sync.Mutex
+	id    AgentID
+	store *fakeRunStore
+	mu    sync.Mutex
 }
 
 func (a *ralphIncompleteAgent) Turn(_ context.Context, c Context) TurnResult {
@@ -132,7 +132,7 @@ func (a *ralphIncompleteAgent) Turn(_ context.Context, c Context) TurnResult {
 		b.WriteString("\n")
 	}
 	if !strings.Contains(b.String(), RoleEvaluatorChunk) {
-		writeRalphProgress(a.root, ralphWindow{complete: false, remaining: []string{"more"}})
+		writeRalphProgress(a.store, ralphWindow{complete: false, remaining: []string{"more"}})
 	}
 	return NewFinalResponse("done", TokenUsage{InputTokens: 1, OutputTokens: 1})
 }
@@ -142,21 +142,22 @@ func (a *ralphIncompleteAgent) ID() AgentID { return a.id }
 var _ Agent = (*ralphIncompleteAgent)(nil)
 
 func TestRalphRunsNonReactInnerPerWindow(t *testing.T) {
-	dir := t.TempDir()
 	// The inner is a genuine SelfVerifying (NOT a bare ReAct). Each Ralph window
 	// must run the WHOLE SelfVerifying loop — so its verifier fires per window. The
-	// agent never writes a complete progress file, so each window exhausts and the
-	// OUTER loop resets MaxResets (2) times => the inner verifier fires >= 1 per
-	// window => >= 2 total. A monolithic Ralph that ignored `inner` (hardcoded
-	// ReAct worker) would record ZERO verifier invocations.
+	// agent never writes a complete progress checkpoint, so each window exhausts
+	// and the OUTER loop resets MaxResets (2) times => the inner verifier fires
+	// >= 1 per window => >= 2 total. A monolithic Ralph that ignored `inner`
+	// (hardcoded ReAct worker) would record ZERO verifier invocations.
 	v := newSVVerifier(3, "pass") // PASS each iteration (1 verify per SV run)
-	agent := &ralphIncompleteAgent{id: AgentID("ralph-sv"), root: dir}
+	store := newFakeRunStore()
+	agent := &ralphIncompleteAgent{id: AgentID("ralph-sv"), store: store}
 
 	worker := withOutputSchema(^uint32(0))
 	inner := SelfVerifyingStrategy(SelfVerifyingConfig{Inner: &worker, Evaluator: SchemaRef("eval")})
 
 	cfg := standardCfg(agent)
-	cfg.Sandbox = rootedSandbox{root: dir}
+	cfg.RunStore = store
+	cfg.ProjectNamespace = ralphProjectNS
 	cfg.MaxResets = 2
 	cfg = cfg.WithRegistryVerifier("eval", v)
 	h := NewStandardHarness(cfg)

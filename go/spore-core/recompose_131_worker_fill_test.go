@@ -35,11 +35,12 @@ import (
 // ----------------------------------------------------------------------------
 
 // keyedCountingAgent records how many turns it ran and writes a COMPLETE Ralph
-// progress file on its build turns (the turns that do NOT carry the evaluator
-// role chunk), so a Ralph window that dispatches to it completes in one window.
+// progress checkpoint to the shared store on its build turns (the turns that do
+// NOT carry the evaluator role chunk), so a Ralph window that dispatches to it
+// completes in one window.
 type keyedCountingAgent struct {
 	id    AgentID
-	root  string
+	store *fakeRunStore
 	mu    sync.Mutex
 	calls int
 }
@@ -56,7 +57,7 @@ func (a *keyedCountingAgent) Turn(_ context.Context, c Context) TurnResult {
 	// On a build turn (not the fresh-evaluator turn) declare the work COMPLETE so
 	// the Ralph window terminates successfully in a single window.
 	if !strings.Contains(b.String(), RoleEvaluatorChunk) {
-		writeRalphProgress(a.root, ralphWindow{complete: true})
+		writeRalphProgress(a.store, ralphWindow{complete: true})
 	}
 	return NewFinalResponse("done", TokenUsage{InputTokens: 1, OutputTokens: 1})
 }
@@ -72,15 +73,15 @@ func (a *keyedCountingAgent) callCount() int {
 var _ Agent = (*keyedCountingAgent)(nil)
 
 func TestRalphAgentDoesNotShadowDeclaredWorkerLeaf(t *testing.T) {
-	dir := t.TempDir()
+	store := newFakeRunStore()
 
 	planner := newPlanTurnCounter("planner", `{"tasks":["t0"],"rationale":"r"}`, "plan-noop")
-	executor := &keyedCountingAgent{id: AgentID("executor"), root: dir}
+	executor := &keyedCountingAgent{id: AgentID("executor"), store: store}
 	// ralphAgentLeaf is registered under "ralph-agent" — the per-window Ralph
 	// agent. If Fix A regresses (override semantics), THIS agent would run the
 	// execute worker turns instead of `executor`.
-	ralphAgentLeaf := &keyedCountingAgent{id: AgentID("ralph-agent"), root: dir}
-	def := &keyedCountingAgent{id: AgentID("default"), root: dir}
+	ralphAgentLeaf := &keyedCountingAgent{id: AgentID("ralph-agent"), store: store}
+	def := &keyedCountingAgent{id: AgentID("default"), store: store}
 
 	// Plan child routes to "planner"; execute worker leaf explicitly routes to
 	// "executor". Both structured slots carry an output schema (A.5).
@@ -95,7 +96,8 @@ func TestRalphAgentDoesNotShadowDeclaredWorkerLeaf(t *testing.T) {
 
 	v := newSVVerifier(3, "pass")
 	cfg := standardCfg(def)
-	cfg.Sandbox = rootedSandbox{root: dir}
+	cfg.RunStore = store
+	cfg.ProjectNamespace = ralphProjectNS
 	cfg.MaxResets = 2
 	cfg = cfg.
 		WithRegistryAgent("planner", planner).
@@ -115,7 +117,7 @@ func TestRalphAgentDoesNotShadowDeclaredWorkerLeaf(t *testing.T) {
 
 	// The declared "executor" leaf must have run the worker turns.
 	if executor.callCount() == 0 {
-		t.Fatalf("the declared worker leaf agent \"executor\" ran 0 turns — Ralph's "+
+		t.Fatalf("the declared worker leaf agent \"executor\" ran 0 turns — Ralph's " +
 			"per-window agent SHADOWED the explicit leaf (old override behavior)")
 	}
 	// Ralph's per-window agent must NOT have been dispatched as the worker.

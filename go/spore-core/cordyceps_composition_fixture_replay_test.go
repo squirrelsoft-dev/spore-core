@@ -164,18 +164,30 @@ func compHarness(t *testing.T, fixture string, consultReg *ScriptedToolRegistry)
 		TerminationPolicy: AlwaysContinuePolicy{},
 		Registry:          reg,
 		RunStore:          store,
-		EscalationMode:    AutonomousEscalation(),
+		// #142: durable artifacts (task_list) are keyed by the project namespace;
+		// pin a known one so compSeed / runStoreTaskList key the SAME namespace the
+		// harness reads/writes under (compProjectNS), NOT the per-run session.
+		ProjectNamespace: compProjectNS,
+		EscalationMode:   AutonomousEscalation(),
 	}
 	return NewStandardHarness(cfg), store
 }
 
-func compSeed(t *testing.T, store *fakeRunStore, sessionID SessionID, list TaskList) {
+// compProjectNS is the fixed durable project namespace the cordyceps composition
+// tests key the task_list by (#142). A storage.ProjectID.Namespace() value (here
+// a plain stable string, since the test only needs a key both sides agree on) —
+// compSeed / runStoreTaskList key this, NOT the ephemeral run session, so the
+// seeded list is what the harness reads.
+const compProjectNS = SessionID("cordyceps-project")
+
+func compSeed(t *testing.T, store *fakeRunStore, _ SessionID, list TaskList) {
 	t.Helper()
 	value, err := json.Marshal(list)
 	if err != nil {
 		t.Fatalf("marshal seed list: %v", err)
 	}
-	if err := store.Put(context.Background(), sessionID, TaskListExtrasKey, value); err != nil {
+	// #142: seed under the project namespace (not the ephemeral session id).
+	if err := store.Put(context.Background(), compProjectNS, TaskListExtrasKey, value); err != nil {
 		t.Fatalf("seed put: %v", err)
 	}
 }
@@ -321,7 +333,7 @@ func TestCordycepsPlanBuildsDAGExecuteWalksReadyset(t *testing.T) {
 	if r.Kind != RunSuccess {
 		t.Fatalf("expected Success, got %+v", r)
 	}
-	after := runStoreTaskList(t, store, session)
+	after := runStoreTaskList(t, store, compProjectNS)
 	for _, x := range after.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("all ready-set tasks must complete; task %d = %q", x.ID, x.Status)
@@ -337,10 +349,10 @@ func TestCordycepsRunawayBounded(t *testing.T) {
 	h, store := compHarness(t, "cordyceps_runaway_bounded.jsonl", nil)
 	session := SessionID("cordyceps-runaway")
 	l := DefaultTaskList()
-	mustAddBlk(t, &l, "root module", nil)               // 1 (completes)
-	mustAddBlk(t, &l, "runaway module", []uint32{1})    // 2 -> 1 (PerLoop{12} budget-Fail)
+	mustAddBlk(t, &l, "root module", nil)                  // 1 (completes)
+	mustAddBlk(t, &l, "runaway module", []uint32{1})       // 2 -> 1 (PerLoop{12} budget-Fail)
 	mustAddBlk(t, &l, "dependent of runaway", []uint32{2}) // 3 -> 2 (cascade-blocked)
-	mustAddBlk(t, &l, "independent module", nil)        // 4 (still completes)
+	mustAddBlk(t, &l, "independent module", nil)           // 4 (still completes)
 	compSeed(t, store, session, l)
 
 	r := h.Run(context.Background(), NewHarnessRunOptions(compPETask(t, "cordyceps-runaway")))
@@ -443,7 +455,7 @@ func TestCordycepsWorkerConsultSurfacesAndHostResumes(t *testing.T) {
 	}
 
 	// The worker's task self-verified and completed after the consult.
-	after := runStoreTaskList(t, store, session)
+	after := runStoreTaskList(t, store, compProjectNS)
 	for _, x := range after.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("the consulted task must complete; task %d = %q", x.ID, x.Status)

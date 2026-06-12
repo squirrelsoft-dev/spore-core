@@ -27,8 +27,6 @@ package sporecore
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -36,11 +34,27 @@ import (
 // Ralph loop strategy support types (issue #58)
 // ============================================================================
 
-// Canonical .spore/ paths the Ralph strategy reads (issue #58, B2). These agree
-// with termination.FeatureListCheck's default path.
+// Canonical labels the Ralph reload context block uses (issue #58, B2). After
+// #142 the checkpoint MOVED off these filesystem paths onto the project-id
+// RunStore (see RalphProgressKey / RalphFeatureListKey), but the human-readable
+// reload labels keep the familiar .spore/ names so the re-seeded window's prompt
+// reads the same.
 const (
 	ralphProgressRelPath    = ".spore/progress.json"
 	ralphFeatureListRelPath = ".spore/feature_list.json"
+)
+
+// Durable RunStore keys for the Ralph checkpoint (issue #142, decision 3). The
+// checkpoint moved off {workspace_root}/.spore/{progress,feature_list}.json onto
+// the project-id store so it survives Ralph window resets (NewSessionID() per
+// window) and process restarts. These string literals MIRROR
+// storage.RalphProgressKey / storage.RalphFeatureListKey — the root sporecore
+// package cannot import storage (a cycle), and the namespace-reuse seam means
+// both sides key the same (project namespace, key) RunStore axis, so the literal
+// strings must agree. (A storage-package test pins this agreement.)
+const (
+	RalphProgressKey    = "ralph_progress"
+	RalphFeatureListKey = "ralph_feature_list"
 )
 
 // ralphProgress is the deserialized .spore/progress.json (issue #58, B1/B2). The
@@ -65,30 +79,37 @@ type ralphFeatureEntry struct {
 // ============================================================================
 
 // newRalphStopHook builds the Stop lifecycle hook the Ralph loop strategy
-// registers at construction (issue #58, B1). Drives multi-context-window
-// continuation off .spore/progress.json: while tasks remain incomplete it
-// returns Block (the reason describes what is left) so the harness loops into a
-// new context window; when complete it returns Continue so the loop terminates
-// with success.
+// registers at construction (issue #58, B1; rewired in #142). Drives
+// multi-context-window continuation off the DURABLE Ralph progress checkpoint
+// (the project-id RunStore under RalphProgressKey, decision 3): while tasks
+// remain incomplete it returns Block (the reason describes what is left) so the
+// harness loops into a new context window; when complete it returns Continue so
+// the loop terminates with success.
 //
-// Registration is harmless for non-Ralph strategies: when .spore/progress.json
-// is ABSENT the hook returns Continue and does not interfere with other runs. It
-// only blocks when a progress file is PRESENT and reports incomplete tasks — the
-// Ralph contract. The completion logic is the SAME ralphCompletionStatus the
-// outer loop consults: one source of truth.
-func newRalphStopHook(workspaceRoot string) *FunctionHook {
+// Registration is harmless for non-Ralph strategies: when the progress
+// checkpoint is ABSENT (or no RunStore is wired) the hook returns Continue and
+// does not interfere with other runs. It only blocks when a progress checkpoint
+// is PRESENT and reports incomplete tasks — the Ralph contract. The completion
+// logic is the SAME ralphCompletionStatus the outer loop consults: one source of
+// truth. project is the stable project namespace (#142) the checkpoint is keyed
+// by; run is the durable RunStore (nil => inert).
+func newRalphStopHook(run RunStore, project SessionID) *FunctionHook {
 	return NewFunctionHook(
 		"ralph_stop",
 		[]HookEvent{HookEventStop},
-		func(_ context.Context, hctx *HookContext) (HookDecision, error) {
+		func(ctx context.Context, hctx *HookContext) (HookDecision, error) {
 			if hctx.Event != HookEventStop {
 				return Continue(), nil
 			}
-			// Absent progress file => do not interfere with non-Ralph runs.
-			if _, err := os.Stat(filepath.Join(workspaceRoot, ralphProgressRelPath)); err != nil {
+			// No store / absent progress checkpoint => do not interfere with
+			// non-Ralph runs.
+			if run == nil {
 				return Continue(), nil
 			}
-			if reason, ok := ralphCompletionStatus(workspaceRoot); ok {
+			if _, found, err := run.Get(ctx, project, RalphProgressKey); err != nil || !found {
+				return Continue(), nil
+			}
+			if reason, ok := ralphCompletionStatus(ctx, run, project); ok {
 				return Block(reason), nil
 			}
 			return Continue(), nil
@@ -100,24 +121,29 @@ func newRalphStopHook(workspaceRoot string) *FunctionHook {
 // Ralph external completion check + filesystem reload (issue #58, B1/B4)
 // ============================================================================
 
-// ralphCompletionStatus is the Ralph external completion check (issue #58, B1).
-// Reads the deterministic .spore/ files under workspaceRoot and reports whether
-// the task is complete. Returns ("", false) when complete; (reason, true) when
-// tasks remain (reason describes what is left). This is the SAME logic the
-// registered Ralph Stop hook applies — one source of truth.
+// ralphCompletionStatus is the Ralph external completion check (issue #58, B1;
+// rewired onto the project store in #142). Reads the DURABLE progress +
+// feature-list checkpoints from run keyed by the stable project namespace and
+// reports whether the task is complete. Returns ("", false) when complete;
+// (reason, true) when tasks remain (reason describes what is left). This is the
+// SAME logic the registered Ralph Stop hook applies — one source of truth. A nil
+// run reads as "missing" (incomplete).
 //
-// Contract (both files are written by the strategy/initializer and fixture
-// cleanly — B4, no git):
-//   - .spore/progress.json: { "complete": bool, "remaining": [string] }.
+// Contract (both blobs are written by the strategy/initializer via
+// WriteRalphProgress / WriteRalphFeatureList — B4, no git):
+//   - RalphProgressKey: { "complete": bool, "remaining": [string] }.
 //     complete:true with an empty remaining => progress satisfied.
 //     Missing/unreadable/invalid => incomplete (so the agent learns to write it).
-//   - .spore/feature_list.json: a JSON array of { "name", "passes" } (the
+//   - RalphFeatureListKey: a JSON array of { "name", "passes" } (the
 //     termination.FeatureListCheck schema). Any passes:false => incomplete. A
-//     MISSING feature list is tolerated here (progress.json is the primary
-//     signal); an invalid one is not.
-func ralphCompletionStatus(workspaceRoot string) (string, bool) {
-	raw, err := os.ReadFile(filepath.Join(workspaceRoot, ralphProgressRelPath))
-	if err != nil {
+//     MISSING feature list is tolerated here (progress is the primary signal); an
+//     invalid one is not.
+func ralphCompletionStatus(ctx context.Context, run RunStore, project SessionID) (string, bool) {
+	if run == nil {
+		return ".spore/progress.json missing", true
+	}
+	raw, found, err := run.Get(ctx, project, RalphProgressKey)
+	if err != nil || !found {
 		return ".spore/progress.json missing", true
 	}
 	var progress ralphProgress
@@ -135,9 +161,9 @@ func ralphCompletionStatus(workspaceRoot string) (string, bool) {
 	}
 
 	// Progress says done — corroborate against the feature list when present.
-	featureRaw, err := os.ReadFile(filepath.Join(workspaceRoot, ralphFeatureListRelPath))
-	if err != nil {
-		// Missing feature list is tolerated; progress.json is the primary signal.
+	featureRaw, found, err := run.Get(ctx, project, RalphFeatureListKey)
+	if err != nil || !found {
+		// Missing feature list is tolerated; progress is the primary signal.
 		return "", false
 	}
 	var entries []ralphFeatureEntry
@@ -156,18 +182,22 @@ func ralphCompletionStatus(workspaceRoot string) (string, bool) {
 	return "", false
 }
 
-// ralphReloadContext builds the filesystem-reload context block injected into
-// each fresh context window (issue #58, B4). Returns the verbatim
-// .spore/progress.json and .spore/feature_list.json contents (when present) so
-// the re-seeded window knows what is already done and what remains. Returns
-// ("", false) when neither file exists (nothing to reload).
-func ralphReloadContext(workspaceRoot string) (string, bool) {
-	var parts []string
-	if raw, err := os.ReadFile(filepath.Join(workspaceRoot, ralphProgressRelPath)); err == nil {
-		parts = append(parts, "Reloaded .spore/progress.json:\n"+strings.TrimSpace(string(raw)))
+// ralphReloadContext builds the checkpoint-reload context block injected into
+// each fresh context window (issue #58, B4; rewired onto the project store in
+// #142). Returns the verbatim progress + feature-list checkpoint contents (when
+// present, under the .spore/ labels the prompt has always used) so the re-seeded
+// window knows what is already done and what remains. Returns ("", false) when
+// neither checkpoint exists (nothing to reload). A nil run reloads nothing.
+func ralphReloadContext(ctx context.Context, run RunStore, project SessionID) (string, bool) {
+	if run == nil {
+		return "", false
 	}
-	if raw, err := os.ReadFile(filepath.Join(workspaceRoot, ralphFeatureListRelPath)); err == nil {
-		parts = append(parts, "Reloaded .spore/feature_list.json:\n"+strings.TrimSpace(string(raw)))
+	var parts []string
+	if raw, found, err := run.Get(ctx, project, RalphProgressKey); err == nil && found {
+		parts = append(parts, "Reloaded "+ralphProgressRelPath+":\n"+strings.TrimSpace(string(raw)))
+	}
+	if raw, found, err := run.Get(ctx, project, RalphFeatureListKey); err == nil && found {
+		parts = append(parts, "Reloaded "+ralphFeatureListRelPath+":\n"+strings.TrimSpace(string(raw)))
 	}
 	if len(parts) == 0 {
 		return "", false
@@ -191,13 +221,11 @@ func ralphReloadContext(workspaceRoot string) (string, bool) {
 // when a VcsProvider is wired — the recent VCS history block. No message
 // carryover from any prior window.
 func (h *StandardHarness) RalphSeedSession(ctx context.Context, instruction string) SessionState {
-	workspaceRoot := ""
-	if h.config.Sandbox != nil {
-		workspaceRoot = h.config.Sandbox.WorkspaceRoot()
-	}
 	var session SessionState
 	h.config.ContextManager.AppendUserMessage(ctx, &session, instruction)
-	if reload, ok := ralphReloadContext(workspaceRoot); ok {
+	// #142: reload the DURABLE checkpoint from the project store (keyed by the
+	// stable project namespace), not the sandbox filesystem.
+	if reload, ok := ralphReloadContext(ctx, h.config.RunStore, h.config.ProjectNamespace); ok {
 		h.config.ContextManager.AppendUserMessage(ctx, &session, reload)
 	}
 	if h.config.VcsProvider != nil {
@@ -212,16 +240,38 @@ func (h *StandardHarness) RalphSeedSession(ctx context.Context, instruction stri
 	return session
 }
 
-// RalphCompletionStatus is the Ralph external completion check (issue #58, B1):
-// reads the .spore/ state under the sandbox workspace root and reports (reason,
+// RalphCompletionStatus is the Ralph external completion check (issue #58, B1;
+// rewired onto the project store in #142): reads the DURABLE checkpoint from the
+// project store (keyed by the stable project namespace) and reports (reason,
 // incomplete). incomplete=false means complete. Delegates to the package-level
-// ralphCompletionStatus — the SAME logic the registered Stop hook reads.
-func (h *StandardHarness) RalphCompletionStatus() (string, bool) {
-	workspaceRoot := ""
-	if h.config.Sandbox != nil {
-		workspaceRoot = h.config.Sandbox.WorkspaceRoot()
+// ralphCompletionStatus — the SAME logic the registered Stop hook reads. (Rust
+// async-ified this when the checkpoint moved onto the store; Go's RunStore is
+// sync, so this stays sync but threads ctx + the store + project namespace.)
+func (h *StandardHarness) RalphCompletionStatus(ctx context.Context) (string, bool) {
+	return ralphCompletionStatus(ctx, h.config.RunStore, h.config.ProjectNamespace)
+}
+
+// WriteRalphProgress writes the Ralph progress checkpoint to the DURABLE project
+// store under RalphProgressKey (issue #142, decision 3 — the WRITE path the
+// relocated checkpoint needs; nothing wrote progress.json before). body is the
+// raw JSON ({ "complete": bool, "remaining": [string] }). A no-op when no
+// RunStore is wired; serialization/store failures are swallowed (best-effort
+// checkpoint).
+func (h *StandardHarness) WriteRalphProgress(ctx context.Context, body json.RawMessage) {
+	if h.config.RunStore == nil {
+		return
 	}
-	return ralphCompletionStatus(workspaceRoot)
+	_ = h.config.RunStore.Put(ctx, h.config.ProjectNamespace, RalphProgressKey, body)
+}
+
+// WriteRalphFeatureList writes the Ralph feature-list checkpoint to the DURABLE
+// project store under RalphFeatureListKey (issue #142, decision 3). body is the
+// raw JSON array of { "name", "passes" }. A no-op when no RunStore is wired.
+func (h *StandardHarness) WriteRalphFeatureList(ctx context.Context, body json.RawMessage) {
+	if h.config.RunStore == nil {
+		return
+	}
+	_ = h.config.RunStore.Put(ctx, h.config.ProjectNamespace, RalphFeatureListKey, body)
 }
 
 // RalphMaxResets returns the configured Ralph outer-loop reset cap (B3, default

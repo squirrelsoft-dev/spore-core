@@ -328,18 +328,44 @@ type ToolMemoryStore interface{}
 // ToolMemoryStore for why it is opaque. A nil MemoryStore is the never-null
 // library default — MemoryStore() returns it as-is and storage-aware callers
 // treat a nil/absent store as a no-op.
+//
+// ProjectNamespace (#142) is the STABLE durable namespace projected onto the
+// RunStore's SessionID axis (the namespace-reuse seam — it is a
+// storage.ProjectID.Namespace() value, carried as a SessionID because the root
+// sporecore package cannot import storage). DURABLE artifacts (the task_list)
+// key the RunStore by ProjectNamespace instead of SessionID so a Ralph window
+// reset (which regenerates SessionID) re-reads the prior window's list rather
+// than starting empty. EPHEMERAL session state stays keyed by SessionID. When
+// ProjectNamespace is empty (the default), durable reads/writes fall back to
+// SessionID, preserving today's single-process behaviour.
 type ToolContext struct {
-	SessionID   SessionID
-	RunStore    ToolRunStore
-	MemoryStore ToolMemoryStore
+	SessionID        SessionID
+	ProjectNamespace SessionID
+	RunStore         ToolRunStore
+	MemoryStore      ToolMemoryStore
 }
 
 // NewToolContext builds a ToolContext from the run's session id and the storage
 // seams. A nil runStore yields a context whose RunStore reads empty and discards
 // writes; a nil memStore yields a context with no memory backend (callers treat
-// it as a no-op).
+// it as a no-op). The project namespace (#142) is left empty, so durable
+// reads/writes fall back to the session id; use NewToolContextWithProject to
+// pin the stable durable namespace.
 func NewToolContext(sessionID SessionID, runStore ToolRunStore, memStore ToolMemoryStore) *ToolContext {
 	return &ToolContext{SessionID: sessionID, RunStore: runStore, MemoryStore: memStore}
+}
+
+// NewToolContextWithProject builds a ToolContext that pins the stable project
+// namespace (#142) used for DURABLE artifacts, alongside the per-window session
+// id used for ephemeral state. An empty projectNamespace behaves exactly like
+// NewToolContext (durable reads/writes fall back to the session id).
+func NewToolContextWithProject(sessionID, projectNamespace SessionID, runStore ToolRunStore, memStore ToolMemoryStore) *ToolContext {
+	return &ToolContext{
+		SessionID:        sessionID,
+		ProjectNamespace: projectNamespace,
+		RunStore:         runStore,
+		MemoryStore:      memStore,
+	}
 }
 
 // runStoreOrNoOp returns the configured run store, or a no-op store when nil so
@@ -351,7 +377,8 @@ func (c *ToolContext) runStoreOrNoOp() ToolRunStore {
 	return c.RunStore
 }
 
-// Get reads through the context's run store (no-op when unset).
+// Get reads EPHEMERAL state through the context's run store, keyed by the
+// per-window SessionID (no-op when unset).
 func (c *ToolContext) Get(ctx context.Context, key string) (json.RawMessage, bool, error) {
 	var sid SessionID
 	if c != nil {
@@ -360,13 +387,43 @@ func (c *ToolContext) Get(ctx context.Context, key string) (json.RawMessage, boo
 	return c.runStoreOrNoOp().Get(ctx, sid, key)
 }
 
-// Put writes through the context's run store (no-op when unset).
+// Put writes EPHEMERAL state through the context's run store, keyed by the
+// per-window SessionID (no-op when unset).
 func (c *ToolContext) Put(ctx context.Context, key string, value json.RawMessage) error {
 	var sid SessionID
 	if c != nil {
 		sid = c.SessionID
 	}
 	return c.runStoreOrNoOp().Put(ctx, sid, key, value)
+}
+
+// durableNamespace returns the key axis for DURABLE artifacts (#142): the pinned
+// project namespace when set, otherwise the per-window session id (preserving
+// today's single-process behaviour when no project id is wired).
+func (c *ToolContext) durableNamespace() SessionID {
+	if c == nil {
+		return ""
+	}
+	if c.ProjectNamespace != "" {
+		return c.ProjectNamespace
+	}
+	return c.SessionID
+}
+
+// GetDurable reads a DURABLE artifact (e.g. the task_list) through the context's
+// run store, keyed by the STABLE project namespace (#142) — so a value written
+// in one Ralph window is visible from the next window's fresh session id. Falls
+// back to the session id when no project namespace is pinned. No-op when the run
+// store is unset.
+func (c *ToolContext) GetDurable(ctx context.Context, key string) (json.RawMessage, bool, error) {
+	return c.runStoreOrNoOp().Get(ctx, c.durableNamespace(), key)
+}
+
+// PutDurable writes a DURABLE artifact through the context's run store, keyed by
+// the STABLE project namespace (#142). Falls back to the session id when no
+// project namespace is pinned. No-op when the run store is unset.
+func (c *ToolContext) PutDurable(ctx context.Context, key string, value json.RawMessage) error {
+	return c.runStoreOrNoOp().Put(ctx, c.durableNamespace(), key, value)
 }
 
 // noOpToolRunStore is the silent-discard run store used when a ToolContext has

@@ -1697,7 +1697,7 @@ func (c *RalphConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 			return cx.finish(ctx, executor, task, windowResult)
 		}
 
-		reason, incomplete := executor.RalphCompletionStatus()
+		reason, incomplete := executor.RalphCompletionStatus(ctx)
 		if !incomplete {
 			output := ""
 			finalState := SessionState{}

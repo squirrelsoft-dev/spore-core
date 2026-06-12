@@ -374,6 +374,26 @@ func run() error {
 		return fmt.Errorf("failed to create workspace dir: %w", err)
 	}
 
+	// #142: a STABLE project id derived from the canonicalized repo root (decision
+	// 5 — derived from the workspace root, not the per-window session). It keys the
+	// DURABLE task_list / plan / Ralph checkpoint so they survive Ralph window
+	// resets AND process restarts. ProjectIDFromPath canonicalizes first (symlinks,
+	// macOS case); fall back to the pure derivation over the abs path if the repo
+	// root cannot be canonicalized.
+	projectID, pidErr := storage.ProjectIDFromPath(repoRoot)
+	if pidErr != nil {
+		projectID = storage.ProjectIDFromCanonicalPath(repoRoot)
+	}
+	// The CENTRAL durable root, à la Claude Code: ~/.spore/projects/<project_id>/
+	// (decision 1). Falls back to a .spore dir under the repo if no home dir.
+	sporeRoot := filepath.Join(repoRoot, ".spore", "projects", projectID.String())
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+		sporeRoot = filepath.Join(home, ".spore", "projects", projectID.String())
+	}
+	if err := os.MkdirAll(sporeRoot, 0o755); err != nil {
+		return fmt.Errorf("failed to create durable root: %w", err)
+	}
+
 	// AC5: the fully-bounded tree's worst-case per-window turn count is computable
 	// BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]] =
 	// 4 + (12 + 1) = 17. An Unlimited anywhere would collapse this to (_, false).
@@ -391,6 +411,8 @@ func run() error {
 	fmt.Printf("advisor model: %s\n", advisorModel)
 	fmt.Printf("search       : %s\n", endpoint)
 	fmt.Printf("repo root    : %s\n", repoRoot)
+	fmt.Printf("project id   : %s\n", projectID)
+	fmt.Printf("durable root : %s\n", sporeRoot)
 	fmt.Printf("strategy     : Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (from fixture)\n")
 	fmt.Printf("max_steps    : %s  (per-window worst case; Unlimited anywhere => none)\n", maxStepsStr)
 	fmt.Printf("consults     : research(web_search, budget 5, soft-fail), advice(advisor, budget 3, escalate)\n\n")
@@ -403,7 +425,17 @@ func run() error {
 		}
 
 		session := sporecore.NewSessionID()
-		store := storage.SingleStorageProvider(storage.NewInMemoryStorageProvider())
+		// #142: route the DURABLE run domain to a FileSystemStorageProvider under
+		// the central root (atomic write-rename) so the task_list / plan / Ralph
+		// checkpoint persist across context-window resets AND process restarts.
+		// Session and observability share the same durable root; memory stays
+		// project-scoped. Keyed by the stable project namespace, not the per-window
+		// session id.
+		durable := storage.NewFileSystemStorageProvider(sporeRoot)
+		store := storage.NewCompositeStorageProvider().
+			Run(durable).
+			Memory(storage.StorageScopeProject, durable).
+			Build()
 		runStore := store.Run()
 
 		// Read-only repo sandbox: the audit never writes source files.
@@ -448,6 +480,12 @@ func run() error {
 		cfg := observability.ConversationalBuilder(harnessModel).
 			Sandbox(sandbox).
 			Storage(runStore, nil).
+			// #142: pin the stable project id so durable artifacts (the task_list,
+			// plan, and Ralph checkpoint) key by it — surviving the per-window
+			// NewSessionID() above and process restarts — instead of the ephemeral
+			// session id. The namespace is the project id projected onto the
+			// SessionID axis (the builder cannot import storage directly).
+			ProjectID(projectID.Namespace()).
 			ContextManager(contextManager).
 			SystemPrompt(execSystemPrompt).
 			ToolsetTools("plan-tools", planTools()...).

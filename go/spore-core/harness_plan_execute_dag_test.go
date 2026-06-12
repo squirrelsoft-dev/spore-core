@@ -33,15 +33,22 @@ func dagTask() Task {
 	return NewTask("build the DAG", SessionID("plan-sess"), dagPlanStrategy())
 }
 
+// dagProjectNS is the fixed durable project namespace the DAG tests key the
+// task_list by (#142). A storage.ProjectID.Namespace() value (here a plain stable
+// string) — seedDAG / runStoreTaskList key this, NOT the ephemeral run session,
+// so what the test seeds is what the harness reads and vice versa.
+const dagProjectNS = SessionID("dag-project")
+
 // seedDAG writes list to the fakeRunStore under the session's task_list key so
 // the executor's LoadTaskList picks it up over the linear plan bridge (#126 C).
-func seedDAG(t *testing.T, store *fakeRunStore, sessionID SessionID, list TaskList) {
+func seedDAG(t *testing.T, store *fakeRunStore, _ SessionID, list TaskList) {
 	t.Helper()
 	value, err := json.Marshal(list)
 	if err != nil {
 		t.Fatalf("marshal seed list: %v", err)
 	}
-	if err := store.Put(context.Background(), sessionID, TaskListExtrasKey, value); err != nil {
+	// #142: seed under the project namespace (not the ephemeral session id).
+	if err := store.Put(context.Background(), dagProjectNS, TaskListExtrasKey, value); err != nil {
 		t.Fatalf("seed put: %v", err)
 	}
 }
@@ -68,6 +75,7 @@ func TestDAGExecutesInDependencyOrderWithIDTiebreak(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -81,7 +89,7 @@ func TestDAGExecutesInDependencyOrderWithIDTiebreak(t *testing.T) {
 	if r.Kind != RunSuccess || r.Output != "did 4" {
 		t.Fatalf("expected Success(did 4), got %+v", r)
 	}
-	final := runStoreTaskList(t, store, SessionID("plan-sess"))
+	final := runStoreTaskList(t, store, dagProjectNS)
 	for _, x := range final.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("task %d status = %q, want completed", x.ID, x.Status)
@@ -101,6 +109,7 @@ func TestDAGBranchIsolationTier1ExcludesIndependentBranch(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(agent)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -148,6 +157,7 @@ func TestDAGFilesTouchedObservedNotSelfReported(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	reg := NewScriptedToolRegistry()
 	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "edited"})
 	cfg.ToolRegistry = reg
@@ -220,6 +230,7 @@ func TestDAGFailureCascadePartition(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -269,6 +280,7 @@ func TestDAGBudgetFailCascadesLikeError(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -301,6 +313,7 @@ func TestDAGCycleRejectedAtExecuteEntry(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -333,6 +346,7 @@ func TestDAGLedgerDropOldestPastNThroughExecutor(t *testing.T) {
 	store := newFakeRunStore()
 	cfg := standardCfg(agent)
 	cfg.RunStore = store
+	cfg.ProjectNamespace = dagProjectNS
 	h := NewStandardHarness(cfg)
 
 	l := DefaultTaskList()
@@ -395,6 +409,9 @@ func dagFixtureHarness(t *testing.T, name string) (*StandardHarness, *fakeRunSto
 		ContextManager:    NoopContextManager{},
 		TerminationPolicy: AlwaysContinuePolicy{},
 		RunStore:          store,
+		// #142: durable artifacts keyed by the project namespace; seedDAG and
+		// runStoreTaskList key the SAME namespace the harness reads/writes under.
+		ProjectNamespace: dagProjectNS,
 	}
 	return NewStandardHarness(cfg), store
 }
@@ -418,7 +435,7 @@ func TestDAGOrderDiamondAllCompleteFixture(t *testing.T) {
 	if r.Kind != RunSuccess || r.Output != "did 4" {
 		t.Fatalf("expected Success(did 4), got %+v", r)
 	}
-	final := runStoreTaskList(t, store, SessionID("dag-fixture"))
+	final := runStoreTaskList(t, store, dagProjectNS)
 	for _, x := range final.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("task %d status = %q, want completed", x.ID, x.Status)
@@ -440,7 +457,7 @@ func TestDAGBranchIsolationCompletesFixture(t *testing.T) {
 	if r.Kind != RunSuccess || r.Output != "INDEP_OUTPUT_CCC" {
 		t.Fatalf("expected Success(INDEP_OUTPUT_CCC), got %+v", r)
 	}
-	final := runStoreTaskList(t, store, SessionID("dag-fixture"))
+	final := runStoreTaskList(t, store, dagProjectNS)
 	for _, x := range final.Tasks {
 		if x.Status != TaskStatusCompleted {
 			t.Fatalf("task %d status = %q, want completed", x.ID, x.Status)

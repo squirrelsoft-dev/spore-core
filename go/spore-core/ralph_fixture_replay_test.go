@@ -74,16 +74,17 @@ func TestRalphFixtureReplay(t *testing.T) {
 
 	for _, c := range fx.Cases {
 		t.Run(c.Name, func(t *testing.T) {
-			dir := t.TempDir()
-			// Seed an initial incomplete progress file so window 1 reloads state.
-			writeRalphProgress(dir, ralphWindow{complete: false, remaining: []string{"task A"}})
+			store := newFakeRunStore()
+			// #142: seed an initial incomplete progress checkpoint in the DURABLE
+			// store so window 1 reloads prior state.
+			writeRalphProgress(store, ralphWindow{complete: false, remaining: []string{"task A"}})
 
 			windows := make([]ralphWindow, len(c.Windows))
 			for i, w := range c.Windows {
 				windows[i] = ralphWindow{complete: w.Complete, remaining: w.Remaining}
 			}
-			a := newRalphAgent(dir, windows...)
-			cfg := ralphCfg(a, dir)
+			a := newRalphAgent(store, windows...)
+			cfg := ralphCfg(a, store)
 			cfg.MaxResets = c.MaxResets
 			// issue #58 v2: when the case carries a vcs_log, wire a deterministic
 			// FixtureVcsProvider seeded with it; absent => nil => no git section.

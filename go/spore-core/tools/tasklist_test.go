@@ -211,6 +211,69 @@ func TestListsAreKeyedBySessionID(t *testing.T) {
 	}
 }
 
+// #142: keyed by the PROJECT namespace, not the session id. Two DIFFERENT
+// project ids over the SAME run store keep separate lists, even when the session
+// ids are identical.
+func TestListsAreKeyedByProjectID(t *testing.T) {
+	store := storage.NewInMemoryStorageProvider()
+	projA := storage.ProjectIDFromCanonicalPath("/proj/a").Namespace()
+	projB := storage.ProjectIDFromCanonicalPath("/proj/b").Namespace()
+	// SAME ephemeral session id on both — the project namespace is what separates.
+	tcA := sporecore.NewToolContextWithProject("same-session", projA, store, nil)
+	tcB := sporecore.NewToolContextWithProject("same-session", projB, store, nil)
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "a1"}), sb, tcA)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b1"}), sb, tcB)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "b2"}), sb, tcB)
+
+	a, foundA := loadFromStore(t, store, string(projA))
+	b, foundB := loadFromStore(t, store, string(projB))
+	if !foundA || !foundB {
+		t.Fatalf("both projects should persist: a=%v b=%v", foundA, foundB)
+	}
+	if len(a.Tasks) != 1 || a.Tasks[0].Description != "a1" {
+		t.Fatalf("project-a: %+v", a)
+	}
+	if len(b.Tasks) != 2 {
+		t.Fatalf("project-b: %+v", b)
+	}
+	// The SHARED session id must NOT have its own list — durable writes went to the
+	// project namespace, not the session id.
+	if _, foundSession := loadFromStore(t, store, "same-session"); foundSession {
+		t.Fatal("durable list must NOT be keyed by the (shared) session id")
+	}
+}
+
+// #142 (THE bug this issue fixes): the task_list is visible across DIFFERENT
+// sessions with the SAME project id — mirroring the Ralph window-reset path,
+// where each window mints a fresh session id but the project id is stable, so
+// window 2 must see window 1's list.
+func TestTaskListVisibleAcrossSessionsWithSameProject(t *testing.T) {
+	store := storage.NewInMemoryStorageProvider()
+	project := storage.ProjectIDFromCanonicalPath("/proj/shared").Namespace()
+	sb := sporecore.AllowAllSandbox{}
+	tool := NewTaskListTool()
+	ctx := context.Background()
+
+	// Window 1: a distinct session id, but the shared project namespace.
+	w1 := sporecore.NewToolContextWithProject("window-1-session", project, store, nil)
+	tool.Execute(ctx, tlCall(map[string]any{"action": "add_task", "description": "from window 1"}), sb, w1)
+
+	// Window 2: a DIFFERENT (freshly generated) session id, SAME project namespace.
+	w2 := sporecore.NewToolContextWithProject(sporecore.NewSessionID(), project, store, nil)
+	out := tool.Execute(ctx, tlCall(map[string]any{"action": "list_tasks"}), sb, w2)
+	list := parseList(t, out)
+	if len(list.Tasks) != 1 {
+		t.Fatalf("window 2 must see window 1's list, got %+v", list)
+	}
+	if list.Tasks[0].Description != "from window 1" {
+		t.Fatalf("window 2 saw the wrong task: %+v", list.Tasks[0])
+	}
+}
+
 // Persist then reload with a FRESH tool over the SAME ctx yields the identical
 // list.
 func TestPersistThenReloadYieldsIdenticalList(t *testing.T) {
