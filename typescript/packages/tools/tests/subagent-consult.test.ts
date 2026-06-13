@@ -131,6 +131,7 @@ function consultPaused(): PausedState {
     }),
     budget_used: emptyBudgetSnapshot(),
     child_state: null,
+    toolset: "",
   };
 }
 

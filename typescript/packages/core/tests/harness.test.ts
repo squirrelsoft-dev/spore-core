@@ -308,6 +308,7 @@ describe("Harness — ReAct loop", () => {
         task: childTask,
         budget_used: emptyBudgetSnapshot(),
         parent_tool_call_id: "c",
+        toolset: "",
       },
       request: { kind: "clarification", question: "?" },
     });
@@ -332,6 +333,7 @@ describe("Harness — ReAct loop", () => {
       task: react(5),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const r = await h.resume(state, { kind: "halt" });
     expect(r.kind).toBe("failure");
@@ -356,6 +358,7 @@ describe("Harness — ReAct loop", () => {
       task: react(5),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const r = await h.resume(state, { kind: "allow" });
     expect(r.kind).toBe("success");

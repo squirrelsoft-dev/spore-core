@@ -1878,6 +1878,10 @@ export function promoteBudgetExhaustedToHuman(
     task,
     budget_used: budgetUsed,
     child_state: null,
+    // #140 decision 2: a budget-exhausted pause has empty `pending_tool_calls`
+    // and re-drives the strategy on resume, so the handle is behaviorally
+    // irrelevant here. Leave the empty default.
+    toolset: "",
   };
   return { kind: "waiting_for_human", state, request };
 }
@@ -4308,6 +4312,14 @@ export interface ChildPausedState {
   task: Task;
   budget_used: BudgetSnapshot;
   parent_tool_call_id: string;
+  /**
+   * The toolset handle of the child leaf that paused (#140); same semantics and
+   * serialization contract as {@link PausedState.toolset}. ALWAYS serializes
+   * (`"toolset":""` when unset) for cross-language byte-parity; old child blobs
+   * without the key hydrate to `""`. Declared LAST so `JSON.stringify` emits it
+   * after `parent_tool_call_id`, matching the shared fixtures.
+   */
+  toolset: ToolsetRef;
 }
 
 export interface PausedState {
@@ -4327,6 +4339,17 @@ export interface PausedState {
   task: Task;
   budget_used: BudgetSnapshot;
   child_state: ChildPausedState | null;
+  /**
+   * The toolset handle of the leaf that paused (#140). Resume routes pending
+   * per-node tool calls through this handle's scoped catalogue via
+   * {@link StandardHarness}'s `effectiveToolRegistry`; an empty handle (the
+   * default) falls back to the global catalogue, so pre-#140 paused-state blobs
+   * — which lack the key — hydrate to `""` and behave unchanged. The field
+   * ALWAYS serializes (even when empty, as `"toolset":""`) for cross-language
+   * byte-parity; never conditionally omit it. Declared LAST so `JSON.stringify`
+   * emits it after `child_state`, matching the shared fixtures.
+   */
+  toolset: ToolsetRef;
 }
 
 /**
@@ -4367,6 +4390,8 @@ export function loadCheckpoint(blob: string): PausedState {
     task: TaskSchema.parse(c.task),
     budget_used: BudgetSnapshotSchema.parse(c.budget_used),
     parent_tool_call_id: c.parent_tool_call_id as string,
+    // #140 back-compat: pre-#140 child blobs omit `toolset` → default to "".
+    toolset: (c.toolset as string) ?? "",
   });
   return {
     session_id: new SessionId(raw.session_id as string),
@@ -4381,6 +4406,10 @@ export function loadCheckpoint(blob: string): PausedState {
     budget_used: BudgetSnapshotSchema.parse(raw.budget_used),
     child_state:
       raw.child_state == null ? null : hydrateChild(raw.child_state as Record<string, unknown>),
+    // #140 back-compat: pre-#140 paused-state blobs omit `toolset` → default to
+    // "". Declared LAST so the re-serialized blob keeps `toolset` after
+    // `child_state`, byte-matching the shared fixtures.
+    toolset: (raw.toolset as string) ?? "",
   };
 }
 

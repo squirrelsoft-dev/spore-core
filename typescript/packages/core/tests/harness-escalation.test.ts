@@ -155,6 +155,7 @@ describe("Harness escalation — R3: finalizes observability as Escalated", () =
         task: react(1),
         budget_used: { turns: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 },
         parent_tool_call_id: "c",
+        toolset: "",
       },
       request: { kind: "clarification", question: "?" },
     });

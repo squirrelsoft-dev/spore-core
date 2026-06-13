@@ -168,6 +168,7 @@ describe("Harness consult — resume seam injects answer as tool result", () => 
       task: react(5),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const r = await h.resumeConsult(state, { kind: "answer", text: "the answer" });
     expect(r.kind).toBe("success");
@@ -195,6 +196,7 @@ describe("Harness consult — resume seam injects answer as tool result", () => 
       task: react(5),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const r = await h.resumeConsult(state, {
       kind: "budget_exhausted",

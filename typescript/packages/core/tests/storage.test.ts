@@ -85,6 +85,7 @@ function paused(session: string, turn = 3): PausedState {
     }),
     budget_used: emptyBudgetSnapshot(),
     child_state: null,
+    toolset: "",
   };
 }
 

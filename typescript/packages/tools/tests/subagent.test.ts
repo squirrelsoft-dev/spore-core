@@ -136,6 +136,7 @@ describe("SubagentTool", () => {
       }),
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const harness = new ScriptedHarness([
       {

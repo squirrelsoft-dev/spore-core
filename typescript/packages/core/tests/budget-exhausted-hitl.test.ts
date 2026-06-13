@@ -424,6 +424,7 @@ describe("Resume — Skip on a PlanExecute advances the outer loop", () => {
       task: t,
       budget_used: emptyBudgetSnapshot(),
       child_state: null,
+      toolset: "",
     };
     const resumed = await h.resume(state, { kind: "escalate", action: { kind: "skip" } });
     // Skip re-entered the PlanExecute loop rather than re-pausing.

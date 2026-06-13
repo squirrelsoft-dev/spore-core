@@ -227,6 +227,7 @@ describe("fixture: subagent_scenarios", () => {
               }),
               budget_used: emptyBudgetSnapshot(),
               child_state: null,
+              toolset: "",
             },
             request: { kind: "clarification", question: "?" },
           };

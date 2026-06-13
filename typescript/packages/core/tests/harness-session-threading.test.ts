@@ -338,6 +338,7 @@ describe("Harness — session-state threading (#102)", () => {
       }),
       budget_used: { turns: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 },
       child_state: null,
+      toolset: "",
     });
     store.gets = 0;
     store.puts = 0; // reset the pre-seed write

@@ -162,6 +162,9 @@ function continueCheckpointPausedState(): PausedState {
     task,
     budget_used: { turns: 3, input_tokens: 0, output_tokens: 0, wall_time: null, cost_usd: 0 },
     child_state: null,
+    // #140: matches the fixture's `"toolset": ""` so the loadCheckpoint round-trip
+    // is structurally equal.
+    toolset: "",
   };
 }
 

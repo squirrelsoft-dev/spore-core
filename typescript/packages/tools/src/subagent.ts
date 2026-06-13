@@ -412,5 +412,8 @@ function childStateFromPaused(
     task: state.task,
     budget_used: state.budget_used,
     parent_tool_call_id: parentToolCallId,
+    // #140: carry the child leaf's own toolset handle so the child resumes
+    // against its scoped catalogue, not the parent's / global fallback.
+    toolset: state.toolset,
   };
 }

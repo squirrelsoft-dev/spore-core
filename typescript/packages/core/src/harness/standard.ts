@@ -777,6 +777,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
           task: newTask("", sessionId, reactPerLoop(0)),
           budget_used: emptyBudgetSnapshot(),
           child_state: null,
+          // #140: a synthesized completed-run state has empty pending fields, so
+          // the handle is behaviorally irrelevant here → empty default.
+          toolset: "",
         };
         break;
       }
@@ -1763,10 +1766,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // Resolve the effective tool registry for this resumed session — bridges
     // catalogue tools the same way the turn loop does (issue #91), so pending
     // tool calls dispatched during resume thread the run's storage + sandbox.
-    // Issue 2: resume paths carry no per-node toolset handle in PausedState yet,
-    // so they keep the global-catalogue fallback (empty handle) — byte-for-byte
-    // with pre-Issue-2 behaviour.
-    const toolRegistry = this.effectiveToolRegistry(state.session_id, "");
+    // #140: resume now routes through the pausing leaf's own toolset handle,
+    // restoring its scoped per-node catalogue. An empty handle (the default)
+    // still falls back to the global catalogue, so pre-#140 blobs and root pauses
+    // behave unchanged. NOTE: the budget-escalation branch above returned early
+    // via the re-drive, which re-resolves per-leaf toolsets — so this line is
+    // only reached by the Clarification / direct-resume paths whose pending calls
+    // need the carried handle.
+    const toolRegistry = this.effectiveToolRegistry(state.session_id, state.toolset);
 
     // Subagent depth: if there's a child, the caller-installed SubagentTool
     // owns the dispatch back into the child harness; without #4/#5 wired up
@@ -1964,10 +1971,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
       this.config.observability.emitContext(span);
     }
 
-    // Issue 2: resume paths carry no per-node toolset handle in PausedState yet,
-    // so they keep the global-catalogue fallback (empty handle) — byte-for-byte
-    // with pre-Issue-2 behaviour.
-    const toolRegistry = this.effectiveToolRegistry(state.session_id, "");
+    // #140: resume routes the preserved consulting call (and any remaining
+    // pending calls) through the pausing leaf's own toolset handle, restoring its
+    // scoped per-node catalogue. An empty handle (the default) still falls back to
+    // the global catalogue, so pre-#140 blobs behave unchanged.
+    const toolRegistry = this.effectiveToolRegistry(state.session_id, state.toolset);
 
     // Inject the consult answer as the RESULT of the head pending (consult) call,
     // then dispatch the remaining pending calls in the same batch.
@@ -2727,6 +2735,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
               task,
               budget_used: budgetUsed,
               child_state: null,
+              // #140: carry this leaf's toolset handle so resume routes through
+              // its scoped catalogue.
+              toolset,
             };
             return { kind: "waiting_for_human", state: ps, request: decision.request };
           }
@@ -2950,6 +2961,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   task,
                   budget_used: budgetUsed,
                   child_state: null,
+                  // #140: carry this leaf's toolset handle so resume routes
+                  // through its scoped catalogue.
+                  toolset,
                 };
                 return { kind: "waiting_for_human", state: ps, request: d.request };
               }
@@ -3080,6 +3094,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
                   task,
                   budget_used: budgetUsed,
                   child_state: null,
+                  // #140: carry this leaf's toolset handle so resume routes
+                  // through its scoped catalogue.
+                  toolset,
                 };
                 return { kind: "waiting_for_human", state: ps, request: d.request };
               }
@@ -3156,6 +3173,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 task,
                 budget_used: budgetUsed,
                 child_state: child,
+                // #140: the parent leaf's toolset handle (the child carries its
+                // own inside `child_state`).
+                toolset,
               };
               return { kind: "waiting_for_human", state: ps, request: output.request };
             }
@@ -3181,6 +3201,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 task,
                 budget_used: budgetUsed,
                 child_state: null,
+                // #140: carry this leaf's toolset handle so resume routes pending
+                // per-node calls through its catalogue.
+                toolset,
               };
               return {
                 kind: "escalate",
@@ -3218,6 +3241,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 task,
                 budget_used: budgetUsed,
                 child_state: null,
+                // #140: carry this leaf's toolset handle so the preserved
+                // clarifying call resumes against its scoped catalogue.
+                toolset,
               };
               return { kind: "waiting_for_human", state: ps, request };
             }
@@ -3265,6 +3291,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 task,
                 budget_used: budgetUsed,
                 child_state: null,
+                // #140 (THE load-bearing path): carry this leaf's toolset handle
+                // so `resumeConsult` routes the preserved consulting call through
+                // its scoped catalogue instead of the global fallback.
+                toolset,
               };
               return {
                 kind: "consult",
