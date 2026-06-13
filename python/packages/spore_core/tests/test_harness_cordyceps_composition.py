@@ -23,34 +23,52 @@ from pydantic import TypeAdapter
 
 from spore_core import (
     AgentId,
+    AgentRef,
     AllowAllSandbox,
     AlwaysContinuePolicy,
+    BudgetExhaustedEscalate,
+    BudgetPolicyPerLoop,
     BudgetPolicyUnlimited,
     ConsultRequest,
     ConsultResponseAnswer,
     EmptyToolRegistry,
+    EscalationActionContinueWithBudget,
     EscalationModeAutonomous,
+    EscalationModeSurfaceToHuman,
     EvaluatorResponseVerifier,
     ExecutionRegistry,
     HaltReasonTasksBlockedByFailure,
     HarnessConfig,
     HarnessRunOptions,
+    HumanRequestBudgetExhausted,
+    HumanResponseEscalate,
     InMemoryStorageProvider,
     LoopStrategy,
+    Message,
     ModelAgent,
+    PausedState,
+    PlanExecuteConfig,
     ProviderInfo,
     RalphConfig,
+    ReactConfig,
     ReplayModelInterface,
+    Role,
     RunResultConsult,
     RunResultFailure,
     RunResultSuccess,
+    RunResultWaitingForHuman,
+    SchemaRef,
     ScriptedToolRegistry,
+    SelfVerifyingConfig,
     SessionId,
     SessionState,
     StandardHarness,
     StorageProvider,
     Task,
+    TextContent,
     ToolOutputConsult,
+    ToolOutputSuccess,
+    ToolsetRef,
     Verifier,
 )
 from spore_core.harness import AggregateUsage, loop_strategy_max_steps
@@ -414,3 +432,410 @@ async def test_self_verified_default_fail() -> None:
 
     assert isinstance(await v.verify(vinput("verdict: PASS")), VerifierVerdictPassed)
     assert isinstance(await v.verify(vinput("looks plausible")), VerifierVerdictFailed)
+
+
+# ===========================================================================
+# #138 budget-resume (seed the stalled worker, skip re-planning).
+#
+# Mirror of the Rust reference's ``budget-resume`` block in
+# ``cordyceps_composition_fixture_replay.rs``.
+# ===========================================================================
+
+
+def _small_budget_pe() -> LoopStrategy:
+    """A small-budget ``PlanExecute[ ReAct(plan), SelfVerifying[ ReAct(PerLoop{2}) ] ]``
+    tree whose worker leaf exhausts after exactly TWO turns — so a budget pause is
+    reachable with a tiny fixture. Mirrors the cordyceps execute leaf's handles
+    (``executor`` / ``exec-tools`` / ``worker-schema`` / ``exec-evaluator``)."""
+    worker = ReactConfig(
+        behavior=BudgetExhaustedEscalate(),
+        budget=BudgetPolicyPerLoop(value=2),
+        agent=AgentRef("executor"),
+        toolset=ToolsetRef("exec-tools"),
+        output=SchemaRef("worker-schema"),
+    )
+    plan = ReactConfig(
+        behavior=BudgetExhaustedEscalate(),
+        budget=BudgetPolicyPerLoop(value=12),
+        agent=AgentRef("planner"),
+        toolset=ToolsetRef("plan-tools"),
+        output=SchemaRef("plan-schema"),
+    )
+    return PlanExecuteConfig(
+        behavior=BudgetExhaustedEscalate(),
+        plan=plan,
+        execute=SelfVerifyingConfig(
+            behavior=BudgetExhaustedEscalate(),
+            inner=worker,
+            evaluator=SchemaRef("exec-evaluator"),
+        ),
+        plan_model=None,
+    )
+
+
+def _surface_harness_for(
+    fixture: str,
+    storage: StorageProvider,
+) -> StandardHarness:
+    """A SurfaceToHuman harness whose plan/worker/evaluate turns replay
+    positionally from ONE shared :class:`ReplayModelInterface`, plus a
+    :class:`ScriptedToolRegistry` that returns success for the worker's two
+    budget-burning tool calls. Mirrors Rust's ``surface_harness_for``."""
+    jsonl = _fixture_path(fixture).read_text()
+    replay = ReplayModelInterface.from_jsonl(jsonl, _provider())
+    # The worker's two tool calls each dispatch to a plain success (content is
+    # irrelevant; they only burn the PerLoop{2} budget).
+    tool_registry = ScriptedToolRegistry()
+    tool_registry.push(ToolOutputSuccess(content="src/one.rs\nsrc/two.rs", truncated=False))
+    tool_registry.push(ToolOutputSuccess(content="fn one() { x.unwrap() }", truncated=False))
+    registry = _registry(replay)
+    return StandardHarness(
+        HarnessConfig(
+            agent=ModelAgent(AgentId("ralph-agent"), replay),
+            tool_registry=tool_registry,
+            sandbox=AllowAllSandbox(),
+            context_manager=_StoringContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=storage,
+            registry=registry,
+            # #138/#130: the worker leaf's budget exhaustion PAUSES.
+            escalation_mode=EscalationModeSurfaceToHuman(),
+            consult_handlers={},
+        )
+    )
+
+
+def _small_pe_task(session: str) -> Task:
+    from spore_core import BudgetLimits
+
+    t = Task.new("audit the repo", SessionId(session), _small_budget_pe())
+    t.budget = BudgetLimits(max_turns=64)
+    return t
+
+
+# #138 AC2 + AC1: a budget-resume of an execute-phase exhaustion SEEDS the stalled
+# worker (carries its full session across the pause) and SKIPS re-planning. Leg 1
+# drives the worker leaf to its PerLoop{2} cap and PAUSES with a BudgetExhausted
+# request whose PausedState carries the FULL worker session (AC2-a) and the
+# ``exec-tools`` handle (AC4-a). Leg 2 (ContinueWithBudget) does NOT re-plan (the
+# fixture has NO plan turn) and re-attaches the carried session so the worker
+# continues mid-loop to a finding that the evaluator clears.
+async def test_budget_resume_seeds_stalled_worker_and_skips_replanning() -> None:
+    storage = _new_storage()
+    session = SessionId("cordyceps-budget")
+    h = _surface_harness_for("cordyceps_budget_resume.jsonl", storage)
+    # Pre-seed ONE ready task so AC1's skip-replan precondition holds (non-empty
+    # durable list) and the execute phase runs exactly one worker.
+    tl = TaskList()
+    tl.add("audit module one", [])
+    await _seed(storage, session, tl)
+
+    # Leg 1: drive to the budget-exhaustion pause.
+    first = await h.run(HarnessRunOptions(_small_pe_task("cordyceps-budget")))
+    assert isinstance(first, RunResultWaitingForHuman), (
+        f"expected WaitingForHuman budget pause, got {first!r}"
+    )
+    request, state = first.request, first.state
+    # The combinator (PlanExecute) resolves the worker leaf's propagated
+    # exhaustion, so the pause's ``phase`` is the resolving scope.
+    assert isinstance(request, HumanRequestBudgetExhausted), f"got {request!r}"
+    assert request.phase == "plan_execute", "the combinator resolved the exhaustion"
+    # AC4-a (#140 parity): the pause carries the worker leaf's toolset handle.
+    assert state.toolset == "exec-tools", "AC4-a: budget pause carries worker handle"
+    # AC2-a: the pause carries the FULL worker session (instruction + the two
+    # budget-burning tool-call rounds), NOT a partial-only stub.
+    assert len(state.session_state.messages) > 1, (
+        f"AC2-a: full worker session carried, got {len(state.session_state.messages)} messages"
+    )
+    # AC2 parity: the stalled task stays InProgress on the durable list at the
+    # pause (the consult path's invariant) — NOT permanently Blocked — so the
+    # resume can re-attach the carried session via InProgress->Pending->complete.
+    paused_list = await _stored_list(storage, session)
+    assert paused_list.tasks[0].status is TaskStatus.IN_PROGRESS, (
+        "the stalled task awaits a budget grant (InProgress, not Blocked)"
+    )
+
+    # Leg 2: grant more budget and resume. AC1: NO plan turn in the fixture, so a
+    # re-plan would exhaust the positional replay and error — Success proves the
+    # plan phase was skipped. AC2-b: the carried session re-attaches to the
+    # InProgress task, so the worker continues to its finding and self-verifies.
+    resumed = await h.resume(
+        state,
+        HumanResponseEscalate(action=EscalationActionContinueWithBudget(steps=5)),
+    )
+    assert isinstance(resumed, RunResultSuccess), (
+        f"expected Success after budget resume, got {resumed!r}"
+    )
+    assert "resume-continued" in resumed.output, (
+        f"run output is the post-resume worker finding: {resumed.output}"
+    )
+
+    # The resumed task self-verified and completed (InProgress->Pending->Completed
+    # — the same transition machinery the consult path uses, AC2 parity).
+    after = await _stored_list(storage, session)
+    assert all(t.status is TaskStatus.COMPLETED for t in after.tasks), (
+        f"the resumed task completed: {[t.status for t in after.tasks]}"
+    )
+
+
+# #138 AC4: the budget-exhausted PausedState fixture round-trips byte-structurally
+# — the carried worker session (AC2-a) and the ``exec-tools`` handle (AC4-a)
+# survive a serde round-trip identically. This is the cross-language wire-parity
+# lock for the four-language ports. Mirrors Rust's
+# ``budget_exhausted_paused_state_round_trips``.
+def test_budget_exhausted_paused_state_round_trips() -> None:
+    raw = (
+        _repo_root() / "fixtures" / "paused_states" / "cordyceps_budget_exhausted.json"
+    ).read_text()
+    value = json.loads(raw)
+
+    typed = PausedState.model_validate(value)
+    reser = json.loads(typed.model_dump_json())
+    assert reser == value, "PausedState round-trips byte-structurally"
+
+    # AC4-a: the toolset handle is the worker leaf's, always serialized.
+    assert value["toolset"] == "exec-tools"
+    # AC2-a: the carried session grew beyond the single partial-only stub.
+    assert len(value["session_state"]["messages"]) > 1, (
+        "AC2-a: the budget-exhausted session carries the worker conversation"
+    )
+
+
+# #138 AC3: plan-phase exhaustion resumes the PLAN session. When a budget resume
+# carries a worker session AND the durable task_list is EMPTY (no InProgress task
+# ⇒ the exhaustion happened in the PLAN phase), ``PlanExecuteConfig`` seeds the
+# PLAN session from the carried conversation instead of a fresh base session — so
+# the planner CONTINUES on it.
+#
+# NOTE (per #138 plan): the carried-session→plan seeding is observed via the
+# planner agent's RECORDED contexts; the replay harness's NoopContextManager would
+# not otherwise surface it. Mirrors Rust's
+# ``budget_resume_plan_phase_seeds_plan_session_from_carried``.
+async def test_budget_resume_plan_phase_seeds_plan_session_from_carried() -> None:
+    from spore_core import BudgetLimits, FinalResponse, TokenUsage
+
+    marker = "CARRIED_PLAN_SESSION_MARKER"
+
+    class _RecordingPlanner:
+        """Records every assembled context's text, then authors a one-task plan."""
+
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        async def turn(self, context: object) -> FinalResponse:
+            parts = [
+                getattr(m.content, "text", "")
+                for m in context.messages  # type: ignore[attr-defined]
+                if getattr(m.content, "text", "")
+            ]
+            self.seen.append("\n".join(parts))
+            return FinalResponse(
+                content='{"tasks":["only"],"rationale":"r"}',
+                usage=TokenUsage(),
+            )
+
+        def id(self) -> AgentId:
+            return AgentId("planner")
+
+    class _Worker:
+        async def turn(self, context: object) -> FinalResponse:
+            return FinalResponse(content="did the work", usage=TokenUsage())
+
+        def id(self) -> AgentId:
+            return AgentId("")
+
+    planner = _RecordingPlanner()
+    registry = ExecutionRegistry.builder().agent("planner", planner).agent("", _Worker()).build()
+    storage = _new_storage()
+    h = StandardHarness(
+        HarnessConfig(
+            agent=_Worker(),
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=_StoringContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=storage,
+            registry=registry,
+            escalation_mode=EscalationModeSurfaceToHuman(),
+            consult_handlers={},
+        )
+    )
+
+    # A PlanExecute whose PLAN leaf resolves to "planner"; execute is a bare ReAct
+    # on the default key.
+    pe = PlanExecuteConfig(
+        behavior=BudgetExhaustedEscalate(),
+        plan=ReactConfig(
+            behavior=BudgetExhaustedEscalate(),
+            budget=BudgetPolicyPerLoop(value=12),
+            agent=AgentRef("planner"),
+            toolset=ToolsetRef(""),
+            output=SchemaRef(""),
+        ),
+        execute=ReactConfig.per_loop(8),
+        plan_model=None,
+    )
+    t = Task.new("audit the repo", SessionId("s1"), pe)
+    t.budget = BudgetLimits(max_turns=32)
+
+    # A budget-exhausted pause carrying a worker session with a MARKER, and NO
+    # durable task_list persisted (empty ⇒ plan-phase exhaustion, AC3).
+    carried = SessionState(
+        messages=[Message(role=Role.ASSISTANT, content=TextContent(text=marker))]
+    )
+    from spore_core import (
+        BudgetSnapshot,
+        EscalationActionFail,
+        EscalationActionSkip,
+        BudgetPolicyTotalSteps,
+    )
+
+    state = PausedState(
+        session_id=SessionId("s1"),
+        task_id=t.id,
+        turn_number=1,
+        session_state=carried,
+        pending_tool_calls=[],
+        approved_results=[],
+        human_request=HumanRequestBudgetExhausted(
+            phase="plan_execute",
+            policy=BudgetPolicyTotalSteps(value=1),
+            steps_taken=1,
+            continues_used=0,
+            partial_output=None,
+            available_actions=[
+                EscalationActionContinueWithBudget(steps=1),
+                EscalationActionSkip(),
+                EscalationActionFail(),
+            ],
+        ),
+        task=t,
+        budget_used=BudgetSnapshot(),
+        child_state=None,
+        toolset="",
+    )
+
+    await h.resume(
+        state,
+        HumanResponseEscalate(action=EscalationActionContinueWithBudget(steps=10)),
+    )
+
+    # AC3: the planner's FIRST context was seeded from the CARRIED session — the
+    # marker is present, proving the plan session continued on it rather than
+    # starting from a fresh base session.
+    assert planner.seen and marker in planner.seen[0], (
+        f"AC3: the plan session must be seeded from the carried conversation; "
+        f"planner saw: {planner.seen!r}"
+    )
+
+
+# #138 AC1: skip-plan reconciles already-Completed tasks (dedup). A non-empty
+# durable task_list whose task #1 is already Completed: a fresh run SKIPS the plan
+# phase (AC1) and reconcile does NOT re-run the completed task — only the
+# still-Pending task #2 runs (one model call, no plan turn). Mirrors Rust's
+# ``skip_plan_reconciles_completed_tasks``.
+async def test_skip_plan_reconciles_completed_tasks() -> None:
+    from spore_core import BudgetLimits, FinalResponse, MockAgent, TokenUsage
+
+    a = MockAgent(AgentId(""))
+    # NO plan turn pushed (AC1 skips it). Only task #2 runs.
+    a.push(FinalResponse(content="did two", usage=TokenUsage()))
+    storage = _new_storage()
+    session = SessionId("s1")
+    h = StandardHarness(
+        HarnessConfig(
+            agent=a,
+            tool_registry=ScriptedToolRegistry(),
+            sandbox=AllowAllSandbox(),
+            context_manager=_StoringContextManager(),
+            termination_policy=AlwaysContinuePolicy(),
+            storage=storage,
+        )
+    )
+
+    # Pre-seed: task #1 already Completed, task #2 Pending.
+    tl = TaskList()
+    tl.add("one", [])  # 1
+    tl.add("two", [])  # 2
+    tl.update(1, TaskStatus.IN_PROGRESS)
+    tl.complete(1)
+    await _seed(storage, session, tl)
+
+    pe = PlanExecuteConfig.simple()
+    t = Task.new("audit the repo", session, pe)
+    t.budget = BudgetLimits(max_turns=64)
+    r = await h.run(HarnessRunOptions(t))
+    assert isinstance(r, RunResultSuccess), f"expected Success, got {r!r}"
+    assert r.output == "did two"
+    # Exactly ONE model call: task #2 (no plan turn, task #1 not re-run).
+    assert a.call_count == 1, "AC1: plan skipped + completed task #1 deduped — only task #2 ran"
+    # Both tasks are Completed in the durable store (1 deduped, 2 freshly run).
+    stored = await _stored_list(storage, session)
+    assert all(t.status is TaskStatus.COMPLETED for t in stored.tasks)
+
+
+# #138 AC2-a (unit): the pause helper carries the FULL stalled worker session and
+# the worker leaf's toolset handle (AC4-a) — not a partial-only stub. A direct
+# unit on the boundary helper, decoupled from the surrounding strategy. Mirrors
+# Rust's ``promote_budget_pause_carries_full_worker_session_and_handle``.
+def test_promote_budget_pause_carries_full_worker_session_and_handle() -> None:
+    from spore_core import BudgetLimits
+    from spore_core.harness import (
+        BudgetExhausted,
+        BudgetSnapshot,
+        _leaf_escalation_actions,
+        _promote_budget_exhausted_to_human,
+    )
+
+    err = BudgetExhausted(
+        policy=BudgetPolicyPerLoop(value=2),
+        behavior=BudgetExhaustedEscalate(),
+        steps_taken=2,
+        continues_used=0,
+        phase="react",
+    )
+    react = ReactConfig.per_loop(2)
+    task = Task.new("worker", SessionId("s1"), react, budget=BudgetLimits(max_turns=2))
+    # A realistic worker conversation (instruction + a tool round).
+    worker = SessionState(
+        messages=[
+            Message(role=Role.USER, content=TextContent(text="worker: audit")),
+            Message(role=Role.ASSISTANT, content=TextContent(text="looking")),
+            Message(role=Role.TOOL, content=TextContent(text="listing")),
+        ]
+    )
+    waiting = _promote_budget_exhausted_to_human(
+        err,
+        "partial",
+        _leaf_escalation_actions(err),
+        SessionId("s1"),
+        task,
+        BudgetSnapshot(),
+        2,
+        worker,
+        ToolsetRef("exec-tools"),
+    )
+    assert isinstance(waiting, RunResultWaitingForHuman)
+    # AC2-a: the FULL worker session is carried (3 messages), NOT the single
+    # partial-only assistant stub.
+    assert waiting.state.session_state.messages == worker.messages
+    # AC4-a: the worker leaf's toolset handle rides the pause (#140 parity).
+    assert waiting.state.toolset == "exec-tools"
+
+    # Back-compat: an EMPTY worker session falls back to the partial-only stub (the
+    # pre-#138 behavior) so legacy / HillClimbing sites are unchanged.
+    waiting2 = _promote_budget_exhausted_to_human(
+        err,
+        "just-the-partial",
+        _leaf_escalation_actions(err),
+        SessionId("s1"),
+        task,
+        BudgetSnapshot(),
+        2,
+        SessionState(),
+        ToolsetRef(""),
+    )
+    assert isinstance(waiting2, RunResultWaitingForHuman)
+    msgs = waiting2.state.session_state.messages
+    assert len(msgs) == 1
+    assert getattr(msgs[0].content, "text", None) == "just-the-partial"

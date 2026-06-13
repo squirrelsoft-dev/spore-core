@@ -658,8 +658,12 @@ async def test_hill_climbing_runs_non_react_inner_per_iteration() -> None:
     """HillClimbing[inner: PlanExecute[ReAct, ReAct]] improve-then-stagnate — each
     iteration recurses the inner PlanExecute's WHOLE loop (firing a plan turn +
     execute step) before the metric eval. baseline 1.0, iter1 2.0 (improve→keep),
-    iter2 0.5 (regress→discard, stagnation hits cap 1 ⇒ halt). The plan turn must
-    fire ONCE PER iteration (2x). A hardcoded-ReAct proposer would record ZERO.
+    iter2 0.5 (regress→discard, stagnation hits cap 1 ⇒ halt).
+
+    #138 AC1: the durable task_list is project-scoped, so iteration 1 authors it and
+    iteration 2 SKIPS re-planning (the list already exists). The plan phase fires
+    EXACTLY ONCE across the whole climb — which still proves the recursion (a ReAct
+    proposer would fire it zero times).
     Mirrors Rust's ``hill_climbing_runs_non_react_inner_per_iteration``."""
     import tempfile
     from pathlib import Path
@@ -700,13 +704,12 @@ async def test_hill_climbing_runs_non_react_inner_per_iteration() -> None:
             def workspace_root(self) -> Path:
                 return root
 
-        # Per iteration the inner PlanExecute fires a plan JSON turn + execute step.
+        # Iteration 1 fires a plan JSON turn + execute step; #138 AC1 makes
+        # iteration 2 skip the (now-durable) plan phase.
         worker = _RecordingAgent(
             [
                 '{"tasks":["only"],"rationale":"r"}',
                 "changed iter1",
-                '{"tasks":["only"],"rationale":"r"}',
-                "changed iter2",
             ]
         )
         evaluator = _ScriptedMetric([1.0, 2.0, 0.5])
@@ -717,6 +720,10 @@ async def test_hill_climbing_runs_non_react_inner_per_iteration() -> None:
             context_manager=_StoringContextManager(),
             termination_policy=AlwaysContinuePolicy(),
             metric_evaluator=evaluator,
+            # #138 AC1: a real durable store so iteration 1's task_list survives
+            # into iteration 2 (which then skips re-planning). The no-op default
+            # would drop the write and force a re-plan every iteration.
+            storage=StorageProvider.single(InMemoryStorageProvider()),
         )
         h = StandardHarness(cfg)
 
@@ -741,9 +748,12 @@ async def test_hill_climbing_runs_non_react_inner_per_iteration() -> None:
 
         assert isinstance(r, RunResultFailure), f"expected Failure, got {r!r}"
         assert isinstance(r.reason, HaltReasonStagnationLimitReached)
-        # The inner PlanExecute fired its plan turn ONCE PER iteration (2x). A
-        # hardcoded-ReAct proposer would record ZERO plan turns.
+        # #138 AC1: the inner PlanExecute fired its plan turn EXACTLY ONCE — the
+        # first iteration authored the durable task_list; later iterations skip
+        # re-planning. A hardcoded-ReAct proposer would record ZERO plan turns, so
+        # a single plan turn still proves the genuine recursion into PlanExecute.
         plan_turns = sum(1 for c in worker.seen_text() if "step-by-step plan" in c)
-        assert plan_turns == 2, (
-            f"inner PlanExecute plan phase fires once per iteration; saw {worker.seen_text()!r}"
+        assert plan_turns == 1, (
+            f"inner PlanExecute plan phase fires once (then #138 AC1 skips "
+            f"re-planning); saw {worker.seen_text()!r}"
         )

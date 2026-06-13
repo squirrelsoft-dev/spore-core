@@ -163,7 +163,8 @@ async def _stored(h: StandardHarness, session: SessionId) -> TaskList:
 
 async def test_dag_executes_in_dependency_order_with_id_tiebreak() -> None:
     a = _agent()
-    a.push(FinalResponse(content='{"tasks":["ignored"]}', usage=_usage()))  # plan turn
+    # #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    # SKIPPED — no plan turn is pushed. The first model call is task 1.
     a.push(FinalResponse(content="did 1", usage=_usage()))
     a.push(FinalResponse(content="did 2", usage=_usage()))
     a.push(FinalResponse(content="did 3", usage=_usage()))
@@ -193,9 +194,10 @@ async def test_dag_executes_in_dependency_order_with_id_tiebreak() -> None:
 
 
 async def test_dag_branch_isolation_tier1_excludes_independent_branch() -> None:
+    # #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    # SKIPPED — no plan turn. The first call is task 1.
     worker = _RecordingAgent(
         [
-            '{"tasks":["ignored"]}',  # plan
             "ROOT_OUTPUT_AAA",  # task 1
             "CHILD_OUTPUT_BBB",  # task 2 (-> 1)
             "INDEP_OUTPUT_CCC",  # task 3 (indep)
@@ -212,14 +214,14 @@ async def test_dag_branch_isolation_tier1_excludes_independent_branch() -> None:
 
     await h.run(HarnessRunOptions(_plan_task()))
     contexts = worker.seen_text()
-    # [0] plan, [1] task1, [2] task2, [3] task3.
-    assert len(contexts) == 4
-    # Task 2 (index 2) is seeded with its transitive blocker (task 1)'s output.
-    assert "ROOT_OUTPUT_AAA" in contexts[2]
+    # #138 AC1: plan skipped → [0] task1, [1] task2, [2] task3.
+    assert len(contexts) == 3
+    # Task 2 (index 1) is seeded with its transitive blocker (task 1)'s output.
+    assert "ROOT_OUTPUT_AAA" in contexts[1]
     # Task 2 must NOT see the independent task 3 (not a blocker; not yet run).
-    assert "INDEP_OUTPUT_CCC" not in contexts[2]
-    # Task 3 (index 3) is INDEPENDENT — no Tier-1 upstream block.
-    assert "Results from upstream tasks" not in contexts[3]
+    assert "INDEP_OUTPUT_CCC" not in contexts[1]
+    # Task 3 (index 2) is INDEPENDENT — no Tier-1 upstream block.
+    assert "Results from upstream tasks" not in contexts[2]
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +233,8 @@ async def test_dag_branch_isolation_tier1_excludes_independent_branch() -> None:
 
 async def test_dag_files_touched_observed_not_self_reported() -> None:
     a = _agent()
-    a.push(FinalResponse(content='{"tasks":["ignored"]}', usage=_usage()))  # plan
-    # Task 1: prose claims a file but issues NO write call.
+    # #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    # SKIPPED — no plan turn. Task 1: prose claims a file but no write call.
     a.push(FinalResponse(content="I touched src/phantom.py (but did not)", usage=_usage()))
     # Task 2: a real edit_file call carrying a path, then finalize.
     a.push(
@@ -302,7 +304,8 @@ async def test_observed_writes_seam_records_only_real_write_calls() -> None:
 
 async def test_failure_cascades_only_to_dependents() -> None:
     a = _agent()
-    a.push(FinalResponse(content='{"tasks":["good","bad","dep","indep"]}', usage=_usage()))
+    # #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    # SKIPPED — no plan turn. The first model call is task 1.
     a.push(FinalResponse(content="did good", usage=_usage()))  # task 1
     # task 2 fails terminally: an agent error inside its sub-loop.
     a.push(TurnError(error=AgentErrorEmpty(), usage=None))
@@ -325,8 +328,9 @@ async def test_failure_cascades_only_to_dependents() -> None:
     # 1 (good) and 4 (indep) complete; 2 and its dependent 3 are blocked.
     assert r.reason.completed == [1, 4]
     assert r.reason.blocked == [2, 3]
-    # plan(1) + good(1) + bad(1) + indep(1) = 4 calls; "dep" never ran.
-    assert a.call_count == 4
+    # #138 AC1: plan SKIPPED (durable list pre-seeded). good(1) + bad(1) +
+    # indep(1) = 3 calls; "dep" never ran.
+    assert a.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +340,9 @@ async def test_failure_cascades_only_to_dependents() -> None:
 
 async def test_cyclic_graph_rejected_at_execute_entry() -> None:
     a = _agent()
-    a.push(FinalResponse(content='{"tasks":["ignored"]}', usage=_usage()))  # plan
+    # #138 AC1: a non-empty (cyclic) task_list is pre-seeded below, so the plan
+    # phase is SKIPPED — the cycle is detected at execute entry with NO model turn
+    # at all. No plan turn is pushed.
     storage = _new_storage()
     session = SessionId("s1")
     # Hand-build a cyclic graph (add() would reject it): 1 -> 2, 2 -> 1.
@@ -353,8 +359,9 @@ async def test_cyclic_graph_rejected_at_execute_entry() -> None:
     r = await h.run(HarnessRunOptions(_plan_task()))
     assert isinstance(r, RunResultFailure)
     assert isinstance(r.reason, HaltReasonTaskGraphCycle)
-    # Only the plan turn ran; no execute step.
-    assert a.call_count == 1
+    # #138 AC1: skip-plan means NO model turn ran — the cycle is caught at execute
+    # entry before any plan or execute dispatch.
+    assert a.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +373,8 @@ async def test_cyclic_graph_rejected_at_execute_entry() -> None:
 
 async def test_long_chain_succeeds_with_bounded_ledger() -> None:
     a = _agent()
-    a.push(FinalResponse(content='{"tasks":["ignored"]}', usage=_usage()))  # plan
+    # #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    # SKIPPED — no plan turn. Only the per-task turns are queued.
     storage = _new_storage()
     session = SessionId("s1")
     tl = TaskList()

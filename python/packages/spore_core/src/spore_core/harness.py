@@ -1016,18 +1016,27 @@ class RunScratch:
     # in-process Continue never sets it → AC3: no serialization on the in-process
     # path). Mirrors Rust's ``RunScratch::resume_continues``.
     resume_continues: tuple[str, int] | None = None
-    # Consult re-drive seed (#131): the worker conversation (with the consult
-    # answer already injected as the pending call's tool result) carried from a
-    # resumed :class:`RunResultConsult`. When set, a :class:`PlanExecuteConfig`
-    # walk resumes its single ``InProgress`` task from THIS session (instead of a
-    # fresh instruction-seeded session) so the consulting worker continues
-    # mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
-    # proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
-    # the session itself rides the serialized ``PausedState.session_state``, so a
+    # Phase-agnostic resume seed (#131 consult re-drive + #138 budget resume): the
+    # stalled worker conversation carried from a resumed pause. For a CONSULT
+    # resume the consult answer is already injected as the pending call's tool
+    # result; for a BUDGET resume (#138) it is the worker's full post-exhaustion
+    # session. When set, a :class:`PlanExecuteConfig` walk resumes its single
+    # ``InProgress`` task from THIS session (instead of a fresh instruction-seeded
+    # session) so the stalled worker continues mid-loop, its SelfVerifying
+    # evaluator still runs, and the ready-set walk proceeds.
+    #
+    # #138 AC3 (plan-phase exhaustion): when the durable task_list has NO
+    # ``InProgress`` task, the exhaustion happened in the PLAN phase before any
+    # task was authored — the walk seeds the PLAN session from this carried
+    # conversation instead of cloning a fresh base session.
+    #
+    # The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the
+    # session itself rides the serialized ``PausedState.session_state``, so a
     # cross-process resume reconstructs this seed in
-    # :meth:`StandardHarness.resume_consult`. ``None`` on a fresh run / after the
-    # seed is consumed. Mirrors Rust's ``RunScratch::consult_resume``.
-    consult_resume: SessionState | None = None
+    # :meth:`StandardHarness.resume_consult` (consult) or :meth:`resume`'s
+    # ``ContinueWithBudget`` arm (#138 budget). ``None`` on a fresh run / after the
+    # seed is consumed. Mirrors Rust's ``RunScratch::resume_seed``.
+    resume_seed: SessionState | None = None
 
 
 @dataclass
@@ -1135,7 +1144,7 @@ class ExecutionContext:
         # ``_finish``, rewrite its ``state.task`` to the combinator's OWN composed
         # task; by the top it carries the FULL tree, so ``resume_consult``
         # re-drives the whole strategy (the in-progress task resumes from
-        # ``consult_resume``).
+        # ``resume_seed``).
         if isinstance(result, RunResultConsult):
             new_state = result.state.model_copy()
             new_state.task = parent_task
@@ -1666,6 +1675,8 @@ def _promote_budget_exhausted_to_human(
     task: Task,
     budget_used: BudgetSnapshot,
     turn_number: int,
+    worker_session: SessionState | None = None,
+    toolset: ToolsetRef = "",
 ) -> RunResult:
     """Promote a charge-time :class:`BudgetExhausted` to a
     :class:`RunResultWaitingForHuman` (#130 HITL pause boundary). Built ONLY when
@@ -1673,13 +1684,29 @@ def _promote_budget_exhausted_to_human(
     :class:`EscalationModeSurfaceToHuman`; carries the node's ``partial_output``
     and the advisory ``available_actions``. The request also stashes
     ``steps_taken`` / ``continues_used`` so ``resume`` can reconstruct the node's
-    budget context from the request alone (fork E). Mirrors Rust's
-    ``promote_budget_exhausted_to_human``."""
-    messages = (
-        [Message(role=Role.ASSISTANT, content=TextContent(text=partial_output))]
-        if partial_output is not None
-        else []
-    )
+    budget context from the request alone (fork E).
+
+    #138 AC2-a: the paused ``session_state`` is the FULL stalled worker session
+    (``worker_session``) — parallel to how the consult pause preserves the worker
+    conversation — so a budget RESUME re-attaches it as the in-progress task's
+    seed and the worker continues with its real context instead of a partial-only
+    stub. When ``worker_session`` is empty / ``None`` (a bare-leaf propagate site
+    with no richer conversation, or a legacy caller), it falls back to the single
+    ``partial_output`` assistant message so the pre-#138 behavior is intact.
+    #138 AC4-a: ``toolset`` carries the stalled worker leaf's handle (e.g.
+    ``"exec-tools"``), consistent with #140, instead of staying ``""``. Mirrors
+    Rust's ``promote_budget_exhausted_to_human``."""
+    # #138 AC2-a: prefer the FULL worker conversation; fall back to the
+    # partial-only stub when the carried session is empty (back-compat).
+    if worker_session is not None and worker_session.messages:
+        session_state = worker_session
+    else:
+        messages = (
+            [Message(role=Role.ASSISTANT, content=TextContent(text=partial_output))]
+            if partial_output is not None
+            else []
+        )
+        session_state = SessionState(messages=messages)
     request = HumanRequestBudgetExhausted(
         phase=err.phase,
         policy=err.policy,
@@ -1692,13 +1719,16 @@ def _promote_budget_exhausted_to_human(
         session_id=session_id,
         task_id=task.id,
         turn_number=turn_number,
-        session_state=SessionState(messages=messages),
+        session_state=session_state,
         pending_tool_calls=[],
         approved_results=[],
         human_request=request,
         task=task,
         budget_used=budget_used,
         child_state=None,
+        # #138 AC4-a: carry the stalled worker leaf's toolset handle (#140 parity)
+        # so a resume routes the re-driven worker through its scoped catalogue.
+        toolset=toolset,
     )
     return RunResultWaitingForHuman(state=state, request=request)
 
@@ -1947,113 +1977,180 @@ async def _run_plan_execute_config(
     on_stream = cx.stream
     cx.stream = None
 
-    # ── Phase 1: plan (dispatch ``self.plan``). ─────────────────────────────
-    #
-    # Seed the planning directive onto a CLONE of the base session so the shared
-    # execute context stays ``[user: task.instruction]`` (#93 — a leaked directive
-    # would make every execute step re-emit a plan). The plan phase runs under the
-    # plan sub-strategy's OWN declared budget (e.g. a ReAct ``PerLoop{4}``); the
-    # global ``max_turns`` is only the outer backstop. Previously this clamped the
-    # planner to ``turns + 1`` — a SINGLE turn — silently overriding the
-    # architect's plan budget and starving multi-step task-graph authoring (the
-    # planner could not both call ``task_list`` and finish, so it emitted prose
-    # instead).
-    directive = executor.plan_directive(task.instruction)
-    plan_session = base_session.model_copy(deep=True)
-    await executor.seed_user_message(plan_session, directive)
-    plan_task = Task(
-        id=task.id,
-        instruction=directive,
-        session_id=session_id,
-        budget=task.budget.model_copy(deep=True),
-        loop_strategy=self.plan,
-    )
-    plan_result = await executor.run_plan_subtree(
-        self.plan, plan_task, plan_session, budget_used.model_copy(deep=True)
-    )
-    if isinstance(plan_result, RunResultSuccess):
-        plan_output, plan_usage, plan_turns = (
-            plan_result.output,
-            plan_result.usage,
-            plan_result.turns,
-        )
-    elif plan_result is None:
-        cx.stream = on_stream
-        result: RunResult = RunResultFailure(
-            reason=HaltReasonPlanPhaseFailed(
-                error=PlanPhaseErrorPayload(
-                    kind="planning_turn_failed",
-                    message="plan sub-strategy produced no terminal",
+    # #131/#138: the phase-agnostic resume seed (the stalled worker conversation
+    # carried from a resumed consult or budget pause). Taken BEFORE the plan phase
+    # so AC3 (plan-phase exhaustion) can seed the plan session from it, and AC2
+    # (execute-phase exhaustion) can re-attach it to the single ``InProgress`` task.
+    resume_seed_session = cx.scratch.resume_seed
+    cx.scratch.resume_seed = None
+
+    # #138 AC1 (skip re-planning): probe the DURABLE task_list BEFORE the plan
+    # phase. If a non-empty list already exists (e.g. a prior window authored it,
+    # #142 makes it survive Ralph's per-window session reset), the plan phase is
+    # REDUNDANT — go straight to reconcile + the ready-set walk. This is the core
+    # fix: a budget/consult re-entry no longer burns its grant re-planning a graph
+    # that is already durable. The plan artifact may be ABSENT in this case (AC1-a
+    # artifact-optional) — nothing downstream requires it once a task_list exists.
+    preexisting = await executor.load_task_list(session_id)
+    skip_plan = isinstance(preexisting, TaskList) and bool(preexisting.tasks)
+
+    if skip_plan:
+        # ── AC1: skip-plan path. The list is the durable source of truth. ───────
+        assert isinstance(preexisting, TaskList)
+        task_list = preexisting
+
+        # AC5 (defense in depth): re-check the durable graph for cycles.
+        if task_list.has_cycle():
+            cx.stream = on_stream
+            result: RunResult = RunResultFailure(
+                reason=HaltReasonTaskGraphCycle(
+                    reason="persisted task graph contains a directed cycle",
                 ),
-            ),
-            session_id=session_id,
-            usage=AggregateUsage(),
-            turns=budget_used.turns,
-            session_state=SessionState(),
-        )
-        return await cx._finish(executor, task, result)
+                session_id=session_id,
+                usage=AggregateUsage(),
+                turns=budget_used.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+
+        # A.6 deep-resume: reconcile already-Completed tasks so they are NOT
+        # re-run (handles the dedup the plan path would have done).
+        await executor.reconcile_completed_tasks(session_id, task_list)
+        await executor.persist_task_list(session_id, task_list)
+
+        # No plan turn ran: usage starts empty and the shared budget is carried
+        # unchanged (turns stay at the incoming ``budget_used.turns``).
+        total_usage = AggregateUsage()
+        carried = budget_used.model_copy(deep=True)
     else:
-        # A non-success plan terminal (budget / agent error / pause) propagates
-        # verbatim — the run never reaches execute.
-        cx.stream = on_stream
-        return await cx._finish(executor, task, plan_result)
-
-    # Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-    # the harness-side machinery, no model turn.
-    outcome = await executor.capture_plan_artifact(session_id, plan_output, plan_usage, plan_turns)
-    if not isinstance(outcome, _PlanPhaseOutcome):
-        cx.stream = on_stream
-        return await cx._finish(executor, task, outcome)
-
-    # #126 decision C: the runnable task list comes from the persisted
-    # ``task_list`` tool store (the ONE authoring path — it can carry real
-    # blockers). Fall back to the linear plan-artifact bridge only when nothing
-    # was authored via the tool (back-compat with the #59/#124 plan-only path and
-    # its replay fixtures). The plan artifact is still captured+persisted above so
-    # the plan-phase replay tests stay green.
-    persisted = await executor.load_task_list(session_id)
-    if isinstance(persisted, TaskList) and persisted.tasks:
-        task_list = persisted
-    else:
-        # The fallback intentionally uses the deprecated linear bridge (decision
-        # C keeps it working for the plan-only back-compat path); silence its
-        # DeprecationWarning here (mirrors Rust's ``#[allow(deprecated)]``).
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            task_list = plan_artifact_to_task_list(outcome.artifact)
-    if not task_list.tasks:
-        cx.stream = on_stream
-        result = RunResultFailure(
-            reason=HaltReasonEmptyPlan(),
-            session_id=session_id,
-            usage=outcome.usage,
-            turns=outcome.turns,
-            session_state=SessionState(),
+        # ── AC3 / fresh-plan path: run the plan phase. ──────────────────────────
+        #
+        # Seed the planning directive onto a CLONE of the base session so the
+        # shared execute context stays ``[user: task.instruction]`` (#93 — a
+        # leaked directive would make every execute step re-emit a plan). The plan
+        # phase runs under the plan sub-strategy's OWN declared budget (e.g. a
+        # ReAct ``PerLoop{4}``); the global ``max_turns`` is only the outer
+        # backstop.
+        #
+        # #138 AC3 (plan-phase exhaustion, infer-from-task_list option iii): when a
+        # resume seed is present AND the durable list has no ``InProgress`` task,
+        # the exhaustion happened in the PLAN phase before authoring any task
+        # (AC3-b: the list is still empty). Seed the PLAN session from the carried
+        # conversation so the planner CONTINUES on it instead of starting fresh —
+        # and consume the seed here so the execute-phase re-attach below does not
+        # also fire.
+        plan_resume = resume_seed_session is not None and (
+            not isinstance(preexisting, TaskList)
+            or all(t.status != TaskStatus.IN_PROGRESS for t in preexisting.tasks)
         )
-        return await cx._finish(executor, task, result)
-
-    # #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
-    # depth — ``add_task`` already rejects cycles, but the persisted store could
-    # be cyclic out of band). No task runs.
-    if task_list.has_cycle():
-        cx.stream = on_stream
-        result = RunResultFailure(
-            reason=HaltReasonTaskGraphCycle(
-                reason="persisted task graph contains a directed cycle",
-            ),
+        directive = executor.plan_directive(task.instruction)
+        if plan_resume and resume_seed_session is not None:
+            plan_session = resume_seed_session
+            resume_seed_session = None
+        else:
+            plan_session = base_session.model_copy(deep=True)
+        await executor.seed_user_message(plan_session, directive)
+        plan_task = Task(
+            id=task.id,
+            instruction=directive,
             session_id=session_id,
-            usage=outcome.usage,
-            turns=outcome.turns,
-            session_state=SessionState(),
+            budget=task.budget.model_copy(deep=True),
+            loop_strategy=self.plan,
         )
-        return await cx._finish(executor, task, result)
-    await executor.persist_task_list(session_id, task_list)
+        plan_result = await executor.run_plan_subtree(
+            self.plan, plan_task, plan_session, budget_used.model_copy(deep=True)
+        )
+        if isinstance(plan_result, RunResultSuccess):
+            plan_output, plan_usage, plan_turns = (
+                plan_result.output,
+                plan_result.usage,
+                plan_result.turns,
+            )
+        elif plan_result is None:
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=HaltReasonPlanPhaseFailed(
+                    error=PlanPhaseErrorPayload(
+                        kind="planning_turn_failed",
+                        message="plan sub-strategy produced no terminal",
+                    ),
+                ),
+                session_id=session_id,
+                usage=AggregateUsage(),
+                turns=budget_used.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+        else:
+            # A non-success plan terminal (budget / agent error / pause)
+            # propagates verbatim — the run never reaches execute.
+            cx.stream = on_stream
+            return await cx._finish(executor, task, plan_result)
 
-    # Carry the shared budget past the plan phase.
-    carried = budget_used.model_copy(deep=True)
-    carried.turns = outcome.turns
-    carried.input_tokens += outcome.usage.input_tokens
-    carried.output_tokens += outcome.usage.output_tokens
+        # Capture + persist the artifact from the plan child's output (R3/R4/R11) —
+        # the harness-side machinery, no model turn.
+        outcome = await executor.capture_plan_artifact(
+            session_id, plan_output, plan_usage, plan_turns
+        )
+        if not isinstance(outcome, _PlanPhaseOutcome):
+            cx.stream = on_stream
+            return await cx._finish(executor, task, outcome)
+
+        # #126 decision C: the runnable task list comes from the persisted
+        # ``task_list`` tool store (the ONE authoring path — it can carry real
+        # blockers). Fall back to the linear plan-artifact bridge only when nothing
+        # was authored via the tool (back-compat with the #59/#124 plan-only path
+        # and its replay fixtures).
+        persisted = await executor.load_task_list(session_id)
+        if isinstance(persisted, TaskList) and persisted.tasks:
+            task_list = persisted
+        else:
+            # The fallback intentionally uses the deprecated linear bridge
+            # (decision C keeps it working for the plan-only back-compat path);
+            # silence its DeprecationWarning here (mirrors Rust's
+            # ``#[allow(deprecated)]``).
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                task_list = plan_artifact_to_task_list(outcome.artifact)
+        if not task_list.tasks:
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=HaltReasonEmptyPlan(),
+                session_id=session_id,
+                usage=outcome.usage,
+                turns=outcome.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+
+        # #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+        # depth — ``add_task`` already rejects cycles, but the persisted store
+        # could be cyclic out of band). No task runs.
+        if task_list.has_cycle():
+            cx.stream = on_stream
+            result = RunResultFailure(
+                reason=HaltReasonTaskGraphCycle(
+                    reason="persisted task graph contains a directed cycle",
+                ),
+                session_id=session_id,
+                usage=outcome.usage,
+                turns=outcome.turns,
+                session_state=SessionState(),
+            )
+            return await cx._finish(executor, task, result)
+        await executor.persist_task_list(session_id, task_list)
+
+        # Carry the shared budget past the plan phase.
+        carried = budget_used.model_copy(deep=True)
+        carried.turns = outcome.turns
+        carried.input_tokens += outcome.usage.input_tokens
+        carried.output_tokens += outcome.usage.output_tokens
+
+        # A.6 deep-resume (Q2): reconcile against the durable checkpoint so
+        # already-Completed tasks are not re-run.
+        await executor.reconcile_completed_tasks(session_id, task_list)
+
+        total_usage = outcome.usage.model_copy(deep=True)
 
     # ── Phase 2: ready-set DAG walk (#126). ─────────────────────────────────
     #
@@ -2062,19 +2159,15 @@ async def _run_plan_execute_config(
     # scoped context and the Tier-2 global ledger (#93 — the plan directive never
     # leaks because the plan child ran over a clone).
 
-    # A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
-    # Completed tasks are not re-run.
-    await executor.reconcile_completed_tasks(session_id, task_list)
-
-    # #131 consult re-drive: a resumed consult carries the worker conversation
-    # (answer already injected) in ``cx.scratch.consult_resume``. The consulting
-    # task is the single ``InProgress`` task in the durable list (PlanExecute
-    # marks a task InProgress before running it). Reset it to ``Pending`` so
-    # ``next_ready`` re-schedules it, and remember its id so its step uses the
-    # carried session instead of a fresh one — the worker then continues mid-loop
-    # and its evaluator still runs.
-    consult_resume_session = cx.scratch.consult_resume
-    cx.scratch.consult_resume = None
+    # #131 consult / #138 budget re-drive: a resumed pause carries the stalled
+    # worker conversation in ``resume_seed_session``. The stalled task is the
+    # single ``InProgress`` task in the durable list (PlanExecute marks a task
+    # InProgress before running it). Reset it to ``Pending`` so ``next_ready``
+    # re-schedules it, and remember its id so its step uses the carried session
+    # instead of a fresh one — the worker then continues mid-loop and its
+    # evaluator still runs. (When the seed was already consumed by the AC3
+    # plan-resume path above, this is a no-op.)
+    consult_resume_session = resume_seed_session
     consult_resume_task: int | None = None
     if consult_resume_session is not None:
         in_progress = next(
@@ -2094,7 +2187,6 @@ async def _run_plan_execute_config(
             # the walk proceeds normally rather than stalling.
             consult_resume_session = None
 
-    total_usage = outcome.usage.model_copy(deep=True)
     last_output = ""
     last_state = SessionState()
 
@@ -2238,15 +2330,32 @@ async def _run_plan_execute_config(
             # Escalate: under ``Autonomous`` surface the partial and abort the run.
             # Under ``SurfaceToHuman`` (#130) the node PAUSES with a
             # ``BudgetExhausted`` request via the ``terminal_override`` seam.
-            task_list.update(task_id, TaskStatus.BLOCKED)
+            from .execution_registry import EscalationModeSurfaceToHuman
+
+            surface = isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman)
+            # #138 AC2-b: under SurfaceToHuman the task is NOT permanently failed —
+            # it pauses awaiting a budget grant. Leave it ``InProgress`` (the
+            # consult path's invariant) so the resume's seed re-attaches via the
+            # SAME InProgress→Pending→complete machinery. Under Autonomous the run
+            # aborts, so the task is ``Blocked`` as before.
+            task_list.update(
+                task_id,
+                TaskStatus.IN_PROGRESS if surface else TaskStatus.BLOCKED,
+            )
             await executor.persist_task_list(session_id, task_list)
             partial = _plan_execute_partial_json(task_list)
+            # #138 AC2-a: carry the FULL stalled worker session (the execute child
+            # left it in scratch) into the pause so a budget RESUME re-attaches it
+            # as the in-progress task's seed — parallel to the consult pause —
+            # instead of discarding it for a partial-only stub.
+            worker_session = cx.scratch.run_session
+            cx.scratch.run_session = SessionState()
+            worker_toolset = _worker_toolset_of(self.execute)
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
-            from .execution_registry import EscalationModeSurfaceToHuman
 
-            if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+            if surface:
                 waiting = _promote_budget_exhausted_to_human(
                     err,
                     partial,
@@ -2255,6 +2364,8 @@ async def _run_plan_execute_config(
                     task,
                     carried.model_copy(deep=True),
                     carried.turns,
+                    worker_session,
+                    worker_toolset,
                 )
                 return cx._record_terminal(waiting)
             return _promote_budget_exhausted(err, partial)
@@ -2307,6 +2418,9 @@ async def _run_plan_execute_config(
                     from .execution_registry import EscalationModeSurfaceToHuman
 
                     if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                        # #138 AC2-a: this step already COMPLETED; carry its
+                        # post-run session (``last_state``) so a budget resume
+                        # re-attaches the real worker context, not a partial stub.
                         waiting = _promote_budget_exhausted_to_human(
                             charge_err,
                             partial,
@@ -2315,6 +2429,8 @@ async def _run_plan_execute_config(
                             task,
                             carried.model_copy(deep=True),
                             carried.turns,
+                            last_state,
+                            _worker_toolset_of(self.execute),
                         )
                         return cx._record_terminal(waiting)
                     return _promote_budget_exhausted(charge_err, partial)
@@ -2559,6 +2675,10 @@ async def _run_self_verifying_config(
                 from .execution_registry import EscalationModeSurfaceToHuman
 
                 if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                    # #138 AC2-a: carry the FULL build (worker) session — the
+                    # SelfVerifying loop carries it forward in ``session_state``
+                    # after each iteration — so a budget resume re-attaches the
+                    # real worker context.
                     waiting = _promote_budget_exhausted_to_human(
                         charge_err,
                         partial,
@@ -2567,6 +2687,8 @@ async def _run_self_verifying_config(
                         task,
                         carried.model_copy(deep=True),
                         carried.turns,
+                        session_state,
+                        _worker_toolset_of(self.inner),
                     )
                     return cx._record_terminal(waiting)
                 return _promote_budget_exhausted(charge_err, partial)
@@ -2832,6 +2954,11 @@ async def _run_hill_climbing_config(
                 from .execution_registry import EscalationModeSurfaceToHuman
 
                 if isinstance(executor.escalation_mode(), EscalationModeSurfaceToHuman):
+                    # #138 AC2-a: HillClimbing iterates on a METRIC, not a worker
+                    # conversation, so there is no richer session to carry — pass
+                    # the empty default to fall back to the partial-only stub
+                    # (pre-#138 behavior). The worker leaf's toolset handle is
+                    # still carried (#140 parity, AC4-a).
                     waiting = _promote_budget_exhausted_to_human(
                         charge_err,
                         partial,
@@ -2840,6 +2967,8 @@ async def _run_hill_climbing_config(
                         task,
                         carried.model_copy(deep=True),
                         carried.turns,
+                        SessionState(),
+                        _worker_toolset_of(self.inner),
                     )
                     return cx._record_terminal(waiting)
                 return _promote_budget_exhausted(charge_err, partial)
@@ -2980,6 +3109,26 @@ def _worker_agent_key_of(ls: LoopStrategy) -> str:
         return ls.agent if ls.agent else _worker_agent_key_of(ls.inner)
     if isinstance(ls, HillClimbingConfig):
         return _worker_agent_key_of(ls.inner)
+    raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
+
+
+def _worker_toolset_of(ls: LoopStrategy) -> ToolsetRef:
+    """Descend a :data:`LoopStrategy` tree to the worker (execute) leaf's toolset
+    handle (#138 AC4-a). Mirrors :func:`_worker_agent_key_of`: a combinator
+    descends into its EXECUTE child (PlanExecute) / inner (SelfVerifying / Ralph /
+    HillClimbing) so a budget-exhausted pause records the same handle #140 would
+    have on the leaf's own pause (e.g. ``"exec-tools"``), not the empty default.
+    Mirrors Rust's ``worker_toolset_of``."""
+    if isinstance(ls, ReactConfig):
+        return ls.toolset
+    if isinstance(ls, PlanExecuteConfig):
+        return _worker_toolset_of(ls.execute)
+    if isinstance(ls, SelfVerifyingConfig):
+        return _worker_toolset_of(ls.inner)
+    if isinstance(ls, RalphConfig):
+        return _worker_toolset_of(ls.inner)
+    if isinstance(ls, HillClimbingConfig):
+        return _worker_toolset_of(ls.inner)
     raise AssertionError(f"unknown loop strategy: {ls!r}")  # pragma: no cover
 
 
@@ -6795,7 +6944,7 @@ class StandardHarness:
             # continue count (it cannot exceed ``max_continues``). Q3:
             # ``continues_used`` rides the REQUEST payload, NOT a new serialized
             # :class:`BudgetContext` / :class:`PausedState` field.
-            resume_seed = (req.phase, req.continues_used)
+            resume_continues = (req.phase, req.continues_used)
             # ``ContinueWithBudget(steps)``: grant ``steps_taken + steps`` total
             # allowance and re-enter the loop from the restored checkpoint. The
             # strategy tree is rebuilt with the node's budget caps raised so the
@@ -6807,8 +6956,27 @@ class StandardHarness:
             ):
                 granted = steps_taken + response.action.steps
                 resumed_task = _grant_task_budget(task, granted)
+                # #138 AC2-b: for a COMPOSED task (PlanExecute etc.) thread the
+                # carried worker session through the phase-agnostic resume seed and
+                # start the TOP-LEVEL session EMPTY — exactly mirroring
+                # ``_resume_consult_inner``. The PlanExecute walk re-attaches the
+                # seed to the single ``InProgress`` task (execute-phase exhaustion)
+                # via the InProgress→Pending→complete machinery, or to the PLAN
+                # session (AC3 plan-phase exhaustion) — so the stalled worker
+                # continues mid-loop instead of re-planning. A BARE leaf has no
+                # surrounding walk, so it resumes from ``session_state`` directly
+                # (the seed has nowhere to attach).
+                if isinstance(resumed_task.loop_strategy, ReactConfig):
+                    top_session, resume_seed = session_state, None
+                else:
+                    top_session, resume_seed = SessionState(), session_state
                 return await self._drive_strategy(
-                    resumed_task, session_state, budget_used, on_stream, resume_seed
+                    resumed_task,
+                    top_session,
+                    budget_used,
+                    on_stream,
+                    resume_continues,
+                    resume_seed,
                 )
             # ``Skip``: the node is marked skipped and the outer loop advances. For
             # a combinator (PlanExecute) the per-task partial already recorded the
@@ -6996,7 +7164,7 @@ class StandardHarness:
         # FULL strategy in ``task.loop_strategy`` (each combinator's ``_finish``
         # rewrote the pause's task on the way up). Re-DRIVE that strategy rather
         # than resuming only the worker leaf: the PlanExecute walk resumes its
-        # in-progress task from the injected worker session (``consult_resume``
+        # in-progress task from the injected worker session (``resume_seed``
         # seed), so the worker finishes mid-loop, its SelfVerifying evaluator
         # runs, the task is marked Completed, and the remaining ready-set is
         # walked. A BARE worker leaf (depth-1, e.g. a SubagentTool-mediated
@@ -7284,7 +7452,7 @@ class StandardHarness:
         budget_used: BudgetSnapshot,
         on_stream: StreamSink | None,
         resume_continues: tuple[str, int] | None = None,
-        consult_resume: SessionState | None = None,
+        resume_seed: SessionState | None = None,
     ) -> RunResult:
         """The recursive-executor entry (#124): build the shared
         :class:`ExecutionContext`, seed the per-run scratch (task / session /
@@ -7306,10 +7474,14 @@ class StandardHarness:
         that spanned a process pause resumes with the correct continue count (AC2);
         ``None`` is the fresh-run path.
 
-        ``consult_resume = session`` (#131) seeds the FIRST PlanExecute walk's
-        in-progress task with ``session`` (a worker conversation whose consult
-        answer is already injected) so a resumed consult continues mid-loop and
-        walks the remaining ready-set. ``None`` on every non-consult path."""
+        ``resume_seed = session`` (#131 consult + #138 budget) seeds the FIRST
+        PlanExecute walk from ``session`` (the stalled worker conversation). For a
+        consult resume the consult answer is already injected; for a budget resume
+        (#138) it is the worker's full post-exhaustion session. The walk
+        re-attaches it to the single ``InProgress`` task (execute-phase
+        exhaustion) or, when the durable task_list has no ``InProgress`` task, to
+        the PLAN session (#138 AC3 plan-phase exhaustion). ``None`` on every fresh
+        / non-resume path."""
         session_id = task.session_id
         # The Continue resolution state threaded across in-process rounds: the
         # (possibly fallen-through) behavior + how many continues have been spent.
@@ -7327,10 +7499,10 @@ class StandardHarness:
             # carry their continue count via ``behavior_for_resolution``.
             cx.scratch.resume_continues = resume_continues
             resume_continues = None
-            # #131: the consult re-drive seed is consumed by the FIRST round's
+            # #131/#138: the resume seed is consumed by the FIRST round's
             # PlanExecute walk only; later in-process rounds run normally.
-            cx.scratch.consult_resume = consult_resume
-            consult_resume = None
+            cx.scratch.resume_seed = resume_seed
+            resume_seed = None
 
             outcome = await run_strategy(task.loop_strategy, cx)
 
@@ -7423,6 +7595,12 @@ class StandardHarness:
                         continues_used=scope.continues_used,
                         phase=outcome.phase,
                     )
+                    # #138 AC2-a: carry the FULL stalled leaf session (it
+                    # propagated into scratch with its conversation) and the leaf's
+                    # own toolset handle (#140/AC4-a).
+                    worker_session = cx.scratch.run_session
+                    cx.scratch.run_session = SessionState()
+                    worker_toolset = _worker_toolset_of(task.loop_strategy)
                     return _promote_budget_exhausted_to_human(
                         err,
                         outcome.partial_output,
@@ -7431,6 +7609,8 @@ class StandardHarness:
                         task,
                         cx.scratch.run_budget.model_copy(deep=True),
                         turns,
+                        worker_session,
+                        worker_toolset,
                     )
                 # Under ``Autonomous``: surface the partial (Escalate carries it).
                 messages = (
