@@ -1,12 +1,12 @@
 # PROJECT STATE
-_Last updated: 2026-06-12 by /close (#143 **complete** — `add_task` returns the assigned task id, all four languages, on `main`; formally closed this loop. Implemented in a prior session, never closed — reconciled now. Earlier this same day #142 — project-scoped durable storage / stable `project_id` — was completed + merged + closed; it was the **linchpin** of the harness-hardening cluster #137–#143, so **#138 is now unblocked**.) ⚠️ **Local `main` is 24 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`) — unpushed; standing push gate requires maintainer OK (Deviation #10)._
+_Last updated: 2026-06-12 by /close (#140 **complete** — `PausedState`/`ChildPausedState` now carry the pausing leaf's toolset handle, so both resume paths route pending tool calls through the leaf's scoped catalogue instead of the empty global fallback; all four languages, on `main`; closed + `status: complete` this loop. Earlier this same day #142 (project-scoped durable storage / stable `project_id`) + #143 (`add_task` returns the assigned id) were completed + closed — #142 was the **linchpin** of the harness-hardening cluster #137–#143, unblocking #138. Sibling cluster gaps #138/#139/#141 triaged to `status: queued` this loop.) ⚠️ **Local `main` is 29 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`) — unpushed; standing push gate requires maintainer OK (Deviation #10)._
 
-_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. The cluster is now mostly done: **#137 ✅**, **#142 ✅**, **#143 ✅** (all closed). Remaining: **#138** (resume seeding — now unblocked by #142), and the independent parallel gaps **#139/#140/#141** (open, currently unlabeled — triage-labeling was scope-blocked under per-issue `/close`). The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
+_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. The cluster is now nearly done: **#137 ✅**, **#142 ✅**, **#143 ✅**, **#140 ✅** (all closed). Remaining: **#138** (resume seeding — now unblocked by #142) and the independent parallel gaps **#139** (output schemas) / **#141** (compaction window) — both now `status: queued`. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **24 commits
+serialized formats byte-identical across all four. Local `main` is **29 commits
 ahead of `origin/main`** (unpushed; origin at the PR #136 merge `0954db1`).
 
 **🎯 Active work: harden the composed `12-cordyceps` runtime for small local models
@@ -51,9 +51,15 @@ of robustness gaps, each verified in the Rust reference (several observed live):
 - **#139 — `ReactConfig.output` schemas are decorative (open).** Presence-validated by the
   registry but `ReactConfig::run` never reads it: the schema is never delivered to the model
   nor enforced on the terminal.
-- **#140 — `PausedState` drops the leaf's toolset handle (open).** Both resume paths resolve
-  tools with the empty global-catalogue fallback, so a node with a per-node toolset resumes
-  against the wrong catalogue.
+- **#140 — `PausedState` carries the leaf's toolset handle ✅ DONE THIS LOOP
+  (`status: complete`, CLOSED).** `PausedState` + `ChildPausedState` gained an always-serialized,
+  serde-default `toolset` field (last field, byte-parity-safe); all 7 leaf pause sites populate it
+  and both resume paths thread it into `effective_tool_registry`, so a node with a per-node toolset
+  now resumes against its scoped catalogue instead of the empty global fallback (the cordyceps
+  Consult repro). Two extra embedded-paused-state fixtures (`harness/consult.json`,
+  `harness/escalation_signals.json`) also needed the key. Load-bearing AC2b resume-routing test
+  (+ negative control: empty handle → recoverable unknown-tool error) in all four. Commits Rust
+  `9998a0c`, Py `d66afe3`, Go `3e177d3`, TS `d8f8123`.
 
 **Landed: Composable Execution refactor #117–#131 (all `status: complete` except the
 still-open #131 capstone).** Delivered across all four languages, byte-identical where
@@ -123,15 +129,15 @@ axis (#142); runnable (#57), debuggable (#64/#65), evaluation loop (#26/#68).
 **Harden the composed `12-cordyceps` runtime so `Ralph[PlanExecute[ReAct,
 SelfVerifying[ReAct]]]` runs reliably on small local models — cluster #137–#143.** With the
 **linchpin #142 landed**, the task-survival failure that orphaned the `task_list` on every
-Ralph window reset is fixed, and #138 is unblocked. The cluster is now mostly done
-(#137 ✅, #142 ✅, #143 ✅ impl). Drive the remainder with `/implement` (Rust reference →
+Ralph window reset is fixed, and #138 is unblocked. The cluster is now nearly done
+(#137 ✅, #142 ✅, #143 ✅, #140 ✅). Drive the remainder with `/implement` (Rust reference →
 three parallel language agents → cross-language verifier), byte-identical where serialized.
 
 **Work next: #138** (resume seeding) — make `ContinueWithBudget`/consult resume seed the
 stalled worker and skip re-running PLAN when the now-surviving task_list is non-empty. Then
-the independent, parallel-grabbable gaps: **#141** (thread `ModelProfile.context_window` into
-`SessionState.window_limit`), **#139** (deliver + enforce `ReactConfig.output`), **#140**
-(carry the pausing leaf's toolset handle through resume).
+the independent, parallel-grabbable gaps (both `status: queued`): **#141** (thread
+`ModelProfile.context_window` into `SessionState.window_limit`), **#139** (deliver + enforce
+`ReactConfig.output`).
 
 **Also outstanding (housekeeping):** run **`/close 131`** (confirm capstone success criteria +
 reconcile — still formally open); push the 24-commit local `main` backlog (maintainer OK
@@ -183,14 +189,17 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
 9. **#114 HITL has no child-consult resume, filed as #116** (`status: queued`) — `EscalateToHuman`
    consult overflow surfaces `WaitingForHuman` at the parent with the worker's paused consult in
    `child_state`, but `resume`'s `child_state` branch is a **no-op** in all four cores. #101's three
-   escalation choices are implemented host-side. **Overlaps #140 (toolset handle on resume) and the
-   #138 resume-seeding work.**
+   escalation choices are implemented host-side. **#140 (toolset handle on resume) is now landed —
+   `ChildPausedState` carries the child's toolset and `child_state_from_paused` propagates it, so when
+   #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
+   Still overlaps the #138 resume-seeding work.**
 10. **Local `main` push hygiene (standing reminder).** ⚠️ **Currently drifted: local `main` is
-    24 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`). Unpushed = the
+    29 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`). Unpushed = the
     cordyceps polish + the #137 series + the 2026-06-11 reconcile `dd984b0` + the **#143 series**
     (`a1d6053`→`5e206e1`) + the **#142 series** (`6bcabb4`→`5b7804f`) + the gitignore hygiene
-    `41a9caf`. **Ask before pushing** — an agent-initiated push was denied in a prior session;
-    push the backlog with maintainer OK to clear the drift.
+    `41a9caf` + the 2026-06-12 reconcile `c71a788` + the **#140 series** (`9998a0c`/`d66afe3`/
+    `3e177d3`/`d8f8123`). **Ask before pushing** — an agent-initiated push was denied in a prior
+    session; push the backlog with maintainer OK to clear the drift.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -247,15 +256,13 @@ loops.)_
    `ContinueWithBudget`/consult resume seed the stalled worker and **skip re-running PLAN** when
    the (now-surviving) task_list is non-empty. The #142 durable key axis makes the list visible
    across Ralph windows, so the AC can finally fire. `/implement`.
-2. **#141 + #139 + #140 — the parallel hardening gaps (grabbable now, no cross-deps).**
+2. **#141 + #139 — the parallel hardening gaps (grabbable now, no cross-deps, both `status: queued`).**
    #141 (thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction fires
-   for small models), #139 (deliver + enforce `ReactConfig.output` schemas), #140 (carry the
-   pausing leaf's toolset handle through `PausedState`/resume). Each via `/implement`.
+   for small models), #139 (deliver + enforce `ReactConfig.output` schemas). Each via `/implement`.
 3. **Housekeeping (cheap, do soon).** Run **`/close 131`** (confirm the capstone success criteria
-   + reconcile — still formally open). Apply `status: queued` to the now-unlabeled cluster issues
-   #138/#139/#140/#141 (triage-labeling was scope-blocked under per-issue `/close`). Reconciliation
-   only; no code.
-4. **Push the 24-commit local `main` backlog** (maintainer OK required — Deviation #10) to clear
+   + reconcile — still formally open). Cluster issues #138/#139/#141 were triaged to `status: queued`
+   this loop; remaining triage is just #131. Reconciliation only; no code.
+4. **Push the 29-commit local `main` backlog** (maintainer OK required — Deviation #10) to clear
    the `origin/main` drift.
 5. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
