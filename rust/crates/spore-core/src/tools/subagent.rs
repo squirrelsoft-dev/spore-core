@@ -398,6 +398,9 @@ fn child_state_from_paused(
         task: state.task,
         budget_used: state.budget_used,
         parent_tool_call_id,
+        // #140: carry the child leaf's own toolset handle so the child resumes
+        // against its scoped catalogue, not the parent's / global fallback.
+        toolset: state.toolset,
     }
 }
 
@@ -552,6 +555,9 @@ mod tests {
             ),
             budget_used: crate::harness::BudgetSnapshot::default(),
             child_state: None,
+            // #140: a scoped per-node handle so the propagation test below can
+            // assert the child carries it through `child_state_from_paused`.
+            toolset: crate::harness::ToolsetRef("worker-tools".into()),
         }
     }
 
@@ -684,6 +690,7 @@ mod tests {
             ),
             budget_used: crate::harness::BudgetSnapshot::default(),
             child_state: None,
+            toolset: crate::harness::ToolsetRef::default(),
         };
         let h = Arc::new(ScriptedHarness::new(vec![RunResult::WaitingForHuman {
             state: Box::new(paused),
@@ -713,6 +720,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// #140: `child_state_from_paused` must carry the child leaf's OWN toolset
+    /// handle through to the `ChildPausedState`, so the child resumes against its
+    /// scoped catalogue rather than the parent's / global fallback.
+    #[test]
+    fn child_state_from_paused_carries_toolset() {
+        // `consult_paused()` carries `ToolsetRef("worker-tools")`.
+        let child = child_state_from_paused(consult_paused(), "parent-call-1".into());
+        assert_eq!(
+            child.toolset,
+            crate::harness::ToolsetRef("worker-tools".into())
+        );
     }
 
     #[tokio::test]

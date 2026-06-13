@@ -421,8 +421,10 @@ pub enum HillClimbingDirection {
 pub struct AgentRef(pub String);
 
 /// Per-node handle to a named toolset. Serializes as a bare JSON string.
-/// Resolution lands with the registry slice (#120).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Resolution lands with the registry slice (#120). `Default` yields the empty
+/// handle (`ToolsetRef("")`) — the global-catalogue fallback — which backs the
+/// `#[serde(default)]` on [`PausedState::toolset`] (#140).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ToolsetRef(pub String);
 
@@ -3352,6 +3354,10 @@ fn promote_budget_exhausted_to_human(
         task,
         budget_used,
         child_state: None,
+        // #140 decision 2: budget-exhausted pause has empty `pending_tool_calls`
+        // and re-drives the strategy on resume, so the handle is behaviorally
+        // irrelevant here. Leave the empty default.
+        toolset: ToolsetRef::default(),
     };
     RunResult::WaitingForHuman {
         state: Box::new(state),
@@ -5041,6 +5047,11 @@ impl std::fmt::Debug for ConsultHandlerEntry {
 // PausedState / ChildPausedState
 // ============================================================================
 
+/// The durable snapshot of a paused leaf. Carries everything needed to resume:
+/// the in-progress session, the pending tool calls, the human/consult request,
+/// and — since #140 — the pausing leaf's [`toolset`](Self::toolset) handle, so
+/// resume routes pending per-node tool calls back through that leaf's scoped
+/// catalogue instead of the global-catalogue fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PausedState {
     pub session_id: SessionId,
@@ -5059,6 +5070,16 @@ pub struct PausedState {
     pub budget_used: BudgetSnapshot,
     #[serde(default)]
     pub child_state: Option<ChildPausedState>,
+    /// The toolset handle of the leaf that paused (#140). Resume routes pending
+    /// per-node tool calls through this handle's scoped catalogue via
+    /// [`effective_tool_registry`](StandardHarness::effective_tool_registry); an
+    /// empty handle (the default) falls back to the global catalogue. `#[serde(default)]`
+    /// keeps pre-#140 paused-state blobs (no `toolset` key) deserializing — they
+    /// restore as `ToolsetRef("")`. The field ALWAYS serializes (even when empty,
+    /// as `"toolset":""`) for cross-language byte-parity; never add
+    /// `skip_serializing_if`.
+    #[serde(default)]
+    pub toolset: ToolsetRef,
 }
 
 impl PausedState {
@@ -5102,6 +5123,12 @@ pub struct ChildPausedState {
     pub task: Task,
     pub budget_used: BudgetSnapshot,
     pub parent_tool_call_id: String,
+    /// The toolset handle of the child leaf that paused (#140); same semantics
+    /// and serialization contract as [`PausedState::toolset`]. ALWAYS serializes
+    /// (`"toolset":""` when empty); `#[serde(default)]` keeps pre-#140 child
+    /// blobs deserializing.
+    #[serde(default)]
+    pub toolset: ToolsetRef,
 }
 
 // ============================================================================
@@ -7223,6 +7250,9 @@ impl StandardHarness {
                             task,
                             budget_used,
                             child_state: None,
+                            // #140: carry this leaf's toolset handle so resume
+                            // routes through its scoped catalogue.
+                            toolset: toolset.clone(),
                         };
                         return RunResult::WaitingForHuman {
                             state: Box::new(state),
@@ -7512,6 +7542,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     task,
                                     budget_used,
                                     child_state: None,
+                                    // #140: carry this leaf's toolset handle so
+                                    // resume routes through its scoped catalogue.
+                                    toolset: toolset.clone(),
                                 };
                                 return RunResult::WaitingForHuman {
                                     state: Box::new(state),
@@ -7664,6 +7697,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     task,
                                     budget_used,
                                     child_state: None,
+                                    // #140: carry this leaf's toolset handle so
+                                    // resume routes through its scoped catalogue.
+                                    toolset: toolset.clone(),
                                 };
                                 return RunResult::WaitingForHuman {
                                     state: Box::new(state),
@@ -7814,6 +7850,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 task,
                                 budget_used,
                                 child_state: Some(*child_state),
+                                // #140: the parent leaf's toolset handle (the
+                                // child carries its own inside `child_state`).
+                                toolset: toolset.clone(),
                             };
                             return RunResult::WaitingForHuman {
                                 state: Box::new(state),
@@ -7846,6 +7885,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 task,
                                 budget_used,
                                 child_state: None,
+                                // #140: carry this leaf's toolset handle so resume
+                                // routes pending per-node calls through its catalogue.
+                                toolset: toolset.clone(),
                             };
                             return RunResult::Escalate {
                                 signal,
@@ -7880,6 +7922,10 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 task,
                                 budget_used,
                                 child_state: None,
+                                // #140: carry this leaf's toolset handle so the
+                                // preserved clarifying call resumes against its
+                                // scoped catalogue.
+                                toolset: toolset.clone(),
                             };
                             return RunResult::WaitingForHuman {
                                 state: Box::new(state),
@@ -7941,6 +7987,11 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 task,
                                 budget_used,
                                 child_state: None,
+                                // #140 (THE load-bearing path): carry this leaf's
+                                // toolset handle so `resume_consult` routes the
+                                // preserved consulting call through its scoped
+                                // catalogue instead of the global fallback.
+                                toolset: toolset.clone(),
                             };
                             return RunResult::Consult {
                                 request,
@@ -9819,6 +9870,8 @@ impl StandardHarness {
             task,
             budget_used,
             child_state: _,
+            // #140: the pausing leaf's toolset handle, carried through the pause.
+            toolset,
         } = state;
 
         let (text, answered) = match &response {
@@ -9856,10 +9909,11 @@ impl StandardHarness {
             });
         }
 
-        // Issue 2: resume paths carry no per-node toolset handle in `PausedState`
-        // yet, so they keep the global-catalogue fallback (empty handle) —
-        // byte-for-byte with pre-Issue-2 behaviour.
-        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
+        // #140: resume routes the preserved consulting call (and any remaining
+        // pending calls) through the pausing leaf's own toolset handle, restoring
+        // its scoped per-node catalogue. An empty handle (the default) still falls
+        // back to the global catalogue, so pre-#140 blobs behave unchanged.
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
 
         // Inject the consult answer as the RESULT of the head pending (consult)
         // call, then dispatch the remaining pending calls in the same batch.
@@ -9990,6 +10044,9 @@ impl StandardHarness {
                     ),
                     budget_used: BudgetSnapshot::default(),
                     child_state: None,
+                    // #140: a synthesized completed-run state has empty pending
+                    // fields; the handle is behaviorally irrelevant here.
+                    toolset: ToolsetRef::default(),
                 };
                 (session_id.clone(), state)
             }
@@ -10353,6 +10410,8 @@ impl StandardHarness {
             task,
             budget_used,
             child_state,
+            // #140: the pausing leaf's toolset handle, carried through the pause.
+            toolset,
         } = state;
 
         // Budget-escalation resume (#130/#129): if this pause came from
@@ -10452,10 +10511,16 @@ impl StandardHarness {
 
         // Resolve the effective tool registry for this resumed session — bridges
         // catalogue tools the same way the turn loop does, so pending tool calls
-        // dispatched during resume thread the run's storage + sandbox. Issue 2:
-        // resume carries no per-node toolset handle yet, so it uses the
-        // global-catalogue fallback (empty handle).
-        let tool_registry = self.effective_tool_registry(&session_id, &ToolsetRef(String::new()));
+        // dispatched during resume thread the run's storage + sandbox. #140:
+        // resume now routes through the pausing leaf's own toolset handle,
+        // restoring its scoped per-node catalogue. An empty handle (the default)
+        // still falls back to the global catalogue, so pre-#140 blobs and root
+        // pauses behave unchanged. NOTE: the budget-escalation branch above
+        // returned early via `drive_strategy_with_resume_seed`, which re-resolves
+        // per-leaf toolsets during the re-drive — so this line is only reached by
+        // the Clarification / direct-resume paths whose pending calls need the
+        // carried handle.
+        let tool_registry = self.effective_tool_registry(&session_id, &toolset);
 
         // Clarification resume (issue #81, Q4b): if this pause came from
         // `ToolOutput::AwaitingClarification`, the human's answer is injected as
@@ -11408,6 +11473,8 @@ mod strategy_tests {
             task,
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            // #140: Ralph/PlanExecute root, no scoped handle → empty default.
+            toolset: ToolsetRef::default(),
         }
     }
 
@@ -11442,6 +11509,8 @@ mod strategy_tests {
             task: cordyceps_task(),
             budget_used: BudgetSnapshot::default(),
             parent_tool_call_id: "call-1".to_string(),
+            // #140: no scoped handle in this fixture → empty default.
+            toolset: ToolsetRef::default(),
         };
         let json = serde_json::to_string(&cps).unwrap();
         let back: ChildPausedState = serde_json::from_str(&json).unwrap();
@@ -11514,6 +11583,8 @@ mod strategy_tests {
             task: cordyceps_task(),
             budget_used: BudgetSnapshot::default(),
             parent_tool_call_id: "call-1".to_string(),
+            // #140: no scoped handle in this fixture → empty default.
+            toolset: ToolsetRef::default(),
         };
         println!(
             "CHILD_PAUSED_STATE={}",
@@ -13444,6 +13515,7 @@ mod tests {
                 task: child_task,
                 budget_used: BudgetSnapshot::default(),
                 parent_tool_call_id: "c".into(),
+                toolset: ToolsetRef::default(),
             }),
             request: HumanRequest::Clarification {
                 question: "?".into(),
@@ -13609,6 +13681,7 @@ mod tests {
                 task: task(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 budget_used: BudgetSnapshot::default(),
                 parent_tool_call_id: "c".into(),
+                toolset: ToolsetRef::default(),
             }),
             request: HumanRequest::Clarification {
                 question: "?".into(),
@@ -13839,6 +13912,7 @@ mod tests {
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         match h
             .resume_consult(
@@ -13853,6 +13927,288 @@ mod tests {
             RunResult::Success { output, .. } => assert_eq!(output, "consult-resumed-done"),
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    // ====================================================================
+    // #140 — PausedState carries the pausing leaf's toolset handle
+    // ====================================================================
+
+    /// A bare ReAct task whose leaf carries a NON-EMPTY toolset handle. Used to
+    /// prove the leaf's handle threads into the pause state (#140 AC2a) and that
+    /// resume routes pending calls through it (#140 AC2b).
+    fn react_scoped(max: u32, handle: &str) -> Task {
+        task(LoopStrategy::ReAct(ReactConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            budget: BudgetPolicy::PerLoop { value: max },
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(handle.into()),
+            output: None,
+        }))
+    }
+
+    /// #140 AC1 (back-compat): a paused-state blob WITHOUT a `toolset` key still
+    /// deserializes, defaulting to the empty handle. A non-empty handle round-trips.
+    #[test]
+    fn paused_state_toolset_back_compat_and_round_trip() {
+        // A pre-#140 PausedState JSON (no `toolset` key) — must default to "".
+        let pre_140 = serde_json::json!({
+            "session_id": "s",
+            "task_id": "t",
+            "turn_number": 1,
+            "session_state": { "messages": [], "extras": {} },
+            "pending_tool_calls": [],
+            "approved_results": [],
+            "human_request": null,
+            "task": serde_json::to_value(react(5)).unwrap(),
+            "budget_used": serde_json::to_value(BudgetSnapshot::default()).unwrap(),
+            "child_state": null
+            // note: NO "toolset" key
+        });
+        let parsed: PausedState = serde_json::from_value(pre_140).unwrap();
+        assert_eq!(
+            parsed.toolset,
+            ToolsetRef(String::new()),
+            "missing toolset must default to the empty handle"
+        );
+
+        // The empty handle ALWAYS serializes (never skipped) for byte-parity.
+        let wire = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            wire.contains("\"toolset\":\"\""),
+            "empty toolset must serialize explicitly, not be skipped: {wire}"
+        );
+
+        // A non-empty handle round-trips by value.
+        let mut scoped = parsed.clone();
+        scoped.toolset = ToolsetRef("scoped".into());
+        let back: PausedState =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(back.toolset, ToolsetRef("scoped".into()));
+        assert_eq!(back, scoped);
+
+        // The same back-compat + always-serialize contract holds for ChildPausedState.
+        let child_pre_140 = serde_json::json!({
+            "session_id": "c",
+            "task_id": "ct",
+            "turn_number": 1,
+            "session_state": { "messages": [], "extras": {} },
+            "pending_tool_calls": [],
+            "approved_results": [],
+            "human_request": null,
+            "task": serde_json::to_value(react(1)).unwrap(),
+            "budget_used": serde_json::to_value(BudgetSnapshot::default()).unwrap(),
+            "parent_tool_call_id": "p"
+            // note: NO "toolset" key
+        });
+        let child: ChildPausedState = serde_json::from_value(child_pre_140).unwrap();
+        assert_eq!(child.toolset, ToolsetRef(String::new()));
+        assert!(serde_json::to_string(&child)
+            .unwrap()
+            .contains("\"toolset\":\"\""));
+    }
+
+    /// #140 AC2a (populate): a Consult pause from a leaf carrying
+    /// `ToolsetRef("scoped")` returns a `PausedState` whose `toolset` is that
+    /// handle — proving the leaf's handle is captured at the pause site.
+    #[tokio::test]
+    async fn consult_pause_carries_leaf_toolset_handle() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        // Register the "scoped" toolset handle so `validate()` at run entry passes.
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .toolset("scoped", Arc::new(EmptyToolRegistry))
+            .build();
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::consult(consult_req()));
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h
+            .run(HarnessRunOptions::new(react_scoped(5, "scoped")))
+            .await
+        {
+            RunResult::Consult { state, .. } => {
+                assert_eq!(
+                    state.toolset,
+                    ToolsetRef("scoped".into()),
+                    "consult pause must carry the leaf's toolset handle"
+                );
+            }
+            other => panic!("expected Consult, got {other:?}"),
+        }
+    }
+
+    /// #140 AC2a (populate): the Clarification (#81) leaf-pause path likewise
+    /// carries the leaf's toolset handle.
+    #[tokio::test]
+    async fn clarification_pause_carries_leaf_toolset_handle() {
+        let a = agent_with_tool_calls(1);
+        let mut cfg = standard_config(a);
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .toolset("scoped", Arc::new(EmptyToolRegistry))
+            .build();
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::AwaitingClarification {
+            question: "which?".into(),
+            options: None,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+        match h
+            .run(HarnessRunOptions::new(react_scoped(5, "scoped")))
+            .await
+        {
+            RunResult::WaitingForHuman { state, .. } => {
+                assert_eq!(state.toolset, ToolsetRef("scoped".into()));
+            }
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        }
+    }
+
+    /// #140 AC2b (THE load-bearing regression guard): a `PausedState` whose
+    /// `toolset` is `"scoped"` resumes pending per-node tool calls against the
+    /// SCOPED catalogue. A tool registered ONLY under `"scoped"` (absent from the
+    /// global catalogue) dispatches successfully on resume.
+    ///
+    /// NEGATIVE CONTROL: the identical state with an EMPTY handle resumes against
+    /// the global catalogue, where the scoped-only tool is unknown → a recoverable
+    /// unknown-tool error. This proves the carried handle is behaviorally
+    /// load-bearing, not cosmetic.
+    #[tokio::test]
+    async fn resume_consult_routes_pending_calls_through_carried_toolset() {
+        use crate::tool_registry::mock::EchoTool;
+        use crate::tool_registry::{ToolAnnotations, ToolSchema};
+        use crate::tools::StandardTool;
+
+        // An echo tool under an arbitrary name (registered into a named catalogue).
+        fn echo_tool(name: &str) -> StandardTool {
+            StandardTool::new(
+                Box::new(EchoTool::new(name)),
+                ToolSchema {
+                    name: name.into(),
+                    description: "echo".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    annotations: ToolAnnotations::default(),
+                },
+            )
+        }
+
+        // A paused state with TWO pending calls: the head consult call (gets the
+        // answer injected) and a trailing call to the scoped-only tool (dispatched
+        // through `effective_tool_registry(&session_id, &state.toolset)`).
+        fn make_state(handle: &str) -> PausedState {
+            PausedState {
+                session_id: SessionId::new("s"),
+                task_id: TaskId::new("t"),
+                turn_number: 1,
+                session_state: SessionState::default(),
+                pending_tool_calls: vec![
+                    ToolCall {
+                        id: "consult".into(),
+                        name: "ask_advice".into(),
+                        input: serde_json::json!({"kind": "advice"}),
+                    },
+                    ToolCall {
+                        id: "scoped".into(),
+                        name: "scoped_only".into(),
+                        input: serde_json::json!({"probe": 1}),
+                    },
+                ],
+                approved_results: vec![],
+                human_request: None,
+                // A bare ReAct leaf carrying the handle, so resume takes the
+                // dispatch-then-re-enter-window path (not the re-drive path).
+                task: task(LoopStrategy::ReAct(ReactConfig {
+                    behavior: BudgetExhaustedBehavior::Escalate,
+                    budget: BudgetPolicy::PerLoop { value: 5 },
+                    agent: AgentRef(String::new()),
+                    toolset: ToolsetRef(handle.into()),
+                    output: None,
+                })),
+                budget_used: BudgetSnapshot::default(),
+                child_state: None,
+                toolset: ToolsetRef(handle.into()),
+            }
+        }
+
+        // Was the scoped-only tool's pending call dispatched successfully? Scan the
+        // resumed session history for its tool-result message. `NoopContextManager`
+        // prefixes a recoverable error result with "[error]"; a success echoes the
+        // call input verbatim (so it contains "probe").
+        fn scoped_dispatched_ok(messages: &[Message]) -> bool {
+            messages.iter().any(|m| {
+                matches!(m.role, crate::model::Role::Tool)
+                    && match &m.content {
+                        Content::Text { text } => {
+                            text.contains("probe") && !text.contains("[error]")
+                        }
+                        _ => false,
+                    }
+            })
+        }
+
+        // Build a harness with a SCOPED catalogue ("scoped" → scoped_only) AND a
+        // GLOBAL catalogue ("global_only", which does NOT contain scoped_only) plus
+        // a worker agent that emits a final response so the re-entered ReAct window
+        // terminates cleanly. The global catalogue is what the EMPTY handle falls
+        // back to — and it makes `scoped_only` a genuine unknown-tool there.
+        fn harness_with_scoped_catalogue() -> StandardHarness {
+            let a = make_agent();
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: "resumed-done".into(),
+                usage: usage(),
+            });
+            let cfg = catalogue_builder(a)
+                .tools(vec![echo_tool("global_only")])
+                .toolset_tools("scoped", vec![echo_tool("scoped_only")])
+                .build_config();
+            StandardHarness::new(cfg)
+        }
+
+        // ── Positive: carried handle "scoped" routes to the scoped catalogue ──
+        let h = harness_with_scoped_catalogue();
+        let result = h
+            .resume_consult(
+                make_state("scoped"),
+                ConsultResponse::Answer { text: "ok".into() },
+                None,
+            )
+            .await;
+        let RunResult::Success { session_state, .. } = result else {
+            panic!("expected Success, got {result:?}");
+        };
+        assert!(
+            scoped_dispatched_ok(&session_state.messages),
+            "scoped-only tool must dispatch successfully when the carried handle is 'scoped'"
+        );
+
+        // ── Negative control: EMPTY handle falls back to the global catalogue ──
+        let h = harness_with_scoped_catalogue();
+        let result = h
+            .resume_consult(
+                make_state(""),
+                ConsultResponse::Answer { text: "ok".into() },
+                None,
+            )
+            .await;
+        let RunResult::Success { session_state, .. } = result else {
+            panic!("expected Success, got {result:?}");
+        };
+        assert!(
+            !scoped_dispatched_ok(&session_state.messages),
+            "with the EMPTY handle the scoped-only tool is unknown → must NOT dispatch successfully"
+        );
+        // And it produced the recoverable unknown-tool error result.
+        assert!(
+            session_state
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, crate::model::Role::Tool)
+                    && matches!(&m.content, Content::Text { text } if text.contains("[error]"))),
+            "the scoped-only call must surface a recoverable error under the empty handle"
+        );
     }
 
     // R8: serde round-trip is byte-identical for every consult type. For each
@@ -13946,6 +14302,7 @@ mod tests {
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         match h
             .resume(
@@ -14113,6 +14470,7 @@ mod tests {
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         match h.resume(state, HumanResponse::Halt, None).await {
             RunResult::Failure {
@@ -14158,6 +14516,7 @@ mod tests {
             task: react(5),
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         match h.resume(state, HumanResponse::Allow, None).await {
             RunResult::Success { output, .. } => assert_eq!(output, "done"),
@@ -16028,6 +16387,7 @@ mod tests {
                 cost_usd: 0.0,
             },
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         let s = serde_json::to_string(&ps).unwrap();
         let back: PausedState = serde_json::from_str(&s).unwrap();
@@ -16055,6 +16415,7 @@ mod tests {
             task: react(1),
             budget_used: BudgetSnapshot::default(),
             parent_tool_call_id: "p".into(),
+            toolset: ToolsetRef::default(),
         };
         let s = serde_json::to_string(&cs).unwrap();
         assert!(!s.contains("\"child_state\""));
@@ -19906,6 +20267,7 @@ mod tests {
                     ),
                     budget_used: BudgetSnapshot::default(),
                     child_state: None,
+                    toolset: ToolsetRef::default(),
                 };
                 store
                     .inner
@@ -20452,6 +20814,7 @@ mod tests {
             task: t,
             budget_used: BudgetSnapshot::default(),
             child_state: None,
+            toolset: ToolsetRef::default(),
         };
         let resumed = h
             .resume(
@@ -20552,6 +20915,9 @@ mod tests {
                 ..Default::default()
             },
             child_state: None,
+            // #140 decision 2: budget-exhausted pause re-drives on resume; the
+            // handle is behaviorally irrelevant here → empty default.
+            toolset: ToolsetRef::default(),
         }
     }
 
@@ -20627,6 +20993,9 @@ mod tests {
                 ..Default::default()
             },
             child_state: None,
+            // #140 decision 2: continue-checkpoint pause re-drives on resume; the
+            // handle is behaviorally irrelevant here → empty default.
+            toolset: ToolsetRef::default(),
         }
     }
 

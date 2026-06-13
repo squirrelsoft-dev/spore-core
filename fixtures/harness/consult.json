@@ -86,6 +86,7 @@
           "session_id": "consult-session"
         },
         "task_id": "consult-task",
+        "toolset": "",
         "turn_number": 2
       },
       "turns": 2,
@@ -145,6 +146,7 @@
           "session_id": "worker-session"
         },
         "task_id": "worker-task",
+        "toolset": "",
         "turn_number": 1
       },
       "kind": "consult",

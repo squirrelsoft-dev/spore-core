@@ -7,7 +7,7 @@
 use super::*;
 use crate::harness::{
     BudgetSnapshot, HumanRequest, LoopStrategy, PausedState, ReactConfig, RiskLevel, SessionId,
-    SessionState, Task, TaskId,
+    SessionState, Task, TaskId, ToolsetRef,
 };
 use crate::memory::Timestamp;
 use serde_json::json;
@@ -40,6 +40,7 @@ fn paused(session: &str) -> PausedState {
         ),
         budget_used: BudgetSnapshot::default(),
         child_state: None,
+        toolset: ToolsetRef::default(),
     }
 }
 
