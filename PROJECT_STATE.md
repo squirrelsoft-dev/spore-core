@@ -1,13 +1,13 @@
 # PROJECT STATE
-_Last updated: 2026-06-12 by /close (#140 **complete** — `PausedState`/`ChildPausedState` now carry the pausing leaf's toolset handle, so both resume paths route pending tool calls through the leaf's scoped catalogue instead of the empty global fallback; all four languages, on `main`; closed + `status: complete` this loop. Earlier this same day #142 (project-scoped durable storage / stable `project_id`) + #143 (`add_task` returns the assigned id) were completed + closed — #142 was the **linchpin** of the harness-hardening cluster #137–#143, unblocking #138. Sibling cluster gaps #138/#139/#141 triaged to `status: queued` this loop.) ⚠️ **Local `main` is 29 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`) — unpushed; standing push gate requires maintainer OK (Deviation #10)._
+_Last updated: 2026-06-12 by /close (#140 **complete** — `PausedState`/`ChildPausedState` now carry the pausing leaf's toolset handle, so both resume paths route pending tool calls through the leaf's scoped catalogue instead of the empty global fallback; all four languages, on `main`; closed + `status: complete` this loop. Earlier this same day #142 (project-scoped durable storage / stable `project_id`) + #143 (`add_task` returns the assigned id) were completed + closed — #142 was the **linchpin** of the harness-hardening cluster #137–#143, unblocking #138. Sibling cluster gaps #138/#139/#141 triaged to `status: queued` this loop.) ✅ **Local `main` is now in sync with `origin/main`** — the 29-commit post-#136 backlog was **pushed this loop** with maintainer OK (Deviation #10 resolved); `origin/main` advanced `0954db1`→`51e2853`._
 
 _**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. The cluster is now nearly done: **#137 ✅**, **#142 ✅**, **#143 ✅**, **#140 ✅** (all closed). Remaining: **#138** (resume seeding — now unblocked by #142) and the independent parallel gaps **#139** (output schemas) / **#141** (compaction window) — both now `status: queued`. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **29 commits
-ahead of `origin/main`** (unpushed; origin at the PR #136 merge `0954db1`).
+serialized formats byte-identical across all four. Local `main` is **in sync with
+`origin/main`** (the post-#136 backlog was pushed this loop; `origin/main` at `51e2853`).
 
 **🎯 Active work: harden the composed `12-cordyceps` runtime for small local models
 — cluster #137–#143.** Running the capstone composition live on gemma exposed a set
@@ -193,13 +193,11 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    `ChildPausedState` carries the child's toolset and `child_state_from_paused` propagates it, so when
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    Still overlaps the #138 resume-seeding work.**
-10. **Local `main` push hygiene (standing reminder).** ⚠️ **Currently drifted: local `main` is
-    29 commits ahead of `origin/main`** (origin at the PR #136 merge `0954db1`). Unpushed = the
-    cordyceps polish + the #137 series + the 2026-06-11 reconcile `dd984b0` + the **#143 series**
-    (`a1d6053`→`5e206e1`) + the **#142 series** (`6bcabb4`→`5b7804f`) + the gitignore hygiene
-    `41a9caf` + the 2026-06-12 reconcile `c71a788` + the **#140 series** (`9998a0c`/`d66afe3`/
-    `3e177d3`/`d8f8123`). **Ask before pushing** — an agent-initiated push was denied in a prior
-    session; push the backlog with maintainer OK to clear the drift.
+10. **Local `main` push hygiene (standing reminder).** ✅ **RESOLVED this loop (2026-06-12):** the
+    29-commit post-#136 backlog (cordyceps polish + #137/#142/#143/#140 series + reconciles) was
+    pushed with maintainer OK; `origin/main` advanced `0954db1`→`51e2853` and local `main` is now in
+    sync. The standing reminder persists for future loops: **ask before pushing** — an agent-initiated
+    push was denied in an earlier session, so confirm maintainer OK before clearing any new drift.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -261,9 +259,8 @@ loops.)_
    for small models), #139 (deliver + enforce `ReactConfig.output` schemas). Each via `/implement`.
 3. **Housekeeping (cheap, do soon).** Run **`/close 131`** (confirm the capstone success criteria
    + reconcile — still formally open). Cluster issues #138/#139/#141 were triaged to `status: queued`
-   this loop; remaining triage is just #131. Reconciliation only; no code.
-4. **Push the 29-commit local `main` backlog** (maintainer OK required — Deviation #10) to clear
-   the `origin/main` drift.
-5. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
+   this loop; remaining triage is just #131. Reconciliation only; no code. (Push backlog **cleared
+   this loop** — `main` in sync with `origin/main`, Deviation #10 resolved.)
+4. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
    docs — on an explicit maintainer call.
