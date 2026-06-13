@@ -466,6 +466,9 @@ func childStateFromPaused(p *sporecore.PausedState, parentCallID string) *sporec
 		Task:             p.Task,
 		BudgetUsed:       p.BudgetUsed,
 		ParentToolCallID: parentCallID,
+		// #140: carry the child leaf's own toolset handle so the child resumes
+		// against its scoped catalogue, not the parent's / global fallback.
+		Toolset: p.Toolset,
 	}
 }
 

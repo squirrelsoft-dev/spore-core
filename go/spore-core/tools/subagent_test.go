@@ -155,6 +155,27 @@ func TestSubagentMissingInstructionRecoverable(t *testing.T) {
 	}
 }
 
+// TestChildStateFromPausedCarriesToolset — #140: childStateFromPaused must carry
+// the child leaf's OWN toolset handle through to the ChildPausedState, so the
+// child resumes against its scoped catalogue rather than the parent's / global
+// fallback. Mirrors the Rust child_state_from_paused_carries_toolset test.
+func TestChildStateFromPausedCarriesToolset(t *testing.T) {
+	paused := &sporecore.PausedState{
+		SessionID:  "worker",
+		TaskID:     "t",
+		TurnNumber: 1,
+		PendingToolCalls: []sporecore.ToolCall{
+			{ID: "consult-call", Name: "ask_advice", Input: json.RawMessage(`{"kind":"advice"}`)},
+		},
+		Task:    sporecore.NewTask("audit", "worker", sporecore.ReActStrategy(4)),
+		Toolset: sporecore.ToolsetRef("worker-tools"),
+	}
+	child := childStateFromPaused(paused, "parent-call-1")
+	if child.Toolset != sporecore.ToolsetRef("worker-tools") {
+		t.Fatalf("child must carry the leaf's toolset handle, got %q", child.Toolset)
+	}
+}
+
 func TestContextSharingJSONRoundtrip(t *testing.T) {
 	for _, c := range []ContextSharing{
 		Isolated{},

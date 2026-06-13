@@ -2053,6 +2053,15 @@ type PausedState struct {
 	// Rust Option<ChildPausedState> with #[serde(default)] and the Python
 	// sibling so PausedState round-trips byte-identically across languages.
 	ChildState *ChildPausedState `json:"child_state"`
+	// Toolset is the toolset handle of the leaf that paused (#140). Resume routes
+	// pending per-node tool calls through this handle's scoped catalogue via
+	// effectiveToolRegistry; an empty handle (the zero value) falls back to the
+	// global catalogue. A missing "toolset" key in pre-#140 blobs unmarshals to
+	// the empty handle, so old paused-state blobs deserialise unchanged. The
+	// field ALWAYS serialises (even when empty, as "toolset":"") for
+	// cross-language byte-parity — NO omitempty. Declared LAST so encoding/json
+	// emits it last, byte-matching the fixtures.
+	Toolset ToolsetRef `json:"toolset"`
 }
 
 // MarshalJSON ensures slice fields serialise as [].
@@ -2107,6 +2116,11 @@ type ChildPausedState struct {
 	Task             Task           `json:"task"`
 	BudgetUsed       BudgetSnapshot `json:"budget_used"`
 	ParentToolCallID string         `json:"parent_tool_call_id"`
+	// Toolset is the toolset handle of the child leaf that paused (#140); same
+	// semantics and serialization contract as PausedState.Toolset. ALWAYS
+	// serialises ("toolset":"" when empty); a missing key in pre-#140 child blobs
+	// unmarshals to the empty handle. Declared LAST to byte-match the fixtures.
+	Toolset ToolsetRef `json:"toolset"`
 }
 
 // MarshalJSON ensures slice fields serialise as [].
@@ -4371,6 +4385,9 @@ func (h *StandardHarness) runReActInner(
 					SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 					SessionState: session, PendingToolCalls: nil, ApprovedResults: nil,
 					HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
+					// #140: carry this leaf's toolset handle so resume routes
+					// through its scoped catalogue.
+					Toolset: toolset,
 				}
 				return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 			}
@@ -4514,6 +4531,9 @@ func (h *StandardHarness) runReActInner(
 						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 						SessionState: session, PendingToolCalls: nil, ApprovedResults: nil,
 						HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
+						// #140: carry this leaf's toolset handle so resume routes
+						// through its scoped catalogue.
+						Toolset: toolset,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
@@ -4617,6 +4637,9 @@ func (h *StandardHarness) runReActInner(
 						SessionID: sessionID, TaskID: task.ID, TurnNumber: budget.Turns,
 						SessionState: session, PendingToolCalls: calls, ApprovedResults: nil,
 						HumanRequest: &req, Task: task, BudgetUsed: budget, ChildState: nil,
+						// #140: carry this leaf's toolset handle so resume routes
+						// through its scoped catalogue.
+						Toolset: toolset,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
@@ -4688,6 +4711,9 @@ func (h *StandardHarness) runReActInner(
 						SessionState: session, PendingToolCalls: pending,
 						ApprovedResults: approved, HumanRequest: &req, Task: task,
 						BudgetUsed: budget, ChildState: nil,
+						// #140: carry this leaf's toolset handle so the preserved
+						// clarifying call resumes against its scoped catalogue.
+						Toolset: toolset,
 					}
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
 				}
@@ -4720,6 +4746,11 @@ func (h *StandardHarness) runReActInner(
 						SessionState: session, PendingToolCalls: pending,
 						ApprovedResults: approved, HumanRequest: nil, Task: task,
 						BudgetUsed: budget, ChildState: nil,
+						// #140 (THE load-bearing path): carry this leaf's toolset
+						// handle so ResumeConsult routes the preserved consulting
+						// call through its scoped catalogue instead of the global
+						// fallback.
+						Toolset: toolset,
 					}
 					return RunResult{
 						Kind:           RunConsult,
@@ -4754,6 +4785,9 @@ func (h *StandardHarness) runReActInner(
 						SessionState: session, PendingToolCalls: remaining,
 						ApprovedResults: approved, HumanRequest: &req, Task: task,
 						BudgetUsed: budget, ChildState: output.ChildState,
+						// #140: the parent leaf's toolset handle (the child carries
+						// its own inside ChildState).
+						Toolset: toolset,
 					}
 					_ = toolPause
 					return RunResult{Kind: RunWaitingForHuman, State: state, Request: &req}
@@ -4781,6 +4815,9 @@ func (h *StandardHarness) runReActInner(
 						SessionState: session, PendingToolCalls: remaining,
 						ApprovedResults: approved, HumanRequest: nil, Task: task,
 						BudgetUsed: budget, ChildState: nil,
+						// #140: carry this leaf's toolset handle so resume routes
+						// pending per-node calls through its catalogue.
+						Toolset: toolset,
 					}
 					return RunResult{
 						Kind:      RunEscalate,
@@ -5244,10 +5281,11 @@ func (h *StandardHarness) resumeConsultInner(
 		)
 	}
 
-	// Issue 2: the consult-resume tool-dispatch path carries no per-node toolset
-	// handle, so it threads the EMPTY handle → global-catalogue fallback,
-	// byte-for-byte with pre-Issue-2 behaviour.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, ToolsetRef(""))
+	// #140: resume routes the preserved consulting call (and any remaining
+	// pending calls) through the pausing leaf's own toolset handle, restoring its
+	// scoped per-node catalogue. An empty handle (the default) still falls back to
+	// the global catalogue, so pre-#140 blobs behave unchanged.
+	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
 
 	// Inject the consult answer as the RESULT of the head pending (consult)
 	// call, then dispatch the remaining pending calls in the same batch.
@@ -5319,10 +5357,11 @@ func (h *StandardHarness) resumeInner(
 
 	// Resolve the effective tool registry for this resumed session — bridges
 	// catalogue tools the same way the turn loop does, so pending tool calls
-	// dispatched during resume thread the run's storage + sandbox. Issue 2: this
-	// legacy resume path carries no per-node toolset handle, so it threads the
-	// EMPTY handle → global-catalogue fallback, byte-for-byte.
-	toolRegistry := h.effectiveToolRegistry(state.SessionID, ToolsetRef(""))
+	// dispatched during resume thread the run's storage + sandbox. #140: resume
+	// now routes through the pausing leaf's own toolset handle, restoring its
+	// scoped per-node catalogue. An empty handle (the default) still falls back to
+	// the global catalogue, so pre-#140 blobs and root pauses behave unchanged.
+	toolRegistry := h.effectiveToolRegistry(state.SessionID, state.Toolset)
 
 	// Subagent depth-1: a child state, if present, would be resumed via the
 	// caller-installed SubagentTool. Wiring lands with #4/#5. The harness
