@@ -4459,6 +4459,15 @@ class PausedState(_Model):
     task: Task
     budget_used: BudgetSnapshot
     child_state: ChildPausedState | None = None
+    # The toolset handle of the leaf that paused (#140). Resume routes pending
+    # per-node tool calls through this handle's scoped catalogue via
+    # :meth:`StandardHarness._effective_tool_registry`; an empty handle (the
+    # default) falls back to the global catalogue. The pydantic default ``""``
+    # keeps pre-#140 paused-state blobs (no ``toolset`` key) deserializing — they
+    # restore as ``""``. The field ALWAYS serializes (even when empty, as
+    # ``"toolset":""``) for cross-language byte-parity; declared LAST so it
+    # serializes after ``child_state`` to byte-match the shared fixtures.
+    toolset: ToolsetRef = ""
 
     def serialize_checkpoint(self) -> str:
         """The SHARED durable checkpoint round-trip (#129, AC1). Both cross-process
@@ -4499,6 +4508,11 @@ class ChildPausedState(_Model):
     task: Task
     budget_used: BudgetSnapshot
     parent_tool_call_id: str
+    # The toolset handle of the child leaf that paused (#140); same semantics and
+    # serialization contract as :attr:`PausedState.toolset`. ALWAYS serializes
+    # (``"toolset":""`` when empty); the pydantic default keeps pre-#140 child
+    # blobs deserializing. Declared LAST to byte-match the shared fixtures.
+    toolset: ToolsetRef = ""
 
 
 # Forward refs are resolved at the BOTTOM of the module (after the deferred
@@ -6723,7 +6737,14 @@ class StandardHarness:
         # Resolve the effective tool registry for this resumed session — bridges
         # catalogue tools the same way the turn loop does, so pending tool calls
         # dispatched during resume thread the run's storage + sandbox (issue #91).
-        tool_registry = self._effective_tool_registry(session_id)
+        # #140: resume now routes through the pausing leaf's own toolset handle,
+        # restoring its scoped per-node catalogue. An empty handle (the default)
+        # still falls back to the global catalogue, so pre-#140 blobs and root
+        # pauses behave unchanged. The budget-escalation branch below returns early
+        # via ``_drive_strategy``, which re-resolves per-leaf toolsets during the
+        # re-drive — so this registry is only used by the Clarification /
+        # direct-resume paths whose pending calls need the carried handle.
+        tool_registry = self._effective_tool_registry(session_id, state.toolset)
 
         # Clarification resume (issue #81, Q4b): if this pause came from
         # :class:`ToolOutputAwaitingClarification`, the human's answer is
@@ -6919,7 +6940,11 @@ class StandardHarness:
         task = state.task
         budget_used = state.budget_used
         session_id = state.session_id
-        tool_registry = self._effective_tool_registry(session_id)
+        # #140: resume routes the preserved consulting call (and any remaining
+        # pending calls) through the pausing leaf's own toolset handle, restoring
+        # its scoped per-node catalogue. An empty handle (the default) still falls
+        # back to the global catalogue, so pre-#140 blobs behave unchanged.
+        tool_registry = self._effective_tool_registry(session_id, state.toolset)
 
         if isinstance(response, ConsultResponseAnswer):
             text, answered = response.text, True
@@ -8331,6 +8356,9 @@ class StandardHarness:
                         task=task,
                         budget_used=budget_used,
                         child_state=None,
+                        # #140: carry this leaf's toolset handle so resume routes
+                        # through its scoped catalogue.
+                        toolset=toolset,
                     )
                     return RunResultWaitingForHuman(state=paused, request=decision.request)
 
@@ -8524,6 +8552,9 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=None,
+                            # #140: carry this leaf's toolset handle so resume
+                            # routes through its scoped catalogue.
+                            toolset=toolset,
                         )
                         return RunResultWaitingForHuman(state=paused, request=decision.request)
 
@@ -8642,6 +8673,9 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=None,
+                            # #140: carry this leaf's toolset handle so resume
+                            # routes through its scoped catalogue.
+                            toolset=toolset,
                         )
                         return RunResultWaitingForHuman(state=paused, request=decision.request)
 
@@ -8707,6 +8741,9 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=output.child_state,
+                            # #140: the parent leaf's toolset handle (the child
+                            # carries its own inside ``child_state``).
+                            toolset=toolset,
                         )
                         return RunResultWaitingForHuman(state=paused, request=output.request)
 
@@ -8737,6 +8774,9 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=None,
+                            # #140: carry this leaf's toolset handle so resume
+                            # routes pending per-node calls through its catalogue.
+                            toolset=toolset,
                         )
                         return RunResultEscalate(
                             signal=output.signal,
@@ -8771,6 +8811,10 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=None,
+                            # #140: carry this leaf's toolset handle so the
+                            # preserved clarifying call resumes against its scoped
+                            # catalogue.
+                            toolset=toolset,
                         )
                         return RunResultWaitingForHuman(state=paused, request=request)
 
@@ -8822,6 +8866,11 @@ class StandardHarness:
                             task=task,
                             budget_used=budget_used,
                             child_state=None,
+                            # #140 (THE load-bearing path): carry this leaf's
+                            # toolset handle so ``resume_consult`` routes the
+                            # preserved consulting call through its scoped
+                            # catalogue instead of the global fallback.
+                            toolset=toolset,
                         )
                         return RunResultConsult(
                             request=output.request,
