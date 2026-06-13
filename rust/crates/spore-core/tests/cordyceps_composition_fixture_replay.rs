@@ -336,9 +336,12 @@ async fn plan_builds_dag_execute_walks_readyset() {
 // receives every node's events, each stamped with the node that produced it
 // (kind / agent_id / depth / root→leaf path). This is the seam an API backing a
 // web UI subscribes to and forwards over SSE. Proven here against the same
-// plan→worker→evaluator replay as the ready-set test: plan turns carry the
-// `planner` leaf nested under `plan_execute`; worker turns carry the `executor`
-// leaf nested DEEPER, under `plan_execute → self_verifying`.
+// worker→evaluator replay as the ready-set test: worker turns carry the
+// `executor` leaf nested under `plan_execute → self_verifying`.
+//
+// #138 AC1: the durable task_list is pre-seeded, so the plan phase is SKIPPED —
+// there is NO `planner`-attributed event. The execute (worker) leaf still
+// streams with full nesting attribution, which is what this test now asserts.
 #[tokio::test]
 async fn composed_tree_streams_attributed_events() {
     use spore_core::HarnessStreamEvent;
@@ -376,24 +379,18 @@ async fn composed_tree_streams_attributed_events() {
         .iter()
         .filter_map(|e| e.node().and_then(|n| n.agent_id.as_deref()))
         .collect();
+    // #138 AC1: the plan phase is skipped, so there is NO planner event.
     assert!(
-        agents.contains("planner"),
-        "plan turns attributed to planner: {agents:?}"
+        !agents.contains("planner"),
+        "#138 AC1: skip-plan emits no planner event: {agents:?}"
     );
     assert!(
         agents.contains("executor"),
         "worker turns attributed to executor: {agents:?}"
     );
 
-    // The plan leaf sits under `plan_execute`; the worker leaf sits DEEPER, under
-    // `plan_execute → self_verifying` — the path/depth carry the full nesting.
-    let planner = events
-        .iter()
-        .find_map(|e| {
-            e.node()
-                .filter(|n| n.agent_id.as_deref() == Some("planner"))
-        })
-        .expect("a planner-attributed event");
+    // The worker leaf sits under `plan_execute → self_verifying` — the path/depth
+    // carry the full nesting attribution even though the plan phase was skipped.
     let executor = events
         .iter()
         .find_map(|e| {
@@ -402,17 +399,15 @@ async fn composed_tree_streams_attributed_events() {
         })
         .expect("an executor-attributed event");
 
-    assert_eq!(planner.kind, "react");
-    assert_eq!(planner.path, vec!["plan_execute", "react"]);
+    assert_eq!(executor.kind, "react");
     assert_eq!(
         executor.path,
         vec!["plan_execute", "self_verifying", "react"]
     );
     assert!(
-        executor.depth > planner.depth,
-        "the worker leaf is nested deeper than the plan leaf: worker={} plan={}",
-        executor.depth,
-        planner.depth
+        executor.depth >= 2,
+        "the worker leaf carries its full nesting depth: {}",
+        executor.depth
     );
 }
 
@@ -587,6 +582,241 @@ async fn worker_consult_surfaces_and_host_resumes() {
             .all(|t| t.status == TaskStatus::Completed),
         "the consulted task completed: {:?}",
         after.tasks.iter().map(|t| t.status).collect::<Vec<_>>()
+    );
+}
+
+// ── #138 budget-resume (seed the stalled worker, skip re-planning) ──────────
+
+/// A small-budget `PlanExecute[ ReAct(plan), SelfVerifying[ ReAct(PerLoop{2}) ] ]`
+/// tree whose worker leaf exhausts after exactly TWO turns — so a budget pause is
+/// reachable with a tiny fixture. Mirrors the cordyceps execute leaf's handles
+/// (`executor` / `exec-tools` / `worker-schema` / `exec-evaluator`).
+fn small_budget_pe() -> LoopStrategy {
+    use spore_core::{
+        AgentRef, BudgetExhaustedBehavior, BudgetPolicy, PlanExecuteConfig, ReactConfig, SchemaRef,
+        SelfVerifyingConfig, ToolsetRef,
+    };
+    let worker = LoopStrategy::ReAct(ReactConfig {
+        behavior: BudgetExhaustedBehavior::Escalate,
+        budget: BudgetPolicy::PerLoop { value: 2 },
+        agent: AgentRef("executor".into()),
+        toolset: ToolsetRef("exec-tools".into()),
+        output: Some(SchemaRef("worker-schema".into())),
+    });
+    let plan = LoopStrategy::ReAct(ReactConfig {
+        behavior: BudgetExhaustedBehavior::Escalate,
+        budget: BudgetPolicy::PerLoop { value: 12 },
+        agent: AgentRef("planner".into()),
+        toolset: ToolsetRef("plan-tools".into()),
+        output: Some(SchemaRef("plan-schema".into())),
+    });
+    LoopStrategy::PlanExecute(PlanExecuteConfig {
+        behavior: BudgetExhaustedBehavior::Escalate,
+        plan: Box::new(plan),
+        execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(worker),
+            evaluator: SchemaRef("exec-evaluator".into()),
+        })),
+        plan_model: None,
+    })
+}
+
+/// A SurfaceToHuman harness whose plan/worker/evaluate turns replay positionally
+/// from ONE shared `ReplayModelInterface` plus a `ScriptedToolRegistry` that
+/// returns success for the worker's two budget-burning tool calls.
+fn surface_harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
+    let jsonl = std::fs::read_to_string(fixture_path(fixture))
+        .unwrap_or_else(|e| panic!("read {fixture}: {e}"));
+    let replay = Arc::new(ReplayModelInterface::from_jsonl(&jsonl, provider()).expect("fixture"));
+    let agent = |id: &str| -> Arc<dyn Agent> {
+        Arc::new(ModelAgent::new(AgentId::new(id), replay.clone()))
+    };
+    // The worker's two tool calls each dispatch to a plain success (content is
+    // irrelevant; they only burn the PerLoop{2} budget).
+    let tool_registry = Arc::new(spore_core::harness::testing::ScriptedToolRegistry::new());
+    tool_registry.push(ToolOutput::Success {
+        content: "src/one.rs\nsrc/two.rs".into(),
+        truncated: false,
+    });
+    tool_registry.push(ToolOutput::Success {
+        content: "fn one() { x.unwrap() }".into(),
+        truncated: false,
+    });
+    let storage = Arc::new(StorageProvider::single(Arc::new(
+        spore_core::storage::InMemoryStorageProvider::new(),
+    )));
+    let registry = ExecutionRegistry::builder()
+        .agent("planner", agent("planner"))
+        .agent("executor", agent("executor"))
+        .agent("ralph-agent", agent("ralph-agent"))
+        .toolset("plan-tools", Arc::new(spore_core::EmptyToolRegistry))
+        .toolset("exec-tools", Arc::new(spore_core::EmptyToolRegistry))
+        .schema("plan-schema", serde_json::json!({"type": "object"}))
+        .schema("worker-schema", serde_json::json!({"type": "array"}))
+        .verifier("exec-evaluator", exec_evaluator())
+        .build();
+    let cfg = HarnessConfig {
+        tool_registry,
+        sandbox: Arc::new(AllowAllSandbox),
+        context_manager: Arc::new(NoopContextManager),
+        termination_policy: Arc::new(AlwaysContinuePolicy),
+        toolset_catalogues: Default::default(),
+        middleware: None,
+        observability: None,
+        compaction_verifier: Arc::new(spore_core::KeyTermVerifier),
+        max_compaction_attempts: 2,
+        pricing: spore_core::PricingTable::DEFAULT,
+        content_capture: spore_core::ContentCaptureConfig::default(),
+        tool_call_repair: None,
+        max_repair_attempts: 1,
+        max_stop_blocks: 8,
+        error_loop_threshold: 3,
+        hooks: None,
+        storage: storage.clone(),
+        project_id: spore_core::ProjectId::from_canonical_path(CORDYCEPS_PROJECT_PATH),
+        chunk_provider: Arc::new(spore_core::prompt_assembly::InMemoryChunkProvider::empty()),
+        max_resets: 3,
+        vcs_provider: None,
+        catalogue_registry: None,
+        system_prompt: None,
+        model_params: spore_core::ModelParams::default(),
+        auto_persist_sessions: false,
+        prompt_tool_call_flag: None,
+        consult_handlers: std::collections::HashMap::new(),
+        registry,
+        // #138/#130: the worker leaf's budget exhaustion PAUSES (WaitingForHuman).
+        escalation_mode: EscalationMode::SurfaceToHuman,
+    };
+    (StandardHarness::new(cfg), storage)
+}
+
+fn small_pe_task(session: &str) -> Task {
+    let mut t = Task::new("audit the repo", SessionId::new(session), small_budget_pe());
+    t.budget.max_turns = Some(64);
+    t
+}
+
+// #138 AC2 + AC1: a budget-resume of an execute-phase exhaustion SEEDS the
+// stalled worker (carries its full session across the pause) and SKIPS
+// re-planning. Leg 1 drives the worker leaf to its PerLoop{2} cap and PAUSES with
+// a `BudgetExhausted` request whose `PausedState` carries the FULL worker session
+// (AC2-a) and the `exec-tools` handle (AC4-a). Leg 2 (`ContinueWithBudget`) does
+// NOT re-plan (the fixture has NO plan turn) and re-attaches the carried session
+// so the worker continues mid-loop to a finding that the evaluator clears.
+#[tokio::test]
+async fn budget_resume_seeds_stalled_worker_and_skips_replanning() {
+    use spore_core::{EscalationAction, HumanRequest, HumanResponse};
+
+    let (h, storage) = surface_harness_for("cordyceps_budget_resume.jsonl");
+    let session = SessionId::new("cordyceps-budget");
+    // Pre-seed ONE ready task so AC1's skip-replan precondition holds (non-empty
+    // durable list) and the execute phase runs exactly one worker.
+    let mut tl = TaskList::default();
+    tl.add("audit module one".into(), vec![]).unwrap();
+    seed(&storage, &session, &tl).await;
+
+    // Leg 1: drive to the budget-exhaustion pause.
+    let first = h
+        .run(HarnessRunOptions::new(small_pe_task("cordyceps-budget")))
+        .await;
+    let (request, state) = match first {
+        RunResult::WaitingForHuman { request, state } => (request, state),
+        other => panic!("expected WaitingForHuman budget pause, got {other:?}"),
+    };
+    match &request {
+        // The combinator (PlanExecute) resolves the worker leaf's propagated
+        // exhaustion, so the pause's `phase` is the resolving scope.
+        HumanRequest::BudgetExhausted { phase, .. } => {
+            assert_eq!(
+                phase, "plan_execute",
+                "the combinator resolved the exhaustion"
+            );
+        }
+        other => panic!("expected BudgetExhausted, got {other:?}"),
+    }
+    // AC4-a (#140 parity): the pause carries the worker leaf's toolset handle.
+    assert_eq!(
+        state.toolset.0, "exec-tools",
+        "AC4-a: budget pause carries the worker leaf's handle"
+    );
+    // AC2-a: the pause carries the FULL worker session (instruction + the two
+    // budget-burning tool-call rounds), NOT a partial-only stub.
+    assert!(
+        state.session_state.messages.len() > 1,
+        "AC2-a: full worker session carried, got {} messages",
+        state.session_state.messages.len()
+    );
+    // AC2 parity: the stalled task stays `InProgress` on the durable list at the
+    // pause (the consult path's invariant) — NOT permanently Blocked — so the
+    // resume can re-attach the carried session via InProgress->Pending->complete.
+    let paused_list = stored_list(&storage, &session).await;
+    assert_eq!(
+        paused_list.tasks[0].status,
+        TaskStatus::InProgress,
+        "the stalled task awaits a budget grant (InProgress, not Blocked)"
+    );
+
+    // Leg 2: grant more budget and resume. AC1: NO plan turn in the fixture, so a
+    // re-plan would exhaust the positional replay and error — Success proves the
+    // plan phase was skipped. AC2-b: the carried session re-attaches to the
+    // InProgress task, so the worker continues to its finding and self-verifies.
+    let resumed = h
+        .resume(
+            *state,
+            HumanResponse::Escalate {
+                action: EscalationAction::ContinueWithBudget { steps: 5 },
+            },
+            None,
+        )
+        .await;
+    match resumed {
+        RunResult::Success { output, .. } => assert!(
+            output.contains("resume-continued"),
+            "run output is the post-resume worker finding: {output}"
+        ),
+        other => panic!("expected Success after budget resume, got {other:?}"),
+    }
+
+    // The resumed task self-verified and completed (InProgress->Pending->Completed
+    // — the same transition machinery the consult path uses, AC2 parity).
+    let after = stored_list(&storage, &session).await;
+    assert!(
+        after
+            .tasks
+            .iter()
+            .all(|t| t.status == TaskStatus::Completed),
+        "the resumed task completed: {:?}",
+        after.tasks.iter().map(|t| t.status).collect::<Vec<_>>()
+    );
+}
+
+// #138 AC4: the budget-exhausted `PausedState` fixture round-trips
+// byte-structurally — the carried worker session (AC2-a) and the `exec-tools`
+// handle (AC4-a) survive a serde round-trip identically. This is the
+// cross-language wire-parity lock for the four-language ports.
+#[test]
+fn budget_exhausted_paused_state_round_trips() {
+    use spore_core::PausedState;
+    let raw = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("fixtures/paused_states/cordyceps_budget_exhausted.json"),
+    )
+    .expect("cordyceps_budget_exhausted.json present");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+    let typed: PausedState =
+        serde_json::from_value(value.clone()).expect("PausedState deserializes");
+    let reser = serde_json::to_value(&typed).expect("re-serialize");
+    assert_eq!(reser, value, "PausedState round-trips byte-structurally");
+
+    // AC4-a: the toolset handle is the worker leaf's, always serialized.
+    assert_eq!(value["toolset"], "exec-tools");
+    // AC2-a: the carried session grew beyond the single partial-only stub.
+    assert!(
+        value["session_state"]["messages"].as_array().unwrap().len() > 1,
+        "AC2-a: the budget-exhausted session carries the worker conversation"
     );
 }
 

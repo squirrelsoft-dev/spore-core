@@ -5,6 +5,27 @@
   "session_state": {
     "messages": [
       {
+        "role": "user",
+        "content": {
+          "type": "text",
+          "text": "worker: audit the runaway module"
+        }
+      },
+      {
+        "role": "assistant",
+        "content": {
+          "type": "text",
+          "text": "listing the module to find the defect"
+        }
+      },
+      {
+        "role": "tool",
+        "content": {
+          "type": "text",
+          "text": "src/runaway.rs (1200 lines)"
+        }
+      },
+      {
         "role": "assistant",
         "content": {
           "type": "text",
@@ -105,5 +126,5 @@
     "cost_usd": 0.0
   },
   "child_state": null,
-  "toolset": ""
+  "toolset": "exec-tools"
 }
