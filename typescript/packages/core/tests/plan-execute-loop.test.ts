@@ -396,8 +396,9 @@ describe("PlanExecute execute phase (issue #59)", () => {
     //   3 "never" (blocked by 2) → cascade-blocked (never runs)
     // The run does NOT abort on the first failure; it drains to the partial
     // terminal `tasks_blocked_by_failure` reporting the full partition.
+    // #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn. The first model call is task 1.
     const a = new RecordingAgent(AgentId.of("default"))
-      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("did good"))
       .push({ kind: "error", error: new EmptyResponse(), usage: null });
     const provider = StorageProvider.single(new InMemoryStorageProvider());
@@ -420,8 +421,9 @@ describe("PlanExecute execute phase (issue #59)", () => {
         expect(r.reason.blocked).toEqual([2, 3]);
       }
     }
-    // plan(1) + good(1) + bad(1) = 3 agent calls; the dependent "never" never ran.
-    expect(a.ran).toBe(3);
+    // #138 AC1: plan SKIPPED — good(1) + bad(1) = 2 agent calls; the dependent
+    // "never" never ran.
+    expect(a.ran).toBe(2);
   });
 
   it("Q4: the task list persists through the RunStore seam (not the sandbox path)", async () => {
@@ -479,7 +481,9 @@ describe("PlanExecute execute phase (issue #59)", () => {
       ],
       next_id: 3,
     };
-    await provider.run().put(DURABLE_NS, TASK_LIST_EXTRAS_KEY, JSON.parse(JSON.stringify(checkpoint)));
+    await provider
+      .run()
+      .put(DURABLE_NS, TASK_LIST_EXTRAS_KEY, JSON.parse(JSON.stringify(checkpoint)));
 
     // The freshly-parsed list (as the plan phase produces) is all-Pending.
     const fresh = planArtifactToTaskList({ tasks: ["one", "two"], rationale: "r" });

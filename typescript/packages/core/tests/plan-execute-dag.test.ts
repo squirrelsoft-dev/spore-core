@@ -236,8 +236,9 @@ describe("PlanExecute DAG executor (#126)", () => {
   it("AC1: a blocker DAG executes in dependency order with a lowest-id tiebreak", async () => {
     // DAG: 2 and 3 both block on 1; 4 blocks on 2 and 3. Expected run order by
     // lowest-ready-id: 1, 2, 3, 4.
+    // #138 AC1: the durable task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn is pushed. The first model call is task 1.
     const a = new RecordingAgent()
-      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("did 1"))
       .push(fr("did 2"))
       .push(fr("did 3"))
@@ -254,21 +255,22 @@ describe("PlanExecute DAG executor (#126)", () => {
     const r = await h.run({ task: planTask() });
     expect(r.kind).toBe("success");
     if (r.kind === "success") expect(r.output).toBe("did 4");
-    // plan + 4 steps in order.
-    expect(a.ran).toBe(5);
-    // Step contexts (indices 1..4) carry their own instructions in run order.
-    expect(ctxText(a.seen[1]!)).toContain("one");
-    expect(ctxText(a.seen[2]!)).toContain("two");
-    expect(ctxText(a.seen[3]!)).toContain("three");
-    expect(ctxText(a.seen[4]!)).toContain("four");
+    // #138 AC1: plan SKIPPED → 4 steps in order, no plan turn.
+    expect(a.ran).toBe(4);
+    // Step contexts (indices 0..3) carry their own instructions in run order.
+    expect(ctxText(a.seen[0]!)).toContain("one");
+    expect(ctxText(a.seen[1]!)).toContain("two");
+    expect(ctxText(a.seen[2]!)).toContain("three");
+    expect(ctxText(a.seen[3]!)).toContain("four");
   });
 
   it("AC1: independent branches do NOT pollute each other's context (Tier-1 isolation)", async () => {
     // 1 (root) → 2 (child of 1); 3 is independent. Child (2) sees root's (1)
     // output; the independent task (3) must NOT see it, and the child must NOT
     // see the independent branch.
+    // #138 AC1: the durable task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn. The first model call is task 1.
     const a = new RecordingAgent()
-      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("ROOT_OUTPUT_AAA")) // task 1
       .push(fr("CHILD_OUTPUT_BBB")) // task 2 (blocked by 1)
       .push(fr("INDEP_OUTPUT_CCC")); // task 3 (independent)
@@ -282,9 +284,9 @@ describe("PlanExecute DAG executor (#126)", () => {
 
     const r = await h.run({ task: planTask() });
     expect(r.kind).toBe("success");
-    // Run order by lowest-ready id: 1, 2, 3.
-    const childCtx = ctxText(a.seen[2]!); // task 2
-    const indepCtx = ctxText(a.seen[3]!); // task 3
+    // Run order by lowest-ready id: 1, 2, 3 (indices 0, 1, 2 — plan skipped).
+    const childCtx = ctxText(a.seen[1]!); // task 2
+    const indepCtx = ctxText(a.seen[2]!); // task 3
     // Child (Tier-1) sees its transitive blocker (root)'s output.
     expect(childCtx).toContain("ROOT_OUTPUT_AAA");
     // Child does NOT see the independent branch (task 3 has not run; not a blocker).
@@ -299,8 +301,9 @@ describe("PlanExecute DAG executor (#126)", () => {
     // Diamond: 1 → {2,3} → 4. Task 4's Tier-1 seed should carry 1, 2, 3's outputs
     // (its transitive blockers) and nothing else. Task 2's seed should carry only
     // task 1 (NOT its sibling task 3).
+    // #138 AC1: the durable task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn. The first model call is task 1.
     const a = new RecordingAgent()
-      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("OUT_ONE"))
       .push(fr("OUT_TWO"))
       .push(fr("OUT_THREE"))
@@ -315,8 +318,8 @@ describe("PlanExecute DAG executor (#126)", () => {
     await seedDag(h, SID, tl);
 
     await h.run({ task: planTask() });
-    const twoCtx = ctxText(a.seen[2]!); // task 2
-    const fourCtx = ctxText(a.seen[4]!); // task 4
+    const twoCtx = ctxText(a.seen[1]!); // task 2 (index 1 — plan skipped)
+    const fourCtx = ctxText(a.seen[3]!); // task 4 (index 3 — plan skipped)
     // Task 2's seed carries task 1's output but NOT task 3's (a sibling, not a blocker).
     expect(twoCtx).toContain("OUT_ONE");
     expect(twoCtx).not.toContain("OUT_THREE");
@@ -336,8 +339,9 @@ describe("PlanExecute DAG executor (#126)", () => {
     // path is OBSERVED and recorded. Task 3 (blocked by 2) sees task 2's ledger
     // row including the observed file, proving the seam end-to-end.
     const editCall: ToolCall = { id: "e1", name: "edit_file", input: { path: "src/widget.ts" } };
+    // #138 AC1: the durable task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn. The first model call is task 1.
     const a = new RecordingAgent()
-      .push(fr('{"tasks":["plan placeholder"]}'))
       // Task 1: narrate touching a file but make no tool call.
       .push(fr("I touched src/phantom.ts (narrated only, no tool call)"))
       // Task 2: real edit_file call, then finalize.
@@ -398,8 +402,9 @@ describe("PlanExecute DAG executor (#126)", () => {
     // DAG: 1 "good" → completes; 2 "bad" → fails; 3 "dep" (blocked by 2) →
     // cascade-blocked; 4 "indep" → still completes. Run does NOT abort on first
     // failure; drains to tasks_blocked_by_failure with the full partition.
+    // #138 AC1: the durable task_list is pre-seeded below, so the plan phase is
+    // SKIPPED — no plan turn. The first model call is task 1.
     const a = new RecordingAgent()
-      .push(fr('{"tasks":["plan placeholder"]}'))
       .push(fr("did good")) // task 1
       .push({ kind: "error", error: new EmptyResponse(), usage: null }) // task 2 fails
       .push(fr("did indep")); // task 4 (3 is blocked, never runs)
@@ -422,8 +427,9 @@ describe("PlanExecute DAG executor (#126)", () => {
         expect(r.reason.blocked).toEqual([2, 3]);
       }
     }
-    // plan + good + bad + indep = 4 agent calls; the dependent "dep" never ran.
-    expect(a.ran).toBe(4);
+    // #138 AC1: plan SKIPPED — good + bad + indep = 3 agent calls; the dependent
+    // "dep" never ran.
+    expect(a.ran).toBe(3);
   });
 
   // ========================================================================
@@ -431,7 +437,10 @@ describe("PlanExecute DAG executor (#126)", () => {
   // ========================================================================
 
   it("AC5: a cyclic persisted graph is rejected at execute entry; no task runs", async () => {
-    const a = new RecordingAgent().push(fr('{"tasks":["plan placeholder"]}'));
+    // #138 AC1: a non-empty (cyclic) task_list is pre-seeded below, so the plan
+    // phase is SKIPPED — the cycle is detected at execute entry with NO model turn
+    // at all. No plan turn is pushed.
+    const a = new RecordingAgent();
     const provider = StorageProvider.single(new InMemoryStorageProvider());
     const h = new StandardHarness(configWith(a, { storage: provider }));
     // Hand-build a cyclic graph (addTask would reject it) and persist it.
@@ -449,8 +458,9 @@ describe("PlanExecute DAG executor (#126)", () => {
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("task_graph_cycle");
     }
-    // Only the plan turn ran — no execute step.
-    expect(a.ran).toBe(1);
+    // #138 AC1: skip-plan means NO model turn ran — the cycle is caught at execute
+    // entry before any plan or execute dispatch.
+    expect(a.ran).toBe(0);
   });
 
   // ========================================================================

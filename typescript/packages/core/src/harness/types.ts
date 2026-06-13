@@ -1372,19 +1372,28 @@ export interface RunScratch {
    */
   resumeContinues?: [string, number];
   /**
-   * Consult re-drive seed (#131): the worker conversation (with the consult
-   * answer already injected as the pending call's tool result) carried from a
-   * resumed {@link RunResult} `consult`. When set, a {@link PlanExecuteConfig}
-   * walk resumes its single `in_progress` task from THIS session (instead of a
-   * fresh instruction-seeded session) so the consulting worker continues
-   * mid-loop, its SelfVerifying evaluator still runs, and the ready-set walk
-   * proceeds. The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only —
-   * the session itself rides the serialized {@link PausedState} `sessionState`,
-   * so a cross-process resume reconstructs this seed in
-   * {@link StandardHarness.resumeConsult}. `undefined` on a fresh run / after
-   * the seed is consumed.
+   * Phase-agnostic resume seed (#131 consult re-drive + #138 budget resume): the
+   * stalled worker conversation carried from a resumed pause. For a CONSULT
+   * resume the consult answer is already injected as the pending call's tool
+   * result; for a BUDGET resume (#138) it is the worker's full post-exhaustion
+   * session. When set, a {@link PlanExecuteConfig} walk resumes its single
+   * `in_progress` task from THIS session (instead of a fresh instruction-seeded
+   * session) so the stalled worker continues mid-loop, its SelfVerifying
+   * evaluator still runs, and the ready-set walk proceeds.
+   *
+   * #138 AC3 (plan-phase exhaustion): when the durable task_list has NO
+   * `in_progress` task, the exhaustion happened in the PLAN phase before any task
+   * was authored — the walk seeds the PLAN session from this carried conversation
+   * instead of cloning a fresh base session.
+   *
+   * The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the session
+   * itself rides the serialized {@link PausedState} `sessionState`, so a
+   * cross-process resume reconstructs this seed in
+   * {@link StandardHarness.resumeConsult} (consult) or the `continue_with_budget`
+   * resume arm (#138 budget). `undefined` on a fresh run / after the seed is
+   * consumed.
    */
-  consultResume?: SessionState;
+  resumeSeed?: SessionState;
 }
 
 function newRunScratch(): RunScratch {
@@ -1653,7 +1662,7 @@ async function finishCombinator(
   // walk. As the pause unwinds through each combinator's `finish`, rewrite its
   // `state.task` to the combinator's OWN composed task; by the top it carries
   // the FULL tree, so `resumeConsult` re-drives the whole strategy (the
-  // in-progress task resumes from `consultResume`).
+  // in-progress task resumes from `resumeSeed`).
   if (result.kind === "consult") {
     result = { ...result, state: { ...result.state, task: parentTask } };
   }
@@ -1837,9 +1846,15 @@ export function leafEscalationActions(err: BudgetExhausted): EscalationAction[] 
  * node's `steps_taken` / `continues_used` (on the request) so `resumeInner` can
  * reconstruct the node's budget context from the request alone (fork E).
  *
- * The `partialOutput` is preserved both on the request (for the operator to
- * inspect) AND as a single assistant text message on the paused `session_state`
- * (so a resume re-enters the loop with that context). Mirrors Rust
+ * #138 AC2-a: the paused `session_state` is the FULL stalled worker session
+ * (`workerSession`) — parallel to how the consult pause preserves the worker
+ * conversation — so a budget RESUME re-attaches it as the in-progress task's
+ * seed and the worker continues with its real context instead of a partial-only
+ * stub. When `workerSession` is empty (a bare-leaf propagate site that has no
+ * richer conversation to carry, or a legacy caller), it falls back to the single
+ * `partialOutput` assistant message so the pre-#138 behavior is intact. #138
+ * AC4-a: `toolset` carries the stalled worker leaf's handle (e.g. `"exec-tools"`),
+ * consistent with #140, instead of staying `""`. Mirrors Rust
  * `promote_budget_exhausted_to_human`.
  */
 export function promoteBudgetExhaustedToHuman(
@@ -1850,14 +1865,22 @@ export function promoteBudgetExhaustedToHuman(
   task: Task,
   budgetUsed: BudgetSnapshot,
   turnNumber: number,
+  // #138 AC2-a: the FULL stalled worker session to carry across the pause.
+  workerSession: SessionState = emptySessionState(),
+  // #138 AC4-a: the stalled worker leaf's toolset handle (#140 parity).
+  toolset: ToolsetRef = "",
 ): RunResult {
+  // #138 AC2-a: prefer the FULL worker conversation; fall back to the
+  // partial-only stub when the carried session is empty (back-compat).
   const sessionState: SessionState =
-    partialOutput != null
-      ? {
-          messages: [{ role: "assistant", content: { type: "text", text: partialOutput } }],
-          extras: {},
-        }
-      : emptySessionState();
+    workerSession.messages.length > 0
+      ? workerSession
+      : partialOutput != null
+        ? {
+            messages: [{ role: "assistant", content: { type: "text", text: partialOutput } }],
+            extras: {},
+          }
+        : emptySessionState();
   const request: HumanRequest = {
     kind: "budget_exhausted",
     phase: err.phase,
@@ -1878,10 +1901,9 @@ export function promoteBudgetExhaustedToHuman(
     task,
     budget_used: budgetUsed,
     child_state: null,
-    // #140 decision 2: a budget-exhausted pause has empty `pending_tool_calls`
-    // and re-drives the strategy on resume, so the handle is behaviorally
-    // irrelevant here. Leave the empty default.
-    toolset: "",
+    // #138 AC4-a: carry the stalled worker leaf's toolset handle (#140 parity)
+    // so a resume routes the re-driven worker through its scoped catalogue.
+    toolset,
   };
   return { kind: "waiting_for_human", state, request };
 }
@@ -2132,6 +2154,28 @@ function workerAgentKeyOf(ls: LoopStrategy): string {
 }
 
 /**
+ * Descend a {@link LoopStrategy} tree to the worker (execute) leaf's toolset
+ * handle (#138 AC4-a). Mirrors {@link workerAgentKeyOf}: a combinator descends
+ * into its EXECUTE child (PlanExecute) / inner (SelfVerifying/Ralph/HillClimbing)
+ * so a budget-exhausted pause records the same handle #140 would have on the
+ * leaf's own pause (e.g. `"exec-tools"`), not the empty default.
+ */
+export function workerToolsetOf(ls: LoopStrategy): ToolsetRef {
+  switch (ls.kind) {
+    case "react":
+      return ls.toolset;
+    case "plan_execute":
+      return workerToolsetOf(ls.execute);
+    case "self_verifying":
+      return workerToolsetOf(ls.inner);
+    case "ralph":
+      return workerToolsetOf(ls.inner);
+    case "hill_climbing":
+      return workerToolsetOf(ls.inner);
+  }
+}
+
+/**
  * Fill the worker leaf's agent handle of `ls` with `agent` ONLY where the leaf
  * left it empty — Ralph's bare-leaf convenience. An explicitly-declared leaf
  * agent is authoritative and is never replaced (the architect's node wins).
@@ -2194,6 +2238,22 @@ function foldUsageInto(
  * (directive, plan dispatch, artifact capture/persist, deep-resume reconcile,
  * `on_task_advance` fire) — none of which touch the per-task model loop. The
  * ready-set walk lands in #126 (execute runs per task sequentially for now).
+ *
+ * #138 — resume seeding + skip re-planning:
+ * - **AC1 (skip re-planning):** the durable `task_list` (project-scoped, so it
+ *   survives Ralph's per-window session reset, #142) is probed BEFORE the plan
+ *   dispatch. A non-empty list ⇒ the WHOLE plan phase is skipped (no directive /
+ *   plan subtree / artifact capture); the run goes straight to reconcile + the
+ *   ready-set walk. The plan artifact may be ABSENT (AC1-a). `totalUsage` starts
+ *   empty and `carried.turns` stays at the incoming `budgetUsed.turns`.
+ * - **AC2 (seed the stalled worker):** a budget/consult resume carries the
+ *   stalled worker session in the phase-agnostic {@link RunScratch.resumeSeed}.
+ *   For execute-phase exhaustion the single `in_progress` task is reset to
+ *   `pending` and its step is seeded from the carried session.
+ * - **AC3 (plan-phase exhaustion):** when the seed is present AND the durable
+ *   list has NO `in_progress` task (the exhaustion was the plan phase, list still
+ *   empty per AC3-b), the PLAN session is seeded from the carried conversation
+ *   instead of a fresh base session.
  */
 async function runPlanExecuteConfig(
   c: PlanExecuteConfig,
@@ -2220,124 +2280,194 @@ async function runPlanExecuteConfig(
   const onStream = cx.stream;
   cx.stream = undefined;
 
-  // ── Phase 1: plan (dispatch through `c.plan`). ──────────────────────────────
-  //
-  // Seed the planning directive onto a CLONE of the base session so the shared
-  // execute context stays `[user: task.instruction]` (#93 — a leaked directive
-  // would make every execute step re-emit a plan). The plan phase runs under the
-  // plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`); the
-  // global `max_turns` is only the outer backstop. Previously this clamped the
-  // planner to `turns + 1` — a SINGLE turn — silently overriding the architect's
-  // plan budget and starving multi-step task-graph authoring (the planner could
-  // not both call `task_list` and finish, so it emitted prose instead).
-  const directive = executor.planDirective(task.instruction);
-  const planSession = structuredClone(baseSession);
-  await executor.seedUserMessage(planSession, directive);
-  const planTask: Task = {
-    id: task.id,
-    instruction: directive,
-    session_id: sessionId,
-    budget: { ...task.budget },
-    loop_strategy: c.plan,
-  };
-  const planResult = await executor.runPlanSubtree(
-    c.plan,
-    planTask,
-    planSession,
-    { ...budgetUsed },
-    cx.signal,
-  );
+  // #131/#138: the phase-agnostic resume seed (the stalled worker conversation
+  // carried from a resumed consult or budget pause). Taken BEFORE the plan phase
+  // so AC3 (plan-phase exhaustion) can seed the plan session from it, and AC2
+  // (execute-phase exhaustion) can re-attach it to the single `in_progress` task.
+  let resumeSeedSession = cx.scratch.resumeSeed;
+  cx.scratch.resumeSeed = undefined;
 
-  let planOutput: string;
-  let planUsage: AggregateUsage;
-  let planTurns: number;
-  if (planResult == null) {
-    cx.stream = onStream;
-    const result: RunResult = {
-      kind: "failure",
-      reason: {
-        kind: "plan_phase_failed",
-        error: { kind: "planning_turn_failed", message: "plan sub-strategy produced no terminal" },
-      },
-      session_id: sessionId,
-      usage: emptyAggregateUsage(),
-      turns: budgetUsed.turns,
-      session_state: emptySessionState(),
-    };
-    return finishCombinator(cx, executor, task, result);
-  } else if (planResult.kind === "success") {
-    planOutput = planResult.output;
-    planUsage = planResult.usage;
-    planTurns = planResult.turns;
+  // #138 AC1 (skip re-planning): probe the DURABLE task_list BEFORE the plan
+  // phase. If a non-empty list already exists (e.g. a prior window authored it,
+  // #142 makes it survive Ralph's per-window session reset), the plan phase is
+  // REDUNDANT — go straight to reconcile + the ready-set walk. This is the core
+  // fix: a budget/consult re-entry no longer burns its grant re-planning a graph
+  // that is already durable. The plan artifact may be ABSENT in this case (AC1-a
+  // artifact-optional) — nothing downstream requires it once a task_list exists.
+  const preexisting = await executor.loadTaskList(sessionId);
+  const skipPlan = preexisting != null && preexisting.tasks.length > 0;
+
+  let taskList: TaskList;
+  let totalUsage: AggregateUsage;
+  let carried: BudgetSnapshot;
+  if (skipPlan) {
+    // ── AC1: skip-plan path. The list is the durable source of truth. ─────────
+    taskList = preexisting;
+
+    // AC5 (defense in depth): re-check the durable graph for cycles. No task runs.
+    if (hasCycle(taskList)) {
+      cx.stream = onStream;
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "task_graph_cycle",
+          reason: "persisted task graph contains a directed cycle",
+        },
+        session_id: sessionId,
+        usage: emptyAggregateUsage(),
+        turns: budgetUsed.turns,
+      };
+      return finishCombinator(cx, executor, task, result);
+    }
+
+    // A.6 deep-resume: reconcile already-Completed tasks so they are NOT re-run
+    // (handles the dedup the plan path would have done).
+    await executor.reconcileCompletedTasks(sessionId, taskList);
+    await executor.persistTaskList(sessionId, taskList);
+
+    // No plan turn ran: usage starts empty and the shared budget is carried
+    // unchanged (turns stay at the incoming `budgetUsed.turns`).
+    totalUsage = emptyAggregateUsage();
+    carried = { ...budgetUsed };
   } else {
-    // A non-success plan terminal (budget / agent error / pause) propagates
-    // verbatim — the run never reaches execute.
-    cx.stream = onStream;
-    return finishCombinator(cx, executor, task, planResult);
-  }
+    // ── AC3 / fresh-plan path: run the plan phase. ────────────────────────────
+    //
+    // #138 AC3 (plan-phase exhaustion): when a resume seed is present AND the
+    // durable list has no `in_progress` task, the exhaustion happened in the PLAN
+    // phase before authoring any task (AC3-b: the list is still empty). Seed the
+    // PLAN session from the carried conversation so the planner CONTINUES on it
+    // instead of starting fresh — and consume the seed here so the execute-phase
+    // re-attach below does not also fire.
+    const planResume =
+      resumeSeedSession !== undefined &&
+      (preexisting == null || preexisting.tasks.every((t) => t.status !== "in_progress"));
 
-  // Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-  // the harness-side machinery, no model turn.
-  const outcome = await executor.capturePlanArtifact(
-    sessionId,
-    planOutput,
-    planUsage,
-    planTurns,
-    cx.signal,
-  );
-  if (!outcome.ok) {
-    cx.stream = onStream;
-    return finishCombinator(cx, executor, task, outcome.failure);
-  }
-
-  // #126 decision C: the runnable task list comes from the persisted `task_list`
-  // tool store (the ONE authoring path — it can carry real blockers). Fall back
-  // to the linear plan-artifact bridge only when nothing was authored via the
-  // tool (back-compat with the #59/#124 plan-only path and its replay fixtures).
-  // The plan artifact is still captured + persisted above so the plan-phase
-  // replay tests stay green.
-  const persisted = await executor.loadTaskList(sessionId);
-  const taskList: TaskList =
-    persisted != null && persisted.tasks.length > 0
-      ? persisted
-      : planArtifactToTaskList(outcome.artifact);
-  if (taskList.tasks.length === 0) {
-    cx.stream = onStream;
-    const result: RunResult = {
-      kind: "failure",
-      reason: { kind: "empty_plan" },
+    // Seed the planning directive onto a CLONE of the base session so the shared
+    // execute context stays `[user: task.instruction]` (#93 — a leaked directive
+    // would make every execute step re-emit a plan). The plan phase runs under
+    // the plan sub-strategy's OWN declared budget (e.g. a ReAct `PerLoop{4}`);
+    // the global `max_turns` is only the outer backstop.
+    const directive = executor.planDirective(task.instruction);
+    const planSession =
+      planResume && resumeSeedSession !== undefined
+        ? resumeSeedSession
+        : structuredClone(baseSession);
+    if (planResume) resumeSeedSession = undefined;
+    await executor.seedUserMessage(planSession, directive);
+    const planTask: Task = {
+      id: task.id,
+      instruction: directive,
       session_id: sessionId,
-      usage: outcome.usage,
-      turns: outcome.turns,
+      budget: { ...task.budget },
+      loop_strategy: c.plan,
     };
-    return finishCombinator(cx, executor, task, result);
+    const planResult = await executor.runPlanSubtree(
+      c.plan,
+      planTask,
+      planSession,
+      { ...budgetUsed },
+      cx.signal,
+    );
+
+    let planOutput: string;
+    let planUsage: AggregateUsage;
+    let planTurns: number;
+    if (planResult == null) {
+      cx.stream = onStream;
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "plan_phase_failed",
+          error: {
+            kind: "planning_turn_failed",
+            message: "plan sub-strategy produced no terminal",
+          },
+        },
+        session_id: sessionId,
+        usage: emptyAggregateUsage(),
+        turns: budgetUsed.turns,
+        session_state: emptySessionState(),
+      };
+      return finishCombinator(cx, executor, task, result);
+    } else if (planResult.kind === "success") {
+      planOutput = planResult.output;
+      planUsage = planResult.usage;
+      planTurns = planResult.turns;
+    } else {
+      // A non-success plan terminal (budget / agent error / pause) propagates
+      // verbatim — the run never reaches execute.
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, planResult);
+    }
+
+    // Capture + persist the artifact from the plan child's output (R3/R4/R11) —
+    // the harness-side machinery, no model turn.
+    const outcome = await executor.capturePlanArtifact(
+      sessionId,
+      planOutput,
+      planUsage,
+      planTurns,
+      cx.signal,
+    );
+    if (!outcome.ok) {
+      cx.stream = onStream;
+      return finishCombinator(cx, executor, task, outcome.failure);
+    }
+
+    // #126 decision C: the runnable task list comes from the persisted
+    // `task_list` tool store (the ONE authoring path — it can carry real
+    // blockers). Fall back to the linear plan-artifact bridge only when nothing
+    // was authored via the tool (back-compat with the #59/#124 plan-only path and
+    // its replay fixtures).
+    const persisted = await executor.loadTaskList(sessionId);
+    taskList =
+      persisted != null && persisted.tasks.length > 0
+        ? persisted
+        : planArtifactToTaskList(outcome.artifact);
+    if (taskList.tasks.length === 0) {
+      cx.stream = onStream;
+      const result: RunResult = {
+        kind: "failure",
+        reason: { kind: "empty_plan" },
+        session_id: sessionId,
+        usage: outcome.usage,
+        turns: outcome.turns,
+      };
+      return finishCombinator(cx, executor, task, result);
+    }
+
+    // #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+    // depth — `add_task` already rejects cycles, but the persisted store could be
+    // cyclic out of band). No task runs.
+    if (hasCycle(taskList)) {
+      cx.stream = onStream;
+      const result: RunResult = {
+        kind: "failure",
+        reason: {
+          kind: "task_graph_cycle",
+          reason: "persisted task graph contains a directed cycle",
+        },
+        session_id: sessionId,
+        usage: outcome.usage,
+        turns: outcome.turns,
+      };
+      return finishCombinator(cx, executor, task, result);
+    }
+
+    await executor.persistTaskList(sessionId, taskList);
+
+    // Carry the shared budget past the plan turn.
+    carried = { ...budgetUsed };
+    carried.turns = outcome.turns;
+    carried.input_tokens += outcome.usage.input_tokens;
+    carried.output_tokens += outcome.usage.output_tokens;
+
+    // A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
+    // Completed tasks are not re-run.
+    await executor.reconcileCompletedTasks(sessionId, taskList);
+
+    totalUsage = { ...outcome.usage };
   }
-
-  // #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
-  // depth — `add_task` already rejects cycles, but the persisted store could be
-  // cyclic out of band). No task runs.
-  if (hasCycle(taskList)) {
-    cx.stream = onStream;
-    const result: RunResult = {
-      kind: "failure",
-      reason: {
-        kind: "task_graph_cycle",
-        reason: "persisted task graph contains a directed cycle",
-      },
-      session_id: sessionId,
-      usage: outcome.usage,
-      turns: outcome.turns,
-    };
-    return finishCombinator(cx, executor, task, result);
-  }
-
-  await executor.persistTaskList(sessionId, taskList);
-
-  // Carry the shared budget past the plan turn.
-  const carried: BudgetSnapshot = { ...budgetUsed };
-  carried.turns = outcome.turns;
-  carried.input_tokens += outcome.usage.input_tokens;
-  carried.output_tokens += outcome.usage.output_tokens;
 
   // ── Phase 2: ready-set DAG walk (#126). ─────────────────────────────────────
   //
@@ -2346,19 +2476,14 @@ async function runPlanExecuteConfig(
   // longer `pending` and never becomes ready). When no `pending` task is ready,
   // the walk drains.
 
-  // A.6 deep-resume (Q2): reconcile against the durable checkpoint so already-
-  // Completed tasks are not re-run.
-  await executor.reconcileCompletedTasks(sessionId, taskList);
-
-  // #131 consult re-drive: a resumed consult carries the worker conversation
-  // (answer already injected) in `cx.scratch.consultResume`. The consulting
-  // task is the single `in_progress` task in the durable list (PlanExecute marks
-  // a task in_progress before running it). Reset it to `pending` so `nextReady`
-  // re-schedules it, and remember its id so its step uses the carried session
-  // instead of a fresh one — the worker then continues mid-loop and its
-  // evaluator still runs.
-  let consultResumeSession = cx.scratch.consultResume;
-  cx.scratch.consultResume = undefined;
+  // #131 consult / #138 budget re-drive: a resumed pause carries the stalled
+  // worker conversation in `resumeSeedSession`. The stalled task is the single
+  // `in_progress` task in the durable list (PlanExecute marks a task in_progress
+  // before running it). Reset it to `pending` so `nextReady` re-schedules it, and
+  // remember its id so its step uses the carried session instead of a fresh one —
+  // the worker then continues mid-loop and its evaluator still runs. (When the
+  // seed was already consumed by the AC3 plan-resume path above, this is a no-op.)
+  let consultResumeSession = resumeSeedSession;
   let consultResumeTask: number | undefined;
   if (consultResumeSession !== undefined) {
     const inProgress = taskList.tasks.find((t) => t.status === "in_progress");
@@ -2377,7 +2502,6 @@ async function runPlanExecuteConfig(
 
   // Total positional count for the on_task_advance hook (stable).
   const totalTasks = taskList.tasks.length;
-  const totalUsage: AggregateUsage = { ...outcome.usage };
   let lastOutput = "";
   let lastState: SessionState = emptySessionState();
 
@@ -2421,11 +2545,11 @@ async function runPlanExecuteConfig(
     };
     await executor.fireTaskAdvance(sessionId, stepTask, index, totalTasks, cx.signal);
 
-    // #131 consult re-drive: if THIS is the task that was consulting, resume its
-    // worker from the carried conversation (answer already injected) instead of a
-    // fresh instruction-seeded session — the worker continues mid-loop and its
-    // evaluator still runs. Otherwise build the normal fresh, Tier-1/Tier-2-seeded
-    // step session.
+    // #131 consult / #138 budget re-drive: if THIS is the stalled task, resume its
+    // worker from the carried conversation (for a consult, the answer is already
+    // injected) instead of a fresh instruction-seeded session — the worker
+    // continues mid-loop and its evaluator still runs. Otherwise build the normal
+    // fresh, Tier-1/Tier-2-seeded step session.
     let stepSession: SessionState;
     if (consultResumeTask !== undefined && taskId === consultResumeTask) {
       stepSession = consultResumeSession ?? structuredClone(baseSession);
@@ -2523,13 +2647,26 @@ async function runPlanExecuteConfig(
       // request via the `terminalOverride` seam instead of propagating up.
       // Combinators offer [continue_with_budget, skip, fail]. (#129: `continue` is
       // handled above as an in-process re-schedule.)
-      updateTask(taskList, taskId, "blocked");
+      const surface = executor.escalationMode().kind === "surface_to_human";
+      // #138 AC2-b: under SurfaceToHuman the task is NOT permanently failed — it
+      // pauses awaiting a budget grant. Leave it `in_progress` (the consult path's
+      // invariant) so the resume's seed re-attaches via the SAME
+      // in_progress->pending->complete machinery. Under autonomous the run aborts,
+      // so the task is `blocked` as before.
+      updateTask(taskList, taskId, surface ? "in_progress" : "blocked");
       await executor.persistTaskList(sessionId, taskList);
       const partial = planExecutePartialJson(taskList);
+      // #138 AC2-a: carry the FULL stalled worker session (the execute child left
+      // it in scratch) into the pause so a budget RESUME re-attaches it as the
+      // in-progress task's seed — parallel to the consult pause — instead of
+      // discarding it for a partial-only stub.
+      const workerSession = cx.scratch.runSession;
+      cx.scratch.runSession = emptySessionState();
+      const workerToolset = workerToolsetOf(c.execute);
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
-      if (executor.escalationMode().kind === "surface_to_human") {
+      if (surface) {
         const waiting = promoteBudgetExhaustedToHuman(
           err,
           partial,
@@ -2538,6 +2675,8 @@ async function runPlanExecuteConfig(
           task,
           { ...carried },
           carried.turns,
+          workerSession,
+          workerToolset,
         );
         return recordTerminal(cx, waiting);
       }
@@ -2598,6 +2737,9 @@ async function runPlanExecuteConfig(
           // [continue_with_budget, skip, fail]. (#129: `continue` handled above.)
           case "escalate":
             if (executor.escalationMode().kind === "surface_to_human") {
+              // #138 AC2-a: this step already COMPLETED; carry its post-run session
+              // (`lastState`) so a budget resume re-attaches the real worker
+              // context, not a partial-only stub.
               const waiting = promoteBudgetExhaustedToHuman(
                 stepCharge.error,
                 partial,
@@ -2606,6 +2748,8 @@ async function runPlanExecuteConfig(
                 task,
                 { ...carried },
                 carried.turns,
+                lastState,
+                workerToolsetOf(c.execute),
               );
               return recordTerminal(cx, waiting);
             }
@@ -2889,6 +3033,9 @@ async function runSelfVerifyingConfig(
         // an in-process re-run.)
         case "escalate":
           if (executor.escalationMode().kind === "surface_to_human") {
+            // #138 AC2-a: carry the FULL build (worker) session — the
+            // SelfVerifying loop carries it forward in `sessionState` after each
+            // iteration — so a budget resume re-attaches the real worker context.
             const waiting = promoteBudgetExhaustedToHuman(
               buildCharge.error,
               partial,
@@ -2897,6 +3044,8 @@ async function runSelfVerifyingConfig(
               task,
               { ...carried },
               carried.turns,
+              sessionState,
+              workerToolsetOf(c.inner),
             );
             return recordTerminal(cx, waiting);
           }
@@ -3173,6 +3322,10 @@ async function runHillClimbingConfig(
         // an in-process iterate.)
         case "escalate":
           if (executor.escalationMode().kind === "surface_to_human") {
+            // #138 AC2-a: HillClimbing iterates on a METRIC, not a worker
+            // conversation, so there is no richer session to carry — pass the empty
+            // default to fall back to the partial-only stub (pre-#138 behavior). The
+            // worker leaf's toolset handle is still carried (#140 parity, AC4-a).
             const waiting = promoteBudgetExhaustedToHuman(
               gateCharge.error,
               partial,
@@ -3181,6 +3334,8 @@ async function runHillClimbingConfig(
               task,
               { ...carried },
               carried.turns,
+              emptySessionState(),
+              workerToolsetOf(c.inner),
             );
             return recordTerminal(cx, waiting);
           }

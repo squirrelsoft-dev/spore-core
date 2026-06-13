@@ -48,6 +48,7 @@ import {
   ScriptedToolRegistry,
   registryWith,
 } from "../src/harness/testing.js";
+import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
 
 const { InMemoryObservabilityProvider } = obsNs;
 
@@ -512,17 +513,23 @@ describe("HillClimbing loop strategy (issue #60)", () => {
     }
   });
 
-  it("hill_climbing_runs_non_react_inner_per_iteration (#124): the inner PlanExecute plan turn fires once per iteration", async () => {
+  it("hill_climbing_runs_non_react_inner_per_iteration (#124): the inner PlanExecute plan turn fires once (#138 AC1 skips re-planning after)", async () => {
     // #124: HillClimbing GENUINELY recurses into `inner`. With a non-ReAct inner
-    // (PlanExecute[ReAct, ReAct]) the inner plan turn must fire ONCE PER iteration.
+    // (PlanExecute[ReAct, ReAct]) the inner PlanExecute's WHOLE loop runs per
+    // iteration, firing the plan phase — proving the recursion.
     // baseline 1.0, iter1 2.0 (improve→keep, stagnation reset), iter2 0.5
     // (regress→discard, stagnation cap 1 ⇒ halt) ⇒ two agent iterations.
+    //
+    // #138 AC1: the durable task_list is project-scoped (a real in-memory store,
+    // mirroring Rust's standard_config), so iteration 1 authors it and iteration 2
+    // SKIPS re-planning (the list already exists). The plan phase therefore fires
+    // EXACTLY ONCE across the whole climb — which still proves the recursion (a
+    // ReAct proposer would fire it zero times). Iteration 2 also reconciles the
+    // now-Completed task, so it runs no execute turn either.
     const evaluator = new ScriptedMetricEvaluator([1.0, 2.0, 0.5], "maximize");
     const worker = new ScriptedRecordingAgent(AgentId.of("hc-inner"))
       .push(fr('{"tasks":["only"],"rationale":"r"}')) // iter1 plan
-      .push(fr("changed iter1")) // iter1 execute
-      .push(fr('{"tasks":["only"],"rationale":"r"}')) // iter2 plan
-      .push(fr("changed iter2")); // iter2 execute
+      .push(fr("changed iter1")); // iter1 execute
     const strategy: LoopStrategy = {
       kind: "hill_climbing",
       inner: {
@@ -547,17 +554,21 @@ describe("HillClimbing loop strategy (issue #60)", () => {
       min_improvement_delta: 0,
       evaluator: "",
     };
-    const h = new StandardHarness(config(worker, { metricEvaluator: evaluator }));
+    // #138 AC1: a real durable store so the task_list survives between iterations.
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    const h = new StandardHarness(config(worker, { metricEvaluator: evaluator, storage }));
     const r = await h.run({ task: newTask("optimize", SID, strategy, { max_turns: 50 }) });
     expect(r.kind).toBe("failure");
     if (r.kind === "failure") {
       expect(r.reason.kind).toBe("stagnation_limit_reached");
     }
-    // The inner PlanExecute fired its plan turn ONCE PER iteration (2x). A
-    // hardcoded-ReAct proposer would record ZERO plan turns.
+    // #138 AC1: the inner PlanExecute fired its plan turn EXACTLY ONCE — the first
+    // iteration authored the durable task_list; later iterations skip re-planning.
+    // A hardcoded-ReAct proposer would record ZERO plan turns, so a single plan
+    // turn still proves the genuine recursion into PlanExecute.
     const planTurns = worker.contexts.filter((ctx) =>
       ctxText(ctx).includes("step-by-step plan"),
     ).length;
-    expect(planTurns).toBe(2);
+    expect(planTurns).toBe(1);
   });
 });

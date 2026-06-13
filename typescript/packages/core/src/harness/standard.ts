@@ -163,6 +163,7 @@ import {
   grantTaskBudget,
   leafEscalationActions,
   promoteBudgetExhaustedToHuman,
+  workerToolsetOf,
   type HarnessRunOptions,
   surfaceToHuman,
   type HookPoint,
@@ -909,10 +910,13 @@ export class StandardHarness implements Harness, StrategyExecutor {
    * the resolution chain's mutated state across in-process continues so
    * `max_continues` is honored.
    *
-   * `consultResume = session` (#131) seeds the FIRST PlanExecute walk's
-   * in-progress task with `session` (a worker conversation whose consult answer
-   * is already injected) so a resumed consult continues mid-loop and walks the
-   * remaining ready-set. `undefined` on every non-consult path.
+   * `resumeSeed = session` (#131 consult + #138 budget) seeds the FIRST
+   * PlanExecute walk from `session` (the stalled worker conversation). For a
+   * consult resume the consult answer is already injected; for a budget resume
+   * (#138) it is the worker's full post-exhaustion session. The walk re-attaches
+   * it to the single `in_progress` task (execute-phase exhaustion) or, when the
+   * durable task_list has no `in_progress` task, to the PLAN session (#138 AC3
+   * plan-phase exhaustion). `undefined` on every fresh / non-resume path.
    */
   private async driveStrategyWithResumeSeed(
     task: Task,
@@ -921,7 +925,7 @@ export class StandardHarness implements Harness, StrategyExecutor {
     onStream: StreamSink | undefined,
     signal: AbortSignal | undefined,
     resumeContinues: [string, number] | undefined,
-    consultResume: SessionState | undefined,
+    resumeSeed: SessionState | undefined,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     const registry = this.config.registry ?? ExecutionRegistry.empty();
@@ -937,9 +941,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // round only (the resumed node's scope); later in-process rounds carry their
     // continue count via `behaviorForResolution`.
     let seed = resumeContinues;
-    // #131: the consult re-drive seed is consumed by the FIRST round's
-    // PlanExecute walk only; later in-process rounds run normally.
-    let consultSeed = consultResume;
+    // #131/#138: the resume seed is consumed by the FIRST round's PlanExecute
+    // walk only; later in-process rounds run normally.
+    let resumeSeedNext = resumeSeed;
 
     for (;;) {
       const cx: ExecutionContext = newExecutionContext(registry);
@@ -950,9 +954,9 @@ export class StandardHarness implements Harness, StrategyExecutor {
       cx.scratch.runBudget = currentBudget;
       cx.scratch.task = currentTask;
       cx.scratch.resumeContinues = seed;
-      cx.scratch.consultResume = consultSeed;
+      cx.scratch.resumeSeed = resumeSeedNext;
       seed = undefined;
-      consultSeed = undefined;
+      resumeSeedNext = undefined;
 
       const outcome = await runStrategy(currentTask.loop_strategy, cx);
 
@@ -1049,6 +1053,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 continuesUsed: scope.continuesUsed,
                 phase: outcome.phase,
               };
+              // #138 AC2-a: carry the FULL stalled leaf session (it propagated
+              // into scratch with its conversation) and the leaf's own toolset
+              // handle (#140/AC4-a).
+              const workerSession = cx.scratch.runSession;
+              cx.scratch.runSession = emptySessionState();
               return promoteBudgetExhaustedToHuman(
                 err,
                 outcome.partialOutput,
@@ -1057,6 +1066,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
                 currentTask,
                 cx.scratch.runBudget,
                 turns,
+                workerSession,
+                workerToolsetOf(currentTask.loop_strategy),
               );
             }
             return {
@@ -1715,14 +1726,26 @@ export class StandardHarness implements Harness, StrategyExecutor {
         case "continue_with_budget": {
           const granted = stepsTaken + action.steps;
           const resumedTask = grantTaskBudget(state.task, granted);
+          // #138 AC2-b: for a COMPOSED task (PlanExecute etc.) thread the carried
+          // worker session through the phase-agnostic resume seed and start the
+          // TOP-LEVEL session EMPTY — exactly mirroring `resumeConsultInner`. The
+          // PlanExecute walk re-attaches the seed to the single `in_progress` task
+          // (execute-phase exhaustion) via the in_progress->pending->complete
+          // machinery, or to the PLAN session (AC3 plan-phase exhaustion) — so the
+          // stalled worker continues mid-loop instead of re-planning. A BARE leaf
+          // has no surrounding walk, so it resumes from `session_state` directly
+          // (the seed has nowhere to attach).
+          const isBareLeaf = resumedTask.loop_strategy.kind === "react";
+          const topSession = isBareLeaf ? sessionState : emptySessionState();
+          const carriedSeed = isBareLeaf ? undefined : sessionState;
           return this.driveStrategyWithResumeSeed(
             resumedTask,
-            sessionState,
+            topSession,
             state.budget_used,
             onStream,
             signal,
             resumeSeed,
-            undefined,
+            carriedSeed,
           );
         }
         // Skip: the node is marked skipped and the outer loop advances. For a
@@ -1997,11 +2020,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // strategy in `task.loop_strategy` (each combinator's `finish` rewrote the
     // pause's task on the way up). Re-DRIVE that strategy rather than resuming
     // only the worker leaf: the PlanExecute walk resumes its in-progress task
-    // from the injected worker session (`consultResume` seed), so the worker
-    // finishes mid-loop, its SelfVerifying evaluator runs, the task is marked
-    // completed, and the remaining ready-set is walked. A BARE worker leaf
-    // (depth-1, e.g. a SubagentTool-mediated consult) has no surrounding walk, so
-    // it keeps the original leaf-only resume (back-compat).
+    // from the injected worker session (`resumeSeed`), so the worker finishes
+    // mid-loop, its SelfVerifying evaluator runs, the task is marked completed,
+    // and the remaining ready-set is walked. A BARE worker leaf (depth-1, e.g. a
+    // SubagentTool-mediated consult) has no surrounding walk, so it keeps the
+    // original leaf-only resume (back-compat).
     if (state.task.loop_strategy.kind !== "react") {
       return this.driveStrategyWithResumeSeed(
         state.task,
@@ -2235,12 +2258,10 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // (matching persistTaskList): a successfully-captured plan must not be lost to
     // a storage hiccup.
     try {
-      await this.storage()
-        .run()
-        .put(this.resolvedProjectId.namespace(), PLAN_EXECUTE_EXTRAS_KEY, {
-          tasks: artifact.tasks,
-          rationale: artifact.rationale,
-        });
+      await this.storage().run().put(this.resolvedProjectId.namespace(), PLAN_EXECUTE_EXTRAS_KEY, {
+        tasks: artifact.tasks,
+        rationale: artifact.rationale,
+      });
     } catch {
       // Durable write failure is non-fatal.
     }

@@ -30,15 +30,23 @@ import {
   emptyBudgetSnapshot,
   emptySessionState,
   grantTaskBudget,
+  leafEscalationActions,
   newTask,
+  promoteBudgetExhaustedToHuman,
   reactPartialJson,
   surfaceToHuman,
+  type Agent,
+  type BudgetExhausted,
+  type Content,
+  type Context,
   type EscalationAction,
   type HarnessConfig,
   type HumanRequest,
   type HumanResponse,
   type LoopStrategy,
+  type Message,
   type PausedState,
+  type SessionState,
   type Task,
   type TokenUsage,
   type ToolCall,
@@ -52,6 +60,8 @@ import {
   ScriptedToolRegistry,
   registryWith,
 } from "../src/harness/testing.js";
+import { InMemoryStorageProvider, StorageProvider } from "../src/storage/index.js";
+import { addTask, completeTask, defaultTaskList, updateTask } from "../src/tasklist/index.js";
 
 // ── config helpers ───────────────────────────────────────────────────────────
 
@@ -226,7 +236,11 @@ describe("SurfaceToHuman — bare leaf pauses with a budget request (no Skip)", 
     if (r.kind === "waiting_for_human") {
       // The PausedState mirrors the request verbatim.
       expect(r.state.human_request).toEqual(r.request);
-      expect(r.state.session_state.messages).toHaveLength(1);
+      // #138 AC2-a: the pause now carries the FULL stalled worker session
+      // (instruction + the budget-burning tool-call rounds), NOT a single
+      // partial-only assistant stub — so a budget resume re-attaches the real
+      // worker context. The session therefore has MORE than one message.
+      expect(r.state.session_state.messages.length).toBeGreaterThan(1);
       expect(r.request.kind).toBe("budget_exhausted");
       if (r.request.kind === "budget_exhausted") {
         expect(r.request.phase).toBe("react");
@@ -487,5 +501,260 @@ describe("grantTaskBudget", () => {
     expect(t.loop_strategy.kind === "react" && t.loop_strategy.budget).toEqual({
       kind: "unlimited",
     });
+  });
+});
+
+// ============================================================================
+// #138 AC2-a: promoteBudgetExhaustedToHuman carries the FULL worker session
+// ============================================================================
+
+describe("#138 AC2-a — promoteBudgetExhaustedToHuman carries the full worker session", () => {
+  // The pause helper carries the FULL stalled worker session (AC2-a) and the
+  // worker leaf's toolset handle (AC4-a) — not a partial-only stub. A direct unit
+  // on the boundary helper, decoupled from the surrounding strategy.
+  it("carries the full worker session + the worker leaf's toolset handle", () => {
+    const err: BudgetExhausted = {
+      policy: { kind: "per_loop", value: 2 },
+      behavior: { kind: "escalate" },
+      stepsTaken: 2,
+      continuesUsed: 0,
+      phase: "react",
+    };
+    // A realistic worker conversation (instruction + a tool round).
+    const worker: SessionState = {
+      messages: [
+        { role: "user", content: { type: "text", text: "worker: audit" } as Content },
+        { role: "assistant", content: { type: "text", text: "looking" } as Content },
+        { role: "tool", content: { type: "text", text: "listing" } as Content },
+      ] as Message[],
+      extras: {},
+    };
+    const waiting = promoteBudgetExhaustedToHuman(
+      err,
+      "partial",
+      leafEscalationActions(err),
+      SessionId.of("s1"),
+      react(2),
+      emptyBudgetSnapshot(),
+      2,
+      worker,
+      "exec-tools",
+    );
+    expect(waiting.kind).toBe("waiting_for_human");
+    if (waiting.kind === "waiting_for_human") {
+      // AC2-a: the FULL worker session is carried (3 messages), NOT the single
+      // partial-only assistant stub.
+      expect(waiting.state.session_state.messages).toEqual(worker.messages);
+      // AC4-a: the worker leaf's toolset handle rides the pause (#140 parity).
+      expect(waiting.state.toolset).toBe("exec-tools");
+    }
+
+    // Back-compat: an EMPTY worker session falls back to the partial-only stub
+    // (the pre-#138 behavior) so legacy/HillClimbing sites are unchanged.
+    const waiting2 = promoteBudgetExhaustedToHuman(
+      err,
+      "just-the-partial",
+      leafEscalationActions(err),
+      SessionId.of("s1"),
+      react(2),
+      emptyBudgetSnapshot(),
+      2,
+      emptySessionState(),
+      "",
+    );
+    if (waiting2.kind === "waiting_for_human") {
+      expect(waiting2.state.session_state.messages).toHaveLength(1);
+      const head = waiting2.state.session_state.messages[0]!;
+      expect(head.content.type === "text" && head.content.text).toBe("just-the-partial");
+    }
+  });
+});
+
+// ============================================================================
+// #138 AC1: skip-plan reconciles already-Completed tasks (dedup)
+// ============================================================================
+
+describe("#138 AC1 — skip-plan reconciles already-Completed tasks", () => {
+  // A non-empty durable task_list whose task #1 is already Completed: a fresh run
+  // SKIPS the plan phase (AC1) and reconcile does NOT re-run the completed task —
+  // only the still-Pending task #2 runs (one model call, no plan turn).
+  it("skips the plan phase and dedups the completed task", async () => {
+    const a = makeAgent();
+    // NO plan turn pushed (AC1 skips it). Only task #2 runs.
+    a.push({ kind: "final_response", content: "did two", usage: usage() });
+    const session = SessionId.of("s1");
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    // The plan slot is STRUCTURED — its leaf needs an output schema registered
+    // (#124 A.5), even though AC1 skips the plan phase at runtime.
+    const registry = ExecutionRegistry.builder()
+      .agent("", a)
+      .toolset("", new EmptyToolRegistry())
+      .schema("plan-schema", { type: "object" })
+      .build();
+    const cfg: HarnessConfig = {
+      registry,
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      escalationMode: surfaceToHuman,
+      storage,
+    };
+    const h = new StandardHarness(cfg);
+
+    // Pre-seed: task #1 already Completed, task #2 Pending.
+    const tl = defaultTaskList();
+    addTask(tl, "one", []); // 1
+    addTask(tl, "two", []); // 2
+    updateTask(tl, 1, "in_progress");
+    completeTask(tl, 1);
+    await h.persistTaskList(session, tl);
+
+    const planStrategy: LoopStrategy = {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 12 },
+        agent: "",
+        toolset: "",
+        output: "plan-schema",
+      },
+      execute: { kind: "react", budget: { kind: "per_loop", value: 12 }, agent: "", toolset: "" },
+    };
+    const r = await h.run({ task: newTask("audit", session, planStrategy) });
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") expect(r.output).toBe("did two");
+
+    // Exactly ONE model call: task #2 (no plan turn, task #1 not re-run).
+    expect(a.callCount).toBe(1);
+
+    // Both tasks are Completed in the durable store (1 deduped, 2 freshly run).
+    const stored = (await storage.run().get(h.projectId().namespace(), "task_list")) as {
+      tasks: { status: string }[];
+    };
+    expect(stored.tasks.every((t) => t.status === "completed")).toBe(true);
+  });
+});
+
+// ============================================================================
+// #138 AC3: plan-phase exhaustion resumes the PLAN session from the carried conv
+// ============================================================================
+
+describe("#138 AC3 — plan-phase exhaustion seeds the plan session from the carried conversation", () => {
+  /** Scripts one final response per call and records every Context it sees. */
+  class RecordingPlanner implements Agent {
+    readonly contexts: Context[] = [];
+    private readonly results: TurnResult[] = [];
+    constructor(private readonly agentId: AgentId) {}
+    push(r: TurnResult): this {
+      this.results.push(r);
+      return this;
+    }
+    id(): AgentId {
+      return this.agentId;
+    }
+    async turn(ctx: Context, _signal?: AbortSignal): Promise<TurnResult> {
+      this.contexts.push(ctx);
+      return this.results.shift() ?? { kind: "final_response", content: "done", usage: usage() };
+    }
+  }
+
+  function ctxText(ctx: Context): string {
+    return ctx.messages.map((m) => (m.content.type === "text" ? m.content.text : "")).join("\n");
+  }
+
+  // When a budget resume carries a worker session AND the durable task_list is
+  // EMPTY (no `in_progress` task ⇒ the exhaustion happened in the PLAN phase),
+  // `runPlanExecuteConfig` seeds the PLAN session from the carried conversation
+  // instead of a fresh base session — so the planner CONTINUES on it. Observed via
+  // the planner agent's RECORDED contexts (the replay harness would not otherwise
+  // surface it through NoopContextManager).
+  it("the plan session is seeded from the carried conversation", async () => {
+    const planner = new RecordingPlanner(AgentId.of("planner")).push({
+      kind: "final_response",
+      content: '{"tasks":["only"],"rationale":"r"}',
+      usage: usage(),
+    });
+    const worker = makeAgent();
+    worker.push({ kind: "final_response", content: "did the work", usage: usage() });
+
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    const registry = ExecutionRegistry.builder()
+      .agent("planner", planner)
+      .agent("", worker)
+      .build();
+    const cfg: HarnessConfig = {
+      registry,
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new NoopContextManager(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      escalationMode: surfaceToHuman,
+      storage,
+    };
+    const h = new StandardHarness(cfg);
+
+    // A PlanExecute whose PLAN leaf resolves to "planner"; execute is a bare ReAct
+    // on the default key.
+    const pe: LoopStrategy = {
+      kind: "plan_execute",
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: 12 },
+        agent: "planner",
+        toolset: "",
+        output: "",
+      },
+      execute: { kind: "react", budget: { kind: "per_loop", value: 8 }, agent: "", toolset: "" },
+    };
+    const t = newTask("audit", SessionId.of("s1"), pe, { max_turns: 32 });
+
+    // A budget-exhausted pause carrying a worker session with a MARKER, and NO
+    // durable task_list persisted (empty ⇒ plan-phase exhaustion, AC3).
+    const MARKER = "CARRIED_PLAN_SESSION_MARKER";
+    const carried: SessionState = {
+      messages: [
+        { role: "assistant", content: { type: "text", text: MARKER } as Content },
+      ] as Message[],
+      extras: {},
+    };
+    const state: PausedState = {
+      session_id: SessionId.of("s1"),
+      task_id: t.id,
+      turn_number: 1,
+      session_state: carried,
+      pending_tool_calls: [],
+      approved_results: [],
+      human_request: {
+        kind: "budget_exhausted",
+        phase: "plan_execute",
+        policy: { kind: "total_steps", value: 1 },
+        steps_taken: 1,
+        continues_used: 0,
+        partial_output: reactPartialJson(""),
+        available_actions: [
+          { kind: "continue_with_budget", steps: 1 },
+          { kind: "skip" },
+          { kind: "fail" },
+        ],
+      },
+      task: t,
+      budget_used: emptyBudgetSnapshot(),
+      child_state: null,
+      toolset: "",
+    };
+
+    await h.resume(state, {
+      kind: "escalate",
+      action: { kind: "continue_with_budget", steps: 10 },
+    });
+
+    // AC3: the planner's FIRST context was seeded from the CARRIED session — the
+    // marker is present, proving the plan session continued on it rather than
+    // starting from a fresh base session.
+    expect(planner.contexts.length).toBeGreaterThan(0);
+    expect(ctxText(planner.contexts[0]!)).toContain(MARKER);
   });
 });

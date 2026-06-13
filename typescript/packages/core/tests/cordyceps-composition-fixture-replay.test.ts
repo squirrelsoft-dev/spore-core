@@ -28,8 +28,11 @@ import {
   StandardHarness,
   TaskSchema,
   emptyAggregateUsage,
+  loadCheckpoint,
   loopStrategyMaxSteps,
   newTask,
+  serializeCheckpoint,
+  surfaceToHuman,
   type Agent,
   type ConsultRequest,
   type EscalationMode,
@@ -118,6 +121,66 @@ function harnessFor(
     escalationMode,
   };
   return { h: new StandardHarness(cfg), storage };
+}
+
+/**
+ * A small-budget `PlanExecute[ ReAct(plan), SelfVerifying[ ReAct(PerLoop{2}) ] ]`
+ * tree whose worker leaf exhausts after exactly TWO turns — so a budget pause is
+ * reachable with a tiny fixture. Mirrors the cordyceps execute leaf's handles
+ * (`executor` / `exec-tools` / `worker-schema` / `exec-evaluator`). (#138)
+ */
+function smallBudgetPe(): LoopStrategy {
+  const worker: LoopStrategy = {
+    kind: "react",
+    budget: { kind: "per_loop", value: 2 },
+    agent: "executor",
+    toolset: "exec-tools",
+    output: "worker-schema",
+  };
+  const plan: LoopStrategy = {
+    kind: "react",
+    budget: { kind: "per_loop", value: 12 },
+    agent: "planner",
+    toolset: "plan-tools",
+    output: "plan-schema",
+  };
+  return {
+    kind: "plan_execute",
+    plan,
+    execute: { kind: "self_verifying", inner: worker, evaluator: "exec-evaluator" },
+  };
+}
+
+/**
+ * A SurfaceToHuman harness whose plan/worker/evaluate turns replay positionally
+ * from ONE shared `ReplayModelInterface` plus a `ScriptedToolRegistry` that
+ * returns success for the worker's two budget-burning tool calls. (#138)
+ */
+function surfaceHarnessFor(fixture: string): { h: StandardHarness; storage: StorageProvider } {
+  const jsonl = readFileSync(fixturePath(fixture), "utf-8");
+  const replay = ReplayModelInterface.fromJsonl(jsonl, provider);
+  // The worker's two tool calls each dispatch to a plain success (content is
+  // irrelevant; they only burn the PerLoop{2} budget).
+  const toolRegistry = new ScriptedToolRegistry();
+  toolRegistry.push({ kind: "success", content: "src/one.rs\nsrc/two.rs", truncated: false });
+  toolRegistry.push({ kind: "success", content: "fn one() { x.unwrap() }", truncated: false });
+  const storage = StorageProvider.single(new InMemoryStorageProvider());
+  const cfg: HarnessConfig = {
+    registry: cordycepsRegistry(replay),
+    toolRegistry,
+    sandbox: new AllowAllSandbox(),
+    contextManager: new NoopContextManager(),
+    terminationPolicy: new AlwaysContinuePolicy(),
+    modelParams: { stop_sequences: [] },
+    storage,
+    // #138/#130: the worker leaf's budget exhaustion PAUSES (WaitingForHuman).
+    escalationMode: surfaceToHuman,
+  };
+  return { h: new StandardHarness(cfg), storage };
+}
+
+function smallPeTask(session: string): Task {
+  return newTask("audit the repo", SessionId.of(session), smallBudgetPe(), { max_turns: 64 });
 }
 
 /** The canonical cordyceps tree, deserialized from the shared fixture (the same
@@ -317,6 +380,88 @@ describe("cordyceps composition fixture replay (#131)", () => {
     // The worker's task self-verified and completed after the consult.
     const after = await storedList(h, storage);
     expect(after.tasks.every((t) => t.status === "completed")).toBe(true);
+  });
+
+  // ── #138 budget-resume (seed the stalled worker, skip re-planning) ──────────
+
+  // #138 AC2 + AC1: a budget-resume of an execute-phase exhaustion SEEDS the
+  // stalled worker (carries its full session across the pause) and SKIPS
+  // re-planning. Leg 1 drives the worker leaf to its PerLoop{2} cap and PAUSES
+  // with a `budget_exhausted` request whose `PausedState` carries the FULL worker
+  // session (AC2-a) and the `exec-tools` handle (AC4-a). Leg 2
+  // (`continue_with_budget`) does NOT re-plan (the fixture has NO plan turn) and
+  // re-attaches the carried session so the worker continues mid-loop to a finding
+  // that the evaluator clears.
+  it("budget resume seeds the stalled worker and skips re-planning", async () => {
+    const { h, storage } = surfaceHarnessFor("cordyceps_budget_resume.jsonl");
+    const session = SessionId.of("cordyceps-budget");
+    // Pre-seed ONE ready task so AC1's skip-replan precondition holds (non-empty
+    // durable list) and the execute phase runs exactly one worker.
+    const tl = defaultTaskList();
+    addTask(tl, "audit module one", []);
+    await h.persistTaskList(session, tl);
+
+    // Leg 1: drive to the budget-exhaustion pause.
+    const first = await h.run({ task: smallPeTask("cordyceps-budget") });
+    if (first.kind !== "waiting_for_human") {
+      throw new Error(`expected WaitingForHuman budget pause, got ${first.kind}`);
+    }
+    if (first.request.kind !== "budget_exhausted") {
+      throw new Error(`expected budget_exhausted, got ${first.request.kind}`);
+    }
+    // The combinator (PlanExecute) resolves the worker leaf's propagated
+    // exhaustion, so the pause's `phase` is the resolving scope.
+    expect(first.request.phase).toBe("plan_execute");
+    // AC4-a (#140 parity): the pause carries the worker leaf's toolset handle.
+    expect(first.state.toolset).toBe("exec-tools");
+    // AC2-a: the pause carries the FULL worker session (instruction + the two
+    // budget-burning tool-call rounds), NOT a partial-only stub.
+    expect(first.state.session_state.messages.length).toBeGreaterThan(1);
+    // AC2 parity: the stalled task stays `in_progress` on the durable list at the
+    // pause (the consult path's invariant) — NOT permanently blocked — so the
+    // resume can re-attach the carried session via in_progress->pending->complete.
+    const pausedList = await storedList(h, storage);
+    expect(pausedList.tasks[0]!.status).toBe("in_progress");
+
+    // Leg 2: grant more budget and resume. AC1: NO plan turn in the fixture, so a
+    // re-plan would exhaust the positional replay and error — Success proves the
+    // plan phase was skipped. AC2-b: the carried session re-attaches to the
+    // in-progress task, so the worker continues to its finding and self-verifies.
+    const resumed = await h.resume(first.state, {
+      kind: "escalate",
+      action: { kind: "continue_with_budget", steps: 5 },
+    });
+    expect(resumed.kind).toBe("success");
+    if (resumed.kind === "success") {
+      expect(resumed.output).toContain("resume-continued");
+    }
+
+    // The resumed task self-verified and completed (in_progress->pending->completed
+    // — the same transition machinery the consult path uses, AC2 parity).
+    const after = await storedList(h, storage);
+    expect(after.tasks.every((t) => t.status === "completed")).toBe(true);
+  });
+
+  // #138 AC4: the budget-exhausted `PausedState` fixture round-trips
+  // byte-structurally — the carried worker session (AC2-a) and the `exec-tools`
+  // handle (AC4-a) survive a serde round-trip identically. This is the
+  // cross-language wire-parity lock for the four-language ports.
+  it("budget-exhausted PausedState round-trips byte-structurally", () => {
+    const raw = readFileSync(
+      resolve(repoRoot, "fixtures/paused_states/cordyceps_budget_exhausted.json"),
+      "utf-8",
+    );
+    const value = JSON.parse(raw);
+
+    // Deserialize → re-serialize: the structural wire shape is identical.
+    const typed = loadCheckpoint(raw);
+    const reser = JSON.parse(serializeCheckpoint(typed));
+    expect(reser).toEqual(value);
+
+    // AC4-a: the toolset handle is the worker leaf's, always serialized.
+    expect(value.toolset).toBe("exec-tools");
+    // AC2-a: the carried session grew beyond the single partial-only stub.
+    expect((value.session_state.messages as unknown[]).length).toBeGreaterThan(1);
   });
 
   // AC3: the registered `exec-evaluator` is Default-FAIL — Passed only on an
