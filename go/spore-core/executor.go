@@ -280,17 +280,26 @@ type RunScratch struct {
 	// is consumed (an in-process Continue never sets it → AC3: no serialization
 	// on the in-process path).
 	ResumeContinues *ResumeContinueSeed
-	// ConsultResume is the consult re-drive seed (#131): the worker conversation
-	// (with the consult answer already injected as the pending call's tool result)
-	// carried from a resumed RunConsult. When set, a PlanExecuteConfig walk resumes
-	// its single InProgress task from THIS session (instead of a fresh
-	// instruction-seeded session) so the consulting worker continues mid-loop, its
-	// SelfVerifying evaluator still runs, and the ready-set walk proceeds. The
-	// FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the session
+	// ResumeSeed is the phase-agnostic resume seed (#131 consult re-drive + #138
+	// budget resume): the stalled worker conversation carried from a resumed pause.
+	// For a CONSULT resume the consult answer is already injected as the pending
+	// call's tool result; for a BUDGET resume (#138) it is the worker's full
+	// post-exhaustion session. When set, a PlanExecuteConfig walk resumes its
+	// single InProgress task from THIS session (instead of a fresh
+	// instruction-seeded session) so the stalled worker continues mid-loop, its
+	// SelfVerifying evaluator still runs, and the ready-set walk proceeds.
+	//
+	// #138 AC3 (plan-phase exhaustion): when the durable task_list has NO
+	// InProgress task, the exhaustion happened in the PLAN phase before any task
+	// was authored — the walk seeds the PLAN session from this carried conversation
+	// instead of cloning a fresh base session.
+	//
+	// The FIRST PlanExecute walk consumes and CLEARS it. Runtime-only — the session
 	// itself rides the serialized PausedState.SessionState, so a cross-process
-	// resume reconstructs this seed in ResumeConsult. Nil on a fresh run / after
-	// the seed is consumed.
-	ConsultResume *SessionState
+	// resume reconstructs this seed in ResumeConsult (consult) or the
+	// ContinueWithBudget resume arm (#138 budget). Nil on a fresh run / after the
+	// seed is consumed.
+	ResumeSeed *SessionState
 }
 
 // ResumeContinueSeed is the cross-process Continue checkpoint seed (#129):
@@ -392,7 +401,7 @@ func (cx *ExecutionContext) finish(ctx context.Context, executor StrategyExecuto
 	// As the pause unwinds through each combinator's finish, rewrite its State.Task
 	// to the combinator's OWN composed task; by the top it carries the FULL tree,
 	// so ResumeConsult re-drives the whole strategy (the in-progress task resumes
-	// from ConsultResume).
+	// from ResumeSeed).
 	if result.Kind == RunConsult && result.State != nil {
 		st := *result.State
 		st.Task = parentTask
@@ -517,12 +526,19 @@ func budgetExhaustedRequest(err *BudgetExhausted, partialOutput *string, actions
 // promoteBudgetExhaustedToHuman builds a RunResult.WaitingForHuman carrying a
 // HumanRequest.BudgetExhausted (#130 HITL pause boundary). Built ONLY when a
 // node's Escalate resolution is consulted under EscalationSurfaceToHuman. The
-// partialOutput is preserved both on the request (for the operator) AND as a
-// single assistant text message on the paused session_state (so a resume
-// re-enters the loop with that context — mirroring the propagate path's
-// reconstruction). The PausedState records StepsTaken / ContinuesUsed on the
-// request so resumeInner can reconstruct the node's budget context from the
-// request alone (fork E).
+// PausedState records StepsTaken / ContinuesUsed on the request so resumeInner
+// can reconstruct the node's budget context from the request alone (fork E).
+//
+// #138 AC2-a: the paused session_state is the FULL stalled worker session
+// (workerSession) — parallel to how the consult pause preserves the worker
+// conversation — so a budget RESUME re-attaches it as the in-progress task's
+// seed and the worker continues with its real context instead of a partial-only
+// stub. When workerSession is empty (a bare-leaf propagate site that has no
+// richer conversation to carry, or a legacy caller), it falls back to the single
+// partialOutput assistant message so the pre-#138 behavior is intact.
+//
+// #138 AC4-a: toolset carries the stalled worker leaf's handle (e.g.
+// "exec-tools"), consistent with #140, instead of staying "".
 func promoteBudgetExhaustedToHuman(
 	err *BudgetExhausted,
 	partialOutput *string,
@@ -531,13 +547,23 @@ func promoteBudgetExhaustedToHuman(
 	task Task,
 	budgetUsed BudgetSnapshot,
 	turnNumber uint32,
+	// #138 AC2-a: the FULL stalled worker session to carry across the pause.
+	workerSession SessionState,
+	// #138 AC4-a: the stalled worker leaf's toolset handle (#140 parity).
+	toolset ToolsetRef,
 ) RunResult {
-	var messages []Message
-	if partialOutput != nil {
-		messages = []Message{{
-			Role:    RoleAssistant,
-			Content: NewTextContent(*partialOutput),
-		}}
+	// #138 AC2-a: prefer the FULL worker conversation; fall back to the
+	// partial-only stub when the carried session is empty (back-compat).
+	sessionState := workerSession
+	if len(sessionState.Messages) == 0 {
+		var messages []Message
+		if partialOutput != nil {
+			messages = []Message{{
+				Role:    RoleAssistant,
+				Content: NewTextContent(*partialOutput),
+			}}
+		}
+		sessionState = SessionState{Messages: messages}
 	}
 	request := budgetExhaustedRequest(err, partialOutput, actions)
 	req := request
@@ -545,13 +571,16 @@ func promoteBudgetExhaustedToHuman(
 		SessionID:        sessionID,
 		TaskID:           task.ID,
 		TurnNumber:       turnNumber,
-		SessionState:     SessionState{Messages: messages},
+		SessionState:     sessionState,
 		PendingToolCalls: nil,
 		ApprovedResults:  nil,
 		HumanRequest:     &req,
 		Task:             task,
 		BudgetUsed:       budgetUsed,
 		ChildState:       nil,
+		// #138 AC4-a: carry the stalled worker leaf's toolset handle (#140 parity)
+		// so a resume routes the re-driven worker through its scoped catalogue.
+		Toolset: toolset,
 	}
 	return RunResult{Kind: RunWaitingForHuman, State: state, Request: &request}
 }

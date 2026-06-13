@@ -89,7 +89,11 @@ func (h *StandardHarness) runExecutePhase(
 	}
 	cx := NewExecutionContext(&h.config.Registry)
 	cx.Executor = h
-	result, exhausted := cfg.runExecuteLoop(ctx, cx, h, task, *session, taskList, carried, planUsage, onStream)
+	// #138: the A.6 deep-resume reconcile moved out of runExecuteLoop into
+	// PlanExecuteConfig.Run; reproduce it here so this granular helper keeps the
+	// same behavior as the real combinator (no resume seed in this isolated path).
+	h.ReconcileCompletedTasks(ctx, task.SessionID, &taskList)
+	result, exhausted := cfg.runExecuteLoop(ctx, cx, h, task, *session, taskList, carried, planUsage, nil, onStream)
 	// #125: a BudgetExhausted is surfaced as a typed StrategyOutcome. Map it back
 	// to the equivalent BudgetExceeded Failure RunResult so this legacy test
 	// helper preserves its single-RunResult signature (mirrors driveStrategy).

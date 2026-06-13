@@ -183,11 +183,16 @@ func TestRalphRunsNonReactInnerPerWindow(t *testing.T) {
 
 func TestHillClimbingRunsNonReactInnerPerIteration(t *testing.T) {
 	// The inner is a genuine PlanExecute (NOT a bare ReAct). Each HillClimbing
-	// iteration (after the iteration-0 baseline) must run the WHOLE PlanExecute
-	// loop, so a plan turn fires per iteration. Metric: baseline 1.0, improve to
-	// 2.0 (iter1, kept), then 2.0 again (iter2, no improvement) with
-	// max_stagnation=1 => halt after iter2. So exactly 2 inner iterations =>
-	// 2 inner plan turns. A dropped inner would record 0.
+	// iteration (after the iteration-0 baseline) runs the WHOLE PlanExecute loop —
+	// its EXECUTE phase fires per iteration, which is what proves genuine #124
+	// recursion. Metric: baseline 1.0, improve to 2.0 (iter1, kept), then 2.0
+	// again (iter2, no improvement) with max_stagnation=1 => halt after iter2.
+	//
+	// #138 AC1: the durable task_list is project-scoped (a durable in-memory
+	// RunStore is wired below), so iteration 1 authors the list and iteration 2
+	// SKIPS re-planning. The plan phase therefore fires EXACTLY ONCE across the
+	// whole climb — which still proves the recursion (a hardcoded-ReAct proposer
+	// would fire the plan phase ZERO times).
 	agent := newPlanTurnCounter("hc-inner", `{"tasks":["t0"],"rationale":"r"}`, "done")
 	eval := &scriptedMetricEvaluator{results: []*HillClimbMetricResult{
 		res(1.0), // iteration 0 baseline (no agent turn)
@@ -202,6 +207,13 @@ func TestHillClimbingRunsNonReactInnerPerIteration(t *testing.T) {
 	})
 
 	cfg, _ := hcConfigWith(t, dir, agent, eval)
+	// #138 AC1: wire a DURABLE in-memory RunStore (project-scoped, #142) so the
+	// task_list survives across HillClimbing iterations and the skip-replan guard
+	// fires — mirroring the Rust/TS/Python siblings. (hcConfigWith is storeless and
+	// has no other callers; scope the store to THIS test inline.)
+	store := newFakeRunStore()
+	cfg.RunStore = store
+	cfg.ProjectNamespace = SessionID("hc-project")
 	h := NewStandardHarness(cfg)
 
 	maxTurns := uint32(64)
@@ -219,9 +231,10 @@ func TestHillClimbingRunsNonReactInnerPerIteration(t *testing.T) {
 	if r.Kind != RunFailure || r.Reason.Kind != HaltStagnationLimitReached {
 		t.Fatalf("expected StagnationLimitReached, got %+v", r)
 	}
-	if got := agent.planTurnCount(); got != 2 {
-		t.Fatalf("the inner PlanExecute plan turn must fire once per HillClimbing "+
-			"iteration (2); got %d — a dropped inner would record 0", got)
+	if got := agent.planTurnCount(); got != 1 {
+		t.Fatalf("#138 AC1: the inner PlanExecute plan turn fires EXACTLY ONCE (iter 1 "+
+			"authors the durable task_list; later iterations skip re-planning); got %d — "+
+			"a dropped inner would record 0", got)
 	}
 }
 

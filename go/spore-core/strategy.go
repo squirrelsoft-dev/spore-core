@@ -856,109 +856,176 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 	// it OUT of cx.Stream so the recursive children run with a suppressed sink.
 	onStream := cx.takeStream()
 
-	// ── Phase 1: plan (dispatch through c.Plan). ────────────────────────────
-	//
-	// Seed the planning directive onto a CLONE of the base session so the shared
-	// execute context stays [user: task.instruction] (#93 — a leaked directive
-	// would make every execute step re-emit a plan). The plan sub-strategy's own
-	// declared budget governs the plan phase (R1): an authored task_list may take
-	// more than one turn. The task's global turn ceiling remains the outer
-	// backstop (R10), enforced by the shared budget — not a turns+1 clamp.
-	directive := executor.PlanDirective(task.Instruction)
-	planSession := baseSession
-	executor.SeedUserMessage(ctx, &planSession, directive)
-	planBudget := task.Budget
-	planTask := Task{
-		ID:           task.ID,
-		Instruction:  directive,
-		SessionID:    sessionID,
-		Budget:       planBudget,
-		LoopStrategy: *c.Plan,
-	}
-	planResult := executor.RunPlanSubtree(ctx, c.Plan, planTask, planSession, budget)
-	if planResult == nil {
-		result := RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind: HaltPlanPhaseFailed,
-				PlanError: &PlanPhaseError{
-					Kind:    PlanErrorPlanningTurnFailed,
-					Message: "plan sub-strategy produced no terminal",
-				},
-			},
-			SessionID: sessionID,
-			Turns:     budget.Turns,
-		}
-		return cx.finish(ctx, executor, task, result)
-	}
-	if planResult.Kind != RunSuccess {
-		// A non-success plan terminal (budget / agent error / pause) propagates
-		// verbatim — the run never reaches execute.
-		return cx.finish(ctx, executor, task, *planResult)
-	}
-	planOutput := planResult.Output
-	planUsageAgg := planResult.Usage
-	planTurns := planResult.Turns
+	// #131/#138: the phase-agnostic resume seed (the stalled worker conversation
+	// carried from a resumed consult or budget pause). Taken BEFORE the plan phase
+	// so AC3 (plan-phase exhaustion) can seed the plan session from it, and AC2
+	// (execute-phase exhaustion) can re-attach it to the single InProgress task.
+	resumeSeedSession := cx.Scratch.ResumeSeed
+	cx.Scratch.ResumeSeed = nil
 
-	// Capture + persist the artifact from the plan child's output (R3/R4/R11) —
-	// the harness-side machinery, no model turn.
-	outcome, failure := executor.CapturePlanArtifact(ctx, sessionID, planOutput, planUsageAgg, planTurns)
-	if failure != nil {
-		return cx.finish(ctx, executor, task, *failure)
-	}
+	// #138 AC1 (skip re-planning): probe the DURABLE task_list BEFORE the plan
+	// phase. If a non-empty list already exists (e.g. a prior window authored it,
+	// #142 makes it survive Ralph's per-window session reset), the plan phase is
+	// REDUNDANT — go straight to reconcile + the ready-set walk. This is the core
+	// fix: a budget/consult re-entry no longer burns its grant re-planning a graph
+	// that is already durable. The plan artifact under PlanExecuteExtrasKey may be
+	// ABSENT in this case (AC1-a artifact-optional) — nothing downstream requires
+	// it once a task_list exists.
+	preexisting, havePreexisting := executor.LoadTaskList(ctx, sessionID)
+	skipPlan := havePreexisting && len(preexisting.Tasks) > 0
 
-	// #126 decision C: the runnable task list comes from the persisted task_list
-	// tool store (the ONE authoring path — it can carry real blockers). Fall back
-	// to the linear plan-artifact bridge only when nothing was authored via the
-	// tool (back-compat with the #59/#124 plan-only path and its replay fixtures).
-	// The plan artifact is still captured+persisted above so the plan-phase replay
-	// tests stay green.
 	var taskList TaskList
-	if persisted, ok := executor.LoadTaskList(ctx, sessionID); ok && len(persisted.Tasks) > 0 {
-		taskList = persisted
+	var totalUsage AggregateUsage
+	var carried BudgetSnapshot
+	if skipPlan {
+		// ── AC1: skip-plan path. The list is the durable source of truth.
+		taskList = preexisting
+
+		// AC5 (defense in depth): re-check the durable graph for cycles. No task
+		// runs.
+		if taskList.HasCycle() {
+			result := RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:   HaltTaskGraphCycle,
+					Reason: "persisted task graph contains a directed cycle",
+				},
+				SessionID: sessionID,
+			}
+			return cx.finish(ctx, executor, task, result)
+		}
+
+		// A.6 deep-resume: reconcile already-Completed tasks so they are NOT
+		// re-run (handles the dedup the plan path would have done).
+		executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
+		executor.PersistTaskList(ctx, sessionID, taskList)
+
+		// No plan turn ran: usage starts empty and the shared budget is carried
+		// unchanged (turns stay at the incoming budget.Turns).
+		totalUsage = AggregateUsage{}
+		carried = budget
 	} else {
-		taskList = PlanArtifactToTaskList(outcome.Artifact)
-	}
-	if len(taskList.Tasks) == 0 {
-		result := RunResult{
-			Kind:      RunFailure,
-			Reason:    HaltReason{Kind: HaltEmptyPlan},
-			SessionID: sessionID,
-			Usage:     outcome.Usage,
-			Turns:     outcome.Turns,
+		// ── AC3 / fresh-plan path: run the plan phase. ──────────────────────────
+		//
+		// Seed the planning directive onto a CLONE of the base session so the shared
+		// execute context stays [user: task.instruction] (#93 — a leaked directive
+		// would make every execute step re-emit a plan). The plan sub-strategy's own
+		// declared budget governs the plan phase (R1): an authored task_list may take
+		// more than one turn. The task's global turn ceiling remains the outer
+		// backstop (R10), enforced by the shared budget — not a turns+1 clamp.
+		//
+		// #138 AC3 (plan-phase exhaustion, infer-from-task_list option iii): when a
+		// resume seed is present AND the durable list has no InProgress task, the
+		// exhaustion happened in the PLAN phase before authoring any task (AC3-b: the
+		// list is still empty). Seed the PLAN session from the carried conversation
+		// so the planner CONTINUES on it instead of starting fresh — and consume the
+		// seed here so the execute-phase re-attach below does not also fire.
+		planResume := resumeSeedSession != nil && !preexistingHasInProgress(preexisting)
+		directive := executor.PlanDirective(task.Instruction)
+		var planSession SessionState
+		if planResume {
+			planSession = *resumeSeedSession
+			resumeSeedSession = nil
+		} else {
+			planSession = baseSession
 		}
-		return cx.finish(ctx, executor, task, result)
-	}
-
-	// #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
-	// depth — add_task already rejects cycles, but the persisted store could be
-	// cyclic out of band). No task runs.
-	if taskList.HasCycle() {
-		result := RunResult{
-			Kind: RunFailure,
-			Reason: HaltReason{
-				Kind:   HaltTaskGraphCycle,
-				Reason: "persisted task graph contains a directed cycle",
-			},
-			SessionID: sessionID,
-			Usage:     outcome.Usage,
-			Turns:     outcome.Turns,
+		executor.SeedUserMessage(ctx, &planSession, directive)
+		planBudget := task.Budget
+		planTask := Task{
+			ID:           task.ID,
+			Instruction:  directive,
+			SessionID:    sessionID,
+			Budget:       planBudget,
+			LoopStrategy: *c.Plan,
 		}
-		return cx.finish(ctx, executor, task, result)
-	}
-	executor.PersistTaskList(ctx, sessionID, taskList)
+		planResult := executor.RunPlanSubtree(ctx, c.Plan, planTask, planSession, budget)
+		if planResult == nil {
+			result := RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind: HaltPlanPhaseFailed,
+					PlanError: &PlanPhaseError{
+						Kind:    PlanErrorPlanningTurnFailed,
+						Message: "plan sub-strategy produced no terminal",
+					},
+				},
+				SessionID: sessionID,
+				Turns:     budget.Turns,
+			}
+			return cx.finish(ctx, executor, task, result)
+		}
+		if planResult.Kind != RunSuccess {
+			// A non-success plan terminal (budget / agent error / pause) propagates
+			// verbatim — the run never reaches execute.
+			return cx.finish(ctx, executor, task, *planResult)
+		}
+		planOutput := planResult.Output
+		planUsageAgg := planResult.Usage
+		planTurns := planResult.Turns
 
-	// Carry the shared budget past the plan turn.
-	carried := budget
-	carried.Turns = outcome.Turns
-	carried.InputTokens += outcome.Usage.InputTokens
-	carried.OutputTokens += outcome.Usage.OutputTokens
+		// Capture + persist the artifact from the plan child's output (R3/R4/R11) —
+		// the harness-side machinery, no model turn.
+		outcome, failure := executor.CapturePlanArtifact(ctx, sessionID, planOutput, planUsageAgg, planTurns)
+		if failure != nil {
+			return cx.finish(ctx, executor, task, *failure)
+		}
+
+		// #126 decision C: the runnable task list comes from the persisted task_list
+		// tool store (the ONE authoring path — it can carry real blockers). Fall back
+		// to the linear plan-artifact bridge only when nothing was authored via the
+		// tool (back-compat with the #59/#124 plan-only path and its replay fixtures).
+		if persisted, ok := executor.LoadTaskList(ctx, sessionID); ok && len(persisted.Tasks) > 0 {
+			taskList = persisted
+		} else {
+			taskList = PlanArtifactToTaskList(outcome.Artifact)
+		}
+		if len(taskList.Tasks) == 0 {
+			result := RunResult{
+				Kind:      RunFailure,
+				Reason:    HaltReason{Kind: HaltEmptyPlan},
+				SessionID: sessionID,
+				Usage:     outcome.Usage,
+				Turns:     outcome.Turns,
+			}
+			return cx.finish(ctx, executor, task, result)
+		}
+
+		// #126 AC5: re-check the WHOLE graph for cycles at execute entry (defense in
+		// depth — add_task already rejects cycles, but the persisted store could be
+		// cyclic out of band). No task runs.
+		if taskList.HasCycle() {
+			result := RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:   HaltTaskGraphCycle,
+					Reason: "persisted task graph contains a directed cycle",
+				},
+				SessionID: sessionID,
+				Usage:     outcome.Usage,
+				Turns:     outcome.Turns,
+			}
+			return cx.finish(ctx, executor, task, result)
+		}
+		executor.PersistTaskList(ctx, sessionID, taskList)
+
+		// Carry the shared budget past the plan turn.
+		carried = budget
+		carried.Turns = outcome.Turns
+		carried.InputTokens += outcome.Usage.InputTokens
+		carried.OutputTokens += outcome.Usage.OutputTokens
+
+		// A.6 deep-resume (Q2): reconcile against the durable checkpoint so
+		// already-Completed tasks are not re-run.
+		executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
+
+		totalUsage = outcome.Usage
+	}
 
 	// ── Phase 2: execute (dispatch c.Execute PER TASK). ─────────────────────
 	//
 	// The shared execute context starts from baseSession (NOT the plan child's
 	// polluted session) so the directive never leaks (#93).
-	result, exhausted := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, outcome.Usage, onStream)
+	result, exhausted := c.runExecuteLoop(ctx, cx, executor, &task, baseSession, taskList, carried, totalUsage, resumeSeedSession, onStream)
 	if exhausted != nil {
 		// #125: a BudgetExhausted is surfaced as a typed StrategyOutcome (NOT
 		// collapsed through finish into a Failure override). Restore the parent task
@@ -973,11 +1040,19 @@ func (c *PlanExecuteConfig) Run(ctx context.Context, cx *ExecutionContext) Strat
 }
 
 // runExecuteLoop drains taskList by dispatching c.Execute.Run ONCE PER TASK
-// (#124). It owns the per-task orchestration: A.6 deep-resume reconcile, Q1
-// per-task turn allocation, the OnTaskAdvance hook, seeding each step instruction
-// as a user message on the SHARED execute context, task-list persistence after
-// each transition (Q4), and cumulative usage / last-output / last-state carry.
-// Returns the terminal RunResult for the execute phase.
+// (#124). It owns the per-task orchestration: Q1 per-task turn allocation, the
+// OnTaskAdvance hook, seeding each step instruction as a user message on the
+// SHARED execute context, task-list persistence after each transition (Q4), and
+// cumulative usage / last-output / last-state carry. The A.6 deep-resume
+// reconcile already ran in Run before this call. Returns the terminal RunResult
+// for the execute phase.
+//
+// #131 consult / #138 budget re-drive: resumeSeedSession is the stalled worker
+// conversation carried from a resumed pause (nil on a fresh run, or when the AC3
+// plan-resume path already consumed it). The stalled task is the single
+// InProgress task in the durable list; this resets it to Pending so NextReady
+// re-schedules it and seeds its step from the carried session instead of a fresh
+// one — the worker continues mid-loop and its evaluator still runs.
 func (c *PlanExecuteConfig) runExecuteLoop(
 	ctx context.Context,
 	cx *ExecutionContext,
@@ -987,29 +1062,23 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 	taskList TaskList,
 	carried BudgetSnapshot,
 	planUsage AggregateUsage,
+	resumeSeedSession *SessionState,
 	onStream StreamSink,
 ) (RunResult, *StrategyOutcome) {
 	sessionID := task.SessionID
 
-	// A.6 deep-resume (Q2): reconcile against the durable checkpoint so
-	// already-Completed tasks are not re-run.
-	executor.ReconcileCompletedTasks(ctx, sessionID, &taskList)
-
-	// #131 consult re-drive: a resumed consult carries the worker conversation
-	// (answer already injected) in cx.Scratch.ConsultResume. The consulting task is
-	// the single InProgress task in the durable list (PlanExecute marks a task
-	// InProgress before running it). Reset it to Pending so NextReady re-schedules
-	// it, and remember its id so its step uses the carried session instead of a
-	// fresh one — the worker then continues mid-loop and its evaluator still runs.
-	consultResumeSession := cx.Scratch.ConsultResume
-	cx.Scratch.ConsultResume = nil
+	// #131 consult / #138 budget re-drive: the stalled task is the single
+	// InProgress task in the durable list (PlanExecute marks a task InProgress
+	// before running it). Reset it to Pending so NextReady re-schedules it, and
+	// remember its id so its step uses the carried session instead of a fresh one.
+	consultResumeSession := resumeSeedSession
 	var consultResumeTask uint32
 	var haveConsultResumeTask bool
 	if consultResumeSession != nil {
 		for i := range taskList.Tasks {
 			if taskList.Tasks[i].Status == TaskStatusInProgress {
 				// Reset directly (bypassing Update's forward-only transition guard,
-				// which rejects InProgress->Pending): the consult resume legitimately
+				// which rejects InProgress->Pending): the resume legitimately
 				// re-schedules the in-flight task.
 				taskList.Tasks[i].Status = TaskStatusPending
 				consultResumeTask = taskList.Tasks[i].ID
@@ -1201,20 +1270,36 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				cascade(taskID, "budget exhausted (Fail)")
 				continue
 			default: // Escalate: surface the partial and abort.
-				blocked := TaskStatusBlocked
-				_ = taskList.Update(taskID, &blocked, nil)
+				// #138 AC2-b: under SurfaceToHuman the task is NOT permanently failed
+				// — it pauses awaiting a budget grant. Leave it InProgress (the consult
+				// path's invariant) so the resume's seed re-attaches via the SAME
+				// InProgress->Pending->complete machinery. Under Autonomous the run
+				// aborts, so the task is Blocked as before.
+				surface := executor.EscalationMode().Kind == EscalationSurfaceToHuman
+				newStatus := TaskStatusBlocked
+				if surface {
+					newStatus = TaskStatusInProgress
+				}
+				_ = taskList.Update(taskID, &newStatus, nil)
 				executor.PersistTaskList(ctx, sessionID, taskList)
 				partial := planExecutePartialJSON(taskList)
+				// #138 AC2-a: carry the FULL stalled worker session (the execute child
+				// left it in scratch) into the pause so a budget RESUME re-attaches it
+				// as the in-progress task's seed — parallel to the consult pause —
+				// instead of discarding it for a partial-only stub.
+				workerSession := cx.takeSession()
+				workerToolset := workerToolsetOf(c.Execute)
 				cx.PopBudget()
 				cx.Scratch.RunSession = session
 				// #130: under SurfaceToHuman, PAUSE with a BudgetExhausted request
 				// (combinator actions: [ContinueWithBudget, Skip, Fail]) instead of
 				// propagating up. The waiting RunResult is returned as the terminal
 				// result so Run finishes it as the verbatim override.
-				if executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				if surface {
 					waiting := promoteBudgetExhaustedToHuman(
 						err, &partial, combinatorEscalationActions(err),
 						sessionID, *task, carried, carried.Turns,
+						workerSession, workerToolset,
 					)
 					return waiting, nil
 				}
@@ -1281,9 +1366,13 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				// propagating up.
 				if resolution != ExhaustedResolutionFail &&
 					executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+					// #138 AC2-a: this step already COMPLETED; carry its post-run
+					// session (lastState) so a budget resume re-attaches the real worker
+					// context, not a partial-only stub.
 					waiting := promoteBudgetExhaustedToHuman(
 						chErr, &partial, combinatorEscalationActions(chErr),
 						sessionID, *task, carried, carried.Turns,
+						lastState, workerToolsetOf(c.Execute),
 					)
 					return waiting, nil
 				}
@@ -1528,9 +1617,13 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			// verbatim terminal override instead of propagating up.
 			if resolution != ExhaustedResolutionFail &&
 				executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				// #138 AC2-a: carry the FULL build (worker) session — the
+				// SelfVerifying loop carries it forward in session after each
+				// iteration — so a budget resume re-attaches the real worker context.
 				waiting := promoteBudgetExhaustedToHuman(
 					chErr, &partial, combinatorEscalationActions(chErr),
 					buildSessionID, task, carried, carried.Turns,
+					session, workerToolsetOf(c.Inner),
 				)
 				return cx.recordTerminal(waiting)
 			}
@@ -1866,9 +1959,14 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			// verbatim terminal override instead of propagating up.
 			if resolution != ExhaustedResolutionFail &&
 				executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				// #138 AC2-a: HillClimbing iterates on a METRIC, not a worker
+				// conversation, so there is no richer session to carry — pass the empty
+				// default to fall back to the partial-only stub (pre-#138 behavior). The
+				// worker leaf's toolset handle is still carried (#140 parity, AC4-a).
 				waiting := promoteBudgetExhaustedToHuman(
 					chErr, &partial, combinatorEscalationActions(chErr),
 					sessionID, task, carried, carried.Turns,
+					SessionState{}, workerToolsetOf(c.Inner),
 				)
 				return cx.recordTerminal(waiting)
 			}
@@ -2079,6 +2177,61 @@ func workerAgentKeyOf(ls *LoopStrategy) string {
 		return workerAgentKeyOf(ls.HillClimbing.Inner)
 	default:
 		return ""
+	}
+}
+
+// preexistingHasInProgress reports whether the durable task_list (as probed
+// before the plan phase) has any InProgress task (#138 AC3). An empty / absent
+// list (no InProgress task) means a present resume seed came from a PLAN-phase
+// exhaustion — the planner is re-seeded from the carried conversation. A list
+// WITH an InProgress task means an EXECUTE-phase exhaustion — the seed re-attaches
+// to that task in the ready-set walk instead.
+func preexistingHasInProgress(list TaskList) bool {
+	for i := range list.Tasks {
+		if list.Tasks[i].Status == TaskStatusInProgress {
+			return true
+		}
+	}
+	return false
+}
+
+// workerToolsetOf descends a LoopStrategy tree to the worker (execute) leaf's
+// toolset handle (#138 AC4-a). Mirrors workerAgentKeyOf: a combinator descends
+// into its EXECUTE child (PlanExecute) / inner (SelfVerifying/Ralph/HillClimbing)
+// so a budget-exhausted pause records the same handle #140 would have on the
+// leaf's own pause (e.g. "exec-tools"), not the empty default.
+func workerToolsetOf(ls *LoopStrategy) ToolsetRef {
+	if ls == nil {
+		return ToolsetRef("")
+	}
+	switch ls.Kind {
+	case StrategyReAct:
+		if ls.ReActCfg == nil {
+			return ToolsetRef("")
+		}
+		return ls.ReActCfg.Toolset
+	case StrategyPlanExecute:
+		if ls.PlanExecute == nil {
+			return ToolsetRef("")
+		}
+		return workerToolsetOf(ls.PlanExecute.Execute)
+	case StrategySelfVerifying:
+		if ls.SelfVerify == nil {
+			return ToolsetRef("")
+		}
+		return workerToolsetOf(ls.SelfVerify.Inner)
+	case StrategyRalph:
+		if ls.Ralph == nil {
+			return ToolsetRef("")
+		}
+		return workerToolsetOf(ls.Ralph.Inner)
+	case StrategyHillClimbing:
+		if ls.HillClimbing == nil {
+			return ToolsetRef("")
+		}
+		return workerToolsetOf(ls.HillClimbing.Inner)
+	default:
+		return ToolsetRef("")
 	}
 }
 

@@ -67,7 +67,8 @@ func mustAddBlk(t *testing.T, l *TaskList, desc string, blockers []uint32) uint3
 // the last completed task's text and every task ends Completed.
 func TestDAGExecutesInDependencyOrderWithIDTiebreak(t *testing.T) {
 	a := NewMockAgent("dag")
-	a.Push(planFinal(`{"tasks":["ignored"]}`)) // plan turn (list comes from store)
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn is pushed. The first model call is task 1.
 	a.Push(planFinal("did 1"))
 	a.Push(planFinal("did 2"))
 	a.Push(planFinal("did 3"))
@@ -102,10 +103,11 @@ func TestDAGExecutesInDependencyOrderWithIDTiebreak(t *testing.T) {
 // full transcript fold. DAG: 1 (root), 2 -> 1, 3 (independent). Order: 1, 2, 3.
 func TestDAGBranchIsolationTier1ExcludesIndependentBranch(t *testing.T) {
 	agent := newPlanRecordingAgent("rec")
-	agent.push(planFinal(`{"tasks":["ignored"]}`)) // plan
-	agent.push(planFinal("ROOT_OUTPUT_AAA"))       // task 1
-	agent.push(planFinal("CHILD_OUTPUT_BBB"))      // task 2 (-> 1)
-	agent.push(planFinal("INDEP_OUTPUT_CCC"))      // task 3 (indep)
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn. The first call is task 1.
+	agent.push(planFinal("ROOT_OUTPUT_AAA"))  // task 1
+	agent.push(planFinal("CHILD_OUTPUT_BBB")) // task 2 (-> 1)
+	agent.push(planFinal("INDEP_OUTPUT_CCC")) // task 3 (indep)
 	store := newFakeRunStore()
 	cfg := standardCfg(agent)
 	cfg.RunStore = store
@@ -122,19 +124,20 @@ func TestDAGBranchIsolationTier1ExcludesIndependentBranch(t *testing.T) {
 
 	agent.mu.Lock()
 	defer agent.mu.Unlock()
-	if len(agent.seen) != 4 { // [0] plan, [1] task1, [2] task2, [3] task3
-		t.Fatalf("captured %d turns, want 4", len(agent.seen))
+	// #138 AC1: plan skipped → [0] task1, [1] task2, [2] task3.
+	if len(agent.seen) != 3 {
+		t.Fatalf("captured %d turns, want 3", len(agent.seen))
 	}
-	// Task 2 (index 2) is seeded with its transitive blocker (task 1)'s output.
-	if c := contextText(agent.seen[2]); !contains(c, "ROOT_OUTPUT_AAA") {
+	// Task 2 (index 1) is seeded with its transitive blocker (task 1)'s output.
+	if c := contextText(agent.seen[1]); !contains(c, "ROOT_OUTPUT_AAA") {
 		t.Fatalf("task 2 must see its transitive blocker (task 1) output:\n%s", c)
 	}
 	// Task 2 must NOT see the independent task 3.
-	if c := contextText(agent.seen[2]); contains(c, "INDEP_OUTPUT_CCC") {
+	if c := contextText(agent.seen[1]); contains(c, "INDEP_OUTPUT_CCC") {
 		t.Fatalf("task 2 must NOT see the independent branch:\n%s", c)
 	}
-	// Task 3 (index 3) is INDEPENDENT — no Tier-1 upstream block.
-	if c := contextText(agent.seen[3]); contains(c, "Results from upstream tasks") {
+	// Task 3 (index 2) is INDEPENDENT — no Tier-1 upstream block.
+	if c := contextText(agent.seen[2]); contains(c, "Results from upstream tasks") {
 		t.Fatalf("independent task 3 must have no Tier-1 upstream block:\n%s", c)
 	}
 }
@@ -144,8 +147,8 @@ func TestDAGBranchIsolationTier1ExcludesIndependentBranch(t *testing.T) {
 // files_touched. Task 2 issues a real edit_file call → the path is recorded.
 func TestDAGFilesTouchedObservedNotSelfReported(t *testing.T) {
 	a := NewMockAgent("dag")
-	a.Push(planFinal(`{"tasks":["ignored"]}`)) // plan
-	// Task 1: prose claims a file but issues NO write call.
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn. Task 1: prose claims a file but no write call.
 	a.Push(planFinal("I touched src/phantom.go (but did not really)"))
 	// Task 2: issue a real edit_file call carrying a path, then finalize.
 	a.Push(NewToolCallRequested([]ToolCall{{
@@ -223,7 +226,8 @@ func TestObservedWritesSeamRecordsOnlyRealWriteCalls(t *testing.T) {
 // DAG: 1 (root), 2 -> 1 (fails), 3 -> 2 (cascade-blocked), 4 (independent).
 func TestDAGFailureCascadePartition(t *testing.T) {
 	a := NewMockAgent("dag")
-	a.Push(planFinal(`{"tasks":["ignored"]}`))         // plan
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn. The first model call is task 1.
 	a.Push(planFinal("did root"))                      // task 1
 	a.Push(NewTurnError(NewEmptyResponseError(), nil)) // task 2 fails terminally
 	a.Push(planFinal("did indep"))                     // task 4 independent still runs
@@ -253,7 +257,8 @@ func TestDAGFailureCascadePartition(t *testing.T) {
 	if want := []uint32{2, 3}; !equalU32s(r.Reason.Blocked, want) {
 		t.Fatalf("blocked = %v, want %v", r.Reason.Blocked, want)
 	}
-	// plan + root + mid + indep consumed; "leaf" (cascade-blocked) never ran.
+	// #138 AC1: plan skipped — root + mid + indep consumed; "leaf"
+	// (cascade-blocked) never ran.
 	if remaining := len(a.results); remaining != 0 {
 		t.Fatalf("remaining queued responses = %d, want 0", remaining)
 	}
@@ -273,7 +278,8 @@ func TestDAGFailureCascadePartition(t *testing.T) {
 // budget-Fail/​error twin is covered structurally by the fixture replay below.
 func TestDAGBudgetFailCascadesLikeError(t *testing.T) {
 	a := NewMockAgent("dag")
-	a.Push(planFinal(`{"tasks":["ignored"]}`))         // plan
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn. The first model call is task 1.
 	a.Push(planFinal("did root"))                      // task 1
 	a.Push(NewTurnError(NewEmptyResponseError(), nil)) // task 2 fails terminally
 	a.Push(planFinal("did indep"))                     // task 4 independent still runs
@@ -309,7 +315,9 @@ func TestDAGBudgetFailCascadesLikeError(t *testing.T) {
 // → HaltTaskGraphCycle. No execute step runs (only the plan turn is consumed).
 func TestDAGCycleRejectedAtExecuteEntry(t *testing.T) {
 	a := NewMockAgent("dag")
-	a.Push(planFinal(`{"tasks":["ignored"]}`)) // plan turn only
+	// #138 AC1: a non-empty (cyclic) task_list is pre-seeded below, so the plan
+	// phase is SKIPPED — the cycle is detected at execute entry with NO model turn
+	// at all. No plan turn is pushed.
 	store := newFakeRunStore()
 	cfg := standardCfg(a)
 	cfg.RunStore = store
@@ -326,9 +334,10 @@ func TestDAGCycleRejectedAtExecuteEntry(t *testing.T) {
 	if r.Kind != RunFailure || r.Reason.Kind != HaltTaskGraphCycle {
 		t.Fatalf("expected TaskGraphCycle, got %+v", r)
 	}
-	// Only the plan turn ran; no execute step was dispatched.
+	// #138 AC1: skip-plan means NO model turn ran — the cycle is caught at execute
+	// entry before any plan or execute dispatch. No turns were pushed/consumed.
 	if remaining := len(a.results); remaining != 0 {
-		t.Fatalf("remaining queued responses = %d, want 0 (no execute step runs)", remaining)
+		t.Fatalf("remaining queued responses = %d, want 0 (no model turn runs)", remaining)
 	}
 }
 
@@ -339,7 +348,8 @@ func TestDAGLedgerDropOldestPastNThroughExecutor(t *testing.T) {
 	n := StepLedgerMaxEntries
 	total := n + 2 // 22 tasks
 	agent := newPlanRecordingAgent("rec")
-	agent.push(planFinal(`{"tasks":["ignored"]}`)) // plan
+	// #138 AC1: a non-empty task_list is pre-seeded below, so the plan phase is
+	// SKIPPED — no plan turn. Only the per-task SUMMARY turns are queued.
 	for i := 0; i < total; i++ {
 		agent.push(planFinal(fmt.Sprintf("SUMMARY_%d", i)))
 	}
