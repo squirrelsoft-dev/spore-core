@@ -475,7 +475,14 @@ fn build_request(
                 },
             })
             .collect();
-        (tools, None)
+        // Issue #139: the harness sets `params.output_schema` for the terminal
+        // turn of an output-schema-enforced ReAct leaf. Route it into the same
+        // `format` constrained-decoding channel the structured-tool-calls path
+        // uses, so the model is forced onto the schema. (When structured tool
+        // calls ARE active, that schema wins — the `if structured` arm above —
+        // since the leaf is still requesting tools, not emitting its terminal.)
+        let format = req.params.output_schema.clone();
+        (tools, format)
     };
 
     let options = OllamaOptions {
@@ -1331,6 +1338,37 @@ mod tests {
         let body = build_request("llama3.2", &None, &r, false);
         assert!(body.format.is_none());
         assert_eq!(body.tools.len(), 1);
+    }
+
+    // ── output-schema constrained decoding (issue #139) ────────────────────
+
+    #[test]
+    fn build_request_output_schema_populates_format_channel() {
+        // #139 AC1: `params.output_schema` (set by the harness for an
+        // output-schema-enforced terminal turn) routes into the Ollama `format`
+        // constrained-decoding channel verbatim, even with NO tools.
+        let mut r = req(vec![user("answer")]);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["ok", "error"]}},
+            "required": ["status"]
+        });
+        r.params.output_schema = Some(schema.clone());
+        let body = build_request("llama3.2", &None, &r, false);
+        assert_eq!(
+            body.format.as_ref(),
+            Some(&schema),
+            "output_schema must populate the Ollama `format` channel"
+        );
+    }
+
+    #[test]
+    fn build_request_no_output_schema_leaves_format_none() {
+        // Absent output_schema (the default) keeps `format` None — byte-identical
+        // to pre-#139.
+        let r = req(vec![user("hi")]);
+        let body = build_request("llama3.2", &None, &r, false);
+        assert!(body.format.is_none());
     }
 
     #[test]

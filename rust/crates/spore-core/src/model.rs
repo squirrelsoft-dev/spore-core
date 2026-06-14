@@ -108,6 +108,17 @@ pub struct ModelParams {
     /// text. Default `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub structured_tool_calls: bool,
+    /// Terminal-turn output schema delivered to the model's constrained-decoding
+    /// channel (issue #139). When `Some`, providers that support constrained
+    /// decoding (Ollama via the `format` JSON-schema parameter) force the
+    /// response onto the schema. Providers without it (Anthropic / OpenAI)
+    /// IGNORE it — a no-op, exactly like [`structured_tool_calls`]. The harness
+    /// sets this only for the terminal turn of a `ReactConfig` leaf with
+    /// `output = Some(..)` when `enforce_output_schemas` is ON. `None` (the
+    /// default) keeps every existing fixture byte-identical (the field is
+    /// `skip_serializing_if = "Option::is_none"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,7 +356,13 @@ pub fn request_hash(req: &ModelRequest) -> String {
     encode_hex(&digest[..8])
 }
 
-fn canonicalize_json(v: &serde_json::Value) -> String {
+/// Canonical compact key-sorted JSON encoding of `v` (object keys sorted
+/// lexicographically, no insignificant whitespace). The single cross-language
+/// source of truth for deterministic, byte-identical JSON — reused by request
+/// hashing (#37/#38) AND output-schema delivery + validator messages (#139, so
+/// the embedded schema and `{enum}`/`{value}` renderings are identical across
+/// Rust/TS/Python/Go regardless of each language's map insertion order).
+pub(crate) fn canonicalize_json(v: &serde_json::Value) -> String {
     use serde_json::Value;
     match v {
         Value::Null => "null".into(),

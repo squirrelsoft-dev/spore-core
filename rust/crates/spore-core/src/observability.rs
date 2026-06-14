@@ -464,6 +464,24 @@ pub enum ContextOperation {
         tool_name: String,
         consecutive_errors: u32,
     },
+    /// Output-schema enforcement fed a validation error back and RETRIED (issue
+    /// #139): the terminal `FinalResponse` failed validation against the leaf's
+    /// `output` schema and a retry turn was granted (within budget). Carries the
+    /// number of extra retry turns spent so far (`= attempt`) and the frozen
+    /// validator error string that was fed back.
+    OutputSchemaRetry {
+        attempt: u32,
+        error: String,
+    },
+    /// Output-schema enforcement EXHAUSTED its retries (issue #139): the terminal
+    /// still failed validation after `output_schema_max_retries` extra turns
+    /// (with budget remaining), so the run terminates with
+    /// `HaltReason::OutputSchemaViolation`. Carries the total attempt count
+    /// (`= 1 + max_retries`) and the final frozen validator error.
+    OutputSchemaViolation {
+        attempts: u32,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

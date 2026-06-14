@@ -1220,6 +1220,17 @@ pub trait StrategyExecutor: Send + Sync {
         // handle, threaded alongside `agent`. Empty ⇒ global-catalogue fallback;
         // a non-empty handle with its own catalogue ⇒ strict per-node scoping.
         toolset: ToolsetRef,
+        // Issue #139: the leaf's RESOLVED output schema (canonical compact
+        // key-sorted JSON) when `enforce_output_schemas` is ON and the leaf
+        // carries `output = Some(..)`; `None` otherwise (no delivery, no
+        // validation). When `Some`, the window VALIDATES its terminal against it
+        // and retries up to `output_schema_max_retries` extra turns, and sets
+        // [`ModelParams::output_schema`] on every turn so the Ollama `format`
+        // channel constrains decoding.
+        output_schema: Option<serde_json::Value>,
+        // Issue #139: the `N` extra validation-retry turns (total attempts =
+        // `1 + N`). Ignored when `output_schema` is `None`.
+        output_schema_max_retries: u32,
     ) -> BoxFut<'a, RunResult>;
 
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
@@ -1261,6 +1272,18 @@ pub trait StrategyExecutor: Send + Sync {
     /// propagate-up behavior. Mirrors [`ralph_max_resets`](Self::ralph_max_resets)
     /// / [`workspace_root`](Self::workspace_root).
     fn escalation_mode(&self) -> EscalationMode;
+
+    /// The output-schema enforcement MIGRATION GATE (issue #139). `false` (the
+    /// default) means [`ReactConfig::run`] never resolves/delivers/validates a
+    /// leaf's `output` schema — byte-identical to pre-#139. The `*Config::run`
+    /// bodies only hold `&dyn StrategyExecutor`, so they read it through this
+    /// accessor (mirrors [`escalation_mode`](Self::escalation_mode)).
+    fn enforce_output_schemas(&self) -> bool;
+
+    /// The number of EXTRA terminal-validation retry turns `N` granted under
+    /// output-schema enforcement (issue #139; total attempts = `1 + N`). Read by
+    /// [`ReactConfig::run`] to thread into the window. Default `2`.
+    fn output_schema_max_retries(&self) -> u32;
 
     /// Seed a user message onto `session_state` (the `ContextManager` seam).
     fn seed_user_message<'a>(
@@ -1479,7 +1502,7 @@ impl RunStrategy for ReactConfig {
             };
             let task = cx.current_task();
             let max_iterations = self.max_iterations();
-            let session_state = std::mem::take(&mut cx.scratch.run_session);
+            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
             let budget_used = cx.scratch.run_budget.clone();
             // #124: resolve the worker agent from the registry by THIS leaf's
             // handle (genuine recursion — no `config.agent`). A missing handle is
@@ -1492,6 +1515,38 @@ impl RunStrategy for ReactConfig {
                     return cx.record_terminal(result);
                 }
             };
+            // Output-schema delivery + enforcement (issue #139). MIGRATION GATE:
+            // only when `enforce_output_schemas` is ON AND this leaf carries
+            // `output = Some(..)` do we resolve the schema, DELIVER it (directive
+            // seed + the constrained-decoding channel), and pass it (plus the
+            // retry budget `N`) into the window for terminal validation. When the
+            // gate is OFF or there is no `output`, `output_schema` is `None` and
+            // the window behaves byte-identically to pre-#139 (no resolve, no
+            // delivery, no validation). The schema is canonicalized to compact
+            // key-sorted JSON so its delivered/reported bytes are identical
+            // across the four language ports.
+            let output_schema: Option<serde_json::Value> = if executor.enforce_output_schemas() {
+                self.output
+                    .as_ref()
+                    .and_then(|r| cx.registry.resolve_schema(r))
+                    .cloned()
+            } else {
+                None
+            };
+            let output_schema_max_retries = executor.output_schema_max_retries();
+            if let Some(schema) = output_schema.as_ref() {
+                // AC1: append the resolved schema to the leaf's directive/system
+                // context as a USER message, key-sorted via `canonicalize_json`
+                // so the seeded bytes are identical across languages.
+                let directive = format!(
+                    "Your final response must be a JSON value that conforms to this \
+JSON schema: {}",
+                    crate::model::canonicalize_json(schema)
+                );
+                executor
+                    .seed_user_message(&mut session_state, &directive)
+                    .await;
+            }
             // #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
             // `behavior`. The leaf still never RESOLVES it in the nested case (rule
             // 6: it PROPAGATES a `BudgetExhausted` to its parent, which owns the
@@ -1519,6 +1574,10 @@ impl RunStrategy for ReactConfig {
                     // window dispatches the per-node scoped catalogue (empty
                     // handle ⇒ global-catalogue fallback). Mirrors `agent`.
                     self.toolset.clone(),
+                    // Issue #139: thread the resolved output schema (or `None`)
+                    // and the retry budget so the window validates the terminal.
+                    output_schema,
+                    output_schema_max_retries,
                 )
                 .await;
             executor.finalize(&result).await;
@@ -3857,6 +3916,28 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<NodeAttr>,
     },
+    /// Output-schema enforcement (issue #139) fed a validation error back and
+    /// RETRIED: the terminal `FinalResponse` failed validation against the
+    /// leaf's `output` schema and a retry turn was granted (within budget). A
+    /// warning — the loop continues. Carries the extra-retry count so far
+    /// (`= attempt`) and the frozen validator error fed back.
+    OutputSchemaRetry {
+        attempt: u32,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
+    },
+    /// Output-schema enforcement (issue #139) EXHAUSTED its retries: the
+    /// terminal still failed validation after `output_schema_max_retries` extra
+    /// turns (with budget remaining), so the run terminates with
+    /// [`HaltReason::OutputSchemaViolation`]. Carries the total attempt count
+    /// (`= 1 + max_retries`) and the final frozen validator error.
+    OutputSchemaViolation {
+        attempts: u32,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<NodeAttr>,
+    },
 }
 
 impl StreamEvent {
@@ -3879,7 +3960,9 @@ impl StreamEvent {
             | StreamEvent::BlockStop { node, .. }
             | StreamEvent::ToolCallStart { node, .. }
             | StreamEvent::ToolErrorLoopDetected { node, .. }
-            | StreamEvent::ToolErrorLoopBroken { node, .. } => node,
+            | StreamEvent::ToolErrorLoopBroken { node, .. }
+            | StreamEvent::OutputSchemaRetry { node, .. }
+            | StreamEvent::OutputSchemaViolation { node, .. } => node,
         }
     }
 
@@ -3900,7 +3983,9 @@ impl StreamEvent {
             | StreamEvent::BlockStop { node, .. }
             | StreamEvent::ToolCallStart { node, .. }
             | StreamEvent::ToolErrorLoopDetected { node, .. }
-            | StreamEvent::ToolErrorLoopBroken { node, .. } => node.as_ref(),
+            | StreamEvent::ToolErrorLoopBroken { node, .. }
+            | StreamEvent::OutputSchemaRetry { node, .. }
+            | StreamEvent::OutputSchemaViolation { node, .. } => node.as_ref(),
         }
     }
 }
@@ -5468,6 +5553,23 @@ pub enum HaltReason {
         tool: String,
         consecutive_errors: u32,
     },
+    /// Returned by [`StandardHarness`] (issue #139) when output-schema
+    /// enforcement is ON (`HarnessConfig::enforce_output_schemas`) for a
+    /// `ReactConfig` leaf carrying `output = Some(..)`, and the leaf's terminal
+    /// `FinalResponse` STILL failed validation after the configured
+    /// `output_schema_max_retries` extra turns were exhausted WITH budget
+    /// remaining. DISTINCT from [`BudgetExceeded`](Self::BudgetExceeded): a
+    /// budget/turn cap that a retry would exceed surfaces the budget terminal
+    /// instead (budget-cap-wins precedence) — `OutputSchemaViolation` fires ONLY
+    /// on a genuine validation exhaustion. Carries the resolved `schema` (the
+    /// canonical compact key-sorted JSON), the total number of `attempts`
+    /// (`1 + max_retries`), and the `last_error` (the frozen validator error
+    /// string from the final attempt).
+    OutputSchemaViolation {
+        schema: String,
+        attempts: u32,
+        last_error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5800,6 +5902,31 @@ pub struct HarnessConfig {
     /// [`HaltReason::BudgetExceeded`]). The `2×` hard-stop multiplier is FIXED,
     /// not an independent field. Defaults to `3`.
     pub error_loop_threshold: u32,
+    /// MIGRATION GATE (issue #139) — NOT a permanent feature flag. When `true`,
+    /// a [`ReactConfig`] leaf carrying `output = Some(..)` has its resolved
+    /// output schema DELIVERED to the model (directive seed + the
+    /// [`ModelParams::output_schema`] constrained-decoding channel) and its
+    /// terminal `FinalResponse` VALIDATED against that schema; a validation
+    /// failure feeds the error back and retries up to
+    /// [`output_schema_max_retries`](Self::output_schema_max_retries) extra turns
+    /// (within budget), then terminates with
+    /// [`HaltReason::OutputSchemaViolation`]. Enforcement is UNIFORM — it applies
+    /// to structured-slot leaves (plan / worker / propose) too, and is additive
+    /// to and earlier than any downstream combinator validation.
+    ///
+    /// Default `false` (OFF) is NON-NEGOTIABLE: it keeps every existing replay
+    /// fixture byte-for-byte green during migration. When OFF, `ReactConfig::run`
+    /// behaves EXACTLY as before — no resolve, no delivery, no validation.
+    pub enforce_output_schemas: bool,
+    /// The `N` extra terminal-validation retry turns granted when
+    /// [`enforce_output_schemas`](Self::enforce_output_schemas) is ON and a
+    /// terminal fails output-schema validation (issue #139). Total attempts =
+    /// `1 + N`. Retried turns COUNT against the turn budget; a retry that would
+    /// exceed the budget surfaces the budget terminal instead of
+    /// [`HaltReason::OutputSchemaViolation`] (budget-cap-wins precedence).
+    /// Defaults to `2` (mirrors [`error_loop_threshold`](Self::error_loop_threshold)'s
+    /// builder default-handling idiom).
+    pub output_schema_max_retries: u32,
     /// Lifecycle hook chain (issue #69). When set, the harness fires the wired
     /// lifecycle events (`PreTurn`, `Stop`, `OnError`, …) through it.
     /// `None` (the default) preserves today's behaviour byte-for-byte.
@@ -5951,6 +6078,8 @@ impl Clone for HarnessConfig {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             error_loop_threshold: self.error_loop_threshold,
+            enforce_output_schemas: self.enforce_output_schemas,
+            output_schema_max_retries: self.output_schema_max_retries,
             hooks: self.hooks.clone(),
             storage: self.storage.clone(),
             project_id: self.project_id.clone(),
@@ -6013,6 +6142,13 @@ pub struct HarnessBuilder {
     /// Consecutive-recoverable-tool-error breaker threshold `N` (issue #137).
     /// Defaults to `3`. See [`HarnessConfig::error_loop_threshold`].
     error_loop_threshold: u32,
+    /// MIGRATION GATE (issue #139): deliver + enforce `ReactConfig.output`
+    /// schemas. Defaults to `false` (OFF). See
+    /// [`HarnessConfig::enforce_output_schemas`].
+    enforce_output_schemas: bool,
+    /// Extra output-schema validation retry turns `N` (issue #139). Defaults to
+    /// `2`. See [`HarnessConfig::output_schema_max_retries`].
+    output_schema_max_retries: u32,
     hooks: Option<Arc<dyn crate::hooks::HookChain>>,
     /// #124: the default SelfVerifying verifier, folded into the registry under
     /// the empty key at build (no longer a live `HarnessConfig` field).
@@ -6110,6 +6246,8 @@ impl HarnessBuilder {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
+            enforce_output_schemas: false,
+            output_schema_max_retries: 2,
             hooks: None,
             verifier: None,
             storage: None,
@@ -6559,6 +6697,24 @@ impl HarnessBuilder {
         self
     }
 
+    /// Turn ON output-schema delivery + enforcement for `ReactConfig` leaves
+    /// carrying `output = Some(..)` (issue #139 — MIGRATION GATE). Defaults to
+    /// `false` (OFF), which keeps existing replay fixtures byte-identical. See
+    /// [`HarnessConfig::enforce_output_schemas`].
+    pub fn enforce_output_schemas(mut self, enforce: bool) -> Self {
+        self.enforce_output_schemas = enforce;
+        self
+    }
+
+    /// Set the number of EXTRA terminal-validation retry turns `N` granted when
+    /// [`enforce_output_schemas`](Self::enforce_output_schemas) is ON (issue
+    /// #139). Total attempts = `1 + N`. Defaults to `2`. See
+    /// [`HarnessConfig::output_schema_max_retries`].
+    pub fn output_schema_max_retries(mut self, n: u32) -> Self {
+        self.output_schema_max_retries = n;
+        self
+    }
+
     /// Set the outer-loop context-window reset cap for the `Ralph` loop strategy
     /// (issue #58, B3). Defaults to `3`.
     pub fn max_resets(mut self, max: u32) -> Self {
@@ -6753,6 +6909,8 @@ impl HarnessBuilder {
             max_repair_attempts: self.max_repair_attempts,
             max_stop_blocks: self.max_stop_blocks,
             error_loop_threshold: self.error_loop_threshold,
+            enforce_output_schemas: self.enforce_output_schemas,
+            output_schema_max_retries: self.output_schema_max_retries,
             hooks: self.hooks,
             storage,
             project_id,
@@ -7241,6 +7399,11 @@ impl StandardHarness {
                 // handle, so they keep the global-catalogue fallback (empty
                 // handle) — byte-for-byte with pre-Issue-2 behaviour.
                 ToolsetRef(String::new()),
+                // Issue #139: the legacy `run_react` wrapper does NOT enforce
+                // output schemas (the recursive `ReactConfig::run` is the single
+                // enforcement seam). `None`/`0` ⇒ byte-for-byte pre-#139.
+                None,
+                0,
             )
             .await;
         match &result {
@@ -7323,6 +7486,7 @@ impl StandardHarness {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_react_inner(
         &self,
         task: Task,
@@ -7338,6 +7502,16 @@ impl StandardHarness {
         // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
         // per-key catalogue ⇒ strict per-node scoping.
         toolset: ToolsetRef,
+        // Issue #139: the leaf's RESOLVED output schema (`None` ⇒ no enforcement,
+        // identical to pre-#139 behavior). When `Some`, the terminal is validated
+        // against it (frozen validator subset) and a validation failure feeds the
+        // error back + retries up to `output_schema_max_retries` extra turns
+        // WITHIN budget; on exhaustion WITH budget remaining the window returns
+        // `HaltReason::OutputSchemaViolation`. The schema is also set on every
+        // turn's `ModelParams.output_schema` so the Ollama `format` channel
+        // constrains decoding (Anthropic/OpenAI ignore it).
+        output_schema: Option<serde_json::Value>,
+        output_schema_max_retries: u32,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
@@ -7365,6 +7539,17 @@ impl StandardHarness {
         let error_loop_n = self.config.error_loop_threshold;
         let mut error_runs: std::collections::HashMap<String, ErrorRun> =
             std::collections::HashMap::new();
+        // Output-schema enforcement state (issue #139), loop-local to this
+        // window. `output_schema_retries_used` counts the EXTRA retry turns spent
+        // on validation feedback; the budget for them is `output_schema_max_retries`
+        // (the `N`). `last_schema_error` holds the most recent frozen validator
+        // error so a final exhaustion can report it. Both are inert when
+        // `output_schema` is `None` (enforcement OFF / no schema).
+        let mut output_schema_retries_used: u32 = 0;
+        // Set on every validation failure before it is read in the violation
+        // terminal; the initial empty value is never observed.
+        #[allow(unused_assignments)]
+        let mut last_schema_error: String = String::new();
         // Monotonic per-run span counter for turn / tool-call span ids, and the
         // most recent turn span — parent for the tool-call spans of that turn.
         let mut span_seq: u64 = 0;
@@ -7485,6 +7670,13 @@ impl StandardHarness {
             // structured tool calls) to every tool-requesting ReAct/execute/
             // streaming turn.
             context.params = self.config.model_params.clone();
+            // Issue #139: route the enforced output schema into this turn's
+            // constrained-decoding channel (`ModelParams.output_schema`). Ollama
+            // honors it via `format`; Anthropic/OpenAI ignore it (no-op, like
+            // `structured_tool_calls`). `None` leaves the params byte-identical.
+            if output_schema.is_some() {
+                context.params.output_schema = output_schema.clone();
+            }
             // Whether tools were advertised to the model this turn — a
             // precondition for classifying a prose final response as a missed
             // tool call (adaptive prompt-based escalation). Captured before
@@ -7784,6 +7976,125 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     .append_user_message(&mut session_state, &reason)
                                     .await;
                                 continue;
+                            }
+
+                            // Output-schema enforcement gate (issue #139).
+                            // Additive to and EARLIER than the Success terminal:
+                            // when a schema is active, validate this terminal
+                            // `FinalResponse`. On a validation FAILURE, feed the
+                            // frozen error back as a USER message and retry one
+                            // more turn (up to `output_schema_max_retries` extra
+                            // turns). The retried turn re-enters the loop top,
+                            // where the budget gate fires FIRST — so a retry that
+                            // would exceed the turn/budget backstop surfaces the
+                            // existing `BudgetExceeded` terminal, NOT
+                            // `OutputSchemaViolation` (budget-cap-wins, Q2). Only
+                            // when the N retries are exhausted WITH budget
+                            // remaining does the window terminate with
+                            // `OutputSchemaViolation`. `None` schema ⇒ no
+                            // validation (migration gate OFF / no `output`), so
+                            // the terminal is byte-identical to pre-#139.
+                            if let Some(schema) = output_schema.as_ref() {
+                                if let Err(verr) =
+                                    crate::output_schema::validate_output(&content, schema)
+                                {
+                                    last_schema_error = verr.clone();
+                                    if output_schema_retries_used < output_schema_max_retries {
+                                        // Grant one more turn: feed the validator
+                                        // error back as a USER message (the
+                                        // assistant's invalid text is already in
+                                        // history above) and loop. The budget gate
+                                        // at the loop top enforces Q2 precedence.
+                                        output_schema_retries_used += 1;
+                                        Self::emit(
+                                            &on_stream,
+                                            StreamEvent::OutputSchemaRetry {
+                                                attempt: output_schema_retries_used,
+                                                error: verr.clone(),
+                                                node: None,
+                                            },
+                                        );
+                                        if let Some(obs) = self.config.observability.as_ref() {
+                                            let base = SpanBase::new_root(
+                                                SpanId::new(format!(
+                                                    "{}-output-schema-retry-{}",
+                                                    session_id.as_str(),
+                                                    span_seq
+                                                )),
+                                                session_id.clone(),
+                                                task.id.clone(),
+                                                SpanKind::ContextAssembly,
+                                                Timestamp::now(),
+                                            );
+                                            obs.emit_context(ContextSpan {
+                                                base,
+                                                operation: ContextOperation::OutputSchemaRetry {
+                                                    attempt: output_schema_retries_used,
+                                                    error: verr.clone(),
+                                                },
+                                                tokens_before: 0,
+                                                tokens_after: 0,
+                                                utilization_before: 0.0,
+                                                utilization_after: 0.0,
+                                            });
+                                        }
+                                        let feedback =
+                                            crate::output_schema::feedback_message(&verr);
+                                        self.config
+                                            .context_manager
+                                            .append_user_message(&mut session_state, &feedback)
+                                            .await;
+                                        continue;
+                                    }
+                                    // Retries exhausted WITH budget remaining
+                                    // (the budget gate did not fire) → the typed
+                                    // schema-violation terminal (Q2/AC3). Total
+                                    // attempts = 1 + max_retries.
+                                    let attempts = output_schema_max_retries + 1;
+                                    Self::emit(
+                                        &on_stream,
+                                        StreamEvent::OutputSchemaViolation {
+                                            attempts,
+                                            error: last_schema_error.clone(),
+                                            node: None,
+                                        },
+                                    );
+                                    if let Some(obs) = self.config.observability.as_ref() {
+                                        let base = SpanBase::new_root(
+                                            SpanId::new(format!(
+                                                "{}-output-schema-violation-{}",
+                                                session_id.as_str(),
+                                                span_seq
+                                            )),
+                                            session_id.clone(),
+                                            task.id.clone(),
+                                            SpanKind::ContextAssembly,
+                                            Timestamp::now(),
+                                        );
+                                        obs.emit_context(ContextSpan {
+                                            base,
+                                            operation: ContextOperation::OutputSchemaViolation {
+                                                attempts,
+                                                error: last_schema_error.clone(),
+                                            },
+                                            tokens_before: 0,
+                                            tokens_after: 0,
+                                            utilization_before: 0.0,
+                                            utilization_after: 0.0,
+                                        });
+                                    }
+                                    return RunResult::Failure {
+                                        reason: HaltReason::OutputSchemaViolation {
+                                            schema: crate::model::canonicalize_json(schema),
+                                            attempts,
+                                            last_error: last_schema_error.clone(),
+                                        },
+                                        session_id,
+                                        usage,
+                                        turns: budget_used.turns,
+                                        session_state: session_state.clone(),
+                                    };
+                                }
                             }
 
                             Self::emit(
@@ -9502,6 +9813,8 @@ impl StrategyExecutor for StandardHarness {
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
         toolset: ToolsetRef,
+        output_schema: Option<serde_json::Value>,
+        output_schema_max_retries: u32,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
             self.run_react_inner(
@@ -9512,6 +9825,8 @@ impl StrategyExecutor for StandardHarness {
                 on_stream,
                 agent,
                 toolset,
+                output_schema,
+                output_schema_max_retries,
             )
             .await
         })
@@ -9763,6 +10078,14 @@ impl StrategyExecutor for StandardHarness {
 
     fn escalation_mode(&self) -> EscalationMode {
         self.config.escalation_mode
+    }
+
+    fn enforce_output_schemas(&self) -> bool {
+        self.config.enforce_output_schemas
+    }
+
+    fn output_schema_max_retries(&self) -> u32 {
+        self.config.output_schema_max_retries
     }
 
     fn resolve_metric_evaluator(
@@ -12266,6 +12589,11 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
+            // #139: OFF by default in the shared test config (migration gate),
+            // so every pre-#139 test keeps its byte-for-byte terminal. The #139
+            // tests build a config with this flipped ON explicitly.
+            enforce_output_schemas: false,
+            output_schema_max_retries: 2,
             hooks: None,
             // #76: plan_execute + task_list persistence now lives on the
             // RunStore seam (not SessionState.extras), so the test harness
@@ -16834,6 +17162,8 @@ mod tests {
                 max_repair_attempts: 1,
                 max_stop_blocks: 8,
                 error_loop_threshold: 3,
+                enforce_output_schemas: false,
+                output_schema_max_retries: 2,
                 hooks: None,
                 storage: Arc::new(crate::storage::StorageProvider::no_op()),
                 project_id: crate::storage::ProjectId::from_canonical_path("/test-workspace"),
@@ -22257,6 +22587,326 @@ mod tests {
             RunResult::Success { output, .. } => assert_eq!(output, "fin"),
             other => panic!("expected Success (breaker off), got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // Output-schema delivery + enforcement (issue #139)
+    // ========================================================================
+    //
+    // Types/rules under test:
+    //   - `HarnessConfig::enforce_output_schemas` (MIGRATION GATE, default OFF).
+    //   - `HarnessConfig::output_schema_max_retries` (N, default 2).
+    //   - `HaltReason::OutputSchemaViolation { schema, attempts, last_error }`.
+    //   - AC1: the resolved schema is DELIVERED to the leaf's directive seed
+    //     (key-sorted) AND set on `ModelParams.output_schema`.
+    //   - AC2: terminal validated; valid ⇒ Success; invalid ⇒ feed the frozen
+    //     error back + retry within budget.
+    //   - AC3: after N retries WITH budget remaining ⇒ OutputSchemaViolation
+    //     (distinct from budget exhaustion; turns < budget).
+    //   - AC3 budget precedence: a retry that would exceed the turn cap surfaces
+    //     `BudgetExceeded`, NOT `OutputSchemaViolation`.
+    //   - AC4: flag OFF ⇒ an invalid terminal is accepted as Success.
+
+    /// The output schema the #139 tests enforce: an object requiring a `status`
+    /// (one of `ok`/`error`) and a `count` integer.
+    fn os_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["status", "count"],
+            "properties": {
+                "status": {"type": "string", "enum": ["ok", "error"]},
+                "count": {"type": "integer"}
+            }
+        })
+    }
+
+    /// A valid terminal body for [`os_schema`].
+    const OS_VALID: &str = "{\"status\":\"ok\",\"count\":3}";
+    /// An invalid terminal body for [`os_schema`] (missing both required props).
+    const OS_INVALID: &str = "{}";
+
+    /// A `standard_config` with output-schema enforcement ON and [`os_schema`]
+    /// registered under the default empty `SchemaRef` key. `max_retries` is the
+    /// `N`.
+    fn os_config(agent: Arc<MockAgent>, max_retries: u32) -> HarnessConfig {
+        let mut cfg = standard_config(agent);
+        cfg.enforce_output_schemas = true;
+        cfg.output_schema_max_retries = max_retries;
+        // Register the real schema under the empty key (replacing the default
+        // `{}` the test config installs).
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .schema("", os_schema())
+            .build();
+        cfg
+    }
+
+    /// A bare ReAct leaf that carries `output = Some(SchemaRef(""))` and a turn
+    /// budget of `budget`.
+    fn os_leaf(budget: u32) -> Task {
+        task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: budget },
+            behavior: default_budget_behavior(),
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: Some(SchemaRef(String::new())),
+        }))
+    }
+
+    fn os_user_msgs(state: &SessionState) -> Vec<String> {
+        state
+            .messages
+            .iter()
+            .filter_map(|m| match (&m.role, &m.content) {
+                (crate::model::Role::User, crate::model::Content::Text { text }) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // AC1: the resolved schema is delivered to the directive seed (key-sorted),
+    // and a valid terminal accepts on turn 1. (The Ollama `format` population +
+    // non-Ollama no-op are unit-tested in `ollama.rs`; here we assert delivery
+    // via the seeded directive.)
+    #[tokio::test]
+    async fn os_ac1_schema_delivered_to_directive_seed() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: OS_VALID.into(),
+            usage: usage(),
+        });
+        let h = StandardHarness::new(os_config(a, 2));
+        match h.run(HarnessRunOptions::new(os_leaf(10))).await {
+            RunResult::Success {
+                session_state,
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 1, "valid on turn 1");
+                let users = os_user_msgs(&session_state);
+                // The directive carries the KEY-SORTED schema bytes. Pin the
+                // exact canonical compact JSON so the four ports match.
+                const EXPECTED_SCHEMA: &str = "{\"properties\":{\"count\":{\"type\":\"integer\"},\"status\":{\"enum\":[\"ok\",\"error\"],\"type\":\"string\"}},\"required\":[\"status\",\"count\"],\"type\":\"object\"}";
+                assert!(
+                    users.iter().any(|m| m.contains(EXPECTED_SCHEMA)),
+                    "directive must carry the key-sorted schema; got {users:?}"
+                );
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // AC2 accept: schema ON, turn 1 valid → Success, turns == 1, NO feedback.
+    #[tokio::test]
+    async fn os_ac2_accept_valid_on_first_turn() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: OS_VALID.into(),
+            usage: usage(),
+        });
+        let h = StandardHarness::new(os_config(a, 2));
+        match h.run(HarnessRunOptions::new(os_leaf(10))).await {
+            RunResult::Success {
+                output,
+                turns,
+                session_state,
+                ..
+            } => {
+                assert_eq!(output, OS_VALID);
+                assert_eq!(turns, 1);
+                let fed_back = os_user_msgs(&session_state)
+                    .iter()
+                    .any(|m| m.contains("did not match the required output schema"));
+                assert!(!fed_back, "no feedback message on a turn-1 accept");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    // AC2 retry: turn 1 invalid → feed error back → turn 2 valid → Success,
+    // turns == 2, the frozen feedback (with the validator error) is present.
+    #[tokio::test]
+    async fn os_ac2_retry_invalid_then_valid() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: OS_INVALID.into(),
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: OS_VALID.into(),
+            usage: usage(),
+        });
+        let h = StandardHarness::new(os_config(a, 2));
+        match h.run(HarnessRunOptions::new(os_leaf(10))).await {
+            RunResult::Success {
+                output,
+                turns,
+                session_state,
+                ..
+            } => {
+                assert_eq!(output, OS_VALID);
+                assert_eq!(turns, 2, "one retry consumed");
+                // The frozen feedback for the FIRST-failing rule (missing
+                // required `status`, array order) must be present, exact bytes.
+                const EXPECTED_FEEDBACK: &str = "Your previous response did not match the required output schema. Missing required property \"status\". Reply with only a JSON value that satisfies the schema.";
+                assert!(
+                    os_user_msgs(&session_state)
+                        .iter()
+                        .any(|m| m == EXPECTED_FEEDBACK),
+                    "the exact frozen feedback (with validator error) must be fed back"
+                );
+            }
+            other => panic!("expected Success after retry, got {other:?}"),
+        }
+    }
+
+    // AC3 fail: N+1 invalid terminals (N == 2 ⇒ 3 attempts) with a generous
+    // budget → OutputSchemaViolation, DISTINCT from budget, turns < budget.
+    #[tokio::test]
+    async fn os_ac3_fail_after_retries_exhausted() {
+        let a = make_agent();
+        for _ in 0..3 {
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: OS_INVALID.into(),
+                usage: usage(),
+            });
+        }
+        let h = StandardHarness::new(os_config(a, 2));
+        match h.run(HarnessRunOptions::new(os_leaf(50))).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::OutputSchemaViolation {
+                        attempts,
+                        last_error,
+                        schema,
+                    },
+                turns,
+                ..
+            } => {
+                assert_eq!(attempts, 3, "1 + N == 1 + 2 attempts");
+                assert_eq!(turns, 3, "exactly 1 + N turns");
+                assert!(turns < 50, "budget NOT exhausted (distinct from budget)");
+                assert_eq!(last_error, "Missing required property \"status\".");
+                // The reported schema is the canonical key-sorted JSON.
+                assert_eq!(
+                    schema,
+                    "{\"properties\":{\"count\":{\"type\":\"integer\"},\"status\":{\"enum\":[\"ok\",\"error\"],\"type\":\"string\"}},\"required\":[\"status\",\"count\"],\"type\":\"object\"}"
+                );
+            }
+            other => panic!("expected OutputSchemaViolation, got {other:?}"),
+        }
+    }
+
+    // AC3 budget precedence: a tiny turn budget (2) is exhausted by retries
+    // BEFORE the N==5 retries run out → the BUDGET terminal wins, NOT
+    // OutputSchemaViolation (Q2 budget-cap-wins).
+    #[tokio::test]
+    async fn os_ac3_budget_precedence_over_schema_violation() {
+        let a = make_agent();
+        // More invalid turns than the budget allows; the budget gate stops first.
+        for _ in 0..5 {
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: OS_INVALID.into(),
+                usage: usage(),
+            });
+        }
+        // N == 5 (large), budget == 2 turns. After 2 invalid terminals the
+        // 3rd retry re-enters the loop where the turn-budget gate fires.
+        let h = StandardHarness::new(os_config(a, 5));
+        match h.run(HarnessRunOptions::new(os_leaf(2))).await {
+            RunResult::Failure {
+                reason: HaltReason::BudgetExceeded { .. },
+                turns,
+                ..
+            } => {
+                assert_eq!(turns, 2, "stopped at the turn budget, not on schema");
+            }
+            other => panic!("expected BudgetExceeded (budget wins), got {other:?}"),
+        }
+    }
+
+    // AC4: flag OFF ⇒ an INVALID terminal is accepted as Success (no resolve, no
+    // delivery, no validation) — the migration-gate guarantee.
+    #[tokio::test]
+    async fn os_ac4_flag_off_accepts_invalid_terminal() {
+        let a = make_agent();
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: OS_INVALID.into(),
+            usage: usage(),
+        });
+        // standard_config has enforce_output_schemas = false; register the schema
+        // anyway to prove it is IGNORED when the gate is OFF.
+        let mut cfg = standard_config(a);
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .schema("", os_schema())
+            .build();
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(os_leaf(10))).await {
+            RunResult::Success {
+                output,
+                turns,
+                session_state,
+                ..
+            } => {
+                assert_eq!(output, OS_INVALID, "invalid terminal accepted as-is");
+                assert_eq!(turns, 1);
+                // No directive seeded when the gate is OFF.
+                let seeded = os_user_msgs(&session_state)
+                    .iter()
+                    .any(|m| m.contains("conforms to this"));
+                assert!(!seeded, "no schema directive delivered when gate is OFF");
+            }
+            other => panic!("expected Success (gate OFF), got {other:?}"),
+        }
+    }
+
+    // AC4 + events: enforcement ON emits the retry + violation stream events.
+    #[tokio::test]
+    async fn os_emits_retry_and_violation_events() {
+        let a = make_agent();
+        for _ in 0..2 {
+            a.push(TurnResult::FinalResponse {
+                reasoning: None,
+                content: OS_INVALID.into(),
+                usage: usage(),
+            });
+        }
+        let captured: Arc<std::sync::Mutex<Vec<StreamEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        // N == 1 ⇒ 1 retry then violation (2 attempts).
+        let h = StandardHarness::new(os_config(a, 1));
+        let opts = HarnessRunOptions::new(os_leaf(50)).with_stream(move |ev| {
+            sink.lock().unwrap().push(ev);
+        });
+        let _ = h.run(opts).await;
+        let evs = captured.lock().unwrap();
+        let retries: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::OutputSchemaRetry { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        let violations: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::OutputSchemaViolation { attempts, .. } => Some(*attempts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retries, vec![1], "one retry event at attempt 1");
+        assert_eq!(violations, vec![2], "one violation event, attempts == 2");
     }
 }
 

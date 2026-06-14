@@ -87,6 +87,8 @@ fn harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>) {
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         error_loop_threshold: 3,
+        enforce_output_schemas: false,
+        output_schema_max_retries: 2,
         hooks: None,
         storage: storage.clone(),
         // #142: durable artifacts (task_list) are keyed by the project namespace;
@@ -508,6 +510,8 @@ async fn worker_consult_surfaces_and_host_resumes() {
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         error_loop_threshold: 3,
+        enforce_output_schemas: false,
+        output_schema_max_retries: 2,
         hooks: None,
         storage: storage.clone(),
         // #142: durable artifacts (task_list) are keyed by the project namespace;
@@ -672,6 +676,8 @@ fn surface_harness_for(fixture: &str) -> (StandardHarness, Arc<StorageProvider>)
         max_repair_attempts: 1,
         max_stop_blocks: 8,
         error_loop_threshold: 3,
+        enforce_output_schemas: false,
+        output_schema_max_retries: 2,
         hooks: None,
         storage: storage.clone(),
         project_id: spore_core::ProjectId::from_canonical_path(CORDYCEPS_PROJECT_PATH),

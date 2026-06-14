@@ -1759,6 +1759,8 @@ mod tests {
             max_repair_attempts: 1,
             max_stop_blocks: 8,
             error_loop_threshold: 3,
+            enforce_output_schemas: false,
+            output_schema_max_retries: 2,
             hooks: None,
             storage: Arc::new(crate::storage::StorageProvider::no_op()),
             project_id: crate::storage::ProjectId::from_canonical_path("/test-workspace"),

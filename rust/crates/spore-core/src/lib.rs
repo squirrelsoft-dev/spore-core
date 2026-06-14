@@ -36,6 +36,7 @@ pub mod observability;
 pub mod observability_outbox;
 pub mod ollama;
 pub mod openai;
+pub mod output_schema;
 pub mod plan;
 pub mod prompt_assembly;
 pub mod prompt_chunk_registry;
