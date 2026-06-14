@@ -28,6 +28,7 @@ const {
   KeyTermVerifier,
   ContextErrorException,
   DEFAULT_CONTEXT_LENGTH,
+  CompactionConfigSchema,
 } = context;
 
 type CompactionConfig = context.CompactionConfig;
@@ -770,5 +771,30 @@ describe("CompactionConfig serialization (issue #141)", () => {
     const config: CompactionConfig = { ...defaultCompactionConfig(), context_length: 8000 };
     const parsed = JSON.parse(JSON.stringify(config));
     expect(parsed.context_length).toBe(8000);
+  });
+});
+
+describe("CompactionConfig.context_length explicit-zero cross-language parity (issue #141)", () => {
+  // The cross-language domain is unsigned (Rust u32 / Go uint32 / Python int):
+  // an explicit `0` is a VALID input that parses, then falls through in the
+  // resolver. `.positive()` would throw in TS while three sibling languages
+  // accept `0` — a real interface divergence. `.nonnegative()` closes it.
+  it("schema accepts an explicit context_length of 0", () => {
+    const parsed = CompactionConfigSchema.parse({
+      ...defaultCompactionConfig(),
+      context_length: 0,
+    });
+    expect(parsed.context_length).toBe(0);
+  });
+
+  it("schema still rejects a negative context_length", () => {
+    expect(() =>
+      CompactionConfigSchema.parse({ ...defaultCompactionConfig(), context_length: -1 }),
+    ).toThrow();
+  });
+
+  it("resolver with context_length 0 + model window 128000 falls through to 128000", () => {
+    // The schema boundary and the resolver agree: 0 parses, then falls through.
+    expect(mkResolver(0, 128000).resolveContextLength()).toBe(128000);
   });
 });

@@ -212,8 +212,14 @@ export const CompactionConfigSchema = z.object({
    * Serialized as ABSENT when unset — `JSON.stringify` emits no
    * `context_length` key, so an existing serialized `CompactionConfig` stays
    * byte-identical (no new key when omitted).
+   *
+   * `nonnegative` (not `positive`): the cross-language domain is unsigned
+   * (Rust `u32` / Go `uint32` / Python `int`), so an explicit `0` is a VALID
+   * input that parses and then falls through in the resolver (honored only
+   * when `> 0`). Rejecting `0` here would throw in TS while three sibling
+   * languages accept it — a real interface divergence (#141).
    */
-  context_length: z.number().int().positive().nullable().optional(),
+  context_length: z.number().int().nonnegative().nullable().optional(),
 });
 export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;
 
