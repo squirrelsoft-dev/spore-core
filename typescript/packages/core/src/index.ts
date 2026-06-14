@@ -44,3 +44,4 @@ export * as cacheProvider from "./cache-provider/index.js";
 export * as verifier from "./verifier/index.js";
 export * as hooks from "./hooks/index.js";
 export * as storage from "./storage/index.js";
+export * as outputSchema from "./output-schema/index.js";

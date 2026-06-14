@@ -554,6 +554,14 @@ export function buildRequest(
         parameters: t.input_schema,
       },
     }));
+    // Issue #139: the harness sets `params.output_schema` for the terminal turn
+    // of an output-schema-enforced ReAct leaf. Route it into the same `format`
+    // constrained-decoding channel the structured-tool-calls path uses, so the
+    // model is forced onto the schema. (When structured tool calls ARE active,
+    // that schema wins — the `if (structured)` arm above — since the leaf is
+    // still requesting tools, not emitting its terminal.) `undefined` leaves
+    // `format` unset, byte-identical to pre-#139.
+    format = req.params.output_schema;
   }
 
   const options: OllamaOptions = {};

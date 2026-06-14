@@ -1134,6 +1134,16 @@ export interface StrategyExecutor {
     // threaded alongside `agent`. Empty ⇒ global-catalogue fallback; a non-empty
     // handle with its own catalogue ⇒ strict per-node scoping.
     toolset: ToolsetRef,
+    // Issue #139: the leaf's RESOLVED output schema (canonical compact key-sorted
+    // JSON value) when `enforceOutputSchemas` is ON and the leaf carries an
+    // `output` schema; `undefined` otherwise (no delivery, no validation). When
+    // set, the window VALIDATES its terminal against it and retries up to
+    // `outputSchemaMaxRetries` extra turns, and sets `ModelParams.output_schema`
+    // on every turn so the Ollama `format` channel constrains decoding.
+    outputSchema: unknown | undefined,
+    // Issue #139: the `N` extra validation-retry turns (total attempts =
+    // `1 + N`). Ignored when `outputSchema` is `undefined`.
+    outputSchemaMaxRetries: number,
   ): Promise<RunResult>;
 
   /**
@@ -1337,6 +1347,22 @@ export interface StrategyExecutor {
    * propagate behavior. Mirrors Rust `StrategyExecutor::escalation_mode`.
    */
   escalationMode(): EscalationMode;
+
+  /**
+   * The output-schema enforcement MIGRATION GATE (issue #139). `false` (the
+   * default) means {@link runReactConfig} never resolves/delivers/validates a
+   * leaf's `output` schema — byte-identical to pre-#139. Read through this
+   * accessor (mirrors {@link escalationMode}) because the strategy bodies only
+   * hold a {@link StrategyExecutor}, not the harness config.
+   */
+  enforceOutputSchemas(): boolean;
+
+  /**
+   * The number of EXTRA terminal-validation retry turns `N` granted under
+   * output-schema enforcement (issue #139; total attempts = `1 + N`). Read by
+   * {@link runReactConfig} to thread into the window. Default `2`.
+   */
+  outputSchemaMaxRetries(): number;
 }
 
 /**
@@ -2029,6 +2055,21 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     await executor.finalize(agent);
     return recordTerminal(cx, agent);
   }
+  // Output-schema delivery + enforcement (issue #139). MIGRATION GATE: only when
+  // `enforceOutputSchemas` is ON AND this leaf carries an `output` schema do we
+  // resolve the schema and thread it (plus the retry budget `N`) into the window.
+  // The window DELIVERS it (the directive seed right after the instruction + the
+  // constrained-decoding channel) and VALIDATES the terminal against it. When the
+  // gate is OFF or there is no `output`, `outputSchema` is `undefined` and the
+  // window behaves byte-identically to pre-#139 (no resolve, no delivery, no
+  // validation). The schema's delivered/reported bytes are canonicalized to
+  // compact key-sorted JSON in the window, so they are identical across the four
+  // language ports.
+  let outputSchema: unknown | undefined;
+  if (executor.enforceOutputSchemas() && c.output !== undefined) {
+    outputSchema = cx.registry.resolveSchema(c.output);
+  }
+  const outputSchemaMaxRetries = executor.outputSchemaMaxRetries();
   // #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
   // `behavior` (default `escalate`). The leaf still never RESOLVES it in the
   // nested case (rule 6: it PROPAGATES a `budget_exhausted` to its parent, which
@@ -2052,6 +2093,10 @@ async function runReactConfig(c: ReactConfig, cx: ExecutionContext): Promise<Str
     // the per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
     // Mirrors `agent`.
     c.toolset,
+    // Issue #139: thread the resolved output schema (or `undefined`) and the
+    // retry budget so the window delivers + validates the terminal.
+    outputSchema,
+    outputSchemaMaxRetries,
   );
   await executor.finalize(result);
 
@@ -3714,7 +3759,23 @@ export type HarnessStreamEvent =
    * errors and the loop STOPPED to resolve the node's
    * {@link BudgetExhaustedBehavior}. Carries the tool name and the count (`= 2*N`).
    */
-  | { kind: "tool_error_loop_broken"; tool: string; consecutive_errors: number };
+  | { kind: "tool_error_loop_broken"; tool: string; consecutive_errors: number }
+  /**
+   * Output-schema enforcement (issue #139) fed a validation error back and
+   * RETRIED: the terminal `final_response` failed validation against the leaf's
+   * `output` schema and a retry turn was granted (within budget). A warning —
+   * the loop continues. Carries the extra-retry count so far (`= attempt`) and
+   * the frozen validator error fed back.
+   */
+  | { kind: "output_schema_retry"; attempt: number; error: string }
+  /**
+   * Output-schema enforcement (issue #139) EXHAUSTED its retries: the terminal
+   * still failed validation after `outputSchemaMaxRetries` extra turns (with
+   * budget remaining), so the run terminates with {@link HaltReason}
+   * `output_schema_violation`. Carries the total attempt count (`= 1 + max_retries`)
+   * and the final frozen validator error.
+   */
+  | { kind: "output_schema_violation"; attempts: number; error: string };
 
 export type StreamSink = (event: HarnessStreamEvent) => void;
 
@@ -4687,6 +4748,20 @@ export type HaltReason =
    * of the hard stop (`2 * N`).
    */
   | { kind: "tool_error_loop"; tool: string; consecutive_errors: number }
+  /**
+   * Returned by {@link StandardHarness} (issue #139) when output-schema
+   * enforcement is ON (`HarnessConfig.enforceOutputSchemas`) for a `ReactConfig`
+   * leaf with `output` set, and the leaf's terminal `final_response` STILL
+   * failed validation after the configured `outputSchemaMaxRetries` extra turns
+   * were exhausted WITH budget remaining. DISTINCT from `budget_exceeded`: a
+   * budget/turn cap that a retry would exceed surfaces the budget terminal
+   * instead (budget-cap-wins precedence) — `output_schema_violation` fires ONLY
+   * on a genuine validation exhaustion. Carries the resolved `schema` (canonical
+   * compact key-sorted JSON), the total number of `attempts` (`1 + max_retries`),
+   * and the `last_error` (the frozen validator error string from the final
+   * attempt).
+   */
+  | { kind: "output_schema_violation"; schema: string; attempts: number; last_error: string }
   /**
    * Returned by {@link StandardHarness} when {@link ExecutionRegistry.validate}
    * fails at run entry (issue #120): a handle referenced by the task's strategy

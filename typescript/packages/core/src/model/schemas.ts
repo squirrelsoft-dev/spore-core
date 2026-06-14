@@ -81,6 +81,20 @@ export const ModelParamsSchema = z.object({
    * cross-language request-hash byte-identical when off.
    */
   structured_tool_calls: z.boolean().optional(),
+  /**
+   * Terminal-turn output schema delivered to the model's constrained-decoding
+   * channel (issue #139). When set, providers that support constrained decoding
+   * (Ollama via the `format` JSON-schema parameter) force the response onto the
+   * schema; providers without it (Anthropic / OpenAI) IGNORE it — a no-op,
+   * exactly like {@link structured_tool_calls}. The harness sets this only for
+   * the terminal turn of a `ReactConfig` leaf with `output` set when
+   * `enforceOutputSchemas` is ON.
+   *
+   * Mirrors Rust's `#[serde(skip_serializing_if = "Option::is_none")]`: OMITTED
+   * from the canonical request hash when absent (`undefined`), keeping every
+   * existing fixture byte-identical across the four language ports.
+   */
+  output_schema: z.unknown().optional(),
 });
 
 export const ModelRequestSchema = z.object({

@@ -375,7 +375,23 @@ export type ContextOperation =
    * identical-argument errors and the loop STOPPED to resolve the node's budget
    * behavior.
    */
-  | { kind: "tool_error_loop_broken"; tool_name: string; consecutive_errors: number };
+  | { kind: "tool_error_loop_broken"; tool_name: string; consecutive_errors: number }
+  /**
+   * Output-schema enforcement fed a validation error back and RETRIED (issue
+   * #139): the terminal `final_response` failed validation against the leaf's
+   * `output` schema and a retry turn was granted (within budget). Carries the
+   * number of extra retry turns spent so far (`= attempt`) and the frozen
+   * validator error string that was fed back.
+   */
+  | { kind: "output_schema_retry"; attempt: number; error: string }
+  /**
+   * Output-schema enforcement EXHAUSTED its retries (issue #139): the terminal
+   * still failed validation after `outputSchemaMaxRetries` extra turns (with
+   * budget remaining), so the run terminates with {@link HaltReason}
+   * `output_schema_violation`. Carries the total attempt count
+   * (`= 1 + max_retries`) and the final frozen validator error.
+   */
+  | { kind: "output_schema_violation"; attempts: number; error: string };
 
 export interface ContextSpan {
   base: SpanBase;

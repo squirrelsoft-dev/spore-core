@@ -31,6 +31,21 @@ export function requestHash(request: ModelRequest): string {
   return digest.subarray(0, 8).toString("hex");
 }
 
+/**
+ * Canonical compact key-sorted JSON encoding of `value` (object keys sorted
+ * lexicographically by ASCII codepoint, no insignificant whitespace, standard
+ * JSON string escaping). The single cross-language source of truth for
+ * deterministic, byte-identical JSON — the TS analogue of Rust's
+ * `canonicalize_json`. Reused by request hashing (#37/#38) AND output-schema
+ * delivery + validator messages (#139), so the embedded schema and
+ * `{enum}`/`{value}` renderings are byte-identical across Rust/TS/Python/Go
+ * regardless of each language's map insertion order. `undefined` members are
+ * dropped (JSON has no such concept), matching `serde_json::Value`.
+ */
+export function canonicalizeJson(value: unknown): string {
+  return canonicalize(unknownToValue(value));
+}
+
 // ---------------------------------------------------------------------------
 // Canonical-value construction
 //
@@ -107,6 +122,13 @@ function paramsValue(p: ModelRequest["params"]): CanonValue {
   // other languages when the flag is off/absent.
   if (p.structured_tool_calls === true) {
     out.structured_tool_calls = true;
+  }
+  // `output_schema` mirrors Rust's `skip_serializing_if = "Option::is_none"`:
+  // emitted ONLY when present (#139), so a request that carries an output schema
+  // hashes identically across languages, while the common no-schema case stays
+  // byte-for-byte unchanged.
+  if (p.output_schema !== undefined) {
+    out.output_schema = unknownToValue(p.output_schema);
   }
   return out;
 }

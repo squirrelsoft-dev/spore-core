@@ -65,6 +65,8 @@ import type {
   ToolSchema as ModelToolSchema,
 } from "../model/schemas.js";
 import { ModelParamsSchema } from "../model/schemas.js";
+import { canonicalizeJson } from "../model/hash.js";
+import { validateOutput, feedbackMessage } from "../output-schema/index.js";
 import type { GenAiRole } from "../observability/types.js";
 import { OutboxObservabilityProvider, outboxConfig } from "../observability/outbox.js";
 import {
@@ -399,12 +401,40 @@ export interface HarnessConfig {
    * it to {@link surfaceToHuman}.
    */
   escalationMode?: EscalationMode;
+  /**
+   * MIGRATION GATE (issue #139) — NOT a permanent feature flag. When `true`, a
+   * {@link ReactConfig} leaf carrying an `output` schema has that schema
+   * DELIVERED to the model (directive seed + the {@link ModelParams.output_schema}
+   * constrained-decoding channel) and its terminal `final_response` VALIDATED
+   * against it; a validation failure feeds the error back and retries up to
+   * {@link outputSchemaMaxRetries} extra turns (within budget), then terminates
+   * with {@link HaltReason} `output_schema_violation`. Enforcement is UNIFORM —
+   * it applies to structured-slot leaves (plan / worker / propose) too, and is
+   * additive to and earlier than any downstream combinator validation.
+   *
+   * Absent / `false` (the default, OFF) is NON-NEGOTIABLE: it keeps every
+   * existing replay fixture byte-for-byte green during migration. When OFF the
+   * run behaves EXACTLY as before — no resolve, no delivery, no validation.
+   */
+  enforceOutputSchemas?: boolean;
+  /**
+   * The `N` extra terminal-validation retry turns granted when
+   * {@link enforceOutputSchemas} is ON and a terminal fails output-schema
+   * validation (issue #139). Total attempts = `1 + N`. Retried turns COUNT
+   * against the turn budget; a retry that would exceed the budget surfaces the
+   * budget terminal instead of {@link HaltReason} `output_schema_violation`
+   * (budget-cap-wins precedence). Optional; defaults to `2`.
+   */
+  outputSchemaMaxRetries?: number;
 }
 
 const DEFAULT_MAX_STOP_BLOCKS = 8;
 const DEFAULT_MAX_RESETS = 3;
 /** Default consecutive-recoverable-tool-error breaker threshold `N` (#137). */
 const DEFAULT_ERROR_LOOP_THRESHOLD = 3;
+/** Default extra terminal-validation retry turns `N` under output-schema
+ *  enforcement (#139). Total attempts = `1 + N`. */
+const DEFAULT_OUTPUT_SCHEMA_MAX_RETRIES = 2;
 
 /**
  * The current run of consecutive recoverable tool errors for ONE tool name
@@ -1127,6 +1157,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     signal: AbortSignal | undefined,
     agent: Agent,
     toolset: ToolsetRef,
+    // Issue #139: the leaf's RESOLVED output schema (or `undefined`) and the
+    // extra-retry budget `N`. Threaded verbatim into `runReactInner`, which
+    // delivers + validates the terminal.
+    outputSchema: unknown | undefined,
+    outputSchemaMaxRetries: number,
   ): Promise<RunResult> {
     // The leaf seeds the task instruction (parity with the old top-level ReAct
     // entry, which called runReact(.., seedInstruction: true)). The resolved
@@ -1141,6 +1176,8 @@ export class StandardHarness implements Harness, StrategyExecutor {
       true,
       agent,
       toolset,
+      outputSchema,
+      outputSchemaMaxRetries,
     );
   }
 
@@ -1679,6 +1716,18 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // explicitly defaults the knob to {@link surfaceToHuman}, so builder-based
     // callers opt into HITL.
     return this.config.escalationMode ?? autonomous;
+  }
+
+  /** {@inheritDoc StrategyExecutor.enforceOutputSchemas} */
+  enforceOutputSchemas(): boolean {
+    // #139 MIGRATION GATE. Optional in the raw {@link HarnessConfig}; absent ⇒
+    // OFF (byte-for-byte pre-#139). The {@link HarnessBuilder} also defaults it OFF.
+    return this.config.enforceOutputSchemas ?? false;
+  }
+
+  /** {@inheritDoc StrategyExecutor.outputSchemaMaxRetries} */
+  outputSchemaMaxRetries(): number {
+    return this.config.outputSchemaMaxRetries ?? DEFAULT_OUTPUT_SCHEMA_MAX_RETRIES;
   }
 
   async resume(
@@ -2617,6 +2666,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
       seedInstruction,
       agent,
       "",
+      // Issue #139: the legacy `runReact` wrapper does NOT enforce output
+      // schemas (the recursive `runReactConfig` is the single enforcement seam).
+      // `undefined`/`0` ⇒ byte-for-byte pre-#139.
+      undefined,
+      0,
     );
     switch (result.kind) {
       case "success":
@@ -2657,6 +2711,16 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // (`""`) ⇒ global-catalogue fallback; a non-empty handle with its own
     // per-key catalogue ⇒ strict per-node scoping.
     toolset: ToolsetRef,
+    // Issue #139: the leaf's RESOLVED output schema (`undefined` ⇒ no
+    // enforcement, identical to pre-#139). When set, the terminal is validated
+    // against it (frozen validator subset) and a validation failure feeds the
+    // error back + retries up to `outputSchemaMaxRetries` extra turns WITHIN
+    // budget; on exhaustion WITH budget remaining the window returns
+    // {@link HaltReason} `output_schema_violation`. The schema is also set on
+    // every turn's `ModelParams.output_schema` so the Ollama `format` channel
+    // constrains decoding (Anthropic/OpenAI ignore it).
+    outputSchema: unknown | undefined,
+    outputSchemaMaxRetries: number,
   ): Promise<RunResult> {
     const sessionId = task.session_id;
     // Resolve the effective tool registry once per turn-loop window (issue #91).
@@ -2690,6 +2754,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // `errorLoopThreshold`; the hard stop is at `2 * N`. `0` disables the breaker.
     const errorLoopN = this.config.errorLoopThreshold ?? DEFAULT_ERROR_LOOP_THRESHOLD;
     const errorRuns = new Map<string, ErrorRun>();
+    // Output-schema enforcement state (issue #139), loop-local to this window.
+    // `outputSchemaRetriesUsed` counts the EXTRA retry turns spent on validation
+    // feedback; the budget for them is `outputSchemaMaxRetries` (the `N`).
+    // `lastSchemaError` holds the most recent frozen validator error so a final
+    // exhaustion can report it. Both are inert when `outputSchema` is `undefined`
+    // (enforcement OFF / no schema).
+    let outputSchemaRetriesUsed = 0;
+    let lastSchemaError = "";
     const taskMaxTurns = task.budget.max_turns ?? undefined;
     const effectiveTurnCap =
       taskMaxTurns != null ? Math.min(taskMaxTurns, maxIterations) : maxIterations;
@@ -2704,6 +2776,20 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // and `resume` has already appended the human response.
     if (seedInstruction) {
       await this.config.contextManager.appendUserMessage(sessionState, task.instruction);
+    }
+
+    // Output-schema delivery (issue #139, AC1). When a schema is active, append
+    // the resolved schema to the leaf's directive/system context as a USER
+    // message — IMMEDIATELY after the task instruction so the delivered order is
+    // `[instruction, directive]` (the order the shared replay fixtures embed).
+    // Key-sorted via `canonicalizeJson` so the seeded bytes are identical across
+    // languages. `undefined` schema ⇒ no directive (gate OFF / no `output`),
+    // byte-identical to pre-#139.
+    if (outputSchema !== undefined) {
+      const directive =
+        "Your final response must be a JSON value that conforms to this JSON schema: " +
+        canonicalizeJson(outputSchema);
+      await this.config.contextManager.appendUserMessage(sessionState, directive);
     }
 
     // Outer loop
@@ -2796,6 +2882,14 @@ export class StandardHarness implements Harness, StrategyExecutor {
       // seam that delivers configured params (e.g. structured tool calls) to
       // every tool-requesting ReAct/execute/streaming turn.
       context.params = this.config.modelParams;
+      // Issue #139: route the enforced output schema into this turn's
+      // constrained-decoding channel (`ModelParams.output_schema`). Ollama honors
+      // it via `format`; Anthropic/OpenAI ignore it (a no-op, like
+      // `structured_tool_calls`). `undefined` leaves the params byte-identical.
+      // A shallow copy avoids mutating the shared `config.modelParams`.
+      if (outputSchema !== undefined) {
+        context.params = { ...this.config.modelParams, output_schema: outputSchema };
+      }
       // Whether tools were advertised to the model this turn — a precondition for
       // classifying a prose final response as a missed tool call (adaptive
       // prompt-based escalation, #111). Captured before `context` is consumed by
@@ -3034,6 +3128,105 @@ export class StandardHarness implements Harness, StrategyExecutor {
             if (reason != null) {
               await this.config.contextManager.appendUserMessage(sessionState, reason);
               continue;
+            }
+          }
+
+          // Output-schema enforcement gate (issue #139). Additive to and EARLIER
+          // than the Success terminal: when a schema is active, validate this
+          // terminal `final_response`. On a validation FAILURE, feed the frozen
+          // error back as a USER message and retry one more turn (up to
+          // `outputSchemaMaxRetries` extra turns). The retried turn re-enters the
+          // loop top, where the budget gate fires FIRST — so a retry that would
+          // exceed the turn/budget backstop surfaces the existing `budget_exceeded`
+          // terminal, NOT `output_schema_violation` (budget-cap-wins). Only when
+          // the N retries are exhausted WITH budget remaining does the window
+          // terminate with `output_schema_violation`. `undefined` schema ⇒ no
+          // validation (gate OFF / no `output`), so the terminal is byte-identical
+          // to pre-#139. The assistant's (possibly invalid) text is already in
+          // history above.
+          if (outputSchema !== undefined) {
+            const verr = validateOutput(result.content, outputSchema);
+            if (verr != null) {
+              lastSchemaError = verr;
+              if (outputSchemaRetriesUsed < outputSchemaMaxRetries) {
+                // Grant one more turn: feed the validator error back as a USER
+                // message and loop. The budget gate at the loop top enforces the
+                // budget-cap-wins precedence.
+                outputSchemaRetriesUsed += 1;
+                emit(onStream, {
+                  kind: "output_schema_retry",
+                  attempt: outputSchemaRetriesUsed,
+                  error: verr,
+                });
+                if (this.config.observability) {
+                  const base = newRootSpanBase(
+                    SpanId.of(`${sessionId.asString()}-output-schema-retry-${spanSeq}`),
+                    sessionId,
+                    task.id,
+                    "context_assembly",
+                    Timestamp.now(),
+                  );
+                  this.config.observability.emitContext({
+                    base,
+                    operation: {
+                      kind: "output_schema_retry",
+                      attempt: outputSchemaRetriesUsed,
+                      error: verr,
+                    },
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    utilization_before: 0,
+                    utilization_after: 0,
+                  });
+                }
+                await this.config.contextManager.appendUserMessage(
+                  sessionState,
+                  feedbackMessage(verr),
+                );
+                continue;
+              }
+              // Retries exhausted WITH budget remaining (the budget gate did not
+              // fire) → the typed schema-violation terminal. Total attempts =
+              // 1 + max_retries.
+              const attempts = outputSchemaMaxRetries + 1;
+              emit(onStream, {
+                kind: "output_schema_violation",
+                attempts,
+                error: lastSchemaError,
+              });
+              if (this.config.observability) {
+                const base = newRootSpanBase(
+                  SpanId.of(`${sessionId.asString()}-output-schema-violation-${spanSeq}`),
+                  sessionId,
+                  task.id,
+                  "context_assembly",
+                  Timestamp.now(),
+                );
+                this.config.observability.emitContext({
+                  base,
+                  operation: {
+                    kind: "output_schema_violation",
+                    attempts,
+                    error: lastSchemaError,
+                  },
+                  tokens_before: 0,
+                  tokens_after: 0,
+                  utilization_before: 0,
+                  utilization_after: 0,
+                });
+              }
+              return failure(
+                {
+                  kind: "output_schema_violation",
+                  schema: canonicalizeJson(outputSchema),
+                  attempts,
+                  last_error: lastSchemaError,
+                },
+                sessionId,
+                usage,
+                budgetUsed.turns,
+                sessionState,
+              );
             }
           }
 
@@ -3820,6 +4013,11 @@ export class HarnessBuilder {
   private readonly _consultHandlers: ConsultHandlerMap = new Map();
   private _registry: ExecutionRegistry = ExecutionRegistry.empty();
   private _escalationMode: EscalationMode = surfaceToHuman;
+  /** MIGRATION GATE (issue #139): deliver + enforce `ReactConfig.output`
+   *  schemas. Defaults to `false` (OFF). */
+  private _enforceOutputSchemas = false;
+  /** Extra output-schema validation retry turns `N` (issue #139). Defaults to `2`. */
+  private _outputSchemaMaxRetries = DEFAULT_OUTPUT_SCHEMA_MAX_RETRIES;
 
   constructor(
     private readonly agent: Agent,
@@ -4276,6 +4474,27 @@ export class HarnessBuilder {
     return this;
   }
 
+  /**
+   * Turn ON output-schema delivery + enforcement for {@link ReactConfig} leaves
+   * carrying an `output` schema (issue #139 — MIGRATION GATE). Defaults to
+   * `false` (OFF), which keeps existing replay fixtures byte-identical. See
+   * {@link HarnessConfig.enforceOutputSchemas}.
+   */
+  enforceOutputSchemas(enforce: boolean): this {
+    this._enforceOutputSchemas = enforce;
+    return this;
+  }
+
+  /**
+   * Set the number of EXTRA terminal-validation retry turns `N` granted when
+   * {@link enforceOutputSchemas} is ON (issue #139). Total attempts = `1 + N`.
+   * Defaults to `2`. See {@link HarnessConfig.outputSchemaMaxRetries}.
+   */
+  outputSchemaMaxRetries(n: number): this {
+    this._outputSchemaMaxRetries = n;
+    return this;
+  }
+
   /** Assemble the {@link HarnessConfig} without wrapping it in a harness. */
   buildConfig(): HarnessConfig {
     // Fold catalogue tools accumulated via `.tool()` / `.tools()` into a
@@ -4374,6 +4593,8 @@ export class HarnessBuilder {
       consultHandlers: this._consultHandlers.size > 0 ? this._consultHandlers : undefined,
       registry,
       escalationMode: this._escalationMode,
+      enforceOutputSchemas: this._enforceOutputSchemas,
+      outputSchemaMaxRetries: this._outputSchemaMaxRetries,
     };
   }
 
