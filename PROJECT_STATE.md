@@ -1,19 +1,20 @@
 # PROJECT STATE
-_Last updated: 2026-06-14 by /close (#138 **complete** — budget/consult resume now seeds the stalled worker and skips re-planning when the #142-durable `task_list` survives a Ralph window reset; all four ACs, four-language parity, tests verified green this loop; closed + `status: complete`. Merged to local `main` this session via fast-forward.) ✅ **Local `main` is in sync with `origin/main`** — the #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) + this reconcile were pushed this loop with maintainer OK; `origin/main` advanced `b06a599`→`169ee25` (Deviation #10 resolved)._
+_Last updated: 2026-06-14 by /close (#139 **complete** — `ReactConfig.output` schemas are now delivered to the model + enforced on the terminal via a hand-rolled validator behind a default-OFF migration gate (`enforce_output_schemas`); retry-with-feedback up to N then typed `HaltReason::OutputSchemaViolation`; all four ACs, four-language parity, cross-language verifier PASS; closed + `status: complete`. Implemented via `/implement 139` this loop — Rust ref `3790997`, TS `f412b95`, Go `0157749`, Py `15fbfc6`.) ⚠️ **Local `main` is 4 commits AHEAD of `origin/main`** — the #139 series is **not yet pushed** (maintainer-OK gate; Deviation #10 drift is back)._
 
-_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. **The cluster is now COMPLETE: #137 ✅, #138 ✅, #140 ✅, #142 ✅, #143 ✅ (all closed).** The two independent parallel gaps **#139** (output schemas) / **#141** (compaction window) remain `status: queued` — these were never blocking the cordyceps composition, just adjacent robustness wins. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
+_**Direction note:** The **`12-cordyceps` hardening cluster #137–#143 is COMPLETE and closed** (#137/#138/#140/#142/#143). With **#139 now done too**, only **#141** (compaction window) remains of the adjacent robustness gaps — `status: queued`, independent, grabbable via `/implement`. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **in sync with
-`origin/main`** (the #138 series + this reconcile were pushed this loop; `origin/main`
-at `169ee25`).
+serialized formats byte-identical across all four. Local `main` is **4 commits ahead
+of `origin/main`** (`origin/main` at `32d4093` — the #139 series is unpushed, maintainer
+OK required).
 
-**🎯 The `12-cordyceps` hardening cluster #137–#143 is now COMPLETE.** Running the
-capstone composition live on gemma exposed a set of robustness gaps, each verified in
-the Rust reference (several observed live); all five are now landed across all four
-languages:
+**🎯 The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (all five closed), and
+the adjacent **#139** output-schema enforcement is now done too — only **#141** remains of
+the robustness gaps. Running the capstone composition live on gemma exposed these gaps,
+each verified in the Rust reference (several observed live); all are now landed across all
+four languages:
 
 - **#137 — ReAct tool-error-loop breaker ✅ DONE (`status: complete`).** Per-tool
   consecutive-recoverable-error tracking; corrective schema injection at N (default 3);
@@ -61,9 +62,23 @@ languages:
 - **#141 — compaction window hardcoded `200_000` (open).** `SessionState::new` hardcodes
   `window_limit: 200_000`; `ModelProfile.context_window` exists but is never threaded in, so
   compaction never fires for the 128K/8K local models that need it.
-- **#139 — `ReactConfig.output` schemas are decorative (open).** Presence-validated by the
-  registry but `ReactConfig::run` never reads it: the schema is never delivered to the model
-  nor enforced on the terminal.
+- **#139 — `ReactConfig.output` schemas delivered + enforced ✅ DONE THIS LOOP
+  (`status: complete`, CLOSED).** The schema was presence-validated by `ExecutionRegistry` at
+  startup but `ReactConfig::run` never read it at runtime; that gap is closed. **(AC1)** when
+  enforcement is on and a leaf has `output` set, the resolved (key-sorted) schema is appended to
+  the directive seed AND routed into the model's structured-output channel (Ollama `format`;
+  Anthropic/OpenAI no-op). **(AC2)** the terminal `FinalResponse` is validated by a **hand-rolled
+  minimal validator** (subset `type`/`required`/`properties`/`enum`); on mismatch the frozen
+  validation error is fed back as a user message and the leaf retries up to N extra turns (N =
+  `output_schema_max_retries`, default 2; total 1+N), retries counting against budget. **(AC3)**
+  after N failed retries with budget remaining → typed `HaltReason::OutputSchemaViolation`, distinct
+  from budget exhaustion (budget cap wins precedence if hit first). **(AC4)** global
+  `HarnessConfig.enforce_output_schemas`, **default OFF** — a documented migration gate; OFF keeps
+  every existing replay fixture byte-for-byte green. Three shared fixtures
+  `output_schema_{accept,retry,fail}.jsonl`. Parity-critical determinism: lexicographically-sorted
+  property iteration, semantic `integer` check (42.0 passes / 42.5 fails), canonical key-sorted
+  `{enum}`/`{value}` rendering — all frozen byte-identical across the four. Verifier PASS. Commits
+  Rust `3790997`, TS `f412b95`, Go `0157749`, Py `15fbfc6`.
 - **#140 — `PausedState` carries the leaf's toolset handle ✅ DONE THIS LOOP
   (`status: complete`, CLOSED).** `PausedState` + `ChildPausedState` gained an always-serialized,
   serde-default `toolset` field (last field, byte-parity-safe); all 7 leaf pause sites populate it
@@ -146,19 +161,17 @@ stalled worker instead of re-planning (#138), routes resumed tool calls through 
 scoped catalogue (#140), and breaks tool-error grind loops (#137). The composition's
 small-local-model reliability gaps that motivated the cluster are addressed.
 
-**Next direction is a maintainer call** — the cluster's north star is met. The natural
-candidates, in rough priority order: **(a)** the two independent robustness gaps that were
-adjacent to but never blocking the cluster — **#141** (thread `ModelProfile.context_window`
-into `SessionState.window_limit` so compaction fires for 128K/8K local models) and **#139**
-(deliver + enforce `ReactConfig.output` schemas), both `status: queued`, parallel-grabbable,
-no cross-deps; **(b)** close out the refactor — run **`/close 131`** (capstone still formally
-open) and the off-critical-path finishers #121/#122/#127/#128; **(c)** resume the parked
-examples track (#109 `13-coding-agent`, #92 observability). Drive code with `/implement`
-(Rust reference → three parallel language agents → cross-language verifier), byte-identical
-where serialized.
+**Next direction is a maintainer call** — the cluster's north star is met and #139 is now done.
+The natural candidates, in rough priority order: **(a)** the **last** independent robustness gap —
+**#141** (thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction
+fires for 128K/8K local models), `status: queued`, grabbable now via `/implement`; **(b)** close
+out the refactor — run **`/close 131`** (capstone still formally open) and the off-critical-path
+finishers #121/#122/#127/#128; **(c)** resume the parked examples track (#109 `13-coding-agent`,
+#92 observability). Drive code with `/implement` (Rust reference → three parallel language agents
+→ cross-language verifier), byte-identical where serialized.
 
 **Housekeeping (do first, cheap):** **push local `main`** — it is 4 commits ahead of
-`origin/main` with the #138 series (maintainer OK required — Deviation #10 drift is back).
+`origin/main` with the #139 series (maintainer OK required — Deviation #10 drift is back).
 Then **`/close 131`** (reconcile-only, no code).
 
 **Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
@@ -210,12 +223,12 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ✅ **RESOLVED this loop (2026-06-14):** the
-    #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) + this reconcile were pushed
-    with maintainer OK; `origin/main` advanced `b06a599`→`169ee25` and local `main` is back in sync. The
-    standing reminder persists: **ask before pushing** — an agent-initiated push was denied in an earlier
-    session, so confirm maintainer OK before clearing any future drift. (Prior backlog cleared
-    2026-06-12: `0954db1`→`51e2853`→`b06a599`.)
+10. **Local `main` push hygiene (standing reminder).** ⚠️ **DRIFT IS BACK (2026-06-14, later loop):**
+    local `main` is **4 commits ahead** of `origin/main` (`origin/main` at `32d4093`) — the #139 series
+    (Rust `3790997`, TS `f412b95`, Go `0157749`, Py `15fbfc6`) is **not yet pushed**, plus this reconcile
+    will add one more. The standing reminder holds: **ask before pushing** — an agent-initiated push was
+    denied in an earlier session, so confirm maintainer OK before clearing this drift. (Earlier same day
+    the #138 series was pushed with OK: `b06a599`→`169ee25`→`32d4093`.)
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -268,15 +281,15 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **#141 + #139 — the two remaining parallel hardening gaps (grabbable now, no cross-deps, both
-   `status: queued`).** #141 (thread `ModelProfile.context_window` into `SessionState.window_limit`
-   so compaction fires for 128K/8K local models), #139 (deliver + enforce `ReactConfig.output`
-   schemas). Each via `/implement`. **These are the highest-value remaining code work now that the
-   #137–#143 cluster is done.**
-2. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
+1. **Push local `main` to `origin/main` (maintainer OK required — Deviation #10).** Local `main`
+   is 4 commits ahead with the #139 series (`32d4093`→HEAD), + this reconcile. Cheap, clears the
+   drift. Confirm with maintainer before pushing.
+2. **#141 — the last remaining parallel hardening gap (`status: queued`, grabbable now, no cross-deps).**
+   Thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction fires for
+   128K/8K local models. Via `/implement`. **Highest-value remaining code work now that #137–#143 +
+   #139 are done.**
+3. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
    still formally open, last touched 2026-06-06). Reconciliation only; no code.
-3. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
+4. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
    docs — on an explicit maintainer call.
-4. **Push hygiene.** `main` is in sync with `origin/main` as of this loop (Deviation #10 resolved);
-   keep asking before pushing any future drift.
