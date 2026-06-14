@@ -1,20 +1,20 @@
 # PROJECT STATE
-_Last updated: 2026-06-14 by /close (#139 **complete** — `ReactConfig.output` schemas are now delivered to the model + enforced on the terminal via a hand-rolled validator behind a default-OFF migration gate (`enforce_output_schemas`); retry-with-feedback up to N then typed `HaltReason::OutputSchemaViolation`; all four ACs, four-language parity, cross-language verifier PASS; closed + `status: complete`. Implemented via `/implement 139` this loop — Rust ref `3790997`, TS `f412b95`, Go `0157749`, Py `15fbfc6`.) ⚠️ **Local `main` is 4 commits AHEAD of `origin/main`** — the #139 series is **not yet pushed** (maintainer-OK gate; Deviation #10 drift is back)._
+_Last updated: 2026-06-14 by /close (#141 **complete + CLOSED** — the compaction window is now model-configurable: `CompactionConfig.context_length` + a `StandardContextManager` resolver `config(>0) → model context_window(>0) → DEFAULT_CONTEXT_LENGTH=8000`, applied via a manager-owned `seed_session` helper; the `SessionState` constructor default dropped 200_000 → **8000** (conservative unknown-context fallback, the deliberate spec change vs. the original AC); explicit `0`/null/nil falls through, no clamping; shared fixture `compaction_window/cases.json` (5 trigger + 6 resolver) replays byte-identically in all four, existing compaction fixtures untouched; verifier PASS. Implemented via `/implement 141` — Rust ref `1e3cf4c`, Go `67c8d39`, Py `6be78a2`, TS `32ed008` + parity fix `66aed39`.) ✅ **Local `main` is now IN SYNC with `origin/main`** — the #141 + previously-gated #139 series (10 commits) were pushed this loop with maintainer OK (`32d4093`→`66aed39`)._
 
-_**Direction note:** The **`12-cordyceps` hardening cluster #137–#143 is COMPLETE and closed** (#137/#138/#140/#142/#143). With **#139 now done too**, only **#141** (compaction window) remains of the adjacent robustness gaps — `status: queued`, independent, grabbable via `/implement`. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
+_**Direction note:** The **`12-cordyceps` hardening cluster #137–#143 is COMPLETE and closed**, and with **#139 (output schemas) and now #141 (compaction window) both done**, **every independent robustness gap adjacent to the cluster is closed.** No queued hardening work remains. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131` — now the top cheap housekeeping. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Next substantive direction is a **maintainer call** (refactor close-out vs. resume parked examples #109/#92). Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **4 commits ahead
-of `origin/main`** (`origin/main` at `32d4093` — the #139 series is unpushed, maintainer
-OK required).
+serialized formats byte-identical across all four. Local `main` is **in sync with
+`origin/main`** (`origin/main` at `66aed39` — the #141 + previously-gated #139 series, 10
+commits, were pushed this loop with maintainer OK).
 
 **🎯 The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (all five closed), and
-the adjacent **#139** output-schema enforcement is now done too — only **#141** remains of
-the robustness gaps. Running the capstone composition live on gemma exposed these gaps,
-each verified in the Rust reference (several observed live); all are now landed across all
-four languages:
+the adjacent **#139** (output-schema enforcement) and **#141** (configurable compaction
+window) are now done too — **every robustness gap is closed.** Running the capstone
+composition live on gemma exposed these gaps, each verified in the Rust reference (several
+observed live); all are now landed across all four languages:
 
 - **#137 — ReAct tool-error-loop breaker ✅ DONE (`status: complete`).** Per-tool
   consecutive-recoverable-error tracking; corrective schema injection at N (default 3);
@@ -59,9 +59,26 @@ four languages:
   skip-replan test wires a **real in-memory `RunStore`**, not the no-op default, so the
   store-dependent guard is genuinely exercised. Commits Rust `99a16be`, Py `9133762`, Go
   `4827924`, TS `5ec555a`.
-- **#141 — compaction window hardcoded `200_000` (open).** `SessionState::new` hardcodes
-  `window_limit: 200_000`; `ModelProfile.context_window` exists but is never threaded in, so
-  compaction never fires for the 128K/8K local models that need it.
+- **#141 — compaction window now model-configurable ✅ DONE THIS LOOP
+  (`status: complete`, CLOSED).** `SessionState::new` no longer hardcodes `window_limit: 200_000`.
+  `CompactionConfig` gained a `context_length: Option<u32>` field (serialized **absent** when unset
+  — `skip_serializing_if`/`omitempty`/optional/`None`-excluded — so existing serialized configs stay
+  byte-identical), and `StandardContextManager` gained a `resolve_context_length()` resolver with the
+  fallback chain **config (`> 0`) → model `context_window` (`> 0`) → `DEFAULT_CONTEXT_LENGTH = 8000`**,
+  applied through a manager-owned `seed_session()` helper (the real production seam — the harness
+  round-trips the rich-state blob via `extras`, so callers/the manager seed it, not the loop). Trigger
+  math (`should_compact`) is unchanged — once seeded with the resolved window, `threshold × window_limit`
+  respects config automatically. **Maintainer-pinned spec changes vs. the original AC:** field renamed
+  `window_limit` → `context_length`; explicit `0`/null/nil **falls through** (a zero window would
+  silently disable compaction — the exact bug); **no clamping** of an oversized configured value; and
+  the unknown-context fallback is **8000, not 200_000** (the `SessionState` constructor default dropped
+  to 8k — conservative, fixes the gemma-8k / 128K overrun rather than preserving the dangerous default;
+  provider `context_window` defaults like Claude/OpenAI 200_000 are untouched). New shared fixture
+  `fixtures/compaction_window/cases.json` (5 `trigger_cases` + 6 `resolver_cases`) replays byte-
+  identically in all four; existing `compaction_loop`/`compaction_verifier` fixtures untouched. The
+  one verifier-caught divergence — TS Zod `.positive()` would have rejected an explicit `0` the other
+  three accept — was fixed (`66aed39`, `.nonnegative()`). Verifier PASS. Commits Rust `1e3cf4c`, Go
+  `67c8d39`, Py `6be78a2`, TS `32ed008` + `66aed39`.
 - **#139 — `ReactConfig.output` schemas delivered + enforced ✅ DONE THIS LOOP
   (`status: complete`, CLOSED).** The schema was presence-validated by `ExecutionRegistry` at
   startup but `ReactConfig::run` never read it at runtime; that gap is closed. **(AC1)** when
@@ -155,24 +172,27 @@ axis (#142); runnable (#57), debuggable (#64/#65), evaluation loop (#26/#68).
 
 ## Active Direction
 **The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (#137 ✅, #138 ✅, #140 ✅,
-#142 ✅, #143 ✅ — all closed). `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` now survives
-Ralph window resets and process restarts with the `task_list` durable (#142), resumes the
-stalled worker instead of re-planning (#138), routes resumed tool calls through the leaf's
-scoped catalogue (#140), and breaks tool-error grind loops (#137). The composition's
-small-local-model reliability gaps that motivated the cluster are addressed.
+#142 ✅, #143 ✅ — all closed), and the adjacent robustness gaps **#139** (output schemas) and
+**#141** (compaction window) are **done and closed too.** `Ralph[PlanExecute[ReAct,
+SelfVerifying[ReAct]]]` now survives Ralph window resets and process restarts with the `task_list`
+durable (#142), resumes the stalled worker instead of re-planning (#138), routes resumed tool calls
+through the leaf's scoped catalogue (#140), breaks tool-error grind loops (#137), enforces output
+schemas behind a migration gate (#139), and **fires compaction correctly for small/unknown-window
+models (#141)**. The composition's small-local-model reliability gaps that motivated the cluster are
+fully addressed. **There is no queued hardening or robustness work left.**
 
-**Next direction is a maintainer call** — the cluster's north star is met and #139 is now done.
-The natural candidates, in rough priority order: **(a)** the **last** independent robustness gap —
-**#141** (thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction
-fires for 128K/8K local models), `status: queued`, grabbable now via `/implement`; **(b)** close
-out the refactor — run **`/close 131`** (capstone still formally open) and the off-critical-path
-finishers #121/#122/#127/#128; **(c)** resume the parked examples track (#109 `13-coding-agent`,
-#92 observability). Drive code with `/implement` (Rust reference → three parallel language agents
-→ cross-language verifier), byte-identical where serialized.
+**Next direction is a maintainer call** — the cluster's north star is met with nothing adjacent
+outstanding. Candidates, in rough priority order: **(a)** close out the refactor — run **`/close 131`**
+(the capstone is functionally landed but still formally open) and, whenever convenient, the
+off-critical-path finishers #121/#122/#127/#128; **(b)** resume the parked examples track (#109
+`13-coding-agent`, #92 observability/Phoenix-OTLP) + `web_search` #108/#110; **(c)** the larger parked
+features (#113 spore-lsp, #107 PromptEngineeringAgent, #106 MicroVMSandboxProvider, protocol track
+#83–87) and correctness/safety debt #34→#31→#30 + docs. Drive code with `/implement` (Rust reference →
+three parallel language agents → cross-language verifier), byte-identical where serialized.
 
-**Housekeeping (do first, cheap):** **push local `main`** — it is 4 commits ahead of
-`origin/main` with the #139 series (maintainer OK required — Deviation #10 drift is back).
-Then **`/close 131`** (reconcile-only, no code).
+**Housekeeping:** `main` is now **in sync** with `origin/main` (the #139 + #141 series, 10 commits,
+were pushed this loop with maintainer OK). The remaining cheap reconcile-only step is **`/close 131`**
+(confirm the capstone success criteria; no code).
 
 **Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
 gaps #115 (skill loading) and #116 (HITL child-consult resume — overlaps #130's resume seam,
@@ -223,12 +243,12 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ⚠️ **DRIFT IS BACK (2026-06-14, later loop):**
-    local `main` is **4 commits ahead** of `origin/main` (`origin/main` at `32d4093`) — the #139 series
-    (Rust `3790997`, TS `f412b95`, Go `0157749`, Py `15fbfc6`) is **not yet pushed**, plus this reconcile
-    will add one more. The standing reminder holds: **ask before pushing** — an agent-initiated push was
-    denied in an earlier session, so confirm maintainer OK before clearing this drift. (Earlier same day
-    the #138 series was pushed with OK: `b06a599`→`169ee25`→`32d4093`.)
+10. **Local `main` push hygiene (standing reminder).** ✅ **IN SYNC (2026-06-14, latest loop):**
+    local `main` == `origin/main` at `66aed39` — the #139 + #141 series (10 commits, `32d4093`→`66aed39`)
+    were pushed this loop with explicit maintainer OK. The standing reminder still holds for future loops:
+    **ask before pushing** — an agent-initiated push was denied in an earlier session, so confirm maintainer
+    OK before clearing any future drift. (This reconcile commit will leave `main` one ahead again until the
+    next push.)
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -281,15 +301,18 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **Push local `main` to `origin/main` (maintainer OK required — Deviation #10).** Local `main`
-   is 4 commits ahead with the #139 series (`32d4093`→HEAD), + this reconcile. Cheap, clears the
-   drift. Confirm with maintainer before pushing.
-2. **#141 — the last remaining parallel hardening gap (`status: queued`, grabbable now, no cross-deps).**
-   Thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction fires for
-   128K/8K local models. Via `/implement`. **Highest-value remaining code work now that #137–#143 +
-   #139 are done.**
-3. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
-   still formally open, last touched 2026-06-06). Reconciliation only; no code.
-4. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
-   convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
-   docs — on an explicit maintainer call.
+1. **Run `/close 131` (cheap, reconcile-only, no code) — top housekeeping.** The cordyceps capstone
+   `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` is functionally landed (PR #136) but the issue is
+   **still formally open** (`status: queued`, last touched 2026-06-06). Confirm the success criteria and
+   close it out. With #141 done, this is the last loose end on the completed-work side.
+2. **Refactor finishers (off critical path, `status: queued`, no cross-deps).** #121 (SubagentTool takes
+   a LoopStrategy), #122 (`max_steps()` advisory bound), #127 (custom RunStrategy path end-to-end), #128
+   (per-node observability span attributes) — grab via `/implement` whenever convenient.
+3. **Resume the parked examples + web_search track.** #109 (`13-coding-agent`, the last of 13 examples),
+   #92 (observability/Phoenix-OTLP), #108/#110 (`web_search` auth/params + normalization).
+4. **Larger parked features + debt — maintainer call.** #115/#116 (skill loading / HITL child-consult
+   resume), #113/#107/#106 and the protocol track #83–87; correctness/safety #34→#31→#30 + docs
+   #27/#35/#36. **#7** (ContextManager migration) would live-wire the rich `assemble`.
+
+**Note:** every queued *hardening/robustness* gap is now closed — remaining work is refactor close-out,
+parked examples, and longer-horizon features, all behind an explicit maintainer call on direction.
