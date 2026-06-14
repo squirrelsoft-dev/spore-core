@@ -1,17 +1,19 @@
 # PROJECT STATE
-_Last updated: 2026-06-12 by /close (#140 **complete** — `PausedState`/`ChildPausedState` now carry the pausing leaf's toolset handle, so both resume paths route pending tool calls through the leaf's scoped catalogue instead of the empty global fallback; all four languages, on `main`; closed + `status: complete` this loop. Earlier this same day #142 (project-scoped durable storage / stable `project_id`) + #143 (`add_task` returns the assigned id) were completed + closed — #142 was the **linchpin** of the harness-hardening cluster #137–#143, unblocking #138. Sibling cluster gaps #138/#139/#141 triaged to `status: queued` this loop.) ✅ **Local `main` is now in sync with `origin/main`** — the 29-commit post-#136 backlog was **pushed this loop** with maintainer OK (Deviation #10 resolved); `origin/main` advanced `0954db1`→`51e2853`._
+_Last updated: 2026-06-14 by /close (#138 **complete** — budget/consult resume now seeds the stalled worker and skips re-planning when the #142-durable `task_list` survives a Ralph window reset; all four ACs, four-language parity, tests verified green this loop; closed + `status: complete`. Merged to local `main` this session via fast-forward.) ⚠️ **Local `main` is now 5 commits AHEAD of `origin/main`** — the #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) plus this reconcile commit are **not yet pushed**; Deviation #10 push-hygiene drift is back (maintainer OK required before pushing)._
 
-_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. The cluster is now nearly done: **#137 ✅**, **#142 ✅**, **#143 ✅**, **#140 ✅** (all closed). Remaining: **#138** (resume seeding — now unblocked by #142) and the independent parallel gaps **#139** (output schemas) / **#141** (compaction window) — both now `status: queued`. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
+_**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. **The cluster is now COMPLETE: #137 ✅, #138 ✅, #140 ✅, #142 ✅, #143 ✅ (all closed).** The two independent parallel gaps **#139** (output schemas) / **#141** (compaction window) remain `status: queued` — these were never blocking the cordyceps composition, just adjacent robustness wins. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **in sync with
-`origin/main`** (the post-#136 backlog was pushed this loop; `origin/main` at `51e2853`).
+serialized formats byte-identical across all four. Local `main` is **5 commits ahead
+of `origin/main`** (`origin/main` at `b06a599` — the #138 series + this reconcile are
+unpushed, maintainer OK required).
 
-**🎯 Active work: harden the composed `12-cordyceps` runtime for small local models
-— cluster #137–#143.** Running the capstone composition live on gemma exposed a set
-of robustness gaps, each verified in the Rust reference (several observed live):
+**🎯 The `12-cordyceps` hardening cluster #137–#143 is now COMPLETE.** Running the
+capstone composition live on gemma exposed a set of robustness gaps, each verified in
+the Rust reference (several observed live); all five are now landed across all four
+languages:
 
 - **#137 — ReAct tool-error-loop breaker ✅ DONE (`status: complete`).** Per-tool
   consecutive-recoverable-error tracking; corrective schema injection at N (default 3);
@@ -41,10 +43,21 @@ of robustness gaps, each verified in the Rust reference (several observed live):
   `4c4b586`, TS `e508d23`, docs `5e206e1`) and on `main`; formally closed during this reconcile.
   Cuts the malformed-call grind: small models no longer parse/predict ids for
   `blockers`/`update_task`/`complete_task`.
-- **#138 — resume must seed the stalled worker + skip re-planning (open, NOW UNBLOCKED).**
-  `resume_inner`'s `ContinueWithBudget` arm re-enters and re-runs PLAN; the "skip re-plan if
-  task_list non-empty" fix could not fire until #142 made the list survive window resets —
-  **#142 is now landed, so #138 is workable.**
+- **#138 — resume seeds the stalled worker + skips re-planning ✅ DONE THIS LOOP
+  (`status: complete`, CLOSED).** Three behavioral fixes, all four languages: **(AC1)** on
+  PlanExecute re-entry with a persisted non-empty `task_list` (the #142 `project_id` durable
+  axis lets it survive the Ralph window reset), skip the plan phase and go straight to the
+  ready-set walk (`reconcile_completed_tasks` dedups completed tasks) instead of re-running PLAN
+  unconditionally; **(AC2)** a budget-resume of an execute-phase exhaustion seeds the stalled
+  worker by generalizing the #131 `consult_resume` seed to a phase-agnostic resume seed (was
+  `None`), so the worker resumes its audit instead of re-exploring (the live gemma4:31b-cloud
+  failure); **(AC3)** a plan-phase exhaustion resumes the planner's own session rather than
+  cloning the paused worker's session into the planner's context. New shared fixture
+  `cordyceps_budget_resume.jsonl` + updated `cordyceps_budget_exhausted.json` paused-state replay
+  in all four. Tests verified green this loop (Rust 9 / Go 2 named / Py 11 / TS 29); the Go
+  skip-replan test wires a **real in-memory `RunStore`**, not the no-op default, so the
+  store-dependent guard is genuinely exercised. Commits Rust `99a16be`, Py `9133762`, Go
+  `4827924`, TS `5ec555a`.
 - **#141 — compaction window hardcoded `200_000` (open).** `SessionState::new` hardcodes
   `window_limit: 200_000`; `ModelProfile.context_window` exists but is never threaded in, so
   compaction never fires for the 128K/8K local models that need it.
@@ -126,24 +139,27 @@ axis (#142); runnable (#57), debuggable (#64/#65), evaluation loop (#26/#68).
 `scope: deferred`.
 
 ## Active Direction
-**Harden the composed `12-cordyceps` runtime so `Ralph[PlanExecute[ReAct,
-SelfVerifying[ReAct]]]` runs reliably on small local models — cluster #137–#143.** With the
-**linchpin #142 landed**, the task-survival failure that orphaned the `task_list` on every
-Ralph window reset is fixed, and #138 is unblocked. The cluster is now nearly done
-(#137 ✅, #142 ✅, #143 ✅, #140 ✅). Drive the remainder with `/implement` (Rust reference →
-three parallel language agents → cross-language verifier), byte-identical where serialized.
+**The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (#137 ✅, #138 ✅, #140 ✅,
+#142 ✅, #143 ✅ — all closed). `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` now survives
+Ralph window resets and process restarts with the `task_list` durable (#142), resumes the
+stalled worker instead of re-planning (#138), routes resumed tool calls through the leaf's
+scoped catalogue (#140), and breaks tool-error grind loops (#137). The composition's
+small-local-model reliability gaps that motivated the cluster are addressed.
 
-**Work next: #138** (resume seeding) — make `ContinueWithBudget`/consult resume seed the
-stalled worker and skip re-running PLAN when the now-surviving task_list is non-empty. Then
-the independent, parallel-grabbable gaps (both `status: queued`): **#141** (thread
-`ModelProfile.context_window` into `SessionState.window_limit`), **#139** (deliver + enforce
-`ReactConfig.output`).
+**Next direction is a maintainer call** — the cluster's north star is met. The natural
+candidates, in rough priority order: **(a)** the two independent robustness gaps that were
+adjacent to but never blocking the cluster — **#141** (thread `ModelProfile.context_window`
+into `SessionState.window_limit` so compaction fires for 128K/8K local models) and **#139**
+(deliver + enforce `ReactConfig.output` schemas), both `status: queued`, parallel-grabbable,
+no cross-deps; **(b)** close out the refactor — run **`/close 131`** (capstone still formally
+open) and the off-critical-path finishers #121/#122/#127/#128; **(c)** resume the parked
+examples track (#109 `13-coding-agent`, #92 observability). Drive code with `/implement`
+(Rust reference → three parallel language agents → cross-language verifier), byte-identical
+where serialized.
 
-**Also outstanding (housekeeping):** run **`/close 131`** (confirm capstone success criteria +
-reconcile — still formally open); push the 24-commit local `main` backlog (maintainer OK
-required — Deviation #10). Refactor finishers **#121**
-(`SubagentTool` strategy param), **#122** (`max_steps()`), **#127** (custom-strategy tracer),
-**#128** (per-node observability span attrs) remain open, off the critical path.
+**Housekeeping (do first, cheap):** **push local `main`** — it is 4 commits ahead of
+`origin/main` with the #138 series (maintainer OK required — Deviation #10 drift is back).
+Then **`/close 131`** (reconcile-only, no code).
 
 **Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
 gaps #115 (skill loading) and #116 (HITL child-consult resume — overlaps #130's resume seam,
@@ -192,12 +208,14 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    escalation choices are implemented host-side. **#140 (toolset handle on resume) is now landed —
    `ChildPausedState` carries the child's toolset and `child_state_from_paused` propagates it, so when
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
-   Still overlaps the #138 resume-seeding work.**
-10. **Local `main` push hygiene (standing reminder).** ✅ **RESOLVED this loop (2026-06-12):** the
-    29-commit post-#136 backlog (cordyceps polish + #137/#142/#143/#140 series + reconciles) was
-    pushed with maintainer OK; `origin/main` advanced `0954db1`→`51e2853` and local `main` is now in
-    sync. The standing reminder persists for future loops: **ask before pushing** — an agent-initiated
-    push was denied in an earlier session, so confirm maintainer OK before clearing any new drift.
+   **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
+   seam directly when it wires the `child_state` branch.**
+10. **Local `main` push hygiene (standing reminder).** ⚠️ **DRIFT IS BACK (2026-06-14):** local
+    `main` is **5 commits ahead** of `origin/main` (`origin/main` at `b06a599`) — the #138 series
+    (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) was merged via fast-forward this loop,
+    plus this reconcile commit, but **not pushed**. The standing reminder holds: **ask before pushing** —
+    an agent-initiated push was denied in an earlier session, so confirm maintainer OK before clearing
+    this drift. (Prior backlog was cleared 2026-06-12: `0954db1`→`51e2853`→`b06a599`.)
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -250,17 +268,16 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **#138 — resume seeding (now unblocked by #142, work this next).** Make
-   `ContinueWithBudget`/consult resume seed the stalled worker and **skip re-running PLAN** when
-   the (now-surviving) task_list is non-empty. The #142 durable key axis makes the list visible
-   across Ralph windows, so the AC can finally fire. `/implement`.
-2. **#141 + #139 — the parallel hardening gaps (grabbable now, no cross-deps, both `status: queued`).**
-   #141 (thread `ModelProfile.context_window` into `SessionState.window_limit` so compaction fires
-   for small models), #139 (deliver + enforce `ReactConfig.output` schemas). Each via `/implement`.
-3. **Housekeeping (cheap, do soon).** Run **`/close 131`** (confirm the capstone success criteria
-   + reconcile — still formally open). Cluster issues #138/#139/#141 were triaged to `status: queued`
-   this loop; remaining triage is just #131. Reconciliation only; no code. (Push backlog **cleared
-   this loop** — `main` in sync with `origin/main`, Deviation #10 resolved.)
+1. **Push local `main` to `origin/main` (maintainer OK required — Deviation #10).** Local `main`
+   is 5 commits ahead (the #138 series + this reconcile; `origin/main` at `b06a599`). Cheap, unblocks
+   nothing in code but clears the drift. Confirm with maintainer before pushing.
+2. **#141 + #139 — the two remaining parallel hardening gaps (grabbable now, no cross-deps, both
+   `status: queued`).** #141 (thread `ModelProfile.context_window` into `SessionState.window_limit`
+   so compaction fires for 128K/8K local models), #139 (deliver + enforce `ReactConfig.output`
+   schemas). Each via `/implement`. **These are the highest-value remaining code work now that the
+   #137–#143 cluster is done.**
+3. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
+   still formally open, last touched 2026-06-06). Reconciliation only; no code.
 4. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
    docs — on an explicit maintainer call.
