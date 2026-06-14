@@ -161,6 +161,15 @@ func (c Context) ToRequest(params sporecore.ModelParams) sporecore.ModelRequest 
 	}
 }
 
+// DefaultContextLength is the conservative fallback compaction window used
+// when neither the caller's CompactionConfig.ContextLength nor the model's
+// Provider().ContextWindow supplies a usable (> 0) value (issue #141).
+//
+// Deliberately small (8K, gemma-class) rather than the old 200K: when the real
+// context length is unknown, assume a tight window so compaction still fires
+// rather than silently never running.
+const DefaultContextLength uint32 = 8000
+
 // CompactionConfig controls when and how compaction runs.
 type CompactionConfig struct {
 	Threshold       float32 `json:"threshold"`
@@ -173,6 +182,19 @@ type CompactionConfig struct {
 	// consumes this is deferred (issue #3); the verifier itself does not read
 	// this field.
 	MaxCompactionAttempts uint32 `json:"max_compaction_attempts"`
+	// ContextLength is an optional caller override for the resolved compaction
+	// window (issue #141). When non-nil and *ContextLength > 0, the resolver
+	// (StandardContextManager.ResolveContextLength) uses it as the
+	// WindowLimit. A nil pointer (the default) and an explicit pointer to 0
+	// both fall through to the model's Provider().ContextWindow, then to
+	// DefaultContextLength. Configured values are NOT clamped to the model's
+	// real window.
+	//
+	// A *uint32 sentinel distinguishes absent (nil) from an explicit 0; both
+	// fall through, but the pointer keeps the absent case serialized as a
+	// MISSING key (omitempty), so an existing serialized CompactionConfig
+	// stays byte-identical (no new key when unset).
+	ContextLength *uint32 `json:"context_length,omitempty"`
 }
 
 // DefaultCompactionConfig returns the spec defaults.
@@ -220,13 +242,18 @@ type SessionState struct {
 }
 
 // NewSessionState constructs a SessionState with spec defaults.
+//
+// WindowLimit defaults to the conservative DefaultContextLength (8K) rather
+// than the old hardcoded 200K (issue #141): when the real context length is
+// unknown, assume a tight window so compaction still fires. The manager's
+// SeedSession overrides this with the resolved window for a real run.
 func NewSessionState(sessionID sporecore.SessionID, taskID sporecore.TaskID, instruction string) SessionState {
 	return SessionState{
 		SessionID:       sessionID,
 		TaskID:          taskID,
 		TaskInstruction: instruction,
 		ActivePhase:     sporecore.PhaseExecution,
-		WindowLimit:     200_000,
+		WindowLimit:     DefaultContextLength,
 	}
 }
 
@@ -529,6 +556,41 @@ func NewStandardContextManager(
 func (m *StandardContextManager) WithOffloadThreshold(bytes int) *StandardContextManager {
 	m.offloadThresholdBytes = bytes
 	return m
+}
+
+// ResolveContextLength resolves the compaction window (issue #141). Fallback
+// order:
+//
+//  1. the configured CompactionConfig.ContextLength when non-nil and > 0,
+//  2. else the model's Provider().ContextWindow when > 0,
+//  3. else DefaultContextLength (8K).
+//
+// A nil pointer (and an explicit pointer to 0) falls through to model
+// metadata, then to the default. The configured value is NOT clamped to the
+// model's real window — a larger configured value is used as-is.
+func (m *StandardContextManager) ResolveContextLength() uint32 {
+	if cl := m.compaction.ContextLength; cl != nil && *cl > 0 {
+		return *cl
+	}
+	if m.model != nil {
+		if window := m.model.Provider().ContextWindow; window > 0 {
+			return window
+		}
+	}
+	return DefaultContextLength
+}
+
+// SeedSession builds the initial SessionState for a run, seeding its
+// WindowLimit from ResolveContextLength (issue #141).
+//
+// The manager owns seeding so the resolved window has a single production
+// seam — callers get a SessionState whose WindowLimit already reflects the
+// configured/model/default resolution rather than the bare NewSessionState
+// constructor default.
+func (m *StandardContextManager) SeedSession(sessionID sporecore.SessionID, taskID sporecore.TaskID, instruction string) SessionState {
+	state := NewSessionState(sessionID, taskID, instruction)
+	state.WindowLimit = m.ResolveContextLength()
+	return state
 }
 
 // Assemble builds the per-turn Context.
