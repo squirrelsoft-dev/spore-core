@@ -27,7 +27,10 @@ const {
   defaultCompactionPreserveHints,
   KeyTermVerifier,
   ContextErrorException,
+  DEFAULT_CONTEXT_LENGTH,
 } = context;
+
+type CompactionConfig = context.CompactionConfig;
 
 type ContextSources = context.ContextSources;
 type SessionState = context.SessionState;
@@ -651,5 +654,121 @@ describe("StandardContextManager.recordCacheResult", () => {
     expect(ctx.meta.cache_blocks.static_hit).toBe(true);
     expect(ctx.meta.cache_blocks.session_hit).toBe(false);
     expect(ctx.meta.cache_blocks.history_hit).toBe(true);
+  });
+});
+
+// ── Issue #141: configurable compaction window ───────────────────────────────
+
+/** Model whose `provider().context_window` is configurable per test. */
+class WindowModel extends FakeModel {
+  constructor(private readonly contextWindow: number) {
+    super();
+  }
+  override provider(): ProviderInfo {
+    return { name: "win", model_id: "win", context_window: this.contextWindow };
+  }
+}
+
+function mkResolver(
+  configLen: number | null | undefined,
+  modelWindow: number,
+): {
+  resolveContextLength(): number;
+  seedSession(s: SessionId, t: TaskId, i: string): SessionState;
+} {
+  const config: CompactionConfig = { ...defaultCompactionConfig(), context_length: configLen };
+  return new StandardContextManager(new WindowModel(modelWindow), new NullCacheProvider(), config);
+}
+
+describe("StandardContextManager.resolveContextLength (issue #141)", () => {
+  it("config wins over the model window when > 0 (8000 over 128000)", () => {
+    expect(mkResolver(8000, 128000).resolveContextLength()).toBe(8000);
+  });
+
+  it("falls back to the model window when config is null (null + 128000 ⇒ 128000)", () => {
+    expect(mkResolver(null, 128000).resolveContextLength()).toBe(128000);
+  });
+
+  it("falls back to the model window when config is omitted", () => {
+    expect(mkResolver(undefined, 128000).resolveContextLength()).toBe(128000);
+  });
+
+  it("falls back to the default when neither config nor model supplies one (null + 0 ⇒ 8000)", () => {
+    expect(mkResolver(null, 0).resolveContextLength()).toBe(DEFAULT_CONTEXT_LENGTH);
+    expect(DEFAULT_CONTEXT_LENGTH).toBe(8000);
+  });
+
+  it("an explicit-zero config falls through to the model (0 + 128000 ⇒ 128000)", () => {
+    // 0 is not a positive override; honored only when > 0.
+    expect(mkResolver(0, 128000).resolveContextLength()).toBe(128000);
+  });
+
+  it("an explicit-zero config with no model window uses the default (0 + 0 ⇒ 8000)", () => {
+    expect(mkResolver(0, 0).resolveContextLength()).toBe(DEFAULT_CONTEXT_LENGTH);
+  });
+
+  it("does NOT clamp a configured value larger than the model window (500000 + 128000 ⇒ 500000)", () => {
+    expect(mkResolver(500000, 128000).resolveContextLength()).toBe(500000);
+  });
+});
+
+describe("StandardContextManager.seedSession (issue #141)", () => {
+  it("seeds window_limit to resolveContextLength()", () => {
+    const mgr = mkResolver(8000, 128000);
+    const st = mgr.seedSession(SessionId.of("s1"), TaskId.of("t1"), "do the thing");
+    expect(st.window_limit).toBe(mgr.resolveContextLength());
+    expect(st.window_limit).toBe(8000);
+  });
+
+  it("seeds from the model window when config is unset", () => {
+    const mgr = mkResolver(null, 128000);
+    const st = mgr.seedSession(SessionId.of("s1"), TaskId.of("t1"), "do the thing");
+    expect(st.window_limit).toBe(128000);
+  });
+});
+
+describe("SessionState default window_limit (issue #141)", () => {
+  it("defaults to the conservative DEFAULT_CONTEXT_LENGTH, not 200000", () => {
+    const st = newSessionState(SessionId.of("s1"), TaskId.of("t1"), "task");
+    expect(st.window_limit).toBe(DEFAULT_CONTEXT_LENGTH);
+    expect(st.window_limit).toBe(8000);
+  });
+});
+
+describe("StandardContextManager.shouldCompact at a small window (issue #141)", () => {
+  function smallState(windowLimit: number, used: number): SessionState {
+    const s = newSessionState(SessionId.of("s1"), TaskId.of("t1"), "task");
+    s.window_limit = windowLimit;
+    s.token_budget_used = used;
+    return s;
+  }
+
+  it("triggers when usage reaches threshold × window (8000 × 0.8 = 6400)", () => {
+    const mgr = mk();
+    expect(mgr.shouldCompact(smallState(8000, 6400))).toBe(true);
+  });
+
+  it("does not trigger just under threshold (6399 of 8000)", () => {
+    const mgr = mk();
+    expect(mgr.shouldCompact(smallState(8000, 6399))).toBe(false);
+  });
+
+  it("never compacts when the window is zero", () => {
+    const mgr = mk();
+    expect(mgr.shouldCompact(smallState(0, 9999))).toBe(false);
+  });
+});
+
+describe("CompactionConfig serialization (issue #141)", () => {
+  it("omits context_length from serialized JSON for the default config", () => {
+    const json = JSON.stringify(defaultCompactionConfig());
+    expect(json).not.toContain("context_length");
+    expect(JSON.parse(json)).not.toHaveProperty("context_length");
+  });
+
+  it("emits context_length only when explicitly set", () => {
+    const config: CompactionConfig = { ...defaultCompactionConfig(), context_length: 8000 };
+    const parsed = JSON.parse(JSON.stringify(config));
+    expect(parsed.context_length).toBe(8000);
   });
 });

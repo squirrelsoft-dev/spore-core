@@ -178,6 +178,17 @@ export interface Context {
   meta: ContextMeta;
 }
 
+/**
+ * Conservative fallback compaction window when neither the caller's
+ * {@link CompactionConfig.context_length} nor the model's
+ * `provider().context_window` supplies a usable (`> 0`) value (issue #141).
+ *
+ * Deliberately small (8K, gemma-class) rather than the old 200K: when the
+ * real context length is unknown, assume a tight window so compaction still
+ * fires rather than silently never running.
+ */
+export const DEFAULT_CONTEXT_LENGTH = 8_000;
+
 export const CompactionConfigSchema = z.object({
   threshold: z.number().default(0.8),
   preserve_recent_n: z.number().int().nonnegative().default(8),
@@ -189,10 +200,26 @@ export const CompactionConfigSchema = z.object({
    * warn (issue #29). Mapped to/from `max_compaction_attempts` on the wire.
    */
   max_compaction_attempts: z.number().int().nonnegative().default(2),
+  /**
+   * Optional caller override for the resolved compaction window (issue #141).
+   * When set to a value `> 0`, the resolver
+   * ({@link "./standard.js".StandardContextManager.resolveContextLength})
+   * uses it as the `window_limit`. `null`/absent (the default) and an explicit
+   * `0` all fall through to the model's `provider().context_window`, then to
+   * {@link DEFAULT_CONTEXT_LENGTH}. Configured values are NOT clamped to the
+   * model's real window.
+   *
+   * Serialized as ABSENT when unset — `JSON.stringify` emits no
+   * `context_length` key, so an existing serialized `CompactionConfig` stays
+   * byte-identical (no new key when omitted).
+   */
+  context_length: z.number().int().positive().nullable().optional(),
 });
 export type CompactionConfig = z.infer<typeof CompactionConfigSchema>;
 
 export function defaultCompactionConfig(): CompactionConfig {
+  // `context_length` is intentionally omitted so it serializes as ABSENT,
+  // keeping existing serialized configs byte-identical (issue #141).
   return {
     threshold: 0.8,
     preserve_recent_n: 8,
@@ -219,7 +246,11 @@ export const SessionStateSchema = z.object({
   active_phase: TaskPhaseSchema.default("execution"),
   message_history: z.array(MessageSchema).default([]),
   token_budget_used: z.number().int().nonnegative().default(0),
-  window_limit: z.number().int().nonnegative().default(200_000),
+  // When the real context length is unknown, default to the conservative
+  // DEFAULT_CONTEXT_LENGTH (8_000) rather than the dangerous old 200_000, so
+  // compaction still fires for small-context models (issue #141). The manager's
+  // `seedSession` overrides this with the resolved window.
+  window_limit: z.number().int().nonnegative().default(DEFAULT_CONTEXT_LENGTH),
   guides_loaded: z.array(GuideIdSchema).default([]),
   /**
    * Skills pending Block-3 injection on the next assemble. Skills are
@@ -284,7 +315,7 @@ export function newSessionState(
     active_phase: "execution",
     message_history: [],
     token_budget_used: 0,
-    window_limit: 200_000,
+    window_limit: DEFAULT_CONTEXT_LENGTH,
     guides_loaded: [],
     pending_skill_injections: [],
     budget_warning_active: false,

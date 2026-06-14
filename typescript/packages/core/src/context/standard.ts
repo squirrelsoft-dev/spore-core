@@ -11,7 +11,7 @@
  */
 
 import type { Message, ModelInterface, ModelRequest, ToolSchema } from "../model/index.js";
-import type { SandboxProvider } from "../harness/types.js";
+import type { SandboxProvider, SessionId, TaskId } from "../harness/types.js";
 
 import {
   type BreakpointInfo,
@@ -30,9 +30,11 @@ import {
   type RenderedSystemPrompt,
   type SessionState,
   type ToolResult,
+  DEFAULT_CONTEXT_LENGTH,
   defaultCompactionConfig,
   defaultCompactionPreserveHints,
   emptyCacheBlockStatus,
+  newSessionState,
 } from "./types.js";
 
 // ============================================================================
@@ -139,6 +141,44 @@ export class StandardContextManager implements ContextManager {
     this.cacheProvider = cacheProvider;
     this.compaction = compaction;
     this.offloadThresholdBytes = options.offloadThresholdBytes ?? 32 * 1024;
+  }
+
+  /**
+   * Resolve the compaction window (issue #141). Fallback order:
+   *
+   * 1. configured {@link CompactionConfig.context_length} when set and `> 0`,
+   * 2. else the model's `provider().context_window` when `> 0`,
+   * 3. else {@link DEFAULT_CONTEXT_LENGTH}.
+   *
+   * An explicit `0` (and `null`/absent) falls through to model metadata, then
+   * to the default. The configured value is NOT clamped to the model's real
+   * window — a larger configured value is used as-is.
+   */
+  resolveContextLength(): number {
+    const configured = this.compaction.context_length;
+    if (configured != null && configured > 0) {
+      return configured;
+    }
+    const modelWindow = this.model.provider().context_window;
+    if (modelWindow > 0) {
+      return modelWindow;
+    }
+    return DEFAULT_CONTEXT_LENGTH;
+  }
+
+  /**
+   * Build the initial rich {@link SessionState} for a run, seeding its
+   * `window_limit` from {@link resolveContextLength} (issue #141).
+   *
+   * The manager owns seeding so the resolved window has a single production
+   * seam — callers get a `SessionState` whose `window_limit` already reflects
+   * the configured/model/default resolution rather than the bare
+   * {@link newSessionState} constructor default.
+   */
+  seedSession(sessionId: SessionId, taskId: TaskId, instruction: string): SessionState {
+    const state = newSessionState(sessionId, taskId, instruction);
+    state.window_limit = this.resolveContextLength();
+    return state;
   }
 
   async assemble(state: SessionState, sources: ContextSources): Promise<Context> {
