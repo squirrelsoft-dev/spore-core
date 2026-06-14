@@ -42,6 +42,32 @@
 //! round-tripping. The harness-side retry loop that consumes the verifier
 //! is deferred to a follow-up issue; this module only provides the
 //! verification primitives.
+//!
+//! # Configurable compaction window (issue #141)
+//!
+//! Compaction triggers at `CompactionConfig.threshold × SessionState.window_limit`.
+//! Historically `window_limit` was hardcoded to `200_000`, so the trigger never
+//! fired for small-context local models (an 8K gemma or a 128K model overruns
+//! its real context long before 80% of 200K). Two pieces make the window
+//! model-configurable:
+//!
+//! - [`CompactionConfig::context_length`] (`Option<u32>`) — an optional caller
+//!   override. Serialized as ABSENT when `None`, so existing serialized configs
+//!   stay byte-identical.
+//! - [`StandardContextManager::resolve_context_length`] — the resolver. Fallback
+//!   order: configured `context_length` (only when `Some(n)` and `n > 0`) →
+//!   the model's `provider().context_window` (when `> 0`) →
+//!   [`DEFAULT_CONTEXT_LENGTH`] (`8_000`). An explicit `Some(0)` (or `None`)
+//!   falls through to model metadata, then to the default. Configured values are
+//!   NOT clamped to the model's real window — a larger configured value is used
+//!   as-is.
+//!
+//! The manager seeds the rich [`SessionState.window_limit`] with the resolved
+//! value via [`StandardContextManager::seed_session`]; trigger math
+//! ([`StandardContextManager::should_compact`]) is unchanged and automatically
+//! respects the seeded window. When the real context length is unknown,
+//! [`SessionState::new`] now defaults `window_limit` to the conservative
+//! `DEFAULT_CONTEXT_LENGTH` (8_000) rather than the dangerous old 200_000.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -191,6 +217,15 @@ impl Context {
     }
 }
 
+/// Conservative fallback compaction window when neither the caller's
+/// [`CompactionConfig::context_length`] nor the model's
+/// `provider().context_window` supplies a usable (`> 0`) value (issue #141).
+///
+/// Deliberately small (8K, gemma-class) rather than the old 200K: when the
+/// real context length is unknown, assume a tight window so compaction still
+/// fires rather than silently never running.
+pub const DEFAULT_CONTEXT_LENGTH: u32 = 8_000;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionConfig {
     pub threshold: f32,
@@ -201,6 +236,18 @@ pub struct CompactionConfig {
     /// (deferred, see module docs / issue #29) makes before accepting a
     /// failed-verification summary as-is and logging a warn-level event.
     pub max_compaction_attempts: u32,
+    /// Optional caller override for the resolved compaction window (issue
+    /// #141). When `Some(n)` and `n > 0`, the resolver
+    /// ([`StandardContextManager::resolve_context_length`]) uses `n` as the
+    /// `window_limit`. `None` (the default) and an explicit `Some(0)` both
+    /// fall through to the model's `provider().context_window`, then to
+    /// [`DEFAULT_CONTEXT_LENGTH`]. Configured values are NOT clamped to the
+    /// model's real window.
+    ///
+    /// Serialized as ABSENT when `None`, so an existing serialized
+    /// `CompactionConfig` stays byte-identical (no new key when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
 }
 
 impl Default for CompactionConfig {
@@ -211,6 +258,7 @@ impl Default for CompactionConfig {
             head_tail_tokens: 512,
             offload_path: PathBuf::from(".spore/offload"),
             max_compaction_attempts: 2,
+            context_length: None,
         }
     }
 }
@@ -266,7 +314,7 @@ impl SessionState {
             active_phase: TaskPhase::Execution,
             message_history: Vec::new(),
             token_budget_used: 0,
-            window_limit: 200_000,
+            window_limit: DEFAULT_CONTEXT_LENGTH,
             guides_loaded: Vec::new(),
             pending_skill_injections: Vec::new(),
             budget_warning_active: false,
@@ -560,6 +608,47 @@ impl<M: ModelInterface> StandardContextManager<M> {
     pub fn with_offload_threshold(mut self, bytes: usize) -> Self {
         self.offload_threshold_bytes = bytes;
         self
+    }
+
+    /// Resolve the compaction window (issue #141). Fallback order:
+    ///
+    /// 1. configured [`CompactionConfig::context_length`] when `Some(n)` and
+    ///    `n > 0`,
+    /// 2. else the model's `provider().context_window` when `> 0`,
+    /// 3. else [`DEFAULT_CONTEXT_LENGTH`].
+    ///
+    /// An explicit `Some(0)` (and `None`) falls through to model metadata, then
+    /// to the default. The configured value is NOT clamped to the model's real
+    /// window — a larger configured value is used as-is.
+    pub fn resolve_context_length(&self) -> u32 {
+        if let Some(n) = self.compaction.context_length {
+            if n > 0 {
+                return n;
+            }
+        }
+        let model_window = self.model.provider().context_window;
+        if model_window > 0 {
+            return model_window;
+        }
+        DEFAULT_CONTEXT_LENGTH
+    }
+
+    /// Build the initial rich [`SessionState`] for a run, seeding its
+    /// `window_limit` from [`Self::resolve_context_length`] (issue #141).
+    ///
+    /// The manager owns seeding so the resolved window has a single production
+    /// seam — callers get a `SessionState` whose `window_limit` already
+    /// reflects the configured/model/default resolution rather than the bare
+    /// [`SessionState::new`] constructor default.
+    pub fn seed_session(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        instruction: impl Into<String>,
+    ) -> SessionState {
+        let mut state = SessionState::new(session_id, task_id, instruction);
+        state.window_limit = self.resolve_context_length();
+        state
     }
 
     fn build_session_segments(&self, state: &SessionState) -> Vec<PromptSegment> {
@@ -1790,6 +1879,236 @@ mod tests {
             assert_eq!(
                 result.missing_items, case.expected.missing_items,
                 "case `{}`: missing_items mismatch",
+                case.name
+            );
+        }
+    }
+
+    // ── Issue #141: configurable compaction window ───────────────────────
+
+    /// Model stub whose `provider().context_window` is configurable, for
+    /// exercising the resolver fallback chain.
+    struct WindowModel {
+        context_window: u32,
+    }
+    impl ModelInterface for WindowModel {
+        async fn call(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+        async fn call_streaming(&self, _req: ModelRequest) -> Result<ModelStream, ModelError> {
+            unimplemented!()
+        }
+        async fn count_tokens(&self, _req: &ModelRequest) -> Result<u32, ModelError> {
+            Ok(0)
+        }
+        fn provider(&self) -> ProviderInfo {
+            ProviderInfo {
+                name: "window".into(),
+                model_id: "window".into(),
+                context_window: self.context_window,
+            }
+        }
+    }
+
+    fn mgr_with(
+        config_context_length: Option<u32>,
+        model_context_window: u32,
+    ) -> StandardContextManager<WindowModel> {
+        let compaction = CompactionConfig {
+            context_length: config_context_length,
+            ..CompactionConfig::default()
+        };
+        StandardContextManager::new(
+            Arc::new(WindowModel {
+                context_window: model_context_window,
+            }),
+            Arc::new(NullCacheProvider),
+            compaction,
+        )
+    }
+
+    #[test]
+    fn resolver_config_wins_over_model() {
+        // config Some(8000) + model 128000 ⇒ 8000 (config wins).
+        assert_eq!(mgr_with(Some(8000), 128_000).resolve_context_length(), 8000);
+    }
+
+    #[test]
+    fn resolver_model_fallback_when_config_none() {
+        // config None + model 128000 ⇒ 128000 (model fallback).
+        assert_eq!(mgr_with(None, 128_000).resolve_context_length(), 128_000);
+    }
+
+    #[test]
+    fn resolver_default_when_config_none_and_no_model() {
+        // config None + model 0 ⇒ 8000 (default).
+        assert_eq!(
+            mgr_with(None, 0).resolve_context_length(),
+            DEFAULT_CONTEXT_LENGTH
+        );
+    }
+
+    #[test]
+    fn resolver_explicit_zero_falls_through_to_model() {
+        // config Some(0) + model 128000 ⇒ 128000 (explicit zero falls through).
+        assert_eq!(mgr_with(Some(0), 128_000).resolve_context_length(), 128_000);
+    }
+
+    #[test]
+    fn resolver_explicit_zero_and_no_model_uses_default() {
+        // config Some(0) + model 0 ⇒ 8000.
+        assert_eq!(
+            mgr_with(Some(0), 0).resolve_context_length(),
+            DEFAULT_CONTEXT_LENGTH
+        );
+    }
+
+    #[test]
+    fn resolver_does_not_clamp_config_above_model() {
+        // config Some(500000) + model 128000 ⇒ 500000 (no clamp).
+        assert_eq!(
+            mgr_with(Some(500_000), 128_000).resolve_context_length(),
+            500_000
+        );
+    }
+
+    #[test]
+    fn trigger_math_respects_small_window() {
+        // window 8000 + threshold 0.80 ⇒ trips at 6400, not at 6399.
+        let mgr = mgr_with(Some(8000), 128_000);
+        let mut st = state_with_task("t");
+        st.window_limit = 8000;
+        st.token_budget_used = 6400;
+        assert!(mgr.should_compact(&st));
+        st.token_budget_used = 6399;
+        assert!(!mgr.should_compact(&st));
+    }
+
+    #[test]
+    fn trigger_math_zero_window_never_compacts() {
+        // Existing zero-window guard still holds.
+        let mgr = mgr_with(None, 128_000);
+        let mut st = state_with_task("t");
+        st.window_limit = 0;
+        st.token_budget_used = 9999;
+        assert!(!mgr.should_compact(&st));
+    }
+
+    #[test]
+    fn config_default_context_length_is_none() {
+        assert_eq!(CompactionConfig::default().context_length, None);
+    }
+
+    #[test]
+    fn config_default_serializes_without_context_length_key() {
+        let json = serde_json::to_string(&CompactionConfig::default()).unwrap();
+        assert!(
+            !json.contains("context_length"),
+            "context_length must be absent when None: {json}"
+        );
+        // Round-trips cleanly with the key absent.
+        let back: CompactionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context_length, None);
+    }
+
+    #[test]
+    fn config_some_serializes_with_context_length_key() {
+        let cfg = CompactionConfig {
+            context_length: Some(8192),
+            ..CompactionConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"context_length\":8192"), "{json}");
+    }
+
+    #[test]
+    fn seed_session_sets_window_limit_to_resolved_length() {
+        let mgr = mgr_with(Some(8192), 128_000);
+        let st = mgr.seed_session(SessionId::new("s1"), TaskId::new("t1"), "do the thing");
+        assert_eq!(st.window_limit, mgr.resolve_context_length());
+        assert_eq!(st.window_limit, 8192);
+        // And the resolver tail still applies when neither source is set.
+        let mgr2 = mgr_with(None, 0);
+        let st2 = mgr2.seed_session(SessionId::new("s2"), TaskId::new("t2"), "x");
+        assert_eq!(st2.window_limit, DEFAULT_CONTEXT_LENGTH);
+    }
+
+    #[test]
+    fn session_state_new_defaults_to_conservative_window() {
+        // Issue #141: the unknown-window default is now 8K, not 200K.
+        let st = SessionState::new(SessionId::new("s"), TaskId::new("t"), "x");
+        assert_eq!(st.window_limit, DEFAULT_CONTEXT_LENGTH);
+        assert_eq!(st.window_limit, 8_000);
+    }
+
+    // ── Fixture replay: cross-language consistency (issue #141) ──────────
+
+    #[test]
+    fn compaction_window_fixture_replay() {
+        #[derive(Deserialize)]
+        struct TriggerCase {
+            name: String,
+            window_limit: u32,
+            token_budget_used: u32,
+            threshold: f32,
+            expected_should_compact: bool,
+        }
+        #[derive(Deserialize)]
+        struct ResolverCase {
+            name: String,
+            config_context_length: Option<u32>,
+            model_context_window: u32,
+            expected_resolved: u32,
+        }
+        #[derive(Deserialize)]
+        struct Suite {
+            trigger_cases: Vec<TriggerCase>,
+            resolver_cases: Vec<ResolverCase>,
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/compaction_window/cases.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let suite: Suite = serde_json::from_str(&raw).unwrap();
+        assert!(
+            suite.trigger_cases.len() >= 5,
+            "expected at least 5 trigger cases"
+        );
+        assert!(
+            suite.resolver_cases.len() >= 6,
+            "expected at least 6 resolver cases"
+        );
+
+        // ── trigger_cases: threshold × window_limit drives should_compact ──
+        for case in &suite.trigger_cases {
+            let compaction = CompactionConfig {
+                threshold: case.threshold,
+                ..CompactionConfig::default()
+            };
+            let mgr = StandardContextManager::new(
+                Arc::new(WindowModel { context_window: 0 }),
+                Arc::new(NullCacheProvider),
+                compaction,
+            );
+            let mut st = state_with_task("t");
+            st.window_limit = case.window_limit;
+            st.token_budget_used = case.token_budget_used;
+            assert_eq!(
+                mgr.should_compact(&st),
+                case.expected_should_compact,
+                "trigger case `{}`: should_compact mismatch",
+                case.name
+            );
+        }
+
+        // ── resolver_cases: config → model → default fallback chain ────────
+        for case in &suite.resolver_cases {
+            let mgr = mgr_with(case.config_context_length, case.model_context_window);
+            assert_eq!(
+                mgr.resolve_context_length(),
+                case.expected_resolved,
+                "resolver case `{}`: resolved mismatch",
                 case.name
             );
         }

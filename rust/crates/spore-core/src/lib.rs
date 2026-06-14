@@ -65,7 +65,7 @@ pub use context::{
     CompactionRequest, CompactionResult, CompactionVerificationResult, CompactionVerifier,
     ComposedPrompt, Context, ContextError, ContextManager, ContextMeta, ContextSources,
     KeyTermVerifier, PromptSegment, RenderedSystemPrompt, SegmentStability,
-    SessionState as ContextSessionState, StandardContextManager,
+    SessionState as ContextSessionState, StandardContextManager, DEFAULT_CONTEXT_LENGTH,
 };
 pub use execution_registry::{
     EscalationMode, ExecutionRegistry, ExecutionRegistryBuilder, StrategyResolution,

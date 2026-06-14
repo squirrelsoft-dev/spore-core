@@ -1,0 +1,18 @@
+{
+  "description": "Cross-language fixture for the configurable compaction window (#141). `trigger_cases` set a rich SessionState window_limit + token_budget_used + threshold and assert the should_compact verdict, proving threshold x window_limit respects the configured (often small) window. `resolver_cases` exercise the StandardContextManager fallback chain config.context_length(>0) -> model.context_window(>0) -> 8000 default; a config or model value of 0 (or null config) falls through; configured values are NOT clamped to the model window. ASCII only.",
+  "resolver_cases": [
+    { "name": "config_wins_over_model", "config_context_length": 8000, "model_context_window": 128000, "expected_resolved": 8000 },
+    { "name": "model_fallback_when_config_null", "config_context_length": null, "model_context_window": 128000, "expected_resolved": 128000 },
+    { "name": "default_when_both_absent", "config_context_length": null, "model_context_window": 0, "expected_resolved": 8000 },
+    { "name": "explicit_zero_config_falls_through_to_model", "config_context_length": 0, "model_context_window": 128000, "expected_resolved": 128000 },
+    { "name": "explicit_zero_config_and_no_model_uses_default", "config_context_length": 0, "model_context_window": 0, "expected_resolved": 8000 },
+    { "name": "no_clamp_config_larger_than_model", "config_context_length": 500000, "model_context_window": 128000, "expected_resolved": 500000 }
+  ],
+  "trigger_cases": [
+    { "name": "small_window_overrun_triggers", "window_limit": 8000, "token_budget_used": 6400, "threshold": 0.8, "expected_should_compact": true },
+    { "name": "small_window_just_under", "window_limit": 8000, "token_budget_used": 6399, "threshold": 0.8, "expected_should_compact": false },
+    { "name": "gemma_8k_overrun", "window_limit": 8192, "token_budget_used": 8000, "threshold": 0.8, "expected_should_compact": true },
+    { "name": "zero_window_never_compacts", "window_limit": 0, "token_budget_used": 9999, "threshold": 0.8, "expected_should_compact": false },
+    { "name": "default_window_under_threshold", "window_limit": 200000, "token_budget_used": 100000, "threshold": 0.8, "expected_should_compact": false }
+  ]
+}

@@ -365,6 +365,7 @@ mod tests {
             head_tail_tokens: 64,
             offload_path: std::path::PathBuf::from(".spore/offload"),
             max_compaction_attempts: 2,
+            context_length: None,
         };
         Arc::new(StandardContextManager::new(
             Arc::new(StubModel),
