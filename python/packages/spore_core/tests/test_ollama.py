@@ -1139,3 +1139,27 @@ async def test_streaming_structured_buffers_json_then_reconstructs_tool_call() -
     assert len(tool_jsons) == 1
     assert json.loads(tool_jsons[0]) == {"path": "a.txt", "content": "hi"}
     assert final_stop is StopReason.TOOL_USE
+
+
+# ── output-schema constrained decoding (issue #139) ────────────────────────
+
+
+def test_build_request_output_schema_populates_format_channel() -> None:
+    # #139 AC1: ``params.output_schema`` (set by the harness for an
+    # output-schema-enforced terminal turn) routes into the Ollama ``format``
+    # constrained-decoding channel verbatim, even with NO tools.
+    schema = {
+        "type": "object",
+        "properties": {"status": {"type": "string", "enum": ["ok", "error"]}},
+        "required": ["status"],
+    }
+    req = _req([_user("answer")], params=ModelParams(output_schema=schema))
+    body = build_request_body("llama3.2", None, req, stream=False)
+    assert body["format"] == schema
+
+
+def test_build_request_no_output_schema_leaves_format_absent() -> None:
+    # Absent output_schema (the default) keeps ``format`` unset — byte-identical
+    # to pre-#139.
+    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    assert "format" not in body

@@ -470,6 +470,32 @@ class ContextOperationToolErrorLoopBroken(_Model):
     consecutive_errors: int
 
 
+class ContextOperationOutputSchemaRetry(_Model):
+    """Output-schema enforcement fed a validation error back and RETRIED (issue
+    #139): the terminal ``FinalResponse`` failed validation against the leaf's
+    ``output`` schema and a retry turn was granted (within budget). Carries the
+    number of extra retry turns spent so far (``= attempt``) and the frozen
+    validator error string that was fed back. Mirrors Rust's
+    ``ContextOperation::OutputSchemaRetry``."""
+
+    kind: Literal["output_schema_retry"] = "output_schema_retry"
+    attempt: int
+    error: str
+
+
+class ContextOperationOutputSchemaViolation(_Model):
+    """Output-schema enforcement EXHAUSTED its retries (issue #139): the terminal
+    still failed validation after ``output_schema_max_retries`` extra turns (with
+    budget remaining), so the run terminates with
+    ``HaltReason::OutputSchemaViolation``. Carries the total attempt count
+    (``= 1 + max_retries``) and the final frozen validator error. Mirrors Rust's
+    ``ContextOperation::OutputSchemaViolation``."""
+
+    kind: Literal["output_schema_violation"] = "output_schema_violation"
+    attempts: int
+    error: str
+
+
 ContextOperation = Annotated[
     ContextOperationAssembly
     | ContextOperationToolResultAppended
@@ -478,7 +504,9 @@ ContextOperation = Annotated[
     | ContextOperationConsultSpawned
     | ContextOperationConsultResumed
     | ContextOperationToolErrorLoopDetected
-    | ContextOperationToolErrorLoopBroken,
+    | ContextOperationToolErrorLoopBroken
+    | ContextOperationOutputSchemaRetry
+    | ContextOperationOutputSchemaViolation,
     Field(discriminator="kind"),
 ]
 
@@ -1069,6 +1097,8 @@ __all__ = [
     "ContextOperationCompaction",
     "ContextOperationConsultResumed",
     "ContextOperationConsultSpawned",
+    "ContextOperationOutputSchemaRetry",
+    "ContextOperationOutputSchemaViolation",
     "ContextOperationSkillInjected",
     "ContextOperationToolErrorLoopBroken",
     "ContextOperationToolErrorLoopDetected",

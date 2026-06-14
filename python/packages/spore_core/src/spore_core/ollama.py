@@ -278,18 +278,27 @@ def build_request_body(
             },
             "required": ["tool"],
         }
-    elif request.tools:
-        body["tools"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                },
-            }
-            for t in request.tools
-        ]
+    else:
+        if request.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                }
+                for t in request.tools
+            ]
+        # Issue #139: the harness sets ``params.output_schema`` for the terminal
+        # turn of an output-schema-enforced ReAct leaf. Route it into the same
+        # ``format`` constrained-decoding channel the structured-tool-calls path
+        # uses, so the model is forced onto the schema. (When structured tool
+        # calls ARE active, that schema wins — the ``if structured`` arm above —
+        # since the leaf is still requesting tools, not emitting its terminal.)
+        if request.params.output_schema is not None:
+            body["format"] = request.params.output_schema
     return body
 
 

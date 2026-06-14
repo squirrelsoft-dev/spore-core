@@ -145,6 +145,18 @@ class ModelParams(_Model):
     #: value is OMITTED from the serialized form (see :meth:`_serialize`) so the
     #: cross-language ``request_hash`` stays byte-identical when the flag is off.
     structured_tool_calls: bool = False
+    #: Terminal-turn output schema delivered to the model's constrained-decoding
+    #: channel (issue #139). When set, providers that support constrained
+    #: decoding (Ollama via the ``format`` JSON-schema parameter) force the
+    #: response onto the schema. Providers without it (Anthropic / OpenAI)
+    #: IGNORE it — a no-op, exactly like :attr:`structured_tool_calls`. The
+    #: harness sets this only for the terminal turn of a ``ReactConfig`` leaf
+    #: with ``output`` set when ``enforce_output_schemas`` is ON.
+    #:
+    #: Mirrors Rust's ``#[serde(skip_serializing_if = "Option::is_none")]``:
+    #: ``None`` (the default) is OMITTED from the serialized form (see
+    #: :meth:`_serialize`) so every existing fixture stays byte-identical.
+    output_schema: dict[str, Any] | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -153,6 +165,10 @@ class ModelParams(_Model):
         # (Rust drops the field via ``skip_serializing_if``).
         if not self.structured_tool_calls:
             data.pop("structured_tool_calls", None)
+        # Omit when None for the same reason (Rust drops the field via
+        # ``skip_serializing_if = "Option::is_none"``).
+        if self.output_schema is None:
+            data.pop("output_schema", None)
         return data
 
 

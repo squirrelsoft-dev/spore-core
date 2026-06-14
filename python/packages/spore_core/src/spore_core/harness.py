@@ -108,9 +108,14 @@ from .model import (
     ToolSchema,
     ToolUseDelta,
     ToolUseStart,
+    _canonicalize_json,
 )
 from .model import (
     ContentBlockStop as ModelContentBlockStop,
+)
+from .output_schema import (
+    feedback_message as output_schema_feedback_message,
+    validate_output,
 )
 from .prompt_tool_call import (
     AdaptiveToolCallModelInterface,
@@ -1252,11 +1257,19 @@ class StrategyExecutor(Protocol):
         on_stream: StreamSink | None,
         agent: Agent,
         toolset: ToolsetRef = "",
+        output_schema: dict[str, Any] | None = None,
+        output_schema_max_retries: int = 0,
     ) -> RunResult:
         """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
         resolved worker ``agent`` (#124). Issue 2: ``toolset`` is the leaf's
         RESOLVED handle — empty (``""``) ⇒ global-catalogue fallback; a non-empty
-        handle with its own catalogue ⇒ strict per-node scoping."""
+        handle with its own catalogue ⇒ strict per-node scoping.
+
+        Issue #139: ``output_schema`` is the leaf's RESOLVED output schema
+        (``None`` ⇒ no delivery, no validation). When set, the window VALIDATES
+        its terminal against it, retries up to ``output_schema_max_retries`` extra
+        turns, and sets :attr:`ModelParams.output_schema` on every turn so the
+        Ollama ``format`` channel constrains decoding."""
         ...
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -1448,6 +1461,19 @@ class StrategyExecutor(Protocol):
         :attr:`ExhaustedResolution.ESCALATE` site: ``SurfaceToHuman`` pauses with
         a :class:`HumanRequestBudgetExhausted`; ``Autonomous`` keeps the existing
         propagate behavior."""
+        ...
+
+    def enforce_output_schemas(self) -> bool:
+        """The output-schema enforcement MIGRATION GATE (issue #139). ``False``
+        (the default) means :func:`_run_react_config` never
+        resolves/delivers/validates a leaf's ``output`` schema — byte-identical to
+        pre-#139. Read through this accessor (mirrors :meth:`escalation_mode`)."""
+        ...
+
+    def output_schema_max_retries(self) -> int:
+        """The number of EXTRA terminal-validation retry turns ``N`` granted under
+        output-schema enforcement (issue #139; total attempts = ``1 + N``). Read
+        by :func:`_run_react_config` to thread into the window. Default ``2``."""
         ...
 
 
@@ -1806,6 +1832,30 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
     if isinstance(agent, RunResultFailure):
         await executor.finalize(agent)
         return cx._record_terminal(agent)
+    # Output-schema delivery + enforcement (issue #139). MIGRATION GATE: only when
+    # ``enforce_output_schemas`` is ON AND this leaf carries ``output`` set do we
+    # resolve the schema, DELIVER it (directive seed + the constrained-decoding
+    # channel), and pass it (plus the retry budget ``N``) into the window for
+    # terminal validation. When the gate is OFF or there is no ``output``,
+    # ``output_schema`` is ``None`` and the window behaves byte-identically to
+    # pre-#139 (no resolve, no delivery, no validation). The schema is
+    # canonicalized to compact key-sorted JSON so its delivered/reported bytes are
+    # identical across the four language ports.
+    output_schema: dict[str, Any] | None = None
+    if executor.enforce_output_schemas() and self.output is not None:
+        resolved = cx.registry.resolve_schema(self.output)
+        if isinstance(resolved, dict):
+            output_schema = resolved
+    output_schema_max_retries = executor.output_schema_max_retries()
+    if output_schema is not None:
+        # AC1: append the resolved schema to the leaf's directive/system context
+        # as a USER message, key-sorted via ``_canonicalize_json`` so the seeded
+        # bytes are identical across languages.
+        directive = (
+            "Your final response must be a JSON value that conforms to this "
+            f"JSON schema: {_canonicalize_json(output_schema)}"
+        )
+        await executor.seed_user_message(session_state, directive)
     # #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
     # ``behavior``. The leaf still never RESOLVES it in the nested case (rule 6: it
     # PROPAGATES a ``BudgetExhausted`` to its parent, which owns the single
@@ -1829,6 +1879,10 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         # the per-node scoped catalogue (empty handle ⇒ global-catalogue
         # fallback). Mirrors ``agent``.
         self.toolset,
+        # Issue #139: thread the resolved output schema (or ``None``) and the
+        # retry budget so the window validates the terminal.
+        output_schema,
+        output_schema_max_retries,
     )
     await executor.finalize(result)
 
@@ -3374,6 +3428,32 @@ class StreamToolErrorLoopBroken(_Model):
     consecutive_errors: int
 
 
+class StreamOutputSchemaRetry(_Model):
+    """Output-schema enforcement (issue #139) fed a validation error back and
+    RETRIED: the terminal ``FinalResponse`` failed validation against the leaf's
+    ``output`` schema and a retry turn was granted (within budget). A warning —
+    the loop continues. Carries the extra-retry count so far (``= attempt``) and
+    the frozen validator error fed back. Mirrors Rust's
+    ``StreamEvent::OutputSchemaRetry``."""
+
+    kind: Literal["output_schema_retry"] = "output_schema_retry"
+    attempt: int
+    error: str
+
+
+class StreamOutputSchemaViolation(_Model):
+    """Output-schema enforcement (issue #139) EXHAUSTED its retries: the terminal
+    still failed validation after ``output_schema_max_retries`` extra turns (with
+    budget remaining), so the run terminates with
+    :class:`HaltReasonOutputSchemaViolation`. Carries the total attempt count
+    (``= 1 + max_retries``) and the final frozen validator error. Mirrors Rust's
+    ``StreamEvent::OutputSchemaViolation``."""
+
+    kind: Literal["output_schema_violation"] = "output_schema_violation"
+    attempts: int
+    error: str
+
+
 HarnessStreamEvent = Annotated[
     StreamTurnStart
     | StreamTurnEnd
@@ -3389,7 +3469,9 @@ HarnessStreamEvent = Annotated[
     | StreamBlockStop
     | StreamToolCallStart
     | StreamToolErrorLoopDetected
-    | StreamToolErrorLoopBroken,
+    | StreamToolErrorLoopBroken
+    | StreamOutputSchemaRetry
+    | StreamOutputSchemaViolation,
     Field(discriminator="kind"),
 ]
 
@@ -4981,6 +5063,27 @@ class HaltReasonTaskGraphCycle(_Model):
     reason: str
 
 
+class HaltReasonOutputSchemaViolation(_Model):
+    """Returned by :class:`StandardHarness` (issue #139) when output-schema
+    enforcement is ON (:attr:`HarnessConfig.enforce_output_schemas`) for a
+    ``ReactConfig`` leaf carrying ``output`` set, and the leaf's terminal
+    ``FinalResponse`` STILL failed validation after the configured
+    ``output_schema_max_retries`` extra turns were exhausted WITH budget
+    remaining. DISTINCT from :class:`HaltReasonBudgetExceeded`: a budget/turn cap
+    that a retry would exceed surfaces the budget terminal instead
+    (budget-cap-wins precedence) — ``OutputSchemaViolation`` fires ONLY on a
+    genuine validation exhaustion. Carries the resolved ``schema`` (canonical
+    compact key-sorted JSON), the total number of ``attempts``
+    (``1 + max_retries``), and the ``last_error`` (the frozen validator error
+    string from the final attempt). Mirrors Rust's
+    ``HaltReason::OutputSchemaViolation``."""
+
+    kind: Literal["output_schema_violation"] = "output_schema_violation"
+    schema: str
+    attempts: int
+    last_error: str
+
+
 HaltReason = Annotated[
     HaltReasonBudgetExceeded
     | HaltReasonTerminationPolicyHalt
@@ -5002,7 +5105,8 @@ HaltReason = Annotated[
     | HaltReasonRalphCompletionUnmet
     | HaltReasonConfigurationError
     | HaltReasonTasksBlockedByFailure
-    | HaltReasonTaskGraphCycle,
+    | HaltReasonTaskGraphCycle
+    | HaltReasonOutputSchemaViolation,
     Field(discriminator="kind"),
 ]
 
@@ -5117,6 +5221,8 @@ from .observability import (  # noqa: E402
     ContextOperationCompaction,
     ContextOperationConsultResumed,
     ContextOperationConsultSpawned,
+    ContextOperationOutputSchemaRetry,
+    ContextOperationOutputSchemaViolation,
     ContextOperationToolErrorLoopBroken,
     ContextOperationToolErrorLoopDetected,
     ContextSpan,
@@ -5301,6 +5407,8 @@ class HarnessConfig:
         content_capture: ContentCaptureConfig | None = None,
         max_stop_blocks: int = 8,
         error_loop_threshold: int = 3,
+        enforce_output_schemas: bool = False,
+        output_schema_max_retries: int = 2,
         max_resets: int = 3,
         vcs_provider: VcsProvider | None = None,
         hooks: HookChain | None = None,
@@ -5365,6 +5473,28 @@ class HarnessConfig:
         # WITHOUT burning the remaining budget (AC3). Defaults to ``3``; ``0``
         # disables the breaker. Mirrors Rust's ``HarnessConfig::error_loop_threshold``.
         self.error_loop_threshold = error_loop_threshold
+        # MIGRATION GATE (issue #139) — NOT a permanent feature flag. When
+        # ``True``, a :class:`ReactConfig` leaf carrying ``output`` set has its
+        # resolved output schema DELIVERED to the model (directive seed +
+        # :attr:`ModelParams.output_schema` constrained-decoding channel) and its
+        # terminal ``FinalResponse`` VALIDATED against that schema; a validation
+        # failure feeds the error back and retries up to
+        # ``output_schema_max_retries`` extra turns (within budget), then
+        # terminates with :class:`HaltReasonOutputSchemaViolation`. Enforcement is
+        # UNIFORM. Default ``False`` (OFF) keeps every existing replay fixture
+        # byte-for-byte green: when OFF, ``ReactConfig.run`` behaves EXACTLY as
+        # before — no resolve, no delivery, no validation. Mirrors Rust's
+        # ``HarnessConfig::enforce_output_schemas``.
+        self.enforce_output_schemas = enforce_output_schemas
+        # The ``N`` extra terminal-validation retry turns granted when
+        # ``enforce_output_schemas`` is ON and a terminal fails output-schema
+        # validation (issue #139). Total attempts = ``1 + N``. Retried turns
+        # COUNT against the turn budget; a retry that would exceed the budget
+        # surfaces the budget terminal instead of
+        # :class:`HaltReasonOutputSchemaViolation` (budget-cap-wins precedence).
+        # Defaults to ``2``. Mirrors Rust's
+        # ``HarnessConfig::output_schema_max_retries``.
+        self.output_schema_max_retries = output_schema_max_retries
         # Ralph outer-loop reset cap (issue #58, B3). The maximum number of
         # context windows the ``Ralph`` strategy runs before halting with
         # :class:`HaltReasonRalphCompletionUnmet` when tasks are still
@@ -5567,6 +5697,8 @@ class HarnessConfig:
             content_capture=self.content_capture,
             max_stop_blocks=self.max_stop_blocks,
             error_loop_threshold=self.error_loop_threshold,
+            enforce_output_schemas=self.enforce_output_schemas,
+            output_schema_max_retries=self.output_schema_max_retries,
             max_resets=self.max_resets,
             vcs_provider=self.vcs_provider,
             hooks=self.hooks,
@@ -5619,6 +5751,13 @@ class HarnessBuilder:
         self._content_capture: ContentCaptureConfig | None = None
         self._max_stop_blocks: int = 8
         self._error_loop_threshold: int = 3
+        # MIGRATION GATE (issue #139): deliver + enforce ``ReactConfig.output``
+        # schemas. Defaults to ``False`` (OFF). See
+        # :attr:`HarnessConfig.enforce_output_schemas`.
+        self._enforce_output_schemas: bool = False
+        # Extra output-schema validation retry turns ``N`` (issue #139). Defaults
+        # to ``2``. See :attr:`HarnessConfig.output_schema_max_retries`.
+        self._output_schema_max_retries: int = 2
         self._max_resets: int = 3
         self._vcs_provider: VcsProvider | None = None
         self._hooks: HookChain | None = None
@@ -6077,6 +6216,22 @@ class HarnessBuilder:
         self._error_loop_threshold = n
         return self
 
+    def enforce_output_schemas(self, enforce: bool) -> HarnessBuilder:
+        """Turn ON output-schema delivery + enforcement for ``ReactConfig`` leaves
+        carrying ``output`` set (issue #139 — MIGRATION GATE). Defaults to
+        ``False`` (OFF), which keeps existing replay fixtures byte-identical. See
+        :attr:`HarnessConfig.enforce_output_schemas`."""
+        self._enforce_output_schemas = enforce
+        return self
+
+    def output_schema_max_retries(self, n: int) -> HarnessBuilder:
+        """Set the number of EXTRA terminal-validation retry turns ``N`` granted
+        when :meth:`enforce_output_schemas` is ON (issue #139). Total attempts =
+        ``1 + N``. Defaults to ``2``. See
+        :attr:`HarnessConfig.output_schema_max_retries`."""
+        self._output_schema_max_retries = n
+        return self
+
     def max_resets(self, max_resets: int) -> HarnessBuilder:
         """Set the Ralph outer-loop reset cap (issue #58, B3) — the maximum
         number of context windows the ``Ralph`` strategy runs before halting
@@ -6187,6 +6342,8 @@ class HarnessBuilder:
             content_capture=self._content_capture,
             max_stop_blocks=self._max_stop_blocks,
             error_loop_threshold=self._error_loop_threshold,
+            enforce_output_schemas=self._enforce_output_schemas,
+            output_schema_max_retries=self._output_schema_max_retries,
             max_resets=self._max_resets,
             vcs_provider=self._vcs_provider,
             hooks=self._hooks,
@@ -6456,6 +6613,18 @@ class StandardHarness:
         ``ExhaustedResolution.ESCALATE`` site to decide between the autonomous
         propagate and the HITL pause."""
         return self._config.escalation_mode
+
+    def enforce_output_schemas(self) -> bool:
+        """The output-schema enforcement MIGRATION GATE (issue #139,
+        :class:`StrategyExecutor` accessor): returns
+        ``self._config.enforce_output_schemas``."""
+        return self._config.enforce_output_schemas
+
+    def output_schema_max_retries(self) -> int:
+        """The number of EXTRA terminal-validation retry turns ``N`` (issue #139,
+        :class:`StrategyExecutor` accessor): returns
+        ``self._config.output_schema_max_retries``."""
+        return self._config.output_schema_max_retries
 
     def storage(self) -> StorageProvider:
         """The injected :class:`StorageProvider` (issue #73). Defaults to an
@@ -7223,14 +7392,25 @@ class StandardHarness:
         on_stream: StreamSink | None,
         agent: Agent,
         toolset: ToolsetRef = "",
+        output_schema: dict[str, Any] | None = None,
+        output_schema_max_retries: int = 0,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
         on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
         Does NOT finalize observability — the leaf ``run`` body does. Issue 2:
         ``toolset`` is the leaf's RESOLVED handle, threaded down alongside
-        ``agent``."""
+        ``agent``. Issue #139: ``output_schema`` / ``output_schema_max_retries``
+        drive terminal-output validation + retry (``None`` ⇒ no enforcement)."""
         return await self._run_react_inner(
-            task, max_iterations, session_state, budget_used, on_stream, agent, toolset
+            task,
+            max_iterations,
+            session_state,
+            budget_used,
+            on_stream,
+            agent,
+            toolset,
+            output_schema,
+            output_schema_max_retries,
         )
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -8457,6 +8637,16 @@ class StandardHarness:
         # own per-key catalogue ⇒ strict per-node scoping. Legacy/resume paths
         # (no per-node toolset) thread the EMPTY handle → global fallback.
         toolset: ToolsetRef = "",
+        # Issue #139: the leaf's RESOLVED output schema (``None`` ⇒ no
+        # enforcement, identical to pre-#139). When set, the terminal is validated
+        # against it (frozen validator subset) and a validation failure feeds the
+        # error back + retries up to ``output_schema_max_retries`` extra turns
+        # WITHIN budget; on exhaustion WITH budget remaining the window returns
+        # :class:`HaltReasonOutputSchemaViolation`. The schema is also set on every
+        # turn's ``ModelParams.output_schema`` so the Ollama ``format`` channel
+        # constrains decoding (Anthropic/OpenAI ignore it).
+        output_schema: dict[str, Any] | None = None,
+        output_schema_max_retries: int = 0,
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
@@ -8486,6 +8676,14 @@ class StandardHarness:
         # reset). ``N`` is ``error_loop_threshold``; the hard stop is at ``2 * N``.
         error_loop_n = self._config.error_loop_threshold
         error_runs: dict[str, ErrorRun] = {}
+        # Output-schema enforcement state (issue #139), loop-local to this window.
+        # ``output_schema_retries_used`` counts the EXTRA retry turns spent on
+        # validation feedback; the budget for them is ``output_schema_max_retries``
+        # (the ``N``). ``last_schema_error`` holds the most recent frozen validator
+        # error so a final exhaustion can report it. Both are inert when
+        # ``output_schema`` is ``None`` (enforcement OFF / no schema).
+        output_schema_retries_used = 0
+        last_schema_error = ""
         if task.budget.max_turns is not None:
             effective_turn_cap = min(task.budget.max_turns, max_iterations)
         else:
@@ -8575,6 +8773,16 @@ class StandardHarness:
             # structured tool calls) to every tool-requesting ReAct/execute/
             # streaming turn.
             context.params = config.model_params
+            # Issue #139: route the enforced output schema into this turn's
+            # constrained-decoding channel (``ModelParams.output_schema``). Ollama
+            # honors it via ``format``; Anthropic/OpenAI ignore it (no-op, like
+            # ``structured_tool_calls``). ``None`` leaves the params byte-identical.
+            # Copy before mutating so the shared ``config.model_params`` is never
+            # touched.
+            if output_schema is not None:
+                context.params = config.model_params.model_copy(
+                    update={"output_schema": output_schema}
+                )
             self._emit(on_stream, StreamTurnStart(turn=budget_used.turns + 1))
             turn_started_at = _now()
             turn_clock = time.monotonic()
@@ -8773,6 +8981,106 @@ class StandardHarness:
                     stop_blocks += 1
                     await config.context_manager.append_user_message(session_state, stop_reason)
                     continue
+
+                # Output-schema enforcement gate (issue #139). Additive to and
+                # EARLIER than the Success terminal: when a schema is active,
+                # validate this terminal ``FinalResponse``. On a validation
+                # FAILURE, feed the frozen error back as a USER message and retry
+                # one more turn (up to ``output_schema_max_retries`` extra turns).
+                # The retried turn re-enters the loop top, where the budget gate
+                # fires FIRST — so a retry that would exceed the turn/budget
+                # backstop surfaces the existing ``BudgetExceeded`` terminal, NOT
+                # ``OutputSchemaViolation`` (budget-cap-wins). Only when the N
+                # retries are exhausted WITH budget remaining does the window
+                # terminate with ``OutputSchemaViolation``. ``None`` schema ⇒ no
+                # validation (migration gate OFF / no ``output``), so the terminal
+                # is byte-identical to pre-#139.
+                if output_schema is not None:
+                    verr = validate_output(result.content, output_schema)
+                    if verr is not None:
+                        last_schema_error = verr
+                        if output_schema_retries_used < output_schema_max_retries:
+                            # Grant one more turn: feed the validator error back as
+                            # a USER message (the assistant's invalid text is
+                            # already in history above) and loop. The budget gate at
+                            # the loop top enforces the budget-cap-wins precedence.
+                            output_schema_retries_used += 1
+                            self._emit(
+                                on_stream,
+                                StreamOutputSchemaRetry(
+                                    attempt=output_schema_retries_used,
+                                    error=verr,
+                                ),
+                            )
+                            if config.observability is not None:
+                                base = SpanBase.new_root(
+                                    new_span_id(f"{session_id}-output-schema-retry-{span_seq}"),
+                                    session_id,
+                                    task.id,
+                                    SpanKind.CONTEXT_ASSEMBLY,
+                                    _now(),
+                                )
+                                config.observability.emit_context(
+                                    ContextSpan(
+                                        base=base,
+                                        operation=ContextOperationOutputSchemaRetry(
+                                            attempt=output_schema_retries_used,
+                                            error=verr,
+                                        ),
+                                        tokens_before=0,
+                                        tokens_after=0,
+                                        utilization_before=0.0,
+                                        utilization_after=0.0,
+                                    )
+                                )
+                            feedback = output_schema_feedback_message(verr)
+                            await config.context_manager.append_user_message(
+                                session_state, feedback
+                            )
+                            continue
+                        # Retries exhausted WITH budget remaining (the budget gate
+                        # did not fire) → the typed schema-violation terminal
+                        # (AC3). Total attempts = 1 + max_retries.
+                        attempts = output_schema_max_retries + 1
+                        self._emit(
+                            on_stream,
+                            StreamOutputSchemaViolation(
+                                attempts=attempts,
+                                error=last_schema_error,
+                            ),
+                        )
+                        if config.observability is not None:
+                            base = SpanBase.new_root(
+                                new_span_id(f"{session_id}-output-schema-violation-{span_seq}"),
+                                session_id,
+                                task.id,
+                                SpanKind.CONTEXT_ASSEMBLY,
+                                _now(),
+                            )
+                            config.observability.emit_context(
+                                ContextSpan(
+                                    base=base,
+                                    operation=ContextOperationOutputSchemaViolation(
+                                        attempts=attempts,
+                                        error=last_schema_error,
+                                    ),
+                                    tokens_before=0,
+                                    tokens_after=0,
+                                    utilization_before=0.0,
+                                    utilization_after=0.0,
+                                )
+                            )
+                        return self._fail(
+                            HaltReasonOutputSchemaViolation(
+                                schema=_canonicalize_json(output_schema),
+                                attempts=attempts,
+                                last_error=last_schema_error,
+                            ),
+                            session_id,
+                            usage,
+                            budget_used.turns,
+                            session_state,
+                        )
 
                 self._emit(on_stream, StreamFinalResponse(content=result.content))
                 return RunResultSuccess(
