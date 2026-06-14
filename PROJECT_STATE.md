@@ -1,14 +1,14 @@
 # PROJECT STATE
-_Last updated: 2026-06-14 by /close (#138 **complete** — budget/consult resume now seeds the stalled worker and skips re-planning when the #142-durable `task_list` survives a Ralph window reset; all four ACs, four-language parity, tests verified green this loop; closed + `status: complete`. Merged to local `main` this session via fast-forward.) ⚠️ **Local `main` is now 5 commits AHEAD of `origin/main`** — the #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) plus this reconcile commit are **not yet pushed**; Deviation #10 push-hygiene drift is back (maintainer OK required before pushing)._
+_Last updated: 2026-06-14 by /close (#138 **complete** — budget/consult resume now seeds the stalled worker and skips re-planning when the #142-durable `task_list` survives a Ralph window reset; all four ACs, four-language parity, tests verified green this loop; closed + `status: complete`. Merged to local `main` this session via fast-forward.) ✅ **Local `main` is in sync with `origin/main`** — the #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) + this reconcile were pushed this loop with maintainer OK; `origin/main` advanced `b06a599`→`169ee25` (Deviation #10 resolved)._
 
 _**Direction note:** Active direction remains **hardening the composed `12-cordyceps` runtime for small-local-model reliability (cluster #137–#143)**. **The cluster is now COMPLETE: #137 ✅, #138 ✅, #140 ✅, #142 ✅, #143 ✅ (all closed).** The two independent parallel gaps **#139** (output schemas) / **#141** (compaction window) remain `status: queued` — these were never blocking the cordyceps composition, just adjacent robustness wins. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131`. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **5 commits ahead
-of `origin/main`** (`origin/main` at `b06a599` — the #138 series + this reconcile are
-unpushed, maintainer OK required).
+serialized formats byte-identical across all four. Local `main` is **in sync with
+`origin/main`** (the #138 series + this reconcile were pushed this loop; `origin/main`
+at `169ee25`).
 
 **🎯 The `12-cordyceps` hardening cluster #137–#143 is now COMPLETE.** Running the
 capstone composition live on gemma exposed a set of robustness gaps, each verified in
@@ -210,12 +210,12 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ⚠️ **DRIFT IS BACK (2026-06-14):** local
-    `main` is **5 commits ahead** of `origin/main` (`origin/main` at `b06a599`) — the #138 series
-    (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) was merged via fast-forward this loop,
-    plus this reconcile commit, but **not pushed**. The standing reminder holds: **ask before pushing** —
-    an agent-initiated push was denied in an earlier session, so confirm maintainer OK before clearing
-    this drift. (Prior backlog was cleared 2026-06-12: `0954db1`→`51e2853`→`b06a599`.)
+10. **Local `main` push hygiene (standing reminder).** ✅ **RESOLVED this loop (2026-06-14):** the
+    #138 series (Rust `99a16be`, Py `9133762`, Go `4827924`, TS `5ec555a`) + this reconcile were pushed
+    with maintainer OK; `origin/main` advanced `b06a599`→`169ee25` and local `main` is back in sync. The
+    standing reminder persists: **ask before pushing** — an agent-initiated push was denied in an earlier
+    session, so confirm maintainer OK before clearing any future drift. (Prior backlog cleared
+    2026-06-12: `0954db1`→`51e2853`→`b06a599`.)
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -268,16 +268,15 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **Push local `main` to `origin/main` (maintainer OK required — Deviation #10).** Local `main`
-   is 5 commits ahead (the #138 series + this reconcile; `origin/main` at `b06a599`). Cheap, unblocks
-   nothing in code but clears the drift. Confirm with maintainer before pushing.
-2. **#141 + #139 — the two remaining parallel hardening gaps (grabbable now, no cross-deps, both
+1. **#141 + #139 — the two remaining parallel hardening gaps (grabbable now, no cross-deps, both
    `status: queued`).** #141 (thread `ModelProfile.context_window` into `SessionState.window_limit`
    so compaction fires for 128K/8K local models), #139 (deliver + enforce `ReactConfig.output`
    schemas). Each via `/implement`. **These are the highest-value remaining code work now that the
    #137–#143 cluster is done.**
-3. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
+2. **Housekeeping (cheap).** Run **`/close 131`** (confirm the capstone success criteria + reconcile —
    still formally open, last touched 2026-06-06). Reconciliation only; no code.
-4. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
+3. **Refactor finishers (off critical path) + parked work.** #121/#122/#127/#128 whenever
    convenient; then the parked examples #109/#92, #115/#116, and correctness/safety #34→#31→#30 +
    docs — on an explicit maintainer call.
+4. **Push hygiene.** `main` is in sync with `origin/main` as of this loop (Deviation #10 resolved);
+   keep asking before pushing any future drift.
