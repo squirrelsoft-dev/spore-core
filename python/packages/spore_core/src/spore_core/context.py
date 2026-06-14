@@ -211,6 +211,16 @@ class Context:
         )
 
 
+# Conservative fallback compaction window when neither the caller's
+# ``CompactionConfig.context_length`` nor the model's
+# ``provider().context_window`` supplies a usable (``> 0``) value (issue #141).
+#
+# Deliberately small (8K, gemma-class) rather than the old 200K: when the real
+# context length is unknown, assume a tight window so compaction still fires
+# rather than silently never running.
+DEFAULT_CONTEXT_LENGTH = 8_000
+
+
 @dataclass
 class CompactionConfig:
     threshold: float = 0.80
@@ -222,6 +232,34 @@ class CompactionConfig:
     # summary as-is and logging a warn-level event (issue #29). The verifier
     # itself is NOT held here — the harness owns the verifier instance.
     max_compaction_attempts: int = 2
+    # Optional caller override for the resolved compaction window (issue #141).
+    # When set and ``> 0``, the resolver
+    # (:meth:`StandardContextManager.resolve_context_length`) uses it as the
+    # ``window_limit``. ``None`` (the default) and an explicit ``0`` both fall
+    # through to the model's ``provider().context_window``, then to
+    # :data:`DEFAULT_CONTEXT_LENGTH`. Configured values are NOT clamped to the
+    # model's real window.
+    #
+    # Serialized as ABSENT when ``None`` (see :meth:`to_dict`), so an existing
+    # serialized ``CompactionConfig`` stays byte-identical (no new key unset).
+    context_length: int | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-safe dict. ``context_length`` is OMITTED when ``None`` so an
+        existing serialized ``CompactionConfig`` stays byte-identical — mirrors
+        the Rust ``#[serde(skip_serializing_if = "Option::is_none")]`` on the
+        same field (issue #141)."""
+
+        data: dict[str, object] = {
+            "threshold": self.threshold,
+            "preserve_recent_n": self.preserve_recent_n,
+            "head_tail_tokens": self.head_tail_tokens,
+            "offload_path": str(self.offload_path),
+            "max_compaction_attempts": self.max_compaction_attempts,
+        }
+        if self.context_length is not None:
+            data["context_length"] = self.context_length
+        return data
 
 
 @dataclass
@@ -243,7 +281,12 @@ class SessionState:
     active_phase: TaskPhase = TaskPhase.EXECUTION
     message_history: list[Message] = field(default_factory=list)
     token_budget_used: int = 0
-    window_limit: int = 200_000
+    # When the real context length is unknown, default to the conservative
+    # :data:`DEFAULT_CONTEXT_LENGTH` (8K) rather than the dangerous old 200K so
+    # compaction still fires for small-context local models (issue #141). The
+    # manager seam (:meth:`StandardContextManager.seed_session`) overrides this
+    # with the resolved window in production.
+    window_limit: int = DEFAULT_CONTEXT_LENGTH
     guides_loaded: list[GuideId] = field(default_factory=list)
     # Skills pending Block-3 injection on the next assemble. Cleared after
     # each assemble — skills are ephemeral, one turn only.
@@ -679,6 +722,52 @@ class StandardContextManager:
         self._static_hash: int | None = None
         self._session_hash: int | None = None
 
+    # ---- configurable compaction window (issue #141) ----------------
+
+    def resolve_context_length(self) -> int:
+        """Resolve the compaction window (issue #141). Fallback order:
+
+        1. configured :attr:`CompactionConfig.context_length` when set and
+           ``> 0``,
+        2. else the model's ``provider().context_window`` when ``> 0``,
+        3. else :data:`DEFAULT_CONTEXT_LENGTH`.
+
+        An explicit ``0`` (and ``None``) falls through to model metadata, then
+        to the default. The configured value is NOT clamped to the model's real
+        window — a larger configured value is used as-is.
+        """
+
+        configured = self._compaction.context_length
+        if configured is not None and configured > 0:
+            return configured
+        model_window = self._model.provider().context_window
+        if model_window > 0:
+            return model_window
+        return DEFAULT_CONTEXT_LENGTH
+
+    def seed_session(
+        self,
+        session_id: SessionId,
+        task_id: TaskId,
+        task_instruction: str,
+    ) -> SessionState:
+        """Build the initial rich :class:`SessionState` for a run, seeding its
+        ``window_limit`` from :meth:`resolve_context_length` (issue #141).
+
+        The manager owns seeding so the resolved window has a single production
+        seam — callers get a ``SessionState`` whose ``window_limit`` already
+        reflects the configured/model/default resolution rather than the bare
+        :class:`SessionState` constructor default.
+        """
+
+        state = SessionState(
+            session_id=session_id,
+            task_id=task_id,
+            task_instruction=task_instruction,
+        )
+        state.window_limit = self.resolve_context_length()
+        return state
+
     # ---- assemble ---------------------------------------------------
 
     def _build_session_segments(self, state: SessionState) -> list[PromptSegment]:
@@ -939,6 +1028,7 @@ __all__ = [
     "ContextManager",
     "ContextMeta",
     "ContextSources",
+    "DEFAULT_CONTEXT_LENGTH",
     "Guide",
     "GuideId",
     "MemoryItem",
