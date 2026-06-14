@@ -336,6 +336,21 @@ const (
 	// STOPPED to resolve the node's BudgetExhaustedBehavior. Carries the Tool name
 	// and ConsecutiveErrors (= 2*N).
 	HarnessStreamToolErrorLoopBroken HarnessStreamEventKind = "tool_error_loop_broken"
+
+	// ── Output-schema enforcement (issue #139) ──────────────────────────────────
+
+	// HarnessStreamOutputSchemaRetry: output-schema enforcement fed a validation
+	// error back and RETRIED — the terminal FinalResponse failed validation against
+	// the leaf's output schema and a retry turn was granted (within budget). A
+	// warning — the loop continues. Carries the extra-retry count so far
+	// (= Attempt) and the frozen validator error fed back (= Content).
+	HarnessStreamOutputSchemaRetry HarnessStreamEventKind = "output_schema_retry"
+	// HarnessStreamOutputSchemaViolation: output-schema enforcement EXHAUSTED its
+	// retries — the terminal still failed validation after OutputSchemaMaxRetries
+	// extra turns (with budget remaining), so the run terminates with
+	// HaltOutputSchemaViolation. Carries the total attempt count (= Attempts =
+	// 1 + max_retries) and the final frozen validator error (= Content).
+	HarnessStreamOutputSchemaViolation HarnessStreamEventKind = "output_schema_violation"
 )
 
 // HarnessStreamEvent is one event emitted while the loop runs.
@@ -385,6 +400,12 @@ type HarnessStreamEvent struct {
 	// tool_error_loop_detected, tool_error_loop_broken (issue #137)
 	Tool              string `json:"-"`
 	ConsecutiveErrors uint32 `json:"-"`
+	// output_schema_retry (issue #139): the extra-retry count so far. The frozen
+	// validator error fed back rides the Content field above.
+	Attempt uint32 `json:"-"`
+	// output_schema_violation (issue #139): the total attempt count (1 + N). The
+	// final frozen validator error rides the Content field above.
+	Attempts uint32 `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -460,6 +481,18 @@ func (e HarnessStreamEvent) MarshalJSON() ([]byte, error) {
 			Tool              string                 `json:"tool"`
 			ConsecutiveErrors uint32                 `json:"consecutive_errors"`
 		}{e.Kind, e.Tool, e.ConsecutiveErrors})
+	case HarnessStreamOutputSchemaRetry:
+		return json.Marshal(struct {
+			Kind    HarnessStreamEventKind `json:"kind"`
+			Attempt uint32                 `json:"attempt"`
+			Error   string                 `json:"error"`
+		}{e.Kind, e.Attempt, e.Content})
+	case HarnessStreamOutputSchemaViolation:
+		return json.Marshal(struct {
+			Kind     HarnessStreamEventKind `json:"kind"`
+			Attempts uint32                 `json:"attempts"`
+			Error    string                 `json:"error"`
+		}{e.Kind, e.Attempts, e.Content})
 	default:
 		return nil, fmt.Errorf("HarnessStreamEvent: unknown kind %q", e.Kind)
 	}
@@ -2238,6 +2271,17 @@ const (
 	// detected error loop, not because the step budget ran out. Carries the
 	// offending Tool name and the ConsecutiveErrors count at the hard stop (2*N).
 	HaltToolErrorLoop HaltReasonKind = "tool_error_loop"
+	// HaltOutputSchemaViolation (issue #139) is returned when output-schema
+	// enforcement is ON (HarnessConfig.EnforceOutputSchemas) for a ReactConfig
+	// leaf carrying Output != nil, and the leaf's terminal FinalResponse STILL
+	// failed validation after the configured OutputSchemaMaxRetries extra turns
+	// were exhausted WITH budget remaining. DISTINCT from HaltBudgetExceeded: a
+	// budget/turn cap that a retry would exceed surfaces the budget terminal
+	// instead (budget-cap-wins precedence) — OutputSchemaViolation fires ONLY on a
+	// genuine validation exhaustion. Carries the resolved Schema (canonical
+	// compact key-sorted JSON), the total Attempts (1 + max_retries), and the
+	// LastError (the frozen validator error string from the final attempt).
+	HaltOutputSchemaViolation HaltReasonKind = "output_schema_violation"
 )
 
 // HaltReason carries the explicit reason a loop halted.
@@ -2278,6 +2322,12 @@ type HaltReason struct {
 	// recoverable-error count at the 2*N hard stop. The offending tool name reuses
 	// the Tool field above.
 	ConsecutiveErrors uint32 `json:"-"`
+	// output_schema_violation (issue #139): the resolved Schema (canonical compact
+	// key-sorted JSON), the total Attempts (1 + max_retries), and the LastError
+	// (the frozen validator error from the final attempt).
+	Schema    string `json:"-"`
+	Attempts  uint32 `json:"-"`
+	LastError string `json:"-"`
 }
 
 // MarshalJSON serialises as a flat tagged object.
@@ -2406,6 +2456,13 @@ func (h HaltReason) MarshalJSON() ([]byte, error) {
 			Tool              string         `json:"tool"`
 			ConsecutiveErrors uint32         `json:"consecutive_errors"`
 		}{h.Kind, h.Tool, h.ConsecutiveErrors})
+	case HaltOutputSchemaViolation:
+		return json.Marshal(struct {
+			Kind      HaltReasonKind `json:"kind"`
+			Schema    string         `json:"schema"`
+			Attempts  uint32         `json:"attempts"`
+			LastError string         `json:"last_error"`
+		}{h.Kind, h.Schema, h.Attempts, h.LastError})
 	default:
 		return nil, fmt.Errorf("HaltReason: unknown kind %q", h.Kind)
 	}
@@ -2431,6 +2488,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 		Blocked           []uint32          `json:"blocked"`
 		FailedTask        uint32            `json:"failed_task"`
 		ConsecutiveErrors uint32            `json:"consecutive_errors"`
+		Schema            string            `json:"schema"`
+		Attempts          uint32            `json:"attempts"`
+		LastError         string            `json:"last_error"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -2450,6 +2510,9 @@ func (h *HaltReason) UnmarshalJSON(data []byte) error {
 	h.Blocked = probe.Blocked
 	h.FailedTask = probe.FailedTask
 	h.ConsecutiveErrors = probe.ConsecutiveErrors
+	h.Schema = probe.Schema
+	h.Attempts = probe.Attempts
+	h.LastError = probe.LastError
 
 	switch probe.Kind {
 	case HaltAgentError:
@@ -2751,6 +2814,34 @@ type HarnessConfig struct {
 	// effectiveErrorLoopThreshold: nil -> 3 (the default), *=0 -> disabled, *=n ->
 	// n. Mirrors the house idiom for optional caps (e.g. BudgetLimits.MaxTurns).
 	ErrorLoopThreshold *uint32
+
+	// EnforceOutputSchemas is the output-schema enforcement MIGRATION GATE (issue
+	// #139) — NOT a permanent feature flag. When true, a ReactConfig leaf carrying
+	// Output != nil has its resolved output schema DELIVERED to the model
+	// (directive seed + the ModelParams.OutputSchema constrained-decoding channel)
+	// and its terminal FinalResponse VALIDATED against that schema; a validation
+	// failure feeds the frozen error back and retries up to
+	// OutputSchemaMaxRetries extra turns (within budget), then terminates with
+	// HaltOutputSchemaViolation. Enforcement is UNIFORM — it applies to
+	// structured-slot leaves (plan / worker / propose) too, and is additive to and
+	// earlier than any downstream combinator validation.
+	//
+	// Default false (OFF) is NON-NEGOTIABLE: it keeps every existing replay
+	// fixture byte-for-byte green during migration. When OFF, ReactConfig.Run
+	// behaves EXACTLY as before — no resolve, no delivery, no validation.
+	EnforceOutputSchemas bool
+
+	// OutputSchemaMaxRetries is the N extra terminal-validation retry turns
+	// granted when EnforceOutputSchemas is ON and a terminal fails output-schema
+	// validation (issue #139). Total attempts = 1 + N. Retried turns COUNT against
+	// the turn budget; a retry that would exceed the budget surfaces the budget
+	// terminal instead of HaltOutputSchemaViolation (budget-cap-wins precedence).
+	//
+	// Pointer sentinel (mirrors ErrorLoopThreshold, #137): a nil field on a
+	// default-constructed config yields the cross-language default of 2; an
+	// EXPLICIT 0 is honored (0 extra turns ⇒ the first invalid terminal is a
+	// violation). Read it via effectiveOutputSchemaMaxRetries.
+	OutputSchemaMaxRetries *uint32
 
 	// MaxResets is the outer-loop context-window reset cap for the Ralph loop
 	// strategy (issue #58, B3): the maximum number of context windows the
@@ -3074,6 +3165,19 @@ func (c HarnessConfig) effectiveErrorLoopThreshold() uint32 {
 		return 3
 	}
 	return *c.ErrorLoopThreshold
+}
+
+// effectiveOutputSchemaMaxRetries returns N, the extra terminal-validation retry
+// turns granted under output-schema enforcement (issue #139; total attempts =
+// 1 + N). A nil OutputSchemaMaxRetries (a default-constructed config) yields the
+// cross-language default of 2; a non-nil pointer is honored verbatim, so an
+// EXPLICIT 0 means the first invalid terminal is a violation. Mirrors the
+// effectiveErrorLoopThreshold pointer-sentinel idiom (#137).
+func (c HarnessConfig) effectiveOutputSchemaMaxRetries() uint32 {
+	if c.OutputSchemaMaxRetries == nil {
+		return 2
+	}
+	return *c.OutputSchemaMaxRetries
 }
 
 // durableNamespace returns the key axis for DURABLE artifacts (#142): the pinned
@@ -3540,8 +3644,8 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 // resolved toolset handle is threaded down alongside the agent so the window
 // dispatches the per-node scoped catalogue (empty handle ⇒ global-catalogue
 // fallback).
-func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef) RunResult {
-	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset)
+func (h *StandardHarness) ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32) RunResult {
+	return h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, toolset, outputSchema, outputSchemaMaxRetries)
 }
 
 // ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from the
@@ -3995,7 +4099,10 @@ func (h *StandardHarness) runReAct(
 	// single-shot run, the resume paths) carry no per-node toolset handle, so they
 	// keep the global-catalogue fallback (empty handle) — byte-for-byte with
 	// pre-Issue-2 behaviour.
-	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""))
+	// Issue #139: the legacy wrapper does NOT enforce output schemas (the recursive
+	// ReactConfig.Run is the single enforcement seam). nil/0 ⇒ byte-for-byte
+	// pre-#139.
+	result := h.runReActInner(ctx, task, maxIterations, session, budget, onStream, agent, ToolsetRef(""), nil, 0)
 	switch result.Kind {
 	case RunSuccess:
 		h.finalizeObservability(ctx, result.SessionID, TerminalSuccess, "")
@@ -4057,6 +4164,8 @@ func haltReasonString(r HaltReason) string {
 		return fmt.Sprintf("stagnation limit reached after %d non-improvements (best %.6f)", r.Iterations, r.BestMetric)
 	case HaltHillClimbingMisconfigured:
 		return fmt.Sprintf("hill-climbing misconfigured: %s", r.Reason)
+	case HaltOutputSchemaViolation:
+		return fmt.Sprintf("output schema violation after %d attempts: %s", r.Attempts, r.LastError)
 	default:
 		return string(r.Kind)
 	}
@@ -4297,6 +4406,15 @@ func (h *StandardHarness) runReActInner(
 	// global-catalogue fallback; a non-empty handle with its own per-key catalogue
 	// ⇒ strict per-node scoping.
 	toolset ToolsetRef,
+	// Issue #139: the leaf's RESOLVED output schema (nil ⇒ no enforcement,
+	// identical to pre-#139 behavior). When non-nil, the terminal is validated
+	// against it (frozen validator subset) and a validation failure feeds the
+	// frozen error back + retries up to outputSchemaMaxRetries extra turns WITHIN
+	// budget; on exhaustion WITH budget remaining the window returns
+	// HaltOutputSchemaViolation. The schema is also set on every turn's
+	// ModelParams.OutputSchema so the Ollama `format` channel constrains decoding.
+	outputSchema json.RawMessage,
+	outputSchemaMaxRetries uint32,
 ) (out RunResult) {
 	// Issue #102 part 1: stamp the post-run conversation history onto the
 	// terminal Success/Failure result. The loop mutates `session` in place
@@ -4345,6 +4463,15 @@ func (h *StandardHarness) runReActInner(
 	// 2*N.
 	errorLoopN := h.config.effectiveErrorLoopThreshold()
 	errorRuns := map[string]*errorRun{}
+
+	// Output-schema enforcement state (issue #139), loop-local to this window.
+	// outputSchemaRetriesUsed counts the EXTRA retry turns spent on validation
+	// feedback; the budget for them is outputSchemaMaxRetries (the N).
+	// lastSchemaError holds the most recent frozen validator error so a final
+	// exhaustion can report it. Both are inert when outputSchema is nil
+	// (enforcement OFF / no schema).
+	var outputSchemaRetriesUsed uint32
+	var lastSchemaError string
 
 	effectiveTurnCap := maxIterations
 	if task.Budget.MaxTurns != nil && *task.Budget.MaxTurns < effectiveTurnCap {
@@ -4436,6 +4563,13 @@ func (h *StandardHarness) runReActInner(
 		// configured params (e.g. structured tool calls) to every tool-requesting
 		// ReAct / execute / streaming turn.
 		c.Params = h.config.ModelParams
+		// Issue #139: route the enforced output schema into this turn's
+		// constrained-decoding channel (ModelParams.OutputSchema). Ollama honors it
+		// via `format`; Anthropic/OpenAI ignore it (a no-op, like
+		// StructuredToolCalls). nil leaves the params byte-identical to pre-#139.
+		if outputSchema != nil {
+			c.Params.OutputSchema = outputSchema
+		}
 		emit(onStream, HarnessStreamEvent{Kind: HarnessStreamTurnStart, Turn: budget.Turns + 1})
 		turnStartedAt := nowRFC3339()
 		turnClock := time.Now()
@@ -4574,6 +4708,58 @@ func (h *StandardHarness) runReActInner(
 			if reason, blocked := h.fireStopHooks(ctx, sessionID, &task, budget.Turns, result.Content, &session, &stopBlocks); blocked {
 				h.config.ContextManager.AppendUserMessage(ctx, &session, reason)
 				continue
+			}
+
+			// Output-schema enforcement gate (issue #139). Additive to and EARLIER
+			// than the Success terminal: when a schema is active, validate this
+			// terminal FinalResponse. On a validation FAILURE, feed the frozen error
+			// back as a USER message and retry one more turn (up to
+			// outputSchemaMaxRetries extra turns). The retried turn re-enters the loop
+			// top, where the budget gate fires FIRST — so a retry that would exceed the
+			// turn/budget backstop surfaces the existing HaltBudgetExceeded terminal,
+			// NOT HaltOutputSchemaViolation (budget-cap-wins precedence). Only when the
+			// N retries are exhausted WITH budget remaining does the window terminate
+			// with HaltOutputSchemaViolation. A nil schema ⇒ no validation (migration
+			// gate OFF / no Output), so the terminal is byte-identical to pre-#139.
+			if outputSchema != nil {
+				if verr := validateOutput(result.Content, outputSchema); verr != "" {
+					lastSchemaError = verr
+					if outputSchemaRetriesUsed < outputSchemaMaxRetries {
+						// Grant one more turn: feed the validator error back as a USER
+						// message (the assistant's invalid text is already in history
+						// above) and loop. The budget gate at the loop top enforces the
+						// budget-cap-wins precedence.
+						outputSchemaRetriesUsed++
+						emit(onStream, HarnessStreamEvent{
+							Kind:    HarnessStreamOutputSchemaRetry,
+							Attempt: outputSchemaRetriesUsed,
+							Content: verr,
+						})
+						h.config.ContextManager.AppendUserMessage(ctx, &session, feedbackMessage(verr))
+						continue
+					}
+					// Retries exhausted WITH budget remaining (the budget gate did not
+					// fire) → the typed schema-violation terminal. Total attempts =
+					// 1 + max_retries.
+					attempts := outputSchemaMaxRetries + 1
+					emit(onStream, HarnessStreamEvent{
+						Kind:     HarnessStreamOutputSchemaViolation,
+						Attempts: attempts,
+						Content:  lastSchemaError,
+					})
+					return RunResult{
+						Kind: RunFailure,
+						Reason: HaltReason{
+							Kind:      HaltOutputSchemaViolation,
+							Schema:    canonicalizeSchema(outputSchema),
+							Attempts:  attempts,
+							LastError: lastSchemaError,
+						},
+						SessionID: sessionID,
+						Usage:     usage,
+						Turns:     budget.Turns,
+					}
+				}
 			}
 
 			emit(onStream, HarnessStreamEvent{Kind: HarnessStreamFinalResponse, Content: result.Content})

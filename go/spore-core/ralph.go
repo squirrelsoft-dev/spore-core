@@ -286,3 +286,17 @@ func (h *StandardHarness) RalphMaxResets() uint32 {
 func (h *StandardHarness) EscalationMode() EscalationMode {
 	return h.config.EffectiveEscalationMode()
 }
+
+// EnforceOutputSchemas returns the output-schema enforcement MIGRATION GATE
+// (issue #139). false (the default) keeps ReactConfig.Run byte-identical to
+// pre-#139. Read by the recursive ReactConfig.Run.
+func (h *StandardHarness) EnforceOutputSchemas() bool {
+	return h.config.EnforceOutputSchemas
+}
+
+// OutputSchemaMaxRetries returns N, the extra terminal-validation retry turns
+// granted under output-schema enforcement (issue #139; total attempts = 1 + N),
+// defaulting a nil config field to 2 via effectiveOutputSchemaMaxRetries.
+func (h *StandardHarness) OutputSchemaMaxRetries() uint32 {
+	return h.config.effectiveOutputSchemaMaxRetries()
+}

@@ -238,6 +238,17 @@ type ModelParams struct {
 	// of the serialized request so the cross-language request hash stays
 	// byte-identical when the flag is off (mirrors Rust's skip_serializing_if).
 	StructuredToolCalls bool `json:"structured_tool_calls,omitempty"`
+	// OutputSchema is the terminal-turn output schema delivered to the model's
+	// constrained-decoding channel (issue #139). When non-empty, providers that
+	// support constrained decoding (Ollama via the `format` JSON-schema
+	// parameter) force the response onto the schema. Providers without it
+	// (Anthropic / OpenAI) IGNORE it — a no-op, exactly like StructuredToolCalls.
+	// The harness sets this only for the turns of a ReactConfig leaf with
+	// Output != nil when EnforceOutputSchemas is ON. Nil (the default) keeps
+	// every existing fixture byte-identical (the `omitempty` tag drops an empty
+	// RawMessage from the serialized request, mirroring Rust's
+	// skip_serializing_if = "Option::is_none").
+	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
 }
 
 // MarshalJSON ensures StopSequences serialises as [] rather than null.

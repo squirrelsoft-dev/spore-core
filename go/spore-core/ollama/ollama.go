@@ -347,6 +347,16 @@ func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream 
 				},
 			})
 		}
+		// Issue #139: the harness sets req.Params.OutputSchema for the terminal turn
+		// of an output-schema-enforced ReAct leaf. Route it into the same `format`
+		// constrained-decoding channel the structured-tool-calls path uses, so the
+		// model is forced onto the schema — even with NO tools. (When structured tool
+		// calls ARE active, that schema wins via the `if structured` arm above, since
+		// the leaf is still requesting tools, not emitting its terminal.) Absent (the
+		// default) leaves format nil, byte-identical to pre-#139.
+		if len(req.Params.OutputSchema) > 0 {
+			format = req.Params.OutputSchema
+		}
 	}
 
 	opts := &wireOptions{

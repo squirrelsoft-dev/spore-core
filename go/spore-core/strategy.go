@@ -744,6 +744,31 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	}
 	session := cx.takeSession()
 	budget := cx.Scratch.RunBudget
+
+	// Output-schema delivery + enforcement (issue #139). MIGRATION GATE: only when
+	// EnforceOutputSchemas is ON AND this leaf carries Output != nil do we resolve
+	// the schema, DELIVER it (directive seed + the constrained-decoding channel),
+	// and pass it (plus the retry budget N) into the window for terminal
+	// validation. When the gate is OFF or there is no Output, outputSchema is nil
+	// and the window behaves byte-identically to pre-#139 (no resolve, no delivery,
+	// no validation). The schema is canonicalized to compact key-sorted JSON so its
+	// delivered/reported bytes are identical across the four language ports.
+	var outputSchema json.RawMessage
+	if executor.EnforceOutputSchemas() && c.Output != nil {
+		if resolved, ok := cx.Registry.ResolveSchema(*c.Output); ok {
+			outputSchema = resolved
+		}
+	}
+	outputSchemaMaxRetries := executor.OutputSchemaMaxRetries()
+	if outputSchema != nil {
+		// AC1: append the resolved schema to the leaf's directive/system context as a
+		// USER message, key-sorted via canonicalizeSchema so the seeded bytes are
+		// identical across languages.
+		directive := "Your final response must be a JSON value that conforms to this " +
+			"JSON schema: " + canonicalizeSchema(outputSchema)
+		executor.SeedUserMessage(ctx, &session, directive)
+	}
+
 	// #125/#129: push this leaf's OWN budget scope carrying its CONFIGURED
 	// Behavior. The leaf still never RESOLVES it in the nested case (rule 6: it
 	// PROPAGATES a BudgetExhausted to its parent, which owns the single recovery
@@ -757,7 +782,9 @@ func (c *ReactConfig) Run(ctx context.Context, cx *ExecutionContext) StrategyOut
 	// Issue 2: thread THIS leaf's toolset handle down so the window dispatches the
 	// per-node scoped catalogue (empty handle ⇒ global-catalogue fallback).
 	// Mirrors agent resolution.
-	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset)
+	// Issue #139: thread the resolved output schema (or nil) and the retry budget
+	// so the window validates the terminal.
+	result := executor.ReactWindow(ctx, task, c.MaxIterations(), session, budget, onStream, agent, c.Toolset, outputSchema, outputSchemaMaxRetries)
 	executor.Finalize(ctx, result)
 
 	// #125: charge the window's turns against this leaf's OWN scope. The leaf

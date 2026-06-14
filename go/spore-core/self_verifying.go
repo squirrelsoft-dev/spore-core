@@ -227,7 +227,9 @@ func (h *StandardHarness) EvaluatePhase(
 
 	// Issue 2: the evaluate phase carries no per-node toolset handle, so it threads
 	// the EMPTY handle → global-catalogue fallback, byte-for-byte.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""))
+	// Issue #139: the evaluate phase does NOT enforce output schemas (only the
+	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""), nil, 0)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }

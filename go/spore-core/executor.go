@@ -113,7 +113,16 @@ type StrategyExecutor interface {
 	// Issue 2 (per-node toolset scoping): toolset is the leaf's RESOLVED toolset
 	// handle, threaded down alongside agent so the window dispatches the per-node
 	// scoped catalogue (empty handle "" ⇒ global-catalogue fallback).
-	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef) RunResult
+	//
+	// Issue #139 (output-schema enforcement): outputSchema is the leaf's RESOLVED
+	// output schema (nil ⇒ no enforcement, byte-identical to pre-#139). When
+	// non-nil the terminal is validated against it (frozen validator subset); a
+	// validation failure feeds the frozen error back + retries up to
+	// outputSchemaMaxRetries extra turns WITHIN budget; on exhaustion WITH budget
+	// remaining the window returns HaltOutputSchemaViolation. The schema is also
+	// set on every turn's ModelParams.OutputSchema so the Ollama `format` channel
+	// constrains decoding (Anthropic/OpenAI ignore it).
+	ReactWindow(ctx context.Context, task Task, maxIterations uint32, session SessionState, budget BudgetSnapshot, onStream StreamSink, agent Agent, toolset ToolsetRef, outputSchema json.RawMessage, outputSchemaMaxRetries uint32) RunResult
 
 	// ResolveWorkerAgent resolves the worker agent for a LoopStrategy tree from
 	// the ExecutionRegistry (#124): the agent on the LEAF reached by descending
@@ -159,6 +168,18 @@ type StrategyExecutor interface {
 	// propagate-up behavior is unchanged. The config bodies only hold a
 	// StrategyExecutor, so this accessor is how they read the knob.
 	EscalationMode() EscalationMode
+
+	// EnforceOutputSchemas is the output-schema enforcement MIGRATION GATE (issue
+	// #139). false (the default) means ReactConfig.Run never
+	// resolves/delivers/validates a leaf's Output schema — byte-identical to
+	// pre-#139. The config bodies only hold a StrategyExecutor, so they read it
+	// through this accessor (mirrors EscalationMode).
+	EnforceOutputSchemas() bool
+
+	// OutputSchemaMaxRetries is the number of EXTRA terminal-validation retry turns
+	// N granted under output-schema enforcement (issue #139; total attempts =
+	// 1 + N). Read by ReactConfig.Run to thread into the window. Default 2.
+	OutputSchemaMaxRetries() uint32
 
 	// HillEvaluate runs one HillClimbing metric evaluation on the resolved
 	// evaluator over a fresh SessionState (#124). On success ok is true and

@@ -311,6 +311,35 @@ func TestBuildRequestStructuredOffWhenNoTools(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// output-schema constrained decoding (issue #139)
+// ---------------------------------------------------------------------------
+
+func TestBuildRequestOutputSchemaPopulatesFormatChannel(t *testing.T) {
+	// #139 AC1: req.Params.OutputSchema (set by the harness for an
+	// output-schema-enforced terminal turn) routes into the Ollama `format`
+	// constrained-decoding channel verbatim, even with NO tools.
+	schema := json.RawMessage(`{"type":"object","properties":{"status":{"type":"string","enum":["ok","error"]}},"required":["status"]}`)
+	r := req(userMsg("answer"))
+	r.Params.OutputSchema = schema
+	body := buildRequest("llama3.2", "", r, false)
+	if len(body.Format) == 0 {
+		t.Fatalf("output_schema must populate the Ollama `format` channel")
+	}
+	if string(body.Format) != string(schema) {
+		t.Fatalf("format = %s, want %s", body.Format, schema)
+	}
+}
+
+func TestBuildRequestNoOutputSchemaLeavesFormatNil(t *testing.T) {
+	// Absent output_schema (the default) keeps `format` nil — byte-identical to
+	// pre-#139.
+	body := buildRequest("llama3.2", "", req(userMsg("hi")), false)
+	if len(body.Format) != 0 {
+		t.Fatalf("format must be nil without output_schema: %s", body.Format)
+	}
+}
+
 func TestBuildRequestStructuredOffByDefault(t *testing.T) {
 	// Flag default off with tools present → native tools, no format.
 	r := req(userMsg("hi"))
