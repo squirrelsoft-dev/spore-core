@@ -33,6 +33,13 @@
 //!   the new prompt is appended on top. So the agent remembers the dialogue, not
 //!   just what's on disk. (Type `clear` to reset the conversation; the
 //!   conversational `ContextManager` compacts it when the window fills.)
+//! - **Auto-continue on a budget pause.** A node's step budget is finite, so a
+//!   long task can spend it mid-flight. The conversational harness then PAUSES
+//!   (`WaitingForHuman { BudgetExhausted }` — its default
+//!   `EscalationMode::SurfaceToHuman`). The REPL answers that pause itself,
+//!   resuming with a `ContinueWithBudget` grant up to [`MAX_AUTO_CONTINUES`] times
+//!   so the plan gets worked to completion without you babysitting it. The resume
+//!   re-seeds the stalled worker, so no work is lost (see [`drive`]).
 //! - **A real coding sandbox.** Catalogue file tools go through a
 //!   [`WorkspaceScopedSandbox`] scoped to the workspace ROOT — by default the
 //!   directory you launched from, so running at your project root lets the agent
@@ -48,7 +55,7 @@
 //! - **Esc-to-abort, without losing context.** A run executes with the terminal
 //!   in raw mode and a background key watcher; pressing Esc drops the
 //!   `harness.run(..)` future, cancelling the in-flight turn at its next await
-//!   point, and drops back to the REPL (see [`run_turn`]). A dropped future never
+//!   point, and drops back to the REPL (see [`run_abortable`]). A dropped future never
 //!   returns its `session_state`, so the turn's progress would be lost — instead
 //!   we mirror the turn from the stream as it happens (each [`HarnessStreamEvent`]
 //!   carries the `call_id` that pairs a result to its call) and, on abort, splice
@@ -69,12 +76,13 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use spore_core::{
-    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, FunctionHook,
-    Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent,
-    HookChain, HookContext, HookDecision, HookEvent, LoopStrategy, Message, NullCacheProvider,
-    OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult, SchemaRef, SessionId,
-    SessionState, StandardContextManager, StandardHookChain, StandardTools, Task, ToolCall,
-    ToolResult, ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
+    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, EscalationAction,
+    FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
+    HarnessStreamEvent, HookChain, HookContext, HookDecision, HookEvent, HumanRequest,
+    HumanResponse, LoopStrategy, Message, NullCacheProvider, OllamaModelInterface,
+    PlanExecuteConfig, ReactConfig, Role, RunResult, SchemaRef, SessionId, SessionState,
+    StandardContextManager, StandardHookChain, StandardTools, Task, ToolCall, ToolResult,
+    ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
@@ -99,6 +107,17 @@ const MAX_STEPS: u32 = 25;
 /// Per-loop ReAct step budget for the PLAN phase — a few turns for the planner to
 /// look around (read_file / grep / list_dir) before it emits its JSON plan.
 const PLAN_STEPS: u32 = 12;
+
+/// When a turn pauses because a step budget was spent, the REPL auto-grants more
+/// budget and resumes — up to this many times per turn — so the agent keeps
+/// working the task list without you babysitting it. The cap stops a stuck task
+/// from burning tokens forever; if it's hit, the turn ends with a note.
+const MAX_AUTO_CONTINUES: u32 = 10;
+
+/// Steps granted on each auto-continue. `ContinueWithBudget` raises the exhausted
+/// scope's cap past where it stopped, so the in-flight task gets this many more
+/// steps (and its stalled worker is re-seeded — no work is lost).
+const CONTINUE_STEPS: u32 = MAX_STEPS;
 
 /// Registry key for the plan slot's output schema. The PlanExecute `plan` slot is
 /// STRUCTURED — startup validation rejects a bare ReAct there unless its leaf
@@ -255,15 +274,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // onto the prior history — otherwise the aborted work would be forgotten.
         let turn_msgs: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Print each turn (Think) and each catalogue tool call + result (Act /
-        // Observe). Lines END WITH `\r\n`, not `\n`: the run executes with the
-        // terminal in raw mode (so a bare Esc can abort it), and raw mode turns
-        // off the kernel's `\n`→`\r\n` translation — without the `\r` the trace
-        // would stair-step to the right. The stray `\r` is harmless when raw mode
-        // isn't active (the non-TTY fallback in `run_turn`).
-        let sink = turn_msgs.clone();
-        let mut options = HarnessRunOptions::new(task).with_stream(Box::new(
-            move |event: HarnessStreamEvent| match event {
+        // The stream sink prints each turn (Think) and each tool call + result
+        // (Act / Observe) AND mirrors the turn into `turn_msgs` for the abort path.
+        // It's built as a shareable `Arc` so the SAME sink feeds both the initial
+        // run and any budget-grant resumes (see `drive`). Lines END WITH `\r\n`,
+        // not `\n`: the run executes with the terminal in raw mode (so a bare Esc
+        // can abort it), and raw mode turns off the kernel's `\n`→`\r\n`
+        // translation — without the `\r` the trace would stair-step to the right.
+        // The stray `\r` is harmless when raw mode isn't active (the non-TTY
+        // fallback in `run_abortable`).
+        let mirror = turn_msgs.clone();
+        let sink: Arc<dyn Fn(HarnessStreamEvent) + Send + Sync> =
+            Arc::new(move |event: HarnessStreamEvent| match event {
                 // The agent's running narration via `send_message` is the section
                 // header: bright white and flush left. This — plus the final
                 // answer — is all the user is really meant to read. (Not recorded:
@@ -282,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 } => {
                     print!("{MUTED}   act → {name}({args}){RESET}\r\n");
-                    sink.lock().unwrap().push(Message {
+                    mirror.lock().unwrap().push(Message {
                         role: Role::Assistant,
                         content: Content::ToolCall(ToolCall {
                             id: call_id,
@@ -303,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (MUTED, "obs")
                     };
                     print!("{color}   {tag} → {}{RESET}\r\n", truncate(&content, 200));
-                    sink.lock().unwrap().push(Message {
+                    mirror.lock().unwrap().push(Message {
                         role: Role::Tool,
                         content: Content::ToolResult(ToolResult {
                             tool_use_id: call_id,
@@ -313,8 +335,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 _ => {}
-            },
-        ));
+            });
+        // Assign `on_stream` directly (it's a public `Option<StreamSink>`) rather
+        // than `with_stream`, which wants a bare `Fn` — our sink is already the
+        // shared `Arc` so we can hand the SAME one to `resume` inside `drive`.
+        let mut options = HarnessRunOptions::new(task);
+        options.on_stream = Some(sink.clone());
         // Carry the running conversation into this turn (no-op on the first).
         // CLONE rather than take: an aborted run never hands back a post-run
         // state, so keeping `history` intact lets us rebuild from it below.
@@ -322,8 +348,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options = options.with_session_state(state.clone());
         }
 
-        // `run_turn` runs with Esc-to-abort armed and returns `None` if aborted.
-        match run_turn(&harness, options).await {
+        // `drive` runs the turn to a terminal result — auto-granting more budget
+        // when it pauses on a spent budget so the plan gets worked to completion —
+        // and stays Esc-abortable throughout. `None` ⇒ the user aborted.
+        match drive(&harness, options, sink).await {
             None => {
                 // Reconstruct the aborted turn so "continue" still has context:
                 // prior history + this turn's user prompt + the tool calls/results
@@ -370,8 +398,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 history = Some(session_state);
                 eprintln!("\nrun did not succeed: {reason:?}\n");
             }
-            Some(other) => {
-                eprintln!("\nrun did not succeed: {other:?}\n");
+            Some(RunResult::WaitingForHuman { state, .. }) => {
+                // The auto-continue cap was hit (or an unexpected human request
+                // surfaced). Keep the conversation so a follow-up prompt can build
+                // on it; the durable task list still holds the remaining work.
+                history = Some(state.session_state.clone());
+                eprintln!(
+                    "\n⏸ still working after {MAX_AUTO_CONTINUES} budget grants — the plan \
+                     isn't finished. Send another prompt to keep going (or `clear` to reset).\n"
+                );
+            }
+            Some(RunResult::Consult { state, .. }) | Some(RunResult::Escalate { state, .. }) => {
+                // Not expected in this single-agent example, but handle it cleanly
+                // rather than dumping the paused state.
+                history = Some(state.session_state.clone());
+                eprintln!("\n⏸ run paused (consult/escalate) — send another prompt to continue.\n");
             }
         }
     }
@@ -418,7 +459,7 @@ fn plan_execute_strategy() -> LoopStrategy {
 /// [`HarnessBuilder::hooks`].
 ///
 /// Lines end with `\r\n` for the same reason the stream trace does — the run is in
-/// raw mode while this fires (see [`run_turn`]).
+/// raw mode while this fires (see [`run_abortable`]).
 fn plan_announcer() -> Arc<dyn HookChain> {
     let chain = StandardHookChain::new();
     let _ = chain.register(Arc::new(FunctionHook::new(
@@ -437,22 +478,70 @@ fn plan_announcer() -> Arc<dyn HookChain> {
     Arc::new(chain)
 }
 
-/// Run one task with **Esc-to-abort** armed. Returns `Some(result)` if the run
-/// finished on its own, or `None` if the user pressed Esc (the run is cancelled
-/// and we fall back to the REPL).
+/// Drive a freshly-built run to a TERMINAL result, auto-granting more budget when
+/// it pauses on a spent step budget so the agent keeps working the task list
+/// without you babysitting it.
+///
+/// Each `harness.run` / `harness.resume` step runs under [`run_abortable`] (Esc
+/// cancels it). When a step returns `WaitingForHuman { BudgetExhausted }` — which
+/// the conversational harness does by default (`EscalationMode::SurfaceToHuman`)
+/// when a node's step budget is spent — we resume it with a `ContinueWithBudget`
+/// grant. That raises the exhausted scope's cap AND re-seeds the stalled worker,
+/// so the in-flight task continues mid-loop without losing work. We do this up to
+/// [`MAX_AUTO_CONTINUES`] times; beyond that (or for any non-budget pause) the
+/// pause is handed back to the caller verbatim.
+///
+/// Returns `None` if the user aborted with Esc at any point.
+async fn drive(
+    harness: &dyn Harness,
+    options: HarnessRunOptions,
+    sink: Arc<dyn Fn(HarnessStreamEvent) + Send + Sync>,
+) -> Option<RunResult> {
+    let mut result = run_abortable(harness.run(options)).await?;
+    let mut granted = 0u32;
+    while let RunResult::WaitingForHuman { state, request } = result {
+        // Only auto-resume a BUDGET pause, and only up to the cap. Anything else
+        // goes back to the caller untouched.
+        if granted >= MAX_AUTO_CONTINUES || !matches!(request, HumanRequest::BudgetExhausted { .. })
+        {
+            return Some(RunResult::WaitingForHuman { state, request });
+        }
+        granted += 1;
+        // Printed between runs, so raw mode is off here — a plain `\n` is correct.
+        println!(
+            "{MUTED}   … step budget reached — granting {CONTINUE_STEPS} more \
+             ({granted}/{MAX_AUTO_CONTINUES}){RESET}"
+        );
+        let response = HumanResponse::Escalate {
+            action: EscalationAction::ContinueWithBudget {
+                steps: CONTINUE_STEPS,
+            },
+        };
+        result = run_abortable(harness.resume(*state, response, Some(sink.clone()))).await?;
+    }
+    Some(result)
+}
+
+/// Run one terminal-producing future (`harness.run` or `harness.resume`) with
+/// **Esc-to-abort** armed. Returns `Some(result)` if it finished on its own, or
+/// `None` if the user pressed Esc (the future is dropped, cancelling the in-flight
+/// turn at its next await point).
 ///
 /// How it works: put the terminal in raw mode so a single Esc keypress is
-/// readable without an Enter, then `select!` the harness run against a background
-/// watcher that blocks on key events. If Esc wins, the `harness.run(..)` future
-/// is dropped — which cancels the in-flight turn at its next await point — and we
-/// return `None`. Raw mode is always restored before returning. If raw mode
-/// can't be enabled (e.g. stdin isn't a TTY), we just run without the watcher.
-async fn run_turn(harness: &dyn Harness, options: HarnessRunOptions) -> Option<RunResult> {
+/// readable without an Enter, then `select!` the future against a background
+/// watcher that blocks on key events. If Esc wins, `fut` is dropped — which
+/// cancels the in-flight turn — and we return `None`. Raw mode is always restored
+/// before returning. If raw mode can't be enabled (e.g. stdin isn't a TTY), we
+/// just await the future without the watcher.
+async fn run_abortable<F>(fut: F) -> Option<RunResult>
+where
+    F: std::future::Future<Output = RunResult>,
+{
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     if crossterm::terminal::enable_raw_mode().is_err() {
-        return Some(harness.run(options).await);
+        return Some(fut.await);
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -461,8 +550,9 @@ async fn run_turn(harness: &dyn Harness, options: HarnessRunOptions) -> Option<R
         tokio::task::spawn_blocking(move || watch_for_escape(&stop))
     };
 
+    tokio::pin!(fut);
     let result = tokio::select! {
-        r = harness.run(options) => {
+        r = &mut fut => {
             // The run finished first — tell the watcher to stop and join it so it
             // releases stdin before the REPL reads the next prompt.
             stop.store(true, Ordering::Relaxed);
@@ -470,8 +560,8 @@ async fn run_turn(harness: &dyn Harness, options: HarnessRunOptions) -> Option<R
             Some(r)
         }
         _ = &mut watcher => {
-            // Esc was pressed. Dropping the `harness.run` future (it's the other
-            // select branch) cancels the turn. Prior history is untouched.
+            // Esc was pressed. Dropping `fut` (the other select branch) cancels
+            // the turn. Prior history is untouched.
             None
         }
     };

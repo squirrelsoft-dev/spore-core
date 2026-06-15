@@ -97,6 +97,33 @@ tasks to the same conversation.
 The plan is printed the moment it's captured, via an `OnPlanCreated` hook
 (`plan_announcer()`), so you see the task list before the execute phase starts.
 
+### Working the list to completion (budget auto-continue)
+
+Every node runs under a finite step budget (the execute leaf is `PerLoop { 25 }`),
+so a meaty task can spend it mid-flight. When that happens the conversational
+harness PAUSES rather than failing — it returns
+`WaitingForHuman { BudgetExhausted }`, because its default escalation mode is
+`SurfaceToHuman`. Left unhandled, that pause is where the run stops (and a naive
+REPL would just print the giant paused-state blob).
+
+So the REPL answers the pause itself. `drive()` resumes the run with a
+`ContinueWithBudget` grant — which raises the exhausted scope's cap **and**
+re-seeds the stalled worker, so the in-flight task picks up exactly where it left
+off, no work lost — and repeats up to `MAX_AUTO_CONTINUES` (10) times:
+
+```
+   act → write_file({"path":"greeting.txt", …})
+   obs → wrote 13 bytes to greeting.txt
+   … step budget reached — granting 25 more (1/10)
+   think · turn 2
+   act → read_file({"path":"greeting.txt"})
+   obs → Hello, spore
+answer (…): created greeting.txt and confirmed its contents.
+```
+
+Each resume is still Esc-abortable. If the cap is hit the turn ends with a note
+(the plan isn't lost — it's durable; send another prompt to keep going).
+
 ### State lives in BOTH the session and on disk
 
 Two things carry across REPL turns:
@@ -151,7 +178,7 @@ work, keeping you in the loop without spending an extra turn.
 
 A run going sideways? Press **Esc** and it drops back to the `code>` prompt. The
 run executes with the terminal in raw mode alongside a background key watcher
-(`run_turn`); an Esc drops the `harness.run(..)` future, which cancels the
+(`run_abortable`); an Esc drops the `harness.run(..)` future, which cancels the
 in-flight turn at its next await point.
 
 The catch: a dropped future never hands back its `session_state`, so naively the
