@@ -1,172 +1,83 @@
-# Example 12 — cordyceps (the Composable Execution capstone)
+# Example 12 — cordyceps (a basic ReAct coding agent)
 
-The capstone of the Composable Execution refactor (#117–#131). It wires and runs
-the motivating composition end-to-end:
+A super-basic **ReAct coding agent** in a REPL. It is
+[`04-filesystem-agent`](../04-filesystem-agent/README.md) with two changes:
 
-```text
-Ralph[ PlanExecute[ ReAct, SelfVerifying[ ReAct ] ] ]
-```
+1. the workspace sandbox is **read-write** and the agent gets the full
+   `StandardTools::coding_set()` (read / write / edit / list / grep / find +
+   `bash`), so it can actually change code; and
+2. the single `harness.run(...)` is wrapped in a **REPL** — build the harness
+   once, then read a task per line and run a fresh ReAct loop for each.
 
-```text
-Ralph (continuation wrapper)        agent: ralph-agent
-  resets the context window, resumes from durable task_list progress
-  └─ PlanExecute
-       ├─ plan:    ReAct            agent: planner   toolset: plan-tools   out: plan-schema   budget: PerLoop{12}
-       │           explores the repo, builds a blocker-aware task graph via `task_list`
-       └─ execute: SelfVerifying     evaluator: exec-evaluator (Default-FAIL)
-            └─ worker: ReAct         agent: executor  toolset: exec-tools   out: worker-schema  budget: PerLoop{12}
-                       audits ONE module per ready task, dependency-ordered
-```
+Everything else is 04 verbatim: the same `conversational(model)` builder, the
+same `ReAct` loop, the same stream-printed `think` / `act` / `obs` trace.
 
-The whole tree shares ONE budget / usage / observability context. A single
-runaway node is bounded by its own `BudgetPolicy` without cascading to unrelated
-tasks. A paused tree resumes by re-resolving handles, with no reconfiguration.
+## The contrast with 04
 
-## The big idea: the strategy is DATA
-
-You do not write the loop. You describe it as a composed `LoopStrategy` tree —
-here loaded VERBATIM from the canonical fixture
-`fixtures/strategy/cordyceps_tree.json`:
+|            | 04 — filesystem-agent                       | 12 — coding agent                                 |
+| ---------- | ------------------------------------------- | ------------------------------------------------- |
+| Builder    | `conversational(model)`                     | `conversational(model)` *(same)*                  |
+| Loop       | `ReAct`                                      | `ReAct` *(same)*                                  |
+| Tools      | `coding_set()`                               | `coding_set()` *(same)*                           |
+| Sandbox    | `WorkspaceScopedSandbox` (read-only effect) | `WorkspaceScopedSandbox` over `workspace/` (read-write) |
+| Driver     | one `harness.run(...)`                       | a REPL: harness built once, run per typed task    |
 
 ```rust
-let tree: LoopStrategy = serde_json::from_str(CORDYCEPS_TREE_JSON)?;
-```
-
-The tree carries only serializable string HANDLES (`planner`, `exec-tools`,
-`worker-schema`, `exec-evaluator`, …). At run entry the harness resolves each
-handle against an `ExecutionRegistry` you assemble once at startup:
-
-```rust
-let registry = ExecutionRegistry::builder()
-    .agent("planner", model_agent(...))
-    .agent("executor", model_agent(...))
-    .agent("ralph-agent", model_agent(...))
-    .toolset("plan-tools", ...)
-    .toolset("exec-tools", ...)
-    .schema("plan-schema", ...)
-    .schema("worker-schema", ...)
-    .verifier("exec-evaluator", exec_evaluator())   // Default-FAIL
+let harness = HarnessBuilder::conversational(model)
+    .sandbox(Arc::new(sandbox))                 // read-WRITE workspace/
+    .tools(StandardTools::coding_set())         // read/write/edit/list/grep/find/bash
+    .system_prompt(SYSTEM_PROMPT)
     .build();
+
+while let Some(prompt) = read_prompt() {        // ← the REPL
+    let task = Task::new(prompt, SessionId::generate(),
+        LoopStrategy::ReAct(ReactConfig::per_loop(25)));
+    harness.run(HarnessRunOptions::new(task).with_stream(...)).await;
+}
 ```
 
-`registry.validate(&task)` walks the tree and reports the FIRST unresolved
-handle as a STARTUP error — before the first model turn. Trait objects never
-enter the serialized `Task`; only string handles do. That is what makes resume
-trivial: a fresh registry re-resolves every handle with no Task reconfiguration.
+### State lives on disk, not in the session
 
-## What you can read off the tree before running it (AC5)
+Each REPL turn is a **fresh** `Task` with a fresh `SessionId` — the conversation
+starts clean every time. What carries across turns is the **workspace**: files
+the agent wrote on an earlier turn are still there, so a later turn can read,
+edit, and build on them. (Threading the `SessionState` across turns to keep the
+conversation itself would be a natural next step — this version keeps it simple.)
 
-The worst-case per-window turn count is computable statically:
+### Watching the loop
 
-```text
-Ralph[PlanExecute[ReAct{12}, SelfVerifying[ReAct{12}]]]
-     = 12 + (12 + 1) = 25          // SelfVerifying adds the single evaluator turn
+```
+code> create a hello.py that prints the first 10 fibonacci numbers, then run it
+think  · turn 1
+    act    → write_file({"path":"hello.py","content":"…"})
+    obs → wrote hello.py
+    act    → bash({"command":"python3 hello.py"})
+    obs → 0 1 1 2 3 5 8 13 21 34
+think  · turn 2
+
+answer (2 turn(s)): I created hello.py and ran it — it prints the first 10 …
 ```
 
-```rust
-tree.max_steps()  // == Some(25)
-```
-
-`max_steps()` is Option-monadic: an `Unlimited` budget anywhere in the tree
-collapses the whole figure to `None` ("no finite advisory bound"). The example
-prints `Some(25)` before each run.
-
-## How the phases behave
-
-- **Plan → ready-set (AC2).** The plan phase explores the repo and authors a
-  blocker-aware task graph via the `task_list` tool. The execute phase walks
-  that graph as a READY-SET: it repeatedly picks the lowest-id task whose
-  blockers are all complete, audits it, and advances — dependency-ordered, with
-  independent branches isolated.
-- **Default-FAIL self-verification (AC3).** Each task's worker result is checked
-  by the `exec-evaluator` (`EvaluatorResponseVerifier`, `max_iterations = 1`): a
-  single read-only evaluator turn. Only an explicit `PASS` clears a task;
-  indeterminate output ⇒ `Failed`. Default-FAIL is not configurable.
-- **Bounded runaway, no cascade (AC4).** A node that exhausts its own
-  `BudgetPolicy` resolves to a task FAILURE that blocks only its transitive
-  dependents. Unrelated tasks keep scheduling; at drain the run reports
-  `TasksBlockedByFailure { failed_task, completed, blocked }` with the partition.
-- **Pause → resume re-resolving handles (AC6).** Under
-  `EscalationMode::SurfaceToHuman`, a budget-exhausted node pauses with a
-  `HumanRequest::BudgetExhausted` carrying its `available_actions`
-  (`continue_with_budget` / `skip` / `fail`). The operator picks one; the harness
-  resumes by RE-RESOLVING every handle from the registry — no reconfiguration.
-
-## The #114 consult ladder — PRESERVED, with its mediation seam moved
-
-The worker still escalates mid-audit through the two consult tools:
-
-- `research_best_practices` → `kind="research"` → a web_search helper harness
-  (budget 5, overflow **SoftFail**: on exhaustion the worker resumes with a
-  "budget exhausted, proceed" message and finishes on general knowledge);
-- `consult_advisor` → `kind="advice"` → a near-frontier cloud-model advisor with
-  `read_file`/`grep` (budget 3, overflow **EscalateToHuman**: the host surfaces
-  a three-choice ladder — run the advisor once more / proceed without help / type
-  a free-form answer).
-
-Both lower to `ToolOutput::Consult`. The pre-#131 example had a `SubagentTool`
-mediate these per-node. The declarative tree has NO `SubagentTool`, so **the seam
-moved to the host run loop**: a worker-leaf consult propagates up through the
-composed tree to a top-level `RunResult::Consult`, and `main`'s `mediate_consult`
-routes it by `kind` to the helper harness (per-kind budget + overflow, host-owned
-for the whole run), then calls `harness.resume_consult(...)`. Identical #114
-semantics; the budget map just lives in the host instead of a tool.
-
-**Resuming a consult continues the whole walk (#131 core change).** Because the
-consult surfaces from a worker nested inside `PlanExecute`, resuming must do more
-than restart that one leaf — the consulted task must still be self-verified and
-the rest of the ready-set must still run. So each combinator rewrites the pause's
-task to its own composed task on the way up (the pause ends up carrying the FULL
-tree), and `resume_consult` re-drives the strategy: `PlanExecute` resumes its
-in-progress task from the worker's own conversation (answer injected), the
-SelfVerifying evaluator runs, the task is marked `Completed`, and the walk
-proceeds to the remaining tasks.
-
-The **#115 `load_skill`** worker-side tool WAS dropped — there is no per-node tool
-seam in the declarative tree. The `audit` **skill is KEPT**, now riding the single
-GLOBAL `context_manager` (`SkillInjectingContextManager`), seeded ALWAYS-ACTIVE at
-startup: its procedure reaches the model structurally every turn, compaction-proof,
-with no `load_skill` round-trip.
-
-Per-node toolset scoping is now in place: each leaf dispatches ONLY its own
-toolset's tools, wired per-toolset on the `HarnessBuilder` via
-`.toolset_tools("plan-tools", ...)` / `.toolset_tools("exec-tools", ...)`. The
-planner (`plan-tools`) cannot reach an exec-only tool (`read_file`) and the worker
-(`exec-tools`) cannot reach a plan-only tool (`task_list`/`list_dir`) — the leaked
-union is closed. The registry toolset HANDLES are validation-only presence entries
-(they must resolve for `validate()`) and are never dispatched; the real dispatchable
-catalogues live in `HarnessConfig.toolset_catalogues`. The audit is kept read-only by
-a read-only sandbox + the absence of any write tool.
-
-## Run it
+## Prerequisites
 
 ```sh
 ollama serve &
 ollama pull gemma4:e4b
-export SPORE_WEB_SEARCH_ENDPOINT=http://localhost:8888/search?format=json  # SearXNG (research consult)
-cargo run        # press enter to accept the default audit prompt; Ctrl-D to quit
 ```
 
-Configuration (see `.env.example`): `SPORE_OLLAMA_MODEL` (default `gemma4:e4b`),
-`SPORE_OLLAMA_BASE_URL` (default `http://localhost:11434`),
-`SPORE_ADVISOR_MODEL` (the `advice` consult handler's cloud model, default
-`minimax-m3:cloud`), and `SPORE_WEB_SEARCH_ENDPOINT` (a SearXNG JSON endpoint
-backing the `research` consult — REQUIRED, fail-fast like examples 06/11).
+Run **gemma4:e4b or better** — small models (e.g. llama3.2 3B) narrate tool use
+instead of emitting tool calls, so they never act.
 
-## Tests
-
-- **Example crate** (no model): `tree_is_byte_identical` (the tree round-trips
-  through serde and has the canonical keys/budgets/behaviors),
-  `max_steps_is_17` (and `Unlimited ⇒ None`), `registry_validates`,
-  `exec_evaluator_is_default_fail`, plus the kept skill-injection unit tests.
-- **Core crate** (deterministic recorded-model replay, in
-  `rust/crates/spore-core/tests/cordyceps_composition_fixture_replay.rs`):
-  `plan_builds_dag_execute_walks_readyset` (AC2),
-  `self_verified_default_fail` (AC3), `cordyceps_runaway_bounded` (AC4),
-  `cordyceps_max_steps_is_17_unlimited_is_none` (AC5), and
-  `resume_reresolves_handles` (AC6).
+## Run
 
 ```sh
-cd examples/rust/12-cordyceps && cargo test
-cd rust && cargo test -p spore-core --test cordyceps_composition_fixture_replay
+cd examples/rust/12-cordyceps
+cargo run                          # type a coding task; Ctrl-D to quit
+cargo run -- --model qwen2.5-coder # override the model for one run
 ```
+
+`SPORE_OLLAMA_MODEL` / `SPORE_OLLAMA_BASE_URL` override the model id and endpoint
+(see `.env.example`); `--model` overrides the id for a single run.
+
+The agent works inside `workspace/` (created on first run). Its contents are
+`.gitignore`d so re-runs stay clean.

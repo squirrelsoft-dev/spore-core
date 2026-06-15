@@ -3,11 +3,9 @@ name = "cordyceps"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "spore-core example 12: cordyceps — the Composable Execution capstone. Runs the declarative composed strategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] (loaded as DATA from fixtures/strategy/cordyceps_tree.json) with handles resolved from an ExecutionRegistry."
+description = "spore-core example 12: a basic ReAct coding agent — example 04's components (conversational ReAct + catalogue tools + workspace sandbox) wrapped in a REPL."
 
 [dependencies]
 spore-core = { path = "../../../rust/crates/spore-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "0.8"
