@@ -679,6 +679,7 @@ SurfaceToHuman { request: HumanRequest }  — valid on BeforeTool and BeforeComp
 - TerminationPolicy is domain-agnostic — all domain knowledge lives in the injected CompletionCheck
 - HumanHalted is set by the harness directly when `HumanResponse::Halt` is received — TerminationPolicy is not consulted
 - Budget tracking resumes from `PausedState.budget_used` on `resume()`
+- An execute-phase budget pause (e.g. `PlanExecute` under `SurfaceToHuman`) returns a monotonic `turns` cursor reflecting the worker's true consumed turns, and a `ContinueWithBudget` grant resumes with a genuinely wider window — each grant buys real new turns rather than re-running the same window. No work is lost and no work is repeated across the pause.
 
 **Evaluation algorithm**:
 ```
