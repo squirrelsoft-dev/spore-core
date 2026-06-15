@@ -2113,14 +2113,31 @@ impl RunStrategy for PlanExecuteConfig {
                 let step_outcome = self.execute.run(cx).await;
 
                 // ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────
-                if let StrategyOutcome::BudgetExhausted { .. } = &step_outcome {
+                if let StrategyOutcome::BudgetExhausted {
+                    steps_taken: leaf_steps,
+                    ..
+                } = &step_outcome
+                {
+                    // The execute LEAF already counted the worker's true consumed
+                    // turns (ABSOLUTE — including the incoming `carried_before`
+                    // floor) and carried them in the outcome's `steps_taken`. Use
+                    // THAT for the grant accounting, NOT the parent `plan_execute`
+                    // scope's `steps_taken`: that scope is `Unlimited` when the Task
+                    // has `max_turns = None` (so its `steps_taken` is 0), which made
+                    // the resume grant `granted = 0 + steps` a no-op and stalled the
+                    // worker on the same window every grant. Everything ELSE on `err`
+                    // stays the parent scope's: `phase` must remain "plan_execute" so
+                    // the resume-seed `continues_used` restore matches in
+                    // `push_budget`, and `continues_used` is the combinator's
+                    // (`max_continues`) count, not the leaf's.
+                    let leaf_steps = *leaf_steps;
                     let err = cx
                         .budgets
                         .current_mut()
                         .map(|s| BudgetExhausted {
                             policy: s.policy.clone(),
                             behavior: s.behavior.clone(),
-                            steps_taken: s.steps_taken,
+                            steps_taken: leaf_steps,
                             continues_used: s.continues_used,
                             phase: s.phase.clone(),
                         })
@@ -2194,6 +2211,15 @@ impl RunStrategy for PlanExecuteConfig {
                             cx.pop_budget();
                             cx.scratch.task = Some(task.clone());
                             cx.stream = on_stream;
+                            // Advance the run-wide turn cursor to the worker's
+                            // consumed turns BEFORE building the pause (mirrors the
+                            // Success branch's `carried.turns = turns`). Otherwise the
+                            // cursor stays frozen at `carried_before`, so the paused
+                            // `budget_used` / `turn_number` and the displayed
+                            // `TurnStart { turn }` regress, and the resumed window
+                            // re-seeds its floor to the same value and re-runs the
+                            // same turns. `leaf_steps` is absolute (>= carried_before).
+                            carried.turns = leaf_steps;
                             if surface {
                                 let waiting = promote_budget_exhausted_to_human(
                                     &err,
@@ -16004,6 +16030,120 @@ mod tests {
                 assert_eq!(turns, 2);
             }
             other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // Regression: a PlanExecute execute-phase worker that exhausts under
+    // SurfaceToHuman and is granted more budget must make FORWARD PROGRESS across
+    // grants — the run-wide turn cursor and the grant's `steps_taken` both
+    // STRICTLY advance, and the worker eventually finishes. Before the fix the
+    // exhaustion branch discarded the execute leaf's consumed-turn count and
+    // re-read `steps_taken = 0` from the (Unlimited, because `max_turns = None`)
+    // `plan_execute` scope, and left `carried.turns` frozen at its pre-task value.
+    // So every grant computed `granted = 0 + steps` (a no-op that never widened the
+    // binding cap) and re-seeded the worker on the SAME window — the cursor and
+    // `steps_taken` stuck, the worker re-ran the same turns, and a `review`-style
+    // task thrashed through every auto-continue making zero progress.
+    #[tokio::test]
+    async fn execute_phase_budget_grant_advances_and_makes_progress() {
+        // One execute task ("only"); the execute leaf cap is PerLoop{2} and the
+        // top task leaves `max_turns = None`, so the `plan_execute` scope is
+        // Unlimited — the exact configuration that zeroed the grant accounting.
+        let a = make_agent();
+        a.push(final_resp(r#"{"tasks":["only"]}"#)); // plan turn (carried.turns -> 1)
+        // Execute worker keeps requesting tools so it never finishes until the
+        // final grant; each ToolCallRequested is one turn against the leaf cap.
+        for i in 0..3 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("e{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        a.push(final_resp("done only")); // completes after the 2nd grant
+        let mut cfg = surface_config(a);
+        cfg.tool_registry = tool_reg(3);
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            plan: Box::new(react_structured(u32::MAX)),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
+            plan_model: None,
+        }));
+
+        // First run → pause #1. The worker consumed real turns past the plan
+        // floor, so the cursor and `steps_taken` reflect that (NOT 0 / frozen).
+        let (turn1, steps1, state1) = match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::WaitingForHuman { request, state } => {
+                let steps = match request {
+                    HumanRequest::BudgetExhausted {
+                        steps_taken, phase, ..
+                    } => {
+                        assert_eq!(phase, "plan_execute", "the combinator scope owns the pause");
+                        steps_taken
+                    }
+                    other => panic!("expected BudgetExhausted, got {other:?}"),
+                };
+                (state.turn_number, steps, *state)
+            }
+            other => panic!("expected pause #1, got {other:?}"),
+        };
+        // The bug froze the cursor at the pre-task value (1 = just the plan turn)
+        // and read steps_taken=0 from the Unlimited scope.
+        assert!(turn1 >= 2, "cursor advanced past the plan floor, got {turn1}");
+        assert!(
+            steps1 >= 2,
+            "grant accounting uses the worker's consumed turns, got {steps1}"
+        );
+
+        // Grant +2 and resume → pause #2. Forward progress: the cursor and
+        // `steps_taken` must STRICTLY advance (the bug re-seeded the same window).
+        let (turn2, steps2, state2) = match h
+            .resume(
+                state1,
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps: 2 },
+                },
+                None,
+            )
+            .await
+        {
+            RunResult::WaitingForHuman { request, state } => {
+                let steps = match request {
+                    HumanRequest::BudgetExhausted { steps_taken, .. } => steps_taken,
+                    other => panic!("expected BudgetExhausted, got {other:?}"),
+                };
+                (state.turn_number, steps, *state)
+            }
+            other => panic!("expected pause #2, got {other:?}"),
+        };
+        assert!(
+            turn2 > turn1,
+            "turn cursor advanced across grants ({turn1} -> {turn2})"
+        );
+        assert!(
+            steps2 > steps1,
+            "steps_taken advanced across grants ({steps1} -> {steps2})"
+        );
+
+        // Grant +2 again and resume → Success: the worker finishes, having made
+        // real progress rather than looping on the same window.
+        match h
+            .resume(
+                state2,
+                HumanResponse::Escalate {
+                    action: EscalationAction::ContinueWithBudget { steps: 2 },
+                },
+                None,
+            )
+            .await
+        {
+            RunResult::Success { output, .. } => assert_eq!(output, "done only"),
+            other => panic!("expected Success after the final grant, got {other:?}"),
         }
     }
 
