@@ -1,5 +1,2 @@
 /target
 .env
-# The agent writes into workspace/ — keep the dir, ignore what it generates.
-workspace/*
-!workspace/.gitkeep
