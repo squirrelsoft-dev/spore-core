@@ -177,6 +177,131 @@ func TestCordycepsBudgetResumeSeedsStalledWorkerAndSkipsReplanning(t *testing.T)
 	}
 }
 
+// #144 (Rust cfffa40 parity): a PlanExecute execute-phase worker that exhausts
+// under SurfaceToHuman and is granted more budget must make FORWARD PROGRESS
+// across grants — the run-wide turn cursor AND the grant's StepsTaken both
+// STRICTLY advance, and the worker eventually finishes. Before the fix the
+// exhaustion branch discarded the execute leaf's consumed-turn count and re-read
+// StepsTaken=0 from the (Unlimited, because MaxTurns==nil) plan_execute scope,
+// and left carried.Turns frozen at its pre-task value. So every grant computed
+// granted = 0 + steps (a no-op that never widened the binding cap) and re-seeded
+// the worker on the SAME window — the cursor and StepsTaken stuck, the worker
+// re-ran the same turns, and a review-style task thrashed through every
+// auto-continue making zero progress. Passes with the fix, fails without it.
+//
+// MUST wire a real in-memory store (not the no-op default): the durable
+// task-list path the resume re-attaches through no-ops under the default store,
+// which would let this pass while asserting the wrong path.
+func TestExecutePhaseBudgetGrantAdvancesAndMakesProgress(t *testing.T) {
+	// One execute task ("only"); the execute leaf cap is PerLoop{2} and the top
+	// task leaves MaxTurns == nil, so the plan_execute scope is Unlimited — the
+	// exact configuration that zeroed the grant accounting.
+	a := NewMockAgent("planner")
+	a.Push(planFinal(`{"tasks":["only"]}`)) // plan turn (carried.Turns -> 1)
+	// Execute worker keeps requesting tools so it never finishes until the final
+	// grant; each ToolCallRequested is one turn against the leaf cap.
+	for i := 0; i < 3; i++ {
+		a.Push(NewToolCallRequested([]ToolCall{{
+			ID:    "e" + string(rune('0'+i)),
+			Name:  "x",
+			Input: json.RawMessage(`{}`),
+		}}, turnUsage()))
+	}
+	a.Push(planFinal("done only")) // completes after the 2nd grant
+
+	// A real in-memory store + fixed project namespace so the durable task-list
+	// re-attach path is exercised (not the no-op default RunStore).
+	store := newFakeRunStore()
+	cfg := surfaceCfg(a)
+	cfg.RunStore = store
+	cfg.ProjectNamespace = compProjectNS
+	// tool_reg(3): three success outputs for the worker's three tool-burning turns.
+	reg := NewScriptedToolRegistry()
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
+	reg.Push(ToolOutput{Kind: ToolOutputSuccess, Content: "ok"})
+	cfg.ToolRegistry = reg
+	h := NewStandardHarness(cfg)
+
+	// react_structured(MAX) plan slot + ReAct(PerLoop{2}) execute leaf, Escalate.
+	plan := ReActStrategy(^uint32(0))
+	plan.ReActCfg.Output = func() *SchemaRef { s := SchemaRef(""); return &s }()
+	exec := ReActStrategy(2)
+	pe := PlanExecuteStrategy(PlanExecuteConfig{
+		Plan:     &plan,
+		Execute:  &exec,
+		Behavior: BudgetExhaustedBehavior{Kind: BehaviorEscalate},
+	})
+	tk := NewTask("do something", SessionID("s1"), pe)
+	// MaxTurns intentionally UNSET -> the plan_execute scope is Unlimited.
+
+	// First run -> pause #1. The worker consumed real turns past the plan floor,
+	// so the cursor and StepsTaken reflect that (NOT 0 / frozen at 1).
+	first := h.Run(context.Background(), NewHarnessRunOptions(tk))
+	if first.Kind != RunWaitingForHuman {
+		t.Fatalf("expected pause #1 (WaitingForHuman), got %+v", first)
+	}
+	if first.State == nil || first.Request == nil {
+		t.Fatal("budget pause must carry a PausedState + request")
+	}
+	if first.Request.Kind != HumanReqBudgetExhausted {
+		t.Fatalf("expected BudgetExhausted request, got %q", first.Request.Kind)
+	}
+	// The combinator scope owns the pause — phase must stay plan_execute so the
+	// resume-seed ContinuesUsed restore matches.
+	if first.Request.Phase != "plan_execute" {
+		t.Fatalf("phase = %q, want plan_execute (the combinator scope owns the pause)", first.Request.Phase)
+	}
+	turn1 := first.State.TurnNumber
+	steps1 := first.Request.StepsTaken
+	// The bug froze the cursor at the pre-task value (1 = just the plan turn) and
+	// read steps_taken=0 from the Unlimited scope.
+	if turn1 < 2 {
+		t.Fatalf("cursor advanced past the plan floor, got %d", turn1)
+	}
+	if steps1 < 2 {
+		t.Fatalf("grant accounting uses the worker's consumed turns, got %d", steps1)
+	}
+
+	// Grant +2 and resume -> pause #2. Forward progress: the cursor and StepsTaken
+	// must STRICTLY advance (the bug re-seeded the same window).
+	second := h.Resume(
+		context.Background(),
+		*first.State,
+		EscalateResponse(ContinueWithBudgetAction(2)),
+		nil,
+	)
+	if second.Kind != RunWaitingForHuman {
+		t.Fatalf("expected pause #2 (WaitingForHuman), got %+v", second)
+	}
+	if second.State == nil || second.Request == nil || second.Request.Kind != HumanReqBudgetExhausted {
+		t.Fatalf("expected BudgetExhausted pause #2, got %+v", second)
+	}
+	turn2 := second.State.TurnNumber
+	steps2 := second.Request.StepsTaken
+	if turn2 <= turn1 {
+		t.Fatalf("turn cursor must advance across grants (%d -> %d)", turn1, turn2)
+	}
+	if steps2 <= steps1 {
+		t.Fatalf("steps_taken must advance across grants (%d -> %d)", steps1, steps2)
+	}
+
+	// Grant +2 again and resume -> Success: the worker finishes, having made real
+	// progress rather than looping on the same window.
+	third := h.Resume(
+		context.Background(),
+		*second.State,
+		EscalateResponse(ContinueWithBudgetAction(2)),
+		nil,
+	)
+	if third.Kind != RunSuccess {
+		t.Fatalf("expected Success after the final grant, got %+v", third)
+	}
+	if third.Output != "done only" {
+		t.Fatalf("output = %q, want %q", third.Output, "done only")
+	}
+}
+
 // #138 AC4: the budget-exhausted PausedState fixture round-trips byte-identically
 // — the carried worker session (AC2-a) and the exec-tools handle (AC4-a) survive
 // a serde round-trip identically. This is the cross-language wire-parity lock.

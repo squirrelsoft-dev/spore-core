@@ -1278,7 +1278,24 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 		// to an error-failed one; an Escalate/Continue resolution surfaces the
 		// partial and aborts the run.
 		if stepOutcome.Kind == StrategyOutcomeBudgetExhausted {
+			// The execute LEAF already counted the worker's true consumed turns
+			// (ABSOLUTE — including the incoming carriedBefore floor) and carried
+			// them in the outcome's StepsTaken. Use THAT for the grant accounting,
+			// NOT the parent plan_execute scope's StepsTaken: that scope is
+			// Unlimited when the Task has MaxTurns == nil (so its StepsTaken is 0),
+			// which made the resume grant granted = 0 + steps a no-op and stalled
+			// the worker on the same window every grant. Everything ELSE on err
+			// stays the parent scope's: Phase must remain "plan_execute" so the
+			// resume-seed ContinuesUsed restore matches in PushBudget, and
+			// ContinuesUsed is the combinator's (MaxContinues) count, not the leaf's.
+			var leafSteps uint32
+			if stepOutcome.Exhausted != nil {
+				leafSteps = stepOutcome.Exhausted.StepsTaken
+			}
 			err := cx.currentExhausted()
+			if err != nil {
+				err.StepsTaken = leafSteps
+			}
 			resolution := cx.ResolveCurrent()
 			_ = cx.takeChildOverride()
 			switch resolution {
@@ -1318,6 +1335,14 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				workerToolset := workerToolsetOf(c.Execute)
 				cx.PopBudget()
 				cx.Scratch.RunSession = session
+				// Advance the run-wide turn cursor to the worker's consumed turns
+				// BEFORE building the pause (mirrors the Success branch's
+				// carried.Turns = subResult.Turns). Otherwise the cursor stays frozen
+				// at carriedBefore, so the paused budget_used / turn_number and the
+				// displayed TurnStart regress, and the resumed window re-seeds its
+				// floor to the same value and re-runs the same turns. leafSteps is
+				// absolute (>= carriedBefore).
+				carried.Turns = leafSteps
 				// #130: under SurfaceToHuman, PAUSE with a BudgetExhausted request
 				// (combinator actions: [ContinueWithBudget, Skip, Fail]) instead of
 				// propagating up. The waiting RunResult is returned as the terminal
