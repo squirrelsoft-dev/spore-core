@@ -1,20 +1,30 @@
-//! spore-core example 12 — **cordyceps**: a basic ReAct coding agent.
+//! spore-core example 12 — **cordyceps**: a basic plan→execute coding agent.
 //!
-//! This is [`04-filesystem-agent`](../../04-filesystem-agent) with two changes:
+//! This started as [`04-filesystem-agent`](../../04-filesystem-agent) and grows it
+//! into a coding REPL. The differences from 04:
 //!
 //! 1. the workspace sandbox is **read-write** and the agent gets the full
 //!    [`StandardTools::coding_set`] (read/write/edit/list/grep/find + `bash`), so
-//!    it can actually change code — not just summarize files; and
+//!    it can actually change code — not just summarize files;
 //! 2. the single `harness.run(...)` is wrapped in a **REPL**: build the harness
-//!    once, then read a task per line, threading the conversation across turns.
+//!    once, then read a task per line, threading the conversation across turns; and
+//! 3. each turn runs the **PlanExecute** strategy instead of a bare `ReAct` loop —
+//!    a plan phase turns your prompt into a task list, then an execute phase works
+//!    that list to completion (see [`plan_execute_strategy`]).
 //!
-//! Everything else is 04 verbatim — the same `conversational(model)` builder, the
-//! same `ReAct` loop, the same stream-printed `think · turn N` / `act` / `obs`
-//! trace. The thesis is the same as 04's: **the harness doesn't change** — here
-//! we only widen the toolset and drive it in a loop.
+//! Same `conversational(model)` builder and the same stream-printed
+//! `think · turn N` / `act` / `obs` trace — the strategy is what changed.
 //!
 //! ## What it shows
 //!
+//! - **PlanExecute, not bare ReAct.** Each turn's [`Task`] carries a
+//!   [`LoopStrategy::PlanExecute`]: a `plan` sub-loop emits a JSON
+//!   `{"tasks":[…]}` plan (printed via an `OnPlanCreated` hook — see
+//!   [`plan_announcer`]), then an `execute` sub-loop runs each task as its own
+//!   ReAct loop, in dependency order, until the whole list is done. The task list
+//!   is DURABLE and project-scoped, so a turn that runs out of budget mid-list
+//!   doesn't re-plan — a later turn resumes the unfinished tasks. See
+//!   [`plan_execute_strategy`].
 //! - **A REPL over one harness, one conversation.** The harness is built once and
 //!   reused; each line you type is a new [`Task`] on a STABLE [`SessionId`]. We
 //!   carry the prior turn's [`SessionState`] forward — `RunResult::Success`
@@ -59,18 +69,20 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use spore_core::{
-    CompactionConfig, Content, Harness, HarnessBuilder, HarnessContextManagerExt,
-    HarnessRunOptions, HarnessStreamEvent, LoopStrategy, Message, NullCacheProvider,
-    OllamaModelInterface, ReactConfig, Role, RunResult, SessionId, SessionState,
-    StandardContextManager, StandardTools, Task, ToolCall, ToolResult, WorkspaceConfig,
-    WorkspaceScopedSandbox,
+    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, FunctionHook,
+    Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent,
+    HookChain, HookContext, HookDecision, HookEvent, LoopStrategy, Message, NullCacheProvider,
+    OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult, SchemaRef, SessionId,
+    SessionState, StandardContextManager, StandardHookChain, StandardTools, Task, ToolCall,
+    ToolResult, ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
      Explore with list_dir, read_file, grep, and find_files; create and change files with \
      write_file and edit_file; run commands with bash. Use `.` and relative paths only. \
-     Act using tools — do not just describe what you would do. When the task is done, reply with \
-     a short summary of what you changed. \
+     Act using tools — do not just describe what you would do. (The one exception: when you are \
+     asked to PRODUCE A PLAN, reply with the requested JSON plan object directly, with no tool \
+     calls in that turn.) When the task is done, reply with a short summary of what you changed. \
      \
      The user CANNOT see your reasoning or your tool calls — they only see the messages you \
      send with the `send_message` tool and your final reply. So keep the user in the loop: \
@@ -79,9 +91,23 @@ const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed w
      in PARALLEL with the tool that does the work — emit both in the same turn — so narration \
      never costs an extra round trip. Keep each message to a single short sentence.";
 
-/// Per-loop ReAct step budget for one REPL turn (04 used 8; a coding task wants
-/// more room to explore, edit, and verify).
+/// Per-loop ReAct step budget for EACH execute-phase task (04 used 8; a coding
+/// task wants more room to explore, edit, and verify). The plan phase runs under
+/// its own, smaller budget (`PLAN_STEPS`).
 const MAX_STEPS: u32 = 25;
+
+/// Per-loop ReAct step budget for the PLAN phase — a few turns for the planner to
+/// look around (read_file / grep / list_dir) before it emits its JSON plan.
+const PLAN_STEPS: u32 = 12;
+
+/// Registry key for the plan slot's output schema. The PlanExecute `plan` slot is
+/// STRUCTURED — startup validation rejects a bare ReAct there unless its leaf
+/// declares an `output` schema (so the slot yields a typed result). We register an
+/// empty schema under this key and point the plan leaf at it. With
+/// `enforce_output_schemas` OFF (the default) the schema is used ONLY to satisfy
+/// that validation — it is not delivered to or enforced on the model; the plan
+/// phase's own "respond with a single JSON plan" directive drives the format.
+const PLAN_SCHEMA_KEY: &str = "plan";
 
 /// Compaction window, in tokens — the size the harness believes the model's
 /// context is, and the budget it compacts against. gemma4's real window is 256K,
@@ -170,10 +196,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tools(StandardTools::coding_set())
         .system_prompt(SYSTEM_PROMPT)
         .context_manager(context_manager)
+        // PlanExecute's `plan` slot is structured: its output schema must resolve
+        // against the registry (see PLAN_SCHEMA_KEY) or startup validation fails.
+        .registry_schema(PLAN_SCHEMA_KEY, serde_json::json!({}))
+        // Surface the plan to the user the moment it's captured (OnPlanCreated).
+        .hooks(plan_announcer())
         .build();
 
-    println!("spore-core — basic ReAct coding agent");
+    println!("spore-core — plan→execute coding agent");
     println!("model     : {model_id}");
+    println!("strategy  : plan (≤{PLAN_STEPS} steps) → execute (≤{MAX_STEPS} steps/task)");
     println!(
         "context   : {context_window} tokens (compact at {:.0}% → {} tokens)",
         COMPACT_THRESHOLD * 100.0,
@@ -198,21 +230,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if trimmed.is_empty() {
             continue;
         }
-        // `clear` wipes the conversation back to a clean slate (the workspace on
-        // disk is untouched) — handy now that history persists across turns.
+        // `clear` wipes the in-memory CONVERSATION back to a clean slate. The
+        // workspace on disk AND the durable (project-scoped) task list are left
+        // intact — so the agent keeps resuming any unfinished plan; `clear` only
+        // forgets the dialogue.
         if trimmed.eq_ignore_ascii_case("clear") {
             history = None;
             println!("(conversation cleared)\n");
             continue;
         }
-        // Each REPL turn appends to the SAME conversation. Files the agent wrote
-        // on a previous turn are still on disk AND the dialogue carries forward,
+        // Each REPL turn appends to the SAME conversation and runs as a
+        // PlanExecute task: the planner turns your prompt into a JSON task list,
+        // then each task runs its own ReAct loop in dependency order. The list is
+        // DURABLE and project-scoped, so if a turn runs out of budget mid-list, a
+        // later turn resumes the unfinished tasks instead of re-planning. Files the
+        // agent wrote earlier are still on disk AND the dialogue carries forward,
         // so it can build on both.
-        let task = Task::new(
-            prompt.clone(),
-            session_id.clone(),
-            LoopStrategy::ReAct(ReactConfig::per_loop(MAX_STEPS)),
-        );
+        let task = Task::new(prompt.clone(), session_id.clone(), plan_execute_strategy());
 
         // Mirror this turn's conversation as it streams. On a clean finish we use
         // the harness's own lossless `session_state`; but an Esc-aborted run is
@@ -344,6 +378,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nbye.");
     Ok(())
+}
+
+/// The strategy each REPL turn runs: **PlanExecute** — a plan phase produces a
+/// JSON task list, then an execute phase runs each task as its own ReAct loop, in
+/// dependency order, until the whole list is `Completed`.
+///
+/// - **plan** — a ReAct sub-loop (≤ [`PLAN_STEPS`]) that may look around with the
+///   read tools, then emits the `{"tasks":[…],"rationale":…}` plan. The harness
+///   seeds the "respond with a single JSON plan" directive itself; we only supply
+///   the slot. It is a STRUCTURED slot, so its leaf MUST declare an `output`
+///   schema or startup validation rejects the run — hence
+///   `Some(SchemaRef(PLAN_SCHEMA_KEY))` (registered as an empty schema on the
+///   builder; resolved, not enforced — see [`PLAN_SCHEMA_KEY`]).
+/// - **execute** — a bare ReAct leaf (≤ [`MAX_STEPS`] per task). The executor
+///   walks the durable task list, running this loop once per ready task.
+///
+/// Both leaves carry empty agent/toolset handles, so they resolve to the
+/// conversational harness's default agent + `coding_set()` toolset. `Escalate` is
+/// the same budget-exhausted behavior `ReactConfig::per_loop` already uses.
+fn plan_execute_strategy() -> LoopStrategy {
+    LoopStrategy::PlanExecute(PlanExecuteConfig {
+        plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: PLAN_STEPS },
+            behavior: BudgetExhaustedBehavior::Escalate,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: Some(SchemaRef(PLAN_SCHEMA_KEY.to_string())),
+        })),
+        execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(MAX_STEPS))),
+        plan_model: None,
+        behavior: BudgetExhaustedBehavior::Escalate,
+    })
+}
+
+/// A hook chain that prints the plan the moment it's captured (the `OnPlanCreated`
+/// lifecycle event), so the user sees the task list before the execute phase
+/// starts grinding through it. Returned as `Arc<dyn HookChain>` for
+/// [`HarnessBuilder::hooks`].
+///
+/// Lines end with `\r\n` for the same reason the stream trace does — the run is in
+/// raw mode while this fires (see [`run_turn`]).
+fn plan_announcer() -> Arc<dyn HookChain> {
+    let chain = StandardHookChain::new();
+    let _ = chain.register(Arc::new(FunctionHook::new(
+        "print-plan",
+        vec![HookEvent::OnPlanCreated],
+        |ctx| {
+            if let HookContext::OnPlanCreated { plan, .. } = ctx {
+                print!("{HEADER}📋 plan ({} task(s)):{RESET}\r\n", plan.tasks.len());
+                for (i, step) in plan.tasks.iter().enumerate() {
+                    print!("{MUTED}   {}. {step}{RESET}\r\n", i + 1);
+                }
+            }
+            Ok(HookDecision::Continue)
+        },
+    )));
+    Arc::new(chain)
 }
 
 /// Run one task with **Esc-to-abort** armed. Returns `Some(result)` if the run

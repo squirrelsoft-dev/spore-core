@@ -1,42 +1,46 @@
-# Example 12 — cordyceps (a basic ReAct coding agent)
+# Example 12 — cordyceps (a basic plan→execute coding agent)
 
-A super-basic **ReAct coding agent** in a REPL. It is
-[`04-filesystem-agent`](../04-filesystem-agent/README.md) with two changes:
+A super-basic **plan→execute coding agent** in a REPL. It started as
+[`04-filesystem-agent`](../04-filesystem-agent/README.md) and grows it three ways:
 
 1. the workspace sandbox is **read-write**, rooted at the directory you launch
    from (override with `--workspace`), and the agent gets the full
    `StandardTools::coding_set()` (read / write / edit / list / grep / find +
-   `bash`), so it can actually change code in your project; and
+   `bash`), so it can actually change code in your project;
 2. the single `harness.run(...)` is wrapped in a **REPL** — build the harness
    once, then read a task per line, carrying the conversation forward across
-   turns.
+   turns; and
+3. each turn runs the **`PlanExecute`** strategy instead of a bare `ReAct` loop —
+   a plan phase turns your prompt into a task list, then an execute phase works
+   that list to completion.
 
-Everything else is 04 verbatim: the same `conversational(model)` builder, the
-same `ReAct` loop, the same stream-printed `think` / `act` / `obs` trace.
+Same `conversational(model)` builder and the same stream-printed `think` / `act`
+/ `obs` trace — the strategy is what changed.
 
 ## The contrast with 04
 
 |            | 04 — filesystem-agent                       | 12 — coding agent                                 |
 | ---------- | ------------------------------------------- | ------------------------------------------------- |
 | Builder    | `conversational(model)`                     | `conversational(model)` *(same)*                  |
-| Loop       | `ReAct`                                      | `ReAct` *(same)*                                  |
+| Loop       | `ReAct`                                      | **`PlanExecute`** (plan → execute, ReAct per task) |
 | Tools      | `coding_set()`                               | `coding_set()` *(same)*                           |
 | Sandbox    | `WorkspaceScopedSandbox` (read-only effect) | `WorkspaceScopedSandbox` over the launch dir (read-write) |
 | Driver     | one `harness.run(...)`                       | a REPL: harness built once, conversation threaded |
 
 ```rust
 let harness = HarnessBuilder::conversational(model)
-    .sandbox(Arc::new(sandbox))                 // read-WRITE workspace/
+    .sandbox(Arc::new(sandbox))                 // read-WRITE workspace
     .tools(StandardTools::coding_set())         // read/write/edit/list/grep/find/bash
     .system_prompt(SYSTEM_PROMPT)
+    .registry_schema("plan", json!({}))         // plan slot's output schema (resolved, not enforced)
+    .hooks(plan_announcer())                     // print the plan on OnPlanCreated
     .build();
 
 let session_id = SessionId::generate();         // one conversation for the REPL
 let mut history: Option<SessionState> = None;
 
 while let Some(prompt) = read_prompt() {        // ← the REPL
-    let task = Task::new(prompt, session_id.clone(),
-        LoopStrategy::ReAct(ReactConfig::per_loop(25)));
+    let task = Task::new(prompt, session_id.clone(), plan_execute_strategy());
     let mut opts = HarnessRunOptions::new(task).with_stream(...);
     if let Some(state) = history.take() {       // carry prior turns forward
         opts = opts.with_session_state(state);
@@ -45,7 +49,53 @@ while let Some(prompt) = read_prompt() {        // ← the REPL
         history = Some(session_state);          // remember for the next turn
     }
 }
+
+// each turn's strategy: plan → execute
+fn plan_execute_strategy() -> LoopStrategy {
+    LoopStrategy::PlanExecute(PlanExecuteConfig {
+        // plan: a ReAct sub-loop that emits a JSON {"tasks":[…]} plan. The plan
+        // slot is STRUCTURED, so its leaf must declare an output schema or
+        // startup validation rejects the run (hence the registry_schema above).
+        plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 12 },
+            behavior: BudgetExhaustedBehavior::Escalate,
+            agent: AgentRef(String::new()),     // default agent
+            toolset: ToolsetRef(String::new()), // default toolset (coding_set)
+            output: Some(SchemaRef("plan".into())),
+        })),
+        // execute: each task runs its own ReAct loop, in dependency order.
+        execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(25))),
+        plan_model: None,
+        behavior: BudgetExhaustedBehavior::Escalate,
+    })
+}
 ```
+
+### Plan, then execute
+
+`PlanExecute` is a two-phase combinator that wraps two child strategies:
+
+- **Plan.** One ReAct sub-loop (≤ 12 steps here) that may look around the
+  codebase with the read tools, then replies with a single JSON object —
+  `{"tasks": [...], "rationale": "..."}`. The harness seeds the "respond with a
+  JSON plan" directive itself; the example only supplies the slot. Because the
+  `plan` slot is **structured** (it must yield a typed task graph), startup
+  validation rejects a bare `ReAct` there unless its leaf declares an `output`
+  schema — so we register an empty schema under `"plan"` and point the leaf at it.
+  With `enforce_output_schemas` off (the default) that schema is only *resolved*,
+  never delivered to or enforced on the model.
+- **Execute.** The harness parses the plan into a **task list** and walks it,
+  running the `execute` child — a ReAct loop (≤ 25 steps per task) — once per
+  ready task, in dependency order, until every task is `Completed`.
+
+The task list is **durable** and project-scoped (derived from the workspace
+root). So this REPL keeps working a list until it's done: if a turn runs out of
+budget partway through, a later turn finds the unfinished tasks and **resumes
+them instead of re-planning**. Each new prompt that *does* re-plan appends its
+tasks to the same conversation.
+
+The plan is printed the moment it's captured, via an `OnPlanCreated` hook
+(`plan_announcer()`), so you see the task list before the execute phase starts.
 
 ### State lives in BOTH the session and on disk
 
@@ -70,16 +120,23 @@ Two things carry across REPL turns:
 ```
 code> create a hello.py that prints the first 10 fibonacci numbers, then run it
    think · turn 1
+📋 plan (2 task(s)):
+   1. Write hello.py with a loop that prints the first 10 fibonacci numbers
+   2. Run hello.py and confirm the output
+   think · turn 2
 💬 Writing hello.py with a fibonacci loop.
    act → write_file({"path":"hello.py","content":"…"})
    obs → wrote hello.py
+   think · turn 3
 💬 Running it to check the output.
    act → bash({"command":"python3 hello.py"})
    obs → 0 1 1 2 3 5 8 13 21 34
-   think · turn 2
 
-answer (2 turn(s)): I created hello.py and ran it — it prints the first 10 …
+answer (3 turn(s)): I created hello.py and ran it — it prints the first 10 …
 ```
+
+The `📋 plan` block is printed by the `OnPlanCreated` hook the moment the plan
+phase captures its JSON plan, before the execute phase runs the tasks.
 
 The `💬` lines are the agent narrating itself through the `send_message` tool
 (part of `coding_set()`). They're the **section headers** — printed in bright
