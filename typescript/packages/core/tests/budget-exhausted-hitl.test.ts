@@ -758,3 +758,100 @@ describe("#138 AC3 — plan-phase exhaustion seeds the plan session from the car
     expect(ctxText(planner.contexts[0]!)).toContain(MARKER);
   });
 });
+
+// ============================================================================
+// #144: PlanExecute budget-resume advances on the worker's consumed turns
+// ============================================================================
+
+describe("#144 — execute-phase budget grant advances and makes forward progress", () => {
+  // Regression (cfffa40): a PlanExecute execute-phase worker that exhausts under
+  // SurfaceToHuman and is granted more budget must make FORWARD PROGRESS across
+  // grants — the run-wide turn cursor and the grant's `steps_taken` both STRICTLY
+  // advance, and the worker eventually finishes. Before the fix the exhaustion
+  // branch discarded the execute leaf's consumed-turn count and re-read
+  // `stepsTaken = 0` from the (unlimited, because `max_turns` is unset)
+  // `plan_execute` scope, and left `carried.turns` frozen at its pre-task value.
+  // So every grant computed `granted = 0 + steps` (a no-op that never widened the
+  // binding cap) and re-seeded the worker on the SAME window — the cursor and
+  // `steps_taken` stuck, the worker re-ran the same turns, and a review-style
+  // task thrashed through every auto-continue making zero progress.
+  it("the turn cursor and steps_taken strictly advance across grants, then completes", async () => {
+    // One execute task ("only"); the execute leaf cap is PerLoop{2} and the top
+    // task leaves `max_turns` unset, so the `plan_execute` scope is unlimited —
+    // the exact configuration that zeroed the grant accounting.
+    const a = makeAgent();
+    a.push({ kind: "final_response", content: '{"tasks":["only"]}', usage: usage() }); // plan turn
+    // Execute worker keeps requesting tools so it never finishes until the final
+    // grant; each tool_call_requested is one turn against the leaf cap.
+    for (let i = 0; i < 3; i += 1) {
+      const call: ToolCall = { id: `e${i}`, name: "x", input: {} };
+      a.push({ kind: "tool_call_requested", calls: [call], usage: usage() } as TurnResult);
+    }
+    a.push({ kind: "final_response", content: "done only", usage: usage() }); // completes after 2nd grant
+
+    // A real in-memory store (NOT the no-op default): the durable task-list path
+    // must survive run -> resume -> resume, otherwise the in-progress task is
+    // dropped and the test asserts the wrong path.
+    const storage = StorageProvider.single(new InMemoryStorageProvider());
+    const cfg = surfaceConfig(a);
+    cfg.toolRegistry = toolReg(3);
+    cfg.storage = storage;
+    const h = new StandardHarness(cfg);
+
+    const pe: LoopStrategy = {
+      kind: "plan_execute",
+      // plan: a structured ReAct leaf (output schema "" is registered by
+      // registryWith); effectively unlimited so the plan turn never binds.
+      plan: {
+        kind: "react",
+        budget: { kind: "per_loop", value: Number.MAX_SAFE_INTEGER },
+        agent: "",
+        toolset: "",
+        output: "",
+      },
+      execute: { kind: "react", budget: { kind: "per_loop", value: 2 }, agent: "", toolset: "" },
+    };
+    // max_turns unset -> the plan_execute combinator scope is unlimited.
+    const t = newTask("build", SessionId.of("s1"), pe);
+
+    // First run -> pause #1. The worker consumed real turns past the plan floor,
+    // so the cursor and `steps_taken` reflect that (NOT 0 / frozen).
+    const r1 = await h.run({ task: t });
+    expect(r1.kind).toBe("waiting_for_human");
+    if (r1.kind !== "waiting_for_human") throw new Error(`expected pause #1, got ${r1.kind}`);
+    expect(r1.request.kind).toBe("budget_exhausted");
+    if (r1.request.kind !== "budget_exhausted") throw new Error("expected budget_exhausted");
+    // The combinator scope owns the pause.
+    expect(r1.request.phase).toBe("plan_execute");
+    const turn1 = r1.state.turn_number;
+    const steps1 = r1.request.steps_taken;
+    // The bug froze the cursor at the pre-task value (1 = just the plan turn) and
+    // read steps_taken=0 from the unlimited scope.
+    expect(turn1).toBeGreaterThanOrEqual(2);
+    expect(steps1).toBeGreaterThanOrEqual(2);
+
+    // Grant +2 and resume -> pause #2. Forward progress: the cursor and
+    // `steps_taken` must STRICTLY advance (the bug re-seeded the same window).
+    const r2 = await h.resume(r1.state, {
+      kind: "escalate",
+      action: { kind: "continue_with_budget", steps: 2 },
+    });
+    expect(r2.kind).toBe("waiting_for_human");
+    if (r2.kind !== "waiting_for_human") throw new Error(`expected pause #2, got ${r2.kind}`);
+    expect(r2.request.kind).toBe("budget_exhausted");
+    if (r2.request.kind !== "budget_exhausted") throw new Error("expected budget_exhausted");
+    const turn2 = r2.state.turn_number;
+    const steps2 = r2.request.steps_taken;
+    expect(turn2).toBeGreaterThan(turn1); // turn cursor advanced across grants
+    expect(steps2).toBeGreaterThan(steps1); // steps_taken advanced across grants
+
+    // Grant +2 again and resume -> Success: the worker finishes, having made real
+    // progress rather than looping on the same window.
+    const r3 = await h.resume(r2.state, {
+      kind: "escalate",
+      action: { kind: "continue_with_budget", steps: 2 },
+    });
+    expect(r3.kind).toBe("success");
+    if (r3.kind === "success") expect(r3.output).toBe("done only");
+  });
+});

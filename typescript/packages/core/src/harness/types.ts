@@ -2649,6 +2649,18 @@ async function runPlanExecuteConfig(
 
     // ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ──────────────
     if (stepOutcome.kind === "budget_exhausted") {
+      // The execute LEAF already counted the worker's true consumed turns
+      // (ABSOLUTE — including the incoming `carriedBefore` floor) and carried
+      // them in the outcome's `stepsTaken`. Use THAT for the grant accounting,
+      // NOT the parent `plan_execute` scope's `stepsTaken`: that scope is
+      // `unlimited` when the Task has `max_turns` unset (so its `stepsTaken` is
+      // 0), which made the resume grant `granted = 0 + steps` a no-op and
+      // stalled the worker on the same window every grant. Everything ELSE on
+      // `err` stays the parent scope's: `phase` must remain "plan_execute" so
+      // the resume-seed `continuesUsed` restore matches in `grantTaskBudget`,
+      // and `continuesUsed` is the combinator's (`max_continues`) count, not
+      // the leaf's.
+      const leafSteps = stepOutcome.stepsTaken;
       const err = currentBudgetExhausted(cx, {
         policy: combinatorBudgetPolicy(task.budget.max_turns),
         behavior: peBehavior,
@@ -2656,6 +2668,7 @@ async function runPlanExecuteConfig(
         continuesUsed: 0,
         phase: "plan_execute",
       });
+      err.stepsTaken = leafSteps;
       const resolution = resolveCurrent(cx);
       // #129: a granted `continue` loops IN-PROCESS — the scope's `resolveCurrent`
       // already reset `stepsTaken` and bumped `continuesUsed`. Reset this task to
@@ -2711,6 +2724,14 @@ async function runPlanExecuteConfig(
       popBudget(cx);
       cx.scratch.task = task;
       cx.stream = onStream;
+      // Advance the run-wide turn cursor to the worker's consumed turns BEFORE
+      // building the pause (mirrors the Success branch's `carried.turns =
+      // subResult.turns`). Otherwise the cursor stays frozen at `carriedBefore`,
+      // so the paused `budget_used` / `turn_number` and the displayed
+      // `TurnStart { turn }` regress, and the resumed window re-seeds its floor
+      // to the same value and re-runs the same turns. `leafSteps` is absolute
+      // (>= carriedBefore).
+      carried.turns = leafSteps;
       if (surface) {
         const waiting = promoteBudgetExhaustedToHuman(
           err,
