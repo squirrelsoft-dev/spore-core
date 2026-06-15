@@ -517,6 +517,97 @@ async def test_escalate_response_to_non_budget_pause_halts() -> None:
 
 
 # ===========================================================================
+# Regression (cfffa40 / #144) — an execute-phase budget pause makes FORWARD
+# PROGRESS across grants: the run-wide turn cursor AND the request's
+# ``steps_taken`` both STRICTLY advance, and the worker eventually finishes.
+#
+# Before the fix the execute-phase exhaustion branch discarded the execute
+# leaf's consumed-turn count and re-read ``steps_taken = 0`` from the (Unlimited,
+# because ``max_turns = None``) ``plan_execute`` scope, and left ``carried.turns``
+# frozen at its pre-task value. So every grant computed ``granted = 0 + steps``
+# (a no-op that never widened the binding cap) and re-seeded the worker on the
+# SAME window — the cursor and ``steps_taken`` stuck and the worker re-ran the
+# same turns. This test passes with the fix and FAILS without it.
+# ===========================================================================
+
+
+async def test_execute_phase_budget_grant_advances_and_makes_progress() -> None:
+    # One execute task ("only"); the execute leaf cap is PerLoop(2) and the top
+    # task leaves ``max_turns = None``, so the ``plan_execute`` scope is Unlimited
+    # — the exact configuration that zeroed the grant accounting.
+    a = MockAgent(AgentId("test"))
+    # Plan turn (carried.turns -> 1).
+    a.push(FinalResponse(content='{"tasks":["only"],"rationale":"r"}', usage=_usage()))
+    # Execute worker keeps requesting tools so it never finishes until the final
+    # grant; each ToolCallRequested is one turn against the leaf cap.
+    for i in range(3):
+        a.push(
+            ToolCallRequested(
+                calls=[ToolCall(id=f"e{i}", name="x", input={})],
+                usage=_usage(),
+            )
+        )
+    # Completes after the 2nd grant.
+    a.push(FinalResponse(content="done only", usage=_usage()))
+
+    reg = ScriptedToolRegistry()
+    for _ in range(3):
+        reg.push(ToolOutputSuccess(content="ok", truncated=False))
+
+    h = StandardHarness(_config(a, reg, escalation_mode=EscalationModeSurfaceToHuman()))
+    tree = PlanExecuteConfig(
+        behavior=BudgetExhaustedEscalate(),
+        plan=ReactConfig(
+            budget=ReactConfig.per_loop(2**31 - 1).budget, agent="", toolset="", output=""
+        ),
+        execute=ReactConfig(budget=ReactConfig.per_loop(2).budget, agent="", toolset=""),
+    )
+    task = Task.new(
+        "build a CLI",
+        SessionId("pe-resume-s1"),
+        tree,
+        # ``max_turns = None`` -> the ``plan_execute`` scope is Unlimited.
+        budget=BudgetLimits(max_turns=None),
+    )
+
+    # First run -> pause #1. The worker consumed real turns past the plan floor,
+    # so the cursor and ``steps_taken`` reflect that (NOT 0 / frozen).
+    r1 = await h.run(HarnessRunOptions(task))
+    assert isinstance(r1, RunResultWaitingForHuman)
+    req1 = r1.request
+    assert isinstance(req1, HumanRequestBudgetExhausted)
+    # The combinator scope owns the pause.
+    assert req1.phase == "plan_execute"
+    turn1 = r1.state.turn_number
+    steps1 = req1.steps_taken
+    # The bug froze the cursor at the pre-task value (1 = just the plan turn) and
+    # read ``steps_taken = 0`` from the Unlimited scope.
+    assert turn1 >= 2, f"cursor advanced past the plan floor, got {turn1}"
+    assert steps1 >= 2, f"grant accounting uses the worker's consumed turns, got {steps1}"
+
+    # Grant +2 and resume -> pause #2. Forward progress: the cursor and
+    # ``steps_taken`` must STRICTLY advance (the bug re-seeded the same window).
+    r2 = await h.resume(
+        r1.state, HumanResponseEscalate(action=EscalationActionContinueWithBudget(steps=2))
+    )
+    assert isinstance(r2, RunResultWaitingForHuman)
+    req2 = r2.request
+    assert isinstance(req2, HumanRequestBudgetExhausted)
+    turn2 = r2.state.turn_number
+    steps2 = req2.steps_taken
+    assert turn2 > turn1, f"turn cursor advanced across grants ({turn1} -> {turn2})"
+    assert steps2 > steps1, f"steps_taken advanced across grants ({steps1} -> {steps2})"
+
+    # Grant +2 again and resume -> Success: the worker finishes, having made real
+    # progress rather than looping on the same window.
+    r3 = await h.resume(
+        r2.state, HumanResponseEscalate(action=EscalationActionContinueWithBudget(steps=2))
+    )
+    assert isinstance(r3, RunResultSuccess)
+    assert r3.output == "done only"
+
+
+# ===========================================================================
 # Fixture replay — deserialize, assert field-for-field, re-serialize
 # byte-identically.
 # ===========================================================================

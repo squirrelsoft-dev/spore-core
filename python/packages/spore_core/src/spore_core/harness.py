@@ -2348,12 +2348,25 @@ async def _run_plan_execute_config(
 
         # ── BudgetExhausted (#125 rule 4/7) — resolve THIS scope. ────────────
         if isinstance(step_outcome, StrategyOutcomeBudgetExhausted):
+            # The execute LEAF already counted the worker's true consumed turns
+            # (ABSOLUTE — including the incoming ``carried_before`` floor) and
+            # carried them in the outcome's ``steps_taken``. Use THAT for the grant
+            # accounting, NOT the parent ``plan_execute`` scope's ``steps_taken``:
+            # that scope is ``Unlimited`` when the Task has ``max_turns = None`` (so
+            # its ``steps_taken`` is 0), which made the resume grant
+            # ``granted = 0 + steps`` a no-op and stalled the worker on the same
+            # window every grant. Everything ELSE on ``err`` stays the parent
+            # scope's: ``phase`` must remain "plan_execute" so the resume-seed
+            # ``continues_used`` restore matches in ``_grant_task_budget``, and
+            # ``continues_used`` is the combinator's (``max_continues``) count, not
+            # the leaf's.
+            leaf_steps = step_outcome.steps_taken
             scope = cx.budgets.current()
             assert scope is not None, "plan_execute scope pushed above"
             err = BudgetExhausted(
                 policy=scope.policy,
                 behavior=scope.behavior,
-                steps_taken=scope.steps_taken,
+                steps_taken=leaf_steps,
                 continues_used=scope.continues_used,
                 phase=scope.phase,
             )
@@ -2408,6 +2421,14 @@ async def _run_plan_execute_config(
             cx.pop_budget()
             cx.scratch.task = task
             cx.stream = on_stream
+            # Advance the run-wide turn cursor to the worker's consumed turns
+            # BEFORE building the pause (mirrors the Success branch's
+            # ``carried.turns = sub_result.turns``). Otherwise the cursor stays
+            # frozen at ``carried_before``, so the paused ``budget_used`` /
+            # ``turn_number`` and the displayed ``TurnStart`` turn regress, and the
+            # resumed window re-seeds its floor to the same value and re-runs the
+            # same turns. ``leaf_steps`` is absolute (>= carried_before).
+            carried.turns = leaf_steps
 
             if surface:
                 waiting = _promote_budget_exhausted_to_human(
