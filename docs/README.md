@@ -30,6 +30,7 @@ these as language tabs driven by one global selector.
 | [architecture](./concepts/architecture.md) | `Agent = Model + Harness`; the components and how they wire together |
 | [loop-strategies](./concepts/loop-strategies.md) | ReAct, PlanExecute, SelfVerifying, HillClimbing, Ralph |
 | [tools](./concepts/tools.md) | The three ways to give an agent a tool, and when to use each |
+| [modes-and-approval](./concepts/modes-and-approval.md) | Modes, the approval policies they imply, risk levels, and the approval pause |
 | [memory](./concepts/memory.md) | The storage seam, `SessionState`, episodic vs semantic memory |
 | [observability](./concepts/observability.md) | The trace outbox, OTLP, viewing traces |
 | [multi-agent](./concepts/multi-agent.md) | Composition, agent-as-tool, sequential handoff |

@@ -79,3 +79,4 @@ Tools carry annotations (read-only, destructive, touches external systems) from 
 level is derived. Middleware — a permission policy tied to the harness **mode** — can route a
 risky call to a human for approval before it runs, surfacing as a pause the caller resumes. This
 is how "always ask," "auto-edit," "safe-auto," and "yolo" modes differ without changing any tool.
+See [modes and approval policies](./modes-and-approval.md) for the full picture.
