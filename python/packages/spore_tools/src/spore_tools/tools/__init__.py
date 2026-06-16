@@ -60,7 +60,7 @@ from .subagent import (
 )
 from .tasklist import TaskListTool
 from .todo import TODO_STORE_KEY, TodoWriteTool
-from .web import WebFetchTool, WebSearchTool
+from .web import UrlPolicy, WebFetchTool, WebSearchTool
 
 __all__ = [
     "AbortTool",
@@ -108,6 +108,7 @@ __all__ = [
     "Timeout",
     "TodoWriteTool",
     "ToolExecutionError",
+    "UrlPolicy",
     "WebFetchTool",
     "WebSearchTool",
     "WriteFileTool",

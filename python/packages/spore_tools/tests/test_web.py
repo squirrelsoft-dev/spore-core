@@ -16,10 +16,12 @@ from spore_tools.tools.web import (
     EnvVarEmpty,
     EnvVarNotSet,
     SearchMethod,
+    UrlPolicy,
     WebFetchTool,
     WebSearchConfig,
     WebSearchTool,
     _apply_web_fetch_range,
+    validate_fetch_url,
 )
 
 _CTX = make_test_ctx()
@@ -282,6 +284,85 @@ async def test_get_returns_body_verbatim(httpx_mock: HTTPXMock) -> None:
     r = await tool.execute(_call("web_search", {"query": "t"}), AllowAllSandbox(), _CTX)
     assert isinstance(r, ToolOutputSuccess)
     assert r.content == raw
+
+
+# ── SSRF guard: validate_fetch_url (#145) ─────────────────────────────────────
+
+_DENY_URLS = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://localhost/",
+    "file:///etc/passwd",
+    "http://127.0.0.1/",
+    "http://10.1.2.3/",
+    "http://192.168.0.1/",
+    "http://172.16.5.5/",
+    "http://[::1]/",
+    "ftp://example.com/x",
+]
+
+_ALLOW_URLS = [
+    "https://example.com/",
+    "http://93.184.216.34/",
+]
+
+
+@pytest.mark.parametrize("url", _DENY_URLS + _ALLOW_URLS)
+def test_permissive_policy_allows_everything(url: str) -> None:
+    assert validate_fetch_url(url, UrlPolicy.permissive()) is None
+
+
+@pytest.mark.parametrize("url", _DENY_URLS + _ALLOW_URLS)
+def test_default_policy_is_permissive(url: str) -> None:
+    # The dataclass default and ``permissive()`` are equivalent — both allow all.
+    assert UrlPolicy() == UrlPolicy.permissive()
+    assert validate_fetch_url(url, UrlPolicy()) is None
+
+
+@pytest.mark.parametrize("url", _DENY_URLS)
+def test_deny_private_rejects_blocked_urls(url: str) -> None:
+    result = validate_fetch_url(url, UrlPolicy.deny_private())
+    assert isinstance(result, ToolOutputError)
+    assert result.recoverable is True
+
+
+@pytest.mark.parametrize("url", _ALLOW_URLS)
+def test_deny_private_allows_public_hosts(url: str) -> None:
+    assert validate_fetch_url(url, UrlPolicy.deny_private()) is None
+
+
+def test_deny_private_rejects_ipv4_mapped_metadata() -> None:
+    # ``::ffff:169.254.169.254`` must unwrap to the v4 and be blocked.
+    result = validate_fetch_url("http://[::ffff:169.254.169.254]/", UrlPolicy.deny_private())
+    assert isinstance(result, ToolOutputError)
+    assert result.recoverable is True
+
+
+def test_deny_private_rejects_broadcast_and_unspecified() -> None:
+    for url in ("http://255.255.255.255/", "http://0.0.0.0/"):
+        result = validate_fetch_url(url, UrlPolicy.deny_private())
+        assert isinstance(result, ToolOutputError), url
+
+
+async def test_web_fetch_deny_private_blocks_metadata_endpoint(
+    httpx_mock: HTTPXMock,
+) -> None:
+    tool = WebFetchTool().with_url_policy(UrlPolicy.deny_private())
+    r = await tool.execute(
+        _call("web_fetch", {"url": "http://169.254.169.254/"}), AllowAllSandbox(), _CTX
+    )
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable is True
+    # The outbound request was never issued.
+    assert httpx_mock.get_requests() == []
+
+
+async def test_web_search_deny_private_blocks_localhost_endpoint() -> None:
+    tool = WebSearchTool.with_endpoint("http://localhost:8080/search").with_url_policy(
+        UrlPolicy.deny_private()
+    )
+    r = await tool.execute(_call("web_search", {"query": "x"}), AllowAllSandbox(), _CTX)
+    assert isinstance(r, ToolOutputError)
+    assert r.recoverable is True
 
 
 # ── _apply_web_fetch_range unit tests (#135) ──────────────────────────────────

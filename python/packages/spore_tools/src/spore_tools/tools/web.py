@@ -41,6 +41,7 @@ serializable structure and never stored on the serializable config.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -59,6 +60,121 @@ from spore_core.tool_registry import ToolAnnotations, ToolContext, ToolSchema
 from ._common import finish_with_possible_truncation
 from .error import ToolExecutionError
 from .params import WebFetchParams, WebSearchParams, parse_params
+
+
+# ── SSRF guard — outbound URL policy (validate_fetch_url seam) ────────────────
+
+
+@dataclass(frozen=True)
+class UrlPolicy:
+    """Policy consulted before any outbound ``web_fetch`` / ``web_search`` request.
+
+    **Permissive by default** — :meth:`UrlPolicy.permissive` (the default) allows
+    every URL with no parsing at all, so existing wiring, tests, and examples are
+    unaffected. A deployment that wants SSRF protection opts in with
+    :meth:`UrlPolicy.deny_private` (wired via the web-tool builders, see
+    :meth:`WebFetchTool.with_url_policy` / :meth:`WebSearchTool.with_url_policy`).
+
+    ``deny_private`` rejects non-``http(s)`` schemes and hosts given as an IP
+    literal in a loopback / link-local / private (RFC-1918) / cloud-metadata
+    (``169.254.169.254``) range, plus the ``localhost`` hostname (and
+    ``*.localhost``). **Limitation:** non-``localhost`` hostnames are NOT
+    DNS-resolved here, so a hostname that resolves to a private address is not
+    caught by this seam — deployments that need resolution-time protection must
+    enforce it at the network layer.
+    """
+
+    # The boolean is stored as a private field so the ``deny_private`` name is
+    # free for the constructor classmethod below (a public field named
+    # ``deny_private`` would collide with / be shadowed by the classmethod).
+    _deny_private: bool = False
+
+    @classmethod
+    def permissive(cls) -> UrlPolicy:
+        """Allow every URL (the default). No SSRF restrictions."""
+        return cls(_deny_private=False)
+
+    @classmethod
+    def deny_private(cls) -> UrlPolicy:
+        """Reject non-``http(s)`` schemes and private/loopback/link-local/metadata
+        IP-literal hosts (and the ``localhost`` hostname)."""
+        return cls(_deny_private=True)
+
+
+def _is_blocked_v4(v4: ipaddress.IPv4Address) -> bool:
+    """Match the Rust SSRF range set exactly.
+
+    Python's ``IPv4Address.is_private`` is both broader and narrower than the
+    Rust predicate (e.g. it does NOT flag ``255.255.255.255``), so assemble the
+    blocked set explicitly rather than relying on a single property.
+    """
+    return (
+        v4.is_loopback  # 127.0.0.0/8
+        or v4 in ipaddress.ip_network("10.0.0.0/8")  # RFC-1918
+        or v4 in ipaddress.ip_network("172.16.0.0/12")  # RFC-1918
+        or v4 in ipaddress.ip_network("192.168.0.0/16")  # RFC-1918
+        or v4.is_link_local  # 169.254.0.0/16 — includes 169.254.169.254
+        or v4.is_unspecified  # 0.0.0.0
+        or v4 == ipaddress.IPv4Address("255.255.255.255")  # broadcast
+        or v4 in ipaddress.ip_network("192.0.2.0/24")  # documentation
+        or v4 in ipaddress.ip_network("198.51.100.0/24")  # documentation
+        or v4 in ipaddress.ip_network("203.0.113.0/24")  # documentation
+    )
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv4Address):
+        return _is_blocked_v4(ip)
+    # IPv4-mapped (``::ffff:a.b.c.d``) → unwrap and apply the v4 rules so e.g.
+    # ``::ffff:169.254.169.254`` is blocked.
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return _is_blocked_v4(mapped)
+    return (
+        ip.is_loopback  # ::1
+        or ip.is_unspecified  # ::
+        or ip in ipaddress.ip_network("fe80::/10")  # link-local
+        or ip in ipaddress.ip_network("fc00::/7")  # unique-local
+    )
+
+
+def validate_fetch_url(url: str, policy: UrlPolicy) -> None | ToolOutputError:
+    """Validate ``url`` against ``policy`` before an outbound request.
+
+    Returns ``None`` when the URL is allowed, or a recoverable
+    :class:`ToolOutputError` when ``deny_private`` rejects it. The permissive
+    policy performs no parsing and always allows.
+    """
+    if not policy._deny_private:
+        return None
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError) as e:
+        return ToolOutputError(message=f"invalid URL: {e}", recoverable=True)
+    if parsed.scheme not in ("http", "https"):
+        return ToolOutputError(
+            message=f"scheme '{parsed.scheme}' not allowed by URL policy",
+            recoverable=True,
+        )
+    host = parsed.host
+    if not host:
+        return ToolOutputError(message="URL has no host", recoverable=True)
+    lowered = host.lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        return ToolOutputError(message=f"host '{host}' is loopback", recoverable=True)
+    # ``httpx.URL.host`` is already unbracketed for IPv6 literals. A non-IP host
+    # (DNS name) raises ``ValueError`` here → allowed without resolution (the
+    # documented limitation: a name resolving to a private address is not caught).
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if _is_blocked_ip(ip):
+        return ToolOutputError(
+            message=f"host '{host}' is in a blocked address range",
+            recoverable=True,
+        )
+    return None
 
 
 def _apply_web_fetch_range(body: str, start_byte: int) -> str | ToolOutputError:
@@ -88,6 +204,15 @@ def _apply_web_fetch_range(body: str, start_byte: int) -> str | ToolOutputError:
 
 class WebFetchTool:
     NAME = "web_fetch"
+
+    def __init__(self, policy: UrlPolicy | None = None) -> None:
+        self._policy = policy or UrlPolicy.permissive()
+
+    def with_url_policy(self, policy: UrlPolicy) -> WebFetchTool:
+        """Opt into an SSRF policy (e.g. :meth:`UrlPolicy.deny_private`). Returns
+        ``self`` so it chains off the constructor."""
+        self._policy = policy
+        return self
 
     def name(self) -> str:
         return self.NAME
@@ -130,6 +255,9 @@ class WebFetchTool:
             params = parse_params(WebFetchParams, call)
         except ToolExecutionError as e:
             return e.to_tool_output()
+        denied = validate_fetch_url(params.url, self._policy)
+        if isinstance(denied, ToolOutputError):
+            return denied
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(params.url)
@@ -244,6 +372,7 @@ class WebSearchTool:
     NAME = "web_search"
 
     def __init__(self, endpoint: str | None = None) -> None:
+        self._policy = UrlPolicy.permissive()
         if endpoint is None:
             self._backend: _ResolvedBackend | None = None
         else:
@@ -254,6 +383,13 @@ class WebSearchTool:
                 auth_headers=[],
                 body_auth_params=[],
             )
+
+    def with_url_policy(self, policy: UrlPolicy) -> WebSearchTool:
+        """Opt into an SSRF policy (e.g. :meth:`UrlPolicy.deny_private`) applied
+        to the configured backend endpoint. Returns ``self`` so it chains off the
+        constructor."""
+        self._policy = policy
+        return self
 
     @classmethod
     def with_endpoint(cls, endpoint: str) -> WebSearchTool:
@@ -274,6 +410,9 @@ class WebSearchTool:
             (name, _resolve_env(env_var)) for name, env_var in config.body_auth_params
         ]
         tool = cls.__new__(cls)
+        # ``__new__`` bypasses ``__init__``, so set ``_policy`` explicitly or
+        # ``execute`` would ``AttributeError``.
+        tool._policy = UrlPolicy.permissive()
         tool._backend = _ResolvedBackend(
             endpoint=config.endpoint,
             method=config.method,
@@ -315,6 +454,11 @@ class WebSearchTool:
         backend = self._backend
         if backend is None:
             return ToolOutputError(message="web_search backend not configured", recoverable=True)
+        # Validate the CONFIGURED endpoint (raw string, pre-merge) — not the URL
+        # with the query/auth params appended.
+        denied = validate_fetch_url(backend.endpoint, self._policy)
+        if isinstance(denied, ToolOutputError):
+            return denied
         headers = {name: value for name, value in backend.auth_headers}
         try:
             async with httpx.AsyncClient() as client:
@@ -351,9 +495,11 @@ __all__ = [
     "EnvVarEmpty",
     "EnvVarNotSet",
     "SearchMethod",
+    "UrlPolicy",
     "WebFetchTool",
     "WebSearchConfig",
     "WebSearchConfigError",
     "WebSearchTool",
     "_apply_web_fetch_range",
+    "validate_fetch_url",
 ]
