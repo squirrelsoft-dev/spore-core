@@ -20,12 +20,127 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
+
+// ============================================================================
+// SSRF guard — outbound URL policy (validateFetchURL seam)
+// ============================================================================
+
+// UrlPolicy is consulted before any outbound web_fetch / web_search request.
+//
+// Permissive by default — the zero value (UrlPolicy{}) and
+// UrlPolicyPermissive() allow every URL, so existing wiring, tests, and
+// examples are unaffected. A deployment that wants SSRF protection opts in with
+// UrlPolicyDenyPrivate() (wired via the web-tool builders, see
+// (*WebFetchTool).WithURLPolicy / (*WebSearchTool).WithURLPolicy).
+//
+// DenyPrivate rejects non-http(s) schemes and hosts given as an IP literal in a
+// loopback / link-local / private (RFC-1918) / cloud-metadata
+// (169.254.169.254) range, plus the localhost hostname. Limitation:
+// non-localhost hostnames are NOT DNS-resolved here, so a hostname that
+// resolves to a private address is not caught by this seam — deployments that
+// need resolution-time protection must enforce it at the network layer.
+type UrlPolicy struct {
+	// denyPrivate is unexported so the zero value stays permissive: a struct
+	// that forgets to initialize it remains safe (allows everything).
+	denyPrivate bool
+}
+
+// UrlPolicyPermissive allows every URL (the default). No SSRF restrictions.
+func UrlPolicyPermissive() UrlPolicy { return UrlPolicy{denyPrivate: false} }
+
+// UrlPolicyDenyPrivate rejects non-http(s) schemes and
+// private/loopback/link-local/metadata IP-literal hosts (and the localhost
+// hostname).
+func UrlPolicyDenyPrivate() UrlPolicy { return UrlPolicy{denyPrivate: true} }
+
+func urlDenied(message string) *sporecore.ToolOutput {
+	return &sporecore.ToolOutput{
+		Kind:        sporecore.ToolOutputError,
+		Message:     message,
+		Recoverable: true,
+	}
+}
+
+// isBlockedAddr reports whether addr is in a range web_fetch / web_search must
+// not reach under a deny-private policy.
+func isBlockedAddr(addr netip.Addr) bool {
+	// IPv4-mapped IPv6 (::ffff:a.b.c.d): unmap and apply the v4 rules so e.g.
+	// ::ffff:169.254.169.254 is blocked.
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	switch {
+	case addr.IsLoopback(): // 127.0.0.0/8, ::1
+		return true
+	case addr.IsPrivate(): // RFC-1918 (10/8, 172.16/12, 192.168/16) + fc00::/7
+		return true
+	case addr.IsLinkLocalUnicast(): // 169.254.0.0/16 (incl. metadata) + fe80::/10
+		return true
+	case addr.IsUnspecified(): // 0.0.0.0, ::
+		return true
+	}
+	if addr.Is4() {
+		// IsPrivate does not cover the broadcast or documentation ranges; add
+		// the explicit checks Rust applies.
+		if addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+			return true // limited broadcast
+		}
+		b := addr.As4()
+		// Documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
+		switch {
+		case b[0] == 192 && b[1] == 0 && b[2] == 2:
+			return true
+		case b[0] == 198 && b[1] == 51 && b[2] == 100:
+			return true
+		case b[0] == 203 && b[1] == 0 && b[2] == 113:
+			return true
+		}
+	}
+	return false
+}
+
+// validateFetchURL validates rawURL against policy before an outbound request.
+// The permissive policy always returns nil; DenyPrivate returns a recoverable
+// error ToolOutput when the URL is disallowed (first failure wins).
+func validateFetchURL(rawURL string, policy UrlPolicy) *sporecore.ToolOutput {
+	if !policy.denyPrivate {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return urlDenied(fmt.Sprintf("invalid URL: %s", err))
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return urlDenied(fmt.Sprintf("scheme '%s' not allowed by URL policy", u.Scheme))
+	}
+	host := u.Hostname() // strips IPv6 brackets: http://[::1]/ → ::1
+	if host == "" {
+		return urlDenied("URL has no host")
+	}
+	lowered := strings.ToLower(host)
+	if lowered == "localhost" || strings.HasSuffix(lowered, ".localhost") {
+		return urlDenied(fmt.Sprintf("host '%s' is loopback", host))
+	}
+	// IP-literal hosts only: a parse failure means host is a DNS name, which we
+	// intentionally do NOT resolve (documented limitation) — allow it.
+	addr, perr := netip.ParseAddr(host)
+	if perr != nil {
+		return nil
+	}
+	if isBlockedAddr(addr) {
+		return urlDenied(fmt.Sprintf("host '%s' is in a blocked address range", host))
+	}
+	return nil
+}
 
 // ============================================================================
 // WebFetch
@@ -35,10 +150,21 @@ import (
 const WebFetchToolName = "web_fetch"
 
 // WebFetchTool GETs a URL and returns the response body.
-type WebFetchTool struct{}
+type WebFetchTool struct {
+	// policy is consulted before the outbound request. Zero value is
+	// permissive (allows everything).
+	policy UrlPolicy
+}
 
-// NewWebFetchTool constructs a WebFetchTool.
+// NewWebFetchTool constructs a WebFetchTool with the permissive (zero-value)
+// URL policy.
 func NewWebFetchTool() *WebFetchTool { return &WebFetchTool{} }
+
+// WithURLPolicy sets the SSRF URL policy and returns the receiver for chaining.
+func (t *WebFetchTool) WithURLPolicy(p UrlPolicy) *WebFetchTool {
+	t.policy = p
+	return t
+}
 
 func (*WebFetchTool) Name() string                { return WebFetchToolName }
 func (*WebFetchTool) IsSubagentTool() bool        { return false }
@@ -93,6 +219,9 @@ func (t *WebFetchTool) Execute(ctx context.Context, call sporecore.ToolCall, san
 	var params WebFetchParams
 	if e := parseParams(call, &params); e != nil {
 		return e.ToToolOutput()
+	}
+	if denied := validateFetchURL(params.URL, t.policy); denied != nil {
+		return *denied
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, params.URL, nil)
 	if err != nil {
@@ -261,6 +390,15 @@ func resolveEnv(envVar string) (string, error) {
 // every call is a recoverable error.
 type WebSearchTool struct {
 	backend *resolvedBackend
+	// policy is consulted (against the configured endpoint) before the
+	// outbound request. Zero value is permissive (allows everything).
+	policy UrlPolicy
+}
+
+// WithURLPolicy sets the SSRF URL policy and returns the receiver for chaining.
+func (t *WebSearchTool) WithURLPolicy(p UrlPolicy) *WebSearchTool {
+	t.policy = p
+	return t
 }
 
 // NewWebSearchTool constructs a WebSearchTool with no backend configured (calls
@@ -342,6 +480,11 @@ func (t *WebSearchTool) Execute(ctx context.Context, call sporecore.ToolCall, sa
 	b := t.backend
 	if b == nil {
 		return ExecutionFailed("web_search backend not configured", true).ToToolOutput()
+	}
+	// Validate the configured endpoint (the raw backend URL, not the
+	// post-merge URL) before building any request.
+	if denied := validateFetchURL(b.endpoint, t.policy); denied != nil {
+		return *denied
 	}
 	var req *http.Request
 	var err error

@@ -364,6 +364,95 @@ func TestSearchMethodDefaultIsPost(t *testing.T) {
 	}
 }
 
+// ── SSRF guard: validateFetchURL (#145) ──────────────────────────────────────
+
+func TestValidateFetchURLDenyPrivateRejects(t *testing.T) {
+	policy := UrlPolicyDenyPrivate()
+	denied := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://localhost/",
+		"file:///etc/passwd",
+		"http://127.0.0.1/",
+		"http://10.1.2.3/",
+		"http://192.168.0.1/",
+		"http://172.16.5.5/",
+		"http://[::1]/",
+		"ftp://example.com/x",
+	}
+	for _, u := range denied {
+		out := validateFetchURL(u, policy)
+		if out == nil {
+			t.Fatalf("expected %q to be denied", u)
+		}
+		if out.Kind != sporecore.ToolOutputError || !out.Recoverable {
+			t.Fatalf("expected recoverable error for %q, got %+v", u, out)
+		}
+	}
+}
+
+func TestValidateFetchURLDenyPrivateAllowsPublic(t *testing.T) {
+	policy := UrlPolicyDenyPrivate()
+	for _, u := range []string{
+		"https://example.com/",
+		"http://93.184.216.34/",
+	} {
+		if out := validateFetchURL(u, policy); out != nil {
+			t.Fatalf("expected %q to be allowed, got %+v", u, out)
+		}
+	}
+}
+
+func TestValidateFetchURLPermissiveAllowsEverything(t *testing.T) {
+	// Both the explicit permissive policy and the zero value allow everything
+	// (proves no churn for existing wiring/tests/examples).
+	policies := []UrlPolicy{UrlPolicyPermissive(), {}}
+	urls := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://localhost:8080/",
+		"file:///etc/passwd",
+		"https://example.com/",
+		"http://127.0.0.1/",
+		"http://[::1]/",
+	}
+	for _, policy := range policies {
+		for _, u := range urls {
+			if out := validateFetchURL(u, policy); out != nil {
+				t.Fatalf("permissive policy should allow %q, got %+v", u, out)
+			}
+		}
+	}
+}
+
+func TestValidateFetchURLBlocksIPv4MappedMetadata(t *testing.T) {
+	// ::ffff:169.254.169.254 must be unmapped and blocked.
+	policy := UrlPolicyDenyPrivate()
+	if out := validateFetchURL("http://[::ffff:169.254.169.254]/", policy); out == nil {
+		t.Fatal("expected IPv4-mapped metadata address to be denied")
+	}
+}
+
+func TestWebFetchWithDenyPrivateBlocksMetadataEndpoint(t *testing.T) {
+	// httptest server with a hit flag: validation must run before any request,
+	// so the server is never hit.
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		_, _ = w.Write([]byte("should-not-reach"))
+	}))
+	defer srv.Close()
+
+	tool := NewWebFetchTool().WithURLPolicy(UrlPolicyDenyPrivate())
+	r := tool.Execute(context.Background(),
+		call("web_fetch", "c1", map[string]any{"url": "http://169.254.169.254/"}),
+		sporecore.AllowAllSandbox{}, nil)
+	if r.Kind != sporecore.ToolOutputError || !r.Recoverable {
+		t.Fatalf("expected recoverable error, got %+v", r)
+	}
+	if hit {
+		t.Fatal("validation should run before any outbound request; server was hit")
+	}
+}
+
 // ── applyWebFetchRange unit tests (#135) ─────────────────────────────────────
 
 func TestApplyWebFetchRangeStartZeroNoHeader(t *testing.T) {
