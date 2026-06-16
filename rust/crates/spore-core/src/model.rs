@@ -307,6 +307,53 @@ pub fn enforce_budget(used: u32, budget: Option<u32>) -> Result<(), ModelError> 
 }
 
 // ============================================================================
+// Incremental streaming line decoder
+// ============================================================================
+
+/// Accumulates raw response-stream bytes and yields complete delimiter-terminated
+/// lines decoded as UTF-8, keeping any trailing partial bytes buffered.
+///
+/// The provider streaming decoders (Ollama NDJSON `\n`, OpenAI SSE `\n`,
+/// Anthropic SSE `\n\n`) used to `String::from_utf8_lossy(&chunk)` **per chunk**,
+/// which corrupts any multibyte codepoint that straddles a chunk boundary (each
+/// half becomes `U+FFFD`). Buffering the raw bytes and only decoding up to a
+/// delimiter avoids that: the delimiters here are ASCII (`\n`), which can never
+/// appear inside a multibyte UTF-8 sequence, so a complete line always ends on a
+/// char boundary. A codepoint split across chunks simply stays in the buffer's
+/// tail until the rest of its bytes arrive.
+#[derive(Debug, Default)]
+pub(crate) struct ByteLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl ByteLineBuffer {
+    pub(crate) fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append freshly received stream bytes.
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Remove and return the next complete `delimiter`-terminated line, decoded
+    /// as UTF-8 (lossy, but lossiness now only happens on genuinely invalid
+    /// bytes — never on a chunk-split codepoint). The delimiter is consumed and
+    /// excluded from the returned string. Returns `None` when no complete line
+    /// is buffered yet.
+    pub(crate) fn next_line(&mut self, delimiter: &[u8]) -> Option<String> {
+        debug_assert!(!delimiter.is_empty(), "delimiter must be non-empty");
+        let pos = self
+            .buf
+            .windows(delimiter.len())
+            .position(|w| w == delimiter)?;
+        let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
+        self.buf.drain(..pos + delimiter.len());
+        Some(line)
+    }
+}
+
+// ============================================================================
 // Fixture-replay implementation
 // ============================================================================
 
@@ -789,6 +836,39 @@ mod tests {
     use super::mock::MockModelInterface;
     use super::*;
     use futures_util::StreamExt;
+
+    #[test]
+    fn byte_line_buffer_decodes_codepoint_split_across_chunks() {
+        // "café\n" — 'é' is 0xC3 0xA9. Split the two bytes of 'é' across two
+        // pushes (the classic streaming corruption case).
+        let mut b = ByteLineBuffer::new();
+        b.push(&[b'c', b'a', b'f', 0xC3]); // 'é' lead byte only
+        assert_eq!(b.next_line(b"\n"), None, "no complete line yet");
+        b.push(&[0xA9, b'\n']); // 'é' continuation byte + newline
+        assert_eq!(b.next_line(b"\n").as_deref(), Some("café"));
+        assert_eq!(b.next_line(b"\n"), None);
+    }
+
+    #[test]
+    fn byte_line_buffer_yields_multiple_lines_and_keeps_partial_tail() {
+        let mut b = ByteLineBuffer::new();
+        b.push("a\nb\nc".as_bytes());
+        assert_eq!(b.next_line(b"\n").as_deref(), Some("a"));
+        assert_eq!(b.next_line(b"\n").as_deref(), Some("b"));
+        assert_eq!(b.next_line(b"\n"), None, "trailing 'c' has no delimiter");
+        b.push(b"\n");
+        assert_eq!(b.next_line(b"\n").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn byte_line_buffer_supports_multibyte_delimiter() {
+        // Anthropic SSE separates events with a blank line ("\n\n").
+        let mut b = ByteLineBuffer::new();
+        b.push(b"event: x\ndata: 1\n\nevent: y\n\n");
+        assert_eq!(b.next_line(b"\n\n").as_deref(), Some("event: x\ndata: 1"));
+        assert_eq!(b.next_line(b"\n\n").as_deref(), Some("event: y"));
+        assert_eq!(b.next_line(b"\n\n"), None);
+    }
 
     fn provider() -> ProviderInfo {
         ProviderInfo {

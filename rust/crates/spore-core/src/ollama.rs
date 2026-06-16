@@ -906,7 +906,7 @@ fn ndjson_to_events(
     async_stream::stream! {
         let stream = resp.bytes_stream();
         futures_util::pin_mut!(stream);
-        let mut buf = String::new();
+        let mut buf = crate::model::ByteLineBuffer::new();
         let mut started = false;
         let mut tool_indices_seen: std::collections::HashSet<u32> =
             std::collections::HashSet::new();
@@ -931,10 +931,8 @@ fn ndjson_to_events(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(idx) = buf.find('\n') {
-                let raw_line = buf[..idx].to_string();
-                buf = buf[idx + 1..].to_string();
+            buf.push(&chunk);
+            while let Some(raw_line) = buf.next_line(b"\n") {
                 let line = raw_line.trim_end_matches('\r').trim();
                 if line.is_empty() {
                     continue;

@@ -303,6 +303,13 @@ fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequ
     } else {
         req.params.temperature
     };
+    // o-series reasoning models reject sampling-control params: drop `top_p` and
+    // `stop` for them, exactly as `temperature` is dropped above.
+    let (top_p, stop) = if is_reasoning {
+        (None, Vec::new())
+    } else {
+        (req.params.top_p, req.params.stop_sequences.clone())
+    };
 
     OpenAIRequest {
         model: model_id.into(),
@@ -310,8 +317,8 @@ fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequ
         max_tokens,
         max_completion_tokens,
         temperature,
-        top_p: req.params.top_p,
-        stop: req.params.stop_sequences.clone(),
+        top_p,
+        stop,
         tools,
         stream,
         stream_options: if stream {
@@ -546,28 +553,24 @@ impl ModelInterface for OpenAIModelInterface {
             message: format!("request encode failed: {e}"),
         })?;
         let client = self.http_client.clone();
-        let resp = client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .timeout(self.timeout)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ModelError::Timeout
-                } else {
-                    ModelError::ProviderError {
-                        code: 0,
-                        message: format!("HTTP transport error: {e}"),
-                    }
-                }
-            })?;
-        if !resp.status().is_success() {
-            return Err(map_status_error(resp).await);
-        }
+        let api_key = self.api_key.clone();
+        // Route through `send_with_retry` so opening a stream gets the same
+        // retry/backoff on transient failures (timeouts, 429/5xx) as the
+        // non-streaming `call` path. Retries happen BEFORE the body is consumed;
+        // the closure rebuilds the request each attempt (`body.clone()`).
+        let resp = send_with_retry(
+            || {
+                client
+                    .post(&url)
+                    .header("authorization", format!("Bearer {api_key}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .body(body.clone())
+            },
+            self.max_retries,
+            self.timeout,
+        )
+        .await?;
         Ok(Box::pin(sse_to_events(resp)))
     }
 
@@ -620,7 +623,7 @@ fn sse_to_events(
     async_stream::stream! {
         let stream = resp.bytes_stream();
         futures_util::pin_mut!(stream);
-        let mut buf = String::new();
+        let mut buf = crate::model::ByteLineBuffer::new();
         let mut usage = TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
         let mut started = false;
@@ -638,10 +641,8 @@ fn sse_to_events(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(idx) = buf.find('\n') {
-                let raw_line = buf[..idx].to_string();
-                buf = buf[idx + 1..].to_string();
+            buf.push(&chunk);
+            while let Some(raw_line) = buf.next_line(b"\n") {
                 let line = raw_line.trim_end_matches('\r');
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
@@ -816,6 +817,21 @@ mod tests {
         assert_eq!(body.max_tokens, None);
         assert_eq!(body.max_completion_tokens, Some(512));
         assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn build_request_o_series_drops_top_p_and_stop() {
+        let mut r = req(vec![user("hi")]);
+        r.params.top_p = Some(0.9);
+        r.params.stop_sequences = vec!["STOP".into()];
+        // Reasoning model: both sampling-control params are dropped.
+        let reasoning = build_request("o3", &r, false);
+        assert_eq!(reasoning.top_p, None);
+        assert!(reasoning.stop.is_empty());
+        // Chat model: both are preserved.
+        let chat = build_request("gpt-4o", &r, false);
+        assert_eq!(chat.top_p, Some(0.9));
+        assert_eq!(chat.stop, vec!["STOP".to_string()]);
     }
 
     #[test]

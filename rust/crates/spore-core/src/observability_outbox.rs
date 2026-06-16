@@ -75,7 +75,7 @@
 //! Tempo stack or network. This isolates the version-churny OTLP SDK surface
 //! from the reliability-critical outbox and lets the tests run hermetically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -95,7 +95,6 @@ use crate::observability::{
 use crate::storage::{parse_otlp_endpoints, ObservabilityStore};
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
-const OTLP_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ============================================================================
 // Config
@@ -718,9 +717,9 @@ impl OtlpForwarder for OtlpSdkForwarder {
     }
 
     fn force_flush(&self) {
-        // SdkTracerProvider::force_flush flushes all batch processors. The SDK
-        // export is internally bounded; OTLP_FLUSH_TIMEOUT documents the intent.
-        let _ = &OTLP_FLUSH_TIMEOUT;
+        // SdkTracerProvider::force_flush flushes all batch processors and is
+        // internally bounded — it blocks until export completes or the SDK's own
+        // timeout fires, so no extra wrapper timeout is needed.
         if let Err(e) = self.provider.force_flush() {
             eprintln!("[spore-core] OTLP force_flush failed (JSONL is durable): {e:?}");
         }
@@ -733,7 +732,13 @@ impl OtlpForwarder for OtlpSdkForwarder {
 /// filesystem stores do sync I/O inside an `async move` block), so a single
 /// `poll` resolves it. This lets the sync `emit_*` surface call the async store
 /// inline without a nested runtime `block_on`.
-fn drive_to_completion<T>(mut fut: BoxFut<'_, T>) -> T {
+///
+/// Returns `None` if the future is still `Pending` after a bounded number of
+/// polls. Because the waker is a no-op, a future that genuinely suspends on real
+/// I/O can never be woken here — the old unbounded `spin_loop()` would busy-hang
+/// the whole process forever. The bound turns that into a recoverable miss the
+/// caller can log instead of a silent deadlock.
+fn drive_to_completion<T>(mut fut: BoxFut<'_, T>) -> Option<T> {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
     fn clone(_: *const ()) -> RawWaker {
@@ -743,13 +748,17 @@ fn drive_to_completion<T>(mut fut: BoxFut<'_, T>) -> T {
     // SAFETY: the vtable's clone/wake/drop are all no-ops on a null pointer.
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&waker);
-    loop {
+    // The leaf store futures resolve on the first poll; this bound only matters
+    // for a misbehaving store that returns `Pending`. Yield between polls so a
+    // store that does a single cooperative `yield_now()` still completes.
+    const MAX_POLLS: u32 = 10_000;
+    for _ in 0..MAX_POLLS {
         match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            // These leaf store futures never pend; spin defensively.
-            Poll::Pending => std::hint::spin_loop(),
+            Poll::Ready(v) => return Some(v),
+            Poll::Pending => std::thread::yield_now(),
         }
     }
+    None
 }
 
 // ============================================================================
@@ -806,10 +815,15 @@ impl SessionWriter {
         max_seen + 1
     }
 
-    /// Append one line, flush, then rotate if the active file is now over size.
+    /// Append one line, flush + fsync, then rotate if the active file is now over
+    /// size.
     fn append(&mut self, line: &str) -> std::io::Result<()> {
         self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
+        // Durability: fsync so a crash after `append` returns cannot lose the
+        // line (mirrors `storage::atomic_write`). This is an fsync-per-append
+        // cost; if trace volume makes it hot, gate it behind a durability flag.
+        self.file.sync_all()?;
         self.bytes_written += line.len() as u64;
         if self.bytes_written > self.max_size_bytes {
             self.rotate()?;
@@ -854,6 +868,13 @@ pub struct OutboxObservabilityProvider {
     /// outbox's own JSONL writer remains the durable source of truth; this
     /// delegates the span store to the pluggable abstraction (issue #73).
     store: Option<Arc<dyn ObservabilityStore>>,
+    /// Sessions that have had at least one append leg fail (JSONL write, writer
+    /// open, or store leg). A failed append was previously logged-and-dropped,
+    /// leaving the trace silently incomplete; recording it here makes the loss
+    /// observable via [`sessions_with_failed_appends`](Self::sessions_with_failed_appends).
+    /// (Distinct from the store trait's `list_unflushed_sessions`, which reports
+    /// session dirs missing a `.flushed` marker.)
+    failed_appends: Mutex<HashSet<SessionId>>,
 }
 
 impl OutboxObservabilityProvider {
@@ -873,6 +894,7 @@ impl OutboxObservabilityProvider {
             writers: Mutex::new(HashMap::new()),
             otlp,
             store: None,
+            failed_appends: Mutex::new(HashSet::new()),
         }
     }
 
@@ -911,6 +933,7 @@ impl OutboxObservabilityProvider {
             writers: Mutex::new(HashMap::new()),
             otlp,
             store: None,
+            failed_appends: Mutex::new(HashSet::new()),
         }
     }
 
@@ -940,10 +963,28 @@ impl OutboxObservabilityProvider {
         Ok(writers.get_mut(session_id).unwrap())
     }
 
+    /// Mark `session_id` as having a failed append leg (D2). The data is already
+    /// lost for that line; recording it makes the loss queryable instead of only
+    /// emitting a one-shot `eprintln`.
+    fn mark_failed_append(&self, session_id: &SessionId) {
+        self.failed_appends
+            .lock()
+            .unwrap()
+            .insert(session_id.clone());
+    }
+
+    /// Sessions that have had at least one append leg fail since construction.
+    /// A non-empty result means the durable JSONL trace and/or store may be
+    /// missing lines for those sessions.
+    pub fn sessions_with_failed_appends(&self) -> Vec<SessionId> {
+        self.failed_appends.lock().unwrap().iter().cloned().collect()
+    }
+
     /// Append a built line to the session's JSONL file, fan out to every OTLP
     /// forwarder, and (when configured) append the span to the
     /// [`ObservabilityStore`] leg. Every leg is independent: a failure on any
-    /// one is logged but never propagates or blocks the others (issue #73).
+    /// one is logged but never propagates or blocks the others (issue #73). A
+    /// failed durable leg also marks the session unflushed (D2).
     fn write_line(&self, session_id: &SessionId, line: TraceLine) {
         let jsonl = line.to_jsonl_line();
         {
@@ -952,10 +993,12 @@ impl OutboxObservabilityProvider {
                 Ok(w) => {
                     if let Err(e) = w.append(&jsonl) {
                         eprintln!("[spore-core] outbox append failed: {e}");
+                        self.mark_failed_append(session_id);
                     }
                 }
                 Err(e) => {
                     eprintln!("[spore-core] outbox open failed: {e}");
+                    self.mark_failed_append(session_id);
                 }
             }
         }
@@ -965,12 +1008,24 @@ impl OutboxObservabilityProvider {
             forwarder.forward(&line);
         }
         // ObservabilityStore leg (issue #73): serialize the line to JSON and
-        // append inline. Failure is logged, never propagated.
+        // append inline. Failure (or a store that suspends — `None`) is logged
+        // and the session is marked unflushed, never propagated.
         if let Some(store) = &self.store {
             let value = serde_json::to_value(&line).unwrap_or(Value::Null);
             let fut = store.append_span(session_id, value);
-            if let Err(e) = drive_to_completion(fut) {
-                eprintln!("[spore-core] observability store append failed: {e}");
+            match drive_to_completion(fut) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    eprintln!("[spore-core] observability store append failed: {e}");
+                    self.mark_failed_append(session_id);
+                }
+                None => {
+                    eprintln!(
+                        "[spore-core] observability store append did not complete \
+                         (store returned Pending); marking session unflushed"
+                    );
+                    self.mark_failed_append(session_id);
+                }
             }
         }
     }
@@ -1089,8 +1144,10 @@ impl ObservabilityProvider for OutboxObservabilityProvider {
                     eprintln!("[spore-core] observability store flush failed: {e}");
                 }
             }
-            let provider_flush = tokio::time::timeout(OTLP_FLUSH_TIMEOUT, async {}).await;
-            let _ = provider_flush;
+            // (Removed: a `tokio::time::timeout(OTLP_FLUSH_TIMEOUT, async {})` that
+            // wrapped an EMPTY future — it bounded nothing. The OTLP forwarders'
+            // `force_flush()` above is synchronous and the SDK batch export is
+            // internally bounded, so there is no async flush to time out here.)
 
             // Create the sibling .flushed marker.
             let dir = self.config.session_dir(session_id);

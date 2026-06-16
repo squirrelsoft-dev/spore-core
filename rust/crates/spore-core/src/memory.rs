@@ -301,11 +301,21 @@ struct Store {
     semantic: HashMap<MemoryId, SemanticMemory>,
     /// Monotonic counter for generating archival ids on Replace.
     archive_seq: u64,
+    /// Optional pinned "now" for deterministic tests (mirrors
+    /// [`guide_registry`](crate::guide_registry)'s `now_override`). When `None`,
+    /// lifecycle transitions stamp the real system clock via [`Timestamp::now`].
+    now_override: Option<Timestamp>,
 }
 
 impl StandardMemoryProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin the "now" timestamp used to stamp lifecycle transitions
+    /// (`deprecate` / `mark_pending_review`). Tests use this for determinism.
+    pub fn set_now(&self, now: Timestamp) {
+        self.inner.lock().unwrap().now_override = Some(now);
     }
 
     fn next_archive_id(store: &mut Store, original: &MemoryId) -> MemoryId {
@@ -466,13 +476,16 @@ impl MemoryProvider for StandardMemoryProvider {
 
     async fn deprecate(&self, id: &MemoryId, reason: &str) -> Result<(), MemoryError> {
         let mut store = self.inner.lock().unwrap();
+        // Stamp the transition with "now", not the stale `updated_at` (which
+        // predates this deprecation).
+        let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
         let m = store
             .semantic
             .get_mut(id)
             .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
         m.status = MemoryStatus::Deprecated {
             reason: reason.to_string(),
-            at: m.updated_at.clone(),
+            at: now,
         };
         Ok(())
     }
@@ -494,13 +507,13 @@ impl MemoryProvider for StandardMemoryProvider {
 
     async fn mark_pending_review(&self, id: &MemoryId) -> Result<(), MemoryError> {
         let mut store = self.inner.lock().unwrap();
+        // Stamp the transition with "now", not the stale `updated_at`.
+        let now = store.now_override.clone().unwrap_or_else(Timestamp::now);
         let m = store
             .semantic
             .get_mut(id)
             .ok_or_else(|| MemoryError::NotFound(id.clone()))?;
-        m.status = MemoryStatus::PendingReview {
-            proposed_at: m.updated_at.clone(),
-        };
+        m.status = MemoryStatus::PendingReview { proposed_at: now };
         Ok(())
     }
 }
@@ -808,6 +821,43 @@ mod tests {
         let mp = StandardMemoryProvider::new();
         let err = mp.deprecate(&MemoryId::new("nope"), "r").await.unwrap_err();
         assert!(matches!(err, MemoryError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn deprecate_stamps_now_not_stale_updated_at() {
+        // The seeded memory's `updated_at` is 2026-05-16; deprecation happens
+        // "later" (pinned to 2026-06-15) and must record THAT, not the stale ts.
+        let mp = StandardMemoryProvider::new();
+        mp.store_semantic(sem("g1", "x"), MergeStrategy::Reject)
+            .await
+            .unwrap();
+        mp.set_now(ts("2026-06-15T00:00:00Z"));
+        mp.deprecate(&MemoryId::new("g1"), "obsolete")
+            .await
+            .unwrap();
+        match mp.get_semantic(&MemoryId::new("g1")).await.unwrap().status {
+            MemoryStatus::Deprecated { at, .. } => {
+                assert_eq!(at, ts("2026-06-15T00:00:00Z"));
+                assert_ne!(at, ts("2026-05-16T00:00:00Z"), "must not reuse updated_at");
+            }
+            s => panic!("expected Deprecated, got {s:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_pending_review_stamps_now_not_stale_updated_at() {
+        let mp = StandardMemoryProvider::new();
+        mp.store_semantic(sem("g1", "x"), MergeStrategy::Reject)
+            .await
+            .unwrap();
+        mp.set_now(ts("2026-06-15T00:00:00Z"));
+        mp.mark_pending_review(&MemoryId::new("g1")).await.unwrap();
+        match mp.get_semantic(&MemoryId::new("g1")).await.unwrap().status {
+            MemoryStatus::PendingReview { proposed_at } => {
+                assert_eq!(proposed_at, ts("2026-06-15T00:00:00Z"));
+            }
+            s => panic!("expected PendingReview, got {s:?}"),
+        }
     }
 
     // ── Rule: mark_pending_review ───────────────────────────────────────────

@@ -175,7 +175,7 @@ pub use tasklist::{
 pub use tools::{
     AbortTool, AskUserQuestionTool, EditFileTool, EnterPlanModeTool, ExitPlanModeTool, GrepTool,
     SearchMethod, SendMessageTool, StandardTool, StandardTools, TaskListTool, TodoWriteTool,
-    WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool, TODO_STORE_KEY,
+    UrlPolicy, WebFetchTool, WebSearchConfig, WebSearchConfigError, WebSearchTool, TODO_STORE_KEY,
 };
 // `CompletionCheck` is `#[deprecated]` (issue #69) but still publicly
 // re-exported for backward compatibility; external callers see the deprecation.

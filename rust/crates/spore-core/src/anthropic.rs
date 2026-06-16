@@ -507,29 +507,25 @@ impl ModelInterface for AnthropicModelInterface {
             message: format!("request encode failed: {e}"),
         })?;
         let client = self.http_client.clone();
-        let resp = client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", Self::ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .timeout(self.timeout)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ModelError::Timeout
-                } else {
-                    ModelError::ProviderError {
-                        code: 0,
-                        message: format!("HTTP transport error: {e}"),
-                    }
-                }
-            })?;
-        if !resp.status().is_success() {
-            return Err(map_status_error(resp).await);
-        }
+        let api_key = self.api_key.clone();
+        // Route through `send_with_retry` so opening a stream gets the same
+        // retry/backoff on transient failures (timeouts, 429/5xx/529) as the
+        // non-streaming paths. Retries happen BEFORE the body is consumed; the
+        // closure rebuilds the request each attempt (`body.clone()`).
+        let resp = send_with_retry(
+            || {
+                client
+                    .post(&url)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", Self::ANTHROPIC_VERSION)
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream")
+                    .body(body.clone())
+            },
+            self.max_retries,
+            self.timeout,
+        )
+        .await?;
         Ok(Box::pin(sse_to_events(resp)))
     }
 
@@ -593,7 +589,7 @@ fn sse_to_events(
     async_stream::stream! {
         let stream = resp.bytes_stream();
         futures_util::pin_mut!(stream);
-        let mut buf = String::new();
+        let mut buf = crate::model::ByteLineBuffer::new();
         let mut usage = TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
         while let Some(chunk) = stream.next().await {
@@ -607,12 +603,10 @@ fn sse_to_events(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.push(&chunk);
             // SSE events are separated by blank lines (\n\n). Process complete
             // events; leave any partial trailing event in the buffer.
-            while let Some(idx) = buf.find("\n\n") {
-                let raw = buf[..idx].to_string();
-                buf = buf[idx + 2..].to_string();
+            while let Some(raw) = buf.next_line(b"\n\n") {
                 let event = parse_sse_event(&raw);
                 if let Some((event_name, data)) = event {
                     // Skip non-JSON keepalive lines and unrecognized event types.

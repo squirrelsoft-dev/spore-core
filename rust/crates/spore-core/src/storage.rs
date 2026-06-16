@@ -1139,6 +1139,10 @@ fn append_jsonl(path: &Path, value: &JsonValue) -> Result<(), StorageError> {
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     f.flush()?;
+    // Durability: fsync so a crash after this returns cannot lose the appended
+    // record (mirrors `atomic_write`). fsync-per-append cost; gate behind a
+    // durability flag if it proves hot.
+    f.sync_all()?;
     Ok(())
 }
 

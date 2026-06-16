@@ -201,12 +201,15 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         if request.messages_to_compact.is_empty() {
             return None;
         }
-        let messages_removed = request.messages_to_compact.len() as u32;
+        // The exact dropped set, computed ONCE here and carried on the turn so
+        // `apply_compaction` reuses it (no 2nd `prepare_compaction`).
+        let dropped_messages = request.messages_to_compact.clone();
+        let messages_removed = dropped_messages.len() as u32;
 
         // Build the summarization context: the messages to compact, followed by
         // the summarization instruction. `inject_missing_items` (inherited
         // default) appends the retry instruction on verification failure.
-        let mut messages = request.messages_to_compact.clone();
+        let mut messages = dropped_messages.clone();
         messages.push(Message {
             role: Role::User,
             content: Content::Text {
@@ -225,6 +228,7 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
             preserve_hints: request.preserve_hints,
             verification_state: rich,
             messages_removed,
+            dropped_messages,
         })
     }
 
@@ -232,16 +236,13 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
     // default produces the exact "Your summary is missing these items: …"
     // prompt the `compaction_loop` fixture asserts.
 
-    fn apply_compaction(&self, session: &mut HarnessState, summary: String) {
+    fn apply_compaction(&self, session: &mut HarnessState, summary: String, dropped: &[Message]) {
         let Some(mut rich) = Self::read_rich_state(session) else {
             // No rich state to apply against — degrade safely; never panic.
             return;
         };
-        let request = self.inner.prepare_compaction(&rich).ok();
-        let dropped: &[Message] = request
-            .as_ref()
-            .map(|r| r.messages_to_compact.as_slice())
-            .unwrap_or(&[]);
+        // `dropped` is the set `prepare_compaction_turn` already computed (carried
+        // on the `CompactionTurn`) — one source of truth, no re-derivation.
         let messages_removed = dropped.len() as u32;
 
         let summary_message = Message {
@@ -473,7 +474,14 @@ mod tests {
         let adapter = StandardCompactionAdapter::new(rich_manager());
         let mut session = session_with(&rich_state(10, 95, 100));
         let before = session.messages.len();
-        adapter.apply_compaction(&mut session, "summary preserving payment deploy".into());
+        let turn = adapter
+            .prepare_compaction_turn(&session)
+            .expect("turn present");
+        adapter.apply_compaction(
+            &mut session,
+            "summary preserving payment deploy".into(),
+            &turn.dropped_messages,
+        );
         // 2 preserved + 1 summary = 3.
         assert!(session.messages.len() < before);
         assert_eq!(session.messages.len(), 3);
@@ -512,7 +520,14 @@ mod tests {
         let before = StandardCompactionAdapter::<StubModel>::read_rich_state(&session)
             .unwrap()
             .token_budget_used;
-        adapter.apply_compaction(&mut session, "summary preserving payment deploy".into());
+        let turn = adapter
+            .prepare_compaction_turn(&session)
+            .expect("turn present");
+        adapter.apply_compaction(
+            &mut session,
+            "summary preserving payment deploy".into(),
+            &turn.dropped_messages,
+        );
         let after = StandardCompactionAdapter::<StubModel>::read_rich_state(&session)
             .unwrap()
             .token_budget_used;
@@ -550,7 +565,14 @@ mod tests {
         rich.message_history = mk_history(10);
         let mut session = session_with(&rich);
 
-        adapter.apply_compaction(&mut session, "first summary about payment deploy".into());
+        let turn1 = adapter
+            .prepare_compaction_turn(&session)
+            .expect("turn present");
+        adapter.apply_compaction(
+            &mut session,
+            "first summary about payment deploy".into(),
+            &turn1.dropped_messages,
+        );
         let after_first = adapter.token_budget_used(&session).unwrap();
         assert!(after_first < 95);
 
@@ -560,7 +582,14 @@ mod tests {
         grown.message_history = mk_history(10);
         seed_rich_state(&mut session, &grown);
 
-        adapter.apply_compaction(&mut session, "second summary about payment deploy".into());
+        let turn2 = adapter
+            .prepare_compaction_turn(&session)
+            .expect("turn present");
+        adapter.apply_compaction(
+            &mut session,
+            "second summary about payment deploy".into(),
+            &turn2.dropped_messages,
+        );
         let after_second = adapter.token_budget_used(&session).unwrap();
         assert!(
             after_second < 95,
@@ -573,7 +602,7 @@ mod tests {
         let adapter = StandardCompactionAdapter::new(rich_manager());
         let mut session = HarnessState::default();
         // No rich state -> no-op, no panic.
-        adapter.apply_compaction(&mut session, "summary".into());
+        adapter.apply_compaction(&mut session, "summary".into(), &[]);
         assert!(session.messages.is_empty());
     }
 

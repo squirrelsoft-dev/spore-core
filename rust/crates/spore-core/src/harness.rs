@@ -2661,6 +2661,56 @@ impl RunStrategy for SelfVerifyingConfig {
                     .evaluate_phase(&task, eval_agent.clone(), &mut carried, &mut total_usage)
                     .await;
 
+                // #C1: charge the evaluator's OWN turns against the SelfVerifying
+                // scope, mirroring the build charge above. `run_evaluate_phase`
+                // runs the evaluator in an isolated harness from a fresh
+                // `BudgetSnapshot`, so `eval_result.turns` is the evaluator's
+                // standalone turn count — and `fold_usage` folds it via `.max()`
+                // (NOT a sum), so it never reaches `carried.turns` once build
+                // turns dominate. Charging the build delta alone therefore missed
+                // the evaluate phase entirely; charge it explicitly here so both
+                // phases count against the budget.
+                let eval_turns = match &eval_result {
+                    RunResult::Success { turns, .. }
+                    | RunResult::Failure { turns, .. }
+                    | RunResult::Escalate { turns, .. } => *turns,
+                    RunResult::WaitingForHuman { .. } | RunResult::Consult { .. } => 0,
+                };
+                if let Err(err) = cx.charge_current(eval_turns) {
+                    let partial = self_verifying_partial_json(&last_worker_output, &last_reason);
+                    let resolution = cx.resolve_current();
+                    // A granted `Continue` resets the scope and re-runs the
+                    // build↔evaluate iteration in-process (mirrors the build path).
+                    if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
+                    cx.pop_budget();
+                    cx.scratch.task = Some(task.clone());
+                    cx.stream = on_stream;
+                    return match resolution {
+                        ExhaustedResolution::Fail => promote_budget_exhausted(&err, None),
+                        ExhaustedResolution::Continue | ExhaustedResolution::Escalate => {
+                            if matches!(executor.escalation_mode(), EscalationMode::SurfaceToHuman)
+                            {
+                                let waiting = promote_budget_exhausted_to_human(
+                                    &err,
+                                    Some(partial),
+                                    combinator_escalation_actions(&err),
+                                    build_session_id.clone(),
+                                    task,
+                                    carried.clone(),
+                                    carried.turns,
+                                    session_state.clone(),
+                                    worker_toolset_of(&self.inner),
+                                );
+                                cx.record_terminal(waiting)
+                            } else {
+                                promote_budget_exhausted(&err, Some(partial))
+                            }
+                        }
+                    };
+                }
+
                 let input = VerifierInput {
                     build_result,
                     eval_result,
@@ -4515,6 +4565,15 @@ pub trait SandboxProvider: Send + Sync {
     fn workspace_root(&self) -> &std::path::Path {
         std::path::Path::new("/")
     }
+
+    /// Maximum number of bytes a single write/append may produce, or `None` for
+    /// no cap. Write tools consult this BEFORE writing (`resolve_path` only sees
+    /// the path, not the payload, so the read-side `max_file_size` cap cannot
+    /// cover writes). Default `None` — production sandboxes override to mirror
+    /// their read cap.
+    fn max_write_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A [`SandboxProvider`] with no filesystem.
@@ -4557,7 +4616,10 @@ pub enum IsolationMode {
     #[cfg(feature = "dangerous")]
     None,
     /// Path enforcement only — no process or network isolation. Default for
-    /// the canonical `WorkspaceScopedSandbox`.
+    /// the canonical `WorkspaceScopedSandbox`. Commands run UNCONTAINED on the
+    /// host (full privileges + network); real process isolation
+    /// (`Bubblewrap`/`Docker`) is tracked under issue #6. Do not run untrusted
+    /// agents under this mode.
     WorkspaceScoped,
     /// Linux process isolation via bubblewrap. Reserved; not implemented in
     /// the v1 reference sandbox.
@@ -4911,6 +4973,11 @@ pub struct CompactionTurn {
     pub verification_state: ContextSessionState,
     /// Messages about to be removed — used to stamp the compaction span.
     pub messages_removed: u32,
+    /// The exact messages this turn will drop, computed once in
+    /// `prepare_compaction_turn`. Threaded into [`ContextManager::apply_compaction`]
+    /// so the manager reuses this set for token accounting instead of
+    /// re-deriving it (one source of truth).
+    pub dropped_messages: Vec<Message>,
 }
 
 /// Issue #7 — ContextManager: assembles per-turn context.
@@ -4980,10 +5047,13 @@ pub trait ContextManager: Send + Sync {
     }
 
     /// Accept a verified (or accepted-anyway) summary into the session,
-    /// replacing the compacted span (issue #46). Default: no-op — only
+    /// replacing the compacted span (issue #46). `dropped` is the message set
+    /// computed by [`prepare_compaction_turn`](Self::prepare_compaction_turn)
+    /// (carried on the [`CompactionTurn`]); managers use it for token accounting
+    /// instead of re-deriving the dropped set. Default: no-op — only
     /// compaction-capable managers implement it.
-    fn apply_compaction(&self, session: &mut SessionState, summary: String) {
-        let _ = (session, summary);
+    fn apply_compaction(&self, session: &mut SessionState, summary: String, dropped: &[Message]) {
+        let _ = (session, summary, dropped);
     }
 
     /// Current token budget used for this session, if the manager tracks one
@@ -9691,6 +9761,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                     session_state,
                     summary,
                     turn.messages_removed,
+                    &turn.dropped_messages,
                     tokens_before,
                     session_id,
                     task_id,
@@ -9729,6 +9800,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                 session_state,
                 summary,
                 turn.messages_removed,
+                &turn.dropped_messages,
                 tokens_before,
                 session_id,
                 task_id,
@@ -9745,6 +9817,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
         session_state: &mut SessionState,
         summary: String,
         messages_removed: u32,
+        dropped: &[Message],
         tokens_before: u32,
         session_id: &SessionId,
         task_id: &TaskId,
@@ -9752,7 +9825,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
     ) {
         self.config
             .context_manager
-            .apply_compaction(session_state, summary);
+            .apply_compaction(session_state, summary, dropped);
 
         // Real token accounting (issue #57): read the post-compaction budget the
         // manager tracks. Managers that do not track tokens report `None`, in
@@ -17193,9 +17266,15 @@ mod tests {
                     preserve_hints: CompactionPreserveHints::default(),
                     verification_state: vs,
                     messages_removed: 3,
+                    dropped_messages: vec![],
                 })
             }
-            fn apply_compaction(&self, _session: &mut SessionState, _summary: String) {
+            fn apply_compaction(
+                &self,
+                _session: &mut SessionState,
+                _summary: String,
+                _dropped: &[Message],
+            ) {
                 *self.applied.lock().unwrap() += 1;
             }
         }
@@ -18533,6 +18612,56 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    /// Run a 2-iteration SelfVerifying (build,eval,build,eval — the worker serves
+    /// both phases per Q1c) under a `max_turns` cap. Used to prove the evaluate
+    /// phase is charged against the SelfVerifying budget scope, not just the
+    /// build phase.
+    async fn run_sv_two_iters_with_cap(cap: u32) -> RunResult {
+        let worker = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("build0"),
+                RecordingTurnAgent::final_resp("eval0"),
+                RecordingTurnAgent::final_resp("build1"),
+                RecordingTurnAgent::final_resp("eval1"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker);
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(
+                vec![failed("retry"), passed()],
+                passed(),
+                3,
+            )),
+        );
+        let h = StandardHarness::new(cfg);
+        let t = self_verifying_task().with_budget(BudgetLimits {
+            max_turns: Some(cap),
+            ..Default::default()
+        });
+        h.run(HarnessRunOptions::new(t)).await
+    }
+
+    #[tokio::test]
+    async fn self_verifying_charges_evaluator_turns_against_scope() {
+        // 2 iterations × (build 1 turn + eval 1 turn) = 4 turns. With the
+        // evaluator turns charged, a cap of 4 just fits → Success; a cap of 3 is
+        // overrun by the second iteration's EVALUATOR turn (the two build turns
+        // alone are only 2, so without charging the evaluator this would
+        // wrongly succeed).
+        match run_sv_two_iters_with_cap(4).await {
+            RunResult::Success { .. } => {}
+            other => panic!("cap=4 should fit all 4 turns, got {other:?}"),
+        }
+        let exhausted = run_sv_two_iters_with_cap(3).await;
+        assert!(
+            !matches!(exhausted, RunResult::Success { .. }),
+            "cap=3 must be exhausted once evaluator turns are charged, got {exhausted:?}"
+        );
     }
 
     // R12: fixture replay — scripted (build verdict sequence, evaluator output

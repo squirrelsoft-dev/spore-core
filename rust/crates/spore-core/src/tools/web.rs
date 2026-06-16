@@ -74,10 +74,117 @@ fn shared_client() -> &'static reqwest::Client {
 }
 
 // ============================================================================
+// SSRF guard — outbound URL policy (validate_fetch_url seam)
+// ============================================================================
+
+/// Policy consulted before any outbound `web_fetch` / `web_search` request.
+///
+/// **Permissive by default** — [`UrlPolicy::default`] / [`UrlPolicy::permissive`]
+/// allow every URL, so existing wiring, tests, and examples are unaffected. A
+/// deployment that wants SSRF protection opts in with [`UrlPolicy::deny_private`]
+/// (wired via the web-tool builders, see [`WebFetchTool::with_url_policy`] /
+/// [`WebSearchTool::with_url_policy`]).
+///
+/// `deny_private` rejects non-`http(s)` schemes and hosts given as an IP literal
+/// in a loopback / link-local / private (RFC-1918) / cloud-metadata
+/// (`169.254.169.254`) range, plus the `localhost` hostname. **Limitation:**
+/// non-`localhost` hostnames are NOT DNS-resolved here, so a hostname that
+/// resolves to a private address is not caught by this seam — deployments that
+/// need resolution-time protection must enforce it at the network layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UrlPolicy {
+    deny_private: bool,
+}
+
+impl UrlPolicy {
+    /// Allow every URL (the default). No SSRF restrictions.
+    pub fn permissive() -> Self {
+        Self { deny_private: false }
+    }
+
+    /// Reject non-`http(s)` schemes and private/loopback/link-local/metadata
+    /// IP-literal hosts (and the `localhost` hostname).
+    pub fn deny_private() -> Self {
+        Self { deny_private: true }
+    }
+}
+
+fn url_denied(message: String) -> ToolOutput {
+    ToolOutput::Error {
+        message,
+        recoverable: true,
+    }
+}
+
+fn is_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local() // 169.254.0.0/16 — includes 169.254.169.254
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+}
+
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || v6.to_ipv4_mapped().map(is_blocked_v4).unwrap_or(false)
+        }
+    }
+}
+
+/// Validate `url` against `policy` before an outbound request. The permissive
+/// policy always returns `Ok(())`; `deny_private` returns a recoverable
+/// [`ToolOutput::Error`] when the URL is disallowed.
+pub(crate) fn validate_fetch_url(url: &str, policy: &UrlPolicy) -> Result<(), ToolOutput> {
+    if !policy.deny_private {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| url_denied(format!("invalid URL: {e}")))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(url_denied(format!(
+                "scheme `{other}` not allowed by URL policy"
+            )))
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| url_denied("URL has no host".to_string()))?;
+    let lowered = host.to_ascii_lowercase();
+    if lowered == "localhost" || lowered.ends_with(".localhost") {
+        return Err(url_denied(format!("host `{host}` is loopback")));
+    }
+    // `host_str` keeps the brackets on an IPv6 literal (`[::1]`); strip them so a
+    // direct `IpAddr` parse covers both families.
+    let host_ip = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(url_denied(format!(
+                "host `{host}` is in a blocked address range"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // WebFetch
 // ============================================================================
 
-pub struct WebFetchTool;
+#[derive(Debug)]
+pub struct WebFetchTool {
+    policy: UrlPolicy,
+}
 
 /// Apply `start_byte` slicing to a fetched response body.
 ///
@@ -97,16 +204,30 @@ pub(crate) fn apply_web_fetch_range(body: &str, start_byte: u64) -> Result<Strin
             recoverable: true,
         });
     }
-    let slice = &body[start_byte as usize..];
-    Ok(format!(
-        "[starting at byte {start_byte} of {total}]\n{slice}"
-    ))
+    // The model supplies a raw BYTE offset that may land in the middle of a
+    // multibyte UTF-8 char. Slicing there would panic. Back off to the nearest
+    // char boundary <= start_byte (the same `is_char_boundary` idiom as
+    // `observability::truncate_field`) so the slice is always valid; the header
+    // reports the adjusted offset where the slice actually begins.
+    let mut start = start_byte as usize;
+    while start > 0 && !body.is_char_boundary(start) {
+        start -= 1;
+    }
+    let slice = &body[start..];
+    Ok(format!("[starting at byte {start} of {total}]\n{slice}"))
 }
 
 impl WebFetchTool {
     pub const NAME: &'static str = "web_fetch";
     pub fn new() -> Self {
-        Self
+        Self {
+            policy: UrlPolicy::permissive(),
+        }
+    }
+    /// Wire an opt-in SSRF [`UrlPolicy`] (default is permissive).
+    pub fn with_url_policy(mut self, policy: UrlPolicy) -> Self {
+        self.policy = policy;
+        self
     }
     pub fn schema() -> ToolSchema {
         ToolSchema {
@@ -157,6 +278,9 @@ impl Tool for WebFetchTool {
                 Ok(p) => p,
                 Err(e) => return e.into(),
             };
+            if let Err(denied) = validate_fetch_url(&params.url, &self.policy) {
+                return denied;
+            }
             match shared_client().get(&params.url).send().await {
                 Ok(resp) => match resp.text().await {
                     Ok(body) => match apply_web_fetch_range(&body, params.start_byte) {
@@ -303,6 +427,7 @@ fn resolve_env(env_var: &str) -> Result<String, WebSearchConfigError> {
 #[derive(Debug)]
 pub struct WebSearchTool {
     backend: Option<ResolvedBackend>,
+    policy: UrlPolicy,
 }
 
 impl WebSearchTool {
@@ -310,7 +435,17 @@ impl WebSearchTool {
 
     /// Construct with no backend configured (calls error until one is set).
     pub fn new() -> Self {
-        Self { backend: None }
+        Self {
+            backend: None,
+            policy: UrlPolicy::permissive(),
+        }
+    }
+
+    /// Wire an opt-in SSRF [`UrlPolicy`] (default is permissive). The endpoint is
+    /// validated against this policy before each request is sent.
+    pub fn with_url_policy(mut self, policy: UrlPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Construct with a search endpoint (the query is POSTed to it as JSON
@@ -326,6 +461,7 @@ impl WebSearchTool {
                 auth_headers: Vec::new(),
                 body_auth_params: Vec::new(),
             }),
+            policy: UrlPolicy::permissive(),
         }
     }
 
@@ -351,6 +487,7 @@ impl WebSearchTool {
                 auth_headers,
                 body_auth_params,
             }),
+            policy: UrlPolicy::permissive(),
         })
     }
 
@@ -402,6 +539,9 @@ impl Tool for WebSearchTool {
                     recoverable: true,
                 };
             };
+            if let Err(denied) = validate_fetch_url(&backend.endpoint, &self.policy) {
+                return denied;
+            }
             let mut req = match backend.method {
                 SearchMethod::Get => {
                     // Query + body-auth params are URL-encoded into the query
@@ -847,6 +987,82 @@ mod tests {
         assert_eq!(SearchMethod::default(), SearchMethod::Post);
     }
 
+    // ── SSRF guard: validate_fetch_url (#B1) ──────────────────────────────────
+
+    #[test]
+    fn permissive_policy_allows_everything() {
+        let p = UrlPolicy::permissive();
+        assert!(validate_fetch_url("http://169.254.169.254/latest/meta-data/", &p).is_ok());
+        assert!(validate_fetch_url("http://localhost:8080/", &p).is_ok());
+        assert!(validate_fetch_url("file:///etc/passwd", &p).is_ok());
+        assert!(validate_fetch_url("https://example.com/", &p).is_ok());
+    }
+
+    #[test]
+    fn default_policy_is_permissive() {
+        assert_eq!(UrlPolicy::default(), UrlPolicy::permissive());
+        assert!(validate_fetch_url("http://127.0.0.1/", &UrlPolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn deny_private_rejects_cloud_metadata_ip() {
+        let p = UrlPolicy::deny_private();
+        let err = validate_fetch_url("http://169.254.169.254/latest/meta-data/", &p).unwrap_err();
+        match err {
+            ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn deny_private_rejects_localhost_and_loopback_and_private() {
+        let p = UrlPolicy::deny_private();
+        for url in [
+            "http://localhost/",
+            "http://127.0.0.1/",
+            "http://10.1.2.3/",
+            "http://192.168.0.1/",
+            "http://172.16.5.5/",
+            "http://[::1]/",
+        ] {
+            assert!(
+                validate_fetch_url(url, &p).is_err(),
+                "expected {url} to be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_private_rejects_non_http_scheme() {
+        let p = UrlPolicy::deny_private();
+        assert!(validate_fetch_url("file:///etc/passwd", &p).is_err());
+        assert!(validate_fetch_url("ftp://example.com/x", &p).is_err());
+    }
+
+    #[test]
+    fn deny_private_allows_public_hosts() {
+        let p = UrlPolicy::deny_private();
+        assert!(validate_fetch_url("https://example.com/", &p).is_ok());
+        assert!(validate_fetch_url("http://93.184.216.34/", &p).is_ok());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_with_deny_private_blocks_metadata_endpoint() {
+        let sb = AllowAllSandbox;
+        let tool = WebFetchTool::new().with_url_policy(UrlPolicy::deny_private());
+        let r = tool
+            .execute(
+                &call("web_fetch", json!({"url": "http://169.254.169.254/"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::Error { recoverable, .. } => assert!(recoverable),
+            other => panic!("{other:?}"),
+        }
+    }
+
     // ── apply_web_fetch_range unit tests (#135) ───────────────────────────────
 
     #[test]
@@ -916,6 +1132,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn range_mid_codepoint_backs_off_to_char_boundary() {
+        // "héllo": h(0) é(1..3, 2 bytes) l(3) l(4) o(5), total 6 bytes. A
+        // start_byte of 2 lands INSIDE 'é' (byte 2 is its continuation byte);
+        // naive slicing would panic. We back off to byte 1 (start of 'é').
+        let body = "héllo";
+        assert_eq!(body.len(), 6);
+        assert!(!body.is_char_boundary(2));
+        let result = apply_web_fetch_range(body, 2).unwrap();
+        assert_eq!(result, "[starting at byte 1 of 6]\néllo");
+    }
+
+    #[test]
+    fn range_on_char_boundary_of_multibyte_body_unchanged() {
+        // start_byte 3 ('l') is already a boundary — no adjustment.
+        let body = "héllo";
+        let result = apply_web_fetch_range(body, 3).unwrap();
+        assert_eq!(result, "[starting at byte 3 of 6]\nllo");
     }
 
     // ── fixture replay: web_fetch_range.json (#135) ───────────────────────────

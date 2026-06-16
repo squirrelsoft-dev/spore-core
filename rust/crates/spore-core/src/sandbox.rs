@@ -321,6 +321,15 @@ impl SandboxProvider for WorkspaceScopedSandbox {
             match self.isolation_mode {
                 #[cfg(feature = "dangerous")]
                 IsolationMode::None => {}
+                // CAVEAT (issue #6): `WorkspaceScoped` only scopes FILESYSTEM
+                // paths (via `resolve_path`); it does NOT contain process
+                // execution. Commands dispatched here run directly on the host
+                // with the agent's privileges — no namespace/cgroup/seccomp
+                // isolation, full network access, and `working_dir` is only a
+                // default, not a jail. Deployments that run untrusted agents must
+                // select `Bubblewrap`/`Docker` (tracked under #6) once those
+                // backends land. Until then, treat the coding/exec tools wired to
+                // this sandbox as running uncontained.
                 IsolationMode::WorkspaceScoped => {}
                 IsolationMode::Bubblewrap { .. } => {
                     // TODO(#6): wire bubblewrap backend.
@@ -443,6 +452,12 @@ impl SandboxProvider for WorkspaceScopedSandbox {
 
     fn workspace_root(&self) -> &Path {
         &self.config.root
+    }
+
+    fn max_write_size(&self) -> Option<u64> {
+        // Mirror the read-side cap on writes/appends (0 = unlimited, matching
+        // `resolve`'s `max_file_size > 0` guard).
+        (self.config.max_file_size > 0).then_some(self.config.max_file_size)
     }
 }
 

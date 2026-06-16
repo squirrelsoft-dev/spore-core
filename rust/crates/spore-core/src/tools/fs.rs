@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::harness::{BoxFut, Operation, SandboxProvider, ToolOutput};
+use crate::harness::{BoxFut, Operation, SandboxProvider, SandboxViolation, ToolOutput};
 use crate::model::ToolCall;
 use crate::tool_registry::{Tool, ToolAnnotations, ToolSchema};
 use crate::tools::error::ToolExecutionError;
@@ -218,6 +218,19 @@ impl Tool for WriteFileTool {
                 Err(v) => return ToolExecutionError::SandboxViolation(v).into(),
             };
             let bytes = params.content.len();
+            // Enforce the sandbox's write cap on the payload (reads are capped in
+            // `resolve_path`; writes/appends are capped here, since the resolver
+            // never sees the content).
+            if let Some(limit) = sandbox.max_write_size() {
+                if bytes as u64 > limit {
+                    return ToolExecutionError::SandboxViolation(SandboxViolation::FileSizeExceeded {
+                        path: params.path.clone(),
+                        size: bytes as u64,
+                        limit,
+                    })
+                    .into();
+                }
+            }
             let result = if params.append {
                 use tokio::io::AsyncWriteExt;
                 match tokio::fs::OpenOptions::new()
@@ -609,6 +622,47 @@ mod tests {
             .await;
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(content, "ab");
+    }
+
+    #[tokio::test]
+    async fn write_over_size_cap_is_rejected() {
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            root,
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 8,
+        })
+        .unwrap();
+        // 9 bytes > 8-byte cap → rejected on the write path.
+        let over = WriteFileTool::new()
+            .execute(
+                &call("write_file", json!({"path": "big.txt", "content": "123456789"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match over {
+            ToolOutput::Error { message, .. } => assert!(
+                message.contains("size") || message.to_lowercase().contains("exceed"),
+                "{message}"
+            ),
+            other => panic!("expected size violation, got {other:?}"),
+        }
+        // 8 bytes == cap → allowed; the appended byte (1 byte ≤ cap) is allowed too.
+        let ok = WriteFileTool::new()
+            .execute(
+                &call("write_file", json!({"path": "ok.txt", "content": "12345678"})),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        assert!(matches!(ok, ToolOutput::Success { .. }), "{ok:?}");
     }
 
     #[tokio::test]

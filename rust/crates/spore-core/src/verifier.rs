@@ -130,13 +130,10 @@ fn describe_halt(reason: &HaltReason) -> String {
 }
 
 fn truncate_for_reason(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut out = s[..max].to_string();
-        out.push_str("... [truncated]");
-        out
-    }
+    // Reuse the char-boundary-safe, already-tested truncator (it backs off to a
+    // valid UTF-8 boundary and appends `TRUNCATION_MARKER`). Byte-slicing here
+    // would panic on multibyte evaluator/model text.
+    crate::observability::truncate_field(s, max).0
 }
 
 // ============================================================================
@@ -629,8 +626,26 @@ mod tests {
         let i = input_with(success("ok"), success("ok"));
         match c.verify(&i).await {
             VerifierVerdict::Failed { reason } => {
-                assert!(reason.len() <= 2000 + "... [truncated]".len());
-                assert!(reason.ends_with("... [truncated]"));
+                use crate::observability::TRUNCATION_MARKER;
+                assert!(reason.len() <= 2000 + TRUNCATION_MARKER.len());
+                assert!(reason.ends_with(TRUNCATION_MARKER));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multibyte_reason_truncation_does_not_panic() {
+        // Evaluator/model text is often multibyte; truncating mid-codepoint with
+        // a raw byte slice used to panic. A long run of 4-byte emoji exercises
+        // the char-boundary backoff.
+        let long = "😀".repeat(2000); // 8000 bytes
+        let c = CompositeVerifier::new(vec![fail_v(&long)], 3);
+        let i = input_with(success("ok"), success("ok"));
+        match c.verify(&i).await {
+            VerifierVerdict::Failed { reason } => {
+                use crate::observability::TRUNCATION_MARKER;
+                assert!(reason.ends_with(TRUNCATION_MARKER));
             }
             other => panic!("expected Failed, got {other:?}"),
         }
