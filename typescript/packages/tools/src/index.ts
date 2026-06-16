@@ -42,6 +42,8 @@ export { FindFilesTool, GrepFilesTool, GrepTool } from "./search.js";
 export { SendMessageTool } from "./message.js";
 export {
   applyWebFetchRange,
+  UrlPolicy,
+  validateFetchUrl,
   WebFetchTool,
   WebSearchTool,
   WebSearchConfigError,

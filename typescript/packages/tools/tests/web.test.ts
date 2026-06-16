@@ -16,6 +16,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   applyWebFetchRange,
+  UrlPolicy,
+  validateFetchUrl,
   WebFetchTool,
   WebSearchConfigError,
   WebSearchTool,
@@ -613,6 +615,116 @@ describe("WebFetchTool #135 — start_byte integration", () => {
       expect(r.kind).toBe("success");
       if (r.kind !== "success") throw new Error("unreachable");
       expect(r.content).toBe("body text here");
+    } finally {
+      await close();
+    }
+  });
+});
+
+// ============================================================================
+// SSRF guard: validateFetchUrl + opt-in UrlPolicy (#145)
+// ============================================================================
+
+describe("validateFetchUrl #145 — deny_private", () => {
+  const policy = UrlPolicy.denyPrivate();
+  const denied = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://localhost/",
+    "file:///etc/passwd",
+    "http://127.0.0.1/",
+    "http://10.1.2.3/",
+    "http://192.168.0.1/",
+    "http://172.16.5.5/",
+    "http://[::1]/",
+    "ftp://example.com/x",
+  ];
+  for (const url of denied) {
+    it(`denies ${url}`, () => {
+      const r = validateFetchUrl(url, policy);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.error.kind).toBe("error");
+      if (r.error.kind !== "error") throw new Error("unreachable");
+      expect(r.error.recoverable).toBe(true);
+    });
+  }
+
+  const allowed = ["https://example.com/", "http://93.184.216.34/"];
+  for (const url of allowed) {
+    it(`allows ${url}`, () => {
+      const r = validateFetchUrl(url, policy);
+      expect(r.ok).toBe(true);
+    });
+  }
+
+  it("denies an IPv4-mapped IPv6 metadata literal (::ffff:169.254.169.254)", () => {
+    const r = validateFetchUrl("http://[::ffff:169.254.169.254]/", policy);
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe("validateFetchUrl #145 — permissive (zero churn)", () => {
+  const policy = UrlPolicy.permissive();
+  const everything = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://localhost/",
+    "file:///etc/passwd",
+    "https://example.com/",
+  ];
+  for (const url of everything) {
+    it(`allows ${url}`, () => {
+      expect(validateFetchUrl(url, policy).ok).toBe(true);
+    });
+  }
+
+  it("permissive is the default tool behavior (no parsing, allows anything)", () => {
+    // A new tool with no .withUrlPolicy() call must not block anything: prove it
+    // via the seam directly using a fresh permissive policy (the tool default).
+    expect(
+      validateFetchUrl("http://169.254.169.254/", UrlPolicy.permissive()).ok,
+    ).toBe(true);
+    // Even a totally unparseable string is allowed under permissive (no parse).
+    expect(
+      validateFetchUrl("not a url at all", UrlPolicy.permissive()).ok,
+    ).toBe(true);
+  });
+});
+
+describe("WebFetchTool #145 — opt-in deny_private blocks before any fetch", () => {
+  it("returns a recoverable error for a metadata URL", async () => {
+    const tool = new WebFetchTool().withUrlPolicy(UrlPolicy.denyPrivate());
+    const r = await tool.execute(
+      webFetchCall({ url: "http://169.254.169.254/" }),
+      new AllowAllSandbox(),
+      ctx,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") throw new Error("unreachable");
+    expect(r.recoverable).toBe(true);
+  });
+
+  it("never contacts the server when the (loopback) endpoint is denied", async () => {
+    // The capturing server binds 127.0.0.1, which deny_private blocks; validate
+    // that no request lands by racing the `captured` promise against a short
+    // deadline. A hit would resolve `captured`; a clean block leaves it pending.
+    const { url, captured, close } = await startCapturingServer("nope");
+    try {
+      const tool = new WebFetchTool().withUrlPolicy(UrlPolicy.denyPrivate());
+      const r = await tool.execute(
+        webFetchCall({ url: `${url}/page` }),
+        new AllowAllSandbox(),
+        ctx,
+      );
+      expect(r.kind).toBe("error");
+
+      const sentinel = Symbol("never-hit");
+      const raced = await Promise.race([
+        captured.then(() => "hit" as const),
+        new Promise<typeof sentinel>((res) =>
+          setTimeout(() => res(sentinel), 50),
+        ),
+      ]);
+      expect(raced).toBe(sentinel);
     } finally {
       await close();
     }
