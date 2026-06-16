@@ -192,6 +192,74 @@ you can abort, type `continue`, and the agent still knows what it was doing.
 
 (Esc-to-abort needs a TTY; piped/non-interactive stdin just runs without it.)
 
+## Skills (progressive disclosure)
+
+This agent supports [**Agent Skills**](https://agentskills.io/specification) —
+reusable, named procedures the agent pulls into context only when a task calls for
+them. A skill is a directory with a `SKILL.md`: YAML frontmatter (`name` +
+`description`) followed by a markdown procedure body.
+
+Skills are discovered at startup from, in precedence order (last wins):
+
+1. `skills/<name>/SKILL.md` next to this example (bundled — ships with it);
+2. `.spore/skills/<name>/SKILL.md` under the agent's workspace;
+3. `~/.spore/skills/<name>/SKILL.md` (your user skills).
+
+### Two tiers, loaded on demand
+
+Following the spec's **progressive disclosure**, the agent never holds every skill
+body in context. It sees only a cheap **manifest** every turn — each skill's
+`name` + one-line `description` — and pulls in a full body only when it decides the
+skill is relevant:
+
+- **Manifest (always).** `SkillInjectingContextManager` prepends `AVAILABLE
+  SKILLS:` + one `name: description` line per skill to every turn (~tier 1).
+- **Body (on load, then sticky).** A skill's full `SKILL.md` body is injected only
+  once it is **active**, and every turn thereafter (tier 2).
+
+### Three ways a skill activates
+
+- **The agent loads it** via a `load_skill(name)` tool. The spec puts trigger
+  keywords *inside* the `description` ("Use when …"), so when your request matches
+  a skill's description the agent calls `load_skill` first, then follows the
+  procedure. (The advanced case is the same tool driven by the agent's own
+  judgement over the descriptions — no literal keyword needed.)
+- **You load it** — type `/<name>` in the REPL (e.g. `/security-review`) to flip a
+  skill active yourself. `/<name> <task>` loads it and runs `<task>` in one line.
+  `/skills` lists what's available and what's active.
+- (`clear` resets the conversation **and** the active-skill set.)
+
+```
+code> create a file named greeting.txt that greets the project
+   think · turn 1
+📋 plan (2 task(s)):
+   1. load_skill('greeting-protocol')
+   2. write_file('greeting.txt', …)
+   act → load_skill({"name":"greeting-protocol"})
+   obs → Loaded skill 'greeting-protocol' — its full procedure is now in your context. Follow it.
+   act → write_file({"path":"greeting.txt","content":"GREETING-PROTOCOL-V1\n…"})
+   obs → wrote 46 bytes to greeting.txt
+answer: created greeting.txt following the active protocol.
+```
+
+The prompt's "greeting" matched the skill's `description`, so the agent loaded it
+on its own and the injected body shaped what it wrote (the mandated first line).
+
+### Why it's wired in the example, not the harness
+
+Issue #9 added the `skill` guide type and the rich context manager can inject
+skills structurally — but the **live** harness loop assembles context through the
+pass-through compaction adapter, not the rich `assemble` (Known Deviation #8 /
+issue #115). So skills reach the model only if the example injects them. We do that
+by **wrapping** the compaction adapter: `SkillInjectingContextManager` forwards
+every seam method (compaction included) to the inner adapter and only *prepends*
+the manifest + active bodies in `assemble`. Issue #115 will fold discovery +
+`load_skill` + sticky injection into the harness itself.
+
+> No skills ship in this example by default — drop a `SKILL.md` under
+> `skills/<name>/` (see [`skills/README.md`](skills/README.md)) and restart to see
+> it in the manifest.
+
 ## Prerequisites
 
 ```sh

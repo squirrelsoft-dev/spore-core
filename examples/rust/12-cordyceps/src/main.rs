@@ -52,6 +52,13 @@
 //!   final answer, so it should narrate each step in one short sentence — called
 //!   in parallel with the tool doing the work. The harness turns each call into a
 //!   [`HarnessStreamEvent::UserMessage`] we print as a `💬` line.
+//! - **Skills (progressive disclosure).** Drop a `SKILL.md` under `skills/<name>/`
+//!   (or `.spore/skills/`), and the agent sees a cheap manifest (name +
+//!   description) of it every turn, pulling the full body into context only when
+//!   it calls the `load_skill` tool — or when you load it yourself with `/<name>`.
+//!   It follows the [Agent Skills spec](https://agentskills.io/specification),
+//!   wired example-side by wrapping the context manager (see [`skills`]); issue
+//!   #115 will productionize it in the harness.
 //! - **Esc-to-abort, without losing context.** A run executes with the terminal
 //!   in raw mode and a background key watcher; pressing Esc drops the
 //!   `harness.run(..)` future, cancelling the in-flight turn at its next await
@@ -85,6 +92,8 @@ use spore_core::{
     ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
 
+mod skills;
+
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
      Explore with list_dir, read_file, grep, and find_files; create and change files with \
      write_file and edit_file; run commands with bash. Use `.` and relative paths only. \
@@ -97,7 +106,12 @@ const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed w
      before (or as) you act, call `send_message` with one short sentence saying what you are \
      about to do, e.g. \"Reading the Cargo.toml to find the entry point.\" Call `send_message` \
      in PARALLEL with the tool that does the work — emit both in the same turn — so narration \
-     never costs an extra round trip. Keep each message to a single short sentence.";
+     never costs an extra round trip. Keep each message to a single short sentence. \
+     \
+     You may have SKILLS available — reusable, named procedures listed under AVAILABLE SKILLS \
+     in your context (each as `name: description`). When the user's request matches a skill's \
+     description, call the `load_skill` tool with that skill's name BEFORE you start, then \
+     follow the full procedure it injects. You can load more than one.";
 
 /// Per-loop ReAct step budget for EACH execute-phase task (04 used 8; a coding
 /// task wants more room to explore, edit, and verify). The plan phase runs under
@@ -198,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `threshold × window` (should_compact: used/window >= threshold), leaving
     // headroom for the turn that crosses the line. 0.80 is the default — set it
     // explicitly here so the 80% trigger is visible, not buried in a default.
-    let context_manager = Arc::new(StandardContextManager::new(
+    let base_adapter = Arc::new(StandardContextManager::new(
         Arc::new(OllamaModelInterface::with_base_url(&model_id, base_url.clone())),
         Arc::new(NullCacheProvider),
         CompactionConfig {
@@ -209,10 +223,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .into_harness_adapter();
 
+    // --- Skills (the Agent Skills spec, wired example-side) -------------------
+    // Discover `SKILL.md` files (bundled with the example + `.spore/skills` in the
+    // workspace + `~/.spore/skills`). The manifest (name + description of every
+    // skill) is injected every turn; a skill's full body is injected only once it
+    // is ACTIVE. A skill goes active when the agent calls `load_skill` (it should,
+    // when a request matches a skill's description) or when you load it yourself
+    // with `/<name>`. The active set is shared in-process across all three sites.
+    let catalog = skills::SkillCatalog::bootstrap(&workspace_root);
+    let known = catalog.names();
+    let active = skills::new_active_set();
+    // Wrap the compaction adapter so the manifest + active bodies ride along every
+    // turn — the live loop bypasses the rich `assemble` (Known Deviation #8 / #115).
+    let context_manager = Arc::new(skills::SkillInjectingContextManager::new(
+        base_adapter,
+        active.clone(),
+        catalog.manifest(),
+    ));
+
     let model = OllamaModelInterface::with_base_url(&model_id, base_url);
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
+        // The coding catalogue PLUS the architect-side `load_skill` tool, so the
+        // agent can pull a skill's full procedure into context on demand.
         .tools(StandardTools::coding_set())
+        .tool(skills::load_skill_tool(active.clone(), known.clone()))
         .system_prompt(SYSTEM_PROMPT)
         .context_manager(context_manager)
         // PlanExecute's `plan` slot is structured: its output schema must resolve
@@ -231,7 +266,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (context_window as f32 * COMPACT_THRESHOLD) as u32,
     );
     println!("workspace : {}", workspace_root.display());
-    println!("tools     : read_file, write_file, edit_file, list_dir, grep, find_files, bash, …");
+    println!(
+        "tools     : read_file, write_file, edit_file, list_dir, grep, find_files, bash, load_skill, …"
+    );
+    println!(
+        "skills    : {} discovered — load with /<name>, or the agent loads via load_skill (/skills to list)",
+        known.len()
+    );
     println!("Type a coding task and press enter. Esc aborts a running task; Ctrl-D quits.\n");
 
     // One conversation for the whole REPL. We keep a stable SessionId and carry
@@ -244,20 +285,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_id = SessionId::generate();
     let mut history: Option<SessionState> = None;
 
-    while let Some(prompt) = read_prompt() {
-        let trimmed = prompt.trim();
+    while let Some(line) = read_prompt() {
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // `clear` wipes the in-memory CONVERSATION back to a clean slate. The
+        // `clear` wipes the in-memory CONVERSATION back to a clean slate — and the
+        // active-skill set with it, since both are conversation-scoped context. The
         // workspace on disk AND the durable (project-scoped) task list are left
         // intact — so the agent keeps resuming any unfinished plan; `clear` only
         // forgets the dialogue.
         if trimmed.eq_ignore_ascii_case("clear") {
             history = None;
+            active.lock().unwrap().clear();
             println!("(conversation cleared)\n");
             continue;
         }
+
+        // Slash commands resolve to the task text we actually run (if any).
+        // `/skills` lists the catalog; `/<name>` loads a skill yourself (the
+        // host-driven path); `/<name> <task>` loads it then runs <task> in one go.
+        let prompt: String = if let Some(rest) = trimmed.strip_prefix('/') {
+            let (cmd, inline) = rest
+                .split_once(char::is_whitespace)
+                .map(|(c, r)| (c, r.trim()))
+                .unwrap_or((rest, ""));
+            if cmd.eq_ignore_ascii_case("skills") {
+                print_skills(&catalog, &active);
+                continue;
+            }
+            if known.iter().any(|n| n == cmd) {
+                active.lock().unwrap().insert(cmd.to_string());
+                println!("✓ loaded skill '{cmd}' — active for this conversation.\n");
+                if inline.is_empty() {
+                    continue; // just loaded; wait for the next prompt
+                }
+                inline.to_string()
+            } else {
+                eprintln!("unknown command '/{cmd}'. Try /skills to list available skills.\n");
+                continue;
+            }
+        } else {
+            trimmed.to_string()
+        };
         // Each REPL turn appends to the SAME conversation and runs as a
         // PlanExecute task: the planner turns your prompt into a JSON task list,
         // then each task runs its own ReAct loop in dependency order. The list is
@@ -592,6 +662,33 @@ fn watch_for_escape(stop: &std::sync::atomic::AtomicBool) {
             Err(_) => std::thread::sleep(tick),
         }
     }
+}
+
+/// List the discovered skills and which are currently active — the `/skills`
+/// command. `●` marks an active skill (its full body is in context every turn);
+/// `○` marks one the agent (or you, via `/<name>`) can still load.
+fn print_skills(catalog: &skills::SkillCatalog, active: &skills::ActiveSkills) {
+    if catalog.is_empty() {
+        println!(
+            "no skills found. Add one at skills/<name>/SKILL.md (next to this example) or \
+             .spore/skills/<name>/SKILL.md in your workspace, then restart.\n"
+        );
+        return;
+    }
+    let active = active.lock().unwrap();
+    println!("skills:");
+    for e in catalog.entries() {
+        let mark = if active.contains(&e.name) {
+            "● active  "
+        } else {
+            "○ loadable"
+        };
+        println!("  {mark}  {} — {}", e.name, e.description);
+    }
+    println!(
+        "\nLoad one yourself with /<name>, or just describe your task and the agent loads \
+         what it needs.\n"
+    );
 }
 
 /// Read one task line from the REPL. `Some(line)` to run; `None` on EOF (Ctrl-D),
