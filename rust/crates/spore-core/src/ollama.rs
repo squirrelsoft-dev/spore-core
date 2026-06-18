@@ -50,7 +50,14 @@
 //! 3. 404 from `/api/chat` or model missing from `/api/tags` →
 //!    `ProviderError { code: 404, message: "Model {id} not found. Run:
 //!    ollama pull {id}" }`.
-//! 4. Timeout → `ModelError::Timeout`.
+//! 4. Timeout → `ModelError::Timeout`. Unary `call` / `count_tokens` / the
+//!    availability probes use a TOTAL request timeout (`with_timeout`, default
+//!    300s). `call_streaming` deliberately omits the total timeout — `reqwest`'s
+//!    request timeout also covers reading the streamed body, so it would abort a
+//!    healthy-but-slow generation mid-stream (surfacing as `ProviderError {
+//!    code: 0, "stream chunk error: error decoding response body" }`). Streaming
+//!    relies instead on the client `read_timeout` (idle / per-chunk) plus
+//!    `connect_timeout`, both configured in [`default_http_client`].
 //! 5. Other 4xx/5xx → `ProviderError { code, message }`.
 //! 6. Lazy model availability check on first call; cached for instance lifetime.
 //! 7. On first call, a one-time `POST /api/show` discovery runs alongside the
@@ -140,9 +147,26 @@ impl OllamaModelInterface {
             base_url: Self::DEFAULT_BASE_URL.into(),
             timeout: Self::DEFAULT_TIMEOUT,
             keep_alive: Some(Self::DEFAULT_KEEP_ALIVE.into()),
-            http_client: Arc::new(reqwest::Client::new()),
+            http_client: Arc::new(Self::default_http_client()),
             model_checked: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// The default HTTP client. Streaming responses rely on a **read (idle)
+    /// timeout** rather than a total-request timeout: the agent streams a long
+    /// generation chunk-by-chunk, and `reqwest`'s request `.timeout()` is a
+    /// TOTAL deadline that also covers the body read — applying it to a stream
+    /// guillotines a healthy-but-slow generation mid-body, which surfaces as
+    /// `ProviderError { code: 0, "stream chunk error: error decoding response
+    /// body" }`. `read_timeout` resets after every chunk, so it only trips on a
+    /// genuinely stalled connection. `connect_timeout` keeps an unreachable host
+    /// from hanging forever now that streaming carries no total deadline.
+    fn default_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Self::DEFAULT_TIMEOUT)
+            .build()
+            .expect("failed to build default Ollama HTTP client")
     }
 
     pub fn with_base_url(model_id: impl Into<String>, base_url: impl Into<String>) -> Self {
@@ -843,11 +867,16 @@ impl ModelInterface for OllamaModelInterface {
         })?;
         let base_url = self.base_url.clone();
         let model_id = self.model_id.clone();
+        // NB: no per-request `.timeout()` here. `reqwest`'s request timeout is a
+        // TOTAL deadline that also covers reading the streamed body, so applying
+        // it would abort a long-but-healthy generation mid-stream — surfacing as
+        // `ProviderError { code: 0, "stream chunk error: error decoding response
+        // body" }`. Streaming relies on the client `read_timeout` (idle /
+        // per-chunk) and `connect_timeout` from `default_http_client` instead.
         let resp = self
             .http_client
             .post(&url)
             .header("content-type", "application/json")
-            .timeout(self.timeout)
             .body(encoded)
             .send()
             .await
@@ -2091,6 +2120,43 @@ mod tests {
             events.last().unwrap(),
             StreamEvent::MessageStop { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn streaming_ignores_total_timeout_for_slow_response() {
+        // Regression: `reqwest`'s request `.timeout()` is a TOTAL deadline that
+        // covers reading the streamed body, so a short `with_timeout` used to
+        // abort a healthy-but-slow generation mid-stream with
+        // `stream chunk error: error decoding response body`. The streaming path
+        // drops the per-request timeout; here a response slower than the
+        // (unary) `with_timeout` must still stream to completion.
+        let ndjson = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"slow\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1,\"eval_count\":1}\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(ndjson)
+                    .insert_header("content-type", "application/x-ndjson")
+                    // Response arrives well AFTER the 200ms total deadline below.
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri())
+            .with_timeout(Duration::from_millis(200));
+        let mut stream = client.call_streaming(req(vec![user("hi")])).await.unwrap();
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            if let StreamEvent::ContentBlockDelta { delta, .. } = ev.unwrap() {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "slow", "slow streaming response must not be aborted");
     }
 
     #[tokio::test]
