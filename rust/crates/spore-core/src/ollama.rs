@@ -32,8 +32,15 @@
 //!   JSON-encoded string like OpenAI.
 //! - Ollama does not return tool-call ids; we synthesize `call-{i}` per index
 //!   so downstream `ToolResult.tool_use_id` round-trips work.
-//! - Thinking blocks are silently omitted from outgoing requests — Ollama
-//!   has no structured reasoning shape.
+//! - Reasoning models are supported. When `ModelParams.reasoning_budget` is a
+//!   positive value AND the model's `/api/show` `capabilities` include
+//!   `"thinking"`, the request carries `think: true` and Ollama's separate
+//!   `message.thinking` channel is surfaced as `ContentBlock::Thinking` (unary)
+//!   / `StreamEvent::ThinkingDelta` (streaming). Reasoning is requested-but-
+//!   unsupported is a no-op, not an error: the `think` flag is dropped so
+//!   non-reasoning models keep working (`reasoning_budget` is a hint, mirroring
+//!   `structured_tool_calls` / `output_schema`). Thinking blocks on the request
+//!   side (assistant history) have no Ollama wire shape and are still omitted.
 //!
 //! ## Rules enforced here
 //! 1. `TokenUsage` reported on every successful `call` and final `MessageStop`
@@ -100,6 +107,14 @@ struct ModelMeta {
 impl ModelMeta {
     fn supports_tools(&self) -> bool {
         self.capabilities.iter().any(|c| c == "tools")
+    }
+
+    /// True when `/api/show` reports the `"thinking"` capability. Used to gate
+    /// the request-side `think: true` flag: sending `think` to a model that
+    /// can't reason returns an Ollama 400, so we fail closed (drop the flag)
+    /// exactly like [`supports_tools`](Self::supports_tools) gates `tools`.
+    fn supports_thinking(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "thinking")
     }
 }
 
@@ -267,6 +282,15 @@ struct OllamaRequest {
     options: Option<OllamaOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OllamaTool>,
+    /// Enables Ollama's reasoning pass on thinking-capable models. When `true`,
+    /// the model's reasoning is returned on the separate `message.thinking`
+    /// channel instead of being inlined into (or omitted from) `content`. Set
+    /// from a positive `ModelParams.reasoning_budget`, then dropped in
+    /// `call` / `call_streaming` when the model lacks the `"thinking"`
+    /// capability. `None` (the default) is omitted from the wire, keeping
+    /// non-reasoning requests byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     /// Constrained-decoding JSON schema (Ollama's `format` parameter). Set only
     /// in structured-tool-calls mode (`ModelParams.structured_tool_calls`); when
     /// present, native `tools` are dropped and the model is forced to emit a
@@ -357,6 +381,10 @@ struct OllamaResponseMessage {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning trace from thinking-capable models, populated only when the
+    /// request carried `think: true`. Surfaced as `ContentBlock::Thinking`.
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Vec<OllamaResponseToolCall>,
 }
@@ -492,6 +520,16 @@ fn build_request(
         stop: req.params.stop_sequences.clone(),
     };
 
+    // Reasoning models: a positive `reasoning_budget` asks Ollama to run the
+    // model's thinking pass and return reasoning on the separate
+    // `message.thinking` channel (`think: true`). The budget magnitude has no
+    // Ollama analogue — `think` is a plain boolean — so any positive budget maps
+    // to `Some(true)`; `None`/`Some(0)` leave `think` unset. Capability gating
+    // (dropping `think` when the model can't reason) happens in `call` /
+    // `call_streaming`, which hold the `/api/show` metadata `build_request`
+    // lacks.
+    let think = matches!(req.params.reasoning_budget, Some(n) if n > 0).then_some(true);
+
     OllamaRequest {
         model: model_id.into(),
         messages,
@@ -503,7 +541,20 @@ fn build_request(
             Some(options)
         },
         tools,
+        think,
         format,
+    }
+}
+
+/// Drop the request-side `think: true` flag when the model can't reason.
+/// Sending `think` to a non-thinking model returns an Ollama 400, so — like the
+/// tool-capability guard — we fail closed: reasoning requested on a model whose
+/// `/api/show` `capabilities` omit `"thinking"` (or whose metadata is
+/// unavailable) silently no-ops rather than erroring. Leaves `think` untouched
+/// when it was never set.
+fn gate_thinking(body: &mut OllamaRequest, meta: &ModelMeta) {
+    if body.think.is_some() && !meta.supports_thinking() {
+        body.think = None;
     }
 }
 
@@ -610,6 +661,13 @@ fn parse_response(body: OllamaResponse, structured: bool) -> ModelResponse {
     }
 
     let mut content: Vec<ContentBlock> = Vec::new();
+    // Reasoning precedes the answer — mirror the Anthropic / OpenAI clients,
+    // which push the Thinking block ahead of Text.
+    if let Some(thinking) = body.message.thinking {
+        if !thinking.is_empty() {
+            content.push(ContentBlock::Thinking { text: thinking });
+        }
+    }
     if let Some(text) = body.message.content {
         if !text.is_empty() {
             content.push(ContentBlock::Text { text });
@@ -746,7 +804,8 @@ impl ModelInterface for OllamaModelInterface {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
-        let body = build_request(&self.model_id, &self.keep_alive, &request, false);
+        let mut body = build_request(&self.model_id, &self.keep_alive, &request, false);
+        gate_thinking(&mut body, meta);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
             code: 0,
@@ -775,7 +834,8 @@ impl ModelInterface for OllamaModelInterface {
     async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
-        let body = build_request(&self.model_id, &self.keep_alive, &request, true);
+        let mut body = build_request(&self.model_id, &self.keep_alive, &request, true);
+        gate_thinking(&mut body, meta);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
             code: 0,
@@ -912,6 +972,15 @@ fn ndjson_to_events(
             std::collections::HashSet::new();
         let mut content_index: u32 = 0;
         let mut content_open = false;
+        // Reasoning channel (thinking-capable models, `think:true`): Ollama
+        // streams reasoning deltas in `message.thinking`, a separate prefix
+        // ahead of `message.content`. `thinking_open` tracks the live block;
+        // `saw_thinking` (latched) shifts later text/tool indices past the
+        // thinking block so they never collide in the stream accumulator, which
+        // keys blocks by index and fixes a block's type on its first delta.
+        const THINKING_INDEX: u32 = 0;
+        let mut thinking_open = false;
+        let mut saw_thinking = false;
         // Structured mode: the constrained JSON object arrives as `message.content`
         // text deltas spread across chunks. We must NOT surface that raw JSON to
         // the user — instead buffer it for the whole response and parse it at the
@@ -1004,11 +1073,34 @@ fn ndjson_to_events(
                     continue;
                 }
                 let message = value.get("message");
+                if let Some(think) = message
+                    .and_then(|m| m.get("thinking"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !think.is_empty() {
+                        thinking_open = true;
+                        saw_thinking = true;
+                        yield Ok(StreamEvent::ThinkingDelta {
+                            index: THINKING_INDEX,
+                            delta: think.into(),
+                        });
+                    }
+                }
                 if let Some(text) = message
                     .and_then(|m| m.get("content"))
                     .and_then(|v| v.as_str())
                 {
                     if !text.is_empty() {
+                        // First text after a reasoning prefix: close the thinking
+                        // block and move text onto its own index so both survive
+                        // accumulation.
+                        if thinking_open {
+                            yield Ok(StreamEvent::ContentBlockStop {
+                                index: THINKING_INDEX,
+                            });
+                            thinking_open = false;
+                            content_index = THINKING_INDEX + 1;
+                        }
                         content_open = true;
                         yield Ok(StreamEvent::ContentBlockDelta {
                             index: content_index,
@@ -1035,10 +1127,20 @@ fn ndjson_to_events(
                             .and_then(|v| v.as_u64())
                             .map(|n| n as u32)
                             .unwrap_or(i as u32);
-                        let event_index = model_index + 1;
+                        // Reserve index 0 for a thinking block and index 1 for the
+                        // text block when reasoning was streamed, so a tool with
+                        // `function.index` 0 can't collide with them.
+                        let tool_base = if saw_thinking { 2 } else { 1 };
+                        let event_index = model_index + tool_base;
                         let first_seen = !tool_indices_seen.contains(&event_index);
                         if first_seen {
                             tool_indices_seen.insert(event_index);
+                            if thinking_open {
+                                yield Ok(StreamEvent::ContentBlockStop {
+                                    index: THINKING_INDEX,
+                                });
+                                thinking_open = false;
+                            }
                             if content_open {
                                 yield Ok(StreamEvent::ContentBlockStop {
                                     index: content_index,
@@ -1240,6 +1342,68 @@ mod tests {
         let body = build_request("llama3.2", &None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("thinking"), "wire: {s}");
+    }
+
+    // ── reasoning / thinking request flag ──────────────────────────────────
+
+    #[test]
+    fn build_request_omits_think_without_reasoning_budget() {
+        // Default request (no reasoning_budget) carries no `think` key.
+        let r = req(vec![user("hi")]);
+        let body = build_request("llama3.2", &None, &r, false);
+        assert_eq!(body.think, None);
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(!s.contains("\"think\""), "wire: {s}");
+    }
+
+    #[test]
+    fn build_request_sets_think_with_positive_reasoning_budget() {
+        // A positive reasoning_budget maps to `think: true` (the budget
+        // magnitude has no Ollama analogue). Capability gating is separate.
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(2048);
+        let body = build_request("llama3.2", &None, &r, false);
+        assert_eq!(body.think, Some(true));
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(s.contains("\"think\":true"), "wire: {s}");
+    }
+
+    #[test]
+    fn build_request_omits_think_when_budget_zero() {
+        // Some(0) is "no reasoning" — must not enable thinking.
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(0);
+        let body = build_request("llama3.2", &None, &r, false);
+        assert_eq!(body.think, None);
+    }
+
+    #[test]
+    fn gate_thinking_drops_flag_when_capability_absent() {
+        // Reasoning requested on a model whose capabilities omit "thinking":
+        // fail closed (drop `think`) rather than letting Ollama 400.
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(1024);
+        let mut body = build_request("llama3.2", &None, &r, false);
+        assert_eq!(body.think, Some(true));
+        let meta = ModelMeta {
+            context_length: None,
+            capabilities: vec!["completion".into()],
+        };
+        gate_thinking(&mut body, &meta);
+        assert_eq!(body.think, None, "think must be dropped without capability");
+    }
+
+    #[test]
+    fn gate_thinking_keeps_flag_when_capability_present() {
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(1024);
+        let mut body = build_request("deepseek-r1", &None, &r, false);
+        let meta = ModelMeta {
+            context_length: None,
+            capabilities: vec!["thinking".into()],
+        };
+        gate_thinking(&mut body, &meta);
+        assert_eq!(body.think, Some(true), "think must survive with capability");
     }
 
     // ── structured tool calls (opt-in constrained decoding) ────────────────
@@ -1585,6 +1749,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_response_extracts_thinking_block_before_text() {
+        // A reasoning model returns `message.thinking` alongside `content`.
+        // Mirror Anthropic/OpenAI: Thinking precedes Text in the block list.
+        let body: OllamaResponse = serde_json::from_value(serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "thinking": "let me reason...",
+                "content": "the answer is 42"
+            },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 3,
+            "eval_count": 9
+        }))
+        .unwrap();
+        let r = parse_response(body, false);
+        assert_eq!(
+            r.content,
+            vec![
+                ContentBlock::Thinking {
+                    text: "let me reason...".into()
+                },
+                ContentBlock::Text {
+                    text: "the answer is 42".into()
+                },
+            ]
+        );
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn parse_response_empty_thinking_omitted() {
+        // An empty `thinking` string must not produce a Thinking block.
+        let body: OllamaResponse = serde_json::from_value(serde_json::json!({
+            "message": {"role": "assistant", "thinking": "", "content": "hi"},
+            "done": true,
+            "done_reason": "stop"
+        }))
+        .unwrap();
+        let r = parse_response(body, false);
+        assert_eq!(r.content, vec![ContentBlock::Text { text: "hi".into() }]);
+    }
+
     // ── context_window / provider ──────────────────────────────────────────
 
     #[test]
@@ -1821,6 +2029,68 @@ mod tests {
             }
             other => panic!("expected MessageStop, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_thinking_then_text_on_distinct_indices() {
+        // Reasoning model: `message.thinking` streams as a prefix, then
+        // `message.content`. Thinking surfaces as ThinkingDelta on its own block
+        // index (0), distinct from the text block (1), so the stream accumulator
+        // — which fixes a block's type on its first delta — keeps both.
+        let ndjson = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"thinking\":\"think a\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"thinking\":\"think b\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"answer\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":2,\"eval_count\":4}\n",
+        );
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(ndjson)
+                    .insert_header("content-type", "application/x-ndjson"),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let mut stream = client.call_streaming(req(vec![user("hi")])).await.unwrap();
+        let mut events: Vec<StreamEvent> = vec![];
+        while let Some(ev) = stream.next().await {
+            events.push(ev.unwrap());
+        }
+        let thinking: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec![(0, "think a".into()), (0, "think b".into())],
+            "thinking deltas on index 0"
+        );
+        let text: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta { index, delta } => Some((*index, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec![(1, "answer".into())], "text delta on index 1");
+        // Thinking block is explicitly closed before text opens.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            "thinking block must be closed: {events:?}"
+        );
+        assert!(matches!(
+            events.last().unwrap(),
+            StreamEvent::MessageStop { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2198,6 +2468,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_flag_sent_and_parsed_when_capability_present() {
+        // End-to-end: a positive reasoning_budget on a thinking-capable model
+        // sends `think: true` on the wire (asserted via a body matcher — the
+        // /api/chat mock only responds when the body carries it) AND the
+        // returned `message.thinking` is parsed back into a Thinking block.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "deepseek-r1").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"deepseek2.context_length": 65_536},
+                "capabilities": ["completion", "thinking"]
+            }),
+            None,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"think": true}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "thinking": "hmm", "content": "ok"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("deepseek-r1", server.uri());
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(1024);
+        let resp = client.call(r).await.unwrap();
+        assert_eq!(
+            resp.content,
+            vec![
+                ContentBlock::Thinking { text: "hmm".into() },
+                ContentBlock::Text { text: "ok".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_flag_dropped_when_capability_absent() {
+        // Reasoning requested on a model whose capabilities omit "thinking":
+        // the flag is dropped, so the /api/chat body carries NO `think`. The
+        // mock requires `think` to be absent (a body_partial_json({"think":true})
+        // matcher would NOT match), proving the fail-closed gate end-to-end.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"llama.context_length": 128_000},
+                "capabilities": ["completion"]
+            }),
+            None,
+        )
+        .await;
+        // Only matches when `think:true` is NOT present in the body.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(|req: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+                body.get("think").is_none()
+            })
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(1024);
+        let resp = client.call(r).await.unwrap();
+        assert_eq!(resp.content, vec![ContentBlock::Text { text: "ok".into() }]);
+    }
+
+    #[tokio::test]
     async fn tool_request_rejected_when_capabilities_empty() {
         // `/api/show` returns an empty `capabilities` array. With the static
         // whitelist removed, empty capabilities fail closed — even for a model
@@ -2327,5 +2686,24 @@ mod tests {
             resp.stop_reason,
             StopReason::ToolUse | StopReason::EndTurn
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "live-API; needs local ollama with a thinking model. Override id via \
+                OLLAMA_THINKING_MODEL (default deepseek-r1:1.5b)"]
+    async fn ollama_live_thinking() {
+        let model = std::env::var("OLLAMA_THINKING_MODEL")
+            .unwrap_or_else(|_| "deepseek-r1:1.5b".into());
+        let mut r = req(vec![user("What is 17 * 23? Think step by step.")]);
+        r.params.reasoning_budget = Some(2048);
+        let client = OllamaModelInterface::new(model);
+        let resp = client.call(r).await.unwrap();
+        assert!(
+            resp.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "expected a Thinking block, got {:?}",
+            resp.content
+        );
     }
 }

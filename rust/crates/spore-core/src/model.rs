@@ -92,6 +92,13 @@ pub struct ModelParams {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Opt-in reasoning hint for providers that expose a thinking mode. A
+    /// positive value asks the provider to run the model's reasoning pass and
+    /// return it as a [`ContentBlock::Thinking`] block (and `ThinkingDelta`
+    /// stream events). The Ollama client maps any positive budget to `think:
+    /// true` when the model's `/api/show` capabilities include `"thinking"`,
+    /// and otherwise drops the flag. `None`/`Some(0)` request no reasoning.
+    /// Providers without a thinking toggle ignore it on the request side.
     #[serde(default)]
     pub reasoning_budget: Option<u32>,
     #[serde(default)]
