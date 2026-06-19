@@ -1,14 +1,41 @@
 # PROJECT STATE
-_Last updated: 2026-06-14 by /close (#141 **complete + CLOSED** — the compaction window is now model-configurable: `CompactionConfig.context_length` + a `StandardContextManager` resolver `config(>0) → model context_window(>0) → DEFAULT_CONTEXT_LENGTH=8000`, applied via a manager-owned `seed_session` helper; the `SessionState` constructor default dropped 200_000 → **8000** (conservative unknown-context fallback, the deliberate spec change vs. the original AC); explicit `0`/null/nil falls through, no clamping; shared fixture `compaction_window/cases.json` (5 trigger + 6 resolver) replays byte-identically in all four, existing compaction fixtures untouched; verifier PASS. Implemented via `/implement 141` — Rust ref `1e3cf4c`, Go `67c8d39`, Py `6be78a2`, TS `32ed008` + parity fix `66aed39`.) ✅ **Local `main` is now IN SYNC with `origin/main`** — the #141 + previously-gated #139 series (10 commits) were pushed this loop with maintainer OK (`32d4093`→`66aed39`)._
+_Last updated: 2026-06-19 by /close (#149 **complete + CLOSED** — Ollama `num_ctx` ported from the Rust reference `3273386` to TS `ff5358a`, Python `5c9b613`, Go `4a544a7`; opt-in interface field (each language's `keep_alive` idiom, not the literal `with_num_ctx`), threaded into `options.num_ctx`, **omitted when unset** (existing fixtures replay byte-identical), `num_ctx` serialized **first** in `options` to match Rust serde field order; wire-level HTTP-mock test + unit tests in each; verifier PASS across all four. The three port commits are on **local `main` only — 3 ahead of `origin/main` (`64938ee`), NOT pushed**.)_
 
-_**Direction note:** The **`12-cordyceps` hardening cluster #137–#143 is COMPLETE and closed**, and with **#139 (output schemas) and now #141 (compaction window) both done**, **every independent robustness gap adjacent to the cluster is closed.** No queued hardening work remains. The refactor (#117–#131) is landed; #131's capstone is integrated but the issue is **still formally open** (`status: queued`, last touched 2026-06-06) pending its own `/close 131` — now the top cheap housekeeping. Parallel-grabbable refactor finishers #121/#122/#127/#128 remain open and off the critical path. Next substantive direction is a **maintainer call** (refactor close-out vs. resume parked examples #109/#92). Use the `/implement` skill per issue (Rust reference → three parallel language agents → cross-language verifier)._
+_**Direction note:** The project has shifted from "hardening cluster done, maintainer call" into an active **cross-language parity catch-up** phase. Rust raced ahead on `main` with a batch of Ollama + sandbox + bugfix work; TS/Python/Go are now catching up issue-by-issue via `/implement` (land Rust first → three parallel language agents → cross-language verifier). Open parity backlog: **#150** (recoverable sandbox violations — larger, breaking default change), **#148** (Ollama thinking/reasoning models), **#146** (web_fetch start_byte, Python/Go), **#147** (SelfVerifying evaluator budget, TS/Python), and **#144** (PlanExecute budget-resume — ports appear landed, verify + `/close 144`). #149 (num_ctx) and #145 (SSRF seam) are done/closed. This is the current north star until the backlog drains; refactor close-out (#131 + finishers) and parked examples (#109/#92) remain behind it. The hardening cluster #137–#143 + #139/#141 remain fully closed._
 
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **in sync with
-`origin/main`** (`origin/main` at `66aed39` — the #141 + previously-gated #139 series, 10
-commits, were pushed this loop with maintainer OK).
+serialized formats byte-identical across all four. Local `main` is **3 commits ahead of
+`origin/main`** (`origin/main` at `64938ee`); the three #149 `num_ctx` ports
+(`ff5358a`/`5c9b613`/`4a544a7`) are committed locally but **not yet pushed** — ask the maintainer
+before pushing (Deviation #10).
+
+**Active phase — cross-language parity catch-up (#144–#150).** Since the 2026-06-14 reconcile, Rust
+raced ahead on `main` with a wave of Ollama + sandbox + bugfix work, and TS/Python/Go are catching up
+issue-by-issue via `/implement` (Rust reference → three parallel language agents → cross-language
+verifier). Backlog status:
+- **#149 — Ollama `num_ctx` ✅ DONE THIS LOOP (`status: complete`, CLOSED).** Opt-in interface field
+  (`numCtx` ctor option / `num_ctx` kwarg / `SetNumCtx` setter — each language's `keep_alive` idiom, not
+  the literal Rust `with_num_ctx`), threaded into `options.num_ctx`, **omitted when unset** (bare requests
+  + existing fixtures stay byte-identical), `num_ctx` serialized **first** in `options` to match Rust serde
+  field order (TS/Python carry explicit ordering tests); wire-level HTTP-mock test in each. Verifier PASS.
+  Rust ref `3273386`; ports TS `ff5358a`, Python `5c9b613`, Go `4a544a7`.
+- **#145 — SSRF URL-validation seam ✅ DONE (CLOSED).** Ported TS `986a15e`, Python `ca3d8a9`, Go
+  `498c87f` (see memory `ssrf-seam-url-bracket-parity-gotchas`).
+- **#144 — PlanExecute budget-resume fix → ports appear LANDED, issue still OPEN.** TS `2401fee`, Python
+  `9b1d310`, Go `b56e852` + Rust docs `a25e6bf` are on `main`; verify the AC and run `/close 144`.
+- **#150 — recoverable sandbox violations via `SandboxViolationPolicy` (port OWED).** Rust landed
+  (`64938ee`); TS/Python/Go owed — the larger port, a **breaking default change** (path escapes / blocked
+  commands become recoverable feedback). See issue #150 + the handoff for the typed-violation-to-harness
+  shape (keep the loud compile error on exhaustive matches).
+- **#148 — Ollama thinking/reasoning models (port OWED).** Rust landed (`a9c856b`); TS/Python/Go owed.
+- **#146 — char-boundary-safe `web_fetch` `start_byte` slicing (Python/Go OWED).**
+- **#147 — SelfVerifying must charge evaluator turns against budget (TS/Python OWED).**
+
+Also Rust-ahead but **not yet filed as parity issues**: Ollama streaming `read_timeout` fix (`56361b2`)
+and Ollama think-effort levels (`c486331`) — confirm whether these need their own TS/Py/Go parity issues
+or fold into #148.
 
 **🎯 The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (all five closed), and
 the adjacent **#139** (output-schema enforcement) and **#141** (configurable compaction
@@ -179,20 +206,23 @@ durable (#142), resumes the stalled worker instead of re-planning (#138), routes
 through the leaf's scoped catalogue (#140), breaks tool-error grind loops (#137), enforces output
 schemas behind a migration gate (#139), and **fires compaction correctly for small/unknown-window
 models (#141)**. The composition's small-local-model reliability gaps that motivated the cluster are
-fully addressed. **There is no queued hardening or robustness work left.**
+fully addressed.
 
-**Next direction is a maintainer call** — the cluster's north star is met with nothing adjacent
-outstanding. Candidates, in rough priority order: **(a)** close out the refactor — run **`/close 131`**
-(the capstone is functionally landed but still formally open) and, whenever convenient, the
-off-critical-path finishers #121/#122/#127/#128; **(b)** resume the parked examples track (#109
-`13-coding-agent`, #92 observability/Phoenix-OTLP) + `web_search` #108/#110; **(c)** the larger parked
-features (#113 spore-lsp, #107 PromptEngineeringAgent, #106 MicroVMSandboxProvider, protocol track
-#83–87) and correctness/safety debt #34→#31→#30 + docs. Drive code with `/implement` (Rust reference →
-three parallel language agents → cross-language verifier), byte-identical where serialized.
+**The active direction is the cross-language parity catch-up backlog (#144–#150).** The maintainer
+pushed a Rust-first wave of Ollama + sandbox + bugfix work; the job now is porting each to TS/Python/Go
+via `/implement` (Rust reference → three parallel language agents → cross-language verifier),
+byte-identical where serialized, until the backlog drains. Order, roughly: **#149 ✅ done → #150**
+(recoverable sandbox violations — larger, breaking default change) **and #148** (Ollama thinking models)
+for the Ollama/sandbox cluster; then the smaller bugfix ports **#146** (web_fetch start_byte) and **#147**
+(SelfVerifying evaluator budget); **#144** ports appear landed — verify + `/close 144`. Behind the parity
+backlog the prior maintainer-call candidates still stand: refactor close-out (`/close 131` + finishers
+#121/#122/#127/#128), parked examples (#109 `13-coding-agent`, #92 observability) + `web_search`
+#108/#110, then larger parked features (#113/#107/#106, protocol track #83–87) and correctness/safety
+debt #34→#31→#30 + docs.
 
-**Housekeeping:** `main` is now **in sync** with `origin/main` (the #139 + #141 series, 10 commits,
-were pushed this loop with maintainer OK). The remaining cheap reconcile-only step is **`/close 131`**
-(confirm the capstone success criteria; no code).
+**Housekeeping:** local `main` is **3 commits ahead of `origin/main`** (`64938ee`) — the three #149
+ports are unpushed; **ask the maintainer before pushing** (Deviation #10). `/close 131` (confirm the
+capstone success criteria; no code) remains an outstanding cheap reconcile-only step.
 
 **Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
 gaps #115 (skill loading) and #116 (HITL child-consult resume — overlaps #130's resume seam,
@@ -243,12 +273,11 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ✅ **IN SYNC (2026-06-14, latest loop):**
-    local `main` == `origin/main` at `66aed39` — the #139 + #141 series (10 commits, `32d4093`→`66aed39`)
-    were pushed this loop with explicit maintainer OK. The standing reminder still holds for future loops:
-    **ask before pushing** — an agent-initiated push was denied in an earlier session, so confirm maintainer
-    OK before clearing any future drift. (This reconcile commit will leave `main` one ahead again until the
-    next push.)
+10. **Local `main` push hygiene (standing reminder).** ⚠️ **3 AHEAD (2026-06-19, this loop):** local
+    `main` is 3 commits ahead of `origin/main` (`64938ee`) — the three #149 `num_ctx` ports
+    (`ff5358a`/`5c9b613`/`4a544a7`) are committed locally but **not pushed**. The Rust Ollama/sandbox wave
+    up to `64938ee` IS on `origin`. The standing reminder holds: **ask before pushing** — an agent-initiated
+    push was denied in an earlier session, so confirm maintainer OK before clearing this drift.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -301,18 +330,23 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **Run `/close 131` (cheap, reconcile-only, no code) — top housekeeping.** The cordyceps capstone
-   `Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]]` is functionally landed (PR #136) but the issue is
-   **still formally open** (`status: queued`, last touched 2026-06-06). Confirm the success criteria and
-   close it out. With #141 done, this is the last loose end on the completed-work side.
-2. **Refactor finishers (off critical path, `status: queued`, no cross-deps).** #121 (SubagentTool takes
-   a LoopStrategy), #122 (`max_steps()` advisory bound), #127 (custom RunStrategy path end-to-end), #128
-   (per-node observability span attributes) — grab via `/implement` whenever convenient.
-3. **Resume the parked examples + web_search track.** #109 (`13-coding-agent`, the last of 13 examples),
-   #92 (observability/Phoenix-OTLP), #108/#110 (`web_search` auth/params + normalization).
-4. **Larger parked features + debt — maintainer call.** #115/#116 (skill loading / HITL child-consult
-   resume), #113/#107/#106 and the protocol track #83–87; correctness/safety #34→#31→#30 + docs
-   #27/#35/#36. **#7** (ContextManager migration) would live-wire the rich `assemble`.
+1. **Port #150 — recoverable sandbox violations via `SandboxViolationPolicy` (TS/Python/Go).** Rust
+   landed (`64938ee`); the larger of the Ollama/sandbox parity ports and a **breaking default change**
+   (path escapes / blocked commands become recoverable feedback). Drive via `/implement 150`; keep the
+   typed-violation-to-harness shape and the loud compile error on exhaustive matches (see issue #150 + the
+   handoff). Current top of the parity backlog.
+2. **Port #148 — Ollama thinking/reasoning models (TS/Python/Go).** Rust landed (`a9c856b`); `/implement 148`.
+   While here, confirm whether the Rust-ahead Ollama `read_timeout` fix (`56361b2`) and think-effort levels
+   (`c486331`) need their own parity issues or fold into #148.
+3. **Port the smaller bugfix-parity issues.** #146 (char-boundary-safe `web_fetch` `start_byte`, Python/Go)
+   and #147 (SelfVerifying charge evaluator turns against budget, TS/Python). Both via `/implement`.
+4. **Verify + `/close 144`, then push.** PlanExecute budget-resume ports appear landed
+   (`2401fee`/`9b1d310`/`b56e852` + Rust docs `a25e6bf`); confirm the AC then close. Also push the 3
+   unpushed #149 commits once the maintainer OKs (Deviation #10).
+5. **Behind the parity backlog (maintainer call):** `/close 131` + refactor finishers #121/#122/#127/#128;
+   parked examples #109/#92 + `web_search` #108/#110; larger features #113/#107/#106, protocol #83–87;
+   debt #34→#31→#30 + docs. **#7** (ContextManager migration) would live-wire the rich `assemble`.
 
-**Note:** every queued *hardening/robustness* gap is now closed — remaining work is refactor close-out,
-parked examples, and longer-horizon features, all behind an explicit maintainer call on direction.
+**Note:** the hardening cluster (#137–#143) + #139/#141 remain fully closed; the active work is the
+**cross-language parity catch-up backlog (#144–#150)** — Rust-first features/bugfixes being ported to the
+other three languages issue-by-issue.
