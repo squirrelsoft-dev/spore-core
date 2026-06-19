@@ -52,6 +52,7 @@ async fn react_loop_dispatches_tool_then_completes() {
     let config = HarnessConfig {
         tool_registry: tool_registry.clone(),
         sandbox: Arc::new(AllowAllSandbox),
+        sandbox_violation_policy: spore_core::harness::SandboxViolationPolicy::default(),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
         toolset_catalogues: Default::default(),

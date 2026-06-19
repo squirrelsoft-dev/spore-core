@@ -648,9 +648,9 @@ mod tests {
             )
             .await;
         match over {
-            ToolOutput::Error { message, .. } => assert!(
-                message.contains("size") || message.to_lowercase().contains("exceed"),
-                "{message}"
+            ToolOutput::SandboxViolation { violation } => assert!(
+                matches!(violation, SandboxViolation::FileSizeExceeded { .. }),
+                "expected FileSizeExceeded, got {violation:?}"
             ),
             other => panic!("expected size violation, got {other:?}"),
         }
@@ -912,15 +912,16 @@ mod tests {
                 &test_ctx(),
             )
             .await;
+        // The tool surfaces the TYPED violation; the harness (not the tool)
+        // decides recoverable-vs-halt via SandboxViolationPolicy.
         match r {
-            ToolOutput::Error { message, .. } => {
+            ToolOutput::SandboxViolation { violation } => {
                 assert!(
-                    message.to_lowercase().contains("escape")
-                        || message.to_lowercase().contains("sandbox"),
-                    "expected a sandbox/path-escape error, got: {message}"
+                    matches!(violation, SandboxViolation::PathEscape { .. }),
+                    "expected PathEscape, got {violation:?}"
                 );
             }
-            other => panic!("expected sandbox violation error, got {other:?}"),
+            other => panic!("expected SandboxViolation, got {other:?}"),
         }
     }
 
@@ -933,6 +934,46 @@ mod tests {
         match r {
             ToolOutput::Error { recoverable, .. } => assert!(recoverable),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_outside_workspace_surfaces_typed_violation() {
+        // A write that escapes the workspace root surfaces the TYPED violation
+        // (`ToolOutput::SandboxViolation`), end to end through the real sandbox.
+        // The tool does NOT decide recoverable-vs-halt — the harness does, via
+        // SandboxViolationPolicy (see the harness-level policy tests).
+        use crate::sandbox::{WorkspaceConfig, WorkspaceScopedSandbox};
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let sb = WorkspaceScopedSandbox::new(WorkspaceConfig {
+            root: root.clone(),
+            allowed_paths: vec![],
+            denied_paths: vec![],
+            allowed_extensions: None,
+            denied_extensions: vec![],
+            read_only: false,
+            max_file_size: 0,
+        })
+        .unwrap();
+        let r = WriteFileTool::new()
+            .execute(
+                &call(
+                    "write_file",
+                    json!({"path": "../escape.txt", "content": "x"}),
+                ),
+                &sb,
+                &test_ctx(),
+            )
+            .await;
+        match r {
+            ToolOutput::SandboxViolation { violation } => {
+                assert!(
+                    matches!(violation, SandboxViolation::PathEscape { .. }),
+                    "expected PathEscape, got {violation:?}"
+                );
+            }
+            other => panic!("expected SandboxViolation, got {other:?}"),
         }
     }
 

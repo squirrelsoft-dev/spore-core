@@ -45,6 +45,7 @@ fn config() -> HarnessConfig {
     HarnessConfig {
         tool_registry: Arc::new(ScriptedToolRegistry::new()),
         sandbox: Arc::new(AllowAllSandbox),
+        sandbox_violation_policy: spore_core::harness::SandboxViolationPolicy::default(),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
         toolset_catalogues: Default::default(),

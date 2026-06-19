@@ -150,6 +150,9 @@ impl<M: ModelInterface + 'static> HarnessContextManager for StandardCompactionAd
         let text = match &result.output {
             ToolOutput::Success { content, .. } => content.clone(),
             ToolOutput::Error { message, .. } => message.clone(),
+            // Normally normalized into an `Error` by the harness before being
+            // appended; record the violation text defensively if it reaches here.
+            ToolOutput::SandboxViolation { violation } => format!("sandbox violation: {violation:?}"),
             ToolOutput::WaitingForHuman { .. } => String::new(),
             ToolOutput::Escalate { .. } => String::new(),
             ToolOutput::AwaitingClarification { .. } => String::new(),

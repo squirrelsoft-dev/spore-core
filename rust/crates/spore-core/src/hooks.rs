@@ -1747,6 +1747,7 @@ mod tests {
         HarnessConfig {
             tool_registry: Arc::new(ScriptedToolRegistry::new()),
             sandbox: Arc::new(AllowAllSandbox),
+            sandbox_violation_policy: crate::harness::SandboxViolationPolicy::default(),
             context_manager: Arc::new(NoopContextManager),
             termination_policy: Arc::new(AlwaysContinuePolicy),
             middleware: None,

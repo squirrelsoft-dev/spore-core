@@ -4271,6 +4271,15 @@ pub enum ToolOutput {
         child_state: Option<Box<ChildPausedState>>,
         request: ConsultRequest,
     },
+    /// A tool was denied by the sandbox (e.g. a path escaped the workspace root,
+    /// or a command was disallowed). Carries the typed [`SandboxViolation`] so
+    /// the harness — not the tool — decides whether it halts the run or is fed
+    /// back to the model as a recoverable error, per
+    /// [`HarnessConfig::sandbox_violation_policy`]. Produced by the
+    /// `From<ToolExecutionError>` conversion; the harness normalizes it into a
+    /// halt or a recoverable [`ToolOutput::Error`] immediately after dispatch,
+    /// so it never reaches message history.
+    SandboxViolation { violation: SandboxViolation },
 }
 
 impl ToolOutput {
@@ -4322,8 +4331,10 @@ pub struct ToolResult {
 }
 
 /// Sandbox-side violation. Full enum lives in issue #6 (SandboxProvider).
-/// `PathEscape` and `NetworkViolation` are Layer-1 always-halt per the spec;
-/// the remaining variants are middleware-routable.
+/// `PathEscape` and `NetworkViolation` are the halt-ELIGIBLE Layer-1 variants
+/// (see [`is_always_halt`](Self::is_always_halt)); whether they actually halt is
+/// decided by [`SandboxViolationPolicy`]. The remaining variants are always
+/// recoverable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -4357,13 +4368,45 @@ pub enum SandboxViolation {
 }
 
 impl SandboxViolation {
-    /// Layer-1 violations cannot be overridden — they always halt.
+    /// The halt-ELIGIBLE Layer-1 violations: a path escaping the workspace root
+    /// or a blocked network host. Whether such a violation actually halts the
+    /// run is governed by [`SandboxViolationPolicy`]; under the default
+    /// (`Recoverable`) even these are fed back to the model. The Layer-2
+    /// variants (`PathDenied`, `ReadOnlyViolation`, …) are never halt-eligible —
+    /// they are always recoverable regardless of policy.
     pub fn is_always_halt(&self) -> bool {
         matches!(
             self,
             SandboxViolation::PathEscape { .. } | SandboxViolation::NetworkViolation { .. }
         )
     }
+}
+
+/// How the harness treats a [`SandboxViolation`] surfaced by a tool (or the
+/// pre-dispatch `validate` check): coach the model and let it retry, or halt the
+/// run outright.
+///
+/// This is the single switch for sandbox-violation handling, applied uniformly
+/// across every tool (filesystem, bash/exec, …) and both surfacing paths. The
+/// default is [`Recoverable`](Self::Recoverable): a mis-targeted write or a
+/// blocked command is a benign mistake for an agent, so the violation is
+/// appended as a recoverable tool error and the model self-corrects (the
+/// boundary still holds — the access was refused). Opt into
+/// [`Halt`](Self::Halt) to restore the original Layer-1 always-halt behavior for
+/// path escapes / network violations.
+///
+/// Set it via [`HarnessBuilder::sandbox_violation_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxViolationPolicy {
+    /// Surface the violation to the model as a recoverable tool error it can
+    /// retry from. Halt-eligible or not, nothing halts the run. The default.
+    #[default]
+    Recoverable,
+    /// Halt the run when a halt-eligible violation
+    /// ([`SandboxViolation::is_always_halt`]) is encountered. Layer-2 violations
+    /// stay recoverable. Restores the pre-policy Layer-1 behavior.
+    Halt,
 }
 
 /// Where in the lifecycle a middleware hook fired. Full enum lives in #11.
@@ -5954,6 +5997,10 @@ pub trait Harness: Send + Sync {
 pub struct HarnessConfig {
     pub tool_registry: Arc<dyn ToolRegistry>,
     pub sandbox: Arc<dyn SandboxProvider>,
+    /// How a [`SandboxViolation`] surfaced by a tool (or the pre-dispatch
+    /// `validate` check) is handled: fed back to the model as a recoverable
+    /// error (the default) or halted on. See [`SandboxViolationPolicy`].
+    pub sandbox_violation_policy: SandboxViolationPolicy,
     pub context_manager: Arc<dyn ContextManager>,
     pub termination_policy: Arc<dyn TerminationPolicy>,
     pub middleware: Option<Arc<dyn MiddlewareChain>>,
@@ -6162,6 +6209,7 @@ impl Clone for HarnessConfig {
         Self {
             tool_registry: self.tool_registry.clone(),
             sandbox: self.sandbox.clone(),
+            sandbox_violation_policy: self.sandbox_violation_policy,
             context_manager: self.context_manager.clone(),
             termination_policy: self.termination_policy.clone(),
             middleware: self.middleware.clone(),
@@ -6224,6 +6272,7 @@ pub struct HarnessBuilder {
     agent: Arc<dyn Agent>,
     tool_registry: Arc<dyn ToolRegistry>,
     sandbox: Arc<dyn SandboxProvider>,
+    sandbox_violation_policy: SandboxViolationPolicy,
     context_manager: Arc<dyn ContextManager>,
     termination_policy: Arc<dyn TerminationPolicy>,
     middleware: Option<Arc<dyn MiddlewareChain>>,
@@ -6330,6 +6379,7 @@ impl HarnessBuilder {
             agent,
             tool_registry,
             sandbox,
+            sandbox_violation_policy: SandboxViolationPolicy::default(),
             context_manager,
             termination_policy,
             middleware: None,
@@ -6485,6 +6535,22 @@ impl HarnessBuilder {
     /// ```
     pub fn sandbox(mut self, sandbox: Arc<dyn SandboxProvider>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Set how a [`SandboxViolation`] surfaced by a tool is handled — recoverable
+    /// feedback to the model (the default) or a hard halt. See
+    /// [`SandboxViolationPolicy`].
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spore_core::harness::{HarnessBuilder, SandboxViolationPolicy};
+    /// # fn ex(b: HarnessBuilder) -> HarnessBuilder {
+    /// b.sandbox_violation_policy(SandboxViolationPolicy::Halt)
+    /// # }
+    /// ```
+    pub fn sandbox_violation_policy(mut self, policy: SandboxViolationPolicy) -> Self {
+        self.sandbox_violation_policy = policy;
         self
     }
 
@@ -6993,6 +7059,7 @@ impl HarnessBuilder {
         HarnessConfig {
             tool_registry: self.tool_registry,
             sandbox: self.sandbox,
+            sandbox_violation_policy: self.sandbox_violation_policy,
             context_manager: self.context_manager,
             termination_policy: self.termination_policy,
             middleware: self.middleware,
@@ -7090,6 +7157,34 @@ impl StandardHarness {
                     acc.push(path.clone());
                 }
             }
+        }
+    }
+
+    /// Whether a sandbox violation should HALT the run under the configured
+    /// [`SandboxViolationPolicy`]: only when the policy is `Halt` AND the
+    /// violation is halt-eligible (`PathEscape` / `NetworkViolation`). Layer-2
+    /// violations are never halt-eligible, so they stay recoverable regardless.
+    fn sandbox_violation_halts(&self, violation: &SandboxViolation) -> bool {
+        self.config.sandbox_violation_policy == SandboxViolationPolicy::Halt
+            && violation.is_always_halt()
+    }
+
+    /// Flatten a [`ToolOutput::SandboxViolation`] into a plain
+    /// [`ToolOutput::Error`] whose `recoverable` flag reflects the policy. Used
+    /// on tool-result drain paths (resume / human-approval flushes) that append
+    /// results to history but have no place to issue a typed halt; the main loop
+    /// handles the variant directly so it can return the typed
+    /// [`HaltReason::SandboxViolation`]. A non-violation output passes through.
+    fn normalize_sandbox_violation(&self, output: ToolOutput) -> ToolOutput {
+        match output {
+            ToolOutput::SandboxViolation { violation } => {
+                let recoverable = !self.sandbox_violation_halts(&violation);
+                ToolOutput::Error {
+                    message: format!("sandbox violation: {violation:?}"),
+                    recoverable,
+                }
+            }
+            other => other,
         }
     }
 
@@ -8298,9 +8393,12 @@ tool. Use the provided tool-call format to actually invoke the tool."
 
                     let mut approved_results: Vec<ToolResult> = Vec::new();
                     for (i, call) in calls.iter().enumerate() {
-                        // Sandbox validation.
+                        // Sandbox validation. The pre-dispatch `validate` seam
+                        // honours the SAME policy as tool-surfaced violations
+                        // (`sandbox_violation_halts`): halt only under `Halt` for
+                        // an always-halt-eligible violation; otherwise recoverable.
                         if let Err(violation) = self.config.sandbox.validate(call).await {
-                            if violation.is_always_halt() {
+                            if self.sandbox_violation_halts(&violation) {
                                 return RunResult::Failure {
                                     reason: HaltReason::SandboxViolation { violation },
                                     session_id,
@@ -8309,7 +8407,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     session_state: session_state.clone(),
                                 };
                             }
-                            // Layer-2 default: recoverable — append as tool error.
+                            // Recoverable — append as tool error.
                             let tr = ToolResult {
                                 call_id: call.id.clone(),
                                 output: ToolOutput::Error {
@@ -8409,6 +8507,31 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     }
                                 }
                             }
+                        }
+
+                        // Tool-surfaced sandbox violation: the HARNESS decides
+                        // halt-vs-recoverable per `sandbox_violation_policy`, not
+                        // the tool. Under `Halt` an always-halt-eligible violation
+                        // ends the run with a typed `HaltReason::SandboxViolation`;
+                        // otherwise (the default) it becomes a recoverable error
+                        // the model retries from — uniform across every tool.
+                        if let ToolOutput::SandboxViolation { violation } = &output {
+                            if self.sandbox_violation_halts(violation) {
+                                return RunResult::Failure {
+                                    reason: HaltReason::SandboxViolation {
+                                        violation: violation.clone(),
+                                    },
+                                    session_id,
+                                    usage,
+                                    turns: budget_used.turns,
+                                    session_state: session_state.clone(),
+                                };
+                            }
+                            let message = format!("sandbox violation: {violation:?}");
+                            output = ToolOutput::Error {
+                                message,
+                                recoverable: true,
+                            };
                         }
                         let call = &effective_call;
 
@@ -8815,6 +8938,9 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                     ToolOutput::Escalate { .. } => None,
                                     ToolOutput::AwaitingClarification { .. } => None,
                                     ToolOutput::Consult { .. } => None,
+                                    // Normalized into an `Error` (or a halt)
+                                    // before this point; never reaches here.
+                                    ToolOutput::SandboxViolation { .. } => None,
                                 };
                                 (Some(args), result)
                             } else {
@@ -8829,6 +8955,8 @@ tool. Use the provided tool-call format to actually invoke the tool."
                                 ToolOutput::Escalate { .. } => (0, false),
                                 ToolOutput::AwaitingClarification { .. } => (0, false),
                                 ToolOutput::Consult { .. } => (0, false),
+                                // Normalized away before this point.
+                                ToolOutput::SandboxViolation { .. } => (0, false),
                             };
                             let span_id =
                                 SpanId::new(format!("{}-tool-{}", session_id.as_str(), span_seq));
@@ -10534,7 +10662,8 @@ impl StandardHarness {
                 .await;
         }
         for call in pending {
-            let output = tool_registry.dispatch(call.clone()).await;
+            let output =
+                self.normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
             let tr = ToolResult {
                 call_id: call.id,
                 output,
@@ -11176,7 +11305,8 @@ impl StandardHarness {
                 }
                 // Dispatch any remaining pending calls from the same batch.
                 for call in pending {
-                    let output = tool_registry.dispatch(call.clone()).await;
+                    let output = self
+                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -11267,7 +11397,8 @@ impl StandardHarness {
             HumanResponse::Allow => {
                 // Dispatch remaining pending calls before resuming the loop.
                 for call in pending_tool_calls {
-                    let output = tool_registry.dispatch(call.clone()).await;
+                    let output = self
+                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -11280,7 +11411,8 @@ impl StandardHarness {
             }
             HumanResponse::AllowWithModification { calls } => {
                 for call in calls {
-                    let output = tool_registry.dispatch(call.clone()).await;
+                    let output = self
+                        .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -11372,6 +11504,9 @@ pub mod testing {
                 let text = match &result.output {
                     ToolOutput::Success { content, .. } => content.clone(),
                     ToolOutput::Error { message, .. } => format!("[error] {message}"),
+                    ToolOutput::SandboxViolation { violation } => {
+                        format!("[error] sandbox violation: {violation:?}")
+                    }
                     ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                     ToolOutput::Escalate { .. } => "[escalate]".into(),
                     ToolOutput::AwaitingClarification { .. } => "[clarification]".into(),
@@ -12676,6 +12811,7 @@ mod tests {
         HarnessConfig {
             tool_registry: Arc::new(ScriptedToolRegistry::new()),
             sandbox: Arc::new(AllowAllSandbox),
+            sandbox_violation_policy: crate::harness::SandboxViolationPolicy::default(),
             context_manager: Arc::new(NoopContextManager),
             termination_policy: Arc::new(AlwaysContinuePolicy),
             middleware: None,
@@ -13828,6 +13964,9 @@ mod tests {
             path: "/etc/passwd".into(),
         }));
         cfg.sandbox = sb;
+        // Halting on a path escape is now opt-in via the policy (default is
+        // Recoverable). Opt in so this exercises the always-halt path.
+        cfg.sandbox_violation_policy = SandboxViolationPolicy::Halt;
         let h = StandardHarness::new(cfg);
         match h.run(HarnessRunOptions::new(react(5))).await {
             RunResult::Failure {
@@ -13870,6 +14009,112 @@ mod tests {
         match h.run(HarnessRunOptions::new(react(5))).await {
             RunResult::Success { turns, .. } => assert_eq!(turns, 2),
             other => panic!("expected Success after recoverable violation, got {other:?}"),
+        }
+    }
+
+    // Policy: a TOOL-surfaced sandbox violation is RECOVERABLE by default — the
+    // harness appends it as a tool error and the loop continues to completion.
+    #[tokio::test]
+    async fn tool_sandbox_violation_recoverable_by_default() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "ack".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::SandboxViolation {
+            violation: SandboxViolation::PathEscape {
+                path: "/etc/passwd".into(),
+            },
+        });
+        cfg.tool_registry = reg;
+        // default policy = Recoverable (no opt-in)
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { turns, .. } => assert_eq!(turns, 2),
+            other => panic!("expected Success (recoverable, loop continued), got {other:?}"),
+        }
+    }
+
+    // Policy: opting into `Halt` makes a tool-surfaced always-halt violation end
+    // the run with a TYPED `HaltReason::SandboxViolation` (not UnrecoverableTool).
+    #[tokio::test]
+    async fn tool_sandbox_violation_halts_under_halt_policy() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::SandboxViolation {
+            violation: SandboxViolation::PathEscape {
+                path: "/etc/passwd".into(),
+            },
+        });
+        cfg.tool_registry = reg;
+        cfg.sandbox_violation_policy = SandboxViolationPolicy::Halt;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Failure {
+                reason:
+                    HaltReason::SandboxViolation {
+                        violation: SandboxViolation::PathEscape { .. },
+                    },
+                ..
+            } => {}
+            other => panic!("expected SandboxViolation halt, got {other:?}"),
+        }
+    }
+
+    // Policy: a Layer-2 (non-always-halt) violation stays recoverable even under
+    // `Halt` — only PathEscape/NetworkViolation are halt-eligible.
+    #[tokio::test]
+    async fn tool_layer2_violation_recoverable_even_under_halt_policy() {
+        let a = make_agent();
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "ack".into(),
+            usage: usage(),
+        });
+        let mut cfg = standard_config(a);
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::SandboxViolation {
+            violation: SandboxViolation::ReadOnlyViolation {
+                path: "x".into(),
+            },
+        });
+        cfg.tool_registry = reg;
+        cfg.sandbox_violation_policy = SandboxViolationPolicy::Halt;
+        let h = StandardHarness::new(cfg);
+        match h.run(HarnessRunOptions::new(react(5))).await {
+            RunResult::Success { turns, .. } => assert_eq!(turns, 2),
+            other => panic!("expected Success (Layer-2 stays recoverable), got {other:?}"),
         }
     }
 
@@ -17369,6 +17614,7 @@ mod tests {
             StandardHarness::new(HarnessConfig {
                 tool_registry: Arc::new(ScriptedToolRegistry::new()),
                 sandbox: Arc::new(AllowAllSandbox),
+                sandbox_violation_policy: crate::harness::SandboxViolationPolicy::default(),
                 context_manager: cm,
                 termination_policy: Arc::new(AlwaysContinuePolicy),
                 middleware: None,
@@ -17796,6 +18042,9 @@ mod tests {
                     content: match &result.output {
                         ToolOutput::Success { content, .. } => content.clone(),
                         ToolOutput::Error { message, .. } => message.clone(),
+                        ToolOutput::SandboxViolation { violation } => {
+                            format!("sandbox violation: {violation:?}")
+                        }
                         ToolOutput::WaitingForHuman { .. } => String::new(),
                         ToolOutput::Escalate { .. } => String::new(),
                         ToolOutput::AwaitingClarification { .. } => String::new(),

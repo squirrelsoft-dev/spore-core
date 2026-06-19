@@ -1,13 +1,24 @@
 //! `ToolExecutionError` — typed error class for tool implementations.
 //!
-//! Spec (issue #5) requires:
-//! - `InvalidParameters { reason }` → recoverable: true
-//! - `ExecutionFailed { reason, recoverable }` → as given
-//! - `SandboxViolation(SandboxViolation)` → recoverable: false
-//! - `Timeout { after: Duration }` → recoverable: true
+//! Error → `ToolOutput` mapping:
+//! - `InvalidParameters { reason }` → `Error { recoverable: true }`
+//! - `ExecutionFailed { reason, recoverable }` → `Error { recoverable }` (as given)
+//! - `SandboxViolation(v)` → `ToolOutput::SandboxViolation { violation: v }`
+//! - `Timeout { after }` → `Error { recoverable: true }`
 //!
-//! Tools convert errors via `ToolExecutionError::into()` → `ToolOutput::Error`
-//! so the registry can stay in its happy path.
+//! A tool-surfaced `SandboxViolation` is NOT flattened into a recoverable-or-not
+//! `Error` here — that decision is the HARNESS's, not the tool's. The conversion
+//! carries the typed violation through as [`ToolOutput::SandboxViolation`], and
+//! the harness applies its [`SandboxViolationPolicy`](crate::harness::SandboxViolationPolicy):
+//! by default the model is fed a recoverable error and retries (the boundary
+//! still holds — the access was refused); under `Halt` an always-halt-eligible
+//! violation ends the run with a typed `HaltReason::SandboxViolation`. Keeping
+//! the violation typed all the way to the harness is what makes the policy
+//! uniform across every tool (filesystem, bash/exec, …) and both surfacing
+//! paths (this one and the pre-dispatch `validate` check).
+//!
+//! Tools convert errors via `ToolExecutionError::into()` so the registry can
+//! stay in its happy path.
 
 use std::time::Duration;
 
@@ -46,10 +57,12 @@ impl From<ToolExecutionError> for ToolOutput {
                 message: reason,
                 recoverable,
             },
-            ToolExecutionError::SandboxViolation(v) => ToolOutput::Error {
-                message: format!("sandbox violation: {v:?}"),
-                recoverable: false,
-            },
+            // Carry the typed violation to the harness, which applies the
+            // configured `SandboxViolationPolicy` (recoverable feedback by
+            // default; halt on opt-in). See the module-level note.
+            ToolExecutionError::SandboxViolation(v) => {
+                ToolOutput::SandboxViolation { violation: v }
+            }
             ToolExecutionError::Timeout { after } => ToolOutput::Error {
                 message: format!("timed out after {}s", after.as_secs()),
                 recoverable: true,
@@ -86,13 +99,17 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_violation_not_recoverable() {
-        let e = ToolExecutionError::SandboxViolation(SandboxViolation::PathEscape {
+    fn sandbox_violation_carries_typed_violation() {
+        // The conversion does NOT pre-decide recoverability — it carries the
+        // typed violation through as `ToolOutput::SandboxViolation` so the
+        // harness can apply its `SandboxViolationPolicy` (recoverable by
+        // default; halt on opt-in).
+        let v = SandboxViolation::PathEscape {
             path: "/etc".into(),
-        });
-        match ToolOutput::from(e) {
-            ToolOutput::Error { recoverable, .. } => assert!(!recoverable),
-            _ => panic!(),
+        };
+        match ToolOutput::from(ToolExecutionError::SandboxViolation(v.clone())) {
+            ToolOutput::SandboxViolation { violation } => assert_eq!(violation, v),
+            other => panic!("expected SandboxViolation, got {other:?}"),
         }
     }
 

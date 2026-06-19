@@ -884,6 +884,10 @@ impl<M: ModelInterface + 'static> ContextManager for StandardContextManager<M> {
             let text = match &result.output {
                 ToolOutput::Success { content, .. } => content.clone(),
                 ToolOutput::Error { message, .. } => format!("[error] {message}"),
+                // Normally normalized into an `Error` before append; defensive.
+                ToolOutput::SandboxViolation { violation } => {
+                    format!("[error] sandbox violation: {violation:?}")
+                }
                 ToolOutput::WaitingForHuman { .. } => "[waiting]".into(),
                 ToolOutput::Escalate { .. } => "[escalate]".into(),
                 ToolOutput::AwaitingClarification { .. } => "[clarification]".into(),

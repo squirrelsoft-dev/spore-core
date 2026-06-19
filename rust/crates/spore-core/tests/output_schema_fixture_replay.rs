@@ -73,6 +73,7 @@ fn harness_for(fixture: &str, max_retries: u32) -> StandardHarness {
     let config = HarnessConfig {
         tool_registry: tool_registry.clone(),
         sandbox: Arc::new(AllowAllSandbox),
+        sandbox_violation_policy: spore_core::harness::SandboxViolationPolicy::default(),
         context_manager: Arc::new(NoopContextManager),
         termination_policy: Arc::new(AlwaysContinuePolicy),
         toolset_catalogues: Default::default(),
