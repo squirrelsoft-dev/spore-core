@@ -111,7 +111,7 @@ func TestBuildRequestSerializesOptionsAndKeepAlive(t *testing.T) {
 	r.Params.Temperature = &temp
 	r.Params.TopP = &top
 	r.Params.StopSequences = []string{"END"}
-	body := buildRequest("llama3.2", "10m", r, false)
+	body := buildRequest("llama3.2", "10m", nil, r, false)
 	out, _ := json.Marshal(body)
 	s := string(out)
 	for _, want := range []string{
@@ -128,6 +128,46 @@ func TestBuildRequestSerializesOptionsAndKeepAlive(t *testing.T) {
 	if strings.Contains(s, `"stream":true`) {
 		t.Fatalf("expected stream=false: %s", s)
 	}
+	// num_ctx is opt-in: unset here, so it must NOT appear on the wire.
+	if strings.Contains(s, "num_ctx") {
+		t.Fatalf("num_ctx must be omitted when unset: %s", s)
+	}
+}
+
+func TestNewDefaultsNumCtxToNil(t *testing.T) {
+	c := New("llama3.2")
+	if c.numCtx != nil {
+		t.Fatalf("numCtx should default to nil, got %v", *c.numCtx)
+	}
+	c = c.SetNumCtx(256_000)
+	if c.numCtx == nil || *c.numCtx != 256_000 {
+		t.Fatalf("SetNumCtx(256000): numCtx = %v", c.numCtx)
+	}
+}
+
+func TestBuildRequestSerializesNumCtxWhenSet(t *testing.T) {
+	// num_ctx is the ONLY option set — exercises both the serialized field and
+	// wireOptions.isEmpty (the options object must still be emitted).
+	n := uint32(256_000)
+	body := buildRequest("llama3.2", "", &n, req(userMsg("hi")), false)
+	out, _ := json.Marshal(body)
+	s := string(out)
+	if !strings.Contains(s, `"options":{`) {
+		t.Fatalf("options object must be present: %s", s)
+	}
+	if !strings.Contains(s, `"num_ctx":256000`) {
+		t.Fatalf("num_ctx not serialized: %s", s)
+	}
+}
+
+func TestBuildRequestOmitsOptionsWhenOnlyNumCtxUnset(t *testing.T) {
+	// No sampling params and no num_ctx → no `options` key at all, keeping the
+	// bare request byte-identical to before num_ctx existed.
+	body := buildRequest("llama3.2", "", nil, req(userMsg("hi")), false)
+	out, _ := json.Marshal(body)
+	if strings.Contains(string(out), `"options"`) {
+		t.Fatalf("options must be omitted when empty: %s", out)
+	}
 }
 
 func TestBuildRequestSerializesTools(t *testing.T) {
@@ -137,7 +177,7 @@ func TestBuildRequestSerializesTools(t *testing.T) {
 		Description: "search the web",
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 	}}
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	out, _ := json.Marshal(body)
 	s := string(out)
 	for _, want := range []string{`"tools":[`, `"name":"search"`, `"type":"function"`} {
@@ -156,7 +196,7 @@ func TestBuildRequestToolCallUsesObjectArguments(t *testing.T) {
 			Input: json.RawMessage(`{"url":"x"}`),
 		}),
 	})
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	out, _ := json.Marshal(body.Messages[0])
 	s := string(out)
 	if !strings.Contains(s, `"arguments":{"url":"x"}`) {
@@ -176,7 +216,7 @@ func TestBuildRequestToolResultMapsToToolRole(t *testing.T) {
 			Content:   "ok",
 		}),
 	})
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	m := body.Messages[0]
 	if m.Role != "tool" || m.Content != "ok" || m.ToolCallID != "call-0" {
 		t.Fatalf("msg: %+v", m)
@@ -184,14 +224,14 @@ func TestBuildRequestToolResultMapsToToolRole(t *testing.T) {
 }
 
 func TestBuildRequestStreamingFlag(t *testing.T) {
-	body := buildRequest("llama3.2", "", req(userMsg("hi")), true)
+	body := buildRequest("llama3.2", "", nil, req(userMsg("hi")), true)
 	if !body.Stream {
 		t.Fatalf("stream: false")
 	}
 }
 
 func TestBuildRequestOptionsOmittedWhenEmpty(t *testing.T) {
-	body := buildRequest("llama3.2", "", req(userMsg("hi")), false)
+	body := buildRequest("llama3.2", "", nil, req(userMsg("hi")), false)
 	out, _ := json.Marshal(body)
 	if strings.Contains(string(out), `"options"`) {
 		t.Fatalf("options should be omitted: %s", out)
@@ -201,7 +241,7 @@ func TestBuildRequestOptionsOmittedWhenEmpty(t *testing.T) {
 func TestThinkingBlockOmittedInRequest(t *testing.T) {
 	// Thinking blocks are response-side only; a normal request must produce
 	// no "thinking" key in the wire payload.
-	body := buildRequest("llama3.2", "", req(userMsg("hi")), false)
+	body := buildRequest("llama3.2", "", nil, req(userMsg("hi")), false)
 	out, _ := json.Marshal(body)
 	if strings.Contains(string(out), "thinking") {
 		t.Fatalf("thinking key leaked: %s", out)
@@ -237,7 +277,7 @@ func structuredToolReq() sporecore.ModelRequest {
 }
 
 func TestBuildRequestStructuredSetsFormatDropsToolsAddsSystem(t *testing.T) {
-	body := buildRequest("llama3.2", "", structuredToolReq(), false)
+	body := buildRequest("llama3.2", "", nil, structuredToolReq(), false)
 	// Native tools dropped in structured mode.
 	if len(body.Tools) != 0 {
 		t.Fatalf("native tools must be empty, got %d", len(body.Tools))
@@ -283,7 +323,7 @@ func TestBuildRequestStructuredMergesIntoExistingSystemMessage(t *testing.T) {
 		Role:    sporecore.RoleSystem,
 		Content: sporecore.NewTextContent("You are terse."),
 	}}, r.Messages...)
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	systemCount := 0
 	for _, m := range body.Messages {
 		if m.Role == "system" {
@@ -305,7 +345,7 @@ func TestBuildRequestStructuredOffWhenNoTools(t *testing.T) {
 	// Flag on but no tools → unchanged behavior, no format.
 	r := req(userMsg("hi"))
 	r.Params.StructuredToolCalls = true
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	if len(body.Format) != 0 {
 		t.Fatalf("format must be absent when no tools: %s", body.Format)
 	}
@@ -322,7 +362,7 @@ func TestBuildRequestOutputSchemaPopulatesFormatChannel(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","properties":{"status":{"type":"string","enum":["ok","error"]}},"required":["status"]}`)
 	r := req(userMsg("answer"))
 	r.Params.OutputSchema = schema
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	if len(body.Format) == 0 {
 		t.Fatalf("output_schema must populate the Ollama `format` channel")
 	}
@@ -334,7 +374,7 @@ func TestBuildRequestOutputSchemaPopulatesFormatChannel(t *testing.T) {
 func TestBuildRequestNoOutputSchemaLeavesFormatNil(t *testing.T) {
 	// Absent output_schema (the default) keeps `format` nil — byte-identical to
 	// pre-#139.
-	body := buildRequest("llama3.2", "", req(userMsg("hi")), false)
+	body := buildRequest("llama3.2", "", nil, req(userMsg("hi")), false)
 	if len(body.Format) != 0 {
 		t.Fatalf("format must be nil without output_schema: %s", body.Format)
 	}
@@ -348,7 +388,7 @@ func TestBuildRequestStructuredOffByDefault(t *testing.T) {
 		Description: "search the web",
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 	}}
-	body := buildRequest("llama3.2", "", r, false)
+	body := buildRequest("llama3.2", "", nil, r, false)
 	if len(body.Format) != 0 {
 		t.Fatalf("format must be absent by default: %s", body.Format)
 	}
@@ -680,6 +720,60 @@ func TestCallAgainstMockReturnsResponse(t *testing.T) {
 	}
 	if r.Usage.InputTokens != 5 || r.Usage.OutputTokens != 2 {
 		t.Fatalf("usage: %+v", r.Usage)
+	}
+}
+
+func TestNumCtxSentOnWireWhenConfigured(t *testing.T) {
+	// End-to-end: SetNumCtx reaches /api/chat as options.num_ctx through the real
+	// HTTP path. The chat handler inspects the body and fails the test if num_ctx
+	// is dropped — the regression guard for the reported bug.
+	srv, _ := newSplitServer(t, "llama3.2", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var parsed struct {
+			Options *struct {
+				NumCtx *uint32 `json:"num_ctx"`
+			} `json:"options"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("decode chat body: %v (%s)", err, body)
+		}
+		if parsed.Options == nil || parsed.Options.NumCtx == nil || *parsed.Options.NumCtx != 256_000 {
+			t.Fatalf("expected options.num_ctx=256000 on the wire, got: %s", body)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`)
+	})
+	c := WithBaseURL("llama3.2", srv.URL).SetNumCtx(256_000)
+	resp, err := c.Call(context.Background(), req(userMsg("hi")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Text != "ok" {
+		t.Fatalf("content: %+v", resp.Content)
+	}
+}
+
+func TestNumCtxAbsentOnWireByDefault(t *testing.T) {
+	// The mirror: with no SetNumCtx, the chat request must carry NO num_ctx key
+	// (and, since no other options are set, no options object at all).
+	srv, _ := newSplitServer(t, "llama3.2", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "num_ctx") {
+			t.Fatalf("num_ctx must be absent by default, got: %s", body)
+		}
+		if strings.Contains(string(body), `"options"`) {
+			t.Fatalf("options must be absent when no params set, got: %s", body)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}`)
+	})
+	c := WithBaseURL("llama3.2", srv.URL)
+	resp, err := c.Call(context.Background(), req(userMsg("hi")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Text != "ok" {
+		t.Fatalf("content: %+v", resp.Content)
 	}
 }
 

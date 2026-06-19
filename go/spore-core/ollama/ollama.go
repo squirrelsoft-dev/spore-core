@@ -17,6 +17,18 @@
 //     under `options` rather than being top-level keys.
 //   - keep_alive (default "5m") controls how long Ollama keeps the model
 //     loaded after the call returns.
+//   - num_ctx (the context window) is also nested under `options`. It is the
+//     ONLY way to tell Ollama how many prompt tokens the model may see: omitted,
+//     Ollama loads the model at its small server default (historically 2048,
+//     4096 in recent builds) and silently truncates longer prompts. It is opt-in
+//     via SetNumCtx and unset by default (so every existing request stays
+//     byte-identical). NOTE the discovery/enforcement split: Provider's
+//     ContextWindow REPORTS the model's window (from /api/show or the static
+//     table) for the harness's budget/compaction accounting, but that value is
+//     advisory only — it is never written back as num_ctx. A caller that sizes
+//     the harness's compaction window to the model's real window must call
+//     SetNumCtx with the same value, or the harness will manage a large budget
+//     while Ollama truncates at its default.
 //   - Tool-call arguments are a JSON OBJECT in the wire format, not a
 //     JSON-encoded string like OpenAI.
 //   - Ollama does not return tool-call ids; we synthesize "call-{i}" per
@@ -70,10 +82,16 @@ const (
 // ModelInterface is the Ollama HTTP client. It implements
 // sporecore.ModelInterface.
 type ModelInterface struct {
-	modelID    string
-	baseURL    string
-	timeout    time.Duration
-	keepAlive  string
+	modelID   string
+	baseURL   string
+	timeout   time.Duration
+	keepAlive string
+	// numCtx is the context window (options.num_ctx) sent on every chat
+	// request. nil (the default) omits it, leaving Ollama on its small server
+	// default (historically 2048, 4096 in recent builds) — so callers that want
+	// the model's real window must opt in via SetNumCtx. Like keepAlive, this is
+	// a model-loading setting, not a per-turn sampling param.
+	numCtx     *uint32
 	httpClient *http.Client
 
 	// Lazy /api/tags availability + /api/show discovery probe. The first
@@ -138,6 +156,24 @@ func (c *ModelInterface) SetKeepAlive(s string) *ModelInterface {
 	return c
 }
 
+// SetNumCtx sets the context window (options.num_ctx) sent on every chat
+// request.
+//
+// This is how Ollama is told to size the model's context: without it, Ollama
+// loads the model at its small server default (historically 2048, 4096 in
+// recent builds) and silently truncates any longer prompt — no matter the
+// model's true capacity or what the harness believes the window to be. Set this
+// to the same value used for the harness's compaction window so the budget the
+// harness manages and the context the model actually sees agree.
+//
+// num_ctx sizes Ollama's KV-cache allocation at load time, so a very large
+// value costs proportional memory — pass the window you actually want the model
+// to use, not an arbitrary maximum. Unset by default (omitted from the wire).
+func (c *ModelInterface) SetNumCtx(n uint32) *ModelInterface {
+	c.numCtx = &n
+	return c
+}
+
 // SetHTTPClient overrides the http.Client.
 func (c *ModelInterface) SetHTTPClient(h *http.Client) *ModelInterface {
 	c.httpClient = h
@@ -146,9 +182,13 @@ func (c *ModelInterface) SetHTTPClient(h *http.Client) *ModelInterface {
 
 // String returns a debug representation.
 func (c *ModelInterface) String() string {
+	numCtx := "<nil>"
+	if c.numCtx != nil {
+		numCtx = fmt.Sprintf("%d", *c.numCtx)
+	}
 	return fmt.Sprintf(
-		"OllamaModelInterface{model_id=%q, base_url=%q, timeout=%s, keep_alive=%q}",
-		c.modelID, c.baseURL, c.timeout, c.keepAlive,
+		"OllamaModelInterface{model_id=%q, base_url=%q, timeout=%s, keep_alive=%q, num_ctx=%s}",
+		c.modelID, c.baseURL, c.timeout, c.keepAlive, numCtx,
 	)
 }
 
@@ -213,6 +253,14 @@ type wireRequest struct {
 }
 
 type wireOptions struct {
+	// NumCtx (num_ctx) — sizes the KV cache Ollama allocates when the model
+	// loads, and therefore how many prompt tokens the model can actually see.
+	// UNSET ⟹ omitted, and Ollama falls back to its server default (historically
+	// 2048, 4096 in recent builds) regardless of the model's true window,
+	// silently truncating longer prompts. Carried from SetNumCtx; provider-side,
+	// not a sampling param. Declared FIRST so it serializes ahead of num_predict,
+	// matching the Rust wire byte order.
+	NumCtx      *uint32  `json:"num_ctx,omitempty"`
 	NumPredict  *uint32  `json:"num_predict,omitempty"`
 	Temperature *float32 `json:"temperature,omitempty"`
 	TopP        *float32 `json:"top_p,omitempty"`
@@ -220,7 +268,7 @@ type wireOptions struct {
 }
 
 func (o *wireOptions) isEmpty() bool {
-	return o.NumPredict == nil && o.Temperature == nil && o.TopP == nil && len(o.Stop) == 0
+	return o.NumCtx == nil && o.NumPredict == nil && o.Temperature == nil && o.TopP == nil && len(o.Stop) == 0
 }
 
 type wireMessage struct {
@@ -306,7 +354,7 @@ type wireEmbedResponse struct {
 // Conversions
 // ---------------------------------------------------------------------------
 
-func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream bool) wireRequest {
+func buildRequest(modelID, keepAlive string, numCtx *uint32, req sporecore.ModelRequest, stream bool) wireRequest {
 	// Structured-tool-calls mode (opt-in): constrained decoding via `format`.
 	// We send NO native tools — describing them in a system message instead —
 	// and force the model to emit a single schema-constrained JSON object. The
@@ -360,6 +408,7 @@ func buildRequest(modelID, keepAlive string, req sporecore.ModelRequest, stream 
 	}
 
 	opts := &wireOptions{
+		NumCtx:      numCtx,
 		NumPredict:  req.Params.MaxTokens,
 		Temperature: req.Params.Temperature,
 		TopP:        req.Params.TopP,
@@ -841,7 +890,7 @@ func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (
 	if err := c.guardToolSupport(req); err != nil {
 		return sporecore.ModelResponse{}, err
 	}
-	body := buildRequest(c.modelID, c.keepAlive, req, false)
+	body := buildRequest(c.modelID, c.keepAlive, c.numCtx, req, false)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
@@ -941,7 +990,7 @@ func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelR
 	if err := c.guardToolSupport(req); err != nil {
 		return nil, err
 	}
-	body := buildRequest(c.modelID, c.keepAlive, req, true)
+	body := buildRequest(c.modelID, c.keepAlive, c.numCtx, req, true)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
