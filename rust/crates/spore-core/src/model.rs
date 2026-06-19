@@ -86,6 +86,19 @@ pub struct ToolSchema {
 // Request / params / response
 // ============================================================================
 
+/// Categorical reasoning effort for providers that expose discrete levels
+/// (e.g. Ollama's `think: "low"|"medium"|"high"|"max"` for gpt-oss-style models).
+/// Distinct from [`ModelParams::reasoning_budget`], which is a token count; when
+/// both are set, providers prefer this categorical effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelParams {
     #[serde(default)]
@@ -98,9 +111,19 @@ pub struct ModelParams {
     /// stream events). The Ollama client maps any positive budget to `think:
     /// true` when the model's `/api/show` capabilities include `"thinking"`,
     /// and otherwise drops the flag. `None`/`Some(0)` request no reasoning.
-    /// Providers without a thinking toggle ignore it on the request side.
+    /// Providers without a thinking toggle ignore it on the request side. For a
+    /// categorical effort level (rather than a token count) prefer
+    /// [`reasoning_effort`](Self::reasoning_effort), which wins when both are set.
     #[serde(default)]
     pub reasoning_budget: Option<u32>,
+    /// Opt-in categorical reasoning effort for providers that expose discrete
+    /// levels. The Ollama client maps it to `think: "low"|"medium"|"high"|"max"`
+    /// (gated on the `"thinking"` capability, like [`reasoning_budget`]); when
+    /// set it takes precedence over `reasoning_budget` (which only yields the
+    /// boolean `think: true`). `None` (the default) keeps serialized params
+    /// byte-identical. Providers without level support ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]

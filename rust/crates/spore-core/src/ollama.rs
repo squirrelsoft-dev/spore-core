@@ -32,13 +32,14 @@
 //!   JSON-encoded string like OpenAI.
 //! - Ollama does not return tool-call ids; we synthesize `call-{i}` per index
 //!   so downstream `ToolResult.tool_use_id` round-trips work.
-//! - Reasoning models are supported. When `ModelParams.reasoning_budget` is a
-//!   positive value AND the model's `/api/show` `capabilities` include
-//!   `"thinking"`, the request carries `think: true` and Ollama's separate
+//! - Reasoning models are supported. When the model's `/api/show` `capabilities`
+//!   include `"thinking"`, the request carries `think` and Ollama's separate
 //!   `message.thinking` channel is surfaced as `ContentBlock::Thinking` (unary)
-//!   / `StreamEvent::ThinkingDelta` (streaming). Reasoning is requested-but-
-//!   unsupported is a no-op, not an error: the `think` flag is dropped so
-//!   non-reasoning models keep working (`reasoning_budget` is a hint, mirroring
+//!   / `StreamEvent::ThinkingDelta` (streaming). `think` is a categorical level
+//!   (`"low"|"medium"|"high"|"max"`) when `ModelParams.reasoning_effort` is set,
+//!   else the boolean `true` when `reasoning_budget` is positive — effort wins.
+//!   Reasoning requested-but-unsupported is a no-op, not an error: the `think`
+//!   field is dropped so non-reasoning models keep working (mirroring
 //!   `structured_tool_calls` / `output_schema`). Thinking blocks on the request
 //!   side (assistant history) have no Ollama wire shape and are still omitted.
 //!
@@ -81,7 +82,7 @@ use tokio::sync::OnceCell;
 
 use crate::model::{
     Content, ContentBlock, ModelError, ModelInterface, ModelRequest, ModelResponse, ModelStream,
-    ProviderInfo, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
+    ProviderInfo, ReasoningEffort, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
 };
 
 // ============================================================================
@@ -306,15 +307,15 @@ struct OllamaRequest {
     options: Option<OllamaOptions>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OllamaTool>,
-    /// Enables Ollama's reasoning pass on thinking-capable models. When `true`,
-    /// the model's reasoning is returned on the separate `message.thinking`
-    /// channel instead of being inlined into (or omitted from) `content`. Set
-    /// from a positive `ModelParams.reasoning_budget`, then dropped in
-    /// `call` / `call_streaming` when the model lacks the `"thinking"`
-    /// capability. `None` (the default) is omitted from the wire, keeping
-    /// non-reasoning requests byte-identical.
+    /// Enables Ollama's reasoning pass on thinking-capable models. Reasoning is
+    /// then returned on the separate `message.thinking` channel instead of being
+    /// inlined into (or omitted from) `content`. Either a boolean (from
+    /// `ModelParams.reasoning_budget`) or a categorical level (from
+    /// `ModelParams.reasoning_effort`); dropped in `call` / `call_streaming` when
+    /// the model lacks the `"thinking"` capability. `None` (the default) is
+    /// omitted from the wire, keeping non-reasoning requests byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
-    think: Option<bool>,
+    think: Option<OllamaThink>,
     /// Constrained-decoding JSON schema (Ollama's `format` parameter). Set only
     /// in structured-tool-calls mode (`ModelParams.structured_tool_calls`); when
     /// present, native `tools` are dropped and the model is forced to emit a
@@ -323,6 +324,29 @@ struct OllamaRequest {
     /// causing the call to leak into `message.content`).
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<serde_json::Value>,
+}
+
+/// Ollama's `think` request parameter. Serialized untagged so it lands on the
+/// wire as a bare boolean (`true`) or a bare level string (`"low"` / `"medium"`
+/// / `"high"` / `"max"`). Ollama rejects any other string with
+/// `invalid think value`, so the level set is fixed by [`ReasoningEffort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum OllamaThink {
+    Enabled(bool),
+    Level(&'static str),
+}
+
+impl OllamaThink {
+    /// Map an abstract [`ReasoningEffort`] to Ollama's accepted level string.
+    fn from_effort(effort: ReasoningEffort) -> Self {
+        OllamaThink::Level(match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -544,15 +568,19 @@ fn build_request(
         stop: req.params.stop_sequences.clone(),
     };
 
-    // Reasoning models: a positive `reasoning_budget` asks Ollama to run the
-    // model's thinking pass and return reasoning on the separate
-    // `message.thinking` channel (`think: true`). The budget magnitude has no
-    // Ollama analogue — `think` is a plain boolean — so any positive budget maps
-    // to `Some(true)`; `None`/`Some(0)` leave `think` unset. Capability gating
+    // Reasoning models run a thinking pass and return reasoning on the separate
+    // `message.thinking` channel. A categorical `reasoning_effort` maps to
+    // Ollama's level string (`think: "low"|"medium"|"high"|"max"`) and WINS when
+    // set; otherwise a positive `reasoning_budget` enables the boolean
+    // (`think: true`) — the budget magnitude has no Ollama analogue. `None` /
+    // `Some(0)` budget with no effort leaves `think` unset. Capability gating
     // (dropping `think` when the model can't reason) happens in `call` /
-    // `call_streaming`, which hold the `/api/show` metadata `build_request`
-    // lacks.
-    let think = matches!(req.params.reasoning_budget, Some(n) if n > 0).then_some(true);
+    // `call_streaming`, which hold the `/api/show` metadata `build_request` lacks.
+    let think = match req.params.reasoning_effort {
+        Some(effort) => Some(OllamaThink::from_effort(effort)),
+        None => matches!(req.params.reasoning_budget, Some(n) if n > 0)
+            .then_some(OllamaThink::Enabled(true)),
+    };
 
     OllamaRequest {
         model: model_id.into(),
@@ -1392,7 +1420,7 @@ mod tests {
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(2048);
         let body = build_request("llama3.2", &None, &r, false);
-        assert_eq!(body.think, Some(true));
+        assert_eq!(body.think, Some(OllamaThink::Enabled(true)));
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"think\":true"), "wire: {s}");
     }
@@ -1407,32 +1435,82 @@ mod tests {
     }
 
     #[test]
+    fn build_request_reasoning_effort_serializes_as_level_string() {
+        // Each effort level maps to Ollama's accepted `think` string verbatim.
+        for (effort, wire) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let mut r = req(vec![user("hi")]);
+            r.params.reasoning_effort = Some(effort);
+            let body = build_request("gpt-oss", &None, &r, false);
+            assert_eq!(body.think, Some(OllamaThink::Level(wire)));
+            let s = serde_json::to_string(&body).unwrap();
+            assert!(
+                s.contains(&format!("\"think\":\"{wire}\"")),
+                "effort {effort:?} wire: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_reasoning_effort_wins_over_budget() {
+        // When both are set, the categorical effort takes precedence over the
+        // boolean budget mapping.
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_budget = Some(2048);
+        r.params.reasoning_effort = Some(ReasoningEffort::High);
+        let body = build_request("gpt-oss", &None, &r, false);
+        assert_eq!(body.think, Some(OllamaThink::Level("high")));
+    }
+
+    #[test]
     fn gate_thinking_drops_flag_when_capability_absent() {
         // Reasoning requested on a model whose capabilities omit "thinking":
-        // fail closed (drop `think`) rather than letting Ollama 400.
-        let mut r = req(vec![user("hi")]);
-        r.params.reasoning_budget = Some(1024);
-        let mut body = build_request("llama3.2", &None, &r, false);
-        assert_eq!(body.think, Some(true));
-        let meta = ModelMeta {
-            context_length: None,
-            capabilities: vec!["completion".into()],
-        };
-        gate_thinking(&mut body, &meta);
-        assert_eq!(body.think, None, "think must be dropped without capability");
+        // fail closed (drop `think`) rather than letting Ollama 400. Holds for
+        // both the boolean and level forms.
+        for params in [
+            {
+                let mut p = crate::model::ModelParams::default();
+                p.reasoning_budget = Some(1024);
+                p
+            },
+            {
+                let mut p = crate::model::ModelParams::default();
+                p.reasoning_effort = Some(ReasoningEffort::High);
+                p
+            },
+        ] {
+            let mut r = req(vec![user("hi")]);
+            r.params = params;
+            let mut body = build_request("llama3.2", &None, &r, false);
+            assert!(body.think.is_some());
+            let meta = ModelMeta {
+                context_length: None,
+                capabilities: vec!["completion".into()],
+            };
+            gate_thinking(&mut body, &meta);
+            assert_eq!(body.think, None, "think must be dropped without capability");
+        }
     }
 
     #[test]
     fn gate_thinking_keeps_flag_when_capability_present() {
         let mut r = req(vec![user("hi")]);
-        r.params.reasoning_budget = Some(1024);
-        let mut body = build_request("deepseek-r1", &None, &r, false);
+        r.params.reasoning_effort = Some(ReasoningEffort::Max);
+        let mut body = build_request("gpt-oss", &None, &r, false);
         let meta = ModelMeta {
             context_length: None,
             capabilities: vec!["thinking".into()],
         };
         gate_thinking(&mut body, &meta);
-        assert_eq!(body.think, Some(true), "think must survive with capability");
+        assert_eq!(
+            body.think,
+            Some(OllamaThink::Level("max")),
+            "think must survive with capability"
+        );
     }
 
     // ── structured tool calls (opt-in constrained decoding) ────────────────
@@ -2580,6 +2658,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_effort_sends_level_string_on_wire() {
+        // End-to-end: a reasoning_effort level reaches /api/chat as a bare
+        // `think: "high"` string (untagged serialization survives the real HTTP
+        // path) — the mock only responds when the body carries it.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "gpt-oss").await;
+        mock_show(
+            &server,
+            serde_json::json!({
+                "model_info": {"gptoss.context_length": 131_072},
+                "capabilities": ["completion", "thinking"]
+            }),
+            None,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"think": "high"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "thinking": "reasoning", "content": "42"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("gpt-oss", server.uri());
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_effort = Some(ReasoningEffort::High);
+        let resp = client.call(r).await.unwrap();
+        assert_eq!(
+            resp.content,
+            vec![
+                ContentBlock::Thinking {
+                    text: "reasoning".into()
+                },
+                ContentBlock::Text { text: "42".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn thinking_flag_dropped_when_capability_absent() {
         // Reasoning requested on a model whose capabilities omit "thinking":
         // the flag is dropped, so the /api/chat body carries NO `think`. The
@@ -2756,12 +2881,19 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live-API; needs local ollama with a thinking model. Override id via \
-                OLLAMA_THINKING_MODEL (default deepseek-r1:1.5b)"]
+                OLLAMA_THINKING_MODEL (default deepseek-r1:1.5b); optionally set \
+                OLLAMA_THINKING_EFFORT=low|medium|high|max to exercise the level path"]
     async fn ollama_live_thinking() {
         let model = std::env::var("OLLAMA_THINKING_MODEL")
             .unwrap_or_else(|_| "deepseek-r1:1.5b".into());
         let mut r = req(vec![user("What is 17 * 23? Think step by step.")]);
-        r.params.reasoning_budget = Some(2048);
+        match std::env::var("OLLAMA_THINKING_EFFORT").ok().as_deref() {
+            Some("low") => r.params.reasoning_effort = Some(ReasoningEffort::Low),
+            Some("medium") => r.params.reasoning_effort = Some(ReasoningEffort::Medium),
+            Some("high") => r.params.reasoning_effort = Some(ReasoningEffort::High),
+            Some("max") => r.params.reasoning_effort = Some(ReasoningEffort::Max),
+            _ => r.params.reasoning_budget = Some(2048),
+        }
         let client = OllamaModelInterface::new(model);
         let resp = client.call(r).await.unwrap();
         assert!(
