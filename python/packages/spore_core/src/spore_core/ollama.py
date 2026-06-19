@@ -20,6 +20,18 @@ Provider-specific shape:
   ``stop``) are nested under ``options`` rather than top-level keys.
 - ``keep_alive`` (default ``"5m"``) controls how long Ollama keeps the
   model loaded after the call returns.
+- ``num_ctx`` (the context window) is also nested under ``options``. It is
+  the ONLY way to tell Ollama how many prompt tokens the model may see:
+  omitted, Ollama loads the model at its small server default (historically
+  2048, 4096 in recent builds) and silently truncates longer prompts. It is
+  opt-in via the ``num_ctx`` constructor kwarg and unset by default (so every
+  existing request stays byte-identical). NOTE the discovery/enforcement
+  split: ``provider().context_window`` REPORTS the model's window (from the
+  ``/api/show`` probe or the static table) for the harness's budget/compaction
+  accounting, but that value is advisory only — it is never written back as
+  ``num_ctx``. A caller that sizes the harness's compaction window to the
+  model's real window must pass the same value as ``num_ctx``, or the harness
+  will manage a large budget while Ollama truncates at its default.
 - Tool-call arguments are a JSON **object** in the wire format, not a
   JSON-encoded string like OpenAI.
 - Ollama does not return tool-call ids; we synthesize ``call-{i}`` per
@@ -219,6 +231,7 @@ def _message_to_ollama(m: Message) -> dict[str, Any]:
 def build_request_body(
     model_id: str,
     keep_alive: str | None,
+    num_ctx: int | None,
     request: ModelRequest,
     stream: bool,
 ) -> dict[str, Any]:
@@ -253,6 +266,11 @@ def build_request_body(
         body["keep_alive"] = keep_alive
 
     options: dict[str, Any] = {}
+    # ``num_ctx`` first in the options object (matches the Rust byte order: it is
+    # emitted before ``num_predict``). Opt-in via the interface's ``num_ctx``
+    # knob; ``None`` omits it, leaving Ollama on its small server default.
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
     if request.params.max_tokens is not None:
         options["num_predict"] = request.params.max_tokens
     if request.params.temperature is not None:
@@ -648,12 +666,19 @@ class OllamaModelInterface:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         keep_alive: str | None = DEFAULT_KEEP_ALIVE,
+        num_ctx: int | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._model_id = model_id
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._keep_alive = keep_alive
+        # Context window (``options.num_ctx``) sent on every chat request.
+        # ``None`` (the default) omits it, leaving Ollama on its small server
+        # default — so callers that want the model's real window must opt in.
+        # Like ``keep_alive``, this is a model-loading setting, not a per-turn
+        # sampling param.
+        self._num_ctx = num_ctx
         self._http_client = http_client
         self._owns_client = http_client is None
         self._model_checked = False
@@ -668,7 +693,8 @@ class OllamaModelInterface:
             f"model_id={self._model_id!r}, "
             f"base_url={self._base_url!r}, "
             f"timeout={self._timeout!r}, "
-            f"keep_alive={self._keep_alive!r})"
+            f"keep_alive={self._keep_alive!r}, "
+            f"num_ctx={self._num_ctx!r})"
         )
 
     @classmethod
@@ -688,6 +714,10 @@ class OllamaModelInterface:
     @property
     def keep_alive(self) -> str | None:
         return self._keep_alive
+
+    @property
+    def num_ctx(self) -> int | None:
+        return self._num_ctx
 
     def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -828,7 +858,9 @@ class OllamaModelInterface:
         await self._ensure_model_available()
         self._guard_tool_support(request)
         url = f"{self._base_url}/api/chat"
-        body = build_request_body(self._model_id, self._keep_alive, request, stream=False)
+        body = build_request_body(
+            self._model_id, self._keep_alive, self._num_ctx, request, stream=False
+        )
         payload = json.dumps(body).encode("utf-8")
         client = self._client()
         try:
@@ -857,7 +889,9 @@ class OllamaModelInterface:
         await self._ensure_model_available()
         self._guard_tool_support(request)
         url = f"{self._base_url}/api/chat"
-        body = build_request_body(self._model_id, self._keep_alive, request, stream=True)
+        body = build_request_body(
+            self._model_id, self._keep_alive, self._num_ctx, request, stream=True
+        )
         payload = json.dumps(body).encode("utf-8")
         client = self._client()
         try:

@@ -87,6 +87,18 @@ def test_new_uses_localhost_defaults() -> None:
     assert c.keep_alive == "5m"
 
 
+def test_new_defaults_num_ctx_to_none() -> None:
+    c = OllamaModelInterface("llama3.2")
+    assert c.num_ctx is None
+    c = OllamaModelInterface("llama3.2", num_ctx=256_000)
+    assert c.num_ctx == 256_000
+
+
+def test_with_base_url_forwards_num_ctx() -> None:
+    c = OllamaModelInterface.with_base_url("mistral", "http://remote:9999", num_ctx=256_000)
+    assert c.num_ctx == 256_000
+
+
 def test_with_base_url_overrides() -> None:
     c = OllamaModelInterface.with_base_url("mistral", "http://remote:9999")
     assert c.base_url == "http://remote:9999"
@@ -108,6 +120,7 @@ def test_build_request_serializes_options_and_keep_alive() -> None:
     body = build_request_body(
         "llama3.2",
         "10m",
+        None,
         _req(
             [_user("hi")],
             params=ModelParams(max_tokens=256, temperature=0.7, top_p=0.9, stop_sequences=["END"]),
@@ -119,12 +132,15 @@ def test_build_request_serializes_options_and_keep_alive() -> None:
     assert body["options"]["temperature"] == 0.7
     assert body["options"]["top_p"] == 0.9
     assert body["options"]["stop"] == ["END"]
+    # num_ctx is opt-in: unset here, so it must NOT appear in the options.
+    assert "num_ctx" not in body["options"]
     assert body["stream"] is False
 
 
 def test_build_request_serializes_tools() -> None:
     body = build_request_body(
         "llama3.2",
+        None,
         None,
         _req(
             [_user("hi")],
@@ -143,6 +159,7 @@ def test_build_request_serializes_tools() -> None:
 def test_build_request_tool_call_uses_object_arguments() -> None:
     body = build_request_body(
         "llama3.2",
+        None,
         None,
         _req(
             [
@@ -165,6 +182,7 @@ def test_build_request_tool_result_maps_to_tool_role() -> None:
     body = build_request_body(
         "llama3.2",
         None,
+        None,
         _req(
             [
                 Message(
@@ -182,19 +200,47 @@ def test_build_request_tool_result_maps_to_tool_role() -> None:
 
 
 def test_thinking_block_omitted_in_request() -> None:
-    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    body = build_request_body("llama3.2", None, None, _req([_user("hi")]), stream=False)
     s = json.dumps(body)
     # No "thinking" key ever appears on the Ollama wire.
     assert "thinking" not in s
 
 
 def test_build_request_omits_keep_alive_when_none() -> None:
-    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    body = build_request_body("llama3.2", None, None, _req([_user("hi")]), stream=False)
     assert "keep_alive" not in body
 
 
 def test_build_request_omits_options_when_empty() -> None:
-    body = build_request_body("llama3.2", "5m", _req([_user("hi")]), stream=False)
+    body = build_request_body("llama3.2", "5m", None, _req([_user("hi")]), stream=False)
+    assert "options" not in body
+
+
+def test_build_request_serializes_num_ctx_when_set() -> None:
+    # num_ctx is the ONLY option set — exercises both the serialized field and
+    # the empty-options guard (the options object must still be emitted).
+    body = build_request_body("llama3.2", None, 256_000, _req([_user("hi")]), stream=False)
+    assert "options" in body
+    assert body["options"]["num_ctx"] == 256_000
+
+
+def test_build_request_num_ctx_first_in_options() -> None:
+    # Field order parity with Rust: num_ctx is emitted before num_predict in the
+    # options object. dict insertion order is the JSON byte order on the wire.
+    body = build_request_body(
+        "llama3.2",
+        None,
+        256_000,
+        _req([_user("hi")], params=ModelParams(max_tokens=256)),
+        stream=False,
+    )
+    assert list(body["options"].keys())[:2] == ["num_ctx", "num_predict"]
+
+
+def test_build_request_omits_options_when_only_num_ctx_unset() -> None:
+    # No sampling params and no num_ctx → no `options` key at all, keeping the
+    # bare request byte-identical to before num_ctx existed.
+    body = build_request_body("llama3.2", None, None, _req([_user("hi")]), stream=False)
     assert "options" not in body
 
 
@@ -319,6 +365,61 @@ async def test_call_against_mock_returns_response() -> None:
     assert r.content[0].text == "hello there"
     assert r.usage.input_tokens == 5
     assert r.usage.output_tokens == 2
+
+
+async def test_call_sends_num_ctx_on_wire_when_configured() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/chat":
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1,
+                },
+            )
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface(
+        "llama3.2", base_url="http://x.test", num_ctx=256_000, http_client=client
+    )
+    await iface.call(_req([_user("hi")]))
+    assert seen["body"]["options"]["num_ctx"] == 256_000
+
+
+async def test_call_omits_num_ctx_on_wire_by_default() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
+        if request.url.path == "/api/chat":
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1,
+                },
+            )
+        raise AssertionError(f"unexpected: {request.url}")
+
+    client = _mock_client(httpx.MockTransport(handler))
+    iface = OllamaModelInterface("llama3.2", base_url="http://x.test", http_client=client)
+    await iface.call(_req([_user("hi")]))
+    # No num_ctx configured and no sampling params → no options key at all.
+    assert "options" not in seen["body"]
 
 
 async def test_connection_refused_helpful_message() -> None:
@@ -920,7 +1021,7 @@ def _structured_tool_req() -> ModelRequest:
 
 
 def test_build_request_structured_sets_format_drops_tools_adds_system() -> None:
-    body = build_request_body("llama3.2", None, _structured_tool_req(), stream=False)
+    body = build_request_body("llama3.2", None, None, _structured_tool_req(), stream=False)
     # Native tools dropped in structured mode.
     assert "tools" not in body
     # format schema present with tool enum = tool names + "final".
@@ -940,7 +1041,7 @@ def test_build_request_structured_sets_format_drops_tools_adds_system() -> None:
 def test_build_request_structured_merges_into_existing_system_message() -> None:
     req = _structured_tool_req()
     req.messages.insert(0, Message(role=Role.SYSTEM, content=TextContent(text="You are terse.")))
-    body = build_request_body("llama3.2", None, req, stream=False)
+    body = build_request_body("llama3.2", None, None, req, stream=False)
     system_count = sum(1 for m in body["messages"] if m["role"] == "system")
     assert system_count == 1
     assert "You are terse." in body["messages"][0]["content"]
@@ -953,7 +1054,7 @@ def test_build_request_structured_off_when_no_tools() -> None:
         messages=[_user("hi")],
         params=ModelParams(structured_tool_calls=True),
     )
-    body = build_request_body("llama3.2", None, req, stream=False)
+    body = build_request_body("llama3.2", None, None, req, stream=False)
     assert "format" not in body
 
 
@@ -963,7 +1064,7 @@ def test_build_request_structured_off_by_default() -> None:
         messages=[_user("hi")],
         tools=[ToolSchema(name="search", description="search the web", input_schema={})],
     )
-    body = build_request_body("llama3.2", None, req, stream=False)
+    body = build_request_body("llama3.2", None, None, req, stream=False)
     assert "format" not in body
     assert len(body["tools"]) == 1
 
@@ -1154,12 +1255,12 @@ def test_build_request_output_schema_populates_format_channel() -> None:
         "required": ["status"],
     }
     req = _req([_user("answer")], params=ModelParams(output_schema=schema))
-    body = build_request_body("llama3.2", None, req, stream=False)
+    body = build_request_body("llama3.2", None, None, req, stream=False)
     assert body["format"] == schema
 
 
 def test_build_request_no_output_schema_leaves_format_absent() -> None:
     # Absent output_schema (the default) keeps ``format`` unset — byte-identical
     # to pre-#139.
-    body = build_request_body("llama3.2", None, _req([_user("hi")]), stream=False)
+    body = build_request_body("llama3.2", None, None, _req([_user("hi")]), stream=False)
     assert "format" not in body
