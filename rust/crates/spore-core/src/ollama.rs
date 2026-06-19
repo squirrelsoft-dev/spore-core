@@ -28,6 +28,18 @@
 //!   nested under `options` rather than being top-level keys.
 //! - `keep_alive` (default `"5m"`) controls how long Ollama keeps the model
 //!   loaded after the call returns.
+//! - `num_ctx` (the context window) is also nested under `options`. It is the
+//!   ONLY way to tell Ollama how many prompt tokens the model may see: omitted,
+//!   Ollama loads the model at its small server default (historically 2048,
+//!   4096 in recent builds) and silently truncates longer prompts. It is opt-in
+//!   via [`OllamaModelInterface::with_num_ctx`] and unset by default (so every
+//!   existing request stays byte-identical). NOTE the discovery/enforcement
+//!   split: `provider().context_window` REPORTS the model's window (from the
+//!   `/api/show` probe or the static table) for the harness's budget/compaction
+//!   accounting, but that value is advisory only — it is never written back as
+//!   `num_ctx`. A caller that sizes the harness's compaction window to the
+//!   model's real window must call `with_num_ctx` with the same value, or the
+//!   harness will manage a large budget while Ollama truncates at its default.
 //! - Tool-call arguments are a JSON **object** in the wire format, not a
 //!   JSON-encoded string like OpenAI.
 //! - Ollama does not return tool-call ids; we synthesize `call-{i}` per index
@@ -94,6 +106,12 @@ pub struct OllamaModelInterface {
     base_url: String,
     timeout: Duration,
     keep_alive: Option<String>,
+    /// Context window (`options.num_ctx`) sent on every chat request. `None`
+    /// (the default) omits it, leaving Ollama on its small server default — so
+    /// callers that want the model's real window must opt in via
+    /// [`with_num_ctx`](Self::with_num_ctx). Like `keep_alive`, this is a
+    /// model-loading setting, not a per-turn sampling param.
+    num_ctx: Option<u32>,
     http_client: Arc<reqwest::Client>,
     /// Lazily set after the first availability + discovery probe. Holds the
     /// `/api/show`-discovered metadata (context length + capabilities); empty
@@ -133,6 +151,7 @@ impl std::fmt::Debug for OllamaModelInterface {
             .field("base_url", &self.base_url)
             .field("timeout", &self.timeout)
             .field("keep_alive", &self.keep_alive)
+            .field("num_ctx", &self.num_ctx)
             .finish()
     }
 }
@@ -148,6 +167,7 @@ impl OllamaModelInterface {
             base_url: Self::DEFAULT_BASE_URL.into(),
             timeout: Self::DEFAULT_TIMEOUT,
             keep_alive: Some(Self::DEFAULT_KEEP_ALIVE.into()),
+            num_ctx: None,
             http_client: Arc::new(Self::default_http_client()),
             model_checked: Arc::new(OnceCell::new()),
         }
@@ -183,6 +203,24 @@ impl OllamaModelInterface {
 
     pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
         self.keep_alive = Some(keep_alive.into());
+        self
+    }
+
+    /// Set the context window (`options.num_ctx`) sent on every chat request.
+    ///
+    /// This is how Ollama is told to size the model's context: without it,
+    /// Ollama loads the model at its small **server default** (historically
+    /// 2048, 4096 in recent builds) and silently truncates any longer prompt —
+    /// no matter the model's true capacity or what the harness believes the
+    /// window to be. Set this to the same value used for the harness's
+    /// compaction window so the budget the harness manages and the context the
+    /// model actually sees agree.
+    ///
+    /// `num_ctx` sizes Ollama's KV-cache allocation at load time, so a very
+    /// large value costs proportional memory — pass the window you actually want
+    /// the model to use, not an arbitrary maximum.
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = Some(num_ctx);
         self
     }
 
@@ -351,6 +389,15 @@ impl OllamaThink {
 
 #[derive(Debug, Serialize, Default)]
 struct OllamaOptions {
+    /// Context window (`num_ctx`) — sizes the KV cache Ollama allocates when the
+    /// model loads, and therefore how many prompt tokens the model can actually
+    /// see. UNSET ⟹ omitted, and Ollama falls back to its **server default**
+    /// (historically 2048, 4096 in recent builds) regardless of the model's true
+    /// window, silently truncating longer prompts. Carried from
+    /// [`OllamaModelInterface::with_num_ctx`]; provider-side, not a sampling
+    /// param. See the module-level note on context-window discovery vs. enforcement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_predict: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,7 +410,8 @@ struct OllamaOptions {
 
 impl OllamaOptions {
     fn is_empty(&self) -> bool {
-        self.num_predict.is_none()
+        self.num_ctx.is_none()
+            && self.num_predict.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
             && self.stop.is_empty()
@@ -496,6 +544,7 @@ struct EmbedResponse {
 fn build_request(
     model_id: &str,
     keep_alive: &Option<String>,
+    num_ctx: Option<u32>,
     req: &ModelRequest,
     stream: bool,
 ) -> OllamaRequest {
@@ -562,6 +611,7 @@ fn build_request(
     };
 
     let options = OllamaOptions {
+        num_ctx,
         num_predict: req.params.max_tokens,
         temperature: req.params.temperature,
         top_p: req.params.top_p,
@@ -856,7 +906,13 @@ impl ModelInterface for OllamaModelInterface {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
-        let mut body = build_request(&self.model_id, &self.keep_alive, &request, false);
+        let mut body = build_request(
+            &self.model_id,
+            &self.keep_alive,
+            self.num_ctx,
+            &request,
+            false,
+        );
         gate_thinking(&mut body, meta);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -886,7 +942,13 @@ impl ModelInterface for OllamaModelInterface {
     async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
-        let mut body = build_request(&self.model_id, &self.keep_alive, &request, true);
+        let mut body = build_request(
+            &self.model_id,
+            &self.keep_alive,
+            self.num_ctx,
+            &request,
+            true,
+        );
         gate_thinking(&mut body, meta);
         let url = format!("{}/api/chat", self.base_url);
         let encoded = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -1331,7 +1393,7 @@ mod tests {
         r.params.temperature = Some(0.7);
         r.params.top_p = Some(0.9);
         r.params.stop_sequences = vec!["END".into()];
-        let body = build_request("llama3.2", &Some("10m".into()), &r, false);
+        let body = build_request("llama3.2", &Some("10m".into()), None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"keep_alive\":\"10m\""), "wire: {s}");
         assert!(s.contains("\"num_predict\":256"), "wire: {s}");
@@ -1339,6 +1401,40 @@ mod tests {
         assert!(s.contains("\"top_p\":0.9"), "wire: {s}");
         assert!(s.contains("\"stop\":[\"END\"]"), "wire: {s}");
         assert!(!s.contains("\"stream\":true"), "default stream=false");
+        // num_ctx is opt-in: unset here, so it must NOT appear on the wire.
+        assert!(!s.contains("num_ctx"), "num_ctx omitted when unset: {s}");
+    }
+
+    #[test]
+    fn new_defaults_num_ctx_to_none() {
+        let c = OllamaModelInterface::new("llama3.2");
+        assert_eq!(c.num_ctx, None);
+        let c = c.with_num_ctx(256_000);
+        assert_eq!(c.num_ctx, Some(256_000));
+    }
+
+    #[test]
+    fn build_request_serializes_num_ctx_when_set() {
+        let r = req(vec![user("hi")]);
+        // num_ctx is the ONLY option set — exercises both the serialized field
+        // and `OllamaOptions::is_empty` (the options object must still be emitted).
+        let body = build_request("llama3.2", &None, Some(256_000), &r, false);
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(s.contains("\"options\":{"), "options object present: {s}");
+        assert!(s.contains("\"num_ctx\":256000"), "wire: {s}");
+    }
+
+    #[test]
+    fn build_request_omits_options_when_only_num_ctx_unset() {
+        // No sampling params and no num_ctx → no `options` key at all, keeping
+        // the bare request byte-identical to before num_ctx existed.
+        let r = req(vec![user("hi")]);
+        let body = build_request("llama3.2", &None, None, &r, false);
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(
+            !s.contains("\"options\""),
+            "options omitted when empty: {s}"
+        );
     }
 
     #[test]
@@ -1349,7 +1445,7 @@ mod tests {
             description: "search the web".into(),
             input_schema: serde_json::json!({"type":"object"}),
         });
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"tools\":["), "wire: {s}");
         assert!(s.contains("\"name\":\"search\""), "wire: {s}");
@@ -1366,7 +1462,7 @@ mod tests {
                 input: serde_json::json!({"url":"x"}),
             }),
         }]);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         let s = serde_json::to_string(&body.messages[0]).unwrap();
         // arguments must be an object, NOT a JSON-encoded string
         assert!(s.contains("\"arguments\":{\"url\":\"x\"}"), "wire: {s}");
@@ -1383,7 +1479,7 @@ mod tests {
                 is_error: false,
             }),
         }]);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         let m = &body.messages[0];
         assert_eq!(m.role, "tool");
         assert_eq!(m.content, "ok");
@@ -1396,7 +1492,7 @@ mod tests {
         // (request side). Confirm a normal request round-trips with no
         // "thinking" key, which proves we never emit one.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("thinking"), "wire: {s}");
     }
@@ -1407,7 +1503,7 @@ mod tests {
     fn build_request_omits_think_without_reasoning_budget() {
         // Default request (no reasoning_budget) carries no `think` key.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert_eq!(body.think, None);
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("\"think\""), "wire: {s}");
@@ -1419,7 +1515,7 @@ mod tests {
         // magnitude has no Ollama analogue). Capability gating is separate.
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(2048);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert_eq!(body.think, Some(OllamaThink::Enabled(true)));
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"think\":true"), "wire: {s}");
@@ -1430,7 +1526,7 @@ mod tests {
         // Some(0) is "no reasoning" — must not enable thinking.
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(0);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert_eq!(body.think, None);
     }
 
@@ -1445,7 +1541,7 @@ mod tests {
         ] {
             let mut r = req(vec![user("hi")]);
             r.params.reasoning_effort = Some(effort);
-            let body = build_request("gpt-oss", &None, &r, false);
+            let body = build_request("gpt-oss", &None, None, &r, false);
             assert_eq!(body.think, Some(OllamaThink::Level(wire)));
             let s = serde_json::to_string(&body).unwrap();
             assert!(
@@ -1462,7 +1558,7 @@ mod tests {
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_budget = Some(2048);
         r.params.reasoning_effort = Some(ReasoningEffort::High);
-        let body = build_request("gpt-oss", &None, &r, false);
+        let body = build_request("gpt-oss", &None, None, &r, false);
         assert_eq!(body.think, Some(OllamaThink::Level("high")));
     }
 
@@ -1485,7 +1581,7 @@ mod tests {
         ] {
             let mut r = req(vec![user("hi")]);
             r.params = params;
-            let mut body = build_request("llama3.2", &None, &r, false);
+            let mut body = build_request("llama3.2", &None, None, &r, false);
             assert!(body.think.is_some());
             let meta = ModelMeta {
                 context_length: None,
@@ -1500,7 +1596,7 @@ mod tests {
     fn gate_thinking_keeps_flag_when_capability_present() {
         let mut r = req(vec![user("hi")]);
         r.params.reasoning_effort = Some(ReasoningEffort::Max);
-        let mut body = build_request("gpt-oss", &None, &r, false);
+        let mut body = build_request("gpt-oss", &None, None, &r, false);
         let meta = ModelMeta {
             context_length: None,
             capabilities: vec!["thinking".into()],
@@ -1546,7 +1642,7 @@ mod tests {
     #[test]
     fn build_request_structured_sets_format_drops_tools_adds_system() {
         let r = structured_tool_req();
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         // Native tools dropped in structured mode.
         assert!(body.tools.is_empty(), "native tools must be empty");
         // format schema present with tool enum = tool names + "final".
@@ -1578,7 +1674,7 @@ mod tests {
                 },
             },
         );
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         // Only one system message; original content preserved + preamble merged.
         let system_count = body.messages.iter().filter(|m| m.role == "system").count();
         assert_eq!(system_count, 1);
@@ -1591,7 +1687,7 @@ mod tests {
         // Flag on but no tools → unchanged behavior, no format.
         let mut r = req(vec![user("hi")]);
         r.params.structured_tool_calls = true;
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert!(body.format.is_none());
     }
 
@@ -1604,7 +1700,7 @@ mod tests {
             description: "search the web".into(),
             input_schema: serde_json::json!({"type":"object"}),
         });
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert!(body.format.is_none());
         assert_eq!(body.tools.len(), 1);
     }
@@ -1623,7 +1719,7 @@ mod tests {
             "required": ["status"]
         });
         r.params.output_schema = Some(schema.clone());
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert_eq!(
             body.format.as_ref(),
             Some(&schema),
@@ -1636,7 +1732,7 @@ mod tests {
         // Absent output_schema (the default) keeps `format` None — byte-identical
         // to pre-#139.
         let r = req(vec![user("hi")]);
-        let body = build_request("llama3.2", &None, &r, false);
+        let body = build_request("llama3.2", &None, None, &r, false);
         assert!(body.format.is_none());
     }
 
@@ -2702,6 +2798,67 @@ mod tests {
                 ContentBlock::Text { text: "42".into() },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn num_ctx_sent_on_wire_when_configured() {
+        // End-to-end: `with_num_ctx` reaches /api/chat as `options.num_ctx`
+        // through the real HTTP path. The chat mock matches ONLY when the body
+        // carries it, so the call fails (no matching response) if num_ctx is
+        // dropped — this is the regression guard for the reported bug.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"options": {"num_ctx": 256_000}}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            OllamaModelInterface::with_base_url("llama3.2", server.uri()).with_num_ctx(256_000);
+        let resp = client.call(req(vec![user("hi")])).await.unwrap();
+        assert_eq!(resp.content, vec![ContentBlock::Text { text: "ok".into() }]);
+    }
+
+    #[tokio::test]
+    async fn num_ctx_absent_on_wire_by_default() {
+        // The mirror: with no `with_num_ctx`, the chat request must carry NO
+        // `num_ctx` key. The mock matches only the ABSENCE (a bare request with
+        // no `options`), so a stray num_ctx would miss it and fail the call.
+        let server = wiremock::MockServer::start().await;
+        mock_tags_ok(&server, "llama3.2").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/chat"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "model": "llama3.2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+                "keep_alive": "5m"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"role": "assistant", "content": "ok"},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 1,
+                    "eval_count": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaModelInterface::with_base_url("llama3.2", server.uri());
+        let resp = client.call(req(vec![user("hi")])).await.unwrap();
+        assert_eq!(resp.content, vec![ContentBlock::Text { text: "ok".into() }]);
     }
 
     #[tokio::test]

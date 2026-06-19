@@ -150,7 +150,10 @@ const PLAN_SCHEMA_KEY: &str = "plan";
 /// headroom instead of compacting ~30× too early. Override for a smaller model
 /// with `--context-window <tokens>` / `SPORE_CONTEXT_WINDOW` — the value is used
 /// as-is and is NOT clamped to the model's true window, so don't set it larger
-/// than the model can actually hold.
+/// than the model can actually hold. This same value is also sent to Ollama as
+/// `num_ctx` (via [`OllamaModelInterface::with_num_ctx`]), so it sizes the KV
+/// cache Ollama allocates as well as the harness's compaction budget — a larger
+/// window therefore costs proportionally more memory at model-load time.
 const DEFAULT_CONTEXT_WINDOW: u32 = 256_000;
 
 /// Fraction of the window at which the harness compacts. `should_compact` fires
@@ -212,8 +215,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `threshold × window` (should_compact: used/window >= threshold), leaving
     // headroom for the turn that crosses the line. 0.80 is the default — set it
     // explicitly here so the 80% trigger is visible, not buried in a default.
+    //
+    // `with_num_ctx(context_window)` is the OTHER half of sizing the window, and
+    // the half that's easy to forget: `context_length` only tells the HARNESS how
+    // much budget it has before compacting. Ollama itself defaults to a tiny
+    // context (~2-4K) and silently truncates the prompt unless we send `num_ctx`.
+    // Without this the harness would happily fill 200K of budget the model never
+    // actually sees. Both must agree, so both read `context_window`.
     let base_adapter = Arc::new(StandardContextManager::new(
-        Arc::new(OllamaModelInterface::with_base_url(&model_id, base_url.clone())),
+        Arc::new(
+            OllamaModelInterface::with_base_url(&model_id, base_url.clone())
+                .with_num_ctx(context_window),
+        ),
         Arc::new(NullCacheProvider),
         CompactionConfig {
             context_length: Some(context_window),
@@ -241,7 +254,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog.manifest(),
     ));
 
-    let model = OllamaModelInterface::with_base_url(&model_id, base_url);
+    // Same `num_ctx` as the compaction handle above — the agent's own model must
+    // see the full window the harness budgets against, or every long turn is
+    // truncated by Ollama before the model reads it.
+    let model = OllamaModelInterface::with_base_url(&model_id, base_url).with_num_ctx(context_window);
     let harness = HarnessBuilder::conversational(model)
         .sandbox(Arc::new(sandbox))
         // The coding catalogue PLUS the architect-side `load_skill` tool, so the
@@ -261,7 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("model     : {model_id}");
     println!("strategy  : plan (≤{PLAN_STEPS} steps) → execute (≤{MAX_STEPS} steps/task)");
     println!(
-        "context   : {context_window} tokens (compact at {:.0}% → {} tokens)",
+        "context   : {context_window} tokens (num_ctx sent to Ollama; compact at {:.0}% → {} tokens)",
         COMPACT_THRESHOLD * 100.0,
         (context_window as f32 * COMPACT_THRESHOLD) as u32,
     );
