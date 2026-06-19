@@ -18,6 +18,18 @@
  *   nested under `options` rather than top-level keys.
  * - `keepAlive` (default `"5m"`) controls how long Ollama keeps the model
  *   loaded after the call returns.
+ * - `numCtx` (the context window) is also nested under `options` as `num_ctx`.
+ *   It is the ONLY way to tell Ollama how many prompt tokens the model may see:
+ *   omitted, Ollama loads the model at its small server default (historically
+ *   2048, 4096 in recent builds) and silently truncates longer prompts. It is
+ *   opt-in via the `numCtx` constructor option and unset by default, so every
+ *   existing request stays byte-identical. NOTE the discovery/enforcement
+ *   split: `provider().context_window` REPORTS the model's window (from the
+ *   `/api/show` probe or the static table) for the harness's budget/compaction
+ *   accounting, but that value is advisory only — it is never written back as
+ *   `num_ctx`. A caller that sizes the harness's compaction window to the
+ *   model's real window must pass the same value as `numCtx`, or the harness
+ *   will manage a large budget while Ollama truncates at its default.
  * - Tool-call arguments are a JSON **object** in the wire format, not a
  *   JSON-encoded string like OpenAI.
  * - Ollama does not return tool-call ids; we synthesize `call-{i}` per index
@@ -56,6 +68,18 @@ export interface OllamaModelInterfaceOptions {
   timeoutMs?: number;
   /** How long Ollama should keep the model loaded. Defaults to "5m". */
   keepAlive?: string | null;
+  /**
+   * Context window (`options.num_ctx`) sent on every chat request. Omitted
+   * (the default) leaves Ollama on its small **server default** (historically
+   * 2048, 4096 in recent builds), which silently truncates any longer prompt
+   * regardless of the model's true window. Like `keepAlive`, this is a
+   * model-**load** setting, not a per-turn sampling param — set it to the same
+   * value used for the harness's compaction window so the budget the harness
+   * manages and the context the model actually sees agree. NOT auto-defaulted
+   * to the discovered `context_length`: a large `num_ctx` makes Ollama allocate
+   * a proportionally large KV cache, so it's the caller's deliberate choice.
+   */
+  numCtx?: number;
   /** Injected fetch implementation. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -93,6 +117,12 @@ export class OllamaModelInterface implements ModelInterface {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly keepAlive: string | null;
+  /**
+   * Context window (`options.num_ctx`) sent on every chat request. `null` (the
+   * default) omits it, leaving Ollama on its small server default. See
+   * {@link OllamaModelInterfaceOptions.numCtx}.
+   */
+  private readonly numCtx: number | null;
   private readonly fetchImpl: typeof fetch;
   /** Lazy availability + discovery check — populated after first successful probe. */
   private modelCheckPromise: Promise<ModelMeta> | null = null;
@@ -108,6 +138,7 @@ export class OllamaModelInterface implements ModelInterface {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.keepAlive = options.keepAlive === undefined ? DEFAULT_KEEP_ALIVE : options.keepAlive;
+    this.numCtx = options.numCtx ?? null;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -153,7 +184,9 @@ export class OllamaModelInterface implements ModelInterface {
   async call(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse> {
     const meta = await this.ensureModelAvailable(signal);
     this.guardToolSupport(request, meta);
-    const body = JSON.stringify(buildRequest(this.modelId, this.keepAlive, request, false));
+    const body = JSON.stringify(
+      buildRequest(this.modelId, this.keepAlive, this.numCtx, request, false),
+    );
     const url = `${this.baseUrl}/api/chat`;
     let resp: Response;
     try {
@@ -177,7 +210,9 @@ export class OllamaModelInterface implements ModelInterface {
   async *callStreaming(request: ModelRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
     const meta = await this.ensureModelAvailable(signal);
     this.guardToolSupport(request, meta);
-    const body = JSON.stringify(buildRequest(this.modelId, this.keepAlive, request, true));
+    const body = JSON.stringify(
+      buildRequest(this.modelId, this.keepAlive, this.numCtx, request, true),
+    );
     const url = `${this.baseUrl}/api/chat`;
     let resp: Response;
     try {
@@ -442,6 +477,17 @@ export interface OllamaRequest {
 }
 
 export interface OllamaOptions {
+  /**
+   * Context window (`num_ctx`) — sizes the KV cache Ollama allocates at model
+   * load, and therefore how many prompt tokens the model can actually see.
+   * Unset ⟹ omitted, so Ollama falls back to its small **server default**
+   * (historically 2048, 4096 in recent builds) regardless of the model's true
+   * window, silently truncating longer prompts. Carried from
+   * {@link OllamaModelInterfaceOptions.numCtx}; a model-load setting, not a
+   * sampling param. Declared FIRST so insertion order matches Rust's serde
+   * struct order (`{num_ctx, num_predict, ...}`) for cross-language byte parity.
+   */
+  num_ctx?: number;
   num_predict?: number;
   temperature?: number;
   top_p?: number;
@@ -511,6 +557,7 @@ interface ShowResponse {
 export function buildRequest(
   modelId: string,
   keepAlive: string | null,
+  numCtx: number | null,
   req: ModelRequest,
   stream: boolean,
 ): OllamaRequest {
@@ -565,6 +612,10 @@ export function buildRequest(
   }
 
   const options: OllamaOptions = {};
+  // `num_ctx` first so insertion order matches Rust's serde struct order
+  // (`{num_ctx, num_predict, ...}`) — Ollama options are NOT key-sorted on the
+  // wire, so the byte order is load-bearing for cross-language parity.
+  if (numCtx != null) options.num_ctx = numCtx;
   if (req.params.max_tokens != null) options.num_predict = req.params.max_tokens;
   if (req.params.temperature != null) options.temperature = req.params.temperature;
   if (req.params.top_p != null) options.top_p = req.params.top_p;
@@ -577,6 +628,7 @@ export function buildRequest(
   };
   if (keepAlive != null) out.keep_alive = keepAlive;
   if (
+    options.num_ctx != null ||
     options.num_predict != null ||
     options.temperature != null ||
     options.top_p != null ||

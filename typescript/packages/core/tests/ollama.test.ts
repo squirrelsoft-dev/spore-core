@@ -168,19 +168,59 @@ describe("buildRequest", () => {
     r.params.temperature = 0.7;
     r.params.top_p = 0.9;
     r.params.stop_sequences = ["END"];
-    const body = ollamaBuildRequest("llama3.2", "10m", r, false);
+    const body = ollamaBuildRequest("llama3.2", "10m", null, r, false);
     expect(body.keep_alive).toBe("10m");
     expect(body.options?.num_predict).toBe(256);
     expect(body.options?.temperature).toBe(0.7);
     expect(body.options?.top_p).toBe(0.9);
     expect(body.options?.stop).toEqual(["END"]);
     expect(body.stream).toBe(false);
+    // num_ctx is opt-in: unset here, so it must NOT appear on the wire.
+    expect(body.options?.num_ctx).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("num_ctx");
   });
 
   it("omits options object when no sampling params set", () => {
-    const body = ollamaBuildRequest("llama3.2", null, req([user("hi")]), false);
+    const body = ollamaBuildRequest("llama3.2", null, null, req([user("hi")]), false);
     expect(body.options).toBeUndefined();
     expect(body.keep_alive).toBeUndefined();
+  });
+
+  it("defaults numCtx to undefined; constructing with numCtx sets it", () => {
+    // Mirrors Rust's `new_defaults_num_ctx_to_none`: opt-in, unset by default.
+    const def = new OllamaModelInterface("llama3.2");
+    expect((def as unknown as { numCtx: number | null }).numCtx).toBeNull();
+    const set = new OllamaModelInterface("llama3.2", { numCtx: 256_000 });
+    expect((set as unknown as { numCtx: number | null }).numCtx).toBe(256_000);
+  });
+
+  it("serializes num_ctx when set (options object present)", () => {
+    // num_ctx is the ONLY option set — exercises both the serialized field and
+    // the options-emission guard (the options object must still be emitted).
+    const body = ollamaBuildRequest("llama3.2", null, 256_000, req([user("hi")]), false);
+    expect(body.options).toBeDefined();
+    expect(body.options?.num_ctx).toBe(256_000);
+    const s = JSON.stringify(body);
+    expect(s).toContain('"options":{');
+    expect(s).toContain('"num_ctx":256000');
+  });
+
+  it("omits the options object when only num_ctx is unset", () => {
+    // No sampling params and no num_ctx → no `options` key at all, keeping the
+    // bare request byte-identical to before num_ctx existed.
+    const body = ollamaBuildRequest("llama3.2", null, null, req([user("hi")]), false);
+    const s = JSON.stringify(body);
+    expect(body.options).toBeUndefined();
+    expect(s).not.toContain('"options"');
+  });
+
+  it("emits num_ctx before num_predict in the options object (byte-order parity)", () => {
+    // Ollama options are NOT key-sorted on the wire; Rust's serde emits num_ctx
+    // first, so TS must too.
+    const r = req([user("hi")]);
+    r.params.max_tokens = 256;
+    const s = JSON.stringify(ollamaBuildRequest("llama3.2", null, 256_000, r, false));
+    expect(s).toContain('"options":{"num_ctx":256000,"num_predict":256');
   });
 
   it("serializes tools", () => {
@@ -190,7 +230,7 @@ describe("buildRequest", () => {
       description: "search the web",
       input_schema: { type: "object" },
     });
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     const s = JSON.stringify(body);
     expect(s).toContain('"tools":[');
     expect(s).toContain('"name":"search"');
@@ -204,7 +244,7 @@ describe("buildRequest", () => {
         content: { type: "tool_call", id: "call-0", name: "fetch", input: { url: "x" } },
       },
     ]);
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     const m = body.messages[0]!;
     expect(typeof m.tool_calls![0]!.function.arguments).toBe("object");
     expect(m.tool_calls![0]!.function.arguments).toEqual({ url: "x" });
@@ -220,7 +260,7 @@ describe("buildRequest", () => {
         content: { type: "tool_result", tool_use_id: "call-0", content: "ok", is_error: false },
       },
     ]);
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     const m = body.messages[0]!;
     expect(m.role).toBe("tool");
     expect(m.content).toBe("ok");
@@ -228,7 +268,7 @@ describe("buildRequest", () => {
   });
 
   it("never emits a thinking key", () => {
-    const body = ollamaBuildRequest("llama3.2", null, req([user("hi")]), false);
+    const body = ollamaBuildRequest("llama3.2", null, null, req([user("hi")]), false);
     const s = JSON.stringify(body);
     expect(s).not.toContain("thinking");
   });
@@ -265,7 +305,7 @@ function structuredToolReq(): ModelRequest {
 
 describe("buildRequest structured tool calls", () => {
   it("sets format, drops tools, adds a system message", () => {
-    const body = ollamaBuildRequest("llama3.2", null, structuredToolReq(), false);
+    const body = ollamaBuildRequest("llama3.2", null, null, structuredToolReq(), false);
     // Native tools dropped in structured mode.
     expect(body.tools).toBeUndefined();
     // format schema present with tool enum = tool names + "final".
@@ -287,7 +327,7 @@ describe("buildRequest structured tool calls", () => {
   it("merges the preamble into an existing leading system message", () => {
     const r = structuredToolReq();
     r.messages.unshift({ role: "system", content: { type: "text", text: "You are terse." } });
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     const systemCount = body.messages.filter((m) => m.role === "system").length;
     expect(systemCount).toBe(1);
     expect(body.messages[0]!.content).toContain("You are terse.");
@@ -297,7 +337,7 @@ describe("buildRequest structured tool calls", () => {
   it("off when flag set but no tools", () => {
     const r = req([user("hi")]);
     r.params.structured_tool_calls = true;
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     expect(body.format).toBeUndefined();
   });
 
@@ -308,7 +348,7 @@ describe("buildRequest structured tool calls", () => {
       description: "search the web",
       input_schema: { type: "object" },
     });
-    const body = ollamaBuildRequest("llama3.2", null, r, false);
+    const body = ollamaBuildRequest("llama3.2", null, null, r, false);
     expect(body.format).toBeUndefined();
     expect(body.tools).toHaveLength(1);
   });
@@ -726,6 +766,37 @@ describe("call() against a mock server", () => {
     expect(r.usage.output_tokens).toBe(2);
     const chatReq = server.requests.find((q) => q.url === "/api/chat")!;
     expect(chatReq.headers["content-type"]).toBe("application/json");
+  });
+
+  it("sends options.num_ctx on the wire when configured", async () => {
+    // End-to-end: `numCtx` reaches /api/chat as `options.num_ctx` through the
+    // real HTTP path — the regression guard for the reported bug.
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route("POST", "/api/chat", chatOk());
+    const client = new OllamaModelInterface("llama3.2", {
+      baseUrl: server.baseUrl(),
+      numCtx: 256_000,
+    });
+    const r = await client.call(req([user("hi")]));
+    expect(r.content).toEqual([{ type: "text", text: "ok" }]);
+    const chatReq = server.requests.find((q) => q.url === "/api/chat")!;
+    const sentBody = JSON.parse(chatReq.body) as { options?: { num_ctx?: number } };
+    expect(sentBody.options?.num_ctx).toBe(256_000);
+  });
+
+  it("omits num_ctx from the wire by default", async () => {
+    // The mirror: with no `numCtx`, the chat request carries NO num_ctx key (and
+    // no `options` at all, since no sampling params are set either).
+    server.reset();
+    server.route("GET", "/api/tags", tagsOk("llama3.2"));
+    server.route("POST", "/api/chat", chatOk());
+    const client = OllamaModelInterface.withBaseUrl("llama3.2", server.baseUrl());
+    await client.call(req([user("hi")]));
+    const chatReq = server.requests.find((q) => q.url === "/api/chat")!;
+    expect(chatReq.body).not.toContain("num_ctx");
+    const sentBody = JSON.parse(chatReq.body) as { options?: unknown };
+    expect(sentBody.options).toBeUndefined();
   });
 
   it("connection refused yields a helpful 'Ollama not running' message", async () => {

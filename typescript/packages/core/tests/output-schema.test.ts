@@ -204,6 +204,7 @@ describe("output-schema delivery (#139) — AC1 Ollama format channel", () => {
     const body = ollamaBuildRequest(
       "llama3.2",
       null,
+      null,
       req([{ role: "user", content: { type: "text", text: "answer" } }], schema),
       false,
     );
@@ -213,6 +214,7 @@ describe("output-schema delivery (#139) — AC1 Ollama format channel", () => {
   it("absent output_schema leaves `format` unset — byte-identical to pre-#139", () => {
     const body = ollamaBuildRequest(
       "llama3.2",
+      null,
       null,
       req([{ role: "user", content: { type: "text", text: "hi" } }]),
       false,
