@@ -72,25 +72,29 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 
 ### Phase 2 — Provider/model knobs (additive; un-gated by Q1, ships alongside Phase 1)
 
-**SC-4 — Compaction window silently collapses to 8K. Hit by cordyceps + any non-tiny model.**
+> **LANDED (Rust) at `f1c0beb`** (2026-06-23). All four items below are implemented + tested in the Rust reference; TS/Py/Go parity tracked in **#155**. Per-item notes inline.
+
+**SC-4 — Compaction window silently collapses to 8K. Hit by cordyceps + any non-tiny model. — LANDED `f1c0beb`.**
+- *Done (Rust):* Ollama `with_context_window(n)` sets BOTH `num_ctx` (what the model loads) AND the reported `provider().context_window`; the compaction budget auto-derives via the existing #141 `resolve_context_length` chain (no second setter). Anthropic/OpenAI `with_context_window(n)` set the reported window only (no `num_ctx`). Stale "80% of 200K" builder doc corrected.
 - *Root cause:* `DEFAULT_CONTEXT_LENGTH = 8_000` (`context.rs:227`); `resolve_context_length` (`context.rs:613`) → config → `provider().context_window` → 8000; Ollama prefix table (`ollama.rs:232`: `gemma*`→8192, unknown→0), best-effort `/api/show`. Stale doc `harness.rs:6541` ("80% of 200K").
 - *Fix:* one `.context_window(n)` builder setter fanning out to both the compaction budget and the model's `num_ctx`; fix the stale doc. Also closes looper's `num_ctx` drift.
 - *Fixture impact:* the **setter** is additive; only flipping the raw 8K default touches `fixtures/compaction_window`/`compaction_loop` — and per Q1 we don't flip it (presets carry the friendly value).
 - *Acceptance:* `.context_window(256_000)` once → both compaction budget and `num_ctx` reflect it, model built once, 200K conversation doesn't compact prematurely. cordyceps deletes `main.rs:144-260`.
 
-**SC-5 — No "autonomous but capped" escalation mode. Hit by cordyceps + looper.**
+**SC-5 — No "autonomous but capped" escalation mode. Hit by cordyceps + looper. — LANDED `f1c0beb`.**
+- *Done (Rust):* `EscalationMode::AutoContinue { max_grants, steps_per_grant, on_grant: Option<Callback> }` consulted at every `Escalate` site (5 nested via `ExecutionContext::try_auto_continue` + `BudgetContext::grant_auto_continue`; the top-level bare-leaf `drive_strategy_with_resume_seed` site via a loop-local counter). Auto-grants in-process up to `max_grants`, fires `on_grant` per grant, then falls through to the `Autonomous` terminal. `on_grant` (`Arc<dyn Fn>`, serde-skipped) drops `Copy`/`Eq` from `EscalationMode` (hand-rolled `Debug`); never serialized in fixtures.
 - *Symptom:* keep-working-to-completion-but-cap-at-N exists nowhere. cordyceps hand-rolls `drive()` (`main.rs:567-609`); looper hand-rolls it in `governor.rs:567-590` (`MAX_AUTO_CONTINUES = 10`).
 - *Root cause:* `EscalationMode` is binary (`execution_registry.rs:77`): `SurfaceToHuman` | `Autonomous` (propagate up = give up). `ContinueWithBudget`/`resume` machinery exists but isn't wired as a policy.
 - *Fix — DECIDED (Q4):* `EscalationMode::AutoContinue { max_grants, steps_per_grant, on_grant: Option<Callback> }`. Default stays `SurfaceToHuman` (no fixture impact).
 - *Acceptance:* `AutoContinue { max_grants: 5, .. }` continues without consumer loop code, firing `on_grant` per grant. cordyceps deletes `drive()`; looper deletes the governor arm, keeps the callback.
 
-**SC-6 — Per-provider window tables have no override. Enables SC-4.**
+**SC-6 — Per-provider window tables have no override. Enables SC-4. — LANDED `f1c0beb`.**
+- *Done (Rust):* per-provider `context_window_override: Option<u32>` + `with_context_window(n)` setter (a single builder value, not a `HashMap<prefix>` — each interface wraps one model id). `provider().context_window` prefers the override; built-in table stays default (no fixture impact). Ollama precedence: override > `/api/show` discovery > static.
 - *Root cause:* hard-coded match arms (`anthropic.rs:132`, `openai.rs:116`, `ollama.rs:232`), unknown → 0 → 8K fallback.
-- *Fix:* injectable `HashMap<prefix, u32>` or a builder override; built-in table stays default (no fixture impact).
 
-**SC-27 — OpenAI compat is id-heuristic-only; no `with_compat`. Hit by looper (Gap A).**
+**SC-27 — OpenAI compat is id-heuristic-only; no `with_compat`. Hit by looper (Gap A). — LANDED `f1c0beb`.**
+- *Done (Rust):* `OpenAICompat { reasoning_model, developer_role, supports_reasoning_effort }` + `with_compat(..)`, OR'd OVER the id heuristic. Sets `max_completion_tokens` + drops sampling params (reasoning_model), routes system→`developer` role (developer_role), and emits a `reasoning_effort` field `low|medium|high|max` (supports_reasoning_effort, gated on reasoning-treated). Default compat keeps recognized o-series byte-identical.
 - *Root cause:* `is_reasoning_model` is a hard-coded `o1/o3/o4` prefix match (`openai.rs:129`); no vehicle to declare developer-role / reasoning-effort for an unrecognized (e.g. local) model. looper's parsed `Compat` (`config.rs:104-114,398`) is dead plumbing.
-- *Fix:* `with_compat(...)` on `OpenAIModelInterface` that beats the id heuristic. Distinct from SC-16 (Ollama thinking).
 - *Acceptance:* `with_compat { supports_reasoning_effort: true, .. }` on an unrecognized model → request carries reasoning-effort/developer-role; looper's `Compat` becomes live.
 
 **SC-7 — Fixture re-baseline. RESOLVED (Q1): no re-baseline.** Friendly behaviour via additive setters + presets (SC-8), not default flips. The 8K default (SC-4) is the only candidate flip and is revisited only inside SC-23's deliberate, fixture-affecting deprecation batch.
@@ -204,7 +208,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 1. **Phase 0** (DONE) — D1/D2 reconciled, #151 committed at `d14341f` (the pin).
 2. **Phase 1** — **SC-1 + SC-30 bundled** (same "handle must resolve or it's ceremony" class: auto-synthesize the schema + auto-derive the read-only eval catalogue, one PR), **SC-2** (fixture-safe but not quick), **SC-3**. Plus the D2 single-`Default` fix.
 3. **SC-BUG-1** — with the #151 work; it's the resume path the reviewer depends on (SC-30 inert for looper until then).
-4. **Phase 2** (SC-4/5/6/27) — additive, ships alongside Phase 1 (un-gated by Q1).
+4. **Phase 2** (SC-4/5/6/27) — additive, ships alongside Phase 1 (un-gated by Q1). **LANDED (Rust) `f1c0beb`; parity #155.**
 5. **Phase 2.5** (SC-8) — presets, once Phase 1 lands.
 6. **Phase 3** — Q2 canonical-chain adoption (subsumes SC-9 + SC-11) + SC-10/26/28. **Phase 4/5** as capacity allows.
 7. **agent-repl-kit** (ARK) + **looper-local** (LOC) — alongside, mostly independent.
