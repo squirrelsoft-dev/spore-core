@@ -6716,6 +6716,133 @@ impl HarnessBuilder {
         Self::conversational(model)
     }
 
+    /// Built-in system prompt for [`coding_agent`](Self::coding_agent): a coding
+    /// agent that ACTS through the workspace tools (rather than describing what it
+    /// would do) and narrates each step to the user via `send_message`. Exposed so
+    /// a consumer can extend it; override it wholesale with
+    /// [`system_prompt`](Self::system_prompt).
+    pub const CODING_AGENT_SYSTEM_PROMPT: &'static str =
+        "You are a coding agent working inside a sandboxed workspace directory. \
+         Explore with list_dir, read_file, grep, and find_files; create and change files with \
+         write_file and edit_file; run commands with bash. Use relative paths only. \
+         Act using tools — do not just describe what you would do. When the task is done, \
+         reply with a short summary of what you changed. \
+         The user CANNOT see your reasoning or your tool calls — they only see the messages you \
+         send with the `send_message` tool and your final reply. So before (or as) you act, \
+         call `send_message` with one short sentence saying what you are about to do, in \
+         PARALLEL with the tool that does the work, so narration never costs an extra round trip. \
+         Keep each message to a single short sentence.";
+
+    /// Default per-scope auto-continue cap for the autonomous presets
+    /// ([`coding_agent`](Self::coding_agent) / [`hill_climber`](Self::hill_climber)):
+    /// grant up to this many extra step budgets at an `Escalate` point before the
+    /// run gives up. Mirrors the hand-rolled drive loop the consumers used (the
+    /// `12-cordyceps` example's `MAX_AUTO_CONTINUES`). Override the whole policy
+    /// with [`escalation_mode`](Self::escalation_mode).
+    pub const PRESET_MAX_AUTO_GRANTS: u32 = 10;
+    /// Steps granted on each auto-continue for the autonomous presets (the
+    /// `12-cordyceps` example's `CONTINUE_STEPS`). See
+    /// [`PRESET_MAX_AUTO_GRANTS`](Self::PRESET_MAX_AUTO_GRANTS).
+    pub const PRESET_STEPS_PER_GRANT: u32 = 25;
+
+    /// `EscalationMode::AutoContinue` with the preset defaults
+    /// ([`PRESET_MAX_AUTO_GRANTS`](Self::PRESET_MAX_AUTO_GRANTS) ×
+    /// [`PRESET_STEPS_PER_GRANT`](Self::PRESET_STEPS_PER_GRANT), no `on_grant`
+    /// observer). The "autonomous but capped" policy both autonomous presets share.
+    fn preset_auto_continue() -> EscalationMode {
+        EscalationMode::AutoContinue {
+            max_grants: Self::PRESET_MAX_AUTO_GRANTS,
+            steps_per_grant: Self::PRESET_STEPS_PER_GRANT,
+            on_grant: None,
+        }
+    }
+
+    /// Assemble an autonomous **coding agent** over a workspace directory (SC-8) —
+    /// the looper preset.
+    ///
+    /// Builds on [`conversational`](Self::conversational) and wires the bits a
+    /// coding agent always needs: a **read-write** [`WorkspaceScopedSandbox`] rooted
+    /// at `workspace`, the full [`StandardTools::coding_set`] (read/write/edit/list/
+    /// grep/find + `bash` + `send_message` + web/memory/task-list), the built-in
+    /// [`CODING_AGENT_SYSTEM_PROMPT`](Self::CODING_AGENT_SYSTEM_PROMPT), and
+    /// [`EscalationMode::AutoContinue`] (autonomous-but-capped — it keeps working
+    /// through a spent step budget instead of pausing, so there is no consumer
+    /// drive loop to hand-roll; SC-5).
+    ///
+    /// **Window sizing (SC-4/SC-6).** Size the model's context window ONCE on the
+    /// model before passing it in (e.g. `OllamaModelInterface::with_context_window`):
+    /// the preset's `conversational` context manager auto-derives its compaction
+    /// budget from `provider().context_window`, and Ollama's `with_context_window`
+    /// also sets `num_ctx` — so one call sizes both halves and no manual
+    /// [`context_manager`](Self::context_manager) is needed.
+    ///
+    /// Returns [`Err`] if the workspace path can't be resolved (it must exist and
+    /// canonicalize — the sandbox requirement). The strategy is per-run: pass a
+    /// `ReAct` / `PlanExecute` [`Task`] to [`run`](Harness::run); the empty
+    /// agent/toolset handles on its leaves resolve to this preset's defaults.
+    ///
+    /// ```no_run
+    /// # use spore_core::{HarnessBuilder, OllamaModelInterface};
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// let model = OllamaModelInterface::new("gemma4:e4b").with_context_window(256_000);
+    /// let harness = HarnessBuilder::coding_agent(model, "/path/to/project")?.build();
+    /// # let _ = harness;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn coding_agent<M: crate::model::ModelInterface + 'static>(
+        model: M,
+        workspace: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, crate::sandbox::BuildError> {
+        let sandbox = crate::sandbox::WorkspaceScopedSandbox::new(
+            crate::sandbox::WorkspaceConfig::scoped(workspace),
+        )?;
+        Ok(Self::conversational(model)
+            .sandbox(Arc::new(sandbox))
+            .tools(crate::tools::StandardTools::coding_set())
+            .system_prompt(Self::CODING_AGENT_SYSTEM_PROMPT)
+            .escalation_mode(Self::preset_auto_continue()))
+    }
+
+    /// Assemble an autonomous **hill-climbing agent** (SC-8) — the cordyceps preset.
+    ///
+    /// Builds on [`conversational`](Self::conversational) and registers the scoring
+    /// `evaluator` (required for the [`HillClimbing`](crate::LoopStrategy::HillClimbing)
+    /// loop strategy) under the default handle, plus
+    /// [`EscalationMode::AutoContinue`] (autonomous-but-capped; SC-5) so a spent
+    /// per-iteration build budget keeps working instead of pausing.
+    ///
+    /// Unlike [`coding_agent`](Self::coding_agent) this does NOT install a sandbox
+    /// or tools — hill-climbing workspaces vary (some climb a prose artifact, some
+    /// climb files), and the build task's system prompt is task-specific. Add them
+    /// with [`sandbox`](Self::sandbox) / [`tools`](Self::tools) /
+    /// [`system_prompt`](Self::system_prompt) as the climb requires. Size the
+    /// model's window on the model first (SC-4/SC-6), as in
+    /// [`coding_agent`](Self::coding_agent).
+    ///
+    /// The `HillClimbing` config (direction / `max_stagnation` / per-iteration
+    /// budget) lives on the per-run [`Task`]'s strategy; the iteration ceiling is
+    /// the task's `max_turns`.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spore_core::{HarnessBuilder, OllamaModelInterface, MetricEvaluator};
+    /// # fn demo(evaluator: Arc<dyn MetricEvaluator>) {
+    /// let model = OllamaModelInterface::new("gemma4:e4b").with_context_window(256_000);
+    /// // Add a workspace `sandbox(..)` + `tools(..)` for the climb as it requires.
+    /// let harness = HarnessBuilder::hill_climber(model, evaluator).build();
+    /// # let _ = harness;
+    /// # }
+    /// ```
+    pub fn hill_climber<M: crate::model::ModelInterface + 'static>(
+        model: M,
+        evaluator: Arc<dyn crate::metric::MetricEvaluator>,
+    ) -> Self {
+        Self::conversational(model)
+            .metric_evaluator(evaluator)
+            .escalation_mode(Self::preset_auto_continue())
+    }
+
     /// Override the harness-loop tool registry (issue #4 seam).
     ///
     /// Use this to supply your own [`ToolRegistry`] implementation — e.g. a set
@@ -13337,6 +13464,107 @@ mod tests {
         let _harness = HarnessBuilder::conversational_arc(model).build();
     }
 
+    // ── SC-8 presets: coding_agent + hill_climber ───────────────────────────
+
+    fn preset_mock_model() -> crate::model::mock::MockModelInterface {
+        crate::model::mock::MockModelInterface::new(crate::model::ProviderInfo {
+            name: "test".into(),
+            model_id: "test-1".into(),
+            context_window: 8192,
+        })
+    }
+
+    // SC-8: `coding_agent` wires the read-write workspace sandbox, the coding tool
+    // catalogue, the built-in coding system prompt, and AutoContinue (the looper
+    // preset) — so a consumer collapses to one call.
+    #[tokio::test]
+    async fn coding_agent_preset_wires_sandbox_tools_prompt_and_autocontinue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = HarnessBuilder::coding_agent(preset_mock_model(), tmp.path())
+            .expect("workspace canonicalizes")
+            .build_config();
+
+        // Autonomous-but-capped escalation with the preset defaults (SC-5).
+        assert!(
+            matches!(
+                cfg.escalation_mode,
+                EscalationMode::AutoContinue { max_grants, steps_per_grant, .. }
+                    if max_grants == HarnessBuilder::PRESET_MAX_AUTO_GRANTS
+                        && steps_per_grant == HarnessBuilder::PRESET_STEPS_PER_GRANT
+            ),
+            "coding_agent must default to AutoContinue, got {:?}",
+            cfg.escalation_mode
+        );
+        // The built-in coding system prompt is installed.
+        assert_eq!(
+            cfg.system_prompt.as_deref(),
+            Some(HarnessBuilder::CODING_AGENT_SYSTEM_PROMPT),
+            "coding_agent installs its built-in system prompt"
+        );
+        // The coding catalogue is wired (a representative sample of coding_set()).
+        // `.tools()` are folded into the `catalogue_registry` (bridged per-run),
+        // not the harness-loop `tool_registry`, which stays the conversational
+        // `EmptyToolRegistry` until the run binds a `ToolContext`.
+        use crate::tool_registry::ToolRegistry as _;
+        let catalogue = cfg
+            .catalogue_registry
+            .as_ref()
+            .expect("coding_agent wires a catalogue registry from coding_set()");
+        let tools: std::collections::HashSet<String> = catalogue
+            .active_schemas(None)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for expected in ["read_file", "write_file", "edit_file", "bash_command", "send_message"] {
+            assert!(
+                tools.contains(expected),
+                "coding_set must include {expected}; got {tools:?}"
+            );
+        }
+    }
+
+    // SC-8: a workspace path that can't be resolved is a typed `BuildError`, not a
+    // panic — the sandbox requires a canonical, existing root.
+    #[test]
+    fn coding_agent_preset_errors_on_missing_workspace() {
+        let missing = std::path::Path::new("/spore-sc8-does-not-exist-37a1/nope");
+        // Can't `unwrap_err()` — the Ok type (`HarnessBuilder`) is not `Debug`.
+        match HarnessBuilder::coding_agent(preset_mock_model(), missing) {
+            Err(
+                crate::sandbox::BuildError::RootNotFound { .. }
+                | crate::sandbox::BuildError::RootIo { .. },
+            ) => {}
+            Err(other) => panic!("unexpected BuildError variant: {other:?}"),
+            Ok(_) => panic!("a missing workspace must surface a BuildError, not build"),
+        }
+    }
+
+    // SC-8: `hill_climber` registers the scoring evaluator (required for the
+    // HillClimbing strategy) under the default handle and defaults to AutoContinue
+    // — the cordyceps preset.
+    #[test]
+    fn hill_climber_preset_registers_evaluator_and_autocontinue() {
+        let evaluator: Arc<dyn crate::metric::MetricEvaluator> =
+            Arc::new(crate::metric::LatencyEvaluator {
+                command: "true".into(),
+                args: vec![],
+                warmup_runs: 0,
+                measured_runs: 1,
+                timeout: std::time::Duration::from_secs(1),
+                working_dir: None,
+            });
+        let cfg = HarnessBuilder::hill_climber(preset_mock_model(), evaluator).build_config();
+        assert!(
+            cfg.registry.resolve_metric_evaluator("").is_some(),
+            "hill_climber must register the metric evaluator under the default handle"
+        );
+        assert!(
+            matches!(cfg.escalation_mode, EscalationMode::AutoContinue { .. }),
+            "hill_climber must default to AutoContinue, got {:?}",
+            cfg.escalation_mode
+        );
+    }
+
     /// #142: the fixed canonical path the test config helpers derive their
     /// `project_id` from. Durable artifacts (task_list, plan) are keyed by this
     /// project namespace, so readback assertions key by `durable_ns()` rather
@@ -19680,7 +19908,7 @@ mod tests {
             "deny resume must run to a verdict, got {resumed:?}"
         );
         assert!(
-            verifier.seen.lock().unwrap().len() >= 1,
+            !verifier.seen.lock().unwrap().is_empty(),
             "SelfVerifying frame must be re-entered on a DENY resume so the \
              eval-phase verifier runs"
         );
@@ -19739,7 +19967,7 @@ mod tests {
             "clarification resume must run to a verdict, got {resumed:?}"
         );
         assert!(
-            verifier.seen.lock().unwrap().len() >= 1,
+            !verifier.seen.lock().unwrap().is_empty(),
             "SelfVerifying frame must be re-entered on a clarification resume so \
              the eval-phase verifier runs"
         );
