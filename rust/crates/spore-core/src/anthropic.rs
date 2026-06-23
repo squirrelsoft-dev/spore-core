@@ -50,6 +50,10 @@ pub struct AnthropicModelInterface {
     base_url: String,
     timeout: Duration,
     max_retries: u32,
+    /// Explicit override for the window reported by [`provider`](ModelInterface::provider)
+    /// (SC-6). `None` defers to the static [`context_window`](Self::context_window)
+    /// table; `Some(n)` pins it (e.g. a newer model the table predates).
+    context_window_override: Option<u32>,
     http_client: Arc<reqwest::Client>,
 }
 
@@ -62,6 +66,7 @@ impl std::fmt::Debug for AnthropicModelInterface {
             .field("base_url", &self.base_url)
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
+            .field("context_window_override", &self.context_window_override)
             .finish()
     }
 }
@@ -86,6 +91,7 @@ impl AnthropicModelInterface {
             base_url: Self::DEFAULT_BASE_URL.into(),
             timeout: Self::DEFAULT_TIMEOUT,
             max_retries: Self::DEFAULT_MAX_RETRIES,
+            context_window_override: None,
             http_client: Arc::new(reqwest::Client::new()),
         }
     }
@@ -118,6 +124,17 @@ impl AnthropicModelInterface {
 
     pub fn with_max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
+        self
+    }
+
+    /// Override the window reported by [`provider`](ModelInterface::provider)
+    /// (SC-6 / SC-4): the value the harness's compaction budget sizes itself to
+    /// (via the context manager's `resolve_context_length`, issue #141). Use it
+    /// to pin the window for a model the static table predates. Anthropic has no
+    /// `num_ctx`-style knob — the API always serves the model's full window — so
+    /// this affects reporting (and thus the compaction budget) only.
+    pub fn with_context_window(mut self, n: u32) -> Self {
+        self.context_window_override = Some(n);
         self
     }
 
@@ -575,7 +592,10 @@ impl ModelInterface for AnthropicModelInterface {
         ProviderInfo {
             name: "anthropic".into(),
             model_id: self.model_id.clone(),
-            context_window: Self::context_window(&self.model_id),
+            // SC-6: an explicit override wins over the static table.
+            context_window: self
+                .context_window_override
+                .unwrap_or_else(|| Self::context_window(&self.model_id)),
         }
     }
 }
@@ -948,6 +968,24 @@ mod tests {
         assert_eq!(p.name, "anthropic");
         assert_eq!(p.model_id, "claude-sonnet-4-6");
         assert_eq!(p.context_window, 200_000);
+    }
+
+    #[test]
+    fn with_context_window_overrides_reported_window() {
+        // SC-6: an unrecognized id normally reports 0; the override pins it,
+        // so the harness's compaction budget sizes correctly.
+        let bare = AnthropicModelInterface::new("test-key", "claude-imaginary-9");
+        assert_eq!(bare.provider().context_window, 200_000);
+        let pinned =
+            AnthropicModelInterface::new("test-key", "some-proxy-model").with_context_window(500_000);
+        assert_eq!(pinned.provider().context_window, 500_000);
+        // A bare foreign id still reports 0 (callers can detect "unknown").
+        assert_eq!(
+            AnthropicModelInterface::new("k", "some-proxy-model")
+                .provider()
+                .context_window,
+            0
+        );
     }
 
     // ── from_env ────────────────────────────────────────────────────────────

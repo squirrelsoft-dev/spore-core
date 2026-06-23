@@ -68,7 +68,8 @@ pub use context::{
     SessionState as ContextSessionState, StandardContextManager, DEFAULT_CONTEXT_LENGTH,
 };
 pub use execution_registry::{
-    EscalationMode, ExecutionRegistry, ExecutionRegistryBuilder, StrategyResolution,
+    AutoGrantInfo, EscalationMode, ExecutionRegistry, ExecutionRegistryBuilder, GrantCallback,
+    StrategyResolution,
 };
 pub use guide_registry::{
     Guide, GuideConflict, GuideId, GuideQuery, GuideRegistry, GuideRegistryError, GuideSource,
@@ -129,7 +130,7 @@ pub use observability::{
 };
 pub use observability_outbox::{OutboxConfig, OutboxObservabilityProvider, TraceLine};
 pub use ollama::OllamaModelInterface;
-pub use openai::OpenAIModelInterface;
+pub use openai::{OpenAICompat, OpenAIModelInterface};
 // `PlanArtifact` is re-exported via `hooks` above (it is the `OnPlanCreated`
 // payload); `plan` reuses that type and adds the capture step + phase error.
 pub use plan::{capture_plan_artifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};

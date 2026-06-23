@@ -62,23 +62,84 @@ use crate::harness::{
 use crate::metric::MetricEvaluator;
 use crate::verifier::Verifier;
 
+/// Details handed to an [`EscalationMode::AutoContinue`] `on_grant` callback each
+/// time the harness auto-grants more budget at an escalation point (SC-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoGrantInfo {
+    /// 1-based index of this grant within the exhausted scope (`1..=max_grants`).
+    pub grant_number: u32,
+    /// Steps granted this round (the mode's `steps_per_grant`).
+    pub steps_granted: u32,
+    /// The budget scope phase that exhausted (e.g. `"react"`, `"plan_execute"`).
+    pub phase: String,
+}
+
+/// Callback fired once per [`EscalationMode::AutoContinue`] grant (SC-5). Runtime
+/// only — never serialized. Lets a consumer (e.g. looper's governor) observe each
+/// auto-grant without owning the keep-working loop itself.
+pub type GrantCallback = std::sync::Arc<dyn Fn(AutoGrantInfo) + Send + Sync>;
+
 /// HITL-vs-AFK escalation knob (PRD goal #7: local vs. prod differ only by
-/// config). Selects whether budget escalation surfaces to a human or proceeds
-/// autonomously. Stored on `HarnessConfig` this slice; consumed in #130.
+/// config). Selects what budget escalation does: surface to a human, fail
+/// autonomously, or keep working under an auto-granted cap (SC-5). Stored on
+/// `HarnessConfig`; consumed at every `Escalate` resolution site (#130, SC-5).
 ///
 /// No `Default` impl by design — mirrors the budget-types discipline
 /// (`BudgetExhaustedBehavior` has none). The `HarnessBuilder` picks an explicit
 /// default ([`EscalationMode::SurfaceToHuman`]).
 ///
 /// Has serde derives for symmetry with the other harness enums, but it is NOT
-/// placed on the serialized `Task`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// placed on the serialized `Task` (no fixture). The [`AutoContinue::on_grant`]
+/// callback is `#[serde(skip)]` (a trait object can't serialize) — so the mode is
+/// no longer `Copy`/`Eq` and carries a hand-rolled `Debug`.
+///
+/// [`AutoContinue::on_grant`]: EscalationMode::AutoContinue
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EscalationMode {
     /// Budget escalation pauses and surfaces to a human (HITL).
     SurfaceToHuman,
-    /// Budget escalation proceeds autonomously (AFK / prod).
+    /// Budget escalation fails the run autonomously (AFK / prod): the partial is
+    /// propagated and the run stops.
     Autonomous,
+    /// "Autonomous but capped" (SC-5): at an escalation point, auto-grant
+    /// `steps_per_grant` more steps and KEEP WORKING in-process, up to
+    /// `max_grants` times, firing `on_grant` per grant. Once the grants are spent
+    /// it falls through to the same terminal as [`Autonomous`](Self::Autonomous).
+    /// This is the keep-working-to-completion-but-cap-at-N policy consumers
+    /// otherwise hand-roll around the harness.
+    AutoContinue {
+        /// Maximum number of auto-grants per exhausted scope before falling
+        /// through to the autonomous terminal. `0` behaves like
+        /// [`Autonomous`](Self::Autonomous) (no grants).
+        max_grants: u32,
+        /// Steps granted each time. A grant raises the exhausted scope's cap to
+        /// `steps_taken + steps_per_grant` so the loop gets exactly this many more
+        /// steps after the exhaustion point.
+        steps_per_grant: u32,
+        /// Optional per-grant observer (runtime only; not serialized).
+        #[serde(skip)]
+        on_grant: Option<GrantCallback>,
+    },
+}
+
+impl std::fmt::Debug for EscalationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EscalationMode::SurfaceToHuman => f.write_str("SurfaceToHuman"),
+            EscalationMode::Autonomous => f.write_str("Autonomous"),
+            EscalationMode::AutoContinue {
+                max_grants,
+                steps_per_grant,
+                on_grant,
+            } => f
+                .debug_struct("AutoContinue")
+                .field("max_grants", max_grants)
+                .field("steps_per_grant", steps_per_grant)
+                .field("on_grant", &on_grant.as_ref().map(|_| "<callback>"))
+                .finish(),
+        }
+    }
 }
 
 /// The result of resolving a [`StrategyRef`] against an [`ExecutionRegistry`]:

@@ -113,6 +113,14 @@ pub struct OllamaModelInterface {
     /// [`with_num_ctx`](Self::with_num_ctx). Like `keep_alive`, this is a
     /// model-loading setting, not a per-turn sampling param.
     num_ctx: Option<u32>,
+    /// Explicit override for the window REPORTED by [`provider`](ModelInterface::provider)
+    /// (SC-6). `None` (the default) defers to the `/api/show`-discovered length,
+    /// then the static [`context_window`](Self::context_window) table. When set it
+    /// is the highest authority — a caller that knows the real window can pin it
+    /// without waiting on (or contradicting) discovery. [`with_context_window`](Self::with_context_window)
+    /// sets this AND `num_ctx` together so the harness's compaction budget and the
+    /// window Ollama actually loads agree (SC-4).
+    context_window_override: Option<u32>,
     http_client: Arc<reqwest::Client>,
     /// Lazily set after the first availability + discovery probe. Holds the
     /// `/api/show`-discovered metadata (context length + capabilities); empty
@@ -153,6 +161,7 @@ impl std::fmt::Debug for OllamaModelInterface {
             .field("timeout", &self.timeout)
             .field("keep_alive", &self.keep_alive)
             .field("num_ctx", &self.num_ctx)
+            .field("context_window_override", &self.context_window_override)
             .finish()
     }
 }
@@ -169,6 +178,7 @@ impl OllamaModelInterface {
             timeout: Self::DEFAULT_TIMEOUT,
             keep_alive: Some(Self::DEFAULT_KEEP_ALIVE.into()),
             num_ctx: None,
+            context_window_override: None,
             http_client: Arc::new(Self::default_http_client()),
             model_checked: Arc::new(OnceCell::new()),
         }
@@ -222,6 +232,29 @@ impl OllamaModelInterface {
     /// the model to use, not an arbitrary maximum.
     pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
         self.num_ctx = Some(num_ctx);
+        self
+    }
+
+    /// Set the model's context window in ONE call (SC-4) — the friendly setter
+    /// that resolves the discovery/enforcement split this module documents.
+    ///
+    /// It does two things at once:
+    /// 1. sets `num_ctx` (so Ollama loads the model at window `n` instead of its
+    ///    small server default and stops silently truncating longer prompts), and
+    /// 2. sets the window REPORTED by [`provider`](ModelInterface::provider) to `n`
+    ///    (so the harness's compaction budget — which reads
+    ///    `provider().context_window` via the context manager's
+    ///    `resolve_context_length`, issue #141 — sizes itself to the SAME window
+    ///    the model actually sees).
+    ///
+    /// Without this, a caller had to call [`with_num_ctx`](Self::with_num_ctx) AND
+    /// separately keep the harness's compaction window in sync, or the harness
+    /// would manage a large budget while Ollama truncated at its default (looper's
+    /// `num_ctx` drift). `num_ctx` sizes Ollama's KV-cache allocation at load
+    /// time, so pass the window you actually want — not an arbitrary maximum.
+    pub fn with_context_window(mut self, n: u32) -> Self {
+        self.num_ctx = Some(n);
+        self.context_window_override = Some(n);
         self
     }
 
@@ -1000,13 +1033,13 @@ impl ModelInterface for OllamaModelInterface {
     }
 
     fn provider(&self) -> ProviderInfo {
-        // `provider()` is synchronous, so it cannot await `/api/show`. Read the
-        // probe cache non-blockingly: prefer a discovered context length if the
-        // probe has already run; otherwise fall back to the static table.
+        // `provider()` is synchronous, so it cannot await `/api/show`. Resolve the
+        // reported window by precedence (SC-6): an explicit caller override wins;
+        // else a discovered context length if the probe has already run; else the
+        // static table.
         let context_window = self
-            .model_checked
-            .get()
-            .and_then(|m| m.context_length)
+            .context_window_override
+            .or_else(|| self.model_checked.get().and_then(|m| m.context_length))
             .unwrap_or_else(|| Self::context_window(&self.model_id));
         ProviderInfo {
             name: "ollama".into(),
@@ -1421,6 +1454,56 @@ mod tests {
         assert_eq!(c.num_ctx, None);
         let c = c.with_num_ctx(256_000);
         assert_eq!(c.num_ctx, Some(256_000));
+    }
+
+    #[test]
+    fn with_context_window_sets_both_num_ctx_and_reported_window() {
+        // SC-4: ONE call fans out to the model-loading knob (`num_ctx`) AND the
+        // window REPORTED to the harness's compaction budget (`provider()`).
+        let c = OllamaModelInterface::new("gemma3:4b").with_context_window(256_000);
+        assert_eq!(c.num_ctx, Some(256_000), "num_ctx: what Ollama loads");
+        assert_eq!(
+            c.provider().context_window,
+            256_000,
+            "reported window: what compaction sizes to"
+        );
+    }
+
+    #[test]
+    fn context_window_override_beats_static_table() {
+        // SC-6: `gemma*` statically reports 8_192; the explicit override wins.
+        assert_eq!(OllamaModelInterface::context_window("gemma3:4b"), 8_192);
+        let c = OllamaModelInterface::new("gemma3:4b").with_context_window(128_000);
+        assert_eq!(c.provider().context_window, 128_000);
+        // No override → the static table still governs.
+        let bare = OllamaModelInterface::new("gemma3:4b");
+        assert_eq!(bare.provider().context_window, 8_192);
+    }
+
+    #[test]
+    fn with_context_window_fans_out_to_compaction_budget() {
+        use crate::cache_provider::NullCacheProvider;
+        use crate::context::{CompactionConfig, StandardContextManager};
+        use crate::harness::{SessionId, TaskId};
+        // SC-4 acceptance: the reported window flows through the context
+        // manager's #141 resolve chain into the seeded `window_limit` — the
+        // compaction budget — with no separate CompactionConfig setting.
+        let model = Arc::new(OllamaModelInterface::new("gemma3:4b").with_context_window(256_000));
+        let mgr = StandardContextManager::new(
+            model,
+            Arc::new(NullCacheProvider),
+            CompactionConfig::default(), // context_length: None → falls to provider window
+        );
+        assert_eq!(mgr.resolve_context_length(), 256_000);
+        let state = mgr.seed_session(
+            SessionId::new("s"),
+            TaskId::new("t"),
+            "do the thing",
+        );
+        assert_eq!(
+            state.window_limit, 256_000,
+            "200K conversation won't compact prematurely at 80% of 256K"
+        );
     }
 
     #[test]

@@ -142,7 +142,7 @@ use crate::context::{
     CompactionPreserveHints, CompactionVerifier, ContextError, KeyTermVerifier,
     SessionState as ContextSessionState,
 };
-use crate::execution_registry::{EscalationMode, ExecutionRegistry};
+use crate::execution_registry::{AutoGrantInfo, EscalationMode, ExecutionRegistry};
 use crate::guide_registry::SessionOutcome;
 use crate::memory::Timestamp;
 use crate::model::{
@@ -850,6 +850,10 @@ pub struct BudgetContext {
     pub steps_taken: u32,
     pub continues_used: u32,
     pub phase: String,
+    /// In-process auto-grants spent at this scope's escalation point under
+    /// [`EscalationMode::AutoContinue`] (SC-5). Bounded by the mode's
+    /// `max_grants`. Runtime-only, like `continues_used`; never serialized.
+    pub auto_grants_used: u32,
 }
 
 impl BudgetContext {
@@ -865,6 +869,7 @@ impl BudgetContext {
             steps_taken: 0,
             continues_used: 0,
             phase: phase.into(),
+            auto_grants_used: 0,
         }
     }
 
@@ -888,6 +893,7 @@ impl BudgetContext {
             steps_taken: 0,
             continues_used,
             phase: phase.into(),
+            auto_grants_used: 0,
         }
     }
 
@@ -944,6 +950,26 @@ impl BudgetContext {
     pub fn consume_continue(&mut self) {
         self.continues_used = self.continues_used.saturating_add(1);
         self.steps_taken = 0;
+    }
+
+    /// Grant one in-process AUTO-continue at this scope's escalation point
+    /// (SC-5, [`EscalationMode::AutoContinue`]): bump `auto_grants_used` and raise
+    /// the scope's cap to `steps_taken + steps_per_grant` so the loop gets exactly
+    /// `steps_per_grant` more steps after the exhaustion point (mirrors a human
+    /// `ContinueWithBudget { steps }` grant, applied automatically). `Unlimited`
+    /// never reaches here. Unlike [`consume_continue`](Self::consume_continue) this
+    /// does NOT rewind `steps_taken` — the cap moves up instead, so the grant is a
+    /// strict, additive `steps_per_grant`.
+    pub fn grant_auto_continue(&mut self, steps_per_grant: u32) {
+        self.auto_grants_used = self.auto_grants_used.saturating_add(1);
+        let granted = self.steps_taken.saturating_add(steps_per_grant);
+        grant_budget_policy(&mut self.policy, granted);
+    }
+
+    /// Auto-grants still available before falling through to the autonomous
+    /// terminal, given the mode's `max_grants` (SC-5). `0` once spent.
+    pub fn auto_grants_remaining(&self, max_grants: u32) -> u32 {
+        max_grants.saturating_sub(self.auto_grants_used)
     }
 
     /// Resolve this scope's [`BudgetExhaustedBehavior`] at the moment of
@@ -1281,13 +1307,16 @@ pub trait StrategyExecutor: Send + Sync {
     /// The configured sandbox workspace root (#124, for `VerifierInput`).
     fn workspace_root(&self) -> std::path::PathBuf;
 
-    /// The configured HITL-vs-AFK escalation knob (#130). The `*Config::run`
+    /// The configured HITL-vs-AFK escalation knob (#130, SC-5). The `*Config::run`
     /// bodies only hold `&dyn StrategyExecutor`, so they consult the
     /// [`EscalationMode`] through this accessor at each
     /// [`ExhaustedResolution::Escalate`] site: `SurfaceToHuman` pauses with a
     /// [`HumanRequest::BudgetExhausted`]; `Autonomous` keeps the existing
-    /// propagate-up behavior. Mirrors [`ralph_max_resets`](Self::ralph_max_resets)
-    /// / [`workspace_root`](Self::workspace_root).
+    /// propagate-up behavior; `AutoContinue` auto-grants in-process (via
+    /// [`ExecutionContext::try_auto_continue`]) up to its cap, then falls through
+    /// to the `Autonomous` terminal. Mirrors
+    /// [`ralph_max_resets`](Self::ralph_max_resets) /
+    /// [`workspace_root`](Self::workspace_root).
     fn escalation_mode(&self) -> EscalationMode;
 
     /// The output-schema enforcement MIGRATION GATE (issue #139). `false` (the
@@ -2197,10 +2226,20 @@ impl RunStrategy for PlanExecuteConfig {
                         // a `BudgetExhausted` request via the `terminal_override`
                         // seam instead of propagating up.
                         ExhaustedResolution::Escalate => {
-                            let surface = matches!(
-                                executor.escalation_mode(),
-                                EscalationMode::SurfaceToHuman
-                            );
+                            let mode = executor.escalation_mode();
+                            // SC-5: AutoContinue auto-grants this scope in-process
+                            // (bounded by `max_grants`, fires `on_grant`) and
+                            // re-walks the ready set — mirroring the `Continue` arm
+                            // above. Once grants are spent it falls through to the
+                            // surface/abort handling below.
+                            if cx.try_auto_continue(&mode) {
+                                let _ =
+                                    task_list.update(task_id, Some(TaskStatus::Pending), None);
+                                executor.persist_task_list(&session_id, &task_list).await;
+                                continue;
+                            }
+                            let surface =
+                                matches!(mode, EscalationMode::SurfaceToHuman);
                             // #138 AC2-b: under SurfaceToHuman the task is NOT
                             // permanently failed — it pauses awaiting a budget grant.
                             // Leave it `InProgress` (the consult path's invariant) so
@@ -2310,6 +2349,13 @@ impl RunStrategy for PlanExecuteConfig {
                             // keeps scheduling the remaining ready tasks IN-PROCESS
                             // (this step already completed). NO serialization (AC3).
                             if matches!(resolution, ExhaustedResolution::Continue) {
+                                continue;
+                            }
+                            // SC-5: AutoContinue auto-grants in-process at this
+                            // Escalate point (scope still pushed) before surfacing.
+                            if matches!(resolution, ExhaustedResolution::Escalate)
+                                && cx.try_auto_continue(&executor.escalation_mode())
+                            {
                                 continue;
                             }
                             let partial = plan_execute_partial_json(&task_list);
@@ -2650,6 +2696,13 @@ impl RunStrategy for SelfVerifyingConfig {
                     if matches!(resolution, ExhaustedResolution::Continue) {
                         continue;
                     }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
+                        continue;
+                    }
                     cx.pop_budget();
                     cx.scratch.task = Some(task.clone());
                     cx.stream = on_stream;
@@ -2716,6 +2769,13 @@ impl RunStrategy for SelfVerifyingConfig {
                     // A granted `Continue` resets the scope and re-runs the
                     // build↔evaluate iteration in-process (mirrors the build path).
                     if matches!(resolution, ExhaustedResolution::Continue) {
+                        continue;
+                    }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
                         continue;
                     }
                     cx.pop_budget();
@@ -3106,6 +3166,13 @@ impl RunStrategy for HillClimbingConfig {
                     if matches!(resolution, ExhaustedResolution::Continue) {
                         continue;
                     }
+                    // SC-5: AutoContinue auto-grants in-process at this Escalate
+                    // point (scope still pushed) before surfacing/aborting.
+                    if matches!(resolution, ExhaustedResolution::Escalate)
+                        && cx.try_auto_continue(&executor.escalation_mode())
+                    {
+                        continue;
+                    }
                     executor.hill_write_tsv(&task_id, &rows).await;
                     let partial = hill_climbing_partial_json(current_best);
                     cx.pop_budget();
@@ -3413,6 +3480,40 @@ impl ExecutionContext<'_> {
             Some(scope) => scope.resolve_exhausted(),
             None => ExhaustedResolution::Fail,
         }
+    }
+
+    /// SC-5: attempt one [`EscalationMode::AutoContinue`] auto-grant at the
+    /// CURRENT scope. Returns `true` when the mode is `AutoContinue`, grants
+    /// remain (`auto_grants_used < max_grants`), and the scope was refreshed with
+    /// `steps_per_grant` more steps — the caller should then `continue` its loop
+    /// IN-PROCESS (the scope is still on the stack). Fires `on_grant` for the
+    /// grant. Returns `false` for any other mode, when grants are spent, or when
+    /// there is no current scope — the caller then falls through to its existing
+    /// pause (`SurfaceToHuman`) / abort (`Autonomous`) handling.
+    pub fn try_auto_continue(&mut self, mode: &EscalationMode) -> bool {
+        let EscalationMode::AutoContinue {
+            max_grants,
+            steps_per_grant,
+            on_grant,
+        } = mode
+        else {
+            return false;
+        };
+        let Some(scope) = self.budgets.current_mut() else {
+            return false;
+        };
+        if scope.auto_grants_remaining(*max_grants) == 0 {
+            return false;
+        }
+        scope.grant_auto_continue(*steps_per_grant);
+        if let Some(cb) = on_grant {
+            cb(AutoGrantInfo {
+                grant_number: scope.auto_grants_used,
+                steps_granted: *steps_per_grant,
+                phase: scope.phase.clone(),
+            });
+        }
+        true
     }
 }
 
@@ -6321,7 +6422,7 @@ impl Clone for HarnessConfig {
             prompt_tool_call_flag: self.prompt_tool_call_flag.clone(),
             consult_handlers: self.consult_handlers.clone(),
             registry: self.registry.clone(),
-            escalation_mode: self.escalation_mode,
+            escalation_mode: self.escalation_mode.clone(),
         }
     }
 }
@@ -6610,9 +6711,13 @@ impl HarnessBuilder {
 
     /// Override the [`ContextManager`] that assembles per-turn context and drives
     /// compaction. `conversational` installs a `StandardContextManager` with
-    /// `CompactionConfig::default()` (compaction at 80% of a 200K window); supply
-    /// your own (e.g. a lower `threshold`) to make compaction fire earlier for
-    /// models with a smaller context window.
+    /// `CompactionConfig::default()` — compaction fires at 80% of the *resolved*
+    /// context window, which (issue #141) is the configured
+    /// `CompactionConfig::context_length`, else the model's
+    /// `provider().context_window`, else `DEFAULT_CONTEXT_LENGTH` (8K). Size the
+    /// model's window in one call with the provider's `with_context_window`
+    /// (SC-4); supply your own manager here (e.g. a lower `threshold`) to make
+    /// compaction fire earlier.
     pub fn context_manager(mut self, context_manager: Arc<dyn ContextManager>) -> Self {
         self.context_manager = context_manager;
         self
@@ -10457,7 +10562,9 @@ impl StrategyExecutor for StandardHarness {
     }
 
     fn escalation_mode(&self) -> EscalationMode {
-        self.config.escalation_mode
+        // No longer `Copy` (SC-5's `AutoContinue` holds an `Arc` callback); clone
+        // out — the callback is refcounted, so this is cheap.
+        self.config.escalation_mode.clone()
     }
 
     fn enforce_output_schemas(&self) -> bool {
@@ -11111,6 +11218,11 @@ impl StandardHarness {
         // #131/#138: the resume seed is consumed by the FIRST round's
         // PlanExecute walk only; later in-process rounds run normally.
         let mut resume_seed = resume_seed;
+        // SC-5: auto-grants spent at the BARE-LEAF Escalate site under
+        // `EscalationMode::AutoContinue`. The scope is rebuilt each round here
+        // (unlike the in-loop combinator scopes, which carry their own
+        // `auto_grants_used`), so the counter lives across rounds in this local.
+        let mut auto_grants_used: u32 = 0;
 
         loop {
             let mut cx = ExecutionContext::new(&self.config.registry);
@@ -11226,6 +11338,37 @@ impl StandardHarness {
                             continue;
                         }
                         ExhaustedResolution::Escalate => {
+                            // SC-5: AutoContinue auto-grants `steps_per_grant` more
+                            // steps and re-drives IN-PROCESS (mirroring the
+                            // `Continue` arm above), up to `max_grants` times,
+                            // firing `on_grant` per grant. This is the bare-leaf /
+                            // top-level keep-working-but-capped site — where
+                            // consumers otherwise hand-roll a drive loop. Once the
+                            // grants are spent it falls through to the
+                            // surface/abort handling below (the `Autonomous`
+                            // terminal).
+                            if let EscalationMode::AutoContinue {
+                                max_grants,
+                                steps_per_grant,
+                                on_grant,
+                            } = &self.config.escalation_mode
+                            {
+                                if auto_grants_used < *max_grants {
+                                    auto_grants_used += 1;
+                                    if let Some(cb) = on_grant {
+                                        cb(AutoGrantInfo {
+                                            grant_number: auto_grants_used,
+                                            steps_granted: *steps_per_grant,
+                                            phase: phase.clone(),
+                                        });
+                                    }
+                                    let granted = steps_taken.saturating_add(*steps_per_grant);
+                                    grant_task_budget(&mut task, granted);
+                                    session_state = std::mem::take(&mut cx.scratch.run_session);
+                                    budget_used = cx.scratch.run_budget.clone();
+                                    continue;
+                                }
+                            }
                             if matches!(self.config.escalation_mode, EscalationMode::SurfaceToHuman)
                             {
                                 let err = BudgetExhausted {
@@ -13601,13 +13744,16 @@ mod tests {
     fn escalation_mode_is_selectable_and_readable_on_config() {
         // Default is SurfaceToHuman.
         let cfg = catalogue_builder(make_agent()).build_config();
-        assert_eq!(cfg.escalation_mode, EscalationMode::SurfaceToHuman);
+        assert!(matches!(
+            cfg.escalation_mode,
+            EscalationMode::SurfaceToHuman
+        ));
 
         // And the builder setter overrides it.
         let cfg = catalogue_builder(make_agent())
             .escalation_mode(EscalationMode::Autonomous)
             .build_config();
-        assert_eq!(cfg.escalation_mode, EscalationMode::Autonomous);
+        assert!(matches!(cfg.escalation_mode, EscalationMode::Autonomous));
     }
 
     #[test]
@@ -22076,9 +22222,12 @@ mod tests {
     #[test]
     fn standard_harness_escalation_mode_accessor_reflects_config() {
         let h = StandardHarness::new(surface_config(make_agent()));
-        assert_eq!(h.escalation_mode(), EscalationMode::SurfaceToHuman);
+        assert!(matches!(
+            h.escalation_mode(),
+            EscalationMode::SurfaceToHuman
+        ));
         let h = StandardHarness::new(standard_config(make_agent()));
-        assert_eq!(h.escalation_mode(), EscalationMode::Autonomous);
+        assert!(matches!(h.escalation_mode(), EscalationMode::Autonomous));
     }
 
     // ── helper: a bare ReAct leaf whose cap is binding (drives a pause) ───────
@@ -23015,6 +23164,124 @@ mod tests {
             }
             other => panic!("expected Success via in-process Continue, got {other:?}"),
         }
+    }
+
+    /// SC-5 acceptance: `EscalationMode::AutoContinue` keeps a budget-exhausted
+    /// bare ReAct leaf working IN-PROCESS — no consumer drive loop — by
+    /// auto-granting `steps_per_grant` more steps at the Escalate fall-through,
+    /// firing `on_grant` per grant, until the worker completes. Same shape as the
+    /// `Continue`-behavior test above, but the grant comes from the *escalation
+    /// mode*, not the leaf's `behavior` (which is `Escalate`).
+    #[tokio::test]
+    async fn auto_continue_grants_in_process_then_completes() {
+        let a = make_agent();
+        // First window: 2 tool turns exhaust the PerLoop{2} cap → Escalate.
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c0".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        a.push(TurnResult::ToolCallRequested {
+            reasoning: None,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "x".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: usage(),
+        });
+        // After one auto-grant refreshes the cap, the worker completes.
+        a.push(TurnResult::FinalResponse {
+            reasoning: None,
+            content: "done after auto-continue".into(),
+            usage: usage(),
+        });
+
+        let grants = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let g2 = grants.clone();
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tool_reg(3);
+        cfg.escalation_mode = EscalationMode::AutoContinue {
+            max_grants: 3,
+            steps_per_grant: 2,
+            on_grant: Some(Arc::new(move |info: AutoGrantInfo| {
+                assert_eq!(info.steps_granted, 2);
+                g2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        };
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 2 },
+            behavior: BudgetExhaustedBehavior::Escalate,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { output, .. } => {
+                assert_eq!(output, "done after auto-continue");
+            }
+            other => panic!("expected Success via AutoContinue, got {other:?}"),
+        }
+        assert_eq!(
+            grants.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one auto-grant was needed to finish"
+        );
+    }
+
+    /// SC-5: AutoContinue is CAPPED — once `max_grants` grants are spent it falls
+    /// through to the autonomous terminal (Failure), firing `on_grant` exactly
+    /// `max_grants` times. The agent never emits a final response, so every window
+    /// exhausts.
+    #[tokio::test]
+    async fn auto_continue_caps_at_max_grants_then_fails() {
+        let a = make_agent();
+        // Plenty of tool turns (far more than any window can consume) so the run
+        // only ends when the grant cap is reached — never on an empty queue.
+        for i in 0..40 {
+            a.push(TurnResult::ToolCallRequested {
+                reasoning: None,
+                calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "x".into(),
+                    input: serde_json::json!({}),
+                }],
+                usage: usage(),
+            });
+        }
+        let grants = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let g2 = grants.clone();
+        let mut cfg = standard_config(a);
+        cfg.tool_registry = tool_reg(80);
+        cfg.escalation_mode = EscalationMode::AutoContinue {
+            max_grants: 2,
+            steps_per_grant: 2,
+            on_grant: Some(Arc::new(move |_| {
+                g2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        };
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::ReAct(ReactConfig {
+            budget: BudgetPolicy::PerLoop { value: 2 },
+            behavior: BudgetExhaustedBehavior::Escalate,
+            agent: AgentRef(String::new()),
+            toolset: ToolsetRef(String::new()),
+            output: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Failure { .. } => {}
+            other => panic!("expected Failure once grants are spent, got {other:?}"),
+        }
+        assert_eq!(
+            grants.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly max_grants auto-grants fired before falling through to Failure"
+        );
     }
 
     /// AC4: a Continue resume PRESERVES the prior `session_state.messages` (the
@@ -24511,5 +24778,72 @@ mod budget_enforcement_tests {
         let mut cx = ExecutionContext::new(&registry);
         assert!(cx.charge_current(u32::MAX).is_ok());
         assert_eq!(cx.resolve_current(), ExhaustedResolution::Fail);
+    }
+
+    // ── SC-5: AutoContinue grant mechanics ───────────────────────────────────
+
+    #[test]
+    fn grant_auto_continue_is_additive_and_counted() {
+        // The grant raises the scope cap to `steps_taken + steps_per_grant`
+        // (additive, NO `steps_taken` rewind), so the loop gets exactly
+        // `steps_per_grant` more steps — distinct from `consume_continue`.
+        let mut scope = BudgetContext::new(
+            BudgetPolicy::PerLoop { value: 2 },
+            BudgetExhaustedBehavior::Escalate,
+            "react",
+        );
+        scope.charge(2).unwrap();
+        assert!(scope.charge(1).is_err(), "exhausts at the cap");
+        assert_eq!(scope.auto_grants_remaining(3), 3);
+        scope.grant_auto_continue(2); // cap → steps_taken(2) + 2 = 4
+        assert_eq!(scope.auto_grants_used, 1);
+        assert_eq!(scope.auto_grants_remaining(3), 2);
+        assert!(scope.charge(2).is_ok(), "two more steps fit after the grant");
+        assert!(scope.charge(1).is_err(), "and it exhausts again at the raised cap");
+    }
+
+    #[test]
+    fn try_auto_continue_grants_until_capped_then_false() {
+        let registry = crate::execution_registry::ExecutionRegistry::empty();
+        let mut cx = ExecutionContext::new(&registry);
+        cx.push_budget(
+            BudgetPolicy::PerLoop { value: 2 },
+            BudgetExhaustedBehavior::Escalate,
+            "react",
+        );
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        let mode = EscalationMode::AutoContinue {
+            max_grants: 2,
+            steps_per_grant: 2,
+            on_grant: Some(Arc::new(move |info: AutoGrantInfo| {
+                assert_eq!(info.steps_granted, 2);
+                assert_eq!(info.phase, "react");
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        };
+
+        assert!(cx.charge_current(2).is_ok());
+        assert!(cx.charge_current(1).is_err());
+        assert!(cx.try_auto_continue(&mode), "grant 1");
+        assert!(cx.charge_current(2).is_ok(), "two more steps after grant 1");
+        assert!(cx.charge_current(1).is_err());
+        assert!(cx.try_auto_continue(&mode), "grant 2");
+        assert!(
+            !cx.try_auto_continue(&mode),
+            "grants spent (max_grants = 2) → falls through to the autonomous terminal"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Other modes never auto-continue.
+        assert!(!cx.try_auto_continue(&EscalationMode::Autonomous));
+        assert!(!cx.try_auto_continue(&EscalationMode::SurfaceToHuman));
+        // max_grants = 0 behaves like Autonomous (no grant).
+        assert!(!cx.try_auto_continue(&EscalationMode::AutoContinue {
+            max_grants: 0,
+            steps_per_grant: 5,
+            on_grant: None,
+        }));
     }
 }

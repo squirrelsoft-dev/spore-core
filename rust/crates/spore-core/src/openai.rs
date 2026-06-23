@@ -15,7 +15,10 @@
 //!   and a `tool_call_id` linking back to the call.
 //! - Reasoning models (`o1`, `o3`, `o4*`) do not accept `temperature` and
 //!   replace `max_tokens` with `max_completion_tokens`. Detection is by
-//!   model-id prefix.
+//!   model-id prefix, overridable via [`OpenAICompat`] / [`with_compat`]
+//!   ([`OpenAIModelInterface::with_compat`]) for models the prefix heuristic
+//!   does not recognize — also the vehicle for the `developer` role and the
+//!   `reasoning_effort` request field (SC-27).
 //! - Streaming SSE chunks contain `delta.content` (text), `delta.tool_calls`
 //!   (partial tool calls indexed and accumulated across chunks), and end with
 //!   a literal `data: [DONE]` line. The final usage block only appears when
@@ -43,12 +46,45 @@ use crate::model::{
 // OpenAIModelInterface
 // ============================================================================
 
+/// Capability declarations that BEAT OpenAI's id-prefix heuristics (SC-27).
+///
+/// The built-in [`is_reasoning_model`](OpenAIModelInterface::is_reasoning_model)
+/// check only recognizes the `o1`/`o3`/`o4` families. A model served behind an
+/// OpenAI-compatible endpoint (a local server, a renamed deployment, a newer
+/// family the heuristic predates) gets no way to declare that it wants
+/// reasoning-model request shaping. `OpenAICompat`, supplied via
+/// [`with_compat`](OpenAIModelInterface::with_compat), is that vehicle: every
+/// field is OR'd over the id heuristic, never subtracted from it, so the default
+/// (all `false`) leaves the recognized o-series behavior byte-identical.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenAICompat {
+    /// Treat this model as a reasoning model regardless of its id (beats the
+    /// `o1`/`o3`/`o4` heuristic): send `max_completion_tokens` instead of
+    /// `max_tokens` and drop `temperature`/`top_p`/`stop`, which reasoning models
+    /// reject.
+    pub reasoning_model: bool,
+    /// Route the system message to the `developer` role instead of `system` —
+    /// OpenAI's reasoning-model convention, which some compatible servers require.
+    pub developer_role: bool,
+    /// Emit a `reasoning_effort` field carrying
+    /// [`ModelParams::reasoning_effort`](crate::model::ModelParams::reasoning_effort)
+    /// (`"low"|"medium"|"high"|"max"`) when it is set. No-op when the caller
+    /// leaves `reasoning_effort` unset.
+    pub supports_reasoning_effort: bool,
+}
+
 pub struct OpenAIModelInterface {
     api_key: String,
     model_id: String,
     base_url: String,
     timeout: Duration,
     max_retries: u32,
+    /// Explicit override for the window reported by [`provider`](ModelInterface::provider)
+    /// (SC-6). `None` defers to the static [`context_window`](Self::context_window)
+    /// table; `Some(n)` pins it.
+    context_window_override: Option<u32>,
+    /// Capability declarations that override the id heuristics (SC-27).
+    compat: OpenAICompat,
     http_client: Arc<reqwest::Client>,
 }
 
@@ -60,6 +96,8 @@ impl std::fmt::Debug for OpenAIModelInterface {
             .field("base_url", &self.base_url)
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
+            .field("context_window_override", &self.context_window_override)
+            .field("compat", &self.compat)
             .finish()
     }
 }
@@ -76,6 +114,8 @@ impl OpenAIModelInterface {
             base_url: Self::DEFAULT_BASE_URL.into(),
             timeout: Self::DEFAULT_TIMEOUT,
             max_retries: Self::DEFAULT_MAX_RETRIES,
+            context_window_override: None,
+            compat: OpenAICompat::default(),
             http_client: Arc::new(reqwest::Client::new()),
         }
     }
@@ -106,6 +146,29 @@ impl OpenAIModelInterface {
 
     pub fn with_max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
+        self
+    }
+
+    /// Override the window reported by [`provider`](ModelInterface::provider)
+    /// (SC-6 / SC-4): the value the harness's compaction budget sizes itself to
+    /// (via the context manager's `resolve_context_length`, issue #141). Use it to
+    /// pin the window for a model the static table predates, or for a local
+    /// OpenAI-compatible deployment whose id the table does not recognize. OpenAI
+    /// has no `num_ctx`-style knob, so this affects reporting (and thus the
+    /// compaction budget) only.
+    pub fn with_context_window(mut self, n: u32) -> Self {
+        self.context_window_override = Some(n);
+        self
+    }
+
+    /// Declare model capabilities that BEAT the id-prefix heuristics (SC-27).
+    ///
+    /// See [`OpenAICompat`]. Use it for a reasoning model the `o1`/`o3`/`o4`
+    /// [`is_reasoning_model`](Self::is_reasoning_model) check does not recognize —
+    /// e.g. a local server or a renamed deployment — so the request still carries
+    /// the developer role, `max_completion_tokens`, and `reasoning_effort`.
+    pub fn with_compat(mut self, compat: OpenAICompat) -> Self {
+        self.compat = compat;
         self
     }
 
@@ -145,6 +208,12 @@ struct OpenAIRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    /// SC-27: `"low"|"medium"|"high"|"max"`, emitted only when the model is
+    /// treated as reasoning-capable AND `OpenAICompat.supports_reasoning_effort`
+    /// is set. Absent (skipped) otherwise, so non-reasoning requests stay
+    /// byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,8 +346,17 @@ struct OpenAIErrorInner {
 // Conversions
 // ============================================================================
 
-fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequest {
-    let messages: Vec<OpenAIMessage> = req.messages.iter().map(message_to_openai).collect();
+fn build_request(
+    model_id: &str,
+    req: &ModelRequest,
+    stream: bool,
+    compat: &OpenAICompat,
+) -> OpenAIRequest {
+    let messages: Vec<OpenAIMessage> = req
+        .messages
+        .iter()
+        .map(|m| message_to_openai(m, compat))
+        .collect();
 
     let tools: Vec<OpenAITool> = req
         .tools
@@ -293,7 +371,10 @@ fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequ
         })
         .collect();
 
-    let is_reasoning = OpenAIModelInterface::is_reasoning_model(model_id);
+    // SC-27: `OpenAICompat.reasoning_model` is OR'd OVER the id heuristic, so a
+    // model the `o1`/`o3`/`o4` prefix check misses still gets reasoning shaping.
+    let is_reasoning =
+        OpenAIModelInterface::is_reasoning_model(model_id) || compat.reasoning_model;
     let (max_tokens, max_completion_tokens) = if is_reasoning {
         (None, req.params.max_tokens)
     } else {
@@ -311,12 +392,21 @@ fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequ
     } else {
         (req.params.top_p, req.params.stop_sequences.clone())
     };
+    // SC-27: emit `reasoning_effort` only for a reasoning model whose compat
+    // opted in AND whose caller set an effort level. Absent otherwise so
+    // non-reasoning requests stay byte-identical.
+    let reasoning_effort = if is_reasoning && compat.supports_reasoning_effort {
+        req.params.reasoning_effort.map(reasoning_effort_str)
+    } else {
+        None
+    };
 
     OpenAIRequest {
         model: model_id.into(),
         messages,
         max_tokens,
         max_completion_tokens,
+        reasoning_effort,
         temperature,
         top_p,
         stop,
@@ -332,8 +422,22 @@ fn build_request(model_id: &str, req: &ModelRequest, stream: bool) -> OpenAIRequ
     }
 }
 
-fn message_to_openai(m: &crate::model::Message) -> OpenAIMessage {
+/// SC-27: the OpenAI `reasoning_effort` wire string. Mirrors Ollama's `think`
+/// level mapping so the two providers agree on the level vocabulary.
+fn reasoning_effort_str(effort: crate::model::ReasoningEffort) -> &'static str {
+    use crate::model::ReasoningEffort::*;
+    match effort {
+        Low => "low",
+        Medium => "medium",
+        High => "high",
+        Max => "max",
+    }
+}
+
+fn message_to_openai(m: &crate::model::Message, compat: &OpenAICompat) -> OpenAIMessage {
     let role = match m.role {
+        // SC-27: reasoning models use the `developer` role for system content.
+        Role::System if compat.developer_role => "developer",
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -519,7 +623,7 @@ async fn map_status_error(resp: reqwest::Response) -> ModelError {
 impl ModelInterface for OpenAIModelInterface {
     fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, false);
+        let body = build_request(&self.model_id, &request, false, &self.compat);
         let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
         let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -552,7 +656,7 @@ impl ModelInterface for OpenAIModelInterface {
         request: ModelRequest,
     ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
         Box::pin(async move {
-        let body = build_request(&self.model_id, &request, true);
+        let body = build_request(&self.model_id, &request, true, &self.compat);
         let url = format!("{}/chat/completions", self.base_url);
         let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
             code: 0,
@@ -607,7 +711,10 @@ impl ModelInterface for OpenAIModelInterface {
         ProviderInfo {
             name: "openai".into(),
             model_id: self.model_id.clone(),
-            context_window: Self::context_window(&self.model_id),
+            // SC-6: an explicit override wins over the static table.
+            context_window: self
+                .context_window_override
+                .unwrap_or_else(|| Self::context_window(&self.model_id)),
         }
     }
 }
@@ -804,7 +911,7 @@ mod tests {
     #[test]
     fn build_request_keeps_system_in_messages() {
         let r = req(vec![sys("be helpful"), user("hi")]);
-        let body = build_request("gpt-4o", &r, false);
+        let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(body.messages.len(), 2);
         assert_eq!(body.messages[0].role, "system");
         assert_eq!(body.messages[1].role, "user");
@@ -814,7 +921,7 @@ mod tests {
     fn build_request_sets_max_tokens_for_chat_models() {
         let mut r = req(vec![user("hi")]);
         r.params.max_tokens = Some(256);
-        let body = build_request("gpt-4o", &r, false);
+        let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(body.max_tokens, Some(256));
         assert_eq!(body.max_completion_tokens, None);
     }
@@ -824,7 +931,7 @@ mod tests {
         let mut r = req(vec![user("hi")]);
         r.params.max_tokens = Some(512);
         r.params.temperature = Some(0.7);
-        let body = build_request("o3", &r, false);
+        let body = build_request("o3", &r, false, &OpenAICompat::default());
         assert_eq!(body.max_tokens, None);
         assert_eq!(body.max_completion_tokens, Some(512));
         assert_eq!(body.temperature, None);
@@ -836,11 +943,11 @@ mod tests {
         r.params.top_p = Some(0.9);
         r.params.stop_sequences = vec!["STOP".into()];
         // Reasoning model: both sampling-control params are dropped.
-        let reasoning = build_request("o3", &r, false);
+        let reasoning = build_request("o3", &r, false, &OpenAICompat::default());
         assert_eq!(reasoning.top_p, None);
         assert!(reasoning.stop.is_empty());
         // Chat model: both are preserved.
-        let chat = build_request("gpt-4o", &r, false);
+        let chat = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(chat.top_p, Some(0.9));
         assert_eq!(chat.stop, vec!["STOP".to_string()]);
     }
@@ -863,7 +970,7 @@ mod tests {
                 input: serde_json::json!({"url": "x"}),
             }),
         }]);
-        let body = build_request("gpt-4o", &r, false);
+        let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         let s = serde_json::to_string(&body.messages[0]).unwrap();
         assert!(s.contains("\"role\":\"assistant\""), "wire: {s}");
         assert!(s.contains("\"tool_calls\""), "wire: {s}");
@@ -882,7 +989,7 @@ mod tests {
                 is_error: false,
             }),
         }]);
-        let body = build_request("gpt-4o", &r, false);
+        let body = build_request("gpt-4o", &r, false, &OpenAICompat::default());
         assert_eq!(body.messages[0].role, "tool");
         let s = serde_json::to_string(&body.messages[0]).unwrap();
         assert!(s.contains("\"tool_call_id\":\"call-1\""), "wire: {s}");
@@ -892,7 +999,7 @@ mod tests {
     #[test]
     fn build_request_streaming_sets_include_usage() {
         let r = req(vec![user("hi")]);
-        let body = build_request("gpt-4o", &r, true);
+        let body = build_request("gpt-4o", &r, true, &OpenAICompat::default());
         assert!(body.stream);
         assert!(body.stream_options.is_some());
     }
@@ -1019,6 +1126,109 @@ mod tests {
         assert_eq!(p.name, "openai");
         assert_eq!(p.model_id, "gpt-4o");
         assert_eq!(p.context_window, 128_000);
+    }
+
+    #[test]
+    fn with_context_window_overrides_reported_window() {
+        // SC-6: an unrecognized id reports 0; the override pins it.
+        let bare = OpenAIModelInterface::new("k", "local-llama");
+        assert_eq!(bare.provider().context_window, 0);
+        let pinned = OpenAIModelInterface::new("k", "local-llama").with_context_window(32_768);
+        assert_eq!(pinned.provider().context_window, 32_768);
+    }
+
+    // ── SC-27: with_compat beats the id heuristic ────────────────────────────
+
+    #[test]
+    fn compat_reasoning_model_beats_id_heuristic() {
+        // An unrecognized id is NOT reasoning by the heuristic, so by default it
+        // gets chat shaping (max_tokens, temperature kept).
+        let mut r = req(vec![user("hi")]);
+        r.params.max_tokens = Some(512);
+        r.params.temperature = Some(0.7);
+        let chat = build_request("local-reasoner", &r, false, &OpenAICompat::default());
+        assert_eq!(chat.max_tokens, Some(512));
+        assert_eq!(chat.max_completion_tokens, None);
+        assert_eq!(chat.temperature, Some(0.7));
+
+        // Declaring it reasoning flips the shaping even though the id is unknown.
+        let compat = OpenAICompat {
+            reasoning_model: true,
+            ..Default::default()
+        };
+        let reasoning = build_request("local-reasoner", &r, false, &compat);
+        assert_eq!(reasoning.max_tokens, None);
+        assert_eq!(reasoning.max_completion_tokens, Some(512));
+        assert_eq!(reasoning.temperature, None);
+    }
+
+    #[test]
+    fn compat_developer_role_routes_system_message() {
+        let r = req(vec![sys("be terse"), user("hi")]);
+        // Default: system stays `system`.
+        let plain = build_request("local-reasoner", &r, false, &OpenAICompat::default());
+        assert_eq!(plain.messages[0].role, "system");
+        // developer_role: the system message routes to `developer`.
+        let compat = OpenAICompat {
+            developer_role: true,
+            ..Default::default()
+        };
+        let dev = build_request("local-reasoner", &r, false, &compat);
+        assert_eq!(dev.messages[0].role, "developer");
+        // User messages are untouched.
+        assert_eq!(dev.messages[1].role, "user");
+    }
+
+    #[test]
+    fn compat_emits_reasoning_effort_for_reasoning_model() {
+        let mut r = req(vec![sys("x"), user("hi")]);
+        r.params.reasoning_effort = Some(crate::model::ReasoningEffort::High);
+
+        // SC-27 acceptance: an unrecognized model with reasoning + effort support
+        // carries reasoning_effort AND the developer role on the wire.
+        let compat = OpenAICompat {
+            reasoning_model: true,
+            developer_role: true,
+            supports_reasoning_effort: true,
+        };
+        let body = build_request("local-reasoner", &r, false, &compat);
+        assert_eq!(body.reasoning_effort, Some("high"));
+        assert_eq!(body.messages[0].role, "developer");
+
+        // Opt-in is required: without supports_reasoning_effort, the field is absent.
+        let no_effort = OpenAICompat {
+            reasoning_model: true,
+            ..Default::default()
+        };
+        let body2 = build_request("local-reasoner", &r, false, &no_effort);
+        assert_eq!(body2.reasoning_effort, None);
+
+        // And it's gated on the model being reasoning at all (effort alone on a
+        // chat model does nothing).
+        let effort_only = OpenAICompat {
+            supports_reasoning_effort: true,
+            ..Default::default()
+        };
+        let body3 = build_request("gpt-4o", &r, false, &effort_only);
+        assert_eq!(body3.reasoning_effort, None);
+    }
+
+    #[test]
+    fn compat_reasoning_effort_serialized_on_wire() {
+        let mut r = req(vec![user("hi")]);
+        r.params.reasoning_effort = Some(crate::model::ReasoningEffort::Medium);
+        let compat = OpenAICompat {
+            reasoning_model: true,
+            supports_reasoning_effort: true,
+            ..Default::default()
+        };
+        let body = build_request("local-reasoner", &r, false, &compat);
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(s.contains("\"reasoning_effort\":\"medium\""), "wire: {s}");
+        // A bare (default-compat) request must NOT carry the field.
+        let bare = build_request("gpt-4o", &r, false, &OpenAICompat::default());
+        let sb = serde_json::to_string(&bare).unwrap();
+        assert!(!sb.contains("reasoning_effort"), "absent by default: {sb}");
     }
 
     // ── from_env ────────────────────────────────────────────────────────────
