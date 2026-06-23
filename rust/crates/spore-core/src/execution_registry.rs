@@ -249,9 +249,12 @@ impl ExecutionRegistry {
                 Ok(())
             }
             LoopStrategy::PlanExecute(PlanExecuteConfig { plan, execute, .. }) => {
-                // A.5 (#124, Q3): the `plan` slot is STRUCTURED — it must yield a
-                // task graph. A bare `ReAct` there needs an output schema.
-                Self::check_structured_slot(plan, "plan")?;
+                // SC-1: a bare `ReAct` in the structured `plan` slot MAY omit its
+                // `output` schema. An absent schema is treated as an empty
+                // (accept-all) one, so a consumer no longer has to register a
+                // do-nothing schema purely to pass startup validation. When
+                // `enforce_output_schemas` is off the schema is unused anyway; when
+                // on, an empty schema is a no-op constraint.
                 self.walk_strategy(plan)?;
                 self.walk_strategy(execute)?;
                 Ok(())
@@ -263,9 +266,9 @@ impl ExecutionRegistry {
                 eval_toolset,
                 ..
             }) => {
-                // A.5: the `inner` (worker) slot is STRUCTURED — its result must be
-                // evaluable. A bare `ReAct` worker needs an output schema.
-                Self::check_structured_slot(inner, "worker")?;
+                // SC-1: the `inner` (worker) slot MAY omit its `output` schema (an
+                // absent schema is treated as empty/accept-all); no registration is
+                // required just to pass validation.
                 self.walk_strategy(inner)?;
                 // #124 Q1: the evaluator's wire string (a `SchemaRef`) is the
                 // VERIFIER registry key — resolved against the `verifiers` map.
@@ -291,9 +294,9 @@ impl ExecutionRegistry {
             LoopStrategy::HillClimbing(HillClimbingConfig {
                 inner, evaluator, ..
             }) => {
-                // A.5: the `inner` (propose) slot is STRUCTURED — it must yield a
-                // candidate. A bare `ReAct` proposer needs an output schema.
-                Self::check_structured_slot(inner, "propose")?;
+                // SC-1: the `inner` (propose) slot MAY omit its `output` schema (an
+                // absent schema is treated as empty/accept-all); no registration is
+                // required just to pass validation.
                 self.walk_strategy(inner)?;
                 // #124 Q2: the evaluator's wire string is resolved against the
                 // sixth `metric_evaluators` map (not `agents`).
@@ -301,21 +304,6 @@ impl ExecutionRegistry {
                 Ok(())
             }
         }
-    }
-
-    /// A.5 output-contract enforcement (#124, Q3): a bare `ReAct` feeding a
-    /// STRUCTURED slot (`plan` ⇒ task graph, `propose` ⇒ candidate, `worker` ⇒
-    /// evaluable result) MUST declare `ReAct.output = Some(SchemaRef)`. A combinator
-    /// child carries its own contract, so this check applies only to the leaf.
-    /// Returns [`HarnessError::InvalidConfiguration`] naming the offending slot.
-    fn check_structured_slot(slot: &LoopStrategy, slot_name: &str) -> Result<(), HarnessError> {
-        if let LoopStrategy::ReAct(ReactConfig { output: None, .. }) = slot {
-            return Err(HarnessError::InvalidConfiguration(format!(
-                "a bare ReAct in the structured `{slot_name}` slot requires \
-                 `output = Some(schema)` so the slot yields a typed result"
-            )));
-        }
-        Ok(())
     }
 
     fn check_agent(&self, r: &AgentRef) -> Result<(), HarnessError> {
@@ -687,32 +675,31 @@ mod tests {
         assert!(reg.validate(&task).is_ok());
     }
 
-    // ---- A.5 output-contract enforcement (#124, Q3) ------------------------
+    // ---- SC-1: structured slots may omit the output schema -----------------
 
     #[test]
-    fn structured_slot_rejects_bare_react_without_output_schema() {
-        // A PlanExecute whose `plan` slot is a bare ReAct with no output schema
-        // violates the A.5 contract: the structured plan slot must yield a typed
-        // task graph. Validation rejects it BEFORE any handle resolution.
+    fn structured_slot_allows_bare_react_without_output_schema() {
+        // SC-1: a PlanExecute whose `plan` slot is a bare ReAct with NO output
+        // schema — and with no schema registered anywhere — now passes startup
+        // validation. The structured-slot ceremony (register a do-nothing schema
+        // and stamp `output = Some(SchemaRef)` just to validate) is gone; an absent
+        // schema is treated as an empty/accept-all one. (Pre-SC-1 this returned
+        // `InvalidConfiguration`.)
         let reg = ExecutionRegistry::builder()
             .agent("a1", Arc::new(StubAgent))
             .toolset("t1", Arc::new(EmptyToolRegistry))
             .build();
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
             behavior: BudgetExhaustedBehavior::Escalate,
-            plan: Box::new(react_leaf("a1", "t1")), // output: None
+            plan: Box::new(react_leaf("a1", "t1")), // output: None — no schema needed
             execute: Box::new(react_leaf("a1", "t1")),
             plan_model: None,
         });
         let task = Task::new("contract", SessionId::generate(), tree);
-        match reg.validate(&task) {
-            Err(HarnessError::InvalidConfiguration(msg)) => {
-                assert!(msg.contains("plan"), "error should name the slot: {msg}");
-            }
-            other => {
-                panic!("expected InvalidConfiguration for bare-ReAct plan slot, got {other:?}")
-            }
-        }
+        assert!(
+            reg.validate(&task).is_ok(),
+            "a bare ReAct plan slot without an output schema must validate (SC-1)"
+        );
     }
 
     #[test]
