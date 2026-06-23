@@ -67,8 +67,8 @@
 //!    availability probes use a TOTAL request timeout (`with_timeout`, default
 //!    300s). `call_streaming` deliberately omits the total timeout — `reqwest`'s
 //!    request timeout also covers reading the streamed body, so it would abort a
-//!    healthy-but-slow generation mid-stream (surfacing as `ProviderError {
-//!    code: 0, "stream chunk error: error decoding response body" }`). Streaming
+//!    healthy-but-slow generation mid-stream (surfacing as `StreamInterrupted {
+//!    "stream chunk error: error decoding response body" }`). Streaming
 //!    relies instead on the client `read_timeout` (idle / per-chunk) plus
 //!    `connect_timeout`, both configured in [`default_http_client`].
 //! 5. Other 4xx/5xx → `ProviderError { code, message }`.
@@ -92,6 +92,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 
+use crate::harness::BoxFut;
 use crate::model::{
     Content, ContentBlock, ModelError, ModelInterface, ModelRequest, ModelResponse, ModelStream,
     ProviderInfo, ReasoningEffort, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
@@ -178,7 +179,7 @@ impl OllamaModelInterface {
     /// generation chunk-by-chunk, and `reqwest`'s request `.timeout()` is a
     /// TOTAL deadline that also covers the body read — applying it to a stream
     /// guillotines a healthy-but-slow generation mid-body, which surfaces as
-    /// `ProviderError { code: 0, "stream chunk error: error decoding response
+    /// `StreamInterrupted { "stream chunk error: error decoding response
     /// body" }`. `read_timeout` resets after every chunk, so it only trips on a
     /// genuinely stalled connection. `connect_timeout` keeps an unreachable host
     /// from hanging forever now that streaming carries no total deadline.
@@ -863,13 +864,11 @@ fn transport_error(e: reqwest::Error, base_url: &str) -> ModelError {
         return ModelError::Timeout;
     }
     if e.is_connect() || e.is_request() {
-        return ModelError::ProviderError {
-            code: 0,
+        return ModelError::Transport {
             message: format!("Ollama not running at {base_url}"),
         };
     }
-    ModelError::ProviderError {
-        code: 0,
+    ModelError::Transport {
         message: format!("HTTP transport error: {e}"),
     }
 }
@@ -903,7 +902,8 @@ async fn map_status_error(resp: reqwest::Response, model_id: &str) -> ModelError
 // ============================================================================
 
 impl ModelInterface for OllamaModelInterface {
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
         let mut body = build_request(
@@ -937,9 +937,14 @@ impl ModelInterface for OllamaModelInterface {
         })?;
         let structured = request.params.structured_tool_calls && !request.tools.is_empty();
         Ok(parse_response(parsed, structured))
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         let meta = self.ensure_model_available().await?;
         self.guard_tool_support(&request, meta)?;
         let mut body = build_request(
@@ -960,7 +965,7 @@ impl ModelInterface for OllamaModelInterface {
         // NB: no per-request `.timeout()` here. `reqwest`'s request timeout is a
         // TOTAL deadline that also covers reading the streamed body, so applying
         // it would abort a long-but-healthy generation mid-stream — surfacing as
-        // `ProviderError { code: 0, "stream chunk error: error decoding response
+        // `StreamInterrupted { "stream chunk error: error decoding response
         // body" }`. Streaming relies on the client `read_timeout` (idle /
         // per-chunk) and `connect_timeout` from `default_http_client` instead.
         let resp = self
@@ -975,10 +980,15 @@ impl ModelInterface for OllamaModelInterface {
             return Err(map_status_error(resp, &model_id).await);
         }
         let structured = request.params.structured_tool_calls && !request.tools.is_empty();
-        Ok(Box::pin(ndjson_to_events(resp, structured)))
+        Ok::<ModelStream, ModelError>(Box::pin(ndjson_to_events(resp, structured)))
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move {
         // Try the embed endpoint; fall back to bytes/4 on missing field or
         // any transport failure. Matches the openai.rs fallback strategy.
         let text = concat_request_text(request);
@@ -986,6 +996,7 @@ impl ModelInterface for OllamaModelInterface {
             return Ok(n);
         }
         Ok((text.len() / 4) as u32)
+        })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -1112,8 +1123,7 @@ fn ndjson_to_events(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(ModelError::ProviderError {
-                        code: 0,
+                    yield Err(ModelError::StreamInterrupted {
                         message: format!("stream chunk error: {e}"),
                     });
                     return;
@@ -2071,13 +2081,14 @@ mod tests {
         let client = OllamaModelInterface::with_base_url("llama3.2", "http://127.0.0.1:1")
             .with_timeout(Duration::from_secs(2));
         let err = client.call(req(vec![user("hi")])).await.unwrap_err();
-        match err {
-            ModelError::ProviderError { code, message } => {
-                assert_eq!(code, 0);
+        match &err {
+            // SC-3: connect failures are a typed, retryable Transport error.
+            ModelError::Transport { message } => {
                 assert!(message.contains("Ollama not running"), "msg: {message}");
             }
-            other => panic!("expected ProviderError, got {other:?}"),
+            other => panic!("expected Transport, got {other:?}"),
         }
+        assert!(err.retryable(), "a connect failure is retryable");
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::BoxFut;
 use crate::model::{
     Content, ContentBlock, ModelError, ModelInterface, ModelRequest, ModelResponse, ModelStream,
     ProviderInfo, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
@@ -477,8 +478,7 @@ async fn send_with_retry(
             }
             Err(e) if e.is_timeout() => return Err(ModelError::Timeout),
             Err(e) => {
-                return Err(ModelError::ProviderError {
-                    code: 0,
+                return Err(ModelError::Transport {
                     message: format!("HTTP transport error: {e}"),
                 })
             }
@@ -517,7 +517,8 @@ async fn map_status_error(resp: reqwest::Response) -> ModelError {
 // ============================================================================
 
 impl ModelInterface for OpenAIModelInterface {
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         let body = build_request(&self.model_id, &request, false);
         let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
@@ -543,9 +544,14 @@ impl ModelInterface for OpenAIModelInterface {
             message: format!("response decode failed: {e}"),
         })?;
         Ok(parse_response(parsed))
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         let body = build_request(&self.model_id, &request, true);
         let url = format!("{}/chat/completions", self.base_url);
         let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -571,10 +577,15 @@ impl ModelInterface for OpenAIModelInterface {
             self.timeout,
         )
         .await?;
-        Ok(Box::pin(sse_to_events(resp)))
+        Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move {
         // OpenAI has no count_tokens endpoint. Use the bytes/4 heuristic
         // consistent with ReplayModelInterface — sufficient for compaction
         // decisions; exact counts come back via response usage.
@@ -589,6 +600,7 @@ impl ModelInterface for OpenAIModelInterface {
             })
             .sum();
         Ok((n / 4) as u32)
+        })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -634,8 +646,7 @@ fn sse_to_events(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(ModelError::ProviderError {
-                        code: 0,
+                    yield Err(ModelError::StreamInterrupted {
                         message: format!("stream chunk error: {e}"),
                     });
                     return;
@@ -1184,6 +1195,55 @@ mod tests {
             }
             other => panic!("expected MessageStop, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_interruption_is_typed_and_retryable() {
+        // SC-3: a connection dropped mid-stream surfaces as the typed, retryable
+        // `StreamInterrupted` variant — a consumer drives its retry off
+        // `retryable()`, not a substring match on the error text. A raw TCP
+        // server promises a 200-byte body (Content-Length) but sends a few bytes
+        // then closes the socket, so the client's body stream errors mid-read.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf); // drain the request headers
+                // 200 OK so `call_streaming` returns Ok (headers arrived), then
+                // promise 200 body bytes but deliver only a partial SSE line and
+                // drop the socket — EOF before Content-Length errors the stream.
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 200\r\n\r\ndata: partial",
+                );
+                let _ = sock.flush();
+                // `sock` dropped here -> connection closes mid-body.
+            }
+        });
+
+        let client = OpenAIModelInterface::new("k", "gpt-4o").with_base_url(format!("http://{addr}"));
+        let mut stream = client
+            .call_streaming(req(vec![user("hi")]))
+            .await
+            .expect("headers (200) arrive before the body is truncated");
+
+        let mut last_err = None;
+        while let Some(ev) = stream.next().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+                break;
+            }
+        }
+        let err = last_err.expect("the truncated body must error the stream");
+        assert!(
+            matches!(err, ModelError::StreamInterrupted { .. }),
+            "expected StreamInterrupted, got {err:?}",
+        );
+        assert!(err.retryable(), "a mid-stream interruption is retryable");
+        server.join().unwrap();
     }
 
     #[tokio::test]

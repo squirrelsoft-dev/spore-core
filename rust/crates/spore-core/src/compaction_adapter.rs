@@ -325,22 +325,33 @@ mod tests {
     use crate::observability::{InMemoryObservabilityProvider, ObservabilityProvider};
     use std::sync::Mutex;
 
-    // ---- minimal model stub (native async-fn ModelInterface) -------------
+    // ---- minimal model stub (BoxFut ModelInterface) ----------------------
 
     struct StubModel;
     impl ModelInterface for StubModel {
-        async fn call(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        fn call<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move {
             Ok(ModelResponse {
                 content: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
             })
+            })
         }
-        async fn call_streaming(&self, _req: ModelRequest) -> Result<ModelStream, ModelError> {
-            Err(ModelError::Timeout)
+        fn call_streaming<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+            Box::pin(async move { Err(ModelError::Timeout) })
         }
-        async fn count_tokens(&self, _req: &ModelRequest) -> Result<u32, ModelError> {
-            Ok(0)
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move { Ok(0) })
         }
         fn provider(&self) -> ProviderInfo {
             ProviderInfo {

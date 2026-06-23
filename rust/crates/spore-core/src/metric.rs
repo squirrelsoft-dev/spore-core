@@ -883,7 +883,11 @@ mod tests {
     }
 
     impl ModelInterface for FakeModel {
-        async fn call(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        fn call<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move {
             Ok(ModelResponse {
                 content: vec![MCB::Text {
                     text: self.text.clone(),
@@ -891,17 +895,21 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
             })
+            })
         }
 
-        async fn call_streaming(
-            &self,
+        fn call_streaming<'a>(
+            &'a self,
             _req: ModelRequest,
-        ) -> Result<crate::model::ModelStream, ModelError> {
-            unimplemented!()
+        ) -> BoxFut<'a, Result<crate::model::ModelStream, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
 
-        async fn count_tokens(&self, _req: &ModelRequest) -> Result<u32, ModelError> {
-            Ok(0)
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move { Ok(0) })
         }
 
         fn provider(&self) -> ProviderInfo {

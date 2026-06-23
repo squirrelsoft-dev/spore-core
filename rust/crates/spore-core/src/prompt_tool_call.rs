@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::harness::BoxFut;
 use crate::model::{
     Content, ContentBlock, Message, ModelError, ModelInterface, ModelRequest, ModelResponse,
     ModelStream, ProviderInfo, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
@@ -386,9 +387,10 @@ async fn streaming_prompt_call<M: ModelInterface + 'static>(
 /// parses `<tool_call>` markers from the response into native [`ToolCall`]s.
 /// `count_tokens` and `provider` delegate to the inner model unchanged.
 ///
-/// Generic over `M` because [`ModelInterface`] is not dyn-compatible (RPITIT via
-/// `trait_variant`); inject `Arc<ConcreteModel>` at construction, exactly like
-/// [`RecordingModelInterface`](crate::model::RecordingModelInterface).
+/// Generic over `M` so it monomorphizes onto a concrete model; inject
+/// `Arc<ConcreteModel>` (or, since [`ModelInterface`] is now object-safe and
+/// `Arc<dyn ModelInterface>` impls it, a boxed model) at construction, exactly
+/// like [`RecordingModelInterface`](crate::model::RecordingModelInterface).
 pub struct PromptBasedToolCallModelInterface<M: ModelInterface + 'static> {
     inner: Arc<M>,
 }
@@ -414,18 +416,29 @@ impl<M: ModelInterface + 'static> PromptBasedToolCallModelInterface<M> {
 }
 
 impl<M: ModelInterface + 'static> ModelInterface for PromptBasedToolCallModelInterface<M> {
-    async fn call(&self, mut request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(
+        &'a self,
+        mut request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         inject_tool_prompt(&mut request);
         let response = self.inner.call(request).await?;
         Ok(parse_prose_response(response))
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        streaming_prompt_call(&self.inner, request).await
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move { streaming_prompt_call(&self.inner, request).await })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
-        self.inner.count_tokens(request).await
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move { self.inner.count_tokens(request).await })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -464,24 +477,37 @@ impl<M: ModelInterface + 'static> AdaptiveToolCallModelInterface<M> {
 }
 
 impl<M: ModelInterface + 'static> ModelInterface for AdaptiveToolCallModelInterface<M> {
-    async fn call(&self, mut request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(
+        &'a self,
+        mut request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         if !self.flag.load(Ordering::Acquire) {
             return self.inner.call(request).await;
         }
         inject_tool_prompt(&mut request);
         let response = self.inner.call(request).await?;
         Ok(parse_prose_response(response))
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         if !self.flag.load(Ordering::Acquire) {
             return self.inner.call_streaming(request).await;
         }
         streaming_prompt_call(&self.inner, request).await
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
-        self.inner.count_tokens(request).await
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move { self.inner.count_tokens(request).await })
     }
 
     fn provider(&self) -> ProviderInfo {

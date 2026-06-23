@@ -1318,10 +1318,11 @@ mod tests {
     }
 
     impl crate::model::ModelInterface for StubJudge {
-        async fn call(
-            &self,
+        fn call<'a>(
+            &'a self,
             _req: crate::model::ModelRequest,
-        ) -> Result<crate::model::ModelResponse, crate::model::ModelError> {
+        ) -> BoxFut<'a, Result<crate::model::ModelResponse, crate::model::ModelError>> {
+            Box::pin(async move {
             Ok(crate::model::ModelResponse {
                 content: vec![crate::model::ContentBlock::Text {
                     text: self.verdict.clone(),
@@ -1329,18 +1330,21 @@ mod tests {
                 stop_reason: crate::model::StopReason::EndTurn,
                 usage: crate::model::TokenUsage::default(),
             })
+            })
         }
-        async fn call_streaming(
-            &self,
+        fn call_streaming<'a>(
+            &'a self,
             _req: crate::model::ModelRequest,
-        ) -> Result<crate::model::ModelStream, crate::model::ModelError> {
+        ) -> BoxFut<'a, Result<crate::model::ModelStream, crate::model::ModelError>> {
+            Box::pin(async move {
             unreachable!("StubJudge::call_streaming is not used by QuestionAnsweredCheck")
+            })
         }
-        async fn count_tokens(
-            &self,
-            _req: &crate::model::ModelRequest,
-        ) -> Result<u32, crate::model::ModelError> {
-            Ok(0)
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a crate::model::ModelRequest,
+        ) -> BoxFut<'a, Result<u32, crate::model::ModelError>> {
+            Box::pin(async move { Ok(0) })
         }
         fn provider(&self) -> crate::model::ProviderInfo {
             crate::model::ProviderInfo {

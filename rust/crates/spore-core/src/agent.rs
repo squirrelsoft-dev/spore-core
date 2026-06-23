@@ -354,10 +354,12 @@ pub fn classify_response(response: ModelResponse) -> TurnResult {
 /// Standard `Agent` impl: forwards [`Context`] to a `ModelInterface` and
 /// classifies the response per the rules in the module header.
 ///
-/// Generic over the model implementation because `ModelInterface` uses
-/// return-position `impl Trait` (via `trait_variant`) and is therefore not
-/// `dyn`-compatible. Inject `Arc<ConcreteModel>` at construction; the harness
-/// holds the agent itself behind `Arc<dyn Agent>`.
+/// Generic over the model implementation so the common case monomorphizes with
+/// zero dispatch overhead. `ModelInterface` is now object-safe (`BoxFut`), and an
+/// `Arc<dyn ModelInterface>` is itself a `ModelInterface` (blanket impl), so a
+/// runtime-selected boxed model can be injected here too. Inject
+/// `Arc<ConcreteModel>` (or `Arc<dyn ModelInterface>`) at construction; the
+/// harness holds the agent itself behind `Arc<dyn Agent>`.
 pub struct ModelAgent<M: ModelInterface> {
     id: AgentId,
     model: Arc<M>,

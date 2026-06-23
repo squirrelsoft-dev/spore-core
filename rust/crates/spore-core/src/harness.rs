@@ -6564,6 +6564,29 @@ impl HarnessBuilder {
         builder
     }
 
+    /// Like [`conversational`](Self::conversational), but takes an already-boxed
+    /// `Arc<dyn ModelInterface>` (SC-2).
+    ///
+    /// `ModelInterface` is now object-safe (`BoxFut`), so a consumer can hold a
+    /// single `Arc<dyn ModelInterface>` — picking the provider at runtime — and
+    /// inject it here without monomorphizing through a concrete model type. This
+    /// is the entry point `CONVENTIONS.md` refers to when it says components are
+    /// injected as `Arc<dyn ModelInterface>`.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use spore_core::{HarnessBuilder, ModelInterface, OllamaModelInterface};
+    /// let model: Arc<dyn ModelInterface> = Arc::new(OllamaModelInterface::new("llama3.2"));
+    /// let harness = HarnessBuilder::conversational_arc(model).build();
+    /// # let _ = harness;
+    /// ```
+    pub fn conversational_arc(model: Arc<dyn crate::model::ModelInterface>) -> Self {
+        // `Arc<dyn ModelInterface>` is itself a `ModelInterface` (blanket impl),
+        // so the generic preset accepts it directly — the boxed model is shared
+        // by reference-count, never re-minted.
+        Self::conversational(model)
+    }
+
     /// Override the harness-loop tool registry (issue #4 seam).
     ///
     /// Use this to supply your own [`ToolRegistry`] implementation — e.g. a set
@@ -13042,6 +13065,61 @@ mod tests {
             .await;
         assert!(matches!(blocked, ToolOutput::Error { recoverable: true, .. }));
         assert_eq!(&*inner.dispatched.lock().unwrap(), &["read_file".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn harness_constructs_from_boxed_model_interface() {
+        // SC-2: ModelInterface is now object-safe (BoxFut, not RPITIT), so a
+        // consumer can hold ONE `Arc<dyn ModelInterface>` — provider chosen at
+        // runtime — and inject it without monomorphizing through a concrete model
+        // type (looper's hand-rolled `AgentModel` enum + dispatch matches).
+        use crate::model::mock::MockModelInterface;
+        use crate::model::{
+            ContentBlock, ModelParams, ModelRequest, ModelResponse, ProviderInfo, StopReason,
+            TokenUsage,
+        };
+
+        let mock = Arc::new(MockModelInterface::new(ProviderInfo {
+            name: "test".into(),
+            model_id: "test-1".into(),
+            context_window: 1000,
+        }));
+        mock.push_response(Ok(ModelResponse {
+            content: vec![ContentBlock::Text {
+                text: "greetings".into(),
+            }],
+            usage: TokenUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            stop_reason: StopReason::EndTurn,
+        }));
+
+        // This coercion `Arc<MockModelInterface>` -> `Arc<dyn ModelInterface>`
+        // only compiles because the trait is object-safe.
+        let model: Arc<dyn crate::model::ModelInterface> = mock.clone();
+
+        // The blanket `impl ModelInterface for Arc<T>` + dyn dispatch genuinely
+        // work at runtime (not just at compile time).
+        assert_eq!(model.provider().model_id, "test-1");
+        let resp = model
+            .call(ModelRequest {
+                messages: vec![],
+                tools: vec![],
+                params: ModelParams::default(),
+                stream: false,
+            })
+            .await
+            .expect("boxed model dispatches");
+        assert!(
+            matches!(resp.content.first(), Some(ContentBlock::Text { text }) if text == "greetings"),
+            "the boxed model returned its queued response",
+        );
+
+        // The builder accepts the boxed model — the SC-2 acceptance check.
+        let _harness = HarnessBuilder::conversational_arc(model).build();
     }
 
     /// #142: the fixed canonical path the test config helpers derive their

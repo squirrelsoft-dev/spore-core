@@ -18,16 +18,25 @@ any component (issues #1–#13).
 
 ## Trait / interface pattern
 
+Component traits return a boxed `Send` future (`BoxFut`) rather than using
+`async fn` in traits. `async fn`/RPITIT (`#[trait_variant::make(Send)]`) is **not**
+`dyn`-compatible, and every injected component must be holdable as `Arc<dyn Trait>`
+(above) — so the dyn-safe traits hand-roll the future type:
+
 ```rust
-#[trait_variant::make(Send)]
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub trait ModelInterface: Send + Sync {
-    async fn call(&self, req: ModelRequest) -> Result<ModelResponse, ModelError>;
-    async fn count_tokens(&self, req: &ModelRequest) -> Result<u32, ModelError>;
+    fn call<'a>(&'a self, req: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>>;
+    fn count_tokens<'a>(&'a self, req: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>>;
 }
 ```
 
-Components are injected as `Arc<dyn ModelInterface>`. Concrete impls live in
-sibling modules (`anthropic.rs`, `openai.rs`, `recording.rs`).
+Components are injected as `Arc<dyn ModelInterface>` (a blanket
+`impl ModelInterface for Arc<T: ?Sized>` makes the boxed model a first-class
+`ModelInterface`; build one with `HarnessBuilder::conversational_arc`). Concrete
+impls live in sibling modules (`anthropic.rs`, `openai.rs`, `ollama.rs`,
+`model.rs`).
 
 ## Error handling
 

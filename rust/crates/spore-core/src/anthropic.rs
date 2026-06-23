@@ -27,6 +27,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::BoxFut;
 use crate::model::{
     Content, ContentBlock, ModelError, ModelInterface, ModelRequest, ModelResponse, ModelStream,
     ProviderInfo, Role, StopReason, StreamEvent, TokenUsage, ToolCall, ToolSchema,
@@ -425,8 +426,7 @@ async fn send_with_retry(
             }
             Err(e) if e.is_timeout() => return Err(ModelError::Timeout),
             Err(e) => {
-                return Err(ModelError::ProviderError {
-                    code: 0,
+                return Err(ModelError::Transport {
                     message: format!("HTTP transport error: {e}"),
                 })
             }
@@ -469,7 +469,8 @@ async fn map_status_error(resp: reqwest::Response) -> ModelError {
 // ============================================================================
 
 impl ModelInterface for AnthropicModelInterface {
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         let body = build_request(&self.model_id, &request, false);
         let url = format!("{}/v1/messages", self.base_url);
         let api_key = self.api_key.clone();
@@ -497,9 +498,14 @@ impl ModelInterface for AnthropicModelInterface {
                 message: format!("response decode failed: {e}"),
             })?;
         Ok(parse_response(parsed))
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         let body = build_request(&self.model_id, &request, true);
         let url = format!("{}/v1/messages", self.base_url);
         let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -526,10 +532,15 @@ impl ModelInterface for AnthropicModelInterface {
             self.timeout,
         )
         .await?;
-        Ok(Box::pin(sse_to_events(resp)))
+        Ok::<ModelStream, ModelError>(Box::pin(sse_to_events(resp)))
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move {
         let body = build_request(&self.model_id, request, false);
         let url = format!("{}/v1/messages/count_tokens", self.base_url);
         let body = serde_json::to_string(&body).map_err(|e| ModelError::ProviderError {
@@ -557,6 +568,7 @@ impl ModelInterface for AnthropicModelInterface {
                 message: format!("count_tokens decode failed: {e}"),
             })?;
         Ok(parsed.input_tokens)
+        })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -596,8 +608,7 @@ fn sse_to_events(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(ModelError::ProviderError {
-                        code: 0,
+                    yield Err(ModelError::StreamInterrupted {
                         message: format!("stream chunk error: {e}"),
                     });
                     return;

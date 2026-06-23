@@ -1041,18 +1041,29 @@ mod tests {
         }
     }
     impl ModelInterface for FakeModel {
-        async fn call(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        fn call<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move {
             Ok(ModelResponse {
                 content: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
             })
+            })
         }
-        async fn call_streaming(&self, _req: ModelRequest) -> Result<ModelStream, ModelError> {
-            unimplemented!()
+        fn call_streaming<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
-        async fn count_tokens(&self, _req: &ModelRequest) -> Result<u32, ModelError> {
-            Ok(self.per_call.load(Ordering::SeqCst))
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move { Ok(self.per_call.load(Ordering::SeqCst)) })
         }
         fn provider(&self) -> ProviderInfo {
             ProviderInfo {
@@ -1522,14 +1533,17 @@ mod tests {
 
     struct FailingModel;
     impl ModelInterface for FailingModel {
-        async fn call(&self, _r: ModelRequest) -> Result<ModelResponse, ModelError> {
-            unimplemented!()
+        fn call<'a>(&'a self, _r: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
-        async fn call_streaming(&self, _r: ModelRequest) -> Result<ModelStream, ModelError> {
-            unimplemented!()
+        fn call_streaming<'a>(
+            &'a self,
+            _r: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
-        async fn count_tokens(&self, _r: &ModelRequest) -> Result<u32, ModelError> {
-            Err(ModelError::Timeout)
+        fn count_tokens<'a>(&'a self, _r: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move { Err(ModelError::Timeout) })
         }
         fn provider(&self) -> ProviderInfo {
             ProviderInfo {
@@ -1896,14 +1910,23 @@ mod tests {
         context_window: u32,
     }
     impl ModelInterface for WindowModel {
-        async fn call(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
-            unimplemented!()
+        fn call<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
-        async fn call_streaming(&self, _req: ModelRequest) -> Result<ModelStream, ModelError> {
-            unimplemented!()
+        fn call_streaming<'a>(
+            &'a self,
+            _req: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+            Box::pin(async move { unimplemented!() })
         }
-        async fn count_tokens(&self, _req: &ModelRequest) -> Result<u32, ModelError> {
-            Ok(0)
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move { Ok(0) })
         }
         fn provider(&self) -> ProviderInfo {
             ProviderInfo {

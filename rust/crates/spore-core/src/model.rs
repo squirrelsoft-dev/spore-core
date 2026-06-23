@@ -28,6 +28,8 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::harness::BoxFut;
+
 // ============================================================================
 // Roles, content, messages
 // ============================================================================
@@ -274,6 +276,40 @@ pub enum ModelError {
 
     #[error("model call timed out")]
     Timeout,
+
+    /// Network/transport failure reaching the provider (connection refused,
+    /// socket error, generic HTTP transport error) — the request never produced
+    /// a usable response. Transient: [`retryable`](ModelError::retryable) is
+    /// `true`.
+    #[error("transport error: {message}")]
+    Transport { message: String },
+
+    /// The response stream was interrupted mid-flight (a chunk read/decode
+    /// failure while draining a streaming body). Transient:
+    /// [`retryable`](ModelError::retryable) is `true` — the turn can be retried.
+    /// Distinct from a deterministic decode failure of a *complete* response,
+    /// which stays [`ProviderError`](ModelError::ProviderError).
+    #[error("stream interrupted: {message}")]
+    StreamInterrupted { message: String },
+}
+
+impl ModelError {
+    /// Whether retrying the identical call could plausibly succeed.
+    ///
+    /// Transport drops, mid-stream interruptions, timeouts, and rate-limits are
+    /// transient. Provider/encode/decode/capability errors and context/budget
+    /// overflows are deterministic and will recur. Lets a consumer drive its
+    /// retry loop off a typed predicate instead of substring-matching the error
+    /// text (SC-3).
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            ModelError::Transport { .. }
+                | ModelError::StreamInterrupted { .. }
+                | ModelError::Timeout
+                | ModelError::RateLimited { .. }
+        )
+    }
 }
 
 mod duration_secs_opt {
@@ -295,21 +331,51 @@ mod duration_secs_opt {
 /// Boundary between the harness and the underlying LLM.
 ///
 /// Implementors must observe the rules documented in the module header.
-#[trait_variant::make(Send)]
 pub trait ModelInterface: Send + Sync {
     /// One blocking model call. `TokenUsage` must be populated on success.
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError>;
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>>;
 
     /// Streaming variant. Yields `StreamEvent`s as they arrive; the final
     /// `MessageStop` event carries the accumulated `TokenUsage`.
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError>;
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>>;
 
     /// Pre-call token count for context-size estimation. Used by the harness
     /// to detect `ContextLimitExceeded` before contacting the provider.
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError>;
+    fn count_tokens<'a>(&'a self, request: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>>;
 
     /// Provider identity for tracing and routing decisions.
     fn provider(&self) -> ProviderInfo;
+}
+
+/// Blanket impl so an `Arc`-wrapped model is itself a `ModelInterface`. Now that
+/// the trait is object-safe (`BoxFut`, not RPITIT), this makes
+/// `Arc<dyn ModelInterface>` a first-class `ModelInterface` — a consumer can
+/// hold one boxed model and inject it anywhere a `ModelInterface` is expected
+/// (e.g. [`HarnessBuilder::conversational_arc`](crate::HarnessBuilder::conversational_arc)),
+/// instead of monomorphizing through a concrete generic. `?Sized` covers the
+/// `dyn` case; `Arc<ConcreteModel>` works too.
+impl<T: ModelInterface + ?Sized> ModelInterface for Arc<T> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        (**self).call(request)
+    }
+
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        (**self).call_streaming(request)
+    }
+
+    fn count_tokens<'a>(&'a self, request: &'a ModelRequest) -> BoxFut<'a, Result<u32, ModelError>> {
+        (**self).count_tokens(request)
+    }
+
+    fn provider(&self) -> ProviderInfo {
+        (**self).provider()
+    }
 }
 
 /// Shared pre-call validation. Implementations should call this before
@@ -552,7 +618,8 @@ impl ReplayModelInterface {
 }
 
 impl ModelInterface for ReplayModelInterface {
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         match self.mode {
             ReplayMode::HashMatched => {
                 let want = request_hash(&request);
@@ -579,9 +646,14 @@ impl ModelInterface for ReplayModelInterface {
                 Ok(exchange.response.clone())
             }
         }
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         let response = self.call(request).await?;
         let stream = async_stream::stream! {
             yield Ok(StreamEvent::MessageStart);
@@ -611,10 +683,15 @@ impl ModelInterface for ReplayModelInterface {
                 stop_reason: response.stop_reason,
             });
         };
-        Ok(Box::pin(stream))
+        Ok::<ModelStream, ModelError>(Box::pin(stream))
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move {
         // When the fixture was recorded by RecordingModelInterface against a
         // real provider, the recorded response's `usage.input_tokens` carries
         // the provider's exact count. Use that whenever we can match by hash;
@@ -641,6 +718,7 @@ impl ModelInterface for ReplayModelInterface {
             })
             .sum();
         Ok((n / 4) as u32) // ~4 chars/token rule-of-thumb (fallback)
+        })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -750,7 +828,8 @@ impl<M: ModelInterface + 'static> RecordingModelInterface<M> {
 }
 
 impl<M: ModelInterface + 'static> ModelInterface for RecordingModelInterface<M> {
-    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    fn call<'a>(&'a self, request: ModelRequest) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+        Box::pin(async move {
         let start = std::time::Instant::now();
         let response = self.inner.call(request.clone()).await?;
         let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -761,16 +840,25 @@ impl<M: ModelInterface + 'static> ModelInterface for RecordingModelInterface<M> 
             });
         }
         Ok(response)
+        })
     }
 
-    async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+    fn call_streaming<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+        Box::pin(async move {
         // Streaming recording is not implemented: spec only requires the
         // blocking `call()` pair to be recorded. Pass through unchanged.
         self.inner.call_streaming(request).await
+        })
     }
 
-    async fn count_tokens(&self, request: &ModelRequest) -> Result<u32, ModelError> {
-        self.inner.count_tokens(request).await
+    fn count_tokens<'a>(
+        &'a self,
+        request: &'a ModelRequest,
+    ) -> BoxFut<'a, Result<u32, ModelError>> {
+        Box::pin(async move { self.inner.count_tokens(request).await })
     }
 
     fn provider(&self) -> ProviderInfo {
@@ -818,7 +906,11 @@ pub mod mock {
     }
 
     impl ModelInterface for MockModelInterface {
-        async fn call(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        fn call<'a>(
+            &'a self,
+            _request: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelResponse, ModelError>> {
+            Box::pin(async move {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.responses
@@ -829,9 +921,14 @@ pub mod mock {
                     code: 0,
                     message: "mock: no response queued".into(),
                 }))
+            })
         }
 
-        async fn call_streaming(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+        fn call_streaming<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFut<'a, Result<ModelStream, ModelError>> {
+            Box::pin(async move {
             let response = self.call(request).await?;
             let stream = async_stream::stream! {
                 yield Ok(StreamEvent::MessageStart);
@@ -840,15 +937,21 @@ pub mod mock {
                     stop_reason: response.stop_reason,
                 });
             };
-            Ok(Box::pin(stream))
+            Ok::<ModelStream, ModelError>(Box::pin(stream))
+            })
         }
 
-        async fn count_tokens(&self, _request: &ModelRequest) -> Result<u32, ModelError> {
+        fn count_tokens<'a>(
+            &'a self,
+            _request: &'a ModelRequest,
+        ) -> BoxFut<'a, Result<u32, ModelError>> {
+            Box::pin(async move {
             self.token_counts
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(0))
+            })
         }
 
         fn provider(&self) -> ProviderInfo {
@@ -866,6 +969,59 @@ mod tests {
     use super::mock::MockModelInterface;
     use super::*;
     use futures_util::StreamExt;
+
+    #[test]
+    fn retryable_classifies_transient_vs_deterministic() {
+        // SC-3: transport drops, mid-stream interruptions, timeouts and rate
+        // limits are transient; provider/context/budget errors are deterministic.
+        assert!(ModelError::Transport { message: "x".into() }.retryable());
+        assert!(ModelError::StreamInterrupted { message: "x".into() }.retryable());
+        assert!(ModelError::Timeout.retryable());
+        assert!(ModelError::RateLimited { retry_after: None }.retryable());
+        assert!(!ModelError::ProviderError {
+            code: 0,
+            message: "x".into()
+        }
+        .retryable());
+        assert!(!ModelError::ContextLimitExceeded {
+            limit: 1,
+            actual: 2
+        }
+        .retryable());
+        assert!(!ModelError::BudgetExceeded { budget: 1, used: 2 }.retryable());
+    }
+
+    #[test]
+    fn typed_transport_errors_serde_roundtrip() {
+        // The two SC-3 variants round-trip and carry the `kind`-tagged shape the
+        // TS/Python/Go ports must mirror byte-for-byte.
+        for e in [
+            ModelError::Transport {
+                message: "boom".into(),
+            },
+            ModelError::StreamInterrupted {
+                message: "stream chunk error: eof".into(),
+            },
+        ] {
+            let j = serde_json::to_string(&e).unwrap();
+            let back: ModelError = serde_json::from_str(&j).unwrap();
+            assert_eq!(e, back);
+        }
+        assert_eq!(
+            serde_json::to_value(ModelError::Transport {
+                message: "m".into()
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "Transport", "message": "m"}),
+        );
+        assert_eq!(
+            serde_json::to_value(ModelError::StreamInterrupted {
+                message: "m".into()
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "StreamInterrupted", "message": "m"}),
+        );
+    }
 
     #[test]
     fn byte_line_buffer_decodes_codepoint_split_across_chunks() {
