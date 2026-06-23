@@ -257,7 +257,11 @@ impl ExecutionRegistry {
                 Ok(())
             }
             LoopStrategy::SelfVerifying(SelfVerifyingConfig {
-                inner, evaluator, ..
+                inner,
+                evaluator,
+                eval_agent,
+                eval_toolset,
+                ..
             }) => {
                 // A.5: the `inner` (worker) slot is STRUCTURED — its result must be
                 // evaluable. A bare `ReAct` worker needs an output schema.
@@ -266,6 +270,17 @@ impl ExecutionRegistry {
                 // #124 Q1: the evaluator's wire string (a `SchemaRef`) is the
                 // VERIFIER registry key — resolved against the `verifiers` map.
                 self.check_verifier(evaluator)?;
+                // Optional dedicated reviewer agent / read-only toolset for the
+                // evaluate phase. Validated against the same `agents`/`toolsets`
+                // maps as a leaf's own handles when set (mirrors Ralph's
+                // `check_agent`); `None` ⇒ the worker-agent / global-catalogue
+                // defaults, nothing extra to resolve.
+                if let Some(eval_agent) = eval_agent {
+                    self.check_agent(eval_agent)?;
+                }
+                if let Some(eval_toolset) = eval_toolset {
+                    self.check_toolset(eval_toolset)?;
+                }
                 Ok(())
             }
             LoopStrategy::Ralph(RalphConfig { inner, agent, .. }) => {
@@ -746,6 +761,8 @@ mod tests {
             behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(worker),
             evaluator: SchemaRef("eval-schema".into()),
+            eval_agent: None,
+            eval_toolset: None,
         });
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
             behavior: BudgetExhaustedBehavior::Escalate,

@@ -522,6 +522,21 @@ impl PlanExecuteConfig {
 pub struct SelfVerifyingConfig {
     pub inner: Box<LoopStrategy>,
     pub evaluator: SchemaRef,
+    /// Optional dedicated reviewer agent for the evaluate phase. `None` ⇒ the
+    /// evaluate phase reuses the inner worker's resolved agent (Q1c default).
+    /// Set this to a SEPARATE agent so the reviewer is not the same model that
+    /// wrote the code (a builder reviewing its own work tends to rubber-stamp).
+    /// Omitted from the wire when unset (existing configs stay byte-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_agent: Option<AgentRef>,
+    /// Optional read-only/inspection toolset for the evaluate phase. `None` ⇒
+    /// the empty handle (global-catalogue fallback), byte-identical to prior
+    /// behavior. The evaluate phase already runs on a read-only sandbox; scoping
+    /// the toolset to read-only tools additionally prevents the reviewer from
+    /// reaching non-filesystem side-effecting tools (web/MCP) that the sandbox
+    /// does not gate. Omitted from the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_toolset: Option<ToolsetRef>,
     /// What this combinator does when its build↔evaluate budget is spent (#129).
     /// Canonical position on a combinator: the LAST field. Always serialized (Q1).
     #[serde(default = "default_budget_behavior")]
@@ -1244,12 +1259,14 @@ pub trait StrategyExecutor: Send + Sync {
     ) -> Result<Arc<dyn Agent>, Box<RunResult>>;
 
     /// Run the SelfVerifying evaluate phase (#124): a fresh evaluator RUN over a
-    /// read-only sandbox in a never-shared session, on `eval_agent`. Folds the
+    /// read-only sandbox in a never-shared session, on `eval_agent`, scoped to
+    /// `eval_toolset` (empty handle ⇒ global-catalogue fallback). Folds the
     /// run's usage into `total_usage`/`carried`; returns its terminal.
     fn evaluate_phase<'a>(
         &'a self,
         task: &'a Task,
         eval_agent: Arc<dyn Agent>,
+        eval_toolset: ToolsetRef,
         carried: &'a mut BudgetSnapshot,
         total_usage: &'a mut AggregateUsage,
     ) -> BoxFut<'a, RunResult>;
@@ -2503,16 +2520,27 @@ impl RunStrategy for SelfVerifyingConfig {
                     return cx.finish(executor, task, result).await;
                 }
             };
-            // Q1c: the evaluate-phase agent defaults to the inner worker's agent.
-            let eval_agent = match executor
-                .resolve_agent_ref(&AgentRef(executor_worker_key(self)), &build_session_id)
-            {
+            // Q1c: the evaluate-phase agent defaults to the inner worker's agent;
+            // an explicit `eval_agent` override (a dedicated reviewer, distinct
+            // from the builder) takes precedence.
+            let eval_agent_ref = self
+                .eval_agent
+                .clone()
+                .unwrap_or_else(|| AgentRef(executor_worker_key(self)));
+            let eval_agent = match executor.resolve_agent_ref(&eval_agent_ref, &build_session_id) {
                 Ok(a) => a,
                 Err(result) => {
                     cx.stream = on_stream;
                     return cx.finish(executor, task, *result).await;
                 }
             };
+            // The evaluate phase runs against `eval_toolset` (a read-only/
+            // inspection catalogue) when set; `None` ⇒ the empty handle (global-
+            // catalogue fallback), byte-identical to pre-override behavior.
+            let eval_toolset = self
+                .eval_toolset
+                .clone()
+                .unwrap_or_else(|| ToolsetRef(String::new()));
 
             let max_iterations = verifier.max_iterations();
             let mut total_usage = AggregateUsage::default();
@@ -2658,7 +2686,13 @@ impl RunStrategy for SelfVerifyingConfig {
 
                 // ── Evaluate phase: a fresh evaluator run on `eval_agent`.
                 let eval_result = executor
-                    .evaluate_phase(&task, eval_agent.clone(), &mut carried, &mut total_usage)
+                    .evaluate_phase(
+                        &task,
+                        eval_agent.clone(),
+                        eval_toolset.clone(),
+                        &mut carried,
+                        &mut total_usage,
+                    )
                     .await;
 
                 // #C1: charge the evaluator's OWN turns against the SelfVerifying
@@ -7568,6 +7602,7 @@ impl StandardHarness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_react(
         &self,
         task: Task,
@@ -7576,6 +7611,12 @@ impl StandardHarness {
         budget_used: BudgetSnapshot,
         on_stream: Option<StreamSink>,
         agent: Arc<dyn Agent>,
+        // Issue 2: the RESOLVED per-node toolset handle. Most `run_react`
+        // wrappers (PlanExecute/DAG execute steps, single-shot run) pass the
+        // empty handle (`ToolsetRef("")`) ⇒ global-catalogue fallback, byte-for-
+        // byte with pre-Issue-2 behaviour. The SelfVerifying evaluate phase
+        // passes its `eval_toolset` so the reviewer is scoped to read-only tools.
+        toolset: ToolsetRef,
     ) -> RunResult {
         let result = self
             .run_react_inner(
@@ -7585,11 +7626,7 @@ impl StandardHarness {
                 budget_used,
                 on_stream,
                 agent,
-                // Issue 2: the legacy `run_react` wrappers (PlanExecute/DAG
-                // execute steps, single-shot run) carry no per-node toolset
-                // handle, so they keep the global-catalogue fallback (empty
-                // handle) — byte-for-byte with pre-Issue-2 behaviour.
-                ToolsetRef(String::new()),
+                toolset,
                 // Issue #139: the legacy `run_react` wrapper does NOT enforce
                 // output schemas (the recursive `ReactConfig::run` is the single
                 // enforcement seam). `None`/`0` ⇒ byte-for-byte pre-#139.
@@ -9154,6 +9191,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
         &self,
         task: &Task,
         evaluator: Arc<dyn Agent>,
+        eval_toolset: ToolsetRef,
         carried: &mut BudgetSnapshot,
         total_usage: &mut AggregateUsage,
     ) -> RunResult {
@@ -9199,6 +9237,18 @@ tool. Use the provided tool-call format to actually invoke the tool."
         // `config.agent`).
         let mut eval_config = self.config.clone();
         eval_config.sandbox = read_only_sandbox;
+        // The evaluate phase is a NON-INTERACTIVE nested review run: the caller
+        // never sees its (freshly generated) session id, so an approval/HITL
+        // middleware that resolves `SurfaceToHuman` would pause this run with no
+        // human able to resume it — the reviewer's first `read_file` would yield
+        // `WaitingForHuman`, which the verifier reads as a misconfiguration, and
+        // the review half would silently never run. The read-only sandbox already
+        // enforces the only safety property a reviewer needs (no writes, no
+        // command execution), so the caller's approval middleware is both
+        // redundant and harmful here — drop it for the evaluate phase. (Pair with
+        // an `eval_toolset` scoped to read-only tools so non-filesystem
+        // side-effecting tools the sandbox does not gate stay out of reach.)
+        eval_config.middleware = None;
         let eval_harness = StandardHarness::new(eval_config);
 
         let mut eval_state = SessionState::default();
@@ -9217,6 +9267,7 @@ tool. Use the provided tool-call format to actually invoke the tool."
                 BudgetSnapshot::default(),
                 None,
                 evaluator,
+                eval_toolset,
             )
             .await;
 
@@ -10088,11 +10139,12 @@ impl StrategyExecutor for StandardHarness {
         &'a self,
         task: &'a Task,
         eval_agent: Arc<dyn Agent>,
+        eval_toolset: ToolsetRef,
         carried: &'a mut BudgetSnapshot,
         total_usage: &'a mut AggregateUsage,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
-            self.run_evaluate_phase(task, eval_agent, carried, total_usage)
+            self.run_evaluate_phase(task, eval_agent, eval_toolset, carried, total_usage)
                 .await
         })
     }
@@ -10721,6 +10773,8 @@ impl StandardHarness {
             budget_used,
             on_stream,
             agent,
+            // legacy wrapper: empty handle ⇒ global-catalogue fallback.
+            ToolsetRef(String::new()),
         )
         .await
     }
@@ -11340,6 +11394,8 @@ impl StandardHarness {
                         budget_used,
                         on_stream,
                         agent,
+                        // legacy wrapper: empty handle ⇒ global-catalogue fallback.
+                        ToolsetRef(String::new()),
                     )
                     .await;
             }
@@ -11396,9 +11452,36 @@ impl StandardHarness {
             }
             HumanResponse::Allow => {
                 // Dispatch remaining pending calls before resuming the loop.
+                // Mirror the turn-loop's stream events (ToolCall before dispatch,
+                // ToolResult after) so an approved tool's execution and output
+                // render in the UI sink. Without these emits the resume path runs
+                // silently, leaving every human-gated tool (bash, writes, gated
+                // reads) with an approval line but no visible result.
                 for call in pending_tool_calls {
+                    Self::emit(
+                        &on_stream,
+                        StreamEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: call.input.clone(),
+                            node: None,
+                        },
+                    );
                     let output = self
                         .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                    Self::emit(
+                        &on_stream,
+                        StreamEvent::ToolResult {
+                            call_id: call.id.clone(),
+                            is_error: matches!(output, ToolOutput::Error { .. }),
+                            content: match &output {
+                                ToolOutput::Success { content, .. } => content.clone(),
+                                ToolOutput::Error { message, .. } => message.clone(),
+                                _ => String::new(),
+                            },
+                            node: None,
+                        },
+                    );
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -11410,9 +11493,33 @@ impl StandardHarness {
                 }
             }
             HumanResponse::AllowWithModification { calls } => {
+                // Same stream-event mirroring as `Allow` (see above) so the
+                // modified-and-approved calls render their output in the UI sink.
                 for call in calls {
+                    Self::emit(
+                        &on_stream,
+                        StreamEvent::ToolCall {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: call.input.clone(),
+                            node: None,
+                        },
+                    );
                     let output = self
                         .normalize_sandbox_violation(tool_registry.dispatch(call.clone()).await);
+                    Self::emit(
+                        &on_stream,
+                        StreamEvent::ToolResult {
+                            call_id: call.id.clone(),
+                            is_error: matches!(output, ToolOutput::Error { .. }),
+                            content: match &output {
+                                ToolOutput::Success { content, .. } => content.clone(),
+                                ToolOutput::Error { message, .. } => message.clone(),
+                                _ => String::new(),
+                            },
+                            node: None,
+                        },
+                    );
                     let tr = ToolResult {
                         call_id: call.id,
                         output,
@@ -11464,6 +11571,8 @@ impl StandardHarness {
             budget_used,
             on_stream,
             agent,
+            // legacy wrapper: empty handle ⇒ global-catalogue fallback.
+            ToolsetRef(String::new()),
         )
         .await
     }
@@ -12027,6 +12136,8 @@ mod strategy_tests {
                         output: Some(SchemaRef("worker-schema".to_string())),
                     })),
                     evaluator: SchemaRef("exec-evaluator".to_string()),
+                    eval_agent: None,
+                    eval_toolset: None,
                 })),
                 plan_model: None,
             })),
@@ -12097,6 +12208,8 @@ mod strategy_tests {
                 behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(2))),
                 evaluator: SchemaRef("ev".to_string()),
+                eval_agent: None,
+                eval_toolset: None,
             }),
             LoopStrategy::Ralph(RalphConfig {
                 behavior: BudgetExhaustedBehavior::Escalate,
@@ -12191,6 +12304,8 @@ mod strategy_tests {
                 behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
                 evaluator: SchemaRef("e".to_string()),
+                eval_agent: None,
+                eval_toolset: None,
             }),
             LoopStrategy::Ralph(RalphConfig {
                 behavior: BudgetExhaustedBehavior::Escalate,
@@ -12375,6 +12490,8 @@ mod strategy_tests {
             behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(inner),
             evaluator: SchemaRef("ev".to_string()),
+            eval_agent: None,
+            eval_toolset: None,
         })
     }
 
@@ -17202,6 +17319,8 @@ mod tests {
                 behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(react_structured(u32::MAX)),
                 evaluator: SchemaRef(String::new()),
+                eval_agent: None,
+                eval_toolset: None,
             })),
             plan_model: None,
         }));
@@ -17257,6 +17376,8 @@ mod tests {
                 plan_model: None,
             })),
             evaluator: SchemaRef(String::new()),
+            eval_agent: None,
+            eval_toolset: None,
         }));
 
         match h.run(HarnessRunOptions::new(t)).await {
@@ -18377,6 +18498,8 @@ mod tests {
             behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(react_structured(u32::MAX)),
             evaluator: SchemaRef(String::new()),
+            eval_agent: None,
+            eval_toolset: None,
         }))
     }
 
@@ -18913,6 +19036,165 @@ mod tests {
         );
     }
 
+    // ── eval-phase reviewer-context regression tests ─────────────────────────
+
+    // BLOCKER FIX: the evaluate phase must NOT inherit the caller's approval
+    // middleware. A nested review run is non-interactive (the caller never sees
+    // its generated session id), so a `SurfaceToHuman` BeforeTool decision would
+    // pause it with no human able to resume — the reviewer's first tool call
+    // would never dispatch and the review half would silently never run. With the
+    // caller middleware dropped for the read-only eval phase, the reviewer's
+    // read dispatches and the run reaches a verdict.
+    #[tokio::test]
+    async fn self_verifying_eval_phase_drops_caller_middleware() {
+        // Build emits a tool-free FinalResponse (so the BUILD phase, which DOES
+        // run the caller middleware, never trips it); the eval phase (same worker
+        // per Q1c) then issues a read — the call the middleware would have gated.
+        let worker = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::final_resp("built"),
+                RecordingTurnAgent::tool_call("read_file"),
+                RecordingTurnAgent::final_resp("reviewed: PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker);
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
+        // The dispatch count is the discriminator: it only increments if the eval
+        // phase's tool call actually dispatched (i.e. was NOT paused at BeforeTool).
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        cfg.tool_registry = reg.clone();
+        // The caller's approval middleware: SurfaceToHuman at BeforeTool. Without
+        // the eval-phase drop, it pauses the reviewer's read and the run never
+        // dispatches the tool.
+        let mw = Arc::new(ScriptedMiddleware::new());
+        mw.push(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::SurfaceToHuman {
+                request: HumanRequest::ToolApproval {
+                    calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    risk_level: RiskLevel::Medium,
+                },
+            },
+        );
+        cfg.middleware = Some(mw);
+        let h = StandardHarness::new(cfg);
+        let r = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+        assert!(
+            matches!(r, RunResult::Success { .. }),
+            "eval phase must run to a verdict, got {r:?}"
+        );
+        // Load-bearing: the reviewer's read actually dispatched. With the caller
+        // middleware NOT dropped, the eval phase pauses at BeforeTool BEFORE
+        // dispatch and this count stays 0.
+        assert!(
+            reg.call_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "eval-phase reviewer tool must dispatch (caller approval middleware \
+             must be dropped for the read-only review run)"
+        );
+    }
+
+    // The evaluate phase runs the configured `eval_agent` (a dedicated reviewer),
+    // not the inner worker's agent — so the model reviewing the work is not the
+    // one that wrote it (a builder reviewing itself tends to rubber-stamp).
+    #[tokio::test]
+    async fn self_verifying_eval_agent_override_runs_distinct_reviewer() {
+        let build = RecordingTurnAgent::new("build", vec![RecordingTurnAgent::final_resp("built")]);
+        let reviewer =
+            RecordingTurnAgent::new("reviewer", vec![RecordingTurnAgent::final_resp("reviewed")]);
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, build.clone());
+        cfg.registry = std::mem::take(&mut cfg.registry)
+            .into_builder()
+            .agent("reviewer", reviewer.clone())
+            .build();
+        set_default_verifier(
+            &mut cfg,
+            Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3)),
+        );
+        let h = StandardHarness::new(cfg);
+        let t = task(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(react_structured(u32::MAX)),
+            evaluator: SchemaRef(String::new()),
+            eval_agent: Some(AgentRef("reviewer".into())),
+            eval_toolset: None,
+        }));
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+        // The reviewer ran the evaluate phase exactly once; the builder ran only
+        // the build phase. Without the override the worker would serve BOTH and
+        // the reviewer would never be called.
+        assert_eq!(
+            reviewer.call_count(),
+            1,
+            "eval_agent reviewer runs the evaluate phase"
+        );
+        assert_eq!(build.call_count(), 1, "builder runs only the build phase");
+    }
+
+    // Wire-format contract (cross-language parity): the two optional eval-phase
+    // overrides are OMITTED when unset (existing configs stay byte-identical) and
+    // serialize as bare string handles in declaration order (evaluator <
+    // eval_agent < eval_toolset < behavior) when set, round-tripping intact.
+    #[test]
+    fn self_verifying_config_eval_overrides_serde() {
+        let bare = LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+            evaluator: SchemaRef("v".into()),
+            eval_agent: None,
+            eval_toolset: None,
+        });
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("eval_agent").is_none(), "eval_agent omitted when None");
+        assert!(
+            v.get("eval_toolset").is_none(),
+            "eval_toolset omitted when None"
+        );
+
+        let with = LoopStrategy::SelfVerifying(SelfVerifyingConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            inner: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(1))),
+            evaluator: SchemaRef("v".into()),
+            eval_agent: Some(AgentRef("reviewer".into())),
+            eval_toolset: Some(ToolsetRef("ro-tools".into())),
+        });
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(
+            s.contains("\"eval_agent\":\"reviewer\""),
+            "bare string handle: {s}"
+        );
+        assert!(
+            s.contains("\"eval_toolset\":\"ro-tools\""),
+            "bare string handle: {s}"
+        );
+        // `behavior` appears twice (inner ReAct + this config); the SelfVerifying
+        // one is LAST, so `rfind` targets it.
+        let (ev, ea, et, bh) = (
+            s.find("evaluator").unwrap(),
+            s.find("eval_agent").unwrap(),
+            s.find("eval_toolset").unwrap(),
+            s.rfind("behavior").unwrap(),
+        );
+        assert!(
+            ev < ea && ea < et && et < bh,
+            "field order locked for parity: {s}"
+        );
+        let back: LoopStrategy = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, with, "round-trips intact");
+    }
+
     // R12: fixture replay — scripted (build verdict sequence, evaluator output
     // sequence) → expected terminal RunResult kind + iteration count.
     #[derive(serde::Deserialize)]
@@ -19295,6 +19577,8 @@ mod tests {
                 behavior: BudgetExhaustedBehavior::Escalate,
                 inner: Box::new(react_structured(u32::MAX)),
                 evaluator: SchemaRef(String::new()),
+                eval_agent: None,
+                eval_toolset: None,
             })),
             agent: AgentRef(String::new()),
         }));

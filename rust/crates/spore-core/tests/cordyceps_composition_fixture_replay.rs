@@ -623,6 +623,8 @@ fn small_budget_pe() -> LoopStrategy {
             behavior: BudgetExhaustedBehavior::Escalate,
             inner: Box::new(worker),
             evaluator: SchemaRef("exec-evaluator".into()),
+            eval_agent: None,
+            eval_toolset: None,
         })),
         plan_model: None,
     })
