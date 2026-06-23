@@ -101,7 +101,9 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 
 ### Phase 2.5 — Presets (the force multiplier)
 
-**SC-8 — Build presets from the working consumers.** cordyceps **is** `HarnessBuilder::hill_climber(model, evaluator)`; looper **is** `HarnessBuilder::coding_agent(model, workspace)`. Once Phases 1–2 land, extract each preset; each consumer collapses to ~40 lines. These presets are what carry the friendly behaviour (Q1).
+**SC-8 — Build presets from the working consumers. LANDED (Rust) `6f39933`; parity #157.** cordyceps **is** `HarnessBuilder::hill_climber(model, evaluator)`; looper **is** `HarnessBuilder::coding_agent(model, workspace)`. Once Phases 1–2 land, extract each preset; each consumer collapses to ~40 lines. These presets are what carry the friendly behaviour (Q1).
+
+> **LANDED `6f39933`.** Both compose `conversational(model)` + the Phase 1–2 knobs. `coding_agent(model, workspace) -> Result<Self, BuildError>`: read-write `WorkspaceScopedSandbox` + `coding_set()` + built-in `CODING_AGENT_SYSTEM_PROMPT` + `AutoContinue` (SC-5, replaces the hand-rolled drive loop). `hill_climber(model, evaluator) -> Self`: registers the `MetricEvaluator` under the default handle + `AutoContinue`; sandbox/tools/system-prompt left to the caller (climbs vary). Shared defaults exposed as `HarnessBuilder::{CODING_AGENT_SYSTEM_PROMPT, PRESET_MAX_AUTO_GRANTS=10, PRESET_STEPS_PER_GRANT=25}`; the strategy stays per-run on the Task. Window sizing rides SC-4/SC-6 (`with_context_window` once → compaction auto-derives). Additive — new constructors only; no fixture impact. Tests: `coding_agent_preset_{wires…,errors_on_missing_workspace}` + `hill_climber_preset_registers_evaluator_and_autocontinue` + a doctest each. **Follow-up:** migrate the `10-hill-climbing` / `12-cordyceps` examples to USE the presets (the "collapses to ~40 lines" proof) — a separate live-verified change.
 
 ### Phase 3 — Wire the dead seams
 
@@ -211,7 +213,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 2. **Phase 1** — **SC-1 + SC-30 bundled** (same "handle must resolve or it's ceremony" class: auto-synthesize the schema + auto-derive the read-only eval catalogue, one PR), **SC-2** (fixture-safe but not quick), **SC-3**. Plus the D2 single-`Default` fix.
 3. **SC-BUG-1** — with the #151 work; it's the resume path the reviewer depends on (SC-30 inert for looper until then). **LANDED (Rust) `8d1d679`; parity #156.**
 4. **Phase 2** (SC-4/5/6/27) — additive, ships alongside Phase 1 (un-gated by Q1). **LANDED (Rust) `f1c0beb`; parity #155.**
-5. **Phase 2.5** (SC-8) — presets, once Phase 1 lands.
+5. **Phase 2.5** (SC-8) — presets, once Phase 1 lands. **LANDED (Rust) `6f39933`; parity #157.**
 6. **Phase 3** — Q2 canonical-chain adoption (subsumes SC-9 + SC-11) + SC-10/26/28. **Phase 4/5** as capacity allows.
 7. **agent-repl-kit** (ARK) + **looper-local** (LOC) — alongside, mostly independent.
 8. **SC-29** — confirm always-drop, port to TS/Py/Go (#151).
