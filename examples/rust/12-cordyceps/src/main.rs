@@ -87,7 +87,7 @@ use spore_core::{
     FunctionHook, Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions,
     HarnessStreamEvent, HookChain, HookContext, HookDecision, HookEvent, HumanRequest,
     HumanResponse, LoopStrategy, Message, NullCacheProvider, OllamaModelInterface,
-    PlanExecuteConfig, ReactConfig, Role, RunResult, SchemaRef, SessionId, SessionState,
+    PlanExecuteConfig, ReactConfig, Role, RunResult, SessionId, SessionState,
     StandardContextManager, StandardHookChain, StandardTools, Task, ToolCall, ToolResult,
     ToolsetRef, WorkspaceConfig, WorkspaceScopedSandbox,
 };
@@ -132,15 +132,6 @@ const MAX_AUTO_CONTINUES: u32 = 10;
 /// scope's cap past where it stopped, so the in-flight task gets this many more
 /// steps (and its stalled worker is re-seeded — no work is lost).
 const CONTINUE_STEPS: u32 = MAX_STEPS;
-
-/// Registry key for the plan slot's output schema. The PlanExecute `plan` slot is
-/// STRUCTURED — startup validation rejects a bare ReAct there unless its leaf
-/// declares an `output` schema (so the slot yields a typed result). We register an
-/// empty schema under this key and point the plan leaf at it. With
-/// `enforce_output_schemas` OFF (the default) the schema is used ONLY to satisfy
-/// that validation — it is not delivered to or enforced on the model; the plan
-/// phase's own "respond with a single JSON plan" directive drives the format.
-const PLAN_SCHEMA_KEY: &str = "plan";
 
 /// Compaction window, in tokens — the size the harness believes the model's
 /// context is, and the budget it compacts against. gemma4's real window is 256K,
@@ -266,9 +257,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(skills::load_skill_tool(active.clone(), known.clone()))
         .system_prompt(SYSTEM_PROMPT)
         .context_manager(context_manager)
-        // PlanExecute's `plan` slot is structured: its output schema must resolve
-        // against the registry (see PLAN_SCHEMA_KEY) or startup validation fails.
-        .registry_schema(PLAN_SCHEMA_KEY, serde_json::json!({}))
         // Surface the plan to the user the moment it's captured (OnPlanCreated).
         .hooks(plan_announcer())
         .build();
@@ -514,10 +502,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// - **plan** — a ReAct sub-loop (≤ [`PLAN_STEPS`]) that may look around with the
 ///   read tools, then emits the `{"tasks":[…],"rationale":…}` plan. The harness
 ///   seeds the "respond with a single JSON plan" directive itself; we only supply
-///   the slot. It is a STRUCTURED slot, so its leaf MUST declare an `output`
-///   schema or startup validation rejects the run — hence
-///   `Some(SchemaRef(PLAN_SCHEMA_KEY))` (registered as an empty schema on the
-///   builder; resolved, not enforced — see [`PLAN_SCHEMA_KEY`]).
+///   the slot. The leaf carries NO `output` schema: SC-1 lets a structured slot
+///   omit it (an absent schema is treated as accept-all), so no registry stamp is
+///   needed just to pass startup validation — the plan phase's own "respond with a
+///   single JSON plan" directive drives the format.
 /// - **execute** — a bare ReAct leaf (≤ [`MAX_STEPS`] per task). The executor
 ///   walks the durable task list, running this loop once per ready task.
 ///
@@ -531,7 +519,7 @@ fn plan_execute_strategy() -> LoopStrategy {
             behavior: BudgetExhaustedBehavior::Escalate,
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
-            output: Some(SchemaRef(PLAN_SCHEMA_KEY.to_string())),
+            output: None,
         })),
         execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(MAX_STEPS))),
         plan_model: None,
