@@ -4513,6 +4513,55 @@ impl ToolRegistry for EmptyToolRegistry {
     }
 }
 
+/// SC-30: a read-only VIEW over an inner harness-loop [`ToolRegistry`]. It
+/// advertises ([`schemas`](ToolRegistry::schemas)) and dispatches ONLY tools
+/// whose name is in `allow` — the INTERSECTION of the wrapped catalogue with a
+/// read-only allow-list (`StandardTools::readonly_set()` names). Used internally
+/// for the SelfVerifying evaluate phase so a reviewer cannot reach
+/// write / exec / side-effecting tools (web/MCP the read-only sandbox does not
+/// gate) even though the work phase could — WITHOUT the consumer registering a
+/// scoped read-only toolset. A non-allow-listed dispatch (which the model should
+/// never request, since it is never advertised) returns a recoverable
+/// [`ToolOutput::error`]. A consumer that wants a different reviewer toolset sets
+/// an explicit `eval_toolset` handle, which bypasses this view entirely.
+struct ReadOnlyToolView {
+    inner: Arc<dyn ToolRegistry>,
+    allow: std::collections::HashSet<String>,
+}
+
+impl ReadOnlyToolView {
+    fn new(inner: Arc<dyn ToolRegistry>, allow: std::collections::HashSet<String>) -> Self {
+        Self { inner, allow }
+    }
+}
+
+impl ToolRegistry for ReadOnlyToolView {
+    fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+        if self.allow.contains(&call.name) {
+            self.inner.dispatch(call)
+        } else {
+            let name = call.name;
+            Box::pin(async move {
+                ToolOutput::error(format!(
+                    "tool `{name}` is not available in the read-only evaluate phase"
+                ))
+            })
+        }
+    }
+
+    fn is_always_halt(&self, tool_name: &str) -> bool {
+        self.inner.is_always_halt(tool_name)
+    }
+
+    fn schemas(&self) -> Vec<ToolSchema> {
+        self.inner
+            .schemas()
+            .into_iter()
+            .filter(|s| self.allow.contains(&s.name))
+            .collect()
+    }
+}
+
 /// Issue #6 — SandboxProvider: validates tool calls against sandbox policy.
 ///
 /// Issue #5 adds default implementations for `execute_command`,
@@ -9249,6 +9298,35 @@ tool. Use the provided tool-call format to actually invoke the tool."
         // an `eval_toolset` scoped to read-only tools so non-filesystem
         // side-effecting tools the sandbox does not gate stay out of reach.)
         eval_config.middleware = None;
+        // SC-30: when the eval phase falls back to the GLOBAL catalogue (empty
+        // `eval_toolset`), auto-derive a read-only VIEW of it — advertise +
+        // dispatch only the intersection with `StandardTools::readonly_set()`, so
+        // the reviewer cannot reach write / exec / side-effecting tools (incl.
+        // web/MCP the read-only sandbox does not gate) WITHOUT the consumer
+        // registering a scoped read-only toolset. A non-empty `eval_toolset` is an
+        // explicit opt-in and is left untouched (it resolves via its own catalogue).
+        if eval_toolset.0.is_empty() {
+            if let Some(catalogue) = eval_config.catalogue_registry.take() {
+                let allow: std::collections::HashSet<String> =
+                    crate::tools::StandardTools::readonly_set()
+                        .into_iter()
+                        .map(|t| t.schema.name)
+                        .collect();
+                let real: Arc<dyn ToolRegistry> =
+                    Arc::new(crate::tool_registry::RealToolRegistry::new(
+                        catalogue,
+                        eval_config.sandbox.clone(),
+                        eval_session_id.clone(),
+                        eval_config.project_id.clone(),
+                        eval_config.storage.run().clone(),
+                        eval_config.storage.memory().clone(),
+                    ));
+                // `catalogue_registry` is now None (taken), so the empty-handle
+                // path of `effective_tool_registry` returns this filtered
+                // `tool_registry` for the reviewer's dispatch + schema advertising.
+                eval_config.tool_registry = Arc::new(ReadOnlyToolView::new(real, allow));
+            }
+        }
         let eval_harness = StandardHarness::new(eval_config);
 
         let mut eval_state = SessionState::default();
@@ -12899,6 +12977,71 @@ mod tests {
 
     fn make_agent() -> Arc<MockAgent> {
         Arc::new(MockAgent::new(AgentId::new("test")))
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_view_filters_to_readonly_allowlist() {
+        // SC-30: the eval-phase read-only view advertises + dispatches only the
+        // INTERSECTION of the wrapped catalogue with StandardTools::readonly_set().
+        use crate::model::ToolSchema as ModelToolSchema;
+        use std::sync::Mutex;
+
+        // Inner registry advertising read + write + exec tools, recording dispatches.
+        struct Inner {
+            dispatched: Mutex<Vec<String>>,
+        }
+        impl ToolRegistry for Inner {
+            fn dispatch<'a>(&'a self, call: ToolCall) -> BoxFut<'a, ToolOutput> {
+                self.dispatched.lock().unwrap().push(call.name.clone());
+                Box::pin(async { ToolOutput::success("ok") })
+            }
+            fn schemas(&self) -> Vec<ModelToolSchema> {
+                ["read_file", "write_file", "bash"]
+                    .into_iter()
+                    .map(|n| ModelToolSchema {
+                        name: n.to_string(),
+                        description: String::new(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })
+                    .collect()
+            }
+        }
+
+        let inner = Arc::new(Inner {
+            dispatched: Mutex::new(Vec::new()),
+        });
+        let allow: std::collections::HashSet<String> = crate::tools::StandardTools::readonly_set()
+            .into_iter()
+            .map(|t| t.schema.name)
+            .collect();
+        let view = ReadOnlyToolView::new(inner.clone(), allow);
+
+        // Schemas: only read_file survives the intersection; write_file/bash gone.
+        let names: Vec<String> = view.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"read_file".to_string()), "read_file advertised");
+        assert!(!names.contains(&"write_file".to_string()), "write_file hidden");
+        assert!(!names.contains(&"bash".to_string()), "bash hidden");
+
+        // read_file dispatches through to the inner registry.
+        let ok = view
+            .dispatch(ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        assert!(matches!(ok, ToolOutput::Success { .. }));
+
+        // write_file is blocked with a recoverable error and never reaches inner.
+        let blocked = view
+            .dispatch(ToolCall {
+                id: "2".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({}),
+            })
+            .await;
+        assert!(matches!(blocked, ToolOutput::Error { recoverable: true, .. }));
+        assert_eq!(&*inner.dispatched.lock().unwrap(), &["read_file".to_string()]);
     }
 
     /// #142: the fixed canonical path the test config helpers derive their
