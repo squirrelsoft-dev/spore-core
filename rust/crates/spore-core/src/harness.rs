@@ -2538,7 +2538,22 @@ impl RunStrategy for SelfVerifyingConfig {
             };
             let task = cx.current_task();
             let build_session_id = task.session_id.clone();
-            let mut session_state = std::mem::take(&mut cx.scratch.run_session);
+            // SC-BUG-1: a HITL resume re-drives the whole SelfVerifying strategy
+            // with the stalled build (worker) conversation carried in the
+            // phase-agnostic resume seed. Consume it as the FIRST build iteration's
+            // session so the build phase CONTINUES the approved/answered worker turn
+            // (which already carries the original instruction + the dispatched tool
+            // result) instead of restarting from an empty top-level session — then
+            // the evaluate phase + verifier run, reaching the looper's eval-frame
+            // reviewer. On a fresh run the seed is `None` and this is the incoming
+            // `run_session`, byte-identical to before. When SelfVerifying is NESTED
+            // under a PlanExecute walk, that outer walk `.take()`s the seed BEFORE
+            // recursing, so this sees `None` and the nested behavior is unchanged.
+            let mut session_state = cx
+                .scratch
+                .resume_seed
+                .take()
+                .unwrap_or_else(|| std::mem::take(&mut cx.scratch.run_session));
             let mut carried = cx.scratch.run_budget.clone();
             // #stream: save the parent sink, install a `self_verifying`-attributing
             // wrapper so the build (worker) and evaluate phases stream through it;
@@ -3390,6 +3405,15 @@ impl ExecutionContext<'_> {
         // `finish`, rewrite its `state.task` to the combinator's OWN composed
         // task; by the top it carries the FULL tree, so `resume_consult` re-drives
         // the whole strategy (the in-progress task resumes from `resume_seed`).
+        //
+        // SC-BUG-1: a HITL pause (`WaitingForHuman`) propagated from a worker leaf
+        // ALSO carries the LEAF task (a leaf records its terminal via
+        // `record_terminal`, which never rewrites it). Without the same rewrite, a
+        // host `resume` runs only that bare leaf and loses the surrounding frame —
+        // the SelfVerifying evaluate phase / PlanExecute walk never re-runs (so
+        // under `AlwaysAsk` the verify gate silently degrades to a plain executor).
+        // Rewrite it on the way up exactly like `Consult`, so `resume_inner`
+        // re-drives the whole composed strategy from the approved worker session.
         let result = match result {
             RunResult::Consult {
                 request,
@@ -3406,6 +3430,10 @@ impl ExecutionContext<'_> {
                     usage,
                     turns,
                 }
+            }
+            RunResult::WaitingForHuman { request, mut state } => {
+                state.task = parent_task.clone();
+                RunResult::WaitingForHuman { request, state }
             }
             other => other,
         };
@@ -11614,6 +11642,28 @@ impl StandardHarness {
                         .append_tool_result(&mut session_state, &tr)
                         .await;
                 }
+                // SC-BUG-1: a clarification that surfaced from inside a composed
+                // tree carries the FULL strategy in `task.loop_strategy` (each
+                // combinator's `finish` rewrote the pause's task on the way up).
+                // Re-DRIVE that strategy from the answered worker session — exactly
+                // as the consult resume does — so the SelfVerifying evaluate phase /
+                // PlanExecute walk runs instead of only the bare worker leaf. A
+                // BARE ReAct leaf has no surrounding frame, so it keeps the
+                // leaf-only resume below (back-compat).
+                if !matches!(task.loop_strategy, LoopStrategy::ReAct(_)) {
+                    return self
+                        .drive_strategy_with_resume_seed(
+                            task,
+                            // Top-level session starts fresh; the answered worker
+                            // conversation threads in as the resume seed.
+                            SessionState::default(),
+                            budget_used,
+                            on_stream,
+                            None,
+                            Some(session_state),
+                        )
+                        .await;
+                }
                 let max_iterations = match &task.loop_strategy {
                     LoopStrategy::ReAct(c) => c.max_iterations(),
                     _ => u32::MAX,
@@ -11789,6 +11839,28 @@ impl StandardHarness {
                     session_state,
                 };
             }
+        }
+
+        // SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from
+        // inside a composed tree carries the FULL strategy in `task.loop_strategy`
+        // (each combinator's `finish` rewrote the pause's task on the way up). The
+        // human response has already been applied to `session_state` above (the
+        // approved calls dispatched, or the deny/answer message appended). Re-DRIVE
+        // the whole strategy from that mutated worker session — mirroring the
+        // consult resume — so the SelfVerifying evaluate phase (the looper's
+        // eval-frame reviewer) / PlanExecute walk re-runs instead of degrading to a
+        // plain executor. A BARE ReAct leaf keeps the leaf-only resume below.
+        if !matches!(task.loop_strategy, LoopStrategy::ReAct(_)) {
+            return self
+                .drive_strategy_with_resume_seed(
+                    task,
+                    SessionState::default(),
+                    budget_used,
+                    on_stream,
+                    None,
+                    Some(session_state),
+                )
+                .await;
         }
 
         // Resume the ReAct loop from where we left off.
@@ -19466,6 +19538,210 @@ mod tests {
             reg.call_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "eval-phase reviewer tool must dispatch (caller approval middleware \
              must be dropped for the read-only review run)"
+        );
+    }
+
+    // SC-BUG-1: a HITL approval/clarification resume must RE-ENTER the
+    // SelfVerifying frame, not run only the bare build leaf. The original run
+    // pauses on the BUILD phase's first tool call (caller approval middleware →
+    // SurfaceToHuman). Before the fix, `resume_inner` ran `run_react` on the
+    // paused ReAct leaf and returned its Success directly — the evaluate phase +
+    // verifier never ran, so the looper's eval-frame reviewer was silently
+    // skipped (SC-30 inert for looper). After the fix the pause carries the full
+    // composed task (`finish` rewrites it on the way up, as it already does for
+    // `Consult`) and the resume re-drives the whole SelfVerifying strategy from
+    // the approved worker session, so the verifier runs and a verdict is reached.
+    #[tokio::test]
+    async fn self_verifying_hitl_resume_reenters_eval_frame() {
+        // Build phase: a tool call (gated → pause), then a FinalResponse once the
+        // approved call dispatches. Eval phase (same worker per Q1c; its caller
+        // middleware is dropped, SC-29) emits a tool-free FinalResponse so it
+        // never re-trips the gate.
+        let worker = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::tool_call("write_file"),
+                RecordingTurnAgent::final_resp("built"),
+                RecordingTurnAgent::final_resp("reviewed: PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker);
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
+        set_default_verifier(&mut cfg, verifier.clone());
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        cfg.tool_registry = reg.clone();
+        // Caller approval middleware: SurfaceToHuman at BeforeTool. The build
+        // phase's `write_file` trips it and the run pauses for approval.
+        let mw = Arc::new(ScriptedMiddleware::new());
+        mw.push(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::SurfaceToHuman {
+                request: HumanRequest::ToolApproval {
+                    calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    risk_level: RiskLevel::Medium,
+                },
+            },
+        );
+        cfg.middleware = Some(mw);
+        let h = StandardHarness::new(cfg);
+
+        // 1) The run pauses on the build-phase tool call.
+        let paused = h.run(HarnessRunOptions::new(self_verifying_task())).await;
+        let state = match paused {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected WaitingForHuman on the build tool call, got {other:?}"),
+        };
+        // The pause must carry the COMPOSED task so the resume can re-enter the
+        // frame — not the bare ReAct build leaf.
+        assert!(
+            matches!(state.task.loop_strategy, LoopStrategy::SelfVerifying(_)),
+            "the unwound pause must carry the SelfVerifying task, got {:?}",
+            state.task.loop_strategy
+        );
+
+        // 2) Approve and resume.
+        let resumed = h.resume(state, HumanResponse::Allow, None).await;
+        assert!(
+            matches!(resumed, RunResult::Success { .. }),
+            "resume must run to a verdict, got {resumed:?}"
+        );
+
+        // Load-bearing: the eval-phase verifier ran AFTER the resume — i.e. the
+        // SelfVerifying frame was re-entered. Before the fix the resume returned
+        // the bare leaf's Success and this count stays 0.
+        let verifier_calls = verifier.seen.lock().unwrap().len();
+        assert!(
+            verifier_calls >= 1,
+            "SelfVerifying frame must be re-entered on HITL resume so the \
+             eval-phase verifier runs (got {verifier_calls} verifier calls)"
+        );
+        // And the approved build tool actually dispatched on resume.
+        assert!(
+            reg.call_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the approved build-phase tool must dispatch on resume"
+        );
+    }
+
+    // SC-BUG-1 (Deny arm): a DENIED tool-approval resume must also re-enter the
+    // SelfVerifying frame. Deny appends a recoverable error tool result for the
+    // gated call and then re-drives the strategy (the same final-match tail as
+    // Allow). The build continues from the denial and the evaluate phase runs.
+    #[tokio::test]
+    async fn self_verifying_hitl_deny_reenters_eval_frame() {
+        let worker = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::tool_call("write_file"),
+                RecordingTurnAgent::final_resp("built without the write"),
+                RecordingTurnAgent::final_resp("reviewed: PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker);
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
+        set_default_verifier(&mut cfg, verifier.clone());
+        let mw = Arc::new(ScriptedMiddleware::new());
+        mw.push(
+            HookPoint::BeforeTool,
+            MiddlewareDecision::SurfaceToHuman {
+                request: HumanRequest::ToolApproval {
+                    calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    risk_level: RiskLevel::High,
+                },
+            },
+        );
+        cfg.middleware = Some(mw);
+        let h = StandardHarness::new(cfg);
+
+        let state = match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::WaitingForHuman { state, .. } => *state,
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        };
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Deny {
+                    reason: "not allowed".into(),
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(resumed, RunResult::Success { .. }),
+            "deny resume must run to a verdict, got {resumed:?}"
+        );
+        assert!(
+            verifier.seen.lock().unwrap().len() >= 1,
+            "SelfVerifying frame must be re-entered on a DENY resume so the \
+             eval-phase verifier runs"
+        );
+    }
+
+    // SC-BUG-1 (clarification/Answer arm): a clarification resume (the SEPARATE
+    // `resume_inner` clarification tail) must also re-enter the SelfVerifying
+    // frame. The build worker's tool returns `AwaitingClarification`; the human's
+    // Answer is injected as that call's tool result and the strategy is re-driven,
+    // so the evaluate phase runs.
+    #[tokio::test]
+    async fn self_verifying_hitl_clarification_reenters_eval_frame() {
+        let worker = RecordingTurnAgent::new(
+            "build",
+            vec![
+                RecordingTurnAgent::tool_call("ask"),
+                RecordingTurnAgent::final_resp("built"),
+                RecordingTurnAgent::final_resp("reviewed: PASS"),
+            ],
+        );
+        let mut cfg = standard_config(make_agent());
+        set_worker_agent(&mut cfg, worker);
+        let verifier = Arc::new(ScriptedVerifier::new(vec![passed()], passed(), 3));
+        set_default_verifier(&mut cfg, verifier.clone());
+        // No approval middleware: the tool itself returns AwaitingClarification,
+        // pausing the build phase with a `HumanRequest::Clarification`.
+        let reg = Arc::new(ScriptedToolRegistry::new());
+        reg.push(ToolOutput::AwaitingClarification {
+            question: "which file?".into(),
+            options: None,
+        });
+        cfg.tool_registry = reg;
+        let h = StandardHarness::new(cfg);
+
+        let state = match h.run(HarnessRunOptions::new(self_verifying_task())).await {
+            RunResult::WaitingForHuman { state, request } => {
+                assert!(
+                    matches!(request, HumanRequest::Clarification { .. }),
+                    "expected a clarification pause, got {request:?}"
+                );
+                *state
+            }
+            other => panic!("expected WaitingForHuman, got {other:?}"),
+        };
+        let resumed = h
+            .resume(
+                state,
+                HumanResponse::Answer {
+                    text: "the config file".into(),
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(resumed, RunResult::Success { .. }),
+            "clarification resume must run to a verdict, got {resumed:?}"
+        );
+        assert!(
+            verifier.seen.lock().unwrap().len() >= 1,
+            "SelfVerifying frame must be re-entered on a clarification resume so \
+             the eval-phase verifier runs"
         );
     }
 
