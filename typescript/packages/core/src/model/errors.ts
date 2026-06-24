@@ -11,7 +11,11 @@ export type ModelErrorKind =
   | "rate_limited"
   | "context_limit_exceeded"
   | "budget_exceeded"
-  | "timeout";
+  | "timeout"
+  // SC-3: the two new typed transport/stream variants emit a PascalCase `kind`
+  // (cross-language ground truth — see {@link Transport} / {@link StreamInterrupted}).
+  | "Transport"
+  | "StreamInterrupted";
 
 export abstract class ModelError extends Error {
   abstract readonly kind: ModelErrorKind;
@@ -23,6 +27,19 @@ export abstract class ModelError extends Error {
 
   /** JSON wire shape — matches Rust `#[serde(tag = "kind")]`. */
   abstract toJSON(): Record<string, unknown>;
+
+  /**
+   * Whether retrying the identical call could plausibly succeed (SC-3).
+   *
+   * Transport drops, mid-stream interruptions, timeouts, and rate-limits are
+   * transient. Provider/encode/decode/capability errors and context/budget
+   * overflows are deterministic and will recur. Lets a consumer drive its retry
+   * loop off a typed predicate instead of substring-matching the error text.
+   * Defaults to `false`; transient variants override.
+   */
+  retryable(): boolean {
+    return false;
+  }
 }
 
 export class ProviderError extends ModelError {
@@ -52,6 +69,9 @@ export class RateLimited extends ModelError {
   }
   toJSON() {
     return { kind: this.kind, retry_after: this.retryAfter };
+  }
+  override retryable() {
+    return true;
   }
 }
 
@@ -89,6 +109,52 @@ export class Timeout extends ModelError {
   toJSON() {
     return { kind: this.kind };
   }
+  override retryable() {
+    return true;
+  }
+}
+
+/**
+ * Network/transport failure reaching the provider (connection refused, socket
+ * error, generic HTTP transport error) — the request never produced a usable
+ * response. Transient: {@link retryable} is `true` (SC-3).
+ *
+ * Serialises with a PascalCase `kind` tag (`{ "kind": "Transport", ... }`) —
+ * cross-language ground truth, byte-for-byte with the Rust `ModelError` enum.
+ */
+export class Transport extends ModelError {
+  readonly kind = "Transport" as const;
+  constructor(message: string) {
+    super(message);
+  }
+  toJSON() {
+    return { kind: this.kind, message: this.message };
+  }
+  override retryable() {
+    return true;
+  }
+}
+
+/**
+ * The response stream was interrupted mid-flight (a chunk read/decode failure
+ * while draining a streaming body). Transient: {@link retryable} is `true` — the
+ * turn can be retried (SC-3). Distinct from a deterministic decode failure of a
+ * *complete* response, which stays a {@link ProviderError}.
+ *
+ * Serialises with a PascalCase `kind` tag (`{ "kind": "StreamInterrupted", ... }`)
+ * — cross-language ground truth, byte-for-byte with the Rust `ModelError` enum.
+ */
+export class StreamInterrupted extends ModelError {
+  readonly kind = "StreamInterrupted" as const;
+  constructor(message: string) {
+    super(message);
+  }
+  toJSON() {
+    return { kind: this.kind, message: this.message };
+  }
+  override retryable() {
+    return true;
+  }
 }
 
 /**
@@ -96,10 +162,7 @@ export class Timeout extends ModelError {
  * otherwise. We return rather than throw so call-sites can decide how to
  * surface the error and stay friendly to async pipelines.
  */
-export function enforceContextLimit(
-  actual: number,
-  limit: number,
-): ContextLimitExceeded | null {
+export function enforceContextLimit(actual: number, limit: number): ContextLimitExceeded | null {
   if (actual > limit) return new ContextLimitExceeded(limit, actual);
   return null;
 }
@@ -109,10 +172,7 @@ export function enforceContextLimit(
  * `ModelParams.max_tokens`. Returns `null` on success, a typed error
  * otherwise. `budget` undefined means "no budget configured".
  */
-export function enforceBudget(
-  used: number,
-  budget?: number | null,
-): BudgetExceeded | null {
+export function enforceBudget(used: number, budget?: number | null): BudgetExceeded | null {
   if (budget != null && used > budget) return new BudgetExceeded(budget, used);
   return null;
 }

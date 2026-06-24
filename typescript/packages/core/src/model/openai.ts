@@ -33,7 +33,14 @@
  * {@link "../cache-provider/types.js".OpenAICacheProvider.withModelPricing}.
  */
 
-import { ProviderError, RateLimited, Timeout, type ModelError } from "./errors.js";
+import {
+  ProviderError,
+  RateLimited,
+  StreamInterrupted,
+  Timeout,
+  Transport,
+  type ModelError,
+} from "./errors.js";
 import type { ModelInterface } from "./interface.js";
 import type {
   Content,
@@ -137,9 +144,7 @@ export class OpenAIModelInterface implements ModelInterface {
    * `max_completion_tokens`).
    */
   static isReasoningModel(modelId: string): boolean {
-    return (
-      modelId.startsWith("o1") || modelId.startsWith("o3") || modelId.startsWith("o4")
-    );
+    return modelId.startsWith("o1") || modelId.startsWith("o3") || modelId.startsWith("o4");
   }
 
   provider(): ProviderInfo {
@@ -564,7 +569,9 @@ function toModelError(e: unknown): ModelError {
   if (e instanceof Error && /timeout|ETIMEDOUT|AbortError/i.test(e.message)) {
     return new Timeout();
   }
-  return new ProviderError(0, `HTTP transport error: ${formatError(e)}`);
+  // SC-3: a network/transport failure reaching the provider is a typed,
+  // retryable Transport error — not a generic ProviderError.
+  return new Transport(`HTTP transport error: ${formatError(e)}`);
 }
 
 function formatError(e: unknown): string {
@@ -718,6 +725,11 @@ export async function* sseToEvents(body: ReadableStream<Uint8Array>): AsyncItera
     // If the stream ended without an explicit [DONE] marker we still emit
     // MessageStop so consumers see a terminator.
     yield { type: "message_stop", usage, stop_reason: stopReason };
+  } catch (e) {
+    // SC-3: a chunk read/decode failure while draining the streaming body is a
+    // mid-flight interruption — surface the typed, retryable StreamInterrupted
+    // variant rather than letting an untyped reader rejection escape.
+    throw new StreamInterrupted(`stream chunk error: ${formatError(e)}`);
   } finally {
     try {
       reader.releaseLock();

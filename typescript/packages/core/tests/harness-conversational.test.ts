@@ -20,6 +20,7 @@ import {
   runResultSessionState,
   simpleTask,
 } from "../src/index.js";
+import type { ModelInterface } from "../src/model/interface.js";
 import { MockModelInterface } from "../src/model/mock.js";
 import type { ModelResponse } from "../src/model/schemas.js";
 
@@ -53,6 +54,25 @@ describe("HarnessBuilder.conversational", () => {
     // Lossless post-run history (issue #102): user line + assistant reply.
     const state = runResultSessionState(result);
     expect(state.messages.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("constructs from an interface-typed (non-concrete) model and dispatches one call", async () => {
+    // SC-2 acceptance: object-safety is automatic for TS interfaces. The harness
+    // accepts the ModelInterface type — not the concrete MockModelInterface — so
+    // a consumer can hold one interface-typed model without a concrete-type enum
+    // + dispatch. Mirrors Rust's `harness_constructs_from_boxed_model_interface`
+    // minus the Arc coercion.
+    const model: ModelInterface = new MockModelInterface({
+      name: "mock",
+      model_id: "mock-model",
+    }).pushResponse(finalResponse("queued reply"));
+    const harness = HarnessBuilder.conversational(model).build();
+
+    const result = await harness.run({ task: simpleTask("Say something.") });
+
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") throw new Error("expected success");
+    expect(result.output).toBe("queued reply");
   });
 
   it("wires the documented defaults (no tools, allow-all null sandbox, respond-and-stop)", async () => {

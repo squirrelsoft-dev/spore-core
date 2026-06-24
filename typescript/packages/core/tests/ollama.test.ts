@@ -15,6 +15,7 @@ import {
   OLLAMA_DEFAULT_TIMEOUT_MS,
   ProviderError,
   Timeout,
+  Transport,
   ollamaBuildRequest,
   ollamaNameMatches,
   ollamaNdjsonToEvents,
@@ -799,8 +800,9 @@ describe("call() against a mock server", () => {
     expect(sentBody.options).toBeUndefined();
   });
 
-  it("connection refused yields a helpful 'Ollama not running' message", async () => {
-    // Closed port → connect should fail immediately.
+  it("connection refused yields a typed, retryable Transport 'Ollama not running' error", async () => {
+    // Closed port → connect should fail immediately. SC-3: a connect failure is
+    // a typed, retryable Transport error (was a generic ProviderError).
     const client = new OllamaModelInterface("llama3.2", {
       baseUrl: "http://127.0.0.1:1",
       timeoutMs: 2_000,
@@ -811,9 +813,9 @@ describe("call() against a mock server", () => {
     } catch (e) {
       err = e;
     }
-    expect(err).toBeInstanceOf(ProviderError);
-    expect((err as ProviderError).code).toBe(0);
-    expect((err as ProviderError).message).toContain("Ollama not running");
+    expect(err).toBeInstanceOf(Transport);
+    expect((err as Transport).message).toContain("Ollama not running");
+    expect((err as Transport).retryable()).toBe(true);
   });
 
   it("connection error does NOT retry (fail-fast)", async () => {

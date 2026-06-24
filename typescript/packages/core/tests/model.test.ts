@@ -7,7 +7,9 @@ import {
   ModelResponseSchema,
   ProviderError,
   RateLimited,
+  StreamInterrupted,
   Timeout,
+  Transport,
   enforceBudget,
   enforceContextLimit,
   type ModelRequest,
@@ -105,9 +107,7 @@ describe("ModelInterface — rules", () => {
   });
 
   it("provider errors surface as typed harness errors", async () => {
-    const m = new MockModelInterface(provider).pushError(
-      new ProviderError(503, "unavailable"),
-    );
+    const m = new MockModelInterface(provider).pushError(new ProviderError(503, "unavailable"));
     await expect(m.call(emptyRequest)).rejects.toBeInstanceOf(ProviderError);
   });
 });
@@ -145,6 +145,32 @@ describe("ModelError variants", () => {
     expect(new RateLimited().toJSON()).toEqual({
       kind: "rate_limited",
       retry_after: null,
+    });
+  });
+
+  // SC-3: typed retryable model errors.
+  it("retryable() is true for transport/stream/timeout/rate-limit, false otherwise", () => {
+    // Transient — retrying the identical call could plausibly succeed.
+    expect(new Transport("boom").retryable()).toBe(true);
+    expect(new StreamInterrupted("drop").retryable()).toBe(true);
+    expect(new Timeout().retryable()).toBe(true);
+    expect(new RateLimited(5).retryable()).toBe(true);
+    expect(new RateLimited().retryable()).toBe(true);
+    // Deterministic — will recur on retry.
+    expect(new ProviderError(500, "boom").retryable()).toBe(false);
+    expect(new ContextLimitExceeded(1, 2).retryable()).toBe(false);
+    expect(new BudgetExceeded(1, 2).retryable()).toBe(false);
+  });
+
+  it("Transport / StreamInterrupted serialise with a PascalCase kind tag", () => {
+    // Cross-language ground truth — byte-for-byte with the Rust ModelError enum.
+    expect(JSON.parse(JSON.stringify(new Transport("m")))).toEqual({
+      kind: "Transport",
+      message: "m",
+    });
+    expect(JSON.parse(JSON.stringify(new StreamInterrupted("m")))).toEqual({
+      kind: "StreamInterrupted",
+      message: "m",
     });
   });
 });

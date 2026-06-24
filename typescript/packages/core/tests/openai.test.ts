@@ -4,6 +4,7 @@
  */
 
 import * as http from "node:http";
+import * as net from "node:net";
 import type { AddressInfo } from "node:net";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import {
   OpenAIModelInterface,
   ProviderError,
   RateLimited,
+  StreamInterrupted,
   Timeout,
   openaiBackoffDelayMs,
   openaiBuildRequest,
@@ -203,9 +205,7 @@ describe("parseResponse", () => {
       choices: [
         {
           message: {
-            tool_calls: [
-              { id: "c1", function: { name: "search", arguments: '{"q":"rust"}' } },
-            ],
+            tool_calls: [{ id: "c1", function: { name: "search", arguments: '{"q":"rust"}' } }],
           },
           finish_reason: "tool_calls",
         },
@@ -312,16 +312,16 @@ describe("contextWindow / provider()", () => {
 describe("fromEnv", () => {
   it("throws ProviderError when the variable is unset", () => {
     delete process.env.__SPORE_TEST_OPENAI_KEY_UNSET__;
-    expect(() =>
-      OpenAIModelInterface.fromEnv("__SPORE_TEST_OPENAI_KEY_UNSET__", "gpt-4o"),
-    ).toThrow(ProviderError);
+    expect(() => OpenAIModelInterface.fromEnv("__SPORE_TEST_OPENAI_KEY_UNSET__", "gpt-4o")).toThrow(
+      ProviderError,
+    );
   });
 
   it("throws ProviderError when the variable is empty", () => {
     process.env.__SPORE_TEST_OPENAI_KEY_EMPTY__ = "   ";
-    expect(() =>
-      OpenAIModelInterface.fromEnv("__SPORE_TEST_OPENAI_KEY_EMPTY__", "gpt-4o"),
-    ).toThrow(ProviderError);
+    expect(() => OpenAIModelInterface.fromEnv("__SPORE_TEST_OPENAI_KEY_EMPTY__", "gpt-4o")).toThrow(
+      ProviderError,
+    );
     delete process.env.__SPORE_TEST_OPENAI_KEY_EMPTY__;
   });
 });
@@ -352,7 +352,10 @@ describe("sseToEvents", () => {
 
     expect(events[0]?.type).toBe("message_start");
     const textDeltas = events
-      .filter((e): e is Extract<StreamEvent, { type: "content_block_delta" }> => e.type === "content_block_delta")
+      .filter(
+        (e): e is Extract<StreamEvent, { type: "content_block_delta" }> =>
+          e.type === "content_block_delta",
+      )
       .map((e) => e.delta);
     expect(textDeltas).toEqual(["hello", " world"]);
     const last = events[events.length - 1];
@@ -517,9 +520,7 @@ describe("call() against a mock server", () => {
       'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n' +
       'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n' +
       "data: [DONE]\n\n";
-    server.setCases([
-      { status: 200, headers: { "content-type": "text/event-stream" }, body: sse },
-    ]);
+    server.setCases([{ status: 200, headers: { "content-type": "text/event-stream" }, body: sse }]);
     const client = new OpenAIModelInterface("k", "gpt-4o", { baseUrl: server.baseUrl() });
     const events: StreamEvent[] = [];
     for await (const ev of client.callStreaming(req([user("hi")]))) events.push(ev);
@@ -535,6 +536,58 @@ describe("call() against a mock server", () => {
     const c = new OpenAIModelInterface("k", "gpt-4o");
     const r = req([user("a".repeat(40))]);
     expect(await c.countTokens(r)).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mid-stream truncation — SC-3 typed StreamInterrupted
+// ---------------------------------------------------------------------------
+
+describe("callStreaming() mid-stream truncation", () => {
+  it("surfaces a typed, retryable StreamInterrupted when the body is cut off", async () => {
+    // A raw TCP server promises a 200-byte body (Content-Length) but sends only
+    // a partial SSE line then drops the connection — so the client's body stream
+    // errors mid-read after the 200 headers arrived. SC-3: a connection dropped
+    // mid-stream surfaces as the typed, retryable StreamInterrupted variant — a
+    // consumer drives its retry off retryable(), not a substring match.
+    const server = net.createServer((sock) => {
+      sock.once("data", () => {
+        // 200 OK so callStreaming returns Ok (headers arrived), then promise 200
+        // body bytes but deliver only a partial SSE line and drop the socket —
+        // EOF before Content-Length errors the stream.
+        sock.write(
+          "HTTP/1.1 200 OK\r\n" +
+            "content-type: text/event-stream\r\n" +
+            "content-length: 200\r\n" +
+            "\r\n" +
+            "data: partial",
+        );
+        sock.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as AddressInfo;
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const client = new OpenAIModelInterface("k", "gpt-4o", { baseUrl });
+      // Headers (200) arrive before the body is truncated, so callStreaming
+      // itself does not throw — the stream errors mid-drain.
+      let caught: unknown;
+      try {
+        for await (const _ev of client.callStreaming(req([user("hi")]))) {
+          /* drain until the truncated body errors the stream */
+        }
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(StreamInterrupted);
+      expect((caught as StreamInterrupted).retryable()).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((e) => (e ? reject(e) : resolve())),
+      );
+    }
   });
 });
 

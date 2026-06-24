@@ -42,7 +42,14 @@
  */
 
 import { stripCodeFence } from "../plan/index.js";
-import { ProviderError, Timeout, type ModelError } from "./errors.js";
+import {
+  ProviderError,
+  RateLimited,
+  StreamInterrupted,
+  Timeout,
+  Transport,
+  type ModelError,
+} from "./errors.js";
 import type { ModelInterface } from "./interface.js";
 import type {
   Content,
@@ -423,7 +430,17 @@ export class OllamaModelInterface implements ModelInterface {
   }
 
   private toTransportError(e: unknown): ModelError {
-    if (e instanceof ProviderError || e instanceof Timeout) return e;
+    // SC-3: pass an already-typed error straight through so a typed transport /
+    // stream / rate-limit error isn't re-wrapped into a generic provider error.
+    if (
+      e instanceof ProviderError ||
+      e instanceof Timeout ||
+      e instanceof Transport ||
+      e instanceof StreamInterrupted ||
+      e instanceof RateLimited
+    ) {
+      return e;
+    }
     if (e instanceof Error) {
       if (e.name === "TimeoutSentinel") return new Timeout();
       if (e.name === "AbortError") {
@@ -432,10 +449,11 @@ export class OllamaModelInterface implements ModelInterface {
         return new ProviderError(0, `request aborted: ${e.message}`);
       }
       // Any other transport-level failure on the chat endpoint is treated as
-      // "Ollama not running" — matches the Rust fail-fast behavior.
-      return new ProviderError(0, `Ollama not running at ${this.baseUrl}`);
+      // "Ollama not running" — matches the Rust fail-fast behavior. SC-3: this
+      // is a typed, retryable Transport error, not a generic ProviderError.
+      return new Transport(`Ollama not running at ${this.baseUrl}`);
     }
-    return new ProviderError(0, `Ollama not running at ${this.baseUrl}`);
+    return new Transport(`Ollama not running at ${this.baseUrl}`);
   }
 }
 
@@ -1056,6 +1074,11 @@ export async function* ndjsonToEvents(
       },
       stop_reason: "end_turn",
     };
+  } catch (e) {
+    // SC-3: a chunk read/decode failure while draining the NDJSON body is a
+    // mid-flight interruption — surface the typed, retryable StreamInterrupted
+    // variant rather than letting an untyped reader rejection escape.
+    throw new StreamInterrupted(`stream chunk error: ${formatError(e)}`);
   } finally {
     try {
       reader.releaseLock();
