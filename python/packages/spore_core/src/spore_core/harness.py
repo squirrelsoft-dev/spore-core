@@ -376,12 +376,26 @@ class ReactConfig(_Model):
     toolset: ToolsetRef
     # OMITTED from JSON when None (matches Rust ``skip_serializing_if``).
     output: SchemaRef | None = None
+    # SC-10 (#161): per-leaf operating system-prompt OVERRIDE. ``None`` (the
+    # default) preserves today's behaviour — the leaf's turn window uses the
+    # global :attr:`HarnessConfig.system_prompt`. When set, THIS prompt REPLACES
+    # the global one for every turn of this leaf's window (the leaf sees ONLY its
+    # own prompt; nothing leaks from the configured global prompt). This is the
+    # per-leaf prompt half of SC-10; the per-leaf TOOLSET half is the existing
+    # :attr:`toolset` handle. In a :class:`PlanExecuteConfig` this lets the plan
+    # and execute phases run under DISTINCT system prompts. CANONICAL POSITION:
+    # LAST field (after ``output``, alongside ``toolset``). OMITTED from the JSON
+    # wire when None (matches Rust ``skip_serializing_if``), so existing
+    # strategy-config fixtures serialize byte-identically.
+    system_prompt: str | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         data = handler(self)
         if self.output is None:
             data.pop("output", None)
+        if self.system_prompt is None:
+            data.pop("system_prompt", None)
         return data
 
     @classmethod
@@ -1263,6 +1277,7 @@ class StrategyExecutor(Protocol):
         toolset: ToolsetRef = "",
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
+        system_prompt: str | None = None,
     ) -> RunResult:
         """Run ONE bounded ReAct turn-loop window (the leaf primitive) on the
         resolved worker ``agent`` (#124). Issue 2: ``toolset`` is the leaf's
@@ -1273,7 +1288,13 @@ class StrategyExecutor(Protocol):
         (``None`` ⇒ no delivery, no validation). When set, the window VALIDATES
         its terminal against it, retries up to ``output_schema_max_retries`` extra
         turns, and sets :attr:`ModelParams.output_schema` on every turn so the
-        Ollama ``format`` channel constrains decoding."""
+        Ollama ``format`` channel constrains decoding.
+
+        SC-10 (#161): ``system_prompt`` is the leaf's per-node system-prompt
+        OVERRIDE. ``None`` ⇒ the window uses the global ``config.system_prompt``
+        (byte-identical to pre-SC-10). When set, it REPLACES the global prompt for
+        every turn of this window, so the leaf sees ONLY its own prompt. Mirrors
+        ``toolset``."""
         ...
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -1887,6 +1908,10 @@ async def _run_react_config(self: ReactConfig, cx: ExecutionContext) -> Strategy
         # retry budget so the window validates the terminal.
         output_schema,
         output_schema_max_retries,
+        # SC-10 (#161): thread THIS leaf's per-node system-prompt override
+        # (``None`` ⇒ the window keeps using the global prompt). Mirrors
+        # ``self.toolset``.
+        self.system_prompt,
     )
     await executor.finalize(result)
 
@@ -7527,13 +7552,16 @@ class StandardHarness:
         toolset: ToolsetRef = "",
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
+        system_prompt: str | None = None,
     ) -> RunResult:
         """:class:`StrategyExecutor` primitive: one bounded ReAct turn-loop window
         on the resolved worker ``agent`` (delegates to :meth:`_run_react_inner`).
         Does NOT finalize observability — the leaf ``run`` body does. Issue 2:
         ``toolset`` is the leaf's RESOLVED handle, threaded down alongside
         ``agent``. Issue #139: ``output_schema`` / ``output_schema_max_retries``
-        drive terminal-output validation + retry (``None`` ⇒ no enforcement)."""
+        drive terminal-output validation + retry (``None`` ⇒ no enforcement).
+        SC-10 (#161): ``system_prompt`` is the leaf's per-node prompt override,
+        threaded down alongside ``toolset`` (``None`` ⇒ global prompt)."""
         return await self._run_react_inner(
             task,
             max_iterations,
@@ -7544,6 +7572,7 @@ class StandardHarness:
             toolset,
             output_schema,
             output_schema_max_retries,
+            system_prompt,
         )
 
     def resolve_agent_ref(self, ref: str, session_id: SessionId) -> Agent | RunResultFailure:
@@ -8780,6 +8809,12 @@ class StandardHarness:
         # constrains decoding (Anthropic/OpenAI ignore it).
         output_schema: dict[str, Any] | None = None,
         output_schema_max_retries: int = 0,
+        # SC-10 (#161): the leaf's RESOLVED per-node system-prompt OVERRIDE.
+        # ``None`` ⇒ the global ``config.system_prompt`` is used (byte-identical to
+        # pre-SC-10). When set, it REPLACES the global prompt for every turn of
+        # this window, so the leaf sees ONLY its own prompt (the per-leaf prompt
+        # half of SC-10; the toolset half is the ``toolset`` arg above).
+        system_prompt: str | None = None,
     ) -> RunResult:
         session_id = task.session_id
         # Resolve the effective tool registry once per turn-loop window (all
@@ -8920,16 +8955,28 @@ class StandardHarness:
             # no-structural-block path stays byte-identical. The ``startswith``
             # guard keeps a resumed/seeded session that already leads with the
             # system prompt from being given it twice.
-            if config.system_prompt is not None:
+            #
+            # SC-10 (#161): the leaf's per-node ``system_prompt`` override WINS
+            # over the global ``config.system_prompt``. When this window's leaf
+            # carries one it is used EXCLUSIVELY (the global prompt does not leak
+            # in), so the plan and execute phases of a ``PlanExecuteConfig`` can
+            # run under distinct prompts. With no leaf override (``None``) the
+            # global prompt applies exactly as before — byte-identical. The check
+            # is None-based (mirrors Rust's ``leaf.or(global)``), NOT falsy: an
+            # explicit empty-string leaf override still REPLACES the global.
+            effective_system_prompt = (
+                system_prompt if system_prompt is not None else config.system_prompt
+            )
+            if effective_system_prompt is not None:
                 first = context.messages[0] if context.messages else None
                 if (
                     first is not None
                     and first.role == Role.SYSTEM
                     and isinstance(first.content, TextContent)
                 ):
-                    if not first.content.text.startswith(config.system_prompt):
+                    if not first.content.text.startswith(effective_system_prompt):
                         first.content = TextContent(
-                            text=f"{config.system_prompt}\n\n{first.content.text}"
+                            text=f"{effective_system_prompt}\n\n{first.content.text}"
                         )
                     # else: already leads with the system prompt — leave it.
                 elif first is not None and first.role == Role.SYSTEM:
@@ -8940,7 +8987,7 @@ class StandardHarness:
                         0,
                         Message(
                             role=Role.SYSTEM,
-                            content=TextContent(text=config.system_prompt),
+                            content=TextContent(text=effective_system_prompt),
                         ),
                     )
             # Per-run model params win unconditionally (issue #93). The agent

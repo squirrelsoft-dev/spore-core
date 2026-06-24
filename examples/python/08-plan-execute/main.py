@@ -131,16 +131,39 @@ from spore_core import (
 from spore_tools import StandardTool, StandardTools, WebSearchTool
 from spore_tools.tools.web import SearchMethod, WebSearchConfig
 
+# The GLOBAL operating prompt — the shared capability contract. It is the
+# DEFAULT every leaf falls back to. Under SC-10 (#161) the plan and execute
+# leaves below each carry their OWN ``system_prompt``, which REPLACES this for
+# those phases (each phase sees ONLY its own prompt). This global remains the
+# prompt any leaf WITHOUT an override would use.
 SYSTEM_PROMPT = (
     "You are a research-and-writing agent. Your ONLY capabilities are: web_search "
     "(find current information online), read_file, and write_file (save your work to "
     "the workspace). You have NO shell or terminal — you cannot install software, set "
-    "up projects or environments, run/compile/build code, or execute commands. "
-    "Decompose the goal into subtasks that are each achievable with web_search and "
-    "writing alone; never plan setup, installation, or build steps. For each subtask, "
-    "use web_search to gather current information, then synthesize a clear, cited "
-    "comparison and save the final document with write_file. Act using tools — do not "
-    "answer from memory alone."
+    "up projects or environments, run/compile/build code, or execute commands. Act "
+    "using tools — do not answer from memory alone."
+)
+
+# SC-10 (#161): the PLAN phase's own system prompt. The planner only DECOMPOSES —
+# it never executes a subtask, so its prompt is about producing a good plan, not
+# about searching/writing. This replaces SYSTEM_PROMPT for the plan leaf only.
+PLAN_SYSTEM_PROMPT = (
+    "You are the PLANNER. Your ONLY job is to decompose the goal into an ordered "
+    "list of subtasks. Each subtask must be achievable with web_search and "
+    "write_file alone — there is NO shell or terminal, so never plan setup, "
+    "installation, or build steps. Do not perform any subtask yourself; output ONLY "
+    "the plan."
+)
+
+# SC-10 (#161): the EXECUTE phase's own system prompt. The executor works ONE
+# subtask at a time — it does not re-plan. This replaces SYSTEM_PROMPT for the
+# execute leaf only, so plan-phase decomposition guidance never leaks into
+# execution.
+EXECUTE_SYSTEM_PROMPT = (
+    "You are the EXECUTOR. You are given ONE subtask at a time. Use web_search to "
+    "gather current information for it, then synthesize a clear, cited result and "
+    "save your work with write_file. Do not re-plan or invent new subtasks — "
+    "complete the one you were given, using tools rather than memory."
 )
 
 
@@ -178,15 +201,29 @@ def plan_execute_strategy() -> LoopStrategy:
     structured ``plan`` slot); both leaves use empty agent/toolset handles that the
     builder default-fills. Old flat shape was ``LoopStrategyPlanExecute()``. The
     plan leaf is bare and effectively unbounded (``per_loop(2**31 - 1)``); the
-    global ``max_turns`` backstop bounds the whole run."""
+    global ``max_turns`` backstop bounds the whole run.
+
+    SC-10 (#161, per-leaf system prompt): the plan and execute leaves each carry
+    their OWN ``system_prompt``. The plan phase runs under ``PLAN_SYSTEM_PROMPT``
+    (decompose only) and the execute phase under ``EXECUTE_SYSTEM_PROMPT`` (do one
+    subtask) — each phase sees ONLY its own prompt, so planning guidance never
+    leaks into execution and vice versa. The global ``SYSTEM_PROMPT`` remains the
+    documented fallback for any leaf WITHOUT an override. (The per-leaf TOOLSET
+    override is the existing ``ReactConfig.toolset`` handle; here both phases share
+    the global catalogue.)"""
     # The plan leaf is a bare ReAct (empty agent/toolset, default-filled by the
     # builder) carrying the structured-slot ``plan-schema`` output contract and an
     # effectively-unbounded ``per_loop`` budget. ``PlanExecuteConfig.simple()``
-    # gives both phases bare ReAct leaves; we override the plan leaf's output.
+    # gives both phases bare ReAct leaves; we override the plan leaf's output and
+    # wire each leaf's per-phase ``system_prompt`` (SC-10).
     plan = ReactConfig.per_loop(2**31 - 1)
     plan.output = "plan-schema"
+    plan.system_prompt = PLAN_SYSTEM_PROMPT
+    execute = ReactConfig.per_loop(2**31 - 1)
+    execute.system_prompt = EXECUTE_SYSTEM_PROMPT
     strategy = PlanExecuteConfig.simple()
     strategy.plan = plan
+    strategy.execute = execute
     return strategy
 
 
