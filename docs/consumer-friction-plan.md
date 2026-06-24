@@ -115,7 +115,8 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 
 **SC-9 — `AfterTool` can't rewrite a result (collapses into Q2). Hit by cordyceps. — DONE (Rust) `ca41f8f`.** `build_check.rs` returns a landed write as `ToolOutput::error` (`build_check.rs:217`) to force model reaction. `PostToolUse` is documented wired (`hooks.rs:89`) but never constructed; `AfterTool` fired immutable + Halt-only. The rich chain's `fire_after_tool(results: &mut …)` gives rewriting by construction; the loop propagates the rewrite into the conversation via `ContextManager::replace_tool_result`. *Acceptance:* an after-tool middleware rewrites a result; cordyceps removes the inversion. ✅ (`after_tool_middleware_rewrites_result_in_place`).
 
-**SC-10 — No per-phase prompt/toolset in PlanExecute. Hit by cordyceps.** Plan + execute run under one `HarnessConfig.system_prompt`; plan format hard-coded in `plan_directive`. *Fix:* per-leaf `system_prompt`/toolset override, or let a leaf's output schema drive a phase-specific directive. *Acceptance:* distinct plan/execute prompts, each phase sees only its own.
+**SC-10 — No per-phase prompt/toolset in PlanExecute. Hit by cordyceps. — DONE (Rust).** Plan + execute run under one `HarnessConfig.system_prompt`; plan format hard-coded in `plan_directive`. *Fix:* per-leaf `system_prompt`/toolset override, or let a leaf's output schema drive a phase-specific directive. *Acceptance:* distinct plan/execute prompts, each phase sees only its own.
+> **LANDED (Rust) `9844794`.** The TOOLSET half was already per-leaf (`ReactConfig::toolset` threads to `react_window`); SC-10 adds the matching **per-leaf `ReactConfig::system_prompt: Option<String>`** (canonical LAST field, `skip_serializing_if None` ⇒ wire byte-identical). It threads `ReactConfig::run → react_window → run_react_inner`, and at the system-prompt prepend site the leaf override **REPLACES** the global `config.system_prompt` for that window (`effective = leaf.or(global)`), so each phase sees ONLY its own prompt; a leaf without an override falls back to the global prompt (byte-identical to pre-SC-10). Because both PlanExecute phases bottom out in `ReactConfig` leaves, this gives distinct plan/execute prompts with NO executor-swap/child-harness plumbing. The hard-coded `plan_directive` is left intact (the per-leaf prompt supplies the phase framing; relaxing the directive itself is SC-28's lane). Tests: `plan_and_execute_leaves_see_only_their_own_system_prompt` + `leaf_system_prompt_overrides_global_and_falls_back`; suite green (1251 lib pass). Demoed in `examples/rust/08-plan-execute` (`PLAN_SYSTEM_PROMPT` planner / `EXECUTE_SYSTEM_PROMPT` executor). Additive, no fixture/wire impact. TS/Py/Go parity **#161**.
 
 **SC-28 — Plan phase forces a JSON `PlanArtifact`; relax to free-text/markdown. Hit by looper (Gap B).**
 - *Root cause:* `capture_plan_artifact` parses `PlanArtifact { tasks, rationale }` (`plan.rs:106`); a markdown plan fails the parse. Executor now seeds from the `task_list` tool (`harness.rs:1713`), so JSON isn't the only source.
@@ -194,7 +195,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 | SC-6 | Tier 2 | — | — |
 | SC-8 | "do first" #4 | — | — |
 | SC-9 | — | Tier 1 #2 | — |
-| SC-10 | — | Tier 1 #1 | partial (SC-28) |
+| SC-10 | DONE (Rust) #161 | Tier 1 #1 | partial (SC-28) |
 | SC-11 | — | — | #1/#2 (D1) |
 | SC-12 | — | — | #2 |
 | SC-13 | — | — | #3 |
@@ -218,7 +219,7 @@ The result: cordyceps carries ~700 lines of `main.rs` that is mostly workarounds
 3. **SC-BUG-1** — with the #151 work; it's the resume path the reviewer depends on (SC-30 inert for looper until then). **LANDED (Rust) `8d1d679`; parity #156.**
 4. **Phase 2** (SC-4/5/6/27) — additive, ships alongside Phase 1 (un-gated by Q1). **LANDED (Rust) `f1c0beb`; parity #155.**
 5. **Phase 2.5** (SC-8) — presets, once Phase 1 lands. **LANDED (Rust) `6f39933`; parity #157.** Example migration (the "~40 lines" proof) **DONE 2026-06-24** — `10-hill-climbing` + `12-cordyceps` now build from the presets, live-verified.
-6. **Phase 3** — Q2 canonical-chain adoption (subsumes SC-9 + SC-11) **LANDED (Rust) `ca41f8f`** (parity #158); **SC-26 guides + skills LANDED (Rust) `a061b6d`/`18ed309`/`00b6106`/`2a9b62b`** (parity #159; memory deferred #160); remaining **SC-10**, **SC-28**. **Phase 4/5** as capacity allows.
+6. **Phase 3** — Q2 canonical-chain adoption (subsumes SC-9 + SC-11) **LANDED (Rust) `ca41f8f`** (parity #158); **SC-26 guides + skills LANDED (Rust) `a061b6d`/`18ed309`/`00b6106`/`2a9b62b`** (parity #159; memory deferred #160); **SC-10 per-leaf system prompt LANDED (Rust)** (parity #161); remaining **SC-28**. **Phase 4/5** as capacity allows.
 7. **agent-repl-kit** (ARK) + **looper-local** (LOC) — alongside, mostly independent.
 8. **SC-29** — confirm always-drop, port to TS/Py/Go (#151).
 
