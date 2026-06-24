@@ -20,12 +20,14 @@ import { describe, expect, it } from "vitest";
 import {
   AgentId,
   EscalationActionSchema,
+  EscalationModeSchema,
   ExecutionRegistry,
   HumanRequestSchema,
   HumanResponseSchema,
   MockAgent,
   SessionId,
   StandardHarness,
+  autoContinue,
   autonomous,
   emptyBudgetSnapshot,
   emptySessionState,
@@ -219,6 +221,51 @@ describe("StandardHarness.escalationMode accessor", () => {
     const cfg = surfaceConfig(makeAgent());
     delete cfg.escalationMode;
     expect(new StandardHarness(cfg).escalationMode()).toEqual(autonomous);
+  });
+
+  // SC-5: the auto_continue accessor reflects the configured mode (callback rides
+  // along at runtime — it is never serialized).
+  it("reflects an auto_continue mode (SC-5)", () => {
+    let fired = 0;
+    const mode = autoContinue({ maxGrants: 3, stepsPerGrant: 2, onGrant: () => (fired += 1) });
+    const cfg = { ...surfaceConfig(makeAgent()), escalationMode: mode };
+    const got = new StandardHarness(cfg).escalationMode();
+    expect(got.kind).toBe("auto_continue");
+    if (got.kind === "auto_continue") {
+      expect(got.maxGrants).toBe(3);
+      expect(got.stepsPerGrant).toBe(2);
+      expect(got.onGrant).toBeDefined();
+      got.onGrant?.({ grantNumber: 1, stepsGranted: 2, phase: "react" });
+      expect(fired).toBe(1);
+    }
+  });
+});
+
+// ============================================================================
+// SC-5: EscalationModeSchema validates ONLY the numeric fields (onGrant skipped)
+// ============================================================================
+
+describe("EscalationModeSchema serde (SC-5)", () => {
+  it("round-trips all 3 variants; auto_continue carries only {kind, maxGrants, stepsPerGrant}", () => {
+    expect(EscalationModeSchema.parse({ kind: "surface_to_human" })).toEqual({
+      kind: "surface_to_human",
+    });
+    expect(EscalationModeSchema.parse({ kind: "autonomous" })).toEqual({ kind: "autonomous" });
+    const wire = { kind: "auto_continue", maxGrants: 3, stepsPerGrant: 2 };
+    expect(EscalationModeSchema.parse(wire)).toEqual(wire);
+  });
+
+  it("the runtime-only onGrant callback is NOT part of the wire shape", () => {
+    const mode = autoContinue({ maxGrants: 1, stepsPerGrant: 5, onGrant: () => undefined });
+    // A function cannot serialize: JSON.stringify drops it, leaving the numeric
+    // fields only — and the schema parses that wire shape cleanly.
+    const json = JSON.parse(JSON.stringify(mode)) as unknown;
+    expect(json).toEqual({ kind: "auto_continue", maxGrants: 1, stepsPerGrant: 5 });
+    expect(EscalationModeSchema.parse(json)).toEqual({
+      kind: "auto_continue",
+      maxGrants: 1,
+      stepsPerGrant: 5,
+    });
   });
 });
 

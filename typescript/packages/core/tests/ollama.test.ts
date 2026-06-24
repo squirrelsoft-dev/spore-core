@@ -14,8 +14,11 @@ import {
   OLLAMA_DEFAULT_KEEP_ALIVE,
   OLLAMA_DEFAULT_TIMEOUT_MS,
   ProviderError,
+  SessionId,
+  TaskId,
   Timeout,
   Transport,
+  context,
   ollamaBuildRequest,
   ollamaNameMatches,
   ollamaNdjsonToEvents,
@@ -561,6 +564,53 @@ describe("contextWindow / provider()", () => {
     expect(p.name).toBe("ollama");
     expect(p.model_id).toBe("llama3.2");
     expect(p.context_window).toBe(128_000);
+  });
+
+  // ── SC-4 / SC-6: withContextWindow ────────────────────────────────────────
+
+  it("withContextWindow sets BOTH num_ctx and the reported window (SC-4)", () => {
+    // ONE call fans out to the model-loading knob (`num_ctx`) AND the window
+    // REPORTED to the harness's compaction budget (`provider()`).
+    const c = new OllamaModelInterface("gemma3:4b").withContextWindow(256_000);
+    expect((c as unknown as { numCtx: number | null }).numCtx).toBe(256_000);
+    expect(c.provider().context_window).toBe(256_000);
+    // The chat request carries num_ctx FIRST in options (byte-order parity).
+    const s = JSON.stringify(
+      ollamaBuildRequest(
+        "gemma3:4b",
+        null,
+        (c as unknown as { numCtx: number }).numCtx,
+        req([user("hi")]),
+        false,
+      ),
+    );
+    expect(s).toContain('"options":{"num_ctx":256000');
+  });
+
+  it("context_window override beats the static table (SC-6)", () => {
+    // `gemma*` statically reports 8_192; the explicit override wins.
+    expect(OllamaModelInterface.contextWindow("gemma3:4b")).toBe(8_192);
+    const c = new OllamaModelInterface("gemma3:4b").withContextWindow(128_000);
+    expect(c.provider().context_window).toBe(128_000);
+    // No override → the static table still governs.
+    const bare = new OllamaModelInterface("gemma3:4b");
+    expect(bare.provider().context_window).toBe(8_192);
+  });
+
+  it("withContextWindow fans out to the compaction budget (SC-4)", () => {
+    // The reported window flows through the context manager's #141 resolve chain
+    // into the seeded `window_limit` — the compaction budget — with no separate
+    // CompactionConfig setting.
+    const model = new OllamaModelInterface("gemma3:4b").withContextWindow(256_000);
+    const mgr = new context.StandardContextManager(
+      model,
+      new context.NullCacheProvider(),
+      context.defaultCompactionConfig(), // context_length unset → falls to provider window
+    );
+    expect(mgr.resolveContextLength()).toBe(256_000);
+    const state = mgr.seedSession(SessionId.of("s"), TaskId.of("t"), "do the thing");
+    // A 200K conversation won't compact prematurely at 80% of 256K.
+    expect(state.window_limit).toBe(256_000);
   });
 });
 

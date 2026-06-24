@@ -914,17 +914,29 @@ export class BudgetContext {
   stepsTaken = 0;
   continuesUsed = 0;
   /**
+   * In-process auto-grants spent at this scope's escalation point under the
+   * `auto_continue` {@link EscalationMode} (SC-5). Bounded by the mode's
+   * `maxGrants`. Runtime-only, like `continuesUsed`; never serialized.
+   */
+  autoGrantsUsed = 0;
+  /**
    * Mutable on the {@link resolveExhausted} fall-through path: when a `continue`
    * scope's continues are spent it ADOPTS the boxed `on_exhausted` behavior so
    * subsequent resolutions see the post-fall-through behavior (#125).
    */
   behavior: BudgetExhaustedBehavior;
+  /**
+   * The per-scope step cap policy. Mutable: {@link grantAutoContinue} raises it
+   * additively (SC-5), mirroring Rust's `grant_budget_policy(&mut self.policy)`.
+   */
+  policy: BudgetPolicy;
 
   constructor(
-    readonly policy: BudgetPolicy,
+    policy: BudgetPolicy,
     behavior: BudgetExhaustedBehavior,
     readonly phase: string,
   ) {
+    this.policy = policy;
     this.behavior = behavior;
   }
 
@@ -1011,6 +1023,30 @@ export class BudgetContext {
   consumeContinue(): void {
     this.continuesUsed += 1;
     this.stepsTaken = 0;
+  }
+
+  /**
+   * Grant one in-process AUTO-continue at this scope's escalation point (SC-5,
+   * the `auto_continue` {@link EscalationMode}): bump `autoGrantsUsed` and raise
+   * the scope's cap to `stepsTaken + stepsPerGrant` so the loop gets exactly
+   * `stepsPerGrant` more steps after the exhaustion point (mirrors a human
+   * `continue_with_budget { steps }` grant, applied automatically). `unlimited`
+   * never reaches here. Unlike {@link consumeContinue} this does NOT rewind
+   * `stepsTaken` — the cap moves up instead, so the grant is a strict, additive
+   * `stepsPerGrant`. Mirrors Rust `BudgetContext::grant_auto_continue`.
+   */
+  grantAutoContinue(stepsPerGrant: number): void {
+    this.autoGrantsUsed += 1;
+    this.policy = grantBudgetPolicy(this.policy, this.stepsTaken + stepsPerGrant);
+  }
+
+  /**
+   * Auto-grants still available before falling through to the autonomous
+   * terminal, given the mode's `maxGrants` (SC-5). `0` once spent. Mirrors Rust
+   * `BudgetContext::auto_grants_remaining`.
+   */
+  autoGrantsRemaining(maxGrants: number): number {
+    return Math.max(0, maxGrants - this.autoGrantsUsed);
   }
 
   /**
@@ -1574,6 +1610,33 @@ export function chargeCurrent(cx: ExecutionContext, turns: number): ChargeResult
 export function resolveCurrent(cx: ExecutionContext): ExhaustedResolution {
   const scope = cx.budgets.current();
   return scope === undefined ? "fail" : scope.resolveExhausted();
+}
+
+/**
+ * SC-5: attempt one `auto_continue` {@link EscalationMode} auto-grant at the
+ * CURRENT scope. Returns `true` when the mode is `auto_continue`, grants remain
+ * (`autoGrantsUsed < maxGrants`), and the scope was refreshed with
+ * `stepsPerGrant` more steps — the caller should then `continue` its loop
+ * IN-PROCESS (the scope is still on the stack). Fires `onGrant` for the grant.
+ * Returns `false` for any other mode, when grants are spent, or when there is no
+ * current scope — the caller then falls through to its existing pause
+ * (`surface_to_human`) / abort (`autonomous`) handling. Mirrors Rust
+ * `ExecutionContext::try_auto_continue`.
+ */
+export function tryAutoContinue(cx: ExecutionContext, mode: EscalationMode): boolean {
+  if (mode.kind !== "auto_continue") return false;
+  const scope = cx.budgets.current();
+  if (scope === undefined) return false;
+  if (scope.autoGrantsRemaining(mode.maxGrants) === 0) return false;
+  scope.grantAutoContinue(mode.stepsPerGrant);
+  if (mode.onGrant !== undefined) {
+    mode.onGrant({
+      grantNumber: scope.autoGrantsUsed,
+      stepsGranted: mode.stepsPerGrant,
+      phase: scope.phase,
+    });
+  }
+  return true;
 }
 
 /**
@@ -2736,6 +2799,15 @@ async function runPlanExecuteConfig(
         }
         continue;
       }
+      // SC-5: under `auto_continue`, auto-grant this scope in-process (bounded by
+      // `maxGrants`, fires `onGrant`) and re-walk the ready set — mirroring the
+      // `continue` arm above (reset this task to `pending`). Once grants are spent
+      // it falls through to the surface/abort handling below.
+      if (resolution === "escalate" && tryAutoContinue(cx, executor.escalationMode())) {
+        updateTask(taskList, taskId, "pending");
+        await executor.persistTaskList(sessionId, taskList);
+        continue;
+      }
       // Escalate: under `autonomous`, surface the partial and abort the run.
       // Under `surface_to_human` (#130) the node PAUSES with a `budget_exhausted`
       // request via the `terminalOverride` seam instead of propagating up.
@@ -2825,6 +2897,11 @@ async function runPlanExecuteConfig(
         // remaining ready tasks IN-PROCESS (this step already completed). NO
         // serialization (AC3); do NOT pop the scope.
         if (resolution === "continue") {
+          continue;
+        }
+        // SC-5: AutoContinue auto-grants in-process at this Escalate point (scope
+        // still pushed) before surfacing/aborting.
+        if (resolution === "escalate" && tryAutoContinue(cx, executor.escalationMode())) {
           continue;
         }
         const partial = planExecutePartialJson(taskList);
@@ -3122,6 +3199,11 @@ async function runSelfVerifyingConfig(
       if (resolution === "continue") {
         continue;
       }
+      // SC-5: AutoContinue auto-grants in-process at this Escalate point (scope
+      // still pushed) before surfacing/aborting.
+      if (resolution === "escalate" && tryAutoContinue(cx, executor.escalationMode())) {
+        continue;
+      }
       const partial = selfVerifyingPartialJson(lastWorkerOutput, lastReason);
       popBudget(cx);
       cx.scratch.task = task;
@@ -3410,6 +3492,11 @@ async function runHillClimbingConfig(
       if (resolution === "continue") {
         continue;
       }
+      // SC-5: AutoContinue auto-grants in-process at this Escalate point (scope
+      // still pushed) before surfacing/aborting.
+      if (resolution === "escalate" && tryAutoContinue(cx, executor.escalationMode())) {
+        continue;
+      }
       await executor.hillWriteTsv(taskId, rows);
       const partial = hillClimbingPartialJson(currentBest);
       popBudget(cx);
@@ -3559,30 +3646,106 @@ async function runHillClimbingConfig(
 // ── EscalationMode (HITL-vs-AFK config knob, #120) ──────────────────────────
 
 /**
+ * Details handed to an {@link EscalationMode} `auto_continue` `onGrant` callback
+ * each time the harness auto-grants more budget at an escalation point (SC-5).
+ */
+export interface AutoGrantInfo {
+  /** 1-based index of this grant within the exhausted scope (`1..=maxGrants`). */
+  grantNumber: number;
+  /** Steps granted this round (the mode's `stepsPerGrant`). */
+  stepsGranted: number;
+  /** The budget scope phase that exhausted (e.g. `"react"`, `"plan_execute"`). */
+  phase: string;
+}
+
+/**
+ * Callback fired once per {@link EscalationMode} `auto_continue` grant (SC-5).
+ * Runtime only — never serialized. Lets a consumer (e.g. a looper governor)
+ * observe each auto-grant without owning the keep-working loop itself.
+ */
+export type GrantCallback = (info: AutoGrantInfo) => void;
+
+/**
  * The HITL-vs-AFK escalation knob (PRD goal #7: local vs. prod differ only by
- * config). Selects whether budget escalation surfaces to a human or proceeds
- * autonomously. Stored on {@link HarnessConfig} this slice; consumed in #130.
+ * config). Selects what budget escalation does: surface to a human, fail
+ * autonomously, or keep working under an auto-granted cap (SC-5). Stored on
+ * {@link HarnessConfig}; consumed at every `escalate` resolution site.
  *
  * Adjacently tagged on `kind` (`snake_case`) for symmetry with the other
  * harness enums:
  *   - `{ "kind": "surface_to_human" }` — pauses and surfaces to a human (HITL).
- *   - `{ "kind": "autonomous" }` — proceeds autonomously (AFK / prod).
+ *   - `{ "kind": "autonomous" }` — fails the run autonomously (AFK / prod).
+ *   - `{ "kind": "auto_continue", maxGrants, stepsPerGrant, onGrant? }` —
+ *     "autonomous but capped" (SC-5): at an escalation point, auto-grant
+ *     `stepsPerGrant` more steps and KEEP WORKING in-process, up to `maxGrants`
+ *     times, firing `onGrant` per grant; once spent it falls through to the same
+ *     terminal as `autonomous`.
  *
  * No baked-in default value (mirrors the budget-types discipline); the
  * {@link HarnessBuilder} picks an explicit default ({@link surfaceToHuman}).
- * NOT placed on the serialized {@link Task} — there is no fixture for it.
+ * NOT placed on the serialized {@link Task} — there is no fixture for it. The
+ * `onGrant` callback is runtime-only (NOT serialized — `EscalationModeSchema`
+ * validates only the numeric fields).
  */
-export type EscalationMode = { kind: "surface_to_human" } | { kind: "autonomous" };
+export type EscalationMode =
+  | { kind: "surface_to_human" }
+  | { kind: "autonomous" }
+  | {
+      kind: "auto_continue";
+      /**
+       * Maximum number of auto-grants per exhausted scope before falling through
+       * to the autonomous terminal. `0` behaves like {@link autonomous} (no grants).
+       */
+      maxGrants: number;
+      /**
+       * Steps granted each time. A grant raises the exhausted scope's cap to
+       * `stepsTaken + stepsPerGrant` so the loop gets exactly this many more steps
+       * after the exhaustion point.
+       */
+      stepsPerGrant: number;
+      /** Optional per-grant observer (runtime only; NOT serialized). */
+      onGrant?: GrantCallback;
+    };
 
+/**
+ * Validates {@link EscalationMode} from the wire. The `auto_continue` variant's
+ * `onGrant` callback is runtime-only — a function can't serialize — so the
+ * schema carries ONLY `{kind, maxGrants, stepsPerGrant}` (it is re-attached at
+ * runtime). Mirrors Rust's `#[serde(skip)]` on `on_grant`.
+ */
 export const EscalationModeSchema: z.ZodType<EscalationMode> = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("surface_to_human") }),
   z.object({ kind: z.literal("autonomous") }),
+  z.object({
+    kind: z.literal("auto_continue"),
+    maxGrants: z.number().int().nonnegative(),
+    stepsPerGrant: z.number().int().nonnegative(),
+  }),
 ]);
 
 /** Budget escalation pauses and surfaces to a human (HITL). */
 export const surfaceToHuman: EscalationMode = { kind: "surface_to_human" };
-/** Budget escalation proceeds autonomously (AFK / prod). */
+/** Budget escalation fails the run autonomously (AFK / prod). */
 export const autonomous: EscalationMode = { kind: "autonomous" };
+
+/**
+ * Construct an `auto_continue` {@link EscalationMode} (SC-5): keep working
+ * in-process at each escalation point, auto-granting `stepsPerGrant` more steps
+ * up to `maxGrants` times (firing `onGrant` per grant), then fall through to the
+ * {@link autonomous} terminal. Mirrors {@link surfaceToHuman} / {@link autonomous}.
+ */
+export function autoContinue(opts: {
+  maxGrants: number;
+  stepsPerGrant: number;
+  onGrant?: GrantCallback;
+}): EscalationMode {
+  return {
+    kind: "auto_continue",
+    maxGrants: opts.maxGrants,
+    stepsPerGrant: opts.stepsPerGrant,
+    onGrant: opts.onGrant,
+  };
+}
 
 // ── HarnessError (registry resolution errors, #120) ─────────────────────────
 

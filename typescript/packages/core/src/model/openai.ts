@@ -66,10 +66,55 @@ export interface OpenAIModelInterfaceOptions {
   timeoutMs?: number;
   /** Retry budget for transient 408/425/429/500/502/503/504. Defaults to 3. */
   maxRetries?: number;
+  /**
+   * Explicit override for the window reported by
+   * {@link OpenAIModelInterface.provider} (SC-6). Unset defers to the static
+   * {@link OpenAIModelInterface.contextWindow} table; set pins it. Prefer the
+   * fluent {@link OpenAIModelInterface.withContextWindow}.
+   */
+  contextWindow?: number;
   /** Injected fetch implementation. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   /** Hook called before each retry sleep. Tests override to skip waits. */
   sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Capability declarations that BEAT OpenAI's id-prefix heuristics (SC-27).
+ *
+ * The built-in {@link OpenAIModelInterface.isReasoningModel} check only
+ * recognizes the `o1`/`o3`/`o4` families. A model served behind an
+ * OpenAI-compatible endpoint (a local server, a renamed deployment, a newer
+ * family the heuristic predates) gets no way to declare that it wants
+ * reasoning-model request shaping. `OpenAICompat`, supplied via
+ * {@link OpenAIModelInterface.withCompat}, is that vehicle: every field is OR'd
+ * over the id heuristic, never subtracted from it, so the default (all `false`)
+ * leaves the recognized o-series behavior byte-identical.
+ */
+export interface OpenAICompat {
+  /**
+   * Treat this model as a reasoning model regardless of its id (beats the
+   * `o1`/`o3`/`o4` heuristic): send `max_completion_tokens` instead of
+   * `max_tokens` and drop `temperature`/`top_p`/`stop`, which reasoning models
+   * reject.
+   */
+  reasoningModel: boolean;
+  /**
+   * Route the system message to the `developer` role instead of `system` —
+   * OpenAI's reasoning-model convention, which some compatible servers require.
+   */
+  developerRole: boolean;
+  /**
+   * Emit a `reasoning_effort` field carrying {@link ModelParams.reasoning_effort}
+   * (`"low"|"medium"|"high"|"max"`) when it is set. No-op when the caller leaves
+   * `reasoning_effort` unset.
+   */
+  supportsReasoningEffort: boolean;
+}
+
+/** The all-`false` default {@link OpenAICompat} (recognized o-series stays byte-identical). */
+export function defaultOpenAICompat(): OpenAICompat {
+  return { reasoningModel: false, developerRole: false, supportsReasoningEffort: false };
 }
 
 // ============================================================================
@@ -92,6 +137,17 @@ export class OpenAIModelInterface implements ModelInterface {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
+  /**
+   * Explicit override for the window reported by {@link provider} (SC-6). `null`
+   * (the default) defers to the static {@link contextWindow} table. Set fluently
+   * via {@link withContextWindow}. NOT `readonly` for that reason.
+   */
+  private contextWindowOverride: number | null;
+  /**
+   * Capability declarations that override the id heuristics (SC-27). Defaults to
+   * {@link defaultOpenAICompat} (all `false`). Set fluently via {@link withCompat}.
+   */
+  private compat: OpenAICompat;
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -101,9 +157,38 @@ export class OpenAIModelInterface implements ModelInterface {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+    this.contextWindowOverride = options.contextWindow ?? null;
+    this.compat = defaultOpenAICompat();
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep =
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  }
+
+  /**
+   * Override the window reported by {@link provider} (SC-6 / SC-4): the value the
+   * harness's compaction budget sizes itself to (via the context manager's
+   * `resolveContextLength`, issue #141). Use it to pin the window for a model the
+   * static table predates, or for a local OpenAI-compatible deployment whose id
+   * the table does not recognize. OpenAI has no `num_ctx`-style knob, so this
+   * affects reporting (and thus the compaction budget) only. Fluent: returns
+   * `this`.
+   */
+  withContextWindow(n: number): this {
+    this.contextWindowOverride = n;
+    return this;
+  }
+
+  /**
+   * Declare model capabilities that BEAT the id-prefix heuristics (SC-27).
+   *
+   * See {@link OpenAICompat}. Use it for a reasoning model the `o1`/`o3`/`o4`
+   * {@link isReasoningModel} check does not recognize — e.g. a local server or a
+   * renamed deployment — so the request still carries the developer role,
+   * `max_completion_tokens`, and `reasoning_effort`. Fluent: returns `this`.
+   */
+  withCompat(compat: OpenAICompat): this {
+    this.compat = compat;
+    return this;
   }
 
   /**
@@ -151,7 +236,9 @@ export class OpenAIModelInterface implements ModelInterface {
     return {
       name: "openai",
       model_id: this.modelId,
-      context_window: OpenAIModelInterface.contextWindow(this.modelId),
+      // SC-6: an explicit override wins over the static table.
+      context_window:
+        this.contextWindowOverride ?? OpenAIModelInterface.contextWindow(this.modelId),
     };
   }
 
@@ -167,7 +254,7 @@ export class OpenAIModelInterface implements ModelInterface {
   }
 
   async call(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse> {
-    const body = JSON.stringify(buildRequest(this.modelId, request, false));
+    const body = JSON.stringify(buildRequest(this.modelId, request, false, this.compat));
     const url = `${this.baseUrl}/chat/completions`;
     const resp = await this.sendWithRetry(url, body, false, signal);
     let parsed: OpenAIResponse;
@@ -180,7 +267,7 @@ export class OpenAIModelInterface implements ModelInterface {
   }
 
   async *callStreaming(request: ModelRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
-    const body = JSON.stringify(buildRequest(this.modelId, request, true));
+    const body = JSON.stringify(buildRequest(this.modelId, request, true, this.compat));
     const url = `${this.baseUrl}/chat/completions`;
     let resp: Response;
     try {
@@ -304,6 +391,12 @@ interface OpenAIRequest {
   messages: OpenAIMessage[];
   max_tokens?: number;
   max_completion_tokens?: number;
+  /**
+   * SC-27: `"low"|"medium"|"high"|"max"`, emitted only when the model is treated
+   * as reasoning-capable AND {@link OpenAICompat.supportsReasoningEffort} is set.
+   * Absent (omitted) otherwise, so non-reasoning requests stay byte-identical.
+   */
+  reasoning_effort?: string;
   temperature?: number;
   top_p?: number;
   stop?: string[];
@@ -313,7 +406,9 @@ interface OpenAIRequest {
 }
 
 interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  // `developer` is the SC-27 reasoning-model alias for `system` (when
+  // {@link OpenAICompat.developerRole} is set).
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content?: string | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
@@ -361,8 +456,13 @@ interface OpenAIUsage {
 // Conversions (exported for tests)
 // ============================================================================
 
-export function buildRequest(modelId: string, req: ModelRequest, stream: boolean): OpenAIRequest {
-  const messages: OpenAIMessage[] = req.messages.map(messageToOpenAI);
+export function buildRequest(
+  modelId: string,
+  req: ModelRequest,
+  stream: boolean,
+  compat: OpenAICompat = defaultOpenAICompat(),
+): OpenAIRequest {
+  const messages: OpenAIMessage[] = req.messages.map((m) => messageToOpenAI(m, compat));
 
   const tools: OpenAITool[] = req.tools.map((t: ToolSchema) => ({
     type: "function",
@@ -373,7 +473,9 @@ export function buildRequest(modelId: string, req: ModelRequest, stream: boolean
     },
   }));
 
-  const isReasoning = OpenAIModelInterface.isReasoningModel(modelId);
+  // SC-27: `OpenAICompat.reasoningModel` is OR'd OVER the id heuristic, so a
+  // model the `o1`/`o3`/`o4` prefix check misses still gets reasoning shaping.
+  const isReasoning = OpenAIModelInterface.isReasoningModel(modelId) || compat.reasoningModel;
   const out: OpenAIRequest = {
     model: modelId,
     messages,
@@ -385,9 +487,18 @@ export function buildRequest(modelId: string, req: ModelRequest, stream: boolean
       out.max_tokens = req.params.max_tokens;
     }
   }
+  // SC-27: emit `reasoning_effort` only for a reasoning model whose compat opted
+  // in AND whose caller set an effort level. Absent otherwise so non-reasoning
+  // requests stay byte-identical.
+  if (isReasoning && compat.supportsReasoningEffort && req.params.reasoning_effort != null) {
+    out.reasoning_effort = req.params.reasoning_effort;
+  }
   if (!isReasoning && req.params.temperature != null) out.temperature = req.params.temperature;
-  if (req.params.top_p != null) out.top_p = req.params.top_p;
-  if (req.params.stop_sequences.length > 0) out.stop = [...req.params.stop_sequences];
+  // SC-27: reasoning models reject `top_p` and `stop` as well as `temperature`.
+  if (!isReasoning && req.params.top_p != null) out.top_p = req.params.top_p;
+  if (!isReasoning && req.params.stop_sequences.length > 0) {
+    out.stop = [...req.params.stop_sequences];
+  }
   if (tools.length > 0) out.tools = tools;
   if (stream) {
     out.stream = true;
@@ -396,10 +507,13 @@ export function buildRequest(modelId: string, req: ModelRequest, stream: boolean
   return out;
 }
 
-function messageToOpenAI(m: Message): OpenAIMessage {
+function messageToOpenAI(m: Message, compat: OpenAICompat): OpenAIMessage {
   const role: OpenAIMessage["role"] =
     m.role === "system"
-      ? "system"
+      ? // SC-27: reasoning models use the `developer` role for system content.
+        compat.developerRole
+        ? "developer"
+        : "system"
       : m.role === "assistant"
         ? "assistant"
         : m.role === "tool"

@@ -49,6 +49,14 @@ export interface AnthropicModelInterfaceOptions {
   /** Retry budget for transient 408/425/429/500/502/503/504/529. Defaults to 3. */
   maxRetries?: number;
   /**
+   * Explicit override for the window reported by
+   * {@link AnthropicModelInterface.provider} (SC-6). Unset defers to the static
+   * {@link AnthropicModelInterface.contextWindow} table; set pins it (e.g. a
+   * newer model the table predates). Prefer the fluent
+   * {@link AnthropicModelInterface.withContextWindow}.
+   */
+  contextWindow?: number;
+  /**
    * Injected fetch implementation. Defaults to the global `fetch`. Tests pass
    * a Node http.Server-backed wrapper or stub fetch. Useful for unit testing
    * without spinning up a server.
@@ -87,6 +95,12 @@ export class AnthropicModelInterface implements ModelInterface {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
+  /**
+   * Explicit override for the window reported by {@link provider} (SC-6). `null`
+   * (the default) defers to the static {@link contextWindow} table. Set fluently
+   * via {@link withContextWindow}. NOT `readonly` for that reason.
+   */
+  private contextWindowOverride: number | null;
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -96,9 +110,23 @@ export class AnthropicModelInterface implements ModelInterface {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+    this.contextWindowOverride = options.contextWindow ?? null;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep =
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  }
+
+  /**
+   * Override the window reported by {@link provider} (SC-6 / SC-4): the value the
+   * harness's compaction budget sizes itself to (via the context manager's
+   * `resolveContextLength`, issue #141). Use it to pin the window for a model the
+   * static table predates. Anthropic has no `num_ctx`-style knob — the API always
+   * serves the model's full window — so this affects reporting (and thus the
+   * compaction budget) only. Fluent: returns `this`.
+   */
+  withContextWindow(n: number): this {
+    this.contextWindowOverride = n;
+    return this;
   }
 
   /**
@@ -144,7 +172,9 @@ export class AnthropicModelInterface implements ModelInterface {
     return {
       name: "anthropic",
       model_id: this.modelId,
-      context_window: AnthropicModelInterface.contextWindow(this.modelId),
+      // SC-6: an explicit override wins over the static table.
+      context_window:
+        this.contextWindowOverride ?? AnthropicModelInterface.contextWindow(this.modelId),
     };
   }
 

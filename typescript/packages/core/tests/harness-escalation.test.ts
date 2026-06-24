@@ -15,8 +15,10 @@ import {
   MockAgent,
   SessionId,
   StandardHarness,
+  autoContinue,
   newTask,
   observability,
+  type AutoGrantInfo,
   type HarnessConfig,
   type HarnessSignal,
   type LoopStrategy,
@@ -270,5 +272,97 @@ describe("Harness escalation — R9: remaining calls preserved as pending", () =
     }
     // Exactly one dispatch happened — c1 was preserved, not executed.
     expect(reg.callCount).toBe(1);
+  });
+});
+
+// ============================================================================
+// SC-5: EscalationMode AutoContinue ("autonomous but capped")
+// ============================================================================
+//
+// Mirrors the Rust `auto_continue_*` tests in `harness.rs`. Under
+// `auto_continue { maxGrants, stepsPerGrant }` a budget-exhausted bare ReAct leaf
+// keeps working IN-PROCESS — no consumer drive loop — by auto-granting more steps
+// at the Escalate fall-through, firing `onGrant` per grant, until the worker
+// completes OR the grant cap is hit.
+
+/** A ReAct leaf agent whose cap is binding: `turns` tool-call turns (one call each). */
+function budgetExhaustingAgent(turns: number): MockAgent {
+  const a = makeAgent();
+  for (let i = 0; i < turns; i += 1) {
+    const call: ToolCall = { id: `c${i}`, name: "x", input: {} };
+    a.push({ kind: "tool_call_requested", calls: [call], usage: usage() } as TurnResult);
+  }
+  return a;
+}
+
+function toolReg(n: number): ScriptedToolRegistry {
+  const reg = new ScriptedToolRegistry();
+  for (let i = 0; i < n; i += 1) reg.push({ kind: "success", content: "ok", truncated: false });
+  return reg;
+}
+
+describe("Harness escalation — SC-5: AutoContinue keeps working then completes", () => {
+  it("auto-grants in-process at the Escalate fall-through, then completes (onGrant fired once)", async () => {
+    const a = makeAgent();
+    // First window: 2 tool turns exhaust the PerLoop{2} cap → Escalate.
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c0", name: "x", input: {} }],
+      usage: usage(),
+    } as TurnResult);
+    a.push({
+      kind: "tool_call_requested",
+      calls: [{ id: "c1", name: "x", input: {} }],
+      usage: usage(),
+    } as TurnResult);
+    // After one auto-grant refreshes the cap, the worker completes.
+    a.push({
+      kind: "final_response",
+      content: "done after auto-continue",
+      usage: usage(),
+    } as TurnResult);
+
+    let grants = 0;
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = toolReg(3);
+    cfg.escalationMode = autoContinue({
+      maxGrants: 3,
+      stepsPerGrant: 2,
+      onGrant: (info: AutoGrantInfo) => {
+        expect(info.stepsGranted).toBe(2);
+        grants += 1;
+      },
+    });
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(2) }); // PerLoop{2}, behavior defaults to escalate.
+    expect(r.kind).toBe("success");
+    if (r.kind === "success") {
+      expect(r.output).toBe("done after auto-continue");
+    }
+    // Exactly one auto-grant was needed to finish.
+    expect(grants).toBe(1);
+  });
+});
+
+describe("Harness escalation — SC-5: AutoContinue is capped at maxGrants, then fails", () => {
+  it("falls through to Failure once grants are spent (onGrant fired exactly maxGrants times)", async () => {
+    // The agent never emits a final response — far more tool turns than any
+    // window can consume — so the run only ends when the grant cap is reached.
+    const a = budgetExhaustingAgent(40);
+    let grants = 0;
+    const cfg = standardConfig(a);
+    cfg.toolRegistry = toolReg(80);
+    cfg.escalationMode = autoContinue({
+      maxGrants: 2,
+      stepsPerGrant: 2,
+      onGrant: () => {
+        grants += 1;
+      },
+    });
+    const h = new StandardHarness(cfg);
+    const r = await h.run({ task: react(2) }); // PerLoop{2}, behavior defaults to escalate.
+    expect(r.kind).toBe("failure");
+    // Exactly maxGrants auto-grants fired before falling through to Failure.
+    expect(grants).toBe(2);
   });
 });

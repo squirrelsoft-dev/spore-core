@@ -15,6 +15,7 @@ import {
   RateLimited,
   StreamInterrupted,
   Timeout,
+  defaultOpenAICompat,
   openaiBackoffDelayMs,
   openaiBuildRequest,
   openaiParseResponse,
@@ -185,6 +186,109 @@ describe("buildRequest", () => {
 });
 
 // ---------------------------------------------------------------------------
+// SC-27: withCompat beats the id heuristic
+// ---------------------------------------------------------------------------
+
+describe("buildRequest — OpenAICompat (SC-27)", () => {
+  it("reasoningModel beats the id heuristic", () => {
+    // An unrecognized id is NOT reasoning by the heuristic, so by default it gets
+    // chat shaping (max_tokens, temperature kept).
+    const r = req([user("hi")]);
+    r.params.max_tokens = 512;
+    r.params.temperature = 0.7;
+    const chat = openaiBuildRequest("local-reasoner", r, false, defaultOpenAICompat());
+    expect(chat.max_tokens).toBe(512);
+    expect(chat.max_completion_tokens).toBeUndefined();
+    expect(chat.temperature).toBe(0.7);
+
+    // Declaring it reasoning flips the shaping even though the id is unknown.
+    const reasoning = openaiBuildRequest("local-reasoner", r, false, {
+      ...defaultOpenAICompat(),
+      reasoningModel: true,
+    });
+    expect(reasoning.max_tokens).toBeUndefined();
+    expect(reasoning.max_completion_tokens).toBe(512);
+    expect(reasoning.temperature).toBeUndefined();
+  });
+
+  it("reasoningModel drops top_p and stop too", () => {
+    const r = req([user("hi")]);
+    r.params.top_p = 0.9;
+    r.params.stop_sequences = ["STOP"];
+    const reasoning = openaiBuildRequest("local-reasoner", r, false, {
+      ...defaultOpenAICompat(),
+      reasoningModel: true,
+    });
+    expect(reasoning.top_p).toBeUndefined();
+    expect(reasoning.stop).toBeUndefined();
+    // A chat model keeps both.
+    const chat = openaiBuildRequest("gpt-4o", r, false, defaultOpenAICompat());
+    expect(chat.top_p).toBe(0.9);
+    expect(chat.stop).toEqual(["STOP"]);
+  });
+
+  it("developerRole routes the system message to the developer role", () => {
+    const r = req([sys("be terse"), user("hi")]);
+    // Default: system stays `system`.
+    const plain = openaiBuildRequest("local-reasoner", r, false, defaultOpenAICompat());
+    expect(plain.messages[0]!.role).toBe("system");
+    // developerRole: the system message routes to `developer`; user untouched.
+    const dev = openaiBuildRequest("local-reasoner", r, false, {
+      ...defaultOpenAICompat(),
+      developerRole: true,
+    });
+    expect(dev.messages[0]!.role).toBe("developer");
+    expect(dev.messages[1]!.role).toBe("user");
+  });
+
+  it("emits reasoning_effort only for an opted-in reasoning model with an effort set", () => {
+    const r = req([sys("x"), user("hi")]);
+    r.params.reasoning_effort = "high";
+
+    // SC-27 acceptance: an unrecognized model with reasoning + effort support
+    // carries reasoning_effort AND the developer role.
+    const body = openaiBuildRequest("local-reasoner", r, false, {
+      reasoningModel: true,
+      developerRole: true,
+      supportsReasoningEffort: true,
+    });
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.messages[0]!.role).toBe("developer");
+    expect(body.max_completion_tokens).toBeUndefined(); // no max_tokens set on r
+
+    // Opt-in is required: without supportsReasoningEffort, the field is absent.
+    const noEffort = openaiBuildRequest("local-reasoner", r, false, {
+      ...defaultOpenAICompat(),
+      reasoningModel: true,
+    });
+    expect(noEffort.reasoning_effort).toBeUndefined();
+
+    // And it's gated on the model being reasoning at all (effort alone on a chat
+    // model does nothing).
+    const effortOnly = openaiBuildRequest("gpt-4o", r, false, {
+      ...defaultOpenAICompat(),
+      supportsReasoningEffort: true,
+    });
+    expect(effortOnly.reasoning_effort).toBeUndefined();
+  });
+
+  it("reasoning_effort serializes on the wire; default-compat omits it", () => {
+    const r = req([user("hi")]);
+    r.params.reasoning_effort = "medium";
+    const body = openaiBuildRequest("local-reasoner", r, false, {
+      ...defaultOpenAICompat(),
+      reasoningModel: true,
+      supportsReasoningEffort: true,
+    });
+    const s = JSON.stringify(body);
+    expect(s).toContain('"reasoning_effort":"medium"');
+    // A bare (default-compat) request must NOT carry the field.
+    const bare = JSON.stringify(openaiBuildRequest("gpt-4o", r, false));
+    expect(bare).not.toContain("reasoning_effort");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseResponse
 // ---------------------------------------------------------------------------
 
@@ -295,6 +399,14 @@ describe("contextWindow / provider()", () => {
     expect(p.name).toBe("openai");
     expect(p.model_id).toBe("gpt-4o");
     expect(p.context_window).toBe(128_000);
+  });
+
+  it("withContextWindow overrides the reported window (SC-6)", () => {
+    // An unrecognized id reports 0; the override pins it.
+    const bare = new OpenAIModelInterface("k", "local-llama");
+    expect(bare.provider().context_window).toBe(0);
+    const pinned = new OpenAIModelInterface("k", "local-llama").withContextWindow(32_768);
+    expect(pinned.provider().context_window).toBe(32_768);
   });
 
   it("toJSON redacts the API key", () => {

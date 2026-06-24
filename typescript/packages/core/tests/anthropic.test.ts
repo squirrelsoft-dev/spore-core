@@ -296,6 +296,19 @@ describe("contextWindow / provider()", () => {
     expect(p.context_window).toBe(200_000);
   });
 
+  it("withContextWindow overrides the reported window (SC-6)", () => {
+    // A `claude-*` id normally reports 200k via the family default; the override
+    // pins a different value (e.g. a proxy / newer model the table predates).
+    const bare = new AnthropicModelInterface("test-key", "claude-imaginary-9");
+    expect(bare.provider().context_window).toBe(200_000);
+    const pinned = new AnthropicModelInterface("test-key", "some-proxy-model").withContextWindow(
+      500_000,
+    );
+    expect(pinned.provider().context_window).toBe(500_000);
+    // A bare foreign id still reports 0 (callers can detect "unknown").
+    expect(new AnthropicModelInterface("k", "some-proxy-model").provider().context_window).toBe(0);
+  });
+
   it("toJSON redacts the API key", () => {
     const c = new AnthropicModelInterface("super-secret-key", "claude-sonnet-4-6");
     const j = c.toJSON();

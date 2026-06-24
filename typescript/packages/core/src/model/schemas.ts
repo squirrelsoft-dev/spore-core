@@ -64,6 +64,19 @@ export const ModelParamsSchema = z.object({
   temperature: z.number().nullable().optional(),
   max_tokens: z.number().int().nonnegative().nullable().optional(),
   reasoning_budget: z.number().int().nonnegative().nullable().optional(),
+  /**
+   * Opt-in CATEGORICAL reasoning effort for providers that expose discrete
+   * levels (mirrors Ollama's `think: "low"|"medium"|"high"|"max"` vocabulary,
+   * and OpenAI's `reasoning_effort` request field via
+   * {@link "./openai.js".OpenAIModelInterface.withCompat}). Distinct from
+   * {@link reasoning_budget} (a token count); providers that support both prefer
+   * this categorical effort when set. `undefined` (the default) keeps serialized
+   * params byte-identical: this field is OMITTED when unset (matching Rust's
+   * `#[serde(skip_serializing_if = "Option::is_none")]`). The Ollama
+   * `think`-level mapping itself is tracked separately (#148); this slice adds
+   * only the field + enum.
+   */
+  reasoning_effort: z.enum(["low", "medium", "high", "max"]).optional(),
   top_p: z.number().nullable().optional(),
   stop_sequences: z.array(z.string()).default([]),
   /**
@@ -197,6 +210,8 @@ export type Content = z.infer<typeof ContentSchema>;
 export type Message = z.infer<typeof MessageSchema>;
 export type ToolSchema = z.infer<typeof ToolSchemaSchema>;
 export type ModelParams = z.infer<typeof ModelParamsSchema>;
+/** Categorical reasoning effort (SC-27). See {@link ModelParamsSchema}'s `reasoning_effort`. */
+export type ReasoningEffort = NonNullable<ModelParams["reasoning_effort"]>;
 export type ModelRequest = z.infer<typeof ModelRequestSchema>;
 export type StopReason = z.infer<typeof StopReasonSchema>;
 export type ContentBlock = z.infer<typeof ContentBlockSchema>;

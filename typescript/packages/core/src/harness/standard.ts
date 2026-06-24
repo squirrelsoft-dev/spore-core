@@ -153,6 +153,7 @@ import {
   type ConsultOverflowPolicy,
   type ConsultResponse,
   type ContextManager,
+  type AutoGrantInfo,
   type EscalationAction,
   type EscalationMode,
   type HaltReason,
@@ -1111,6 +1112,11 @@ export class StandardHarness implements Harness, StrategyExecutor {
     // #131/#138: the resume seed is consumed by the FIRST round's PlanExecute
     // walk only; later in-process rounds run normally.
     let resumeSeedNext = resumeSeed;
+    // SC-5: auto-grants spent at the BARE-LEAF Escalate site under the
+    // `auto_continue` EscalationMode. The scope is rebuilt each round here (unlike
+    // the in-loop combinator scopes, which carry their own `autoGrantsUsed`), so
+    // the counter lives across rounds in this local.
+    let autoGrantsUsed = 0;
 
     for (;;) {
       const cx: ExecutionContext = newExecutionContext(registry);
@@ -1209,6 +1215,30 @@ export class StandardHarness implements Harness, StrategyExecutor {
             continue;
           }
           if (resolution === "escalate") {
+            // SC-5: AutoContinue auto-grants `stepsPerGrant` more steps and
+            // re-drives IN-PROCESS (mirroring the `continue` arm above), up to
+            // `maxGrants` times, firing `onGrant` per grant. This is the bare-leaf
+            // / top-level keep-working-but-capped site — where consumers otherwise
+            // hand-roll a drive loop. Once the grants are spent it falls through to
+            // the surface/abort handling below (the `autonomous` terminal).
+            const mode = this.escalationMode();
+            if (mode.kind === "auto_continue" && autoGrantsUsed < mode.maxGrants) {
+              autoGrantsUsed += 1;
+              if (mode.onGrant !== undefined) {
+                const info: AutoGrantInfo = {
+                  grantNumber: autoGrantsUsed,
+                  stepsGranted: mode.stepsPerGrant,
+                  phase: outcome.phase,
+                };
+                mode.onGrant(info);
+              }
+              const granted = outcome.stepsTaken + mode.stepsPerGrant;
+              currentTask = grantTaskBudget(currentTask, granted);
+              currentSession = cx.scratch.runSession;
+              currentBudget = { ...cx.scratch.runBudget };
+              currentStream = cx.stream;
+              continue;
+            }
             // #130: a BARE LEAF exhaustion under `surface_to_human` PAUSES with a
             // `budget_exhausted` request. A bare leaf offers
             // `[continue_with_budget, fail]` (fork C — no sibling to `skip` to).

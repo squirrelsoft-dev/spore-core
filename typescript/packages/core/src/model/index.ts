@@ -57,5 +57,7 @@ export {
   parseResponse as openaiParseResponse,
   parseStopReason as openaiParseStopReason,
   sseToEvents as openaiSseToEvents,
+  defaultOpenAICompat,
   type OpenAIModelInterfaceOptions,
+  type OpenAICompat,
 } from "./openai.js";

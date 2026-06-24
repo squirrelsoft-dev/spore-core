@@ -87,6 +87,17 @@ export interface OllamaModelInterfaceOptions {
    * a proportionally large KV cache, so it's the caller's deliberate choice.
    */
   numCtx?: number;
+  /**
+   * Explicit override for the window REPORTED by {@link OllamaModelInterface.provider}
+   * (SC-6). Unset (the default) defers to the `/api/show`-discovered length, then
+   * the static {@link OllamaModelInterface.contextWindow} table. When set it is the
+   * highest authority — a caller that knows the real window can pin it without
+   * waiting on (or contradicting) discovery. Prefer the fluent
+   * {@link OllamaModelInterface.withContextWindow}, which sets this AND `numCtx`
+   * together (SC-4) so the harness's compaction budget and the window Ollama
+   * actually loads agree.
+   */
+  contextWindow?: number;
   /** Injected fetch implementation. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -127,9 +138,16 @@ export class OllamaModelInterface implements ModelInterface {
   /**
    * Context window (`options.num_ctx`) sent on every chat request. `null` (the
    * default) omits it, leaving Ollama on its small server default. See
-   * {@link OllamaModelInterfaceOptions.numCtx}.
+   * {@link OllamaModelInterfaceOptions.numCtx}. NOT `readonly`:
+   * {@link withContextWindow} sets it fluently (SC-4).
    */
-  private readonly numCtx: number | null;
+  private numCtx: number | null;
+  /**
+   * Explicit override for the window REPORTED by {@link provider} (SC-6). `null`
+   * (the default) defers to discovery, then the static table. Set fluently via
+   * {@link withContextWindow}. See {@link OllamaModelInterfaceOptions.contextWindow}.
+   */
+  private contextWindowOverride: number | null;
   private readonly fetchImpl: typeof fetch;
   /** Lazy availability + discovery check — populated after first successful probe. */
   private modelCheckPromise: Promise<ModelMeta> | null = null;
@@ -146,7 +164,32 @@ export class OllamaModelInterface implements ModelInterface {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.keepAlive = options.keepAlive === undefined ? DEFAULT_KEEP_ALIVE : options.keepAlive;
     this.numCtx = options.numCtx ?? null;
+    this.contextWindowOverride = options.contextWindow ?? null;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  }
+
+  /**
+   * Set the model's context window in ONE call (SC-4) — the friendly setter that
+   * resolves the discovery/enforcement split this module documents.
+   *
+   * It does two things at once:
+   * 1. sets `numCtx` (so Ollama loads the model at window `n` instead of its
+   *    small server default and stops silently truncating longer prompts), and
+   * 2. sets the window REPORTED by {@link provider} to `n` (so the harness's
+   *    compaction budget — which reads `provider().context_window` via the
+   *    context manager's `resolveContextLength`, issue #141 — sizes itself to the
+   *    SAME window the model actually sees).
+   *
+   * Without this, a caller had to set `numCtx` AND separately keep the harness's
+   * compaction window in sync, or the harness would manage a large budget while
+   * Ollama truncated at its default (looper's `num_ctx` drift). `numCtx` sizes
+   * Ollama's KV-cache allocation at load time, so pass the window you actually
+   * want — not an arbitrary maximum. Fluent: returns `this`.
+   */
+  withContextWindow(n: number): this {
+    this.numCtx = n;
+    this.contextWindowOverride = n;
+    return this;
   }
 
   /** Convenience constructor mirroring the Rust `with_base_url`. */
@@ -168,14 +211,18 @@ export class OllamaModelInterface implements ModelInterface {
   }
 
   provider(): ProviderInfo {
-    // `provider()` is synchronous so it cannot await `/api/show`. Read the probe
-    // cache non-blockingly: prefer a discovered context length if the probe has
-    // already run; otherwise fall back to the static table.
-    const discovered = this.discoveredMeta?.contextLength;
+    // `provider()` is synchronous so it cannot await `/api/show`. Resolve the
+    // reported window by precedence (SC-6): an explicit caller override wins;
+    // else a discovered context length if the probe has already run; else the
+    // static table.
+    const context_window =
+      this.contextWindowOverride ??
+      this.discoveredMeta?.contextLength ??
+      OllamaModelInterface.contextWindow(this.modelId);
     return {
       name: "ollama",
       model_id: this.modelId,
-      context_window: discovered ?? OllamaModelInterface.contextWindow(this.modelId),
+      context_window,
     };
   }
 

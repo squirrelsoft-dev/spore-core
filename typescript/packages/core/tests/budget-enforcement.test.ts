@@ -41,8 +41,11 @@ import {
   reactPartialJson,
   resolveCurrent,
   selfVerifyingPartialJson,
+  tryAutoContinue,
+  type AutoGrantInfo,
   type BudgetExhausted,
   type BudgetExhaustedBehavior,
+  type EscalationMode,
   type RunResult,
   type Task,
   type TokenUsage,
@@ -459,5 +462,78 @@ describe("child budget_exhausted reaches the parent as a StrategyOutcome (rule 4
     // The parent can decide to proceed and Complete within its own budget.
     expect(chargeCurrent(cx, 5).ok).toBe(true);
     expect(resolveCurrent(cx)).toBe("fail");
+  });
+});
+
+// ── SC-5: AutoContinue grant mechanics ──────────────────────────────────────
+
+describe("BudgetContext.grantAutoContinue (SC-5)", () => {
+  it("is additive (no stepsTaken rewind) and counted", () => {
+    // The grant raises the scope cap to `stepsTaken + stepsPerGrant` (additive,
+    // NO `stepsTaken` rewind), so the loop gets exactly `stepsPerGrant` more
+    // steps — distinct from consumeContinue.
+    const scope = new BudgetContext({ kind: "per_loop", value: 2 }, { kind: "escalate" }, "react");
+    expect(scope.charge(2).ok).toBe(true);
+    expect(scope.charge(1).ok).toBe(false); // exhausts at the cap
+    expect(scope.autoGrantsRemaining(3)).toBe(3);
+    scope.grantAutoContinue(2); // cap → stepsTaken(2) + 2 = 4
+    expect(scope.autoGrantsUsed).toBe(1);
+    expect(scope.autoGrantsRemaining(3)).toBe(2);
+    expect(scope.charge(2).ok).toBe(true); // two more steps fit after the grant
+    expect(scope.charge(1).ok).toBe(false); // and it exhausts again at the raised cap
+  });
+});
+
+describe("tryAutoContinue (SC-5)", () => {
+  it("grants until capped, then returns false; other modes never grant", () => {
+    const cx = newExecutionContext(ExecutionRegistry.empty());
+    pushBudget(cx, { kind: "per_loop", value: 2 }, { kind: "escalate" }, "react");
+
+    let count = 0;
+    const mode: EscalationMode = {
+      kind: "auto_continue",
+      maxGrants: 2,
+      stepsPerGrant: 2,
+      onGrant: (info: AutoGrantInfo) => {
+        expect(info.stepsGranted).toBe(2);
+        expect(info.phase).toBe("react");
+        count += 1;
+      },
+    };
+
+    expect(chargeCurrent(cx, 2).ok).toBe(true);
+    expect(chargeCurrent(cx, 1).ok).toBe(false);
+    expect(tryAutoContinue(cx, mode)).toBe(true); // grant 1
+    expect(chargeCurrent(cx, 2).ok).toBe(true); // two more steps after grant 1
+    expect(chargeCurrent(cx, 1).ok).toBe(false);
+    expect(tryAutoContinue(cx, mode)).toBe(true); // grant 2
+    // grants spent (maxGrants = 2) → falls through to the autonomous terminal.
+    expect(tryAutoContinue(cx, mode)).toBe(false);
+    expect(count).toBe(2);
+
+    // Other modes never auto-continue.
+    expect(tryAutoContinue(cx, { kind: "autonomous" })).toBe(false);
+    expect(tryAutoContinue(cx, { kind: "surface_to_human" })).toBe(false);
+    // maxGrants = 0 behaves like autonomous (no grant).
+    expect(tryAutoContinue(cx, { kind: "auto_continue", maxGrants: 0, stepsPerGrant: 5 })).toBe(
+      false,
+    );
+  });
+
+  it("grantNumber increments 1-based across grants", () => {
+    const cx = newExecutionContext(ExecutionRegistry.empty());
+    pushBudget(cx, { kind: "per_loop", value: 1 }, { kind: "escalate" }, "react");
+    const grantNumbers: number[] = [];
+    const mode: EscalationMode = {
+      kind: "auto_continue",
+      maxGrants: 3,
+      stepsPerGrant: 1,
+      onGrant: (info) => grantNumbers.push(info.grantNumber),
+    };
+    expect(tryAutoContinue(cx, mode)).toBe(true);
+    expect(tryAutoContinue(cx, mode)).toBe(true);
+    expect(tryAutoContinue(cx, mode)).toBe(true);
+    expect(tryAutoContinue(cx, mode)).toBe(false);
+    expect(grantNumbers).toEqual([1, 2, 3]);
   });
 });
