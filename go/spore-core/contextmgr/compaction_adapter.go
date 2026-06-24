@@ -163,13 +163,43 @@ func writeRichState(session *sporecore.SessionState, rich *SessionState) {
 // compaction. Mirrors the loop's test-double managers.
 // ============================================================================
 
-// Assemble produces a minimal Context straight from the session messages. The
-// rich Assemble requires ContextSources the seam does not supply, so this is a
-// pass-through (mirrors the Rust adapter + the loop's test doubles).
-func (a *StandardCompactionAdapter) Assemble(_ context.Context, session *sporecore.SessionState, _ *sporecore.Task) sporecore.Context {
-	return sporecore.Context{
-		Messages: append([]sporecore.Message(nil), session.Messages...),
+// renderContextBlock renders the structural context block from ContextSources
+// (issue #115 / SC-26): the composed static prompt, then guides, then merged
+// memory, joined by blank lines. Empty when there is nothing to inject, which
+// keeps the no-source path byte-identical to the pre-#115 pass-through. The
+// harness merges the configured system prompt INTO this block (system prompt
+// first), so guides and memory land in a structural System slot rather than
+// ad-hoc User messages.
+func renderContextBlock(sources sporecore.ContextSources) string {
+	var parts []string
+	if composed := sources.ComposedPrompt.Rendered; composed != "" {
+		parts = append(parts, composed)
 	}
+	for _, g := range sources.Guides {
+		parts = append(parts, "# "+string(g.ID)+"\n"+g.Content)
+	}
+	for _, m := range sources.Memory {
+		parts = append(parts, m.Content)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// Assemble produces a Context from the session messages, prepending the #115
+// structural context block (guides, active skills, merged memory, the composed
+// static prompt) as a leading System message so they reach the model through the
+// seam instead of an ad-hoc User-message wrapper. The adapter does NOT run the
+// rich block-hash assemble (that stays #7's job — the #32 cache-halt machinery
+// is deliberately dormant). An empty block adds nothing, so a harness with no
+// sources stays byte-identical to the pre-#115 pass-through.
+func (a *StandardCompactionAdapter) Assemble(_ context.Context, session *sporecore.SessionState, _ *sporecore.Task, sources sporecore.ContextSources) sporecore.Context {
+	messages := append([]sporecore.Message(nil), session.Messages...)
+	if block := renderContextBlock(sources); block != "" {
+		messages = append([]sporecore.Message{{
+			Role:    sporecore.RoleSystem,
+			Content: sporecore.NewTextContent(block),
+		}}, messages...)
+	}
+	return sporecore.Context{Messages: messages}
 }
 
 // renderToolResultText renders a tool result into the flat text the adapter

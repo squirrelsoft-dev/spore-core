@@ -23,7 +23,7 @@ import (
 // Rust reference's real context manager).
 type recordingCM struct{}
 
-func (recordingCM) Assemble(_ context.Context, s *sporecore.SessionState, _ *sporecore.Task) sporecore.Context {
+func (recordingCM) Assemble(_ context.Context, s *sporecore.SessionState, _ *sporecore.Task, _ sporecore.ContextSources) sporecore.Context {
 	msgs := make([]sporecore.Message, len(s.Messages))
 	copy(msgs, s.Messages)
 	return sporecore.Context{Messages: msgs}

@@ -153,9 +153,11 @@ func TestNoSystemPromptLeavesContextWithoutSystem(t *testing.T) {
 	}
 }
 
-// Issue #91: when the assembled context already leads with a System message, the
-// SystemPrompt is NOT prepended again (no duplicate).
-func TestSystemPromptNotDuplicated(t *testing.T) {
+// Issue #91 / #115 (SC-26): when the assembled context already leads with a
+// System message (e.g. a structural #115 context block, or a resumed/seeded
+// session), the SystemPrompt is MERGED into it — the system prompt first — in a
+// single leading System message, rather than skipped or duplicated.
+func TestSystemPromptMergedIntoExistingSystemBlock(t *testing.T) {
 	agent := &capturingAgent{id: AgentID("cap")}
 	cfg := standardCfg(agent)
 	cfg.SystemPrompt = "OPERATING RULES"
@@ -185,7 +187,44 @@ func TestSystemPromptNotDuplicated(t *testing.T) {
 	if systemCount != 1 {
 		t.Fatalf("expected exactly one System message, got %d", systemCount)
 	}
-	if agent.seen[0].Content.Text != "EXISTING SYSTEM" {
-		t.Fatalf("existing System message was overwritten: %q", agent.seen[0].Content.Text)
+	// The configured system prompt leads; the pre-existing System block follows,
+	// merged into the same single message.
+	if got, want := agent.seen[0].Content.Text, "OPERATING RULES\n\nEXISTING SYSTEM"; got != want {
+		t.Fatalf("system prompt not merged: got %q, want %q", got, want)
+	}
+}
+
+// Issue #91 / #115: a resumed/seeded session whose leading System message ALREADY
+// starts with the configured system prompt is left untouched (no double-prepend).
+func TestSystemPromptNotDuplicatedWhenAlreadyPrefixed(t *testing.T) {
+	agent := &capturingAgent{id: AgentID("cap")}
+	cfg := standardCfg(agent)
+	cfg.SystemPrompt = "OPERATING RULES"
+	cfg.ContextManager = NoopContextManager{}
+	h := NewStandardHarness(cfg)
+
+	task := reactTask(2)
+	session := SessionState{Messages: []Message{
+		{Role: RoleSystem, Content: NewTextContent("OPERATING RULES\n\nseeded")},
+		{Role: RoleUser, Content: NewTextContent("hi")},
+	}}
+	r := h.runReAct(context.Background(), task, 2, session, BudgetSnapshot{}, nil, h.config.Agent)
+	if r.Kind != RunSuccess {
+		t.Fatalf("run: %+v", r)
+	}
+
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	systemCount := 0
+	for _, m := range agent.seen {
+		if m.Role == RoleSystem {
+			systemCount++
+		}
+	}
+	if systemCount != 1 {
+		t.Fatalf("expected exactly one System message, got %d", systemCount)
+	}
+	if agent.seen[0].Content.Text != "OPERATING RULES\n\nseeded" {
+		t.Fatalf("already-prefixed System message was modified: %q", agent.seen[0].Content.Text)
 	}
 }

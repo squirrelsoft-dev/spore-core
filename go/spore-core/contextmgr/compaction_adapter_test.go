@@ -564,3 +564,49 @@ func TestApplyCompactionMultiCompactionKeepsDroppingBudget(t *testing.T) {
 		t.Fatalf("second compaction did not reclaim: %d", afterSecond)
 	}
 }
+
+// ============================================================================
+// SC-26/#115 — structural ContextSources rendering
+// ============================================================================
+
+// TestAssembleEmptyWhenNoSources: empty sources → no System block → the adapter
+// adds no System message, so the no-source path is byte-identical to the
+// pre-#115 pass-through of session.Messages.
+func TestAssembleEmptyWhenNoSources(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	session := sporecore.SessionState{Messages: []sporecore.Message{
+		{Role: sporecore.RoleUser, Content: sporecore.NewTextContent("hi")},
+	}}
+	task := sporecore.NewTask("t", sporecore.NewSessionID(), sporecore.ReActStrategy(4))
+	c := a.Assemble(context.Background(), &session, &task, sporecore.ContextSources{})
+	if len(c.Messages) != 1 || c.Messages[0].Role != sporecore.RoleUser {
+		t.Fatalf("empty sources must not add a System block; got %+v", c.Messages)
+	}
+}
+
+// TestAssembleFormatsGuidesAsLeadingSystemBlock: guides render name-headed, in
+// registration order, joined by blank lines, as a single LEADING System message.
+func TestAssembleFormatsGuidesAsLeadingSystemBlock(t *testing.T) {
+	a := contextmgr.NewStandardCompactionAdapter(richManager(t))
+	session := sporecore.SessionState{Messages: []sporecore.Message{
+		{Role: sporecore.RoleUser, Content: sporecore.NewTextContent("hi")},
+	}}
+	task := sporecore.NewTask("t", sporecore.NewSessionID(), sporecore.ReActStrategy(4))
+	sources := sporecore.ContextSources{Guides: []sporecore.Guide{
+		{ID: "audit", Content: "AUDIT BODY"},
+		{ID: "style", Content: "STYLE BODY"},
+	}}
+	c := a.Assemble(context.Background(), &session, &task, sources)
+	if len(c.Messages) != 2 {
+		t.Fatalf("expected a leading System block + the user message; got %+v", c.Messages)
+	}
+	if c.Messages[0].Role != sporecore.RoleSystem {
+		t.Fatalf("guides must lead as a System message; got role %q", c.Messages[0].Role)
+	}
+	if got, want := c.Messages[0].Content.Text, "# audit\nAUDIT BODY\n\n# style\nSTYLE BODY"; got != want {
+		t.Fatalf("guide block mismatch:\n got %q\nwant %q", got, want)
+	}
+	if c.Messages[1].Role != sporecore.RoleUser {
+		t.Fatalf("the original user message must follow the System block")
+	}
+}

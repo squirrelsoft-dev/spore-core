@@ -57,7 +57,7 @@ func (recordingCM) render(o sporecore.ToolOutput) string {
 	return ""
 }
 
-func (recordingCM) Assemble(_ context.Context, session *sporecore.SessionState, _ *sporecore.Task) sporecore.Context {
+func (recordingCM) Assemble(_ context.Context, session *sporecore.SessionState, _ *sporecore.Task, _ sporecore.ContextSources) sporecore.Context {
 	return sporecore.Context{Messages: append([]sporecore.Message(nil), session.Messages...)}
 }
 

@@ -501,7 +501,7 @@ type recordingContextManager struct {
 	texts   []string // text body for assistant Text / user rows; "" otherwise
 }
 
-func (m *recordingContextManager) Assemble(_ context.Context, session *SessionState, _ *Task) Context {
+func (m *recordingContextManager) Assemble(_ context.Context, session *SessionState, _ *Task, _ ContextSources) Context {
 	return Context{Messages: append([]Message(nil), session.Messages...)}
 }
 

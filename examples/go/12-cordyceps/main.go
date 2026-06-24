@@ -30,11 +30,14 @@
 //     per-kind budget + overflow policy (research → web_search, budget 5,
 //     SoftFail; advice → cloud advisor, budget 3, EscalateToHuman). Identical
 //     #114 semantics, host-owned budgets.
-//   - load_skill is DROPPED — there is no worker-side per-node seam;
-//   - the audit skill is KEPT, but now rides the single GLOBAL
-//     SkillInjectingContextManager (the harness's context manager), seeded
-//     ALWAYS-ACTIVE at startup. The audit procedure reaches the model structurally
-//     every turn, compaction-proof, with no load_skill round-trip.
+//   - the audit skill is KEPT, now baked into the harness (#115 / SC-26):
+//     HarnessBuilder.Skills takes a sporecore.SkillCatalog (discovered from the
+//     bundled skills/ dir + .spore/skills), registers the load_skill tool, and
+//     injects the manifest + each ACTIVE skill's body STRUCTURALLY via the
+//     ContextSources seam — no example-side SkillInjectingContextManager shim.
+//     The example pre-activates `audit` at startup so the audit procedure reaches
+//     the model structurally every turn, compaction-proof, with no load_skill
+//     round-trip required (the model may still call load_skill for others).
 //
 // # The tree is DATA
 //
@@ -61,7 +64,6 @@ import (
 	"strings"
 
 	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
-	"github.com/squirrelsoft-dev/spore-core/go/spore-core/contextmgr"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/observability"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/ollama"
 	"github.com/squirrelsoft-dev/spore-core/go/spore-core/storage"
@@ -75,12 +77,6 @@ import (
 //
 //go:embed cordyceps_tree.json
 var cordycepsTreeJSON []byte
-
-// bundledAuditSkill is the audit skill, embedded so the example is
-// self-contained even with an empty .spore/skills/.
-//
-//go:embed skills/audit/SKILL.md
-var bundledAuditSkill string
 
 // execEvaluatorKey is the verifier registry key the SelfVerifying node's
 // evaluator handle resolves to.
@@ -302,34 +298,6 @@ func buildTask(prompt string, session sporecore.SessionID) (sporecore.Task, erro
 		WithBudget(sporecore.BudgetLimits{MaxTurns: &maxTurns}), nil
 }
 
-// buildInnerContextManager builds the standard compaction adapter (the same one
-// the conversational preset installs), so the global skill-injecting context
-// manager can embed it and inherit every non-Assemble method.
-func buildInnerContextManager(model, baseURL string) *contextmgr.StandardCompactionAdapter {
-	mi := ollama.WithBaseURL(model, baseURL)
-	return contextmgr.NewStandardCompactionAdapter(
-		contextmgr.NewStandardContextManager(
-			mi,
-			contextmgr.NullCacheProvider{},
-			contextmgr.DefaultCompactionConfig(),
-		),
-	)
-}
-
-// seedActiveSkill seeds skillID ALWAYS-ACTIVE for session: the global context
-// manager injects its body structurally every turn (no load_skill round-trip in
-// the composed tree).
-func seedActiveSkill(ctx context.Context, runStore sporecore.RunStore, session sporecore.SessionID, skillID string) error {
-	value, err := json.Marshal([]string{skillID})
-	if err != nil {
-		return fmt.Errorf("marshal active_skills: %w", err)
-	}
-	if err := runStore.Put(ctx, session, activeSkillsKey, value); err != nil {
-		return fmt.Errorf("seed active_skills: %w", err)
-	}
-	return nil
-}
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "\n%s\n", err)
@@ -459,15 +427,16 @@ func run() error {
 		advisorHandler := buildAdvisorHarness(advisorModel, baseURL, advisorSandbox)
 		consultHandlers := buildConsultHandlers(researchHandler, advisorHandler)
 
-		// Scan + register skills, then seed `audit` ALWAYS-ACTIVE so the global
-		// context manager injects its body structurally every turn (no load_skill
-		// round-trip in the composed tree).
-		catalog := BootstrapCatalog(ctx, repoRoot, bundledAuditSkill)
-		if err := seedActiveSkill(ctx, runStore, session, "audit"); err != nil {
-			return err
+		// Discover skills (bundled skills/ dir + .spore/skills + ~/.spore/skills),
+		// then pre-activate `audit` so its body rides the structural ContextSources
+		// seam every turn (no load_skill round-trip in the composed tree). #115 /
+		// SC-26: HarnessBuilder.Skills (below) registers the catalog AND the
+		// load_skill tool, and the harness injects the manifest + each ACTIVE
+		// skill's body STRUCTURALLY — no example-side context-manager shim.
+		catalog := sporecore.Discover([]string{filepath.Join(repoRoot, "skills")}, repoRoot)
+		if !catalog.Activate("audit") {
+			return fmt.Errorf("bundled audit skill not discovered under %s", filepath.Join(repoRoot, "skills"))
 		}
-		inner := buildInnerContextManager(model, baseURL)
-		contextManager := NewSkillInjectingContextManager(inner, runStore, catalog.Manifest())
 
 		// The harness's own model drives the Ralph wrapper; the per-node agents come
 		// from the registry. Compaction/summarization uses this model too. Issue 2
@@ -486,7 +455,7 @@ func run() error {
 			// session id. The namespace is the project id projected onto the
 			// SessionID axis (the builder cannot import storage directly).
 			ProjectID(projectID.Namespace()).
-			ContextManager(contextManager).
+			Skills(catalog).
 			SystemPrompt(execSystemPrompt).
 			ToolsetTools("plan-tools", planTools()...).
 			ToolsetTools("exec-tools", execTools()...).

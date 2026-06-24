@@ -250,8 +250,8 @@ func NewSchemaInjectingContextManager(inner sporecore.ContextManager, toolSchema
 
 // Assemble delegates to the inner manager, then overwrites the assembled Tools
 // with the injected schemas.
-func (m *SchemaInjectingContextManager) Assemble(ctx context.Context, session *sporecore.SessionState, task *sporecore.Task) sporecore.Context {
-	c := m.inner.Assemble(ctx, session, task)
+func (m *SchemaInjectingContextManager) Assemble(ctx context.Context, session *sporecore.SessionState, task *sporecore.Task, sources sporecore.ContextSources) sporecore.Context {
+	c := m.inner.Assemble(ctx, session, task, sources)
 	c.Tools = append([]sporecore.ToolSchema(nil), m.tools...)
 	// Prepend the operational system prompt. The adapter's Assemble yields no
 	// system prompt, so the model would otherwise get no guidance. Guard against

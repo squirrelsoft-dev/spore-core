@@ -499,6 +499,14 @@ type HarnessBuilder struct {
 	// turn's assembled context when the context manager renders none (issue #91).
 	// Empty (the default) preserves today's behaviour.
 	systemPrompt string
+	// guides are structural Guides injected into every turn via ContextSources
+	// (issue #115 / SC-26 / #9). Empty (the default) preserves today's behaviour.
+	// See Guide / Guides.
+	guides []sporecore.Guide
+	// skills is the optional skill catalog (issue #115 / SC-26). Set via Skills,
+	// which also registers the load_skill tool. nil (the default) means no
+	// skills. See Skills.
+	skills *sporecore.SkillCatalog
 	// modelParams are the authoritative per-run model sampling/decoding
 	// parameters (issue #93). Builder params win: the harness replaces each
 	// tool-requesting turn's Context.Params with this value unconditionally
@@ -723,6 +731,36 @@ func (b *HarnessBuilder) SystemPrompt(text string) *HarnessBuilder {
 	return b
 }
 
+// Guide registers a structural Guide (skill/playbook/domain knowledge) injected
+// into every turn's assembled context via the ContextSources seam (issue #115 /
+// SC-26 / #9). Unlike an ad-hoc User-message prepend, the guide is rendered into
+// the leading System block by the production context manager. Call repeatedly to
+// register several; order is preserved. Returns the receiver for fluent
+// chaining.
+func (b *HarnessBuilder) Guide(g sporecore.Guide) *HarnessBuilder {
+	b.guides = append(b.guides, g)
+	return b
+}
+
+// Guides registers several Guides at once (issue #115 / SC-26). Appends to any
+// already registered via Guide. Returns the receiver for fluent chaining.
+func (b *HarnessBuilder) Guides(gs ...sporecore.Guide) *HarnessBuilder {
+	b.guides = append(b.guides, gs...)
+	return b
+}
+
+// Skills registers a SkillCatalog (issue #115 / SC-26). This both (a) injects
+// the catalog's manifest + active skill bodies into every turn's structural
+// context (progressive disclosure) and (b) registers the load_skill tool,
+// sharing the catalog's active set, so the model can activate a skill on demand.
+// Replaces the architect-side skill-injecting context-manager shim. Returns the
+// receiver for fluent chaining.
+func (b *HarnessBuilder) Skills(catalog *sporecore.SkillCatalog) *HarnessBuilder {
+	b.catalogueTools = append(b.catalogueTools, catalog.LoadSkillTool())
+	b.skills = catalog
+	return b
+}
+
 // WithModelParams sets the authoritative model sampling/decoding parameters for
 // the whole run (issue #93).
 //
@@ -873,6 +911,8 @@ func (b *HarnessBuilder) BuildConfig() sporecore.HarnessConfig {
 		ToolRunStore:          runStore,
 		ToolMemoryStore:       b.memStore,
 		SystemPrompt:          b.systemPrompt,
+		Guides:                b.guides,
+		Skills:                b.skills,
 		ModelParams:           b.modelParams,
 		SessionStore:          b.sessionStore,
 		AutoPersistSessions:   b.autoPersistSessions,

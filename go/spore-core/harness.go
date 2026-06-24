@@ -1319,9 +1319,69 @@ type FileRef struct {
 	ByteLen uint64 `json:"byte_len"`
 }
 
+// ----------------------------------------------------------------------------
+// ContextSources bridge types (issue #115 / SC-26)
+// ----------------------------------------------------------------------------
+//
+// The rich ContextSources/Guide/MemoryItem/ComposedPrompt types live in the
+// contextmgr subpackage, which imports this root package — so they cannot be
+// threaded through the root ContextManager.Assemble seam without forming an
+// import cycle. These lightweight root-package mirrors are the harness-loop's
+// view of the rich types, exactly the bridge-type pattern CompactionTurn and
+// CompactionVerificationResult already use. The harness builds a ContextSources
+// per turn (build_context_sources) and threads it into Assemble; the production
+// StandardCompactionAdapter renders it into a leading System block. The empty
+// (zero) value renders to nothing, so a harness with no sources stays
+// byte-identical to the pre-#115 pass-through.
+
+// Guide is the harness-loop mirror of contextmgr.Guide (issue #115 / SC-26 /
+// #9): a unit of structural context — a skill body, a playbook, domain
+// knowledge — injected into the assembled context. Heading is derived from ID;
+// Content is the final rendered body.
+type Guide struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+}
+
+// MemoryItem is the harness-loop mirror of contextmgr.MemoryItem (issue #115 /
+// SC-26 / #8). Memory stays empty pending the MemoryProvider object-safety
+// conversion (#163); the render path already accepts it so wiring it later is
+// additive.
+type MemoryItem struct {
+	Key     string `json:"key"`
+	Content string `json:"content"`
+}
+
+// ComposedPrompt is the harness-loop mirror of contextmgr.ComposedPrompt (issue
+// #115 / SC-26 / #14): the composed static system prompt. Empty until the
+// chunk-provider path is wired live.
+type ComposedPrompt struct {
+	Rendered string `json:"rendered"`
+}
+
+// ContextSources is the harness-loop mirror of contextmgr.ContextSources (issue
+// #115 / SC-26): the rich per-turn inputs — guides, merged memory, tool
+// schemas, and the composed static prompt — threaded into the structural
+// ContextManager.Assemble seam so a manager can place them in structural slots
+// instead of the caller injecting them ad-hoc as User messages. The zero value
+// is the empty path (renders to nothing).
+type ContextSources struct {
+	Guides         []Guide        `json:"guides"`
+	Memory         []MemoryItem   `json:"memory"`
+	ToolSchemas    []ToolSchema   `json:"tool_schemas"`
+	ComposedPrompt ComposedPrompt `json:"composed_prompt"`
+}
+
 // ContextManager (#7) assembles per-turn context and appends results.
 type ContextManager interface {
-	Assemble(ctx context.Context, session *SessionState, task *Task) Context
+	// Assemble builds one turn's model input. sources (issue #115 / SC-26)
+	// carries the rich ContextSources — guides, merged memory, tool schemas,
+	// and the composed static prompt — so a manager can place them in
+	// structural slots instead of the caller injecting them ad-hoc as User
+	// messages. Managers that do not consume sources may ignore the argument
+	// (the pre-#115 behaviour); the production StandardCompactionAdapter renders
+	// them into a leading System block.
+	Assemble(ctx context.Context, session *SessionState, task *Task, sources ContextSources) Context
 	AppendToolResult(ctx context.Context, session *SessionState, result *HarnessToolResult)
 	AppendUserMessage(ctx context.Context, session *SessionState, text string)
 	ShouldCompact(session *SessionState) bool
@@ -3170,6 +3230,21 @@ type HarnessConfig struct {
 	// byte-for-byte.
 	SystemPrompt string // optional
 
+	// Guides (skills/playbooks/domain knowledge) injected structurally into
+	// every turn's assembled context via the ContextSources seam (issue #115 /
+	// SC-26 / #9). The harness clones these into ContextSources.Guides each turn;
+	// the production StandardCompactionAdapter renders them into the leading
+	// System block, not as ad-hoc User messages. Empty (the default) preserves
+	// today's behaviour byte-for-byte. See HarnessBuilder.Guide.
+	Guides []Guide // optional
+
+	// Skills is the optional skill catalog (issue #115 / SC-26). When set, the
+	// harness injects its manifest + active skill bodies into
+	// ContextSources.Guides each turn (progressive disclosure) and the load_skill
+	// tool activates skills against its shared active set. nil (the default)
+	// means no skills. See HarnessBuilder.Skills.
+	Skills *SkillCatalog // optional
+
 	// ModelParams are the authoritative per-run model sampling/decoding
 	// parameters (issue #93). The harness replaces each tool-requesting turn's
 	// Context.Params with this value UNCONDITIONALLY (builder params win) right
@@ -4245,6 +4320,26 @@ func (h *StandardHarness) effectiveToolRegistry(sessionID SessionID, toolset Too
 // Mirrors Rust's ToolRegistry::schemas. Returns nil when the registry exposes
 // no tools, so an empty registry advertises nothing (and the request hash stays
 // byte-identical to the no-tools baseline).
+// buildContextSources builds the per-turn ContextSources threaded into the
+// structural ContextManager.Assemble seam (issue #115 / SC-26). Configured
+// guides reach the model structurally through the seam, not as an ad-hoc
+// User-message prepend. Skills (the manifest + active bodies, progressive
+// disclosure) are appended as guides from the shared catalog, so loading a skill
+// via load_skill makes its body sticky in the System block on the next turn.
+// Memory stays empty pending the MemoryProvider conversion (#163); the composed
+// static prompt is empty until the chunk-provider path is wired. An empty result
+// renders to nothing, so a harness with no sources stays byte-identical.
+func (h *StandardHarness) buildContextSources(toolSchemas []ToolSchema) ContextSources {
+	guides := append([]Guide(nil), h.config.Guides...)
+	if h.config.Skills != nil {
+		guides = append(guides, h.config.Skills.ActiveGuides()...)
+	}
+	return ContextSources{
+		Guides:      guides,
+		ToolSchemas: toolSchemas,
+	}
+}
+
 func registrySchemas(reg ToolRegistry) []ToolSchema {
 	active := reg.ActiveSchemas(nil)
 	if len(active) == 0 {
@@ -4784,8 +4879,13 @@ func (h *StandardHarness) runReActInner(
 			}
 		}
 
-		// Assemble + invoke agent for one turn.
-		c := h.config.ContextManager.Assemble(ctx, &session, &task)
+		// Assemble + invoke agent for one turn. sources (issue #115 / SC-26)
+		// carries the rich ContextSources into the structural assemble seam:
+		// configured guides + active skills + tool schemas (memory/composed
+		// prompt empty for now). An empty sources renders to nothing, so the
+		// no-source path stays byte-identical.
+		sources := h.buildContextSources(registrySchemas(toolRegistry))
+		c := h.config.ContextManager.Assemble(ctx, &session, &task, sources)
 		// Deliver the registry's tool schemas to the model. Tool schemas are
 		// owned by the ToolRegistry; the harness wires them into the assembled
 		// context so the model knows what it can call. Only fill when the context
@@ -4798,13 +4898,26 @@ func (h *StandardHarness) runReActInner(
 		// Whether tools were advertised this turn — the precondition for the
 		// adaptive prompt-based tool-calling prose-detection heuristic (#111).
 		toolsAdvertised := len(c.Tools) > 0
-		// Prepend the configured operating system prompt (issue #91). A context
-		// manager that renders none (e.g. the compaction adapter) leaves the model
-		// with only the task and no guidance. Guard against duplicates so a manager
-		// that already leads with a System message (or a resumed/seeded session)
-		// isn't given two. Empty SystemPrompt (the default) is a no-op.
+		// Prepend the configured operating system prompt (issue #91), MERGING it
+		// with any structural #115 context block the manager already placed as a
+		// leading System message (guides/active skills/memory/composed prompt).
+		// The system prompt always leads. When the manager produced NO System
+		// message (the common case — empty sources, or a test double), this
+		// inserts a fresh System message exactly as before, so the
+		// no-structural-block path stays byte-identical. The HasPrefix guard keeps
+		// a resumed/seeded session that already leads with the system prompt from
+		// being given it twice. Empty SystemPrompt (the default) is a no-op.
 		if h.config.SystemPrompt != "" {
-			if len(c.Messages) == 0 || c.Messages[0].Role != RoleSystem {
+			if len(c.Messages) > 0 && c.Messages[0].Role == RoleSystem &&
+				c.Messages[0].Content.Type == ContentTypeText {
+				text := c.Messages[0].Content.Text
+				if !strings.HasPrefix(text, h.config.SystemPrompt) {
+					c.Messages[0].Content = NewTextContent(h.config.SystemPrompt + "\n\n" + text)
+				}
+				// Already leads with the system prompt — leave it.
+			} else if len(c.Messages) > 0 && c.Messages[0].Role == RoleSystem {
+				// A non-text System block leads — leave it.
+			} else {
 				c.Messages = append([]Message{{
 					Role:    RoleSystem,
 					Content: NewTextContent(h.config.SystemPrompt),
@@ -6170,8 +6283,9 @@ func dispatchAndUnwrap(
 // the session and appends tool results / user messages back into it.
 type NoopContextManager struct{}
 
-// Assemble returns a Context built from the current session messages.
-func (NoopContextManager) Assemble(_ context.Context, s *SessionState, _ *Task) Context {
+// Assemble returns a Context built from the current session messages. The
+// #115 sources are ignored — the Noop manager renders no structural block.
+func (NoopContextManager) Assemble(_ context.Context, s *SessionState, _ *Task, _ ContextSources) Context {
 	msgs := make([]Message, len(s.Messages))
 	copy(msgs, s.Messages)
 	return Context{Messages: msgs}
