@@ -697,6 +697,16 @@ describe("StandardTools presets", () => {
       expect(n).toContain(t);
     }
   });
+
+  // SC-30 (#153) drift guard: `@spore/core`'s READONLY_EVAL_TOOL_NAMES is a hand
+  // copy of `readonlySet()`'s names (core cannot import @spore/tools — that would
+  // be a dependency cycle). This test, in a package that CAN import both, fails
+  // loudly if the two ever diverge.
+  it("READONLY_EVAL_TOOL_NAMES matches readonlySet() names (SC-30 drift guard)", () => {
+    const fromCatalogue = new Set(names(StandardTools.readonlySet()));
+    const fromCore = new Set(toolRegistry.READONLY_EVAL_TOOL_NAMES);
+    expect(fromCore).toEqual(fromCatalogue);
+  });
 });
 
 // ----------------------------------------------------------------------------

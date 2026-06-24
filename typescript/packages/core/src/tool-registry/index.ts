@@ -7,12 +7,9 @@
  */
 
 export * from "./types.js";
-export {
-  defineTool,
-  type DefineToolExecute,
-  type DefineToolOptions,
-} from "./define-tool.js";
+export { defineTool, type DefineToolExecute, type DefineToolOptions } from "./define-tool.js";
 export { StandardToolRegistry } from "./standard.js";
 export { EmptyToolRegistry } from "./empty.js";
 export { RealToolRegistry, toModelSchema } from "./real.js";
+export { ReadOnlyToolView, READONLY_EVAL_TOOL_NAMES } from "./read-only-view.js";
 export * as toolRegistryMock from "./mock.js";

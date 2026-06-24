@@ -82,6 +82,8 @@ import {
   type RunStore,
 } from "../storage/index.js";
 import {
+  READONLY_EVAL_TOOL_NAMES,
+  ReadOnlyToolView,
   RealToolRegistry,
   RegistrationErrorException,
   StandardToolRegistry,
@@ -2612,6 +2614,30 @@ export class StandardHarness implements Harness, StrategyExecutor {
       sandbox: readOnlySandbox,
       middleware: undefined,
     };
+    // SC-30: when the eval phase falls back to the GLOBAL catalogue (empty
+    // `evalToolset`), auto-derive a read-only VIEW of it — advertise + dispatch
+    // only the intersection with the read-only tool names, so the reviewer cannot
+    // reach write / exec / side-effecting tools (incl. web/MCP the read-only
+    // sandbox does not gate) WITHOUT the consumer registering a scoped read-only
+    // toolset. A non-empty `evalToolset` is an explicit opt-in and is left
+    // untouched (it resolves via its own catalogue). We pre-build a
+    // `RealToolRegistry` over the catalogue (same read-only-sandbox + eval session
+    // + project + storage wiring `effectiveToolRegistry` would have used) and drop
+    // `catalogueRegistry`, so the eval harness's empty-handle path returns this
+    // filtered `toolRegistry` for the reviewer's dispatch + schema advertising.
+    if (evalToolset.length === 0 && this.config.catalogueRegistry != null) {
+      const store = this.storage();
+      const real = new RealToolRegistry(
+        this.config.catalogueRegistry,
+        readOnlySandbox,
+        evalSessionId,
+        this.resolvedProjectId,
+        store.run(),
+        store.memory(),
+      );
+      evalConfig.toolRegistry = new ReadOnlyToolView(real, READONLY_EVAL_TOOL_NAMES);
+      evalConfig.catalogueRegistry = undefined;
+    }
     const evalHarness = new StandardHarness(evalConfig);
 
     const evalState = emptySessionState();

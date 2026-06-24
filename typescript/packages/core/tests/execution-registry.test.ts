@@ -28,7 +28,6 @@ import {
   EmptyToolRegistry,
   ExecutionRegistry,
   HarnessBuilder,
-  InvalidConfiguration,
   SessionId,
   StandardHarness,
   StrategyNotFound,
@@ -58,6 +57,8 @@ import {
 } from "../src/harness/testing.js";
 import type { Context } from "../src/agent/types.js";
 import type { Verifier, VerifierVerdict } from "../src/verifier/types.js";
+import type { MetricEvaluator, MetricOutcome } from "../src/metric/types.js";
+import type { OptimizationDirection } from "../src/harness/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..", "..", "..", "..");
@@ -85,6 +86,18 @@ class StubVerifier implements Verifier {
 class StubStrategy implements RunStrategy {
   async run(_cx: ExecutionContext): Promise<StrategyOutcome> {
     return { kind: "complete", output: "" };
+  }
+}
+
+class StubMetricEvaluator implements MetricEvaluator {
+  async evaluate(): Promise<MetricOutcome> {
+    throw new Error("metric evaluator not invoked in registry tests");
+  }
+  direction(): OptimizationDirection {
+    return "minimize";
+  }
+  description(): string {
+    return "stub";
   }
 }
 
@@ -276,72 +289,60 @@ describe("ExecutionRegistry tree-walk over cordyceps_tree.json", () => {
   });
 });
 
-// ── A.5 output-contract enforcement (#124, Q3) ───────────────────────────────
+// ── SC-1: structured slots may omit the output schema ────────────────────────
 
-describe("A.5 output-contract enforcement (#124)", () => {
-  it("a bare ReAct in the structured `plan` slot without output is rejected", () => {
+describe("SC-1 structured slots may omit the output schema (#153)", () => {
+  it("validates a bare ReAct `plan` slot with no output schema", () => {
+    // SC-1: a PlanExecute whose `plan` slot is a bare ReAct with NO output
+    // schema — and with no schema registered anywhere — now passes startup
+    // validation. The structured-slot ceremony is gone; an absent schema is
+    // treated as an empty/accept-all one. (Pre-SC-1 this threw
+    // InvalidConfiguration.)
     const reg = ExecutionRegistry.builder()
       .agent("a1", new StubAgent())
       .toolset("t1", new EmptyToolRegistry())
       .build();
     const tree: LoopStrategy = {
       kind: "plan_execute",
-      plan: reactLeaf("a1", "t1"), // output: undefined
+      plan: reactLeaf("a1", "t1"), // output: undefined — no schema needed
       execute: reactLeaf("a1", "t1"),
     };
     const task = newTask("contract", SessionId.generate(), tree);
-    try {
-      reg.validate(task);
-      throw new Error("expected throw");
-    } catch (e) {
-      expect(e).toBeInstanceOf(InvalidConfiguration);
-      expect((e as InvalidConfiguration).message).toContain("plan");
-    }
+    expect(() => reg.validate(task)).not.toThrow();
   });
 
-  it("a bare ReAct worker slot (self_verifying.inner) without output is rejected", () => {
+  it("validates a bare ReAct `worker` slot (self_verifying.inner) with no output schema", () => {
     const reg = ExecutionRegistry.builder()
       .agent("a1", new StubAgent())
       .toolset("t1", new EmptyToolRegistry())
-      .schema("eval", {})
+      .verifier("eval", new StubVerifier())
       .build();
     const tree: LoopStrategy = {
       kind: "self_verifying",
-      inner: reactLeaf("a1", "t1"),
+      inner: reactLeaf("a1", "t1"), // output: undefined — no schema needed
       evaluator: "eval",
     };
     const task = newTask("contract", SessionId.generate(), tree);
-    try {
-      reg.validate(task);
-      throw new Error("expected throw");
-    } catch (e) {
-      expect(e).toBeInstanceOf(InvalidConfiguration);
-      expect((e as InvalidConfiguration).message).toContain("worker");
-    }
+    expect(() => reg.validate(task)).not.toThrow();
   });
 
-  it("a bare ReAct propose slot (hill_climbing.inner) without output is rejected", () => {
+  it("validates a bare ReAct `propose` slot (hill_climbing.inner) with no output schema", () => {
     const reg = ExecutionRegistry.builder()
       .agent("a1", new StubAgent())
       .toolset("t1", new EmptyToolRegistry())
+      .metricEvaluator("m1", new StubMetricEvaluator())
       .build();
     const tree: LoopStrategy = {
       kind: "hill_climbing",
-      inner: reactLeaf("a1", "t1"),
+      inner: reactLeaf("a1", "t1"), // output: undefined — no schema needed
       direction: "minimize",
       max_stagnation: 1,
       revert_on_no_improvement: false,
       min_improvement_delta: 0,
-      evaluator: "a1",
+      evaluator: "m1",
     };
     const task = newTask("contract", SessionId.generate(), tree);
-    try {
-      reg.validate(task);
-      throw new Error("expected throw");
-    } catch (e) {
-      expect(e).toBeInstanceOf(InvalidConfiguration);
-      expect((e as InvalidConfiguration).message).toContain("propose");
-    }
+    expect(() => reg.validate(task)).not.toThrow();
   });
 
   it("accepts a ReAct in a structured slot WITH an output schema", () => {
