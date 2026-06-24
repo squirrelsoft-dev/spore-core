@@ -273,6 +273,12 @@ fn self_verifying_strategy(max_iterations: u32) -> LoopStrategy {
         // The empty SchemaRef resolves to the default verifier the builder folds
         // in from `.verifier(..)` (#124 single-collaborator migration seam).
         evaluator: SchemaRef(String::new()),
+        // #151 evaluate-phase knobs, both left at their defaults here: `None`
+        // reuses the inner worker's agent as the reviewer (Q1c) and falls back to
+        // the global catalogue (read-only) for the eval toolset. Set these to a
+        // SEPARATE reviewer agent / read-only toolset to harden the verify gate.
+        eval_agent: None,
+        eval_toolset: None,
         // Mirrors the shim default (`ReactConfig::per_loop` stamps `Escalate`):
         // a nested combinator propagates exhaustion to its parent.
         behavior: spore_core::BudgetExhaustedBehavior::Escalate,
