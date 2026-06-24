@@ -1,5 +1,7 @@
 # PROJECT STATE
 
+_2026-06-24 — **#160 memory follow-up LANDED + CLOSED (local `main`, NOT pushed) — `6826df7`.** The deferred memory half of SC-26/#115: `ContextSources.memory` now reaches the model through the SAME structural `assemble` seam as guides + skills (a leading System block), with no consumer-side shim — completing SC-26's full acceptance ("skills AND a guide/memory source all reach the model via the rich path"). **Prerequisite (the SC-2-class change):** `MemoryProvider` was `#[trait_variant::make(Send)]`/RPITIT — NOT `dyn`-compatible — so `HarnessConfig` couldn't hold an `Arc<dyn MemoryProvider>`. Converted it to the house `BoxFut` idiom (the `ModelInterface`/`RunStrategy` precedent, Deviation #12) + added a blanket `impl<T: MemoryProvider + ?Sized> MemoryProvider for Arc<T>`; `StandardMemoryProvider` was the ONLY impl (each method now `Box::pin(async move { .. })`), zero external/example impls (`07-memory`'s provider impls the separate `MemoryStore` trait, untouched), so the ripple was contained. **Wiring:** new `MemoryConfig { provider, query, domain, min_relevance, max_items }` (fluent setters; default `0.5`/`10` matching `MemoryQuery`) + `HarnessConfig.memory: Option<MemoryConfig>` + `HarnessBuilder::memory(..)`. `HarnessConfig` is NOT serialized ⇒ pure struct-literal churn (`memory: None` across ~13 literals via compiler-enumeration), NO fixture/wire impact. `build_context_sources` is now async and queries the provider each turn; the query text **defaults to the task instruction** (so retrieved memory tracks current work; a configured `query` overrides), filtered by `min_relevance`/`max_items`/`domain`. `render_context_block` already consumed `sources.memory` (renders after guides), so the render half needed nothing. A query error is **swallowed** (empty memory, never a halt); no provider ⇒ empty `memory` ⇒ byte-identical pre-#160 path. New tests: `arc_dyn_memory_provider_is_object_safe`, `memory_reaches_model_via_assemble_seam` (acceptance — memory in the leading System block, NOT a User message; exercises `Arc<dyn>`), `build_context_sources_populates_memory_from_provider` (default-query / override / empty), `render_context_block_appends_memory_after_guides`. Additive — full lib suite **1256 pass / 0 fail** (+4), all 4 plan/plan_execute + the other fixture-replay suites byte-identical, 9 doctests, spore-eval 55; clippy clean (2 pre-existing ollama.rs warnings). TS/Py/Go parity: **#163** (filed this session; memory was explicitly scoped OUT of #159). Local `main` now **23 commits ahead of `origin/main`, NOT pushed** — ask the maintainer before pushing (Deviation #10). This was the last deferred slice of SC-26 — the consumer-friction plan's structural-injection story (guides + skills + memory) is now fully landed in Rust._
+
 _2026-06-24 — **SC-28 free-text/markdown plan LANDED (local `main`, NOT pushed).** The LAST open Phase-3 item (consumer-friction plan §4, hit by looper / Gap B). The plan phase FORCED a JSON `PlanArtifact`: `capture_and_persist_plan` ran `capture_plan_artifact_with_repair` and, on failure, returned a terminal `HaltReason::PlanPhaseFailed` — so a planner that emitted a markdown/prose plan killed the whole run. **Key finding (already half-built):** the execute phase has, since #126 decision C, sourced its RUNNABLE task list from the `task_list` TOOL store (`load_task_list`), preferring it over the artifact and only falling back to `plan_artifact_to_task_list(artifact)` — so the artifact's JSON `tasks` were already SECONDARY for execution; JSON was never the only source of steps. The only thing still hard-forcing JSON was the capture failure. **Fix (one seam):** relax `capture_and_persist_plan` (harness.rs ~10369 — the single funnel for both the `run_plan_phase` test seam and the recursive `PlanExecuteConfig::run` production path). On a JSON-capture miss, instead of failing, build a free-text `PlanArtifact { rationale: <verbatim prose>, tasks: <from load_task_list, else empty> }`, then fire `OnPlanCreated` + persist exactly as the JSON path does — so the `OnPlanCreated`/`PLAN_EXECUTE_EXTRAS_KEY` payload's `tasks` stay populated for panel consumers (looper `plan_tracker`, cordyceps `plan_announcer`). A prose plan that authored no `task_list` yields empty `tasks` → execute halts with `EmptyPlan`, exactly as a JSON `{"tasks":[]}` would. **Why this shape:** ZERO contract/wire change — `PlanArtifact { tasks, rationale }` is unchanged (acceptance 3 — stored extras still deserialize — is trivially satisfied; `rationale` carries the prose), so NO struct-literal churn (unlike SC-10) and trivial parity. The pure `capture_plan_artifact` grammar stays STRICT and byte-identical across languages (its 30+ tests untouched); only the harness driver is tolerant. **`plan_directive` left intact** — still requests JSON by default; a consumer wanting prose-first framing overrides the plan leaf's prompt via SC-10. Tests: rewrote `plan_phase_unparseable_response_fails` → `plan_phase_freetext_response_captures_as_prose` (prose now captures + stores, was a Failure); added `plan_phase_freetext_sources_tasks_from_task_list` (seeds the durable `task_list` store, asserts `plan.tasks` pulled from it). Additive — JSON-path + all 4 plan/plan_execute fixture-replay suites byte-identical; full suite green (**1252 lib pass / 0 fail**), clippy clean (2 pre-existing ollama.rs warnings). **LOC-2** (looper-side: delete only the `FinalResponse` suppression + `governor::finish` re-emission, seed survives) is the consumer follow-up that rides the parity port. TS/Py/Go parity: **#162** (filed this session). Local `main` now **21 commits ahead of `origin/main`, NOT pushed** — ask the maintainer before pushing (Deviation #10). **Phase 3 is now COMPLETE** (anchor `ca41f8f` / SC-26 / SC-10 / SC-28); remaining: #160 memory follow-up, the `09-self-verifying` example-compile fix, or port the parity backlog (#158/#159/#161/#SC-28 + #154–#157)._
 
 _2026-06-24 — **SC-10 per-leaf system prompt LANDED (local `main`, NOT pushed) — `9844794`.** The Phase 3 "No per-phase prompt/toolset in PlanExecute" item (consumer-friction plan §4, hit by cordyceps). Plan + execute ran under one global `HarnessConfig.system_prompt` with no way to give the two phases distinct prompts. **Key finding:** the TOOLSET half of SC-10 was ALREADY per-leaf — `ReactConfig::toolset` threads to `react_window` — so the only gap was the prompt. **Fix:** a new per-leaf **`ReactConfig::system_prompt: Option<String>`** (canonical LAST field, `#[serde(default, skip_serializing_if = "Option::is_none")]` ⇒ strategy wire byte-identical when unset), threaded `ReactConfig::run → react_window` (trait + `StandardHarness` impl) `→ run_react_inner`; the legacy single-shot `run_react` wrapper passes `None`. At the system-prompt prepend site the leaf override **REPLACES** the global prompt for that window (`effective = leaf.or(global)`), so each phase sees ONLY its own prompt; a leaf with no override falls back to the global (byte-identical to pre-SC-10). **Why this shape:** both PlanExecute phases bottom out in `ReactConfig` leaves, so the override rides the EXISTING recursion — no executor-swap/child-harness plumbing (the `run_evaluate_phase` clone-config pattern can't reach the inline execute walk anyway, a lifetime dead-end I verified before settling on the leaf field). The hard-coded `plan_directive` is left intact (per-leaf prompt supplies the framing; relaxing the directive is **SC-28**'s lane). **Churn:** every `ReactConfig` literal (~37: harness tests + execution_registry + 6 `tests/*_fixture_replay.rs` + ex12) gained an explicit `system_prompt: None` (brace-aware script + compiler enumeration; spread-syntax examples 08/09/10/11 needed no change). New tests: `plan_and_execute_leaves_see_only_their_own_system_prompt` + `leaf_system_prompt_overrides_global_and_falls_back`. Demoed in `examples/rust/08-plan-execute` (single `SYSTEM_PROMPT` split into `PLAN_SYSTEM_PROMPT` planner / `EXECUTE_SYSTEM_PROMPT` executor, global kept as fallback). Additive — no fixture/wire impact; full suite green (**1251 lib pass / 0 fail**, integration + 9 doctests; spore-eval 55), clippy clean (2 pre-existing ollama.rs warnings). **Pre-existing breakage spotted (NOT mine, NOT fixed):** `examples/rust/09-self-verifying` fails to compile — its `SelfVerifyingConfig` literal is missing `eval_agent`/`eval_toolset`, added in `d14341f` (#151) and never wired into the example; flagged for a separate fix. TS/Py/Go parity: **#161**. Local `main` now **19 commits ahead of `origin/main`, NOT pushed** — ask the maintainer before pushing (Deviation #10). Remaining Phase 3: **SC-28** (relax plan to free-text/markdown); then the #160 memory follow-up, or port the parity backlog (#158/#159/#161 + #154–#157)._
@@ -27,15 +29,20 @@ _**Direction note:** The project has shifted from "hardening cluster done, maint
 ## Current State
 spore-core is a language-agnostic agentic harness runtime with a **complete core
 capability surface**, four targets — Rust (reference), TypeScript, Python, Go —
-serialized formats byte-identical across all four. Local `main` is **3 commits ahead of
-`origin/main`** (`origin/main` at `64938ee`); the three #149 `num_ctx` ports
-(`ff5358a`/`5c9b613`/`4a544a7`) are committed locally but **not yet pushed** — ask the maintainer
-before pushing (Deviation #10).
+serialized formats byte-identical across all four. **The dated log entries at the top of this file are
+the live record;** this section keeps the standing per-issue history below it. Local `main` is **23 commits
+ahead of `origin/main`** (`origin/main` at `e063cfc`) — the whole consumer-friction Phase 1–3 wave
+(`c5f7a01` … `6826df7`) is committed locally but **NOT pushed**; ask the maintainer before pushing
+(Deviation #10).
 
-**Active phase — cross-language parity catch-up (#144–#150).** Since the 2026-06-14 reconcile, Rust
-raced ahead on `main` with a wave of Ollama + sandbox + bugfix work, and TS/Python/Go are catching up
-issue-by-issue via `/implement` (Rust reference → three parallel language agents → cross-language
-verifier). Backlog status:
+**Active phase — the consumer-friction plan, Rust-first then port.** Phases 0–3 are landed in Rust
+(see the dated log + Active Direction): object-safety (SC-2/#160), provider/window/AutoContinue knobs
+(Phase 2), presets (SC-8), the canonical middleware chain (Q2), and structural `ContextSources`
+injection of guides + skills + memory (SC-26/SC-10/SC-28/#160). The job now is porting #154–#163 to
+TS/Python/Go via `/implement`, then Phase 4 (sandbox/exec hardening). **Behind it sits an OLDER
+cross-language parity backlog (#144–#151)** from the pre-consumer-friction wave — Rust raced ahead with
+Ollama + sandbox + bugfix work and TS/Python/Go still owe ports; that backlog's per-issue status (kept
+for reference):
 - **#149 — Ollama `num_ctx` ✅ DONE THIS LOOP (`status: complete`, CLOSED).** Opt-in interface field
   (`numCtx` ctor option / `num_ctx` kwarg / `SetNumCtx` setter — each language's `keep_alive` idiom, not
   the literal Rust `with_num_ctx`), threaded into `options.num_ctx`, **omitted when unset** (bare requests
@@ -219,38 +226,42 @@ axis (#142); runnable (#57), debuggable (#64/#65), evaluation loop (#26/#68).
 `scope: deferred`.
 
 ## Active Direction
-**The `12-cordyceps` hardening cluster #137–#143 is COMPLETE** (#137 ✅, #138 ✅, #140 ✅,
-#142 ✅, #143 ✅ — all closed), and the adjacent robustness gaps **#139** (output schemas) and
-**#141** (compaction window) are **done and closed too.** `Ralph[PlanExecute[ReAct,
-SelfVerifying[ReAct]]]` now survives Ralph window resets and process restarts with the `task_list`
-durable (#142), resumes the stalled worker instead of re-planning (#138), routes resumed tool calls
-through the leaf's scoped catalogue (#140), breaks tool-error grind loops (#137), enforces output
-schemas behind a migration gate (#139), and **fires compaction correctly for small/unknown-window
-models (#141)**. The composition's small-local-model reliability gaps that motivated the cluster are
-fully addressed.
+**The active work is the consumer-friction plan** (`docs/consumer-friction-plan.md`, v2.0) — reframing
+the cross-language defaults as tuned for fixture-replay, not real consumers, and landing ~30 additive
+fixes (SC-#/ARK-#/LOC-#) so spore-core is ergonomic for the cordyceps hill-climber and looper
+coding-agent. **Phases 0–3 are COMPLETE in Rust** (each landed Rust-first, full suite green +
+byte-identical fixtures, then a parity issue filed for TS/Py/Go):
+- **Phase 1** — SC-1/SC-30 (`8be060b`/`e063cfc`, pushed), SC-2 object-safe `ModelInterface` + SC-3 typed
+  retryable errors (`c5f7a01`; parity #154).
+- **Phase 2** — SC-4/5/6/27 provider/window/AutoContinue knobs (`f1c0beb`; parity #155); **SC-BUG-1**
+  HITL-resume re-enters composed frames (`8d1d679`; parity #156).
+- **Phase 2.5** — SC-8 `coding_agent`/`hill_climber` presets (`6f39933`; parity #157) + example migration.
+- **Phase 3** — Q2 canonical middleware chain subsuming SC-9/SC-11 (`ca41f8f`; parity #158); SC-26/#115
+  structural `ContextSources` guides + skills (4 slices; parity #159); SC-10 per-leaf `system_prompt`
+  (`9844794`; parity #161); SC-28 free-text/markdown plan (`9713a91`; parity #162); **#160 memory
+  follow-up** (`6826df7`; parity #163) — the LAST deferred SC-26 slice. **The structural-injection story
+  (guides + skills + memory all reach the model via the rich `assemble` seam) is now fully landed in Rust.**
 
-**The active direction is the cross-language parity catch-up backlog (#144–#150).** The maintainer
-pushed a Rust-first wave of Ollama + sandbox + bugfix work; the job now is porting each to TS/Python/Go
-via `/implement` (Rust reference → three parallel language agents → cross-language verifier),
-byte-identical where serialized, until the backlog drains. Order, roughly: **#149 ✅ done → #150**
-(recoverable sandbox violations — larger, breaking default change) **and #148** (Ollama thinking models)
-for the Ollama/sandbox cluster; then the smaller bugfix ports **#146** (web_fetch start_byte) and **#147**
-(SelfVerifying evaluator budget); **#144** ports appear landed — verify + `/close 144`. Behind the parity
-backlog the prior maintainer-call candidates still stand: refactor close-out (`/close 131` + finishers
-#121/#122/#127/#128), parked examples (#109 `13-coding-agent`, #92 observability) + `web_search`
-#108/#110, then larger parked features (#113/#107/#106, protocol track #83–87) and correctness/safety
-debt #34→#31→#30 + docs.
+**Two tracks are open from here, both maintainer-sequenceable:**
+1. **Port the consumer-friction parity backlog** to TS/Python/Go via `/implement` (land Rust → 3 parallel
+   language agents → cross-language verifier): **#154–#163** (SC-2/3, Phase 2, SC-BUG-1, presets,
+   middleware, ContextSources guides+skills, SC-10, SC-28, memory). These drain the Rust-ahead drift.
+2. **Phase 4** (consumer-friction plan §4) — sandbox/exec hardening knobs: **SC-12** exec-hardening,
+   **SC-13** read-everywhere/write-scoped, **SC-14/15/16**. Rust-first, then port. **LOC-2** (looper-side,
+   not spore-core) is now unblocked by SC-28 and rides the #162 port.
 
-**Housekeeping:** local `main` is **3 commits ahead of `origin/main`** (`64938ee`) — the three #149
-ports are unpushed; **ask the maintainer before pushing** (Deviation #10). `/close 131` (confirm the
-capstone success criteria; no code) remains an outstanding cheap reconcile-only step.
+**Housekeeping:** local `main` is **23 commits ahead of `origin/main`, NOT pushed** — **ask the maintainer
+before pushing** (Deviation #10). `/close 131` (confirm the cordyceps capstone success criteria; no code)
+remains an outstanding cheap reconcile-only step.
 
-**Parked behind the hardening cluster:** examples #109/#92 + `web_search` #108/#110; harness
-gaps #115 (skill loading) and #116 (HITL child-consult resume — overlaps #130's resume seam,
-may be cheaper to fold in); correctness/safety #34 → #31 → #30 and docs #27/#35/#36; larger
-features #113 (spore-lsp), #107 (PromptEngineeringAgent), #106 (MicroVMSandboxProvider), the
-protocol track #83–87, storage follow-ups #77/#88/#89. **#7** (ContextManager migration) would
-live-wire the rich `assemble` (proper home for #115's injection + the #32 cache halts).
+**Parked behind the consumer-friction work:** examples #109 (`13-coding-agent`)/#92 (observability) +
+`web_search` #108/#110; harness gap #116 (HITL child-consult resume — overlaps #130's resume seam, and
+#138 generalized the resume seed so it can reuse that seam); the older cross-language parity backlog
+#144–#151 (#150 sandbox-violations, #148 Ollama thinking, #146/#147 bugfix ports, #144 verify-then-close,
+#151 eval-phase reviewer); refactor close-out finishers #121/#122/#127/#128; correctness/safety
+#34 → #31 → #30 and docs #27/#35/#36; larger features #113/#107/#106, protocol track #83–87, storage
+follow-ups #77/#88/#89. **#7** (full ContextManager migration) is now largely realized by SC-26 + #160 for
+the live loop; what remains under #7 is the Block-1/2 `CacheHashMismatch` halt path (#32).
 
 ## Known Deviations
 1. **Go outbox is not zero-dependency** — closing #50 added `go.opentelemetry.io/otel` +
@@ -294,11 +305,11 @@ live-wire the rich `assemble` (proper home for #115's injection + the #32 cache 
    #116 finally wires the `child_state` resume branch the scoped catalogue is already available.
    **#138 (now landed) generalized the resume seed to be phase-agnostic, so #116 can reuse that
    seam directly when it wires the `child_state` branch.**
-10. **Local `main` push hygiene (standing reminder).** ⚠️ **3 AHEAD (2026-06-19, this loop):** local
-    `main` is 3 commits ahead of `origin/main` (`64938ee`) — the three #149 `num_ctx` ports
-    (`ff5358a`/`5c9b613`/`4a544a7`) are committed locally but **not pushed**. The Rust Ollama/sandbox wave
-    up to `64938ee` IS on `origin`. The standing reminder holds: **ask before pushing** — an agent-initiated
-    push was denied in an earlier session, so confirm maintainer OK before clearing this drift.
+10. **Local `main` push hygiene (standing reminder).** ⚠️ **23 AHEAD (2026-06-24):** local `main` is
+    23 commits ahead of `origin/main` (`origin/main` at `e063cfc`) — the entire consumer-friction Phase 1–3
+    wave (`c5f7a01` … `6826df7`, plus the SC-28 docs/example commits) is committed locally but **not
+    pushed**. The standing reminder holds: **ask before pushing** — an agent-initiated push was denied in an
+    earlier session, so confirm maintainer OK before clearing this drift.
 11. **Rust-only `12-cordyceps` polish + a Rust-only core addition** (`scope: debt`, not yet
     mirrored) — `8bb7734` adds `SubagentTool::with_stream` to the core harness (optional child
     stream sink); `d65ae64` builds on it in the Rust example. **TS/Python/Go have neither the core
@@ -351,23 +362,27 @@ path/extras-mirror/Rust-dyn/compaction-tokens/observability-content stubs — al
 loops.)_
 
 ## Next Actions
-1. **Port #150 — recoverable sandbox violations via `SandboxViolationPolicy` (TS/Python/Go).** Rust
-   landed (`64938ee`); the larger of the Ollama/sandbox parity ports and a **breaking default change**
-   (path escapes / blocked commands become recoverable feedback). Drive via `/implement 150`; keep the
-   typed-violation-to-harness shape and the loud compile error on exhaustive matches (see issue #150 + the
-   handoff). Current top of the parity backlog.
-2. **Port #148 — Ollama thinking/reasoning models (TS/Python/Go).** Rust landed (`a9c856b`); `/implement 148`.
-   While here, confirm whether the Rust-ahead Ollama `read_timeout` fix (`56361b2`) and think-effort levels
-   (`c486331`) need their own parity issues or fold into #148.
-3. **Port the smaller bugfix-parity issues.** #146 (char-boundary-safe `web_fetch` `start_byte`, Python/Go)
-   and #147 (SelfVerifying charge evaluator turns against budget, TS/Python). Both via `/implement`.
-4. **Verify + `/close 144`, then push.** PlanExecute budget-resume ports appear landed
-   (`2401fee`/`9b1d310`/`b56e852` + Rust docs `a25e6bf`); confirm the AC then close. Also push the 3
-   unpushed #149 commits once the maintainer OKs (Deviation #10).
-5. **Behind the parity backlog (maintainer call):** `/close 131` + refactor finishers #121/#122/#127/#128;
-   parked examples #109/#92 + `web_search` #108/#110; larger features #113/#107/#106, protocol #83–87;
-   debt #34→#31→#30 + docs. **#7** (ContextManager migration) would live-wire the rich `assemble`.
+1. **Port the consumer-friction parity backlog to TS/Python/Go via `/implement`.** Phases 0–3 are all
+   Rust-landed with parity issues filed but UNPORTED: **#163** (memory / object-safe `MemoryProvider`,
+   newest), **#162** (SC-28 free-text plan), **#161** (SC-10 per-leaf prompt), **#159** (SC-26
+   ContextSources guides+skills), **#158** (Q2 middleware chain), + the older **#154–#157** (SC-2/3,
+   Phase 2, SC-BUG-1 #156, presets #157). Convention: land Rust first (done) → 3 parallel language agents →
+   cross-language verifier. Reasonable order: foundational #154 (SC-2/3 object-safety — #163's memory
+   conversion mirrors it) → #158 → #159 → #161 → #162 → #163, with #155/#156/#157 sequenced by the
+   maintainer. This is the largest open lever and drains the Rust-ahead drift.
+2. **Phase 4 (consumer-friction plan §4) — sandbox/exec hardening, Rust-first.** SC-12 exec-hardening,
+   SC-13 read-everywhere/write-scoped, SC-14/15/16. Land Rust + tests, then file a parity issue. **LOC-2**
+   (looper-side, not spore-core) is unblocked by SC-28 and rides the #162 port.
+3. **`/close 131`** — confirm the `12-cordyceps` capstone success criteria and close the long-open #131
+   (reconcile-only, no code). Cheap and overdue.
+4. **Drain the OLDER cross-language parity backlog when the consumer-friction ports are in hand.** #150
+   (recoverable sandbox violations — breaking default change), #148 (Ollama thinking models), #146/#147
+   (bugfix ports), #144 (verify-then-`/close 144`), #151 (eval-phase reviewer). These predate the
+   consumer-friction epoch and sit behind it.
+5. **Maintainer call — push + parked work.** Clear the 23-commit `origin/main` drift once OK'd (Deviation
+   #10). Then parked examples #109/#92 + `web_search` #108/#110, refactor finishers #121/#122/#127/#128,
+   larger features #113/#107/#106 + protocol #83–87, correctness/safety #34→#31→#30 + docs #27/#35/#36.
 
-**Note:** the hardening cluster (#137–#143) + #139/#141 remain fully closed; the active work is the
-**cross-language parity catch-up backlog (#144–#150)** — Rust-first features/bugfixes being ported to the
-other three languages issue-by-issue.
+**Note:** the consumer-friction plan Phases 0–3 are COMPLETE in Rust; the live loop now injects guides +
+skills + memory structurally (SC-26 + #160). The active work is porting that Rust-ahead work to the other
+three languages (#154–#163) and Phase 4.
