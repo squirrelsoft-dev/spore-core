@@ -434,6 +434,19 @@ func (cx *ExecutionContext) finish(ctx context.Context, executor StrategyExecuto
 		st.Task = parentTask
 		result.State = &st
 	}
+	// SC-BUG-1: a HITL pause (WaitingForHuman) propagated from a worker leaf ALSO
+	// carries the LEAF task (a leaf records its terminal via recordTerminal, which
+	// never rewrites it). Without the same rewrite a host Resume runs only that
+	// bare leaf and loses the surrounding frame — the SelfVerifying evaluate phase
+	// / PlanExecute walk never re-runs (so under AlwaysAsk the verify gate silently
+	// degrades to a plain executor). Rewrite it on the way up exactly like Consult,
+	// so resumeInner re-drives the whole composed strategy from the approved worker
+	// session.
+	if result.Kind == RunWaitingForHuman && result.State != nil {
+		st := *result.State
+		st.Task = parentTask
+		result.State = &st
+	}
 	pt := parentTask
 	cx.Scratch.Task = &pt
 	switch result.Kind {

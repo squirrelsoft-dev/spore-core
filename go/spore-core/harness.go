@@ -6177,6 +6177,18 @@ func (h *StandardHarness) resumeInner(
 					rtr := HarnessToolResult{CallID: call.ID, Output: output}
 					h.config.ContextManager.AppendToolResult(ctx, &session, &rtr)
 				}
+				// SC-BUG-1: a clarification that surfaced from inside a composed tree
+				// carries the FULL strategy in task.LoopStrategy (each combinator's
+				// finish rewrote the pause's task on the way up). Re-DRIVE that
+				// strategy from the answered worker session — exactly as the consult
+				// resume does — so the SelfVerifying evaluate phase / PlanExecute walk
+				// runs instead of only the bare worker leaf. A BARE ReAct leaf has no
+				// surrounding frame, so it keeps the leaf-only resume below
+				// (back-compat).
+				if task.LoopStrategy.Kind != StrategyReAct {
+					seed := session
+					return h.driveStrategyWithResumeSeed(ctx, task, SessionState{}, budget, onStream, nil, &seed)
+				}
 				return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream, agent)
 			}
 		}
@@ -6309,6 +6321,20 @@ func (h *StandardHarness) resumeInner(
 			Turns:        state.TurnNumber,
 			SessionState: session,
 		}
+	}
+
+	// SC-BUG-1: an Allow / Deny / Answer / Reject resume that surfaced from inside
+	// a composed tree carries the FULL strategy in task.LoopStrategy (each
+	// combinator's finish rewrote the pause's task on the way up). The human
+	// response has already been applied to session above (the approved calls
+	// dispatched, or the deny/answer message appended). Re-DRIVE the whole strategy
+	// from that mutated worker session — mirroring the consult resume — so the
+	// SelfVerifying evaluate phase (the looper's eval-frame reviewer) / PlanExecute
+	// walk re-runs instead of degrading to a plain executor. A BARE ReAct leaf
+	// keeps the leaf-only resume below.
+	if task.LoopStrategy.Kind != StrategyReAct {
+		seed := session
+		return h.driveStrategyWithResumeSeed(ctx, task, SessionState{}, budget, onStream, nil, &seed)
 	}
 
 	return h.runReAct(ctx, task, task.LoopStrategy.MaxIterations(), session, budget, onStream, agent)

@@ -1576,7 +1576,24 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 	}
 	task := cx.currentTask()
 	buildSessionID := task.SessionID
-	session := cx.takeSession()
+	// SC-BUG-1: a HITL resume re-drives the whole SelfVerifying strategy with the
+	// stalled build (worker) conversation carried in the phase-agnostic resume
+	// seed. Consume it as the FIRST build iteration's session so the build phase
+	// CONTINUES the approved/answered worker turn (which already carries the
+	// original instruction + the dispatched tool result) instead of restarting from
+	// an empty top-level session — then the evaluate phase + verifier run, reaching
+	// the looper's eval-frame reviewer. On a fresh run the seed is nil and this is
+	// the incoming run session, byte-identical to before. When SelfVerifying is
+	// NESTED under a PlanExecute walk, that outer walk takes the seed BEFORE
+	// recursing, so this sees nil and the nested behavior is unchanged.
+	var session SessionState
+	if cx.Scratch.ResumeSeed != nil {
+		session = *cx.Scratch.ResumeSeed
+		cx.Scratch.ResumeSeed = nil
+		cx.takeSession() // still drain the run session
+	} else {
+		session = cx.takeSession()
+	}
 	carried := cx.Scratch.RunBudget
 	// Suppress the run's stream sink for the recursive child phases.
 	onStream := cx.takeStream()
