@@ -31,7 +31,9 @@ import {
 } from "../model/prompt-tool-call.js";
 import { StandardContextManager } from "../context/standard.js";
 import { intoHarnessAdapter } from "../context/compaction-adapter.js";
-import { defaultCompactionConfig } from "../context/types.js";
+import { defaultCompactionConfig, emptyContextSources } from "../context/types.js";
+import type { ContextSources, Guide } from "../context/types.js";
+import type { SkillCatalog } from "../skills/index.js";
 import { NullCacheProvider } from "../cache-provider/types.js";
 import { NullSandbox } from "../sandbox/null-sandbox.js";
 import { EmptyToolRegistry } from "../tool-registry/empty.js";
@@ -335,6 +337,26 @@ export interface HarnessConfig {
    */
   systemPrompt?: string;
   /**
+   * Guides (skills/playbooks/domain knowledge) injected structurally into every
+   * turn's assembled context via the rich {@link ContextSources} seam (issue
+   * #115 / SC-26 / #9). The harness clones these into {@link ContextSources.guides}
+   * each turn; the production
+   * {@link "../context/compaction-adapter.js".StandardCompactionAdapter} renders
+   * them into the leading System block, not as ad-hoc User messages. Absent /
+   * empty (the default) preserves today's behaviour byte-for-byte. See
+   * {@link HarnessBuilder.guide}.
+   */
+  guides?: Guide[];
+  /**
+   * Skill catalog (issue #115 / SC-26). When set, the harness appends the
+   * catalog's {@link SkillCatalog.activeGuides} — the manifest (every turn) + each
+   * ACTIVE skill's body (sticky) — to {@link ContextSources.guides} each turn, so
+   * skills ride the structural System block. Wired by
+   * {@link HarnessBuilder.skills}, which ALSO registers the `load_skill` tool.
+   * Absent (the default) means no skills, byte-identical.
+   */
+  skills?: SkillCatalog;
+  /**
    * Authoritative per-run model sampling/decoding parameters (issue #93). The
    * harness replaces each turn's {@link Context.params} with this value
    * UNCONDITIONALLY (builder params win) right before the request is built, so
@@ -562,6 +584,28 @@ export class StandardHarness implements Harness, StrategyExecutor {
     } catch {
       return ProjectId.fromCanonicalPath(workspaceRoot);
     }
+  }
+
+  /**
+   * Build the per-turn {@link ContextSources} threaded into the structural
+   * `ContextManager.assemble` seam (issue #115 / SC-26). Carries the tool
+   * schemas, the configured guides (guide source + each ACTIVE skill's body),
+   * and — empty for now (memory deferred to #163; composed prompt until the
+   * chunk-provider path is wired) — the remaining slots. An empty result renders
+   * to nothing, so a harness with no sources stays byte-identical to the pre-#115
+   * pass-through.
+   */
+  private buildContextSources(toolSchemas: ModelToolSchema[]): ContextSources {
+    // #115 / SC-26 / #9: configured guides reach the model structurally through
+    // the assemble seam, not as an ad-hoc User-message prepend.
+    const guides: Guide[] = [...(this.config.guides ?? [])];
+    // #115 / SC-26: each turn append the skill manifest (tier 1) + each active
+    // skill's body (tier 2) as guides, so loading a skill makes its body sticky
+    // on the next turn. `undefined` (no catalogue) appends nothing.
+    if (this.config.skills) {
+      guides.push(...this.config.skills.activeGuides());
+    }
+    return { ...emptyContextSources(), guides, tool_schemas: toolSchemas };
   }
 
   /**
@@ -2876,22 +2920,44 @@ export class StandardHarness implements Harness, StrategyExecutor {
         }
       }
 
-      // Assemble + invoke agent for one turn.
-      const context = await this.config.contextManager.assemble(sessionState, task, signal);
+      // Assemble + invoke agent for one turn. `sources` (issue #115 / SC-26)
+      // carries the rich ContextSources into the structural assemble seam: tool
+      // schemas, the configured guides, and each active skill's body. An empty
+      // `sources` renders to nothing, so the no-source path stays byte-identical.
+      const sources = this.buildContextSources(toolRegistry.schemas());
+      const context = await this.config.contextManager.assemble(
+        sessionState,
+        task,
+        sources,
+        signal,
+      );
       // Fold the registry's tool schemas in only when the context manager left
       // the tool list empty (issue #91). A manager that deliberately sets a
       // phase-specific subset is preserved.
       if (context.tools.length === 0) {
         context.tools = toolRegistry.schemas();
       }
-      // Prepend the configured operating system prompt (issue #91). The standard
-      // compaction adapter renders none, so without this the model gets only the
-      // task and no guidance. Guard against duplicates so a context manager that
-      // already leads with a system message (or a resumed/seeded session) isn't
-      // given two.
+      // Prepend the configured operating system prompt (issue #91), MERGING it
+      // with any structural #115 context block the manager already placed as a
+      // leading System message (guides/memory/composed prompt). The system prompt
+      // always leads. When the manager produced NO System message (the common
+      // case — empty sources, or a test double), this inserts a fresh System
+      // message exactly as before, so the no-structural-block path stays
+      // byte-identical. The `startsWith` guard keeps a resumed/seeded session that
+      // already leads with the system prompt from being given it twice.
       if (this.config.systemPrompt != null) {
-        const hasSystem = context.messages[0]?.role === "system";
-        if (!hasSystem) {
+        const head = context.messages[0];
+        if (head?.role === "system" && head.content.type === "text") {
+          if (!head.content.text.startsWith(this.config.systemPrompt)) {
+            head.content = {
+              type: "text",
+              text: `${this.config.systemPrompt}\n\n${head.content.text}`,
+            };
+          }
+          // Already leads with the system prompt — leave it.
+        } else if (head?.role === "system") {
+          // A non-text leading System block — leave it.
+        } else {
           context.messages.unshift({
             role: "system",
             content: { type: "text", text: this.config.systemPrompt },
@@ -4123,6 +4189,14 @@ export class HarnessBuilder {
    */
   private readonly _toolsetTools = new Map<string, StandardTool[]>();
   private _systemPrompt?: string;
+  /** Guides injected structurally into every turn via {@link ContextSources}
+   *  (issue #115 / #9). Empty (the default) preserves today's behaviour. See
+   *  {@link guide}. */
+  private readonly _guides: Guide[] = [];
+  /** Skill catalog registered via {@link skills} (issue #115 / SC-26). When set,
+   *  its `activeGuides()` ride the per-turn sources and `load_skill` is added to
+   *  the standard tools. `undefined` (the default) means no skills. */
+  private _skills?: SkillCatalog;
   private _modelParams: ModelParams = ModelParamsSchema.parse({});
   private _autoPersistSessions = false;
   private _promptToolCallFlag?: SharedFlag;
@@ -4425,6 +4499,43 @@ export class HarnessBuilder {
   }
 
   /**
+   * Register a {@link Guide} (skill/playbook/domain knowledge) injected
+   * structurally into every turn's assembled context via the rich
+   * {@link ContextSources} seam (issue #115 / SC-26 / #9). Unlike an ad-hoc
+   * User-message prepend, the guide is rendered into the leading System block by
+   * the production context manager. Call repeatedly to register several; order is
+   * preserved.
+   */
+  guide(guide: Guide): this {
+    this._guides.push(guide);
+    return this;
+  }
+
+  /**
+   * Register several {@link Guide}s at once (issue #115 / SC-26). Appends to any
+   * already registered via {@link guide}.
+   */
+  guides(guides: Iterable<Guide>): this {
+    for (const g of guides) this._guides.push(g);
+    return this;
+  }
+
+  /**
+   * Register a {@link SkillCatalog} (issue #115 / SC-26). Wires BOTH the catalog
+   * (so its `activeGuides()` — the manifest every turn + each ACTIVE skill's body
+   * — ride the per-turn {@link ContextSources}, reaching the model through the
+   * structural System block) AND the catalog's `load_skill` tool (so the agent
+   * can activate a skill mid-run, making its body sticky on the next turn). The
+   * same catalog instance is shared between the harness and the registered tool,
+   * so both read the SAME active set for the run's lifetime.
+   */
+  skills(catalog: SkillCatalog): this {
+    this._skills = catalog;
+    this._standardTools.push(catalog.loadSkillTool());
+    return this;
+  }
+
+  /**
    * Set the authoritative model sampling/decoding parameters for the whole run
    * (issue #93).
    *
@@ -4701,6 +4812,8 @@ export class HarnessBuilder {
       catalogueRegistry,
       toolsetCatalogues,
       systemPrompt: this._systemPrompt,
+      guides: this._guides,
+      skills: this._skills,
       modelParams: this._modelParams,
       autoPersistSessions: this._autoPersistSessions,
       prompt_tool_call_flag: this._promptToolCallFlag,

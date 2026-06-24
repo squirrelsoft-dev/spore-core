@@ -135,9 +135,10 @@ export class SchemaInjectingContextManager implements HarnessContextManager {
   async assemble(
     session: HarnessState,
     task: Task,
+    sources: coreContext.ContextSources,
     signal?: AbortSignal,
   ): Promise<Context> {
-    const ctx = await this.inner.assemble(session, task, signal);
+    const ctx = await this.inner.assemble(session, task, sources, signal);
     ctx.tools = this.tools.slice();
     // Prepend the operational system prompt. The adapter's assemble yields
     // none, so the model would otherwise get no guidance. Guard against

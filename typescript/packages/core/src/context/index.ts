@@ -14,5 +14,6 @@ export {
   StandardCompactionAdapter,
   intoHarnessAdapter,
   seedRichState,
+  renderContextBlock,
   RICH_STATE_KEY,
 } from "./compaction-adapter.js";

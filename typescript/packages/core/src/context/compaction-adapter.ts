@@ -57,6 +57,7 @@ import type {
 import { StandardContextManager } from "./standard.js";
 import {
   type CompactionResult,
+  type ContextSources,
   type SessionState as RichSessionState,
   SessionStateSchema,
 } from "./types.js";
@@ -103,6 +104,30 @@ export function estimateTokens(messages: Message[]): number {
 }
 
 /**
+ * Render the structural context block from {@link ContextSources} (issue #115 /
+ * SC-26): the composed static prompt, then guides, then merged memory, joined by
+ * blank lines. A guide renders as `# {guide.id}\n{guide.content}` — the heading
+ * comes from the guide id. Empty when there is nothing to inject, which keeps the
+ * no-source path byte-identical to the pre-#115 pass-through. The harness merges
+ * the configured system prompt INTO this block (system prompt first), so guides
+ * and memory land in a structural System slot rather than ad-hoc User messages.
+ */
+export function renderContextBlock(sources: ContextSources): string {
+  const parts: string[] = [];
+  const composed = sources.composed_prompt.rendered;
+  if (composed.length > 0) {
+    parts.push(composed);
+  }
+  for (const g of sources.guides) {
+    parts.push(`# ${g.id.toString()}\n${g.content}`);
+  }
+  for (const m of sources.memory) {
+    parts.push(m.content);
+  }
+  return parts.join("\n\n");
+}
+
+/**
  * Reconstruct the rich session state from `extras`. Returns `undefined` when no
  * rich state has been seeded yet or the blob is malformed — callers treat that
  * as "nothing to compact" so the loop is never blocked.
@@ -145,13 +170,26 @@ export function seedRichState(session: HarnessState, rich: RichSessionState): vo
 export class StandardCompactionAdapter implements HarnessContextManager {
   constructor(private readonly inner: StandardContextManager) {}
 
-  async assemble(session: HarnessState, _task: Task, _signal?: AbortSignal): Promise<Context> {
-    // NOT load-bearing for compaction. The rich `assemble` requires
-    // `ContextSources` the seam does not supply, so we produce a minimal
-    // context straight from the session messages (mirrors the loop's
-    // test-double managers).
+  async assemble(
+    session: HarnessState,
+    _task: Task,
+    sources: ContextSources,
+    _signal?: AbortSignal,
+  ): Promise<Context> {
+    // The compaction adapter does not run the rich block-hash `assemble` (that
+    // stays #7's job — the #32 cache-halt machinery is deliberately dormant). It
+    // DOES place the #115 structural context block — guides, merged memory, the
+    // composed static prompt — as a leading System message so they reach the
+    // model through the seam instead of an ad-hoc User-message wrapper. An empty
+    // block adds nothing, so a harness with no sources stays byte-identical to
+    // the pre-#115 pass-through.
+    const messages = session.messages.slice();
+    const block = renderContextBlock(sources);
+    if (block.length > 0) {
+      messages.unshift({ role: "system", content: { type: "text", text: block } });
+    }
     return {
-      messages: session.messages.slice(),
+      messages,
       tools: [],
       params: { stop_sequences: [] },
     };

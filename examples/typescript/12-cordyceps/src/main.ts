@@ -33,11 +33,15 @@
  *   with a per-kind budget + overflow policy (`research` → web_search, budget 5,
  *   soft_fail; `advice` → cloud advisor, budget 3, escalate_to_human). Identical
  *   #114 semantics, host-owned budgets.
- * - `load_skill` is **dropped** — there is no worker-side per-node seam;
- * - the `audit` skill is **kept**, but now rides the single GLOBAL
- *   {@link SkillInjectingContextManager} (the harness's `context_manager`),
- *   seeded ALWAYS-ACTIVE at startup. The audit procedure reaches the model
- *   structurally every turn, compaction-proof, with no `load_skill` round-trip.
+ * - skills are now **productionized in the harness** (#115 / SC-26). A
+ *   `SkillCatalog` is built with `skills.SkillCatalog.discover(...)` and the
+ *   `audit` skill is activated at startup; `HarnessBuilder.skills(catalog)`
+ *   registers the catalog AND the `load_skill` tool, and the harness injects the
+ *   manifest (every turn) + each ACTIVE skill's full body (sticky) STRUCTURALLY
+ *   via the rich `ContextSources` System block — no example-side
+ *   `SkillInjectingContextManager` wrapper, no runStore seed, no
+ *   `.contextManager(...)` override. The audit procedure reaches the model every
+ *   turn, compaction-proof.
  *
  * ## The tree is DATA
  *
@@ -74,18 +78,16 @@ import {
   SessionId,
   StandardHarness,
   WorkspaceScopedSandbox,
-  cacheProvider,
-  context as contextNs,
   loopStrategyMaxSteps,
   newTask,
   reactPerLoop,
+  skills,
   storage,
   toolRegistry,
   verifier,
   type Agent,
   type ConsultHandlerEntry,
   type ConsultRequest,
-  type ContextManager,
   type EscalationAction,
   type EscalationMode,
   type Harness,
@@ -99,11 +101,6 @@ import {
 import { StandardTools, WebSearchTool } from "@spore/tools";
 
 import {
-  SkillCatalog,
-  SkillInjectingContextManager,
-  ACTIVE_SKILLS_KEY,
-} from "./skills.js";
-import {
   consultAdvisorTool,
   researchBestPracticesTool,
   KIND_ADVICE,
@@ -111,11 +108,9 @@ import {
 } from "./tools/consult.js";
 import { sendUserMessageTool } from "./tools/send-message.js";
 
-const { StandardContextManager, intoHarnessAdapter, defaultCompactionConfig } =
-  contextNs;
+const { SkillCatalog } = skills;
 const { ProjectId, CompositeStorageProvider, FileSystemStorageProvider } =
   storage;
-const { NullCacheProvider } = cacheProvider;
 const { EvaluatorResponseVerifier } = verifier;
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -133,8 +128,11 @@ const CORDYCEPS_TREE_PATH = resolve(
   "cordyceps_tree.json",
 );
 
-/** Bundled `audit` skill (the global context_manager's always-active procedure). */
-const BUNDLED_AUDIT_PATH = join(here, "..", "skills", "audit", "SKILL.md");
+/** Bundled skills directory (`skills/<name>/SKILL.md`), discovered by the harness
+ *  via `SkillCatalog.discover`. The `audit` skill is activated at startup so its
+ *  full procedure rides the structural ContextSources System block every turn
+ *  (#115 / SC-26 — no example-side context-manager wrapper). */
+const BUNDLED_SKILLS_DIR = join(here, "..", "skills");
 
 /** The verifier registry key the `SelfVerifying` node's `evaluator` resolves to. */
 export const EXEC_EVALUATOR_KEY = "exec-evaluator";
@@ -371,43 +369,19 @@ export function buildRegistry(
   );
 }
 
-/** Build the inner standard compaction adapter (the same one
- *  `HarnessBuilder.conversational` installs), so the skill-injecting context
- *  manager can wrap it and delegate every non-`assemble` method to it. */
-function buildInnerContextManager(
-  modelId: string,
-  baseUrl: string,
-): ContextManager {
-  const model = OllamaModelInterface.withBaseUrl(modelId, baseUrl);
-  const rich = new StandardContextManager(
-    model,
-    new NullCacheProvider(),
-    defaultCompactionConfig(),
-  );
-  return intoHarnessAdapter(rich);
-}
-
-/** Build the GLOBAL skill-injecting context manager with the `audit` skill seeded
- *  ALWAYS-ACTIVE for `session`. Wraps the standard compaction adapter. */
-async function buildGlobalContextManager(
-  modelId: string,
-  baseUrl: string,
-  storageProvider: storage.StorageProvider,
-  repoRoot: string,
-  session: SessionId,
-): Promise<ContextManager> {
-  const bundledAudit = readFileSync(BUNDLED_AUDIT_PATH, "utf8");
-  const catalog = await SkillCatalog.bootstrap(repoRoot, bundledAudit);
-  // Seed `audit` always-active: the global context_manager injects its body
-  // structurally every turn (no `load_skill` round-trip in the composed tree).
-  await storageProvider.run().put(session, ACTIVE_SKILLS_KEY, ["audit"]);
-
-  const inner = buildInnerContextManager(modelId, baseUrl);
-  return new SkillInjectingContextManager(
-    inner,
-    storageProvider.run(),
-    catalog.manifest(),
-  );
+/**
+ * Build the {@link SkillCatalog} and activate the `audit` skill (#115 / SC-26).
+ * `discover` scans the bundled `skills/` dir + `<workspace>/.spore/skills` +
+ * `~/.spore/skills`. Activating `audit` at startup makes its full body sticky —
+ * the harness injects the manifest (every turn) + the active body STRUCTURALLY
+ * via the rich `ContextSources` System block, with NO example-side
+ * SkillInjectingContextManager and no `load_skill` round-trip. Registered on the
+ * harness via `.skills(catalog)`, which also wires the `load_skill` tool.
+ */
+function buildSkillCatalog(workspaceRoot: string): skills.SkillCatalog {
+  const catalog = SkillCatalog.discover([BUNDLED_SKILLS_DIR], workspaceRoot);
+  catalog.activate("audit");
+  return catalog;
 }
 
 /** Build the cordyceps {@link Task}: the composed tree deserialized from the
@@ -530,13 +504,12 @@ async function main(): Promise<void> {
     );
 
     const registry = buildRegistry(modelId, baseUrl);
-    const contextManager = await buildGlobalContextManager(
-      modelId,
-      baseUrl,
-      storageProvider,
-      repoRoot,
-      session,
-    );
+    // #115 / SC-26: discover skills and activate `audit`. `.skills(catalog)` (below)
+    // wires the catalog AND the `load_skill` tool; the harness injects the manifest
+    // + the active `audit` body STRUCTURALLY via the rich ContextSources System
+    // block every turn — no SkillInjectingContextManager, no runStore seed, no
+    // `.contextManager(...)` override.
+    const catalog = buildSkillCatalog(workspaceRoot);
 
     // The harness's own model drives the Ralph wrapper; the per-node agents come
     // from the registry. Compaction/summarization uses this model too.
@@ -556,7 +529,7 @@ async function main(): Promise<void> {
       .registry(registry)
       .escalationMode(escalationMode)
       .systemPrompt(EXEC_SYSTEM_PROMPT)
-      .contextManager(contextManager)
+      .skills(catalog)
       .toolsetTools("plan-tools", planTools())
       .toolsetTools("exec-tools", execTools())
       .build();

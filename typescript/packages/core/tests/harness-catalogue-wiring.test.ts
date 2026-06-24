@@ -306,7 +306,9 @@ describe("per-node toolset scoping (Issue 2)", () => {
   });
 
   it("a non-empty handle with no per-key catalogue falls back to the global catalogue", async () => {
-    const cfg = catalogueBuilder(makeAgent()).tools([fakeTool("read_file")]).buildConfig();
+    const cfg = catalogueBuilder(makeAgent())
+      .tools([fakeTool("read_file")])
+      .buildConfig();
     const h = new StandardHarness(cfg);
     const reg = effectiveFor(h, SessionId.of("s1"), "not-wired");
     expect(reg.schemas().some((s) => s.name === "read_file")).toBe(true);
@@ -340,9 +342,10 @@ describe("systemPrompt seam (#91)", () => {
     expect(first!.content.type === "text" && first!.content.text).toBe("OPERATING RULES");
   });
 
-  it("does not add a second system message when one already leads the context", async () => {
+  it("merges the system prompt into a single leading System block when one already leads (#115/SC-26)", async () => {
     const agent = new CapturingAgent(AgentId.of("cap"));
-    // A context manager that already renders its own leading system message.
+    // A context manager that already renders its own leading system message —
+    // mirroring the production adapter placing the #115 structural block.
     class LeadingSystemContextManager extends NoopContextManager {
       override async assemble(session: SessionState): Promise<Context> {
         return {
@@ -367,10 +370,52 @@ describe("systemPrompt seam (#91)", () => {
     const h = new StandardHarness(cfg);
     await h.run({ task: react(2) });
 
+    // The loop MERGES the configured system prompt INTO the existing leading
+    // System message (system prompt first) instead of skipping or adding a
+    // second — so guides/structural blocks coexist with the system prompt in one
+    // leading System message.
     const systemMsgs = agent.seen.filter((m) => m.role === "system");
     expect(systemMsgs.length).toBe(1);
     expect(systemMsgs[0]!.content.type === "text" && systemMsgs[0]!.content.text).toBe(
-      "MANAGER PROMPT",
+      "OPERATING RULES\n\nMANAGER PROMPT",
+    );
+  });
+
+  it("does not re-prepend when the leading System block already starts with the system prompt", async () => {
+    const agent = new CapturingAgent(AgentId.of("cap"));
+    // The leading System block already starts with the system prompt (e.g. a
+    // resumed/seeded session) — the loop must NOT prepend it again.
+    class AlreadyMergedContextManager extends NoopContextManager {
+      override async assemble(session: SessionState): Promise<Context> {
+        return {
+          messages: [
+            {
+              role: "system",
+              content: { type: "text", text: "OPERATING RULES\n\nMANAGER PROMPT" },
+            },
+            ...session.messages,
+          ],
+          tools: [],
+          params: { stop_sequences: [] },
+        };
+      }
+    }
+    const cfg = new HarnessBuilder(
+      agent,
+      new ScriptedToolRegistry(),
+      new AllowAllSandbox(),
+      new AlreadyMergedContextManager(),
+      new AlwaysContinuePolicy(),
+    )
+      .systemPrompt("OPERATING RULES")
+      .buildConfig();
+    const h = new StandardHarness(cfg);
+    await h.run({ task: react(2) });
+
+    const systemMsgs = agent.seen.filter((m) => m.role === "system");
+    expect(systemMsgs.length).toBe(1);
+    expect(systemMsgs[0]!.content.type === "text" && systemMsgs[0]!.content.text).toBe(
+      "OPERATING RULES\n\nMANAGER PROMPT",
     );
   });
 

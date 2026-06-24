@@ -4,6 +4,7 @@
  */
 
 import type { Context } from "../agent/types.js";
+import type { ContextSources } from "../context/types.js";
 import type { Agent } from "../agent/interface.js";
 import type { ToolCall, ToolResult, ToolSchema } from "../model/schemas.js";
 import type { Verifier } from "../verifier/types.js";
@@ -60,7 +61,7 @@ export function registryWith(opts: {
 }
 
 export class NoopContextManager implements ContextManager {
-  async assemble(session: SessionState, _task: Task): Promise<Context> {
+  async assemble(session: SessionState, _task: Task, _sources: ContextSources): Promise<Context> {
     return {
       messages: session.messages.slice(),
       tools: [],

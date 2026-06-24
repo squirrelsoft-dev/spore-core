@@ -339,6 +339,23 @@ export interface ContextSources {
   composed_prompt: ComposedPrompt;
 }
 
+/**
+ * An empty {@link ContextSources} (issue #115 / SC-26) — no guides, no memory,
+ * no tool schemas, and an empty composed prompt. Renders to nothing through
+ * {@link "./compaction-adapter.js".renderContextBlock}, so a harness that
+ * supplies no structural sources stays byte-identical to the pre-#115
+ * pass-through. The harness-loop `assemble` seam takes a `ContextSources`
+ * argument; callers with nothing to inject pass this.
+ */
+export function emptyContextSources(): ContextSources {
+  return {
+    guides: [],
+    memory: [],
+    tool_schemas: [],
+    composed_prompt: { rendered: "", block_1_hash: 0 },
+  };
+}
+
 export interface CompactionPreserveHints {
   keep_architectural_decisions: boolean;
   keep_open_problems: boolean;

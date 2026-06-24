@@ -54,8 +54,15 @@ import {
   ScriptedToolRegistry,
 } from "../src/harness/testing.js";
 
-const { StandardContextManager, StandardCompactionAdapter, intoHarnessAdapter, seedRichState } =
-  contextNs;
+const {
+  StandardContextManager,
+  StandardCompactionAdapter,
+  intoHarnessAdapter,
+  seedRichState,
+  renderContextBlock,
+  emptyContextSources,
+  GuideId,
+} = contextNs;
 const { NullCacheProvider } = cacheNs;
 const { InMemoryObservabilityProvider } = obsNs;
 const newSessionState = contextNs.newSessionState;
@@ -496,4 +503,35 @@ describe("StandardCompactionAdapter — compaction loop fixture parity (issue #5
       }
     });
   }
+});
+
+// ---- renderContextBlock (SC-26/#115 structural injection) ------------------
+
+describe("renderContextBlock", () => {
+  it("is empty when there are no sources", () => {
+    // Empty sources → empty block → the adapter adds no System message, so the
+    // no-source path is byte-identical to the pre-#115 pass-through.
+    expect(renderContextBlock(emptyContextSources())).toBe("");
+  });
+
+  it("formats guides as `# {id}` headers in registration order, joined by blank lines", () => {
+    const sources = {
+      ...emptyContextSources(),
+      guides: [
+        { id: GuideId.of("audit"), content: "AUDIT BODY" },
+        { id: GuideId.of("style"), content: "STYLE BODY" },
+      ],
+    };
+    expect(renderContextBlock(sources)).toBe("# audit\nAUDIT BODY\n\n# style\nSTYLE BODY");
+  });
+
+  it("renders composed prompt, then guides, then memory", () => {
+    const sources = {
+      guides: [{ id: GuideId.of("g"), content: "GUIDE" }],
+      memory: [{ key: "k", content: "MEMORY" }],
+      tool_schemas: [],
+      composed_prompt: { rendered: "COMPOSED", block_1_hash: 0 },
+    };
+    expect(renderContextBlock(sources)).toBe("COMPOSED\n\n# g\nGUIDE\n\nMEMORY");
+  });
 });

@@ -21,6 +21,8 @@ import {
   emptySessionState,
   middleware,
   newTask,
+  context as contextNs,
+  skills as skillsNs,
   type Agent,
   type Context,
   type ContextManager,
@@ -1077,5 +1079,108 @@ describe("Harness — rich middleware chain wired into the loop (#158)", () => {
       (m) => m.role === "user" && m.content.type === "text" && m.content.text === "keep going",
     );
     expect(injected, "the force_another_turn injection must be recorded").toBe(true);
+  });
+});
+
+// ── SC-26 / #115: ContextSources reach the model structurally ───────────────
+
+describe("Harness — ContextSources structural injection (#115/SC-26)", () => {
+  /** Agent double that records the {@link Context} it is handed each turn. */
+  class RecordingAgent implements Agent {
+    readonly seen: Context[] = [];
+    async turn(context: Context): Promise<TurnResult> {
+      this.seen.push(context);
+      return fr("done");
+    }
+    id(): AgentId {
+      return AgentId.of("recording");
+    }
+  }
+
+  /**
+   * Minimal context manager mirroring the production adapter: render
+   * `sources.guides` into a leading System block, so the loop's
+   * sources-building + system-prompt merge can be asserted without the adapter's
+   * model machinery.
+   */
+  class GuideRenderingCm extends NoopContextManager {
+    override async assemble(
+      session: SessionState,
+      _task: Task,
+      sources: contextNs.ContextSources,
+    ): Promise<Context> {
+      const messages = session.messages.slice();
+      const block = sources.guides.map((g) => `# ${g.id.toString()}\n${g.content}`).join("\n\n");
+      if (block.length > 0) {
+        messages.unshift({ role: "system", content: { type: "text", text: block } });
+      }
+      return { messages, tools: [], params: { stop_sequences: [] } };
+    }
+  }
+
+  it("a configured guide reaches the model as a leading System block with the system prompt merged in front", async () => {
+    const recording = new RecordingAgent();
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      systemPrompt: "SYSTEM PROMPT",
+      guides: [{ id: contextNs.GuideId.of("audit"), content: "AUDIT PLAYBOOK BODY" }],
+    };
+    const h = new StandardHarness(cfg);
+    await h.run({ task: react(5) });
+
+    expect(recording.seen.length).toBeGreaterThan(0);
+    const first = recording.seen[0]!;
+    const head = first.messages[0]!;
+    expect(head.role).toBe("system");
+    if (head.content.type !== "text") throw new Error("expected a text System block");
+    // System prompt leads the merged System block; the guide rides structurally.
+    expect(head.content.text.startsWith("SYSTEM PROMPT")).toBe(true);
+    expect(head.content.text).toContain("# audit");
+    expect(head.content.text).toContain("AUDIT PLAYBOOK BODY");
+    // The guide is NOT delivered as a stray User message.
+    const userGuide = first.messages.some(
+      (m) =>
+        m.role === "user" &&
+        m.content.type === "text" &&
+        m.content.text.includes("AUDIT PLAYBOOK BODY"),
+    );
+    expect(userGuide, "guide must not be injected as a User message").toBe(false);
+  });
+
+  it("a registered SkillCatalog's activeGuides reach the model through the sources (manifest + active body)", async () => {
+    const recording = new RecordingAgent();
+    const catalog = skillsNs.SkillCatalog.fromEntries([
+      { name: "audit", description: "Audit a module.", body: "AUDIT BODY" },
+      { name: "style", description: "Style guide.", body: "STYLE BODY" },
+    ]);
+    catalog.activate("audit");
+    const cfg: HarnessConfig = {
+      registry: registryWith({ agent: recording }),
+      toolRegistry: new ScriptedToolRegistry(),
+      sandbox: new AllowAllSandbox(),
+      contextManager: new GuideRenderingCm(),
+      terminationPolicy: new AlwaysContinuePolicy(),
+      modelParams: { stop_sequences: [] },
+      skills: catalog,
+    };
+    const h = new StandardHarness(cfg);
+    await h.run({ task: react(5) });
+
+    const first = recording.seen[0]!;
+    const head = first.messages[0]!;
+    expect(head.role).toBe("system");
+    if (head.content.type !== "text") throw new Error("expected a text System block");
+    // Manifest (tier 1) + the active skill's body (tier 2) both ride structurally.
+    expect(head.content.text).toContain("# AVAILABLE SKILLS");
+    expect(head.content.text).toContain("- audit: Audit a module.");
+    expect(head.content.text).toContain("# ACTIVE SKILL — audit");
+    expect(head.content.text).toContain("AUDIT BODY");
+    // An inactive skill's body is NOT injected.
+    expect(head.content.text).not.toContain("STYLE BODY");
   });
 });

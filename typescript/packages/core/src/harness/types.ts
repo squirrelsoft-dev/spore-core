@@ -40,6 +40,7 @@ import type { Mode } from "../prompt-chunk-registry/types.js";
 import type {
   CompactionPreserveHints,
   ContextError,
+  ContextSources,
   SessionState as ContextSessionState,
 } from "../context/types.js";
 import {
@@ -4290,7 +4291,21 @@ export interface CompactionTurn {
  * them; the harness applies the spec defaults when a method is absent.
  */
 export interface ContextManager {
-  assemble(session: SessionState, task: Task, signal?: AbortSignal): Promise<Context>;
+  /**
+   * Build one turn's model input. `sources` (issue #115 / SC-26) carries the
+   * rich {@link ContextSources} — guides, merged memory, tool schemas, and the
+   * composed static prompt — so a manager can place them in structural slots
+   * instead of the caller injecting them ad-hoc as User messages. Managers that
+   * do not consume sources may ignore the argument (the pre-#115 behaviour); the
+   * production {@link "../context/compaction-adapter.js".StandardCompactionAdapter}
+   * renders them. `signal` stays LAST so existing call sites compile.
+   */
+  assemble(
+    session: SessionState,
+    task: Task,
+    sources: ContextSources,
+    signal?: AbortSignal,
+  ): Promise<Context>;
   appendToolResult(session: SessionState, result: ToolResultRecord): Promise<void>;
   appendUserMessage(session: SessionState, text: string): Promise<void>;
   shouldCompact(session: SessionState): boolean;
