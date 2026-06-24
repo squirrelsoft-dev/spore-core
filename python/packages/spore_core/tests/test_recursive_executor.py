@@ -463,7 +463,7 @@ class _StoringContextManager:
     session (unlike the no-op default) and assembles them into the Context, so a
     recording agent can observe the plan directive text the harness seeds."""
 
-    async def assemble(self, session: SessionState, task: object) -> object:
+    async def assemble(self, session: SessionState, task: object, sources: object) -> object:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 

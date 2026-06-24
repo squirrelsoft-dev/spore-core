@@ -31,11 +31,15 @@ per-node consult mediator (#114) and an architect-side ``load_skill`` tool
   ``kind`` to a helper harness with a per-kind budget + overflow policy
   (``research`` → web_search, budget 5, SoftFail; ``advice`` → cloud advisor,
   budget 3, EscalateToHuman). Identical #114 semantics, host-owned budgets.
-- ``load_skill`` is **dropped** — there is no worker-side per-node seam;
-- the ``audit`` skill is **kept**, but now rides the single GLOBAL
-  :class:`SkillInjectingContextManager` (the harness's ``context_manager``),
-  seeded ALWAYS-ACTIVE at startup. The audit procedure reaches the model
-  structurally every turn, compaction-proof, with no ``load_skill`` round-trip.
+- skills are now **harness-native** (#115 / SC-26). The architect-side
+  ``SkillInjectingContextManager`` shim is GONE: ``HarnessBuilder.skills`` takes
+  a :class:`spore_core.SkillCatalog`, registers the ``load_skill`` tool, and
+  injects the skill manifest + every active skill's full body into each turn's
+  structural System block via the rich ``ContextSources`` seam.
+- the ``audit`` skill is **kept** and seeded ALWAYS-ACTIVE at startup
+  (``catalog.activate("audit")`` — replaces the old ``run_store`` active-set
+  seed). Its procedure reaches the model structurally every turn,
+  compaction-proof, with no ``load_skill`` round-trip.
 
 The tree is DATA: we read the canonical fixture
 ``fixtures/strategy/cordyceps_tree.json`` and deserialize it — so this example
@@ -86,7 +90,6 @@ from spore_core import (
     HumanResponseHalt,
     LoopStrategy,
     ModelAgent,
-    NullCacheProvider,
     OllamaModelInterface,
     PausedState,
     ReactConfig,
@@ -95,8 +98,7 @@ from spore_core import (
     RunResultSuccess,
     RunResultWaitingForHuman,
     SessionId,
-    StandardContextManager,
-    StorageProvider,
+    SkillCatalog,
     StorageScope,
     Task,
     Verifier,
@@ -105,13 +107,10 @@ from spore_core import (
     new_session_id,
     project_id_from_canonical_path,
 )
-from spore_core.compaction_adapter import into_harness_adapter
-from spore_core.harness import ContextManager as HarnessContextManager
 from spore_core.harness import loop_strategy_max_steps
 from spore_tools import StandardTool, StandardTools, WebSearchTool
 from spore_tools.tools.web import SearchMethod, WebSearchConfig
 
-from skills import ACTIVE_SKILLS_KEY, SkillCatalog, SkillInjectingContextManager
 from tools import (
     KIND_ADVICE,
     KIND_RESEARCH,
@@ -281,9 +280,7 @@ def _build_advisor_harness(
     )
 
 
-def _build_consult_handlers(
-    research: Harness, advisor: Harness
-) -> dict[str, ConsultHandlerEntry]:
+def _build_consult_handlers(research: Harness, advisor: Harness) -> dict[str, ConsultHandlerEntry]:
     """Build the HOST-owned ``kind → {handler, budget, overflow}`` map (#114). The
     composed tree has no ``SubagentTool``, so the host run loop holds these
     entries and mediates each :class:`RunResultConsult` against them — the
@@ -338,25 +335,25 @@ def build_registry(model_id: str, base_url: str) -> ExecutionRegistry:
     )
 
 
-async def build_global_context_manager(
-    model_id: str,
-    base_url: str,
-    storage: StorageProvider,
-    repo_root: Path,
-    bundled_audit: str,
-    session: SessionId,
-) -> HarnessContextManager:
-    """Build the GLOBAL skill-injecting context manager with the ``audit`` skill
-    seeded ALWAYS-ACTIVE for ``session``. Wraps the standard compaction
-    adapter."""
-    catalog = await SkillCatalog.bootstrap(repo_root, bundled_audit)
-    # Seed `audit` always-active: the global context_manager injects its body
-    # structurally every turn (no `load_skill` round-trip in the composed tree).
-    await storage.run().put(session, ACTIVE_SKILLS_KEY, ["audit"])
+def build_skill_catalog(repo_root: Path) -> SkillCatalog:
+    """Discover skills (the bundled ``audit`` skill next to this example, plus
+    ``<repo>/.spore/skills`` and ``~/.spore/skills``) and seed ``audit``
+    ALWAYS-ACTIVE.
 
-    inner_model = OllamaModelInterface.with_base_url(model_id, base_url)
-    inner = into_harness_adapter(StandardContextManager(inner_model, NullCacheProvider()))
-    return SkillInjectingContextManager(inner, storage.run(), catalog.manifest())
+    #115 / SC-26: the harness now bakes skills in. ``HarnessBuilder.skills``
+    (below) registers the catalog AND the ``load_skill`` tool, and injects the
+    manifest + active skill bodies into every turn's structural System block via
+    the rich ``ContextSources`` seam — no architect-side
+    ``SkillInjectingContextManager`` shim, no ``run_store`` active-set, no
+    ``load_skill`` round-trip needed for the always-on ``audit`` procedure."""
+    catalog = SkillCatalog.discover(
+        [Path(__file__).parent / "skills"],
+        repo_root,
+    )
+    # Seed `audit` always-active: its body rides the structural System block every
+    # turn (sticky), exactly as the old run-store seed did — but harness-native.
+    catalog.activate("audit")
+    return catalog
 
 
 def build_task(prompt: str, session: SessionId) -> Task:
@@ -433,8 +430,7 @@ async def _mediate_consult(
             state,
             ConsultResponseBudgetExhausted(
                 message=(
-                    f"no consult handler for kind {request.kind!r}; "
-                    "proceed without further help"
+                    f"no consult handler for kind {request.kind!r}; proceed without further help"
                 ),
             ),
         )
@@ -509,10 +505,14 @@ async def _handle_consult_overflow(
     # Default ([1] or empty): run the advisor handler once more host-side and
     # inject its answer — a bounded escape hatch past the per-kind budget.
     print("(running advisor for one more turn…)")
-    task = Task.new(_render_consult_instruction(request), new_session_id(), ReactConfig.per_loop(16))
+    task = Task.new(
+        _render_consult_instruction(request), new_session_id(), ReactConfig.per_loop(16)
+    )
     result = await entry.handler.run(HarnessRunOptions(task))
-    answer = result.output if isinstance(result, RunResultSuccess) else (
-        f"advisor did not complete cleanly: {result!r}"
+    answer = (
+        result.output
+        if isinstance(result, RunResultSuccess)
+        else (f"advisor did not complete cleanly: {result!r}")
     )
     print(f"advisor: {_truncate(answer, 300)}")
     return await harness.resume_consult(state, ConsultResponseAnswer(text=answer))
@@ -528,9 +528,7 @@ def _describe_action(action: object) -> str:
     return repr(action)
 
 
-async def _handle_human_escalation(
-    harness: Harness, state: PausedState, request: object
-) -> object:
+async def _handle_human_escalation(harness: Harness, state: PausedState, request: object) -> object:
     """Present a ``BudgetExhausted`` pause and resume with the operator's choice.
     The composed tree surfaces a runaway node here under ``SurfaceToHuman``; we
     offer its ``available_actions`` and resume by re-resolving handles (no
@@ -592,10 +590,6 @@ async def main() -> int:
     repo_root = Path.cwd().resolve(strict=True)
     workspace_root = (Path(__file__).parent / "workspace").resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
-
-    bundled_audit = (Path(__file__).parent / "skills" / "audit" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
 
     # AC5: the fully-bounded tree's worst-case per-window turn count is computable
     # BEFORE the run. Ralph[PlanExecute[ReAct{4}, SelfVerifying[ReAct{12}]]]
@@ -662,9 +656,10 @@ async def main() -> int:
         )
 
         registry = build_registry(model_id, base_url)
-        context_manager = await build_global_context_manager(
-            model_id, base_url, storage, repo_root, bundled_audit, session
-        )
+        # #115 / SC-26: discover skills + seed `audit` always-active. Registered via
+        # `.skills(catalog)` below — the harness injects the manifest + active body
+        # structurally every turn and wires the `load_skill` tool; no shim.
+        catalog = build_skill_catalog(repo_root)
 
         # The harness's own model drives the Ralph wrapper; the per-node agents
         # come from the registry. Compaction/summarization uses this model too.
@@ -685,7 +680,7 @@ async def main() -> int:
             .registry(registry)
             .escalation_mode(EscalationModeSurfaceToHuman())
             .system_prompt(EXEC_SYSTEM_PROMPT)
-            .context_manager(context_manager)
+            .skills(catalog)
             .toolset_tools("plan-tools", _plan_tools())
             .toolset_tools("exec-tools", _exec_tools())
             .build()
@@ -709,9 +704,7 @@ async def main() -> int:
                 print(f"\ndone ({result.turns} turn(s)): {_truncate(result.output, 400)}")
                 break
             if isinstance(result, RunResultFailure):
-                print(
-                    f"\nfailed after {result.turns} turn(s): {result.reason!r}", file=sys.stderr
-                )
+                print(f"\nfailed after {result.turns} turn(s): {result.reason!r}", file=sys.stderr)
                 break
             if isinstance(result, RunResultConsult):
                 # A worker leaf consult propagated up through the composed tree

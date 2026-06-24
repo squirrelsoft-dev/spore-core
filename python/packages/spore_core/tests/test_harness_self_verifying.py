@@ -83,7 +83,7 @@ class RecordingContextManager:
     def __init__(self) -> None:
         self.user_messages: list[str] = []
 
-    async def assemble(self, session: SessionState, task: Task) -> Any:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> Any:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 

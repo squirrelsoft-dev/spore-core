@@ -224,13 +224,15 @@ async def test_no_system_prompt_leaves_context_without_a_system_message() -> Non
     assert all(m.role.value != "system" for m in agent.seen)
 
 
-async def test_system_prompt_not_duplicated_when_context_already_has_one() -> None:
-    # A context manager that already leads with a System message must not get a
-    # second one. We seed one via a tiny custom manager.
+async def test_system_prompt_merged_into_leading_system_block() -> None:
+    # SC-26 / #115 (slice 2): the configured system prompt MERGES into a leading
+    # System block the manager already placed (system prompt first) instead of
+    # being skipped. Still exactly ONE System message — the no-double-prepend
+    # guard is preserved via the startswith check.
     from spore_core.model import Message, ModelParams, Role, TextContent
 
     class _SystemFirstContextManager:
-        async def assemble(self, session: object, task: object) -> Context:
+        async def assemble(self, session: object, task: object, sources: object) -> Context:
             return Context(
                 messages=[Message(role=Role.SYSTEM, content=TextContent(text="MANAGER PROMPT"))],
                 tools=[],
@@ -263,7 +265,8 @@ async def test_system_prompt_not_duplicated_when_context_already_has_one() -> No
 
     system_messages = [m for m in agent.seen if m.role == Role.SYSTEM]
     assert len(system_messages) == 1
-    assert system_messages[0].content.text == "MANAGER PROMPT"
+    # Merged: system prompt leads, the manager's block follows (one System msg).
+    assert system_messages[0].content.text == "OPERATING RULES\n\nMANAGER PROMPT"
 
 
 # ---------------------------------------------------------------------------

@@ -84,7 +84,7 @@ class _StoringContextManager:
     assembles them into the Context, so a recording agent can observe the Tier-1
     / Tier-2 text the executor seeds per step (unlike the no-op default)."""
 
-    async def assemble(self, session: SessionState, task: object) -> object:
+    async def assemble(self, session: SessionState, task: object, sources: object) -> object:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 

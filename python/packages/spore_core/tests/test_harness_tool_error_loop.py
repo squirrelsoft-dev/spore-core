@@ -134,7 +134,7 @@ class _RecordingContextManager:
     what reached history (mirrors the Rust standard config's recording manager,
     where ``tel_user_msgs`` reads ``state.messages``)."""
 
-    async def assemble(self, session: SessionState, task: Task) -> object:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> object:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 

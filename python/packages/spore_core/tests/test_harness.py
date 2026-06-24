@@ -698,7 +698,7 @@ class RecordingContextManager:
     def __init__(self) -> None:
         self.messages: list[Message] = []
 
-    async def assemble(self, session: SessionState, task: Task) -> Context:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> Context:
         _ = task
         return Context(messages=list(session.messages), tools=[], params=ModelParams())
 

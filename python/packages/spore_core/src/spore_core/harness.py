@@ -128,10 +128,13 @@ if TYPE_CHECKING:
         CompactionPreserveHints,
         CompactionVerifier,
         ContextErrorModel,
+        ContextSources,
+        Guide,
     )
     from .context import (
         SessionState as ContextSessionState,
     )
+    from .skills import SkillCatalog
     from .execution_registry import EscalationMode, ExecutionRegistry
     from .hooks import HookChain
     from .middleware import MiddlewareChain
@@ -4540,7 +4543,16 @@ class ContextManager(Protocol):
     implement them.
     """
 
-    async def assemble(self, session: SessionState, task: Task) -> Context: ...
+    async def assemble(self, session: SessionState, task: Task, sources: ContextSources) -> Context:
+        """Build one turn's model input. ``sources`` (issue #115 / SC-26) carries
+        the rich :class:`~spore_core.context.ContextSources` — guides, merged
+        memory, tool schemas, and the composed static prompt — so a manager can
+        place them in structural slots instead of the caller injecting them
+        ad-hoc as User messages. Managers that do not consume sources may ignore
+        the argument (the pre-#115 behaviour); the production
+        :class:`~spore_core.compaction_adapter.StandardCompactionAdapter` renders
+        them into a leading System block."""
+        ...
 
     async def append_tool_result(
         self, session: SessionState, result: HarnessToolResult
@@ -5460,6 +5472,8 @@ class HarnessConfig:
         catalogue_registry: StandardToolRegistry | None = None,
         toolset_catalogues: dict[str, StandardToolRegistry] | None = None,
         system_prompt: str | None = None,
+        guides: list[Guide] | None = None,
+        skills: SkillCatalog | None = None,
         model_params: ModelParams | None = None,
         auto_persist_sessions: bool = False,
         prompt_tool_call_flag: PromptToolCallFlag | None = None,
@@ -5637,6 +5651,20 @@ class HarnessConfig:
         # :meth:`HarnessBuilder.system_prompt`. ``None`` (the default) preserves
         # today's behaviour.
         self.system_prompt: str | None = system_prompt
+        # Guides (skills/playbooks/domain knowledge) injected structurally into
+        # every turn's assembled context via the rich ``ContextSources`` seam
+        # (issue #115 / SC-26 / #9). The harness clones these into
+        # ``ContextSources.guides`` each turn; the production
+        # ``StandardCompactionAdapter`` renders them into the leading System block,
+        # not as ad-hoc User messages. Empty (the default) preserves today's
+        # behaviour byte-for-byte. See :meth:`HarnessBuilder.guide`.
+        self.guides: list[Guide] = list(guides) if guides is not None else []
+        # Optional skill catalog (issue #115 / SC-26). When set, the harness
+        # injects its manifest + active skill bodies into ``ContextSources.guides``
+        # each turn (progressive disclosure) and the ``load_skill`` tool activates
+        # skills against its shared active set. ``None`` (the default) means no
+        # skills. See :meth:`HarnessBuilder.skills`.
+        self.skills: SkillCatalog | None = skills
         # Authoritative per-run model sampling/decoding parameters (issue #93).
         # The harness replaces each turn's ``Context.params`` with this value
         # UNCONDITIONALLY (builder params win) right before the request is built,
@@ -5749,6 +5777,8 @@ class HarnessConfig:
             catalogue_registry=self.catalogue_registry,
             toolset_catalogues=self.toolset_catalogues,
             system_prompt=self.system_prompt,
+            guides=self.guides,
+            skills=self.skills,
             model_params=self.model_params,
             auto_persist_sessions=self.auto_persist_sessions,
             prompt_tool_call_flag=self.prompt_tool_call_flag,
@@ -5835,6 +5865,12 @@ class HarnessBuilder:
         # context (issue #91) when the context manager renders none. ``None``
         # (the default) preserves today's behaviour. See :meth:`system_prompt`.
         self._system_prompt: str | None = None
+        # Guides injected structurally into every turn via ``ContextSources``
+        # (issue #115 / #9). Empty (the default) preserves today's behaviour. See
+        # :meth:`guide`.
+        self._guides: list[Guide] = []
+        # Optional skill catalog (issue #115 / SC-26). See :meth:`skills`.
+        self._skills: SkillCatalog | None = None
         # Authoritative per-run model sampling/decoding parameters (issue #93).
         # Defaults to ``ModelParams()``. See :meth:`model_params`.
         self._model_params: ModelParams = ModelParams()
@@ -6058,6 +6094,35 @@ class HarnessBuilder:
         context manager that renders its own system prompt is preserved.
         ``None`` (the default) preserves today's behaviour."""
         self._system_prompt = system_prompt
+        return self
+
+    def guide(self, guide: Guide) -> HarnessBuilder:
+        """Register a :class:`~spore_core.context.Guide` (skill/playbook/domain
+        knowledge) injected structurally into every turn's assembled context via
+        the rich ``ContextSources`` seam (issue #115 / SC-26 / #9). Unlike an
+        ad-hoc User-message prepend, the guide is rendered into the leading System
+        block by the production context manager. Call repeatedly to register
+        several; order is preserved. Mirrors Rust's ``HarnessBuilder::guide``."""
+        self._guides.append(guide)
+        return self
+
+    def guides(self, guides: Iterable[Guide]) -> HarnessBuilder:
+        """Register several :class:`~spore_core.context.Guide`s at once (issue
+        #115 / SC-26). Appends to any already registered via :meth:`guide`.
+        Mirrors Rust's ``HarnessBuilder::guides``."""
+        self._guides.extend(guides)
+        return self
+
+    def skills(self, catalog: SkillCatalog) -> HarnessBuilder:
+        """Register a :class:`~spore_core.skills.SkillCatalog` (issue #115 /
+        SC-26). This both (a) injects the catalog's manifest + active skill bodies
+        into every turn's structural context (progressive disclosure) and (b)
+        registers the ``load_skill`` tool, sharing the catalog's active set, so
+        the model can activate a skill on demand. Replaces the architect-side
+        skill-injecting context-manager shim. Mirrors Rust's
+        ``HarnessBuilder::skills``."""
+        self._standard_tools.append(catalog.load_skill_tool())
+        self._skills = catalog
         return self
 
     def model_params(self, params: ModelParams) -> HarnessBuilder:
@@ -6395,6 +6460,8 @@ class HarnessBuilder:
             catalogue_registry=catalogue_registry,
             toolset_catalogues=toolset_catalogues,
             system_prompt=self._system_prompt,
+            guides=self._guides,
+            skills=self._skills,
             model_params=self._model_params,
             auto_persist_sessions=self._auto_persist_sessions,
             prompt_tool_call_flag=self._prompt_tool_call_flag,
@@ -6644,6 +6711,34 @@ class StandardHarness:
         path = call.input.get("path")
         if isinstance(path, str) and path not in self._observed_writes:
             self._observed_writes.append(path)
+
+    def _build_context_sources(
+        self, config: HarnessConfig, tool_schemas: list[ToolSchema]
+    ) -> ContextSources:
+        """Build the per-turn :class:`~spore_core.context.ContextSources` threaded
+        into the structural ``ContextManager.assemble`` seam (issue #115 / SC-26).
+
+        Configured guides (the guide source + active skills) reach the model
+        structurally through the assemble seam, not as an ad-hoc User-message
+        prepend. Skills (the manifest + active bodies, progressive disclosure) are
+        appended as guides from the shared catalog, so loading a skill via
+        ``load_skill`` makes its body sticky in the System block on the next turn.
+        Memory stays empty pending the MemoryProvider object-safety conversion
+        (#8); the composed static prompt is empty until the chunk-provider path is
+        wired. An empty result renders to nothing, so a harness with no sources
+        stays byte-identical to the pre-#115 pass-through."""
+        from .context import ComposedPrompt, ContextSources
+
+        guides: list[Guide] = list(config.guides)
+        catalog = config.skills
+        if catalog is not None:
+            guides.extend(catalog.active_guides())
+        return ContextSources(
+            guides=guides,
+            memory=[],
+            tool_schemas=tool_schemas,
+            composed_prompt=ComposedPrompt(rendered="", block_1_hash=0),
+        )
 
     def escalation_mode(self) -> EscalationMode:
         """The configured budget-escalation mode (#130, :class:`StrategyExecutor`
@@ -8799,8 +8894,13 @@ class StandardHarness:
                         session_state,
                     )
 
-            # Assemble + invoke agent for one turn.
-            context = await config.context_manager.assemble(session_state, task)
+            # Assemble + invoke agent for one turn. ``sources`` (issue #115 /
+            # SC-26) carries the rich ContextSources into the structural assemble
+            # seam: tool schemas, configured guides, and active skills. An empty
+            # ``sources`` renders to nothing, so the no-source path stays
+            # byte-identical.
+            sources = self._build_context_sources(config, tool_registry.schemas())
+            context = await config.context_manager.assemble(session_state, task, sources)
             # Fill the model-facing tool list from the effective registry only
             # when the context manager rendered none (the compaction adapter
             # does), so a context manager that deliberately sets a phase-specific
@@ -8811,21 +8911,38 @@ class StandardHarness:
             # precondition for classifying a prose final response as a missed
             # tool call (adaptive prompt-based escalation, #111).
             tools_advertised = bool(context.tools)
-            # Prepend the configured operating system prompt (issue #91). The
-            # standard compaction adapter renders none, so without this the model
-            # gets only the task and no guidance. Guard against duplicates so a
-            # context manager that already leads with a System message (or a
-            # resumed/seeded session) isn't given two.
-            if config.system_prompt is not None and not (
-                context.messages and context.messages[0].role == Role.SYSTEM
-            ):
-                context.messages.insert(
-                    0,
-                    Message(
-                        role=Role.SYSTEM,
-                        content=TextContent(text=config.system_prompt),
-                    ),
-                )
+            # Prepend the configured operating system prompt (issue #91), MERGING
+            # it with any structural #115 context block the manager already placed
+            # as a leading System message (guides/memory/composed prompt). The
+            # system prompt always leads. When the manager produced NO System
+            # message (the common case — empty sources, or a test double), this
+            # inserts a fresh System message exactly as before, so the
+            # no-structural-block path stays byte-identical. The ``startswith``
+            # guard keeps a resumed/seeded session that already leads with the
+            # system prompt from being given it twice.
+            if config.system_prompt is not None:
+                first = context.messages[0] if context.messages else None
+                if (
+                    first is not None
+                    and first.role == Role.SYSTEM
+                    and isinstance(first.content, TextContent)
+                ):
+                    if not first.content.text.startswith(config.system_prompt):
+                        first.content = TextContent(
+                            text=f"{config.system_prompt}\n\n{first.content.text}"
+                        )
+                    # else: already leads with the system prompt — leave it.
+                elif first is not None and first.role == Role.SYSTEM:
+                    # A non-text System block — leave it.
+                    pass
+                else:
+                    context.messages.insert(
+                        0,
+                        Message(
+                            role=Role.SYSTEM,
+                            content=TextContent(text=config.system_prompt),
+                        ),
+                    )
             # Per-run model params win unconditionally (issue #93). The agent
             # copies ``Context.params`` verbatim into the ``ModelRequest``, so
             # this is the single seam that delivers configured params (e.g.
@@ -9961,7 +10078,8 @@ class NoopContextManager:
     and appends tool results / user messages as plain text. Sufficient for
     ReAct unit tests; the canonical impl lands in #7."""
 
-    async def assemble(self, session: SessionState, task: Task) -> Context:
+    async def assemble(self, session: SessionState, task: Task, sources: ContextSources) -> Context:
+        _ = (task, sources)
         return Context(
             messages=list(session.messages),
             tools=[],

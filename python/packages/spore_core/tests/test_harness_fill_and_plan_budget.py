@@ -157,7 +157,7 @@ class _StoringContextManager:
     Context (same shape as the DAG test's stub), so the recorded agent observes
     the seeded directive."""
 
-    async def assemble(self, session: SessionState, task: object) -> object:
+    async def assemble(self, session: SessionState, task: object, sources: object) -> object:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 

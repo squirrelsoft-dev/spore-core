@@ -191,7 +191,7 @@ class PassThroughContextManager:
     so the agent's recorded context reflects what the window was re-seeded
     with (instruction + reloaded ``.spore/`` state)."""
 
-    async def assemble(self, session: SessionState, task: Task) -> Context:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> Context:
         return Context(messages=list(session.messages), tools=[], params=ModelParams())
 
     async def append_tool_result(self, session: SessionState, result: Any) -> None:

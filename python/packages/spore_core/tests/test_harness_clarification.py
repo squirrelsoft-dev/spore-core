@@ -56,7 +56,7 @@ class _RecordingCM:
         self.messages: list[Message] = []
         self.tool_results: list[HarnessToolResult] = []
 
-    async def assemble(self, session: SessionState, task: Task) -> Context:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> Context:
         _ = task
         return Context(messages=list(self.messages), tools=[], params=ModelParams())
 

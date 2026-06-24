@@ -135,8 +135,8 @@ class SchemaInjectingContextManager:
         self._inner = inner
         self._tools = sorted(tools, key=lambda s: s.name)
 
-    async def assemble(self, session: HarnessState, task: Task) -> AgentContext:
-        ctx = await self._inner.assemble(session, task)
+    async def assemble(self, session: HarnessState, task: Task, sources: object) -> AgentContext:
+        ctx = await self._inner.assemble(session, task, sources)
         ctx.tools = list(self._tools)
         # Prepend the operational system prompt. The adapter's assemble yields
         # none, so the model would otherwise get no guidance. Guard against

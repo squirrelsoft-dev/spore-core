@@ -318,6 +318,12 @@ from .compaction_adapter import (
     into_harness_adapter,
     seed_rich_state,
 )
+from .skills import (
+    LOAD_SKILL,
+    SkillCatalog,
+    SkillEntry,
+    parse_skill_doc,
+)
 from .hooks import (
     ALL_EVENTS,
     CommandHook,
@@ -953,6 +959,11 @@ __all__ = [
     "StandardCompactionAdapter",
     "into_harness_adapter",
     "seed_rich_state",
+    # Skills (#115 / SC-26)
+    "LOAD_SKILL",
+    "SkillCatalog",
+    "SkillEntry",
+    "parse_skill_doc",
     # GuideRegistry (#9)
     "CONFLICT_THRESHOLD",
     "Guide",

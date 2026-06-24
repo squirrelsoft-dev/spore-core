@@ -41,8 +41,10 @@ from spore_core import (
 from spore_core.agent import Context, FinalResponse, TurnResult
 from spore_core.compaction_adapter import _rich_from_dict
 from spore_core.context import (
+    ComposedPrompt,
     CompactionPreserveHints,
     CompactionVerificationResult,
+    ContextSources,
 )
 from spore_core.context import SessionState as RichSessionState
 from spore_core.harness import HarnessToolResult
@@ -290,7 +292,13 @@ async def test_append_user_message_and_assemble() -> None:
     await adapter.append_user_message(session, "hello")
     assert len(session.messages) == 1
     assert session.messages[0].role == Role.USER
-    ctx = await adapter.assemble(session, task=None)  # type: ignore[arg-type]
+    empty_sources = ContextSources(
+        guides=[],
+        memory=[],
+        tool_schemas=[],
+        composed_prompt=ComposedPrompt(rendered="", block_1_hash=0),
+    )
+    ctx = await adapter.assemble(session, None, empty_sources)  # type: ignore[arg-type]
     assert len(ctx.messages) == 1
 
 

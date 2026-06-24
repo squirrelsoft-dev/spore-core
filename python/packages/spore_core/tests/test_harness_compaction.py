@@ -54,7 +54,7 @@ class CompactingContextManager:
         self.applied = 0
         self._should = should
 
-    async def assemble(self, session: SessionState, task: object) -> Context:
+    async def assemble(self, session: SessionState, task: object, sources: object) -> Context:
         return Context(messages=list(session.messages), tools=[], params=ModelParams())
 
     async def append_tool_result(self, session: SessionState, result: object) -> None:

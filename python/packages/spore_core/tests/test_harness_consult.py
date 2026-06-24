@@ -100,7 +100,7 @@ class RecordingContextManager:
         self.messages: list[Message] = []
         self.tool_results: list[HarnessToolResult] = []
 
-    async def assemble(self, session: SessionState, task: Task) -> object:
+    async def assemble(self, session: SessionState, task: Task, sources: object) -> object:
         from spore_core.agent import Context
 
         _ = task

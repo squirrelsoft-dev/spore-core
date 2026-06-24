@@ -57,6 +57,7 @@ from typing import Any
 from .agent import Context as AgentContext
 from .context import (
     CompactionResult,
+    ContextSources,
     Guide,
     GuideId,
     SessionState as RichSessionState,
@@ -125,6 +126,25 @@ def estimate_message_tokens(message: Message) -> int:
 def estimate_tokens(messages: list[Message]) -> int:
     """Sum :func:`estimate_message_tokens` over a list of messages."""
     return sum(estimate_message_tokens(m) for m in messages)
+
+
+def _render_context_block(sources: ContextSources) -> str:
+    """Render the structural context block from :class:`ContextSources` (issue
+    #115 / SC-26): the composed static prompt, then guides, then merged memory,
+    joined by blank lines. Empty when there is nothing to inject, which keeps the
+    no-source path byte-identical to the pre-#115 pass-through. The harness merges
+    the configured system prompt INTO this block (system prompt first), so guides
+    and memory land in a structural System slot rather than ad-hoc User
+    messages."""
+    parts: list[str] = []
+    composed = sources.composed_prompt.rendered
+    if composed:
+        parts.append(composed)
+    for g in sources.guides:
+        parts.append(f"# {g.id}\n{g.content}")
+    for m in sources.memory:
+        parts.append(m.memory.content)
+    return "\n\n".join(parts)
 
 
 #: Reserved key under ``harness.SessionState.extras`` holding the serialized
@@ -250,13 +270,22 @@ class StandardCompactionAdapter:
 
     # ---- minimal (non-load-bearing) seam methods --------------------
 
-    async def assemble(self, session: HarnessState, task: Task) -> AgentContext:
-        # NOT load-bearing for compaction. The rich ``assemble`` requires
-        # ``ContextSources`` the seam does not supply, so produce a minimal
-        # context straight from the session messages (mirrors the loop's
-        # test-double managers).
+    async def assemble(
+        self, session: HarnessState, task: Task, sources: ContextSources
+    ) -> AgentContext:
+        # The compaction adapter does not run the rich block-hash ``assemble``
+        # (that stays #7's job — the #32 cache-halt machinery is deliberately
+        # dormant). It DOES place the #115 structural context block — guides,
+        # merged memory, the composed static prompt — as a leading System message
+        # so they reach the model through the seam instead of an ad-hoc
+        # User-message wrapper. An empty block adds nothing, so a harness with no
+        # sources stays byte-identical to the pre-#115 pass-through.
         _ = task
-        return AgentContext(messages=list(session.messages), tools=[], params=ModelParams())
+        messages = list(session.messages)
+        block = _render_context_block(sources)
+        if block:
+            messages.insert(0, Message(role=Role.SYSTEM, content=TextContent(text=block)))
+        return AgentContext(messages=messages, tools=[], params=ModelParams())
 
     @staticmethod
     def _render_tool_result_text(result: HarnessToolResult) -> str:

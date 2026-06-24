@@ -175,7 +175,7 @@ class _StoringContextManager:
     assembles them into the Context, so a recording agent observes the seeded
     text (unlike the no-op default). Same shape as the DAG test's stub."""
 
-    async def assemble(self, session: SessionState, task: object) -> object:
+    async def assemble(self, session: SessionState, task: object, sources: object) -> object:
         from spore_core.agent import Context
         from spore_core.model import ModelParams
 
