@@ -10366,6 +10366,23 @@ tool. Use the provided tool-call format to actually invoke the tool."
     /// `plan_output` ran elsewhere — the recursive `self.plan` child via
     /// `self.plan.run(cx)` — so this carries no agent call. Returns the captured
     /// artifact + accounting or a terminal failure to propagate.
+    ///
+    /// # SC-28 — a free-text / markdown plan is NOT a hard failure
+    /// The strict canonical grammar (+ prose repair) runs first, so a JSON plan
+    /// captures exactly as before — `tasks`/`rationale` come straight from the
+    /// object. When BOTH fail the planner emitted prose rather than the JSON
+    /// object; rather than aborting the whole run we capture it as a free-text
+    /// artifact: the verbatim prose is preserved in `rationale`, and the runnable
+    /// `tasks` are sourced from the durable `task_list` tool store — the ONE
+    /// authoring path (#126 decision C) that the execute phase already prefers
+    /// over the artifact, so JSON was never the only source of executable steps.
+    /// Mirroring it here keeps the `OnPlanCreated` payload's `tasks` populated for
+    /// panel consumers (looper `plan_tracker`, cordyceps `plan_announcer`). A
+    /// prose plan that authored no `task_list` yields empty `tasks` — the execute
+    /// phase then halts with `EmptyPlan`, exactly as a JSON `{"tasks": []}` would.
+    /// The pure [`capture_plan_artifact`](crate::plan::capture_plan_artifact)
+    /// grammar stays strict and byte-identical across languages; only this harness
+    /// driver is tolerant.
     async fn capture_and_persist_plan(
         &self,
         session_id: &SessionId,
@@ -10378,14 +10395,24 @@ tool. Use the provided tool-call format to actually invoke the tool."
         // (the strict canonical grammar runs first; repair only rescues a failure).
         let mut artifact = match crate::plan::capture_plan_artifact_with_repair(plan_output) {
             Ok(a) => a,
-            Err(e) => {
-                return Err(RunResult::Failure {
-                    reason: HaltReason::PlanPhaseFailed { error: e },
-                    session_id: session_id.clone(),
-                    usage,
-                    turns,
-                    session_state: SessionState::default(),
-                });
+            // SC-28: not JSON → capture as free-text. `tasks` from the task_list
+            // tool store (load_task_list reads the durable, project-scoped list
+            // the plan leaf authored via the tool); prose preserved verbatim.
+            Err(_strict_err) => {
+                let tasks = self
+                    .load_task_list(session_id)
+                    .await
+                    .map(|list| {
+                        list.tasks
+                            .iter()
+                            .map(|t| t.description.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                crate::plan::PlanArtifact {
+                    tasks,
+                    rationale: plan_output.to_string(),
+                }
             }
         };
 
@@ -17069,7 +17096,7 @@ mod tests {
 
     // ── PlanExecute plan phase (issue #70) ──────────────────────────────────
 
-    use crate::plan::{PlanArtifact, PlanPhaseError, PLAN_EXECUTE_EXTRAS_KEY};
+    use crate::plan::{PlanArtifact, PLAN_EXECUTE_EXTRAS_KEY};
 
     fn plan_task() -> Task {
         // #124 A.5: the plan slot is STRUCTURED — its leaf carries an output
@@ -17809,36 +17836,71 @@ mod tests {
         );
     }
 
-    // R3: an unparseable plan surfaces PlanPhaseFailed/UnparseablePlan and
-    // stores nothing.
+    // SC-28 acceptance (1): a free-text / markdown plan no longer fails the plan
+    // phase. The strict JSON grammar (+ prose repair) misses, so the driver
+    // captures it as a prose artifact instead of aborting: `rationale` holds the
+    // verbatim prose and `tasks` is sourced from the `task_list` tool store
+    // (empty here — the planner authored none). The artifact IS stored (R4/R11
+    // still apply) and round-trips (acceptance 3).
     #[tokio::test]
-    async fn plan_phase_unparseable_response_fails() {
+    async fn plan_phase_freetext_response_captures_as_prose() {
+        let prose = "This is a markdown plan.\n\n1. do the thing\n2. do the other";
         let a = make_agent();
-        a.push(final_resp("this is not json"));
+        a.push(final_resp(prose));
         let h = StandardHarness::new(standard_config(a));
         let t = plan_task();
         let mut state = SessionState::default();
-        let err = h
+        let outcome = h
             .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
             .await
-            .expect_err("unparseable plan fails");
-        match err {
-            RunResult::Failure {
-                reason:
-                    HaltReason::PlanPhaseFailed {
-                        error: PlanPhaseError::UnparseablePlan { .. },
-                    },
-                ..
-            } => {}
-            other => panic!("expected UnparseablePlan, got {other:?}"),
-        }
-        assert!(h
-            .storage()
+            .expect("a free-text plan captures rather than failing");
+        // Prose preserved verbatim; no JSON tasks parsed and no task_list authored.
+        assert_eq!(outcome.artifact.rationale, prose);
+        assert!(outcome.artifact.tasks.is_empty());
+        // R4: the artifact IS stored now (was absent pre-SC-28) and round-trips.
+        let stored = stored_artifact(&h, &t.session_id).await;
+        assert_eq!(stored, outcome.artifact);
+    }
+
+    // SC-28 acceptance (1): a markdown plan captures without parse failure AND the
+    // OnPlanCreated payload's `tasks` are sourced from the `task_list` tool store
+    // (the ONE authoring path) — so panel consumers (looper `plan_tracker`,
+    // cordyceps `plan_announcer`) still get task texts even though the plan prose
+    // is free-text rather than the JSON `PlanArtifact`.
+    #[tokio::test]
+    async fn plan_phase_freetext_sources_tasks_from_task_list() {
+        let prose = "Here's my plan in prose, no JSON object at all.";
+        let a = make_agent();
+        a.push(final_resp(prose));
+        let h = StandardHarness::new(standard_config(a));
+        let t = plan_task();
+
+        // Seed the durable task_list store as if the plan leaf had authored it via
+        // the `task_list` tool during the plan turn (keyed by the project ns).
+        let mut seeded = TaskList::default();
+        seeded.add("build it".into(), Vec::new()).unwrap();
+        seeded.add("test it".into(), Vec::new()).unwrap();
+        h.storage()
             .run()
-            .get(&durable_ns(), PLAN_EXECUTE_EXTRAS_KEY)
+            .put(
+                &durable_ns(),
+                TASK_LIST_EXTRAS_KEY,
+                serde_json::to_value(&seeded).unwrap(),
+            )
             .await
-            .expect("run store get ok")
-            .is_none());
+            .expect("seed task_list");
+
+        let mut state = SessionState::default();
+        let outcome = h
+            .run_plan_phase(&t, &mut state, BudgetSnapshot::default(), &None)
+            .await
+            .expect("markdown plan captures");
+        // `tasks` pulled from the seeded task_list; prose preserved as rationale.
+        assert_eq!(outcome.artifact.tasks, vec!["build it", "test it"]);
+        assert_eq!(outcome.artifact.rationale, prose);
+        // Stored artifact round-trips (acceptance 3).
+        let stored = stored_artifact(&h, &t.session_id).await;
+        assert_eq!(stored, outcome.artifact);
     }
 
     // ── PlanExecute execute phase (issue #59) ───────────────────────────────
