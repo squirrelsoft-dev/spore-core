@@ -32,6 +32,8 @@ from spore_core import (
     StandardContextManager,
     StandardHarness,
     TaskId,
+    ToolOutputError,
+    ToolOutputSuccess,
     WarnEventCompactionVerificationFailed,
     into_harness_adapter,
     seed_rich_state,
@@ -43,6 +45,7 @@ from spore_core.context import (
     CompactionVerificationResult,
 )
 from spore_core.context import SessionState as RichSessionState
+from spore_core.harness import HarnessToolResult
 from spore_core.harness import SessionState as HarnessState
 from spore_core.model import Message, ProviderInfo, Role, TextContent, TokenUsage
 
@@ -289,6 +292,34 @@ async def test_append_user_message_and_assemble() -> None:
     assert session.messages[0].role == Role.USER
     ctx = await adapter.assemble(session, task=None)  # type: ignore[arg-type]
     assert len(ctx.messages) == 1
+
+
+async def test_replace_tool_result_rerenders_the_recorded_message() -> None:
+    """SC-9 (#158): replace_tool_result re-renders the previously appended
+    role:tool message at the recorded index (no new message added), and is a
+    defensive no-op for an out-of-range index."""
+    adapter = StandardCompactionAdapter(_rich_manager())
+    state = HarnessState()
+    original = HarnessToolResult(call_id="c1", output=ToolOutputSuccess(content="ORIGINAL"))
+    await adapter.append_tool_result(state, original)
+    idx = len(state.messages) - 1
+    assert isinstance(state.messages[idx].content, TextContent)
+    assert state.messages[idx].content.text == "ORIGINAL"
+
+    # A middleware rewrote the result; re-render the recorded message.
+    rewritten = HarnessToolResult(
+        call_id="c1", output=ToolOutputError(message="REWRITTEN", recoverable=True)
+    )
+    await adapter.replace_tool_result(state, idx, rewritten)
+    assert len(state.messages) == 1, "no message added on replace"
+    assert state.messages[idx].role == Role.TOOL
+    assert isinstance(state.messages[idx].content, TextContent)
+    assert state.messages[idx].content.text == "REWRITTEN"
+
+    # Out-of-range index is a defensive no-op.
+    await adapter.replace_tool_result(state, 99, original)
+    assert len(state.messages) == 1
+    assert state.messages[idx].content.text == "REWRITTEN"
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     )
     from .execution_registry import EscalationMode, ExecutionRegistry
     from .hooks import HookChain
+    from .middleware import MiddlewareChain
     from .tasklist import TaskList
     from .tool_registry import StandardToolRegistry
 
@@ -4545,6 +4546,22 @@ class ContextManager(Protocol):
         self, session: SessionState, result: HarnessToolResult
     ) -> None: ...
 
+    async def replace_tool_result(
+        self, session: SessionState, message_index: int, result: HarnessToolResult
+    ) -> None:
+        """Replace the tool-result message previously appended at
+        ``message_index`` with a fresh rendering of ``result``. The harness loop
+        calls this from the ``AfterTool`` middleware hook (issue #11 / SC-9) when
+        a middleware rewrote a result in place, so the rewrite reaches the next
+        model turn. ``message_index`` is the position in ``session.messages``
+        recorded right after the original :meth:`append_tool_result`. Default:
+        no-op — a manager that does not store tool results as standalone messages
+        need not act (the rewrite simply does not propagate, the pre-#11
+        behaviour). Structural (non-inheriting) managers do not pick up this body,
+        so the harness loop probes for the method via ``getattr`` before calling
+        it (see ``_run_react``)."""
+        _ = (session, message_index, result)
+
     async def append_assistant_message(self, session: SessionState, message: Message) -> None:
         """Append the assistant's turn (model output: text and/or the tool calls
         it requested) to the conversation so the next :meth:`assemble` reflects
@@ -4665,21 +4682,14 @@ class EmptyToolRegistry:
         return []
 
 
-@runtime_checkable
-class HarnessMiddlewareChain(Protocol):
-    """Simplified middleware-chain Protocol consumed by
-    :class:`StandardHarness`.
-
-    The canonical, spec-rich :class:`spore_core.middleware.MiddlewareChain`
-    (issue #11) ships with a per-hook ``fire_before_*`` / ``fire_after_*``
-    surface. The harness loop here keeps a thinner ``fire(hook, session)``
-    interface so existing ReAct unit tests and the
-    :class:`ScriptedMiddleware` test double keep working without an
-    adapter. Adapters bridging the two surfaces will land alongside the
-    harness-middleware integration test in a future commit.
-    """
-
-    async def fire(self, hook: HookPoint, session: SessionState) -> MiddlewareDecision: ...
+# Issue #11 / Phase 3 (Q2): the harness loop now wires the canonical, spec-rich
+# :class:`spore_core.middleware.MiddlewareChain` directly through its per-hook
+# ``fire_before_*`` / ``fire_after_*`` surface (the former harness-local
+# ``fire(hook, session)`` stub Protocol was deleted). ``HarnessMiddlewareChain``
+# survives as a deprecated alias to the rich ``MiddlewareChain`` (an external
+# re-export depends on the name); it is bound at the bottom of this module,
+# alongside the deferred middleware import, since the rich chain imports types
+# from here.
 
 
 # Issue #12 — ``ObservabilityProvider`` is no longer a per-turn no-op stub
@@ -5215,6 +5225,8 @@ RunResult = Annotated[
 # :class:`RunResult`, :class:`Task`, :class:`SessionState`, etc., from
 # this module without circularity.
 from .middleware import (  # noqa: E402
+    Middleware,
+    MiddlewareChain,
     MiddlewareContinue,
     MiddlewareContinueWithModification,
     MiddlewareDecision,
@@ -5222,6 +5234,11 @@ from .middleware import (  # noqa: E402
     MiddlewareHalt,
     MiddlewareSurfaceToHuman,
 )
+
+# Deprecated alias: the harness-local middleware stub was deleted in Phase 3 (Q2);
+# the canonical rich ``MiddlewareChain`` is now the type the loop wires. Kept so
+# the ``spore_core`` package re-export of ``HarnessMiddlewareChain`` keeps working.
+HarnessMiddlewareChain = MiddlewareChain
 
 # Canonical observability surface (issue #12). Imported here, after this
 # module's identity types are defined, because :mod:`spore_core.observability`
@@ -5420,7 +5437,7 @@ class HarnessConfig:
         sandbox: SandboxProvider,
         context_manager: ContextManager,
         termination_policy: TerminationPolicy,
-        middleware: HarnessMiddlewareChain | None = None,
+        middleware: MiddlewareChain | None = None,
         observability: ObservabilityProvider | None = None,
         compaction_verifier: CompactionVerifier | None = None,
         max_compaction_attempts: int = 2,
@@ -5764,7 +5781,7 @@ class HarnessBuilder:
         self._sandbox = sandbox
         self._context_manager = context_manager
         self._termination_policy = termination_policy
-        self._middleware: HarnessMiddlewareChain | None = None
+        self._middleware: MiddlewareChain | None = None
         self._observability: ObservabilityProvider | None = None
         self._compaction_verifier: CompactionVerifier | None = None
         self._max_compaction_attempts: int = 2
@@ -6284,7 +6301,7 @@ class HarnessBuilder:
         self._max_compaction_attempts = attempts
         return self
 
-    def middleware(self, middleware: HarnessMiddlewareChain) -> HarnessBuilder:
+    def middleware(self, middleware: MiddlewareChain) -> HarnessBuilder:
         """Inject a middleware chain."""
         self._middleware = middleware
         return self
@@ -8732,10 +8749,16 @@ class StandardHarness:
                     session_state,
                 )
 
-            # Middleware: BeforeTurn.
+            # Middleware: BeforeTurn (rich chain, issue #11). The chain may mutate
+            # ``session_state`` in place (priority-ordered fan-out);
+            # ``ContinueWithModification`` is the modified-but-proceed signal.
             if config.middleware is not None:
-                decision = await config.middleware.fire("before_turn", session_state)
-                if isinstance(decision, MiddlewareHalt):
+                decision = await config.middleware.fire_before_turn(
+                    session_state, budget_used.turns
+                )
+                if isinstance(decision, MiddlewareContinue | MiddlewareContinueWithModification):
+                    pass
+                elif isinstance(decision, MiddlewareHalt):
                     return self._fail(
                         HaltReasonMiddlewareHalt(hook="before_turn", reason=decision.reason),
                         session_id,
@@ -8743,7 +8766,7 @@ class StandardHarness:
                         budget_used.turns,
                         session_state,
                     )
-                if isinstance(decision, MiddlewareSurfaceToHuman):
+                elif isinstance(decision, MiddlewareSurfaceToHuman):
                     paused = PausedState(
                         session_id=session_id,
                         task_id=task.id,
@@ -8760,6 +8783,21 @@ class StandardHarness:
                         toolset=toolset,
                     )
                     return RunResultWaitingForHuman(state=paused, request=decision.request)
+                else:
+                    # ``ForceAnotherTurn`` is valid only at ``BeforeCompletion``; the
+                    # StandardMiddlewareChain converts it to ``Halt`` here. Handle it
+                    # defensively as a halt for any custom chain that emits it.
+                    inject = getattr(decision, "inject", "")
+                    return self._fail(
+                        HaltReasonMiddlewareHalt(
+                            hook="before_turn",
+                            reason=f"ForceAnotherTurn is not valid at BeforeTurn: {inject}",
+                        ),
+                        session_id,
+                        usage,
+                        budget_used.turns,
+                        session_state,
+                    )
 
             # Assemble + invoke agent for one turn.
             context = await config.context_manager.assemble(session_state, task)
@@ -8938,8 +8976,36 @@ class StandardHarness:
                     continue
 
                 if config.middleware is not None:
-                    decision = await config.middleware.fire("before_completion", session_state)
-                    if isinstance(decision, MiddlewareHalt):
+                    decision = await config.middleware.fire_before_completion(
+                        result.content, budget_used.turns, session_state
+                    )
+                    if isinstance(
+                        decision, MiddlewareContinue | MiddlewareContinueWithModification
+                    ):
+                        pass
+                    elif isinstance(decision, MiddlewareForceAnotherTurn):
+                        # The chain concatenates every middleware's injection into
+                        # one ``ForceAnotherTurn`` (issue #11). Record the model's
+                        # final text, then the injection as a user message, and force
+                        # another turn instead of completing — the same channel the
+                        # Stop-block breaker uses, so the conversation stays
+                        # well-formed (assistant final text → user injection).
+                        # Structural managers do not inherit the Protocol default, so
+                        # probe ``append_assistant_message`` via ``getattr``.
+                        appender = getattr(config.context_manager, "append_assistant_message", None)
+                        if appender is not None:
+                            await appender(
+                                session_state,
+                                Message(
+                                    role=Role.ASSISTANT,
+                                    content=TextContent(text=result.content),
+                                ),
+                            )
+                        await config.context_manager.append_user_message(
+                            session_state, decision.inject
+                        )
+                        continue
+                    elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(
                                 hook="before_completion", reason=decision.reason
@@ -8949,7 +9015,7 @@ class StandardHarness:
                             budget_used.turns,
                             session_state,
                         )
-                    if isinstance(decision, MiddlewareSurfaceToHuman):
+                    elif isinstance(decision, MiddlewareSurfaceToHuman):
                         paused = PausedState(
                             session_id=session_id,
                             task_id=task.id,
@@ -9155,13 +9221,19 @@ class StandardHarness:
                             ),
                         )
 
-                # Middleware: BeforeTool.
-                calls = result.calls
+                # Middleware: BeforeTool (rich chain, issue #11 / SC-11). The chain
+                # mutates ``calls`` IN PLACE via a priority-ordered fan-out;
+                # ``ContinueWithModification`` is the modified-but-proceed signal. The
+                # assistant turn recorded just above keeps the model's ORIGINAL
+                # request (``result.calls``) — only what is dispatched (this copied
+                # list) changes.
+                calls = list(result.calls)
                 if config.middleware is not None:
-                    decision = await config.middleware.fire("before_tool", session_state)
-                    if isinstance(decision, MiddlewareContinueWithModification):
-                        if decision.calls is not None:
-                            calls = decision.calls
+                    decision = await config.middleware.fire_before_tool(calls, budget_used.turns)
+                    if isinstance(
+                        decision, MiddlewareContinue | MiddlewareContinueWithModification
+                    ):
+                        pass
                     elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(hook="before_tool", reason=decision.reason),
@@ -9187,8 +9259,29 @@ class StandardHarness:
                             toolset=toolset,
                         )
                         return RunResultWaitingForHuman(state=paused, request=decision.request)
+                    else:
+                        # ``ForceAnotherTurn`` is valid only at ``BeforeCompletion``;
+                        # the StandardMiddlewareChain converts it to ``Halt`` here.
+                        # Defensive for a custom chain that emits it.
+                        inject = getattr(decision, "inject", "")
+                        return self._fail(
+                            HaltReasonMiddlewareHalt(
+                                hook="before_tool",
+                                reason=f"ForceAnotherTurn is not valid at BeforeTool: {inject}",
+                            ),
+                            session_id,
+                            usage,
+                            budget_used.turns,
+                            session_state,
+                        )
 
                 approved_results: list[HarnessToolResult] = []
+                # SC-9: the ``session_state.messages`` index of each appended tool
+                # result, recorded 1:1 with ``approved_results``. The AfterTool
+                # middleware hook uses these to re-render any result it rewrites in
+                # place (via ``ContextManager.replace_tool_result``). Captured at
+                # append time so it survives the #137 corrective-message interleaving.
+                result_msg_indices: list[int] = []
                 for i, call in enumerate(calls):
                     # Sandbox validation.
                     violation = await config.sandbox.validate(call)
@@ -9218,6 +9311,7 @@ class StandardHarness:
                             ),
                         )
                         await config.context_manager.append_tool_result(session_state, tr)
+                        result_msg_indices.append(max(len(session_state.messages) - 1, 0))
                         approved_results.append(tr)
                         continue
 
@@ -9597,6 +9691,10 @@ class StandardHarness:
                         ),
                     )
                     await config.context_manager.append_tool_result(session_state, tr)
+                    # SC-9: record this result's message index BEFORE the #137
+                    # corrective user message may be appended, so the index points
+                    # at the tool-result message (re-sync, not defer-append).
+                    result_msg_indices.append(max(len(session_state.messages) - 1, 0))
                     approved_results.append(tr)
 
                     # #137 (AC2): inject the ONE corrective user message at the N
@@ -9607,12 +9705,45 @@ class StandardHarness:
                             session_state, pending_corrective
                         )
 
-                # Middleware: AfterTool.
+                # Middleware: AfterTool (rich chain, issue #11 / SC-9). The chain
+                # receives the batch's results as a mutable list and may rewrite any
+                # of them in place (priority-ordered, descending). On
+                # ``ContinueWithModification``, re-render the affected tool-result
+                # messages so the rewrite reaches the next model turn — this is what
+                # lets an after-tool middleware turn a landed write into a
+                # model-visible error (or vice versa) without the tool itself having
+                # to invert its output (the cordyceps ``build_check`` inversion, done
+                # by the harness).
                 if config.middleware is not None:
-                    decision = await config.middleware.fire("after_tool", session_state)
-                    if isinstance(decision, MiddlewareHalt):
+                    decision = await config.middleware.fire_after_tool(calls, approved_results)
+                    if isinstance(decision, MiddlewareContinue):
+                        pass
+                    elif isinstance(decision, MiddlewareContinueWithModification):
+                        # Rewrite the SESSION MESSAGE HISTORY (not ``approved_results``,
+                        # which resume ignores). Index captured at append time, so the
+                        # re-sync survives #137 interleaving. Structural managers do not
+                        # inherit the Protocol default, so probe via ``getattr``.
+                        replacer = getattr(config.context_manager, "replace_tool_result", None)
+                        if replacer is not None:
+                            for res, idx in zip(approved_results, result_msg_indices, strict=False):
+                                await replacer(session_state, idx, res)
+                    elif isinstance(decision, MiddlewareHalt):
                         return self._fail(
                             HaltReasonMiddlewareHalt(hook="after_tool", reason=decision.reason),
+                            session_id,
+                            usage,
+                            budget_used.turns,
+                            session_state,
+                        )
+                    else:
+                        # ``SurfaceToHuman`` / ``ForceAnotherTurn`` are not valid at
+                        # ``AfterTool``; the StandardMiddlewareChain converts them to
+                        # ``Halt``. Defensive for a custom chain that emits one.
+                        return self._fail(
+                            HaltReasonMiddlewareHalt(
+                                hook="after_tool",
+                                reason=f"illegal AfterTool decision: {decision.kind}",
+                            ),
                             session_id,
                             usage,
                             budget_used.turns,
@@ -9954,8 +10085,14 @@ class ScriptedTerminationPolicy:
 
 
 class ScriptedMiddleware:
-    """Pop-front (hook, decision) queue. If the next entry's hook doesn't
-    match the current fire(), returns Continue without consuming the entry.
+    """Scripted :class:`MiddlewareChain` test double (rich surface, issue #11).
+
+    Decisions are queued per hook via :meth:`push`; each ``fire_*`` method pops
+    the front entry if it targets that hook, else returns ``Continue`` without
+    consuming the entry. Unlike :class:`StandardMiddlewareChain`, scripted
+    decisions are returned RAW (no ``_validate_decision``), so a test can exercise
+    the harness's defensive handling of an out-of-place decision. The
+    ``.push(hook, decision)`` API is stable.
     """
 
     def __init__(self) -> None:
@@ -9965,13 +10102,46 @@ class ScriptedMiddleware:
         self._decisions.append((hook, decision))
         return self
 
-    async def fire(self, hook: HookPoint, session: SessionState) -> MiddlewareDecision:
+    def _next_for(self, hook: HookPoint) -> MiddlewareDecision:
         if not self._decisions:
             return MiddlewareContinue()
         front_hook, _ = self._decisions[0]
         if front_hook != hook:
             return MiddlewareContinue()
         return self._decisions.pop(0)[1]
+
+    async def register(self, middleware: Middleware) -> None:
+        # The double scripts decisions directly; registration is a no-op.
+        _ = middleware
+
+    async def fire_before_session(self, task: Task, session_id: SessionId) -> MiddlewareDecision:
+        _ = (task, session_id)
+        return self._next_for("before_session")
+
+    async def fire_before_turn(self, session: SessionState, turn_number: int) -> MiddlewareDecision:
+        _ = (session, turn_number)
+        return self._next_for("before_turn")
+
+    async def fire_before_tool(self, calls: list[ToolCall], turn_number: int) -> MiddlewareDecision:
+        _ = (calls, turn_number)
+        return self._next_for("before_tool")
+
+    async def fire_after_tool(
+        self, calls: list[ToolCall], results: list[HarnessToolResult]
+    ) -> MiddlewareDecision:
+        _ = (calls, results)
+        return self._next_for("after_tool")
+
+    async def fire_before_completion(
+        self, response: str, turn_number: int, state: SessionState
+    ) -> MiddlewareDecision:
+        _ = (response, turn_number, state)
+        return self._next_for("before_completion")
+
+    async def fire_after_session(self, result: RunResult, session_id: SessionId) -> None:
+        # After hooks ignore the decision; drain a scripted AfterSession entry.
+        _ = (result, session_id)
+        self._next_for("after_session")
 
 
 # ============================================================================

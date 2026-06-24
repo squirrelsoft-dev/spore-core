@@ -40,8 +40,12 @@ from spore_core import (
     HumanResponseHalt,
     HillClimbingConfig,
     ReactConfig,
+    MiddlewareContinue,
+    MiddlewareContinueWithModification,
+    MiddlewareForceAnotherTurn,
     MiddlewareHalt,
     MiddlewareSurfaceToHuman,
+    StandardMiddlewareChain,
     MockAgent,
     NoopContextManager,
     PausedState,
@@ -73,6 +77,14 @@ from spore_core import (
 )
 from spore_core.agent import Context, ModelAgent
 from spore_core.harness import HarnessToolResult
+from spore_core.middleware import (
+    HookContext,
+    HookContextAfterTool,
+    HookContextBeforeCompletion,
+    HookContextBeforeTool,
+    HookPoint,
+    MiddlewareDecision,
+)
 from spore_core.model import (
     Message,
     ModelParams,
@@ -711,6 +723,37 @@ class RecordingContextManager:
         session.messages.append(msg)
         self.messages.append(msg)
 
+    async def replace_tool_result(
+        self, session: SessionState, message_index: int, result: HarnessToolResult
+    ) -> None:
+        # SC-9: re-render the recorded tool-result message in place so an AfterTool
+        # middleware rewrite reaches the next model turn. Out-of-range is a no-op.
+        output = result.output
+        if isinstance(output, ToolOutputSuccess):
+            content, is_error = output.content, False
+        elif isinstance(output, ToolOutputError):
+            content, is_error = output.message, True
+        else:
+            content, is_error = "", False
+        if 0 <= message_index < len(session.messages):
+            msg = Message(
+                role=Role.TOOL,
+                content=ToolResultContent(
+                    tool_use_id=result.call_id, content=content, is_error=is_error
+                ),
+            )
+            session.messages[message_index] = msg
+            # Mirror the rewrite into the inspection list: replace the recorded
+            # entry for this call id so post-run assertions see the rewrite.
+            for j, recorded in enumerate(self.messages):
+                if (
+                    recorded.role == Role.TOOL
+                    and isinstance(recorded.content, ToolResultContent)
+                    and recorded.content.tool_use_id == result.call_id
+                ):
+                    self.messages[j] = msg
+                    break
+
     async def append_assistant_message(self, session: SessionState, message: Message) -> None:
         session.messages.append(message)
         self.messages.append(message)
@@ -823,3 +866,171 @@ async def test_resume_after_surface_to_human_records_assistant_once_before_resul
         and m.content.id == "c1"
     )
     assert count == 1, "assistant tool-call must be recorded exactly once, not duplicated by resume"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 / Q2 (#158): the rich middleware chain is now wired into the loop.
+# These exercise the StandardMiddlewareChain end-to-end: SC-9 (AfterTool rewrites
+# a result in place), SC-11 (BeforeTool mutates calls in place + priority
+# fan-out), and the BeforeCompletion ForceAnotherTurn injection the former
+# harness stub lacked.
+# ---------------------------------------------------------------------------
+
+
+class _RewriteFirstResultMw:
+    """AfterTool middleware that rewrites the first result's output in place."""
+
+    def __init__(self, to: str) -> None:
+        self._to = to
+
+    async def handle(self, ctx: HookContext) -> MiddlewareDecision:
+        if isinstance(ctx, HookContextAfterTool) and ctx.results:
+            ctx.results[0].output = ToolOutputError(message=self._to, recoverable=True)
+            return MiddlewareContinueWithModification()
+        return MiddlewareContinue()
+
+    def hooks(self) -> list[HookPoint]:
+        return [HookPoint.AFTER_TOOL]
+
+    def name(self) -> str:
+        return "rewrite_first_result"
+
+
+async def test_after_tool_middleware_rewrites_result_in_place() -> None:
+    """SC-9: an AfterTool middleware rewrites a result; the rewrite reaches the
+    conversation the next model turn sees (the cordyceps build_check inversion,
+    done by the harness instead of the tool returning a fake error)."""
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc("c1", "x")], usage=_usage()))
+    a.push(FinalResponse(content="done", usage=_usage()))
+    cm = RecordingContextManager()
+    reg = ScriptedToolRegistry().push(ToolOutputSuccess(content="ORIGINAL"))
+    chain = StandardMiddlewareChain()
+    await chain.register(_RewriteFirstResultMw(to="REWRITTEN"))
+    h = StandardHarness(_config(a, context_manager=cm, tool_registry=reg, middleware=chain))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+
+    tool_texts = [
+        m.content.content
+        for m in r.session_state.messages
+        if m.role == Role.TOOL and isinstance(m.content, ToolResultContent)
+    ]
+    assert any(t == "REWRITTEN" for t in tool_texts), (
+        f"rewritten result must reach the conversation, got {tool_texts!r}"
+    )
+    assert not any(t == "ORIGINAL" for t in tool_texts), (
+        f"original result must not survive the rewrite, got {tool_texts!r}"
+    )
+
+
+class _RecordingToolRegistry:
+    """Tool registry that records every dispatched call and echoes success."""
+
+    def __init__(self) -> None:
+        self.seen: list[ToolCall] = []
+
+    async def dispatch(self, call: ToolCall) -> ToolOutputSuccess:
+        self.seen.append(call)
+        return ToolOutputSuccess(content="ok")
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        return False
+
+    def schemas(self) -> list[Any]:
+        return []
+
+
+class _TraceTagMw:
+    """BeforeTool middleware that appends ``tag`` to ``calls[0].input['trace']``
+    in place, at the given priority."""
+
+    def __init__(self, tag: str, prio: int) -> None:
+        self._tag = tag
+        self._prio = prio
+
+    async def handle(self, ctx: HookContext) -> MiddlewareDecision:
+        if isinstance(ctx, HookContextBeforeTool) and ctx.calls:
+            first = ctx.calls[0]
+            trace = first.input.setdefault("trace", [])
+            trace.append(self._tag)
+            return MiddlewareContinueWithModification()
+        return MiddlewareContinue()
+
+    def hooks(self) -> list[HookPoint]:
+        return [HookPoint.BEFORE_TOOL]
+
+    def priority(self) -> int:
+        return self._prio
+
+    def name(self) -> str:
+        # Distinct names so the chain accepts both registrations.
+        return "trace_first" if self._prio <= 1 else "trace_second"
+
+
+async def test_before_tool_middleware_mutates_calls_in_priority_order() -> None:
+    """SC-11: BeforeTool middleware mutates the dispatched calls IN PLACE, and the
+    chain fans out in priority order (ascending for a before-hook). The lower
+    priority runs first, so the dispatched call carries ['first', 'second']."""
+    a = _agent()
+    a.push(ToolCallRequested(calls=[_tc("c1", "x")], usage=_usage()))
+    a.push(FinalResponse(content="done", usage=_usage()))
+    reg = _RecordingToolRegistry()
+    chain = StandardMiddlewareChain()
+    # Register out of order to prove the chain sorts by priority, not insertion.
+    await chain.register(_TraceTagMw(tag="second", prio=2))
+    await chain.register(_TraceTagMw(tag="first", prio=1))
+    h = StandardHarness(_config(a, tool_registry=reg, middleware=chain))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+
+    assert len(reg.seen) == 1, "exactly one tool dispatched"
+    assert reg.seen[0].input.get("trace") == ["first", "second"], (
+        "BeforeTool middleware must mutate the dispatched call in priority order"
+    )
+
+
+class _ForceOnceMw:
+    """BeforeCompletion middleware that forces ONE extra turn, then lets the run
+    complete."""
+
+    def __init__(self, inject: str) -> None:
+        self._inject = inject
+        self._fired = False
+
+    async def handle(self, ctx: HookContext) -> MiddlewareDecision:
+        if isinstance(ctx, HookContextBeforeCompletion) and not self._fired:
+            self._fired = True
+            return MiddlewareForceAnotherTurn(inject=self._inject)
+        return MiddlewareContinue()
+
+    def hooks(self) -> list[HookPoint]:
+        return [HookPoint.BEFORE_COMPLETION]
+
+    def name(self) -> str:
+        return "force_once"
+
+
+async def test_before_completion_force_another_turn_runs_extra_turn() -> None:
+    """BeforeCompletion ForceAnotherTurn: the chain injects a follow-up and the
+    loop runs another turn instead of completing. The injection lands as a user
+    message and the run completes on the SECOND final response."""
+    a = _agent()
+    a.push(FinalResponse(content="first", usage=_usage()))
+    a.push(FinalResponse(content="second", usage=_usage()))
+    cm = RecordingContextManager()
+    chain = StandardMiddlewareChain()
+    await chain.register(_ForceOnceMw(inject="keep going"))
+    h = StandardHarness(_config(a, context_manager=cm, middleware=chain))
+    r = await h.run(HarnessRunOptions(_react_task()))
+    assert isinstance(r, RunResultSuccess)
+
+    assert r.output == "second", "the forced second turn must win"
+    assert r.turns == 2, "exactly one extra turn was forced"
+    injected = any(
+        m.role == Role.USER
+        and isinstance(m.content, TextContent)
+        and m.content.text == "keep going"
+        for m in r.session_state.messages
+    )
+    assert injected, "the ForceAnotherTurn injection must be recorded as a user message"

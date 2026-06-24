@@ -258,15 +258,37 @@ class StandardCompactionAdapter:
         _ = task
         return AgentContext(messages=list(session.messages), tools=[], params=ModelParams())
 
-    async def append_tool_result(self, session: HarnessState, result: HarnessToolResult) -> None:
+    @staticmethod
+    def _render_tool_result_text(result: HarnessToolResult) -> str:
+        """Render a tool result into the flat text recorded as a ``role:tool``
+        message. Shared by :meth:`append_tool_result` (the normal path) and
+        :meth:`replace_tool_result` (the AfterTool middleware in-place rewrite,
+        SC-9) so the two stay byte-identical."""
         output = result.output
         if isinstance(output, ToolOutputSuccess):
-            text = output.content
-        elif isinstance(output, ToolOutputError):
-            text = output.message
-        else:
-            text = ""
+            return output.content
+        if isinstance(output, ToolOutputError):
+            return output.message
+        return ""
+
+    async def append_tool_result(self, session: HarnessState, result: HarnessToolResult) -> None:
+        text = self._render_tool_result_text(result)
         session.messages.append(Message(role=Role.TOOL, content=TextContent(text=text)))
+
+    async def replace_tool_result(
+        self, session: HarnessState, message_index: int, result: HarnessToolResult
+    ) -> None:
+        # SC-9: an ``AfterTool`` middleware may rewrite a result in place. Re-render
+        # the already-appended ``role:tool`` message at ``message_index`` so the
+        # rewrite reaches the next model turn. Out-of-range indices are ignored
+        # defensively (the loop only passes indices it recorded right after
+        # ``append_tool_result``). Matches ``append_tool_result`` exactly: no rich
+        # state is written, so neither does the replace.
+        if 0 <= message_index < len(session.messages):
+            text = self._render_tool_result_text(result)
+            session.messages[message_index] = Message(
+                role=Role.TOOL, content=TextContent(text=text)
+            )
 
     async def append_assistant_message(self, session: HarnessState, message: Message) -> None:
         # Record the assistant's turn (final text and/or the tool calls it
