@@ -64,8 +64,10 @@
 //!   description) of it every turn, pulling the full body into context only when
 //!   it calls the `load_skill` tool — or when you load it yourself with `/<name>`.
 //!   It follows the [Agent Skills spec](https://agentskills.io/specification),
-//!   wired example-side by wrapping the context manager (see [`skills`]); issue
-//!   #115 will productionize it in the harness.
+//!   now productionized in the harness (#115 / SC-26): `HarnessBuilder::skills`
+//!   takes a `spore_core::SkillCatalog`, registers `load_skill`, and injects the
+//!   manifest + active bodies STRUCTURALLY via the rich `ContextSources` seam — no
+//!   example-side context-manager wrapper.
 //! - **Esc-to-abort, without losing context.** A run executes with the terminal
 //!   in raw mode and a background key watcher; pressing Esc drops the
 //!   `harness.run(..)` future, cancelling the in-flight turn at its next await
@@ -90,14 +92,11 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use spore_core::{
-    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, CompactionConfig, Content, FunctionHook,
-    Harness, HarnessBuilder, HarnessContextManagerExt, HarnessRunOptions, HarnessStreamEvent,
-    HookChain, HookContext, HookDecision, HookEvent, LoopStrategy, Message, NullCacheProvider,
-    OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult, SessionId, SessionState,
-    StandardContextManager, StandardHookChain, Task, ToolCall, ToolResult, ToolsetRef,
+    AgentRef, BudgetExhaustedBehavior, BudgetPolicy, Content, FunctionHook, Harness, HarnessBuilder,
+    HarnessRunOptions, HarnessStreamEvent, HookChain, HookContext, HookDecision, HookEvent,
+    LoopStrategy, Message, OllamaModelInterface, PlanExecuteConfig, ReactConfig, Role, RunResult,
+    SessionId, SessionState, StandardHookChain, Task, ToolCall, ToolResult, ToolsetRef,
 };
-
-mod skills;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent working inside a sandboxed workspace directory. \
      Explore with list_dir, read_file, grep, and find_files; create and change files with \
@@ -187,42 +186,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&workspace_root)?;
     let workspace_root = std::fs::canonicalize(&workspace_root)?;
 
-    // --- Skills (the Agent Skills spec, wired example-side) -------------------
+    // --- Skills (the Agent Skills spec, now productionized in the harness) ----
     // Discover `SKILL.md` files (bundled with the example + `.spore/skills` in the
-    // workspace + `~/.spore/skills`). The manifest (name + description of every
-    // skill) is injected every turn; a skill's full body is injected only once it
-    // is ACTIVE. A skill goes active when the agent calls `load_skill` (it should,
-    // when a request matches a skill's description) or when you load it yourself
-    // with `/<name>`. The active set is shared in-process across all three sites.
-    let catalog = skills::SkillCatalog::bootstrap(&workspace_root);
-    let known = catalog.names();
-    let active = skills::new_active_set();
-
-    // The context manager. The live loop bypasses the rich `assemble` (Known
-    // Deviation #8 / #115), so we wrap the standard compaction adapter to make the
-    // skill manifest + active bodies ride along every turn. The adapter needs its
-    // own model handle (it uses it only for compaction summarization), so build a
-    // second cheap instance — `OllamaModelInterface` is config-only and not
-    // `Clone`. We size that instance's window with ONE call, `with_context_window`
-    // (SC-4): it sets Ollama's `num_ctx` AND the window `provider()` reports, and
-    // `CompactionConfig::default()` leaves `context_length` unset so the compaction
-    // budget AUTO-DERIVES from that provider window (#141) — no second knob to keep
-    // in sync. (`COMPACT_THRESHOLD` is that default's 0.80; named for the status
-    // line below.)
-    let base_adapter = Arc::new(StandardContextManager::new(
-        Arc::new(
-            OllamaModelInterface::with_base_url(&model_id, base_url.clone())
-                .with_context_window(context_window),
-        ),
-        Arc::new(NullCacheProvider),
-        CompactionConfig::default(),
-    ))
-    .into_harness_adapter();
-    let context_manager = Arc::new(skills::SkillInjectingContextManager::new(
-        base_adapter,
-        active.clone(),
-        catalog.manifest(),
-    ));
+    // workspace + `~/.spore/skills`). `HarnessBuilder::skills` (below) registers the
+    // catalog AND the `load_skill` tool, and the harness injects the manifest (every
+    // turn) + each ACTIVE skill's full body (sticky) into the model's context
+    // STRUCTURALLY via the rich `ContextSources` seam (#115 / SC-26) — no example-side
+    // context-manager wrapper, no second model handle. A skill goes active when the
+    // agent calls `load_skill` (it should, when a request matches a skill's
+    // description) or when you load it yourself with `/<name>`. The `Arc<SkillCatalog>`
+    // is shared between the harness and this REPL, so both see the same active set.
+    let catalog = spore_core::SkillCatalog::discover(
+        &[std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills")],
+        &workspace_root,
+    );
 
     // Build the harness via the `coding_agent` PRESET (SC-8). The preset wires the
     // bits a coding agent always needs — a read-WRITE `WorkspaceScopedSandbox`
@@ -232,17 +209,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instead of pausing (no hand-rolled drive loop; SC-5). Sizing the model's
     // window with `with_context_window` (as above) is the only window knob.
     //
-    // On top of the preset we layer this example's extras: the `load_skill` tool,
-    // the skill-injecting context manager (overriding the preset's plain one until
-    // #115), a RICHER system prompt (it overrides the built-in to add the skills
-    // contract AND the plan-phase "reply with JSON only" exception PlanExecute
-    // needs), and the plan-announcer hook. Built once and reused for every turn.
+    // On top of the preset we layer this example's extras: the skill catalog +
+    // `load_skill` tool (via `.skills`, which also injects the manifest/active
+    // bodies structurally — no context-manager override needed anymore, #115), a
+    // RICHER system prompt (it overrides the built-in to add the skills contract
+    // AND the plan-phase "reply with JSON only" exception PlanExecute needs), and
+    // the plan-announcer hook. Built once and reused for every turn.
     let model = OllamaModelInterface::with_base_url(&model_id, base_url)
         .with_context_window(context_window);
     let harness = HarnessBuilder::coding_agent(model, workspace_root.clone())?
-        .tool(skills::load_skill_tool(active.clone(), known.clone()))
+        .skills(catalog.clone())
         .system_prompt(SYSTEM_PROMPT)
-        .context_manager(context_manager)
         // Surface the plan to the user the moment it's captured (OnPlanCreated).
         .hooks(plan_announcer())
         .build();
@@ -266,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "skills    : {} discovered — load with /<name>, or the agent loads via load_skill (/skills to list)",
-        known.len()
+        catalog.entries().len()
     );
     println!("Type a coding task and press enter. Esc aborts a running task; Ctrl-D quits.\n");
 
@@ -292,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // forgets the dialogue.
         if trimmed.eq_ignore_ascii_case("clear") {
             history = None;
-            active.lock().unwrap().clear();
+            catalog.clear_active();
             println!("(conversation cleared)\n");
             continue;
         }
@@ -306,11 +283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(c, r)| (c, r.trim()))
                 .unwrap_or((rest, ""));
             if cmd.eq_ignore_ascii_case("skills") {
-                print_skills(&catalog, &active);
+                print_skills(&catalog);
                 continue;
             }
-            if known.iter().any(|n| n == cmd) {
-                active.lock().unwrap().insert(cmd.to_string());
+            if catalog.activate(cmd) {
                 println!("✓ loaded skill '{cmd}' — active for this conversation.\n");
                 if inline.is_empty() {
                     continue; // just loaded; wait for the next prompt
@@ -625,7 +601,7 @@ fn watch_for_escape(stop: &std::sync::atomic::AtomicBool) {
 /// List the discovered skills and which are currently active — the `/skills`
 /// command. `●` marks an active skill (its full body is in context every turn);
 /// `○` marks one the agent (or you, via `/<name>`) can still load.
-fn print_skills(catalog: &skills::SkillCatalog, active: &skills::ActiveSkills) {
+fn print_skills(catalog: &spore_core::SkillCatalog) {
     if catalog.is_empty() {
         println!(
             "no skills found. Add one at skills/<name>/SKILL.md (next to this example) or \
@@ -633,7 +609,7 @@ fn print_skills(catalog: &skills::SkillCatalog, active: &skills::ActiveSkills) {
         );
         return;
     }
-    let active = active.lock().unwrap();
+    let active = catalog.active();
     println!("skills:");
     for e in catalog.entries() {
         let mark = if active.contains(&e.name) {

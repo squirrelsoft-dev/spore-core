@@ -213,6 +213,15 @@ impl SkillCatalog {
         true
     }
 
+    /// Deactivate every skill (e.g. on a conversation reset). The manifest stays;
+    /// only the sticky bodies are dropped.
+    pub fn clear_active(&self) {
+        self.active
+            .lock()
+            .expect("active-skills mutex poisoned")
+            .clear();
+    }
+
     /// The currently active skill names (sorted).
     pub fn active(&self) -> Vec<String> {
         self.active
