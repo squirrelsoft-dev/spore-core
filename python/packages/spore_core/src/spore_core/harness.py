@@ -65,7 +65,16 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NewType, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    NewType,
+    Protocol,
+    runtime_checkable,
+)
 
 from pydantic import (
     BaseModel,
@@ -5966,6 +5975,47 @@ class HarnessConfig:
         )
 
 
+# ── SC-8 builder-preset shared defaults ──────────────────────────────────────
+#
+# Module constants for the autonomous presets
+# (:meth:`HarnessBuilder.coding_agent` / :meth:`HarnessBuilder.hill_climber`),
+# so a consumer can reference or extend them. Mirrors the Rust associated
+# constants ``HarnessBuilder::{CODING_AGENT_SYSTEM_PROMPT, PRESET_MAX_AUTO_GRANTS,
+# PRESET_STEPS_PER_GRANT}``; re-exposed as class attributes on
+# :class:`HarnessBuilder` for parity with that access path.
+
+#: Built-in system prompt for :meth:`HarnessBuilder.coding_agent`: a coding
+#: agent that ACTS through the workspace tools (rather than describing what it
+#: would do) and narrates each step to the user via ``send_message``. Exposed so
+#: a consumer can extend it; override it wholesale with
+#: :meth:`HarnessBuilder.system_prompt`. The text is COPIED VERBATIM from the
+#: Rust ``CODING_AGENT_SYSTEM_PROMPT`` for cross-language parity.
+CODING_AGENT_SYSTEM_PROMPT = (
+    "You are a coding agent working inside a sandboxed workspace directory. "
+    "Explore with list_dir, read_file, grep, and find_files; create and change files with "
+    "write_file and edit_file; run commands with bash. Use relative paths only. "
+    "Act using tools — do not just describe what you would do. When the task is done, "
+    "reply with a short summary of what you changed. "
+    "The user CANNOT see your reasoning or your tool calls — they only see the messages you "
+    "send with the `send_message` tool and your final reply. So before (or as) you act, "
+    "call `send_message` with one short sentence saying what you are about to do, in "
+    "PARALLEL with the tool that does the work, so narration never costs an extra round trip. "
+    "Keep each message to a single short sentence."
+)
+
+#: Default per-scope auto-continue cap for the autonomous presets
+#: (:meth:`HarnessBuilder.coding_agent` / :meth:`HarnessBuilder.hill_climber`):
+#: grant up to this many extra step budgets at an ``Escalate`` point before the
+#: run gives up. Mirrors the hand-rolled drive loop the consumers used (the
+#: ``12-cordyceps`` example's ``MAX_AUTO_CONTINUES``). Override the whole policy
+#: with :meth:`HarnessBuilder.escalation_mode`.
+PRESET_MAX_AUTO_GRANTS = 10
+#: Steps granted on each auto-continue for the autonomous presets (the
+#: ``12-cordyceps`` example's ``CONTINUE_STEPS``). See
+#: :data:`PRESET_MAX_AUTO_GRANTS`.
+PRESET_STEPS_PER_GRANT = 25
+
+
 class HarnessBuilder:
     """Fluent assembler for a :class:`HarnessConfig` / :class:`StandardHarness`.
 
@@ -5975,6 +6025,14 @@ class HarnessBuilder:
     ones (middleware, observability, pricing), including the durable outbox via
     :meth:`with_observability_outbox`.
     """
+
+    # SC-8: the autonomous-preset shared defaults, re-exposed as class
+    # attributes for parity with the Rust associated-constant access path
+    # (``HarnessBuilder::CODING_AGENT_SYSTEM_PROMPT`` etc.). The module-level
+    # constants are the source of truth.
+    CODING_AGENT_SYSTEM_PROMPT: ClassVar[str] = CODING_AGENT_SYSTEM_PROMPT
+    PRESET_MAX_AUTO_GRANTS: ClassVar[int] = PRESET_MAX_AUTO_GRANTS
+    PRESET_STEPS_PER_GRANT: ClassVar[int] = PRESET_STEPS_PER_GRANT
 
     def __init__(
         self,
@@ -6147,6 +6205,110 @@ class HarnessBuilder:
         )
         builder._prompt_tool_call_flag = prompt_tool_call_flag
         return builder
+
+    @staticmethod
+    def _preset_auto_continue() -> EscalationMode:
+        """``AutoContinue`` with the preset defaults
+        (:data:`PRESET_MAX_AUTO_GRANTS` × :data:`PRESET_STEPS_PER_GRANT`, no
+        ``on_grant`` observer) — the "autonomous but capped" policy both
+        autonomous presets share (SC-8). Mirrors Rust's
+        ``HarnessBuilder::preset_auto_continue``."""
+        from .execution_registry import EscalationModeAutoContinue
+
+        return EscalationModeAutoContinue(
+            max_grants=PRESET_MAX_AUTO_GRANTS,
+            steps_per_grant=PRESET_STEPS_PER_GRANT,
+        )
+
+    @classmethod
+    def coding_agent(cls, model: ModelInterface, workspace: str | Path) -> HarnessBuilder:
+        """Assemble an autonomous **coding agent** over a workspace directory
+        (SC-8) — the looper preset.
+
+        Builds on :meth:`conversational` and wires the bits a coding agent
+        always needs: a **read-write**
+        :class:`~spore_core.sandbox.WorkspaceScopedSandbox` rooted at
+        ``workspace``, the full ``StandardTools.coding_set()``
+        (read/write/edit/list/grep/find + ``bash`` + ``send_message`` +
+        web/memory/task-list), the built-in :data:`CODING_AGENT_SYSTEM_PROMPT`,
+        and :class:`~spore_core.execution_registry.EscalationModeAutoContinue`
+        (autonomous-but-capped — it keeps working through a spent step budget
+        instead of pausing, so there is no consumer drive loop to hand-roll;
+        SC-5).
+
+        **Window sizing (SC-4/SC-6).** Size the model's context window ONCE on
+        the model before passing it in (e.g.
+        ``OllamaModelInterface.with_context_window``): the preset's
+        ``conversational`` context manager auto-derives its compaction budget
+        from ``provider().context_window`` — so one call sizes both halves and
+        no manual :meth:`context_manager` is needed.
+
+        Raises :class:`~spore_core.sandbox.SandboxBuildError` if the workspace
+        path can't be resolved (it must exist and canonicalize — the sandbox
+        requirement). This is the fallible-constructor convention matching
+        Rust's ``Result<Self, BuildError>``: an unresolvable workspace surfaces a
+        typed error, never a bare crash. The strategy is per-run: pass a
+        ``ReAct`` / ``PlanExecute`` :class:`Task` to :meth:`StandardHarness.run`;
+        the empty agent/toolset handles on its leaves resolve to this preset's
+        defaults. Mirrors Rust's ``HarnessBuilder::coding_agent``.
+
+        Example::
+
+            model = OllamaModelInterface("gemma4:e4b").with_context_window(256_000)
+            harness = HarnessBuilder.coding_agent(model, "/path/to/project").build()
+        """
+        # ``coding_set()`` lives in the ``spore_tools`` package, which depends on
+        # ``spore_core`` — so importing it at module scope would be a cycle. A
+        # deferred import inside the preset breaks the cycle: ``spore_tools`` is a
+        # workspace sibling, importable at call time.
+        from spore_tools import StandardTools
+
+        from .sandbox import WorkspaceScopedSandbox
+
+        # A read-write scoped sandbox over ``workspace`` (``read_only`` defaults
+        # to ``False``); construction canonicalizes the root and raises
+        # ``SandboxBuildError`` if it can't resolve.
+        sandbox = WorkspaceScopedSandbox(WorkspaceConfig(root=Path(workspace)))
+        return (
+            cls.conversational(model)
+            .sandbox(sandbox)
+            .tools(StandardTools.coding_set())
+            .system_prompt(CODING_AGENT_SYSTEM_PROMPT)
+            .escalation_mode(cls._preset_auto_continue())
+        )
+
+    @classmethod
+    def hill_climber(cls, model: ModelInterface, evaluator: Any) -> HarnessBuilder:
+        """Assemble an autonomous **hill-climbing agent** (SC-8) — the cordyceps
+        preset.
+
+        Builds on :meth:`conversational` and registers the scoring ``evaluator``
+        (required for the
+        :class:`~spore_core.execution_registry.HillClimbingConfig` loop strategy)
+        under the default ("") handle, plus
+        :class:`~spore_core.execution_registry.EscalationModeAutoContinue`
+        (autonomous-but-capped; SC-5) so a spent per-iteration build budget keeps
+        working instead of pausing.
+
+        Unlike :meth:`coding_agent` this does NOT install a sandbox or tools —
+        hill-climbing workspaces vary (some climb a prose artifact, some climb
+        files), and the build task's system prompt is task-specific. Add them
+        with :meth:`sandbox` / :meth:`tools` / :meth:`system_prompt` as the climb
+        requires. Size the model's window on the model first (SC-4/SC-6), as in
+        :meth:`coding_agent`. Non-fallible. Mirrors Rust's
+        ``HarnessBuilder::hill_climber``.
+
+        Example::
+
+            model = OllamaModelInterface("gemma4:e4b").with_context_window(256_000)
+            # Add a workspace ``.sandbox(..)`` + ``.tools(..)`` for the climb.
+            harness = HarnessBuilder.hill_climber(model, evaluator).build()
+        """
+        return (
+            cls.conversational(model)
+            .metric_evaluator(evaluator)
+            .escalation_mode(cls._preset_auto_continue())
+        )
 
     def chunk_provider(self, provider: Any) -> HarnessBuilder:
         """Set the chunk provider for the #79 prompt assembly engine. Defaults
