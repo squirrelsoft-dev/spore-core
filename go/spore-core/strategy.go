@@ -1335,6 +1335,16 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				cascade(taskID, "budget exhausted (Fail)")
 				continue
 			default: // Escalate: surface the partial and abort.
+				// SC-5: AutoContinue auto-grants this scope in-process (bounded by
+				// MaxGrants, fires OnGrant) and re-walks the ready set — mirroring the
+				// Continue arm above. Once grants are spent it falls through to the
+				// surface/abort handling below.
+				if cx.TryAutoContinue(executor.EscalationMode()) {
+					pending := TaskStatusPending
+					_ = taskList.Update(taskID, &pending, nil)
+					executor.PersistTaskList(ctx, sessionID, taskList)
+					continue
+				}
 				// #138 AC2-b: under SurfaceToHuman the task is NOT permanently failed
 				// — it pauses awaiting a budget grant. Leave it InProgress (the consult
 				// path's invariant) so the resume's seed re-attaches via the SAME
@@ -1429,6 +1439,12 @@ func (c *PlanExecuteConfig) runExecuteLoop(
 				// the remaining ready tasks IN-PROCESS (this step already completed).
 				// NO serialization (AC3).
 				if resolution == ExhaustedResolutionContinue {
+					continue
+				}
+				// SC-5: AutoContinue auto-grants in-process at this Escalate point
+				// (scope still pushed) before surfacing.
+				if resolution == ExhaustedResolutionEscalate &&
+					cx.TryAutoContinue(executor.EscalationMode()) {
 					continue
 				}
 				partial := planExecutePartialJSON(taskList)
@@ -1678,6 +1694,12 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			// continues under the refreshed allowance). NO serialization (AC3).
 			// MaxContinues bounds the loop.
 			if resolution == ExhaustedResolutionContinue {
+				continue
+			}
+			// SC-5: AutoContinue auto-grants in-process at this Escalate point
+			// (scope still pushed) before surfacing/aborting.
+			if resolution == ExhaustedResolutionEscalate &&
+				cx.TryAutoContinue(executor.EscalationMode()) {
 				continue
 			}
 			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
@@ -2019,6 +2041,12 @@ func (c *HillClimbingConfig) Run(ctx context.Context, cx *ExecutionContext) Stra
 			// climb IN-PROCESS (do NOT pop; the refreshed allowance lets the next
 			// charge pass). NO serialization (AC3). MaxContinues bounds the loop.
 			if resolution == ExhaustedResolutionContinue {
+				continue
+			}
+			// SC-5: AutoContinue auto-grants in-process at this Escalate point
+			// (scope still pushed) before surfacing/aborting.
+			if resolution == ExhaustedResolutionEscalate &&
+				cx.TryAutoContinue(executor.EscalationMode()) {
 				continue
 			}
 			executor.HillWriteTSV(workspaceRoot, task.ID, rows)

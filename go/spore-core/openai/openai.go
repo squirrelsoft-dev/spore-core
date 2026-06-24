@@ -68,7 +68,39 @@ type ModelInterface struct {
 	baseURL    string
 	timeout    time.Duration
 	maxRetries uint32
+	// contextWindowOverride is an explicit override for the window reported by
+	// Provider (SC-6). nil defers to the static ContextWindow table; non-nil
+	// pins it.
+	contextWindowOverride *uint32
+	// compat carries capability declarations that override the id heuristics
+	// (SC-27).
+	compat     OpenAICompat
 	httpClient *http.Client
+}
+
+// OpenAICompat carries capability declarations that BEAT OpenAI's id-prefix
+// heuristics (SC-27).
+//
+// The built-in IsReasoningModel check only recognizes the o1/o3/o4 families. A
+// model served behind an OpenAI-compatible endpoint (a local server, a renamed
+// deployment, a newer family the heuristic predates) gets no way to declare
+// that it wants reasoning-model request shaping. OpenAICompat, supplied via
+// WithCompat, is that vehicle: every field is OR'd over the id heuristic, never
+// subtracted from it, so the default (all false) leaves the recognized o-series
+// behavior byte-identical.
+type OpenAICompat struct {
+	// ReasoningModel treats this model as a reasoning model regardless of its id
+	// (beats the o1/o3/o4 heuristic): send max_completion_tokens instead of
+	// max_tokens and drop temperature/top_p/stop, which reasoning models reject.
+	ReasoningModel bool
+	// DeveloperRole routes the system message to the "developer" role instead of
+	// "system" — OpenAI's reasoning-model convention, which some compatible
+	// servers require.
+	DeveloperRole bool
+	// SupportsReasoningEffort emits a reasoning_effort field carrying
+	// ModelParams.ReasoningEffort ("low"|"medium"|"high"|"max") when it is set.
+	// No-op when the caller leaves ReasoningEffort unset.
+	SupportsReasoningEffort bool
 }
 
 // New constructs a ModelInterface with default base URL, timeout, retries,
@@ -122,6 +154,29 @@ func (c *ModelInterface) WithHTTPClient(h *http.Client) *ModelInterface {
 	return c
 }
 
+// WithContextWindow overrides the window reported by Provider (SC-6 / SC-4):
+// the value the harness's compaction budget sizes itself to (via the context
+// manager's ResolveContextLength, issue #141). Use it to pin the window for a
+// model the static table predates, or for a local OpenAI-compatible deployment
+// whose id the table does not recognize. OpenAI has no num_ctx-style knob, so
+// this affects reporting (and thus the compaction budget) only.
+func (c *ModelInterface) WithContextWindow(n uint32) *ModelInterface {
+	c.contextWindowOverride = &n
+	return c
+}
+
+// WithCompat declares model capabilities that BEAT the id-prefix heuristics
+// (SC-27).
+//
+// See OpenAICompat. Use it for a reasoning model the o1/o3/o4 IsReasoningModel
+// check does not recognize — e.g. a local server or a renamed deployment — so
+// the request still carries the developer role, max_completion_tokens, and
+// reasoning_effort.
+func (c *ModelInterface) WithCompat(compat OpenAICompat) *ModelInterface {
+	c.compat = compat
+	return c
+}
+
 // String redacts the API key.
 func (c *ModelInterface) String() string {
 	return fmt.Sprintf(
@@ -161,10 +216,15 @@ func IsReasoningModel(modelID string) bool {
 
 // Provider reports the underlying model identity.
 func (c *ModelInterface) Provider() sporecore.ProviderInfo {
+	// SC-6: an explicit override wins over the static table.
+	cw := ContextWindow(c.modelID)
+	if c.contextWindowOverride != nil {
+		cw = *c.contextWindowOverride
+	}
 	return sporecore.ProviderInfo{
 		Name:          "openai",
 		ModelID:       c.modelID,
-		ContextWindow: ContextWindow(c.modelID),
+		ContextWindow: cw,
 	}
 }
 
@@ -175,16 +235,21 @@ var _ sporecore.ModelInterface = (*ModelInterface)(nil)
 // ---------------------------------------------------------------------------
 
 type wireRequest struct {
-	Model               string         `json:"model"`
-	Messages            []wireMessage  `json:"messages"`
-	MaxTokens           *uint32        `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *uint32        `json:"max_completion_tokens,omitempty"`
-	Temperature         *float32       `json:"temperature,omitempty"`
-	TopP                *float32       `json:"top_p,omitempty"`
-	Stop                []string       `json:"stop,omitempty"`
-	Tools               []wireTool     `json:"tools,omitempty"`
-	Stream              bool           `json:"stream,omitempty"`
-	StreamOptions       *streamOptions `json:"stream_options,omitempty"`
+	Model               string        `json:"model"`
+	Messages            []wireMessage `json:"messages"`
+	MaxTokens           *uint32       `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *uint32       `json:"max_completion_tokens,omitempty"`
+	// ReasoningEffort (SC-27): "low"|"medium"|"high"|"max", emitted only when the
+	// model is treated as reasoning-capable AND OpenAICompat.SupportsReasoningEffort
+	// is set. Absent (omitempty) otherwise, so non-reasoning requests stay
+	// byte-identical.
+	ReasoningEffort *string        `json:"reasoning_effort,omitempty"`
+	Temperature     *float32       `json:"temperature,omitempty"`
+	TopP            *float32       `json:"top_p,omitempty"`
+	Stop            []string       `json:"stop,omitempty"`
+	Tools           []wireTool     `json:"tools,omitempty"`
+	Stream          bool           `json:"stream,omitempty"`
+	StreamOptions   *streamOptions `json:"stream_options,omitempty"`
 }
 
 type streamOptions struct {
@@ -269,10 +334,10 @@ type wireErrorInner struct {
 // Conversions
 // ---------------------------------------------------------------------------
 
-func buildRequest(modelID string, req sporecore.ModelRequest, stream bool) wireRequest {
+func buildRequest(modelID string, req sporecore.ModelRequest, stream bool, compat OpenAICompat) wireRequest {
 	messages := make([]wireMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		messages = append(messages, messageToWire(m))
+		messages = append(messages, messageToWire(m, compat))
 	}
 
 	tools := make([]wireTool, 0, len(req.Tools))
@@ -291,16 +356,32 @@ func buildRequest(modelID string, req sporecore.ModelRequest, stream bool) wireR
 		})
 	}
 
-	reasoning := IsReasoningModel(modelID)
+	// SC-27: OpenAICompat.ReasoningModel is OR'd OVER the id heuristic, so a model
+	// the o1/o3/o4 prefix check misses still gets reasoning shaping.
+	reasoning := IsReasoningModel(modelID) || compat.ReasoningModel
 	var maxTokens, maxCompletion *uint32
 	if reasoning {
 		maxCompletion = req.Params.MaxTokens
 	} else {
 		maxTokens = req.Params.MaxTokens
 	}
+	// Reasoning models reject temperature/top_p/stop — drop all three.
 	temperature := req.Params.Temperature
+	topP := req.Params.TopP
+	stop := req.Params.StopSequences
 	if reasoning {
 		temperature = nil
+		topP = nil
+		stop = nil
+	}
+
+	// SC-27: emit reasoning_effort only for a reasoning model whose compat opted
+	// in AND whose caller set an effort level. Absent otherwise so non-reasoning
+	// requests stay byte-identical.
+	var reasoningEffort *string
+	if reasoning && compat.SupportsReasoningEffort && req.Params.ReasoningEffort != nil {
+		s := string(*req.Params.ReasoningEffort)
+		reasoningEffort = &s
 	}
 
 	w := wireRequest{
@@ -308,9 +389,10 @@ func buildRequest(modelID string, req sporecore.ModelRequest, stream bool) wireR
 		Messages:            messages,
 		MaxTokens:           maxTokens,
 		MaxCompletionTokens: maxCompletion,
+		ReasoningEffort:     reasoningEffort,
 		Temperature:         temperature,
-		TopP:                req.Params.TopP,
-		Stop:                req.Params.StopSequences,
+		TopP:                topP,
+		Stop:                stop,
 		Tools:               tools,
 		Stream:              stream,
 	}
@@ -320,11 +402,16 @@ func buildRequest(modelID string, req sporecore.ModelRequest, stream bool) wireR
 	return w
 }
 
-func messageToWire(m sporecore.Message) wireMessage {
+func messageToWire(m sporecore.Message, compat OpenAICompat) wireMessage {
 	role := "user"
 	switch m.Role {
 	case sporecore.RoleSystem:
-		role = "system"
+		// SC-27: reasoning models use the "developer" role for system content.
+		if compat.DeveloperRole {
+			role = "developer"
+		} else {
+			role = "system"
+		}
 	case sporecore.RoleAssistant:
 		role = "assistant"
 	case sporecore.RoleTool:
@@ -627,7 +714,7 @@ func mapStatusError(resp *http.Response) error {
 
 // Call performs one blocking Chat Completions call.
 func (c *ModelInterface) Call(ctx context.Context, req sporecore.ModelRequest) (sporecore.ModelResponse, error) {
-	body := buildRequest(c.modelID, req, false)
+	body := buildRequest(c.modelID, req, false, c.compat)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return sporecore.ModelResponse{}, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))
@@ -679,7 +766,7 @@ func (c *ModelInterface) CountTokens(_ context.Context, req sporecore.ModelReque
 
 // CallStreaming opens an SSE stream and emits StreamEvents.
 func (c *ModelInterface) CallStreaming(ctx context.Context, req sporecore.ModelRequest) (<-chan sporecore.StreamEventOrErr, error) {
-	body := buildRequest(c.modelID, req, true)
+	body := buildRequest(c.modelID, req, true, c.compat)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, sporecore.NewProviderError(0, fmt.Sprintf("request encode failed: %v", err))

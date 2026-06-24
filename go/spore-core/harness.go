@@ -3761,6 +3761,11 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 	// #129 (AC2): the cross-process checkpoint seed is consumed by the FIRST
 	// round only (the resumed node's scope); later in-process rounds carry their
 	// continue count via behaviorForResolution.
+	// SC-5: auto-grants spent at the BARE-LEAF Escalate site under
+	// EscalationAutoContinue. The scope is rebuilt each round here (unlike the
+	// in-loop combinator scopes, which carry their own AutoGrantsUsed), so the
+	// counter lives across rounds in this local.
+	var autoGrantsUsed uint32
 	for {
 		cx := NewExecutionContext(&h.config.Registry)
 		cx.Executor = h
@@ -3865,6 +3870,29 @@ func (h *StandardHarness) driveStrategyWithResumeSeed(
 				behaviorForResolution = &threaded
 				continue
 			case ExhaustedResolutionEscalate:
+				// SC-5: AutoContinue auto-grants StepsPerGrant more steps and
+				// re-drives IN-PROCESS (mirroring the Continue arm above), up to
+				// MaxGrants times, firing OnGrant per grant. This is the bare-leaf /
+				// top-level keep-working-but-capped site — where consumers otherwise
+				// hand-roll a drive loop. Once the grants are spent it falls through to
+				// the surface/abort handling below (the Autonomous terminal).
+				if mode := h.config.EffectiveEscalationMode(); mode.Kind == EscalationAutoContinue {
+					if autoGrantsUsed < mode.MaxGrants {
+						autoGrantsUsed++
+						if mode.OnGrant != nil {
+							mode.OnGrant(AutoGrantInfo{
+								GrantNumber:  autoGrantsUsed,
+								StepsGranted: mode.StepsPerGrant,
+								Phase:        ex.Phase,
+							})
+						}
+						granted := saturatingAddU32(ex.StepsTaken, mode.StepsPerGrant)
+						grantTaskBudget(&task, granted)
+						session = cx.Scratch.RunSession
+						budget = cx.Scratch.RunBudget
+						continue
+					}
+				}
 				// #130: a BARE LEAF exhaustion under SurfaceToHuman PAUSES with a
 				// BudgetExhausted request (a combinator under SurfaceToHuman never
 				// reaches this arm — it sets the terminal override at its escalate

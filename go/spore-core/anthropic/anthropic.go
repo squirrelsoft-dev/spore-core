@@ -59,7 +59,11 @@ type ModelInterface struct {
 	baseURL    string
 	timeout    time.Duration
 	maxRetries uint32
-	httpClient *http.Client
+	// contextWindowOverride is an explicit override for the window reported by
+	// Provider (SC-6). nil defers to the static ContextWindow table; non-nil
+	// pins it (e.g. a newer model the table predates).
+	contextWindowOverride *uint32
+	httpClient            *http.Client
 }
 
 // New constructs a ModelInterface with default base URL, timeout, retries,
@@ -112,6 +116,17 @@ func (c *ModelInterface) WithHTTPClient(h *http.Client) *ModelInterface {
 	return c
 }
 
+// WithContextWindow overrides the window reported by Provider (SC-6 / SC-4):
+// the value the harness's compaction budget sizes itself to (via the context
+// manager's ResolveContextLength, issue #141). Use it to pin the window for a
+// model the static table predates. Anthropic has no num_ctx-style knob — the
+// API always serves the model's full window — so this affects reporting (and
+// thus the compaction budget) only.
+func (c *ModelInterface) WithContextWindow(n uint32) *ModelInterface {
+	c.contextWindowOverride = &n
+	return c
+}
+
 // String redacts the API key.
 func (c *ModelInterface) String() string {
 	return fmt.Sprintf(
@@ -141,10 +156,15 @@ func ContextWindow(modelID string) uint32 {
 
 // Provider reports the underlying model identity.
 func (c *ModelInterface) Provider() sporecore.ProviderInfo {
+	// SC-6: an explicit override wins over the static table.
+	cw := ContextWindow(c.modelID)
+	if c.contextWindowOverride != nil {
+		cw = *c.contextWindowOverride
+	}
 	return sporecore.ProviderInfo{
 		Name:          "anthropic",
 		ModelID:       c.modelID,
-		ContextWindow: ContextWindow(c.modelID),
+		ContextWindow: cw,
 	}
 }
 

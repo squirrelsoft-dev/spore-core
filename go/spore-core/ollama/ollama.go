@@ -91,8 +91,16 @@ type ModelInterface struct {
 	// default (historically 2048, 4096 in recent builds) — so callers that want
 	// the model's real window must opt in via SetNumCtx. Like keepAlive, this is
 	// a model-loading setting, not a per-turn sampling param.
-	numCtx     *uint32
-	httpClient *http.Client
+	numCtx *uint32
+	// contextWindowOverride is an explicit override for the window REPORTED by
+	// Provider (SC-6). nil (the default) defers to the /api/show-discovered
+	// length, then the static ContextWindow table. When set it is the highest
+	// authority — a caller that knows the real window can pin it without waiting
+	// on (or contradicting) discovery. WithContextWindow sets this AND numCtx
+	// together so the harness's compaction budget and the window Ollama actually
+	// loads agree (SC-4).
+	contextWindowOverride *uint32
+	httpClient            *http.Client
 
 	// Lazy /api/tags availability + /api/show discovery probe. The first
 	// Call/CallStreaming triggers the check; the result is cached for the
@@ -174,6 +182,28 @@ func (c *ModelInterface) SetNumCtx(n uint32) *ModelInterface {
 	return c
 }
 
+// WithContextWindow sets the model's context window in ONE call (SC-4) — the
+// friendly setter that resolves the discovery/enforcement split this module
+// documents.
+//
+// It does two things at once:
+//  1. sets numCtx (so Ollama loads the model at window n instead of its small
+//     server default and stops silently truncating longer prompts), and
+//  2. sets the window REPORTED by Provider to n (so the harness's compaction
+//     budget — which reads Provider().ContextWindow via the context manager's
+//     ResolveContextLength, issue #141 — sizes itself to the SAME window the
+//     model actually sees).
+//
+// Without this, a caller had to call SetNumCtx AND separately keep the harness's
+// compaction window in sync, or the harness would manage a large budget while
+// Ollama truncated at its default. num_ctx sizes Ollama's KV-cache allocation at
+// load time, so pass the window you actually want — not an arbitrary maximum.
+func (c *ModelInterface) WithContextWindow(n uint32) *ModelInterface {
+	c.numCtx = &n
+	c.contextWindowOverride = &n
+	return c
+}
+
 // SetHTTPClient overrides the http.Client.
 func (c *ModelInterface) SetHTTPClient(h *http.Client) *ModelInterface {
 	c.httpClient = h
@@ -214,12 +244,16 @@ func ContextWindow(modelID string) uint32 {
 	}
 }
 
-// Provider reports the underlying model identity. The context window prefers
-// the /api/show-discovered value when the availability probe has already run
-// and produced one; otherwise it falls back to the static ContextWindow table.
+// Provider reports the underlying model identity. The context window is
+// resolved by precedence (SC-6): an explicit caller override wins; else a
+// /api/show-discovered value when the availability probe has already run and
+// produced one; else the static ContextWindow table.
 func (c *ModelInterface) Provider() sporecore.ProviderInfo {
 	cw := ContextWindow(c.modelID)
-	if c.metaReady.Load() && c.checkMeta.contextLength != nil {
+	switch {
+	case c.contextWindowOverride != nil:
+		cw = *c.contextWindowOverride
+	case c.metaReady.Load() && c.checkMeta.contextLength != nil:
 		cw = *c.checkMeta.contextLength
 	}
 	return sporecore.ProviderInfo{

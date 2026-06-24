@@ -204,6 +204,10 @@ type BudgetContext struct {
 	StepsTaken    uint32
 	ContinuesUsed uint32
 	Phase         string
+	// AutoGrantsUsed is the count of in-process auto-grants spent at this scope's
+	// escalation point under EscalationAutoContinue (SC-5). Bounded by the mode's
+	// MaxGrants. Runtime-only, like ContinuesUsed; never serialized.
+	AutoGrantsUsed uint32
 }
 
 // NewBudgetContext constructs a fresh scope (zeroed counters) for
@@ -294,6 +298,26 @@ func (c *BudgetContext) ContinuesRemaining() uint32 {
 func (c *BudgetContext) ConsumeContinue() {
 	c.ContinuesUsed = saturatingAddU32(c.ContinuesUsed, 1)
 	c.StepsTaken = 0
+}
+
+// GrantAutoContinue grants one in-process AUTO-continue at this scope's
+// escalation point (SC-5, EscalationAutoContinue): it bumps AutoGrantsUsed and
+// raises the scope's cap to StepsTaken + stepsPerGrant so the loop gets exactly
+// stepsPerGrant more steps after the exhaustion point (mirrors a human
+// ContinueWithBudget{steps} grant, applied automatically). Unlike
+// ConsumeContinue this does NOT rewind StepsTaken — the cap moves up instead, so
+// the grant is a strict, additive stepsPerGrant. Unlimited never reaches here.
+func (c *BudgetContext) GrantAutoContinue(stepsPerGrant uint32) {
+	c.AutoGrantsUsed = saturatingAddU32(c.AutoGrantsUsed, 1)
+	granted := saturatingAddU32(c.StepsTaken, stepsPerGrant)
+	grantBudgetPolicy(&c.Policy, granted)
+}
+
+// AutoGrantsRemaining returns the auto-grants still available before falling
+// through to the autonomous terminal, given the mode's maxGrants (SC-5). 0 once
+// spent.
+func (c *BudgetContext) AutoGrantsRemaining(maxGrants uint32) uint32 {
+	return saturatingSubU32(maxGrants, c.AutoGrantsUsed)
 }
 
 // ResolveExhausted resolves this scope's BudgetExhaustedBehavior at the moment of
@@ -525,6 +549,36 @@ func (cx *ExecutionContext) ResolveCurrent() ExhaustedResolution {
 		return scope.ResolveExhausted()
 	}
 	return ExhaustedResolutionFail
+}
+
+// TryAutoContinue attempts one EscalationAutoContinue auto-grant at the CURRENT
+// scope (SC-5). It returns true when the mode is AutoContinue, grants remain
+// (AutoGrantsUsed < MaxGrants), and the scope was refreshed with StepsPerGrant
+// more steps — the caller should then `continue` its loop IN-PROCESS (the scope
+// is still on the stack). It fires OnGrant for the grant. It returns false for
+// any other mode, when grants are spent, or when there is no current scope — the
+// caller then falls through to its existing pause (SurfaceToHuman) / abort
+// (Autonomous) handling. EscalationMode is matched on Kind ONLY.
+func (cx *ExecutionContext) TryAutoContinue(mode EscalationMode) bool {
+	if mode.Kind != EscalationAutoContinue {
+		return false
+	}
+	scope := cx.Budgets.Current()
+	if scope == nil {
+		return false
+	}
+	if scope.AutoGrantsRemaining(mode.MaxGrants) == 0 {
+		return false
+	}
+	scope.GrantAutoContinue(mode.StepsPerGrant)
+	if mode.OnGrant != nil {
+		mode.OnGrant(AutoGrantInfo{
+			GrantNumber:  scope.AutoGrantsUsed,
+			StepsGranted: mode.StepsPerGrant,
+			Phase:        scope.Phase,
+		})
+	}
+	return true
 }
 
 // ============================================================================

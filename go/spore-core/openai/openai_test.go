@@ -40,7 +40,7 @@ func req(msgs ...sporecore.Message) sporecore.ModelRequest {
 // ---------------------------------------------------------------------------
 
 func TestBuildRequestKeepsSystemInMessages(t *testing.T) {
-	body := buildRequest("gpt-4o", req(sysMsg("be helpful"), userMsg("hi")), false)
+	body := buildRequest("gpt-4o", req(sysMsg("be helpful"), userMsg("hi")), false, OpenAICompat{})
 	if len(body.Messages) != 2 {
 		t.Fatalf("len = %d", len(body.Messages))
 	}
@@ -53,7 +53,7 @@ func TestBuildRequestSetsMaxTokensForChatModels(t *testing.T) {
 	r := req(userMsg("hi"))
 	mt := uint32(256)
 	r.Params.MaxTokens = &mt
-	body := buildRequest("gpt-4o", r, false)
+	body := buildRequest("gpt-4o", r, false, OpenAICompat{})
 	if body.MaxTokens == nil || *body.MaxTokens != 256 {
 		t.Fatalf("max_tokens: %v", body.MaxTokens)
 	}
@@ -68,7 +68,7 @@ func TestBuildRequestOSeriesUsesMaxCompletionTokensAndNoTemperature(t *testing.T
 	temp := float32(0.7)
 	r.Params.MaxTokens = &mt
 	r.Params.Temperature = &temp
-	body := buildRequest("o3", r, false)
+	body := buildRequest("o3", r, false, OpenAICompat{})
 	if body.MaxTokens != nil {
 		t.Fatalf("max_tokens should be nil for o3: %v", body.MaxTokens)
 	}
@@ -104,7 +104,7 @@ func TestBuildRequestMapsToolCallToAssistantToolCalls(t *testing.T) {
 			Input: json.RawMessage(`{"url":"x"}`),
 		}),
 	})
-	body := buildRequest("gpt-4o", r, false)
+	body := buildRequest("gpt-4o", r, false, OpenAICompat{})
 	if body.Messages[0].Role != "assistant" {
 		t.Fatalf("role: %s", body.Messages[0].Role)
 	}
@@ -131,7 +131,7 @@ func TestBuildRequestMapsToolResultToToolRoleMessage(t *testing.T) {
 			Content:   "ok",
 		}),
 	})
-	body := buildRequest("gpt-4o", r, false)
+	body := buildRequest("gpt-4o", r, false, OpenAICompat{})
 	if body.Messages[0].Role != "tool" {
 		t.Fatalf("role: %s", body.Messages[0].Role)
 	}
@@ -144,7 +144,7 @@ func TestBuildRequestMapsToolResultToToolRoleMessage(t *testing.T) {
 }
 
 func TestBuildRequestStreamingSetsIncludeUsage(t *testing.T) {
-	body := buildRequest("gpt-4o", req(userMsg("hi")), true)
+	body := buildRequest("gpt-4o", req(userMsg("hi")), true, OpenAICompat{})
 	if !body.Stream {
 		t.Fatalf("stream: false")
 	}

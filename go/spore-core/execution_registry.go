@@ -64,17 +64,35 @@ import (
 // ============================================================================
 
 // EscalationMode is the HITL-vs-AFK escalation knob (PRD goal #7: local vs.
-// prod differ only by config). It selects whether budget escalation surfaces to
-// a human or proceeds autonomously. Stored on HarnessConfig this slice;
-// consumed in #130.
+// prod differ only by config). It selects what budget escalation does: surface
+// to a human, fail autonomously, or keep working under an auto-granted cap
+// (SC-5). Stored on HarnessConfig; consumed at every Escalate resolution site
+// (#130, SC-5).
 //
 // No baked-in default by design (mirrors the budget-types discipline); the
 // harness wiring picks an explicit default (EscalationSurfaceToHuman). It has a
-// tagged JSON shape ({"kind":"surface_to_human"} / {"kind":"autonomous"}) for
-// symmetry with the other harness enums, but it is NOT placed on the serialized
-// Task.
+// tagged JSON shape ({"kind":"surface_to_human"} / {"kind":"autonomous"} /
+// {"kind":"auto_continue","max_grants":N,"steps_per_grant":M}) for symmetry with
+// the other harness enums, but it is NOT placed on the serialized Task (no
+// fixture serializes the mode).
+//
+// SC-5: the AutoContinue kind carries MaxGrants / StepsPerGrant plus an OnGrant
+// callback. The callback is runtime-only — NEVER serialized (funcs aren't
+// JSON-serializable). EscalationMode is therefore compared on Kind ONLY (funcs
+// aren't comparable — never use == on the struct).
 type EscalationMode struct {
 	Kind EscalationModeKind
+	// MaxGrants is the maximum number of auto-grants per exhausted scope before
+	// falling through to the autonomous terminal (EscalationAutoContinue). 0
+	// behaves like Autonomous (no grants).
+	MaxGrants uint32
+	// StepsPerGrant is the steps granted each time (EscalationAutoContinue). A
+	// grant raises the exhausted scope's cap to steps_taken + steps_per_grant so
+	// the loop gets exactly this many more steps after the exhaustion point.
+	StepsPerGrant uint32
+	// OnGrant is an optional per-grant observer fired once per auto-grant
+	// (EscalationAutoContinue). Runtime-only — NEVER serialized.
+	OnGrant func(AutoGrantInfo)
 }
 
 // EscalationModeKind discriminates EscalationMode variants. Wire values are
@@ -85,9 +103,31 @@ const (
 	// EscalationSurfaceToHuman pauses and surfaces budget escalation to a human
 	// (HITL).
 	EscalationSurfaceToHuman EscalationModeKind = "surface_to_human"
-	// EscalationAutonomous proceeds autonomously (AFK / prod).
+	// EscalationAutonomous fails the run autonomously (AFK / prod): the partial
+	// is propagated and the run stops.
 	EscalationAutonomous EscalationModeKind = "autonomous"
+	// EscalationAutoContinue is "autonomous but capped" (SC-5): at an escalation
+	// point, auto-grant StepsPerGrant more steps and KEEP WORKING in-process, up
+	// to MaxGrants times, firing OnGrant per grant. Once the grants are spent it
+	// falls through to the same terminal as EscalationAutonomous. This is the
+	// keep-working-to-completion-but-cap-at-N policy consumers otherwise
+	// hand-roll around the harness.
+	EscalationAutoContinue EscalationModeKind = "auto_continue"
 )
+
+// AutoGrantInfo is the detail handed to an EscalationAutoContinue OnGrant
+// callback each time the harness auto-grants more budget at an escalation point
+// (SC-5).
+type AutoGrantInfo struct {
+	// GrantNumber is the 1-based index of this grant within the exhausted scope
+	// (1..=MaxGrants).
+	GrantNumber uint32
+	// StepsGranted is the steps granted this round (the mode's StepsPerGrant).
+	StepsGranted uint32
+	// Phase is the budget scope phase that exhausted (e.g. "react",
+	// "plan_execute").
+	Phase string
+}
 
 // SurfaceToHumanEscalation returns the HITL escalation mode.
 func SurfaceToHumanEscalation() EscalationMode {
@@ -99,22 +139,46 @@ func AutonomousEscalation() EscalationMode {
 	return EscalationMode{Kind: EscalationAutonomous}
 }
 
-// MarshalJSON serialises EscalationMode as a "kind"-tagged object.
+// AutoContinueEscalation returns the "autonomous but capped" escalation mode
+// (SC-5): at each Escalate site, auto-grant stepsPerGrant more steps and keep
+// working in-process up to maxGrants times, firing onGrant per grant. onGrant
+// may be nil.
+func AutoContinueEscalation(maxGrants, stepsPerGrant uint32, onGrant func(AutoGrantInfo)) EscalationMode {
+	return EscalationMode{
+		Kind:          EscalationAutoContinue,
+		MaxGrants:     maxGrants,
+		StepsPerGrant: stepsPerGrant,
+		OnGrant:       onGrant,
+	}
+}
+
+// MarshalJSON serialises EscalationMode as a "kind"-tagged object. The
+// AutoContinue kind also emits max_grants / steps_per_grant; OnGrant is NEVER
+// serialized (funcs aren't JSON-serializable).
 func (m EscalationMode) MarshalJSON() ([]byte, error) {
 	switch m.Kind {
 	case EscalationSurfaceToHuman, EscalationAutonomous:
 		return json.Marshal(struct {
 			Kind EscalationModeKind `json:"kind"`
 		}{m.Kind})
+	case EscalationAutoContinue:
+		return json.Marshal(struct {
+			Kind          EscalationModeKind `json:"kind"`
+			MaxGrants     uint32             `json:"max_grants"`
+			StepsPerGrant uint32             `json:"steps_per_grant"`
+		}{m.Kind, m.MaxGrants, m.StepsPerGrant})
 	default:
 		return nil, fmt.Errorf("EscalationMode: unknown kind %q", m.Kind)
 	}
 }
 
-// UnmarshalJSON decodes the "kind"-tagged form.
+// UnmarshalJSON decodes the "kind"-tagged form. OnGrant is never restored (it is
+// not serialized).
 func (m *EscalationMode) UnmarshalJSON(data []byte) error {
 	var probe struct {
-		Kind EscalationModeKind `json:"kind"`
+		Kind          EscalationModeKind `json:"kind"`
+		MaxGrants     uint32             `json:"max_grants"`
+		StepsPerGrant uint32             `json:"steps_per_grant"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -122,6 +186,11 @@ func (m *EscalationMode) UnmarshalJSON(data []byte) error {
 	switch probe.Kind {
 	case EscalationSurfaceToHuman, EscalationAutonomous:
 		m.Kind = probe.Kind
+		return nil
+	case EscalationAutoContinue:
+		m.Kind = probe.Kind
+		m.MaxGrants = probe.MaxGrants
+		m.StepsPerGrant = probe.StepsPerGrant
 		return nil
 	default:
 		return fmt.Errorf("EscalationMode: unknown kind %q", probe.Kind)

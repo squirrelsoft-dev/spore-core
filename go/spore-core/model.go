@@ -219,14 +219,39 @@ type ToolSchema struct {
 // Request / params / response
 // ============================================================================
 
+// ReasoningEffort is a categorical reasoning effort for providers that expose
+// discrete levels (e.g. Ollama's `think: "low"|"medium"|"high"|"max"` for
+// gpt-oss-style models, and OpenAI's reasoning_effort request field). Distinct
+// from ModelParams.ReasoningBudget, which is a token count; when both are set,
+// providers prefer this categorical effort.
+type ReasoningEffort string
+
+const (
+	// ReasoningEffortLow is the "low" reasoning level.
+	ReasoningEffortLow ReasoningEffort = "low"
+	// ReasoningEffortMedium is the "medium" reasoning level.
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	// ReasoningEffortHigh is the "high" reasoning level.
+	ReasoningEffortHigh ReasoningEffort = "high"
+	// ReasoningEffortMax is the "max" reasoning level.
+	ReasoningEffortMax ReasoningEffort = "max"
+)
+
 // ModelParams carries optional generation knobs. Pointer fields serialise as
 // null when unset, matching the Rust Option<> semantics.
 type ModelParams struct {
 	Temperature     *float32 `json:"temperature"`
 	MaxTokens       *uint32  `json:"max_tokens"`
 	ReasoningBudget *uint32  `json:"reasoning_budget"`
-	TopP            *float32 `json:"top_p"`
-	StopSequences   []string `json:"stop_sequences"`
+	// ReasoningEffort is an opt-in categorical reasoning effort for providers
+	// that expose discrete levels. When set it takes precedence over
+	// ReasoningBudget (which only yields a boolean think: true). nil (the
+	// default) keeps serialized params byte-identical (the omitempty tag drops it
+	// from the wire, mirroring Rust's skip_serializing_if = "Option::is_none").
+	// Providers without level support ignore it.
+	ReasoningEffort *ReasoningEffort `json:"reasoning_effort,omitempty"`
+	TopP            *float32         `json:"top_p"`
+	StopSequences   []string         `json:"stop_sequences"`
 	// StructuredToolCalls is an opt-in hint for providers that support
 	// constrained decoding (Ollama via the `format` JSON-schema parameter).
 	// When true AND the request has tools, the provider forces tool calls to be
