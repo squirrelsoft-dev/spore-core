@@ -10,8 +10,9 @@ loop (recursion = ``run_strategy(self.inner, cx)``). These tests cover the
   strategy's verbatim terminal;
 * A.6 deep-resume — an already-Completed task on the durable checkpoint is not
   re-run;
-* A.5 output-contracts — a bare ``ReAct`` in a structured slot (plan / propose /
-  worker) is rejected at startup validation;
+* SC-1 — a bare ``ReAct`` in a structured slot (plan / propose / worker) MAY omit
+  its output schema; an absent schema is treated as empty/accept-all and passes
+  startup validation (the pre-SC-1 A.5 rejection is gone);
 * the recursive executor threads the shared :class:`ExecutionContext` through a
   stub strategy tree (mirrors the Rust recursion-stub test);
 * StrategyOutcome→RunResult mapping (Q5).
@@ -38,7 +39,6 @@ from spore_core import (
     FinalResponse,
     HaltReasonConfigurationError,
     HarnessConfig,
-    HarnessErrorException,
     HarnessErrorInvalidConfiguration,
     HarnessRunOptions,
     InMemoryStorageProvider,
@@ -352,15 +352,19 @@ def _react_leaf(output: str | None = None) -> ReactConfig:
         ),
     ],
 )
-def test_structured_slot_rejects_bare_react_without_output_schema(
+def test_structured_slot_allows_bare_react_without_output_schema(
     tree: object, slot_name: str
 ) -> None:
+    # SC-1: a bare ReAct in a structured slot (``plan`` / ``worker`` / ``propose``)
+    # MAY omit its output schema. An absent schema is treated as empty/accept-all,
+    # so validation no longer rejects it (pre-SC-1 this raised
+    # InvalidConfiguration naming the slot). The schema-registration ceremony is
+    # gone.
+    _ = slot_name
     reg = _wired_registry()
     task = Task.new("contract", new_session_id(), tree)  # type: ignore[arg-type]
-    with pytest.raises(HarnessErrorException) as ei:
-        reg.validate(task)
-    assert isinstance(ei.value.error, HarnessErrorInvalidConfiguration)
-    assert slot_name in ei.value.error.reason
+    # No raise == valid (SC-1).
+    reg.validate(task)
 
 
 def test_structured_slot_accepts_react_with_output_schema() -> None:
@@ -383,19 +387,24 @@ def test_structured_slot_accepts_combinator_child() -> None:
     reg.validate(task)  # no raise
 
 
-async def test_output_contract_rejected_at_harness_startup() -> None:
-    """The harness runs registry validation at the entry of ``run`` — a bare
-    ReAct in the structured plan slot is a startup ``ConfigurationError`` BEFORE
-    any agent turn."""
+async def test_output_contract_not_rejected_at_harness_startup() -> None:
+    """SC-1: a bare ReAct in the structured plan slot is NO LONGER a startup
+    ``ConfigurationError``. The harness runs registry validation at the entry of
+    ``run``; with the SC-1 schema requirement gone, the bare-ReAct plan passes
+    validation rather than halting with a ``ConfigurationError`` before the first
+    turn (pre-SC-1 this run returned ``HaltReasonConfigurationError`` with the
+    agent never invoked)."""
     a = _agent()
+    a.push(FinalResponse(content="done", usage=_usage()))
     reg = _wired_registry()
     h = StandardHarness(_config(a, registry=reg))
     tree = PlanExecuteConfig(plan=_react_leaf(), execute=_react_leaf())
-    task = Task.new("contract", SessionId("startup-s1"), tree)
+    task = Task.new("contract", SessionId("startup-s1"), tree, budget=BudgetLimits(max_turns=None))
     r = await h.run(HarnessRunOptions(task))
-    assert isinstance(r, RunResultFailure)
-    assert isinstance(r.reason, HaltReasonConfigurationError)
-    assert a.call_count == 0  # rejected before the first turn
+    # The structured-slot contract no longer fails the run at startup validation.
+    assert not (
+        isinstance(r, RunResultFailure) and isinstance(r.reason, HaltReasonConfigurationError)
+    )
 
 
 # ---------------------------------------------------------------------------

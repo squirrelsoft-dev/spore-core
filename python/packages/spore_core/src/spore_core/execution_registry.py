@@ -47,7 +47,6 @@ from .harness import (
     AgentRef,
     HarnessError,
     HarnessErrorException,
-    HarnessErrorInvalidConfiguration,
     HarnessErrorStrategyNotFound,
     HarnessErrorUnresolvedHandle,
     HillClimbingConfig,
@@ -284,15 +283,18 @@ class ExecutionRegistry:
             if ls.output is not None:
                 self._check_schema(ls.output)
         elif isinstance(ls, PlanExecuteConfig):
-            # A.5 (#124, Q3): the ``plan`` slot is STRUCTURED — it must yield a
-            # task graph. A bare ``ReAct`` there needs an output schema.
-            self._check_structured_slot(ls.plan, "plan")
+            # SC-1: a bare ``ReAct`` in the structured ``plan`` slot MAY omit its
+            # ``output`` schema. An absent schema is treated as an empty
+            # (accept-all) one, so a consumer no longer has to register a
+            # do-nothing schema purely to pass startup validation. When
+            # ``enforce_output_schemas`` is off the schema is unused anyway; when
+            # on, an empty schema is a no-op constraint.
             self._walk_strategy(ls.plan)
             self._walk_strategy(ls.execute)
         elif isinstance(ls, SelfVerifyingConfig):
-            # A.5: the ``inner`` (worker) slot is STRUCTURED — its result must be
-            # evaluable. A bare ``ReAct`` worker needs an output schema.
-            self._check_structured_slot(ls.inner, "worker")
+            # SC-1: the ``inner`` (worker) slot MAY omit its ``output`` schema (an
+            # absent schema is treated as empty/accept-all); no registration is
+            # required just to pass validation.
             self._walk_strategy(ls.inner)
             # #124 Q1: the evaluator's wire string (a ``SchemaRef``) is the
             # VERIFIER registry key — resolved against the ``verifiers`` map.
@@ -308,34 +310,15 @@ class ExecutionRegistry:
             self._walk_strategy(ls.inner)
             self._check_agent(ls.agent)
         elif isinstance(ls, HillClimbingConfig):
-            # A.5: the ``inner`` (propose) slot is STRUCTURED — it must yield a
-            # candidate. A bare ``ReAct`` proposer needs an output schema.
-            self._check_structured_slot(ls.inner, "propose")
+            # SC-1: the ``inner`` (propose) slot MAY omit its ``output`` schema (an
+            # absent schema is treated as empty/accept-all); no registration is
+            # required just to pass validation.
             self._walk_strategy(ls.inner)
             # #124 Q2: the evaluator's wire string is resolved against the sixth
             # ``metric_evaluators`` map (not ``agents``).
             self._check_metric_evaluator(ls.evaluator)
         else:  # pragma: no cover — closed union; exhaustive above
             raise AssertionError(f"unknown loop strategy: {ls!r}")
-
-    @staticmethod
-    def _check_structured_slot(slot: LoopStrategy, slot_name: str) -> None:
-        """A.5 output-contract enforcement (#124, Q3): a bare ``ReAct`` feeding a
-        STRUCTURED slot (``plan`` ⇒ task graph, ``propose`` ⇒ candidate,
-        ``worker`` ⇒ evaluable result) MUST declare ``ReAct.output`` set. A
-        combinator child carries its own contract, so this check applies only to a
-        leaf. Raises :class:`~spore_core.harness.HarnessErrorException` wrapping an
-        :class:`~spore_core.harness.HarnessErrorInvalidConfiguration` naming the
-        offending slot."""
-        if isinstance(slot, ReactConfig) and slot.output is None:
-            raise HarnessErrorException(
-                HarnessErrorInvalidConfiguration(
-                    reason=(
-                        f"a bare ReAct in the structured `{slot_name}` slot requires "
-                        "`output = Some(schema)` so the slot yields a typed result"
-                    )
-                )
-            )
 
     def _check_agent(self, ref: AgentRef) -> None:
         if ref not in self.agents:
@@ -474,7 +457,6 @@ __all__ = [
     "StrategyResolutionCustom",
     "HarnessError",
     "HarnessErrorException",
-    "HarnessErrorInvalidConfiguration",
     "HarnessErrorStrategyNotFound",
     "HarnessErrorUnresolvedHandle",
 ]

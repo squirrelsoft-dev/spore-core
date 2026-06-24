@@ -8569,6 +8569,34 @@ class StandardHarness:
         # ``eval_toolset`` scoped to read-only tools so non-filesystem
         # side-effecting tools the sandbox does not gate stay out of reach.
         eval_config.middleware = None
+        # SC-30: when the eval phase falls back to the GLOBAL catalogue (empty
+        # ``eval_toolset``), auto-derive a read-only VIEW of it — advertise +
+        # dispatch only the intersection with ``StandardTools.readonly_set()`` (the
+        # hardcoded ``READONLY_EVAL_TOOL_NAMES``), so the reviewer cannot reach
+        # write / exec / side-effecting tools (incl. web/MCP the read-only sandbox
+        # does not gate) WITHOUT the consumer registering a scoped read-only
+        # toolset. A non-empty ``eval_toolset`` is an explicit opt-in and is left
+        # untouched (it resolves via its own catalogue).
+        if eval_toolset == "" and eval_config.catalogue_registry is not None:
+            from .tool_registry import (
+                READONLY_EVAL_TOOL_NAMES,
+                ReadOnlyToolView,
+                RealToolRegistry,
+            )
+
+            inner = RealToolRegistry(
+                eval_config.catalogue_registry,
+                eval_config.sandbox,
+                eval_session_id,
+                eval_config.project_id,
+                eval_config.storage.run(),
+                eval_config.storage.memory(),
+            )
+            # ``catalogue_registry`` is now cleared, so the empty-handle path of
+            # ``_effective_tool_registry`` returns this filtered ``tool_registry``
+            # for the reviewer's dispatch + schema advertising.
+            eval_config.tool_registry = ReadOnlyToolView(inner, set(READONLY_EVAL_TOOL_NAMES))
+            eval_config.catalogue_registry = None
         eval_harness = StandardHarness(eval_config)
 
         eval_state = SessionState()

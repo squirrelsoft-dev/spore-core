@@ -41,9 +41,12 @@ from spore_core import (
     HarnessErrorStrategyNotFound,
     HarnessErrorUnresolvedHandle,
     HarnessRunOptions,
+    HillClimbingConfig,
     MockAgent,
     NoopContextManager,
+    PlanExecuteConfig,
     ReactConfig,
+    SelfVerifyingConfig,
     RunResultFailure,
     RunResultSuccess,
     SchemaRef,
@@ -221,6 +224,73 @@ def test_validate_happy_path_react() -> None:
     reg = _fully_wired_registry()
     task = Task.new("ok", SessionId("s1"), _react_leaf("a1", "t1", output="s1"))
     # No raise == valid.
+    reg.validate(task)
+
+
+# ---------------------------------------------------------------------------
+# SC-1: structured slots may omit the output schema
+#
+# Pre-SC-1 a bare ReAct in a structured slot (``plan`` / ``worker`` / ``propose``)
+# WITHOUT an output schema was rejected with InvalidConfiguration. SC-1 drops
+# that ceremony: an absent schema is treated as empty/accept-all, so the strategy
+# now validates with NO schema registered anywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_structured_plan_slot_allows_bare_react_without_output_schema() -> None:
+    # A PlanExecute whose ``plan`` slot is a bare ReAct with NO output schema —
+    # and with no schema registered anywhere — now passes startup validation.
+    reg = (
+        ExecutionRegistry.builder().agent("a1", _agent()).toolset("t1", EmptyToolRegistry()).build()
+    )
+    tree = PlanExecuteConfig(
+        plan=_react_leaf("a1", "t1"),  # output=None — no schema needed
+        execute=_react_leaf("a1", "t1"),
+    )
+    task = Task.new("contract", SessionId("s1"), tree)
+    # No raise == valid (SC-1).
+    reg.validate(task)
+
+
+def test_structured_worker_slot_allows_bare_react_without_output_schema() -> None:
+    # A SelfVerifying whose ``inner`` (worker) slot is a bare ReAct with NO output
+    # schema passes validation; the ``evaluator`` still resolves as a VERIFIER key.
+    reg = (
+        ExecutionRegistry.builder()
+        .agent("a1", _agent())
+        .toolset("t1", EmptyToolRegistry())
+        .verifier("v1", object())
+        .build()
+    )
+    tree = SelfVerifyingConfig(
+        inner=_react_leaf("a1", "t1"),  # output=None — no schema needed
+        evaluator="v1",
+    )
+    task = Task.new("contract", SessionId("s1"), tree)
+    # No raise == valid (SC-1).
+    reg.validate(task)
+
+
+def test_structured_propose_slot_allows_bare_react_without_output_schema() -> None:
+    # A HillClimbing whose ``inner`` (propose) slot is a bare ReAct with NO output
+    # schema passes validation; the ``evaluator`` still resolves as a metric key.
+    reg = (
+        ExecutionRegistry.builder()
+        .agent("a1", _agent())
+        .toolset("t1", EmptyToolRegistry())
+        .metric_evaluator("m1", object())
+        .build()
+    )
+    tree = HillClimbingConfig(
+        inner=_react_leaf("a1", "t1"),  # output=None — no schema needed
+        direction="maximize",
+        max_stagnation=3,
+        revert_on_no_improvement=False,
+        min_improvement_delta=0.0,
+        evaluator="m1",
+    )
+    task = Task.new("contract", SessionId("s1"), tree)
+    # No raise == valid (SC-1).
     reg.validate(task)
 
 

@@ -92,7 +92,33 @@ from .model import ToolCall
 from .model import ToolSchema as ModelToolSchema
 
 if TYPE_CHECKING:
+    from .harness import ToolRegistry as HarnessLoopToolRegistry
     from .storage import MemoryStore, ProjectId, RunStore
+
+# ============================================================================
+# SC-30 — read-only eval-phase allow-list
+# ============================================================================
+
+#: SC-30: the read-only tool names auto-derived for the SelfVerifying evaluate
+#: phase when ``eval_toolset`` is empty. These are exactly the names produced by
+#: ``StandardTools.readonly_set()`` in ``spore_tools``. The constant is hardcoded
+#: HERE (in ``spore_core``) rather than imported from ``spore_tools`` because
+#: ``spore_tools`` DEPENDS ON ``spore_core`` — importing it at module load would
+#: risk an import cycle. A drift-guard test (in ``spore_tools``, which already
+#: imports core) asserts this set equals the live ``readonly_set()`` names so the
+#: two never silently diverge.
+READONLY_EVAL_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "list_dir",
+        "grep_files",
+        "grep",
+        "find_files",
+        "web_fetch",
+        "web_search",
+    }
+)
+
 
 # ============================================================================
 # ToolContext — the storage seam handed to every tool (#75)
@@ -574,6 +600,50 @@ class RealToolRegistry:
 
 
 # ============================================================================
+# ReadOnlyToolView — SC-30 read-only view over a harness-loop ToolRegistry
+# ============================================================================
+
+
+class ReadOnlyToolView:
+    """SC-30: a read-only VIEW over an inner harness-loop
+    :class:`~spore_core.harness.ToolRegistry`.
+
+    It advertises (:meth:`schemas`) and dispatches ONLY tools whose name is in
+    ``allow`` — the INTERSECTION of the wrapped catalogue with a read-only
+    allow-list (:data:`READONLY_EVAL_TOOL_NAMES`, the
+    ``StandardTools.readonly_set()`` names). Used internally for the SelfVerifying
+    evaluate phase so a reviewer cannot reach write / exec / side-effecting tools
+    (web/MCP the read-only sandbox does not gate) even though the work phase could
+    — WITHOUT the consumer registering a scoped read-only toolset. A
+    non-allow-listed dispatch (which the model should never request, since it is
+    never advertised) returns a recoverable :class:`~spore_core.harness.ToolOutputError`.
+    A consumer that wants a different reviewer toolset sets an explicit
+    ``eval_toolset`` handle, which bypasses this view entirely.
+
+    Satisfies the harness-loop ``ToolRegistry`` Protocol structurally (it does not
+    inherit it); mirrors Rust's ``ReadOnlyToolView``.
+    """
+
+    def __init__(self, inner: HarnessLoopToolRegistry, allow: set[str]) -> None:
+        self._inner = inner
+        self._allow = set(allow)
+
+    async def dispatch(self, call: ToolCall) -> ToolOutput:
+        if call.name in self._allow:
+            return await self._inner.dispatch(call)
+        return ToolOutputError(
+            message=f"tool `{call.name}` is not available in the read-only evaluate phase",
+            recoverable=True,
+        )
+
+    def is_always_halt(self, tool_name: str) -> bool:
+        return self._inner.is_always_halt(tool_name)
+
+    def schemas(self) -> list[ModelToolSchema]:
+        return [s for s in self._inner.schemas() if s.name in self._allow]
+
+
+# ============================================================================
 # Mock tools (test utility)
 # ============================================================================
 
@@ -690,11 +760,13 @@ _: Awaitable[None] | None = None
 
 
 __all__ = [
+    "READONLY_EVAL_TOOL_NAMES",
     "AllowAllSandbox",
     "DenyAllSandbox",
     "DispatchError",
     "EchoTool",
     "FailingTool",
+    "ReadOnlyToolView",
     "RealToolRegistry",
     "RegistrationError",
     "StandardToolRegistry",
