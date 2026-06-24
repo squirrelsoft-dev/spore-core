@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "spore-core TypeScript example 12: cordyceps — the Composable Execution capstone (#117–#131). A declarative LoopStrategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] is loaded VERBATIM from the canonical fixture, its string handles wired to collaborators in an ExecutionRegistry, and run end-to-end: plan→ready-set DAG, Default-FAIL self-verify, bounded runaway, resume-by-handle-reresolution, and the #114 consult ladder PRESERVED host-mediated (seam moved off SubagentTool). The `audit` skill rides the global SkillInjectingContextManager always-active.",
+  "description": "spore-core TypeScript example 12: cordyceps — the Composable Execution capstone (#117–#131). A declarative LoopStrategy tree Ralph[PlanExecute[ReAct, SelfVerifying[ReAct]]] is loaded VERBATIM from the canonical fixture, its string handles wired to collaborators in an ExecutionRegistry, and run end-to-end: plan→ready-set DAG, Default-FAIL self-verify, bounded runaway, resume-by-handle-reresolution, and the #114 consult ladder PRESERVED host-mediated (seam moved off SubagentTool). The `audit` skill is registered via the harness-native SkillCatalog (.skills(catalog)) and pre-activated, so its body reaches the model structurally each turn (#159).",
   "scripts": {
     "start": "tsx src/main.ts",
     "test": "vitest run",
