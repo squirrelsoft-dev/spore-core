@@ -505,3 +505,81 @@ func canonical(t *testing.T, b []byte) string {
 	}
 	return string(out)
 }
+
+// ============================================================================
+// SC-1: structured slots may omit the output schema
+// ============================================================================
+//
+// Pre-SC-1 the registry's walkStrategy rejected a bare ReAct (output == nil) in
+// a structured slot (PlanExecute.plan / SelfVerifying.worker / HillClimbing.
+// propose) with an InvalidConfigurationError, forcing consumers to register a
+// do-nothing schema and stamp output = Some(SchemaRef) purely to pass startup
+// validation. SC-1 drops that requirement: an absent output schema is now
+// treated as empty/accept-all, so each of these now validates with NO schema
+// registered anywhere. The leaf's own Output path is preserved elsewhere (a
+// registered schema is still resolved when present); only the REQUIREMENT is
+// gone.
+
+func TestStructuredPlanSlotAllowsBareReActWithoutSchema(t *testing.T) {
+	// PlanExecute whose plan slot is a bare ReAct with Output == nil, no schema
+	// registered. Pre-SC-1 this returned InvalidConfiguration naming "plan".
+	reg := NewExecutionRegistryBuilder().
+		Agent("a1", stubAgent{id: "a1"}).
+		Toolset("t1", NewScriptedToolRegistry()).
+		Build()
+	plan := reactLeaf("a1", "t1") // Output == nil — no schema needed
+	exec := reactLeaf("a1", "t1")
+	tree := LoopStrategy{Kind: StrategyPlanExecute, PlanExecute: &PlanExecuteConfig{
+		Plan:     &plan,
+		Execute:  &exec,
+		Behavior: defaultBudgetBehavior(),
+	}}
+	task := NewTask("contract", NewSessionID(), tree)
+	if err := reg.Validate(task); err != nil {
+		t.Fatalf("a bare ReAct plan slot without an output schema must validate (SC-1), got %v", err)
+	}
+}
+
+func TestStructuredWorkerSlotAllowsBareReActWithoutSchema(t *testing.T) {
+	// SelfVerifying whose inner (worker) slot is a bare ReAct with Output == nil,
+	// no schema registered. The evaluator handle still resolves as a VERIFIER.
+	reg := NewExecutionRegistryBuilder().
+		Agent("a1", stubAgent{id: "a1"}).
+		Toolset("t1", NewScriptedToolRegistry()).
+		Verifier("v1", regStubVerifier{}).
+		Build()
+	inner := reactLeaf("a1", "t1") // Output == nil — no schema needed
+	tree := LoopStrategy{Kind: StrategySelfVerifying, SelfVerify: &SelfVerifyingConfig{
+		Inner:     &inner,
+		Evaluator: SchemaRef("v1"),
+		Behavior:  defaultBudgetBehavior(),
+	}}
+	task := NewTask("contract", NewSessionID(), tree)
+	if err := reg.Validate(task); err != nil {
+		t.Fatalf("a bare ReAct worker slot without an output schema must validate (SC-1), got %v", err)
+	}
+}
+
+func TestStructuredProposeSlotAllowsBareReActWithoutSchema(t *testing.T) {
+	// HillClimbing whose inner (propose) slot is a bare ReAct with Output == nil,
+	// no schema registered. The evaluator handle still resolves as a metric
+	// evaluator (an AgentRef against the metricEvaluators map).
+	reg := NewExecutionRegistryBuilder().
+		Agent("a1", stubAgent{id: "a1"}).
+		Toolset("t1", NewScriptedToolRegistry()).
+		MetricEvaluator("m1", &scriptedMetricEvaluator{}).
+		Build()
+	inner := reactLeaf("a1", "t1") // Output == nil — no schema needed
+	tree := LoopStrategy{Kind: StrategyHillClimbing, HillClimbing: &HillClimbingConfig{
+		Inner:               &inner,
+		Direction:           OptimizationMaximize,
+		MaxStagnation:       2,
+		MinImprovementDelta: 0.1,
+		Evaluator:           AgentRef("m1"),
+		Behavior:            defaultBudgetBehavior(),
+	}}
+	task := NewTask("contract", NewSessionID(), tree)
+	if err := reg.Validate(task); err != nil {
+		t.Fatalf("a bare ReAct propose slot without an output schema must validate (SC-1), got %v", err)
+	}
+}

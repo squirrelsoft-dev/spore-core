@@ -10,8 +10,9 @@
 //   - the no-executor scaffold path returns a typed Failed (never a panic)
 //   - non-terminal pause (WaitingForHuman) propagates VERBATIM through the
 //     executor (the terminal-override path)
-//   - A.5 output-contract enforcement: a structured slot rejects a bare ReAct
-//     without an output schema (and accepts one with a schema / a combinator)
+//   - SC-1 (was A.5 output-contract enforcement): a structured slot ALLOWS a
+//     bare ReAct without an output schema (and still accepts one with a schema /
+//     a combinator — a registered schema is resolved when present)
 //   - A.6 deep-resume: an already-Completed task on the durable checkpoint is
 //     NOT re-run
 //   - SelfVerifying is Default-FAIL and bounded; Ralph resets the window per
@@ -166,7 +167,7 @@ func TestDeepResumeNoCheckpointRunsAllTasks(t *testing.T) {
 	}
 }
 
-// ── A.5 output-contract enforcement (#124, Q3) ──────────────────────────────
+// ── SC-1: structured slots may omit the output schema (was A.5, #124 Q3) ─────
 
 func outputContractRegistry() ExecutionRegistry {
 	return NewExecutionRegistryBuilder().
@@ -176,55 +177,52 @@ func outputContractRegistry() ExecutionRegistry {
 		Schema("worker-schema", json.RawMessage(`{}`)).
 		// #124 Q1a: a SelfVerifying evaluator key resolves as a VERIFIER.
 		Verifier("eval-schema", regStubVerifier{}).
+		// SC-1: with the structured-slot check gone, a HillClimbing propose case
+		// proceeds to checkMetricEvaluator, so the evaluator key must resolve as a
+		// metric evaluator (it previously short-circuited at the removed check).
+		MetricEvaluator("metric-eval", &scriptedMetricEvaluator{}).
 		Build()
 }
 
-// A PlanExecute whose plan slot is a bare ReAct with no output schema violates
-// the A.5 contract: validation rejects it with InvalidConfigurationError naming
-// the slot, BEFORE any handle resolution.
-func TestStructuredSlotRejectsBareReActWithoutOutputSchema(t *testing.T) {
+// SC-1: a PlanExecute whose plan slot is a bare ReAct with NO output schema —
+// and with no schema registered for it anywhere — now passes startup validation.
+// The structured-slot ceremony (register a do-nothing schema + stamp output =
+// SchemaRef just to validate) is gone; an absent schema is treated as
+// empty/accept-all. (Pre-SC-1 this returned InvalidConfiguration naming "plan".)
+func TestStructuredSlotAllowsBareReActWithoutOutputSchema(t *testing.T) {
 	reg := outputContractRegistry()
 	tree := PlanExecuteStrategy(PlanExecuteConfig{
-		Plan:    PtrStrategy(reactLeaf("a1", "t1")), // output: nil
+		Plan:    PtrStrategy(reactLeaf("a1", "t1")), // output: nil — no schema needed
 		Execute: PtrStrategy(reactLeaf("a1", "t1")),
 	})
 	task := NewTask("contract", NewSessionID(), tree)
-	err := reg.Validate(task)
-	ce, ok := err.(*InvalidConfigurationError)
-	if !ok {
-		t.Fatalf("expected InvalidConfigurationError, got %T (%v)", err, err)
-	}
-	if !contains(ce.Message, "plan") {
-		t.Fatalf("error should name the slot: %q", ce.Message)
+	if err := reg.Validate(task); err != nil {
+		t.Fatalf("a bare ReAct plan slot without an output schema must validate (SC-1), got %v", err)
 	}
 }
 
-// The worker slot (SelfVerifying.Inner) and the propose slot
-// (HillClimbing.Inner) are equally structured.
-func TestStructuredSlotRejectsBareReActWorkerAndPropose(t *testing.T) {
+// SC-1: the worker slot (SelfVerifying.Inner) and the propose slot
+// (HillClimbing.Inner) are equally relieved of the schema requirement.
+func TestStructuredSlotAllowsBareReActWorkerAndPropose(t *testing.T) {
 	reg := outputContractRegistry()
 
 	sv := SelfVerifyingStrategy(SelfVerifyingConfig{
-		Inner:     PtrStrategy(reactLeaf("a1", "t1")),
+		Inner:     PtrStrategy(reactLeaf("a1", "t1")), // output: nil — no schema needed
 		Evaluator: SchemaRef("eval-schema"),
 	})
-	if err := reg.Validate(NewTask("w", NewSessionID(), sv)); err == nil {
-		t.Fatal("worker slot accepted a bare ReAct without output schema")
-	} else if ce, ok := err.(*InvalidConfigurationError); !ok || !contains(ce.Message, "worker") {
-		t.Fatalf("expected worker-slot InvalidConfigurationError, got %v", err)
+	if err := reg.Validate(NewTask("w", NewSessionID(), sv)); err != nil {
+		t.Fatalf("worker slot bare ReAct without output schema must validate (SC-1), got %v", err)
 	}
 
 	hc := HillClimbingStrategy(HillClimbingConfig{
-		Inner:               PtrStrategy(reactLeaf("a1", "t1")),
+		Inner:               PtrStrategy(reactLeaf("a1", "t1")), // output: nil — no schema needed
 		Direction:           OptimizationMinimize,
 		MaxStagnation:       1,
 		MinImprovementDelta: 0.0,
-		Evaluator:           AgentRef("a1"),
+		Evaluator:           AgentRef("metric-eval"),
 	})
-	if err := reg.Validate(NewTask("p", NewSessionID(), hc)); err == nil {
-		t.Fatal("propose slot accepted a bare ReAct without output schema")
-	} else if ce, ok := err.(*InvalidConfigurationError); !ok || !contains(ce.Message, "propose") {
-		t.Fatalf("expected propose-slot InvalidConfigurationError, got %v", err)
+	if err := reg.Validate(NewTask("p", NewSessionID(), hc)); err != nil {
+		t.Fatalf("propose slot bare ReAct without output schema must validate (SC-1), got %v", err)
 	}
 }
 

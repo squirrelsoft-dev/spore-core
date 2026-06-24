@@ -598,9 +598,9 @@ func TestReadFileRangeFixtureReplay(t *testing.T) {
 		InitialContent string          `json:"initial_content"`
 		Params         json.RawMessage `json:"params"`
 		Expected       struct {
-			Kind           string `json:"kind"`
-			Content        string `json:"content"`
-			Recoverable    *bool  `json:"recoverable"`
+			Kind            string `json:"kind"`
+			Content         string `json:"content"`
+			Recoverable     *bool  `json:"recoverable"`
 			MessageContains string `json:"message_contains"`
 		} `json:"expected"`
 	}

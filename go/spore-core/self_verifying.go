@@ -235,6 +235,38 @@ func (h *StandardHarness) EvaluatePhase(
 	// the sandbox does not gate stay out of reach.) Observability / pricing /
 	// storage seams stay (they are separate fields on the copied config).
 	evalConfig.Middleware = nil
+	// SC-30: when the eval phase falls back to the GLOBAL catalogue (empty
+	// evalToolset), auto-derive a read-only VIEW of it — advertise + dispatch only
+	// the intersection with the read-only allow-list (ReadonlyEvalToolNames, the
+	// names of StandardTools.ReadonlySet()) — so the reviewer cannot reach write /
+	// exec / side-effecting tools (incl. web/MCP the read-only sandbox does not
+	// gate) WITHOUT the consumer registering a scoped read-only toolset. A non-empty
+	// evalToolset is an explicit opt-in and is left untouched (it resolves via its
+	// own catalogue through the normal effectiveToolRegistry path).
+	//
+	// Go wiring (Option Go-A): effectiveToolRegistry normally injects the per-run
+	// ToolContext on the shared *StandardToolRegistry CatalogueRegistry. By setting
+	// ToolRegistry = view and CatalogueRegistry = nil we BYPASS that injection, so
+	// we inject the eval ToolContext on the catalogue ourselves first, then wrap.
+	// Safe: phases run sequentially (the work phase has already completed) and the
+	// view is rebuilt fresh each EvaluatePhase call; effectiveToolRegistry re-sets
+	// the ToolContext for any subsequent build iteration on the original config.
+	if string(evalToolset) == "" && evalConfig.CatalogueRegistry != nil {
+		evalConfig.CatalogueRegistry.SetToolContext(
+			NewToolContextWithProject(
+				evalSessionID,
+				evalConfig.ProjectNamespace,
+				evalConfig.ToolRunStore,
+				evalConfig.ToolMemoryStore,
+			),
+		)
+		view := &ReadOnlyToolView{
+			inner: evalConfig.CatalogueRegistry,
+			allow: readonlyEvalAllowSet(),
+		}
+		evalConfig.ToolRegistry = view
+		evalConfig.CatalogueRegistry = nil
+	}
 	evalHarness := NewStandardHarness(evalConfig)
 
 	var evalState SessionState

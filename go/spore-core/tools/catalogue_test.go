@@ -1,7 +1,10 @@
 package tools
 
 import (
+	"sort"
 	"testing"
+
+	sporecore "github.com/squirrelsoft-dev/spore-core/go/spore-core"
 )
 
 func names(set []StandardTool) map[string]bool {
@@ -78,5 +81,32 @@ func TestStandardToolBundlesImplAndSchema(t *testing.T) {
 	}
 	if !st.Schema.Annotations.Destructive {
 		t.Fatalf("edit_file schema must be destructive")
+	}
+}
+
+// TestReadonlyEvalToolNamesMatchesReadonlySet is the SC-30 DRIFT GUARD: the core
+// package holds a hand-maintained read-only allow-list (sporecore.
+// ReadonlyEvalToolNames) because core cannot import this tools package (import
+// cycle). This test — in a package that CAN import both — asserts that list is
+// exactly the set of registered names from StandardTools.ReadonlySet(), so the
+// SelfVerifying eval-phase view can never silently diverge from the catalogue's
+// read-only preset.
+func TestReadonlyEvalToolNamesMatchesReadonlySet(t *testing.T) {
+	got := sort.StringSlice(append([]string(nil), sporecore.ReadonlyEvalToolNames...))
+	got.Sort()
+
+	want := make([]string, 0)
+	for name := range names(StandardTools{}.ReadonlySet()) {
+		want = append(want, name)
+	}
+	sort.Strings(want)
+
+	if len(got) != len(want) {
+		t.Fatalf("ReadonlyEvalToolNames (%v) must match ReadonlySet() names (%v)", []string(got), want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("ReadonlyEvalToolNames (%v) drifted from ReadonlySet() names (%v) at %d", []string(got), want, i)
+		}
 	}
 }
