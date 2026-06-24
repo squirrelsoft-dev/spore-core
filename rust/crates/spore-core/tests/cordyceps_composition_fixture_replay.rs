@@ -612,6 +612,7 @@ fn small_budget_pe() -> LoopStrategy {
         agent: AgentRef("executor".into()),
         toolset: ToolsetRef("exec-tools".into()),
         output: Some(SchemaRef("worker-schema".into())),
+        system_prompt: None,
     });
     let plan = LoopStrategy::ReAct(ReactConfig {
         behavior: BudgetExhaustedBehavior::Escalate,
@@ -619,6 +620,7 @@ fn small_budget_pe() -> LoopStrategy {
         agent: AgentRef("planner".into()),
         toolset: ToolsetRef("plan-tools".into()),
         output: Some(SchemaRef("plan-schema".into())),
+        system_prompt: None,
     });
     LoopStrategy::PlanExecute(PlanExecuteConfig {
         behavior: BudgetExhaustedBehavior::Escalate,

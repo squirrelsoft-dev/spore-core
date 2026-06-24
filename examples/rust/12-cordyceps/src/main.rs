@@ -494,6 +494,7 @@ fn plan_execute_strategy() -> LoopStrategy {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         })),
         execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(MAX_STEPS))),
         plan_model: None,

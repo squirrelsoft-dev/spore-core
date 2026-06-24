@@ -470,6 +470,19 @@ pub struct ReactConfig {
     pub toolset: ToolsetRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<SchemaRef>,
+    /// Per-leaf operating system-prompt OVERRIDE (SC-10). `None` (the default)
+    /// preserves today's behaviour: the leaf's turn window uses the global
+    /// [`HarnessConfig::system_prompt`]. When `Some`, THIS prompt REPLACES the
+    /// global one for every turn of this leaf's window — the leaf sees ONLY its
+    /// own prompt, nothing leaks from the configured global prompt. This is the
+    /// per-leaf prompt half of SC-10; the per-leaf TOOLSET half is the existing
+    /// [`toolset`](Self::toolset) handle. In a [`PlanExecuteConfig`] this lets the
+    /// plan and execute phases run under DISTINCT system prompts (each phase's
+    /// leaf carries its own). Omitted from the wire when unset, so existing
+    /// strategy configs serialize byte-identically. Canonical position: LAST
+    /// field (after [`output`](Self::output)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 impl ReactConfig {
@@ -483,6 +496,7 @@ impl ReactConfig {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }
     }
 
@@ -1280,6 +1294,11 @@ pub trait StrategyExecutor: Send + Sync {
         // Issue #139: the `N` extra validation-retry turns (total attempts =
         // `1 + N`). Ignored when `output_schema` is `None`.
         output_schema_max_retries: u32,
+        // SC-10: the leaf's per-node system-prompt OVERRIDE (`ReactConfig::system_prompt`).
+        // `None` ⇒ the window uses the global `config.system_prompt` (byte-identical
+        // to pre-SC-10). `Some` ⇒ this prompt REPLACES the global one for every turn
+        // of this window, so the leaf sees ONLY its own prompt. Mirrors `toolset`.
+        system_prompt: Option<String>,
     ) -> BoxFut<'a, RunResult>;
 
     /// Resolve an [`AgentRef`] to its registered agent (#124). The leaf and the
@@ -1632,6 +1651,9 @@ JSON schema: {}",
                     // and the retry budget so the window validates the terminal.
                     output_schema,
                     output_schema_max_retries,
+                    // SC-10: thread THIS leaf's per-node system-prompt override
+                    // (None ⇒ the window keeps using the global prompt).
+                    self.system_prompt.clone(),
                 )
                 .await;
             executor.finalize(&result).await;
@@ -8058,6 +8080,10 @@ impl StandardHarness {
                 // enforcement seam). `None`/`0` ⇒ byte-for-byte pre-#139.
                 None,
                 0,
+                // SC-10: the legacy `run_react` wrapper carries no per-leaf prompt
+                // override (only the recursive `ReactConfig::run` does) ⇒ the
+                // window uses the global `config.system_prompt`, byte-identical.
+                None,
             )
             .await;
         match &result {
@@ -8166,6 +8192,12 @@ impl StandardHarness {
         // constrains decoding (Anthropic/OpenAI ignore it).
         output_schema: Option<serde_json::Value>,
         output_schema_max_retries: u32,
+        // SC-10: the leaf's per-node system-prompt OVERRIDE. `None` ⇒ the global
+        // `config.system_prompt` is used (byte-identical to pre-SC-10). `Some` ⇒
+        // it REPLACES the global prompt for every turn of this window, so the leaf
+        // sees ONLY its own prompt (the per-leaf prompt half of SC-10; the toolset
+        // half is the `toolset` arg above).
+        system_prompt: Option<String>,
     ) -> RunResult {
         let session_id = task.session_id.clone();
         // Resolve the effective tool registry once per turn-loop window (all
@@ -8329,7 +8361,16 @@ impl StandardHarness {
             // no-structural-block path stays byte-identical. The `starts_with`
             // guard keeps a resumed/seeded session that already leads with the
             // system prompt from being given it twice.
-            if let Some(system_prompt) = self.config.system_prompt.as_ref() {
+            //
+            // SC-10: a leaf's per-node `system_prompt` override WINS over the
+            // global `config.system_prompt`. When this window's leaf carries one,
+            // it is used EXCLUSIVELY (the global prompt does not leak in), so the
+            // plan and execute phases of a `PlanExecuteConfig` can run under
+            // distinct prompts. With no leaf override (`None`) the global prompt
+            // applies exactly as before — byte-identical.
+            let effective_system_prompt =
+                system_prompt.as_ref().or(self.config.system_prompt.as_ref());
+            if let Some(system_prompt) = effective_system_prompt {
                 match context.messages.first_mut() {
                     Some(Message {
                         role: Role::System,
@@ -10673,6 +10714,7 @@ impl StrategyExecutor for StandardHarness {
         toolset: ToolsetRef,
         output_schema: Option<serde_json::Value>,
         output_schema_max_retries: u32,
+        system_prompt: Option<String>,
     ) -> BoxFut<'a, RunResult> {
         Box::pin(async move {
             self.run_react_inner(
@@ -10685,6 +10727,7 @@ impl StrategyExecutor for StandardHarness {
                 toolset,
                 output_schema,
                 output_schema_max_retries,
+                system_prompt,
             )
             .await
         })
@@ -12848,6 +12891,7 @@ mod strategy_tests {
                     // A.5 (#124, Q3): the structured plan slot declares an output
                     // schema so it yields a typed task graph.
                     output: Some(SchemaRef("plan-schema".to_string())),
+                    system_prompt: None,
                 })),
                 execute: Box::new(LoopStrategy::SelfVerifying(SelfVerifyingConfig {
                     behavior: BudgetExhaustedBehavior::Escalate,
@@ -12858,6 +12902,7 @@ mod strategy_tests {
                         toolset: ToolsetRef("exec-tools".to_string()),
                         // A.5: the structured worker slot declares an output schema.
                         output: Some(SchemaRef("worker-schema".to_string())),
+                        system_prompt: None,
                     })),
                     evaluator: SchemaRef("exec-evaluator".to_string()),
                     eval_agent: None,
@@ -12921,6 +12966,7 @@ mod strategy_tests {
                 agent: AgentRef("a".to_string()),
                 toolset: ToolsetRef("t".to_string()),
                 output: Some(SchemaRef("out".to_string())),
+                system_prompt: None,
             }),
             LoopStrategy::ReAct(ReactConfig::per_loop(3)),
             LoopStrategy::PlanExecute(PlanExecuteConfig::simple(None)),
@@ -13206,6 +13252,7 @@ mod strategy_tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         })
     }
 
@@ -13973,6 +14020,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: Some(SchemaRef(String::new())),
+            system_prompt: None,
         })
     }
 
@@ -14289,6 +14337,7 @@ mod tests {
             agent: AgentRef("missing".into()),
             toolset: ToolsetRef("t".into()),
             output: None,
+            system_prompt: None,
         });
         let harness = HarnessBuilder::new(
             Arc::new(NeverCalledAgent),
@@ -16392,6 +16441,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(handle.into()),
             output: None,
+            system_prompt: None,
         }))
     }
 
@@ -16574,6 +16624,7 @@ mod tests {
                     agent: AgentRef(String::new()),
                     toolset: ToolsetRef(handle.into()),
                     output: None,
+                    system_prompt: None,
                 })),
                 budget_used: BudgetSnapshot::default(),
                 child_state: None,
@@ -17335,6 +17386,135 @@ mod tests {
         );
     }
 
+    // SC-10: per-leaf `system_prompt` override. A `PlanExecute` whose plan and
+    // execute leaves carry DISTINCT system prompts runs each phase under ONLY its
+    // own prompt — neither leaks into the other. The global `config.system_prompt`
+    // is `None` here, so the ONLY system text a turn can see is what its own leaf
+    // supplied; any cross-phase appearance is therefore an unambiguous leak.
+    #[tokio::test]
+    async fn plan_and_execute_leaves_see_only_their_own_system_prompt() {
+        const PLAN_SYS: &str = "PLAN_SYSTEM_PROMPT_MARKER";
+        const EXEC_SYS: &str = "EXECUTE_SYSTEM_PROMPT_MARKER";
+
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                // Plan turn: a single-step plan.
+                RecordingTurnAgent::final_resp(r#"{"tasks":["only step"],"rationale":"r"}"#),
+                // Execute step: finalize directly.
+                RecordingTurnAgent::final_resp("did the step"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        cfg.tool_registry = Arc::new(ScriptedToolRegistry::new());
+        // No global prompt ⇒ the ONLY system text a turn can see is its leaf's.
+        assert!(cfg.system_prompt.is_none());
+        let h = StandardHarness::new(cfg);
+
+        // The two leaves carry DISTINCT per-leaf system prompts; everything else
+        // is the bare default leaf.
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                system_prompt: Some(PLAN_SYS.to_string()),
+                ..ReactConfig::per_loop(u32::MAX)
+            })),
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig {
+                system_prompt: Some(EXEC_SYS.to_string()),
+                ..ReactConfig::per_loop(u32::MAX)
+            })),
+            plan_model: None,
+        }));
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { output, .. } => assert_eq!(output, "did the step"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let contexts = agent.seen_text();
+        assert_eq!(contexts.len(), 2, "one plan turn + one execute turn");
+
+        // Plan turn (index 0): sees ONLY the plan leaf's prompt.
+        assert!(
+            contexts[0].contains(PLAN_SYS),
+            "plan turn must carry the plan leaf's system prompt: {}",
+            contexts[0]
+        );
+        assert!(
+            !contexts[0].contains(EXEC_SYS),
+            "plan turn must NOT see the execute leaf's system prompt: {}",
+            contexts[0]
+        );
+
+        // Execute turn (index 1): sees ONLY the execute leaf's prompt.
+        assert!(
+            contexts[1].contains(EXEC_SYS),
+            "execute turn must carry the execute leaf's system prompt: {}",
+            contexts[1]
+        );
+        assert!(
+            !contexts[1].contains(PLAN_SYS),
+            "execute turn must NOT see the plan leaf's system prompt: {}",
+            contexts[1]
+        );
+    }
+
+    // SC-10: the per-leaf `system_prompt` override WINS over the global
+    // `config.system_prompt` — a leaf that supplies one sees ONLY its own (the
+    // global does not leak in), while a leaf WITHOUT an override falls back to the
+    // global prompt (byte-identical to pre-SC-10).
+    #[tokio::test]
+    async fn leaf_system_prompt_overrides_global_and_falls_back() {
+        const GLOBAL_SYS: &str = "GLOBAL_SYSTEM_PROMPT_MARKER";
+        const PLAN_SYS: &str = "PLAN_ONLY_SYSTEM_PROMPT_MARKER";
+
+        let agent = RecordingTurnAgent::new(
+            "rec",
+            vec![
+                RecordingTurnAgent::final_resp(r#"{"tasks":["only step"],"rationale":"r"}"#),
+                RecordingTurnAgent::final_resp("did the step"),
+            ],
+        );
+        let mut cfg = recording_config(agent.clone(), ModelParams::default());
+        cfg.tool_registry = Arc::new(ScriptedToolRegistry::new());
+        // A global prompt IS configured this time.
+        cfg.system_prompt = Some(GLOBAL_SYS.to_string());
+        let h = StandardHarness::new(cfg);
+
+        let t = task(LoopStrategy::PlanExecute(PlanExecuteConfig {
+            behavior: BudgetExhaustedBehavior::Escalate,
+            // Plan leaf overrides the global prompt.
+            plan: Box::new(LoopStrategy::ReAct(ReactConfig {
+                system_prompt: Some(PLAN_SYS.to_string()),
+                ..ReactConfig::per_loop(u32::MAX)
+            })),
+            // Execute leaf carries no override ⇒ falls back to the global prompt.
+            execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
+            plan_model: None,
+        }));
+
+        match h.run(HarnessRunOptions::new(t)).await {
+            RunResult::Success { .. } => {}
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        let contexts = agent.seen_text();
+        assert_eq!(contexts.len(), 2, "one plan turn + one execute turn");
+
+        // Plan turn: its override WINS — only the plan prompt, NOT the global one.
+        assert!(
+            contexts[0].contains(PLAN_SYS) && !contexts[0].contains(GLOBAL_SYS),
+            "plan turn must see ONLY its override, not the global prompt: {}",
+            contexts[0]
+        );
+        // Execute turn: no override ⇒ the global prompt applies (back-compat).
+        assert!(
+            contexts[1].contains(GLOBAL_SYS) && !contexts[1].contains(PLAN_SYS),
+            "execute turn must fall back to the global prompt: {}",
+            contexts[1]
+        );
+    }
+
     // #126 two-tier context (REPLACES the pre-#126 linear-folding regression):
     // linear folding broke on a DAG, so it is GONE. The plan-artifact bridge
     // produces a LINEAR chain with EMPTY blockers, so steps 1 and 2 are
@@ -17450,6 +17630,7 @@ mod tests {
                 agent: AgentRef("planner".into()),
                 toolset: ToolsetRef(String::new()),
                 output: Some(SchemaRef("plan-schema".into())),
+                system_prompt: None,
             })),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model: None,
@@ -18717,6 +18898,7 @@ mod tests {
                 agent: AgentRef("planner".into()),
                 toolset: ToolsetRef(String::new()),
                 output: Some(SchemaRef("plan-schema".into())),
+                system_prompt: None,
             })),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model: None,
@@ -23864,6 +24046,7 @@ mod tests {
                 agent: AgentRef("planner".into()),
                 toolset: ToolsetRef(String::new()),
                 output: Some(SchemaRef(String::new())),
+                system_prompt: None,
             })),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(8))),
             plan_model: None,
@@ -24163,6 +24346,7 @@ mod tests {
                             agent: AgentRef("planner".into()),
                             toolset: ToolsetRef("plan-tools".into()),
                             output: Some(SchemaRef("plan-schema".into())),
+                            system_prompt: None,
                         })),
                         execute: Box::new(LoopStrategy::ReAct(ReactConfig {
                             behavior: BudgetExhaustedBehavior::Escalate,
@@ -24170,6 +24354,7 @@ mod tests {
                             agent: AgentRef("executor".into()),
                             toolset: ToolsetRef("exec-tools".into()),
                             output: Some(SchemaRef("worker-schema".into())),
+                            system_prompt: None,
                         })),
                         plan_model: None,
                     }),
@@ -24251,6 +24436,7 @@ mod tests {
                         agent: AgentRef("worker".into()),
                         toolset: ToolsetRef("patch-tools".into()),
                         output: None,
+                        system_prompt: None,
                     }),
                 );
                 t.id = TaskId::new("task-129");
@@ -24323,6 +24509,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         });
         // continues_used == 1: ONE continue already spent (only one remains).
         match state.human_request.as_mut().unwrap() {
@@ -24452,6 +24639,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }));
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Success { output, .. } => {
@@ -24515,6 +24703,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }));
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Success { output, .. } => {
@@ -24567,6 +24756,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }));
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Failure { .. } => {}
@@ -24609,6 +24799,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         });
         let prior_msg_count = state.session_state.messages.len();
         assert!(prior_msg_count >= 1, "checkpoint carries prior context");
@@ -24679,6 +24870,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }));
         match h.run(HarnessRunOptions::new(t)).await {
             RunResult::Failure {
@@ -24734,6 +24926,7 @@ mod tests {
                 agent: AgentRef(String::new()),
                 toolset: ToolsetRef(String::new()),
                 output: None,
+                system_prompt: None,
             })),
             plan_model: None,
             behavior: default_budget_behavior(),
@@ -24834,6 +25027,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }))
     }
 
@@ -25235,6 +25429,7 @@ mod tests {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: Some(SchemaRef(String::new())),
+            system_prompt: None,
         }))
     }
 

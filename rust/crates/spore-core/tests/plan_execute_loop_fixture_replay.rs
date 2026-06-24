@@ -100,6 +100,7 @@ async fn plan_execute_loop_full_trace_succeeds() {
                 agent: spore_core::AgentRef(String::new()),
                 toolset: spore_core::ToolsetRef(String::new()),
                 output: Some(spore_core::SchemaRef(String::new())),
+                system_prompt: None,
             })),
             execute: Box::new(LoopStrategy::ReAct(ReactConfig::per_loop(u32::MAX))),
             plan_model: None,

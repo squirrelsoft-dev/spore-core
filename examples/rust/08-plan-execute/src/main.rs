@@ -96,14 +96,32 @@ use spore_core::{
     PLAN_EXECUTE_EXTRAS_KEY,
 };
 
+// The GLOBAL operating prompt — the shared capability contract. It is the
+// DEFAULT every leaf falls back to. Under SC-10 the plan and execute leaves
+// below each carry their OWN `system_prompt`, which REPLACES this for those
+// phases (each phase sees ONLY its own prompt). This global remains the prompt
+// any leaf WITHOUT an override would use.
 const SYSTEM_PROMPT: &str = "You are a research-and-writing agent. Your ONLY capabilities are: \
      web_search (find current information online), read_file, and write_file (save your work to \
      the workspace). You have NO shell or terminal — you cannot install software, set up projects \
-     or environments, run/compile/build code, or execute commands. Decompose the goal into \
-     subtasks that are each achievable with web_search and writing alone; never plan setup, \
-     installation, or build steps. For each subtask, use web_search to gather current information, \
-     then synthesize a clear, cited comparison and save the final document with write_file. Act \
-     using tools — do not answer from memory alone.";
+     or environments, run/compile/build code, or execute commands. Act using tools — do not answer \
+     from memory alone.";
+
+// SC-10: the PLAN phase's own system prompt. The planner only DECOMPOSES — it
+// never executes a subtask, so its prompt is about producing a good plan, not
+// about searching/writing. This replaces SYSTEM_PROMPT for the plan leaf only.
+const PLAN_SYSTEM_PROMPT: &str = "You are the PLANNER. Your ONLY job is to decompose the goal \
+     into an ordered list of subtasks. Each subtask must be achievable with web_search and \
+     write_file alone — there is NO shell or terminal, so never plan setup, installation, or \
+     build steps. Do not perform any subtask yourself; output ONLY the plan.";
+
+// SC-10: the EXECUTE phase's own system prompt. The executor works ONE subtask
+// at a time — it does not re-plan. This replaces SYSTEM_PROMPT for the execute
+// leaf only, so plan-phase decomposition guidance never leaks into execution.
+const EXECUTE_SYSTEM_PROMPT: &str = "You are the EXECUTOR. You are given ONE subtask at a time. \
+     Use web_search to gather current information for it, then synthesize a clear, cited result \
+     and save your work with write_file. Do not re-plan or invent new subtasks — complete the one \
+     you were given, using tools rather than memory.";
 
 /// The plan-phase output contract (`plan-schema`). Post-#119, `PlanExecute`'s
 /// `plan` slot is STRUCTURED: a bare `ReAct` there must declare an `output`
@@ -139,13 +157,26 @@ fn build_registry() -> ExecutionRegistry {
 /// The plan leaf carries the `plan-schema` output contract (required for the
 /// structured `plan` slot); both leaves use empty agent/toolset handles that the
 /// builder default-fills. Old flat shape was `PlanExecute { plan_model: None }`.
+///
+/// SC-10 (per-leaf system prompt): the plan and execute leaves each carry their
+/// OWN `system_prompt`. The plan phase runs under `PLAN_SYSTEM_PROMPT` (decompose
+/// only) and the execute phase under `EXECUTE_SYSTEM_PROMPT` (do one subtask) —
+/// each phase sees ONLY its own prompt, so planning guidance never leaks into
+/// execution and vice versa. (The per-leaf TOOLSET override is the existing
+/// `ReactConfig::toolset` handle; here both phases share the global catalogue.)
 fn plan_execute_strategy() -> LoopStrategy {
     let plan = ReactConfig {
         output: Some(SchemaRef("plan-schema".to_string())),
+        system_prompt: Some(PLAN_SYSTEM_PROMPT.to_string()),
+        ..ReactConfig::per_loop(u32::MAX)
+    };
+    let execute = ReactConfig {
+        system_prompt: Some(EXECUTE_SYSTEM_PROMPT.to_string()),
         ..ReactConfig::per_loop(u32::MAX)
     };
     LoopStrategy::PlanExecute(PlanExecuteConfig {
         plan: Box::new(LoopStrategy::ReAct(plan)),
+        execute: Box::new(LoopStrategy::ReAct(execute)),
         ..PlanExecuteConfig::simple(None)
     })
 }

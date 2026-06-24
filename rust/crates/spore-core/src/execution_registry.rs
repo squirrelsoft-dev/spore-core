@@ -587,6 +587,7 @@ mod tests {
             agent: AgentRef(agent.to_string()),
             toolset: ToolsetRef(toolset.to_string()),
             output: None,
+            system_prompt: None,
         })
     }
 
@@ -710,6 +711,7 @@ mod tests {
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("missing-schema".into())),
+            system_prompt: None,
         });
         let task = Task::new("do it", SessionId::generate(), leaf);
         let err = reg.validate(&task).unwrap_err();
@@ -731,6 +733,7 @@ mod tests {
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("s1".into())),
+            system_prompt: None,
         });
         let task = Task::new("ok", SessionId::generate(), leaf);
         assert!(reg.validate(&task).is_ok());
@@ -776,6 +779,7 @@ mod tests {
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("plan-schema".into())),
+            system_prompt: None,
         });
         let tree = LoopStrategy::PlanExecute(PlanExecuteConfig {
             behavior: BudgetExhaustedBehavior::Escalate,
@@ -804,6 +808,7 @@ mod tests {
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("worker-schema".into())),
+            system_prompt: None,
         });
         let inner_sv = LoopStrategy::SelfVerifying(SelfVerifyingConfig {
             behavior: BudgetExhaustedBehavior::Escalate,
@@ -877,6 +882,7 @@ mod tests {
             agent: AgentRef("a1".into()),
             toolset: ToolsetRef("t1".into()),
             output: Some(SchemaRef("s1".into())),
+            system_prompt: None,
         });
         let task = Task::new("resume me", SessionId::generate(), leaf);
 

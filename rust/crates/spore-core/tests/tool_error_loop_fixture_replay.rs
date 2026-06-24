@@ -111,6 +111,7 @@ async fn tool_error_loop_breaker_hard_stops_at_two_n() {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: None,
+            system_prompt: None,
         }),
     );
 

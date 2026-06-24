@@ -125,6 +125,7 @@ fn os_task(budget: u32) -> Task {
             agent: AgentRef(String::new()),
             toolset: ToolsetRef(String::new()),
             output: Some(SchemaRef(String::new())),
+            system_prompt: None,
         }),
     )
 }
