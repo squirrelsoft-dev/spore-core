@@ -24,6 +24,8 @@ from spore_core import (
 )
 from spore_core.harness import BudgetSnapshot, SessionState
 from spore_core.model import (
+    MockModelInterface,
+    ModelInterface,
     ModelRequest,
     ModelResponse,
     StopReason,
@@ -128,3 +130,46 @@ def test_task_simple_defaults() -> None:
     assert a.session_id != b.session_id
     # Fresh, distinct task ids too.
     assert a.id != b.id
+
+
+# ---------------------------------------------------------------------------
+# SC-2: object-safe ModelInterface — construct from an interface-typed model
+# ---------------------------------------------------------------------------
+
+
+async def test_harness_constructs_from_interface_typed_model() -> None:
+    """SC-2: a conversational harness can be built from a model held under the
+    interface type (``ModelInterface``), not a concrete generic — the equivalent
+    of Rust's ``Arc<dyn ModelInterface>`` injection. The queued response comes
+    back through the harness. Mirrors Rust's
+    ``harness_constructs_from_boxed_model_interface``.
+    """
+    # The model is held as the structural interface type, not a concrete class.
+    model: ModelInterface = MockModelInterface(
+        ProviderInfo(name="test", model_id="boxed", context_window=8192)
+    )
+    model.push_response(
+        ModelResponse(
+            content=[TextBlock(text="boxed reply")],
+            usage=TokenUsage(input_tokens=3, output_tokens=2),
+            stop_reason=StopReason.END_TURN,
+        )
+    )
+    harness = HarnessBuilder.conversational(model).build()
+    result = await harness.run(HarnessRunOptions(Task.simple("hi")))
+    assert isinstance(result, RunResultSuccess)
+    assert result.output == "boxed reply"
+
+
+def test_conversational_shares_one_model_instance() -> None:
+    """SC-2 acceptance: the agent wrapper and the context manager reference the
+    SAME model instance — the model is held once and shared, not re-minted per
+    component."""
+    model = _GreetingModel("hi")
+    config = HarnessBuilder.conversational(model).build_config()
+    agent = config.registry.resolve_agent("")
+    # The agent wraps the model in an AdaptiveToolCallModelInterface holding the
+    # original instance; the context manager keeps the RAW model. Both are the
+    # one shared instance.
+    assert agent._model._inner is model
+    assert config.context_manager._inner._model is model

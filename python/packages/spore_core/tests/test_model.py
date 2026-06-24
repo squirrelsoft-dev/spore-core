@@ -38,6 +38,7 @@ from spore_core import (
     Role,
     SporeError,
     StopReason,
+    StreamInterrupted,
     TextBlock,
     TextContent,
     TimeoutError,
@@ -45,6 +46,7 @@ from spore_core import (
     ToolCall,
     ToolSchema,
     ToolUseBlock,
+    Transport,
     enforce_budget,
     enforce_context_limit,
     request_hash,
@@ -187,10 +189,53 @@ def test_every_error_variant_is_constructible() -> None:
         ContextLimitExceeded(limit=1, actual=2),
         BudgetExceeded(budget=1, used=2),
         TimeoutError(),
+        Transport("conn refused"),
+        StreamInterrupted("stream chunk error: eof"),
     ]
     for e in errs:
         assert str(e)
         assert e.kind  # class attribute set on every subclass
+
+
+# ---------------------------------------------------------------------------
+# SC-3: typed retryable model errors
+# ---------------------------------------------------------------------------
+
+
+def test_retryable_classifies_transient_vs_deterministic() -> None:
+    """SC-3: transport drops, mid-stream interruptions, timeouts and rate
+    limits are transient; provider/context/budget errors are deterministic.
+    Mirrors Rust's ``retryable_classifies_transient_vs_deterministic``."""
+    assert Transport("x").retryable()
+    assert StreamInterrupted("x").retryable()
+    assert TimeoutError().retryable()
+    assert RateLimited(retry_after=None).retryable()
+    assert not ProviderError(code=0, message="x").retryable()
+    assert not ContextLimitExceeded(limit=1, actual=2).retryable()
+    assert not BudgetExceeded(budget=1, used=2).retryable()
+
+
+def test_typed_transport_errors_serde_tag_shape() -> None:
+    """The two SC-3 variants serialize to the ``kind``-tagged shape the
+    cross-language ports mirror byte-for-byte:
+    ``{"kind": "Transport", "message": ...}`` /
+    ``{"kind": "StreamInterrupted", "message": ...}``."""
+    assert Transport("m").to_dict() == {"kind": "Transport", "message": "m"}
+    assert StreamInterrupted("m").to_dict() == {
+        "kind": "StreamInterrupted",
+        "message": "m",
+    }
+    # The raw `message` field is preserved verbatim (not the display string).
+    assert Transport("m").message == "m"
+    assert Transport("m").kind == "Transport"
+    assert StreamInterrupted("m").message == "m"
+    assert StreamInterrupted("m").kind == "StreamInterrupted"
+    # The serialized form round-trips back to an equivalent typed error.
+    for cls, kind in ((Transport, "Transport"), (StreamInterrupted, "StreamInterrupted")):
+        d = cls("boom").to_dict()
+        assert d["kind"] == kind
+        back = cls(d["message"])
+        assert back.to_dict() == d
 
 
 # ---------------------------------------------------------------------------

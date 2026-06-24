@@ -315,6 +315,31 @@ class ModelError(SporeError):
 
     kind: ClassVar[str] = "ModelError"
 
+    def retryable(self) -> bool:
+        """Whether retrying the identical call could plausibly succeed.
+
+        Transport drops, mid-stream interruptions, timeouts, and rate-limits
+        are transient. Provider/encode/decode/capability errors and
+        context/budget overflows are deterministic and will recur. Lets a
+        consumer drive its retry loop off a typed predicate instead of
+        substring-matching the error text (SC-3, mirrors Rust's
+        ``ModelError::retryable``).
+        """
+
+        return isinstance(self, (Transport, StreamInterrupted, TimeoutError, RateLimited))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the ``kind``-tagged wire shape shared across languages.
+
+        Variants that carry a free-form ``message`` (``Transport``,
+        ``StreamInterrupted``) emit exactly ``{"kind": ..., "message": ...}``
+        byte-for-byte with the Rust serde representation; variants without a
+        ``message`` attribute fall back to the formatted display string.
+        """
+
+        message = getattr(self, "message", None)
+        return {"kind": self.kind, "message": message if message is not None else str(self)}
+
 
 class ProviderError(ModelError):
     kind: ClassVar[str] = "ProviderError"
@@ -356,6 +381,35 @@ class TimeoutError(ModelError):  # noqa: A001 — intentional shadow of builtin
 
     def __init__(self, message: str = "model call timed out") -> None:
         super().__init__(message)
+
+
+class Transport(ModelError):
+    """Network/transport failure reaching the provider (connection refused,
+    socket error, generic HTTP transport error) — the request never produced a
+    usable response. Transient: :meth:`ModelError.retryable` is ``True``.
+    Mirrors Rust's ``ModelError::Transport``.
+    """
+
+    kind: ClassVar[str] = "Transport"
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(f"transport error: {message}")
+
+
+class StreamInterrupted(ModelError):
+    """The response stream was interrupted mid-flight (a chunk read/decode
+    failure while draining a streaming body). Transient:
+    :meth:`ModelError.retryable` is ``True`` — the turn can be retried. Distinct
+    from a deterministic decode failure of a *complete* response, which stays
+    :class:`ProviderError`. Mirrors Rust's ``ModelError::StreamInterrupted``.
+    """
+
+    kind: ClassVar[str] = "StreamInterrupted"
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(f"stream interrupted: {message}")
 
 
 # ============================================================================
@@ -765,6 +819,7 @@ __all__ = [
     "Role",
     "StopReason",
     "StreamEvent",
+    "StreamInterrupted",
     "TextBlock",
     "TextContent",
     "ThinkingBlock",
@@ -779,6 +834,7 @@ __all__ = [
     "ToolUseBlock",
     "ToolUseDelta",
     "ToolUseStart",
+    "Transport",
     "enforce_budget",
     "enforce_context_limit",
     "request_hash",

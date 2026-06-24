@@ -52,6 +52,7 @@ from .model import (
     Role,
     StopReason,
     StreamEvent,
+    StreamInterrupted,
     TextBlock,
     TextContent,
     ThinkingBlock,
@@ -59,6 +60,7 @@ from .model import (
     ToolCallContent,
     ToolResultContent,
     ToolUseBlock,
+    Transport,
 )
 from .model import (
     ContentBlockDelta as _ContentBlockDelta,
@@ -461,6 +463,16 @@ async def _sse_to_events(response: httpx.Response) -> AsyncIterator[StreamEvent]
             ),
             stop_reason=stop_reason,
         )
+    except httpx.TimeoutException as e:
+        # A read timeout mid-stream is still a timeout (maps to Timeout), not a
+        # generic transport drop — placed before the HTTPError handler since
+        # TimeoutException is a subclass of HTTPError.
+        raise _ModelTimeoutError() from e
+    except httpx.HTTPError as e:
+        # SC-3: a chunk read/decode failure while draining the body interrupts
+        # the stream — a typed, retryable StreamInterrupted, not a generic
+        # ProviderError. Mirrors Rust's sse_to_events stream-chunk-error site.
+        raise StreamInterrupted(f"stream chunk error: {e}") from e
     finally:
         await response.aclose()
 
@@ -580,7 +592,7 @@ class OpenAIModelInterface:
                     continue
                 raise _ModelTimeoutError() from e
             except httpx.HTTPError as e:
-                raise ProviderError(code=0, message=f"HTTP transport error: {e}") from e
+                raise Transport(f"HTTP transport error: {e}") from e
             status = resp.status_code
             if 200 <= status < 300:
                 return resp
@@ -624,7 +636,7 @@ class OpenAIModelInterface:
         except httpx.TimeoutException as e:
             raise _ModelTimeoutError() from e
         except httpx.HTTPError as e:
-            raise ProviderError(code=0, message=f"HTTP transport error: {e}") from e
+            raise Transport(f"HTTP transport error: {e}") from e
         if resp.status_code < 200 or resp.status_code >= 300:
             retry_after = _parse_retry_after(resp.headers.get("retry-after"))
             body_text = await resp.aread()

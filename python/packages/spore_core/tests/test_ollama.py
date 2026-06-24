@@ -35,6 +35,7 @@ from spore_core.model import (
     ToolUseBlock,
     ToolUseDelta,
     ToolUseStart,
+    Transport,
 )
 from spore_core.ollama import (
     DEFAULT_BASE_URL,
@@ -423,15 +424,17 @@ async def test_call_omits_num_ctx_on_wire_by_default() -> None:
 
 
 async def test_connection_refused_helpful_message() -> None:
+    # SC-3: a connect failure is a typed, retryable Transport error (was
+    # ProviderError) — mirrors Rust's connect-failure test.
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
     client = _mock_client(httpx.MockTransport(handler))
     iface = OllamaModelInterface("llama3.2", base_url="http://127.0.0.1:1", http_client=client)
-    with pytest.raises(ProviderError) as exc:
+    with pytest.raises(Transport) as exc:
         await iface.call(_req([_user("hi")]))
-    assert exc.value.code == 0
     assert "Ollama not running" in exc.value.message
+    assert exc.value.retryable(), "a connect failure is retryable"
 
 
 async def test_connection_error_does_not_retry() -> None:
@@ -443,7 +446,8 @@ async def test_connection_error_does_not_retry() -> None:
     client = _mock_client(httpx.MockTransport(handler))
     iface = OllamaModelInterface("llama3.2", base_url="http://127.0.0.1:1", http_client=client)
     start = time.monotonic()
-    with pytest.raises(ProviderError):
+    # SC-3: a connect error is now a typed Transport (was ProviderError).
+    with pytest.raises(Transport):
         await iface.call(_req([_user("hi")]))
     elapsed = time.monotonic() - start
     assert elapsed < 0.5, f"expected fail-fast (<500ms); took {elapsed:.3f}s"

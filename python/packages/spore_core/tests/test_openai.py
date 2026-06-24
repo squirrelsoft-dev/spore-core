@@ -6,6 +6,7 @@ test module.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from spore_core.model import (
     ReplayModelInterface,
     Role,
     StopReason,
+    StreamInterrupted,
     TextBlock,
     TextContent,
     ThinkingBlock,
@@ -433,6 +435,54 @@ async def test_call_timeout_surfaces_as_model_timeout() -> None:
     )
     with pytest.raises(ModelTimeoutError):
         await iface.call(_req([_user("hi")]))
+
+
+async def test_streaming_interruption_is_typed_and_retryable() -> None:
+    """SC-3: a connection dropped mid-stream surfaces as the typed, retryable
+    ``StreamInterrupted`` variant — a consumer drives its retry off
+    ``retryable()``, not a substring match on the error text. A raw asyncio TCP
+    server promises a 200-byte body (Content-Length) but sends only a partial
+    SSE line then closes the socket, so the client's body stream errors
+    mid-read. Mirrors Rust's ``streaming_interruption_is_typed_and_retryable``.
+    """
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Drain the request headers (read until the blank line) so the client's
+        # write completes before we respond.
+        try:
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        # 200 OK so call_streaming returns Ok (headers arrived), then promise
+        # 200 body bytes but deliver only a partial SSE line and drop the
+        # socket — EOF before Content-Length errors the stream.
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"content-type: text/event-stream\r\n"
+            b"content-length: 200\r\n"
+            b"\r\n"
+            b"data: partial"
+        )
+        await writer.drain()
+        writer.close()  # connection closes mid-body
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    async with server:
+        await server.start_serving()
+        iface = OpenAIModelInterface("k", "gpt-4o", base_url=f"http://{host}:{port}")
+        try:
+            last_err: Exception | None = None
+            async for ev in iface.call_streaming(_req([_user("hi")])):
+                _ = ev
+        except (StreamInterrupted, ModelTimeoutError, ProviderError) as e:
+            last_err = e
+        finally:
+            await iface.aclose()
+        assert isinstance(last_err, StreamInterrupted), (
+            f"expected StreamInterrupted, got {last_err!r}"
+        )
+        assert last_err.retryable(), "a mid-stream interruption is retryable"
 
 
 # ---------------------------------------------------------------------------

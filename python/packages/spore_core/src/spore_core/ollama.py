@@ -61,12 +61,14 @@ from .model import (
     Role,
     StopReason,
     StreamEvent,
+    StreamInterrupted,
     TextBlock,
     TextContent,
     TokenUsage,
     ToolCallContent,
     ToolResultContent,
     ToolUseBlock,
+    Transport,
 )
 from .model import (
     ContentBlockDelta as _ContentBlockDelta,
@@ -633,6 +635,16 @@ async def _ndjson_to_events(
             ),
             stop_reason=StopReason.END_TURN,
         )
+    except httpx.TimeoutException as e:
+        # A read timeout mid-stream is still a timeout (maps to Timeout), not a
+        # generic transport drop — placed before the HTTPError handler since
+        # TimeoutException is a subclass of HTTPError.
+        raise _ModelTimeoutError() from e
+    except httpx.HTTPError as e:
+        # SC-3: a chunk read/decode failure while draining the NDJSON body
+        # interrupts the stream — a typed, retryable StreamInterrupted, not a
+        # generic ProviderError. Mirrors Rust's ndjson_to_events chunk-error site.
+        raise StreamInterrupted(f"stream chunk error: {e}") from e
     finally:
         await response.aclose()
 
@@ -733,16 +745,19 @@ class OllamaModelInterface:
     def _transport_error(self, exc: Exception) -> Exception:
         if isinstance(exc, httpx.TimeoutException):
             return _ModelTimeoutError()
+        # SC-3: connect / network drops are a typed, retryable Transport error,
+        # not a generic ProviderError — a consumer drives retries off
+        # ``retryable()`` instead of substring-matching the message.
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
-            return ProviderError(code=0, message=f"Ollama not running at {self._base_url}")
+            return Transport(f"Ollama not running at {self._base_url}")
         if isinstance(exc, httpx.HTTPError):
             # NOTE: httpx.RequestError covers DNS / network issues
             # similar to Rust's `is_request` branch; surface them as a
             # helpful "not running" message rather than a generic
             # transport error.
             if isinstance(exc, httpx.RequestError):
-                return ProviderError(code=0, message=f"Ollama not running at {self._base_url}")
-            return ProviderError(code=0, message=f"HTTP transport error: {exc}")
+                return Transport(f"Ollama not running at {self._base_url}")
+            return Transport(f"HTTP transport error: {exc}")
         return exc
 
     async def _ensure_model_available(self) -> None:
