@@ -519,7 +519,24 @@ func (r ExecutionRegistry) walkStrategy(ls *LoopStrategy) error {
 		}
 		// #124 Q1: the evaluator's wire string (a SchemaRef) is the VERIFIER
 		// registry key — resolved against the verifiers map (NO wire change).
-		return r.checkVerifier(ls.SelfVerify.Evaluator)
+		if err := r.checkVerifier(ls.SelfVerify.Evaluator); err != nil {
+			return err
+		}
+		// #151: the optional dedicated reviewer agent / read-only toolset for the
+		// evaluate phase are validated against the same agents/toolsets maps as a
+		// leaf's own handles, but ONLY when set (mirrors Ralph's checkAgent). Empty
+		// ⇒ the worker-agent / global-catalogue defaults, nothing extra to resolve.
+		if string(ls.SelfVerify.EvalAgent) != "" {
+			if err := r.checkAgent(ls.SelfVerify.EvalAgent); err != nil {
+				return err
+			}
+		}
+		if string(ls.SelfVerify.EvalToolset) != "" {
+			if err := r.checkToolset(ls.SelfVerify.EvalToolset); err != nil {
+				return err
+			}
+		}
+		return nil
 	case StrategyRalph:
 		if ls.Ralph == nil {
 			return nil

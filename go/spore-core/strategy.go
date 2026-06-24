@@ -172,6 +172,21 @@ func PlanExecuteSimple(planModel *ModelConfig) PlanExecuteConfig {
 type SelfVerifyingConfig struct {
 	Inner     *LoopStrategy
 	Evaluator SchemaRef
+	// EvalAgent is an optional dedicated reviewer agent for the evaluate phase
+	// (#151). Empty ⇒ the evaluate phase reuses the inner worker's resolved agent
+	// (Q1c default). Set this to a SEPARATE agent so the reviewer is not the same
+	// model that wrote the code (a builder reviewing its own work tends to
+	// rubber-stamp). Go uses the empty-string sentinel (no Option). The wire form
+	// is produced by LoopStrategy.MarshalJSON's flat struct, which omits this key
+	// when empty (omitempty), so existing configs stay byte-identical.
+	EvalAgent AgentRef
+	// EvalToolset is an optional read-only/inspection toolset for the evaluate
+	// phase (#151). Empty ⇒ the empty handle (global-catalogue fallback),
+	// byte-identical to prior behavior. The evaluate phase already runs on a
+	// read-only sandbox; scoping the toolset to read-only tools additionally
+	// prevents the reviewer from reaching non-filesystem side-effecting tools
+	// (web/MCP) the sandbox does not gate. Omitted from the wire when unset.
+	EvalToolset ToolsetRef
 	// Behavior is what this combinator does when its build↔evaluate budget is
 	// spent (#129). Canonical wire position on a combinator: the LAST field.
 	// Always serialized (Q1).
@@ -325,14 +340,19 @@ func (s LoopStrategy) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("LoopStrategy: self_verifying requires config")
 		}
 		c := s.SelfVerify
-		// Key order: kind, inner, evaluator, behavior (LAST).
+		// Key order: kind, inner, evaluator, [eval_agent], [eval_toolset],
+		// behavior (LAST). The two override handles (#151) are bare-string handles
+		// omitted when empty so existing self_verifying + cordyceps-composition
+		// fixtures serialize byte-identically.
 		type selfVerifyFlat struct {
-			Kind      LoopStrategyKind        `json:"kind"`
-			Inner     *LoopStrategy           `json:"inner"`
-			Evaluator SchemaRef               `json:"evaluator"`
-			Behavior  BudgetExhaustedBehavior `json:"behavior"`
+			Kind        LoopStrategyKind        `json:"kind"`
+			Inner       *LoopStrategy           `json:"inner"`
+			Evaluator   SchemaRef               `json:"evaluator"`
+			EvalAgent   AgentRef                `json:"eval_agent,omitempty"`
+			EvalToolset ToolsetRef              `json:"eval_toolset,omitempty"`
+			Behavior    BudgetExhaustedBehavior `json:"behavior"`
 		}
-		return json.Marshal(selfVerifyFlat{s.Kind, c.Inner, c.Evaluator, c.Behavior})
+		return json.Marshal(selfVerifyFlat{s.Kind, c.Inner, c.Evaluator, c.EvalAgent, c.EvalToolset, c.Behavior})
 	case StrategyRalph:
 		if s.Ralph == nil {
 			return nil, fmt.Errorf("LoopStrategy: ralph requires config")
@@ -423,17 +443,21 @@ func (s *LoopStrategy) UnmarshalJSON(data []byte) error {
 		return nil
 	case StrategySelfVerifying:
 		var probe struct {
-			Inner     *LoopStrategy            `json:"inner"`
-			Evaluator SchemaRef                `json:"evaluator"`
-			Behavior  *BudgetExhaustedBehavior `json:"behavior"`
+			Inner       *LoopStrategy            `json:"inner"`
+			Evaluator   SchemaRef                `json:"evaluator"`
+			EvalAgent   AgentRef                 `json:"eval_agent"`
+			EvalToolset ToolsetRef               `json:"eval_toolset"`
+			Behavior    *BudgetExhaustedBehavior `json:"behavior"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
 			return err
 		}
 		s.SelfVerify = &SelfVerifyingConfig{
-			Inner:     probe.Inner,
-			Evaluator: probe.Evaluator,
-			Behavior:  behaviorOrDefault(probe.Behavior),
+			Inner:       probe.Inner,
+			Evaluator:   probe.Evaluator,
+			EvalAgent:   probe.EvalAgent,
+			EvalToolset: probe.EvalToolset,
+			Behavior:    behaviorOrDefault(probe.Behavior),
 		}
 		return nil
 	case StrategyRalph:
@@ -1614,12 +1638,38 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 		cx.Stream = onStream
 		return cx.finish(ctx, executor, task, result)
 	}
-	// Q1c: the evaluate-phase agent defaults to the inner worker's resolved agent.
-	evalAgent, evalFail := executor.ResolveWorkerAgent(c.Inner)
-	if evalFail != nil {
-		cx.Stream = onStream
-		return cx.finish(ctx, executor, task, *evalFail)
+	// Q1c / #151: the evaluate-phase agent defaults to the inner worker's resolved
+	// agent; an explicit EvalAgent override (a dedicated reviewer, distinct from
+	// the builder) takes precedence. The override is validated at startup
+	// (execution_registry's SelfVerifying arm) so an unresolved handle here is a
+	// configuration error surfaced like ResolveWorkerAgent's miss.
+	var evalAgent Agent
+	if string(c.EvalAgent) != "" {
+		a, ok := cx.Registry.ResolveAgent(c.EvalAgent)
+		if !ok {
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, RunResult{
+				Kind: RunFailure,
+				Reason: HaltReason{
+					Kind:        HaltConfigurationError,
+					ConfigError: &UnresolvedHandleError{Kind: "agent", Key: string(c.EvalAgent)},
+				},
+				SessionID: buildSessionID,
+			})
+		}
+		evalAgent = a
+	} else {
+		a, evalFail := executor.ResolveWorkerAgent(c.Inner)
+		if evalFail != nil {
+			cx.Stream = onStream
+			return cx.finish(ctx, executor, task, *evalFail)
+		}
+		evalAgent = a
 	}
+	// #151: the evaluate phase runs against EvalToolset (a read-only/inspection
+	// catalogue) when set; empty ⇒ the empty handle (global-catalogue fallback),
+	// byte-identical to pre-override behavior.
+	evalToolset := c.EvalToolset
 
 	maxIterations := verifier.MaxIterations()
 	var totalUsage AggregateUsage
@@ -1750,8 +1800,61 @@ func (c *SelfVerifyingConfig) Run(ctx context.Context, cx *ExecutionContext) Str
 			}
 		}
 
-		// ── Evaluate phase: a fresh evaluator run on evalAgent.
-		evalResult := executor.EvaluatePhase(ctx, &task, evalAgent, &carried, &totalUsage)
+		// ── Evaluate phase: a fresh evaluator run on evalAgent, scoped to
+		// evalToolset (#151).
+		evalResult := executor.EvaluatePhase(ctx, &task, evalAgent, evalToolset, &carried, &totalUsage)
+
+		// #147: charge the evaluator's OWN turns against the SelfVerifying scope,
+		// mirroring the build charge above. EvaluatePhase runs the evaluator in an
+		// isolated harness from a FRESH BudgetSnapshot, so evalResult.Turns is the
+		// evaluator's standalone turn count — and foldSelfVerifyUsage folds it via
+		// a max (NOT a sum), so it never reaches carried.Turns once the build turns
+		// dominate. Charging the build delta alone therefore missed the evaluate
+		// phase entirely; charge it explicitly here so both phases count against
+		// the budget. A pause/consult carries no turns to charge.
+		var evalTurns uint32
+		switch evalResult.Kind {
+		case RunSuccess, RunFailure, RunEscalate:
+			evalTurns = evalResult.Turns
+		}
+		if chErr := cx.ChargeCurrent(evalTurns); chErr != nil {
+			resolution := cx.ResolveCurrent()
+			// #129: a granted Continue resets the scope and RE-RUNS the
+			// build↔evaluate iteration in-process (mirrors the build path).
+			if resolution == ExhaustedResolutionContinue {
+				continue
+			}
+			// SC-5: AutoContinue auto-grants in-process at this Escalate point
+			// (scope still pushed) before surfacing/aborting.
+			if resolution == ExhaustedResolutionEscalate &&
+				cx.TryAutoContinue(executor.EscalationMode()) {
+				continue
+			}
+			partial := selfVerifyingPartialJSON(lastWorkerOutput, lastReason)
+			cx.PopBudget()
+			pt := task
+			cx.Scratch.Task = &pt
+			cx.Stream = onStream
+			// #130: under SurfaceToHuman, an Escalate-resolving exhaustion PAUSES
+			// with a BudgetExhausted request recorded as the verbatim terminal
+			// override instead of propagating up.
+			if resolution != ExhaustedResolutionFail &&
+				executor.EscalationMode().Kind == EscalationSurfaceToHuman {
+				waiting := promoteBudgetExhaustedToHuman(
+					chErr, &partial, combinatorEscalationActions(chErr),
+					buildSessionID, task, carried, carried.Turns,
+					session, workerToolsetOf(c.Inner),
+				)
+				return cx.recordTerminal(waiting)
+			}
+			cx.Scratch.TerminalOverride = nil
+			switch resolution {
+			case ExhaustedResolutionFail:
+				return promoteBudgetExhausted(chErr, nil)
+			default:
+				return promoteBudgetExhausted(chErr, &partial)
+			}
+		}
 
 		verdict := verifier.Verify(ctx, SelfVerifyInput{
 			BuildResult: buildResult,

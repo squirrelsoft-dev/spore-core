@@ -420,6 +420,222 @@ func TestSelfVerifyingEvaluateSessionsDistinctPerIteration(t *testing.T) {
 }
 
 // ============================================================================
+// #151: eval-phase drops caller middleware (BLOCKER) + EvalAgent override
+// ============================================================================
+
+// svWorkerSchemaStrategy builds the bare-ReAct worker slot carrying the worker
+// output schema A.5 demands, so the self_verifying config validates.
+func svWorkerSchemaStrategy() LoopStrategy {
+	worker := ReActStrategy(^uint32(0))
+	worker.ReActCfg.Output = func() *SchemaRef { s := SchemaRef("worker-schema"); return &s }()
+	return worker
+}
+
+// TestSelfVerifyingEvalPhaseDropsCallerMiddleware is the discriminating
+// regression for the #151 blocker: the evaluate phase must NOT inherit the
+// caller's approval middleware. The build phase is tool-free (a FinalResponse,
+// so the BeforeTool SurfaceToHuman is never tripped there); the eval phase
+// (same worker per Q1c) issues a read_file. With the middleware dropped for the
+// read-only eval run, that read DISPATCHES and the run reaches a verdict; with
+// it kept, the eval run would pause at BeforeTool BEFORE dispatch (call count 0)
+// and the verifier would read WaitingForHuman as a misconfiguration.
+func TestSelfVerifyingEvalPhaseDropsCallerMiddleware(t *testing.T) {
+	// Worker serves both phases (Q1c): build FinalResponse, then eval tool_call,
+	// then eval FinalResponse once the read dispatches.
+	worker := NewMockAgent("build")
+	worker.Push(NewFinalResponse("built", turnUsage()))
+	worker.Push(NewToolCallRequested([]ToolCall{
+		{ID: "c1", Name: "read_file", Input: json.RawMessage(`{}`)},
+	}, turnUsage()))
+	worker.Push(NewFinalResponse("reviewed: PASS", turnUsage()))
+
+	cfg := selfVerifyCfg(worker, newSVVerifier(3, "pass"))
+	// The dispatch count is the discriminator: it only increments if the eval
+	// phase's read actually dispatched (i.e. was NOT paused at BeforeTool).
+	reg := NewScriptedToolRegistry()
+	cfg.ToolRegistry = reg
+	// Caller approval middleware: SurfaceToHuman at BeforeTool. Without the
+	// eval-phase drop it pauses the reviewer's read and the tool never dispatches.
+	mw := NewScriptedMiddleware()
+	req := HumanRequest{
+		Kind:      HumanReqToolApproval,
+		Calls:     []ToolCall{{ID: "c1", Name: "read_file", Input: json.RawMessage(`{}`)}},
+		RiskLevel: RiskMedium,
+	}
+	mw.Push(HookBeforeTool, MiddlewareDecision{Kind: MiddlewareSurfaceToHuman, Request: &req})
+	cfg.Middleware = mw
+
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(selfVerifyTask()))
+	if r.Kind != RunSuccess {
+		t.Fatalf("eval phase must run to a verdict, got %+v", r)
+	}
+	// Load-bearing: the reviewer's read actually dispatched. With the caller
+	// middleware NOT dropped, the eval phase pauses at BeforeTool BEFORE dispatch
+	// and this count stays 0.
+	if reg.CallCount.Load() < 1 {
+		t.Fatalf("eval-phase reviewer tool must dispatch (caller approval middleware "+
+			"must be dropped for the read-only review run); call count = %d", reg.CallCount.Load())
+	}
+}
+
+// TestSelfVerifyingEvalAgentOverrideRunsDistinctReviewer asserts the EvalAgent
+// override (#151) runs a SEPARATE reviewer for the evaluate phase: the builder
+// runs ONLY the build phase, and the reviewer runs the evaluate phase exactly
+// once. Without the override the worker serves both and the reviewer is never
+// called.
+func TestSelfVerifyingEvalAgentOverrideRunsDistinctReviewer(t *testing.T) {
+	builder := newRecordingAgent("builder", "built")
+	reviewer := newRecordingAgent("reviewer", "reviewed")
+
+	worker := svWorkerSchemaStrategy()
+	task := NewTask("build the widget", SessionID("build-sess"),
+		SelfVerifyingStrategy(SelfVerifyingConfig{
+			Inner:     &worker,
+			Evaluator: SchemaRef("evaluator"),
+			EvalAgent: AgentRef("reviewer"),
+		}))
+
+	cfg := selfVerifyCfg(builder, newSVVerifier(3, "pass")).
+		WithRegistryAgent("reviewer", reviewer)
+	h := NewStandardHarness(cfg)
+	r := h.Run(context.Background(), NewHarnessRunOptions(task))
+	if r.Kind != RunSuccess {
+		t.Fatalf("expected Success, got %+v", r)
+	}
+	// The builder ran ONLY the build phase (one turn); it never reviewed.
+	if got := len(builder.turns()); got != 1 {
+		t.Fatalf("builder should run exactly the build phase (1 turn), got %d", got)
+	}
+	// The reviewer ran the evaluate phase exactly once.
+	if got := len(reviewer.turns()); got != 1 {
+		t.Fatalf("reviewer should run the evaluate phase exactly once, got %d", got)
+	}
+	// The reviewer's seed carries the role-evaluator chunk (it is the eval phase).
+	if !strings.Contains(reviewer.turns()[0].messages, RoleEvaluatorChunk) {
+		t.Fatalf("reviewer's seed must carry the role-evaluator chunk (eval phase)")
+	}
+}
+
+// ============================================================================
+// #151: SelfVerifyingConfig serde — eval_agent / eval_toolset overrides
+// ============================================================================
+
+// TestSelfVerifyingConfigEvalOverridesSerde pins the wire form of the two
+// override handles: omitted-when-unset (byte-parity), bare-string handles when
+// set, in declaration order evaluator < eval_agent < eval_toolset < behavior,
+// and a clean round-trip.
+func TestSelfVerifyingConfigEvalOverridesSerde(t *testing.T) {
+	inner := ReActStrategy(^uint32(0))
+
+	// 1) Unset: both keys omitted from the wire so existing fixtures stay
+	// byte-identical.
+	unset := SelfVerifyingStrategy(SelfVerifyingConfig{Inner: &inner, Evaluator: SchemaRef("ev")})
+	rawUnset, err := json.Marshal(unset)
+	if err != nil {
+		t.Fatalf("marshal unset: %v", err)
+	}
+	s := string(rawUnset)
+	if strings.Contains(s, "eval_agent") || strings.Contains(s, "eval_toolset") {
+		t.Fatalf("unset overrides must be omitted from the wire, got %s", s)
+	}
+
+	// 2) Set: bare-string handles, in declaration order
+	// evaluator < eval_agent < eval_toolset < behavior.
+	set := SelfVerifyingStrategy(SelfVerifyingConfig{
+		Inner:       &inner,
+		Evaluator:   SchemaRef("ev"),
+		EvalAgent:   AgentRef("reviewer"),
+		EvalToolset: ToolsetRef("readonly-tools"),
+	})
+	rawSet, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("marshal set: %v", err)
+	}
+	ss := string(rawSet)
+	// Bare-string handles.
+	if !strings.Contains(ss, `"eval_agent":"reviewer"`) {
+		t.Fatalf("eval_agent must serialize as a bare string handle, got %s", ss)
+	}
+	if !strings.Contains(ss, `"eval_toolset":"readonly-tools"`) {
+		t.Fatalf("eval_toolset must serialize as a bare string handle, got %s", ss)
+	}
+	// Field order on the OUTER self_verifying object:
+	// evaluator < eval_agent < eval_toolset < behavior. The nested inner ReAct
+	// also serializes a "behavior" key (before "evaluator"), so the outer
+	// behavior is the LAST occurrence.
+	iEvaluator := strings.Index(ss, `"evaluator"`)
+	iEvalAgent := strings.Index(ss, `"eval_agent"`)
+	iEvalToolset := strings.Index(ss, `"eval_toolset"`)
+	iBehavior := strings.LastIndex(ss, `"behavior"`)
+	if !(iEvaluator < iEvalAgent && iEvalAgent < iEvalToolset && iEvalToolset < iBehavior) {
+		t.Fatalf("field order must be evaluator < eval_agent < eval_toolset < behavior, got %s", ss)
+	}
+
+	// 3) Round-trip.
+	var back LoopStrategy
+	if err := json.Unmarshal(rawSet, &back); err != nil {
+		t.Fatalf("unmarshal set: %v", err)
+	}
+	if back.SelfVerify == nil {
+		t.Fatalf("round-trip lost the self_verifying config")
+	}
+	if back.SelfVerify.EvalAgent != AgentRef("reviewer") {
+		t.Fatalf("round-trip eval_agent = %q, want reviewer", back.SelfVerify.EvalAgent)
+	}
+	if back.SelfVerify.EvalToolset != ToolsetRef("readonly-tools") {
+		t.Fatalf("round-trip eval_toolset = %q, want readonly-tools", back.SelfVerify.EvalToolset)
+	}
+	// Unset round-trips to empty handles.
+	var backUnset LoopStrategy
+	if err := json.Unmarshal(rawUnset, &backUnset); err != nil {
+		t.Fatalf("unmarshal unset: %v", err)
+	}
+	if backUnset.SelfVerify.EvalAgent != "" || backUnset.SelfVerify.EvalToolset != "" {
+		t.Fatalf("unset round-trip must yield empty handles, got %q / %q",
+			backUnset.SelfVerify.EvalAgent, backUnset.SelfVerify.EvalToolset)
+	}
+}
+
+// ============================================================================
+// #147: SelfVerifying charges the evaluator's turns against the budget scope
+// ============================================================================
+
+// runSVTwoItersWithCap runs a 2-iteration SelfVerifying (build,eval,build,eval —
+// the worker serves both phases per Q1c) under a max_turns cap. Used to prove
+// the evaluate phase is charged against the SelfVerifying budget scope, not just
+// the build phase.
+func runSVTwoItersWithCap(cap uint32) RunResult {
+	worker := NewMockAgent("build")
+	worker.Push(NewFinalResponse("build0", turnUsage()))
+	worker.Push(NewFinalResponse("eval0", turnUsage()))
+	worker.Push(NewFinalResponse("build1", turnUsage()))
+	worker.Push(NewFinalResponse("eval1", turnUsage()))
+
+	// fail iter0 (loop), pass iter1.
+	cfg := selfVerifyCfg(worker, newSVVerifier(3, "retry", "pass"))
+	h := NewStandardHarness(cfg)
+	maxTurns := cap
+	task := selfVerifyTask()
+	task.Budget = BudgetLimits{MaxTurns: &maxTurns}
+	return h.Run(context.Background(), NewHarnessRunOptions(task))
+}
+
+// TestSelfVerifyingChargesEvaluatorTurnsAgainstScope (#147): 2 iterations ×
+// (build 1 turn + eval 1 turn) = 4 turns. With the evaluator turns charged, a
+// cap of 4 just fits (Success); a cap of 3 is overrun by the second iteration's
+// EVALUATOR turn — the two build turns alone are only 2, so WITHOUT charging the
+// evaluator this would wrongly succeed.
+func TestSelfVerifyingChargesEvaluatorTurnsAgainstScope(t *testing.T) {
+	if r := runSVTwoItersWithCap(4); r.Kind != RunSuccess {
+		t.Fatalf("cap=4 should fit all 4 turns (build,eval,build,eval), got %+v", r)
+	}
+	if r := runSVTwoItersWithCap(3); r.Kind == RunSuccess {
+		t.Fatalf("cap=3 must be exhausted once evaluator turns are charged, got Success %+v", r)
+	}
+}
+
+// ============================================================================
 // HaltReason JSON round-trips for the two new variants (D4)
 // ============================================================================
 

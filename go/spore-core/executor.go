@@ -146,11 +146,14 @@ type StrategyExecutor interface {
 	// session by value).
 	AppendUserMessage(ctx context.Context, session *SessionState, text string)
 
-	// EvaluatePhase runs a SelfVerifying evaluate phase (#124, Q1c): a fresh
+	// EvaluatePhase runs a SelfVerifying evaluate phase (#124, Q1c; #151): a fresh
 	// evaluator RUN over a read-only sandbox in a never-shared session, on the
-	// RESOLVED evalAgent (the inner worker's agent). Folds the evaluate run's
-	// usage into totalUsage / carried (R8) and returns its terminal RunResult.
-	EvaluatePhase(ctx context.Context, task *Task, evalAgent Agent, carried *BudgetSnapshot, totalUsage *AggregateUsage) RunResult
+	// RESOLVED evalAgent (an explicit EvalAgent override, else the inner worker's
+	// agent), scoped to evalToolset (empty handle ⇒ global-catalogue fallback).
+	// The caller's approval middleware is dropped for this non-interactive nested
+	// run (#151 blocker fix). Folds the evaluate run's usage into totalUsage /
+	// carried (R8) and returns its terminal RunResult.
+	EvaluatePhase(ctx context.Context, task *Task, evalAgent Agent, evalToolset ToolsetRef, carried *BudgetSnapshot, totalUsage *AggregateUsage) RunResult
 
 	// RalphSeedSession builds a FRESH per-window session re-seeded from the
 	// DURABLE project-store checkpoint (#142 — keyed by the stable project

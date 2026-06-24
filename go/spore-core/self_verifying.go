@@ -187,6 +187,7 @@ func (h *StandardHarness) EvaluatePhase(
 	ctx context.Context,
 	task *Task,
 	evalAgent Agent,
+	evalToolset ToolsetRef,
 	carried *BudgetSnapshot,
 	totalUsage *AggregateUsage,
 ) RunResult {
@@ -220,18 +221,33 @@ func (h *StandardHarness) EvaluatePhase(
 	// R9). The resolved evalAgent runs the fresh ReAct window directly.
 	evalConfig := h.config
 	evalConfig.Sandbox = NewReadOnlySandbox(h.config.Sandbox)
+	// #151 (BLOCKER): the evaluate phase must NOT inherit the caller's approval
+	// middleware. This nested review run is non-interactive — the caller never
+	// sees its freshly generated session id, so it can never resume it. Under a
+	// policy engine whose default is "ask the human" (SurfaceToHuman), the
+	// reviewer's first read_file fires BeforeTool → SurfaceToHuman → the nested
+	// run returns WaitingForHuman with no human attached, which the verifier reads
+	// as a misconfiguration → Failed, every iteration. The read-only sandbox
+	// (above) already enforces the only safety property a reviewer needs (no
+	// writes, no command execution), so the caller's approval middleware is both
+	// redundant and harmful here — drop it for the evaluate phase. (Paired with
+	// EvalToolset scoped to read-only tools so non-filesystem side-effecting tools
+	// the sandbox does not gate stay out of reach.) Observability / pricing /
+	// storage seams stay (they are separate fields on the copied config).
+	evalConfig.Middleware = nil
 	evalHarness := NewStandardHarness(evalConfig)
 
 	var evalState SessionState
 	evalHarness.config.ContextManager.AppendUserMessage(ctx, &evalState, directive)
 
-	// Issue 2: the evaluate phase carries no per-node toolset handle, so it threads
-	// the EMPTY handle → global-catalogue fallback, byte-for-byte.
+	// #151: the evaluate phase runs against evalToolset (a read-only/inspection
+	// catalogue) when set; empty ⇒ the EMPTY handle → global-catalogue fallback,
+	// byte-for-byte with prior behavior.
 	// Issue #139: the evaluate phase does NOT enforce output schemas (only the
 	// recursive ReactConfig.Run is the enforcement seam). nil/0 ⇒ pre-#139.
 	// SC-10: the evaluate phase carries no per-leaf system-prompt override ⇒ the
 	// window uses the global config.SystemPrompt, byte-identical.
-	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, ToolsetRef(""), nil, 0, nil)
+	evalResult := evalHarness.runReActInner(ctx, evalTask, cap, evalState, BudgetSnapshot{}, nil, evalAgent, evalToolset, nil, 0, nil)
 	foldSelfVerifyUsage(totalUsage, carried, evalResult)
 	return evalResult
 }
